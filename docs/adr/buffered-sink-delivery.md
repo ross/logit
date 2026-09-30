@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-09-26
+updated: 2026-09-29
 ---
 
 # Buffered, decoupled sink delivery
@@ -297,15 +297,38 @@ fires, but doesn't say what happens to a send still in flight when the grace run
 grace winning drops the send. The destination may already have taken the batch. The only
 `timeout` around `output.send` is the retry budget's, and its expiry is already `Ambiguous`.
 
-[ADR `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md)'s
+[ADR
+`shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md)'s
 decision 3 classifies that send as `Fault::Ambiguous`, and this record's retry table decides the
 rest:
 
-- Under `at_least_once`, the batch will stay uncommitted, so it's replayed or counted by
+- Under `at_least_once`, the batch stays uncommitted, so it's replayed or counted by
   `SinkStore::finish`, as any queued batch is.
-- Under `at_most_once`, the batch will be committed and counted
-  `batches.dropped{reason="shutdown"}`, not `send_failed`, and the sink span tagged
-  `fault=ambiguous`.
+- Under `at_most_once`, the batch is committed and counted `batches.dropped{reason="shutdown"}`,
+  not `send_failed`, and the sink span is tagged `fault=ambiguous`.
 
-A grace that expires while no send is in flight, such as during a backoff sleep, will leave the
-batch uncommitted under either posture.
+A grace that expires while no send is in flight, such as during a backoff sleep, leaves the batch
+uncommitted under either posture.
+
+## Amendment: attempt accounting (2026-09-29)
+
+This record says `send` is one attempt and the runtime owns retry. [ADR
+`sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) adds what that
+means for counters. Encode-side counters count once per batch, through a gate
+`Output::observe_batch` arms, and transport counters count once per attempt. Server-verdict drops
+count per attempt and repeat on a retried batch. `Output::observe_batch` runs once per batch, not
+once per attempt. A sink's zero `buffer.retry_budget` or `buffer.retry_max_delay` fails config
+validation (graph rule 15), so `logit validate` and `logit run` both reject it. `Output` gains no
+method and no parameter.
+
+## Amendment: once-per-batch counting (2026-09-29)
+
+`statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `influxdb_out`, `stdio_out`, and
+`file_out` count once per batch as above, and graph rule 15 rejects the two zero durations ([ADR
+`sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md), decisions 2, 10,
+and 13). The gate lives in `logit_core::Telemetry`, armed by `observe_batch`, and mutes only
+during an encode that repeats one an earlier attempt at the batch already counted. An unarmed gate
+never mutes, so a caller that never calls `observe_batch` counts every `send`. `otlp_out`,
+`prometheus_out`'s remote-write mode, and `splunk_hec_out` are gated the same way. `datadog_out`
+and `datadog_trace_out` are gated per unit: `datadog_out`'s plan and each route, and
+`datadog_trace_out`'s trace and stats routes, with a bisection's re-encodes muted (decision 2).

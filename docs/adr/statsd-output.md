@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-24
+updated: 2026-09-29
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -693,8 +693,10 @@ plaintext, backed by a real proof: one `AsyncWriteExt::write` is one `write(2)`,
 zero bytes of that call were accepted and the whole frame can safely be retried on a fresh
 connection. TLS removes that proof. `tokio_rustls`' `poll_write` copies plaintext into the rustls
 session and loops socket writes until one returns `Pending`; it can therefore fail having already
-put complete records — each a run of complete, LF-terminated statsd lines a receiver keeps and
-counts — on the wire. So on TLS this sink does **no** internal reconnect-and-retry, and every
+put complete records on the wire. rustls splits what each session write accepted into records of
+at most 16384 bytes of plaintext, with no regard for line boundaries, so a record can end
+mid-line, but every complete, LF-terminated statsd line in what arrived is one a receiver keeps
+and counts. So on TLS this sink does **no** internal reconnect-and-retry, and every
 failure at or after the first application write is `Fault::Ambiguous`; `Fault::Clean` survives only
 for failures inside the dial itself. On plaintext the pre-existing behaviour is unchanged: one
 reconnect-and-retry after a zero-byte failure, `Fault::Clean` if the retry fails too. Given
@@ -748,3 +750,13 @@ A message containing `|` no longer relays byte-for-byte; the substitution joins 
 permitted normalizations. `docs/design/data-model.md`'s `statsd.service_check.message` row carries
 the rule, and [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s W7a
 amendment records the same finding from the Datadog side.
+
+## Amendment: the shared stream driver and datagram packer (2026-09-29)
+
+[ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) moves `statsd_out`'s pooled TCP and Unix stream send onto a driver shared with `syslog_out` and
+`graphite_out`, and its datagram packing onto a packer shared with `graphite_out` and the Unix
+datagram transport. It also changes three behaviors: `logit.output.requests` is tagged
+`class=ok|clean|ambiguous|permanent` and counts connect failures, the datagram transports count
+what reached the kernel before a failure, and a TLS server name is parsed at construction, so a
+bad endpoint fails startup. A TLS write `Err` is `Ambiguous`. Over UDP, `max_packet_bytes` is at
+most 65507, the largest UDP payload, and an IPv6 endpoint is sent to over an IPv6 socket.

@@ -29,14 +29,22 @@
 //! `send_relayed` the only write is that frame's `Ack`. So a `logit_out` that gets `GOING_AWAY`
 //! in place of an `Ack` knows the batch never landed, and resends it at any delivery posture.
 //!
-//! **Bounded writes.** Every control write (`HelloAck`, `Ack`, and every `Reject`, including
-//! `GOING_AWAY`) finishes within `handshake_timeout` or is abandoned ([`write_control`]). A peer
+//! **Bounded, flushed writes.** Every control write (`HelloAck`, `Ack`, and every `Reject`,
+//! including `GOING_AWAY`) is flushed, and the write and flush finish within `handshake_timeout`
+//! or are abandoned ([`write_control`]). The flush is what sends a TLS write's queued tail: the
+//! waiting read on this side doesn't, and the peer is waiting for the whole message. A peer
 //! that sends frames but never reads its `Ack`s fills this side's send buffer; unbounded, the
 //! blocked write would hold the task, its permit, and its [`Fanout`] clone, and so the
 //! shutdown, for as long as the peer stayed connected. `idle_timeout` bounds reads only and can't
 //! reach a blocked write. A stalled `Ack` ends the connection as an error, counted as
 //! `logit.proto.errors{reason="ack_write_stalled"}`; a stalled `Reject` is abandoned, since the
 //! connection is closing anyway, and counted as `reason="reject_write_stalled"`.
+//!
+//! **Close.** A peer that closes between frames ends the connection with `Ok(())`: an EOF, or,
+//! under TLS, `UnexpectedEof` from a peer gone without `close_notify` (a `logit_out` dropping a
+//! connection after a failed attempt), since no frame is in flight either way. A close or read
+//! error part-way through a header is an error, counted
+//! `logit.proto.errors{reason="truncated_header"}`; part-way through a body, `reason="truncated"`.
 //!
 //! **Connection limit.** A non-blocking `try_acquire_owned` against the same 1024-connection cap
 //! `otlp_in` ([`crate::otlp::MAX_CONCURRENT_CONNECTIONS`]) and `syslog_in`'s driver use: past the
@@ -61,7 +69,7 @@
 //! how long a handshaken connection may stay quiet before this listener closes it and returns its
 //! permit (`docs/adr/idle-connection-timeout.md`). It's a rolling deadline, not a per-phase one.
 //! It bounds reads only; a write blocked on a peer that stopped reading is `handshake_timeout`'s
-//! ("Bounded writes" above).
+//! ("Bounded, flushed writes" above).
 //!
 //! *Measured from the last `Ack` written* (or from the handshake, before any frame), never from
 //! the last frame read. A peer waiting for an `Ack` is not idle: a slow downstream is delaying
@@ -427,7 +435,8 @@ fn decode_error_reason(err: &CodecError) -> &'static str {
 /// `Hello`/`HelloAck`, then frame, `Fanout::send`, `Ack`, until close, shutdown, or idle close.
 ///
 /// Counts every rejection under `logit.proto.errors{reason}`; `docs/design/internal-telemetry.md`'s
-/// `logit_in` section is the canonical list of reasons. A close or error mid-header is not counted.
+/// `logit_in` section is the canonical list of reasons. A close or read error between frames is
+/// not counted; one mid-header is `truncated_header`.
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
     sink: Fanout,
@@ -473,6 +482,11 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     Ok(header_buf) => header_buf,
                     Err(HeaderReadError::Idle(idle)) => {
                         return close_idle(&mut stream, &telemetry, idle, handshake_timeout).await
+                    }
+                    Err(HeaderReadError::Truncated(err)) => {
+                        let reason = [("reason", "truncated_header")];
+                        telemetry.count("logit.proto.errors", 1.0, &reason);
+                        return Err(err);
                     }
                     Err(err) => return Err(err.into_inner()),
                 }
@@ -653,8 +667,21 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         else {
             anyhow::bail!("connection closed before sending Hello");
         };
-        // `None`: the whole `Hello` read is already inside `handshake_timeout`.
-        read_frame_body(stream, header_buf, max_frame_bytes, None)
+        // A control message, so bounded by the control cap, not `max_frame_bytes`; an over-cap
+        // header fails like any bad `Hello`. A control frame is never compressed, so its
+        // `compressed_len` has the same cap, as `logit_out`'s `read_control` applies, not lz4's
+        // worst case over it. A header that doesn't parse is left to `read_frame_body`.
+        if let Ok(header) = FrameHeader::read(&mut Bytes::copy_from_slice(&header_buf)) {
+            if header.compressed_len > control::MAX_CONTROL_MESSAGE_BYTES {
+                anyhow::bail!(
+                    "Hello declares {} compressed bytes, over the {}-byte control message cap",
+                    header.compressed_len,
+                    control::MAX_CONTROL_MESSAGE_BYTES
+                );
+            }
+        }
+        // `None`: the whole read is inside `handshake_timeout`.
+        read_frame_body(stream, header_buf, control::MAX_CONTROL_MESSAGE_BYTES, None)
             .await
             .map_err(FrameReadError::into_inner)
     });
@@ -745,7 +772,10 @@ impl IdleBounds {
 /// Why [`read_header`] produced no header. `Idle` is separate so a caller can turn it into an
 /// idle close rather than an error.
 enum HeaderReadError {
+    /// A read failed before any byte of the header arrived.
     Io(anyhow::Error),
+    /// The peer closed, or a read failed, part-way through the header.
+    Truncated(anyhow::Error),
     /// An [`IdleBounds`] bound elapsed, first byte or later. Carries the configured
     /// `idle_timeout` for `close_idle` to name.
     Idle(Duration),
@@ -754,7 +784,7 @@ enum HeaderReadError {
 impl HeaderReadError {
     fn into_inner(self) -> anyhow::Error {
         match self {
-            HeaderReadError::Io(err) => err,
+            HeaderReadError::Io(err) | HeaderReadError::Truncated(err) => err,
             // Unreachable from today's flattening callers, which pass no bounds.
             HeaderReadError::Idle(idle) => {
                 anyhow::anyhow!("a frame header stopped arriving for {idle:?}")
@@ -798,12 +828,26 @@ async fn read_header<S: AsyncRead + Unpin>(
                 }
             }
         };
-        let n = read.map_err(|err| HeaderReadError::Io(anyhow::Error::new(err)))?;
+        let n = match read {
+            Ok(n) => n,
+            // A TLS peer gone without `close_notify`: a close at a frame boundary, like `Ok(0)`
+            // (module doc's "Close").
+            Err(err) if filled == 0 && err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(None)
+            }
+            Err(err) if filled == 0 => return Err(HeaderReadError::Io(anyhow::Error::new(err))),
+            Err(err) => {
+                return Err(HeaderReadError::Truncated(anyhow::Error::new(err).context(format!(
+                    "reading a frame header ({filled}/{} bytes)",
+                    frame::HEADER_LEN
+                ))))
+            }
+        };
         if n == 0 {
             if filled == 0 {
                 return Ok(None);
             }
-            return Err(HeaderReadError::Io(anyhow::anyhow!(
+            return Err(HeaderReadError::Truncated(anyhow::anyhow!(
                 "connection closed mid-header ({filled}/{} bytes)",
                 frame::HEADER_LEN
             )));
@@ -917,10 +961,10 @@ async fn read_frame_body<S: AsyncRead + Unpin>(
     }
 }
 
-/// Writes one control message with [`frame::FLAG_CONTROL`] set, within `bound` (the connection's
-/// `handshake_timeout`; module doc's "Bounded writes"). A write not finished within it
-/// fails with [`WriteStalled`]. `codec`/`compression` mean nothing on a control frame
-/// (`logit_proto::native::control`), so they're always `0`/`None`.
+/// Writes and flushes one control message with [`frame::FLAG_CONTROL`] set, within `bound` (the
+/// connection's `handshake_timeout`; module doc's "Bounded, flushed writes"). A write and flush not
+/// finished within it fail with [`WriteStalled`]. `codec`/`compression` mean nothing on a control
+/// frame (`logit_proto::native::control`), so they're always `0`/`None`.
 async fn write_control<S: AsyncWrite + Unpin>(
     stream: &mut S,
     msg: &impl ControlEncode,
@@ -928,7 +972,12 @@ async fn write_control<S: AsyncWrite + Unpin>(
 ) -> anyhow::Result<()> {
     let framed =
         frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &msg.encode())?;
-    match tokio::time::timeout(bound, stream.write_all(&framed)).await {
+    // The flush sends a TLS write's queued tail (module doc's "Bounded, flushed writes").
+    let written = async {
+        stream.write_all(&framed).await?;
+        stream.flush().await
+    };
+    match tokio::time::timeout(bound, written).await {
         Ok(written) => Ok(written?),
         Err(_elapsed) => Err(anyhow::Error::new(WriteStalled { what: msg.name(), bound })),
     }
@@ -2298,6 +2347,202 @@ mod tests {
         );
     }
 
+    // ---- control writes over TLS ----------------------------------------------------------------
+
+    /// A tokio-rustls client and server over `tokio::io::duplex(capacity)`, handshake complete.
+    /// The server sends no session tickets: over a pipe smaller than them, its accept would wait
+    /// for a client that has returned from its own handshake and stopped reading.
+    async fn tls_duplex(
+        capacity: usize,
+    ) -> (
+        tokio_rustls::client::TlsStream<tokio::io::DuplexStream>,
+        tokio_rustls::server::TlsStream<tokio::io::DuplexStream>,
+    ) {
+        let mut config =
+            crate::tls::build_server_config(&test_tls_settings(), &testdata_dir(), &[]).unwrap();
+        config.send_tls13_tickets = 0;
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let connector = tls_connector().await;
+        let (client_io, server_io) = tokio::io::duplex(capacity);
+        let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+        let (client, server) =
+            tokio::join!(connector.connect(name, client_io), acceptor.accept(server_io));
+        (client.unwrap(), server.unwrap())
+    }
+
+    /// Writes `bytes` and flushes them, as a TLS client must before it waits for a reply.
+    async fn write_flushed<S: AsyncWrite + Unpin>(stream: &mut S, bytes: &[u8]) {
+        stream.write_all(bytes).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    /// A TLS write returns with ciphertext still queued in the session, and this listener's
+    /// waiting read never sends it. Over a 16-byte pipe, a `HelloAck` or `Ack` reaches the client
+    /// only because [`write_control`] flushes it.
+    #[tokio::test]
+    async fn hello_ack_and_ack_reach_a_tls_client_over_a_pipe_smaller_than_one_record() {
+        let (mut client, server) = tls_duplex(16).await;
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(serve_connection(
+            server,
+            sink,
+            Telemetry::default(),
+            frame::MAX_SANE_UNCOMPRESSED_LEN,
+            HANDSHAKE_TIMEOUT,
+            None,
+            shutdown_rx,
+        ));
+
+        let hello = frame::write_frame_with_flags(
+            0,
+            Compression::None,
+            frame::FLAG_CONTROL,
+            &hello_v1().encode(),
+        )
+        .unwrap();
+        write_flushed(&mut client, &hello).await;
+        let reply = tokio::time::timeout(
+            logit_pipeline::test_util::RECV_TIMEOUT,
+            read_control_response_over(&mut client),
+        )
+        .await
+        .expect("the HelloAck reaches the client");
+        assert!(matches!(reply, control::ControlMessage::HelloAck(_)), "{reply:?}");
+
+        write_flushed(&mut client, &sample_frame()).await;
+        let reply = tokio::time::timeout(
+            logit_pipeline::test_util::RECV_TIMEOUT,
+            read_control_response_over(&mut client),
+        )
+        .await
+        .expect("the Ack reaches the client");
+        assert_eq!(reply, control::ControlMessage::Ack(control::Ack { seq: 1 }));
+        recv_batch(&mut rx).await;
+    }
+
+    /// [`hello_ack_and_ack_reach_a_tls_client_over_a_pipe_smaller_than_one_record`] for a
+    /// `Reject`, written before the connection closes.
+    #[tokio::test]
+    async fn a_reject_reaches_a_tls_client_over_a_pipe_smaller_than_one_record() {
+        let (mut client, mut server) = tls_duplex(16).await;
+        tokio::spawn(async move {
+            let _ = handshake(
+                &mut server,
+                frame::MAX_SANE_UNCOMPRESSED_LEN,
+                HANDSHAKE_TIMEOUT,
+                &Telemetry::default(),
+            )
+            .await;
+        });
+
+        let hello = control::Hello { version: control::PROTOCOL_VERSION + 1, ..hello_v1() };
+        let hello = frame::write_frame_with_flags(
+            0,
+            Compression::None,
+            frame::FLAG_CONTROL,
+            &hello.encode(),
+        )
+        .unwrap();
+        write_flushed(&mut client, &hello).await;
+        let reply = tokio::time::timeout(
+            logit_pipeline::test_util::RECV_TIMEOUT,
+            read_control_response_over(&mut client),
+        )
+        .await
+        .expect("the Reject reaches the client");
+        match reply {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_VERSION_MISMATCH)
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// Handshakes `client` against a spawned [`serve_connection`] with `telemetry`, and returns
+    /// the task.
+    fn serve_over<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        server: S,
+        telemetry: Telemetry,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let (sink, rx) = fanout_into_channel(16);
+        // Held by the task, so a forward never blocks and the channel outlives it.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            let _keep = (rx, shutdown_tx);
+            serve_connection(
+                server,
+                sink,
+                telemetry,
+                frame::MAX_SANE_UNCOMPRESSED_LEN,
+                HANDSHAKE_TIMEOUT,
+                None,
+                shutdown_rx,
+            )
+            .await
+        })
+    }
+
+    /// A TLS client gone without `close_notify` between frames reads as `UnexpectedEof`
+    /// (`logit_outputs`' `stream_pins`). No frame is in flight, so it's a clean close: no error
+    /// for the accept loop's `connection_error`, and no `logit.proto.errors`.
+    #[tokio::test]
+    async fn a_tls_client_gone_without_close_notify_between_frames_is_a_clean_close() {
+        let registry = Registry::new();
+        let (mut client, server) = tls_duplex(64 * 1024).await;
+        let task = serve_over(server, registry.telemetry_for("logit_in", "logit_in", "listener"));
+
+        write_msg(&mut client, &hello_v1()).await;
+        let _ = read_control_response_over(&mut client).await;
+        client.write_all(&sample_frame()).await.unwrap();
+        assert_eq!(
+            read_control_response_over(&mut client).await,
+            control::ControlMessage::Ack(control::Ack { seq: 1 })
+        );
+        drop(client);
+
+        let result = tokio::time::timeout(logit_pipeline::test_util::RECV_TIMEOUT, task)
+            .await
+            .expect("the connection ends")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!Totals::of(registry.drain(0)).has("logit.proto.errors", &[]));
+    }
+
+    /// A peer gone part-way through a frame header, over TLS (`UnexpectedEof`) or plaintext
+    /// (`Ok(0)`), is an error counted as `truncated_header`.
+    #[tokio::test]
+    async fn a_client_gone_mid_header_is_an_error_counted_as_a_truncated_header() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+
+        let (mut tls_client, tls_server) = tls_duplex(64 * 1024).await;
+        let tls_task = serve_over(tls_server, telemetry.clone());
+        write_msg(&mut tls_client, &hello_v1()).await;
+        let _ = read_control_response_over(&mut tls_client).await;
+        write_flushed(&mut tls_client, &sample_frame()[..10]).await;
+        drop(tls_client);
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let task = serve_over(server, telemetry);
+        write_msg(&mut client, &hello_v1()).await;
+        let _ = read_control_response_over(&mut client).await;
+        client.write_all(&sample_frame()[..10]).await.unwrap();
+        drop(client);
+
+        for (what, task) in [("tls", tls_task), ("plaintext", task)] {
+            let result = tokio::time::timeout(logit_pipeline::test_util::RECV_TIMEOUT, task)
+                .await
+                .expect("the connection ends")
+                .unwrap();
+            let err = result.expect_err(what);
+            assert!(format!("{err:#}").contains("10/24 bytes"), "{what}: {err:#}");
+        }
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "truncated_header")]), 2.0);
+        assert_eq!(totals.sum("logit.proto.errors", &[]), 2.0);
+    }
+
     /// An xorshift-generated printable-ASCII string: lz4 finds almost no 4-byte match in it, so
     /// its lz4 frame is larger than its payload.
     fn incompressible_text(len: usize) -> String {
@@ -2504,6 +2749,101 @@ mod tests {
             })
             .await;
         assert_eq!(totals.sum("logit.proto.errors", &[("reason", "handshake")]), 2.0);
+    }
+
+    /// A `Hello` is read against the control-message cap, not `max_frame_bytes`: one at the cap,
+    /// padded with a field a later protocol version might add, is answered `HelloAck`, and a header
+    /// declaring one byte more closes the connection before any body is read, counted as a
+    /// handshake error like any other bad `Hello`.
+    #[tokio::test]
+    async fn a_hello_is_bounded_by_the_control_message_cap() {
+        let cap = control::MAX_CONTROL_MESSAGE_BYTES as usize;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        // Far longer than the test waits: the close must come from the cap, not a timeout.
+        let mut input =
+            input.with_telemetry(telemetry).with_handshake_timeout(Duration::from_secs(30));
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        // `hello_v1` padded with unknown field 99: tag, a 2-byte uvarint length, then bytes.
+        let mut payload = BytesMut::from(&hello_v1().encode()[..]);
+        let pad = cap - payload.len() - 3;
+        payload.extend_from_slice(&[99, (pad as u8 & 0x7f) | 0x80, (pad >> 7) as u8]);
+        payload.extend_from_slice(&vec![0u8; pad]);
+        assert_eq!(payload.len(), cap);
+
+        let mut at_cap = connect(&addr).await;
+        let framed =
+            frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &payload)
+                .unwrap();
+        at_cap.write_all(&framed).await.unwrap();
+        match read_control_response(&mut at_cap).await {
+            control::ControlMessage::HelloAck(ack) => {
+                assert_eq!(ack.codec, native::CODEC_NATIVE_V1)
+            }
+            other => panic!("expected HelloAck at the cap, got {other:?}"),
+        }
+
+        payload.extend_from_slice(&[0]);
+        let over =
+            frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &payload)
+                .unwrap();
+        let mut over_cap = connect(&addr).await;
+        // The header alone: a listener that waited for the body would hold the connection open.
+        over_cap.write_all(&over[..frame::HEADER_LEN]).await.unwrap();
+        expect_closed(&mut over_cap, "a Hello header over the control-message cap").await;
+
+        let mut probe = TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("the oversized Hello counted", |t| {
+                t.sum("logit.proto.errors", &[("reason", "handshake")]) >= 1.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "handshake")]), 1.0);
+        drop(at_cap);
+    }
+
+    /// A control frame is never compressed, so a `Hello` header whose `compressed_len` is one
+    /// past the control-message cap is refused on the header, as `logit_out`'s `read_control`
+    /// refuses a reply, not admitted up to lz4's worst case over the cap.
+    #[tokio::test]
+    async fn a_hello_whose_compressed_length_is_over_the_control_message_cap_is_refused() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        // Far longer than the test waits: the close must come from the cap, not a timeout.
+        let mut input =
+            input.with_telemetry(telemetry).with_handshake_timeout(Duration::from_secs(30));
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        // A real lz4 `Hello` header with `compressed_len` (bytes 16..20) raised past the cap.
+        let mut header = BytesMut::from(
+            &frame::write_frame_with_flags(
+                0,
+                Compression::Lz4,
+                frame::FLAG_CONTROL,
+                &hello_v1().encode(),
+            )
+            .unwrap()[..frame::HEADER_LEN],
+        );
+        let over = control::MAX_CONTROL_MESSAGE_BYTES + 1;
+        assert!(over <= frame::compressed_bound(control::MAX_CONTROL_MESSAGE_BYTES));
+        header[16..20].copy_from_slice(&over.to_le_bytes());
+
+        let mut client = connect(&addr).await;
+        client.write_all(&header).await.unwrap();
+        expect_closed(&mut client, "a Hello whose compressed length is over the cap").await;
+
+        let mut probe = TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("the oversized Hello counted", |t| {
+                t.sum("logit.proto.errors", &[("reason", "handshake")]) >= 1.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "handshake")]), 1.0);
     }
 
     /// A connection turned away at the cap holds no permit: with the cap at 1, the rejected

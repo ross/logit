@@ -237,7 +237,10 @@ in this section. To make the queue survive a restart, see [Durable buffering](#d
 A sink that can't reach its destination drops and counts batches; it doesn't end `logit run`:
 
 - **A retryable failure** (per the sink's fault classification and delivery posture) is retried
-  within `retry_budget` (60s by default), then the batch is dropped and counted.
+  within `retry_budget` (60s by default), then the batch is dropped and counted. The backoff
+  between attempts starts at 200ms and doubles up to `retry_max_delay` (10s by default).
+  `logit validate` rejects `retry_budget: 0s` and `retry_max_delay: 0s`: the first times every
+  attempt out before it starts, and the second retries with no pause until the budget ends.
 - **A non-retryable failure**, including retry-budget exhaustion, drops the batch, counts it, and
   logs a throttled warning. The writer moves on to the next batch; the rest of the pipeline and
   every other sink keep running.
@@ -285,6 +288,14 @@ buffering:
   (the queue, or batches still waiting to enter it, held data when the sink stopped). Any sustained nonzero rate is data
   loss worth alerting on. The `reason` says whether the cause is an overflowing queue, a failing
   destination, or a slow drain racing shutdown.
+- **A retried batch doesn't inflate a sink's encode-side drop counters, but a drop a peer or the
+  kernel decided repeats.** While a sink retries, counts such as
+  `logit.output.messages.dropped{reason="oversize_datagram"}`, a Splunk code 6, and an OTLP
+  partial success grow with each attempt that meets the same answer, so read them as attempts,
+  not batches. [Internal telemetry](design/internal-telemetry.md#outputs) has the class table
+  that lists every sink counter as once per batch, once per attempt, or repeating
+  ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+  decision 1).
 
 ### Durable buffering
 
@@ -682,9 +693,10 @@ accounting a `Failed` or `Shutdown` close gets.
 
 **On the client side, a pooled sink probes a reused connection before writing to it.** A
 server-side idle close isn't free for a sink holding a pooled connection. Writing into a socket the
-peer already closed either becomes `Fault::Ambiguous` (`logit_out`, whose native protocol's ack
-framing notices the failed write) or is silently lost (`syslog_out`, `statsd_out`, `graphite_out`,
-whose plaintext protocols can't tell the sender anything went wrong). So each of these four pooled
+peer already closed either becomes `Fault::Ambiguous` (`logit_out`, whose ack wait meets the
+close after the write went into the kernel's buffer) or is silently lost (`syslog_out`,
+`statsd_out`, `graphite_out`, whose plaintext protocols can't tell the sender anything went
+wrong). So each of these four pooled
 TCP sinks polls a *reused* pooled connection once before the first write of a send attempt. The
 poll is a single non-cancellable `poll_read`, never a `timeout(read)`, because a timeout on a real
 read could cancel mid-TLS-record and discard bytes that had already arrived. An immediate EOF, or
@@ -693,7 +705,8 @@ unsolicited bytes (the only thing a peer sends unprompted on the native protocol
 written: the ordinary `Clean`/reconnect path, not a lost or ambiguous batch. That catches the
 common case, a peer that idle-closed some time ago. It doesn't catch the peer's FIN racing the
 probe itself (the peer closing *while* the sink writes): that remains `Fault::Ambiguous` on
-`logit_out` and a silent loss on the three plaintext sinks. The probe narrows the window; it doesn't
+`logit_out` when the write completes first, `Fault::Clean` when the write or its flush fails (the
+peer can't hold part of a frame), and a silent loss on the three plaintext sinks. The probe narrows the window; it doesn't
 close it.
 
 ### `collectd_in`: multicast groups and `types_db`
@@ -902,8 +915,9 @@ components:
   resynchronize at. A recorded `datadog` Python client's stream decodes this way, and a real
   Agent 7.83 accepted `statsd_out`'s.
 - **No TLS, and the path must be absolute.** A Unix socket is local and always plaintext, so
-  `logit validate` rejects `tls:` under either Unix transport, and a relative `bind:` (rule 65),
-  which a client's `unix:///` URL couldn't name.
+  `logit validate` rejects `tls:` under either Unix transport, a relative `bind:`, which a
+  client's `unix:///` URL couldn't name, and a path of 108 bytes or more, which doesn't fit a Unix
+  socket address (rule 65).
 
 ### `collectd_out`: relaying back onto the wire
 
@@ -933,8 +947,8 @@ reference. Before deploying one:
   which this relay re-emits as 1717 bytes across two. Expect a capture of relayed traffic to look
   chattier than the original.
 - **`max_packet_bytes:` bounds a datagram, not a value list**, and defaults to `1452`, collectd's
-  own `MaxPacketSize` default. Graph validation rejects values outside `1024..=65535`, collectd's
-  range. Lower it to match a path MTU. The encoder re-packs incoming lists into datagrams of its own
+  own `MaxPacketSize` default. Graph validation rejects values outside `1024..=65507`: 1024 is
+  collectd's own minimum, and 65507 is the largest UDP payload. Lower it to match a path MTU. The encoder re-packs incoming lists into datagrams of its own
   choosing, however the sender packed them, so this setting (together with the inflation above,
   which pushes that 1296-byte capture over the default cap) decides egress framing. A single value
   list too large to fit alone is dropped whole and counted
@@ -979,11 +993,15 @@ one:
   dotted sub-paths tabled in `logit_proto::graphite`'s module doc (`.count`, `.sum`,
   `.q0_5`...`.q0_99`, per-bucket counts, and so on), an explicit, named convention counted
   `logit.output.metrics.degraded{metric_kind=...}` once per record.
-- **Size and timeout bounds.** `max_packet_bytes:` (UDP only, default `1432`) bounds a datagram, not
-  a single line, like `statsd_out`'s setting. `max_frame_bytes:` (default `1MiB`, Twisted's
+- **Size and timeout bounds.** `max_packet_bytes:` (UDP only, default `1432`, at most `65507`, the
+  largest UDP payload) bounds a datagram, not a single line, like `statsd_out`'s setting. `max_frame_bytes:` (default `1MiB`, Twisted's
   `Int32StringReceiver.MAX_LENGTH`) bounds one pickle frame and applies regardless of transport,
   since pickle is TCP-only anyway. `connect_timeout:` (TCP only, default `5s`) matches
   `statsd_out`'s and `syslog_out`'s default.
+- **What to watch.** `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (one per
+  attempt) and, on TCP, `logit.output.reconnects`, which should stay near zero in steady state; a
+  climbing count means the peer or the network is unstable. TCP sends through the same connection
+  handling as `statsd_out` and `syslog_out`.
 - **Retries rely on whisper's semantics.** This is the first non-HTTP sink with a real destination
   to report `duplicate_safe: true` (`null_out` reports it trivially, having no destination):
   whisper is last-write-wins per `(path, second)`, so a datapoint redelivered on retry overwrites
@@ -1018,6 +1036,9 @@ components:
   in this project). No statsd client in the wild speaks TLS, so, like `statsd_in`'s listener block,
   this is for a `logit`-to-`logit` or stunnel-shaped relay hop, not an application's DogStatsD
   client. See ["TLS"](#tls) below for the full field reference.
+- **The TLS server name comes from `endpoint:`'s host, and a host that isn't one fails startup.**
+  An IP literal or a DNS name works; an empty host or a scoped IPv6 address (`[fe80::1%eth0]:8125`)
+  stops `logit run` with an error naming the component and the endpoint.
 - **`connect_timeout:` bounds the TCP connect and the TLS handshake as two separate phases**, not
   one combined deadline, so a TLS connect can take up to twice the configured value (`syslog_out`'s
   arrangement). Account for that if you raise it.
@@ -1029,11 +1050,21 @@ components:
   ([ADR `statsd-output`](adr/statsd-output.md)'s TLS amendment). That is deliberately conservative:
   `statsd_out` reports `duplicate_safe: false` because a redelivered `hits:5|c` *increments the
   destination counter a second time*. Watch `logit.component.batches.dropped` accordingly.
-- **What to watch.** `logit.output.requests{class="ok"|"error"}` (one per attempt) and, on TCP,
-  `logit.output.reconnects`, which should stay near zero in steady state; a climbing count means the
+- **What to watch.** `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (one per
+  attempt, tagged with its fault class) and, on TCP, `logit.output.reconnects`, which should stay near zero in steady state; a climbing count means the
   peer or the network is unstable, not this sink. It counts plaintext and TLS connections the same
   way, since both take the same connect path. `logit.output.datagrams` exists only under the
-  datagram transports, `udp` and `unix`.
+  datagram transports, `udp` and `unix`, and there
+  `logit.output.messages.dropped{reason="oversize_datagram"}` counts the lines of a datagram the
+  kernel refused as too large (`EMSGSIZE`) under an `ok` request. The kernel decided that drop, so a
+  retried batch counts it again (see
+  [What to watch for sink buffering](#what-to-watch-for-sink-buffering)).
+- **Over UDP, `endpoint:` needs a real port and `max_packet_bytes:` at most `65507`.** `logit
+  validate` rejects port 0, which the kernel refuses every datagram to (rule 73), and a
+  `max_packet_bytes:` above 65507, the largest UDP payload (rule 38). A name that resolves to both
+  IPv4 and IPv6 addresses is sent to the first IPv4 one; an endpoint with only IPv6 addresses goes
+  out over an IPv6 socket. `syslog_out`, `graphite_out`, and `collectd_out` resolve their UDP
+  endpoints the same way.
 
 ### `statsd_out`: sending to a DogStatsD Unix socket
 
@@ -1066,8 +1097,11 @@ components:
 - **`unix_stream` connects lazily and reconnects like TCP.** Each packet follows its length as a
   4-byte little-endian integer, which a real Agent 7.83 accepted. A write that fails having
   accepted zero bytes is retried once on a fresh connection, as on plaintext TCP.
-- **No TLS.** `logit validate` rejects `tls:` under either Unix transport, and a relative
-  `endpoint:` (rule 65).
+- **No TLS.** `logit validate` rejects `tls:` under either Unix transport, a relative
+  `endpoint:`, and a path of 108 bytes or more, which doesn't fit a Unix socket address (rule 65).
+- **`max_packet_bytes:` isn't bounded by the UDP ceiling here.** A `unix` datagram's limit is the
+  socket's send buffer (`net.core.wmem_default`, 212 992 bytes on a default kernel); a larger
+  packet is refused `EMSGSIZE` and counted `oversize_datagram`, as over UDP.
 
 ## Tailing files and Docker logs
 
@@ -1654,7 +1688,9 @@ because Datadog's events route answers any compressed body `400 Invalid JSON str
 
 **Stale data is dropped before sending.** Datadog documents a window for each kind of data and
 discards data outside it, so `datadog_out` drops it and counts
-`logit.output.records.dropped{reason="stale"}`, measured from the moment of sending:
+`logit.output.records.dropped{reason="stale"}`, measured from one send time per batch, read when
+the batch is first tried, so every retry of it drops the same points (and a batch retried for up
+to `retry_budget` can send a point that far past its window):
 
 | Data | Dropped when |
 |---|---|
@@ -2276,6 +2312,17 @@ only peers with a certificate you issued can connect, or a proxy in front of the
 [ADR `deployment-threat-model`](adr/deployment-threat-model.md), and `docs/known-gaps.md` for
 what isn't defended.
 
+### `syslog_out` over UDP: the message-size bound
+
+`max_message_bytes:` (default `8192`) bounds one encoded message, PRI and header included. Under
+`transport: udp` a message is also one datagram, so it's bounded by the smaller of
+`max_message_bytes` and `65507`, the largest UDP payload: raising `max_message_bytes` past 65507
+changes nothing over UDP. A longer message is truncated, never dropped, and counted
+`logit.output.messages.truncated` with a throttled `message_truncated` diagnostic. Over
+`transport: tcp` only `max_message_bytes` applies. `syslog_out`'s UDP endpoint follows the same
+port and address-family rules as `statsd_out`'s (see
+["`statsd_out`: `transport: tcp` and TLS"](#statsd_out-transport-tcp-and-tls)).
+
 ### Syslog over TLS (RFC 5425)
 
 `syslog_in`/`syslog_out` can speak TLS too: RFC 5425, syslog framed per RFC 6587 over TLS over TCP
@@ -2314,7 +2361,8 @@ components:
 
 For mutual TLS, add `cert_file`/`key_file` together to `syslog_out`'s `tls:` block, as in
 `otlp_out`'s mutual TLS example above. `tls.insecure_skip_verify` (`syslog_out` only) behaves
-identically too, including the rejection alongside `ca_file`.
+identically too, including the rejection alongside `ca_file`. As for `statsd_out`, the TLS server
+name is `endpoint:`'s host, and a host that isn't an IP literal or a DNS name fails startup.
 
 **`syslog_out.connect_timeout` bounds the TCP connect and the TLS handshake as two separate
 phases**, not one combined deadline, so a TLS connect can take up to twice the configured value
@@ -2331,7 +2379,8 @@ listener"](#idle_timeout-on-a-tcp-listener) above.
 
 **What to watch.**
 
-- `syslog_out`: `logit.output.requests{class="ok"|"error"}` (one per attempt) and
+- `syslog_out`: `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (one per
+  attempt, tagged with its fault class) and
   `logit.output.reconnects`, which should stay near zero in steady state. A climbing count on a TLS
   connection means the peer or the network is unstable, not this sink. Plaintext and TLS
   connections are counted the same way, since both take the same connect path.
@@ -2431,8 +2480,10 @@ components:
 ```
 
 **Sizing `request_timeout` against `buffer.retry_budget`.** Keep `request_timeout` comfortably
-under `retry_budget`. `logit_out.request_timeout` (default 10s) bounds one attempt: the connect,
-the handshake, and the ack wait all share it, as with `otlp_out`'s timeout. `buffer.retry_budget`
+under `retry_budget`. `logit_out.request_timeout` (default 10s) bounds each step of one attempt
+separately: the connect, the TLS handshake, the `HelloAck` wait, and the ack wait, and at shutdown
+the close. The `Hello` and frame writes and their flushes aren't under it, since a large frame on
+a slow link can outlast it; `retry_budget` bounds them. `buffer.retry_budget`
 (default 60s; see [Sink delivery buffering](#sink-delivery-buffering)) bounds all retried attempts
 together. A `request_timeout` close to or above the retry budget leaves room for at most one attempt
 before the budget expires, which defeats retrying.
@@ -2466,17 +2517,31 @@ risk a duplicate instead of losing that batch, set `buffer.delivery: at_least_on
 close, is different: `logit_in` writes it only for a frame it hasn't forwarded, so it's `clean`
 even after a frame left, and the batch is resent under either posture.
 
+**A `HelloAck` that doesn't answer the `Hello` is permanent.** A peer that acks another protocol
+version, or a codec or compression this sink didn't offer, fails every attempt `permanent`, like a
+`Reject` for a version mismatch: the batch is dropped, and a minute of nothing else ends the
+pipeline. A stock `logit_in` never answers this way; it points at something else on the port.
+
+**Clean close.** `logit_out` shuts its connection down when it stops, which under TLS sends
+`close_notify`, and `logit_in` takes a close between frames as the end of a connection, not an
+error, including a TLS peer that went away without `close_notify`. So a `logit_out` restarting or
+reconnecting doesn't show as `connection_error` on the far end.
+
 **What to watch.**
 
 - `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/`permanent`, one per `send`
-  attempt), `logit.output.reconnects` (should stay near zero in steady state; a climbing count means
-  the peer or the network is unstable), and `logit.output.ack.duration`.
+  attempt that returns, a failed connect or handshake and a too-large batch included, so the total
+  is the number of attempts; `clean` is any failure before the frame is fully written and flushed,
+  `ambiguous` only a lost or refused ack), `logit.output.reconnects` (should stay near zero in
+  steady state; a climbing count means the peer or the network is unstable), and
+  `logit.output.ack.duration`.
 - `logit_in`: `logit.input.connections` (a gauge that should match the number of connected
   `logit_out` peers), `logit.input.connections.rejected{reason="limit"}` (nonzero means the
   1024-connection cap is binding; raise it or shed load upstream), and `logit.proto.errors{reason}`
-  (`magic`/`version`/`crc`/`truncated`/`too_large`/`codec`/`handshake`/`ack_write_stalled`/
-  `reject_write_stalled`; any of these on a healthy link points at a version-mismatched or
-  misbehaving peer, not routine loss. `ack_write_stalled` is a peer that stopped reading its `Ack`s
+  (`magic`/`version`/`crc`/`truncated_header`/`truncated`/`too_large`/`codec`/`handshake`/
+  `ack_write_stalled`/`reject_write_stalled`; any of these on a healthy link points at a
+  version-mismatched or misbehaving peer, not routine loss, except `truncated_header` and
+  `truncated`, which a `logit_out` whose write failed part-way through a frame also leaves. `ack_write_stalled` is a peer that stopped reading its `Ack`s
   for `handshake_timeout`, and the connection was closed).
 - Both sides: `logit.proto.frames{direction,codec,compression}` and `logit.proto.frame.bytes` for
   throughput.

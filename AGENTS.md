@@ -243,9 +243,9 @@ in the same file's "Datadog" and "Splunk" sections, each listed by its plan's cl
 Per pair:
 
 - **`statsd_in -> statsd_out`**: `statsd_out` is the mirror of `statsd_in`, over UDP, TCP
-  (optionally TLS, the `syslog_out` arrangement ported verbatim), or the Datadog Agent's two Unix
-  sockets (`transport: unix`/`unix_stream`, graph rule 65), with DogStatsD tags
-  round-tripped through the real decoder. It encodes `Sum` (delta, monotonic),
+  (optionally TLS, through the pooled-stream driver `syslog_out` and `graphite_out` share), or the
+  Datadog Agent's two Unix sockets (`transport: unix`/`unix_stream`, graph rule 65), with DogStatsD
+  tags round-tripped through the real decoder. It encodes `Sum` (delta, monotonic),
   `Gauge`/`GaugeDelta`, `Samples`, `SetMembers`, and DogStatsD events/service checks. A relay with
   no `aggregate` in between, or one configured `distributions: samples`/`sets: members`,
   round-trips timers and sets byte-for-byte under `format: dogstatsd`. Under `format: statsd` it's
@@ -806,6 +806,7 @@ crates/
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, graphite, collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), splunk (splunk_hec_out), logit (logit_out), null_out (load-test discard sink)
+                    shared drivers: `stream` (the pooled TCP, TLS, and Unix-stream send of statsd, syslog, and graphite), `datagram` (the packer and UDP/Unix-datagram send of statsd, syslog, graphite, and collectd), `accounting` (`BatchAccounting`, the once-per-batch encode-side counting gate; ADR `sink-send-path-and-attempt-accounting`)
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, has_attributes, drop_attributes, has_provenance, drop_provenance, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), sample (consistent, keyed sampling on a frozen XXH64 hash), route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)

@@ -331,9 +331,14 @@
 //! | links; events (a scalar or an array of scalars natively, anything else as a string) | `span_links`, `span_events` | `int_as_f64` for a `U64` event value above `i64::MAX`; `json_text`; `timestamp_range` for a negative event time |
 //! | `datadog.chunk.*` of a chunk's first span | v0.7/`AgentPayload` chunk `priority` (`-128` when absent), `origin`, `dropped_trace`, `tags` | -- |
 //! | batch resource `datadog.tracer.*` / `datadog.agent.*` | v0.7: one `TracerPayload`; `AgentPayload`: one payload around one `TracerPayload` | -- |
-//! | a carrier the form has no field for: `datadog.chunk.*` in v0.4/v0.5 (per span), `datadog.tracer.*` in v0.4/v0.5 and `datadog.agent.*` below `AgentPayload` (per batch), `meta_struct`/links/events in v0.5 | dropped | `degraded{reason="no_wire_form"}`, one per item |
-//! | a tracer header's carrier ([`TRACER_STR_HEADERS`], [`TRACER_FLAG_HEADERS`], [`TRACER_U64_HEADERS`]) on the batch resource | never a span tag: a payload field where the form has one (v0.7's `language_name`, say), else dropped | `no_wire_form`, per batch, except under [`DatadogEncoder::encode_tracer_api_traces`], whose caller sends each as its request header |
+//! | a carrier the form has no field for: `datadog.chunk.*` in v0.4/v0.5 (per span), `datadog.tracer.*` in v0.4/v0.5 and `datadog.agent.*` below `AgentPayload` (per body), `meta_struct`/links/events in v0.5 | dropped | `degraded{reason="no_wire_form"}`, one per item |
+//! | a tracer header's carrier ([`TRACER_STR_HEADERS`], [`TRACER_FLAG_HEADERS`], [`TRACER_U64_HEADERS`]) on the batch resource | never a span tag: a payload field where the form has one (v0.7's `language_name`, say), else dropped | `no_wire_form`, per body, except under [`DatadogEncoder::encode_tracer_api_traces`], whose caller sends each as its request header |
 //! | `status: Ok`, span `flags`, `SpanExt` status message / `trace_state` / dropped counts, a link's or event's dropped-attribute count | dropped: Datadog has no field | `degraded{reason="no_wire_form"}`, one per field |
+//!
+//! "Per body" is once per encode call: a sender that cuts one batch into several requests, as
+//! `datadog_trace_out` does past 1,000 traces, counts a batch-resource carrier once per request.
+//! The same holds for the batch resource's `json_text` in a `TracerPayload` or `AgentPayload`,
+//! and for the stats encoders' resource counts below.
 //!
 //! The encoders write the Agent's key sets and orders (`EncodeMsg`), omitting what its
 //! `omitempty` tags omit; an `AttributeAnyValue` carries `type` and its one value field. The
@@ -423,12 +428,12 @@
 //! | Model | Wire | Counter |
 //! |---|---|---|
 //! | a group attribute (the event's, else the resource's) | its field above; `""`, `0`, `false`, or `[]` when absent | a value of the wrong type: `logit.output.tags.dropped{reason="unrepresentable"}` |
-//! | any other event attribute; a resource attribute that is none of the fields above (`datadog.agent.*` and the two envelope flags count on the v0.6 route, which has no envelope) | dropped | `tags.dropped{reason="no_wire_form"}`, one per attribute (a resource's once per batch) |
+//! | any other event attribute; a resource attribute that is none of the fields above (`datadog.agent.*` and the two envelope flags count on the v0.6 route, which has no envelope) | dropped | `tags.dropped{reason="no_wire_form"}`, one per attribute (a resource's once per body) |
 //! | a delta `Sum` hits/errors/top-level-hits/duration | `uint64`, rounded to the nearest integer | a fraction: `logit.output.stats.degraded{reason="fractional_count"}`; negative or non-finite: `0`, `degraded{reason="bad_count"}`; above 2^64: `u64::MAX`, `degraded{reason="count_overflow"}` |
 //! | an ok/error summary `Distribution` under a logarithmic mapping | a DDSketch protobuf: its `gamma` and `indexOffset`, `interpolation: NONE`, both stores as sparse `binCounts` in ascending key order, `zeroCount`. Hand-encoded, since prost's `HashMap` would order the bins at random | a bin limit other than 2048 (a receiver collapses at 2048): `degraded{reason="bin_limit"}`; a summary tracked from observations (`stats_exact`), which the protobuf has no field for: `degraded{reason="exact_summary"}` |
 //! | the same under `Mapping::agent` | `gamma = 1.015625`, `indexOffset = bias + 0.5`, keys unchanged: Datadog's own conversion, reading the Agent's round-half-to-even key as the logarithmic floor. Only a value on an exact tie keys differently, and the exact summary is lost | `degraded{reason="agent_mapping"}` |
 //! | a record of another name, or a known name of another kind (a cumulative `Sum`, say) | skipped | `logit.output.stats.skipped{reason="unrecognized_record"}` |
-//! | a negative `Event::timestamp` | bucket `Start` `0` | `degraded{reason="negative_timestamp"}` |
+//! | a negative `Event::timestamp` | bucket `Start` `0` | `degraded{reason="negative_timestamp"}`, once per bucket of a body |
 //!
 //! ## Permitted normalizations (APM stats)
 //!

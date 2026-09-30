@@ -121,6 +121,11 @@ pub trait FramedEncoder {
     fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf<Self::Meta>) -> Self::Stats;
 }
 
+/// The largest UDP payload over IPv4: 65535 minus the 20-byte IPv4 and 8-byte UDP headers. IPv6
+/// allows 20 more bytes, but an endpoint can be a hostname whose family config validation can't
+/// know, so every UDP sink is bounded by the IPv4 figure.
+pub const MAX_UDP_PAYLOAD_BYTES: usize = 65_507;
+
 /// What a sink does with a metric kind its one-number-per-point wire can't carry natively
 /// (`graphite_out`, `splunk_hec_out`). Each codec's module doc lists what `Expand` renders.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

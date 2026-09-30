@@ -151,6 +151,8 @@
 //! forge an extra metric. A line that would overflow the cap starts a new datagram. A single line
 //! longer than the cap is **dropped whole**, never truncated (unlike `syslog_out`): a truncated
 //! statsd line decodes as a different metric or a parse error, never a shorter version of itself.
+//! The packer, its `EMSGSIZE` handling, and its fault rules are `crate::datagram`'s, shared with
+//! `graphite_out` and used by both datagram transports here.
 //!
 //! TCP terminates **every** line with `\n`, including the last: a stream has no per-batch EOF, so
 //! the last line of one batch would otherwise glue onto the first line of the next. No
@@ -174,9 +176,9 @@
 //! - `transport: unix_stream` writes each packet after its length as a 4-byte little-endian
 //!   integer (the Agent's `dogstatsd_stream_socket` framing, as a real client writes it:
 //!   `testdata/interop/datadog/dogstatsd-unix-stream-000.raw`) on
-//!   one connection, with everything [`StatsdOutput::send_tcp`] says about TCP's plaintext arm:
-//!   the lazy connect, the probe of a reused connection, the one reconnect after a zero-byte
-//!   failure, and the flush before a batch is called delivered.
+//!   one connection, through the pooled-stream driver TCP uses (`crate::stream`): the lazy
+//!   connect, the probe of a reused connection, the one reconnect after a zero-byte failure, and
+//!   the flush before a batch is called delivered.
 //!
 //! ## TLS
 //!
@@ -186,14 +188,14 @@
 //! the signal, so there is no plaintext fallback. No statsd client in the wild speaks TLS, so this
 //! is for a `logit`-to-`logit` (or stunnel-shaped) relay hop. DTLS is out of scope, so `tls:` under
 //! `transport: udp` is a config error (`logit-pipeline::graph::resolve`'s rule 52) as well as an
-//! error here. Every connect after the first counts `logit.output.reconnects`, on TLS and plaintext
-//! alike.
+//! error here. An endpoint whose host is no valid TLS server name fails at construction. Every
+//! connect after the first counts `logit.output.reconnects`, on TLS and plaintext alike.
 //!
-//! TLS changes this sink's fault classification: a `tokio_rustls` write's `Ok` means "the session
-//! accepted these bytes", not "the kernel has them", and its `Err` is never proof that nothing
-//! left the host. [`StatsdOutput::send_tcp`]'s doc has the per-transport rules that follow: no
-//! internal retry and no `Fault::Clean` after an application write on TLS, and a mandatory flush
-//! before any batch is called delivered.
+//! The stream transports send through the driver in `crate::stream`, shared with `syslog_out`
+//! and `graphite_out`; its module doc lists the fault rules. On TLS a write `Err` is
+//! `Fault::Ambiguous` and never retried, since a resend would increment a counter twice
+//! ([`StatsdOutput::duplicate_safe`]). Every transport counts `logit.output.requests` tagged
+//! `class=ok|clean|ambiguous|permanent`.
 //!
 //! ## Sample rate: never for a counter, real for `Samples`
 //!
@@ -314,27 +316,25 @@
 //! `key_str.starts_with("statsd.")` check in [`build_tag_suffix`] keeps them out of every line's
 //! `|#k:v,...` segment.
 
+use crate::accounting::BatchAccounting;
+use crate::count_request;
+use crate::datagram::{
+    send_datagrams, DatagramDest, Datagrams, Framing, Report, Sent, UdpDest, UnixDest, UnixSocket,
+    UnixTarget,
+};
 use crate::influxdb::{push_float, tag_value};
-// Shared with `syslog_out`/`logit_out`, which dial the same bare `host:port`, optionally
-// TLS-wrapped. `AsyncStream` lets `Conn::Tcp` hold either without `StatsdOutput` becoming generic;
-// `host_only` derives the SNI name from an endpoint with no scheme.
-use crate::tls::{host_only, poll_pending_close, AsyncStream, PendingClose};
+use crate::stream::{Dial, PooledStream, Target, TlsTarget};
 use crate::Output;
 use anyhow::Context;
 use logit_core::{
     Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Temporality,
     Value,
 };
-use logit_pipeline::Fault;
+use logit_pipeline::BatchContext;
 use logit_proto::{FramedEncoder, MessageBuf};
-use rustls_pki_types::ServerName;
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::net::{lookup_host, TcpStream, UdpSocket, UnixDatagram, UnixStream};
-use tokio_rustls::TlsConnector;
 
 /// Re-exported for symmetry with `crate::syslog`'s and `crate::logit`'s paths; every TLS-dialing
 /// sink shares the one definition in `crate::tls`.
@@ -424,9 +424,9 @@ pub struct StatsdEncoder {
     format: Format,
     relative_gauges: bool,
     /// The longest line this encoder emits. A longer line is dropped whole
-    /// (`EncodeStats::dropped_oversize_line`), never truncated, since the UDP packer
-    /// (`StatsdOutput::send_udp`) could never fit it in a datagram. `usize::MAX` (the default,
-    /// and TCP's) is uncapped. `StatsdOutput` sets it once for its transport.
+    /// (`EncodeStats::dropped_oversize_line`), never truncated, since the datagram packer
+    /// (`crate::datagram::send_datagrams`) could never fit it in a datagram. `usize::MAX` (the
+    /// default, and TCP's) is uncapped. `StatsdOutput` sets it once for its transport.
     max_packet_bytes: usize,
     diag: Diagnostics,
     /// The current event's `|#k:v,k:v` tag segment, built once and shared across its metrics
@@ -1530,25 +1530,24 @@ fn is_forbidden_in_service_check_message(c: char) -> bool {
 /// local socket is a config error); the Unix datagram and stream arms connect lazily inside
 /// `send`, so a receiver that isn't up yet can't block startup.
 enum Conn {
-    Udp(UdpSocket),
-    /// `Box<dyn AsyncStream>` covers plaintext and TLS without making [`StatsdOutput`] generic,
-    /// since `logit-cli::pipeline::build_spec` builds one concrete sink type per kind. No DTLS arm:
+    Udp(UdpDest),
+    /// Plaintext or TLS through the shared [`PooledStream`] driver. No DTLS arm:
     /// `logit-pipeline::graph::resolve`'s rule 52 rejects `tls:` under `transport: udp`.
     Tcp {
-        stream: Option<Box<dyn AsyncStream>>,
+        pool: PooledStream,
         connect_timeout: Duration,
     },
-    /// Connected to the path in `endpoint` on first use, and `None` again after a send that shows
-    /// the receiver gone or stuck, so the next send reconnects; each send is bounded by
-    /// `send_timeout` (module doc's "Packing and framing").
+    /// Sent through [`UnixDest`], which connects to the path in `endpoint` on first use and
+    /// reconnects after a send that shows the receiver gone or stuck (module doc's "Packing and
+    /// framing").
     UnixDatagram {
-        socket: Option<UnixDatagram>,
+        socket: Option<UnixSocket>,
         send_timeout: Duration,
+        has_connected_once: bool,
     },
-    /// Always plaintext (graph rule 65); boxed like `Tcp` so both share
-    /// [`StatsdOutput::send_tcp`].
+    /// Always plaintext (graph rule 65), through the same driver as `Tcp`.
     UnixStream {
-        stream: Option<Box<dyn AsyncStream>>,
+        pool: PooledStream,
         connect_timeout: Duration,
     },
 }
@@ -1565,38 +1564,41 @@ pub struct StatsdOutput {
     packet_buf: Vec<u8>,
     /// TCP only. `Some` exactly when a `tls:` block was configured (presence turns TLS on). Built
     /// once by [`StatsdOutput::with_tls`] and shared by every connect.
-    tls: Option<Arc<rustls::ClientConfig>>,
-    /// Set by the first connect; every later connect counts `logit.output.reconnects`.
-    has_connected_once: bool,
+    tls: Option<TlsTarget>,
+    /// Ungated: the transport's counts, the `oversize_datagram` drops, and the sink's own
+    /// warnings. The encoder holds a view gated by `accounting` (`crate::accounting`).
     diag: Diagnostics,
     telemetry: Telemetry,
+    accounting: BatchAccounting,
+    /// Replaces the stream transports' dial target with scripted connections.
+    #[cfg(test)]
+    dial_script: Option<std::sync::Arc<crate::test_support::ScriptedDial>>,
 }
 
 impl StatsdOutput {
-    /// Binds an ephemeral local UDP socket now; `endpoint` is resolved per `send`
-    /// (`SyslogOutput::udp` has why).
+    /// Binds an ephemeral local IPv4 UDP socket now; `endpoint` is resolved per `send`
+    /// (`crate::datagram`'s module doc).
     pub fn udp(endpoint: impl Into<String>) -> anyhow::Result<Self> {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")
-            .context("binding statsd_out's local UDP socket")?;
-        socket.set_nonblocking(true).context("configuring statsd_out's UDP socket")?;
-        let socket = UdpSocket::from_std(socket).context("registering statsd_out's UDP socket")?;
-        Ok(Self::new(endpoint, Conn::Udp(socket)))
+        Ok(Self::new(endpoint, Conn::Udp(UdpDest::bind("statsd_out")?)))
     }
 
     /// Never connects here; see [`Conn`].
     pub fn tcp(endpoint: impl Into<String>, connect_timeout: Duration) -> Self {
-        Self::new(endpoint, Conn::Tcp { stream: None, connect_timeout })
+        Self::new(endpoint, Conn::Tcp { pool: PooledStream::default(), connect_timeout })
     }
 
     /// Never connects here; see [`Conn`]. `send_timeout` bounds each send's wait on a full
     /// receiver.
     pub fn unix_datagram(path: impl Into<String>, send_timeout: Duration) -> Self {
-        Self::new(path, Conn::UnixDatagram { socket: None, send_timeout })
+        Self::new(
+            path,
+            Conn::UnixDatagram { socket: None, send_timeout, has_connected_once: false },
+        )
     }
 
     /// Never connects here; see [`Conn`].
     pub fn unix_stream(path: impl Into<String>, connect_timeout: Duration) -> Self {
-        Self::new(path, Conn::UnixStream { stream: None, connect_timeout })
+        Self::new(path, Conn::UnixStream { pool: PooledStream::default(), connect_timeout })
     }
 
     fn new(endpoint: impl Into<String>, conn: Conn) -> Self {
@@ -1608,9 +1610,11 @@ impl StatsdOutput {
             lines: MessageBuf::default(),
             packet_buf: Vec::new(),
             tls: None,
-            has_connected_once: false,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
+            accounting: BatchAccounting::default(),
+            #[cfg(test)]
+            dial_script: None,
         }
         .with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES)
     }
@@ -1626,9 +1630,12 @@ impl StatsdOutput {
         }
     }
 
-    /// Installs `encoder`, overriding its line cap with this sink's, whatever the builder order.
+    /// Installs `encoder`, overriding its line cap and diagnostics with this sink's (gated),
+    /// whatever the builder order.
     pub fn with_encoder(mut self, encoder: StatsdEncoder) -> Self {
-        self.encoder = encoder.with_max_packet_bytes(self.encoder_cap());
+        self.encoder = encoder
+            .with_max_packet_bytes(self.encoder_cap())
+            .with_diagnostics(self.diag.gated(self.accounting.gate()));
         self
     }
 
@@ -1652,7 +1659,8 @@ impl StatsdOutput {
     ///
     /// Errors on UDP (DTLS is out of scope) and on a Unix socket. `logit-pipeline::graph::resolve`'s
     /// rules 52 and 65 already reject those configs; this check stops a caller that skips graph
-    /// validation from getting an unencrypted socket.
+    /// validation from getting an unencrypted socket. Also errors on an endpoint whose host is no
+    /// valid TLS server name (`TlsTarget::new`), so it fails startup and not every batch.
     ///
     /// Paths in `settings` resolve against `base_dir` (the config file's directory) and load here,
     /// since `graph::resolve` never touches the filesystem.
@@ -1677,13 +1685,15 @@ impl StatsdOutput {
                  output will accept any certificate the peer presents, self-signed or otherwise",
             );
         }
-        self.tls = Some(Arc::new(crate::tls::build_client_config(settings, base_dir)?));
+        let config = crate::tls::build_client_config(settings, base_dir)?;
+        self.tls = Some(TlsTarget::new("statsd_out", &self.endpoint, config)?);
         Ok(self)
     }
 
+    /// The encoder gets a view gated by this sink's batch accounting.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.diag = diag.clone();
-        self.encoder = self.encoder.with_diagnostics(diag);
+        self.encoder = self.encoder.with_diagnostics(diag.gated(self.accounting.gate()));
+        self.diag = diag;
         self
     }
 
@@ -1693,166 +1703,174 @@ impl StatsdOutput {
     }
 }
 
-#[async_trait::async_trait]
-impl Output for StatsdOutput {
-    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let stats = self.encoder.encode_into(batch, &mut self.lines);
-        self.telemetry.count("logit.output.events.skipped", stats.skipped_no_metrics as f64, &[]);
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_gauge_delta as f64,
-            &[("reason", "unresolved_gauge_delta")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_unsupported_kind as f64,
-            &[("reason", "unsupported_kind")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_no_recorded_value as f64,
-            &[("reason", "no_recorded_value")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_unencodable_value as f64,
-            &[("reason", "unencodable_value")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_empty_name as f64,
-            &[("reason", "empty_name")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_oversize_line as f64,
-            &[("reason", "oversize_line")],
-        );
-        self.telemetry.count(
-            "logit.output.tags.dropped",
-            stats.tags_dropped_dialect as f64,
-            &[("reason", "dialect")],
-        );
-        self.telemetry.count(
-            "logit.output.tags.dropped",
-            stats.tags_dropped_unrepresentable as f64,
-            &[("reason", "unrepresentable")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_dialect_fields as f64,
-            &[("reason", "dialect_field")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_dialect_events as f64,
-            &[("reason", "dialect_event")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_invalid_service_check as f64,
-            &[("reason", "invalid_service_check")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_invalid_event_fields as f64,
-            &[("reason", "invalid_event_field")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.normalized",
-            stats.type_normalized_dialect as f64,
-            &[("reason", "dialect")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.normalized",
-            stats.members_sanitized as f64,
-            &[("reason", "member_sanitized")],
-        );
+/// Counts one `encode_into` call's [`EncodeStats`].
+fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
+    telemetry.count("logit.output.events.skipped", stats.skipped_no_metrics as f64, &[]);
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_gauge_delta as f64,
+        &[("reason", "unresolved_gauge_delta")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_unsupported_kind as f64,
+        &[("reason", "unsupported_kind")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_no_recorded_value as f64,
+        &[("reason", "no_recorded_value")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_unencodable_value as f64,
+        &[("reason", "unencodable_value")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_empty_name as f64,
+        &[("reason", "empty_name")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_oversize_line as f64,
+        &[("reason", "oversize_line")],
+    );
+    telemetry.count(
+        "logit.output.tags.dropped",
+        stats.tags_dropped_dialect as f64,
+        &[("reason", "dialect")],
+    );
+    telemetry.count(
+        "logit.output.tags.dropped",
+        stats.tags_dropped_unrepresentable as f64,
+        &[("reason", "unrepresentable")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_dialect_fields as f64,
+        &[("reason", "dialect_field")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_dialect_events as f64,
+        &[("reason", "dialect_event")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_invalid_service_check as f64,
+        &[("reason", "invalid_service_check")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_invalid_event_fields as f64,
+        &[("reason", "invalid_event_field")],
+    );
+    telemetry.count(
+        "logit.output.messages.normalized",
+        stats.type_normalized_dialect as f64,
+        &[("reason", "dialect")],
+    );
+    telemetry.count(
+        "logit.output.messages.normalized",
+        stats.members_sanitized as f64,
+        &[("reason", "member_sanitized")],
+    );
+}
+
+impl StatsdOutput {
+    /// One `Output::send` attempt.
+    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let (first, stats) =
+            self.accounting.encode(0, || self.encoder.encode_into(batch, &mut self.lines));
+        if first {
+            report_encode_stats(&self.telemetry, &stats);
+        }
 
         if self.lines.is_empty() {
             return Ok(());
         }
 
-        self.telemetry.count("logit.output.batch.bytes", self.lines.total_bytes() as f64, &[]);
+        if first {
+            self.telemetry.count("logit.output.batch.bytes", self.lines.total_bytes() as f64, &[]);
+        }
         let request_timer = self.telemetry.timer("logit.output.request.duration");
+        let batch = Datagrams {
+            entries: &self.lines,
+            weight: |_| 1,
+            cap: self.max_packet_bytes,
+            framing: Framing::Packed,
+        };
+        let mut report =
+            Report { sink: "statsd_out", diag: &mut self.diag, telemetry: &self.telemetry };
         let result = match &mut self.conn {
-            Conn::Udp(socket) => {
-                Self::send_udp(
-                    socket,
-                    &self.endpoint,
-                    &self.lines,
-                    self.max_packet_bytes,
-                    &mut self.packet_buf,
-                    &mut self.diag,
-                    &self.telemetry,
-                )
-                .await
+            Conn::Udp(udp) => {
+                let (sent, result) =
+                    udp.send(&self.endpoint, batch, &mut self.packet_buf, &mut report).await;
+                count_datagram_send(&self.telemetry, sent, result)
             }
-            Conn::UnixDatagram { socket, send_timeout } => {
+            Conn::UnixDatagram { socket, send_timeout, has_connected_once } => {
                 let mut dest = DatagramDest::Unix(UnixDest {
                     socket,
-                    path: Path::new(&self.endpoint),
+                    target: UnixTarget::Path(Path::new(&self.endpoint)),
                     send_timeout: *send_timeout,
+                    sink: "statsd_out",
                     telemetry: &self.telemetry,
-                    has_connected_once: &mut self.has_connected_once,
+                    has_connected_once,
                 });
-                Self::send_datagrams(
-                    &mut dest,
+                let (sent, result) =
+                    send_datagrams(batch, &mut dest, &mut self.packet_buf, &mut report).await;
+                count_datagram_send(&self.telemetry, sent, result)
+            }
+            // The stream arms count `requests` inside the driver, and messages only once the
+            // frame is delivered.
+            Conn::Tcp { pool, connect_timeout } => {
+                build_lf_frame(&self.lines, &mut self.packet_buf);
+                let target = Target::Tcp { endpoint: &self.endpoint, tls: self.tls.as_ref() };
+                #[cfg(test)]
+                let target = crate::stream::scripted_or(target, &self.dial_script);
+                let dial = Dial { target, connect_timeout: *connect_timeout, sink: "statsd_out" };
+                let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
+                count_stream_send(&self.telemetry, self.lines.len(), result)
+            }
+            Conn::UnixStream { pool, connect_timeout } => {
+                build_length_prefixed_frame(
                     &self.lines,
                     self.max_packet_bytes,
                     &mut self.packet_buf,
-                    &mut self.diag,
-                    &self.telemetry,
-                )
-                .await
-            }
-            Conn::Tcp { stream, connect_timeout } => {
-                let mut dial = TcpDial {
-                    endpoint: &self.endpoint,
-                    connect_timeout: *connect_timeout,
-                    tls: self.tls.as_ref(),
-                    kind: StreamKind::Tcp,
-                    telemetry: &self.telemetry,
-                    has_connected_once: &mut self.has_connected_once,
-                };
-                Self::send_tcp(stream, &mut dial, &self.lines, &mut self.packet_buf).await
-            }
-            Conn::UnixStream { stream, connect_timeout } => {
-                let mut dial = TcpDial {
-                    endpoint: &self.endpoint,
-                    connect_timeout: *connect_timeout,
-                    tls: None,
-                    kind: StreamKind::Unix { max_packet_bytes: self.max_packet_bytes },
-                    telemetry: &self.telemetry,
-                    has_connected_once: &mut self.has_connected_once,
-                };
-                Self::send_tcp(stream, &mut dial, &self.lines, &mut self.packet_buf).await
+                );
+                let target = Target::Unix { path: Path::new(&self.endpoint) };
+                #[cfg(test)]
+                let target = crate::stream::scripted_or(target, &self.dial_script);
+                let dial = Dial { target, connect_timeout: *connect_timeout, sink: "statsd_out" };
+                let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
+                count_stream_send(&self.telemetry, self.lines.len(), result)
             }
         };
         drop(request_timer);
+        result
+    }
+}
 
-        match &result {
-            Ok((messages, datagrams)) => {
-                self.telemetry.count("logit.output.messages", *messages as f64, &[]);
-                if matches!(self.conn, Conn::Udp(_) | Conn::UnixDatagram { .. }) {
-                    self.telemetry.count("logit.output.datagrams", *datagrams as f64, &[]);
-                }
-                self.telemetry.count("logit.output.requests", 1.0, &[("class", "ok")]);
-            }
-            Err(_) => {
-                self.telemetry.count("logit.output.requests", 1.0, &[("class", "error")]);
-            }
-        }
-        result.map(|_| ())
+#[async_trait::async_trait]
+impl Output for StatsdOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
+    /// One attempt ([`StatsdOutput::attempt`]). An `Ok` disarms the batch accounting on every
+    /// path, a batch that encoded to nothing included.
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let result = self.attempt(batch).await;
+        self.accounting.finish(result)
     }
 
     /// `send` flushes and retains nothing between calls, so this only flushes a stream as a
     /// backstop at shutdown.
     async fn flush(&mut self) -> anyhow::Result<()> {
-        if let Conn::Tcp { stream: Some(stream), .. }
-        | Conn::UnixStream { stream: Some(stream), .. } = &mut self.conn
-        {
-            stream.flush().await.context("flushing statsd_out stream")?;
+        if let Conn::Tcp { pool, .. } | Conn::UnixStream { pool, .. } = &mut self.conn {
+            pool.flush().await.context("flushing statsd_out stream")?;
         }
         Ok(())
     }
@@ -1860,344 +1878,54 @@ impl Output for StatsdOutput {
     /// `false`: a redelivered `hits:5|c` **increments the destination counter a second time**,
     /// corrupting the value with no trace at the receiver (worse than `syslog_out`'s duplicated
     /// log line). The derived `AtMostOnce` posture still retries a `Fault::Clean` failure, which
-    /// covers the common receiver-restart outage with no duplicate risk.
+    /// covers the common receiver-restart outage with no duplicate risk. `buffer.delivery`
+    /// overrides this posture for the component.
     fn duplicate_safe(&self) -> bool {
         false
     }
 }
 
-/// Running totals for one [`StatsdOutput::send_udp`] call. `entries_in_packet` can't be recovered
-/// from `packet_buf`'s bytes: a negative-gauge pair is **one** [`MessageBuf`] entry with an
-/// embedded `\n`, so counting `\n` bytes would report two messages where `send_tcp` (and
-/// `syslog_out`) report one.
-#[derive(Default)]
-struct UdpSendCounts {
-    /// [`MessageBuf`] entries written to the socket (`logit.output.messages`).
+/// Counts a datagram send's `messages` and `datagrams`, what reached the kernel even when the
+/// batch then failed, and its `requests` class. A message is a [`MessageBuf`] entry, so a
+/// negative-gauge pair is one message on every transport.
+fn count_datagram_send(
+    telemetry: &Telemetry,
+    sent: Sent,
+    result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    telemetry.count("logit.output.messages", sent.entries as f64, &[]);
+    telemetry.count("logit.output.datagrams", sent.datagrams as f64, &[]);
+    count_request(telemetry, &result);
+    result
+}
+
+/// Counts a stream send's `messages`, all of them once the driver delivered the frame and none
+/// otherwise; the driver counts `requests`.
+fn count_stream_send(
+    telemetry: &Telemetry,
     messages: usize,
-    /// Datagrams written to the socket (`logit.output.datagrams`).
-    datagrams: usize,
-    /// Entries appended to `packet_buf` since the last flush.
-    entries_in_packet: usize,
+    result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if result.is_ok() {
+        telemetry.count("logit.output.messages", messages as f64, &[]);
+    }
+    result
 }
 
-impl StatsdOutput {
-    /// Packs `lines` greedily into datagrams of at most `max_packet_bytes` (newline-joined, no
-    /// trailing newline), one `send_to` each (module doc's "Packing and framing" section). The
-    /// encoder already dropped any line over the cap, so every line fits a datagram alone. Returns
-    /// `(messages sent, datagrams sent)`.
-    async fn send_udp(
-        socket: &UdpSocket,
-        endpoint: &str,
-        lines: &MessageBuf,
-        max_packet_bytes: usize,
-        packet_buf: &mut Vec<u8>,
-        diag: &mut Diagnostics,
-        telemetry: &Telemetry,
-    ) -> anyhow::Result<(usize, usize)> {
-        // Once per batch, not per datagram (`syslog::send_udp` has why).
-        let mut addrs = lookup_host(endpoint)
-            .await
-            .context("resolving statsd_out endpoint")
-            .context(Fault::Clean)?;
-        let addr = addrs
-            .next()
-            .context("statsd_out endpoint resolved to no addresses")
-            .context(Fault::Clean)?;
-        let mut dest = DatagramDest::Udp { socket, addr };
-        Self::send_datagrams(&mut dest, lines, max_packet_bytes, packet_buf, diag, telemetry).await
+/// `transport: tcp` framing: every line `\n`-terminated, including the last (module doc's
+/// "Packing and framing").
+fn build_lf_frame(lines: &MessageBuf, frame: &mut Vec<u8>) {
+    frame.clear();
+    for msg in lines.iter() {
+        frame.extend_from_slice(msg);
+        frame.push(b'\n');
     }
-
-    /// [`Self::send_udp`]'s packing loop over either datagram family.
-    async fn send_datagrams(
-        dest: &mut DatagramDest<'_>,
-        lines: &MessageBuf,
-        max_packet_bytes: usize,
-        packet_buf: &mut Vec<u8>,
-        diag: &mut Diagnostics,
-        telemetry: &Telemetry,
-    ) -> anyhow::Result<(usize, usize)> {
-        let mut counts = UdpSendCounts::default();
-        packet_buf.clear();
-        for msg in lines.iter() {
-            let needs_sep = !packet_buf.is_empty();
-            let extra = msg.len() + usize::from(needs_sep);
-            if !packet_buf.is_empty() && packet_buf.len() + extra > max_packet_bytes {
-                Self::flush_datagram(dest, packet_buf, &mut counts, diag, telemetry).await?;
-            }
-            if needs_sep && !packet_buf.is_empty() {
-                packet_buf.push(b'\n');
-            }
-            packet_buf.extend_from_slice(msg);
-            counts.entries_in_packet += 1;
-        }
-        if !packet_buf.is_empty() {
-            Self::flush_datagram(dest, packet_buf, &mut counts, diag, telemetry).await?;
-        }
-        Ok((counts.messages, counts.datagrams))
-    }
-
-    /// Sends one packed datagram, then clears `packet_buf` and `counts.entries_in_packet`. Counts
-    /// [`MessageBuf`] entries, not `\n` bytes (see [`UdpSendCounts`]), toward `counts.messages`
-    /// or, when the kernel rejects the datagram as too large,
-    /// `logit.output.messages.dropped{reason="oversize_datagram"}`.
-    async fn flush_datagram(
-        dest: &mut DatagramDest<'_>,
-        packet_buf: &mut Vec<u8>,
-        counts: &mut UdpSendCounts,
-        diag: &mut Diagnostics,
-        telemetry: &Telemetry,
-    ) -> anyhow::Result<()> {
-        match dest.send(packet_buf, counts.datagrams == 0).await {
-            Ok(_) => {
-                counts.messages += counts.entries_in_packet;
-                counts.datagrams += 1;
-            }
-            Err(err) if is_message_too_large(&err) => {
-                telemetry.count(
-                    "logit.output.messages.dropped",
-                    counts.entries_in_packet as f64,
-                    &[("reason", "oversize_datagram")],
-                );
-                diag.warn_throttled(
-                    "oversize_datagram",
-                    format_args!("statsd_out: packed datagram too large for one send: {err}"),
-                );
-            }
-            Err(err) => {
-                let fault = if counts.datagrams > 0 { Fault::Ambiguous } else { Fault::Clean };
-                packet_buf.clear();
-                counts.entries_in_packet = 0;
-                return Err(anyhow::Error::new(err).context(fault));
-            }
-        }
-        packet_buf.clear();
-        counts.entries_in_packet = 0;
-        Ok(())
-    }
-
-    /// Writes the whole batch as one frame, every line `\n`-terminated including the last (or, on
-    /// a Unix stream, as length-prefixed packets; module doc's "Packing and framing"), with at
-    /// most one internal reconnect-and-retry. Shares `syslog::send_tcp`'s two properties:
-    /// cancellation safety via `stream.take()`, and never resending once a byte has left this
-    /// host. Returns `(messages sent, 0)`; TCP has no datagram count.
-    ///
-    /// **What a write proves depends on the transport, and TLS proves less.** The stream is a
-    /// `Box<dyn AsyncStream>`, so the code asks [`TcpDial::is_tls`] which case applies:
-    ///
-    /// - **Plaintext.** One `write()` is one `write(2)`: `Ok(n)` means the kernel owns `n` bytes,
-    ///   and `Err` means zero bytes of *this* call were accepted (tokio loops only on
-    ///   `WouldBlock`). So one reconnect-and-retry after a zero-byte failure is safe, and a failed
-    ///   retry is `Fault::Clean`.
-    /// - **TLS.** `tokio_rustls`' `poll_write` copies plaintext into the rustls session and loops
-    ///   socket writes until one returns `Pending`, then returns `Ok(n)` with finished records
-    ///   still queued in userspace. `Ok` proves only that the *session* accepted the bytes; `flush`
-    ///   is what hands them to the kernel. A failing `poll_write` may already have completed
-    ///   several socket writes (rustls fragments at 16 KiB, and each record is a run of complete,
-    ///   LF-terminated lines a receiver keeps and counts), so `Err` never proves a zero-byte
-    ///   attempt. **A TLS write failure is never retried**: once an application write is attempted,
-    ///   every failure is `Fault::Ambiguous`, and `Fault::Clean` survives only for failures inside
-    ///   [`TcpDial::connect`], which precede every byte of the frame. A resend here would be worse
-    ///   than `syslog_out`'s duplicate log line: [`StatsdOutput::duplicate_safe`] is `false`
-    ///   because a redelivered `hits:5|c` increments the destination counter a second time.
-    ///
-    /// **A reused connection is probed before the first write.** The receiver may have closed it
-    /// since the last `send` (a graceful shutdown, a far-end `idle_timeout:`, a relay hop cycling),
-    /// and plaintext statsd has no ack to reveal that: the write lands in the local socket buffer,
-    /// the batch is reported delivered, and the increments are lost. So a connection taken from
-    /// `*stream` (never a fresh one) gets one non-consuming `poll_read` first
-    /// ([`crate::tls::poll_pending_close`] has why one poll, not a `timeout(read)`); anything but
-    /// "still open" drops it and dials fresh with nothing written. That is an ordinary reconnect
-    /// (counted by [`TcpDial::connect`]) and doesn't consume the post-write-failure retry
-    /// (`docs/adr/idle-connection-timeout.md`).
-    ///
-    /// **The success path always `flush`es**, on both transports, before the connection returns
-    /// to `*stream` and this returns `Ok`. TLS requires it: otherwise a batch could be reported
-    /// delivered (and committed off the sink queue, `docs/adr/buffered-sink-delivery.md`) with its
-    /// records still in the rustls buffer, discarded with the boxed stream on the next reconnect
-    /// or cancellation. On plaintext `TcpStream::poll_flush` is a no-op. One delivery rule for
-    /// both matters because nothing reported delivered is ever retried. A failed flush is
-    /// `Fault::Ambiguous` (an earlier record may have landed) and the connection is dropped
-    /// (`docs/adr/statsd-output.md`'s "Amendment: TLS" section).
-    async fn send_tcp(
-        stream: &mut Option<Box<dyn AsyncStream>>,
-        dial: &mut TcpDial<'_>,
-        lines: &MessageBuf,
-        frame_buf: &mut Vec<u8>,
-    ) -> anyhow::Result<(usize, usize)> {
-        match dial.kind {
-            StreamKind::Tcp => {
-                frame_buf.clear();
-                for msg in lines.iter() {
-                    frame_buf.extend_from_slice(msg);
-                    frame_buf.push(b'\n');
-                }
-            }
-            StreamKind::Unix { max_packet_bytes } => {
-                build_length_prefixed_frame(lines, max_packet_bytes, frame_buf);
-            }
-        }
-
-        let mut retried_after_a_zero_byte_failure = false;
-        loop {
-            let mut conn: Box<dyn AsyncStream> = match stream.take() {
-                // A reused connection is probed first (doc comment). A closed one is replaced
-                // with nothing written, so the post-write retry isn't consumed.
-                Some(mut conn) => {
-                    let mut probe = [0u8; 1];
-                    let pending = poll_pending_close(&mut *conn, &mut probe).await;
-                    match pending {
-                        PendingClose::Open => conn,
-                        _closed => {
-                            drop(conn);
-                            dial.connect().await?
-                        }
-                    }
-                }
-                None => dial.connect().await?,
-            };
-
-            let first_write = match conn.write(frame_buf).await {
-                Ok(0) if !frame_buf.is_empty() => {
-                    Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "wrote zero bytes"))
-                }
-                Ok(n) => Ok(n),
-                Err(err) => Err(err),
-            };
-
-            match first_write {
-                Ok(n) => {
-                    let rest_result = if n < frame_buf.len() {
-                        conn.write_all(&frame_buf[n..]).await
-                    } else {
-                        Ok(())
-                    };
-                    // Always flush before calling the batch delivered (doc comment).
-                    let rest_result = match rest_result {
-                        Ok(()) => conn.flush().await,
-                        Err(err) => Err(err),
-                    };
-                    return match rest_result {
-                        Ok(()) => {
-                            *stream = Some(conn);
-                            Ok((lines.len(), 0))
-                        }
-                        // Part of the frame may be at the peer, so a resend could duplicate.
-                        // `*stream` stays `None`: a partly written connection isn't reusable.
-                        Err(err) => Err(anyhow::Error::new(err).context(Fault::Ambiguous)),
-                    };
-                }
-                // Plaintext only: the failed `write(2)` accepted zero bytes, so reconnect and
-                // retry the whole frame once. TLS has no such proof and falls to `Ambiguous`.
-                Err(_) if !dial.is_tls() && !retried_after_a_zero_byte_failure => {
-                    retried_after_a_zero_byte_failure = true;
-                    continue;
-                }
-                Err(err) => {
-                    let fault = if dial.is_tls() { Fault::Ambiguous } else { Fault::Clean };
-                    return Err(anyhow::Error::new(err).context(fault));
-                }
-            }
-        }
-    }
-}
-
-/// What [`StatsdOutput::send_tcp`] needs to open a fresh connection, borrowed per `send` from the
-/// sink's fields (one value instead of five parameters, for `clippy::too_many_arguments`).
-/// `syslog::TcpDial`'s twin: both dial a bare `host:port` plus SNI.
-struct TcpDial<'a> {
-    endpoint: &'a str,
-    connect_timeout: Duration,
-    /// `Some` if and only if a `tls:` block was configured -- see [`StatsdOutput::tls`]. Always
-    /// `None` for [`StreamKind::Unix`].
-    tls: Option<&'a Arc<rustls::ClientConfig>>,
-    /// What `endpoint` names and how a batch is framed on it.
-    kind: StreamKind,
-    telemetry: &'a Telemetry,
-    has_connected_once: &'a mut bool,
-}
-
-impl TcpDial<'_> {
-    /// Whether connections are TLS-wrapped, which decides how [`StatsdOutput::send_tcp`]
-    /// classifies a write failure.
-    fn is_tls(&self) -> bool {
-        self.tls.is_some()
-    }
-
-    /// One fresh connection: TCP connect, then the TLS handshake when `tls` is set. Each phase gets
-    /// its own `connect_timeout`, as in `syslog_out` and `logit_out`, so a TLS connect can take up
-    /// to twice the configured value. Both phases fail `Fault::Clean`: nothing of the batch has
-    /// left the host yet.
-    async fn connect(&mut self) -> anyhow::Result<Box<dyn AsyncStream>> {
-        if let StreamKind::Unix { .. } = self.kind {
-            let unix =
-                tokio::time::timeout(self.connect_timeout, UnixStream::connect(self.endpoint))
-                    .await
-                    .context("connecting to statsd_out socket timed out")
-                    .and_then(|r| r.context("connecting to statsd_out socket"))
-                    .context(Fault::Clean)?;
-            self.count_connect();
-            return Ok(Box::new(unix));
-        }
-        let tcp = tokio::time::timeout(self.connect_timeout, TcpStream::connect(self.endpoint))
-            .await
-            .context("connecting to statsd_out endpoint timed out")
-            .and_then(|r| r.context("connecting to statsd_out endpoint"))
-            .context(Fault::Clean)?;
-
-        let conn: Box<dyn AsyncStream> = match self.tls {
-            Some(cfg) => {
-                let host = host_only(self.endpoint);
-                let server_name = ServerName::try_from(host.to_string())
-                    .map_err(|e| {
-                        anyhow::anyhow!("statsd_out: invalid TLS server name {host:?}: {e}")
-                    })
-                    .context(Fault::Clean)?;
-                let connector = TlsConnector::from(cfg.clone());
-                let tls_stream =
-                    tokio::time::timeout(self.connect_timeout, connector.connect(server_name, tcp))
-                        .await
-                        .context("TLS handshake with statsd_out endpoint timed out")
-                        .and_then(|r| r.context("TLS handshake with statsd_out endpoint"))
-                        .context(Fault::Clean)?;
-                Box::new(tls_stream)
-            }
-            None => Box::new(tcp),
-        };
-
-        self.count_connect();
-        Ok(conn)
-    }
-
-    /// Counts every connect after the first as `logit.output.reconnects`. Counted at connect, not
-    /// after the write, so a reconnect whose first write fails still shows up.
-    fn count_connect(&mut self) {
-        count_connect(self.telemetry, self.has_connected_once);
-    }
-}
-
-/// [`TcpDial::count_connect`]'s rule, shared with [`UnixDest`].
-fn count_connect(telemetry: &Telemetry, has_connected_once: &mut bool) {
-    if *has_connected_once {
-        telemetry.count("logit.output.reconnects", 1.0, &[]);
-    } else {
-        *has_connected_once = true;
-    }
-}
-
-/// Which stream [`TcpDial`] opens and how [`StatsdOutput::send_tcp`] frames a batch on it.
-#[derive(Debug, Clone, Copy)]
-enum StreamKind {
-    /// A TCP connection to a `host:port`, optionally TLS; every line `\n`-terminated.
-    Tcp,
-    /// A Unix stream socket at a path; packets of up to `max_packet_bytes`, each after a 4-byte
-    /// little-endian length.
-    Unix { max_packet_bytes: usize },
 }
 
 /// Packs `lines` into packets of at most `max_packet_bytes` (newline-joined, no trailing newline,
-/// as [`StatsdOutput::send_udp`] packs a datagram) and writes each into `frame` after its length as
-/// a 4-byte little-endian integer: the `unix_stream` framing. The encoder already dropped any line
-/// over the cap, so every line fits a packet alone.
+/// as [`crate::datagram::send_datagrams`] packs a datagram) and writes each into `frame` after its
+/// length as a 4-byte little-endian integer: the `unix_stream` framing. The encoder already dropped
+/// any line over the cap, so every line fits a packet alone.
 fn build_length_prefixed_frame(lines: &MessageBuf, max_packet_bytes: usize, frame: &mut Vec<u8>) {
     const PREFIX: usize = 4;
     fn close(frame: &mut [u8], start: usize) {
@@ -2225,110 +1953,22 @@ fn build_length_prefixed_frame(lines: &MessageBuf, max_packet_bytes: usize, fram
     }
 }
 
-/// Where [`StatsdOutput::send_datagrams`] sends each packed packet.
-enum DatagramDest<'a> {
-    Udp { socket: &'a UdpSocket, addr: std::net::SocketAddr },
-    Unix(UnixDest<'a>),
-}
-
-impl DatagramDest<'_> {
-    /// One datagram; `first_of_batch` is whether nothing of this batch has been sent yet.
-    async fn send(&mut self, buf: &[u8], first_of_batch: bool) -> std::io::Result<usize> {
-        match self {
-            DatagramDest::Udp { socket, addr } => socket.send_to(buf, *addr).await,
-            DatagramDest::Unix(dest) => dest.send(buf, first_of_batch).await,
-        }
-    }
-}
-
-/// A `transport: unix` sender: a datagram socket connected to `path` (module doc's "Packing and
-/// framing" has why it's connected and when it reconnects).
-struct UnixDest<'a> {
-    socket: &'a mut Option<UnixDatagram>,
-    path: &'a Path,
-    send_timeout: Duration,
-    telemetry: &'a Telemetry,
-    has_connected_once: &'a mut bool,
-}
-
-impl UnixDest<'_> {
-    /// Sends one datagram. When it's the batch's first and an inherited socket finds its receiver
-    /// gone, reconnects and retries once: nothing of the batch has left, so the retry can't
-    /// duplicate.
-    async fn send(&mut self, buf: &[u8], first_of_batch: bool) -> std::io::Result<usize> {
-        let inherited = self.socket.is_some();
-        match self.send_once(buf).await {
-            Err(err) if first_of_batch && inherited && is_receiver_gone(&err) => {
-                self.send_once(buf).await
-            }
-            result => result,
-        }
-    }
-
-    /// Connects when there's no socket, then sends under `send_timeout`. Drops the socket on a
-    /// timeout or a gone receiver, so the next send reconnects to whatever is at `path`. A connect
-    /// doesn't block on a datagram socket; its failure reaches `flush_datagram` as a send error,
-    /// `Fault::Clean` on a batch's first datagram.
-    async fn send_once(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let socket: &UnixDatagram = match &mut *self.socket {
-            Some(socket) => socket,
-            slot @ None => {
-                let socket = UnixDatagram::unbound()
-                    .and_then(|socket| socket.connect(self.path).map(|()| socket))
-                    .map_err(|err| {
-                        std::io::Error::new(
-                            err.kind(),
-                            format!(
-                                "connecting to statsd_out socket {}: {err}",
-                                self.path.display()
-                            ),
-                        )
-                    })?;
-                count_connect(self.telemetry, self.has_connected_once);
-                slot.insert(socket)
-            }
-        };
-        let result = match tokio::time::timeout(self.send_timeout, socket.send(buf)).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "the receiver at {} did not take a datagram within {:?}",
-                    self.path.display(),
-                    self.send_timeout
-                ),
-            )),
-        };
-        if let Err(err) = &result {
-            if err.kind() == std::io::ErrorKind::TimedOut || is_receiver_gone(err) {
-                *self.socket = None;
-            }
-        }
-        result
-    }
-}
-
-/// `ECONNREFUSED` (the connected receiver's socket closed) or `ENOTCONN` (a later send on a socket
-/// the kernel already disconnected): the path may now name a new receiver.
-fn is_receiver_gone(err: &std::io::Error) -> bool {
-    matches!(err.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotConnected)
-}
-
-/// `90` is `EMSGSIZE` on Linux, the only target (`syslog::is_message_too_large` has more).
-fn is_message_too_large(err: &std::io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(errno) if errno == 90 /* EMSGSIZE, Linux */)
-        || err.kind() == std::io::ErrorKind::InvalidInput
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{server_tls_config, testdata_dir, tls_settings, Collector, ReadMode};
+    use crate::test_support::{
+        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
+        server_tls_config, sum_of, sums_through_write_loop, testdata_dir, tls_settings, Collector,
+        DialStep, FakeStream, ReadMode, ScriptedDest, ScriptedDial, SendStep, WriteStep,
+    };
     use logit_core::{interner::intern, AttrMap, BodyFormat, LogRecord, MetricRecord, Resource};
     use logit_inputs::statsd::StatsdDecoder;
+    use logit_pipeline::test_util::{TelemetryProbe, RECV_TIMEOUT};
+    use logit_pipeline::Fault;
     use logit_proto::Decoder;
     use std::sync::{Arc, Mutex};
-    use tokio::net::TcpListener;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, UnixDatagram};
 
     fn batch_with(events: Vec<Event>) -> EventBatch {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
@@ -3868,6 +3508,159 @@ mod tests {
         assert_eq!(reconnects_in(registry.drain(0)), Some(1.0));
     }
 
+    // -- Datagram endpoint faults --------------------------------------------------------------
+
+    /// A path of 108 bytes or more doesn't fit `sockaddr_un`, so the connect fails before any
+    /// datagram: a clean error, not every line counted `oversize_datagram` under an `ok` request.
+    #[tokio::test]
+    async fn a_unix_socket_path_too_long_for_sockaddr_un_fails_clean_and_counts_no_oversize() {
+        let path = format!("/tmp/{}", "p".repeat(110));
+        let mut probe = TelemetryProbe::new();
+        let mut output = StatsdOutput::unix_datagram(&path, Duration::from_secs(1))
+            .with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
+        let err = output.send(&two_counters()).await.expect_err("the path can't be connected to");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+        let oversize = [("reason", "oversize_datagram")];
+        assert_eq!(probe.sum("logit.output.messages.dropped", &oversize), 0.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "clean")]), 1.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 0.0);
+    }
+
+    /// The kernel refuses a UDP send to port 0 with `EINVAL`: a clean error, not every line
+    /// counted `oversize_datagram` under an `ok` request.
+    #[tokio::test]
+    async fn a_udp_endpoint_with_port_zero_fails_clean_and_counts_no_oversize() {
+        let mut probe = TelemetryProbe::new();
+        let mut output = StatsdOutput::udp("127.0.0.1:0").unwrap().with_telemetry(probe.telemetry(
+            "out",
+            "statsd_out",
+            "sink",
+        ));
+        let err = output.send(&two_counters()).await.expect_err("the kernel refuses port 0");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+        assert_eq!(crate::test_support::errno_in(&err), Some(22), "EINVAL on Linux: {err:#}");
+        let oversize = [("reason", "oversize_datagram")];
+        assert_eq!(probe.sum("logit.output.messages.dropped", &oversize), 0.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "clean")]), 1.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 0.0);
+    }
+
+    /// An IPv6 endpoint goes out over an IPv6 socket.
+    #[tokio::test]
+    async fn an_ipv6_udp_endpoint_is_delivered() {
+        let Ok(mut collector) = Collector::udp_at("[::1]:0").await else {
+            println!("skipping: this environment has no usable IPv6 loopback");
+            return;
+        };
+        let mut output = StatsdOutput::udp(collector.addr().to_string()).unwrap();
+        output.send(&two_counters()).await.expect("an IPv6 endpoint must be reachable");
+        assert_eq!(collector.next().await, b"a:1|c\nb:2|c");
+    }
+
+    /// A counter named by `len` copies of `name`: a line of `len + 4` bytes.
+    fn long_counter(name: char, len: usize) -> Event {
+        metric_event(&name.to_string().repeat(len), MetricKind::counter(1.0), &[])
+    }
+
+    /// A batch that fails after two datagrams counts the two datagrams' messages before it
+    /// returns the error.
+    #[tokio::test]
+    async fn a_udp_failure_after_two_datagrams_counts_what_reached_the_wire() {
+        let script = ScriptedDest::new([
+            SendStep::Accept,
+            SendStep::Accept,
+            SendStep::Fail(std::io::ErrorKind::ConnectionRefused),
+        ]);
+        let mut probe = TelemetryProbe::new();
+        let mut output = StatsdOutput::udp("127.0.0.1:8125")
+            .unwrap()
+            .with_max_packet_bytes(5) // one five-byte line per datagram
+            .with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
+        output.conn = Conn::Udp(UdpDest::Scripted(Arc::clone(&script)));
+        let batch = batch_with(
+            ["a", "b", "c"].map(|n| metric_event(n, MetricKind::counter(1.0), &[])).to_vec(),
+        );
+        let err = output.send(&batch).await.expect_err("the third datagram fails");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+        assert_eq!(probe.sum("logit.output.messages", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.datagrams", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ambiguous")]), 1.0);
+    }
+
+    /// The kernel refuses a datagram over the largest UDP payload with `EMSGSIZE`. A builder can
+    /// set a cap config validation refuses, so the refused datagram's line is dropped and
+    /// counted, the send is `ok`, and the datagrams on either side arrive.
+    #[tokio::test]
+    async fn a_real_udp_emsgsize_drops_one_datagram_and_the_ones_around_it_arrive() {
+        let mut collector = Collector::udp().await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = StatsdOutput::udp(collector.addr().to_string())
+            .unwrap()
+            .with_max_packet_bytes(100_000)
+            .with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
+        // Lines of 40 004, 70 004, and 40 004 bytes: no two share a datagram, and only the
+        // middle one is over 65 507.
+        let batch = batch_with(vec![
+            long_counter('a', 40_000),
+            long_counter('b', 70_000),
+            long_counter('c', 40_000),
+        ]);
+        output.send(&batch).await.expect("an EMSGSIZE datagram is a drop, not a fault");
+
+        let got = collector.take(2).await;
+        assert!(got[0].starts_with(b"aaaa") && got[0].len() == 40_004);
+        assert!(got[1].starts_with(b"cccc") && got[1].len() == 40_004);
+        let dropped =
+            probe.sum("logit.output.messages.dropped", &[("reason", "oversize_datagram")]);
+        assert_eq!(dropped, 1.0, "one line, in entries");
+        assert_eq!(probe.sum("logit.output.messages", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.datagrams", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(dropped + probe.sum("logit.output.messages", &[]), 3.0, "sent + dropped");
+    }
+
+    /// A Unix datagram longer than the socket's send buffer allows is refused `EMSGSIZE`; the
+    /// buffer defaults to `wmem_default`, so the datagram is sized from it.
+    #[tokio::test]
+    async fn a_real_unix_emsgsize_drops_one_datagram_and_the_ones_around_it_arrive() {
+        let wmem: usize = std::fs::read_to_string("/proc/sys/net/core/wmem_default")
+            .expect("Linux exposes wmem_default")
+            .trim()
+            .parse()
+            .expect("wmem_default is a number");
+        let cap = 2 * wmem;
+        let dir = SocketDir::new("dgram-emsgsize");
+        let path = dir.socket();
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut output = StatsdOutput::unix_datagram(&path, Duration::from_secs(1))
+            .with_max_packet_bytes(cap)
+            .with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
+        // The middle line is past the send buffer but inside the cap, and no two lines share a
+        // datagram.
+        let batch = batch_with(vec![
+            long_counter('a', 96),
+            long_counter('b', cap - 14),
+            long_counter('c', 96),
+        ]);
+        output.send(&batch).await.expect("an EMSGSIZE datagram is a drop, not a fault");
+
+        let mut buf = vec![0u8; 4096];
+        for first in *b"ac" {
+            let n = tokio::time::timeout(RECV_TIMEOUT, receiver.recv(&mut buf))
+                .await
+                .expect("the datagram arrives")
+                .unwrap();
+            assert_eq!((n, buf[0]), (100, first));
+        }
+        let dropped =
+            probe.sum("logit.output.messages.dropped", &[("reason", "oversize_datagram")]);
+        assert_eq!(dropped, 1.0);
+        assert_eq!(probe.sum("logit.output.messages", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.datagrams", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 1.0);
+    }
+
     #[test]
     fn a_length_prefixed_frame_packs_lines_into_le_prefixed_packets() {
         let mut lines = MessageBuf::default();
@@ -4067,9 +3860,7 @@ mod tests {
         let batch = batch_with(vec![metric_event("first", MetricKind::counter(1.0), &[])]);
         output.send(&batch).await.expect("first send should succeed against a fresh connection");
 
-        if let Conn::Tcp { stream: Some(stream), .. } = &mut output.conn {
-            stream.shutdown().await.expect("local shutdown should succeed");
-        }
+        pooled(&mut output).shutdown().await.expect("local shutdown should succeed");
 
         let batch2 = batch_with(vec![metric_event("second", MetricKind::counter(1.0), &[])]);
         output
@@ -4309,9 +4100,7 @@ mod tests {
         );
 
         // Break the local end deterministically rather than racing a peer RST.
-        if let Conn::Tcp { stream: Some(stream), .. } = &mut output.conn {
-            stream.shutdown().await.expect("local shutdown should succeed");
-        }
+        pooled(&mut output).shutdown().await.expect("local shutdown should succeed");
         let batch2 = batch_with(vec![metric_event("second", MetricKind::counter(1.0), &[])]);
         output.send(&batch2).await.expect("second send should reconnect once and succeed");
 
@@ -4341,134 +4130,63 @@ mod tests {
 
     // -- Sink: TCP over TLS, write/flush semantics ----------------------------------------------
     //
-    // The TLS state that matters ("the session accepted the frame, the socket took part of it")
-    // needs a backpressured socket of known send-buffer size to provoke for real, so these tests
-    // drive `send_tcp` against a scripted [`FakeTlsStream`] instead.
+    // These drive `StatsdOutput::send` with a scripted [`FakeStream`] pooled behind the
+    // boxed-stream seam and a real `with_tls` target, so the shared driver takes its TLS arms
+    // with this sink's framing. `crate::stream`'s tests cover every fault arm once, over real TLS
+    // pairs too; `crate::stream_pins` pins the tokio-rustls behavior those arms assume.
 
-    /// An [`AsyncStream`] with `tokio_rustls`' write semantics: `write` buffers in userspace and
-    /// reports success, and only `flush` puts bytes on the notional wire. Failures are scripted
-    /// per call to reach each of `send_tcp`'s arms.
-    #[derive(Clone, Default)]
-    struct FakeTlsStream(Arc<Mutex<FakeState>>);
-
-    #[derive(Default)]
-    struct FakeState {
-        /// Accepted by `write`, not yet flushed (`tokio_rustls`' `sendable_tls`).
-        buffered: Vec<u8>,
-        /// What `flush` has put on the wire.
-        sent: Vec<u8>,
-        writes: usize,
-        flushes: usize,
-        /// `write` fails on this 1-based call number.
-        fail_write_on: Option<usize>,
-    }
-
-    impl FakeTlsStream {
-        fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
-            self.0.lock().unwrap()
-        }
-
-        fn failing_write(call: usize) -> Self {
-            let fake = Self::default();
-            fake.state().fail_write_on = Some(call);
-            fake
-        }
-    }
-
-    impl tokio::io::AsyncWrite for FakeTlsStream {
-        fn poll_write(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            let mut state = self.state();
-            state.writes += 1;
-            if state.fail_write_on == Some(state.writes) {
-                return std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "scripted write failure",
-                )));
+    /// The TCP arm's pooled connection, for a test that breaks it in place.
+    fn pooled(output: &mut StatsdOutput) -> &mut Box<dyn crate::tls::AsyncStream> {
+        match &mut output.conn {
+            Conn::Tcp { pool, .. } => {
+                pool.stream_mut().expect("a successful send pools its connection")
             }
-            state.buffered.extend_from_slice(buf);
-            std::task::Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            let mut state = self.state();
-            state.flushes += 1;
-            let buffered = std::mem::take(&mut state.buffered);
-            state.sent.extend_from_slice(&buffered);
-            std::task::Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
+            _ => panic!("not a TCP statsd_out"),
         }
     }
 
-    impl tokio::io::AsyncRead for FakeTlsStream {
-        /// `Pending`, as a live, quiet stream is: `Ok(())` with nothing filled is EOF, and
-        /// `crate::tls::poll_pending_close` would replace the stream before any scripted write.
-        /// No waker is registered, so anything that awaited a read here would hang loudly.
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            _buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Pending
+    /// A TCP `statsd_out` at `endpoint` with `fake` already pooled, as after a first send, and TLS
+    /// on when `tls` is set (no handshake happens: the pooled stream is reused).
+    fn with_pooled_fake(endpoint: &str, fake: &FakeStream, tls: bool) -> StatsdOutput {
+        let mut output = StatsdOutput::tcp(endpoint, Duration::from_millis(500));
+        if tls {
+            output = output
+                .with_tls(&TlsClientSettings::default(), &testdata_dir())
+                .expect("the default settings and an IP endpoint always build");
         }
+        output.conn = Conn::Tcp {
+            pool: PooledStream::pooled(Box::new(fake.clone())),
+            connect_timeout: Duration::from_millis(500),
+        };
+        output
     }
 
-    /// A client config so a [`TcpDial`] reports `is_tls()`; no handshake happens in these tests.
-    fn any_client_config() -> Arc<rustls::ClientConfig> {
-        Arc::new(
-            crate::tls::build_client_config(&TlsClientSettings::default(), &testdata_dir())
-                .expect("the default settings always build"),
-        )
+    fn one_line() -> EventBatch {
+        batch_with(vec![metric_event("hits", MetricKind::counter(1.0), &[])])
     }
 
-    fn one_line_frame() -> (MessageBuf, Vec<u8>) {
-        let mut lines = MessageBuf::default();
-        lines.push("hits:1|c");
-        (lines, Vec::new())
-    }
-
-    /// `send_tcp`'s `!dial.is_tls()` guard: a TLS write failure is `Ambiguous` and never resent,
+    /// The driver's `!dial.is_tls()` guard: a TLS write failure is `Ambiguous` and never resent,
     /// since a resend would increment the destination counter twice.
     #[tokio::test]
     async fn a_tls_write_failure_is_ambiguous_and_never_retried() {
-        let fake = FakeTlsStream::failing_write(1);
-        let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
-        let cfg = any_client_config();
-        let telemetry = Telemetry::default();
-        let mut connected = true;
-        let mut dial = TcpDial {
-            // Nothing listens here: a wrongly taken retry would fail its connect as `Clean`.
-            endpoint: "127.0.0.1:1",
-            connect_timeout: Duration::from_millis(200),
-            tls: Some(&cfg),
-            kind: StreamKind::Tcp,
-            telemetry: &telemetry,
-            has_connected_once: &mut connected,
-        };
-        let (lines, mut frame_buf) = one_line_frame();
+        let fake = FakeStream::new().on_write(1, WriteStep::Fail(std::io::ErrorKind::BrokenPipe));
+        // Nothing listens here: a wrongly taken retry would fail its connect as `Clean`.
+        let mut output = with_pooled_fake("127.0.0.1:1", &fake, true);
+        let mut probe = TelemetryProbe::new();
+        output = output.with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
 
-        let err = StatsdOutput::send_tcp(&mut stream, &mut dial, &lines, &mut frame_buf)
-            .await
-            .expect_err("a failed write must fail the send");
+        let err = output.send(&one_line()).await.expect_err("a failed write must fail the send");
 
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
-        assert!(stream.is_none(), "a stream whose write failed must not be reused");
+        let Conn::Tcp { pool, .. } = &output.conn else { unreachable!() };
+        assert!(pool.is_empty(), "a stream whose write failed must not be reused");
         let state = fake.state();
-        assert_eq!(state.writes, 1, "exactly one write attempt -- no resend");
+        assert_eq!(state.writes, 1, "one write attempt, no resend");
         assert_eq!(state.flushes, 0, "a failed write never reaches the flush");
-        assert!(state.sent.is_empty());
+        assert!(state.flushed.is_empty());
+        drop(state);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ambiguous")]), 1.0);
+        assert_eq!(probe.sum("logit.output.reconnects", &[]), 0.0, "no redial happened");
     }
 
     /// The plaintext counterpart on the same scripted stream: a zero-byte write failure reconnects
@@ -4479,23 +4197,12 @@ mod tests {
         let dead_addr = dead.local_addr().unwrap().to_string();
         drop(dead); // now nothing is listening there
 
-        let fake = FakeTlsStream::failing_write(1);
-        let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
-        let telemetry = Telemetry::default();
-        let mut connected = true;
-        let mut dial = TcpDial {
-            endpoint: &dead_addr,
-            connect_timeout: Duration::from_millis(500),
-            tls: None,
-            kind: StreamKind::Tcp,
-            telemetry: &telemetry,
-            has_connected_once: &mut connected,
-        };
-        let (lines, mut frame_buf) = one_line_frame();
+        let fake = FakeStream::new().on_write(1, WriteStep::Fail(std::io::ErrorKind::BrokenPipe));
+        let mut output = with_pooled_fake(&dead_addr, &fake, false);
+        let mut probe = TelemetryProbe::new();
+        output = output.with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
 
-        let err = StatsdOutput::send_tcp(&mut stream, &mut dial, &lines, &mut frame_buf)
-            .await
-            .expect_err("the retry's connect is refused");
+        let err = output.send(&one_line()).await.expect_err("the retry's connect is refused");
 
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
         assert_eq!(fake.state().writes, 1);
@@ -4503,39 +4210,29 @@ mod tests {
             format!("{err:#}").contains("connecting to statsd_out endpoint"),
             "the failure must come from the retry's fresh connect, proving one happened: {err:#}"
         );
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "clean")]), 1.0);
     }
 
     /// Nothing is left in the session buffer once a TLS batch is reported delivered, and the
     /// flushed connection is kept.
     #[tokio::test]
     async fn a_tls_batch_is_reported_delivered_only_once_the_stream_has_been_flushed() {
-        let fake = FakeTlsStream::default();
-        let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
-        let cfg = any_client_config();
-        let telemetry = Telemetry::default();
-        let mut connected = true;
-        let mut dial = TcpDial {
-            endpoint: "127.0.0.1:1",
-            connect_timeout: Duration::from_secs(1),
-            tls: Some(&cfg),
-            kind: StreamKind::Tcp,
-            telemetry: &telemetry,
-            has_connected_once: &mut connected,
-        };
-        let (lines, mut frame_buf) = one_line_frame();
+        let fake = FakeStream::new();
+        let mut output = with_pooled_fake("127.0.0.1:1", &fake, true);
+        let mut probe = TelemetryProbe::new();
+        output = output.with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
 
-        let (sent, datagrams) =
-            StatsdOutput::send_tcp(&mut stream, &mut dial, &lines, &mut frame_buf)
-                .await
-                .expect("the write and the flush both succeed");
+        output.send(&one_line()).await.expect("the write and the flush both succeed");
 
-        assert_eq!((sent, datagrams), (1, 0));
         let state = fake.state();
-        assert_eq!(state.flushes, 1, "the success path must flush exactly once");
-        assert!(state.buffered.is_empty(), "nothing may be left in the session buffer");
-        assert_eq!(state.sent, b"hits:1|c\n".to_vec(), "the whole frame must be on the wire");
+        assert_eq!(state.flushes, 1, "the success path must flush once");
+        assert!(state.unflushed.is_empty(), "nothing may be left in the session buffer");
+        assert_eq!(state.flushed, b"hits:1|c\n".to_vec(), "the whole frame must be on the wire");
         drop(state);
-        assert!(stream.is_some(), "a flushed connection is reusable");
+        let Conn::Tcp { pool, .. } = &output.conn else { unreachable!() };
+        assert!(!pool.is_empty(), "a flushed connection is reusable");
+        assert_eq!(probe.sum("logit.output.messages", &[]), 1.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 1.0);
     }
 
     // -- Telemetry --------------------------------------------------------------------------
@@ -4597,6 +4294,70 @@ mod tests {
             "one message per MessageBuf entry: the pair counts once"
         );
         assert_eq!(messages(&tcp_registry), 2.0);
+    }
+
+    /// Each stream transport hands the driver its own framing and reports its own counts: one
+    /// message per `MessageBuf` entry, an `ok` request, and no datagrams.
+    #[tokio::test]
+    async fn the_stream_transports_report_their_counts_through_the_driver() {
+        use tokio::io::AsyncReadExt;
+        let batch = || {
+            batch_with(vec![
+                metric_event("free", MetricKind::Gauge(-5.0), &[]),
+                metric_event("hits", MetricKind::counter(1.0), &[]),
+            ])
+        };
+        let assert_counts = |probe: &mut TelemetryProbe, what: &str| {
+            let totals = probe.poll();
+            assert_eq!(totals.sum("logit.output.messages", &[]), 2.0, "{what}");
+            assert_eq!(totals.sum("logit.output.requests", &[("class", "ok")]), 1.0, "{what}");
+            assert_eq!(totals.sum("logit.output.requests", &[]), 1.0, "{what}: one attempt");
+            assert_eq!(totals.sum("logit.output.datagrams", &[]), 0.0, "{what}");
+        };
+
+        let mut collector = Collector::tcp(ReadMode::ToEof).await;
+        let mut probe = TelemetryProbe::new();
+        let mut tcp = StatsdOutput::tcp(collector.addr().to_string(), Duration::from_secs(2))
+            .with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
+        tcp.send(&batch()).await.expect("tcp");
+        drop(tcp);
+        assert_eq!(collector.next().await, b"free:0|g\nfree:-5|g\nhits:1|c\n");
+        assert_counts(&mut probe, "tcp");
+
+        let dir = SocketDir::new("stream-counts");
+        let path = dir.socket();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut unix = StatsdOutput::unix_stream(&path, Duration::from_secs(1))
+            .with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
+        unix.send(&batch()).await.expect("unix_stream");
+        drop(unix);
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut got = Vec::new();
+        conn.read_to_end(&mut got).await.unwrap();
+        let packet = b"free:0|g\nfree:-5|g\nhits:1|c";
+        let mut expected = (packet.len() as u32).to_le_bytes().to_vec();
+        expected.extend_from_slice(packet);
+        assert_eq!(got, expected);
+        assert_counts(&mut probe, "unix_stream");
+    }
+
+    /// A TLS endpoint whose host is no valid server name fails at construction, naming the
+    /// endpoint, rather than failing every batch; an IP literal is a valid name.
+    #[test]
+    fn with_tls_rejects_an_endpoint_with_no_valid_server_name() {
+        for endpoint in ["[fe80::1%eth0]:8125", ":8125"] {
+            let err = StatsdOutput::tcp(endpoint, Duration::from_secs(1))
+                .with_tls(&TlsClientSettings::default(), &testdata_dir())
+                .err()
+                .expect(endpoint);
+            assert!(err.to_string().contains(endpoint), "{err}");
+        }
+        for endpoint in ["127.0.0.1:8125", "[::1]:8125", "statsd.example.com:8125"] {
+            StatsdOutput::tcp(endpoint, Duration::from_secs(1))
+                .with_tls(&TlsClientSettings::default(), &testdata_dir())
+                .unwrap_or_else(|err| panic!("{endpoint}: {err}"));
+        }
     }
 
     // -- Round-trip through the real StatsdDecoder -----------------------------------------
@@ -5290,5 +5051,188 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- Attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) ----------
+
+    /// A dropped tag, a dropped gauge delta with its diagnostic, and one line that encodes.
+    fn encode_side_batch() -> EventBatch {
+        batch_with(vec![
+            metric_event("hits", MetricKind::counter(1.0), &[("bad", Value::Null)]),
+            metric_event("conns", MetricKind::GaugeDelta(5.0), &[]),
+        ])
+    }
+
+    const ENCODE_SIDE: [(&str, &[(&str, &str)]); 4] = [
+        ("logit.output.messages.dropped", &[("reason", "unresolved_gauge_delta")]),
+        ("logit.output.tags.dropped", &[("reason", "unrepresentable")]),
+        ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
+        ("logit.output.batch.bytes", &[]),
+    ];
+
+    /// `output` with the builders `build_spec` calls, over `probe`'s component `out`.
+    fn instrumented(output: StatsdOutput, probe: &TelemetryProbe) -> StatsdOutput {
+        let telemetry = probe.telemetry("out", "statsd_out", "sink");
+        output
+            .with_encoder(StatsdEncoder::new(Format::DogStatsd))
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+    }
+
+    /// Runs [`encode_side_batch`] through the write loop over the sink `build` makes, once with a
+    /// first attempt that fails `Fault::Clean` (`fail_first`) and once without, and compares.
+    async fn assert_a_retry_counts_encode_side_once(build: impl Fn(bool) -> StatsdOutput) {
+        let mut runs = Vec::new();
+        for fail_first in [false, true] {
+            let mut probe = TelemetryProbe::new();
+            let mut output = instrumented(build(fail_first), &probe);
+            let sums = sums_through_write_loop(
+                &mut output,
+                &mut probe,
+                "statsd_out",
+                vec![encode_side_batch()],
+                fast_retry(),
+            )
+            .await;
+            runs.push(sums);
+        }
+        let (single, retried) = (&runs[0], &runs[1]);
+        assert_eq!(sum_of(single, "logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "clean")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.component.retries", &[]), 1.0);
+        assert_counted_once_per_batch(single, retried, &ENCODE_SIDE, &[]);
+    }
+
+    #[tokio::test]
+    async fn a_udp_retry_counts_encode_side_counters_once() {
+        assert_a_retry_counts_encode_side_once(|fail_first| {
+            let steps = fail_first.then_some(SendStep::Fail(std::io::ErrorKind::ConnectionRefused));
+            let mut output = StatsdOutput::udp("127.0.0.1:8125").unwrap();
+            output.conn = Conn::Udp(UdpDest::Scripted(ScriptedDest::new(steps)));
+            output
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_unix_datagram_retry_counts_encode_side_counters_once() {
+        assert_a_retry_counts_encode_side_once(|fail_first| {
+            // Not a gone receiver, so the socket is kept and the retry sends on it.
+            let steps = fail_first.then_some(SendStep::Fail(std::io::ErrorKind::Other));
+            let mut output = StatsdOutput::unix_datagram("/nonexistent", Duration::from_secs(1));
+            output.conn = Conn::UnixDatagram {
+                socket: Some(UnixSocket::Scripted(ScriptedDest::new(steps))),
+                send_timeout: Duration::from_secs(1),
+                has_connected_once: true,
+            };
+            output
+        })
+        .await;
+    }
+
+    /// A refused dial, then a connection that takes the frame.
+    fn refuse_then_connect(fail_first: bool) -> Arc<ScriptedDial> {
+        let connect = DialStep::Connect(Box::new(FakeStream::new()));
+        let steps = if fail_first { vec![DialStep::Refuse, connect] } else { vec![connect] };
+        Arc::new(ScriptedDial::new(false, steps))
+    }
+
+    #[tokio::test]
+    async fn a_tcp_retry_counts_encode_side_counters_once() {
+        assert_a_retry_counts_encode_side_once(|fail_first| {
+            let mut output = StatsdOutput::tcp("127.0.0.1:8125", Duration::from_secs(1));
+            output.dial_script = Some(refuse_then_connect(fail_first));
+            output
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_unix_stream_retry_counts_encode_side_counters_once() {
+        assert_a_retry_counts_encode_side_once(|fail_first| {
+            let mut output = StatsdOutput::unix_stream("/nonexistent", Duration::from_secs(1));
+            output.dial_script = Some(refuse_then_connect(fail_first));
+            output
+        })
+        .await;
+    }
+
+    /// The gate re-arms per batch: a second batch through the same loop counts as the first did.
+    #[tokio::test]
+    async fn a_second_batch_through_the_write_loop_counts_its_encode_side_counters() {
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(StatsdOutput::udp("127.0.0.1:8125").unwrap(), &probe);
+        output.conn = Conn::Udp(UdpDest::Scripted(ScriptedDest::new([])));
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "statsd_out", batches, fast_retry())
+                .await;
+        for (name, tags) in &ENCODE_SIDE[..3] {
+            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
+        }
+    }
+
+    /// A batch whose one attempt the retry budget cuts off is dropped, and the next batch counts
+    /// its encode-side counters: the cut left no gate muted and the next batch re-armed it.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_after_one_dropped_at_its_budget_counts_its_encode_side_counters() {
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(StatsdOutput::udp("127.0.0.1:8125").unwrap(), &probe);
+        let script = ScriptedDest::new([SendStep::Park]);
+        output.conn = Conn::Udp(UdpDest::Scripted(Arc::clone(&script)));
+        let mut config = fast_retry();
+        config.retry.total_budget = Duration::from_millis(50);
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "statsd_out", batches, config).await;
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(script.datagrams().len(), 1, "the second batch's one datagram");
+        for (name, tags) in &ENCODE_SIDE[..3] {
+            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
+        }
+    }
+
+    /// With no `observe_batch`, as a caller outside the runtime sends, every `send` counts, and
+    /// so does a direct `send` after a batch the write loop delivered.
+    #[tokio::test]
+    async fn a_send_with_no_observe_batch_counts_every_time() {
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(StatsdOutput::udp("127.0.0.1:8125").unwrap(), &probe);
+        output.conn = Conn::Udp(UdpDest::Scripted(ScriptedDest::new([])));
+        let _ = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "statsd_out",
+            vec![encode_side_batch()],
+            fast_retry(),
+        )
+        .await;
+        for _ in 0..2 {
+            output.send(&encode_side_batch()).await.expect("accepted");
+        }
+        let totals = probe.poll();
+        for (name, tags) in &ENCODE_SIDE[..3] {
+            assert_eq!(totals.sum(name, tags), 3.0, "{name} {tags:?}");
+        }
+    }
+
+    /// A batch the encoder skips whole returns `Ok` early and still leaves the accounting
+    /// disarmed, so later direct sends count.
+    #[tokio::test]
+    async fn direct_sends_after_a_batch_that_encoded_nothing_count_every_time() {
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(StatsdOutput::udp("127.0.0.1:8125").unwrap(), &probe);
+        output.conn = Conn::Udp(UdpDest::Scripted(ScriptedDest::new([])));
+        assert_direct_sends_count_after_an_empty_batch(
+            &mut output,
+            &mut probe,
+            "statsd_out",
+            batch_with(vec![log_event(0)]),
+            encode_side_batch,
+            &ENCODE_SIDE,
+        )
+        .await;
     }
 }

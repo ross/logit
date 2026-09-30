@@ -115,13 +115,22 @@
 //! |---|---|
 //! | `logit.output.requests{route, class}` | one per request; `route` is `traces` or `stats`, `class` [`crate::http::status_class`]'s or `network_error` |
 //! | `logit.output.request.duration{route}` | one timer per request |
-//! | `logit.output.request.bytes{route}` | the body as sent, after compression |
+//! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; not for a refused connection or a missing socket file |
 //! | `logit.output.records{route}` | spans (`traces`) or stats groups (`stats`) in a request the Agent accepted |
 //! | `logit.output.records.dropped{route, reason="oversize"}` | as above |
 //!
 //! Plus everything [`DatadogEncoder`] counts itself (`logit.output.spans.degraded`,
 //! `logit.output.stats.*`, `logit.output.tags.dropped`), which this sink doesn't repeat.
+//!
+//! **Once per batch or per attempt** (ADR `sink-send-path-and-attempt-accounting`, decision 1).
+//! Each route is a unit of the sink's `BatchAccounting`: the encoder's counters, the trace or
+//! stats group too large alone, and the `bad_header` diagnostic count on the unit's first encode,
+//! once per batch. A bisection's re-encodes count nothing ([`crate::http::split_encode`]). The
+//! encoder's counters for the batch resource count once per request of up to
+//! [`MAX_TRACES_PER_REQUEST`], not once per batch. The transport counters and a `413`'s
+//! `oversize` count per attempt.
 
+use crate::accounting::BatchAccounting;
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, read_body_prefix, split_encode,
     status_class, Caps, Encoded, ERROR_BODY_SNIPPET_BYTES,
@@ -135,7 +144,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use logit_core::{Diagnostics, EventBatch, Resource, Telemetry, Value};
-use logit_pipeline::{Fault, Output};
+use logit_pipeline::{BatchContext, Fault, Output};
 pub use logit_proto::datadog::traces_msgpack::TracerApiForm;
 use logit_proto::datadog::{
     is_datadog_stats, trace_chunks, DatadogEncoder, HEADER_TRACE_COUNT, TRACER_FLAG_HEADERS,
@@ -412,14 +421,27 @@ pub struct DatadogTraceOutput {
     headers: HeaderMap,
     /// Built by [`DatadogTraceOutput::with_tls`]; `None` keeps `reqwest`'s default trust.
     tls: Option<rustls::ClientConfig>,
+    /// Counts through views of `telemetry`/`diag` gated by `accounting`
+    /// ([`DatadogTraceOutput::new_encoder`]).
     encoder: DatadogEncoder,
+    /// Ungated: the transport counters, the Agent's verdicts, and the oversize drops and
+    /// `bad_header` diagnostic, which the sink skips itself on a repeat encode.
     diag: Diagnostics,
     telemetry: Telemetry,
+    accounting: BatchAccounting,
+    /// Replaces [`CAPS`], so a test can drop a small trace as oversize.
+    #[cfg(test)]
+    caps_override: Option<Caps>,
 }
+
+/// The batch accounting's unit for the trace route's encode and tracer headers.
+const TRACES_UNIT: u32 = 0;
+/// The batch accounting's unit for the stats route's encode.
+const STATS_UNIT: u32 = 1;
 
 impl DatadogTraceOutput {
     fn with_client(client: Client) -> Self {
-        Self {
+        let mut output = Self {
             client,
             version: TracerApiForm::V04,
             compression: DatadogTraceCompression::default(),
@@ -429,7 +451,12 @@ impl DatadogTraceOutput {
             encoder: DatadogEncoder::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
-        }
+            accounting: BatchAccounting::default(),
+            #[cfg(test)]
+            caps_override: None,
+        };
+        output.encoder = output.new_encoder();
+        output
     }
 
     /// Sends to the Agent at `endpoint` (`endpoint:`), an `http://` or `https://` base URL; a
@@ -529,10 +556,23 @@ impl DatadogTraceOutput {
         self
     }
 
+    /// The encoder, on views of this sink's handles gated by its batch accounting, so a retried
+    /// batch counts the codec's drops once (`crate::accounting`). `with_client` and every builder
+    /// that changes what the encoder holds call this, so no builder order leaves it ungated.
     fn new_encoder(&self) -> DatadogEncoder {
+        let gate = self.accounting.gate();
         DatadogEncoder::new()
-            .with_telemetry(self.telemetry.clone())
-            .with_diagnostics(self.diag.clone())
+            .with_telemetry(self.telemetry.gated(gate))
+            .with_diagnostics(self.diag.gated(gate))
+    }
+
+    /// Both routes' request limits: [`CAPS`], or a test's override.
+    fn caps(&self) -> Caps {
+        #[cfg(test)]
+        if let Some(caps) = self.caps_override {
+            return caps;
+        }
+        CAPS
     }
 
     fn dropped(&self, route: Route, reason: &'static str, n: usize) {
@@ -546,7 +586,8 @@ impl DatadogTraceOutput {
     }
 
     /// The trace route's requests: the batch's span events other than APM stats, one item per
-    /// trace so a trace is never split.
+    /// trace so a trace is never split. The encode and the tracer headers are [`TRACES_UNIT`]:
+    /// the oversize drops and the `bad_header` diagnostic count on its first encode only.
     async fn send_traces(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let resource = &batch.resource;
         let chunks: Vec<Vec<usize>> = trace_chunks(batch)
@@ -561,36 +602,43 @@ impl DatadogTraceOutput {
             return Ok(());
         }
         let items: Vec<usize> = (0..chunks.len()).collect();
-        let (version, compression) = (self.version, self.compression);
+        let (version, compression, caps) = (self.version, self.compression, self.caps());
+        let gate = self.accounting.gate().clone();
         let encoder = &mut self.encoder;
-        let split = split_encode(
-            &items,
-            CAPS,
-            |_| 1,
-            |selected| {
-                let mut indices: Vec<usize> =
-                    selected.iter().flat_map(|&c| chunks[c].iter().copied()).collect();
-                indices.sort_unstable();
-                let out = encoder.encode_tracer_api_traces(&sub_batch(batch, &indices), version)?;
-                Some(Encoded {
-                    raw_len: out.body.len(),
-                    body: compression.apply(out.body),
-                    meta: RequestMeta { traces: out.traces, records: indices.len() },
-                })
-            },
-        );
-        for (chunk, raw_len, wire_len) in split.oversize {
-            let spans = chunks[chunk].len();
-            self.dropped(Route::Traces, "oversize", spans);
-            self.diag.warn_throttled(
-                "oversize",
-                format_args!(
-                    "dropped a trace of {spans} spans: it encodes to {raw_len} bytes \
-                     ({wire_len} as sent), over the Agent's {MAX_REQUEST_BYTES}-byte limit"
-                ),
-            );
+        let (first, split) = self.accounting.encode(TRACES_UNIT, || {
+            split_encode(
+                &items,
+                caps,
+                &gate,
+                |_| 1,
+                |selected| {
+                    let mut indices: Vec<usize> =
+                        selected.iter().flat_map(|&c| chunks[c].iter().copied()).collect();
+                    indices.sort_unstable();
+                    let sub = sub_batch(batch, &indices);
+                    let out = encoder.encode_tracer_api_traces(&sub, version)?;
+                    Some(Encoded {
+                        raw_len: out.body.len(),
+                        body: compression.apply(out.body),
+                        meta: RequestMeta { traces: out.traces, records: indices.len() },
+                    })
+                },
+            )
+        });
+        if first {
+            for &(chunk, raw_len, wire_len) in &split.oversize {
+                let spans = chunks[chunk].len();
+                self.dropped(Route::Traces, "oversize", spans);
+                self.diag.warn_throttled(
+                    "oversize",
+                    format_args!(
+                        "dropped a trace of {spans} spans: it encodes to {raw_len} bytes \
+                         ({wire_len} as sent), over the Agent's {MAX_REQUEST_BYTES}-byte limit"
+                    ),
+                );
+            }
         }
-        let headers = self.tracer_headers(resource);
+        let headers = self.tracer_headers(resource, first);
         for (_, encoded) in split.requests {
             let mut headers = headers.clone();
             headers.insert(HEADER_TRACE_COUNT, HeaderValue::from(encoded.meta.traces));
@@ -599,7 +647,8 @@ impl DatadogTraceOutput {
         Ok(())
     }
 
-    /// The stats route's requests: one item per APM stats event (a stats group).
+    /// The stats route's requests: one item per APM stats event (a stats group). The encode is
+    /// [`STATS_UNIT`]: the oversize drops count on its first encode only.
     async fn send_stats(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let items: Vec<usize> = (0..batch.events.len())
             .filter(|&i| is_datadog_stats(&batch.resource, &batch.events[i]))
@@ -607,30 +656,36 @@ impl DatadogTraceOutput {
         if items.is_empty() {
             return Ok(());
         }
-        let compression = self.compression;
+        let (compression, caps) = (self.compression, self.caps());
+        let gate = self.accounting.gate().clone();
         let encoder = &mut self.encoder;
-        let split = split_encode(
-            &items,
-            CAPS,
-            |_| 1,
-            |selected| {
-                let raw = encoder.encode_client_stats_v06(&sub_batch(batch, selected))?;
-                Some(Encoded {
-                    raw_len: raw.len(),
-                    body: compression.apply(raw),
-                    meta: RequestMeta { traces: 0, records: selected.len() },
-                })
-            },
-        );
-        for (_, raw_len, wire_len) in split.oversize {
-            self.dropped(Route::Stats, "oversize", 1);
-            self.diag.warn_throttled(
-                "oversize",
-                format_args!(
-                    "dropped a stats group: it encodes to {raw_len} bytes ({wire_len} as sent), \
-                     over the Agent's {MAX_REQUEST_BYTES}-byte limit"
-                ),
-            );
+        let (first, split) = self.accounting.encode(STATS_UNIT, || {
+            split_encode(
+                &items,
+                caps,
+                &gate,
+                |_| 1,
+                |selected| {
+                    let raw = encoder.encode_client_stats_v06(&sub_batch(batch, selected))?;
+                    Some(Encoded {
+                        raw_len: raw.len(),
+                        body: compression.apply(raw),
+                        meta: RequestMeta { traces: 0, records: selected.len() },
+                    })
+                },
+            )
+        });
+        if first {
+            for &(_, raw_len, wire_len) in &split.oversize {
+                self.dropped(Route::Stats, "oversize", 1);
+                self.diag.warn_throttled(
+                    "oversize",
+                    format_args!(
+                        "dropped a stats group: it encodes to {raw_len} bytes ({wire_len} as \
+                         sent), over the Agent's {MAX_REQUEST_BYTES}-byte limit"
+                    ),
+                );
+            }
         }
         for (_, encoded) in split.requests {
             self.post(Route::Stats, HeaderMap::new(), encoded).await?;
@@ -638,8 +693,10 @@ impl DatadogTraceOutput {
         Ok(())
     }
 
-    /// The tracer headers restored from `resource` (module doc's "The wire").
-    fn tracer_headers(&mut self, resource: &Resource) -> HeaderMap {
+    /// The tracer headers restored from `resource` (module doc's "The wire"). A carrier that
+    /// isn't a legal header value is diagnosed only when `report`: the diagnostic describes the
+    /// batch, so a retry doesn't repeat it.
+    fn tracer_headers(&mut self, resource: &Resource, report: bool) -> HeaderMap {
         let attrs = &resource.attributes;
         let mut headers = HeaderMap::new();
         for (header, attr) in TRACER_STR_HEADERS {
@@ -648,7 +705,7 @@ impl DatadogTraceOutput {
                 Ok(value) => {
                     headers.insert(header, value);
                 }
-                Err(_) => {
+                Err(_) if report => {
                     self.diag.warn_throttled(
                         "bad_header",
                         format_args!(
@@ -657,6 +714,7 @@ impl DatadogTraceOutput {
                         ),
                     );
                 }
+                Err(_) => {}
             }
         }
         for (header, attr) in TRACER_FLAG_HEADERS {
@@ -704,7 +762,15 @@ impl DatadogTraceOutput {
         headers
     }
 
+    /// One attempt: traces, then stats.
+    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        self.send_traces(batch).await?;
+        self.send_stats(batch).await
+    }
+
     /// One request, one attempt (module doc's "Faults, retries, and duplicate safety").
+    /// `request.bytes` counts a request that may have left: any answer, and any error but a
+    /// [`Fault::Clean`] one, which never connected.
     async fn post(
         &mut self,
         route: Route,
@@ -723,11 +789,13 @@ impl DatadogTraceOutput {
             .send(route.method(), path, headers, encoded.body, self.request_timeout)
             .await;
         timer.stop(&tags);
-        self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
 
         let reply = match result {
             Ok(reply) => reply,
             Err((fault, err)) => {
+                if fault != Fault::Clean {
+                    self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
+                }
                 self.telemetry.count(
                     REQUESTS,
                     1.0,
@@ -741,6 +809,7 @@ impl DatadogTraceOutput {
                     .context(fault));
             }
         };
+        self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
         let status = reply.status;
         self.telemetry.count(
             REQUESTS,
@@ -780,11 +849,17 @@ impl DatadogTraceOutput {
 
 #[async_trait::async_trait]
 impl Output for DatadogTraceOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
     /// Traces, then stats, one request at a time; the first failure aborts the rest (module doc's
-    /// "Faults, retries, and duplicate safety").
+    /// "Faults, retries, and duplicate safety"). An `Ok` disarms the batch accounting on every
+    /// path, a batch that sent nothing included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        self.send_traces(batch).await?;
-        self.send_stats(batch).await
+        let result = self.attempt(batch).await;
+        self.accounting.finish(result)
     }
 
     /// `false`: an Agent dedupes nothing, and a batch can be two requests, so a retry after the
@@ -1362,5 +1437,396 @@ mod tests {
     #[test]
     fn datadog_trace_output_is_not_duplicate_safe() {
         assert!(!DatadogTraceOutput::http("http://127.0.0.1:8126").duplicate_safe());
+    }
+
+    // ---- attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) --------
+
+    use crate::test_support::{
+        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch,
+        at_least_once, bodies, fast_retry, http_recorder, per_path_recorder, recorded_paths,
+        refused_addr, sum_of, sums_through_write_loop, Recorded, Reply as Answer, SumSeries, Sums,
+        HUNG_REQUEST_BUDGET,
+    };
+    use logit_pipeline::test_util::TelemetryProbe;
+    use logit_pipeline::WriteLoopConfig;
+    use logit_proto::datadog::RESOURCE_ATTR_TRACER_RUNTIME_ID;
+
+    const TRACES: &str = "/v0.4/traces";
+    const STATS: &str = "/v0.6/stats";
+
+    /// A resource whose runtime id has no v0.4 field (the trace codec counts it `no_wire_form`
+    /// once per request body) and whose language isn't a legal header value (the sink leaves the
+    /// header out and diagnoses `bad_header`).
+    fn lossy_resource() -> Resource {
+        let mut resource = Resource::default();
+        resource.attributes.insert(RESOURCE_ATTR_TRACER_RUNTIME_ID, Value::str("rt-1"));
+        resource.attributes.insert(RESOURCE_ATTR_TRACER_LANGUAGE_NAME, Value::str("py\nthon"));
+        resource
+    }
+
+    /// A span with a map attribute, which the trace codec writes as JSON text and counts
+    /// `json_text`.
+    fn span_with_map(trace: u8, id: u8, parent: Option<u8>) -> Event {
+        let mut event = span(trace, id, parent);
+        let map = AttrMap::from_iter([("k", Value::str("v"))]);
+        event.attributes.insert("nested", Value::Map(Box::new(map)));
+        event
+    }
+
+    /// A stats group with an attribute the stats codec has no field for, counted `no_wire_form`.
+    fn lossy_stats_event() -> Event {
+        let mut event = stats_event();
+        event.attributes.insert("not.a.group.field", Value::str("x"));
+        event
+    }
+
+    /// Two traces and a stats group, each unit with codec counts, and the `bad_header` diagnostic.
+    fn encode_side_batch() -> EventBatch {
+        batch_with(
+            lossy_resource(),
+            vec![
+                span_with_map(1, 1, None),
+                span_with_map(1, 2, Some(1)),
+                span_with_map(2, 3, None),
+                lossy_stats_event(),
+            ],
+        )
+    }
+
+    const ENCODE_SIDE: [SumSeries<'static>; 4] = [
+        ("logit.output.spans.degraded", &[("reason", "json_text")]),
+        ("logit.output.spans.degraded", &[("reason", "no_wire_form")]),
+        ("logit.component.diagnostics", &[("key", "bad_header")]),
+        ("logit.output.tags.dropped", &[("reason", "no_wire_form")]),
+    ];
+
+    /// Beyond `logit.output.requests`, what a retried batch counts once per attempt here.
+    const PER_ATTEMPT: [SumSeries<'static>; 2] = [(REQUEST_BYTES, &[]), (RECORDS, &[])];
+
+    fn accepted() -> Answer {
+        Answer::Answer(200, RATES.as_bytes().to_vec())
+    }
+
+    /// `503` on a path's first request, then [`accepted`].
+    fn busy_once(k: usize) -> Answer {
+        if k == 0 {
+            Answer::Answer(503, Vec::new())
+        } else {
+            accepted()
+        }
+    }
+
+    fn instrumented(addr: SocketAddr, probe: &TelemetryProbe) -> DatadogTraceOutput {
+        let telemetry = probe.telemetry("out", "datadog_trace_out", "sink");
+        sink(addr)
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+    }
+
+    /// `batches` through the write loop under `config`, over the sink `build` makes, against a
+    /// [`per_path_recorder`]; and the requests it received.
+    async fn run_agent(
+        script: impl Fn(&str, usize) -> Answer + Send + Sync + 'static,
+        batches: Vec<EventBatch>,
+        config: WriteLoopConfig,
+        build: impl FnOnce(SocketAddr, &TelemetryProbe) -> DatadogTraceOutput,
+    ) -> (Sums, Vec<Recorded>) {
+        let (addr, log) = per_path_recorder(script).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = build(addr, &probe);
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "datadog_trace_out", batches, config)
+                .await;
+        let log = log.lock().unwrap().clone();
+        (sums, log)
+    }
+
+    /// The stats request fails after the traces were sent: the retry re-sends both, and each
+    /// unit's codec counts and the `bad_header` diagnostic read as after one attempt.
+    #[tokio::test]
+    async fn a_stats_failure_after_the_traces_were_sent_counts_each_units_encode_side_once() {
+        let batches = || vec![encode_side_batch()];
+        let (single, one) =
+            run_agent(|_, _| accepted(), batches(), at_least_once(), instrumented).await;
+        let script = |p: &str, k| if p == STATS { busy_once(k) } else { accepted() };
+        let (retried, log) = run_agent(script, batches(), at_least_once(), instrumented).await;
+
+        assert_eq!(recorded_paths(&one), [TRACES, STATS]);
+        assert_eq!(recorded_paths(&log), [TRACES, STATS, TRACES, STATS], "two attempts");
+        assert_eq!(sum_of(&retried, REQUESTS, &[("route", "traces"), ("class", "2xx")]), 2.0);
+        assert_eq!(sum_of(&retried, REQUESTS, &[("route", "stats"), ("class", "5xx")]), 1.0);
+        assert_eq!(sum_of(&retried, REQUESTS, &[("route", "stats"), ("class", "2xx")]), 1.0);
+        assert_eq!(sum_of(&retried, RECORDS, &[("route", "traces")]), 6.0, "three spans, twice");
+        assert_eq!(sum_of(&retried, RECORDS, &[("route", "stats")]), 1.0);
+        let bytes = sum_of(&single, REQUEST_BYTES, &[("route", "traces")]);
+        assert_eq!(sum_of(&retried, REQUEST_BYTES, &[("route", "traces")]), 2.0 * bytes);
+        for path in [TRACES, STATS] {
+            let first = &bodies(&one, path)[0];
+            for body in bodies(&log, path) {
+                assert_eq!(&body, first, "{path}: a retry sends the first attempt's bytes");
+            }
+        }
+        assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
+    }
+
+    /// The traces request fails first, so attempt 1 never encodes the stats: they count on
+    /// attempt 2, their first encode, once.
+    #[tokio::test]
+    async fn stats_first_encoded_on_a_retry_count_their_encode_side_then() {
+        let batches = || vec![encode_side_batch()];
+        let (single, _) =
+            run_agent(|_, _| accepted(), batches(), at_least_once(), instrumented).await;
+        let script = |p: &str, k| if p == TRACES { busy_once(k) } else { accepted() };
+        let (retried, log) = run_agent(script, batches(), at_least_once(), instrumented).await;
+        assert_eq!(recorded_paths(&log), [TRACES, TRACES, STATS]);
+        assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
+    }
+
+    /// 1,001 traces are two count-capped requests. The runtime id the v0.4 form can't carry is
+    /// counted once per request body, so twice, on one attempt and on a retried one alike.
+    #[tokio::test]
+    async fn a_per_body_counter_counts_once_per_count_capped_chunk_on_every_attempt() {
+        let traces = || {
+            let events: Vec<Event> = (0..1_001u32)
+                .map(|i| {
+                    let mut e = span(0, 1, None);
+                    let span = e.span.as_mut().unwrap();
+                    span.trace_id[12..].copy_from_slice(&(i + 1).to_be_bytes());
+                    e
+                })
+                .collect();
+            let mut resource = Resource::default();
+            resource.attributes.insert(RESOURCE_ATTR_TRACER_RUNTIME_ID, Value::str("rt-1"));
+            vec![batch_with(resource, events)]
+        };
+        let (single, one) =
+            run_agent(|_, _| accepted(), traces(), at_least_once(), instrumented).await;
+        let (retried, log) =
+            run_agent(|_, k| busy_once(k), traces(), at_least_once(), instrumented).await;
+        assert_eq!(one.len(), 2, "two count-capped requests");
+        assert_eq!(log.len(), 3, "the first request failed, then both were resent");
+        let lost = [("reason", "no_wire_form")];
+        assert_eq!(sum_of(&single, "logit.output.spans.degraded", &lost), 2.0);
+        assert_eq!(sum_of(&retried, "logit.output.spans.degraded", &lost), 2.0);
+        let encode_side: [SumSeries<'_>; 1] = [("logit.output.spans.degraded", &lost)];
+        assert_counted_once_per_batch(&single, &retried, &encode_side, &PER_ATTEMPT);
+    }
+
+    /// The gate re-arms per batch: a second batch counts as the first did.
+    #[tokio::test]
+    async fn a_second_trace_batch_counts_its_encode_side_counters() {
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let (sums, _) = run_agent(|_, _| accepted(), batches, fast_retry(), instrumented).await;
+        let (one, _) =
+            run_agent(|_, _| accepted(), vec![encode_side_batch()], fast_retry(), instrumented)
+                .await;
+        for (name, tags) in ENCODE_SIDE {
+            assert_eq!(
+                sum_of(&sums, name, tags),
+                2.0 * sum_of(&one, name, tags),
+                "{name} {tags:?}"
+            );
+        }
+    }
+
+    /// A batch whose stats request never answers is cut off by the retry budget and dropped, and
+    /// the next batch counts its encode-side counters.
+    #[tokio::test]
+    async fn a_trace_batch_after_one_dropped_at_its_budget_counts_encode_side() {
+        let script = |p: &str, k| if p == STATS && k == 0 { Answer::Hang } else { accepted() };
+        let mut config = fast_retry();
+        config.retry.total_budget = HUNG_REQUEST_BUDGET;
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let (sums, log) = run_agent(script, batches, config, instrumented).await;
+        let (one, _) =
+            run_agent(|_, _| accepted(), vec![encode_side_batch()], fast_retry(), instrumented)
+                .await;
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(recorded_paths(&log), [TRACES, STATS, TRACES, STATS]);
+        for (name, tags) in ENCODE_SIDE {
+            assert_eq!(
+                sum_of(&sums, name, tags),
+                2.0 * sum_of(&one, name, tags),
+                "{name} {tags:?}"
+            );
+        }
+    }
+
+    /// A batch with nothing to send returns `Ok` early and leaves the accounting disarmed, so
+    /// later direct sends count.
+    #[tokio::test]
+    async fn trace_direct_sends_after_a_batch_that_sent_nothing_count_every_time() {
+        let (addr, log) = per_path_recorder(|_, _| accepted()).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(addr, &probe);
+        let nothing = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str("not a span"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        assert_direct_sends_count_after_an_empty_batch(
+            &mut output,
+            &mut probe,
+            "datadog_trace_out",
+            batch(vec![nothing]),
+            encode_side_batch,
+            &ENCODE_SIDE,
+        )
+        .await;
+        let log = log.lock().unwrap().clone();
+        assert_eq!(recorded_paths(&log), [TRACES, STATS, TRACES, STATS], "the two direct sends");
+    }
+
+    /// One of the two builders that rebuild the encoder.
+    #[derive(Clone, Copy, Debug)]
+    enum Builder {
+        Diagnostics,
+        Telemetry,
+    }
+
+    /// Both orders of the two encoder-building builders, each after a first call with other
+    /// handles, leave the encoder counting through gated views of the last handles.
+    #[tokio::test]
+    async fn every_trace_builder_order_gates_the_encoder_on_the_final_handles() {
+        use Builder::{Diagnostics as D, Telemetry as T};
+        for order in [[D, T], [T, D]] {
+            let decoy = Registry::new();
+            let build = |addr: SocketAddr, probe: &TelemetryProbe| -> DatadogTraceOutput {
+                let other = decoy.telemetry_for("other", "datadog_trace_out", "sink");
+                let mut sink = sink(addr)
+                    .with_telemetry(other.clone())
+                    .with_diagnostics(Diagnostics::new("other").with_telemetry(other));
+                let telemetry = probe.telemetry("out", "datadog_trace_out", "sink");
+                for builder in order {
+                    sink = match builder {
+                        Builder::Diagnostics => sink.with_diagnostics(
+                            Diagnostics::new("out").with_telemetry(telemetry.clone()),
+                        ),
+                        Builder::Telemetry => sink.with_telemetry(telemetry.clone()),
+                    };
+                }
+                sink
+            };
+            let batches = || vec![encode_side_batch()];
+            let (single, _) = run_agent(|_, _| accepted(), batches(), at_least_once(), build).await;
+            let script = |p: &str, k| if p == STATS { busy_once(k) } else { accepted() };
+            let (retried, _) = run_agent(script, batches(), at_least_once(), build).await;
+            assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
+            let stale = decoy.drain(0).iter().map(|e| e.metrics.len()).sum::<usize>();
+            assert_eq!(stale, 0, "{order:?}: nothing counts through a replaced handle");
+        }
+    }
+
+    /// With no handle builders, a retried batch reports its `bad_header` diagnostic once, read
+    /// from the sink's own throttle.
+    #[tokio::test]
+    async fn a_trace_sink_with_no_handle_builders_reports_each_encode_side_diagnostic_once() {
+        let (addr, log) =
+            per_path_recorder(|p, k| if p == STATS { busy_once(k) } else { accepted() }).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = sink(addr);
+        let batches = vec![encode_side_batch()];
+        sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "datadog_trace_out",
+            batches,
+            at_least_once(),
+        )
+        .await;
+        assert_eq!(recorded_paths(&log.lock().unwrap()), [TRACES, STATS, TRACES, STATS]);
+        assert_eq!(output.diag.occurrences("bad_header"), 1);
+    }
+
+    /// A trace too large to send alone is dropped and counted once, and diagnosed once, on a
+    /// batch whose stats request is retried. Under a 2,000-byte cap the ordinary trace and the
+    /// stats group fit, and the trace with a 5,000-byte attribute doesn't.
+    #[tokio::test]
+    async fn an_oversize_trace_counts_once_on_a_retried_batch() {
+        let small = |addr: SocketAddr, probe: &TelemetryProbe| {
+            let mut out = instrumented(addr, probe);
+            out.caps_override = Some(Caps { wire_bytes: 2_000, ..CAPS });
+            out
+        };
+        let mut big = span(2, 3, None);
+        big.attributes.insert("blob", Value::str("x".repeat(5_000)));
+        let events = vec![span(1, 1, None), big, stats_event()];
+        let b = || vec![batch(events.clone())];
+        let (single, _) = run_agent(|_, _| accepted(), b(), at_least_once(), small).await;
+        let script = |p: &str, k| if p == STATS { busy_once(k) } else { accepted() };
+        let (retried, log) = run_agent(script, b(), at_least_once(), small).await;
+        assert_eq!(recorded_paths(&log), [TRACES, STATS, TRACES, STATS]);
+        let encode_side: [SumSeries<'static>; 2] = [
+            (RECORDS_DROPPED, &[("route", "traces"), ("reason", "oversize")]),
+            ("logit.component.diagnostics", &[("key", "oversize")]),
+        ];
+        for sums in [&single, &retried] {
+            assert_eq!(sum_of(sums, RECORDS_DROPPED, encode_side[0].1), 1.0);
+        }
+        assert_counted_once_per_batch(&single, &retried, &encode_side, &PER_ATTEMPT);
+    }
+
+    /// A `413` answered on a retry is the Agent's verdict on that attempt: its spans are counted
+    /// oversize and it is diagnosed, through the sink's ungated handles.
+    #[tokio::test]
+    async fn a_413_answered_on_a_retry_is_counted() {
+        let script = |_: &str, k| match k {
+            0 => Answer::Answer(503, Vec::new()),
+            _ => Answer::Answer(413, b"too large".to_vec()),
+        };
+        let (sums, log) =
+            run_agent(script, vec![two_traces()], at_least_once(), instrumented).await;
+        assert_eq!(recorded_paths(&log), [TRACES, TRACES]);
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        let oversize = [("route", "traces"), ("reason", "oversize")];
+        assert_eq!(sum_of(&sums, RECORDS_DROPPED, &oversize), 3.0);
+        let rejected = [("key", "request_rejected")];
+        assert_eq!(sum_of(&sums, "logit.component.diagnostics", &rejected), 1.0);
+    }
+
+    // ---- request.bytes -----------------------------------------------------------------------
+
+    /// A refused TCP connection and a missing socket file sent nothing, so they count no
+    /// `request.bytes`, only their request.
+    #[tokio::test]
+    async fn a_refused_connection_or_a_missing_socket_counts_no_request_bytes() {
+        let dir = TempDir::new("bytes");
+        for out in [sink(refused_addr().await), DatadogTraceOutput::unix(dir.0.join("missing"))] {
+            let (registry, mut out) = metered(out);
+            let err = out.send(&two_traces()).await.unwrap_err();
+            assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
+            let points = registry.drain(0);
+            assert_eq!(total(&points, REQUEST_BYTES, &[]), 0.0, "{err:#}");
+            let refused = [("route", "traces"), ("class", "network_error")];
+            assert_eq!(total(&points, REQUESTS, &refused), 1.0);
+        }
+    }
+
+    /// A request that got an answer counts the body as sent, and so does one that timed out,
+    /// which may have reached the Agent.
+    #[tokio::test]
+    async fn an_answered_or_timed_out_request_counts_its_bytes() {
+        let (addr, log) = accepting().await;
+        let (registry, mut out) = metered(sink(addr));
+        out.send(&two_traces()).await.unwrap();
+        let sent = captured(&log)[0].body.len() as f64;
+        assert_eq!(total(&registry.drain(0), REQUEST_BYTES, &[("route", "traces")]), sent);
+
+        let (addr, _log) = http_recorder(|_, _, _| Answer::Hang).await;
+        // The recorder never answers, so the timeout ends the request whatever its length: 100 ms
+        // bounds only how long the test waits, and a loaded machine can't make it fire early.
+        let (registry, mut out) = metered(sink(addr).with_timeout(Duration::from_millis(100)));
+        let err = out.send(&two_traces()).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+        assert!(total(&registry.drain(0), REQUEST_BYTES, &[("route", "traces")]) > 0.0);
     }
 }

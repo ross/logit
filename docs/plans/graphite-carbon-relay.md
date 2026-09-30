@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-09-13
+updated: 2026-09-29
 ---
 
 # Enabling plan: `graphite_in`/`graphite_out` — a lossless Graphite/Carbon relay
@@ -302,8 +302,10 @@ with_encoder (re-applies cap + diag + telemetry — collectd.rs:120-135, order-i
 - `duplicate_safe() -> true` with the whisper argument in the doc comment; the argument's boundary
   (a non-whisper backend could differ) is stated there too.
 - Sink emits only socket facts: `logit.output.batch.bytes`, `logit.output.request.duration`,
-  `logit.output.requests{class="ok"|"error"}`, `logit.output.messages` (entries),
-  `logit.output.datapoints` (Σ Meta), `logit.output.datagrams` (UDP), the oversize_datagram drop.
+  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (the `Fault` classes of ADR
+  `sink-send-path-and-attempt-accounting`, decision 4), `logit.output.messages` (entries),
+  `logit.output.datapoints` (Σ Meta), `logit.output.datagrams` (UDP), `logit.output.reconnects`
+  (TCP), the oversize_datagram drop.
 
 ### Configuration (`crates/logit-config/src/lib.rs`)
 

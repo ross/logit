@@ -3,7 +3,7 @@
 //! repeats. See `docs/adr/service-lifecycle-and-output-retry.md` and
 //! `docs/adr/tracing-for-self-logging.md`.
 
-use crate::telemetry::Telemetry;
+use crate::telemetry::{CountGate, Telemetry};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -60,6 +60,17 @@ impl Diagnostics {
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
+    }
+
+    /// A clone sharing this value's throttle whose [`Diagnostics::warn_throttled`] does nothing
+    /// while `gate` is muted: no report, no `logit.component.diagnostics` count, no throttle bump
+    /// ([`Telemetry::gated`]). The unthrottled reports aren't gated.
+    pub fn gated(&self, gate: &CountGate) -> Diagnostics {
+        Self {
+            component_id: self.component_id.clone(),
+            counts: Arc::clone(&self.counts),
+            telemetry: self.telemetry.gated(gate),
+        }
     }
 
     /// Reports at `warn`, unthrottled, with `component` but no `key`. For rare events like one
@@ -122,7 +133,13 @@ impl Diagnostics {
     ///
     /// `&mut self` isn't needed by the shared counts and scopes nothing: the throttle belongs to
     /// the component, across clones.
+    ///
+    /// Returns `false` at once while a [`Diagnostics::gated`] value's gate is muted, so a muted
+    /// occurrence never advances the throttle.
     pub fn warn_throttled(&mut self, key: &'static str, msg: impl Display) -> bool {
+        if self.telemetry.is_muted() {
+            return false;
+        }
         self.telemetry.count("logit.component.diagnostics", 1.0, &[("key", key)]);
         let mut counts = self.lock_counts();
         let count = counts.entry(key).or_insert(0);
@@ -302,6 +319,80 @@ mod tests {
         );
         assert_eq!(first.occurrences("bad_line"), 3);
         assert_eq!(second.occurrences("bad_line"), 1);
+    }
+
+    /// Diagnostics counted into `registry` under `key`.
+    fn counted(registry: &Registry, key: &str) -> f64 {
+        registry
+            .drain(0)
+            .iter()
+            .filter(|e| e.attributes.get("key").and_then(|v| v.as_str()) == Some(key))
+            .flat_map(|e| e.metrics.iter())
+            .map(|m| match &m.kind {
+                MetricKind::Sum(s) => s.value,
+                other => panic!("expected Sum, got {other:?}"),
+            })
+            .sum()
+    }
+
+    /// A muted call neither reports, counts, nor advances the throttle: after three muted calls
+    /// the next unmuted one is occurrence 1, and reports.
+    #[test]
+    fn a_muted_warn_throttled_leaves_no_trace_in_the_throttle_or_the_counter() {
+        let registry = Registry::new();
+        let diag = Diagnostics::new("statsd_out").with_telemetry(registry.telemetry_for(
+            "statsd_out",
+            "statsd_out",
+            "sink",
+        ));
+        let gate = CountGate::new();
+        let mut gated = diag.gated(&gate);
+        gate.set_muted(true);
+        let events = capture(|| {
+            for _ in 0..3 {
+                assert!(!gated.warn_throttled("bad_line", "x"), "a muted call never reports");
+            }
+        });
+        assert!(events.is_empty(), "a muted call logs nothing: {events:?}");
+        assert_eq!(diag.occurrences("bad_line"), 0);
+        assert_eq!(counted(&registry, "bad_line"), 0.0);
+
+        gate.set_muted(false);
+        let events = capture(|| assert!(gated.warn_throttled("bad_line", "x")));
+        assert_eq!(events.len(), 1);
+        assert!(events[0].message.contains("x1"), "got {:?}", events[0].message);
+        assert_eq!(diag.occurrences("bad_line"), 1);
+        assert_eq!(counted(&registry, "bad_line"), 1.0);
+    }
+
+    /// A gated value counts against its original's throttle, and the original isn't muted.
+    #[test]
+    fn a_gated_value_shares_the_throttle_and_mutes_only_itself() {
+        let mut diag = Diagnostics::new("syslog_out");
+        let gate = CountGate::new();
+        let mut gated = diag.gated(&gate);
+        assert!(diag.warn_throttled("k", "x"), "occurrence 1");
+        assert!(gated.warn_throttled("k", "x"), "occurrence 2, counted against the same throttle");
+        gate.set_muted(true);
+        assert!(!diag.warn_throttled("k", "x"), "occurrence 3 on the ungated original");
+        assert!(diag.warn_throttled("k", "x"), "occurrence 4: the original was never muted");
+        assert_eq!(diag.occurrences("k"), 4);
+        assert_eq!(gated.component_id(), "syslog_out");
+    }
+
+    /// With no `internal` component the telemetry handle is disabled, and the gate still mutes the
+    /// throttle.
+    #[test]
+    fn a_gate_over_a_disabled_handle_still_mutes_the_throttle() {
+        let diag = Diagnostics::new("collectd_out");
+        let gate = CountGate::new();
+        let mut gated = diag.gated(&gate);
+        gate.set_muted(true);
+        assert!(!gated.warn_throttled("k", "x"));
+        assert_eq!(diag.occurrences("k"), 0);
+        gate.set_muted(false);
+        assert!(gated.warn_throttled("k", "x"));
+        assert_eq!(diag.occurrences("k"), 1);
     }
 
     #[test]

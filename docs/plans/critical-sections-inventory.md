@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-09-28
+updated: 2026-09-29
 ---
 
 # Verification plan: critical sections inventory
@@ -24,8 +24,8 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   will be wrong. A deep-dive session's first job is to refute or confirm them.
 - **Totals:** 135 entries — 42 P0, 62 P1, 31 P2. P0 = custom logic on the main data path where
   being wrong means silent loss/duplication/corruption, a crash, a hang, or a remote DoS.
-- **Progress (2026-09-28, at `tailbk/w6`'s head):** 58 of 135
-  entries done (34 P0, 20 P1, 4 P2): 54 with findings and four reviewed clean. The seven finished
+- **Progress (2026-09-29, at `sink/w8`'s head):** 67 of 135
+  entries done (38 P0, 25 P1, 4 P2): 63 with findings and four reviewed clean. The eight finished
   clusters are the `libc` surface (#280–#283), durability (#322–#337), remote-reachable
   crash/DoS (#361, #366, #369–#372, #374, #377), which also closed leads 13 and 15 and
   re-reviewed CORE-05's stale entry, the Lua boundary (#383, #385, #386, #388, #391, #392),
@@ -33,9 +33,12 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   queue and shutdown (#401, #403, #404, #406, #408, #409), which closed NET-02, NET-03,
   NET-06, RT-02..04, RT-07, TAIL-06, and TAIL-08 with findings and reviewed NET-07 and DISK-08
   clean, aggregate (#400, #402, #405, #407, #410), which closed XFORM-01..05 and CORE-07
-  with findings, and tail bookkeeping (#437, #440, #442–#445, #447), which closed TAIL-01..04,
-  TAIL-09..12 with findings. The rest of the list is `unreviewed`. The index's **Status** column is the
-  source of truth.
+  with findings, tail bookkeeping (#437, #440, #442–#445, #447), which closed TAIL-01..04,
+  TAIL-09..12 with findings, and the sink send path (#449–#456, #457), which also closed leads
+  12 and 14 and closed SINK-01..06, WIRE-08, WIRE-09, and RT-05 with findings. It also found two
+  defects the survey didn't name: bisection inflating codec counters on a single attempt in the
+  Datadog sinks (#456), and `PrometheusOutput` not forwarding `observe_batch` (#455). The rest of
+  the list is `unreviewed`. The index's **Status** column is the source of truth.
 
 Two corrections to assumptions going in: `graphite/pickle.rs` and `logit-cli/src/pipeline.rs`
 contain **no** `unsafe` (grep hits were comments/tests). Production `unsafe` lives in exactly three
@@ -60,9 +63,9 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 9 | `write_record`'s torn-write repair ignores `set_len`'s result yet rewinds in-memory lengths — a failed truncate desynchronizes `len` from the `O_APPEND` file | DISK-03 | **Done** (#331) |
 | 10 | Every spool `fsync` and the rotation `create` are `let _ =` — the durability policy is unobservable when it fails | DISK-04 | **Done**: fsyncs observed and counted (#324) |
 | 11 | `drain_inbox` cancelled while parked in `store.push` under `overflow: block` loses one in-hand batch **uncounted**; shutdown's `batches_dropped` log ignores `finish_and_flush` drops | RT-03 | **Done**: the in-hand batch is swept and counted (#333); `batches_dropped` sums every sink and Lua-boundary shutdown drop through `count_shutdown_drop`, and the sweep counts `received` (findings → #404) |
-| 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating exactly the counters read when a sink is unhealthy | SINK-06, RT-05 | open |
+| 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating the counters read when a sink is unhealthy | SINK-06, RT-05 | **Done** (findings → #454, #455, #456): confirmed for every sink, and fixed. `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, and `influxdb_out` count encode-side counters once per batch through a gate `observe_batch` arms, and `stdio_out`/`file_out` count after the write (#454); `otlp_out`, `prometheus_out`'s remote-write mode, and `splunk_hec_out` follow (#455); `datadog_out` and `datadog_trace_out` count per route, with bisection re-encodes muted and `datadog_out`'s send time read once per batch (#456). Server-verdict and kernel drops still repeat per attempt, as documented |
 | 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | **Done** (findings → #377): all nine input accept loops share the shape, and now classify each error, back off on fd exhaustion, and end only on a fatal one |
-| 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | open |
+| 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | **Done** (findings → #450, #451): confirmed, and statsd and syslog classified an invalid TLS server name as `Clean`; one driver (`crates/logit-outputs/src/stream.rs`, #451) replaces the three copies, graphite gains the flush and `reconnects`, and a bad server name fails startup; the TLS write semantics it relies on are pinned by tests (#450) |
 | 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | findings → #366 |
 | 16 | `parse_traceparent` slices a `str` at fixed byte offsets after only a length check — non-ASCII input can panic | CORE-11 | open |
 | 17 | The process-wide interner never evicts and is fed from the network (native dictionary entries, trailer strings, Lua `telemetry` names) | CORE-01, WIRE-02, CORE-19 | CORE-19 half `reviewed`, #392: every Lua feeder is listed in `docs/known-gaps.md`'s interner entry and `docs/design/lua-api.md`'s Limits list; the rest open |
@@ -83,16 +86,20 @@ Repo-wide gaps that cut across entries:
   Prometheus text parser, the TCP `Framer`, json/logfmt/csv tokenizers, disk-spool segments, and
   tail checkpoints still have none (cluster 9).
 - **Cancellation is the least-tested axis.** ~~No test drops a future inside `write_all`, the UDP
-  datagram loop, or a parked `store.push`.~~ **Partly fixed (cluster 3):** every production
+  datagram loop, or a parked `store.push`.~~ **Partly fixed (clusters 3 and 6):** every production
   `select!` and `timeout` on a node's run path is a row of `docs/design/pipeline-graph.md`'s
   "Cancellation points" table, naming what a losing arm drops and what counts it. Tests now drop
   futures mid-flight in the queues (the `queue_stress` harness and the batched-versus-single
   proptest), the UDP read and decode loops (`read_loop` at its push and at a coop-budget yield,
   `decode_loop` mid-batch, the whole listener at the grace backstop), a parked `store.push`, a
-  grace-cut `Output::send`, and the tail driver parked in its final flush. Still untested: a
-  sink's own state after a dropped `send` (`stdio_out`/`file_out` can leave a torn line, in
-  `docs/known-gaps.md`; the pooled TCP sinks are cluster 6), and the uncounted losses the table
-  names (a batch dropped inside `Fanout::send`, pinned only for a partial fan-out).
+  grace-cut `Output::send`, and the tail driver parked in its final flush. Cluster 6 added a
+  pooled-stream `send` dropped inside `write_all`, during a dial, and in the redial after a probe
+  (`stream::tests`), a datagram `send` dropped mid-batch (`datagram::tests`), and `logit_out`'s pool
+  state after a `send` dropped at its ack wait. Still untested: a `logit_out` `send` dropped inside
+  its frame write or flush, or during its handshake; the HTTP sinks' pooled clients after a request
+  dropped mid-flight (only the gate's state after a budget cut is pinned); a sink's own torn output
+  (`stdio_out`/`file_out` can leave a torn line, in `docs/known-gaps.md`); and the uncounted losses
+  the table names (a batch dropped inside `Fanout::send`, pinned only for a partial fan-out).
 - **Dependency bumps are re-verification triggers**: `logit-inputs/src/http.rs`'s idle/graceful
   shutdown driver is pinned by reference to hyper 1.11.1 / hyper-util 0.1.20 internals;
   the queues lean on tokio 1.53.1 internals, now pinned by tests (ADR
@@ -100,8 +107,10 @@ Repo-wide gaps that cut across entries:
   `Notified` constructed before the call, `drop_notified` forwards a `notify_one` permit, a stored
   permit is one permit, `select!` returns on the first `Ready` branch and checks
   `poll_budget_available` before polling any arm, `wait_for` spends the coop budget
-  (`cooperative`), and the initial budget is 128 units; `logit_out`'s `Clean` vs
-  `Ambiguous` fault split rests on an unverified `tokio-rustls` write-semantics assumption; the HLL
+  (`cooperative`), and the initial budget is 128 units; the pooled sinks' TLS write
+  rules and `logit_out`'s `Clean` vs `Ambiguous` split rest on tokio-rustls 0.26.5 / rustls 0.23.45
+  write, flush, and read semantics, now pinned by tests in `crates/logit-outputs/src/stream_pins.rs`
+  (ADR `sink-send-path-and-attempt-accounting`, decision 8); the HLL
   codec's soundness rests on serde's `with_capacity(size_hint)` behaviour.
 - ~~**Connection gauges are decremented by a bare statement, not a drop guard**, in all three stream
   listeners — leaks on panic.~~ **fixed (#374):** every stream input's live-connections gauge is
@@ -126,8 +135,12 @@ Entries that share a mechanism and should be verified together, in suggested ord
    manual `logrotate` run
    ([ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md)).
 5. **`libc` surface (done, #280–#283)** — NET-01, NET-11, NET-12, TAIL-07. miri where possible, strace otherwise.
-6. **Sink send path** — SINK-01..06, WIRE-08/09, RT-05. Mechanical diff of the three copies first,
-   then fault injection (RST mid-write, blackhole, close_notify), then the retry-counter question.
+6. **Sink send path (done, #449–#456, #457)** — SINK-01..06, WIRE-08/09, RT-05. One shared
+   pooled-stream driver and datagram packer for the copied send paths, fault injection against
+   them and against real TLS pairs (RST mid-write, blackhole, a stalled handshake, a partial
+   record under a `Pending` poll), and attempt accounting that counts encode-side drops once per
+   batch
+   ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md)).
 7. **Lua boundary (done, #383, #385, #388, #386, #391, #392)** — CORE-15..19, RT-11. Adversarial scripts: re-entrancy under a held `RefCell`
    borrow, a proxy held past its scope, infinite loop, deep/huge table.
 8. **Aggregate (done, #400, #402, #405, #407, #410)** — XFORM-01..05, CORE-07. Proptest against a naive
@@ -232,7 +245,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [WIRE-03](#wire-03--record-tlv-decode-default-elision-encoding-required-fields-and-opaque-sketch-blobs) | P0 | Record TLV decode: default-elision encoding, required fields, and opaque sketch blobs | `crates/logit-proto/src/native/record.rs` (`write_field`, `read_record_list_into`, `read_metric_kind`) | findings → #370 |
 | [WIRE-05](#wire-05--control-message-tlv-and-the-hellohelloack-negotiation-state-machine) | P0 | Control-message TLV and the `Hello`/`HelloAck` negotiation state machine | `crates/logit-proto/src/native/control.rs` (`Hello`, `HelloAck`, `ControlMessage::decode`) | unreviewed |
 | [WIRE-06](#wire-06--logit_in-per-connection-frame-loop-eager-body-allocation-idle-bounds-ack-as-backpressure) | P0 | `logit_in` per-connection frame loop: eager body allocation, idle bounds, ack-as-backpressure | `crates/logit-inputs/src/logit.rs` (`serve_connection`, `read_frame_body`) | findings → #372 |
-| [WIRE-08](#wire-08--logit_out-send-path-one-frame-in-flight-partial-write-semantics-fault-classification) | P0 | `logit_out` send path: one-frame-in-flight, partial-write semantics, fault classification | `crates/logit-outputs/src/logit.rs` (`Conn`, `LogitOutput`, `Output::send`) | unreviewed |
+| [WIRE-08](#wire-08--logit_out-send-path-one-frame-in-flight-partial-write-semantics-fault-classification) | P0 | `logit_out` send path: one-frame-in-flight, partial-write semantics, fault classification | `crates/logit-outputs/src/logit.rs` (`Conn`, `LogitOutput`, `Output::send`) | findings → #452 |
 | [WIRE-10](#wire-10--hand-rolled-grpc-server-framing-length-prefixed-messages-trailers-gzip-bounds) | P0 | Hand-rolled gRPC server framing: length-prefixed messages, trailers, gzip bounds | `crates/logit-inputs/src/otlp.rs` (`handle_grpc`, `grpc_unframe`, `inflate`) | findings → #374 |
 | [WIRE-11](#wire-11--shared-hyper-connection-lifecycle-idle-tracking-graceful-shutdown-body-stall-bounds) | P0 | Shared hyper connection lifecycle: idle tracking, graceful shutdown, body stall bounds | `crates/logit-inputs/src/http.rs` (`Activity`, `drive_with_idle`) | findings → #374 |
 | [WIRE-15](#wire-15--prometheus_in-remote-write-receiver-ingress-permits-deadlines-body-limits-snappy-bounds-version-dispatch) | P0 | `prometheus_in` remote-write receiver ingress: permits, deadlines, body limits, snappy bounds, version dispatch | `crates/logit-inputs/src/prometheus.rs` (`PrometheusReceiver`, `write_response`, `MAX_REQUEST_BYTES`) | findings → #374 |
@@ -244,9 +257,9 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-17](#core-17--lua-attribute-writes-refcell-borrow-discipline-value-identity-preservation-and-unbounded-table-recursion) | P0 | Lua attribute writes: `RefCell` borrow discipline, value-identity preservation, and unbounded table recursion | `crates/logit-script/src/proxy.rs` (`AttrsProxy`), `crates/logit-script/src/value.rs` (`lua_to_value`) | findings → #385 |
 | [XFORM-02](#xform-02--aggregate-per-event-merge-dispatch-process) | P0 | Aggregate: per-event merge dispatch (`process`) | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::process`) | findings → #405 |
 | [XFORM-03](#xform-03--aggregate-flush-series-retention-and-the-cardinality-cap) | P0 | Aggregate: flush, series retention, and the cardinality cap | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::flush`) | findings → #407 |
-| [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send_tcp`) | unreviewed |
-| [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/statsd.rs` (`send_udp`, `flush_datagram`) | unreviewed |
-| [SINK-05](#sink-05--the-output-trait-contract-each-sink-relies-on-retry-posture-cancellation-shutdown) | P0 | The `Output` trait contract each sink relies on (retry, posture, cancellation, shutdown) | `crates/logit-pipeline/src/output.rs` (`Output`, `Fault`, `classify`) | unreviewed |
+| [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/stream.rs` (`PooledStream::send`) | findings → #451 |
+| [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/datagram.rs` (`send_datagrams`) | findings → #453 |
+| [SINK-05](#sink-05--the-output-trait-contract-each-sink-relies-on-retry-posture-cancellation-shutdown) | P0 | The `Output` trait contract each sink relies on (retry, posture, cancellation, shutdown) | `crates/logit-pipeline/src/output.rs` (`Output`, `Fault`, `classify`) | findings → #454 |
 | [SINK-09](#sink-09--allocate_timestamp--the-per-series-union-find-collision-allocator-behind-duplicate_safe--true) | P0 | `allocate_timestamp` — the per-series union-find collision allocator behind `duplicate_safe() == true` | `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp`, `encode_metric_line`) | unreviewed |
 | [NET-04](#net-04--udplistenerrun_until_shutdown-the-readdecode-two-future-select-and-double-poll-guard) | P1 | `UdpListener::run_until_shutdown`: the read/decode two-future select and double-poll guard | `crates/logit-inputs/src/udp.rs` (`UdpListener`'s `Input::run_until_shutdown`) | unreviewed |
 | [NET-09](#net-09--tcp-serve_connection-the-shared-next-byte-deadline-idle-close-policy-and-end-of-connection-flushes) | P1 | TCP `serve_connection`: the shared next-byte deadline, idle-close policy, and end-of-connection flushes | `crates/logit-inputs/src/tcp.rs` (`serve_connection`) | unreviewed |
@@ -263,7 +276,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue` fields, `closed`, `close`) | reviewed @510291b1 |
 | [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs` (`FileTarget::rotate`, `promote_staged`, `staging_path`) | findings → #326 |
 | [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs` (`MAX_SANE_*`, `read_frame_with_header`, `resync`) | findings → #367 |
-| [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs` (`deliver_with_retry`, `backoff_for`) | unreviewed |
+| [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs` (`deliver_with_retry`, `backoff_for`) | findings → #454 |
 | [RT-06](#rt-06--fanout-clone-vs-move-on-the-last-edge-provenance-stamping-closed-consumer-accounting) | P1 | `Fanout`: clone-vs-move on the last edge, provenance stamping, closed-consumer accounting | `crates/logit-pipeline/src/fanout.rs` (`Fanout`, `Fanout::deliver`, `Fanout::stamp`) | unreviewed |
 | [RT-07](#rt-07--sinkqueue--boundedqueue-the-notify-condvar-pattern-blocking-push-close-semantics) | P1 | `SinkQueue` / `BoundedQueue`: the `Notify` condvar pattern, blocking push, close semantics | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue`, `SinkQueue`, `SinkStore`) | findings → #403 |
 | [RT-08](#rt-08--run_transform-flush-deadline-race-close-time-flush-and-cadence-math) | P1 | `run_transform`: flush-deadline race, close-time flush, and cadence math | `runtime.rs` (`run_transform`, `run_flush`, `advance_flush_deadline`) | unreviewed |
@@ -272,7 +285,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [RT-14](#rt-14--graph-rules-the-runtime-assumes-cycle-detection-target-arity-slot-order) | P1 | Graph rules the runtime *assumes* (cycle detection, target arity, slot order) | `crates/logit-pipeline/src/graph.rs` (`topological_order`, `targets_of`, `resolve`) | unreviewed |
 | [WIRE-04](#wire-04--batch-framing-v1v2-and-the-mandatory-provenance-trailer) | P1 | Batch framing v1/v2 and the mandatory provenance trailer | `crates/logit-proto/src/native/mod.rs` (`decode_batch`, `decode_batch_v2`, `CODEC_NATIVE_V2`) | unreviewed |
 | [WIRE-07](#wire-07--logit_in-accept-loop-connection-cap-bounded-tls-accept-live-connection-accounting) | P1 | `logit_in` accept loop: connection cap, bounded TLS accept, live-connection accounting | `crates/logit-inputs/src/logit.rs` (`Input::run`, `run_until_shutdown`, `reject_or_serve`) | findings → #377 |
-| [WIRE-09](#wire-09--pooled-connection-close-probe-stream-erasure-and-sni-derivation) | P1 | Pooled-connection close probe, stream erasure, and SNI derivation | `crates/logit-outputs/src/tls.rs` (`AsyncStream`, `PendingClose`, `poll_pending_close`, `host_only`) | unreviewed |
+| [WIRE-09](#wire-09--pooled-connection-close-probe-stream-erasure-and-sni-derivation) | P1 | Pooled-connection close probe, stream erasure, and SNI derivation | `crates/logit-outputs/src/tls.rs` (`AsyncStream`, `PendingClose`, `poll_pending_close`, `host_only`) | findings → #450 |
 | [WIRE-12](#wire-12--otlp_out-grpc-round-trip-over-a-pooled-hyper-utilhyper-rustls-client-and-the-fault-table) | P1 | `otlp_out` gRPC round trip over a pooled hyper-util/hyper-rustls client, and the fault table | `crates/logit-outputs/src/otlp.rs` (`send_http`, `send_grpc`, `grpc_roundtrip`) | unreviewed |
 | [WIRE-13](#wire-13--tls-configuration-construction-private-ca-mtls-and-insecure_skip_verify) | P1 | TLS configuration construction: private CA, mTLS, and `insecure_skip_verify` | `crates/logit-inputs/src/tls.rs` (`build_server_config`, `apply_client_tls`) | unreviewed |
 | [WIRE-14](#wire-14--prometheus_in-scrape-loop-per-tick-fan-out-per-target-body-cap-outcome-bookkeeping) | P1 | `prometheus_in` scrape loop: per-tick fan-out, per-target body cap, outcome bookkeeping | `crates/logit-inputs/src/prometheus.rs` (`PrometheusInput::tick`, `scrape_target`, `MAX_SCRAPE_BYTES`) | unreviewed |
@@ -305,9 +318,9 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [XFORM-06](#xform-06--jsonrs-zero-copy-json-into-attributes-parsing) | P1 | json.rs: zero-copy JSON-into-attributes parsing | `crates/logit-transforms/src/json.rs` (`JsonParser::process`, `borrowed_str_bytes`) | unreviewed |
 | [XFORM-08](#xform-08--logfmtrs--kv-parsing-hand-rolled-tokenizers) | P1 | logfmt.rs / kv parsing: hand-rolled tokenizers | `crates/logit-transforms/src/logfmt.rs` (`scan_quoted`, `parse_logfmt`, `parse_kv`) | unreviewed |
 | [XFORM-09](#xform-09--trace_contextrs-timing-resolution-and-skew-arithmetic) | P1 | trace_context.rs: timing resolution and skew arithmetic | `crates/logit-transforms/src/trace_context.rs` (`timing_nanos`, `f64_seconds_to_nanos`, `quantity`) | unreviewed |
-| [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/statsd.rs` (`TcpDial::connect`) | unreviewed |
-| [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | unreviewed |
-| [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send`) | unreviewed |
+| [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/stream.rs` (`connect`, `handshake`) | findings → #451 |
+| [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | findings → #450 |
+| [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/accounting.rs` (`BatchAccounting`) | findings → #454, #455, #456 |
 | [SINK-07](#sink-07--statsd-line-level-drop-rules-indivisible-entries-oversize-whole-drop-and-the-multi-value-timer) | P1 | statsd line-level drop rules: indivisible entries, oversize-whole-drop, and the multi-value timer | `crates/logit-outputs/src/statsd.rs` (`push_line`) | unreviewed |
 | [SINK-08](#sink-08--influxdb_outsend--one-shot-http-attempt-fault-classification-and-its-own-reqwest-client) | P1 | `influxdb_out::send` — one-shot HTTP attempt, fault classification, and its own `reqwest` client | `crates/logit-outputs/src/influxdb.rs` (`InfluxDbOutput::send`, `classify_transport_error`) | unreviewed (error-body read bounded in #332) |
 | [NET-05](#net-05--udp-bind-path-socket2-socket-creation-so_rcvbuf-multicast-join-address-fallback) | P2 | UDP bind path: `socket2` socket creation, `SO_RCVBUF`, multicast join, address fallback | `crates/logit-inputs/src/udp.rs` (`bind_socket`, `bind_first_available`, `bind_one`, `finish_bind`) | unreviewed |
@@ -3458,6 +3471,28 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   the `fast_retry_config` helper. Governed by `docs/adr/buffered-sink-delivery.md`.
 - **Priority:** **P1** — custom timing logic on the hot path, but well covered and failure modes are bounded
   (too many or too few retries, not corruption).
+- **Correction (2026-09-29, `sink/w0`):** ~~`base_delay: 0` is unreachable today.~~ The zero-backoff
+  spin is reachable through `retry_max_delay: 0s`: `write_config` passes
+  `buffer.retry_max_delay` as `RetryConfig::max_delay`, and `backoff_for` ends in
+  `backoff.min(retry.max_delay)`, so it returns zero for every attempt and `deliver_with_retry`
+  loops until the budget ends. A zero `retry_budget` is unvalidated too.
+- **Verified (sink/w5, #454):** findings. Graph rule 15 rejects `buffer.retry_budget: 0s` and
+  `buffer.retry_max_delay: 0s` on a sink
+  (`a_sinks_buffer_with_a_zero_retry_budget_is_rejected`,
+  `a_sinks_buffer_with_a_zero_retry_max_delay_is_rejected`), and `deliver_with_retry`
+  `debug_assert!`s both nonzero. No floor in `backoff_for`: a `retry_max_delay` below 200 ms is a
+  valid cap. The invariants, each with a test shown to fail on a planted bug:
+  - `backoff_for` over `base > max`, `base == max`, and attempts 1, 2, 128, and `u32::MAX`,
+    including a base that saturates `Duration`
+    (`backoff_for_doubles_from_base_and_is_capped_at_max_for_every_attempt`; an uncapped return
+    fails it).
+  - One `send.duration` sample per attempt, one `errors` per failed attempt, and one `retries` per
+    attempt that another follows, over `Clean`, `Ambiguous`, and `Permanent` outcomes and both
+    postures (`every_attempt_records_one_send_duration_sample_and_every_retry_one_error`; a
+    cancelled timer and a retry counted on a drop each fail it).
+  - An attempt the budget cuts off is `Ambiguous` and ends when the budget does
+    (`an_attempt_cut_off_by_the_budget_is_ambiguous`, paused clock; `Clean` fails it).
+  - `attempt` uses `saturating_add`, so it can't wrap even past `u32::MAX` attempts.
 
 ---
 
@@ -3936,9 +3971,12 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   `logit.internal.span.links.dropped{reason="cardinality"}`.
 - `InMemoryBuffer::peek` sets `head_reserved` (`crates/logit-proto/src/buffer.rs`, `InMemoryBuffer::peek`) and only `commit`
   clears it — this reservation lifecycle crosses three crates and is the subtlest shared invariant I found.
-- `Output::observe_batch` (`output.rs`) is implemented only by `logit_out`; whoever surveys
+- ~~`Output::observe_batch` (`output.rs`) is implemented only by `logit_out`; whoever surveys
   `logit-outputs` should confirm it tolerates being called once per *attempt* (retries included), as
-  `write_loop`'s `output.observe_batch(ctx)` call does.
+  `write_loop`'s `output.observe_batch(ctx)` call does.~~ **Resolved (sink/w5, #454, 2026-09-29):**
+  `write_loop` calls it once per batch, before the first attempt, and the trait doc says so. Every
+  sink with encode-side counters overrides it to arm its `BatchAccounting`, and a type that
+  implements `Output` by delegation forwards it (`PrometheusOutput`, #455).
 
 
 ---
@@ -4548,19 +4586,21 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - `Output::flush` is or isn't needed after a write under TLS — the send path never calls
     it, relying on `write_all` having pushed the record out.
 - **Observed concerns (unverified):**
-  - **`logit.output.requests` is not counted on several failure paths.** The two "batch too large"
+  - ~~**`logit.output.requests` is not counted on several failure paths.** The two "batch too large"
     returns (the `MAX_SANE_UNCOMPRESSED_LEN` pre-check and the `bound` check in `send`) and every
     failure inside `connect_and_handshake` (reached via the `?` on `self.connect_and_handshake()`
     in `send`) return without incrementing the counter, while every post-write path does.
     The counter therefore under-reports failures and its `class` distribution does not reconcile
-    with `write_loop`'s attempt count. **High confidence — the code paths are plainly visible.**
-  - TLS write semantics (above) — the memory of the syslog-TLS review records `tokio-rustls` write
+    with `write_loop`'s attempt count. **High confidence — the code paths are plainly visible.**~~
+    **Resolved (sink/w3, #452):** `send` counts once, from `classify` of an inner attempt's result.
+  - ~~TLS write semantics (above) — the memory of the syslog-TLS review records `tokio-rustls` write
     semantics as a past source of error, so this deserves a re-derivation rather than a re-read of
     the "single `write` first" comment in `send`. **Medium confidence there is a real gap; high confidence it is
-    worth re-verifying.**
-  - `compression_from_u8(...).unwrap_or(Compression::None)` in `connect_and_handshake` silently accepts a
+    worth re-verifying.**~~ **Resolved (sink/w3, #452):** a real gap, the missing flush; see the
+    Verified bullet.
+  - ~~`compression_from_u8(...).unwrap_or(Compression::None)` in `connect_and_handshake` silently accepts a
     nonsense compression byte where the adjacent codec check is strict. **High confidence,
-    low impact.**
+    low impact.**~~ **Resolved (sink/w3, #452):** `validate_hello_ack` refuses it as `Permanent`.
   - `Ack.seq` mismatch is `Ambiguous` and drops the connection (the `ack.seq != conn.seq` branch of `send`), but nothing bounds
     how often a peer can force that — a hostile listener that always acks the wrong seq turns
     every batch into a reconnect plus an ambiguous retry, i.e. unbounded duplication downstream.
@@ -4589,6 +4629,70 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   `logit.output.requests` totals equal the number of `send` calls.
 - **Priority:** P0 — this is the sink side of the only lossless-transit-critical native path, the
   classification decides duplicate-versus-drop, and the TLS write assumption is unverified.
+- **Correction (2026-09-29, `sink/w0`):** the first-write `Clean` verdict holds for a framed
+  protocol: under TLS an `Err` can follow bytes of this frame reaching the wire, but the peer then
+  holds a truncated frame it can't forward. The premise in `send`'s comment (nothing left the
+  host) is wrong, and the `io::Error` is discarded. The real defect is the missing `flush()`:
+  tokio-rustls 0.26.5's `poll_write` can return `Ok(n)` with ciphertext still queued, and
+  a `poll_read` that processes its records cleanly drives no writes, so `send` waits for an
+  `Ack` the peer can't send. The same
+  shape exists at `Hello`/`HelloAck`. ~~`Output::flush` is or isn't needed after a write under
+  TLS.~~ It is needed. A third too-large path exists beyond the two the entry names: the
+  compressed-frame check against `frame::compressed_bound`, which also returns `Permanent`
+  without counting `logit.output.requests`.
+- **Verified (sink/w3, #452):** findings, fixed. Read against `logit_in`'s frame path,
+  tokio-rustls 0.26.5, and rustls 0.23.45; tests in `crates/logit-outputs/src/logit.rs` and
+  `crates/logit-inputs/src/logit.rs`, each shown to fail before its fix or on a planted mutation.
+  ADR `sink-send-path-and-attempt-accounting`'s `sink/w3` section lists them.
+  - `self.stream` is `None` for the whole attempt: unchanged, and still pinned by
+    `a_cancelled_send_dropped_mid_await_leaves_stream_none`. Every new write-phase test asserts
+    the pool is empty after the failure.
+  - ~~"Nothing left the host" (`Clean`) versus "at least one byte left" (`Ambiguous`) is true
+    through a `tokio_rustls` stream.~~ **Refuted, and replaced:** the fault now says what the peer
+    holds. `logit_in` fills the whole frame, checks its CRC, decodes, forwards, and only then
+    acks, with no partial decode path (confirmed by reading `read_frame_body` and
+    `serve_connection`), so every failure before the frame is completely written and flushed is
+    `Clean`, and the ack wait is the one `Ambiguous` window.
+    `a_tls_write_error_after_a_whole_record_left_is_clean_and_logit_in_forwards_nothing` puts
+    20 000 bytes of the frame's ciphertext on a real TLS `logit_in` before the socket fails: the
+    attempt is `Clean`, and the listener counts `truncated` and forwards nothing. The residual, a
+    TLS 1.3 `KeyUpdate` queued behind the frame's last record at 2^24 records under one AES-GCM
+    key, is in the ADR's decision 6.
+  - `conn.seq` stays in lockstep: it advances only after the write and flush succeed, and every
+    failure after the connection is taken drops it, except the too-large returns, which write
+    nothing. A fresh connection starts at 0 on both sides. Confirmed by reading;
+    `every_returned_send_counts_one_request` drives an `Ack.seq` mismatch to `Ambiguous`.
+  - No frame is written twice on one connection: the same drop rule. Confirmed by reading.
+  - The too-large checks keep the connection and write nothing:
+    `each_too_large_return_counts_one_permanent_request_and_keeps_the_connection`. The
+    compressed-bound return is unreachable with lz4, since `frame::compressed_bound` is lz4's
+    worst case over a payload the check before it bounded; it has no test.
+  - `read_control` bounds both lengths before allocating, on the first call: now at
+    `control::MAX_CONTROL_MESSAGE_BYTES` (4096; the longest message is a 1033-byte `Reject`), not
+    64 MiB. `read_control_accepts_a_message_at_the_control_message_cap_and_refuses_one_over`.
+    `logit_in` reads a `Hello` against the same cap
+    (`a_hello_is_bounded_by_the_control_message_cap`, which failed before the fix).
+  - The dial is the shared `crate::stream::connect` (`sink/w2`), with the same per-phase
+    `request_timeout` bound and every failure `Clean`; `with_tls` parses the server name once,
+    so a bad endpoint fails startup (`with_tls_rejects_an_endpoint_with_no_valid_server_name`,
+    `a_tls_logit_output_endpoint_with_no_valid_server_name_fails_startup`).
+  - ~~`Output::flush` is or isn't needed after a write under TLS.~~ The frame and the `Hello` are
+    flushed before each wait (`a_tls_frame_larger_than_the_socket_buffer_is_flushed_before_the_ack_wait`,
+    `the_hello_is_flushed_before_the_hello_ack_wait`), and so are `logit_in`'s `HelloAck`, `Ack`,
+    and `Reject` (`hello_ack_and_ack_reach_a_tls_client_over_a_pipe_smaller_than_one_record`,
+    `a_reject_reaches_a_tls_client_over_a_pipe_smaller_than_one_record`). `Output::flush` itself
+    now shuts the connection down and sends `close_notify`.
+  - `Ack.seq` mismatch unbounded: unchanged. The peer is a configured `logit_in`, and ADR
+    `deployment-threat-model` keeps a hostile peer out of scope; each mismatch drops the
+    connection.
+  - Found beyond the entry: `logit_out` never sent `close_notify`, so under TLS every disconnect
+    reached `logit_in` as `UnexpectedEof` and was logged as `connection_error`
+    (`logit_in_reads_a_tls_connection_ended_after_an_ack_as_a_clean_close`,
+    `a_tls_client_gone_without_close_notify_between_frames_is_a_clean_close`); a `HelloAck`
+    naming an unoffered codec was `Ambiguous` and counted a reconnect before it was refused (the
+    four `a_hello_ack_…` tests); a frame truncated mid-header was uncounted
+    (`a_client_gone_mid_header_is_an_error_counted_as_a_truncated_header`); and
+    `observe_batch`'s doc said once per attempt.
 
 ---
 
@@ -4635,6 +4739,43 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
 - **Priority:** P1 — small, well-argued, and covered end-to-end against a real listener; the
   correctness claim rests on a third-party crate's internal behavior, which is worth one
   source-level confirmation.
+- **Correction (2026-09-29, `sink/w0`):** ~~Callers are `logit.rs` and, out of area, `syslog.rs`.~~
+  `poll_pending_close` has four callers: `statsd.rs`, `syslog.rs`, `graphite.rs`, and `logit.rs`.
+  Its doc is wrong on two points: a `Pending` poll can move a partial record from the socket into
+  the TLS session, and a cancelled read loses nothing. The behavior is sound. The
+  "none spotted" concern line stands for the code and not for the prose.
+- **Verified (sink/w1, #450):** findings, prose only; no behavior change. Read against tokio-rustls
+  0.26.5 (`common/mod.rs`, `Stream::poll_fill_buf`) and rustls 0.23.45, and pinned with a real TLS
+  pair over `tokio::io::duplex` in `crates/logit-outputs/src/stream_pins.rs` and `tls.rs`'s new
+  test module.
+  - ~~`Poll::Pending` implies nothing was consumed from the TLS session and from the kernel
+    socket.~~ **Refuted:** a `Pending` poll reads what the socket holds into the session, part of
+    a record or whole post-handshake records. No plaintext is consumed, and the session keeps
+    those bytes: `a_partial_tls_record_survives_a_dropped_read`,
+    `one_poll_of_an_idle_tls_13_connection_after_the_handshake_is_pending`, and
+    `a_partial_tls_record_probes_open_and_is_still_readable` (the probe answers `Open`, and the
+    record completes afterwards). `poll_pending_close`'s doc now says so, and why the probe is one
+    poll: it must not wait.
+  - Both consuming verdicts drop the connection at all four call sites (`statsd.rs`,
+    `syslog.rs`, `graphite.rs`, `logit.rs`: the `_closed` arm drops `conn` and dials fresh),
+    confirmed by reading.
+  - The waker: `poll_pending_close` registers the task's waker with the IO once and never awaits
+    again. tokio 1.53.1 keeps one `AsyncRead` waker per socket (`runtime/io/scheduled_io.rs`,
+    `Waiters::reader`), which the next poll overwrites and the stream's drop frees, so nothing
+    accumulates. Confirmed by reading.
+  - `host_only`: `host_only_takes_the_host_of_a_bare_endpoint` pins `host:port`, bracketed IPv6,
+    a bare host, the empty string, and bare unbracketed IPv6, which yields a truncated host
+    (`::1` to `:`), as the doc's "the brackets are the operator's to write" allows.
+  - The four arms over `FakeStream`: `a_pending_poll_is_open`, `an_empty_ready_is_eof`,
+    `a_read_error_is_eof`, `unsolicited_bytes_are_counted_up_to_the_probe_buffer`. Real-TLS
+    closes: `a_tls_close_notify_probes_eof`, `a_tls_transport_close_without_close_notify_probes_eof`.
+  - The suggested TLS twins of the two `logit_out` probe tests and the FIN-between-probe-and-write
+    test belong to `sink/w3` and `sink/w2`.
+- **Landed (sink/w3, #452):** the TLS twins,
+  `a_pooled_tls_connection_the_peer_closed_is_replaced_before_the_next_write_with_no_batch_lost`
+  and `a_pooled_tls_connection_with_an_unsolicited_reject_is_replaced`, both against a real
+  TLS peer, and `a_tls_peer_gone_between_the_frame_and_its_ack_is_ambiguous_and_the_next_send_reconnects`.
+  The FIN-between-probe-and-write test stays with `sink/w2`.
 
 ---
 
@@ -6966,23 +7107,30 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   - The returned message count (`lines.len()` / `messages.len()` / `buf.len()`) equals what was
     actually framed, including the negative-gauge pair counted as one.
 - **Observed concerns (unverified):**
-  - **Divergence: `graphite_out::send_tcp` never `flush()`es before reporting the batch delivered**
+  - ~~**Divergence: `graphite_out::send_tcp` never `flush()`es before reporting the batch delivered**
     (the `rest_result` match in `GraphiteOutput::send_tcp`), where statsd and syslog
     both do and both document the flush as load-bearing. Benign *today*
     because `Conn::Tcp` in `graphite.rs` holds a bare `TcpStream` (whose `poll_flush` is a documented no-op)
     and graphite has no TLS, but the copied family has drifted and the invariant that made the
     flush necessary is not stated in graphite. High confidence on the divergence; low on current
-    impact.
-  - **Divergence: graphite's `Conn::Tcp` is `Option<TcpStream>`, not `Option<Box<dyn AsyncStream>>`**,
+    impact.~~ **Resolved (sink/w2, #451):** graphite sends through the shared driver, which
+    flushes before it pools a connection or returns `Ok`.
+  - ~~**Divergence: graphite's `Conn::Tcp` is `Option<TcpStream>`, not `Option<Box<dyn AsyncStream>>`**,
     so it has no `is_tls()` guard on the retry arm (`Err(_) if !retried_after_a_zero_byte_failure` in `GraphiteOutput::send_tcp`). Correct now; it is the
     exact line that becomes wrong the day graphite gains a `tls:` block. Medium confidence this is
-    worth a comment rather than a change.
+    worth a comment rather than a change.~~ **Resolved (sink/w2, #451):** graphite holds a
+    `Box<dyn AsyncStream>` in the driver's pool, and the driver's `is_tls` guard covers every
+    caller.
   - `conn.write_all(&frame_buf[n..])` after a short first write (in each `send_tcp`)
     is the non-cancel-safe call; if the runtime's budget
     timeout fires inside it the peer holds a *partial* frame. For syslog's octet-counted framing a
     receiver will block on an incomplete length prefix until the connection closes (fine); for
     statsd/graphite plaintext a truncated final line is a corrupt datapoint the receiver may accept.
-    No test appears to cover cancellation mid-`write_all`. Medium confidence.
+    ~~No test appears to cover cancellation mid-`write_all`. Medium confidence.~~ **Resolved
+    (sink/w2, #451):** covered by
+    `a_send_dropped_inside_write_all_leaves_the_pool_empty_and_the_next_send_dials_fresh`. The
+    truncated line at the peer stands: the cancellation is the runtime's, and `sink/w8` recorded
+    it in `docs/design/pipeline-graph.md`'s "Cancellation points".
   - The reused-connection probe costs one extra `poll_read` per batch on the hot path; cheap, but
     it is per-`send`, not per-idle-period. Low concern.
 - **Existing coverage:** `statsd.rs` tests `tcp_reconnects_exactly_once_after_the_peer_resets_an_inherited_connection`,
@@ -7011,6 +7159,49 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `write_all` and asserts `*stream` is `None` afterwards.
 - **Priority:** P0 — main data path, fully hand-rolled, and a classification or flush mistake is
   silent loss or duplication at the receiver.
+- **Verified (sink/w2, #451):** findings; the three copies are one driver,
+  `crates/logit-outputs/src/stream.rs` (`PooledStream::send`), and every invariant has a test in
+  `stream::tests`, each shown to fail on a planted bug.
+  - A diff of the three copies found no drift beyond the known ones: graphite's missing flush,
+    missing `is_tls` guard, concrete `TcpStream`, and missing `reconnects`, plus the error class
+    `requests` used (`ok|error`). The driver takes the statsd/syslog behavior for all three.
+  - `*stream` is never written through: the connection is taken into a local for the whole
+    attempt and put back only after the flush. A `send` dropped inside `write_all` or in the
+    redial after a probe leaves the pool empty, and the next `send` dials fresh
+    (`a_send_dropped_inside_write_all_leaves_the_pool_empty_and_the_next_send_dials_fresh`,
+    `a_send_dropped_in_the_redial_after_a_probe_leaves_the_pool_empty`); one dropped in a first
+    dial counts nothing (`a_send_dropped_while_dialing_counts_nothing_and_the_next_send_dials_again`).
+    The probe never suspends, so there is no await inside it to drop at.
+  - The probe path over real sockets: `unix_stream_redials_when_the_probe_finds_the_pooled_connection_closed`
+    (a half-closed peer, a wait on the pooled stream probing `Eof`, and the second frame on a new
+    connection with nothing more on the first). The three sinks'
+    `a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost`
+    take the probe path too: each fails when the driver ignores the probe's answer, because the
+    write lands in the FIN'd socket and the message is lost. They see the FIN because awaiting the
+    collector's message runs the I/O driver before the next `send`.
+  - The probe redial doesn't consume the retry: after an `Eof` or unsolicited-bytes probe, the
+    redialed connection's first write fails and the retry still delivers
+    (`a_reused_connection_that_probes_eof_is_redialed_and_the_retry_survives`,
+    `a_reused_connection_that_probes_unsolicited_bytes_is_redialed_and_the_retry_survives`).
+  - The loop is bounded: one `send` dials at most twice, the probe redial and one retry, over
+    every probe answer on plaintext and TLS (`one_send_dials_at_most_the_probe_redial_and_one_retry`).
+  - On TLS a write `Err` is `Ambiguous` and never retried, over a real tokio-rustls pair
+    (`a_tls_write_error_is_ambiguous_and_never_retried`).
+  - A connection is pooled only after its flush: `a_tls_send_returns_only_once_the_peer_can_read_the_whole_frame`
+    (a 100 000-byte frame over a 4096-byte pipe, the peer reading it all with the client no
+    longer polled), and `a_flush_failure_after_a_complete_write_is_ambiguous_and_drops_the_connection`,
+    `a_remainder_failure_after_a_short_first_write_is_ambiguous_and_never_resent`, and
+    `a_real_reset_mid_frame_is_ambiguous` (a loopback RST inside `write_all`) for the failures.
+  - `Ok(0)` is `WriteZero` and retried once on plaintext
+    (`a_plaintext_first_write_of_zero_bytes_is_write_zero_retried_once_then_clean`).
+  - The message counts: each sink counts its own after the driver returns `Ok`, and the wiring
+    tests assert them (`the_stream_transports_report_their_counts_through_the_driver` in statsd,
+    with the negative-gauge pair counted once; `tcp_and_tls_report_their_counts_through_the_driver`
+    in syslog; `plaintext_and_pickle_over_tcp_report_their_own_counts` in graphite).
+  - A FIN that arrives between the probe and the write stays undetected on a plaintext line
+    stream: the write lands in the local socket buffer and succeeds. That is the residual
+    `poll_pending_close`'s doc states. `unix_stream_retries_a_first_write_the_peer_refused` covers
+    the case where the write does fail (a peer's `SHUT_RD` on a Unix stream gives `EPIPE`).
 
 ---
 
@@ -7040,13 +7231,19 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   - `host_only` (`crates/logit-outputs/src/tls.rs`) yields the right SNI for `host:port`, `[::1]:port`, and a bare
     host with no port.
 - **Observed concerns (unverified):**
-  - `graphite_out` has **no reconnect counter at all** (the doc comment on `connect` in `graphite.rs` says so explicitly),
+  - ~~`graphite_out` has **no reconnect counter at all** (the doc comment on `connect` in `graphite.rs` says so explicitly),
     so the probe-driven reconnect this sink also performs is invisible to an operator. Consistent
     with its ADR, but it makes the one sink whose `duplicate_safe()` is `true` also the one whose
-    connection churn cannot be observed. High confidence, design-level.
+    connection churn cannot be observed. High confidence, design-level.~~ **Resolved (sink/w2,
+    #451):** graphite counts `logit.output.reconnects` through the driver
+    (`tcp_counts_every_connect_after_the_first_as_a_reconnect`).
   - `host_only` on an unbracketed IPv6 endpoint splits on the last colon and produces a wrong SNI;
     documented in `host_only`'s doc comment in `tls.rs` as the operator's problem, but nothing validates it and a wrong
-    SNI surfaces as a confusing handshake failure. Low/medium.
+    SNI surfaces as a confusing handshake failure. Low/medium. **Partly resolved (sink/w2,
+    #451):** the name is parsed once, in `with_tls`, and a host that is neither an IP literal nor
+    a DNS name fails startup naming the endpoint, so an unbracketed IPv6 endpoint with no port
+    (`2001:db8::1` gives `2001:db8:`) fails there. One with a port (`::1:6514`) splits on the
+    port's colon and yields `::1`. The brackets stay the operator's to write.
   - A `connect` that succeeds and *then* has its future dropped by the budget timeout has already
     incremented `reconnects` (deliberate, per the comment) — worth confirming that is the intended
     reading of the metric.
@@ -7063,6 +7260,27 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `Clean`.
 - **Priority:** P1 — wrong here means a stalled or mis-budgeted connect and a misleading metric,
   not silent corruption.
+- **Verified (sink/w2, #451):** findings; the two `TcpDial` copies and graphite's `connect` are one
+  free `connect(&Dial)` in `crates/logit-outputs/src/stream.rs` that counts nothing, and
+  `PooledStream` counts `reconnects` after it succeeds.
+  - `has_connected_once` is set by the first successful dial only; a failed dial counts nothing
+    and doesn't set it; a probe-driven redial counts; the first lazy connect doesn't
+    (`reconnects_count_every_successful_dial_after_the_first`,
+    `a_refused_dial_is_clean_leaves_the_pool_empty_and_counts_no_reconnect`). It lives in the pool,
+    not the sink, because a sink holds one transport for its life; `statsd_out`'s
+    `transport: unix` keeps its own flag in its `Conn` arm.
+  - The per-phase bound: `a_stalled_tls_handshake_times_out_clean_within_twice_the_connect_timeout`
+    (a peer that accepts TCP and never answers the ClientHello; the handshake times out `Clean` on a
+    paused clock, and the dial takes less than twice `connect_timeout`). A `send` makes at most two
+    dials, so its connect time is at most four times `connect_timeout`, inside
+    `deliver_with_retry`'s budget as before.
+  - The invalid-SNI `Clean` (F11) is fixed at construction: `TlsTarget::new` parses the name in
+    `with_tls`, so a bad endpoint fails startup (`a_tls_target_needs_a_server_name_in_the_endpoint_host`,
+    `with_tls_rejects_an_endpoint_with_no_valid_server_name` in statsd and syslog, and
+    `logit-cli`'s `a_tls_statsd_output_endpoint_with_no_valid_server_name_fails_startup`). The send
+    path parses no name, so the `Permanent` fallback the ADR names has nothing to catch.
+  - A connect that succeeds and is then dropped by the budget timeout has already counted its
+    reconnect. That is the intended reading: the connection was made.
 
 ---
 
@@ -7072,8 +7290,9 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `logit.rs`, another agent's area).
 - **What it does:** Wraps a single `AsyncRead::poll_read` in `poll_fn`, mapping `Pending` → still
   open, `Ready(Ok)` with an empty buffer → peer EOF, `Ready(Ok)` with bytes → unsolicited data,
-  `Ready(Err)` → treat as closed. Deliberately *not* `timeout(read)`, because a cancelled read on a
-  `tokio-rustls` stream can discard a partially received record.
+  `Ready(Err)` → treat as closed. *Not* `timeout(read)`, ~~because a cancelled read on a
+  `tokio-rustls` stream can discard a partially received record~~ because the probe must not wait
+  (a cancelled read loses nothing; see the Verified bullet).
 - **Why sensitive:** custom (hand-rolled `poll_fn` over a trait object rather than any crate API);
   cancellation (the entire justification for the shape is cancel-safety of the read);
   data-loss (the answer decides whether a batch is written into a dead socket, which is exactly
@@ -7092,11 +7311,14 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     those receivers speaks back), so discarding those bytes loses nothing.
   - The probe is only ever applied to a *reused* connection, never a freshly dialled one.
 - **Observed concerns (unverified):** The doc comment on `poll_pending_close` (its point-in-time paragraph) states the residual honestly (a
-  FIN arriving between probe and write is unchanged). The one thing not argued: `Ready(Err(_)) →
+  FIN arriving between probe and write is unchanged). ~~The one thing not argued: `Ready(Err(_)) →
   Eof` (the last arm of the `poll_fn` closure) swallows the error kind entirely, so a genuinely transient read error is
   indistinguishable from a closed peer and silently costs a reconnect. Low confidence this matters
-  in practice; worth a one-line justification. No test in `tls.rs` itself (it has no test module) —
-  the probe is only covered indirectly through each sink's pooled-connection tests.
+  in practice; worth a one-line justification.~~ **Resolved (sink/w1, #450):** the arm now says why: a
+  reset, a TLS close without `close_notify`, or a bad record leaves nothing to write to, and a
+  transient error costs one reconnect with nothing written. ~~No test in `tls.rs` itself (it has no test module) —
+  the probe is only covered indirectly through each sink's pooled-connection tests.~~
+  **Resolved (sink/w1, #450):** `tls.rs` has a test module.
 - **Existing coverage:** indirect only — the test named
   `a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost`
   in each of `statsd.rs`, `syslog.rs` and `graphite.rs`.
@@ -7107,6 +7329,31 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   against the pinned `tokio-rustls` version's `poll_read`.
 - **Priority:** P1 — a wrong answer costs one reconnect (cheap) or one dead-socket write (silent
   loss), but the logic is small and the callers' tests exercise the main paths.
+- **Verified (sink/w1, #450):** findings, prose only; no behavior change.
+  - All four arms, over the shared `FakeStream`: `a_pending_poll_is_open` (one poll, `Open`),
+    `an_empty_ready_is_eof`, `a_read_error_is_eof`,
+    `unsolicited_bytes_are_counted_up_to_the_probe_buffer`. Each fails on a swapped or rewritten
+    arm.
+  - A partial TLS record held across the probe: `a_partial_tls_record_probes_open_and_is_still_readable`
+    (the probe reads 4096 bytes of a 10 000-byte record into the session, answers `Open`, and the
+    record completes and decrypts afterwards). `a_partial_tls_record_survives_a_dropped_read`
+    pins the same for a dropped read future, against tokio-rustls 0.26.5 directly.
+  - A key update or other post-handshake message read by the probe: the session keeps its state,
+    and a read that processes its records cleanly drives no writes
+    (`a_tls_read_that_succeeds_leaves_queued_ciphertext_queued`), so any reply rustls queues goes
+    out with the next write's flush. A read whose record processing fails, one of the cases the
+    `Ready(Err)` arm names, makes one last-gasp write for the alert that sends any queued
+    ciphertext first (`a_tls_read_failing_on_a_bad_record_sends_queued_ciphertext`). The probe
+    then answers `Eof` and the stream is dropped; a sink that flushed its last batch has nothing
+    queued for that write to send.
+    `one_poll_of_an_idle_tls_13_connection_after_the_handshake_is_pending` pins that the session
+    tickets after a TLS 1.3 handshake read as `Open`, not `Eof` or `Bytes`.
+  - Closes: `a_tls_close_notify_probes_eof`, and
+    `a_tls_transport_close_without_close_notify_probes_eof` through the error arm.
+  - The probe runs only on a connection taken from `*stream`, never a fresh dial (the `Some` arm
+    of each `send_tcp`), confirmed by reading.
+  - `Bytes` in steady state for statsd, syslog, and graphite needs a receiver that sends
+    application data; none does, and TLS post-handshake records carry none.
 
 ---
 
@@ -7152,14 +7399,24 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     `send` reports success and `logit.output.requests{class="ok"}` increments. Deliberate and
     documented (a per-message data condition, not a sink failure — `SyslogOutput::send_udp`'s doc comment), but it
     is the one path where "delivered" and "dropped" are both true for the same batch. High
-    confidence this is intended; worth confirming the counters make it legible.
-  - `is_message_too_large` is duplicated verbatim in four files (`statsd.rs`,
+    confidence this is intended; worth confirming the counters make it legible. **Confirmed
+    (sink/w4, #453):** intended, and legible: every sink counts the drop in its own unit, and
+    `docs/design/internal-telemetry.md`'s oversize table names each. The case that wasn't legible
+    was the `InvalidInput` fallback below, which put whole batches under this path for errors that
+    weren't `EMSGSIZE`.
+  - ~~`is_message_too_large` is duplicated verbatim in four files (`statsd.rs`,
     `syslog.rs`, `graphite.rs`, `collectd.rs`) with a Linux-only errno 90 and an
     `ErrorKind::InvalidInput` fallback; [`docs/known-gaps.md`](../known-gaps.md#udp-intake) already tracks the absence of
     per-errno send accounting (`ENOBUFS` vs `EMSGSIZE` vs `ECONNREFUSED` are one undifferentiated
-    failure). Listed as documented context, not a surprise.
-  - `collectd_out` has **no `flush()` override** (the `impl Output for CollectdOutput` block in `collectd.rs`) — correct for UDP, but it
-    is the only sink in the family that doesn't spell the contract out.
+    failure). Listed as documented context, not a surprise.~~ **Resolved (sink/w4, #453):** one
+    `is_message_too_large` in `crates/logit-outputs/src/datagram.rs` tests `EMSGSIZE` only. The
+    fallback was a real defect: a Unix socket path of 108 bytes or more and a UDP endpoint on port
+    0 each counted every batch `oversize_datagram` under `requests{class="ok"}`. Both are faults
+    now and graph rules 65 and 73 reject them. The per-errno gap stays in `docs/known-gaps.md`,
+    narrowed to the failures other than `EMSGSIZE`.
+  - ~~`collectd_out` has **no `flush()` override** (the `impl Output for CollectdOutput` block in `collectd.rs`) — correct for UDP, but it
+    is the only sink in the family that doesn't spell the contract out.~~ **Resolved (sink/w4,
+    #453):** the `impl` block's doc says why the trait's no-op is right.
 - **Existing coverage:** `statsd.rs` (`udp_packs_several_lines_into_one_newline_separated_datagram`,
   `a_line_that_would_overflow_the_cap_starts_a_new_datagram`,
   `a_single_line_longer_than_max_packet_bytes_is_dropped_whole`,
@@ -7181,6 +7438,53 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `send_udp`/`flush_datagram` against each other.
 - **Priority:** P0 — the packer is custom, runs on every UDP batch, and both the oversize path and
   the partial-batch fault rule decide between silent loss and duplication.
+- **Correction (2026-09-29, `sink/w0`):** ~~`statsd.rs`'s `send_udp` and `flush_datagram` hold the
+  packer, and `graphite.rs`'s copy is near-verbatim.~~ `statsd.rs`'s packer now lives in
+  `send_datagrams` over `DatagramDest` (`Udp` and `Unix`, with `UnixDest`'s reconnect-once rule), shared
+  with the Unix datagram transport. `graphite.rs` keeps the old inline `send_udp`/`flush_datagram`
+  copy. Confirmed still true: an entry of any length is appended into an empty buffer, so the cap
+  rests on the encoder cap alone; `is_message_too_large` has four copies whose `InvalidInput`
+  fallback also catches errors that aren't `EMSGSIZE`; `collectd_out` accepts `max_packet_bytes` up
+  to 65535 against a 65507-byte UDP payload ceiling; and all four UDP sinks bind `0.0.0.0:0`, so
+  an IPv6 endpoint fails `Clean` on every batch.
+- **Verified (sink/w4, #453):** findings; the four UDP sinks and `statsd_out`'s
+  `transport: unix` send through one module, `crates/logit-outputs/src/datagram.rs`
+  (`send_datagrams`, `DatagramDest`, `UnixDest`, `UdpDest`), and every invariant has a test, each
+  shown to fail on a planted bug.
+  - The cap: the packer's check is `len + 1 + entry > cap` on a non-empty buffer, and the
+    proptest `packing_never_exceeds_the_cap_never_splits_an_entry_and_reconciles` asserts every
+    datagram at most the cap, non-empty, with no leading or trailing separator, the datagrams
+    joined by `\n` equal to the entries joined by `\n`, each datagram a run of whole entries, and
+    greedy packing. Planted off-by-one checks in both directions and a separator counted twice
+    each fail it.
+  - An entry over the cap: every encoder caps its entries at the value its sink passes the
+    packer, and the packer has a branch that skips and counts such an entry
+    (`an_entry_over_the_cap_is_dropped_and_counted_and_its_neighbours_are_sent`, and the proptest,
+    whose cap is drawn apart from its entries). `GraphiteOutput::with_encoder` refuses pickle on
+    UDP, the one builder path that could have produced one.
+  - Entries, not `\n` bytes: the scripted destination records the entry count per datagram, and
+    the proptest's entries carry embedded `\n`s, as the negative-gauge pair does.
+  - Resets on every exit: the packer's per-datagram counts are locals reset after each send and
+    the buffer is cleared at the start of each batch. A planted missing reset fails the proptest's
+    reconciliation, and a planted missing clear fails
+    `a_send_dropped_mid_batch_leaves_a_clean_start_and_a_usable_unix_socket`.
+  - `Clean` only before the first sent datagram, `EMSGSIZE` drops included:
+    `emsgsize_then_a_failure_with_nothing_sent_is_clean` and
+    `sent_then_emsgsize_then_a_failure_is_ambiguous`, plus each sink's partial-send test.
+  - One resolution per batch, `Clean` on failure: `UdpDest::resolve`, shared by the four sinks.
+    It now prefers the first IPv4 address, else the first IPv6 one, over an IPv6 socket bound on
+    first use (`pick_addr_takes_the_first_ipv4_address_else_the_first_ipv6_one` and each sink's
+    `an_ipv6_udp_endpoint_is_delivered`).
+  - A cancelled send: the next send starts from a clean buffer and a Unix destination keeps its
+    connection (`a_send_dropped_mid_batch_leaves_a_clean_start_and_a_usable_unix_socket`). The
+    counts of what the cancelled send had sent are lost; `docs/known-gaps.md` records it.
+  - Accounting: a failed attempt now counts what it sent (each sink's partial-send test), and
+    each sink's real-`EMSGSIZE` test reconciles sent plus dropped against what was encoded, in the
+    sink's unit. `collectd_out` counts `requests` under the four fault classes.
+  - The 65507 ceiling binds `collectd_out` and the UDP transports of `statsd_out` and
+    `graphite_out`, not statsd's Unix transports; `syslog_out` on UDP caps its encoder at
+    `min(max_message_bytes, 65507)`, so an over-long message is truncated
+    (`a_message_longer_than_a_udp_datagram_is_truncated_to_fit_one`).
 
 ---
 
@@ -7238,6 +7542,29 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `false` sinks.
 - **Priority:** P0 — this is the contract every other entry in this file depends on, and it decides
   loss vs. duplication for the whole sink side.
+- **Correction (2026-09-29, `sink/w0`):** ~~`bind()` is unimplemented (default) for every sink here,
+  and only `prometheus_out` overrides it.~~ Two sinks override `bind`: `prometheus_out` (`PrometheusOutput`,
+  which delegates to `ExposeOutput` and `RemoteWriteOutput`) and `splunk_hec_out`
+  (`SplunkHecOutput`, which builds its HTTP client and opens nothing). Also confirmed: `buffer.delivery`
+  can override a sink's posture, and a grep for `delivery` across `crates/logit-outputs/src`
+  finds it mentioned only by `otlp_out` and `datadog_trace_out` (in the `duplicate_safe` doc) and by
+  `splunk_hec_out` and `datadog_out` (in the module doc). `statsd_out`, `syslog_out`,
+  `graphite_out`, `collectd_out`, `logit_out`, `influxdb_out`, `prometheus_out`, and `null_out` don't
+  mention it.
+- **Verified (sink/w5, #454):** findings, all prose. The `Output` trait now says:
+  - `observe_batch` runs once per batch, before its first attempt, and is where a sink resets
+    per-batch state; a sink with encode-side counters arms its accounting there.
+  - `send` is one attempt, cancellable at every await, with a synchronous encode and a `Fault` on
+    failure.
+  - "A sink never runs its own retry loop" allows a bounded, verdict-driven resend inside one
+    attempt, naming the two there are: the stream driver's one plaintext reconnect and
+    `splunk_hec_out`'s code-6 resend.
+  - `flush` runs once when the sink's input has closed, which on a grace expiry with a disk buffer
+    isn't after every batch was delivered.
+  - Every `duplicate_safe` doc on the eight sinks above names the `buffer.delivery` override.
+  `send_batch`'s doc and the allocation test that called it `run_output`'s per-batch body are
+  corrected: it calls no `observe_batch`. The cancellation harness this entry suggested exists per
+  sink since `sink/w2` and `sink/w4` (the dropped-`send` tests in `stream.rs` and `datagram.rs`).
 
 ---
 
@@ -7284,6 +7611,79 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `observe_batch` already exists as a per-batch, per-attempt hook, `Output::observe_batch`).
 - **Priority:** P1 — no data is lost, but the drop accounting an operator uses to reconcile a relay
   is wrong exactly when the sink is unhealthy.
+- **Correction (2026-09-29, `sink/w0`):** ~~`Output::observe_batch` is a per-batch, per-attempt hook.~~
+  `write_loop` calls `observe_batch` once per batch, before `deliver_with_retry`'s retry loop, so it
+  is per batch. The trait doc and `LogitOutput`'s field doc say it runs before each attempt and
+  are wrong. A once-per-batch hook is what lets a sink reset a gate there, and the retry-counter
+  question is settled that way in the ADR.
+- **Verified (sink/w5), line, datagram, InfluxDB, and file sinks → #454:** findings. The inflation
+  was real in all five encoding sinks: with the gate never armed, a batch delivered on its second
+  attempt read every encode-side counter and diagnostic twice (`batch.bytes`, the drop and
+  normalization counters, and `logit.component.diagnostics`). The fix
+  ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+  decision 2) is a `CountGate` in `logit_core::Telemetry`: `observe_batch` arms it, an encode
+  that repeats one the batch already counted runs muted, and the sink skips its own encode-side
+  counts on a repeat. Each sink gives its encoder gated handles and keeps ungated ones for its
+  transport counters. Each sink and transport has a test that runs a batch through the real
+  `write_loop` (`drive_write_loop`) with a first attempt that fails `Clean`, against a
+  single-attempt run: `statsd_out` over UDP, `unix`, TCP, and `unix_stream`, `syslog_out` and
+  `graphite_out` over UDP and TCP, `collectd_out`, and `influxdb_out` (a `503`, then a `204`). A
+  second batch, a batch after one the budget cut off, and direct `send`s with no
+  `observe_batch` all count normally.
+  - `stdio_out`/`file_out` had a sibling defect: `StreamOutput::send` counted `batch.bytes` and
+    noted the size before a write whose re-open could fail `Clean`, so a retry counted both twice
+    and rotated early, and a rotation whose re-open failed never counted in `file.rotations`. Both
+    count after the write now
+    (`a_rotation_whose_reopen_fails_counts_once_and_the_retries_count_no_bytes_twice`).
+  - The datagram packer's skip of an entry over the cap counts on every attempt that reaches it,
+    not once per batch: a first attempt that fails ahead of the entry never reaches it, and a
+    once-per-batch count lost the drop on the retry
+    (`an_over_cap_entry_first_reached_on_a_retry_is_counted`). It can repeat on a retry, as
+    `EMSGSIZE` does under the same reason.
+  - The cancelled-attempt asymmetry stays as documented: a cancelled attempt's encode-side counts
+    stand (the batch's one count), and it counts no `requests`.
+- **Verified (sink/w6, #455), `otlp_out`, `prometheus_out`'s remote-write mode, and
+  `splunk_hec_out`:** findings. The inflation was real in all three: before the fix, a batch
+  delivered on its second attempt read every codec counter and diagnostic twice
+  (`metrics.skipped`, the `gauge_delta_unresolved` and `delta_temporality_unresolved`
+  diagnostics, `splunk_hec_out`'s `blank_event` and `max_body_bytes` oversize drop). Each now runs
+  its whole encode as unit 0 of a `BatchAccounting`, with its encoder on gated views built in one
+  encoder-building function its constructor and builders call (ADR decision 14).
+  - `PrometheusOutput`, the enum `build_spec` boxes, didn't forward `observe_batch`, so a gate on
+    the remote-write mode would never have armed in a running pipeline, while a test driving
+    `RemoteWriteOutput` directly passed. It forwards it now, and the retry test drives the enum.
+    No other `Output` wrapper delegates.
+  - `splunk_hec_out` counted `request.bytes` for a request whose connection was refused, on
+    `/event` and on every refused `/ack` poll. It counts only an answered request or one that
+    failed after it may have left.
+  - Tests per sink through `drive_write_loop`: a retry against a single-attempt run with the
+    request bodies compared, a verdict on a repeat attempt counted, a second batch, a batch after
+    one the budget cut off, direct sends after a batch that sent nothing, every builder order
+    after decoy handles, and a sink with no handle builders.
+- **Verified (sink/w7, #456), `datadog_out` and `datadog_trace_out`:** findings. The inflation was real
+  in both, and `datadog_out` had a worse defect beside it: it read the wall clock on every
+  attempt, and staleness isn't monotonic in the clock, so a point 11 minutes ahead was dropped as
+  `stale` on one attempt and sent by an attempt two minutes later. `observe_batch` reads the
+  clock once per batch now, and an `Ok` clears it. Before the fix a retried batch read every codec
+  counter, `plan`'s drops, and the `oversized_sketch` and `bad_header` diagnostics twice, and one
+  attempt of a bisected request counted a record's codec counters once per re-encode (23 for nine
+  logs). The fix is per-route units of the same gate, and `CountGate::muted`, which
+  `split_encode` runs every bisection re-encode inside (ADR decision 2's amendment): the landed
+  gate mutes a whole unit, so it couldn't mute the re-encodes alone.
+  - Codec counters for the batch resource and a stats bucket count once per request body, so once
+    per 1,000 traces on `datadog_trace_out`, not once per batch; the codec docs said once per
+    batch, and say per body now.
+  - Both sinks counted `request.bytes` for a refused connection (and `datadog_trace_out` for a
+    missing socket file). They count only a request that got an answer or may have left.
+  - Tests through `drive_write_loop` per sink: a route failing after another was sent, a route
+    first encoded on a retry, bisection on one attempt and a retried one, a per-body counter over
+    two count-capped requests, the clock (a stale-ahead point never sent; the clock read once per
+    batch, and again after an `Ok`), a second batch, a batch after one the budget cut off, direct
+    sends after a batch that sent nothing, both builder orders after decoy handles, no handle
+    builders, a `413` on a repeat attempt, and `request.bytes` on a refused connection.
+  - Recorded in `docs/known-gaps.md`, not fixed: `datadog_trace_out` returns `Clean` for a
+    connect failure after an earlier request of the same `send` was accepted, as `datadog_out`
+    and `otlp_out` do.
 
 ---
 
@@ -7573,29 +7973,43 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
 
 ### SINK — Cross-cutting notes
 
-- **One TCP send path, three copies, already drifting.** `statsd_out`, `syslog_out` and
+- ~~**One TCP send path, three copies, already drifting.** `statsd_out`, `syslog_out` and
   `graphite_out` each carry a hand-copied `Conn` / lazy-connect / probe / single-write-then-
   `write_all` / one-reconnect / fault-classification machine, with the source file and line range
   cited in the comments (`graphite.rs`'s module doc cites a `statsd.rs` line range, which no longer
   matches after edits). The known drifts are graphite's missing pre-delivery `flush()`, its bare
   `TcpStream` instead of `Box<dyn AsyncStream>`, and its absent `logit.output.reconnects`. Any
   verification session should diff the three before reviewing any one of them, and the stale
-  line-range citations should be treated as unreliable.
+  line-range citations should be treated as unreliable.~~ **Resolved (sink/w2, #451, 2026-09-29):**
+  a diff found no drift beyond the four named, and the three copies are one driver,
+  `crates/logit-outputs/src/stream.rs`, which `logit_out` shares only for its dial. Graphite
+  gained the flush and `reconnects`; its `TcpStream` became a `Box<dyn AsyncStream>`.
 - **`Fault::Clean` is the load-bearing promise.** Every sink's duplicate-safety argument reduces to
   "`Clean` never over-claims": it must mean *nothing of this batch left the host*. The UDP sinks
   enforce it with a `sent > 0` / `datagrams > 0` check, the TCP sinks with the
   plaintext-`write`-returns-`Err`-proves-zero-bytes argument, and TLS is excluded from `Clean`
-  entirely after any application write. Four independent implementations of one rule.
+  entirely after any application write. ~~Four independent implementations of one rule.~~
+  **Resolved (sink/w2 and sink/w4, #451 and #453, 2026-09-29):** the rule lives in three places.
+  `stream.rs` holds the pooled stream sinks', `datagram.rs`'s `send_datagrams` the datagram sinks',
+  and `logit_out` keeps its own, which differs by design: every write-phase failure is `Clean`
+  there, because a length- and CRC-framed frame is never forwarded truncated (ADR
+  `sink-send-path-and-attempt-accounting`, decision 6).
 - **"Delivered" and "dropped" can both be true.** An `EMSGSIZE` datagram is counted as dropped and
   the `send` still returns `Ok`, incrementing `requests{class="ok"}`. Combined with the
-  per-attempt re-emission of encode-side drop counters under retry, the sink-side counters do not
+  ~~per-attempt re-emission of encode-side drop counters under retry, the sink-side counters do not
   reconcile in general — worth settling as a deliberate accounting model before treating any
-  `messages` vs `messages.dropped` sum as authoritative.
+  `messages` vs `messages.dropped` sum as authoritative.~~ **Resolved (sink/w5–w7, #454–#456,
+  2026-09-29):** the model is decided and documented: encode-side counters count once per batch,
+  transport counters per attempt, and a drop a kernel or a destination decided per attempt (ADR
+  `sink-send-path-and-attempt-accounting`, decision 1; `docs/design/internal-telemetry.md`'s class
+  table). An `EMSGSIZE` datagram is still both dropped and part of an `ok` request, by design.
 - **Two fault/HTTP-classification tables.** `http.rs` exists to be the single copy, and
   `influxdb.rs` deliberately keeps its own — along with `reqwest`'s default redirect policy and an
   unbounded error-body read that `http.rs` specifically fixed. `http.rs`'s module doc names this as open.
 - **Cancellation is the least-tested axis.** `deliver_with_retry` drops `send` futures mid-flight
   by design (`deliver_with_retry`'s `tokio::time::timeout`), and every sink's correctness rests on `stream.take()` plus
   local-only connection ownership. I found tests for peer-close, zero-byte-write, TLS flush and
-  connect-refused, but none that drop a `send` future inside `write_all` or inside the UDP
-  datagram loop.
+  connect-refused, ~~but none that drop a `send` future inside `write_all` or inside the UDP
+  datagram loop.~~ **Resolved (sink/w2 and sink/w4, #451 and #453, 2026-09-29):** the pooled-stream
+  driver's tests drop a `send` inside `write_all`, during a dial, and in a redial after a probe,
+  and a datagram test drops one mid-batch. See "Repo-wide gaps" for what stays untested.

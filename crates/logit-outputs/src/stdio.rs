@@ -161,23 +161,6 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
         }
         let bytes = self.encoder.encode(batch).context("encoding batch")?;
 
-        // Rotation is decided before the write, so a batch is never split across files
-        // (`FileTarget::should_rotate` on a batch bigger than `max_bytes`).
-        if let Target::File(file) = &mut self.target {
-            let now = crate::file::now_unix();
-            if file.should_rotate(now, bytes.len()) {
-                let outcome = file.rotate(&mut self.diagnostics).await?;
-                // Counted here because `FileTarget` holds no `Telemetry`. `NotRotated` means the
-                // active file's rename or truncate failed and nothing on disk changed, so it
-                // isn't a rotation.
-                if outcome == RotateOutcome::Rotated {
-                    self.telemetry.count("logit.output.file.rotations", 1.0, &[]);
-                }
-            }
-            file.note_written(now, bytes.len());
-        }
-
-        self.telemetry.count("logit.output.batch.bytes", bytes.len() as f64, &[]);
         // One `write_all` and one `flush` per batch, so nothing sits in tokio's buffer between
         // batches. `flush` is not `fsync`: the OS page cache still holds the bytes. A write error
         // carries no `Fault`, so the runtime doesn't retry the batch, and it doesn't count toward
@@ -192,11 +175,36 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
                 w.write_all(&bytes).await?;
                 w.flush().await?;
             }
-            Target::File(f) => {
-                f.write_all(&bytes).await?;
-                f.flush().await?;
+            Target::File(file) => {
+                // Rotation is decided before the write, so a batch is never split across files
+                // (`FileTarget::should_rotate` on a batch bigger than `max_bytes`).
+                let now = crate::file::now_unix();
+                if file.should_rotate(now, bytes.len()) {
+                    let rotated = file.rotate(&mut self.diagnostics).await;
+                    // Counted here because `FileTarget` holds no `Telemetry`. `NotRotated` means
+                    // the active file's rename or truncate failed and nothing on disk changed, so
+                    // it isn't a rotation. An `Err` after the commit-point rename, a failed
+                    // re-open, is one, and leaves the file closed.
+                    let committed = match &rotated {
+                        Ok(outcome) => *outcome == RotateOutcome::Rotated,
+                        Err(_) => file.awaiting_reopen(),
+                    };
+                    if committed {
+                        self.telemetry.count("logit.output.file.rotations", 1.0, &[]);
+                    }
+                    // `committed` already read the outcome.
+                    let _ = rotated?;
+                }
+                file.write_all(&bytes).await?;
+                file.flush().await?;
+                // After the write, so a retry of a batch whose write failed isn't noted twice
+                // and doesn't rotate early.
+                file.note_written(now, bytes.len());
             }
         }
+        // Once, for the attempt that wrote the batch: an attempt that failed before the write
+        // wrote nothing.
+        self.telemetry.count("logit.output.batch.bytes", bytes.len() as f64, &[]);
         Ok(())
     }
 
@@ -452,6 +460,59 @@ mod tests {
         assert!(rotations.is_none(), "a failed rotation must never be counted, got: {rotations:?}");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A rotation commits, then the re-open fails twice: once inside the rotation and once when
+    /// the retry's write re-opens the file. The third attempt writes. The committed rotation
+    /// counts once, and the batch's bytes count once, in `batch.bytes` and in the size the
+    /// rotation policy tracks, so the next rotation isn't early.
+    #[tokio::test]
+    async fn a_rotation_whose_reopen_fails_counts_once_and_the_retries_count_no_bytes_twice() {
+        use logit_pipeline::fault::{self, errno, sites, Op, Point};
+        use logit_pipeline::test_util::{drive_write_loop, scratch_dir, TelemetryProbe};
+
+        let small = batch_with(vec![metric_event(0, "b", MetricKind::counter(2.0))]);
+        let len = StreamEncoder::human().encode(&small).unwrap().len();
+        let large: Vec<Event> =
+            (0..3).map(|i| metric_event(0, "a", MetricKind::counter(f64::from(i)))).collect();
+        let large = batch_with(large);
+        let large_len = StreamEncoder::human().encode(&large).unwrap().len();
+        assert!(large_len > len);
+
+        let dir = scratch_dir("stream-output-reopen-retry");
+        let path = dir.join("events.log");
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "file_out", "sink");
+        // Two of `small` fit; `large` then `small` crosses the bound and rotates.
+        let policy = RotatePolicy { max_bytes: Some(2 * len as u64), interval: None, max_files: 3 };
+        let mut output = StreamOutput::rotating(&path, policy)
+            .expect("path should open")
+            .with_telemetry(telemetry.clone());
+        output.send(&large).await.expect("the first batch never rotates");
+
+        let scope = fault::scope(&dir);
+        let open = Point::new(sites::FILE_OUT_ACTIVE, Op::Open);
+        // Two rules failing their first hit: a rule counts only the hits no earlier rule failed,
+        // so the second rule's first hit is the second re-open (`docs/known-gaps.md`, "Pipeline
+        // runtime and graph", the `fault` seam entry).
+        scope.fail_nth(open, 1, errno::EMFILE).fail_nth(open, 1, errno::EMFILE);
+        let config = crate::test_support::fast_retry();
+        drive_write_loop(&mut output, vec![small], config, telemetry).await.unwrap();
+        drop(scope);
+
+        let totals = probe.poll();
+        assert_eq!(totals.sum("logit.component.errors", &[]), 2.0, "two failed re-opens");
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(totals.sum("logit.output.file.rotations", &[]), 1.0, "the rotation committed");
+        assert_eq!(totals.sum("logit.output.batch.bytes", &[]), (large_len + len) as f64);
+        assert!(std::fs::read_to_string(dir.join("events.log.1")).unwrap().contains("a"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("b"));
+        let Target::File(file) = &output.target else { panic!("a file target") };
+        assert!(
+            !file.should_rotate(crate::file::now_unix(), len),
+            "one batch of `len` bytes is in the new file, so a second one still fits"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // --- StreamEncoder ---

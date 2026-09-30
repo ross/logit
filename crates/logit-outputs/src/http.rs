@@ -16,6 +16,7 @@
 //! tracked gap in `docs/known-gaps.md`.
 
 use bytes::Bytes;
+use logit_core::CountGate;
 use logit_pipeline::Fault;
 use std::time::Duration;
 
@@ -213,9 +214,16 @@ pub(crate) struct Split<T, M = ()> {
 /// heavier than the cap goes alone), then, for a chunk whose encoded body is over a byte cap, by
 /// bisection and re-encoding down to one item, which is reported oversize if it still doesn't
 /// fit. A chunk `encode` returns `None` for sends nothing. Order is kept.
+///
+/// The count-capped chunks partition `items`, so their encodes see each item once, and they run
+/// with `gate` as the caller left it. Every bisection re-encode sees items a chunk encode already
+/// saw, so it runs inside [`CountGate::muted`]: a codec counting through handles gated by `gate`
+/// counts each item once per `split_encode`, however deep the bisection goes. A counter a codec
+/// emits once per body, not per item, counts once per count-capped chunk.
 pub(crate) fn split_encode<T: Copy, M>(
     items: &[T],
     caps: Caps,
+    gate: &CountGate,
     weight: impl Fn(&T) -> usize,
     mut encode: impl FnMut(&[T]) -> Option<Encoded<M>>,
 ) -> Split<T, M> {
@@ -225,34 +233,38 @@ pub(crate) fn split_encode<T: Copy, M>(
     for (i, item) in items.iter().enumerate() {
         let w = weight(item);
         if i > start && entries.saturating_add(w) > caps.entries {
-            fit(&items[start..i], caps, &mut encode, &mut split);
+            fit(&items[start..i], caps, gate, 0, &mut encode, &mut split);
             start = i;
             entries = 0;
         }
         entries = entries.saturating_add(w);
     }
     if start < items.len() {
-        fit(&items[start..], caps, &mut encode, &mut split);
+        fit(&items[start..], caps, gate, 0, &mut encode, &mut split);
     }
     split
 }
 
-/// [`split_encode`]'s byte-cap half, for one count-capped chunk.
+/// [`split_encode`]'s byte-cap half, for one count-capped chunk (`depth` 0) or one half of a
+/// bisection (`depth` above 0), whose encode runs muted.
 fn fit<T: Copy, M, F: FnMut(&[T]) -> Option<Encoded<M>>>(
     items: &[T],
     caps: Caps,
+    gate: &CountGate,
+    depth: u32,
     encode: &mut F,
     split: &mut Split<T, M>,
 ) {
-    let Some(encoded) = encode(items) else { return };
+    let encoded = if depth == 0 { encode(items) } else { gate.muted(|| encode(items)) };
+    let Some(encoded) = encoded else { return };
     if encoded.raw_len <= caps.raw_bytes && encoded.body.len() <= caps.wire_bytes {
         split.requests.push((items.to_vec(), encoded));
     } else if let [item] = items {
         split.oversize.push((*item, encoded.raw_len, encoded.body.len()));
     } else {
         let mid = items.len() / 2;
-        fit(&items[..mid], caps, encode, split);
-        fit(&items[mid..], caps, encode, split);
+        fit(&items[..mid], caps, gate, depth + 1, encode, split);
+        fit(&items[mid..], caps, gate, depth + 1, encode, split);
     }
 }
 
@@ -305,7 +317,8 @@ mod tests {
     #[test]
     fn the_splitter_cuts_by_entry_count_first() {
         let caps = Caps { entries: 5, ..Caps::UNBOUNDED };
-        let split = split_encode(&[2, 2, 2, 9, 1], caps, |&w| w as usize, fake_encode);
+        let gate = CountGate::new();
+        let split = split_encode(&[2, 2, 2, 9, 1], caps, &gate, |&w| w as usize, fake_encode);
         assert_eq!(chunks(&split), [vec![2, 2], vec![2], vec![9], vec![1]]);
         assert!(split.oversize.is_empty());
     }
@@ -313,13 +326,14 @@ mod tests {
     /// Over a byte cap the chunk bisects, and one item still over it is reported, not sent.
     #[test]
     fn the_splitter_bisects_over_a_byte_cap_and_reports_a_lone_oversize_item() {
+        let gate = CountGate::new();
         let caps = Caps { raw_bytes: 10, ..Caps::UNBOUNDED };
-        let split = split_encode(&[4, 4, 4, 30, 1], caps, |_| 1, fake_encode);
+        let split = split_encode(&[4, 4, 4, 30, 1], caps, &gate, |_| 1, fake_encode);
         assert_eq!(chunks(&split), [vec![4, 4], vec![4], vec![1]]);
         assert_eq!(split.oversize, [(30, 30, 15)]);
 
         let caps = Caps { wire_bytes: 3, ..Caps::UNBOUNDED };
-        let split = split_encode(&[4, 4, 8], caps, |_| 1, fake_encode);
+        let split = split_encode(&[4, 4, 8], caps, &gate, |_| 1, fake_encode);
         assert_eq!(chunks(&split), [vec![4], vec![4]]);
         assert_eq!(split.oversize, [(8, 8, 4)]);
     }
@@ -327,7 +341,55 @@ mod tests {
     /// A chunk the encoder has nothing for sends nothing.
     #[test]
     fn the_splitter_skips_a_chunk_that_encodes_to_nothing() {
-        let split = split_encode(&[1, 2], Caps::UNBOUNDED, |_| 1, |_| None::<Encoded>);
+        let gate = CountGate::new();
+        let split = split_encode(&[1, 2], Caps::UNBOUNDED, &gate, |_| 1, |_| None::<Encoded>);
         assert!(split.requests.is_empty() && split.oversize.is_empty());
+    }
+
+    /// Every encode `split_encode` makes over `items`, in order: the items and whether `gate` was
+    /// muted during it.
+    fn encodes(items: &[u32], caps: Caps, gate: &CountGate) -> Vec<(Vec<u32>, bool)> {
+        let mut seen = Vec::new();
+        split_encode(
+            items,
+            caps,
+            gate,
+            |_| 1,
+            |chunk| {
+                seen.push((chunk.to_vec(), gate.is_muted()));
+                fake_encode(chunk)
+            },
+        );
+        seen
+    }
+
+    /// The count-capped chunks run with the gate as the caller left it and partition the items;
+    /// every bisection re-encode runs muted, and the gate is as it was afterwards.
+    #[test]
+    fn bisection_re_encodes_run_muted_and_count_capped_chunks_as_the_caller_left_the_gate() {
+        // Two count-capped chunks of three; the first is over the byte cap and bisects to one
+        // oversize item, the second fits.
+        let caps = Caps { entries: 3, raw_bytes: 10, ..Caps::UNBOUNDED };
+        let items = [4, 4, 30, 1, 2, 3];
+        for outer in [false, true] {
+            let gate = CountGate::new();
+            gate.set_muted(outer);
+            let seen = encodes(&items, caps, &gate);
+            assert_eq!(
+                seen,
+                [
+                    (vec![4, 4, 30], outer),
+                    (vec![4], true),
+                    (vec![4, 30], true),
+                    (vec![4], true),
+                    (vec![30], true),
+                    (vec![1, 2, 3], outer),
+                ],
+                "outer muted: {outer}"
+            );
+            let depth_0 = [&seen[0].0[..], &seen[5].0[..]].concat();
+            assert_eq!(depth_0, items, "the count-capped chunks partition the items");
+            assert_eq!(gate.is_muted(), outer, "the gate is as the caller left it");
+        }
     }
 }

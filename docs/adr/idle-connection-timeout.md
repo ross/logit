@@ -1,6 +1,6 @@
 ---
 created: 2026-09-14
-updated: 2026-09-25
+updated: 2026-09-29
 ---
 
 # Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe
@@ -337,3 +337,13 @@ Two findings came out of the same review, both fixed in the shared listener code
   senders holding one consumer's slots while waiting on another deadlock a diamond graph
   (`logit_pipeline::fanout`'s module doc). The wait-out loop's contract is unchanged: a handler
   blocked forever in a send holds its connection and permit, as the amendment above records.
+
+## Amendment: the probe's rationale, corrected (2026-09-29)
+
+"The client-side probe" above says a cancelled read on a TLS stream can discard bytes already
+taken off the socket. That's wrong: a `Pending` poll can move a partial record from the socket
+into the TLS session, but the session keeps it, and a cancelled read loses nothing. The probe's
+behavior doesn't change. It still polls once, never wraps a read in a `timeout`, and drops the
+connection on EOF or unsolicited bytes. The one-poll shape stays because the probe must not
+wait. [ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) pins the session's behavior with tests and makes a tokio-rustls bump a re-verification
+trigger.

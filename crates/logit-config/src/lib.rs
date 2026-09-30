@@ -594,8 +594,9 @@ fn default_span_sample_rate() -> f64 {
 pub enum ComponentKind {
     /// statsd / DogStatsD-style tagged metrics, over UDP (the default), TCP, or a Unix socket.
     ///
-    /// `bind` is a `host:port` under `udp`/`tcp`, and the socket file's absolute path under
-    /// `unix`/`unix_stream` (the Datadog Agent's is `/var/run/datadog/dsd.socket`). The directory
+    /// `bind` is a `host:port` under `udp`/`tcp`, and the socket file's absolute path, shorter than
+    /// 108 bytes, under `unix`/`unix_stream` (the Datadog Agent's is
+    /// `/var/run/datadog/dsd.socket`). The directory
     /// must exist; a stale socket file left by an earlier run is replaced, and anything else at the
     /// path is refused. The socket file is made mode `0722`, as the Agent's is, so a client running
     /// as any user can send; restrict access with the directory's permissions. To listen on UDP and
@@ -1935,7 +1936,9 @@ pub enum ComponentKind {
     /// (one that never passed through `syslog_in`, say).
     SyslogOut {
         /// `host:port`. Resolved at connect/bind time, never at config-load time: a destination
-        /// that isn't up yet is not a config error.
+        /// that isn't up yet is not a config error. Under `transport: udp`, port 0 is rejected,
+        /// and a name that resolves to both IPv4 and IPv6 addresses is sent to the first IPv4
+        /// one.
         endpoint: String,
         #[serde(default)]
         transport: SyslogTransport,
@@ -1959,7 +1962,10 @@ pub enum ComponentKind {
         app_name: Option<String>,
         /// Bounds one encoded message (PRI + header + MSG). A byte-count string. Defaults to
         /// `"8192"`, Grafana Alloy's syslog receiver default, rather than RFC 3164's traditional
-        /// 1024, which would truncate a JSON-bodied message on every modern relay chain.
+        /// 1024, which would truncate a JSON-bodied message on every modern relay chain. Under
+        /// `transport: udp` a message is bounded by the smaller of this and `65507`, the largest
+        /// UDP payload; a longer one is truncated and counted
+        /// `logit.output.messages.truncated`.
         #[serde(default = "default_max_message_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_message_bytes: u64,
@@ -1992,8 +1998,10 @@ pub enum ComponentKind {
     /// TCP.
     StatsdOut {
         /// `host:port` under `udp`/`tcp`, resolved at connect/send time, never at config-load
-        /// time. The socket file's absolute path under `unix`/`unix_stream` (the Datadog Agent's
-        /// datagram socket is `/var/run/datadog/dsd.socket`).
+        /// time. Under `udp`, port 0 is rejected, and a name that resolves to both IPv4 and IPv6
+        /// addresses is sent to the first IPv4 one. The socket file's absolute path, shorter than
+        /// 108 bytes, under `unix`/`unix_stream` (the Datadog Agent's datagram socket is
+        /// `/var/run/datadog/dsd.socket`).
         endpoint: String,
         #[serde(default)]
         transport: StatsdTransport,
@@ -2014,7 +2022,8 @@ pub enum ComponentKind {
         /// headroom for VXLAN/IPsec encapsulation, where a larger datagram would silently
         /// fragment or fail `EMSGSIZE`. DogStatsD clients default to `"8192"` over a Unix socket,
         /// the Agent's receive buffer size, which is the most a Datadog Agent reads per packet.
-        /// `0` is rejected. Ignored for `transport: tcp`.
+        /// `0` is rejected, and so is a value above `65507`, the largest UDP payload, under
+        /// `transport: udp`. Ignored for `transport: tcp`.
         #[serde(default = "default_statsd_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
@@ -2039,13 +2048,14 @@ pub enum ComponentKind {
     /// identity, values, and kinds round-trip through the decoder on the other end. UDP only:
     /// collectd's `network` plugin has no TCP mode.
     CollectdOut {
-        /// `host:port`. Resolved at send time, never at config-load time.
+        /// `host:port`. Resolved at send time, never at config-load time. Port 0 is rejected, and
+        /// a name that resolves to both IPv4 and IPv6 addresses is sent to the first IPv4 one.
         endpoint: String,
         /// Bounds one UDP datagram's worth of packed value lists, not a single list's length. A
         /// byte-count string. Defaults to `"1452"`, collectd's own `MaxPacketSize` default (a
         /// 1500-byte MTU minus IPv4 and UDP headers minus headroom). Must be within
-        /// `1024..=65535`, collectd's own range: above it no UDP datagram can carry the result,
-        /// so every send would fail `EMSGSIZE` and be counted as a per-datagram drop.
+        /// `1024..=65507`: 1024 is collectd's own minimum, and 65507 is the largest UDP payload,
+        /// above which every send would fail `EMSGSIZE` and be counted as a per-datagram drop.
         #[serde(default = "default_collectd_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
@@ -2061,7 +2071,9 @@ pub enum ComponentKind {
     /// tags, value, and timestamp round-trip through the decoder on the other end. Both
     /// transports are supported; `protocol: pickle` requires `transport: tcp`.
     GraphiteOut {
-        /// `host:port`. Resolved at send time, never at config-load time.
+        /// `host:port`. Resolved at send time, never at config-load time. Under
+        /// `transport: udp`, port 0 is rejected, and a name that resolves to both IPv4 and IPv6
+        /// addresses is sent to the first IPv4 one.
         endpoint: String,
         #[serde(default)]
         transport: GraphiteTransport,
@@ -2079,8 +2091,8 @@ pub enum ComponentKind {
         multi_value: GraphiteMultiValue,
         /// Bounds one UDP datagram's worth of packed plaintext lines (several lines
         /// newline-joined per send), not a single line's length. A byte-count string. Defaults to
-        /// `"1432"`, the same commodity-Ethernet figure `statsd_out` uses. `0` is rejected.
-        /// Ignored under `transport: tcp`.
+        /// `"1432"`, the same commodity-Ethernet figure `statsd_out` uses. `0` is rejected, and so
+        /// is a value above `65507`, the largest UDP payload. Ignored under `transport: tcp`.
         #[serde(default = "default_graphite_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
@@ -2921,8 +2933,8 @@ pub struct SyslogStructuredData {
 /// it. A TCP message is one LF-delimited line in both directions.
 ///
 /// `unix` and `unix_stream` are the Datadog Agent's two DogStatsD Unix sockets. Under either,
-/// `statsd_in`'s `bind` and `statsd_out`'s `endpoint` are the socket's absolute path, not a
-/// `host:port`, and `tls:` is rejected.
+/// `statsd_in`'s `bind` and `statsd_out`'s `endpoint` are the socket's absolute path, shorter than
+/// 108 bytes, not a `host:port`, and `tls:` is rejected.
 // Its own enum rather than a shared one: schemars publishes a type's name into the schema's
 // `$defs`, so sharing would document this transport by pointing at a syslog-named type.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -3192,11 +3204,12 @@ pub struct BufferConfig {
     #[serde(default)]
     pub delivery: Option<DeliveryPosture>,
     /// Hard ceiling on the total time spent retrying one batch, across every attempt and backoff
-    /// sleep. Defaults to `60s`.
+    /// sleep. Must be greater than `0s`. Defaults to `60s`.
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub retry_budget: Duration,
-    /// Cap on the exponential backoff between retry attempts. Defaults to `10s`.
+    /// Cap on the exponential backoff between retry attempts, which starts at 200 ms and doubles.
+    /// A value below 200 ms caps every backoff. Must be greater than `0s`. Defaults to `10s`.
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub retry_max_delay: Duration,

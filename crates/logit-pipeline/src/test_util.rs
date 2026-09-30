@@ -1,6 +1,7 @@
 //! Shared test helpers for every crate's tests: a named wait, an accumulating telemetry reader, a
-//! channel receive under one timeout, socket close checks, a bind-first input spawn, and a unique
-//! scratch directory. The rules they encode are in `docs/adr/test-timing-and-observables.md`.
+//! channel receive under one timeout, socket close checks, a bind-first input spawn, the runtime's
+//! own sink write loop over a queue of batches ([`drive_write_loop`]), and a unique scratch
+//! directory. The rules they encode are in `docs/adr/test-timing-and-observables.md`.
 //!
 //! Compiled for this crate's own tests and, elsewhere, only through the dev-only `test-util`
 //! feature; `script/lint` fails if `logit-cli`'s release graph enables it.
@@ -112,6 +113,11 @@ impl Totals {
     /// The total of every `Sum` series named `name` whose tags include `tags`; `0.0` if none.
     pub fn sum(&self, name: &str, tags: &[(&str, &str)]) -> f64 {
         self.sums.iter().filter(|(key, _)| matches(key, name, tags)).map(|(_, v)| v).sum()
+    }
+
+    /// Every `Sum` series: its name, its sorted tags, and its total. For comparing whole runs.
+    pub fn sums(&self) -> impl Iterator<Item = (&str, &[(String, String)], f64)> {
+        self.sums.iter().map(|((name, tags), v)| (name.as_str(), tags.as_slice(), *v))
     }
 
     /// Whether any point of any kind named `name` with tags including `tags` has been folded.
@@ -302,6 +308,48 @@ pub async fn spawn_input<I: Input + Send + 'static>(mut input: I, sink: Fanout) 
     let (shutdown, rx) = watch::channel(false);
     let handle = tokio::spawn(async move { input.run_until_shutdown(sink, rx).await });
     Running { shutdown, handle }
+}
+
+/// Runs the runtime's own `write_loop` over `output` until a closed in-memory queue holding
+/// `batches` is drained, with no shutdown, and returns its result. `telemetry` is the runtime's
+/// handle for the component, so pass one from the registry the sink counts into to read both.
+///
+/// Every batch goes through `write_loop`'s real `Output::observe_batch` call site and
+/// `deliver_with_retry`, so a test sees the per-attempt and per-batch counts a running pipeline
+/// produces. Panics if the loop is still running after [`RECV_TIMEOUT`] plus every batch's retry
+/// budget.
+pub async fn drive_write_loop<O: crate::Output + Send>(
+    output: &mut O,
+    batches: Vec<EventBatch>,
+    config: crate::WriteLoopConfig,
+    telemetry: Telemetry,
+) -> anyhow::Result<()> {
+    let store = Arc::new(crate::SinkStore::Memory(crate::SinkQueue::new(
+        crate::SinkQueueConfig::default(),
+        telemetry.clone(),
+    )));
+    let ceiling = RECV_TIMEOUT.saturating_add(
+        config.retry.total_budget.saturating_mul(u32::try_from(batches.len()).unwrap_or(u32::MAX)),
+    );
+    for batch in batches {
+        store.push((Arc::new(batch), crate::TraceContext::default().into())).await;
+    }
+    store.close();
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::time::timeout(
+        ceiling,
+        crate::runtime::write_loop(
+            "out".to_string(),
+            output,
+            store,
+            telemetry,
+            config,
+            shutdown_rx,
+            &AtomicU64::new(0),
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("write_loop still running after {ceiling:?}"))
 }
 
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);

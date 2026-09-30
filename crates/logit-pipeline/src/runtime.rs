@@ -847,13 +847,17 @@ async fn deliver_with_retry(
     grace_deadline: &std::sync::OnceLock<tokio::time::Instant>,
     sending: &mut bool,
 ) -> Delivery {
+    // Graph rule 15 rejects both at zero: a zero `max_delay` retries with no pause until the
+    // budget ends, and a zero budget times every attempt out before it starts.
+    debug_assert!(!retry.total_budget.is_zero(), "a zero retry budget");
+    debug_assert!(!retry.max_delay.is_zero(), "a zero retry max delay");
     let deadline = tokio::time::Instant::now() + retry.total_budget;
     let mut attempt: u32 = 0;
     loop {
         if grace_deadline.get().is_some_and(|&due| tokio::time::Instant::now() >= due) {
             return Delivery::GraceExpired;
         }
-        attempt += 1;
+        attempt = attempt.saturating_add(1);
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let timer = telemetry.timer("logit.component.send.duration");
         *sending = true;
@@ -987,7 +991,7 @@ async fn finish_and_flush(
 /// under at-least-once it stays queued, under at-most-once it's committed and counted through
 /// [`count_shutdown_drop`] into `shutdown_dropped`
 /// (`docs/adr/shutdown-accounting-and-cancellation-safety.md`, decision 3).
-async fn write_loop(
+pub(crate) async fn write_loop(
     id: String,
     output: &mut (dyn Output + Send),
     store: Arc<SinkStore>,
@@ -1051,8 +1055,10 @@ async fn write_loop(
         );
         span.events(batch.events.len() as u64);
 
-        // Once per batch, covering all its retries. `logit_out` uses it to carry provenance
-        // across the wire (`docs/adr/batch-provenance-on-delivered.md`); a no-op elsewhere.
+        // Once per batch, before its first attempt. `logit_out` carries provenance across the
+        // wire from it (`docs/adr/batch-provenance-on-delivered.md`), and a sink with encode-side
+        // counters arms its per-batch accounting
+        // (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 2).
         output.observe_batch(ctx);
 
         enum DeliverStep {
@@ -1171,12 +1177,14 @@ async fn write_loop(
     Ok(())
 }
 
-/// Telemetry accounting plus one `Output::send` call, for `logit-bench`'s allocation tests and
-/// benches to measure that hop in isolation. Call it from a `current_thread` runtime with no
-/// `tokio::spawn`.
+/// The receive counts and one `Output::send` call with its `send.duration` sample and error
+/// count, for `logit-bench`'s allocation tests and benches to measure that hop in isolation. Call
+/// it from a `current_thread` runtime with no `tokio::spawn`.
 ///
-/// Not on the runtime's delivery path: `write_loop` calls `output.send` through
-/// `deliver_with_retry`, which needs the error's `Fault` for retry decisions.
+/// Not on the runtime's delivery path, and not `run_output`'s per-batch body: `drain_inbox`
+/// counts receipt, and `write_loop` calls `output.observe_batch` once and then `output.send`
+/// through `deliver_with_retry`, which retries on the error's `Fault`. This calls no
+/// `observe_batch`, so a sink's per-batch accounting stays unarmed and counts every call.
 pub async fn send_batch(
     id: &str,
     output: &mut (dyn Output + Send),
@@ -4601,35 +4609,144 @@ mod tests {
         batches: Vec<Arc<EventBatch>>,
         retry: RetryConfig,
     ) -> anyhow::Result<()> {
-        let telemetry = Telemetry::default();
-        let store = Arc::new(SinkStore::Memory(SinkQueue::new(
-            SinkQueueConfig::default(),
-            telemetry.clone(),
-        )));
-        for batch in batches {
-            store.push((batch, TraceContext::default().into())).await;
-        }
-        store.close();
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let batches = batches.into_iter().map(Arc::unwrap_or_clone).collect();
         let write_config = WriteLoopConfig {
             retry,
             shutdown_grace: Duration::from_secs(5),
             delivery_override: None,
         };
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            write_loop(
-                "out".to_string(),
+        crate::test_util::drive_write_loop(&mut output, batches, write_config, Telemetry::default())
+            .await
+    }
+
+    /// `backoff_for` over `base > max`, `base == max`, and attempts from 1 to `u32::MAX`: the
+    /// doubling stops at `max_delay` and never overflows.
+    #[test]
+    fn backoff_for_doubles_from_base_and_is_capped_at_max_for_every_attempt() {
+        let ms = Duration::from_millis;
+        let retry = |base, max| RetryConfig {
+            total_budget: Duration::from_secs(60),
+            base_delay: base,
+            max_delay: max,
+        };
+        let cases = [
+            // (base, max, attempt, backoff)
+            (ms(100), ms(1000), 1, ms(100)),
+            (ms(100), ms(1000), 2, ms(200)),
+            (ms(100), ms(1000), 4, ms(800)),
+            (ms(100), ms(1000), 5, ms(1000)),
+            (ms(100), ms(1000), 128, ms(1000)),
+            (ms(100), ms(1000), u32::MAX, ms(1000)),
+            (ms(100), ms(100), 1, ms(100)),
+            (ms(100), ms(100), 2, ms(100)),
+            (ms(100), ms(100), 128, ms(100)),
+            (ms(100), ms(100), u32::MAX, ms(100)),
+            (ms(500), ms(200), 1, ms(200)),
+            (ms(500), ms(200), 2, ms(200)),
+            (ms(500), ms(200), 128, ms(200)),
+            (ms(500), ms(200), u32::MAX, ms(200)),
+            (Duration::from_secs(u64::MAX / 2), Duration::MAX, u32::MAX, Duration::MAX),
+        ];
+        for (base, max, attempt, expected) in cases {
+            assert_eq!(
+                backoff_for(&retry(base, max), attempt),
+                expected,
+                "base {base:?}, max {max:?}, attempt {attempt}"
+            );
+        }
+    }
+
+    /// Per attempt: one `send.duration` sample, and per failed attempt one `errors`, and one
+    /// `retries` when another attempt follows.
+    #[tokio::test]
+    async fn every_attempt_records_one_send_duration_sample_and_every_retry_one_error() {
+        // (fault, failures before a success, delivery posture, attempts, retries)
+        let cases = [
+            (Fault::Clean, 0, false, 1, 0),
+            (Fault::Clean, 1, false, 2, 1),
+            (Fault::Clean, 3, false, 4, 3),
+            (Fault::Ambiguous, 3, true, 4, 3),
+            // Dropped on its first failure: an error, but no retry follows.
+            (Fault::Ambiguous, u32::MAX, false, 1, 0),
+            (Fault::Permanent, u32::MAX, true, 1, 0),
+        ];
+        for (fault, fail_times, duplicate_safe, attempts, retries) in cases {
+            let label = format!("{fault:?} x{fail_times}, duplicate_safe {duplicate_safe}");
+            let (mut output, handles) = faulty_output(fault, fail_times, duplicate_safe);
+            let mut probe = TelemetryProbe::new();
+            let config =
+                WriteLoopConfig { retry: fast_retry_config(), ..WriteLoopConfig::default() };
+            crate::test_util::drive_write_loop(
                 &mut output,
-                store,
-                telemetry,
-                write_config,
-                shutdown_rx,
-                &AtomicU64::new(0),
-            ),
+                vec![Arc::unwrap_or_clone(one_event_batch(1.0))],
+                config,
+                probe.telemetry("out", "influxdb_out", "sink"),
+            )
+            .await
+            .expect("no outcome here ends write_loop");
+            assert_eq!(
+                handles.attempts.load(std::sync::atomic::Ordering::SeqCst),
+                attempts,
+                "{label}"
+            );
+            let totals = probe.poll();
+            let errors = u32::min(fail_times, attempts);
+            assert_eq!(totals.sum("logit.component.errors", &[]), f64::from(errors), "{label}");
+            assert_eq!(totals.sum("logit.component.retries", &[]), f64::from(retries), "{label}");
+            let samples: usize = totals
+                .events
+                .iter()
+                .flat_map(|e| e.metrics.iter())
+                .filter(|m| {
+                    logit_core::interner::resolve(m.name) == "logit.component.send.duration"
+                })
+                .map(|m| match &m.kind {
+                    MetricKind::Distribution(sketch) => sketch.count(),
+                    other => panic!("send.duration is a distribution, got {other:?}"),
+                })
+                .sum();
+            assert_eq!(samples, attempts as usize, "{label}");
+        }
+    }
+
+    /// A `send` that never returns.
+    struct HangingOutput;
+
+    #[async_trait::async_trait]
+    impl Output for HangingOutput {
+        async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+            std::future::pending().await
+        }
+    }
+
+    /// An attempt the remaining budget cuts off may have reached the destination, so it's
+    /// `Ambiguous`: under at-most-once it's dropped after that one attempt.
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_cut_off_by_the_budget_is_ambiguous() {
+        let retry = RetryConfig {
+            total_budget: Duration::from_millis(50),
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(10),
+        };
+        let start = tokio::time::Instant::now();
+        let outcome = deliver_with_retry(
+            &mut HangingOutput,
+            &one_event_batch(1.0),
+            DeliveryPosture::AtMostOnce,
+            &retry,
+            &Telemetry::default(),
+            &std::sync::OnceLock::new(),
+            &mut false,
         )
-        .await
-        .expect("write_loop should not hang")
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                Delivery::Dropped { fault: Fault::Ambiguous, explicit_permanent: false }
+            ),
+            "the budget's timeout is Ambiguous"
+        );
+        assert_eq!(start.elapsed(), retry.total_budget, "cut off when the budget ran out");
     }
 
     async fn assert_clean_fault_retries_and_eventually_delivers(duplicate_safe: bool) {

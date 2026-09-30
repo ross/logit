@@ -1122,9 +1122,12 @@ the property the minimal-watch-set design is for.
 
 - `logit.proto.frames{direction="in",codec,compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
-- `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"|"ack_write_stalled"|"reject_write_stalled"}`
+- `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated_header"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"|"ack_write_stalled"|"reject_write_stalled"}`
   (count): every way a frame or a handshake can be rejected, each its own reason so a version
-  mismatch doesn't hide behind a generic "bad frame" tag. `too_large` is a header that declared a
+  mismatch doesn't hide behind a generic "bad frame" tag. `truncated_header` is a peer that closed,
+  or a read that failed, part-way through a frame header, and `truncated` the same part-way through
+  a body. A close between frames is the ordinary end of a connection and isn't counted, including
+  a TLS peer gone without `close_notify`. `too_large` is a header that declared a
   payload over `max_frame_bytes`, or a `compressed_len` over `frame::compressed_bound` of it,
   answered `Reject{FRAME_TOO_LARGE}`. `decode_budget` is a well-formed batch that would decode
   past its per-frame budget (`native::DecodeBudget`), a batch too large for the frame cap it
@@ -1144,7 +1147,7 @@ the property the minimal-watch-set design is for.
 
 `Diagnostics` keys: `bound`, `decode_budget` (a batch refused by its decode budget, naming the
 budget and `max_frame_bytes`), and `connection_error` (any other connection failing; never an
-idle close).
+idle close, and never a close between frames).
 
 ##### `generate_in`
 
@@ -1455,6 +1458,80 @@ DogStatsD tag key) renders as its last representable element, and every other el
 It's `normalized` rather than `dropped` because the tag or label itself survives, but read it as
 data loss.
 
+The datagram sinks count an oversize drop at one of two points, and in each sink's own unit:
+
+| Counter | Reason | Where | Unit |
+|---|---|---|---|
+| `logit.output.messages.dropped` | `oversize_datagram` | the kernel refused a datagram with `EMSGSIZE`, or the packer skipped an entry over the cap | `statsd_out`: entries (lines); `graphite_out`: datapoints; `collectd_out`: value lists (a notification counts one); `syslog_out`: messages |
+| `logit.output.messages.dropped` | `oversize_line` | `statsd_out`'s encoder: one line over `max_packet_bytes` | lines |
+| `logit.output.metrics.skipped` | `oversize_line` | `graphite_out`'s encoder: one plaintext line over `max_packet_bytes` | lines |
+| `logit.output.metrics.skipped` | `oversize_value_list`, `oversize_notification` | `collectd_out`'s encoder: one value list or notification over `max_packet_bytes` | value lists, notifications |
+
+A sink counter falls in one of three classes
+([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `influxdb_out`,
+`stdio_out`, `file_out`, `otlp_out`, `prometheus_out`'s remote-write mode, `splunk_hec_out`,
+`datadog_out`, and `datadog_trace_out`:
+
+| Class | Counts | Counters |
+|---|---|---|
+| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.dropped`, `labels.normalized`, `spans.degraded`, `stats.skipped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"needs_agent_processing"\|"not_datadog_origin"}`; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `file.rotations`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
+| Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
+| Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `otlp_out`'s `records.rejected`; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `invalid_event`, `token_rejected`, `request_rejected`, `api_key_rejected`, `ack_unsupported`, `ack_timeout`, and `oversize` for Splunk Cloud's answer) |
+
+The sinks with encoders count the first class through a gate `Output::observe_batch` arms
+(`crates/logit-outputs/src/accounting.rs`); `stdio_out` and `file_out` count after the write that
+delivered the batch. A caller that sends without `observe_batch` counts every `send`, unless an
+earlier batch whose last attempt failed left the gate armed (`docs/known-gaps.md`, "Datadog").
+`prometheus_out`'s registry mode has no gate: its `send` never fails, so nothing repeats. No sink
+counts an encode-side counter per attempt.
+
+The two Datadog sinks encode a batch in units: `datadog_out`'s plan (the stale filter and the
+readiness gate) and each of its routes, and `datadog_trace_out`'s trace and stats routes. Each
+unit counts on the batch's first encode of it, so a route an earlier attempt never reached counts
+on the attempt that first encodes it. A request over a route's byte limit is bisected and each
+half re-encoded; the re-encodes count nothing, so a codec counter for a record counts once per
+record, at the record's first encode, however deep the bisection goes, on a single attempt as on
+a retried batch. A record the codec degraded and the sink then dropped as `oversize`
+counts under both counters.
+
+A few Datadog codec counters describe a request body, not a record, and count once per body the
+codec encodes before any bisection, that is once per count-capped request:
+`spans.degraded{reason="no_wire_form"}` for a batch-resource carrier the form can't carry,
+`spans.degraded{reason="json_text"}` for a batch-resource carrier sent as JSON text,
+`tags.dropped{reason="no_wire_form"\|"unrepresentable"}` for a stats payload's resource
+attributes, and `stats.degraded{reason="negative_timestamp"}`, once per bucket. `datadog_out`
+never cuts a traces or stats request by count, so these count once per batch there;
+`datadog_trace_out` counts them once per 1,000 traces or stats groups. "Once" is per bucket for
+`negative_timestamp`: on `datadog_out` it counts once for each distinct negative bucket in the
+batch, on `datadog_trace_out` once for each such bucket in each request.
+
+`splunk_hec_out`'s `records.dropped{reason="oversize"}` mixes two classes: an object over
+`max_body_bytes` is dropped before any request and counts once per batch, and a lone object Splunk
+Cloud answered as over its cap counts on each attempt that gets that answer. The Datadog sinks'
+`oversize` mixes the same two, an event too large alone and a request answered `413`; a `413` is
+`Fault::Permanent`, so its batch isn't retried.
+
+`oversize_datagram` counts per attempt for both of its causes, the kernel's `EMSGSIZE` and the
+packer's skip of an entry over the cap (a backstop no encoder reaches), so a batch retried after a
+later failure can count it again. `crates/logit-outputs/src/datagram.rs`'s module doc has the send
+side's rules.
+
+The same four sinks, and `statsd_out` under `transport: unix`, count `logit.output.messages`,
+`logit.output.datagrams`, and `graphite_out`'s `logit.output.datapoints` for every datagram the
+kernel took, on an attempt that then failed as well as on one that succeeded: those datagrams are on
+the wire either way. A cancelled attempt counts none of them (`docs/known-gaps.md`). On a stream
+transport the same counters count only a delivered frame.
+
+An attempt the runtime cancels (a budget timeout or the shutdown grace) counts no `requests` and
+none of the counts a dropped future never reaches, and `logit.component.errors` covers it. Its
+`request.duration` timer still records, because a timer records when it drops.
+
+`logit.output.requests` has two vocabularies. The stream and datagram sinks and `logit_out` tag
+one count per attempt with `class=ok|clean|ambiguous|permanent`, the `Fault` taxonomy. The HTTP
+sinks tag one count per request with its status class or `network_error`
+(`docs/known-gaps.md`, "Internal telemetry and self-logging").
+
 ##### `influxdb_out`
 
 `crates/logit-outputs/src/influxdb.rs`.
@@ -1476,9 +1553,11 @@ data loss.
 `StreamOutput`, `crates/logit-outputs/src/stdio.rs`. Both are built on the same sink (ADR
 `rotating-file-output`).
 
-- `logit.output.batch.bytes`, matching `influxdb_out`'s. A write error propagates as a hard failure,
-  with no `warn_throttled` call site to bridge.
-- `file_out` rotation only: `logit.output.file.rotations` (count, one per successful rotation) and,
+- `logit.output.batch.bytes`, matching `influxdb_out`'s, counted once the batch is written, so a
+  retried batch counts once. A write error propagates as a hard failure, with no `warn_throttled`
+  call site to bridge.
+- `file_out` rotation only: `logit.output.file.rotations` (count, one per rotation whose rename
+  committed, including one whose re-open then failed and was retried) and,
   through `Diagnostics::warn_throttled`,
   `logit.component.diagnostics{key="rotate_failure"|"retention_failure"}`
   (`crates/logit-outputs/src/file.rs::FileTarget::rotate`). `rotate_failure` means the rotation
@@ -1494,9 +1573,12 @@ data loss.
 
 `crates/logit-outputs/src/syslog.rs`.
 
-- `logit.output.batch.bytes`, `logit.output.request.duration`, and
-  `logit.output.requests{class="ok"|"error"}`: `influxdb_out`'s shape, minus the HTTP status
-  classes, because there's no response to classify.
+- `logit.output.batch.bytes` and `logit.output.request.duration`: `influxdb_out`'s shape.
+- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count): one per attempt
+  that returns, on both transports, tagged with the attempt's `Fault` class
+  ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+  decision 4). A failed connect or TLS handshake is an attempt and counts `clean`; an attempt the
+  runtime cancels counts nothing. There's no HTTP status to classify.
 - `logit.output.messages` (count): messages sent.
 - `logit.output.events.skipped`: events with no `log` record, so nothing to render as a syslog
   message (ADR `multi-payload-events`).
@@ -1509,9 +1591,9 @@ data loss.
   PARAM-NAME to value; the opt-in element colliding with an SD-ID the event already carries.
 - `logit.output.reconnects` (count, TCP only): every connect *after* the first. A climbing count in
   steady state means the peer or the network, not this sink, is unstable. Counted on plaintext and
-  TLS (RFC 5425) connections alike, because both take the same connect path
-  ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)). UDP is connectionless
-  and never reports it.
+  TLS (RFC 5425) connections alike, because both go through the pooled-stream driver
+  `statsd_out` and `graphite_out` share (`crates/logit-outputs/src/stream.rs`). A failed connect
+  doesn't count. UDP is connectionless and never reports it.
 
 `Diagnostics` keys: `invalid_structured_data`, `message_truncated`, `oversize_datagram`, and
 `oversize_header`, mirroring the counters above.
@@ -1521,7 +1603,8 @@ data loss.
 `crates/logit-outputs/src/statsd.rs`, `docs/adr/statsd-output.md`.
 
 - `logit.output.batch.bytes`, `logit.output.request.duration`, and
-  `logit.output.requests{class="ok"|"error"}`: `syslog_out`'s shape.
+  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`: `syslog_out`'s shape, on
+  every transport.
 - `logit.output.messages`: encoded messages, one per `MessageBuf` entry, on every transport,
   matching `syslog_out`'s. Usually one entry is one statsd line. A negative-absolute-gauge metric's
   two-line `0|g`/`-n|g` pair is one indivisible entry (`docs/adr/statsd-output.md`) and counts once
@@ -1550,8 +1633,8 @@ data loss.
   rendering rather than a drop. A timer's `h`/`d` wire-type letter collapsing to `ms` under
   `format: statsd`, or a `SetMembers` member changing after lossy UTF-8 plus sanitization.
 - `logit.output.reconnects` (count; `tcp`, `unix_stream`, and `unix`): every connect *after* the
-  first, as for `syslog_out`. Counted on plaintext and TLS connections alike, because both take the
-  same `TcpDial::connect` path ([ADR `statsd-output`](../adr/statsd-output.md)'s TLS amendment).
+  first, as for `syslog_out`. Counted on plaintext and TLS connections alike, because `tcp` and
+  `unix_stream` both go through the shared pooled-stream driver.
   Under `unix` it counts each reconnect of the connected datagram socket after a timeout or a gone
   receiver ([ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md),
   decision 12). UDP is connectionless and never reports it.
@@ -1575,15 +1658,15 @@ reports through them itself, so both halves of one `send` appear under one compo
 The sink adds only what a socket send can produce and the codec can't know:
 
 - `logit.output.batch.bytes`, `logit.output.request.duration`, and
-  `logit.output.requests{class="ok"|"error"}`: `statsd_out`'s shape.
+  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`: `syslog_out`'s shape.
 - `logit.output.messages`: value lists actually sent (the per-datagram list count each
   `logit_proto::MessageBuf<usize>` entry's meta carries, summed).
 - `logit.output.datagrams`: datagrams actually sent. Both this and `messages` are UDP concepts;
   collectd has no TCP mode.
 - `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled `oversize_datagram`
-  diagnostic: `EMSGSIZE` on one already-packed datagram, as in `statsd_out`'s identical case
-  (`StatsdOutput::flush_datagram`). The datagram's own lists are dropped, not the whole batch, and
-  sending continues with the next datagram.
+  diagnostic: `EMSGSIZE` on one already-packed datagram, as in `statsd_out`'s identical case. The
+  datagram's own lists are dropped, not the whole batch, and sending continues with the next
+  datagram.
 
 A `log`-only event carrying a `collectd.severity` attribute is a notification, and the codec's
 diagnostics mirror `collectd_in`'s: `notification_dropped` (severity absent despite being
@@ -1608,7 +1691,10 @@ The sink's `with_telemetry`/`with_diagnostics` feed the codec, so both halves of
 under one component id, as for `collectd_out`. The sink adds only what a socket send can produce:
 
 - `logit.output.batch.bytes`, `logit.output.request.duration`, and
-  `logit.output.requests{class="ok"|"error"}`: every other sink's shape.
+  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`: `syslog_out`'s shape, on
+  both transports.
+- `logit.output.reconnects` (count, TCP only): every connect *after* the first, including the
+  redial after the probe finds a pooled connection closed, as for `syslog_out`.
 - `logit.output.messages`: entries actually sent (one plaintext line, or one
   already-length-prefixed pickle frame).
 - `logit.output.datapoints`: Σ each sent entry's own datapoint count (`MessageBuf<usize>`'s `meta`).
@@ -1639,7 +1725,8 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   shared `gauge_delta_unresolved`.
 
 There's no `logit.output.request.duration`; layer 2's `logit.component.send.duration` times each
-attempt.
+attempt. The class table above says which of this sink's counters count once per batch and which
+once per attempt.
 
 ##### `datadog_out`
 
@@ -1651,16 +1738,19 @@ One `send` is up to eight routes' requests, so every point carries `route`: `ser
 |---|---|---|
 | `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout |
 | `logit.output.request.duration{route}` | timing | one per request |
-| `logit.output.request.bytes{route}` | count | the body as sent, after compression |
+| `logit.output.request.bytes{route}` | count | the body as sent, after compression, for a request that got an answer or failed after it may have left (a timeout); a refused connection counts none |
 | `logit.output.records{route}` | count | entries in a request Datadog accepted: series points, samples records, and sketches by record; logs, events, checks, spans, and stats groups by event |
-| `logit.output.records.dropped{route, reason="stale"}` | count | a record outside Datadog's window when sent: a metric more than 1h old or 10 min ahead, a log or event more than 18h old, a check more than 10 min old |
-| `logit.output.records.dropped{route, reason="oversize"}` | count | an event whose body alone is over the route's byte limit, or every entry of a request Datadog answered `413` |
-| `logit.output.records.dropped{route="traces", reason="needs_agent_processing"\|"not_datadog_origin"}` | count | a span whose chunk's root has no `_top_level` mark: raw tracer output, or not a Datadog span at all |
+| `logit.output.records.dropped{route, reason="stale"}` | count | a record outside Datadog's window at the batch's send time, read once per batch: a metric more than 1h old or 10 min ahead, a log or event more than 18h old, a check more than 10 min old; once per batch |
+| `logit.output.records.dropped{route, reason="oversize"}` | count | an event whose body alone is over the route's byte limit, once per batch; or every entry of a request Datadog answered `413`, on the attempt that got that answer |
+| `logit.output.records.dropped{route="traces", reason="needs_agent_processing"\|"not_datadog_origin"}` | count | a span whose chunk's root has no `_top_level` mark: raw tracer output, or not a Datadog span at all; once per batch |
 
 A dropped record is never sent, so a `buffer.disk:` replay after a long outage shows up here as
-`stale`, not as a delivery. The codec's own points (`logit.output.metrics.skipped`, including
-every kind no route carries; `metrics.degraded`, `tags.dropped`, `spans.degraded`, `stats.*`) are
-the `datadog` codec's, under [Codecs](#codecs), and this sink doesn't repeat them.
+`stale`, not as a delivery. Every attempt at a batch measures the stale windows from the one send
+time `observe_batch` read, so a point dropped as stale on one attempt is never sent on another.
+The codec's own points (`logit.output.metrics.skipped`, including every kind no route carries;
+`metrics.degraded`, `tags.dropped`, `spans.degraded`, `stats.*`) are the `datadog` codec's, under
+[Codecs](#codecs), and this sink doesn't repeat them. They count once per batch, per route (the
+class table above).
 
 `Diagnostics` keys, each throttled: `api_key_rejected` (a `403`: Datadog refused the key; the key
 itself is never logged), `request_rejected` (any other non-retryable `4xx` or `3xx`, quoting 256
@@ -1675,18 +1765,21 @@ One `send` is up to two routes' requests, so every point carries `route`: `trace
 |---|---|---|
 | `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout, over TCP or the Unix socket alike |
 | `logit.output.request.duration{route}` | timing | one per request |
-| `logit.output.request.bytes{route}` | count | the body as sent, after compression |
+| `logit.output.request.bytes{route}` | count | the body as sent, after compression, for a request that got an answer or failed after it may have left (a timeout); a refused connection or a missing socket file counts none |
 | `logit.output.records{route}` | count | spans (`traces`) or stats groups (`stats`) in a request the Agent accepted |
-| `logit.output.records.dropped{route, reason="oversize"}` | count | a trace's spans, or a stats group, too large for the Agent's 25 MiB request limit alone, or every record of a request the Agent answered `413` |
+| `logit.output.records.dropped{route, reason="oversize"}` | count | a trace's spans, or a stats group, too large for the Agent's 25 MiB request limit alone, once per batch; or every record of a request the Agent answered `413`, on the attempt that got that answer |
 
 The codec's own points are the `datadog` codec's, under [Codecs](#codecs), and this sink doesn't
-repeat them. The one to watch here is `logit.output.spans.degraded{reason="no_wire_form"}` under
-`version: v0.4`: the trace chunk and tracer payload fields v0.4 can't carry. A tracer header's
-carrier doesn't count there, because the request header carries it.
+repeat them. They count once per batch, per route (the class table above). The one to watch here
+is `logit.output.spans.degraded{reason="no_wire_form"}` under `version: v0.4`: the trace chunk and
+tracer payload fields v0.4 can't carry. A tracer header's carrier doesn't count there, because the
+request header carries it. A batch-resource carrier counts once per request body (the
+paragraph on Datadog codec counters above).
 
 `Diagnostics` keys, each throttled: `request_rejected` (a non-retryable `4xx`, `3xx`, or `1xx`,
 quoting 256 bytes of the body), `oversize` (a trace or stats group dropped for its size), and
-`bad_header` (a tracer header left out because its attribute isn't a legal header value).
+`bad_header` (a tracer header left out because its attribute isn't a legal header value, once per
+batch).
 
 ##### `splunk_hec_out`
 
@@ -1698,9 +1791,9 @@ quoting 256 bytes of the body), `oversize` (a trace or stats group dropped for i
 |---|---|---|
 | `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout |
 | `logit.output.request.duration{route}` | timing | one per request |
-| `logit.output.request.bytes{route}` | count | the body as sent, after compression |
+| `logit.output.request.bytes{route}` | count | the body as sent, after compression, for a request that got an answer or failed after it may have left (a timeout); a refused connection counts none |
 | `logit.output.records` | count | records in a body Splunk accepted: one per log or span object, one per `metric_name:` field; also the records ahead of an object a `400` code 6 named, which are assumed indexed |
-| `logit.output.records.dropped{reason="oversize"}` | count | an object larger than `max_body_bytes` alone, never sent |
+| `logit.output.records.dropped{reason="oversize"}` | count | an object larger than `max_body_bytes` alone, never sent, once per batch; or a lone object Splunk Cloud answered as over its cap (`400` code 6 at object 0 of a body over 5 MiB), on each attempt that gets that answer |
 | `logit.output.records.dropped{reason="invalid_event"}` | count | the object a `400` code 6 named, dropped before the rest of its body is resent once |
 | `logit.output.requests.rejected{code}` | count | one per `/event` request answered with a non-retryable status: `code` is the body's HEC code when Splunk documents it (`4` for an invalid token, `6` for invalid data, …), else `other` |
 | `logit.output.acks{result}` | count | under `ack: true`, one per `/event` request: `acked`, `timeout` (still unacknowledged at `ack_timeout`, which fails the batch as ambiguous), or `unsupported` (a `200` with no `ackId`, or a poll answered `400` code 14: the token doesn't acknowledge, and the request counts as delivered) |
@@ -1713,8 +1806,11 @@ submodules, under this component's id, and this sink doesn't repeat them.
 
 `Diagnostics` keys, each throttled: `token_rejected` (a `401` or `403`), `request_rejected` (any
 other non-retryable `4xx` or `3xx`, quoting 256 bytes of the body), `invalid_event` (an object
-dropped on a code 6), `oversize` (an object dropped for its size), `ack_unsupported`, and
-`ack_timeout`. The token never appears in any of them.
+dropped on a code 6), `oversize` (an object dropped for its size, or a body split on Splunk
+Cloud's oversize answer), `ack_unsupported`, and `ack_timeout`. The token never appears in any of
+them. The class table above says which count once per batch: the codec's counters, and the
+`max_body_bytes` drop with its `oversize` diagnostic; everything Splunk's answer decides counts per
+attempt.
 
 ##### `logit_out`
 
@@ -1726,11 +1822,17 @@ dropped on a code 6), `oversize` (an object dropped for its size), `ack_unsuppor
 - `logit.output.ack.duration` (timer, one per attempt): finer-grained than layer 2's
   `logit.component.send.duration`, because it isolates the ack wait from the
   connect/handshake/write that can precede it on a cold connection.
-- `logit.output.reconnects` (count): every connect *after* the first. A climbing count in steady
-  state means the peer or the network, not this sink, is unstable.
-- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`: the `Fault` taxonomy as
-  request-outcome classes, the same shape as `influxdb_out`'s HTTP-status classes and
-  `syslog_out`'s `ok`/`error` pair, with this sink's own vocabulary.
+- `logit.output.reconnects` (count): every connect *after* the first whose `HelloAck` passed
+  validation. A climbing count in steady state means the peer or the network, not this sink, is
+  unstable.
+- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count, one per attempt
+  that returns): the `Fault` taxonomy as request-outcome classes. A connect or handshake failure
+  and a batch too large to send count as attempts, so the total equals the number of `send` calls
+  that returned. A cancelled attempt (a budget timeout, the shutdown grace) returns nothing and
+  isn't counted; `logit.component.errors` covers it. `clean` covers every failure before the frame
+  is completely written and flushed, and `ambiguous` only the ack wait
+  ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+  decision 6).
 
 ##### `prometheus_out`
 
@@ -1775,8 +1877,9 @@ dropped on a code 6), `oversize` (an object dropped for its size), `ack_unsuppor
 A batch that produces no series issues no request and reports none of the three.
 
 **The codec's `PrometheusEncoder` counts in both modes.** In registry mode it's shared by `send`
-and render, so both total under one component; in sender mode it's a plain field with one
-direction.
+and render, so both total under one component, and counts on every `send` and every render; in
+sender mode it's a plain field with one direction, and counts once per batch however many attempts
+it takes (the class table above).
 
 - `logit.output.metrics.skipped{metric_kind="delta_sum"|"delta_histogram"|"gauge_delta"|
   "exponential_histogram"}` and `{reason="no_recorded_value"|"type_conflict"|"name_collision"}`.
@@ -1806,9 +1909,9 @@ Some reasons exist only on one path:
 `Diagnostics` keys: `delta_temporality_unresolved` (both delta arms, naming the `aggregate` with
 `temporality: cumulative` fix); the shared `gauge_delta_unresolved` key `influxdb_out`/`statsd_out`
 use; `prometheus_exponential_histogram_skipped`; `prometheus_accept_failed` from the
-registry-mode listener's accept loop; and `remote_write_rejected`, one per non-2xx in sender mode,
-carrying the status and the first 256 bytes of the response body, read bounded rather than read
-whole and then trimmed.
+registry-mode listener's accept loop; and `remote_write_rejected`, one per non-2xx answer in
+sender mode (`crates/logit-outputs/src/prometheus.rs`'s module doc, "Faults, retries and duplicate
+safety", has what it carries).
 
 Retry is layer 2 in both modes: in registry mode `send` is an in-memory upsert with nothing to
 retry, and in sender mode one `send` is one attempt by design, with `write_loop` owning the retry.
@@ -1856,7 +1959,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.output.stats.degraded{reason="agent_mapping"\|"bin_limit"\|"exact_summary"}` | count | a stats summary sent under the Agent mapping's logarithmic reading, with a bin limit other than 2048, or with an exact summary the DDSketch protobuf can't carry |
 | `logit.input.spans.skipped{reason="malformed"\|"idx_payload"}` | count | a span, trace array, or chunk that doesn't parse (a v0.5 span of the wrong arity or with a dictionary index out of range included), dropped while the rest decodes; an `AgentPayload`'s v1.0 `idxTracerPayloads` entry, which isn't implemented |
 | `logit.input.spans.degraded{reason="bad_tid"\|"negative_duration"\|"key_collision"\|"timestamp_range"\|"bad_attribute_type"\|"invalid_utf8"}` | count | an unparseable `_dd.p.tid` (kept as an attribute, high half zero), a negative duration clamped to 0, one key in two of `meta`/`metrics`/`meta_struct` (or a field spelled like a carrier) keeping one value, a span event time above `i64::MAX` clamped, a span event attribute of unknown type dropped, or a non-UTF-8 string read lossily |
-| `logit.output.spans.degraded{reason="no_wire_form"}` | count | a span field the target form has no home for, one per item: `status: Ok`, span `flags`, a status message, `trace_state`, a dropped count; `datadog.chunk.*` in v0.4/v0.5; `datadog.tracer.*` in v0.4/v0.5 and `datadog.agent.*` below `AgentPayload` (once per batch); `meta_struct`, links, and events in v0.5 |
+| `logit.output.spans.degraded{reason="no_wire_form"}` | count | a span field the target form has no home for, one per item: `status: Ok`, span `flags`, a status message, `trace_state`, a dropped count; `datadog.chunk.*` in v0.4/v0.5; `datadog.tracer.*` in v0.4/v0.5 and `datadog.agent.*` below `AgentPayload` (once per request body); `meta_struct`, links, and events in v0.5 |
 | `logit.output.spans.degraded{reason="int_as_f64"\|"json_text"\|"negative_duration"\|"timestamp_range"}` | count | an integer attribute sent as an inexact `metrics` double, an `Array`/`Map`/`Null` sent as JSON text, a span ending before it starts sent with duration 0, or a negative span event time sent as 0 |
 
 `Diagnostics` keys: `bad_series` and `bad_sketch`; `malformed_log`, `bad_timestamp` (a log
@@ -1864,6 +1967,10 @@ timestamp that is neither a number nor RFC 3339, stamped with `received_at`), `m
 `malformed_service_check`; `malformed_stats` (a dropped stats payload, bucket, or group) and
 `bad_stats_sketch` (a dropped stats summary); `malformed_span` (a dropped span, trace array, or
 chunk); `oversized_sketch` (an outgoing sketch dropped past the entry cap).
+
+A counter for a batch-resource attribute or a stats bucket counts once per request body the
+encoder writes, not once per record; the paragraph after the sink class table names them and says
+what a body is on each Datadog sink.
 
 ## Metrics from Lua scripts
 

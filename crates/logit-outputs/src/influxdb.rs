@@ -14,6 +14,7 @@
 //!
 //! [`render_tag_suffix`] never emits a `statsd.`-prefixed attribute as a tag; see its doc.
 
+use crate::accounting::BatchAccounting;
 use crate::http::{body_snippet, read_body_prefix, ERROR_BODY_SNIPPET_BYTES};
 use crate::Output;
 use anyhow::Context;
@@ -22,7 +23,7 @@ use logit_core::interner::resolve;
 use logit_core::{
     DdSketch, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
 };
-use logit_pipeline::Fault;
+use logit_pipeline::{BatchContext, Fault};
 use logit_proto::{CodecError, Encoder};
 use std::collections::HashMap;
 // `write!` into a `String`: formats straight into the output buffer, no `String` per number
@@ -52,8 +53,10 @@ pub struct InfluxDbOutput {
     /// attempt, so there's no retry budget to clamp it against.
     request_timeout: Duration,
     /// Layer-3 detail (`docs/design/internal-telemetry.md`): the response class, which
-    /// `run_output`'s `logit.component.send.*` can't see inside one `send`.
+    /// `run_output`'s `logit.component.send.*` can't see inside one `send`. Ungated; the encoder's
+    /// diagnostics are gated by `accounting` (`crate::accounting`).
     telemetry: Telemetry,
+    accounting: BatchAccounting,
 }
 
 impl InfluxDbOutput {
@@ -67,6 +70,7 @@ impl InfluxDbOutput {
             encoder: InfluxLineEncoder::default(),
             request_timeout: DEFAULT_TIMEOUT,
             telemetry: Telemetry::default(),
+            accounting: BatchAccounting::default(),
         }
     }
 
@@ -77,10 +81,11 @@ impl InfluxDbOutput {
         self
     }
 
-    /// Attaches the encoder's diagnostics handle (per-metric encode failures). Retry diagnostics
-    /// come from `logit-pipeline`'s writer, not this sink.
+    /// Attaches the encoder's diagnostics handle (per-metric encode failures), gated by this
+    /// sink's batch accounting. Retry diagnostics come from `logit-pipeline`'s writer, not this
+    /// sink.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.encoder = self.encoder.with_diagnostics(diag);
+        self.encoder = self.encoder.with_diagnostics(diag.gated(self.accounting.gate()));
         self
     }
 
@@ -111,17 +116,17 @@ fn build_client(timeout: Duration) -> reqwest::Client {
         .expect("reqwest client should build with default TLS settings")
 }
 
-#[async_trait::async_trait]
-impl Output for InfluxDbOutput {
+impl InfluxDbOutput {
     /// One attempt per call, no loop or sleep: retry timing and budget belong to
     /// `logit-pipeline`'s writer (`docs/adr/buffered-sink-delivery.md`). This classifies the
     /// outcome and attaches it as `.context(fault)`.
-    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let body = self.encoder.encode(batch)?;
+    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let (first, body) = self.accounting.encode(0, || self.encoder.encode(batch));
+        let body = body?;
         // Before the empty-body return: a batch whose every line was unencodable still normalized
         // its tags, and an operator chasing a missing tag value needs to see that. Guarded so an
         // ordinary batch doesn't upsert a permanent zero series.
-        if self.encoder.multi_value_tags > 0 {
+        if first && self.encoder.multi_value_tags > 0 {
             self.telemetry.count(
                 "logit.output.tags.normalized",
                 self.encoder.multi_value_tags as f64,
@@ -134,7 +139,9 @@ impl Output for InfluxDbOutput {
             return Ok(());
         }
 
-        self.telemetry.count("logit.output.batch.bytes", body.len() as f64, &[]);
+        if first {
+            self.telemetry.count("logit.output.batch.bytes", body.len() as f64, &[]);
+        }
 
         let write_url = format!("{}/api/v2/write", self.url.trim_end_matches('/'));
 
@@ -187,12 +194,28 @@ impl Output for InfluxDbOutput {
             }
         }
     }
+}
+
+#[async_trait::async_trait]
+impl Output for InfluxDbOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
+    /// One attempt ([`InfluxDbOutput::attempt`]). An `Ok` disarms the batch accounting on every
+    /// path, a batch that encoded to nothing included.
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let result = self.attempt(batch).await;
+        self.accounting.finish(result)
+    }
 
     /// Every point's timestamp derives from `event.timestamp`, and the per-batch collision map
     /// (`InfluxLineEncoder::series`) is cleared at the top of every `encode`, so a retry re-encodes
     /// byte-for-byte the same body. InfluxDB treats an identical `(measurement, tag set,
     /// timestamp)` write as an idempotent overwrite, not a second point.
-    /// See `docs/adr/buffered-sink-delivery.md`.
+    /// See `docs/adr/buffered-sink-delivery.md`. `buffer.delivery` overrides this posture for the
+    /// component.
     fn duplicate_safe(&self) -> bool {
         true
     }
@@ -1590,5 +1613,101 @@ mod tests {
 
         assert_eq!(value("logit.output.requests", Some(("class", "5xx"))), 1.0);
         assert!(value("logit.output.batch.bytes", None) > 0.0);
+    }
+
+    // -- Attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) ----------
+
+    /// A 503 then a 204: the batch is delivered on its second attempt, and every encode-side
+    /// counter and diagnostic reads as it does after one attempt.
+    #[tokio::test]
+    async fn a_retry_counts_encode_side_counters_once() {
+        use crate::test_support::{
+            assert_counted_once_per_batch, fast_retry, sum_of, sums_through_write_loop,
+        };
+        use logit_pipeline::test_util::TelemetryProbe;
+
+        // A collapsed multi-value tag, and a gauge delta skipped with its diagnostic.
+        let batch = || {
+            let mut tagged = metric_event("hits", MetricKind::counter(1.0), &[]);
+            tagged.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
+            batch_with(vec![tagged, metric_event("conns", MetricKind::GaugeDelta(5.0), &[])])
+        };
+        const ENCODE_SIDE: [(&str, &[(&str, &str)]); 3] = [
+            ("logit.output.tags.normalized", &[("reason", "multi_value")]),
+            ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
+            ("logit.output.batch.bytes", &[]),
+        ];
+        let mut runs = Vec::new();
+        for responses in [vec![RESP_204], vec![RESP_503, RESP_204]] {
+            let (addr, _count) = canned_server(responses).await;
+            let mut probe = TelemetryProbe::new();
+            let telemetry = probe.telemetry("out", "influxdb_out", "sink");
+            let mut output = output_against(addr)
+                .await
+                .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry);
+            runs.push(
+                sums_through_write_loop(
+                    &mut output,
+                    &mut probe,
+                    "influxdb_out",
+                    vec![batch()],
+                    fast_retry(),
+                )
+                .await,
+            );
+        }
+        let (single, retried) = (&runs[0], &runs[1]);
+        assert_eq!(sum_of(single, "logit.output.requests", &[("class", "2xx")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "5xx")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "2xx")]), 1.0);
+        assert_counted_once_per_batch(single, retried, &ENCODE_SIDE, &[]);
+    }
+
+    /// A batch that encodes to an empty body returns `Ok` early and still leaves the accounting
+    /// disarmed, so later direct sends count.
+    #[tokio::test]
+    async fn direct_sends_after_a_batch_that_encoded_nothing_count_every_time() {
+        use crate::test_support::assert_direct_sends_count_after_an_empty_batch;
+        use logit_pipeline::test_util::TelemetryProbe;
+
+        let (addr, _count) = canned_server(vec![RESP_204]).await;
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "influxdb_out", "sink");
+        let mut output = output_against(addr)
+            .await
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry);
+        let log = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str("hello"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let batch = || {
+            let mut tagged = metric_event("hits", MetricKind::counter(1.0), &[]);
+            tagged.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
+            batch_with(vec![tagged, metric_event("conns", MetricKind::GaugeDelta(5.0), &[])])
+        };
+        assert_direct_sends_count_after_an_empty_batch(
+            &mut output,
+            &mut probe,
+            "influxdb_out",
+            batch_with(vec![log]),
+            batch,
+            &[
+                ("logit.output.tags.normalized", &[("reason", "multi_value")]),
+                ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
+                ("logit.output.batch.bytes", &[]),
+            ],
+        )
+        .await;
     }
 }

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-09-12
+updated: 2026-09-29
 ---
 
 # collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder
@@ -50,6 +50,18 @@ fit inside a typical Ethernet MTU after IP/UDP headers on a slightly-tunneled pa
 gives. A value list that doesn't fit in what remains of the current packet flushes it and starts a
 new one; a value list that doesn't fit in an empty packet is dropped whole (see the encode mapping
 table below).
+
+**Amendment (2026-09-29): the upper bound is 65507, not 65535.** collectd's documented range tops
+out at the IP length field's maximum, but a UDP payload over IPv4 can't exceed 65507 bytes (65535
+minus the 20-byte IPv4 and 8-byte UDP headers), and the kernel refuses a longer datagram with
+`EMSGSIZE`, which `collectd_out` counts as a per-datagram drop under an `ok` request. Config
+validation bounds `max_packet_bytes` to **1024..=65507**, the ceiling `statsd_out` and
+`graphite_out` get over UDP too
+([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md),
+decision 9). IPv6 allows 20 more bytes, but an endpoint can be a hostname whose family validation
+can't know, so the bound is the IPv4 figure. `collectd_out` also sends through the datagram path
+the UDP sinks share and counts `logit.output.requests` under the four fault classes, where it
+counted `ok|error`.
 
 ### Model mapping
 

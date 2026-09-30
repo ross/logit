@@ -122,6 +122,31 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   at the sink. It's a named exception in [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md), decision 1.
   Revisit if a reconciliation shows a sink's `received` short of its producers' `sent` after a
   shutdown with no `closed_consumer` drops.
+- **The `fault` seam's rules on one point don't each see every hit.** `logit_pipeline::fault`
+  (a test-only seam) checks a scope's rules on a point in the order they were added, and a rule
+  that fails an operation returns before any later rule counts it. So a rule counts only the hits
+  no earlier rule on that point failed, and `scope.fail_nth(p, 1, E).fail_nth(p, 2, E)` fails the
+  first and the third operation at `p`, not the first two: the second rule never sees hit 1, lets
+  hit 2 through as its first, and fails hit 3 as its second. A test that wants the first two to
+  fail adds two `fail_nth(p, 1, E)` rules, as
+  `stdio::tests::a_rotation_whose_reopen_fails_counts_once_and_the_retries_count_no_bytes_twice`
+  does. Nothing shipped is affected. Revisit when a test needs rules on one point to count the same
+  hits, say `n`th operations named by their absolute position whatever earlier rules failed.
+- **A test that captures `tracing` output fails under plain `cargo test` beside tests that emit
+  diagnostics.** `splunk::tests::a_code_6_out_of_range_is_diagnosed` installs a thread-local
+  subscriber with `set_default` and asserts the `request_rejected` report reached it.
+  - **Verified:** run as `cargo test -p logit-outputs --lib splunk::tests::`, which runs the
+    module's tests on threads of one process, it failed twice in a row with nothing captured. Run
+    alone, and under `cargo nextest run`, which runs each test in its own process, it passes, so
+    `script/test`, `script/check`, and CI are unaffected.
+  - **Suspected, not verified:** `tracing` caches each callsite's interest process-wide. When
+    another test's thread reaches the `warn!` inside `Diagnostics::warn_throttled` with no
+    subscriber interested, that callsite can be cached as never enabled, and this test's
+    thread-local subscriber then never sees the event. The module's attempt-accounting tests
+    emit more such diagnostics concurrently, which would make the race more likely.
+  - **Revisit:** if a documented script runs `logit-outputs` tests under plain `cargo test`; the
+    fix then is a test that doesn't depend on a thread-local subscriber, such as reading
+    `Diagnostics::occurrences`.
 
 ## Event model and interner
 
@@ -472,6 +497,31 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     flow control lands; see the "Credit-based flow control" item of the native wire protocol entry
     in this section.
 
+- **A TLS `logit_out` that dies inside the first record of a frame reads, at `logit_in`, as a clean
+  close.** The frame's header travels in its first TLS record. If the sender's connection fails
+  before that record is complete, `logit_in` has decrypted zero bytes of the header when the
+  stream ends, so `read_header` takes the end as a close between frames and counts nothing, where
+  `logit.proto.errors{reason="truncated_header"}` would be truthful. Nothing is lost or
+  duplicated: the sender's write fails `Clean` and the batch is resent on a new connection. Only
+  the listener's count is off. It isn't fixed because the listener can't tell the two apart:
+  rustls 0.23.45 marks `has_seen_eof` on the transport EOF whatever its deframer still holds, so a
+  record that never completed and no record at all both reach `read_header` as the same
+  `UnexpectedEof` with no plaintext read
+  ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+  decision 12).
+
+- **A shutdown grace that cuts a `logit_out` `send` mid-write commits, and counts as dropped, a
+  batch that provably never landed.** `write_loop` reads any cut-off send as `Fault::Ambiguous`,
+  because it can't know how far the send got. On `logit_out` a cut inside the frame's write or
+  flush leaves `logit_in` holding a truncated frame it never forwards, so the batch didn't
+  arrive. Under the default `at_most_once` posture the runtime then commits it and counts it
+  `logit.component.batches.dropped{reason="shutdown"}`; under `at_least_once` it stays queued. It
+  isn't fixed because the runtime sees a cancelled future, not where in the send it stopped, and
+  a cut inside the ack wait, after the frame landed, is truly ambiguous.
+  `docs/design/pipeline-graph.md`'s "Cancellation points" table has the row. To keep such a
+  batch across the restart, set `buffer.disk:` on the `logit_out` component, which persists it
+  at the read cursor.
+
 - ~~**`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
   per-message framing**~~ **Closed (2026-09-12).** `syslog_out` needs one UDP datagram or one
   octet-counted TCP frame per message, and `statsd_out` one statsd line per metric packed up to a
@@ -589,16 +639,45 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `read_loop_sampled` per socket with no way to reach a second. Left deliberately: it is a signature
   change to a function whose arm ordering is load-bearing.
 - **A UDP sink's send failures are not counted by cause.** `statsd_out`, `syslog_out`,
-  `graphite_out` and `collectd_out` treat every failed datagram send the same way, so an operator
-  can't tell `ENOBUFS` (local socket-buffer pressure: a tuning problem) from `EMSGSIZE` (a datagram
-  past the path MTU: a configuration problem) from `ECONNREFUSED` (an ICMP port-unreachable from a
+  `graphite_out` and `collectd_out` count an `EMSGSIZE` refusal (a datagram past the path MTU: a
+  configuration problem) as `logit.output.messages.dropped{reason="oversize_datagram"}`, but end
+  the batch on every other failed send alike, so an operator can't tell `ENOBUFS` (local
+  socket-buffer pressure: a tuning problem) from `ECONNREFUSED` (an ICMP port-unreachable from a
   missing receiver: a deployment problem). The fix is a `logit.output.send.errors{errno="..."}`
-  count at those four send sites, with the errno set bounded by the handful a UDP `sendmsg` can
-  return; only the call site can see the errno. The receive side's kernel counters (see "No
+  count at the one send site the four share (`send_one` in `crates/logit-outputs/src/datagram.rs`),
+  with the errno set bounded by the handful a UDP `sendmsg` can return; only the call site can see
+  the errno. The receive side's kernel counters (see "No
   visibility into the kernel's own UDP receive-buffer drops", closed, below) have no useful
   send-side twin: `SO_MEMINFO`'s `wmem_alloc` is ~always 0 on a UDP socket because a datagram is
   charged and uncharged inside one `sendmsg`, so a send-buffer gauge would be a flat zero. It was
   deliberately not built; `SockMeminfo` carries the field only because the option returns it.
+- **A cancelled datagram send loses the counts of what it already sent.** A UDP sink, or
+  `statsd_out` under `transport: unix`, counts `logit.output.messages` and
+  `logit.output.datagrams` (and `graphite_out`'s `datapoints`) once `send_datagrams` returns, on
+  success and on failure alike. A `send` dropped mid-batch, by the retry budget or the shutdown
+  grace, never returns, so the datagrams it had already handed the kernel are never counted
+  (`crates/logit-outputs/src/datagram.rs`'s module doc). Counting each datagram as it goes would
+  close it, at a telemetry call per datagram. `logit.component.errors` records the cancelled
+  attempt.
+- **A UDP sink reaches only the IPv4 address of a name that resolves to both families.** Each
+  UDP sink (`statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`) sends to the first IPv4
+  address its endpoint resolves to and falls back to the first IPv6 one only when there is no
+  IPv4 address. Binding by the first resolved address instead would turn a loud failure into
+  silent loss where `localhost` resolves to `::1` first and the receiver listens on `127.0.0.1`
+  only.
+  - **Consequence:** a receiver that listens on IPv6 only, behind a name that also has an IPv4
+    address, gets nothing, and the send reports `ok`.
+  - **Workaround:** write the IPv6 address in `endpoint:`, for example `[::1]:8125`.
+  - **Revisit trigger:** an operator who needs the IPv6 address preferred
+    ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+    decision 9).
+- **The four IPv6 UDP sink tests skip where IPv6 loopback is unavailable.** Each of
+  `statsd::tests::an_ipv6_udp_endpoint_is_delivered` and its `syslog`, `graphite`, and `collectd`
+  twins binds a collector on `[::1]:0` and prints a reason and returns when it can't. The dev
+  container has IPv6 loopback, so `script/test` and CI run them, but a host without it shows four
+  passes that tested nothing. The datagram module's
+  `resolution_selects_the_socket_of_the_chosen_address_family` never skips and covers the family
+  choice.
 - **Netns-wide UDP counters (`/proc/net/snmp`, `netstat -su`) are deliberately not collected.**
   `Udp: InErrors` / `RcvbufErrors` / `NoPorts` and the `UdpLite` block answer questions the
   per-socket counters can't — most usefully `NoPorts`, datagrams for a port nothing listens on,
@@ -774,7 +853,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 - **`logit_in`'s `idle_timeout` bounds reads only; a blocked write is bounded by
   `handshake_timeout`.** `idle_timeout` can't reach a write that a peer has stopped reading, so
   `logit_in` writes every `HelloAck`, `Ack`, and `Reject` (`GOING_AWAY` included) within
-  `handshake_timeout` instead (`crates/logit-inputs/src/logit.rs`'s module doc, "Bounded writes").
+  `handshake_timeout` instead (`crates/logit-inputs/src/logit.rs`'s module doc, "Bounded, flushed writes").
   A peer that sends frames but never reads its `Ack`s is disconnected once the listener's send
   buffer fills and one `Ack` write stalls for `handshake_timeout`
   (`logit.proto.errors{reason="ack_write_stalled"}`). The cost is one knob covering two waits: an
@@ -1254,6 +1333,54 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - **Fix:** `splunk_hec_out`'s rule: once a request of the `send` is accepted, a later
     transport failure is `Fault::Ambiguous` (`crates/logit-outputs/src/splunk.rs`'s
     `after_delivery`).
+- **`datadog_trace_out` reports a connect failure `Clean` after an earlier request of the same
+  batch was accepted.** One `send` is the trace requests, then the stats request, and a batch of
+  more than 1,000 traces is several trace requests. Both transports make a connect failure
+  `Fault::Clean`: `reqwest`'s through `classify_reqwest_error`, and the Unix socket's when the
+  connector can't dial the path. `datadog_out` has the same gap, in the entry above, and
+  `otlp_out` in the OTLP section.
+  - **Consequence:** under the default at-most-once posture, an Agent that goes away between the
+    trace request and the stats request gets the traces again on the retry, and an Agent dedupes
+    nothing, so every span in them is stored twice.
+  - **Fix:** the same as `datadog_out`'s.
+- **Some Datadog codec counters count once per request body, not once per batch.** They
+  describe a body and not a record: `spans.degraded{reason="no_wire_form"}` and
+  `{reason="json_text"}` for a batch-resource carrier,
+  `tags.dropped{reason="no_wire_form"|"unrepresentable"}` for a stats payload's resource
+  attributes, and `stats.degraded{reason="negative_timestamp"}`. A count-capped request is one
+  body, and `datadog_trace_out` cuts a batch of more than 1,000 traces or stats groups into
+  several. `datadog_out` cuts no traces or stats request by count, so there it is once per batch.
+  - **Consequence:** a batch of 1,001 traces reports a carrier the form can't hold twice. The
+    count is stable across retries, which is what the attempt accounting guarantees, but it
+    isn't a per-batch measure.
+  - **Revisit trigger:** a dashboard that needs the per-batch figure
+    ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+    decision 2).
+- **A record a Datadog codec degraded and the sink then dropped as oversize is reported under
+  both counters.** The codec counts the degradation (`no_wire_form`, `json_text`, and the like)
+  at the record's first encode, and `split_encode`'s bisection may then find the record alone
+  over the route's byte limit and drop it, counted `records.dropped{reason="oversize"}`. The
+  record is never sent, so its degradation counter describes a wire form that never left.
+  Suppressing it would need the codec to defer its counts until the request is accepted.
+  - **Consequence:** the degradation counters of a route that also drops oversize records read
+    high by those records.
+- **A sink sent to again without `observe_batch`, after a batch whose last attempt failed, keeps
+  that batch's state.** `observe_batch` arms the attempt gate of every sink that has one, and on
+  `datadog_out` it also fixes the batch's send time; only an `Ok` disarms the gate and clears the
+  time, because the sink can't tell a final failed attempt from one the runtime will retry
+  ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+  decisions 2 and 3). A caller that then calls `send` with a new batch and no `observe_batch`
+  finds the gate armed, so the new batch's encode-side counts for units the failed batch encoded
+  are muted, and on `datadog_out` measures the stale windows from the failed batch's send time.
+  - **Consequence:** none on a shipped path. `write_loop` calls `observe_batch` before every
+    batch, which re-arms the gate and replaces the time. `logit_pipeline::send_batch`, which the
+    benchmarks use, is the one caller that skips it. It never calls `observe_batch`, so no gate is
+    armed and no send time is stored, and its repeated sends to one sink leave no state.
+  - **Fix, if a caller ever needs it:** a runtime signal that a batch ended (an `Output` method,
+    which decision 2 declined to add). A sink can't clear on `Err` without breaking the reuse the
+    retries need.
+  - `datadog::tests::a_direct_send_after_a_failed_batch_reuses_its_send_time_and_armed_gate`
+    pins the behavior, so a change to it is noticed.
 
 ## Splunk
 
@@ -1642,6 +1769,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   without a `GOAWAY`, the request may have been processed. The upstream fix is VictoriaTraces
   sending a `GOAWAY`. `script/victoria-interop`'s leg-7 row can pass a run in which no request
   raced a close; it counts `send_failed` lines but can't force the race.
+- **`otlp_out` reports a connect failure `Clean` after an earlier request of the same batch
+  succeeded.** One `send` is one request per signal, sequentially, and a connect failure is
+  `Fault::Clean` on either transport (`crate::http`'s `classify_reqwest_error` over HTTP,
+  `grpc_roundtrip`'s `is_connect()` over gRPC). `write_loop` retries `Clean` under every delivery
+  posture, and the retry re-sends every signal, the ones already accepted included.
+  - **Consequence:** under the default at-most-once posture, a collector restarted between a
+    mixed batch's traces request and its metrics request gets the traces twice.
+  - **Fix:** `splunk_hec_out`'s rule, as for `datadog_out` in the Datadog section: once a
+    request of the `send` is accepted, a later `Clean` failure is `Fault::Ambiguous`
+    (`crates/logit-outputs/src/splunk.rs`'s `after_delivery`).
 - **An OTLP timestamp past `i64::MAX` saturates to `i64::MAX`.** A wire timestamp
   (`time_unix_nano`, `observed_time_unix_nano`, `start_time_unix_nano`, and the span, span event,
   and exemplar times) past `i64::MAX` nanoseconds decodes as `i64::MAX` through one helper, and
@@ -1892,8 +2029,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   completes the write in flight, so the file can hold a torn line or native frame. The batch is
   counted as the grace decides (ADR
   [`shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md),
-  decision 3), but nothing marks the torn record, and the next run appends after it. Open, for the
-  sink send path's verification cluster.
+  decision 3), but nothing marks the torn record, and the next run appends after it. The sink send
+  path cluster verified what a dropped `send` leaves in the other sink families
+  ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md))
+  and left this one. A write that succeeds followed by a flush that fails
+  leaves `FileTarget::note_written` uncalled for bytes that may have reached the file, so a size
+  rotation can come late; the error carries no `Fault`, so the batch isn't retried.
 - ~~**`influxdb_out`'s line encoder allocates ~180 times per event**~~ **Closed.** It was the
   largest single cost in the pipeline, roughly twice the end-to-end cost of ingesting an event. Now
   30 allocations per 100-event batch (from 18,024) and 2.6× faster: escaping and formatting go
@@ -2721,6 +2862,29 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   only `logit-cli/src/main.rs` — `Command::Run`'s exit-error printer, `Command::Graph`'s
   validation warning, and `Command::Ready`'s probe failure: a CLI's own stderr on its own error
   paths, not a running service's self-log.
+- **A drop a kernel or a destination decided counts again on a retried batch.** Encode-side
+  counters count once per batch, but these repeat on every attempt that gets the same answer:
+  Splunk's code 6 (`records.dropped{reason="invalid_event"}`) and Splunk Cloud's oversize answer,
+  an OTLP `partial_success` (`records.rejected`), a datagram refused with `EMSGSIZE`, and the
+  packer's skip of an entry over the datagram cap (`oversize_datagram`).
+  [internal-telemetry.md](design/internal-telemetry.md)'s class table lists them.
+  - **Consequence:** on a sink that retries, these counters read high by the number of attempts
+    that met the verdict, and the batch's own retries account for the growth.
+  - **Why it stays:** each attempt got its own answer, and a retry might get a different one, so
+    counting once would need the sink to remember what an earlier attempt learned
+    ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+    decision 1).
+- **The HTTP sinks' `logit.output.requests` doesn't use the four fault classes.** The stream and
+  datagram sinks (`statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `logit_out`) tag
+  each attempt `class=ok|clean|ambiguous|permanent`. `influxdb_out`, `otlp_out`,
+  `prometheus_out`'s remote-write mode, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out`
+  tag each request with its status class (`2xx`, `5xx`, `network_error`, and the gRPC status name
+  for `otlp_out`), and count one per request, so a `send` that issues several counts several.
+  - **Consequence:** one alert on `class="ambiguous"` covers the first group and not the second,
+    and a dashboard needs a query per group.
+  - **Revisit trigger:** aligning the vocabulary, which the ADR names as follow-up work
+    ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+    decision 4).
 
 ## Load-test harness and perf tooling
 

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-13
+updated: 2026-09-29
 ---
 
 # Syslog egress: format, transport, and header-field precedence
@@ -91,7 +91,9 @@ partially delivered twice.
 gained TLS ([ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md)), the proof it rests
 on — one `write(2)` failing means zero bytes of that call were accepted — holds for a raw
 `TcpStream` and not for a `tokio_rustls` one, whose failing write may already have put complete
-records (complete octet-counted messages) on the socket. On a TLS connection there is no internal
+records on the socket. rustls splits what each session write accepted into records of at most
+16384 bytes of plaintext, with no regard for message boundaries, and every complete
+octet-counted message in what arrived is one a receiver keeps. On a TLS connection there is no internal
 retry: once an application write has been attempted, every failure is `Fault::Ambiguous` and the
 frame is never resent. That ADR's `syslog_out` section has the details.
 
@@ -160,6 +162,15 @@ stack points this at — rather than RFC 3164 §4.1's traditional 1024, which wo
 JSON-bodied message on every modern relay chain. An oversize MSG is truncated on a UTF-8 character
 boundary (never the header); an oversize header (only reachable with an absurdly small
 `max_message_bytes`) drops the whole message instead of emitting a malformed one.
+
+**Amendment (2026-09-29): over UDP the bound is at most 65507.** A UDP message is one datagram,
+and the kernel refuses a UDP payload over 65507 bytes with `EMSGSIZE`, which dropped the whole
+message. `SyslogOutput::with_encoder` now caps the encoder at `min(max_message_bytes, 65507)` under
+`transport: udp`, so a longer message is truncated by the rule above and counted
+`logit.output.messages.truncated`, and an operator's `max_message_bytes` above 65507 has no further
+effect over UDP. TCP is unchanged
+([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md),
+decision 9).
 
 ### No `logit_proto::Encoder`
 
@@ -283,3 +294,12 @@ side. The asymmetry this ADR recorded as deliberate no longer holds; see
 (RFC 6587 framing auto-detection, the connection-cap/handshake-timeout accept loop, and why no
 receive queue is needed on this transport) and `docs/known-gaps.md` for the closed/narrowed gap
 entries.
+
+## Amendment: the shared stream driver (2026-09-29)
+
+[ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) moves `syslog_out`'s pooled TCP and TLS send onto a driver shared with `statsd_out` and
+`graphite_out`. `logit.output.requests` is tagged `class=ok|clean|ambiguous|permanent` and counts
+connect failures. A TLS server name is parsed at construction, so a bad endpoint fails startup
+instead of retrying to budget exhaustion. Under TLS a write `Err` may follow a record that
+reached the wire, so it is `Ambiguous`. `syslog_out`'s UDP path still sends one datagram per
+message and uses the shared errno helper for an oversize datagram.
