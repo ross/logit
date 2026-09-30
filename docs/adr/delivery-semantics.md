@@ -80,6 +80,9 @@ one a running process can count:
 - a batch dropped on an `Ambiguous` fault under `at_most_once`, where `statsd_out`'s default
   or an operator's `buffer.delivery:` chose that over a duplicate (item 5);
 - a batch a `drop_oldest` or `drop_newest` overflow policy evicted;
+- a batch a disk spool couldn't write or read back (`frame_too_large`, `disk_full`,
+  `disk_io_error`, `disk_corrupt`);
+- a batch sent to a consumer that had already closed (`closed_consumer`, items 3 and 4);
 - a batch in a memory queue when the shutdown grace ran out;
 - everything in memory when the process dies: channels, memory sink queues, receive queues,
   accumulators, an `aggregate` window, and a Lua script's state.
@@ -146,7 +149,8 @@ the hook:
   posture: an `aggregate` with `temporality: cumulative` turns it into a running total that a
   resend repeats rather than adds. `otlp_out` carries both forms, `splunk_hec_out` carries the
   `Sum` and, under `multi_value: expand`, the `Histogram`, and `collectd_out` carries the `Sum`
-  (as `COUNTER`) and drops every `Histogram`. `prometheus_out` needs no remedy: it skips a delta
+  (as `ABSOLUTE`, and as `COUNTER` once `aggregate` makes it cumulative) and drops every
+  `Histogram`. `prometheus_out` needs no remedy: it skips a delta
   outright, so cumulative mode decides whether the metric goes out at all, and what goes out
   overwrites. `datadog_out` has no remedy and needs none for its `Sum`: a Datadog `count`
   carries a per-interval value, so its series route skips a cumulative `Sum`, and a resent
