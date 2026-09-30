@@ -371,9 +371,10 @@ The workstream that closes item 3 settled these:
 - **`splunk_hec_in` answers by how much of the body was taken.** A refused first batch is `503`
   code 9 with `Retry-After: 1`. A refused later batch is `500` code 8 with no `ackId`, because code
   9 promises nothing was taken ([ADR `splunk-hec-relay`](splunk-hec-relay.md)).
-- **`tail_in` and `docker_in` freeze and stop.** On the first refused batch the driver freezes its
-  checkpoint at the last line a consumer took and returns, and the node finishes, like a finite
-  `generate_in`. A restart resumes at the frozen checkpoint.
+- **`tail_in` and `docker_in` freeze and stop.** On the first refused batch the driver stops
+  writing its checkpoint and returns, and the node finishes, like a finite `generate_in`. The
+  frozen checkpoint is the last one written, at or before the last line a consumer took. A restart
+  resumes there and may replay lines a consumer already took.
 - **Counter.** Every acknowledging listener counts
   `logit.input.batches.dropped{reason="closed_consumer"}`: every batch of the request no consumer
   took, the refused one included. It isn't disjoint from `logit.component.batches.sent` (`Fanout`

@@ -253,8 +253,9 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     watcher: Option<super::watch::Watcher>,
     /// Set once an emit finds no consumer to take its batch: every consumer of this listener has
     /// closed. From then on nothing more is emitted and [`Tailer::write_checkpoint`] writes
-    /// nothing, so the persisted offset stays at the last batch a consumer took and a restart
-    /// resumes there. The run loop then returns `Ok`, and the node finishes.
+    /// nothing, so the persisted offset stays at the last checkpoint written, at or before the
+    /// last batch a consumer took, and a restart may replay lines a consumer already took. The
+    /// run loop then returns `Ok`, and the node finishes.
     untaken: bool,
 }
 
@@ -461,8 +462,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         if self.untaken {
             self.diag.warn_throttled(
                 "closed_consumer",
-                "no consumer took a batch; stopped tailing, with the checkpoint left at the last \
-                 batch taken",
+                "no consumer took a batch; stopped tailing, with the checkpoint left where it \
+                 was, at or before the last batch taken",
             );
         }
         Ok(())

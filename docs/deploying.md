@@ -1209,8 +1209,10 @@ at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bou
 crash can replay, and replay is always safe.
 
 **A closed downstream stops the tailer.** When no consumer takes a batch, `tail_in`/`docker_in`
-stops at the first refused batch and freezes the checkpoint at the last line a consumer took, and
-the node finishes. A restart resumes there. It's counted
+stops at the first refused batch and stops writing the checkpoint, and the node finishes. The
+checkpoint on disk is the last one written, at or before the last line a consumer took, up to one
+`checkpoint_interval` of lines behind it. A restart resumes there and may replay lines a consumer
+already took. It's counted
 `logit.input.batches.dropped{reason="closed_consumer"}`.
 
 Each write goes to `<checkpoint_path>.tmp`, is `fsync`ed, renamed over `checkpoint_path`, and the
