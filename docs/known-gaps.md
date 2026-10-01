@@ -1809,8 +1809,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 
   `crates/logit-proto/tests/robustness.rs`'s `otlp_json_peak_memory_per_input_byte_is_documented`
   asserts ceilings of 24 and 128 over these two shapes, so a change that moves either ratio fails
-  a test before this entry drifts. The bound still holds: `MAX_CONCURRENT_CONNECTIONS`'s doc
-  comment (`crates/logit-inputs/src/otlp.rs`) states the worst case across all connections is a
+  a test before this entry drifts. The bound still holds: `OtlpInput::max_connections`'s field
+  doc (`crates/logit-inputs/src/otlp.rs`) states the worst case across all connections is a
   finite multiple of the protobuf path's 1.6 TiB, itself a bound rather than a memory budget
   (`MAX_CONCURRENT_STREAMS` in `crates/logit-inputs/src/http.rs` has the formula). No cap and no streaming parser are added: the
   98× shape needs crafted input, a non-goal under

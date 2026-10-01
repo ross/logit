@@ -228,10 +228,11 @@
 //! 73. A UDP sink `endpoint` (`statsd_out`, `graphite_out`, `syslog_out` on `transport: udp`, and
 //!     `collectd_out`) on port 0, which the kernel refuses every datagram to
 //!     (`docs/adr/sink-send-path-and-attempt-accounting.md`).
-//! 74. A `max_connections` of `0` on any kind that has one, or a non-default one on a UDP
-//!     `syslog_in`/`graphite_in`/`statsd_in` or a `transport: unix` `statsd_in`, which has no
-//!     connections. Compared against `default_max_connections`, so the default stays legal
-//!     everywhere (`docs/adr/syslog-tcp-ingress-and-tls.md`,
+//! 74. A `max_connections` of `0` on any kind that has one, or one above
+//!     `tokio::sync::Semaphore::MAX_PERMITS` (the listener's permit counter would panic on it), or
+//!     a non-default one on a UDP `syslog_in`/`graphite_in`/`statsd_in` or a `transport: unix`
+//!     `statsd_in`, which has no connections. Compared against `default_max_connections`, so the
+//!     default stays legal everywhere (`docs/adr/syslog-tcp-ingress-and-tls.md`,
 //!     `docs/adr/native-hop-identity-and-sequence.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
@@ -3434,7 +3435,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 74: `max_connections`, rule 45's checks one field over. `0` would reject every
-    // connection on accept. A UDP `syslog_in`/`graphite_in`/`statsd_in` (or a `transport: unix`
+    // connection on accept, and a value above `Semaphore::MAX_PERMITS` would panic in the
+    // listener's `Semaphore::new` at startup, past validation. A UDP `syslog_in`/`graphite_in`/`statsd_in` (or a `transport: unix`
     // `statsd_in`) has no connections to cap, so a non-default value there is rejected; the default
     // stays legal. A scrape-mode `prometheus_in`'s non-default value is rule 55's wrong-mode check,
     // which runs first.
@@ -3455,6 +3457,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             anyhow::bail!(
                 "component '{id}': 'max_connections' must be greater than 0 -- 0 would reject \
                  every connection"
+            );
+        }
+        if max_connections > tokio::sync::Semaphore::MAX_PERMITS {
+            anyhow::bail!(
+                "component '{id}': 'max_connections' ({max_connections}) is over {}, the most \
+                 connections a listener's permit counter can hold",
+                tokio::sync::Semaphore::MAX_PERMITS
             );
         }
         if max_connections == default_max_connections() {
@@ -9892,6 +9901,27 @@ mod tests {
                 "for {head}, got: {err}"
             );
         }
+    }
+
+    /// Rule 74: a value the listener's `Semaphore::new` would panic on is a config error, not a
+    /// startup panic. `usize::MAX` deserializes, so the ceiling has to be checked here.
+    #[test]
+    fn a_max_connections_over_the_permit_ceiling_is_rejected() {
+        let over = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        let kind = listener_from_json(&format!(
+            r#"{{"type": "logit_in", "bind": "127.0.0.1:0", "max_connections": {over}}}"#
+        ));
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(
+            err.contains("'max_connections'") && err.contains("permit counter can hold"),
+            "got: {err}"
+        );
+        let kind = listener_from_json(&format!(
+            r#"{{"type": "logit_in", "bind": "127.0.0.1:0", "max_connections": {}}}"#,
+            tokio::sync::Semaphore::MAX_PERMITS
+        ));
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+            .expect("the ceiling itself should resolve");
     }
 
     /// Rule 74: a non-default `max_connections` on a UDP `statsd_in` could never take effect.

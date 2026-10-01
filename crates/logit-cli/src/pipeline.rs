@@ -207,13 +207,6 @@ fn jemalloc_allocated() -> Option<u64> {
 type PrepareResult =
     (graph::Graph, HashMap<String, NodeSpec>, HashMap<String, Telemetry>, Option<InternalInfo>);
 
-/// Resolves a config into a `Graph`, a built `NodeSpec` and a [`Telemetry`] handle per component,
-/// and the config's [`InternalInfo`].
-///
-/// Every handle is [`Telemetry::default`] (a no-op) unless `config` has an `internal` component.
-/// Then one process-wide [`Registry`] is built, and each component's handle serves both its own
-/// instrumentation (`build_spec`, layer 3) and the node runtime's (layer 2), so both drain from
-/// one buffer. See `docs/design/internal-telemetry.md`.
 /// The summed `max_connections` of every listener in `graph` that has connections: what it can
 /// hold open at once, one file descriptor each. A datagram `syslog_in`/`graphite_in`/`statsd_in`
 /// and a scrape-mode `prometheus_in` hold none, so they contribute nothing.
@@ -259,6 +252,13 @@ fn fd_limit_warning(budget: usize, soft_limit: Option<u64>) -> Option<String> {
     })
 }
 
+/// Resolves a config into a `Graph`, a built `NodeSpec` and a [`Telemetry`] handle per component,
+/// and the config's [`InternalInfo`].
+///
+/// Every handle is [`Telemetry::default`] (a no-op) unless `config` has an `internal` component.
+/// Then one process-wide [`Registry`] is built, and each component's handle serves both its own
+/// instrumentation (`build_spec`, layer 3) and the node runtime's (layer 2), so both drain from
+/// one buffer. See `docs/design/internal-telemetry.md`.
 fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<PrepareResult> {
     let graph = graph::resolve(config)?;
 
@@ -3222,11 +3222,13 @@ mod tests {
             let _consumer = rx;
             input.run(sink).await
         });
-        // One byte, so a listener with a first-byte deadline keeps the connection. The accept loop
-        // takes permits one accept at a time in the kernel queue's order, so this holds the one
-        // permit before any later connection is accepted.
+        // One byte, so a listener with a first-byte deadline keeps the connection: `P` is an HTTP
+        // token character and the h2 preface's first byte, so hyper keeps reading rather than
+        // answering `400` and returning the permit; syslog and `logit_in` wait for more bytes
+        // either way. The accept loop takes permits one accept at a time in the kernel queue's
+        // order, so this holds the one permit before any later connection is accepted.
         let mut first = tokio::net::TcpStream::connect(addr).await.unwrap();
-        tokio::io::AsyncWriteExt::write_all(&mut first, b"<").await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut first, b"P").await.unwrap();
         (registry, first)
     }
 
