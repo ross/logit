@@ -84,8 +84,8 @@
 //! write completes first and the ack wait meets it, and `Clean` when the write or flush fails.
 //!
 //! **Telemetry** (`docs/design/internal-telemetry.md`'s `logit_out` section):
-//! `logit.output.requests{class}` counts every `submit` failure and every `await_ack` result,
-//! once, as `ok` or the failure's `Fault` (`clean`/`ambiguous`/`permanent`), so a `send` counts
+//! `logit.output.requests{class}` counts every `submit` failure that carries a `Fault` and
+//! every `await_ack` result, once, as `ok` or the failure's `Fault` (`clean`/`ambiguous`/`permanent`), so a `send` counts
 //! once; a cancelled call isn't counted. `logit.output.reconnects` counts every validated
 //! handshake after the first, probe-driven ones included. `logit.output.ack.duration` times each
 //! ack wait alone. The gauges `logit.output.in_flight` and `logit.output.window` hold the frames
@@ -680,8 +680,9 @@ impl Output for LogitOutput {
         self.stream.as_ref().map_or(1, |conn| conn.window)
     }
 
-    /// Counts a failure in `logit.output.requests`; the `await_ack` after a success counts the
-    /// outcome.
+    /// Counts a failure that carries a [`Fault`] in `logit.output.requests`. A failure with
+    /// frames in flight carries none and isn't counted: the `await_ack`s after it count the
+    /// round's outcome, as the `await_ack` after a success does.
     async fn submit(
         &mut self,
         batch: &EventBatch,
@@ -690,7 +691,7 @@ impl Output for LogitOutput {
         in_flight: usize,
     ) -> anyhow::Result<()> {
         let result = self.submit_frame(batch, ctx, seq, in_flight).await;
-        if result.is_err() {
+        if result.as_ref().is_err_and(|err| err.downcast_ref::<Fault>().is_some()) {
             count_request(&self.telemetry, &result);
         }
         result
@@ -2667,7 +2668,11 @@ mod tests {
         output.await_ack().await.expect("the second Ack");
         assert!(output.stream.is_none(), "a broken connection is dropped once nothing is owed");
         let totals = probe.poll();
-        assert_eq!(requests(totals), ([2.0, 0.0, 0.0, 2.0], 4.0), "two unclassified submits");
+        assert_eq!(
+            requests(totals),
+            ([2.0, 0.0, 0.0, 0.0], 2.0),
+            "an unclassified submit counts none"
+        );
         peer.abort();
     }
 
@@ -2720,7 +2725,11 @@ mod tests {
         let err = output.await_ack().await.unwrap_err();
         assert_eq!(classify(&err), Fault::Ambiguous, "the parked frame alone times out: {err:#}");
         assert!(output.stream.is_none());
-        assert_eq!(requests(probe.poll()), ([2.0, 0.0, 1.0, 1.0], 4.0));
+        assert_eq!(
+            requests(probe.poll()),
+            ([2.0, 0.0, 1.0, 0.0], 3.0),
+            "the stalled submit counts nothing; the drained acks count ok, the parked frame ambiguous"
+        );
     }
 
     /// A `submit` whose `in_flight` isn't the connection's count fails `Ambiguous` and drops the
