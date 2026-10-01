@@ -83,10 +83,10 @@
 //!   that obfuscates on its own keeps doing so.
 //! - `config`: the recorded Agent's `target_tps` 10, `max_eps` 200, `max_request_bytes` 25 MiB,
 //!   and `statsd_port` 8125, with every obfuscation switch off because nothing here obfuscates.
-//!   The rest are `logit`'s own, not the Agent's: `connection_limit` 1024 is this listener's
-//!   connection cap and `receiver_timeout` 5 matches its 5 s handshake timeout (the recorded Agent
-//!   reports 0 for both), and `receiver_port` (0 without `bind`) and `receiver_socket` (empty
-//!   without `socket`) are where it listens. Every
+//!   The rest are `logit`'s own, not the Agent's: `connection_limit` is this listener's
+//!   connection cap (`max_connections:`, 1024 by default) and `receiver_timeout` 5 matches its
+//!   5 s handshake timeout (the recorded Agent reports 0 for both), and `receiver_port` (0
+//!   without `bind`) and `receiver_socket` (empty without `socket`) are where it listens. Every
 //!   field has the JSON type a real Agent's `/info` gives it (`redis`, `valkey`, and `memcached`
 //!   are objects, not switches): libdatadog rejects the whole document over one mistyped field,
 //!   then runs as if no Agent answered. A test holds this document to the recorded
@@ -214,12 +214,6 @@ use tokio_rustls::TlsAcceptor;
 /// `max_request_bytes` default. A denial-of-service bound, not a tuning knob, as on `datadog_in`.
 const MAX_REQUEST_BYTES: usize = 25 * 1024 * 1024;
 
-/// Bounds the connections [`Input::run`] serves at once, across the TCP listener and the Unix
-/// socket together: the same 1024 as `datadog_in`, and the `connection_limit` `/info` reports.
-/// With 25 MiB requests this listener's worst case is about 9.8 TiB, a bound rather than a memory
-/// budget ([`crate::http::MAX_CONCURRENT_STREAMS`] has the formula).
-const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
-
 /// Default for [`DatadogTraceInput::with_handshake_timeout`]: the same 5s as every other TCP
 /// listener. Also the grace an idle close gives hyper.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -260,6 +254,12 @@ pub struct DatadogTraceInput {
     handshake_timeout: Duration,
     /// `None`, the default, means no idle timeout.
     idle_timeout: Option<Duration>,
+    /// Bounds the connections [`Input::run`] serves at once, across the TCP listener and the Unix
+    /// socket together, and the `connection_limit` `/info` reports;
+    /// [`crate::DEFAULT_MAX_CONNECTIONS`] unless [`Self::with_max_connections`] sets it. With
+    /// 25 MiB requests this listener's worst case at the default cap (`max_connections:`, 1024) is
+    /// about 9.8 TiB, a bound rather than a memory budget ([`crate::http::MAX_CONCURRENT_STREAMS`]
+    /// has the formula).
     max_connections: usize,
     busy_after: Duration,
 }
@@ -284,7 +284,7 @@ impl DatadogTraceInput {
             unix_listener: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             idle_timeout: None,
-            max_connections: MAX_CONCURRENT_CONNECTIONS,
+            max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             busy_after: BUSY_AFTER,
         }
     }
@@ -348,9 +348,9 @@ impl DatadogTraceInput {
         self
     }
 
-    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`].
-    #[cfg(test)]
-    fn with_max_connections(mut self, max_connections: usize) -> Self {
+    /// Overrides [`crate::DEFAULT_MAX_CONNECTIONS`]; `max_connections:` in config. Graph rule 74
+    /// rejects `0` before it gets here.
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
         self
     }
@@ -404,7 +404,7 @@ impl Input for DatadogTraceInput {
             handshake_timeout: self.handshake_timeout,
             idle_timeout: self.idle_timeout,
             busy_after: self.busy_after,
-            info: Bytes::from(info_document(receiver_port, &receiver_socket)),
+            info: Bytes::from(info_document(receiver_port, &receiver_socket, self.max_connections)),
         });
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
         let socket_path: Option<Arc<Path>> = self.socket.as_deref().map(Arc::from);
@@ -1154,9 +1154,9 @@ fn reject(
     error_response(status, message)
 }
 
-/// The `/info` document (this module's "`/info`"), with the two values that depend on the
+/// The `/info` document (this module's "`/info`"), with the three values that depend on the
 /// listener filled in.
-fn info_document(receiver_port: u16, receiver_socket: &str) -> String {
+fn info_document(receiver_port: u16, receiver_socket: &str, max_connections: usize) -> String {
     let version = serde_json::to_string(&format!("logit/{}", env!("CARGO_PKG_VERSION")))
         .expect("a string always serializes");
     let receiver_socket =
@@ -1169,7 +1169,8 @@ fn info_document(receiver_port: u16, receiver_socket: &str) -> String {
             r#""span_events":true,"evp_proxy_allowed_headers":[],"#,
             r#""config":{{"default_env":"none","target_tps":10,"max_eps":200,"#,
             r#""receiver_port":{receiver_port},"receiver_socket":{receiver_socket},"#,
-            r#""connection_limit":1024,"receiver_timeout":5,"max_request_bytes":26214400,"#,
+            r#""connection_limit":{max_connections},"receiver_timeout":5,"#,
+            r#""max_request_bytes":26214400,"#,
             r#""statsd_port":8125,"max_memory":0,"max_cpu":0,"analyzed_spans_by_service":{{}},"#,
             r#""obfuscation":{{"elastic_search":false,"mongo":false,"sql_exec_plan":false,"#,
             r#""sql_exec_plan_normalize":false,"sql_obfuscation_mode":"","#,
@@ -1184,6 +1185,7 @@ fn info_document(receiver_port: u16, receiver_socket: &str) -> String {
         version = version,
         receiver_port = receiver_port,
         receiver_socket = receiver_socket,
+        max_connections = max_connections,
     )
 }
 
@@ -1413,6 +1415,7 @@ mod tests {
         assert_eq!(info["span_events"], true);
         assert_eq!(info["config"]["receiver_port"], port);
         assert_eq!(info["config"]["receiver_socket"], "");
+        assert_eq!(info["config"]["connection_limit"], crate::DEFAULT_MAX_CONNECTIONS);
         assert_eq!(info["config"]["max_request_bytes"], MAX_REQUEST_BYTES);
         assert_eq!(info["config"]["obfuscation"]["redis"]["enabled"], false);
         assert_eq!(info["obfuscation_version"], 0);
@@ -1489,7 +1492,8 @@ mod tests {
     /// field this listener serves has the type a real Agent 7.83 gives it.
     #[test]
     fn the_info_document_has_the_recorded_agent_s_field_types() {
-        let ours: serde_json::Value = serde_json::from_str(&info_document(8126, "")).unwrap();
+        let ours: serde_json::Value =
+            serde_json::from_str(&info_document(8126, "", crate::DEFAULT_MAX_CONNECTIONS)).unwrap();
         let agent = recorded_json("testdata/interop/datadog/agent-info.json");
         assert_same_shape(&ours, &agent, "info");
     }
@@ -1498,7 +1502,8 @@ mod tests {
     /// this listener; it must stay this listener's document.
     #[test]
     fn the_recording_s_info_reply_is_this_listener_s_document() {
-        let ours: serde_json::Value = serde_json::from_str(&info_document(8126, "")).unwrap();
+        let ours: serde_json::Value =
+            serde_json::from_str(&info_document(8126, "", crate::DEFAULT_MAX_CONNECTIONS)).unwrap();
         assert_eq!(recorded_json("tools/record-fixtures/datadog-trace-info.json"), ours);
     }
 
@@ -1561,10 +1566,24 @@ mod tests {
         assert_eq!(attr(RESOURCE_ATTR_TRACER_CONTAINER_ID), Some("abc"));
     }
 
+    /// `connection_limit` reports the configured cap, not the default.
+    #[tokio::test]
+    async fn info_reports_the_configured_connection_cap() {
+        let input = DatadogTraceInput::new().with_bind("127.0.0.1:0").with_max_connections(7);
+        let (addr, _rx) = start(input, 16).await;
+        let response = request_raw(&addr, "GET", "/info", "", b"").await;
+        let info: serde_json::Value = serde_json::from_str(body_of(&response)).unwrap();
+        assert_eq!(info["config"]["connection_limit"], 7);
+    }
+
     #[test]
     fn the_info_document_escapes_the_socket_path() {
-        let info: serde_json::Value =
-            serde_json::from_str(&info_document(0, r#"/tmp/a "b".sock"#)).unwrap();
+        let info: serde_json::Value = serde_json::from_str(&info_document(
+            0,
+            r#"/tmp/a "b".sock"#,
+            crate::DEFAULT_MAX_CONNECTIONS,
+        ))
+        .unwrap();
         assert_eq!(info["config"]["receiver_socket"], r#"/tmp/a "b".sock"#);
         assert_eq!(info["config"]["receiver_port"], 0);
     }

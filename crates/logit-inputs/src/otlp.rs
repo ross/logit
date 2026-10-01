@@ -34,13 +34,14 @@
 //!
 //! **TLS is optional, per listener.** `tls:` in config ([`TlsServerSettings`]) turns it on for
 //! both transports; without it the listener accepts plaintext. The handshake runs inside the
-//! per-connection task, after that connection's [`MAX_CONCURRENT_CONNECTIONS`] permit is
-//! acquired, so a slow or hostile handshake stalls only its own connection, counts against the
-//! same bound as a slow request, and never blocks the accept loop
+//! per-connection task, after that connection's connection-cap permit is acquired, so a slow or
+//! hostile handshake stalls only its own connection, counts against the same bound as a slow
+//! request, and never blocks the accept loop
 //! (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
 //!
 //! **Connection limit: reject, don't queue.** A [`tokio::sync::Semaphore`] capped at
-//! [`MAX_CONCURRENT_CONNECTIONS`], acquired with `try_acquire_owned`: at capacity the accepted
+//! [`OtlpInput::max_connections`] (`max_connections:`, 1024 by default), acquired with
+//! `try_acquire_owned`: at capacity the accepted
 //! stream is dropped and counted `logit.input.connections.rejected{reason="limit"}` rather than
 //! parked behind a permit that may never come. A blocking `acquire_owned().await` would stall the
 //! accept loop itself, and enough silent connections would stop this listener draining its
@@ -145,8 +146,8 @@
 //! default `max_recv_msg_size`; a larger request is rejected (`413`/`grpc-status: 8`,
 //! `RESOURCE_EXHAUSTED`) before it can grow an unbounded buffer. That bounds one request;
 //! [`crate::http::MAX_CONCURRENT_STREAMS`] bounds the requests on one HTTP/2 connection and
-//! [`MAX_CONCURRENT_CONNECTIONS`] how many connections are served at once, so the listener's
-//! worst-case memory is finite ([`MAX_CONCURRENT_CONNECTIONS`] has the figure).
+//! the cap (`max_connections:`, 1024 by default) how many connections are served at once, so the
+//! listener's worst-case memory is finite ([`OtlpInput::max_connections`] has the figure).
 //!
 //! **`partial_success` is always empty on a successful decode.** It exists to report which
 //! records in an accepted request were rejected, but `logit_proto::SignalDecoder::decode_signal`
@@ -191,25 +192,8 @@ use tokio_rustls::TlsAcceptor;
 /// Matches the OTel collector's default `max_recv_msg_size`.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
-/// Bounds the connections [`Input::run`] serves at once. With 4 MiB requests this listener's worst
-/// case is 1.6 TiB, a bound rather than a memory budget ([`crate::http::MAX_CONCURRENT_STREAMS`]
-/// has the formula). The same 1024 as `logit_in` and `crate::tcp`'s listeners: no protocol reason
-/// for an OTLP listener to differ, and one figure for an operator to learn. Not operator-tunable;
-/// make it a config field if a deployment needs a different number.
-///
-/// **A connection past the cap is rejected, not queued** (this module's "Connection limit").
-/// `OtlpInput::with_max_connections` lowers it in tests.
-///
-/// **That figure is the protobuf path's worst case, not JSON's.** An OTLP/JSON request is parsed
-/// into a `serde_json::Value` tree first, one `Map`/`Vec`/`String`/`Number` allocation per node,
-/// several times the source bytes for a nested OTLP payload, where `prost::Message::decode` builds
-/// the target structs directly. The bound still holds (a JSON body is capped at
-/// `MAX_REQUEST_BYTES` before parsing), so the all-JSON worst case is a finite multiple of it;
-/// `docs/known-gaps.md`'s OTLP section has the measured multiple.
-const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
-
 /// Default for [`OtlpInput::handshake_timeout`]: how long a connection has, per pre-request phase,
-/// before this listener releases its [`MAX_CONCURRENT_CONNECTIONS`] permit. The same 5s as
+/// before this listener releases its connection-cap permit. The same 5s as
 /// `logit_in` and `crate::tcp`, mirrored by hand in `logit_config::default_handshake_timeout`.
 /// Also the grace an idle close gives hyper (this module's "Idle timeout").
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -239,8 +223,20 @@ pub struct OtlpInput {
     handshake_timeout: std::time::Duration,
     /// `None`, the default, means no idle timeout. See [`Self::with_idle_timeout`].
     idle_timeout: Option<std::time::Duration>,
-    /// [`MAX_CONCURRENT_CONNECTIONS`] unless [`OtlpInput::with_max_connections`] (test-only)
-    /// lowers it.
+    /// Bounds the connections [`Input::run`] serves at once; [`crate::DEFAULT_MAX_CONNECTIONS`]
+    /// unless [`OtlpInput::with_max_connections`] sets it. With 4 MiB requests this listener's
+    /// worst case at the default cap (`max_connections:`, 1024) is 1.6 TiB, a bound rather than a
+    /// memory budget ([`crate::http::MAX_CONCURRENT_STREAMS`] has the formula), and it scales
+    /// linearly with the cap.
+    ///
+    /// **A connection past the cap is rejected, not queued** (this module's "Connection limit").
+    ///
+    /// **That figure is the protobuf path's worst case, not JSON's.** An OTLP/JSON request is
+    /// parsed into a `serde_json::Value` tree first, one `Map`/`Vec`/`String`/`Number` allocation
+    /// per node, several times the source bytes for a nested OTLP payload, where
+    /// `prost::Message::decode` builds the target structs directly. The bound still holds (a JSON
+    /// body is capped at `MAX_REQUEST_BYTES` before parsing), so the all-JSON worst case is a
+    /// finite multiple of it; `docs/known-gaps.md`'s OTLP section has the measured multiple.
     max_connections: usize,
 }
 
@@ -255,7 +251,7 @@ impl OtlpInput {
             listener: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             idle_timeout: None,
-            max_connections: MAX_CONCURRENT_CONNECTIONS,
+            max_connections: crate::DEFAULT_MAX_CONNECTIONS,
         }
     }
 
@@ -308,10 +304,9 @@ impl OtlpInput {
         self
     }
 
-    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`], so the cap is reachable with two
-    /// connections instead of 1025.
-    #[cfg(test)]
-    fn with_max_connections(mut self, max_connections: usize) -> Self {
+    /// Overrides [`crate::DEFAULT_MAX_CONNECTIONS`]; `max_connections:` in config. Graph rule 74
+    /// rejects `0` before it gets here.
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
         self
     }

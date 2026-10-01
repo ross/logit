@@ -41,9 +41,10 @@
 //! [`logit_pipeline::BatchAccumulator`], so `batch_max_events` bounds one connection's in-flight
 //! events, not the listener's: N concurrent connections can hold N times that.
 //!
-//! **Connection limit.** A [`tokio::sync::Semaphore`] with `try_acquire_owned`, capped at
-//! [`MAX_CONCURRENT_CONNECTIONS`], as in `logit_in` (`crates/logit-inputs/src/logit.rs`'s
-//! "Connection limit" section): reject, don't queue. **The one difference from `logit_in`:**
+//! **Connection limit.** A [`tokio::sync::Semaphore`] with `try_acquire_owned`, capped at the
+//! listener's `max_connections:` (1024 by default, [`crate::DEFAULT_MAX_CONNECTIONS`]), as in
+//! `logit_in` (`crates/logit-inputs/src/logit.rs`'s "Connection limit" section): reject, don't
+//! queue. **The one difference from `logit_in`:**
 //! there, a past-the-cap connection is wrapped in TLS first so it can be told why it is being
 //! closed (a `Reject` control frame). None of this driver's protocols has an in-band reject
 //! message, so there is nothing to spend a handshake saying: a past-the-cap connection is dropped
@@ -60,8 +61,9 @@
 //! these back to back (10s at the default) before a silent connection gives up its permit.
 //!
 //! **The first-byte bound applies on both arms, plaintext included.** No `tls:` block is the
-//! default shape, and without the bound 1024 connections that complete the TCP handshake and then
-//! send nothing would hold every permit forever, at a cost to the peer of 1024 SYNs and no bytes.
+//! default shape, and without the bound a cap's worth of connections that complete the TCP
+//! handshake and then send nothing would hold every permit forever, at a cost to the peer of one
+//! SYN each and no bytes.
 //! The bound covers only the *first* byte (until [`Framer::first_byte_seen`] is true), the phase
 //! with no legitimate reason to be slow. The opt-in idle timeout bounds the gaps after it.
 //!
@@ -112,10 +114,6 @@ use tokio_rustls::TlsAcceptor;
 
 /// `crate::tls::TlsServerSettings`, re-exported for symmetry with `crate::logit`/`crate::otlp`.
 pub use crate::tls::TlsServerSettings;
-
-/// See this module's "Connection limit" doc section. The same number `logit_in` and `otlp_in` use:
-/// one shared figure is one thing for an operator to learn.
-const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// How long a connection has, per pre-message phase, before this listener releases its
 /// connection-limit permit: the TLS accept when TLS is configured, and on both arms the wait for
@@ -947,6 +945,7 @@ pub struct TcpListener<D: Decoder + Clone + Send + 'static> {
     /// and `logit_in` also use, so `logit run` fails startup on a bind error before anything is
     /// spawned and a test can learn the real address.
     listener: Option<BoundListener>,
+    /// See this module's "Connection limit" doc section.
     max_connections: usize,
     handshake_timeout: Duration,
     /// `None` (the default) means no idle timeout. See this module's "Idle timeout" doc section.
@@ -999,7 +998,7 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
             max_frame_bytes: MAX_FRAME_BYTES,
             tls: None,
             listener: None,
-            max_connections: MAX_CONCURRENT_CONNECTIONS,
+            max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             idle_timeout: None,
         }
@@ -1106,9 +1105,9 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
         self.max_frame_bytes = max_frame_bytes;
     }
 
-    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`], so the cap is reachable with two
-    /// connections rather than 1025. `pub(crate)` so a wrapper's test module can use it too.
-    #[cfg(test)]
+    /// Overrides [`crate::DEFAULT_MAX_CONNECTIONS`]: the `max_connections:` field of
+    /// `syslog_in`/`graphite_in`/`statsd_in`, through each wrapper's `with_max_connections`. Graph
+    /// rule 74 rejects `0` before it gets here.
     pub(crate) fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
         self
