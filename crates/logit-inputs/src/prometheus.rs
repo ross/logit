@@ -249,14 +249,15 @@
 //! [`logit_proto::prometheus::compression::decompress_bounded`]: Snappy's own `decompress_len`
 //! before a byte is expanded, and for zstd the declared content size, the window size, and a
 //! streaming decode that stops one byte past the cap. So a compression bomb is rejected rather
-//! than inflated. [`MAX_CONCURRENT_CONNECTIONS`] bounds how many connections are served at once; past
-//! it a connection is rejected, not queued (`logit.input.connections.rejected{reason="limit"}`).
-//! An HTTP/2 connection carries up to [`crate::http::MAX_CONCURRENT_STREAMS`] requests at once;
-//! [`MAX_CONCURRENT_CONNECTIONS`] states the listener's worst case.
-//! [`HANDSHAKE_TIMEOUT`] bounds each connection's pre-request phase: its TLS accept on a TLS
-//! listener, its first byte on a plaintext one. None of the three is a config field: the first
-//! two are denial-of-service bounds rather than tuning knobs, and graph rule 45's
-//! `handshake_timeout:` does not cover this kind.
+//! than inflated. The connection cap (`max_connections:`, 1024 by default) bounds how many
+//! connections are served at once; past it a connection is rejected, not queued
+//! (`logit.input.connections.rejected{reason="limit"}`). An HTTP/2 connection carries up to
+//! [`crate::http::MAX_CONCURRENT_STREAMS`] requests at once; [`PrometheusReceiver`]'s
+//! `max_connections` field states the listener's worst case. [`HANDSHAKE_TIMEOUT`] bounds each
+//! connection's pre-request phase: its TLS accept on a TLS listener, its first byte on a plaintext
+//! one. Neither [`MAX_REQUEST_BYTES`] nor [`HANDSHAKE_TIMEOUT`] is a config field: the first is a
+//! denial-of-service bound rather than a tuning knob, and graph rule 45's `handshake_timeout:`
+//! does not cover this kind.
 //!
 //! `idle_timeout:` closes a connection that sits with no request in flight, via the shared
 //! tracker in [`crate::http`]; `otlp_in`'s module doc holds the reasoning (why the clock is at
@@ -264,7 +265,7 @@
 //! `graceful_shutdown` plus a bounded grace rather than a drop). A request whose *body* stalls gets
 //! the narrower per-frame bound instead and answers `408`, **derived from the same field, so it
 //! exists only where `idle_timeout:` is set.** It is off by default, so a default `bind:` has no
-//! bound on a half-uploaded request: it holds its [`MAX_CONCURRENT_CONNECTIONS`] permit until the
+//! bound on a half-uploaded request: it holds its connection-cap permit until the
 //! sender goes away. Set it on any listener a real fleet writes to
 //! ([ADR `idle-connection-timeout`](../../../docs/adr/idle-connection-timeout.md)'s "recommend it
 //! on wherever consistent traffic is expected"; `fixtures/prometheus-remote-write-receive.yaml`
@@ -773,15 +774,8 @@ impl Input for PrometheusInput {
 /// operator who hits this has a misconfigured sender.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
-/// Bounds the connections [`PrometheusReceiver`] serves at once. With 4 MiB requests this
-/// listener's worst case is 1.6 TiB, a bound rather than a memory budget
-/// ([`crate::http::MAX_CONCURRENT_STREAMS`] has the formula). The same 1024 as `otlp_in`,
-/// `logit_in` and `crate::tcp`'s listeners: no protocol reason to differ, and one figure for an
-/// operator to learn. A connection past the cap is **rejected, not queued**, as on those.
-const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
-
 /// How long a connection has, per pre-request phase, before this listener releases its
-/// [`MAX_CONCURRENT_CONNECTIONS`] permit: its TLS accept on a TLS listener, its first byte on a
+/// connection-cap permit: its TLS accept on a TLS listener, its first byte on a
 /// plaintext one. The same 5s every other TCP listener here defaults to.
 ///
 /// **Not an operator-facing field**, unlike `otlp_in`'s `handshake_timeout:`: `prometheus_in` has
@@ -1086,6 +1080,11 @@ pub struct PrometheusReceiver {
     /// connection, hence the `Arc`; see this module's "Metadata cache" section.
     metadata_cache: Option<Arc<MetadataCache>>,
     handshake_timeout: Duration,
+    /// Bounds the connections this receiver serves at once; [`crate::DEFAULT_MAX_CONNECTIONS`]
+    /// unless [`Self::with_max_connections`] sets it. With 4 MiB requests this listener's worst
+    /// case at the default cap (`max_connections:`, 1024) is 1.6 TiB, a bound rather than a memory
+    /// budget ([`crate::http::MAX_CONCURRENT_STREAMS`] has the formula). A connection past the cap
+    /// is **rejected, not queued**, as on every other stream listener.
     max_connections: usize,
     /// The empty `Resource` every batch this receiver builds carries, allocated once (this
     /// module's "Labels stay labels").
@@ -1106,7 +1105,7 @@ impl PrometheusReceiver {
             idle_timeout: None,
             metadata_cache: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
-            max_connections: MAX_CONCURRENT_CONNECTIONS,
+            max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             resource: Arc::new(Resource::default()),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
@@ -1158,10 +1157,9 @@ impl PrometheusReceiver {
         self
     }
 
-    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`], so the cap is reachable with two
-    /// connections instead of 1025.
-    #[cfg(test)]
-    fn with_max_connections(mut self, max_connections: usize) -> Self {
+    /// Overrides [`crate::DEFAULT_MAX_CONNECTIONS`]; `max_connections:` in config. Graph rule 74
+    /// rejects `0` before it gets here.
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
         self
     }
@@ -3382,6 +3380,30 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 204"), "permit came back, got: {response}");
         test_util::recv_batch(&mut rx).await;
         drop(keep_alive);
+    }
+
+    /// Past the cap, an accepted connection is closed before any request is read and counted
+    /// `rejected{reason="limit"}`, as on every other HTTP listener.
+    #[tokio::test]
+    async fn a_connection_past_the_cap_is_dropped_and_counted() {
+        use tokio::io::AsyncWriteExt;
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("receive", "prometheus_in", "listener");
+        let receiver = receiver.with_telemetry(telemetry).with_max_connections(1);
+        let _rx = spawn_receiver(receiver, 4);
+
+        // The first connection holds the one permit. One byte, so it clears the first-byte peek
+        // rather than being closed by the deadline. The accept loop is a single sequential
+        // `accept`, so the kernel's FIFO accept queue admits `first` before `second`.
+        let mut first = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        first.write_all(b"P").await.unwrap();
+
+        let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        expect_closed(&mut second, "a past-the-cap connection").await;
+
+        assert_eq!(probe.sum("logit.input.connections.rejected", &[("reason", "limit")]), 1.0);
+        drop(first);
     }
 
     /// A connection that connects and says nothing is closed by the plaintext first-byte bound.

@@ -27,18 +27,18 @@
 //! **Deduplication.** A v2 frame's trailer can carry its sender's identity and sequence
 //! (`docs/adr/native-hop-identity-and-sequence.md`). Each component keeps one table of
 //! high-water marks, one per identity, shared by its connections and bounded at
-//! `max_connections + max_connections / 4` identities (1280 at the default cap); a new identity
-//! at a full table evicts the least recently seen one. A frame at or below its identity's mark
-//! is a resend: acked and not forwarded. Any other sequenced frame is forwarded, and a consumer
-//! taking it raises the mark to its sequence; gaps above the mark are ignored. An unsequenced
-//! frame (a v1 frame, or a v2 frame without a complete, well-formed pair) is always forwarded.
-//! No lock spans a forward, so a frame an ended connection still holds can be forwarded beside
-//! the sender's resend of it on a new connection (`docs/known-gaps.md`, "A resend can race the
-//! frames an ended connection still holds").
-//! The identity is advisory, never trusted: a peer minting a new identity per frame costs one
-//! scan of the full table each and can evict honest senders, whose resends are then forwarded,
-//! a duplicate and never a loss. Counted as `logit.input.batches.resends`, `logit.input.senders`
-//! (a gauge), and `logit.input.senders.evicted`.
+//! `max_connections + max_connections / 4` identities (`max_connections:` in config; 1280 at the
+//! default cap of 1024); a new identity at a full table evicts the least recently seen one. A
+//! frame at or below its identity's mark is a resend: acked and not forwarded. Any other
+//! sequenced frame is forwarded, and a consumer taking it raises the mark to its sequence; gaps
+//! above the mark are ignored. An unsequenced frame (a v1 frame, or a v2 frame without a
+//! complete, well-formed pair) is always forwarded. No lock spans a forward, so a frame an ended
+//! connection still holds can be forwarded beside the sender's resend of it on a new connection
+//! (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds"). The
+//! identity is advisory, never trusted: a peer minting a new identity per frame costs one scan of
+//! the full table each and can evict honest senders, whose resends are then forwarded, a
+//! duplicate and never a loss. Counted as `logit.input.batches.resends`, `logit.input.senders` (a
+//! gauge), and `logit.input.senders.evicted`.
 //!
 //! **Shutdown.** Every connection task holds its own [`Fanout`] clone, and the cancel-by-drop
 //! shutdown (`docs/adr/service-lifecycle-and-output-retry.md`) needs nothing to outlive the
@@ -80,10 +80,11 @@
 //! and closing over them sends a reset that discards the `GOING_AWAY` or `Ack`s already written.
 //! The permit is held through the linger.
 //!
-//! **Connection limit.** A non-blocking `try_acquire_owned` against the same 1024-connection cap
-//! `otlp_in` ([`crate::otlp::MAX_CONCURRENT_CONNECTIONS`]) and `syslog_in`'s driver use: past the
-//! cap, a client gets a clean `Reject{INTERNAL}` and the connection closes, rather than hanging
-//! with a handshake that never starts. `logit`-to-`logit` peers retry on their own. **With TLS on,
+//! **Connection limit.** A non-blocking `try_acquire_owned` against the connection cap
+//! (`max_connections:`, 1024 by default, the [`crate::DEFAULT_MAX_CONNECTIONS`] `otlp_in` and
+//! `syslog_in`'s driver share): past the cap, a client gets a clean `Reject{INTERNAL}` and the
+//! connection closes, rather than hanging with a handshake that never starts. `logit`-to-`logit`
+//! peers retry on their own. **With TLS on,
 //! the reject goes out after the TLS wrap, not onto the raw `TcpStream`**: a TLS `logit_out` past
 //! the cap is waiting for a ServerHello, not framed bytes. So [`reject_or_serve`] runs after the
 //! TLS accept for every connection. The cost is one TLS handshake per rejected connection,
@@ -97,7 +98,8 @@
 //! read in [`handshake`], which starts a fresh timeout rather than sharing a deadline. The worst
 //! case on the TLS path is two of them back to back (10s at the default) before a silent
 //! connection gives up its permit. Without the TLS-accept bound, a client that connects and sends
-//! nothing pins a permit forever, and 1024 of them turn every later peer into a `Reject`.
+//! nothing pins a permit forever, and a cap's worth of them turn every later peer into a
+//! `Reject`.
 //!
 //! **Idle timeout.** [`LogitInput::with_idle_timeout`] (`idle_timeout:`, off unless set) bounds
 //! how long a handshaken connection may stay quiet before this listener closes it and returns its
@@ -153,9 +155,6 @@ use senders::SenderTable;
 /// this crate).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Rejected outright past this, never queued (module doc's "Connection limit").
-const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
-
 /// The largest window `HelloAck` answers (module doc's "Send window"). A peer can leave this
 /// many `Ack`s unread in this side's send buffer, about 47 KB under TLS, under the default
 /// `tcp_rmem`.
@@ -170,6 +169,9 @@ pub struct LogitInput {
     telemetry: Telemetry,
     tls: Option<Arc<rustls::ServerConfig>>,
     max_frame_bytes: u32,
+    /// Rejected outright past this, never queued (module doc's "Connection limit"); also sizes the
+    /// sender table (module doc's "Deduplication"). The worst case it bounds is `max_frame_bytes`
+    /// per connection, 64 MiB × the cap at the defaults.
     max_connections: usize,
     /// Set by [`Input::bind`], taken by [`Input::run_until_shutdown`]; `None` again after a run,
     /// so a second run rebinds (module doc's "Binding").
@@ -188,7 +190,7 @@ impl LogitInput {
             telemetry: Telemetry::default(),
             tls: None,
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
-            max_connections: MAX_CONCURRENT_CONNECTIONS,
+            max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             listener: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             idle_timeout: None,
@@ -229,10 +231,9 @@ impl LogitInput {
         self
     }
 
-    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`], so a test reaches the cap without
-    /// 1025 real connections.
-    #[cfg(test)]
-    fn with_max_connections(mut self, max_connections: usize) -> Self {
+    /// Overrides [`crate::DEFAULT_MAX_CONNECTIONS`]; `max_connections:` in config. Graph rule 74
+    /// rejects `0` before it gets here.
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
         self
     }
@@ -1345,7 +1346,7 @@ mod tests {
 
     /// A fresh table at the default cap, for tests that call [`serve_connection`] directly.
     fn senders() -> Arc<SenderTable> {
-        Arc::new(SenderTable::new(MAX_CONCURRENT_CONNECTIONS, Telemetry::default()))
+        Arc::new(SenderTable::new(crate::DEFAULT_MAX_CONNECTIONS, Telemetry::default()))
     }
 
     /// [`sample_batch`] with `mark` as its one event's timestamp, so a test reads which batch
@@ -3168,7 +3169,7 @@ mod tests {
     #[tokio::test]
     async fn a_resend_after_a_lost_ack_is_forwarded_once() {
         let mut probe = TelemetryProbe::new();
-        let (addr, mut rx) = spawn_counted(&probe, MAX_CONCURRENT_CONNECTIONS).await;
+        let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
 
         let mut first = v2_client(&addr).await;
         send_acked(&mut first, 1, Some(sid(7, 1))).await;
@@ -3187,7 +3188,7 @@ mod tests {
     #[tokio::test]
     async fn an_unsequenced_frame_is_forwarded_every_time() {
         let mut probe = TelemetryProbe::new();
-        let (addr, mut rx) = spawn_counted(&probe, MAX_CONCURRENT_CONNECTIONS).await;
+        let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
 
         // A v1 payload, then a hand-built trailer: its length (one byte, under 128) and fields.
         let with_trailer = |mark: i64, trailer: &[u8]| {
@@ -3235,7 +3236,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_identity_after_a_restart_is_not_a_resend() {
         let mut probe = TelemetryProbe::new();
-        let (addr, mut rx) = spawn_counted(&probe, MAX_CONCURRENT_CONNECTIONS).await;
+        let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
 
         let mut client = v2_client(&addr).await;
         for seq in 1..=3 {
@@ -3253,7 +3254,7 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_then_replayed_number_is_acknowledged_and_not_forwarded() {
         let mut probe = TelemetryProbe::new();
-        let (addr, mut rx) = spawn_counted(&probe, MAX_CONCURRENT_CONNECTIONS).await;
+        let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
 
         let mut client = v2_client(&addr).await;
         send_acked(&mut client, 2, Some(sid(1, 2))).await;
@@ -3291,8 +3292,8 @@ mod tests {
     async fn two_logit_in_components_do_not_share_a_table() {
         let mut probe_a = TelemetryProbe::new();
         let mut probe_b = TelemetryProbe::new();
-        let (addr_a, mut rx_a) = spawn_counted(&probe_a, MAX_CONCURRENT_CONNECTIONS).await;
-        let (addr_b, mut rx_b) = spawn_counted(&probe_b, MAX_CONCURRENT_CONNECTIONS).await;
+        let (addr_a, mut rx_a) = spawn_counted(&probe_a, crate::DEFAULT_MAX_CONNECTIONS).await;
+        let (addr_b, mut rx_b) = spawn_counted(&probe_b, crate::DEFAULT_MAX_CONNECTIONS).await;
 
         let mut client_a = v2_client(&addr_a).await;
         send_acked(&mut client_a, 1, Some(sid(1, 1))).await;

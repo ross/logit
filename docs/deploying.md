@@ -224,6 +224,11 @@ process, not a component.
 | `recovered` | info | A sink's first successful delivery after `degraded`. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
+Outside the lifecycle events, `logit run` can log one startup `warn` before `ready`: when the
+listeners' summed `max_connections` reaches the process's open-files limit (Linux only). See
+["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener) for its text and
+the fix.
+
 To ship `logit`'s own logs with no separate log-shipping setup, use the `internal` component's
 `logs:` setting (`warn` by default, `error`, or `off`). It routes every `warn`-or-above
 self-diagnostic into the pipeline as an ordinary log event, alongside `internal`'s points and spans;
@@ -647,8 +652,8 @@ backpressure), but its accept queue has the same shape of problem:
 ### `handshake_timeout` on a TCP listener
 
 A stream listener has no receive queue (its connection's flow control is the backpressure), but a
-connection can open and then say nothing while holding one of the listener's 1024
-concurrency-cap permits. `syslog_in`, `graphite_in`, and `statsd_in` (each with `transport: tcp`),
+connection can open and then say nothing while holding one of the listener's
+`max_connections` permits. `syslog_in`, `graphite_in`, and `statsd_in` (each with `transport: tcp`),
 `logit_in`, and `otlp_in` bound that with `handshake_timeout:`, **5s by default**, a humantime
 string like `connect_timeout`:
 
@@ -699,7 +704,8 @@ handshake, so a set value is rejected instead of silently ignored.
 
 **Enable `idle_timeout:` wherever you expect consistent traffic.** Without it, a connection that
 passes its handshake (or, on a plaintext listener, delivers at least one byte) and then goes quiet
-holds its connection-cap permit forever, and enough of them fill the 1024-connection cap.
+holds its connection-cap permit forever, and enough of them fill the listener's
+`max_connections` cap.
 `idle_timeout:` is the opt-in field that closes such a connection. It applies to the five kinds
 `handshake_timeout` covers (`syslog_in`, `graphite_in`, and `statsd_in` with `transport: tcp`;
 `logit_in`; and `otlp_in`) and to `prometheus_in` in remote-write receiver mode, which shares
@@ -781,6 +787,73 @@ probe itself (the peer closing *while* the sink writes): that remains `Fault::Am
 peer can't hold part of a frame), and a silent loss on the three plaintext sinks. The probe narrows the window; it doesn't
 close it.
 
+### `max_connections` on a stream listener
+
+Every stream listener serves at most `max_connections:` connections at once, **1024 by default**.
+A connection arriving past the cap is closed, never queued, and counted
+`logit.input.connections.rejected{reason="limit"}`. The field is on `syslog_in`, `graphite_in`,
+and `statsd_in` under a stream transport (`tcp`, and `unix_stream` on `statsd_in`), `logit_in`,
+`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in` in remote-write
+receiver mode. The cap exists to protect the sinks: each open connection holds a file descriptor,
+and a fleet of senders leaking connections would otherwise run the process out of descriptors,
+leaving the sinks unable to open sockets, which loses data. Rejecting inbound connections keeps
+the outbound side alive.
+
+```yaml
+components:
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:6514
+    transport: tcp
+    max_connections: 1024        # the default; 0 is rejected
+```
+
+**What a connection past the cap sees** depends on the listener:
+
+| Kind | Past the cap |
+|---|---|
+| `syslog_in`, `graphite_in`, `statsd_in` (stream transports, the shared driver) | closed as soon as it's accepted, before any TLS handshake or read; the plaintext wires have no way to say "try later" |
+| `otlp_in`, `datadog_in`, `splunk_hec_in`, `prometheus_in` (receiver) | closed as soon as it's accepted, before any TLS handshake or HTTP exchange; the client retries under its own policy |
+| `datadog_trace_in` | the same, with the TCP listener and the Unix socket counted against one cap; `/info` reports the cap as `connection_limit` |
+| `logit_in` | the TLS handshake completes (under `tls:`), then the peer is told `Reject{INTERNAL}`; a `logit_out` treats that as retryable and reconnects once there's room (see [Forwarding between `logit` nodes](#forwarding-between-logit-nodes)) |
+
+On `logit_in`, the cap also sizes the resend table: `max_connections + max_connections / 4`
+sender identities, tens of bytes each, with no separate setting.
+
+**Budget file descriptors across the whole process.** The caps are per listener, but every
+connection, sink socket, tailed file, and disk spool draws from one open-files limit. If the
+listeners' caps add up to more than that limit, the process runs out of descriptors before any
+cap is reached: `accept()` fails, counted `logit.input.accept.errors{reason="resource"}`, and a
+sink can fail to connect. A single listener at the default already reaches a soft limit of 1024,
+the stock limit for a systemd service. At `logit run` (not `logit validate`, because the limit belongs to the process rather than
+the config), `logit` sums `max_connections` over every stream listener in the graph and, if the
+total is at or above the soft limit, logs a warning like this one, once:
+
+```text
+listeners' max_connections total 2048 is at or above the process's open-files limit 1024: the caps can't bind before file descriptors run out; raise the limit (ulimit -n, LimitNOFILE) or lower the caps
+```
+
+Raise the limit (`ulimit -n`, systemd's `LimitNOFILE=`, or `docker run --ulimit nofile=`), or
+lower the caps on listeners that don't need them. The check reads `/proc/self/limits`, so it runs
+on Linux only. It's an ordinary `warn`-level self-log, so `internal`'s default `logs: warn`
+carries it into the pipeline too.
+
+**Choosing a value.** The default suits most deployments. Lowering it rejects producers that work
+today: a thousand hosts forwarding syslog over TCP, or a thousand OTLP agents each holding one
+gRPC connection. Raising it costs little memory (an idle connection holds tens of KB; the
+per-listener worst-case products elsewhere in this document are bounds, not budgets), but it
+weakens the only protection a box with a low open-files limit has. For comparison, rsyslog's
+`imtcp` defaults `MaxSessions` to 200, the Datadog trace-agent's `connection_limit` is 2000, and
+HAProxy's `maxconn` is 2000; the OpenTelemetry Collector, Vector, Fluent Bit, and carbon set no
+cap. A nonzero `logit.input.connections.rejected{reason="limit"}` means a cap is binding: raise it
+if the senders are legitimate, or find the sender that's leaking connections.
+
+**Validation:** `max_connections` must be greater than `0` (rule 74), since `0` would reject every
+connection. On `syslog_in`, `graphite_in`, or `statsd_in` with `transport: udp`, or `statsd_in`
+with `transport: unix`, leave it at its default: a datagram listener has no connections, so any
+other value is rejected instead of silently ignored. On `prometheus_in` it belongs to the
+remote-write receiver, and rule 55 rejects a non-default value alongside `scrape_targets:`.
+
 ### `collectd_in`: multicast groups and `types_db`
 
 `collectd_in` ([ADR `collectd-binary-relay`](adr/collectd-binary-relay.md)) is an ordinary UDP
@@ -830,8 +903,10 @@ reference); [`fixtures/statsd-to-graphite.yaml`](../fixtures/statsd-to-graphite.
 cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out`.
 
 - **`transport:` picks the driver.** `tcp` is the default, matching carbon's own default listener
-  (plaintext on port 2003). A TCP listener serves up to 1024 connections at once; one arriving past
-  that cap is closed immediately and counted
+  (plaintext on port 2003). A TCP listener serves up to `max_connections` connections at once
+  (1024 by default; see ["`max_connections` on a stream
+  listener"](#max_connections-on-a-stream-listener)); one arriving past that cap is closed
+  immediately and counted
   (`logit.input.connections.rejected{reason="limit"}`), because carbon's wire has no way to say
   "try later", and a sender holding an accepted-but-unread connection would look healthy while
   delivering nothing. `udp` runs the same shared datagram listener as `statsd_in`/`collectd_in`/
@@ -939,7 +1014,7 @@ components:
 - **What to watch.** Under `transport: udp`: the `logit.input.datagrams`/`.datagram.bytes` pair and
   the receive-queue gauges above. Under `transport: tcp`: `logit.input.connections` (a gauge that
   should match the number of connected senders),
-  `logit.input.connections.rejected{reason="limit"}` (nonzero means the 1024-connection cap is
+  `logit.input.connections.rejected{reason="limit"}` (nonzero means the `max_connections` cap is
   binding), `logit.input.frames`/`.frame.bytes` (one frame is one statsd line), and
   `logit.input.frames.dropped{reason="oversize"|"truncated"}`. On either transport, a malformed
   *line* is the decoder's `logit.component.diagnostics{key="bad_line"}`, not a framing error.
@@ -1656,8 +1731,9 @@ timeout, and then the same retry.
 **What to watch.** `logit.input.requests{route, class}` shows which routes are arriving and how
 they're answered, and `logit.input.requests.rejected{reason}` says why a `4xx` happened: a nonzero
 `unknown_route` means an Agent is using a route this listener doesn't speak, and `auth` a key
-mismatch. `docs/design/internal-telemetry.md`'s `datadog_in` section has every counter, and its
-`datadog` codec section the per-item drops inside a request that decoded.
+mismatch. A nonzero `logit.input.connections.rejected{reason="limit"}` means the
+`max_connections` cap is binding. `docs/design/internal-telemetry.md`'s `datadog_in` section has
+every counter, and its `datadog` codec section the per-item drops inside a request that decoded.
 
 ## `datadog_trace_in`: standing in for the Agent's APM API
 
@@ -1733,7 +1809,9 @@ draining.
 **What to watch.** `logit.input.spans` counts spans delivered, `logit.input.requests{route, class}`
 which routes arrive, `logit.input.batches.dropped{reason="busy"}` loss, and
 `logit.input.requests.rejected{reason="unsupported_route"}` a tracer trying a feature this listener
-doesn't speak. `docs/design/internal-telemetry.md`'s `datadog_trace_in` section has every counter.
+doesn't speak. A nonzero `logit.input.connections.rejected{reason="limit"}` means the
+`max_connections` cap, shared by the TCP listener and the Unix socket, is binding.
+`docs/design/internal-telemetry.md`'s `datadog_trace_in` section has every counter.
 
 ## `datadog_out`: sending straight to Datadog
 
@@ -2020,8 +2098,9 @@ is left alone. If the consumers close after the first batch was taken, the reque
 **What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
 answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened: `auth` for a token
 mismatch, `encoding` for a client sending something other than gzip, `oversize` for a body over
-`max_request_bytes`. `docs/design/internal-telemetry.md`'s `splunk_hec_in` section has every
-counter.
+`max_request_bytes`. A nonzero `logit.input.connections.rejected{reason="limit"}` means the
+`max_connections` cap is binding. `docs/design/internal-telemetry.md`'s `splunk_hec_in` section
+has every counter.
 
 ## `splunk_hec_out`: sending to Splunk over HEC
 
@@ -2141,7 +2220,7 @@ components:
 recommendation describes: senders write on a fixed cadence, so a connection quiet for a minute
 isn't coming back. It does a second job here too: the bound on a request whose **body stalls
 mid-upload** is derived from it. With `idle_timeout:` unset, a half-uploaded request holds one of the
-listener's 1024 connection permits until the sender goes away, and the stalled body never gets its
+listener's `max_connections` permits until the sender goes away, and the stalled body never gets its
 `408`. Size it above the senders' longest normal gap; `60s` is comfortable for Prometheus's default
 `remote_timeout` of 30s.
 
@@ -2229,7 +2308,8 @@ Native histograms are skipped and counted on both wires regardless of version
 - Receiver: `logit.input.writes{class}` (`ok` against `bad_request`/`unsupported`/`oversize`; a
   nonzero `unsupported` usually means a sender whose `Content-Type` or `Content-Encoding` doesn't
   match what it sends), `logit.input.write.duration`, `logit.input.samples`, and the
-  `metadata_cache` metrics above.
+  `metadata_cache` metrics above. A nonzero `logit.input.connections.rejected{reason="limit"}`
+  means the `max_connections` cap is binding.
 - Sender: `logit.output.requests{class}`, `logit.output.request.duration`, `logit.output.samples`.
   A `4xx` is permanent and the batch is dropped; the throttled `remote_write_rejected` diagnostic
   quotes the receiver's message, which for Prometheus and Mimir names the offending series. A `3xx`
@@ -2490,7 +2570,7 @@ listener"](#idle_timeout-on-a-tcp-listener) above.
   connections are counted the same way, since both take the same connect path.
 - `syslog_in`: `logit.input.connections` (a gauge that should match the number of connected
   `syslog_out` peers) and `logit.input.connections.rejected{reason="limit"}` (nonzero means the
-  1024-connection cap is binding).
+  `max_connections` cap is binding).
 - Both: a handshake failure, a framing violation, or an oversize or malformed frame surfaces through
   `logit.component.diagnostics{key="connection_error"|"framing_error"}` and
   `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}`. There is no separate
@@ -2693,7 +2773,7 @@ takes it, raises the mark. What follows from that:
   identity was taken, and `logit_in` acknowledges it without forwarding it.
 - **An unsequenced frame is always forwarded.** A v1 frame, or a frame without a complete,
   well-formed identity and sequence, reaches `logit_in`'s consumers every time it arrives.
-- **The table follows the connection cap, with nothing to configure.** It holds
+- **The table follows `max_connections`, with nothing further to configure.** It holds
   `max_connections + max_connections / 4` identities (1280 at the default cap of 1024) and evicts
   the least recently seen when full.
 - **Cloning a running process is unsupported.** A VM snapshot or a CRIU checkpoint restored
@@ -2731,7 +2811,8 @@ reconnecting doesn't show as `connection_error` on the far end.
   connection means `logit_in` answered less).
 - `logit_in`: `logit.input.connections` (a gauge that should match the number of connected
   `logit_out` peers), `logit.input.connections.rejected{reason="limit"}` (nonzero means the
-  1024-connection cap is binding; raise it or shed load upstream), and `logit.proto.errors{reason}`
+  `max_connections` cap is binding; raise `max_connections` or shed load upstream), and
+  `logit.proto.errors{reason}`
   (`magic`/`version`/`crc`/`truncated_header`/`truncated`/`too_large`/`codec`/`handshake`/
   `ack_write_stalled`/`reject_write_stalled`; any of these on a healthy link points at a
   version-mismatched or misbehaving peer, not routine loss, except `truncated_header` and

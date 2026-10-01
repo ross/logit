@@ -392,7 +392,7 @@ Per pair:
 - **TCP**: `syslog_in`, `graphite_in`, and `statsd_in` can each run `transport: tcp` on a
   generic stream driver, `logit-inputs::tcp::TcpListener` (`crates/logit-inputs/src/tcp.rs`),
   which provides:
-  - an accept loop and a connection cap;
+  - an accept loop and a connection cap (`max_connections:`, 1024 by default);
   - per-listener framing: RFC 6587's auto-detecting pair for `syslog_in`, LF-delimited lines for
     `statsd_in` and carbon plaintext, and carbon's 4-byte length prefix for pickle;
   - `handshake_timeout:`, bounding each pre-message phase;
