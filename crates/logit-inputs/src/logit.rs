@@ -555,6 +555,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         let budget = native::DecodeBudget::for_frame_cap(max_frame_bytes);
         let decoded = if negotiated.codec == native::CODEC_NATIVE_V2 {
             native::decode_batch_v2(&mut payload, &budget)
+                .map(|(batch, provenance, _seq)| (batch, provenance))
                 .map_err(|err| (err, "decoding a native v2 batch"))
         } else {
             native::decode_batch(&mut payload, &budget)
@@ -1198,7 +1199,7 @@ mod tests {
         provenance: Provenance,
         compression: Compression,
     ) {
-        let payload = native::encode_batch_v2(batch, provenance);
+        let payload = native::encode_batch_v2(batch, provenance, None);
         let framed = frame::write_frame(native::CODEC_NATIVE_V2, compression, &payload).unwrap();
         stream.write_all(&framed).await.unwrap();
     }

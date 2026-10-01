@@ -413,9 +413,14 @@ fn sample_provenance() -> Provenance {
     }
 }
 
+/// A multi-byte sequence, so truncation and bit flips land inside its uvarint too.
+fn sample_seq() -> native::SeqId {
+    native::SeqId { id: *b"robustness-send!", seq: 1_000_000 }
+}
+
 #[test]
 fn decode_batch_v2_survives_every_single_byte_truncation() {
-    let payload = native::encode_batch_v2(&sample_batch(), sample_provenance());
+    let payload = native::encode_batch_v2(&sample_batch(), sample_provenance(), Some(sample_seq()));
     assert_every_truncation_fails_cleanly(&payload, |bytes| {
         native::decode_batch_v2(bytes, &DecodeBudget::default()).is_err()
     });
@@ -423,7 +428,7 @@ fn decode_batch_v2_survives_every_single_byte_truncation() {
 
 #[test]
 fn decode_batch_v2_survives_seeded_bit_flips() {
-    let payload = native::encode_batch_v2(&sample_batch(), sample_provenance());
+    let payload = native::encode_batch_v2(&sample_batch(), sample_provenance(), Some(sample_seq()));
     assert_bit_flips_never_panic(&payload, 5000, |bytes| {
         native::decode_batch_v2(bytes, &DecodeBudget::default()).is_ok()
     });
@@ -1547,7 +1552,8 @@ fn a_batch_with_bytes_after_its_last_event_is_malformed() {
     v1.extend_from_slice(b"junk");
     assert_malformed(decode_v1(&v1), "trailing bytes", "v1");
 
-    let mut v2 = native::encode_batch_v2(&sample_batch(), sample_provenance()).to_vec();
+    let mut v2 =
+        native::encode_batch_v2(&sample_batch(), sample_provenance(), Some(sample_seq())).to_vec();
     v2.extend_from_slice(b"junk");
     assert_malformed(
         native::decode_batch_v2(&mut Bytes::from(v2), &DecodeBudget::default()),
@@ -1564,10 +1570,11 @@ fn encode_then_decode_then_encode_is_byte_identical() {
     let decoded = decode_v1(&v1).unwrap();
     assert_eq!(native::encode_batch(&decoded), v1);
 
-    let v2 = native::encode_batch_v2(&sample_batch(), sample_provenance());
-    let (decoded, provenance) =
+    let v2 = native::encode_batch_v2(&sample_batch(), sample_provenance(), Some(sample_seq()));
+    let (decoded, provenance, seq) =
         native::decode_batch_v2(&mut v2.clone(), &DecodeBudget::default()).unwrap();
-    assert_eq!(native::encode_batch_v2(&decoded, provenance), v2);
+    assert_eq!(seq, Some(sample_seq()));
+    assert_eq!(native::encode_batch_v2(&decoded, provenance, seq), v2);
 }
 
 /// `write_frame` refuses what `read_frame` would refuse, so no writer can emit a frame over the

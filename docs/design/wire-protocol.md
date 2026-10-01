@@ -76,8 +76,17 @@ it (`docs/design/pipeline-graph.md`'s "Provenance propagation",
 ```
 payload_v2 := dict | resource attrs | uvarint(event_count) | events...
             | uvarint(trailer_len) | trailer_bytes[trailer_len]
-trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*   -- tag 1 = origin, tag 2 = previous
+trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*
+                 -- tag 1 = origin, tag 2 = previous,
+                 -- tag 3 = sender identity ([u8; 16]), tag 4 = sequence (uvarint, from 1)
 ```
+
+Tags 3 and 4 are the native hop's sender identity and sequence
+([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)), written
+together or not at all. A frame without one well-formed tag 3 and one well-formed tag 4 is
+unsequenced, not malformed: a wrong-length identity, a sequence of 0 or with bytes left over, a
+lone tag, or a repeated tag decodes with no pair. A field of any tag that overruns the trailer or
+the 4096-byte field cap still fails the whole payload.
 
 `encode_batch_v2`/`decode_batch_v2` call `encode_batch`/`decode_batch` and add the trailer around
 them. The v1 encoding itself is not stable across releases: ADR `metrics-model-v2` reshaped every

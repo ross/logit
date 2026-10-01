@@ -20,6 +20,12 @@ pub fn write_uvarint(out: &mut BytesMut, mut v: u64) {
     }
 }
 
+/// How many bytes [`write_uvarint`] writes for `v`, so a writer can size a length prefix before
+/// writing what it prefixes.
+pub(crate) fn uvarint_len(v: u64) -> usize {
+    (64 - (v | 1).leading_zeros()).div_ceil(7) as usize
+}
+
 /// The inverse of [`write_uvarint`]. Stops at 10 bytes, a `u64`'s maximum, so a stream with the
 /// continuation bit always set can't spin forever.
 ///
@@ -111,6 +117,15 @@ mod tests {
     fn round_trips_boundary_values() {
         for v in [0u64, 1, 127, 128, 16383, 16384, u32::MAX as u64, u64::MAX] {
             round_trip_uvarint(v);
+        }
+    }
+
+    #[test]
+    fn uvarint_len_matches_what_write_uvarint_writes() {
+        for v in [0u64, 1, 127, 128, 16383, 16384, u32::MAX as u64, u64::MAX] {
+            let mut buf = BytesMut::new();
+            write_uvarint(&mut buf, v);
+            assert_eq!(uvarint_len(v), buf.len(), "uvarint_len({v})");
         }
     }
 

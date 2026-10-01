@@ -178,7 +178,8 @@ fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, usize), Co
         native::CODEC_NATIVE_V1 => {
             (native::decode_batch(&mut payload, &budget)?, Provenance::default())
         }
-        native::CODEC_NATIVE_V2 => native::decode_batch_v2(&mut payload, &budget)?,
+        native::CODEC_NATIVE_V2 => native::decode_batch_v2(&mut payload, &budget)
+            .map(|(batch, provenance, _seq)| (batch, provenance))?,
         other => {
             return Err(CodecError::Malformed(format!(
                 "disk record declares codec {other}, expected native v1 ({}) or v2 ({})",
@@ -887,7 +888,7 @@ impl DiskQueue {
     pub async fn push(&self, item: (Arc<EventBatch>, BatchContext)) {
         let (batch, ctx) = item;
 
-        let payload = native::encode_batch_v2(&batch, ctx.provenance);
+        let payload = native::encode_batch_v2(&batch, ctx.provenance, None);
         // `write_frame` fails for a payload over `MAX_SANE_UNCOMPRESSED_LEN` and for
         // `Compression::Zstd`, which `logit_config::Compression` (where `disk.compression` comes
         // from) cannot express, so a failure here is an oversize batch.
@@ -1774,7 +1775,7 @@ pub(crate) mod test_support {
         batch: &logit_core::EventBatch,
         provenance: logit_core::Provenance,
     ) -> u64 {
-        let payload = native::encode_batch_v2(batch, provenance);
+        let payload = native::encode_batch_v2(batch, provenance, None);
         let framed =
             frame::write_frame(native::CODEC_NATIVE_V2, frame::Compression::None, &payload)
                 .expect("None compression never fails");
@@ -1837,7 +1838,7 @@ pub(crate) mod test_support {
 
     /// The on-disk bytes `DiskQueue::push` writes for one record, for hand-built segment files.
     pub(crate) fn raw_record(batch: &EventBatch, ctx: BatchContext) -> Vec<u8> {
-        let payload = native::encode_batch_v2(batch, ctx.provenance);
+        let payload = native::encode_batch_v2(batch, ctx.provenance, None);
         let framed = frame::write_frame(native::CODEC_NATIVE_V2, Compression::None, &payload)
             .expect("None compression never fails");
         let mut record = Vec::with_capacity(CONTEXT_LEN + framed.len());
@@ -2798,7 +2799,7 @@ mod tests {
         // just past A's end, backed up by `CONTEXT_LEN`, lands inside A, and a record parses
         // there: the last bytes of A plus the filler as its context, then the real frame.
         let a = raw_record(&batch("a"), ctx());
-        let payload = native::encode_batch_v2(&batch("phantom"), Provenance::default());
+        let payload = native::encode_batch_v2(&batch("phantom"), Provenance::default(), None);
         let bare_frame =
             frame::write_frame(native::CODEC_NATIVE_V2, Compression::None, &payload).unwrap();
         for filler in 1..CONTEXT_LEN {
@@ -3249,7 +3250,7 @@ mod tests {
                 logit_config::Compression::None => Compression::None,
                 logit_config::Compression::Lz4 => Compression::Lz4,
             };
-            let payload = native::encode_batch_v2(&batch("x"), Provenance::default());
+            let payload = native::encode_batch_v2(&batch("x"), Provenance::default(), None);
             frame::write_frame(native::CODEC_NATIVE_V2, compression, &payload)
                 .unwrap_or_else(|err| panic!("{configured:?} must encode: {err}"));
 

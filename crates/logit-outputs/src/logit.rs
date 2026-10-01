@@ -371,7 +371,7 @@ impl LogitOutput {
         };
         // Re-encoded only on a v2 connection; a v1 connection reuses `v1_payload`.
         let payload = if conn.codec == native::CODEC_NATIVE_V2 {
-            native::encode_batch_v2(batch, self.pending_provenance)
+            native::encode_batch_v2(batch, self.pending_provenance, None)
         } else {
             v1_payload
         };
@@ -1072,7 +1072,7 @@ mod tests {
             let mut body = vec![0u8; h.compressed_len as usize];
             stream.read_exact(&mut body).await.unwrap();
             let mut payload = Bytes::from(body);
-            let (_batch, provenance) =
+            let (_batch, provenance, _seq) =
                 native::decode_batch_v2(&mut payload, &Default::default()).unwrap();
 
             write_control(&mut stream, &control::Ack { seq: 1 }).await.unwrap();

@@ -1973,7 +1973,7 @@ fn disk_queue_config(dir: std::path::PathBuf) -> logit_pipeline::DiskQueueConfig
     }
 }
 
-/// `DiskQueue::push`: `native::encode_batch_v2` (`encode_batch` plus a provenance trailer,
+/// `DiskQueue::push`: `native::encode_batch_v2` (`encode_batch` plus its trailer,
 /// `docs/adr/batch-provenance-on-delivered.md`), `frame::write_frame`, and one `write_all` to the
 /// active segment. The disk buffer's ADR accepts that this encode breaks
 /// `buffered-sink-delivery`'s zero-clone `Arc<EventBatch>` property. The warm-up push+commit pays
@@ -1999,13 +1999,14 @@ fn disk_queue_push_one_batch() {
     let ((), stats) =
         measure(|| rt.block_on(queue.push((Arc::clone(&batch), BatchContext::default()))));
 
-    // Among the 34: `encode_batch_v2` builds v1's payload as its own `Bytes`, then copies it into
-    // a larger `BytesMut` beside the (here empty) provenance trailer: 2. `write_field`'s
+    // Among the 33: `encode_batch_v2` builds v1's payload as its own `Bytes`, then copies it into
+    // a `BytesMut` sized to the whole payload, the trailer written straight into it: 2. Sizing it
+    // to fit is what spares `freeze` a shared header. `write_field`'s
     // temp buffers: 2 per `MetricRecord` (`write_record_list`'s per-entry length prefix, which
     // lets a reader skip a record with unknown fields, and the `MR_KIND` field) for the four
     // metrics, plus 1 for `LogRecord.message`: 9. The two `Samples` are written straight from
     // their values, with no serialized sketch blob.
-    expect_allocs("disk_queue: push one batch (encode + write)", stats, 34);
+    expect_allocs("disk_queue: push one batch (encode + write)", stats, 33);
     std::fs::remove_dir_all(&dir).ok();
 }
 
