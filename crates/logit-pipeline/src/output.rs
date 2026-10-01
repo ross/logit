@@ -4,6 +4,7 @@
 
 use crate::fanout::BatchContext;
 use logit_core::EventBatch;
+use logit_proto::native::SeqId;
 
 /// A sink component: takes batches and delivers them somewhere. It has at least one source and is
 /// never a source itself (`docs/design/pipeline-graph.md`'s arity table).
@@ -74,8 +75,14 @@ pub trait Output {
     /// runtime that never calls it gets every `send` counted. Default no-op, so a type that
     /// implements `Output` by delegating to another must forward this too, or the inner sink's
     /// accounting never arms (`prometheus_out`'s `PrometheusOutput`).
-    fn observe_batch(&mut self, ctx: BatchContext) {
-        let _ = ctx;
+    ///
+    /// `seq` is the batch's native-hop sender identity and number from the sink's store; only
+    /// `logit_out` reads it, and it never rides on `BatchContext`
+    /// (`docs/adr/native-hop-identity-and-sequence.md`). A caller outside the runtime that
+    /// passes `Some` must observe again before each new batch, or the next batch goes out under
+    /// the last one's number and reads as a resend.
+    fn observe_batch(&mut self, ctx: BatchContext, seq: Option<SeqId>) {
+        let _ = (ctx, seq);
     }
 
     /// Called once, when the sink's input has closed and `write_loop` has stopped, for a sink

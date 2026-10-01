@@ -6,12 +6,13 @@
 //! `prom_remote_write`'s version. [`generate`] is deterministic, so a rerun rewrites the same
 //! bytes and leaves `git status` clean.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use logit_core::interner::intern;
 use logit_core::{DdSketch, EventBatch, HyperLogLog, Mapping, Provenance};
 use logit_proto::frame::{write_frame, write_frame_with_flags, Compression, FLAG_CONTROL};
 use logit_proto::native::control::{Ack, ControlMessage, Hello, HelloAck, Reject};
-use logit_proto::native::{encode_batch, encode_batch_v2, CODEC_NATIVE_V1, CODEC_NATIVE_V2};
+use logit_proto::native::varint::write_uvarint;
+use logit_proto::native::{encode_batch, encode_batch_v2, SeqId, CODEC_NATIVE_V1, CODEC_NATIVE_V2};
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{decompress_bounded, Encoding};
 use logit_proto::prometheus::remote_write::Version;
@@ -63,7 +64,7 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
     }
 
     let mut stream = Vec::new();
-    for (name, batch) in &batches {
+    for (i, (name, batch)) in batches.iter().enumerate() {
         let payloads = OtlpEncoder::new()
             .encode_signals(batch)
             .map_err(|e| std::io::Error::other(format!("encoding {name}: {e}")))?;
@@ -81,7 +82,8 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         let v1 = encode_batch(batch);
         let provenance =
             Provenance { origin: Some(intern("seed_in")), previous: Some(intern("seed_enrich")) };
-        let v2 = encode_batch_v2(batch, provenance);
+        let seq = SeqId { id: *b"seed-sender-id16", seq: 1 + i as u64 };
+        let v2 = encode_batch_v2(batch, provenance, Some(seq));
         for (codec, payload, version) in
             [(CODEC_NATIVE_V1, &v1, "v1"), (CODEC_NATIVE_V2, &v2, "v2")]
         {
@@ -93,6 +95,21 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         }
         add("native_batch_v1", name.clone(), v1.to_vec());
         add("native_batch_v2", name.clone(), v2.to_vec());
+    }
+
+    // Trailers whose sender pair is malformed, which `decode_batch_v2` reads as unsequenced
+    // rather than failing (ADR `native-hop-identity-and-sequence`, decision 1).
+    if let Some((name, batch)) = batches.first() {
+        let v1 = encode_batch(batch);
+        let id: &[u8] = b"seed-sender-id16";
+        let malformed: [(&str, &[TrailerField]); 3] = [
+            ("unsequenced-dup-tag", &[(3, id), (4, &[1]), (4, &[2])]),
+            ("unsequenced-id15", &[(3, &id[..15]), (4, &[1])]),
+            ("seq-trailing-byte", &[(3, id), (4, &[1, 0])]),
+        ];
+        for (label, fields) in malformed {
+            add("native_batch_v2", format!("{name}-{label}"), with_trailer(&v1, fields));
+        }
     }
 
     let controls = [
@@ -116,7 +133,7 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
                 window: 1,
             }),
         ),
-        ("ack", ControlMessage::Ack(Ack { seq: 42 })),
+        ("ack", ControlMessage::Ack(Ack)),
         ("reject", ControlMessage::Reject(Reject { code: 1, message: "no common codec".into() })),
     ];
     for (name, message) in controls {
@@ -208,6 +225,23 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         });
     }
     Ok((seeds, skipped))
+}
+
+/// One v2 trailer field, `(tag, value)`.
+type TrailerField<'a> = (u8, &'a [u8]);
+
+/// A v1 payload followed by a v2 trailer of `fields`, each `(tag, value)` written as given.
+fn with_trailer(v1: &[u8], fields: &[TrailerField]) -> Vec<u8> {
+    let mut trailer = BytesMut::new();
+    for (tag, value) in fields {
+        trailer.extend_from_slice(&[*tag]);
+        write_uvarint(&mut trailer, value.len() as u64);
+        trailer.extend_from_slice(value);
+    }
+    let mut out = BytesMut::from(v1);
+    write_uvarint(&mut out, trailer.len() as u64);
+    out.extend_from_slice(&trailer);
+    out.to_vec()
 }
 
 fn prefixed(selector: u8, body: &[u8]) -> Vec<u8> {

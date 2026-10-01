@@ -4,7 +4,8 @@ The native protocol carries batches between two `logit` nodes when collection an
 different hosts ([overview](../OVERVIEW.md),
 [ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md)). OTLP
 stays available as an interop codec at ingest and egress. The same frames also back `stdio_out`/
-`file_out`'s `format: native` and the `buffer.disk:` spool.
+`file_out`'s `format: native` and the `buffer.disk:` spool, whose records also carry the native
+hop's sender identity and sequence in their trailer.
 
 ## Framing
 
@@ -66,18 +67,28 @@ Compression, when enabled, runs over the dictionary-encoded payload. Each writer
 `buffer.disk:`), defaulting to `none`; `logit_in` can negotiate a `logit_out`'s offer down to
 `none`.
 
-## `CODEC_NATIVE_V2`: a provenance trailer
+## `CODEC_NATIVE_V2`: a provenance and sender trailer
 
 `CODEC_NATIVE_V2` carries everything v1 does plus a mandatory, length-prefixed trailer holding the
-batch's `Provenance`: the component that created the batch and the one that most recently handled
+batch's `Provenance`, the component that created the batch and the one that most recently handled
 it (`docs/design/pipeline-graph.md`'s "Provenance propagation",
-[ADR `batch-provenance-on-delivered`](../adr/batch-provenance-on-delivered.md)):
+[ADR `batch-provenance-on-delivered`](../adr/batch-provenance-on-delivered.md)), and the native
+hop's sender identity and sequence:
 
 ```
 payload_v2 := dict | resource attrs | uvarint(event_count) | events...
             | uvarint(trailer_len) | trailer_bytes[trailer_len]
-trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*   -- tag 1 = origin, tag 2 = previous
+trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*
+                 -- tag 1 = origin, tag 2 = previous,
+                 -- tag 3 = sender identity ([u8; 16]), tag 4 = sequence (uvarint, from 1)
 ```
+
+Tags 3 and 4 are the native hop's sender identity and sequence
+([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)), written
+together or not at all. A frame without one well-formed tag 3 and one well-formed tag 4 is
+unsequenced, not malformed: a wrong-length identity, a sequence of 0 or with bytes left over, a
+lone tag, or a repeated tag decodes with no pair. A field of any tag that overruns the trailer or
+the 4096-byte field cap still fails the whole payload.
 
 `encode_batch_v2`/`decode_batch_v2` call `encode_batch`/`decode_batch` and add the trailer around
 them. The v1 encoding itself is not stable across releases: ADR `metrics-model-v2` reshaped every
@@ -85,7 +96,7 @@ record to TLV and added the mandatory `Scope` section (see "Record layout" below
 encoded before that ADR doesn't decode after it. `logit` is pre-release (ADR `lossless-transit`), so
 format changes are straight reshapes with no dual-read compatibility path.
 
-**The trailer length is mandatory**, written as a single `0x00` byte when both fields are absent.
+**The trailer length is mandatory**, written as a single `0x00` byte when every field is absent.
 An optional trailer would let a payload truncated exactly at the trailer boundary decode as "no
 provenance" instead of failing. That breaks the format's truncation-safety invariant: every proper
 prefix of a valid encoding must fail to decode, pinned by
@@ -96,7 +107,10 @@ with nothing for a dictionary to amortize.
 `Hello.codecs`/`HelloAck.codec` (below) negotiate v2 when both sides offer it and fall back to v1,
 without provenance, otherwise, so neither side needs a protocol version bump. `DiskQueue`'s
 spooled records (`crates/logit-pipeline/src/disk_queue.rs`) carry the same per-record codec byte,
-so a v1 record spooled before an upgrade still replays after it.
+so a v1 record spooled before an upgrade still replays after it. A record carries the sender
+identity and sequence it was written with, and `parse_record` returns them, so a replay after a
+crash goes out under the pair the batch first had. A record without the pair replays
+unsequenced, and `logit_in` forwards it.
 
 ## Decode amplification
 
@@ -350,7 +364,7 @@ decision record.
   |---|---|---|
   | `Hello` | `version`, `codecs`, `compressions`, `max_frame_bytes`, `window` | the connecting side, first |
   | `HelloAck` | `version`, `codec`, `compression`, `max_frame_bytes`, `window` | the listener, once, in reply to a valid `Hello` |
-  | `Ack` | `seq` | the listener, once per data frame forwarded |
+  | `Ack` | none | the listener, once per data frame handled: forwarded, or recognized as a resend and not forwarded |
   | `Reject` | `code`, `message` | either side, closing the connection |
 
 - **Handshake.** The connecting side sends `Hello`. The listener replies with `HelloAck` (codec
@@ -361,13 +375,29 @@ decision record.
   again. A control message is at most `control::MAX_CONTROL_MESSAGE_BYTES` (4096) bytes, and
   each side refuses a longer one on its header: `logit_in` for a `Hello`, `logit_out` for a
   reply.
-- **Sequence numbers are implicit.** TCP is ordered, so the Nth data frame on a connection is seq
-  N, and `Ack.seq` is the cumulative count the receiver has forwarded. The native payload carries
-  no transport fields.
-- **Acknowledgement point:** after the batch is in every downstream inbox (`Fanout::send` returns
-  on the listener side), not when it decodes. A stalled downstream delays the ack, which stalls the
-  sender's next frame. That is the protocol's backpressure, and it's why `logit_in` needs no
-  receive-side queue the way a UDP listener does.
+- **Sender identity and sequence ride in the v2 trailer.** The sink's store assigns each batch
+  a 16-byte sender identity and a sequence number, and `logit_out` writes them into the v2
+  trailer. `Ack` carries no sequence: one frame is in flight per connection, so it answers the
+  one frame outstanding ([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)).
+  A store takes a fresh identity every time it opens, memory or disk, and numbers its batches
+  from 1; a resend, on the same connection or a new one, reuses the batch's pair. Each `logit_in`
+  component keeps one high-water mark per identity, in a table bounded at
+  `max_connections + max_connections / 4` identities (1280 at the default cap) that evicts the
+  least recently seen when full. A frame at or below its identity's mark is a resend; a frame
+  above it is forwarded, and a consumer taking it raises the mark. An unsequenced frame (see
+  "`CODEC_NATIVE_V2`: a provenance and sender trailer" above) is always forwarded. The table
+  reports `logit.input.batches.resends`, `logit.input.senders`, and
+  `logit.input.senders.evicted`. No lock spans a forward, so a forward parked on a full inbox
+  past the sender's ack timeout can be forwarded again when the sender resends on a new
+  connection (`docs/known-gaps.md`, "A forward parked past the sender's ack timeout can be
+  forwarded twice").
+- **Acknowledgement point:** for a frame above its sender's mark, or unsequenced, after
+  `Fanout::send` returns, not when it decodes. `Fanout::send` returns whether any consumer took
+  the batch: if one did, `logit_in` writes `Ack`; if none did, because every direct consumer has
+  closed, it writes `Reject{GOING_AWAY}` instead and closes. A frame at or below its sender's mark
+  is acknowledged on the mark alone, at once and with no forward. A stalled downstream delays the
+  ack, which stalls the sender's next frame. That is the protocol's backpressure, and it's why
+  `logit_in` needs no receive-side queue the way a UDP listener does.
 - **Frame bounds.** `logit_in` checks a data frame's header before reading its body:
   `uncompressed_len` against its `max_frame_bytes`, and `compressed_len` against
   `frame::compressed_bound(max_frame_bytes)`. A frame over either is answered
@@ -382,7 +412,10 @@ decision record.
   for a frame it hasn't forwarded; after forwarding, the only write is that frame's `Ack`.
   `GOING_AWAY` has three causes: a shutdown or an idle close, either of which drops a frame still
   in the socket buffer unread, and a frame no consumer took (every direct consumer of `logit_in`
-  has closed), after which the connection closes. So `logit_out` treats `GOING_AWAY` in place of
+  has closed), after which the connection closes and the sender's mark stays where it was. A frame
+  at or below its sender's mark that the listener reads whole gets an `Ack`; it is never answered
+  `GOING_AWAY` for want of a consumer, since it isn't forwarded. So `logit_out` treats
+  `GOING_AWAY` in place of
   an `Ack` as a clean fault, redials, and resends the batch at any delivery posture. An EOF,
   reset, or ack timeout after a frame left stays ambiguous: the batch may have been forwarded.
 - **A frame is whole or not held.** `logit_in` reads the whole frame and checks its CRC before it
@@ -405,7 +438,9 @@ decision record.
   keeps one frame outstanding (`docs/plans/native-transport.md`'s "In-flight" decision), and
   `LogitOutput`'s `SinkQueue` `peek`/`commit` holds that frame for retransmit. Credit-based flow
   control (several frames outstanding, cumulative acks) isn't built; negotiating `window` now lets
-  it land without a wire-format version bump. `docs/known-gaps.md` tracks it.
+  it land without a wire-format version bump. `docs/known-gaps.md` tracks it. The trailer's
+  sequence is a deduplication identity, never a credit: nothing acknowledges a sequence,
+  `window` stays 1, and the record that builds credit-based flow control decides its own ack form.
 
 ## Buffering
 
@@ -441,8 +476,10 @@ up isn't a policy here, because a synchronous trait can't block usefully; an asy
 `InMemoryBuffer<T>` is the only implementation; `SinkQueue`'s `BoundedQueue<T: Queued>` wraps it.
 The disk-backed sink buffer (`crates/logit-pipeline/src/disk_queue.rs`, ADR
 `disk-backed-sink-buffer`) doesn't implement `Buffer<T>`: the trait's sync, `&mut self`, generic
-shape is the wrong seam for real file I/O over a concrete `(Arc<EventBatch>, TraceContext)`, so
-`DiskQueue` has its own async surface.
+shape is the wrong seam for real file I/O over a concrete store item, so `DiskQueue` has its own
+async surface. Both stores hold `StoreItem`, `(Arc<EventBatch>, BatchContext, Option<SeqId>)`
+(`crates/logit-pipeline/src/queue.rs`): the batch, its context, and the sender identity and
+sequence the store gave it.
 
 ## Open question
 

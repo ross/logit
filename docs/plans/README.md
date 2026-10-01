@@ -10,7 +10,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
-| [Enabling plan: delivery semantics — at-least-once per hop, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-09-29 |
+| [Enabling plan: delivery semantics — at-least-once per hop, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-01 |
 | [Enabling plan: VictoriaMetrics — existing components verified, and zstd on remote-write](victoriametrics-interop.md) | 2026-09-24 | 2026-09-24 |
 | [Enabling plan: SigNoz — OTLP-native, verified, no new kind](signoz-relay.md) | 2026-09-24 | 2026-09-24 |
 | [Enabling plan: OpenSearch — SS4O documents over `_bulk`](opensearch-relay.md) | 2026-09-24 | 2026-09-24 |

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-09-30
+updated: 2026-10-01
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -91,6 +91,9 @@ one a running process can count:
 ahead of the sink.
 
 ### 3. An input's acknowledgment means accepted into the pipeline
+
+[Narrowed for the native hop by "Amendment: W4 decisions (2026-10-01)": `logit_in` also
+acknowledges a frame at or below its sender's high-water mark, with no forward.]
 
 An acknowledgment from a `logit` input means the batch is in every open downstream inbox of
 that process, and in at least one. It says nothing about a sink. This is `logit_in`'s `Ack`, an
@@ -203,9 +206,14 @@ window, and the spool record's layout are a follow-up record, which supersedes [
 `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md)'s "Sequence numbers
 are implicit".
 
-- **Sender identity.** Each `logit_out` component presents an identity in its handshake. It's
+- **Sender identity.** [Superseded in part by "Amendment: W4 decisions (2026-10-01)": each
+  batch carries the identity of the store it entered, a store takes a fresh one every time it
+  opens, a replayed spool record keeps its own, and the handshake carries none.] Each
+  `logit_out` component presents an identity in its handshake. It's
   the same across reconnects. With `buffer.disk:` it's the same across a restart.
-- **A sender that lost its sequence state takes a new identity.** A restart without a spool
+- **A sender that lost its sequence state takes a new identity.** [Superseded in part by
+  "Amendment: W4 decisions (2026-10-01)": every store open takes a new identity, with or without
+  a spool, and nothing recovers a sequence.] A restart without a spool
   starts a new sequence, and the receiver must not read its first frame as a resend of the old
   sequence's first frame.
 - **A sequence per sender, assigned at enqueue.** A batch gets its sequence number when it
@@ -214,7 +222,9 @@ are implicit".
 - **A bounded window at `logit_in`.** `logit_in` remembers, per sender identity, enough to
   recognize a resend inside a bounded window. It acknowledges a recognized resend and doesn't
   forward it.
-- **Outside the window, forward.** A frame `logit_in` can't place, from a sender it has
+- **Outside the window, forward.** [Narrowed by "Amendment: W4 decisions (2026-10-01)": a
+  frame at or below its sender's mark is not forwarded, even one the sender dropped and a spool
+  replayed.] A frame `logit_in` can't place, from a sender it has
   forgotten or older than its window, is forwarded. The target prefers the duplicate.
 - **Identity is advisory.** Under [ADR `deployment-threat-model`](deployment-threat-model.md) it
   protects against accident, not a peer that lies about who it is.
@@ -238,6 +248,8 @@ committed since the last cursor write. The cursor is written by a commit once
 shutdown, with no timer. So the batches that replay are those committed within
 `checkpoint_interval` after the last write, and after an idle period that write can be any
 age. The set includes a batch the sink delivered and a batch it dropped as `Ambiguous`.
+[Narrowed for the native hop by "Amendment: W4 decisions (2026-10-01)": `logit_in` doesn't
+forward a replayed batch at or below its sender's mark.]
 
 `buffer.disk:` with `at_most_once` stays valid. Posture governs the retry of an unknown outcome
 while the process runs, and `at_most_once` then holds across a graceful restart, which persists
@@ -386,3 +398,39 @@ The workstream that closes item 3 settled these:
   downstream has closed. A sink closing behind an open transform is still acknowledged. Propagating
   a closure as a shutdown signal, and a per-edge `on_full` policy, stay open
   (`docs/design/pipeline-graph.md`, "Open question: a closed downstream").
+
+## Amendment: W4 decisions (2026-10-01)
+
+[ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md) decides item 7's
+wire layout, window, and spool record. It restates item 7's bullets as decided:
+
+- **Identity is per batch, from its store.** A sink's store, memory or disk, takes a fresh
+  16-byte identity every time it opens and numbers the batches it holds from 1. The identity and
+  the number ride in the batch's v2 trailer, not in the handshake. A replayed spool record keeps
+  the identity and number it was written with, so nothing recovers a sequence after a restart.
+- **The window is a high-water mark.** Each `logit_in` component keeps one mark per sender
+  identity. A frame at or below its identity's mark is acknowledged and not forwarded, and a
+  frame above it is forwarded and, once a consumer takes it, raises the mark. A batch the sender
+  dropped and a spool later replays is at or below the mark once a later batch of its identity
+  was taken, so it stays dropped. Item 7's
+  "a frame `logit_in` can't place is forwarded" holds for a frame without an identity, from a
+  forgotten sender, or reaching a `logit_in` that restarted.
+- **The bound.** The table holds `max_connections + max_connections / 4` identities and evicts
+  the least recently seen.
+- **The residual race.** A forward parked on a full inbox past the sender's ack timeout can be
+  followed by a resend on a new connection that reads a mark not yet advanced, and both copies
+  are forwarded. The record accepts the duplicate.
+- **Cloning is unsupported.** A running process cloned by a VM snapshot or CRIU shares its
+  identity with its clone.
+
+Item 3's "accepted into the pipeline" holds for a frame above its sender's mark. A frame at or
+below it is acknowledged on the mark alone: for a resend, that repeats the earlier forward's
+acknowledgment; for a batch the sender dropped and a spool replayed, it acknowledges a batch no
+consumer took, and the sender commits it. The sender gave that batch up before the replay.
+
+Item 8's "The set includes a batch the sink delivered and a batch it dropped" holds at the sink.
+On the native hop, a dropped batch the spool replays is at or below its identity's mark once a
+later batch of that identity was taken, and `logit_in` doesn't forward it.
+
+Item 11's first countable replays are `logit.input.batches.resends`: frames `logit_in`
+recognizes at or below the mark, acknowledges, and doesn't forward.

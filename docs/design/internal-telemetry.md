@@ -1137,7 +1137,8 @@ the property the minimal-watch-set design is for.
 ##### `logit_in`
 
 `crates/logit-inputs/src/logit.rs`,
-[ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md).
+[ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md),
+[ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md).
 
 - `logit.proto.frames{direction="in",codec,compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
@@ -1168,6 +1169,15 @@ the property the minimal-watch-set design is for.
   answered `Reject{GOING_AWAY, "no consumer took the batch"}` before the connection closes, and
   never acknowledged. Not disjoint from `logit.component.batches.sent`: the refused batch is also
   counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`.
+- `logit.input.batches.resends` (count): frames at or below their sender identity's mark,
+  acknowledged and not forwarded
+  ([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)). These
+  are the first replays `logit` can count
+  ([ADR `delivery-semantics`](../adr/delivery-semantics.md), item 11).
+- `logit.input.senders` (gauge): identities in the component's table, published when the count
+  changes.
+- `logit.input.senders.evicted` (count): identities evicted from a full table. A sender evicted
+  and then resending has its resend forwarded, a duplicate.
 
 `Diagnostics` keys: `bound`, `decode_budget` (a batch refused by its decode budget, naming the
 budget and `max_frame_bytes`), and `connection_error` (any other connection failing; never an
@@ -1839,7 +1849,8 @@ attempt.
 ##### `logit_out`
 
 `crates/logit-outputs/src/logit.rs`,
-[ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md).
+[ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md),
+[ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md).
 
 - `logit.proto.frames{direction="out",codec,compression}` and `logit.proto.frame.bytes`: the
   send-side mirror of `logit_in`'s pair.

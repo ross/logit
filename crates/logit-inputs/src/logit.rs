@@ -9,12 +9,30 @@
 //! fails startup, and [`LogitInput::local_addr`] reads a `:0` bind's port without a
 //! bind-drop-rebind race. `run_until_shutdown` binds too when nobody did, for direct callers.
 //!
-//! **Ack point.** `Ack{seq}` is written only after `Fanout::send` returns, i.e. after the batch is
-//! in every open downstream inbox. A stalled downstream delays the ack, which stalls the sender's
-//! `write_loop`. That is this listener's backpressure; there is no receive-side queue the way a
-//! UDP listener has one (`crate::udp`). A frame no consumer took, because every consumer of this
-//! listener has closed, is never acked: it is answered `Reject{GOING_AWAY}`, the connection closes,
-//! and the frame's batch is counted `logit.input.batches.dropped{reason="closed_consumer"}`.
+//! **Ack point.** `Ack`, which carries no fields, is written in one of two cases: after
+//! `send_relayed` returns `true`, i.e. after the batch is in every open downstream inbox, or, for
+//! a frame at or below its sender's mark ("Deduplication" below), at once and with no forward. A
+//! stalled downstream delays the ack, which stalls the sender's `write_loop`. That is this
+//! listener's backpressure; there is no receive-side queue the way a UDP listener has one
+//! (`crate::udp`). A frame no consumer took, because every consumer of this listener has closed,
+//! is never acked: it is answered `Reject{GOING_AWAY}`, the connection closes, its sender's mark
+//! stays where it was, and the frame's batch is counted
+//! `logit.input.batches.dropped{reason="closed_consumer"}`.
+//!
+//! **Deduplication.** A v2 frame's trailer can carry its sender's identity and sequence
+//! (`docs/adr/native-hop-identity-and-sequence.md`). Each component keeps one table of
+//! high-water marks, one per identity, shared by its connections and bounded at
+//! `max_connections + max_connections / 4` identities (1280 at the default cap); a new identity
+//! at a full table evicts the least recently seen one. A frame at or below its identity's mark
+//! is a resend: acked and not forwarded. Any other sequenced frame is forwarded, and a consumer
+//! taking it raises the mark to its sequence; gaps above the mark are ignored. An unsequenced
+//! frame (a v1 frame, or a v2 frame without a complete, well-formed pair) is always forwarded.
+//! No lock spans a forward, so a forward parked on a full inbox past the sender's ack timeout
+//! can be forwarded again when the sender resends on a new connection (`docs/known-gaps.md`).
+//! The identity is advisory, never trusted: a peer minting a new identity per frame costs one
+//! scan of the full table each and can evict honest senders, whose resends are then forwarded,
+//! a duplicate and never a loss. Counted as `logit.input.batches.resends`, `logit.input.senders`
+//! (a gauge), and `logit.input.senders.evicted`.
 //!
 //! **Shutdown.** Every connection task holds its own [`Fanout`] clone, and the cancel-by-drop
 //! shutdown (`docs/adr/service-lifecycle-and-output-retry.md`) needs nothing to outlive the
@@ -111,6 +129,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
+
+mod senders;
+use senders::SenderTable;
 
 /// Default for [`LogitInput::handshake_timeout`], per pre-`Hello` phase: generous for a loaded
 /// peer under TLS, tight enough that an abandoned connection (a port scan, a TLS client that never
@@ -244,6 +265,8 @@ impl Input for LogitInput {
         self.bind().await?;
         let listener = self.listener.take().expect("bind() leaves a listener behind");
         let connection_limit = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
+        // One per run and per component: a second `logit_in` in the graph keeps its own.
+        let senders = Arc::new(SenderTable::new(self.max_connections, self.telemetry.clone()));
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
         let live_connections = crate::listener::LiveConnections::new(self.telemetry.clone());
         let max_frame_bytes = self.max_frame_bytes;
@@ -297,6 +320,7 @@ impl Input for LogitInput {
             let tls_acceptor = tls_acceptor.clone();
             let conn_shutdown = shutdown.clone();
             let live_connections = live_connections.clone();
+            let senders = senders.clone();
 
             tokio::spawn(async move {
                 let result = match tls_acceptor {
@@ -314,6 +338,7 @@ impl Input for LogitInput {
                                     idle_timeout,
                                     conn_shutdown,
                                     live_connections,
+                                    senders,
                                 )
                                 .await
                             }
@@ -334,6 +359,7 @@ impl Input for LogitInput {
                             idle_timeout,
                             conn_shutdown,
                             live_connections,
+                            senders,
                         )
                         .await
                     }
@@ -369,7 +395,7 @@ impl Input for LogitInput {
 /// Runs on the already-TLS-wrapped stream, so the reject is decodable with or without TLS (module
 /// doc's "Connection limit"). The `logit.input.connections` gauge counts only connections holding
 /// a permit, so it's updated here rather than in the accept loop.
-#[allow(clippy::too_many_arguments)] // one small helper is clearer here than a params struct for 9 mostly-unrelated threaded-through values
+#[allow(clippy::too_many_arguments)] // one small helper is clearer here than a params struct for 10 mostly-unrelated threaded-through values
 async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -380,6 +406,7 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     idle_timeout: Option<Duration>,
     shutdown: watch::Receiver<bool>,
     live_connections: crate::listener::LiveConnections,
+    senders: Arc<SenderTable>,
 ) -> anyhow::Result<()> {
     let Some(_permit) = permit else {
         let reject = control::Reject {
@@ -399,6 +426,7 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         handshake_timeout,
         idle_timeout,
         shutdown,
+        senders,
     )
     .await
 }
@@ -441,6 +469,7 @@ fn decode_error_reason(err: &CodecError) -> &'static str {
 /// Counts every rejection under `logit.proto.errors{reason}`; `docs/design/internal-telemetry.md`'s
 /// `logit_in` section is the canonical list of reasons. A close or read error between frames is
 /// not counted; one mid-header is `truncated_header`.
+#[allow(clippy::too_many_arguments)] // threaded through from `reject_or_serve`, which has the same allow
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
     sink: Fanout,
@@ -449,6 +478,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
     mut shutdown: watch::Receiver<bool>,
+    senders: Arc<SenderTable>,
 ) -> anyhow::Result<()> {
     let negotiated =
         match handshake(&mut stream, max_frame_bytes, handshake_timeout, &telemetry).await {
@@ -463,7 +493,6 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // The idle clock starts at the handshake; after this, only an `Ack` write advances it.
     let mut last_progress = tokio::time::Instant::now();
 
-    let mut seq: u64 = 0;
     loop {
         // Only the header read races `shutdown` (`docs/design/pipeline-graph.md`'s "Cancellation
         // points"). This explicit check catches a shutdown
@@ -558,10 +587,10 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 .map_err(|err| (err, "decoding a native v2 batch"))
         } else {
             native::decode_batch(&mut payload, &budget)
-                .map(|batch| (batch, Provenance::default()))
+                .map(|batch| (batch, Provenance::default(), None))
                 .map_err(|err| (err, "decoding a native batch"))
         };
-        let (batch, provenance) = match decoded {
+        let (batch, provenance, seq) = match decoded {
             Ok(decoded) => decoded,
             Err((err, what)) => {
                 telemetry.count(
@@ -597,24 +626,42 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
             &[("direction", "in")],
         );
 
-        // The ack point: `send_relayed` returns once every open downstream inbox has the batch. It
-        // backfills only provenance the wire didn't carry (a v1 peer, or a v2 peer with none) and
-        // passes a v2 peer's `origin`/`previous` through untouched
-        // (`docs/adr/batch-provenance-on-delivered.md`).
-        if !sink.send_relayed(batch, provenance).await {
-            // Before `seq` advances, so a redialing sender's numbering and this side's agree.
-            telemetry.count("logit.input.batches.dropped", 1.0, &[("reason", "closed_consumer")]);
-            going_away(&mut stream, "no consumer took the batch", handshake_timeout, &telemetry)
+        // A frame at or below its sender's mark is acknowledged on the mark alone (module doc's
+        // "Deduplication"). An unsequenced frame is never a resend.
+        let resend = seq.is_some_and(|seq| senders.is_resend(seq));
+        if resend {
+            telemetry.count(senders::RESENDS, 1.0, &[]);
+        } else {
+            // The ack point: `send_relayed` returns once every open downstream inbox has the
+            // batch. It backfills only provenance the wire didn't carry (a v1 peer, or a v2 peer
+            // with none) and passes a v2 peer's `origin`/`previous` through untouched
+            // (`docs/adr/batch-provenance-on-delivered.md`). The sender pair names this hop only
+            // and stays here; a relay's own store numbers the next.
+            if !sink.send_relayed(batch, provenance).await {
+                telemetry.count(
+                    "logit.input.batches.dropped",
+                    1.0,
+                    &[("reason", "closed_consumer")],
+                );
+                going_away(
+                    &mut stream,
+                    "no consumer took the batch",
+                    handshake_timeout,
+                    &telemetry,
+                )
                 .await;
-            return Ok(());
+                return Ok(());
+            }
+            // Only after a consumer took the batch: a batch answered `GOING_AWAY` comes back,
+            // and a raised mark would drop it as a resend.
+            if let Some(seq) = seq {
+                senders.raise(seq);
+            }
         }
 
-        // `seq` is implicit: the Nth data frame on a connection is acked as N.
-        seq += 1;
         // After a forwarding `send_relayed` this is the only write: a frame is never both
         // forwarded and answered `GOING_AWAY` (module doc's "Shutdown").
-        if let Err(err) = write_control(&mut stream, &control::Ack { seq }, handshake_timeout).await
-        {
+        if let Err(err) = write_control(&mut stream, &control::Ack, handshake_timeout).await {
             if err.is::<WriteStalled>() {
                 telemetry.count("logit.proto.errors", 1.0, &[("reason", "ack_write_stalled")]);
             }
@@ -1198,9 +1245,81 @@ mod tests {
         provenance: Provenance,
         compression: Compression,
     ) {
-        let payload = native::encode_batch_v2(batch, provenance);
-        let framed = frame::write_frame(native::CODEC_NATIVE_V2, compression, &payload).unwrap();
+        send_data_frame_v2_seq(stream, batch, provenance, None, compression).await;
+    }
+
+    /// [`send_data_frame_v2`] with a sender identity and sequence in the trailer.
+    async fn send_data_frame_v2_seq(
+        stream: &mut TcpStream,
+        batch: &EventBatch,
+        provenance: Provenance,
+        seq: Option<native::SeqId>,
+        compression: Compression,
+    ) {
+        let payload = native::encode_batch_v2(batch, provenance, seq);
+        send_v2_payload(stream, &payload, compression).await;
+    }
+
+    /// Frames a hand-built v2 payload, for a trailer `encode_batch_v2` never writes.
+    async fn send_v2_payload(stream: &mut TcpStream, payload: &[u8], compression: Compression) {
+        let framed = frame::write_frame(native::CODEC_NATIVE_V2, compression, payload).unwrap();
         stream.write_all(&framed).await.unwrap();
+    }
+
+    /// A fresh table at the default cap, for tests that call [`serve_connection`] directly.
+    fn senders() -> Arc<SenderTable> {
+        Arc::new(SenderTable::new(MAX_CONCURRENT_CONNECTIONS, Telemetry::default()))
+    }
+
+    /// [`sample_batch`] with `mark` as its one event's timestamp, so a test reads which batch
+    /// arrived.
+    fn batch_marked(mark: i64) -> EventBatch {
+        let mut batch = sample_batch();
+        batch.events[0].timestamp = mark;
+        batch
+    }
+
+    async fn recv_mark(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> i64 {
+        recv_batch(rx).await.events[0].timestamp
+    }
+
+    fn sid(id: u8, seq: u64) -> native::SeqId {
+        native::SeqId { id: [id; 16], seq }
+    }
+
+    /// A connected, handshaken `CODEC_NATIVE_V2` client.
+    async fn v2_client(addr: &str) -> TcpStream {
+        let mut client = connect(addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V2], vec![0]).await;
+        match read_control_response(&mut client).await {
+            control::ControlMessage::HelloAck(ack) => {
+                assert_eq!(ack.codec, native::CODEC_NATIVE_V2)
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+        client
+    }
+
+    /// Sends [`batch_marked`]`(mark)` under `seq` and waits for its `Ack`. The `Ack` follows the
+    /// forward and every counter, so a test reads both right after.
+    async fn send_acked(client: &mut TcpStream, mark: i64, seq: Option<native::SeqId>) {
+        let batch = batch_marked(mark);
+        send_data_frame_v2_seq(client, &batch, Provenance::default(), seq, Compression::None).await;
+        read_ack(client).await;
+    }
+
+    /// A running `logit_in` counting into `probe`, its address, and its consumer.
+    async fn spawn_counted(
+        probe: &TelemetryProbe,
+        max_connections: usize,
+    ) -> (String, mpsc::Receiver<logit_pipeline::Delivered>) {
+        let (addr, input) = bound_input().await;
+        let mut input = input
+            .with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"))
+            .with_max_connections(max_connections);
+        let (sink, rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+        (addr, rx)
     }
 
     async fn read_ack(stream: &mut TcpStream) -> control::Ack {
@@ -1494,8 +1613,7 @@ mod tests {
         let _ = read_control_response(&mut client).await;
 
         send_data_frame(&mut client, &sample_batch(), Compression::None).await;
-        let ack1 = read_ack(&mut client).await;
-        assert_eq!(ack1.seq, 1);
+        read_ack(&mut client).await;
 
         send_data_frame(&mut client, &sample_batch(), Compression::None).await;
         let mut buf = [0u8; 1];
@@ -1504,8 +1622,7 @@ mod tests {
         assert!(premature.is_err(), "ack for the second batch arrived before the inbox drained");
 
         recv_batch(&mut rx).await; // drains the first batch, freeing capacity
-        let ack2 = read_ack(&mut client).await;
-        assert_eq!(ack2.seq, 2);
+        read_ack(&mut client).await;
     }
 
     #[tokio::test]
@@ -1948,8 +2065,8 @@ mod tests {
         tokio::time::sleep(idle * 3).await;
 
         recv_batch(&mut rx).await; // drains the first batch, unblocking the second's send
-        assert_eq!(read_ack(&mut client).await.seq, 1, "the first ack, written long before");
-        assert_eq!(read_ack(&mut client).await.seq, 2, "and the second, after the drain");
+        read_ack(&mut client).await; // the first ack, written long before
+        read_ack(&mut client).await; // and the second, after the drain
         recv_batch(&mut rx).await;
 
         assert!(
@@ -1974,10 +2091,10 @@ mod tests {
         client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
-        for expected_seq in 1..=8u64 {
+        for _ in 0..8 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             send_data_frame(&mut client, &sample_batch(), Compression::None).await;
-            assert_eq!(read_ack(&mut client).await.seq, expected_seq);
+            read_ack(&mut client).await;
             recv_batch(&mut rx).await;
         }
 
@@ -2017,11 +2134,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         client.write_all(&framed[1..]).await.unwrap();
 
-        assert_eq!(
-            read_ack(&mut client).await.seq,
-            1,
-            "a frame whose header started arriving before the deadline must be acked"
-        );
+        // A frame whose header started arriving before the deadline must be acked.
+        read_ack(&mut client).await;
         assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
         assert!(
             !Totals::of(registry.drain(0))
@@ -2119,7 +2233,7 @@ mod tests {
         .await;
 
         send_data_frame(&mut client, &sample_batch(), Compression::None).await;
-        assert_eq!(read_ack(&mut client).await.seq, 1, "and still serving frames");
+        read_ack(&mut client).await; // and still serving frames
         recv_batch(&mut rx).await;
 
         assert!(
@@ -2188,6 +2302,7 @@ mod tests {
             None,
             shutdown_rx,
             live.clone(),
+            senders(),
         ));
 
         write_msg(&mut client, &hello_v1()).await;
@@ -2238,7 +2353,7 @@ mod tests {
         const BOUND: Duration = Duration::from_millis(300);
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
-        let ack_len = control_frame_len(&control::Ack { seq: 1 });
+        let ack_len = control_frame_len(&control::Ack);
         let (mut client, server) = tokio::io::duplex(2 * ack_len);
         let (sink, mut rx) = fanout_into_channel(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2250,6 +2365,7 @@ mod tests {
             BOUND,
             None,
             shutdown_rx,
+            senders(),
         ));
 
         write_msg(&mut client, &hello_v1()).await;
@@ -2328,6 +2444,7 @@ mod tests {
                 HANDSHAKE_TIMEOUT,
                 None,
                 shutdown_rx,
+                senders(),
             ));
             write_msg(&mut client, &hello_v1()).await;
             let _ = read_control_response_over(&mut client).await;
@@ -2376,6 +2493,7 @@ mod tests {
             HANDSHAKE_TIMEOUT,
             None,
             shutdown_rx,
+            senders(),
         ));
         write_msg(&mut client, &hello_v1()).await;
         let _ = read_control_response_over(&mut client).await;
@@ -2449,6 +2567,7 @@ mod tests {
             HANDSHAKE_TIMEOUT,
             None,
             shutdown_rx,
+            senders(),
         ));
 
         let hello = frame::write_frame_with_flags(
@@ -2474,7 +2593,7 @@ mod tests {
         )
         .await
         .expect("the Ack reaches the client");
-        assert_eq!(reply, control::ControlMessage::Ack(control::Ack { seq: 1 }));
+        assert_eq!(reply, control::ControlMessage::Ack(control::Ack));
         recv_batch(&mut rx).await;
     }
 
@@ -2535,6 +2654,7 @@ mod tests {
                 HANDSHAKE_TIMEOUT,
                 None,
                 shutdown_rx,
+                senders(),
             )
             .await
         })
@@ -2554,7 +2674,7 @@ mod tests {
         client.write_all(&sample_frame()).await.unwrap();
         assert_eq!(
             read_control_response_over(&mut client).await,
-            control::ControlMessage::Ack(control::Ack { seq: 1 })
+            control::ControlMessage::Ack(control::Ack)
         );
         drop(client);
 
@@ -2661,7 +2781,7 @@ mod tests {
         );
         client.write_all(&framed).await.unwrap();
 
-        assert_eq!(read_ack(&mut client).await.seq, 1, "the frame is acked, not rejected");
+        read_ack(&mut client).await; // the frame is acked, not rejected
         let relayed = recv_batch(&mut rx).await;
         assert_eq!(relayed.events.len(), 1);
     }
@@ -2944,5 +3064,151 @@ mod tests {
             }
         }
         drop(rejected);
+    }
+
+    // ---- deduplication ------------------------------------------------------------------------
+    //
+    // "Not forwarded" is read off FIFO order: every `Ack` follows its forward, so the next batch
+    // on the channel after a resend's `Ack` is the later batch sent behind it.
+
+    /// A sender that lost an `Ack` and resends the batch on a new connection gets an `Ack`, and
+    /// the batch reaches the consumer once.
+    #[tokio::test]
+    async fn a_resend_after_a_lost_ack_is_forwarded_once() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_counted(&probe, MAX_CONCURRENT_CONNECTIONS).await;
+
+        let mut first = v2_client(&addr).await;
+        send_acked(&mut first, 1, Some(sid(7, 1))).await;
+        assert_eq!(recv_mark(&mut rx).await, 1);
+        drop(first);
+
+        let mut second = v2_client(&addr).await;
+        send_acked(&mut second, 1, Some(sid(7, 1))).await;
+        send_acked(&mut second, 2, Some(sid(7, 2))).await;
+        assert_eq!(recv_mark(&mut rx).await, 2, "the resend was not forwarded");
+        assert_eq!(probe.sum("logit.input.batches.resends", &[]), 1.0);
+    }
+
+    /// Every malformed or missing pair is unsequenced and forwarded, a second copy included, and
+    /// a v1 connection's frames are forwarded however often they repeat.
+    #[tokio::test]
+    async fn an_unsequenced_frame_is_forwarded_every_time() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_counted(&probe, MAX_CONCURRENT_CONNECTIONS).await;
+
+        // A v1 payload, then a hand-built trailer: its length (one byte, under 128) and fields.
+        let with_trailer = |mark: i64, trailer: &[u8]| {
+            let mut payload = native::encode_batch(&batch_marked(mark)).to_vec();
+            payload.push(u8::try_from(trailer.len()).unwrap());
+            payload.extend_from_slice(trailer);
+            payload
+        };
+        let id_15 = [[3u8, 15].as_slice(), &[9; 15], &[4, 1, 1]].concat();
+        let seq_0 = [[3u8, 16].as_slice(), &[9; 16], &[4, 1, 0]].concat();
+        let tag_4_twice = [[3u8, 16].as_slice(), &[9; 16], &[4, 1, 1, 4, 1, 2]].concat();
+        let payloads = [
+            native::encode_batch_v2(&batch_marked(1), Provenance::default(), None).to_vec(),
+            with_trailer(2, &id_15),
+            with_trailer(3, &seq_0),
+            with_trailer(4, &tag_4_twice),
+        ];
+
+        let mut client = v2_client(&addr).await;
+        for payload in &payloads {
+            for _ in 0..2 {
+                send_v2_payload(&mut client, payload, Compression::None).await;
+                read_ack(&mut client).await;
+            }
+        }
+        for mark in 1..=4 {
+            assert_eq!(recv_mark(&mut rx).await, mark, "first copy");
+            assert_eq!(recv_mark(&mut rx).await, mark, "second copy");
+        }
+
+        let mut v1 = connect(&addr).await;
+        client_hello(&mut v1, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        read_control_response(&mut v1).await;
+        for _ in 0..2 {
+            send_data_frame(&mut v1, &batch_marked(5), Compression::None).await;
+            read_ack(&mut v1).await;
+        }
+        assert_eq!(recv_mark(&mut rx).await, 5);
+        assert_eq!(recv_mark(&mut rx).await, 5);
+        assert_eq!(probe.sum("logit.input.batches.resends", &[]), 0.0);
+    }
+
+    /// A sender that restarts without a spool comes back under a new identity from 1, and its
+    /// first batch is new, not a resend of the old identity's 1.
+    #[tokio::test]
+    async fn a_new_identity_after_a_restart_is_not_a_resend() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_counted(&probe, MAX_CONCURRENT_CONNECTIONS).await;
+
+        let mut client = v2_client(&addr).await;
+        for seq in 1..=3 {
+            send_acked(&mut client, seq as i64, Some(sid(1, seq))).await;
+        }
+        send_acked(&mut client, 4, Some(sid(2, 1))).await;
+        for mark in 1..=4 {
+            assert_eq!(recv_mark(&mut rx).await, mark);
+        }
+        assert_eq!(probe.sum("logit.input.batches.resends", &[]), 0.0);
+    }
+
+    /// A number below the mark that was never forwarded (a batch the sender dropped, replayed by
+    /// its spool) is acknowledged and not forwarded; the mark rule doesn't tell it from a resend.
+    #[tokio::test]
+    async fn a_dropped_then_replayed_number_is_acknowledged_and_not_forwarded() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_counted(&probe, MAX_CONCURRENT_CONNECTIONS).await;
+
+        let mut client = v2_client(&addr).await;
+        send_acked(&mut client, 2, Some(sid(1, 2))).await;
+        send_acked(&mut client, 1, Some(sid(1, 1))).await;
+        send_acked(&mut client, 3, Some(sid(1, 3))).await;
+        assert_eq!(recv_mark(&mut rx).await, 2);
+        assert_eq!(recv_mark(&mut rx).await, 3, "the number below the mark was not forwarded");
+        assert_eq!(probe.sum("logit.input.batches.resends", &[]), 1.0);
+    }
+
+    /// At a cap of one connection the table holds one identity: a second evicts the first, and
+    /// the first's resend is then forwarded, a duplicate rather than a loss.
+    #[tokio::test]
+    async fn an_evicted_senders_resend_is_forwarded() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_counted(&probe, 1).await;
+
+        let mut client = v2_client(&addr).await;
+        send_acked(&mut client, 1, Some(sid(1, 1))).await;
+        send_acked(&mut client, 2, Some(sid(2, 1))).await;
+        send_acked(&mut client, 3, Some(sid(1, 1))).await;
+        for mark in 1..=3 {
+            assert_eq!(recv_mark(&mut rx).await, mark);
+        }
+        let totals = probe.poll();
+        // The second identity evicts the first, and the first's forwarded resend evicts the
+        // second in turn.
+        assert_eq!(totals.sum("logit.input.senders.evicted", &[]), 2.0);
+        assert_eq!(totals.gauge("logit.input.senders", &[]), Some(1.0));
+        assert_eq!(totals.sum("logit.input.batches.resends", &[]), 0.0);
+    }
+
+    /// Two `logit_in` components keep separate tables: a batch one forwarded is new to the other.
+    #[tokio::test]
+    async fn two_logit_in_components_do_not_share_a_table() {
+        let mut probe_a = TelemetryProbe::new();
+        let mut probe_b = TelemetryProbe::new();
+        let (addr_a, mut rx_a) = spawn_counted(&probe_a, MAX_CONCURRENT_CONNECTIONS).await;
+        let (addr_b, mut rx_b) = spawn_counted(&probe_b, MAX_CONCURRENT_CONNECTIONS).await;
+
+        let mut client_a = v2_client(&addr_a).await;
+        send_acked(&mut client_a, 1, Some(sid(1, 1))).await;
+        let mut client_b = v2_client(&addr_b).await;
+        send_acked(&mut client_b, 1, Some(sid(1, 1))).await;
+        assert_eq!(recv_mark(&mut rx_a).await, 1);
+        assert_eq!(recv_mark(&mut rx_b).await, 1);
+        assert_eq!(probe_a.sum("logit.input.batches.resends", &[]), 0.0);
+        assert_eq!(probe_b.sum("logit.input.batches.resends", &[]), 0.0);
     }
 }

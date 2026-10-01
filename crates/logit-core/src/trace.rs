@@ -139,12 +139,14 @@ pub fn parse_traceparent(s: &str) -> Option<([u8; 16], [u8; 8], u8)> {
     Some((trace_id, parent_id, flags))
 }
 
-/// Mints `N` random bytes for a trace or span id from a per-thread SplitMix64.
+/// Mints `N` random bytes for a trace, span, or sender id from a per-thread SplitMix64.
 ///
 /// Not `tracing::span::Id`, which a `Registry` recycles after a span closes, and no `rand`
 /// dependency. Not security-relevant: listeners are private by deployment shape
-/// (`docs/OVERVIEW.md`), and a trace id isn't a capability. Callers: the pipeline `TraceContext`
-/// and `trace_context`'s opt-in `mint_id` (`docs/adr/trace-context-span-lifting.md`).
+/// (`docs/OVERVIEW.md`), and a trace id isn't a capability. Callers: the pipeline `TraceContext`,
+/// `trace_context`'s opt-in `mint_id` (`docs/adr/trace-context-span-lifting.md`), and
+/// `logit-pipeline`'s `Numbering::mint`, a sink store's native-hop sender identity
+/// (`docs/adr/native-hop-identity-and-sequence.md`).
 pub fn random_id_bytes<const N: usize>() -> [u8; N] {
     use std::cell::Cell;
     thread_local! {
@@ -315,6 +317,43 @@ mod tests {
         assert_ne!(a, there);
         let short: [u8; 8] = random_id_bytes();
         assert_ne!(short, [0; 8]);
+    }
+
+    /// Set in a child run of [`random_ids_differ_across_processes`]: print one id and stop.
+    const PRINT_ID_ENV: &str = "LOGIT_PRINT_ID";
+
+    /// Two processes mint different ids. A sink store's native-hop identity depends on it: a
+    /// restarted sender that repeated its last run's identity would have its first batches read
+    /// as resends and dropped.
+    #[test]
+    fn random_ids_differ_across_processes() {
+        if std::env::var_os(PRINT_ID_ENV).is_some() {
+            let id: [u8; 16] = random_id_bytes();
+            let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+            println!("{PRINT_ID_ENV}={hex}");
+            return;
+        }
+        let child_id = || {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "trace::tests::random_ids_differ_across_processes",
+                    "--nocapture",
+                ])
+                .env(PRINT_ID_ENV, "1")
+                .output()
+                .expect("re-running this test binary");
+            assert!(output.status.success(), "the child run failed: {output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let prefix = format!("{PRINT_ID_ENV}=");
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix).map(str::to_string))
+                .unwrap_or_else(|| panic!("the child printed no id: {stdout}"))
+        };
+        let (first, second) = (child_id(), child_id());
+        assert_eq!(first.len(), 32);
+        assert_ne!(first, second, "two processes minted the same id");
     }
 
     // Datadog's documented forms: a decimal uint64 `dd.trace_id` (older tracers), a 128-bit hex

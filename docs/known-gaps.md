@@ -372,7 +372,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - **Credit-based flow control (`window` > 1).** `Hello`/`HelloAck` negotiate and record a
     `window`, but the sender only ever has one frame outstanding. Several in-flight frames
     acknowledged out of order need `logit-pipeline`'s `SinkQueue` to track more than one
-    outstanding batch: a real queue-shape change, not designed yet.
+    outstanding batch: a real queue-shape change, not designed yet. The sequence [ADR
+    `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md) adds is a
+    deduplication identity, not a credit, and `Ack` carries no sequence.
   - **QUIC.** TCP only today; a plausible later transport upgrade, not attempted.
   - **An OTLP passthrough codec.** Whether the native protocol should carry OTLP-encoded payloads
     unmodified (a relay forwarding OTLP without re-encoding into native) is an open question in
@@ -536,14 +538,26 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   ([`docs/plans/delivery-semantics.md`](plans/delivery-semantics.md), W1), set
   `buffer.delivery: at_least_once` on a sink that should resend.
 
-- **The native hop has no sender identity and no deduplication.** [ADR
-  `delivery-semantics`](adr/delivery-semantics.md), item 7, targets effectively-once between
-  `logit_out` and `logit_in`. As built, `Ack.seq` counts frames on one connection and restarts
-  on a reconnect, and `logit_in` forwards every frame it receives. Under the default,
-  `at_least_once`, a resend after a lost `Ack`, and a `buffer.disk:` replay after a crash, reach
-  `logit_in`'s consumers twice, and a `statsd_out` or an aggregated kind among them double-counts. Until the
-  wire layout has its own record (the plan's W4 and W5), `buffer.delivery: at_most_once` on a
-  `logit_out` whose far side feeds a counter sink avoids that at the cost of the batch.
+- ~~**The native hop has no sender identity and no deduplication.**~~ **Closed 2026-10-01:** a sink's store numbers every batch under an identity minted when it opens, `logit_out` sends the pair in each v2 frame's trailer, and `logit_in` acks a frame at or below its identity's mark without forwarding it ([ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md)). What still reaches consumers twice is in that record's decision 5 and in the parked-forward entry below.
+
+  [ADR `delivery-semantics`](adr/delivery-semantics.md), item 7, targets effectively-once between
+  `logit_out` and `logit_in`, and [ADR
+  `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md) decides the layout:
+  a sender identity and a sequence in each frame's v2 trailer, assigned by the sink's store, and a
+  high-water mark per identity at `logit_in`. A resend after a lost `Ack` and a `buffer.disk:`
+  replay after a crash are acknowledged on the mark and not forwarded; `logit.input.batches.resends`
+  counts them. Still open: the parked-forward race in the next entry, and the duplicate a
+  `logit_in` restart, an evicted sender, a v1 peer, or a load balancer forwards, which the record
+  accepts.
+
+- **A forward parked past the sender's ack timeout can be forwarded twice.** `logit_in` holds no
+  lock per sender identity across a forward. When a forward on one connection parks on a full
+  inbox past the sender's ack timeout, the sender redials and resends the same number, and the
+  new connection reads a mark the parked forward hasn't raised yet and forwards a second copy.
+  The consumers get a duplicate, possibly after later batches, since the parked copy can land
+  behind them. [ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md),
+  decision 7, accepts it: a per-sender lock held across the forward would close it at the cost of
+  a lock per frame, to prevent a duplicate the at-least-once target tolerates.
 
 - ~~**`logit_in` acknowledges a batch no consumer took.**~~ **Closed 2026-09-30:** `Fanout`'s sends return whether any consumer took the batch, and `logit_in` answers `Reject{GOING_AWAY}` and closes for a frame none took. `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s receiver answer their protocol's retryable failure, and `tail_in` and `docker_in` freeze their checkpoint and stop (ADR `delivery-semantics`, item 3, and its W3 amendment).
 
@@ -558,7 +572,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   dropped as `Ambiguous` to avoid a duplicate. It isn't a gap to close: [ADR
   `delivery-semantics`](adr/delivery-semantics.md), item 8, keeps the combination valid and
   states the window. A `statsd_out`, or a sink whose destination aggregates a resend, with
-  `buffer.disk:` can replay counters from that window after a crash.
+  `buffer.disk:` can replay counters from that window after a crash. On the native hop, a
+  `logit_in` that still holds the replayed records' sender identity acks them without forwarding
+  them ([ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md)).
 
 - ~~**`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
   per-message framing**~~ **Closed (2026-09-12).** `syslog_out` needs one UDP datagram or one

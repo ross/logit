@@ -62,7 +62,7 @@ struct RecordingOutput {
 
 #[async_trait::async_trait]
 impl Output for RecordingOutput {
-    fn observe_batch(&mut self, ctx: BatchContext) {
+    fn observe_batch(&mut self, ctx: BatchContext, _seq: Option<logit_pipeline::SeqId>) {
         self.last_provenance = ctx.provenance;
     }
 
@@ -191,13 +191,16 @@ async fn a_route_component_splits_a_real_logit_in_stream_onto_its_targets() {
     let mut output = LogitOutput::new(addr);
 
     // -- Batch 1: origin edge_host -> host_stream ------------------------------------------
-    output.observe_batch(BatchContext {
-        trace: TraceContext::new_root(),
-        provenance: Provenance {
-            origin: Some(intern("edge_host")),
-            previous: Some(intern("tag_host")),
+    output.observe_batch(
+        BatchContext {
+            trace: TraceContext::new_root(),
+            provenance: Provenance {
+                origin: Some(intern("edge_host")),
+                previous: Some(intern("tag_host")),
+            },
         },
-    });
+        None,
+    );
     output
         .send(&tagged_batch("host"))
         .await
@@ -231,13 +234,16 @@ async fn a_route_component_splits_a_real_logit_in_stream_onto_its_targets() {
     );
 
     // -- Batch 2: origin edge_app -> app_stream --------------------------------------------
-    output.observe_batch(BatchContext {
-        trace: TraceContext::new_root(),
-        provenance: Provenance {
-            origin: Some(intern("edge_app")),
-            previous: Some(intern("tag_app")),
+    output.observe_batch(
+        BatchContext {
+            trace: TraceContext::new_root(),
+            provenance: Provenance {
+                origin: Some(intern("edge_app")),
+                previous: Some(intern("tag_app")),
+            },
         },
-    });
+        None,
+    );
     output.send(&tagged_batch("app")).await.expect("send should succeed on the reused connection");
 
     let (app_batch, app_provenance) = tokio::time::timeout(Duration::from_secs(5), app_rx.recv())
@@ -257,13 +263,16 @@ async fn a_route_component_splits_a_real_logit_in_stream_onto_its_targets() {
     );
 
     // -- Batch 3: an origin no route names -> split's own consumer (forward_sink) ----------
-    output.observe_batch(BatchContext {
-        trace: TraceContext::new_root(),
-        provenance: Provenance {
-            origin: Some(intern("edge_unknown")),
-            previous: Some(intern("tag_unknown")),
+    output.observe_batch(
+        BatchContext {
+            trace: TraceContext::new_root(),
+            provenance: Provenance {
+                origin: Some(intern("edge_unknown")),
+                previous: Some(intern("tag_unknown")),
+            },
         },
-    });
+        None,
+    );
     output
         .send(&tagged_batch("unknown"))
         .await

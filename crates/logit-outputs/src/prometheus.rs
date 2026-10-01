@@ -237,7 +237,7 @@ use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, Event, EventBatch, Exemplar, Telemetry};
-use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output};
+use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::prometheus::compression::{self, Encoding};
 use logit_proto::prometheus::{
     events_to_families, remote_write, text, Dialect, FamilyType, MetricFamily, Point,
@@ -535,10 +535,10 @@ impl Output for PrometheusOutput {
         }
     }
 
-    fn observe_batch(&mut self, ctx: BatchContext) {
+    fn observe_batch(&mut self, ctx: BatchContext, seq: Option<SeqId>) {
         match self {
-            PrometheusOutput::Expose(output) => output.observe_batch(ctx),
-            PrometheusOutput::Send(output) => output.observe_batch(ctx),
+            PrometheusOutput::Expose(output) => output.observe_batch(ctx, seq),
+            PrometheusOutput::Send(output) => output.observe_batch(ctx, seq),
         }
     }
 
@@ -1020,7 +1020,7 @@ impl Output for RemoteWriteOutput {
     }
 
     /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext) {
+    fn observe_batch(&mut self, _ctx: BatchContext, _seq: Option<SeqId>) {
         self.accounting.observe();
     }
 
@@ -2914,7 +2914,7 @@ mod tests {
         sink.bind().await.unwrap();
         let PrometheusOutput::Expose(expose) = &sink else { unreachable!("built to expose") };
         let url = format!("http://{}/metrics", expose.local_addr().unwrap());
-        sink.observe_batch(logit_pipeline::BatchContext::default());
+        sink.observe_batch(logit_pipeline::BatchContext::default(), None);
         for _ in 0..2 {
             sink.send(&b).await.unwrap();
             get(&url, &[("accept", OM_ACCEPT)]).await.text().await.unwrap();

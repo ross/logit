@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-10
+updated: 2026-10-01
 ---
 
 # Batch provenance (`origin`/`previous`) carried on `Delivered`, stamped by `Fanout`
@@ -155,6 +155,11 @@ Provenance rides inside the v2 frame payload instead, where the codec byte `pars
 reads makes it self-describing: `CODEC_NATIVE_V1` records decode with `Provenance::default()`,
 `CODEC_NATIVE_V2` records decode their trailer, and an already-spooled v1 record keeps replaying
 correctly forever.
+
+[Amendment (2026-10-01): a new field can also ride as a new v2 trailer tag, with no new codec
+byte, because `decode_batch_v2` skips a tag it doesn't know; [ADR
+`native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md) adds tags 3 and 4 this
+way.]
 
 **Two new hooks, not widened existing ones, for reading it.** `Transform::observe_provenance`
 (default no-op) sits alongside `observe_batch_context`, not folded into it: `Aggregator` exposes

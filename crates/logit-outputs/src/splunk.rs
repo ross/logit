@@ -143,7 +143,7 @@ pub use crate::tls::TlsClientSettings;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use logit_core::{Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::{BatchContext, Fault, Output};
+use logit_pipeline::{BatchContext, Fault, Output, SeqId};
 use logit_proto::splunk::response::{
     encode_ack_request, parse_ack_reply, parse_reply, HecReply, HecStatus, SPLUNK_CLOUD_BODY_CAP,
 };
@@ -864,7 +864,7 @@ impl Output for SplunkHecOutput {
     }
 
     /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext) {
+    fn observe_batch(&mut self, _ctx: BatchContext, _seq: Option<SeqId>) {
         self.accounting.observe();
     }
 
