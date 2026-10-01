@@ -2621,6 +2621,7 @@ mod tests {
         assert_eq!(marker_of(&q.peek_at(0).await.expect("queued").0), "f");
         assert_eq!(marker_of(&q.commit().unwrap().0), "f");
         q.push((batch("g"), ctx())).await; // rotates segment 1 away, the cursor at its end
+        q.wait_for_persists().await; // segment 0's unlink runs off the push
         assert_eq!(list_segments(&dir).unwrap(), vec![1, 2]);
         assert_eq!(marker_of(&q.peek_at(0).await.expect("reads on into segment 2").0), "g");
         assert_eq!(marker_of(&q.commit().unwrap().0), "g");
