@@ -57,7 +57,7 @@ use crate::accounting::BatchAccounting;
 use crate::count_request;
 use crate::datagram::{Datagrams, Framing, Report, UdpDest};
 use logit_core::{Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::{BatchContext, Output};
+use logit_pipeline::{BatchContext, Output, SeqId};
 use logit_proto::collectd::{CollectdEncoder, DEFAULT_MAX_PACKET_BYTES};
 use logit_proto::{FramedEncoder, MessageBuf};
 
@@ -178,7 +178,7 @@ impl CollectdOutput {
 #[async_trait::async_trait]
 impl Output for CollectdOutput {
     /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext) {
+    fn observe_batch(&mut self, _ctx: BatchContext, _seq: Option<SeqId>) {
         self.accounting.observe();
     }
 

@@ -201,7 +201,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use logit_core::{Diagnostics, EventBatch, MetricKind, Telemetry};
-use logit_pipeline::{BatchContext, Fault, Output};
+use logit_pipeline::{BatchContext, Fault, Output, SeqId};
 use logit_proto::datadog::events::EventFormat;
 use logit_proto::datadog::{
     is_datadog_event, is_datadog_stats, is_service_check, trace_readiness, DatadogEncoder,
@@ -944,7 +944,7 @@ impl DatadogOutput {
 impl Output for DatadogOutput {
     /// Arms this sink's batch accounting (`crate::accounting`) and fixes the batch's send time,
     /// so every attempt at it reaches the same stale verdict (module doc's "What is never sent").
-    fn observe_batch(&mut self, _ctx: BatchContext) {
+    fn observe_batch(&mut self, _ctx: BatchContext, _seq: Option<SeqId>) {
         self.accounting.observe();
         self.batch_now = Some((self.clock)());
     }

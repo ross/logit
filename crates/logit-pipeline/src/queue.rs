@@ -8,8 +8,9 @@
 use crate::fanout::BatchContext;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_proto::buffer::{Buffer, InMemoryBuffer, OverflowPolicy as DropPolicy, PushOutcome};
+use logit_proto::native::SeqId;
 use std::iter::Peekable;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::vec;
 use tokio::sync::Notify;
@@ -34,10 +35,10 @@ impl Queued for Arc<EventBatch> {
     }
 }
 
-/// [`SinkQueue`]'s item type: a batch and the [`BatchContext`] it arrived with. `BatchContext`
-/// is `Copy` and 32 bytes, so it rides inline with no allocation; weight and units come from the
-/// batch alone.
-impl Queued for (Arc<EventBatch>, BatchContext) {
+/// [`SinkQueue`]'s item type: a batch, the [`BatchContext`] it arrived with, and the [`SeqId`]
+/// the queue numbered it with. Both are `Copy` and ride inline with no allocation; weight and
+/// units come from the batch alone.
+impl Queued for (Arc<EventBatch>, BatchContext, SeqId) {
     fn weight(&self) -> u64 {
         self.0.weight()
     }
@@ -635,15 +636,71 @@ impl<T: Queued + Clone> BoundedQueue<T> {
     }
 }
 
+/// What a [`SinkStore`] hands its consumer: a batch, the [`BatchContext`] it arrived with, and
+/// its native-hop sender identity and number. The number is `None` only for a disk record
+/// written without one (`docs/adr/native-hop-identity-and-sequence.md`, decision 3).
+pub type StoreItem = (Arc<EventBatch>, BatchContext, Option<SeqId>);
+
+/// One store's sender identity and its next sequence number
+/// (`docs/adr/native-hop-identity-and-sequence.md`, decisions 2 and 3). Minted when the store
+/// opens, so a reopened store is a new sender whose numbers start at 1.
+pub(crate) struct Numbering {
+    id: [u8; 16],
+    next: AtomicU64,
+}
+
+impl Numbering {
+    pub(crate) fn mint() -> Self {
+        Self { id: logit_core::random_id_bytes::<16>(), next: AtomicU64::new(1) }
+    }
+
+    /// The next number. A store calls it before its push's first `.await`, so numbers follow
+    /// push order; a push that then fails or is cancelled leaves a gap, which the receiver
+    /// ignores. Pushes into one store are sequential, so `Relaxed` is enough.
+    pub(crate) fn next(&self) -> SeqId {
+        SeqId { id: self.id, seq: self.next.fetch_add(1, Ordering::Relaxed) }
+    }
+}
+
 /// A sink's delivery queue. Each batch keeps the [`BatchContext`] it arrived with: `write_loop`'s
 /// sink span needs its trace context
 /// (`docs/adr/internal-span-emission-and-deterministic-sampling.md`), and
-/// `Output::observe_batch` its provenance (`docs/adr/batch-provenance-on-delivered.md`).
-pub type SinkQueue = BoundedQueue<(Arc<EventBatch>, BatchContext)>;
+/// `Output::observe_batch` its provenance (`docs/adr/batch-provenance-on-delivered.md`). The
+/// queue also numbers each batch it admits, for `logit_out`'s native hop.
+pub struct SinkQueue {
+    queue: BoundedQueue<(Arc<EventBatch>, BatchContext, SeqId)>,
+    numbering: Numbering,
+}
 
 impl SinkQueue {
+    /// Mints the queue's sender identity: every [`SinkStore::open`] of a memory store is a new
+    /// sender.
     pub fn new(config: SinkQueueConfig, telemetry: Telemetry) -> Self {
-        Self::with_metrics(config.into(), &SINK_QUEUE_METRICS, telemetry)
+        Self {
+            queue: BoundedQueue::with_metrics(config.into(), &SINK_QUEUE_METRICS, telemetry),
+            numbering: Numbering::mint(),
+        }
+    }
+
+    /// Numbers the batch, then admits it under the configured overflow policy. The number is
+    /// taken before `Block`'s wait, so a push that `DropNewest` rejects still consumes one.
+    pub async fn push(&self, (batch, ctx): (Arc<EventBatch>, BatchContext)) {
+        let seq = self.numbering.next();
+        self.queue.push((batch, ctx, seq)).await
+    }
+
+    /// See [`BoundedQueue::peek`], including its one-consumer rule.
+    pub async fn peek(&self) -> Option<StoreItem> {
+        self.queue.peek().await.map(|(batch, ctx, seq)| (batch, ctx, Some(seq)))
+    }
+
+    /// See [`BoundedQueue::commit`].
+    pub fn commit(&self) -> Option<StoreItem> {
+        self.queue.commit().map(|(batch, ctx, seq)| (batch, ctx, Some(seq)))
+    }
+
+    pub fn close(&self) {
+        self.queue.close()
     }
 }
 
@@ -652,10 +709,13 @@ impl SinkQueue {
 /// over the two known implementations. `DiskQueue` does not implement
 /// `logit_proto::buffer::Buffer<T>`, whose sync `&mut self` shape can't express an async,
 /// file-backed queue.
+// There's one per sink, behind an `Arc`, so the boxed `Disk` variant padded to `SinkQueue`'s size
+// costs a couple of hundred bytes per component; boxing `Memory` too would add an indirection
+// to every push, peek, and commit.
+#[allow(clippy::large_enum_variant)]
 pub enum SinkStore {
     Memory(SinkQueue),
-    // Boxed so the common `Memory` variant isn't padded to `DiskQueue`'s size
-    // (`clippy::large_enum_variant`).
+    // Boxed so the common `Memory` variant isn't padded to `DiskQueue`'s size.
     Disk(Box<crate::disk_queue::DiskQueue>),
 }
 
@@ -690,7 +750,7 @@ impl SinkStore {
         }
     }
 
-    pub async fn peek(&self) -> Option<(Arc<EventBatch>, BatchContext)> {
+    pub async fn peek(&self) -> Option<StoreItem> {
         match self {
             SinkStore::Memory(q) => q.peek().await,
             SinkStore::Disk(q) => q.peek().await,
@@ -698,7 +758,7 @@ impl SinkStore {
     }
 
     /// Advances past the head, returning it. Production callers ignore the value; tests read it.
-    pub fn commit(&self) -> Option<(Arc<EventBatch>, BatchContext)> {
+    pub fn commit(&self) -> Option<StoreItem> {
         match self {
             SinkStore::Memory(q) => q.commit(),
             SinkStore::Disk(q) => q.commit(),
@@ -727,7 +787,7 @@ impl SinkStore {
             SinkStore::Memory(q) => {
                 let mut dropped_batches = 0u64;
                 let mut dropped_events = 0u64;
-                while let Some((batch, _ctx)) = q.commit() {
+                while let Some((batch, ..)) = q.commit() {
                     dropped_batches += 1;
                     dropped_events += batch.events.len() as u64;
                 }
@@ -791,7 +851,7 @@ mod tests {
         };
         q.push((Arc::clone(&sent), sent_ctx)).await;
 
-        let (peeked, peeked_ctx) = q.peek().await.expect("should peek the pushed batch");
+        let (peeked, peeked_ctx, _) = q.peek().await.expect("should peek the pushed batch");
         assert!(Arc::ptr_eq(&peeked, &sent));
         assert_eq!(
             peeked_ctx, sent_ctx,
@@ -799,7 +859,7 @@ mod tests {
              unchanged"
         );
 
-        let (committed, _) = q.commit().expect("should commit the pushed batch");
+        let (committed, ..) = q.commit().expect("should commit the pushed batch");
         assert!(Arc::ptr_eq(&committed, &sent));
         assert!(q.commit().is_none(), "nothing left to commit");
     }
@@ -810,8 +870,8 @@ mod tests {
         let sent = tiny_batch();
         q.push((Arc::clone(&sent), ctx())).await;
 
-        let (first, _) = q.peek().await.expect("should peek");
-        let (second, _) = q.peek().await.expect("should peek again");
+        let (first, ..) = q.peek().await.expect("should peek");
+        let (second, ..) = q.peek().await.expect("should peek again");
         assert!(Arc::ptr_eq(&first, &sent));
         assert!(Arc::ptr_eq(&second, &sent));
     }
@@ -849,9 +909,9 @@ mod tests {
         q.push((Arc::clone(&b), ctx())).await;
         q.push((Arc::clone(&c), ctx())).await; // evicts `a`
 
-        let (first, _) = q.commit().expect("should commit");
+        let (first, ..) = q.commit().expect("should commit");
         assert!(Arc::ptr_eq(&first, &b), "the oldest batch (a) should never appear");
-        let (second, _) = q.commit().expect("should commit");
+        let (second, ..) = q.commit().expect("should commit");
         assert!(Arc::ptr_eq(&second, &c));
         assert!(q.commit().is_none());
     }
@@ -867,18 +927,18 @@ mod tests {
         q.push((Arc::clone(&a), ctx())).await;
         q.push((Arc::clone(&b), ctx())).await;
 
-        let (peeked, _) = q.peek().await.expect("should peek a"); // reserves `a`
+        let (peeked, ..) = q.peek().await.expect("should peek a"); // reserves `a`
         assert!(Arc::ptr_eq(&peeked, &a));
 
         q.push((Arc::clone(&c), ctx())).await; // must evict `b`, never the reserved `a`
 
-        let (committed, _) =
+        let (committed, ..) =
             q.commit().expect("should commit the batch that was actually peeked/sent");
         assert!(
             Arc::ptr_eq(&committed, &a),
             "commit must return the exact batch that was peeked, not whatever is now at the front"
         );
-        let (next, _) = q.commit().expect("should commit");
+        let (next, ..) = q.commit().expect("should commit");
         assert!(Arc::ptr_eq(&next, &c), "b should have been the one evicted, not delivered");
         assert!(q.commit().is_none());
     }
@@ -921,11 +981,54 @@ mod tests {
         q.push((Arc::clone(&b), ctx())).await;
         q.push((c, ctx())).await; // rejected -- queue contents unchanged
 
-        let (first, _) = q.commit().expect("should commit");
+        let (first, ..) = q.commit().expect("should commit");
         assert!(Arc::ptr_eq(&first, &a));
-        let (second, _) = q.commit().expect("should commit");
+        let (second, ..) = q.commit().expect("should commit");
         assert!(Arc::ptr_eq(&second, &b));
         assert!(q.commit().is_none());
+    }
+
+    /// Each queue is a new sender: a restart without a spool must not read as a resend at
+    /// `logit_in` (`docs/adr/native-hop-identity-and-sequence.md`, decision 3).
+    #[tokio::test]
+    async fn every_new_queue_mints_its_own_identity_and_starts_at_one() {
+        let a = queue(10, u64::MAX, OverflowPolicy::Block);
+        let b = queue(10, u64::MAX, OverflowPolicy::Block);
+        a.push((tiny_batch(), ctx())).await;
+        b.push((tiny_batch(), ctx())).await;
+
+        let (.., seq_a) = a.peek().await.expect("should peek");
+        let (.., seq_b) = b.peek().await.expect("should peek");
+        let (seq_a, seq_b) = (seq_a.expect("a memory store numbers"), seq_b.expect("numbered"));
+        assert_eq!((seq_a.seq, seq_b.seq), (1, 1));
+        assert_ne!(seq_a.id, seq_b.id, "two queues should not share a sender identity");
+    }
+
+    #[tokio::test]
+    async fn the_queue_numbers_batches_in_push_order_from_one() {
+        let q = queue(10, u64::MAX, OverflowPolicy::Block);
+        for _ in 0..3 {
+            q.push((tiny_batch(), ctx())).await;
+        }
+        let mut seen = Vec::new();
+        while let Some((.., seq)) = q.commit() {
+            seen.push(seq.expect("a memory store numbers every batch"));
+        }
+        assert_eq!(seen.iter().map(|s| s.seq).collect::<Vec<_>>(), [1, 2, 3]);
+        assert!(seen.iter().all(|s| s.id == seen[0].id), "one queue is one sender");
+    }
+
+    /// The number is taken before the overflow policy decides, so a rejected push leaves a gap
+    /// rather than reusing its number for the next batch.
+    #[tokio::test]
+    async fn a_push_that_drop_newest_rejects_leaves_a_gap_in_the_numbering() {
+        let q = queue(1, u64::MAX, OverflowPolicy::DropNewest);
+        q.push((tiny_batch(), ctx())).await;
+        q.push((tiny_batch(), ctx())).await; // rejected: the queue holds one
+        let (.., first) = q.commit().expect("should commit");
+        q.push((tiny_batch(), ctx())).await;
+        let (.., third) = q.commit().expect("should commit");
+        assert_eq!((first.map(|s| s.seq), third.map(|s| s.seq)), (Some(1), Some(3)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -942,7 +1045,7 @@ mod tests {
 
         q.push((sent2, ctx())).await;
 
-        let (peeked, _) = tokio::time::timeout(Duration::from_secs(1), peeking)
+        let (peeked, ..) = tokio::time::timeout(Duration::from_secs(1), peeking)
             .await
             .expect("peek should resolve once a batch is pushed")
             .expect("the spawned task should not panic")

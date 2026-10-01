@@ -1973,9 +1973,10 @@ fn disk_queue_config(dir: std::path::PathBuf) -> logit_pipeline::DiskQueueConfig
     }
 }
 
-/// `DiskQueue::push`: `native::encode_batch_v2` (`encode_batch` plus its trailer,
-/// `docs/adr/batch-provenance-on-delivered.md`), `frame::write_frame`, and one `write_all` to the
-/// active segment. The disk buffer's ADR accepts that this encode breaks
+/// `DiskQueue::push`: `native::encode_batch_v2` (`encode_batch` plus its trailer of provenance and
+/// the store's sender identity and sequence, `docs/adr/batch-provenance-on-delivered.md` and
+/// `docs/adr/native-hop-identity-and-sequence.md`), `frame::write_frame`, and one `write_all` to
+/// the active segment. Taking the sequence number is an atomic add and allocates nothing. The disk buffer's ADR accepts that this encode breaks
 /// `buffered-sink-delivery`'s zero-clone `Arc<EventBatch>` property. The warm-up push+commit pays
 /// the one-time setup (the lock file, the first segment's open).
 #[test]
@@ -2000,8 +2001,8 @@ fn disk_queue_push_one_batch() {
         measure(|| rt.block_on(queue.push((Arc::clone(&batch), BatchContext::default()))));
 
     // Among the 33: `encode_batch_v2` builds v1's payload as its own `Bytes`, then copies it into
-    // a `BytesMut` sized to the whole payload, the trailer written straight into it: 2. Sizing it
-    // to fit is what spares `freeze` a shared header. `write_field`'s
+    // a `BytesMut` sized to the whole payload, the trailer (provenance and the sender pair)
+    // written straight into it: 2. Sizing it to fit is what spares `freeze` a shared header. `write_field`'s
     // temp buffers: 2 per `MetricRecord` (`write_record_list`'s per-entry length prefix, which
     // lets a reader skip a record with unknown fields, and the `MR_KIND` field) for the four
     // metrics, plus 1 for `LogRecord.message`: 9. The two `Samples` are written straight from

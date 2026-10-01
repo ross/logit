@@ -44,7 +44,7 @@ pub use logit_proto::native::SeqId;
 pub use output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault, Output};
 pub use queue::{
     BoundedQueue, CountedDrain, OverflowPolicy, QueueConfig, QueueMetrics, Queued, SinkQueue,
-    SinkQueueConfig, SinkStore, SinkStoreConfig, SINK_QUEUE_METRICS,
+    SinkQueueConfig, SinkStore, SinkStoreConfig, StoreItem, SINK_QUEUE_METRICS,
 };
 pub use readiness::{NodeState, Phase, PipelineState, Readiness};
 pub use router::{Destination, Router, RouterScratch};

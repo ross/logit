@@ -20,6 +20,7 @@ use crate::router::{Destination, Router, RouterScratch};
 use crate::{Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
 use anyhow::Context;
 use logit_core::{Diagnostics, Event, EventBatch, Resource, Scope, SpanKind, Telemetry};
+use logit_proto::native::SeqId;
 use logit_script::{Heartbeat, ProcessOutcome, ScriptWorker};
 use std::collections::HashMap;
 use std::future::Future;
@@ -1017,7 +1018,7 @@ pub(crate) async fn write_loop(
         // `deliver_with_retry` future already borrows it mutably, and the borrow checker rejects
         // a second overlapping borrow inside the macro.
         enum NextBatch {
-            Batch(Arc<EventBatch>, BatchContext),
+            Batch(Arc<EventBatch>, BatchContext, Option<SeqId>),
             Closed,
             ShutdownExpired,
         }
@@ -1025,7 +1026,7 @@ pub(crate) async fn write_loop(
         // "Cancellation points".
         let next = tokio::select! {
             batch = store.peek() => match batch {
-                Some((batch, ctx)) => NextBatch::Batch(batch, ctx),
+                Some((batch, ctx, seq)) => NextBatch::Batch(batch, ctx, seq),
                 None => NextBatch::Closed,
             },
             () = tokio::task::unconstrained(shutdown_grace_expired(
@@ -1034,8 +1035,8 @@ pub(crate) async fn write_loop(
                 write_config.shutdown_grace,
             )) => NextBatch::ShutdownExpired,
         };
-        let (batch, ctx) = match next {
-            NextBatch::Batch(batch, ctx) => (batch, ctx),
+        let (batch, ctx, seq) = match next {
+            NextBatch::Batch(batch, ctx, seq) => (batch, ctx, seq),
             NextBatch::Closed => break, // queue closed and empty: nothing left to deliver.
             NextBatch::ShutdownExpired => return Ok(()),
         };
@@ -1053,11 +1054,12 @@ pub(crate) async fn write_loop(
         );
         span.events(batch.events.len() as u64);
 
-        // Once per batch, before its first attempt. `logit_out` carries provenance across the
-        // wire from it (`docs/adr/batch-provenance-on-delivered.md`), and a sink with encode-side
-        // counters arms its per-batch accounting
-        // (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 2).
-        output.observe_batch(ctx);
+        // Once per batch, before its first attempt. `logit_out` carries provenance and the
+        // store's sequence across the wire from it (`docs/adr/batch-provenance-on-delivered.md`,
+        // `docs/adr/native-hop-identity-and-sequence.md`), and a sink with encode-side counters
+        // arms its per-batch accounting (`docs/adr/sink-send-path-and-attempt-accounting.md`,
+        // decision 2).
+        output.observe_batch(ctx, seq);
 
         enum DeliverStep {
             Outcome(Delivery),
@@ -5609,7 +5611,7 @@ mod tests {
         .unwrap();
         reopened.close();
         let mut spooled = Vec::new();
-        while let Some((batch, _)) = reopened.peek().await {
+        while let Some((batch, ..)) = reopened.peek().await {
             spooled.push(counter_value_of(&batch));
             reopened.commit().unwrap();
         }
@@ -5687,7 +5689,7 @@ mod tests {
         .unwrap();
         reopened.close();
         let mut spooled = Vec::new();
-        while let Some((batch, _)) = reopened.peek().await {
+        while let Some((batch, ..)) = reopened.peek().await {
             spooled.push(counter_value_of(&batch));
             reopened.commit().unwrap();
         }

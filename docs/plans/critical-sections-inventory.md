@@ -2462,7 +2462,7 @@ surveyor's.
   disagrees with the file; concurrency — `State` is a `std::sync::Mutex` whose guard must never be held across an
   `.await` (clippy-enforced), so every step re-locks and re-reads; accounting — every failure path must count
   exactly one dropped item; hot-path — this is the per-batch cost of a disk-backed sink
-  (`disk_queue_push_one_batch` pins 34 allocations).
+  (`disk_queue_push_one_batch` pins 33 allocations).
 - **Invariants to verify:**
   - After any `push` returns, `segments.back().len` equals the active segment's real on-disk length.
   - A `push` future dropped at the `write_all`/`flush` await leaves *only* trailing garbage, never a partially

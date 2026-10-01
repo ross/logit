@@ -139,12 +139,14 @@ pub fn parse_traceparent(s: &str) -> Option<([u8; 16], [u8; 8], u8)> {
     Some((trace_id, parent_id, flags))
 }
 
-/// Mints `N` random bytes for a trace or span id from a per-thread SplitMix64.
+/// Mints `N` random bytes for a trace, span, or sender id from a per-thread SplitMix64.
 ///
 /// Not `tracing::span::Id`, which a `Registry` recycles after a span closes, and no `rand`
 /// dependency. Not security-relevant: listeners are private by deployment shape
-/// (`docs/OVERVIEW.md`), and a trace id isn't a capability. Callers: the pipeline `TraceContext`
-/// and `trace_context`'s opt-in `mint_id` (`docs/adr/trace-context-span-lifting.md`).
+/// (`docs/OVERVIEW.md`), and a trace id isn't a capability. Callers: the pipeline `TraceContext`,
+/// `trace_context`'s opt-in `mint_id` (`docs/adr/trace-context-span-lifting.md`), and
+/// `logit-pipeline`'s `Numbering::mint`, a sink store's native-hop sender identity
+/// (`docs/adr/native-hop-identity-and-sequence.md`).
 pub fn random_id_bytes<const N: usize>() -> [u8; N] {
     use std::cell::Cell;
     thread_local! {

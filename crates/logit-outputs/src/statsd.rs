@@ -339,7 +339,7 @@ use logit_core::{
     Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Temporality,
     Value,
 };
-use logit_pipeline::{BatchContext, DeliveryPosture};
+use logit_pipeline::{BatchContext, DeliveryPosture, SeqId};
 use logit_proto::{FramedEncoder, MessageBuf};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -1864,7 +1864,7 @@ impl StatsdOutput {
 #[async_trait::async_trait]
 impl Output for StatsdOutput {
     /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext) {
+    fn observe_batch(&mut self, _ctx: BatchContext, _seq: Option<SeqId>) {
         self.accounting.observe();
     }
 

@@ -69,7 +69,7 @@ use crate::Output;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 use logit_core::{Diagnostics, EventBatch, Provenance, Telemetry};
-use logit_pipeline::{BatchContext, Fault};
+use logit_pipeline::{BatchContext, Fault, SeqId};
 use logit_proto::frame::{self, Compression};
 use logit_proto::native::{self, control};
 use std::path::Path;
@@ -490,7 +490,7 @@ impl LogitOutput {
 impl Output for LogitOutput {
     /// Records `ctx.provenance` for `send`. `write_loop` calls this once per batch, before its
     /// first attempt, so every attempt at one batch carries the same provenance.
-    fn observe_batch(&mut self, ctx: BatchContext) {
+    fn observe_batch(&mut self, ctx: BatchContext, _seq: Option<SeqId>) {
         self.pending_provenance = ctx.provenance;
     }
 
@@ -1080,13 +1080,16 @@ mod tests {
         });
 
         let mut output = LogitOutput::new(addr);
-        output.observe_batch(logit_pipeline::BatchContext {
-            trace: logit_pipeline::TraceContext::new_root(),
-            provenance: logit_core::Provenance {
-                origin: Some(logit_core::interner::intern("logit_out_test_origin")),
-                previous: Some(logit_core::interner::intern("logit_out_test_previous")),
+        output.observe_batch(
+            logit_pipeline::BatchContext {
+                trace: logit_pipeline::TraceContext::new_root(),
+                provenance: logit_core::Provenance {
+                    origin: Some(logit_core::interner::intern("logit_out_test_origin")),
+                    previous: Some(logit_core::interner::intern("logit_out_test_previous")),
+                },
             },
-        });
+            None,
+        );
         output.send(&sample_batch()).await.expect("send should succeed");
 
         let provenance = server.await.expect("server task should not panic");
@@ -1129,13 +1132,16 @@ mod tests {
         });
 
         let mut output = LogitOutput::new(addr);
-        output.observe_batch(logit_pipeline::BatchContext {
-            trace: logit_pipeline::TraceContext::new_root(),
-            provenance: logit_core::Provenance {
-                origin: Some(logit_core::interner::intern("logit_out_test_origin")),
-                previous: None,
+        output.observe_batch(
+            logit_pipeline::BatchContext {
+                trace: logit_pipeline::TraceContext::new_root(),
+                provenance: logit_core::Provenance {
+                    origin: Some(logit_core::interner::intern("logit_out_test_origin")),
+                    previous: None,
+                },
             },
-        });
+            None,
+        );
         output.send(&sample_batch()).await.expect("send should succeed");
         server.await.expect("server task should not panic");
     }

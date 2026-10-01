@@ -185,7 +185,7 @@ use crate::Output;
 use anyhow::Context;
 use logit_core::time::format_rfc3339_utc;
 use logit_core::{interner, AttrMap, Diagnostics, Event, EventBatch, Severity, Telemetry, Value};
-use logit_pipeline::BatchContext;
+use logit_pipeline::{BatchContext, SeqId};
 use logit_proto::{FramedEncoder, MessageBuf, MAX_UDP_PAYLOAD_BYTES};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -1327,7 +1327,7 @@ impl SyslogOutput {
 #[async_trait::async_trait]
 impl Output for SyslogOutput {
     /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext) {
+    fn observe_batch(&mut self, _ctx: BatchContext, _seq: Option<SeqId>) {
         self.accounting.observe();
     }
 
