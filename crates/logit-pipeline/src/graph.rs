@@ -3436,10 +3436,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     // Rule 74: `max_connections`, rule 45's checks one field over. `0` would reject every
     // connection on accept, and a value above `Semaphore::MAX_PERMITS` would panic in the
-    // listener's `Semaphore::new` at startup, past validation. A UDP `syslog_in`/`graphite_in`/`statsd_in` (or a `transport: unix`
-    // `statsd_in`) has no connections to cap, so a non-default value there is rejected; the default
-    // stays legal. A scrape-mode `prometheus_in`'s non-default value is rule 55's wrong-mode check,
-    // which runs first.
+    // listener's `Semaphore::new` at startup, past validation. A UDP
+    // `syslog_in`/`graphite_in`/`statsd_in` (or a `transport: unix` `statsd_in`) has no
+    // connections to cap, so a non-default value there is rejected; the default stays legal. A
+    // scrape-mode `prometheus_in`'s non-default value is rule 55's wrong-mode check, which runs
+    // first.
     for (id, component) in &components {
         let max_connections = match &component.kind {
             ComponentKind::SyslogIn { max_connections, .. }
