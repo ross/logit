@@ -475,6 +475,7 @@ mod window {
         graph: graph::Graph,
         specs: HashMap<String, NodeSpec>,
         marks: &Arc<Mutex<Vec<i64>>>,
+        probe: &mut TelemetryProbe,
     ) {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let run = tokio::spawn(logit_pipeline::run_with_shutdown(graph, specs, async move {
@@ -487,6 +488,8 @@ mod window {
             || marks.lock().unwrap().len() >= BATCHES,
         )
         .await;
+        // Read while the pooled connection is live: its drop at shutdown resets the gauge.
+        assert_eq!(probe.poll().gauge("logit.output.window", &[]), Some(32.0));
         let _ = shutdown_tx.send(true);
         tokio::time::timeout(RECV_TIMEOUT, run)
             .await
@@ -507,12 +510,12 @@ mod window {
         let dir = scratch_dir("logit-round-trip-window");
         let (graph, specs) = specs(output, dir.clone());
 
-        run_until_delivered(graph, specs, &marks).await;
+        run_until_delivered(graph, specs, &marks, &mut probe).await;
 
         let expected: Vec<i64> = (0..BATCHES as i64).collect();
         assert_eq!(*marks.lock().unwrap(), expected, "each batch once, in order");
         let totals = probe.poll();
-        assert_eq!(totals.gauge("logit.output.window", &[]), Some(32.0));
+        assert_eq!(totals.gauge("logit.output.window", &[]), Some(1.0), "the flush dropped it");
         assert!(!totals.has("logit.input.batches.resends", &[]));
         std::fs::remove_dir_all(&dir).ok();
     }

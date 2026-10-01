@@ -89,7 +89,9 @@
 //! once; a cancelled call isn't counted. `logit.output.reconnects` counts every validated
 //! handshake after the first, probe-driven ones included. `logit.output.ack.duration` times each
 //! ack wait alone. The gauges `logit.output.in_flight` and `logit.output.window` hold the frames
-//! awaiting an `Ack` and the last negotiated window.
+//! awaiting an `Ack` and the negotiated window, and read 0 and 1 after every connection drop.
+//! A drift counts once, in `submit`; a `Permanent` past the head is counted when it becomes the
+//! head.
 
 use crate::Output;
 use anyhow::Context;
@@ -137,6 +139,17 @@ struct Conn {
     /// A write failed or stalled with frames in flight. Nothing more is written on it; it's
     /// kept for the acks already owed and dropped once none is.
     broken: bool,
+    /// Where the drop resets `logit.output.in_flight` and `logit.output.window`.
+    telemetry: Telemetry,
+}
+
+impl Drop for Conn {
+    /// Every drop, a cancelled call's included, leaves nothing in flight and no negotiated
+    /// window, so the gauges say so rather than keep the dropped connection's last values.
+    fn drop(&mut self) {
+        self.telemetry.gauge("logit.output.in_flight", 0.0, &[]);
+        self.telemetry.gauge("logit.output.window", 1.0, &[]);
+    }
 }
 
 pub struct LogitOutput {
@@ -322,6 +335,7 @@ impl LogitOutput {
             window,
             in_flight: 0,
             broken: false,
+            telemetry: self.telemetry.clone(),
         })
     }
 }
@@ -410,8 +424,8 @@ impl LogitOutput {
         // v2 is this plus a trailer, never smaller, so the pre-check holds for either codec.
         let v1_payload = native::encode_batch(batch);
         if v1_payload.len() as u64 > frame::MAX_SANE_UNCOMPRESSED_LEN as u64 {
-            self.diag.warn_throttled(
-                "frame_too_large",
+            self.warn_at_head(
+                in_flight,
                 format!(
                     "batch encodes to {} bytes, over the {}-byte sanity cap -- dropping it \
                      rather than ever attempting to send it",
@@ -477,8 +491,8 @@ impl LogitOutput {
         if payload.len() as u32 > bound {
             // Only this batch doesn't fit; the connection is kept and nothing is written.
             self.stream = Some(conn);
-            self.diag.warn_throttled(
-                "frame_too_large",
+            self.warn_at_head(
+                in_flight,
                 format!(
                     "batch encodes to {} bytes, over this connection's {bound}-byte bound",
                     payload.len()
@@ -501,8 +515,8 @@ impl LogitOutput {
         let compressed_len = framed.len() - frame::HEADER_LEN;
         if compressed_len as u64 > frame::compressed_bound(bound) as u64 {
             self.stream = Some(conn);
-            self.diag.warn_throttled(
-                "frame_too_large",
+            self.warn_at_head(
+                in_flight,
                 format!(
                     "batch compresses to {compressed_len} bytes, over this connection's {}-byte \
                      compressed bound",
@@ -555,12 +569,6 @@ impl LogitOutput {
     /// `Output::await_ack`'s body: reads the `Ack` for the oldest frame in flight. Every `Err`
     /// carries a [`Fault`] and leaves no connection.
     async fn read_ack(&mut self) -> anyhow::Result<()> {
-        if std::mem::take(&mut self.drifted) {
-            return Err(anyhow::anyhow!(
-                "a submit's in-flight count disagreed with the connection's, which was dropped"
-            ))
-            .context(Fault::Ambiguous);
-        }
         // Taken into a local for the read, so a cancelled wait drops the connection.
         let mut conn = match self.stream.take() {
             Some(conn) if conn.in_flight > 0 => conn,
@@ -613,6 +621,14 @@ impl LogitOutput {
         };
         self.record_in_flight(0);
         Err(err)
+    }
+
+    /// Warns `frame_too_large` for the batch at the head only; one past it is warned once it
+    /// becomes the head.
+    fn warn_at_head(&mut self, in_flight: usize, message: String) {
+        if in_flight == 0 {
+            self.diag.warn_throttled("frame_too_large", message);
+        }
     }
 
     /// Sets the `logit.output.in_flight` gauge.
@@ -682,7 +698,9 @@ impl Output for LogitOutput {
 
     /// Counts a failure that carries a [`Fault`] in `logit.output.requests`. A failure with
     /// frames in flight carries none and isn't counted: the `await_ack`s after it count the
-    /// round's outcome, as the `await_ack` after a success does.
+    /// round's outcome, as the `await_ack` after a success does. A `Permanent` past the head is
+    /// counted only once its batch is the head: `write_loop` stops the fill there and submits
+    /// that batch again each round until then.
     async fn submit(
         &mut self,
         batch: &EventBatch,
@@ -691,14 +709,26 @@ impl Output for LogitOutput {
         in_flight: usize,
     ) -> anyhow::Result<()> {
         let result = self.submit_frame(batch, ctx, seq, in_flight).await;
-        if result.as_ref().is_err_and(|err| err.downcast_ref::<Fault>().is_some()) {
+        let counted = match result.as_ref().map_err(|err| err.downcast_ref::<Fault>()) {
+            Err(Some(Fault::Permanent)) => in_flight == 0,
+            Err(Some(_)) => true,
+            Ok(()) | Err(None) => false,
+        };
+        if counted {
             count_request(&self.telemetry, &result);
         }
         result
     }
 
-    /// Counts every result in `logit.output.requests`, so a `send` counts once.
+    /// Counts every result in `logit.output.requests`, so a `send` counts once, except the
+    /// failure that reports a drifted submit: that submit counted it.
     async fn await_ack(&mut self) -> anyhow::Result<()> {
+        if std::mem::take(&mut self.drifted) {
+            return Err(anyhow::anyhow!(
+                "a submit's in-flight count disagreed with the connection's, which was dropped"
+            ))
+            .context(Fault::Ambiguous);
+        }
         let result = self.read_ack().await;
         count_request(&self.telemetry, &result);
         result
@@ -2080,7 +2110,22 @@ mod tests {
             window: 1,
             in_flight: 0,
             broken: false,
+            telemetry: Telemetry::default(),
         }
+    }
+
+    /// [`conn_over`] with `window` negotiated, `in_flight` frames outstanding, and `telemetry`.
+    fn conn_with(
+        stream: impl AsyncStream + 'static,
+        window: usize,
+        in_flight: usize,
+        telemetry: Telemetry,
+    ) -> Conn {
+        let mut conn = conn_over(stream);
+        conn.window = window;
+        conn.in_flight = in_flight;
+        conn.telemetry = telemetry;
+        conn
     }
 
     /// A `logit_in` presenting `testdata/tls/server.pem`, which `tls_client_connector` trusts.
@@ -2652,7 +2697,7 @@ mod tests {
             "logit_out",
             "sink",
         ));
-        output.stream = Some(Conn { window: 8, ..conn_over(tcp) });
+        output.stream = Some(conn_with(tcp, 8, 0, output.telemetry.clone()));
 
         submit_at(&mut output, &sample_batch(), 0).await.unwrap();
         submit_at(&mut output, &sample_batch(), 1).await.unwrap();
@@ -2737,15 +2782,22 @@ mod tests {
     /// no connection as an `Ack`.
     #[tokio::test]
     async fn a_submit_whose_in_flight_disagrees_with_the_connection_is_ambiguous() {
-        let mut output = LogitOutput::new("127.0.0.1:1");
+        let mut probe = TelemetryProbe::new();
+        let mut output = LogitOutput::new("127.0.0.1:1").with_telemetry(probe.telemetry(
+            "out",
+            "logit_out",
+            "sink",
+        ));
         let err = submit_at(&mut output, &sample_batch(), 2).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Ambiguous, "{err:#}");
         let err = output.await_ack().await.unwrap_err();
         assert_eq!(classify(&err), Fault::Ambiguous, "{err:#}");
+        // Counted once, by the submit, and not again by the `await_ack` that reports it.
+        assert_eq!(requests(probe.poll()), ([0.0, 0.0, 1.0, 0.0], 1.0));
         output.await_ack().await.expect("the failure is reported once");
 
         let fake = FakeStream::new();
-        output.stream = Some(Conn { window: 8, in_flight: 1, ..conn_over(fake.clone()) });
+        output.stream = Some(conn_with(fake.clone(), 8, 1, Telemetry::default()));
         let err = submit_at(&mut output, &sample_batch(), 0).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Ambiguous, "{err:#}");
         assert!(output.stream.is_none(), "the connection whose count drifted is dropped");
@@ -2766,10 +2818,15 @@ mod tests {
             let _ = read_tx.send(());
             std::future::pending::<()>().await;
         });
-        let mut output = LogitOutput::new(addr);
+        let mut probe = TelemetryProbe::new();
+        let mut output =
+            LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
         submit_at(&mut output, &sample_batch(), 0).await.unwrap();
         submit_at(&mut output, &sample_batch(), 1).await.unwrap();
         assert_eq!(output.window(), 8);
+        let totals = probe.poll();
+        assert_eq!(totals.gauge("logit.output.in_flight", &[]), Some(2.0));
+        assert_eq!(totals.gauge("logit.output.window", &[]), Some(8.0));
         frames_read.await.unwrap();
 
         tokio::select! {
@@ -2779,6 +2836,54 @@ mod tests {
         }
         assert!(output.stream.is_none(), "the cancelled wait dropped the connection");
         assert_eq!(output.window(), 1);
+        let totals = probe.poll();
+        assert_eq!(totals.gauge("logit.output.in_flight", &[]), Some(0.0), "reset by the drop");
+        assert_eq!(totals.gauge("logit.output.window", &[]), Some(1.0), "reset by the drop");
+    }
+
+    /// A batch over the peer's bound past the head fails `Permanent` with no count and no warning:
+    /// `write_loop` stops the fill there and submits it again each round, and it is counted and
+    /// warned once, when it is the head.
+    #[tokio::test]
+    async fn a_permanent_frame_past_the_head_is_counted_once_when_it_becomes_the_head() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let control::ControlMessage::Hello(_) = read_control(&mut stream).await.unwrap() else {
+                panic!("expected Hello");
+            };
+            let ack = control::HelloAck { window: 8, max_frame_bytes: 4096, ..hello_ack_v1() };
+            write_control(&mut stream, &ack).await.unwrap();
+            loop {
+                read_data_frame(&mut stream).await;
+                write_control(&mut stream, &control::Ack).await.unwrap();
+            }
+        });
+        let mut probe = TelemetryProbe::new();
+        let diag = Diagnostics::new("logit_out");
+        let mut output = LogitOutput::new(addr)
+            .with_diagnostics(diag.clone())
+            .with_telemetry(probe.telemetry("out", "logit_out", "sink"));
+        let oversized = batch_of(8192);
+
+        submit_at(&mut output, &sample_batch(), 0).await.unwrap();
+        submit_at(&mut output, &sample_batch(), 1).await.unwrap();
+        for _round in 0..2 {
+            let err = submit_at(&mut output, &oversized, 2).await.unwrap_err();
+            assert_eq!(classify(&err), Fault::Permanent, "{err:#}");
+        }
+        assert!(!probe.poll().has("logit.output.requests", &[]), "nothing counted past the head");
+        assert_eq!(diag.occurrences("frame_too_large"), 0, "nor warned");
+        output.await_ack().await.unwrap();
+        output.await_ack().await.unwrap();
+
+        let err = submit_at(&mut output, &oversized, 0).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Permanent, "{err:#}");
+        assert!(output.stream.is_some(), "the connection is kept");
+        assert_eq!(requests(probe.poll()), ([2.0, 0.0, 0.0, 1.0], 3.0));
+        assert_eq!(diag.occurrences("frame_too_large"), 1);
+        peer.abort();
     }
 
     /// Over TLS, `Ack`s written in one burst behind several frames arrive in a few records; each
