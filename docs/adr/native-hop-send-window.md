@@ -21,6 +21,9 @@ Accepted. Supersedes in part:
 - [ADR `disk-backed-sink-buffer`](disk-backed-sink-buffer.md): "Corrections to the design
   sketch", item 1's list of the `SinkStore` surface as `push`/`peek`/`commit`/`close`/`finish`.
   `SinkStore` gains `peek_at` and `max_in_flight`.
+- [ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md):
+  decision 7's "it isn't under the sink's `request_timeout`", for a `logit_out` write with
+  frames in flight, which decision 5 bounds by progress.
 
 ## Context
 
@@ -181,15 +184,19 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   no connection so its `window()` reads 1, and `deliver_with_retry`'s `send` would carry the
   pending sequence of the last batch observed rather than the head's, which raises the
   receiver's mark past batches not yet delivered. Such a head goes through `deliver_window`
-  with an effective window of 1 and its context and sequence passed explicitly.
+  with an effective window of 1 and its context and sequence passed explicitly. On the fast
+  path `write_loop` calls `observe_batch` before `deliver_with_retry`, as today, and leaves
+  `observed` at 0; only `deliver_window` counts what it observes.
 - **Otherwise `deliver_window`**, with an effective window of
   `min(output.window(), store.max_in_flight())`:
   - **Fill.** While `outstanding < window`: `peek_at(outstanding)`, `observe_batch` if the batch
     isn't observed yet, then `submit` under the remaining attempt time. An `Ok` increments
-    `outstanding`. The sink bounds its own write by `request_timeout` (decision 5, step 6), so
-    the attempt time cuts a submit only when less than that is left of the head's budget; a
-    submit cut that way, past the head, is a window fault: the sink dropped the connection, the
-    acks it held unread are lost, and every frame in flight is `Ambiguous`.
+    `outstanding`. With frames in flight the sink bounds its own write by progress (decision 5,
+    step 6), so the attempt time cancels a submit only when less than `request_timeout` is left
+    of the head's budget. A submit cancelled that way, past the head, is a window fault: the
+    sink dropped the connection, the acks it held unread are lost, and every frame in flight is
+    `Ambiguous`. That differs from a submit that returns `Err` past the head, below, which keeps
+    the connection.
   - **A submit `Err` at the head** is the head's own fault, classified as today.
   - **A submit `Err` past the head classifies nothing.** The fill stops and the loop goes to
     `await_ack`. The sink keeps the connection, marked `broken` (no more writes), so the acks
@@ -199,8 +206,8 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
     timeout sets `outstanding` to 0, classifies the fault, and backs off and retries while the
     fault is retryable and the head's retry budget lasts, else drops the head with that fault.
   - **One retry budget per head.** Its clock starts when the batch becomes the head, as today.
-- **Delivered and dropped.** A delivered head is committed, and `outstanding` and `observed` each
-  drop by 1. A dropped head is committed as dropped. Under `at_most_once` an `Ambiguous` fault
+- **Delivered and dropped.** A delivered head is committed, and on the window path `outstanding`
+  and `observed` each drop by 1. A dropped head is committed as dropped. Under `at_most_once` an `Ambiguous` fault
   also commits every other outstanding item and counts each `send_failed`, since each is as
   ambiguous as the head. A `Permanent` fault drops only the head.
 - **Grace.** The write loop counts as sending while `outstanding > 0` or a submit is in
@@ -223,13 +230,17 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   4. Probe a pooled connection only when `in_flight == 0`: the probe consumes a byte, and with
      frames in flight that byte is an `Ack`'s.
   5. Size checks fail `Permanent` and keep the connection.
-  6. Write and flush, under `request_timeout`. An error or a timeout with `in_flight == 0` is
-     `Clean` and drops the connection. An error or a timeout with frames in flight marks the
-     connection `broken` and returns the error unclassified: a stalled write doesn't invalidate
-     the acks the receiver already sent, and `await_ack` reads them before the window is
-     retried. Nothing more is written on a `broken` connection, so the partial frame a timeout
-     leaves on the wire ends the connection at `logit_in` as a truncated frame once the sender
-     drops it. `Ok` increments `in_flight`.
+  6. Write and flush. With `in_flight == 0` the write is bounded by the retry budget alone, as
+     [ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md),
+     decision 7, keeps it, and an error is `Clean` and drops the connection. With frames in
+     flight the write is bounded by progress: the frame is written in chunks, and a chunk write
+     or the final flush that accepts nothing for `request_timeout` is a stall. A large frame on
+     a slow link makes progress every chunk and never trips it; a receiver parked on an earlier
+     frame does. A stall or an error with frames in flight marks the connection `broken` and
+     returns the error unclassified: neither invalidates the acks the receiver already sent,
+     and `await_ack` reads them before the window is retried. Nothing more is written on a
+     `broken` connection, so the partial frame a stall leaves on the wire ends the connection
+     at `logit_in` as a truncated frame once the sender drops it. `Ok` increments `in_flight`.
 - **`await_ack`.** With `in_flight == 0` it returns `Ok`. Otherwise it reads one control message
   under the request timeout:
   - `Ack` decrements `in_flight`, and drops a `broken` connection once `in_flight` reaches 0.
@@ -259,13 +270,15 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
 - **`at_most_once`.** An `Ambiguous` fault drops the whole window. The operator docs recommend
   `window: 1` under this posture; nothing couples the two.
 - **A long downstream stall.** The receiver parks on one frame and stops reading, the sender's
-  socket buffers fill, and a frame write stalls. The write's `request_timeout` bound marks the
+  socket buffers fill, and a frame write makes no progress. The progress bound marks the
   connection `broken`, the acks already received deliver their heads, and the parked frame
   alone times out in `await_ack`, is retried, and is dropped when its budget runs out: the
-  batch dropped is the stuck one, as at window 1. The residual is the loop's own attempt
-  timeout, which can cut a write when less than `request_timeout` of the head's budget is
-  left; the head is then retried or dropped as `Ambiguous` with its acks unread, after it has
-  already failed for most of its budget.
+  batch dropped is the stuck one, as at window 1. Each retry round costs about two
+  `request_timeout`s, the stalled write and then the ack wait, where window 1 pays one, and
+  each costs `logit_in` one `logit.proto.errors{reason="truncated"}` for the partial frame.
+  The residual is the loop's own attempt timeout, which can cancel a write when less than
+  `request_timeout` of the head's budget is left; the head is then retried or dropped as
+  `Ambiguous` with its acks unread, after it has already failed for most of its budget.
 - **The parked-forward race grows.** The abandoned connection's task can forward several
   buffered frames that race the new connection's resend, so the worst case is a few duplicates
   instead of one. It limits itself: the first forward raises the mark. The `docs/known-gaps.md`

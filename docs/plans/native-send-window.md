@@ -94,7 +94,7 @@ Files: `crates/logit-pipeline/src/output.rs`, `crates/logit-pipeline/src/runtime
   other sink on `send`.
 - [ ] `write_loop` tracks `outstanding` and `observed`; `observe_batch` runs once per batch,
   before its first submission.
-- [ ] The fast path: `outstanding == 0 && output.window() <= 1` runs `deliver_with_retry`
+- [ ] The fast path: `outstanding == 0 && observed == 0 && output.window() <= 1` runs `deliver_with_retry`
   unchanged.
 - [ ] `deliver_window`: fill to `min(output.window(), store.max_in_flight())`, the head-only
   classification of a submit `Err`, the unclassified submit `Err` past the head, the
@@ -131,9 +131,9 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-outputs/src/stream.rs`
 - [ ] `crates/logit-cli/src/pipeline.rs` passes `.with_window(*window)`; `script/schema`
   regenerates `schema/logit.schema.json`.
 - [ ] `logit_out`: `Conn` gains `window`, `in_flight`, and `broken`; `submit`, `await_ack`, and
-  `send` as `submit` then `await_ack`; the frame write and flush under `request_timeout`, a
-  timeout with frames in flight marking the connection `broken`; the probe only at
-  `in_flight == 0`; `Dial.nodelay`.
+  `send` as `submit` then `await_ack`; with frames in flight the frame written in chunks under
+  a per-chunk progress bound of `request_timeout`, a stall marking the connection `broken`;
+  the probe only at `in_flight == 0`; `Dial.nodelay`.
 - [ ] `logit_out` counters: `submit` counts its `Err`s in `logit.output.requests`, `await_ack`
   every result; `logit.output.ack.duration` per await; gauges `logit.output.in_flight` and
   `logit.output.window`, recorded in `docs/design/internal-telemetry.md`.
