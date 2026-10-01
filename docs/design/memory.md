@@ -577,7 +577,10 @@ Four findings:
    not fixed here. A hand-written `Pin<Box<dyn Future<...>>>` method is not a fix: that return type
    needs the same allocation, since the box *is* how a `dyn Trait` object returns a future of
    unknown, implementer-varying size. A real fix gives up `dyn Output` for the call: enum dispatch
-   over the closed set of concrete `Output` kinds, or a per-node generic runtime.
+   over the closed set of concrete `Output` kinds, or a per-node generic runtime. A sink with a
+   window above 1 pays the same box per `Output::submit` and per `Output::await_ack` instead; a
+   head that starts at a window of 1 with nothing in flight stays on `send` and pays one
+   (`docs/adr/native-hop-send-window.md`, decision 4).
 
 4. **A failing send is a distinct allocation shape, not a bigger success number.** A `NoopOutput`
    that always succeeds never exercises `logit.component.errors` or `result.with_context(...)`, so
