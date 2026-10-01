@@ -87,7 +87,9 @@ design. What an operator needs:
   decisions). The one case that still exits is a sustained, purely configuration-error failure;
   see [Sink delivery buffering](#sink-delivery-buffering).
 - **An input never acknowledges a batch no consumer took.** An acknowledgment means the batch is
-  in the inbox of at least one consumer directly downstream, never that a sink delivered it. Once
+  in the inbox of at least one consumer directly downstream, never that a sink delivered it. The
+  one exception is `logit_in`'s acknowledgment of a frame at or below its sender's mark, which it
+  doesn't forward (see [Forwarding between `logit` nodes](#forwarding-between-logit-nodes)). Once
   every direct consumer has closed, as happens while a shutdown tears the graph down, an
   acknowledging input refuses instead: `logit_in` answers `Reject{GOING_AWAY}` and closes the
   connection, an HTTP listener answers its protocol's retryable failure (a `503`, or gRPC status
@@ -2636,8 +2638,8 @@ closed). `logit_in` writes it only for a frame it hasn't forwarded, so it's `cle
 frame left, and the batch is resent under either posture: `logit_out` redials and resends it. For
 a frame no consumer took, `logit_in` leaves its sender's mark unchanged and closes the
 connection, so the resend is forwarded when a consumer can take it. A frame at or below its
-sender's mark always gets an `Ack`, never a `Reject`, even with no consumer open, because
-`logit_in` doesn't forward it.
+sender's mark that `logit_in` reads whole gets an `Ack` even with no consumer open, because
+`logit_in` doesn't forward it; it is never refused for want of a consumer.
 
 **Sender identity and sequence.** On a connection that negotiated the v2 codec, every frame
 `logit_out` sends carries a 16-byte sender identity and a sequence number in its trailer
@@ -2653,9 +2655,9 @@ takes it, raises the mark. What follows from that:
   was written with, so a replay after a crash goes out under them, and a `logit_in` that saw the
   record recognizes it. New batches take the new identity.
 - **A dropped batch that a spool replays stays dropped.** A batch the sink gave up on (an
-  exhausted `retry_budget`, `at_most_once`, or a `drop_*` overflow) that a crash replay then sends
-  is at or below the mark once a later batch of its identity was taken, and `logit_in`
-  acknowledges it without forwarding it.
+  exhausted `retry_budget`, `at_most_once`, or a `drop_oldest` eviction whose cursor wasn't
+  persisted) that a crash replay then sends is at or below the mark once a later batch of its
+  identity was taken, and `logit_in` acknowledges it without forwarding it.
 - **An unsequenced frame is always forwarded.** A v1 frame, or a frame without a complete,
   well-formed identity and sequence, reaches `logit_in`'s consumers every time it arrives.
 - **The table follows the connection cap, with nothing to configure.** It holds

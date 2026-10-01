@@ -413,8 +413,9 @@ decision record.
   `GOING_AWAY` has three causes: a shutdown or an idle close, either of which drops a frame still
   in the socket buffer unread, and a frame no consumer took (every direct consumer of `logit_in`
   has closed), after which the connection closes and the sender's mark stays where it was. A frame
-  at or below its sender's mark gets only an `Ack`, never `GOING_AWAY`, since it isn't forwarded
-  either way. So `logit_out` treats `GOING_AWAY` in place of
+  at or below its sender's mark that the listener reads whole gets an `Ack`; it is never answered
+  `GOING_AWAY` for want of a consumer, since it isn't forwarded. So `logit_out` treats
+  `GOING_AWAY` in place of
   an `Ack` as a clean fault, redials, and resends the batch at any delivery posture. An EOF,
   reset, or ack timeout after a frame left stays ambiguous: the batch may have been forwarded.
 - **A frame is whole or not held.** `logit_in` reads the whole frame and checks its CRC before it
