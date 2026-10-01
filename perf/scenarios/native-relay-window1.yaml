@@ -1,12 +1,12 @@
 # Native encode + decode + per-batch ack round trip: one process, two disconnected chains sharing
 # one loopback connection, `gen -> relay_out` (logit_out, dialing) and `relay_in -> drop`
-# (logit_in, listening). `relay_out` encodes each batch to logit_proto::native and keeps the
-# default send window of frames in flight, each answered by one of `relay_in`'s Acks, so this
-# measures the whole transport round trip (encode, one loopback TCP hop, decode, ack), unlike
-# encode-native-devnull's one-way encode. native-relay-window1 is the same graph with one frame
-# in flight. Scenario table: docs/plans/load-test-harness.md, "Scenarios".
+# (logit_in, listening). The same graph as native-relay with `window: 1` on `relay_out`: each
+# batch waits for `relay_in`'s Ack before the next is sent. It is the one-frame-in-flight
+# comparison point for native-relay, which runs the default window
+# (docs/adr/native-hop-send-window.md). Scenario table: docs/plans/load-test-harness.md,
+# "Scenarios".
 #
-#   script/perf run --scenario native-relay
+#   script/perf run --scenario native-relay-window1
 #
 # Two disconnected chains in one graph is a legal shape: graph rule 5's cycle check runs per
 # weakly-connected component. The runtime binds every listener before any task runs
@@ -29,6 +29,7 @@ components:
     type: logit_out
     sources: [gen]
     endpoint: 127.0.0.1:19001
+    window: 1
 
   relay_in:
     type: logit_in

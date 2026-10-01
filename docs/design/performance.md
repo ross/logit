@@ -195,7 +195,10 @@ noise sub-section after the readings explains what a wide range means.
 
 The `native-relay` row predates
 [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md) and is pending
-re-measurement on the perf VM; the `native-relay` reading below lists what changed.
+re-measurement on the perf VM; the `native-relay` reading below lists what changed. It also
+predates [ADR `native-hop-send-window`](../adr/native-hop-send-window.md), which runs it at the
+default window of 32. `native-relay-window1`, the same graph at `window: 1`, is pending VM
+measurement.
 
 ### What moved since 2026-09-20
 
