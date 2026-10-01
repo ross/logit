@@ -234,7 +234,7 @@
 //!     `statsd_in`, which has no connections. Compared against `default_max_connections`, so the
 //!     default stays legal everywhere (`docs/adr/syslog-tcp-ingress-and-tls.md`,
 //!     `docs/adr/native-hop-identity-and-sequence.md`).
-//! 74. A `logit_out` `window` of 0, which could send nothing, or past 1024, the largest window a
+//! 75. A `logit_out` `window` of 0, which could send nothing, or past 1024, the largest window a
 //!     `logit_in` answers (`docs/adr/native-hop-send-window.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
@@ -256,7 +256,7 @@ use logit_proto::MAX_UDP_PAYLOAD_BYTES;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
-/// Rule 74's upper bound: `logit_in`'s `RECEIVER_MAX_WINDOW`, mirrored by hand since this crate
+/// Rule 75's upper bound: `logit_in`'s `RECEIVER_MAX_WINDOW`, mirrored by hand since this crate
 /// can't depend on `logit-inputs`.
 const MAX_LOGIT_OUT_WINDOW: u32 = 1024;
 
@@ -3485,7 +3485,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 74: `logit_out`'s `window`. `logit_in` answers at most `RECEIVER_MAX_WINDOW`
+    // Rule 75: `logit_out`'s `window`. `logit_in` answers at most `RECEIVER_MAX_WINDOW`
     // (`logit-inputs`), so a larger offer would never take effect.
     for (id, component) in &components {
         if let ComponentKind::LogitOut { window, .. } = &component.kind {
@@ -11850,9 +11850,9 @@ mod tests {
         }
     }
 
-    // ---- Rule 74: `logit_out`'s `window` --------------------------------------------------------
+    // ---- Rule 75: `logit_out`'s `window` --------------------------------------------------------
 
-    /// Rule 74: a window of 0 could send nothing, and one past 1024 is more than any `logit_in`
+    /// Rule 75: a window of 0 could send nothing, and one past 1024 is more than any `logit_in`
     /// answers. The bounds themselves pass.
     #[test]
     fn a_logit_out_window_of_zero_or_past_1024_is_rejected() {
