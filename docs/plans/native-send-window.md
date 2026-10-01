@@ -49,29 +49,29 @@ branch from the one before.
 Files: `crates/logit-proto/src/buffer.rs`, `crates/logit-pipeline/src/queue.rs`,
 `crates/logit-pipeline/src/disk_queue.rs`, `queue_stress.rs`, `disk_queue_verification.rs`.
 
-- [ ] `Buffer::peek_at(&mut self, n) -> Option<&T>`; `InMemoryBuffer.head_reserved: bool` becomes
+- [x] `Buffer::peek_at(&mut self, n) -> Option<&T>`; `InMemoryBuffer.head_reserved: bool` becomes
   `reserved: usize` (`peek` is `peek_at(0)`, `commit` decrements saturating, eviction starts at
   `reserved`, invariant `reserved <= len`).
-- [ ] `BoundedQueue::peek_at` (synchronous, one lock), `SinkQueue::peek_at`, `max_in_flight`.
-- [ ] `SinkStore::peek_at` (`async`, never waits for a push) and `SinkStore::max_in_flight`
+- [x] `BoundedQueue::peek_at` (synchronous, one lock), `SinkQueue::peek_at`, `max_in_flight`.
+- [x] `SinkStore::peek_at` (`async`, never waits for a push) and `SinkStore::max_in_flight`
   (memory `max_batches.max(1)`, disk `usize::MAX`).
-- [ ] `DiskQueue.head_cache` becomes `read_ahead: VecDeque<ReadAhead { batch, ctx, seq, seg,
+- [x] `DiskQueue.head_cache` becomes `read_ahead: VecDeque<ReadAhead { batch, ctx, seq, seg,
   offset, len }>`, with a next-segment helper that mirrors `roll_read_cursor` without unlinking.
   Every `head_cache` check (`push`'s make-room `nothing_queued`, the `DropOldest` to `DropNewest`
   arm, `evict_oldest`, `skip_corrupt`) becomes a `read_ahead` check.
-- [ ] `queue_stress.rs` gains a `PeekAt` consumer op.
-- [ ] `disk_queue_verification.rs`: `spool_op()` gains `PeekAt(n)`; the model checks FIFO
+- [x] `queue_stress.rs` gains a `PeekAt` consumer op.
+- [x] `disk_queue_verification.rs`: `spool_op()` gains `PeekAt(n)`; the model checks FIFO
   first-commits and replay of uncommitted records.
-- [ ] Buffer tests:
+- [x] Buffer tests:
   - `peek_at_reserves_every_item_up_to_n_and_drop_oldest_evicts_past_them`
   - `peek_at_past_the_end_returns_none_and_reserves_nothing_new`
   - `commit_releases_one_reservation_and_leaves_the_rest`
   - `with_every_item_reserved_drop_oldest_accepts_one_over_the_bound`
-- [ ] Queue tests:
+- [x] Queue tests:
   - `peek_at_never_waits_on_an_empty_open_queue`
   - `drop_oldest_never_evicts_a_batch_reserved_by_peek_at`
   - `take_all_clears_every_reservation_peek_at_made`
-- [ ] Disk tests:
+- [x] Disk tests:
   - `peek_at_reads_ahead_across_a_segment_boundary_and_commit_advances_one_record_at_a_time`
   - `peek_at_follows_the_writer_after_the_active_segment_it_caught_up_to_rotates_away`
   - `a_peek_at_cancelled_mid_read_caches_nothing_and_the_next_one_reads_the_same_record`
@@ -79,7 +79,7 @@ Files: `crates/logit-proto/src/buffer.rs`, `crates/logit-pipeline/src/queue.rs`,
   - `drop_oldest_drops_the_newest_while_any_record_is_read_ahead`
   - `make_room_never_rotates_a_spool_with_a_record_read_ahead`
   - `finish_with_records_read_ahead_replays_all_of_them_on_reopen`
-- [ ] Pins: `disk_queue_push_one_batch` (33), `disk_queue_peek_cached_costs_nothing` (0), and
+- [x] Pins: `disk_queue_push_one_batch` (33), `disk_queue_peek_cached_costs_nothing` (0), and
   `drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc` (1) expected unchanged. New:
   `disk_queue_peek_at_cached_costs_nothing` (0) and `sink_queue_peek_at_costs_nothing` (0), with
   rows in `docs/design/memory.md` and a note that a spooled `logit_out` holds up to `window`
@@ -90,20 +90,20 @@ Files: `crates/logit-proto/src/buffer.rs`, `crates/logit-pipeline/src/queue.rs`,
 Files: `crates/logit-pipeline/src/output.rs`, `crates/logit-pipeline/src/runtime.rs`,
 `docs/design/pipeline-graph.md`.
 
-- [ ] `Output::window`, `Output::submit`, and `Output::await_ack`, with defaults that keep every
+- [x] `Output::window`, `Output::submit`, and `Output::await_ack`, with defaults that keep every
   other sink on `send`.
-- [ ] `write_loop` tracks `outstanding` and `observed`; `observe_batch` runs once per batch,
+- [x] `write_loop` tracks `outstanding` and `observed`; `observe_batch` runs once per batch,
   before its first submission.
-- [ ] The fast path: `outstanding == 0 && observed == 0 && output.window() <= 1` runs `deliver_with_retry`
+- [x] The fast path: `outstanding == 0 && observed == 0 && output.window() <= 1` runs `deliver_with_retry`
   unchanged.
-- [ ] `deliver_window`: fill to `min(output.window(), store.max_in_flight())`, the head-only
+- [x] `deliver_window`: fill to `min(output.window(), store.max_in_flight())`, the head-only
   classification of a submit `Err`, the unclassified submit `Err` past the head, the
   `at_most_once` whole-window drop on `Ambiguous`, and the grace rules. The head's submit runs
   under the head's remaining attempt time; a submit past the head and every `await_ack` run
   under no attempt time (the sink bounds them), and the budget decides only whether a failed
   round is retried.
-- [ ] A `deliver_window` row in `docs/design/pipeline-graph.md`'s "Cancellation points" table.
-- [ ] Tests in `runtime.rs`, with a scripted `WindowedOutput` double, `start_paused`, and
+- [x] A `deliver_window` row in `docs/design/pipeline-graph.md`'s "Cancellation points" table.
+- [x] Tests in `runtime.rs`, with a scripted `WindowedOutput` double, `start_paused`, and
   observables, not sleeps:
   - `a_window_has_every_batch_submitted_before_the_first_ack`
   - `a_window_of_one_calls_send_and_never_submit`
@@ -128,22 +128,22 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-outputs/src/stream.rs`
 `schema/logit.schema.json`, `docs/design/internal-telemetry.md`,
 `docs/design/pipeline-graph.md`.
 
-- [ ] `LogitOut.window: u32`, default 32 (`default_logit_out_window`), with its operator doc.
+- [x] `LogitOut.window: u32`, default 32 (`default_logit_out_window`), with its operator doc.
   Exhaustive `LogitOut {..}` patterns gain the field (in `lib.rs`, `graph.rs`, and
   `pipeline.rs`), and `conn_over` gains the new connection fields.
-- [ ] Graph rule 74, `1 <= window <= 1024`, with a row in `docs/design/pipeline-graph.md`.
-- [ ] `crates/logit-cli/src/pipeline.rs` passes `.with_window(*window)`; `script/schema`
+- [x] Graph rule 74, `1 <= window <= 1024`, with a row in `docs/design/pipeline-graph.md`.
+- [x] `crates/logit-cli/src/pipeline.rs` passes `.with_window(*window)`; `script/schema`
   regenerates `schema/logit.schema.json`.
-- [ ] `logit_out`: `Conn` gains `window`, `in_flight`, and `broken`; `submit`, `await_ack`, and
+- [x] `logit_out`: `Conn` gains `window`, `in_flight`, and `broken`; `submit`, `await_ack`, and
   `send` as `submit` then `await_ack`; with frames in flight the frame written in chunks under
   a per-chunk progress bound of `request_timeout`, a stall marking the connection `broken`;
   the probe only at `in_flight == 0`; `Dial.nodelay`.
-- [ ] `logit_out` counters: `submit` counts its `Err`s in `logit.output.requests`, `await_ack`
+- [x] `logit_out` counters: `submit` counts its `Err`s in `logit.output.requests`, `await_ack`
   every result; `logit.output.ack.duration` per await; gauges `logit.output.in_flight` and
   `logit.output.window`, recorded in `docs/design/internal-telemetry.md`.
-- [ ] `logit_in`: `RECEIVER_MAX_WINDOW = 1024`, the clamp in `handshake`, `set_nodelay` on
+- [x] `logit_in`: `RECEIVER_MAX_WINDOW = 1024`, the clamp in `handshake`, `set_nodelay` on
   accept, and `close_lingering(stream, bound)` after the `Fanout` clone is dropped.
-- [ ] `logit_out` tests:
+- [x] `logit_out` tests:
   - `a_negotiated_window_puts_several_frames_on_the_wire_before_the_first_ack`
   - `a_peer_answering_window_one_keeps_one_frame_in_flight`
   - `a_hello_ack_window_of_zero_is_read_as_one`
@@ -156,16 +156,16 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-outputs/src/stream.rs`
   - `a_window_over_tls_reads_acks_buffered_behind_several_frames`
   - `a_window_against_logit_in_delivers_every_batch_once_in_order`
   - `a_window_resent_after_a_dropped_connection_is_forwarded_once`
-- [ ] `logit_in` tests:
+- [x] `logit_in` tests:
   - `hello_ack_answers_the_offered_window_clamped_to_the_receiver_maximum`
   - `pipelined_frames_are_acked_in_frame_order`
   - `a_shutdown_with_frames_still_buffered_reaches_the_peer_as_going_away_not_a_reset`
   - `a_frame_no_consumer_took_mid_window_is_answered_going_away_and_nothing_after_it_is_forwarded`
   - `the_graph_closes_while_a_connection_lingers_after_going_away`
-- [ ] Config and graph tests:
+- [x] Config and graph tests:
   - `logit_out_window_defaults_to_32`
   - `a_logit_out_window_of_zero_or_past_1024_is_rejected`
-- [ ] Integration tests in `crates/logit-cli/tests/logit_round_trip.rs`:
+- [x] Integration tests in `crates/logit-cli/tests/logit_round_trip.rs`:
   - a real pair through `run_output` with `window: 32` and a disk spool: N batches forwarded
     once, in order;
   - a listener restarted mid-stream with the same `logit_in` table: resends counted, nothing
@@ -173,7 +173,7 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-outputs/src/stream.rs`
 
 ### W4: operator docs, known gaps, and measurements
 
-- [ ] Rewrite every passage that says one frame is in flight, that `window` stays 1, or that
+- [x] Rewrite every passage that says one frame is in flight, that `window` stays 1, or that
   `logit_in` answers the one frame outstanding:
   - module docs of `crates/logit-inputs/src/logit.rs` and `crates/logit-outputs/src/logit.rs`;
     the docs in `output.rs`, `runtime.rs`, `buffer.rs`, and `disk_queue.rs`; the
@@ -191,9 +191,9 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-outputs/src/stream.rs`
     `docs/plans/delivery-semantics.md` non-goal;
   - `docs/design/memory.md`;
   - `AGENTS.md`: the `logit_out` row's ADR list and the delivery bullet.
-- [ ] Sweep every comment line the stream added for the banned words.
+- [x] Sweep every comment line the stream added for the banned words.
 - [ ] `script/cibuild` at the stack's tip, from a private `CARGO_TARGET_DIR`.
-- [ ] Record the measurements in "Findings" below, not in `docs/design/performance.md`, which
+- [x] Record the measurements in "Findings" below, not in `docs/design/performance.md`, which
   holds VM numbers only.
 
 ## Verification
@@ -215,8 +215,44 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-outputs/src/stream.rs`
 
 ## Findings
 
-W4 records here:
+Laptop numbers, not the perf VM: AMD Ryzen AI 9 HX 370 (24 logical CPUs, mixed Zen 5 and Zen 5c
+cores), 62 GiB, Linux 7.2.7, on battery under the `powersave` governor, runs unpinned, the
+harness run inside the dev container through a bind-mounted private target dir. Binaries: the
+`flow/w4` tip including 847c912c, and `main` at 958b93e7. `generate_in` batches are 100 events,
+so batches/s is events/s divided by 100. The harness's wall time ends at "generation complete",
+so up to one queue of batches is still undelivered; that overstates window 1 by about 3% under
+`netem` and every loopback arm by about 1.5%.
 
-- Laptop loopback: `native-relay` before and after.
-- Container `netem`: `native-relay` at `window: 1` and `window: 32` with 5 ms of delay each way.
-- Perf VM: owed, with the pending re-baseline.
+**Loopback** (`native-relay`, 7M events, `--repeat 3`, medians):
+
+| Arm | Events/s | CPU µs/event | Peak RSS |
+|---|---|---|---|
+| `main`, one frame in flight | 688,235 | 1.829 | 130.0 MiB |
+| `flow/w4`, `window: 1` (`native-relay-window1`) | 628,860 | 1.968 | 143.9 MiB |
+| `flow/w4`, default `window: 32` (`native-relay`) | 876,336 | 1.725 | 230.5 MiB |
+
+- Window 32 against window 1 on the same binary: 1.39× events/s and 12% less CPU per event.
+- Window 32 against `main`: 1.27× events/s.
+- Window 1 against `main`: 0.91×, inside this box's spread (`main`'s own repeats span ±7%);
+  not called a regression without VM numbers.
+- Peak RSS rises with the window (230 MiB against 130–144 MiB), consistent with batches held
+  along `logit_in`'s path and in the sink queue rather than one at a time; not attributed.
+
+**Latency** (`tc qdisc add dev lo root netem delay 5ms` in a throwaway `logit-dev:local`
+container with `--cap-add NET_ADMIN`; measured RTT 10.1/11.9/15.3 ms min/avg/max; `flow/w4`,
+`--repeat 2`, `--settle 2s`; temporary copies of `native-relay` with `buffer.max_batches: 64`
+so the queue left at "generation complete" drains inside the settle at window 1; 3M events at
+window 32 and 200k at window 1):
+
+| Arm | Events/s | Batches/s | CPU µs/event | Peak RSS |
+|---|---|---|---|---|
+| `window: 32` | 312,734 | ~3,127 | 1.811 | 60.7 MiB |
+| `window: 1` | 9,133 | ~91 | 5.724 | 42.3 MiB |
+
+- 34.2× on batch rate at a 10 ms RTT, against the record's expected ~30×. Window 32 reaches
+  about 98% of its ceiling of 32 frames per RTT (3,200 batches/s); window 1 about 91% of its one
+  per RTT (100 batches/s). The window-1 arm's CPU per event is inflated by idle wake-ups per
+  batch.
+
+**Owed:** `native-relay` and `native-relay-window1` on the perf VM, with the pending
+re-baseline (`docs/design/performance.md`).

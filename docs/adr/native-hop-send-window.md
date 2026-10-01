@@ -306,7 +306,7 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
 - **The parked-forward race grows.** The abandoned connection's task can forward several
   buffered frames that race the new connection's resend, so the worst case is a few duplicates
   instead of one. It limits itself: the first forward raises the mark. The `docs/known-gaps.md`
-  entry "A forward parked past the sender's ack timeout can be forwarded twice" says so.
+  entry "A resend can race the frames an ended connection still holds, and be forwarded twice" says so.
 - **The shutdown count grows.** A memory store's `finish` counts outstanding frames as
   `dropped{reason="shutdown"}`, and `flush`'s `shutdown()` can then let `logit_in` forward them.
   The over-count is at most one batch today and at most `window` with this record.
@@ -358,8 +358,7 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   frames outstanding and the negotiated window. `docs/design/internal-telemetry.md` records all
   four.
 - **Known gaps.** In `docs/known-gaps.md`, "Credit-based flow control (`window` > 1)" and "No
-  out-of-order/credit-based acknowledgement" close. "A forward parked past the sender's ack
-  timeout can be forwarded twice" changes to the several-duplicate worst case of decision 6, and
+  out-of-order/credit-based acknowledgement" close. "A resend can race the frames an ended connection still holds, and be forwarded twice" changes to the several-duplicate worst case of decision 6, and
   the `ack_write_stalled` reasoning under "`logit_in`'s `idle_timeout` bounds reads only"
   changes for a peer with a window of unread acks.
 - **Operator docs.** The plan's W4 rewrites every passage that says one frame is in flight:
