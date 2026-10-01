@@ -256,8 +256,9 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
      frame does. A stall or an error with frames in flight marks the connection `broken` and
      returns the error unclassified: neither invalidates the acks the receiver already sent,
      and `await_ack` reads them before the window is retried. Nothing more is written on a
-     `broken` connection, so the partial frame a stall leaves on the wire ends the connection
-     at `logit_in` as a truncated frame once the sender drops it. `Ok` increments `in_flight`.
+     `broken` connection. Once the sender drops it, `logit_in` sees a clean close at a frame
+     boundary when the stall wrote nothing, a truncated header or a truncated frame when it
+     fell inside one. `Ok` increments `in_flight`.
 - **`await_ack`.** With `in_flight == 0` it returns `Ok`, unless step 2 recorded a drift since
   the last call. Otherwise it reads one control message under the request timeout:
   - `Ack` decrements `in_flight`, and drops a `broken` connection once `in_flight` reaches 0.
@@ -297,7 +298,7 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   alone times out in `await_ack`, is retried, and is dropped when its budget runs out: the
   batch dropped is the stuck one, as at window 1. Each retry round costs about two
   `request_timeout`s, the stalled write and then the ack wait, where window 1 pays one, and
-  each costs `logit_in` one `logit.proto.errors{reason="truncated"}` for the partial frame.
+  a stall that fell inside a frame costs `logit_in` one `logit.proto.errors` for it.
 - **A slowly draining receiver.** A receiver that forwards a frame every few seconds makes
   progress, so no write stalls, and a fill of `window - 1` frames can take longer than the
   head's retry budget. The head is delivered when the fill ends and its buffered `Ack` is read;
