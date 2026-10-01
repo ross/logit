@@ -92,6 +92,9 @@ ahead of the sink.
 
 ### 3. An input's acknowledgment means accepted into the pipeline
 
+[Narrowed for the native hop by "Amendment: W4 decisions (2026-10-01)": `logit_in` also
+acknowledges a frame at or below its sender's high-water mark, with no forward.]
+
 An acknowledgment from a `logit` input means the batch is in every open downstream inbox of
 that process, and in at least one. It says nothing about a sink. This is `logit_in`'s `Ack`, an
 HTTP listener's success status, `splunk_hec_in`'s `/ack` answer of `true`, and the offset
@@ -415,6 +418,11 @@ wire layout, window, and spool record. It restates item 7's bullets as decided:
   are forwarded. The record accepts the duplicate.
 - **Cloning is unsupported.** A running process cloned by a VM snapshot or CRIU shares its
   identity with its clone.
+
+Item 3's "accepted into the pipeline" holds for a frame above its sender's mark. A frame at or
+below it is acknowledged on the mark alone: for a resend, that repeats the earlier forward's
+acknowledgment; for a batch the sender dropped and a spool replayed, it acknowledges a batch no
+consumer took, and the sender commits it. The sender gave that batch up before the replay.
 
 Item 8's "The set includes a batch the sink delivered and a batch it dropped" holds at the sink.
 On the native hop, a dropped batch the spool replays is at or below its identity's mark once a

@@ -8,8 +8,9 @@ updated: 2026-10-01
 ## Status
 Accepted. Supersedes, in part, [ADR
 `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md): "Sequence numbers
-are implicit", the `Ack` entry of its control payload, and its rejected alternative "An explicit
-`seq` field on every data frame".
+are implicit", the `Ack` entry of its control payload, its rejected alternative "An explicit
+`seq` field on every data frame", and "Ack point", which now has a second case. It narrows [ADR
+`delivery-semantics`](delivery-semantics.md), item 3, for the native hop.
 
 ## Context
 
@@ -42,8 +43,9 @@ These facts about the code fix the design:
   anything new rides inside the frame. `parse_record` decodes every record, and `logit_out`
   re-encodes the payload on every attempt (`LogitOutput::send`), so the concern behind the old
   rejected alternative, that one frame's bytes serve both a socket and a file, no longer binds.
-- **The store has one producer and one per-batch hook.** `SinkStore::push` takes
-  `(Arc<EventBatch>, BatchContext)` from `drain_inbox`, its single producer.
+- **The store's pushes are sequential, and it has one per-batch hook.** `SinkStore::push` takes
+  `(Arc<EventBatch>, BatchContext)` from `drain_inbox` and, after `drain_inbox` stops, from
+  `run_output`'s shutdown sweep, which re-pushes the batch in hand and the inbox's remainder.
   `Output::observe_batch` runs once per batch, never between retries. `BatchContext` is pinned at
   32 bytes and `Delivered` at 72 by `fanout.rs`'s size tests, and the delivery record's item 4
   keeps identity off in-process edges.
@@ -73,9 +75,9 @@ mark per sender identity, in a table bounded by its connection cap.
 
 ### 2. A sink's store numbers what it holds
 
-- **Numbers are assigned in push order by the store's single producer.** `drain_inbox` pushes,
-  and the store assigns the next number when it encodes the batch (disk) or admits it (memory),
-  advancing its counter before the push's first `.await`.
+- **Numbers are assigned in push order.** Pushes are sequential, `drain_inbox`'s and then the
+  shutdown sweep's, and the store, not the pusher, assigns the next number when it encodes the
+  batch (disk) or admits it (memory), advancing its counter before the push's first `.await`.
 - **A gap is legal.** A number consumed by a push that fails or is cancelled (`frame_too_large`,
   `drop_newest`, `disk_full`, a cancelled push) is never sent, and the receiver ignores the gap.
 - **The pair travels beside `BatchContext`, never on it.** The store item becomes
@@ -116,6 +118,14 @@ mark per sender identity, in a table bounded by its connection cap.
 - **`Ack` means the frame is handled.** With one frame in flight per connection the reply is
   unambiguous, so `Ack` names nothing. It means the frame was forwarded, or recognized as a
   resend and not forwarded. `logit_out` drops its `Ack.seq == conn.seq` check.
+- **The acknowledgment point gains a second case.** The native-transport record's "Ack point"
+  acknowledges a frame after `Fanout::send` returns, and the delivery record's item 3 says an
+  acknowledgment means accepted into the pipeline. Both still hold for a frame above its mark.
+  A frame at or below it is acknowledged on the mark alone, with no `send_relayed`: for a
+  resend that's the earlier forward's acknowledgment repeated, and for a batch the sender
+  dropped and a spool replayed (decision 5) it's an acknowledgment of a batch no consumer took,
+  which the sender then commits. The sender gave that batch up before the replay, so nothing
+  is lost that wasn't already counted.
 - **The sequence is a deduplication identity, never a credit.** Nothing acknowledges a sequence,
   `window` stays 1, and a future credit-based flow-control record decides its own acknowledgment
   form.
@@ -132,9 +142,10 @@ mark per sender identity, in a table bounded by its connection cap.
   1. If it's unsequenced, forward it as today.
   2. If its sequence is at or below its identity's mark, count it, write `Ack`, and don't
      forward it.
-  3. Otherwise, call `send_relayed`. If a consumer took the batch, set the mark to the frame's
-     sequence and write `Ack`. If none took it, write `Reject{GOING_AWAY}` and leave the mark
-     unchanged ([ADR `delivery-semantics`](delivery-semantics.md), "Amendment: W3 decisions").
+  3. Otherwise, call `send_relayed`. If a consumer took the batch, raise the mark to the larger
+     of itself and the frame's sequence, and write `Ack`. If none took it, write
+     `Reject{GOING_AWAY}` and leave the mark unchanged ([ADR
+     `delivery-semantics`](delivery-semantics.md), "Amendment: W3 decisions").
 
   An identity the table doesn't hold has a mark of 0. Gaps above the mark are ignored.
 - **The window is every number at or below the mark.** Per sender, `logit_in` holds one 64-bit
@@ -212,22 +223,11 @@ accepts it.
 
 ## Consequences
 
-- **Code (the plan's W5).** Tags 3 and 4 in `crates/logit-proto/src/native/mod.rs`. `SeqId`
-  beside `BatchContext` through `SinkStore::push`, `peek`, and `Output::observe_batch`. Numbering
-  in `crates/logit-pipeline/src/queue.rs` and `crates/logit-pipeline/src/disk_queue.rs`, with
-  `parse_record` returning the pair and `CONTEXT_LEN`'s doc amended to name a trailer tag.
-  `Ack` emptied in `crates/logit-proto/src/native/control.rs`, and the equality check removed
-  from `logit_out`. The per-component table in `logit_in`'s `run_until_shutdown`, the three
-  counters, and the `docs/known-gaps.md` entry for the parked-forward race. Stale text to fix:
-  `logit_out`'s module doc ("Ack wait" and "Delivery posture"), `control.rs`'s module doc and
-  `Ack`'s doc, and the doc on `logit_out`'s `Conn::seq`.
-- **Pins it trips**, each updated in the same commit as `docs/design/memory.md`:
-  `disk_queue_push_one_batch` (34, likely 35 unless the trailer is written straight into the
-  output buffer); `disk_queue_peek_cached_costs_nothing` stays 0 because `SeqId` is `Copy`;
-  `the_largest_message_of_each_type_fits_the_control_message_cap`'s `Ack` literal; the
-  `ack.seq` assertions and the `control_frame_len(&control::Ack { .. })` call in `logit_in`'s
-  tests; and the exact-size spool helpers `one_counter_record_len`, `encoded_record_len`, and
-  `raw_record`.
+- **Code.** The trailer tags, `SeqId` through the store and `Output::observe_batch`, store
+  numbering, the emptied `Ack`, the per-component table, the counters, the stale text to fix,
+  and the allocation and size pins each change trips are listed once, in
+  [`docs/plans/delivery-semantics.md`](../plans/delivery-semantics.md), W5, with that
+  workstream's tests. A tripped pin is updated in the same commit as `docs/design/memory.md`.
 - **The breaking change.** An older `logit_out` against a newer `logit_in` doesn't work, and no
   version bump marks it: it decodes the empty `Ack` as `seq` 0, which fails its equality check,
   so it reads every attempt as `Ambiguous`. The other direction works without deduplication: an

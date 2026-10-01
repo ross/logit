@@ -8,8 +8,8 @@ updated: 2026-10-01
 ## Status
 Accepted. Superseded in part on 2026-10-01 by
 [ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md): "Sequence numbers
-are implicit", the `Ack` entry of "Control payload", and the rejected alternative "An explicit
-`seq` field on every data frame".
+are implicit", the `Ack` entry of "Control payload", the rejected alternative "An explicit
+`seq` field on every data frame", and "Ack point", which gains a second case.
 
 ## Context
 
@@ -47,7 +47,11 @@ seq N; `Ack.seq` is the cumulative count of data frames the receiver has forward
 the data frame itself, so the native-v1 payload is untouched, and a future credit window > 1 can
 use cumulative acks unchanged.
 
-**Ack point: after `Fanout::send` returns**, not after the frame is merely decoded. A stalled
+**Ack point: after `Fanout::send` returns**, not after the frame is merely decoded. [Superseded
+in part on 2026-10-01 by [ADR
+`native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md): a frame at or below
+its sender's high-water mark is acknowledged on the mark alone, with no `Fanout::send`. A frame
+above it is acknowledged as written here.] A stalled
 downstream delays the ack, which stalls the sender's own delivery attempt — that *is* this
 protocol's backpressure. `logit_in` needs no receive-side queue on top of this; the ack itself is
 the queue depth of one.
@@ -268,18 +272,20 @@ recognizes a resend and doesn't forward it.
 
 "Sequence numbers are implicit" and the rejected alternative "An explicit `seq` field on every
 data frame" describe the wire as built. A follow-up record decides the new layout and supersedes
-both: [ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md). Until it
-lands, `Ack.seq` counts frames on one connection and restarts on a reconnect, and `logit_in`
-forwards a resend.
+both: [ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md). Until its
+implementation lands (`docs/plans/delivery-semantics.md`, W5), `Ack.seq` counts frames on one
+connection and restarts on a reconnect, and `logit_in` forwards a resend.
 
-"Ack point" is unchanged, and that record's item 3 adds that `logit_in` doesn't acknowledge a
-batch no consumer took.
+"Ack point" keeps its rule for a frame above its sender's mark, and that record's item 3 adds
+that `logit_in` doesn't acknowledge a batch no consumer took. The follow-up record adds the
+case of a frame at or below the mark, acknowledged with no forward.
 
 ## Amendment: `GOING_AWAY` also answers a frame no consumer took (2026-09-30)
 
 "Ack point" holds that a frame is acknowledged once the batch is in every open downstream inbox.
 `Fanout::send_relayed` now reports whether any consumer took the batch, and a batch none took is
-not acknowledged: `logit_in` writes `Reject{GOING_AWAY, "no consumer took the batch"}` and closes
+not acknowledged (for a frame at or below its sender's mark, which is acknowledged with no
+forward, see [ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md)): `logit_in` writes `Reject{GOING_AWAY, "no consumer took the batch"}` and closes
 the connection, before the sequence advances. `GOING_AWAY` has three causes: shutdown, an idle
 close, and no consumer taking the frame. The frame wasn't forwarded, so `logit_out` classifies it
 `Clean`, redials, and resends, and the sender and receiver sequences stay aligned. The invariant
