@@ -69,7 +69,7 @@ use logit_proto::CodecError;
 
 /// `[trace_id: 16][span_id: 8]`, ahead of the frame. Never widen it: a record carries no version,
 /// so a wider prefix would misparse every already-spooled record. Anything new rides inside the
-/// frame, under a new codec byte (as `Provenance` did with `CODEC_NATIVE_V2`) or a new v2 trailer
+/// frame, under a new codec byte (as `Provenance` does with `CODEC_NATIVE_V2`) or a new v2 trailer
 /// tag (as the sender identity and sequence do). A `V1` record still replays with empty
 /// provenance and no sequence, and a binary that doesn't know `V2` resyncs past it
 /// (`docs/adr/batch-provenance-on-delivered.md`).

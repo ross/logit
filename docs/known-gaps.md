@@ -541,15 +541,14 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 - ~~**The native hop has no sender identity and no deduplication.**~~ **Closed 2026-10-01:** a sink's store numbers every batch under an identity minted when it opens, `logit_out` sends the pair in each v2 frame's trailer, and `logit_in` acks a frame at or below its identity's mark without forwarding it ([ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md)). What still reaches consumers twice is in that record's decision 5 and in the parked-forward entry below.
 
   [ADR `delivery-semantics`](adr/delivery-semantics.md), item 7, targets effectively-once between
-  `logit_out` and `logit_in`. As built, `Ack.seq` counts frames on one connection and restarts
-  on a reconnect, and `logit_in` forwards every frame it receives. Under the default,
-  `at_least_once`, a resend after a lost `Ack`, and a `buffer.disk:` replay after a crash, reach
-  `logit_in`'s consumers twice, and a `statsd_out` or an aggregated kind among them double-counts.
-  [ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md) decides the
-  layout: a sender identity and a sequence in each frame's v2 trailer, and a high-water mark per
-  identity at `logit_in`. The plan's W5 implements it. Until it lands,
-  `buffer.delivery: at_most_once` on a `logit_out` whose far side feeds a counter sink avoids the
-  double count at the cost of the batch.
+  `logit_out` and `logit_in`, and [ADR
+  `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md) decides the layout:
+  a sender identity and a sequence in each frame's v2 trailer, assigned by the sink's store, and a
+  high-water mark per identity at `logit_in`. A resend after a lost `Ack` and a `buffer.disk:`
+  replay after a crash are acknowledged on the mark and not forwarded; `logit.input.batches.resends`
+  counts them. Still open: the parked-forward race in the next entry, and the duplicate a
+  `logit_in` restart, an evicted sender, a v1 peer, or a load balancer forwards, which the record
+  accepts.
 
 - **A forward parked past the sender's ack timeout can be forwarded twice.** `logit_in` holds no
   lock per sender identity across a forward. When a forward on one connection parks on a full
