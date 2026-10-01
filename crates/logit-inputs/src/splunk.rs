@@ -166,13 +166,6 @@ use tokio_rustls::TlsAcceptor;
 /// `logit_config::default_splunk_max_request_bytes`.
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 5 * 1024 * 1024;
 
-/// Bounds the connections [`Input::run`] serves at once: the same 1024 as every other HTTP
-/// listener. A connection past the cap is rejected, not queued. With the default 5 MiB request cap,
-/// which bounds the compressed and decompressed body alike, this listener's worst case is about
-/// 2 TiB, a bound rather than a memory budget ([`crate::http::MAX_CONCURRENT_STREAMS`] has the
-/// formula).
-const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
-
 /// Default for [`SplunkHecInput::with_handshake_timeout`]: the same 5s as every other TCP
 /// listener, mirrored by hand in `logit_config::default_handshake_timeout`. Also the grace an idle
 /// close gives hyper.
@@ -216,6 +209,12 @@ pub struct SplunkHecInput {
     /// Empty accepts any request (this module's "Request handling", step 3).
     tokens: Arc<[Box<[u8]>]>,
     max_request_bytes: usize,
+    /// Bounds the connections [`Input::run`] serves at once; [`crate::DEFAULT_MAX_CONNECTIONS`]
+    /// unless [`Self::with_max_connections`] sets it. A connection past the cap is rejected, not
+    /// queued. With the default 5 MiB request cap, which bounds the compressed and decompressed
+    /// body alike, this listener's worst case at the default cap (`max_connections:`, 1024) is
+    /// about 2 TiB, a bound rather than a memory budget ([`crate::http::MAX_CONCURRENT_STREAMS`]
+    /// has the formula).
     max_connections: usize,
     busy_after: Duration,
     health_busy_window: Duration,
@@ -235,7 +234,7 @@ impl SplunkHecInput {
             idle_timeout: None,
             tokens: Arc::from(Vec::new()),
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
-            max_connections: MAX_CONCURRENT_CONNECTIONS,
+            max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             busy_after: BUSY_AFTER,
             health_busy_window: HEALTH_BUSY_WINDOW,
             max_ack_channels: DEFAULT_MAX_ACK_CHANNELS,
@@ -300,9 +299,9 @@ impl SplunkHecInput {
         self
     }
 
-    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`].
-    #[cfg(test)]
-    fn with_max_connections(mut self, max_connections: usize) -> Self {
+    /// Overrides [`crate::DEFAULT_MAX_CONNECTIONS`]; `max_connections:` in config. Graph rule 74
+    /// rejects `0` before it gets here.
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
         self
     }
@@ -2074,7 +2073,7 @@ mod tests {
         assert_eq!(input.busy_after, Duration::from_secs(5));
         assert_eq!(input.handshake_timeout, Duration::from_secs(5));
         assert_eq!(input.max_request_bytes, 5 * 1024 * 1024);
-        assert_eq!(input.max_connections, 1024);
+        assert_eq!(input.max_connections, crate::DEFAULT_MAX_CONNECTIONS);
         assert_eq!(input.health_busy_window, Duration::from_secs(5));
         assert_eq!(input.max_ack_channels, 256);
         assert_eq!(input.max_pending_acks, 1_000_000);

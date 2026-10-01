@@ -2545,6 +2545,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -2662,6 +2663,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -2801,6 +2803,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -2975,6 +2978,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -3329,6 +3333,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -3443,6 +3448,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -3578,6 +3584,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -3683,6 +3690,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -3806,6 +3814,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -3910,6 +3919,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -4020,6 +4030,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -4231,6 +4242,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -4336,6 +4348,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -4400,6 +4413,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -4466,6 +4480,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -6803,6 +6818,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -6829,6 +6845,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -7011,6 +7028,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -7037,6 +7055,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             },
         );
@@ -7157,6 +7176,7 @@ mod tests {
             tls: None,
             handshake_timeout: logit_config::default_handshake_timeout(),
             idle_timeout: None,
+            max_connections: logit_config::default_max_connections(),
         }
     }
 
@@ -9620,6 +9640,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             ),
             (
@@ -9706,6 +9727,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             ),
             (
@@ -9769,6 +9791,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             ),
             (
@@ -9857,6 +9880,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             ),
             (
@@ -9976,6 +10000,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             ),
             (
@@ -10052,6 +10077,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             ),
             (
@@ -10215,6 +10241,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             ),
             (
@@ -10308,6 +10335,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             ),
             (
@@ -10388,6 +10416,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             ),
             (
@@ -10515,6 +10544,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             ),
             (
@@ -10620,6 +10650,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             ),
             (
@@ -10855,6 +10886,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             ),
             (

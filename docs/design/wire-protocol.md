@@ -382,9 +382,10 @@ decision record.
   A store takes a fresh identity every time it opens, memory or disk, and numbers its batches
   from 1; a resend, on the same connection or a new one, reuses the batch's pair. Each `logit_in`
   component keeps one high-water mark per identity, in a table bounded at
-  `max_connections + max_connections / 4` identities (1280 at the default cap) that evicts the
-  least recently seen when full. A frame at or below its identity's mark is a resend; a frame
-  above it is forwarded, and a consumer taking it raises the mark. An unsequenced frame (see
+  `max_connections + max_connections / 4` identities (1280 at the default `max_connections` of
+  1024) that evicts the least recently seen when full. A frame at or below its identity's mark is
+  a resend; a frame above it is forwarded, and a consumer taking it raises the mark. An
+  unsequenced frame (see
   "`CODEC_NATIVE_V2`: a provenance and sender trailer" above) is always forwarded. The table
   reports `logit.input.batches.resends`, `logit.input.senders`, and
   `logit.input.senders.evicted`. No lock spans a forward, so a forward parked on a full inbox

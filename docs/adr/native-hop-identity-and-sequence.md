@@ -170,6 +170,11 @@ mark per sender identity, in a table bounded by its connection cap.
 - **Eviction.** When the table is full, the least recently seen identity is evicted.
 - **No config field.** The bound follows the connection cap.
 
+**Amendment (2026-10-01): the cap is configurable, the table still has no field.** The connection
+cap is now each `logit_in`'s `max_connections:` field (default 1024). The table's bound still
+follows it: `max_connections + max_connections / 4` identities, 1.25 times the configured cap, with
+no floor or ceiling. A cap of N costs 1.25N entries of tens of bytes each.
+
 ### 7. No per-sender lock, and the parked-forward race is a residual
 
 `logit_in` takes no lock per identity across a forward. The race that leaves open: a forward on
@@ -214,7 +219,9 @@ accepts it.
 - **`Ack` echoing the sequence.** That's sequence acknowledgment in all but name, the first step
   toward the flow control this record keeps out. With one frame in flight the echo adds nothing.
 - **A config `max_senders`.** A knob with no driver: the connection cap already bounds how many
-  senders can be live, and the headroom covers reconnects.
+  senders can be live, and the headroom covers reconnects. [Amendment (2026-10-01): the cap is
+  now the `max_connections:` field, and the table follows it, so a separate `max_senders` stays
+  rejected.]
 - **A per-sender lock held across the forward.** It closes the parked-forward race at the cost
   of a lock per frame and a wait during the race, to prevent a duplicate the target tolerates.
 - **A receiver table persisted across a `logit_in` restart.** It adds a file, its `fsync`, and its

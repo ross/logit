@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-09-30
+updated: 2026-10-01
 ---
 
 # Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment
@@ -179,6 +179,11 @@ Four facts from the survey drive the shape of the decision:
 
 20. **The connection cap stays an internal constant.** No HTTP listener exposes
     `max_connections`; `splunk_hec_in` keeps the shared cap, not a new operator knob.
+
+    **Amendment (2026-10-01): superseded.** Every stream listener, `splunk_hec_in` included,
+    exposes `max_connections:` (default 1024, `0` rejected), and the default is one shared
+    constant, `logit_inputs::DEFAULT_MAX_CONNECTIONS`. [`docs/deploying.md`](../deploying.md)'s
+    "`max_connections` on a stream listener" section has the operator account.
 
 21. **`serde_json`'s `raw_value` feature, not `arbitrary_precision`.** The decoder reads each
     object as `BTreeMap<String, &RawValue>` and parses `time` from the number's own text with

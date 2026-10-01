@@ -120,6 +120,7 @@ fn central_graph() -> graph::Graph {
                 max_frame_bytes: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: None,
+                max_connections: logit_config::default_max_connections(),
             },
         ),
     );
