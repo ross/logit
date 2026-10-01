@@ -6,7 +6,8 @@ updated: 2026-10-01
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
 
 ## Status
-Accepted
+Accepted. Superseded in part on 2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md):
+item 7's last line, "`window` stays 1".
 
 ## Context
 
@@ -238,7 +239,10 @@ between, or a different `logit_in` when the sender's `endpoint` resolves to more
 it doesn't cover a duplicate that arrived at the sending process as two batches, such as a
 `tail_in` replay or a client's retry. Each of those is forwarded.
 
-`window` stays 1. Credit-based flow control is separate work and this record doesn't design it.
+[Superseded in part on 2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md):
+`window` is negotiated up to 1024, and a fault resends the window, which `logit_in`
+deduplicates.] `window` stays 1. Credit-based flow control is separate work and this record
+doesn't design it.
 
 ### 8. A disk spool is at-least-once across a crash, under either posture
 

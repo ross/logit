@@ -11,7 +11,9 @@ Accepted. Supersedes, in part, [ADR
 are implicit", the `Ack` entry of its control payload, its rejected alternative "An explicit
 `seq` field on every data frame", and "Ack point", which now has a second case. It narrows [ADR
 `delivery-semantics`](delivery-semantics.md) for the native hop: item 3's acknowledgment, item
-7's "Outside the window, forward", and item 8's replayed set.
+7's "Outside the window, forward", and item 8's replayed set. Superseded in part on 2026-10-01 by
+[ADR `native-hop-send-window`](native-hop-send-window.md): decision 4's one-frame-in-flight reasoning and its
+"`window` stays 1" sentence, and the rejected alternative "`Ack` echoing the sequence".
 
 ## Context
 
@@ -119,7 +121,10 @@ mark per sender identity, in a table bounded by its connection cap.
 ### 4. `Ack` carries no fields
 
 - **`Ack` means the frame is handled.** With one frame in flight per connection the reply is
-  unambiguous, so `Ack` names nothing. It means the frame was forwarded, or recognized as a
+  unambiguous, so `Ack` names nothing. [Superseded in part on 2026-10-01 by [ADR
+  `native-hop-send-window`](native-hop-send-window.md): several frames can be in flight, and
+  `Ack` still names nothing, because `logit_in` answers one connection's frames in order, so the
+  k-th `Ack` answers the k-th unanswered frame.] It means the frame was forwarded, or recognized as a
   resend and not forwarded. `logit_out` drops its `Ack.seq == conn.seq` check.
 - **The acknowledgment point gains a second case.** The native-transport record's "Ack point"
   acknowledges a frame after `Fanout::send` returns, and the delivery record's item 3 says an
@@ -129,9 +134,11 @@ mark per sender identity, in a table bounded by its connection cap.
   dropped and a spool replayed (decision 5) it's an acknowledgment of a batch no consumer took,
   which the sender then commits. The sender gave that batch up before the replay, so nothing
   is lost that wasn't already counted.
-- **The sequence is a deduplication identity, never a credit.** Nothing acknowledges a sequence,
-  `window` stays 1, and a future credit-based flow-control record decides its own acknowledgment
-  form.
+- **The sequence is a deduplication identity, never a credit.** [Superseded in part on
+  2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md): `window` is
+  negotiated up to 1024, with no credit messages, and acks answer frames in frame order.] Nothing
+  acknowledges a sequence, `window` stays 1, and a future credit-based flow-control record
+  decides its own acknowledgment form.
 - **No version changes.** `PROTOCOL_VERSION` stays 1, the frame `VERSION` stays 1, and the codec
   byte stays `CODEC_NATIVE_V2`.
 - **Breaking change.** `logit` is pre-release, so this is a breaking change to the native wire
@@ -211,7 +218,9 @@ accepts it.
   record.
 - **A new codec byte (`CODEC_NATIVE_V3`).** Unnecessary: the v2 trailer skips unknown tags, so a
   new tag extends it without a codec, a negotiation change, or a dispatch arm in `parse_record`.
-- **`Ack` echoing the sequence.** That's sequence acknowledgment in all but name, the first step
+- **`Ack` echoing the sequence.** [Superseded in part on 2026-10-01 by [ADR
+  `native-hop-send-window`](native-hop-send-window.md): several frames can be in flight, and the
+  echo stays rejected because a serial receiver acknowledges in frame order.] That's sequence acknowledgment in all but name, the first step
   toward the flow control this record keeps out. With one frame in flight the echo adds nothing.
 - **A config `max_senders`.** A knob with no driver: the connection cap already bounds how many
   senders can be live, and the headroom covers reconnects.
