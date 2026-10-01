@@ -22,7 +22,8 @@ and this plan, and changes no code.
 
 ## Workstreams
 
-Each is one PR, stacked in order: each branches from the one before it.
+Each is one PR. W0 is docs only, so W1 branches from `main` beside it; W2, W3, and W4 each
+branch from the one before.
 
 | WS | Branch | Change | ADR decision |
 |---|---|---|---|
@@ -130,7 +131,9 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-outputs/src/stream.rs`
 - [ ] `crates/logit-cli/src/pipeline.rs` passes `.with_window(*window)`; `script/schema`
   regenerates `schema/logit.schema.json`.
 - [ ] `logit_out`: `Conn` gains `window`, `in_flight`, and `broken`; `submit`, `await_ack`, and
-  `send` as `submit` then `await_ack`; the probe only at `in_flight == 0`; `Dial.nodelay`.
+  `send` as `submit` then `await_ack`; the frame write and flush under `request_timeout`, a
+  timeout with frames in flight marking the connection `broken`; the probe only at
+  `in_flight == 0`; `Dial.nodelay`.
 - [ ] `logit_out` counters: `submit` counts its `Err`s in `logit.output.requests`, `await_ack`
   every result; `logit.output.ack.duration` per await; gauges `logit.output.in_flight` and
   `logit.output.window`, recorded in `docs/design/internal-telemetry.md`.
@@ -143,6 +146,7 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-outputs/src/stream.rs`
   - `a_going_away_after_some_acks_is_clean_for_every_unanswered_frame`
   - `an_eof_mid_window_is_ambiguous_and_the_next_submit_reconnects`
   - `a_write_failure_with_frames_in_flight_still_reads_the_acks_already_sent`
+  - `a_write_that_stalls_with_frames_in_flight_still_reads_the_acks_already_sent_and_times_out_only_the_parked_frame`
   - `a_submit_whose_in_flight_disagrees_with_the_connection_is_ambiguous`
   - `a_cancelled_await_ack_drops_the_connection_and_its_window`
   - `a_window_over_tls_reads_acks_buffered_behind_several_frames`
