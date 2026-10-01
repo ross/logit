@@ -48,7 +48,8 @@
 //! twice from a v1 peer (its frames are unsequenced), after a `logit_in` restart (the marks are in
 //! memory), for a sender evicted from `logit_in`'s table, behind a load balancer that sends the
 //! resend to another `logit_in`, and when the first forward is still parked as the resend arrives
-//! (`docs/known-gaps.md`).
+//! (`docs/known-gaps.md`, "A forward parked past the sender's ack timeout can be forwarded
+//! twice").
 //!
 //! **Close.** `Output::flush`, called once after the last batch, shuts the pooled connection
 //! down, which under TLS sends `close_notify`. A connection dropped after a failed or cancelled
@@ -1149,6 +1150,72 @@ mod tests {
         );
         output.send(&sample_batch()).await.expect("send should succeed");
         server.await.expect("server task should not panic");
+    }
+
+    /// A spool that loses its cursor in a crash replays a batch `logit_in` already forwarded,
+    /// under the pair it was written with. `logit_in` acks the replay without forwarding it, so
+    /// the next batch its consumer gets is the one behind it.
+    #[tokio::test]
+    async fn a_spool_replay_after_a_crash_is_forwarded_once() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_real_listener_with_idle_timeout(
+            None,
+            probe.telemetry("logit_in", "logit_in", "listener"),
+        )
+        .await;
+        let dir = logit_pipeline::test_util::scratch_dir("logit-out-spool-replay");
+        // An hour between checkpoints: a commit never persists the cursor before the drop.
+        let open = || {
+            let config = logit_pipeline::DiskQueueConfig {
+                dir: dir.clone(),
+                max_bytes: 10 * 1024 * 1024,
+                segment_bytes: 1024 * 1024,
+                overflow: logit_pipeline::OverflowPolicy::Block,
+                compression: Compression::None,
+                checkpoint_interval: Duration::from_secs(3600),
+            };
+            logit_pipeline::DiskQueue::open(
+                config,
+                Telemetry::default(),
+                logit_core::Diagnostics::new("test"),
+            )
+            .unwrap()
+        };
+        let marked = |mark: i64| {
+            let mut batch = sample_batch();
+            batch.events[0].timestamp = mark;
+            Arc::new(batch)
+        };
+        let ctx = || logit_pipeline::BatchContext::from(logit_pipeline::TraceContext::default());
+        let mut output = LogitOutput::new(addr);
+
+        let spool = open();
+        spool.push((marked(1), ctx())).await;
+        spool.push((marked(2), ctx())).await;
+        let (first, first_ctx, first_seq) = spool.peek().await.expect("the first batch");
+        output.observe_batch(first_ctx, first_seq);
+        output.send(&first).await.expect("the first send");
+        assert_eq!(recv_batch(&mut rx).await.events[0].timestamp, 1);
+        spool.commit().expect("commit the first batch");
+        drop(spool); // a crash: no `finish`, so the cursor stays where the open persisted it
+
+        let spool = open();
+        let (replayed, replayed_ctx, replayed_seq) = spool.peek().await.expect("the replay");
+        assert_eq!(replayed.events[0].timestamp, 1);
+        assert_eq!(replayed_seq, first_seq, "a replay goes out under its recorded pair");
+        output.observe_batch(replayed_ctx, replayed_seq);
+        output.send(&replayed).await.expect("the replay is acked");
+        spool.commit().expect("commit the replay");
+
+        let (second, second_ctx, second_seq) = spool.peek().await.expect("the second batch");
+        output.observe_batch(second_ctx, second_seq);
+        output.send(&second).await.expect("the second send");
+        spool.commit().expect("commit the second batch");
+
+        assert_eq!(recv_batch(&mut rx).await.events[0].timestamp, 2, "the replay not forwarded");
+        assert_eq!(probe.sum("logit.input.batches.resends", &[]), 1.0);
+        drop(spool);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- logit.output.requests: one count per returned attempt ------------------------------

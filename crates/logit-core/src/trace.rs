@@ -319,6 +319,43 @@ mod tests {
         assert_ne!(short, [0; 8]);
     }
 
+    /// Set in a child run of [`random_ids_differ_across_processes`]: print one id and stop.
+    const PRINT_ID_ENV: &str = "LOGIT_PRINT_ID";
+
+    /// Two processes mint different ids. A sink store's native-hop identity depends on it: a
+    /// restarted sender that repeated its last run's identity would have its first batches read
+    /// as resends and dropped.
+    #[test]
+    fn random_ids_differ_across_processes() {
+        if std::env::var_os(PRINT_ID_ENV).is_some() {
+            let id: [u8; 16] = random_id_bytes();
+            let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+            println!("{PRINT_ID_ENV}={hex}");
+            return;
+        }
+        let child_id = || {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "trace::tests::random_ids_differ_across_processes",
+                    "--nocapture",
+                ])
+                .env(PRINT_ID_ENV, "1")
+                .output()
+                .expect("re-running this test binary");
+            assert!(output.status.success(), "the child run failed: {output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let prefix = format!("{PRINT_ID_ENV}=");
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix).map(str::to_string))
+                .unwrap_or_else(|| panic!("the child printed no id: {stdout}"))
+        };
+        let (first, second) = (child_id(), child_id());
+        assert_eq!(first.len(), 32);
+        assert_ne!(first, second, "two processes minted the same id");
+    }
+
     // Datadog's documented forms: a decimal uint64 `dd.trace_id` (older tracers), a 128-bit hex
     // one (newer tracers), and `_dd.p.tid` carrying that hex's high half.
     const DD_DECIMAL: &str = "1234567890123456789";
