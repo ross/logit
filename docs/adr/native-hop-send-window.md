@@ -237,7 +237,10 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   `LogitOutput` gains `window: u32` and `with_window`.
 - **`submit`**, in order:
   1. Encode with the passed context and sequence.
-  2. Fail `Ambiguous` if `in_flight` differs from the connection's count (0 with no connection).
+  2. Fail `Ambiguous` if `in_flight` differs from the connection's count (0 with no connection),
+     drop the connection, and remember the drift: the next `await_ack` fails `Ambiguous` once
+     instead of answering `Ok` for nothing in flight, so a head the loop believes submitted is
+     never delivered unacknowledged.
   3. Connect and handshake if there's no connection, and record the negotiated window.
   4. Probe a pooled connection only when `in_flight == 0`: the probe consumes a byte, and with
      frames in flight that byte is an `Ack`'s.
@@ -253,8 +256,8 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
      and `await_ack` reads them before the window is retried. Nothing more is written on a
      `broken` connection, so the partial frame a stall leaves on the wire ends the connection
      at `logit_in` as a truncated frame once the sender drops it. `Ok` increments `in_flight`.
-- **`await_ack`.** With `in_flight == 0` it returns `Ok`. Otherwise it reads one control message
-  under the request timeout:
+- **`await_ack`.** With `in_flight == 0` it returns `Ok`, unless step 2 recorded a drift since
+  the last call. Otherwise it reads one control message under the request timeout:
   - `Ack` decrements `in_flight`, and drops a `broken` connection once `in_flight` reaches 0.
   - `Reject{GOING_AWAY}` is `Clean`, for every unanswered frame. `logit_in` writes it only for a
     frame it didn't forward, and reads nothing after writing it, so every frame still unanswered
@@ -266,8 +269,10 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
 - **`send` is `submit` then `await_ack`.** `send` calls `submit` with the pending context and
   sequence and `in_flight` 0, then `await_ack`, and clears the pending sequence on `Ok`. Direct
   callers and fake peers that answer `window: 1` see today's behavior.
-- **Counters.** `submit` counts only its `Err`s in `logit.output.requests`, and `await_ack`
-  counts every result, so a `send` still counts once. `logit.output.ack.duration` records one
+- **Counters.** `submit` counts in `logit.output.requests` only an `Err` that carries a fault;
+  an unclassified error past the head isn't a returned attempt, and the `await_ack` results
+  that drain the window count its outcome. `await_ack` counts every result, so a `send` still
+  counts once. `logit.output.ack.duration` records one
   sample per `await_ack`. New gauges: `logit.output.in_flight` and `logit.output.window`.
 - **`logit_in`.** It adds `RECEIVER_MAX_WINDOW`, the clamp in `handshake`, `set_nodelay`, and the
   lingering close (`close_lingering(stream, bound)` after the `Fanout` clone is dropped).
