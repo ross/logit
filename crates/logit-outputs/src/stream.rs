@@ -102,6 +102,9 @@ pub(crate) struct Dial<'a> {
     pub(crate) connect_timeout: Duration,
     /// The sink kind, for error context.
     pub(crate) sink: &'static str,
+    /// Sets `TCP_NODELAY` on a TCP connection before any TLS wrap. `logit_out` sets it: an ack
+    /// it waits on can otherwise sit behind Nagle's algorithm and the peer's delayed ACK.
+    pub(crate) nodelay: bool,
 }
 
 impl Dial<'_> {
@@ -136,6 +139,13 @@ pub(crate) async fn connect(dial: &Dial<'_>) -> anyhow::Result<Box<dyn AsyncStre
                     r.with_context(|| format!("connecting to {sink} endpoint {endpoint}"))
                 })
                 .context(Fault::Clean)?;
+            if dial.nodelay {
+                tcp.set_nodelay(true)
+                    .with_context(|| {
+                        format!("setting TCP_NODELAY toward {sink} endpoint {endpoint}")
+                    })
+                    .context(Fault::Clean)?;
+            }
             match tls {
                 Some(tls) => Ok(Box::new(handshake(tls, tcp, dial.connect_timeout, sink).await?)),
                 None => Ok(Box::new(tcp)),
@@ -330,6 +340,7 @@ mod tests {
             target: Target::Scripted(script),
             connect_timeout: Duration::from_secs(1),
             sink: "test_out",
+            nodelay: false,
         }
     }
 
@@ -377,6 +388,7 @@ mod tests {
             target: Target::Tcp { endpoint: &endpoint, tls: None },
             connect_timeout: Duration::from_secs(1),
             sink: "test_out",
+            nodelay: false,
         };
         // A pooled connection the probe finds closed, so the refused dial is a redial: a wrongly
         // counted reconnect would show, and so would the closed connection put back.
@@ -688,6 +700,7 @@ mod tests {
             target: Target::Tcp { endpoint: &endpoint, tls: None },
             connect_timeout: Duration::from_secs(1),
             sink: "test_out",
+            nodelay: false,
         };
         let (mut probe, telemetry) = sink_telemetry();
         let mut pool = PooledStream::default();
@@ -725,6 +738,7 @@ mod tests {
             target: Target::Tcp { endpoint: &endpoint, tls: Some(&tls) },
             connect_timeout: TIMEOUT,
             sink: "test_out",
+            nodelay: false,
         };
 
         let start = tokio::time::Instant::now();
@@ -825,6 +839,7 @@ mod tests {
             target: Target::Unix { path },
             connect_timeout: Duration::from_secs(1),
             sink: "test_out",
+            nodelay: false,
         }
     }
 

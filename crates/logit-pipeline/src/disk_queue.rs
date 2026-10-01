@@ -1,8 +1,13 @@
 //! A disk-backed, crash-recoverable alternative to [`crate::queue::SinkQueue`]
 //! (`docs/adr/disk-backed-sink-buffer.md`). [`DiskQueue`] has `SinkQueue`'s
-//! `push`/`peek`/`commit`/`close` shape (both sit behind `crate::queue::SinkStore`), but every
-//! batch is appended to a segment file before it is eligible for delivery, and a restart resumes
-//! from the last checkpointed read cursor.
+//! `push`/`peek`/`peek_at`/`commit`/`close` shape (both sit behind `crate::queue::SinkStore`), but
+//! every batch is appended to a segment file before it is eligible for delivery, and a restart
+//! resumes from the last checkpointed read cursor.
+//!
+//! **A reserved prefix, not a reserved head.** `peek` and `peek_at` decode records into
+//! `State::read_ahead`, oldest first, from the read cursor on; each `commit` pops the oldest and
+//! advances the cursor past it. Nothing evicts or skips at the cursor while any record is read
+//! ahead, and a record read ahead but never committed replays after the next open.
 //!
 //! **On-disk layout.** `<dir>/` holds:
 //!
@@ -526,11 +531,48 @@ impl WriteError {
     }
 }
 
-struct HeadCache {
+/// One record [`DiskQueue::peek`] or [`DiskQueue::peek_at`] has read and reserved, with where it
+/// starts and how far the cursor advances past it.
+struct ReadAhead {
     batch: Arc<EventBatch>,
     ctx: BatchContext,
     seq: Option<SeqId>,
-    record_len: u64,
+    /// The segment and offset the read started at: the commit cursor's position once every
+    /// record ahead of this one is committed.
+    seg: u64,
+    offset: u64,
+    /// The cursor delta past the record, including any corrupt bytes skipped to reach it (see
+    /// [`ReadOutcome::Record`]).
+    len: u64,
+}
+
+impl ReadAhead {
+    fn item(&self) -> StoreItem {
+        (Arc::clone(&self.batch), self.ctx, self.seq)
+    }
+}
+
+/// Where the next record past `read_ahead` starts: the end of its last entry, or the commit
+/// cursor when it is empty, moved to the start of the next surviving segment while that position
+/// is the end of a finished, non-active segment. `roll_read_cursor`'s walk, without moving the
+/// cursor or deleting anything. `None` when nothing is readable there yet.
+fn next_read_position(state: &State) -> Option<(u64, u64)> {
+    let (mut seg, mut offset) = match state.read_ahead.back() {
+        Some(last) => (last.seg, last.offset + last.len),
+        None => (state.read_seq, state.read_offset),
+    };
+    let active = state.segments.back().map(|s| s.seq);
+    loop {
+        let len = state.segments.iter().find(|s| s.seq == seg)?.len;
+        if offset < len {
+            return Some((seg, offset));
+        }
+        if active == Some(seg) {
+            return None;
+        }
+        seg = state.segments.iter().map(|s| s.seq).find(|&s| s > seg)?;
+        offset -= len;
+    }
 }
 
 struct State {
@@ -550,7 +592,11 @@ struct State {
     read_offset: u64,
     total_bytes: u64,
     queued_records: u64,
-    head_cache: Option<HeadCache>,
+    /// The reserved prefix: every record read but not committed, oldest first, contiguous from
+    /// the commit cursor (`read_seq`, `read_offset`). While it is non-empty nothing evicts or
+    /// skips at the cursor, and `commit` pops its front. Each entry starts where the one before
+    /// it ends, rolled to the next segment when that one is finished.
+    read_ahead: VecDeque<ReadAhead>,
     /// The active segment's one write handle, while no [`HeldWriteFile`] has it out. `None`
     /// until the first write after [`DiskQueue::open`].
     write_file: Option<tokio::fs::File>,
@@ -582,8 +628,8 @@ struct State {
 /// **One producer and one consumer, polled from one task.** Two operations check under one lock
 /// acquisition and act under another:
 ///
-/// - [`DiskQueue::commit`] takes `head_cache`, then advances the cursor.
-/// - `evict_oldest` re-checks the head is unreserved, then advances the cursor.
+/// - [`DiskQueue::commit`] pops the front of `read_ahead`, then advances the cursor.
+/// - `evict_oldest` re-checks that nothing is read ahead, then advances the cursor.
 ///
 /// Neither has an `.await` in that gap, and `run_output` polls the producer (`drain_inbox`) and
 /// the consumer (`write_loop`) as two futures in one task, so the other side never runs inside
@@ -815,7 +861,7 @@ impl DiskQueue {
             read_offset,
             total_bytes,
             queued_records: replayed,
-            head_cache: None,
+            read_ahead: VecDeque::new(),
             write_file: None,
             needs_repair: None,
             rotation_started: false,
@@ -947,7 +993,7 @@ impl DiskQueue {
                 // other segment is gone and nothing is queued. The spool can still read as full:
                 // `total_bytes` shrinks only when a whole segment is deleted, and the active
                 // segment never is.
-                let nothing_queued = state.head_cache.is_none()
+                let nothing_queued = state.read_ahead.is_empty()
                     && state.read_seq == active.seq
                     && state.read_offset >= active.len;
                 if !full || impossible_to_ever_fit || self.closed() {
@@ -968,10 +1014,10 @@ impl DiskQueue {
                     match self.overflow {
                         OverflowPolicy::Block => Action::Block,
                         OverflowPolicy::DropNewest => Action::DropNewest,
-                        // Accepting over-bound while the head is reserved would leave
+                        // Accepting over-bound while a record is reserved would leave
                         // `disk.max_bytes` unenforced for most of a destination outage, the case
                         // the bound exists for.
-                        OverflowPolicy::DropOldest if state.head_cache.is_some() => {
+                        OverflowPolicy::DropOldest if !state.read_ahead.is_empty() => {
                             // The head is reserved (peeked, mid-delivery). A file-backed FIFO
                             // can't evict behind it the way the in-memory buffer can, so reject
                             // the new push, as `DropNewest` would.
@@ -1278,11 +1324,11 @@ impl DiskQueue {
     /// `DropOldest` under a full queue: advances the read cursor past the head record without
     /// delivering it. After the async read, re-checks under the lock that the head is the same
     /// unreserved record, since a concurrent `peek` may have reserved it. Returns whether it
-    /// evicted anything.
+    /// evicted anything; never anything while a record is read ahead.
     async fn evict_oldest(&self) -> bool {
         let (seq, offset) = {
             let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if state.head_cache.is_some() {
+            if !state.read_ahead.is_empty() {
                 return false;
             }
             (state.read_seq, state.read_offset)
@@ -1294,7 +1340,8 @@ impl DiskQueue {
         };
         {
             let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if state.head_cache.is_some() || state.read_seq != seq || state.read_offset != offset {
+            if !state.read_ahead.is_empty() || state.read_seq != seq || state.read_offset != offset
+            {
                 return false;
             }
         }
@@ -1374,7 +1421,7 @@ impl DiskQueue {
     /// Advances the read cursor past `delta` bytes of corruption at `(seq, offset)` without
     /// delivering, as a commit would, and counts one `batches.dropped{reason="disk_corrupt"}`
     /// with zero events: how many events a run of undecodable bytes held is unknowable. Returns
-    /// whether it skipped: `false` if the head moved or was reserved since the read.
+    /// whether it skipped: `false` if the head moved or any record was read ahead since the read.
     ///
     /// Leaves `queued_records` alone. `open` seeds it from the records that parse, so corruption
     /// already there at open was never counted, and decrementing for it would under-report
@@ -1383,7 +1430,8 @@ impl DiskQueue {
     fn skip_corrupt(&self, seq: u64, offset: u64, delta: u64) -> bool {
         {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if state.head_cache.is_some() || state.read_seq != seq || state.read_offset != offset {
+            if !state.read_ahead.is_empty() || state.read_seq != seq || state.read_offset != offset
+            {
                 return false;
             }
             state.read_offset += delta;
@@ -1492,13 +1540,13 @@ impl DiskQueue {
         readable
     }
 
-    /// Advances the read cursor past `record_len` bytes, clears the head reservation, rolls
-    /// across any segment boundary crossed, and queues a cursor persist if `checkpoint_interval`
-    /// has elapsed. Sync, and does no I/O: the persist worker does it.
+    /// Advances the read cursor past `record_len` bytes, rolls across any segment boundary
+    /// crossed, and queues a cursor persist if `checkpoint_interval` has elapsed. Sync, and does
+    /// no I/O: the persist worker does it. The caller has already released the record's
+    /// reservation, if it had one.
     fn advance_read_cursor(&self, record_len: u64) {
         {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            state.head_cache = None;
             state.read_offset += record_len;
         }
         self.after_cursor_advance();
@@ -1546,9 +1594,10 @@ impl DiskQueue {
         run_persist_job(&self.dir, job, &self.telemetry, &mut diag);
     }
 
-    /// The head, without removing it. Cached, and reserved against `DropOldest` eviction, until
-    /// [`DiskQueue::commit`], so a retry (`write_loop` peeks once per delivery attempt) costs
-    /// nothing after the first. `None` once closed and empty.
+    /// The head, without removing it. Cached in `read_ahead`, and reserved against `DropOldest`
+    /// eviction, until [`DiskQueue::commit`], so a retry (`write_loop` peeks once per delivery
+    /// attempt) costs nothing after the first. Waits while nothing is queued; `None` once closed
+    /// and empty.
     pub async fn peek(&self) -> Option<StoreItem> {
         loop {
             // Roll past a segment the reader finished while it was active and that has since
@@ -1556,8 +1605,8 @@ impl DiskQueue {
             self.roll_read_cursor();
             let (cached, seq, offset, has_data) = {
                 let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(cache) = &state.head_cache {
-                    (Some((Arc::clone(&cache.batch), cache.ctx, cache.seq)), 0, 0, true)
+                if let Some(head) = state.read_ahead.front() {
+                    (Some(head.item()), 0, 0, true)
                 } else {
                     let seg_len =
                         state.segments.iter().find(|s| s.seq == state.read_seq).map(|s| s.len);
@@ -1589,9 +1638,18 @@ impl DiskQueue {
             match self.read_record_at(seq, offset).await {
                 ReadOutcome::Record(ctx, batch, record_seq, record_len) => {
                     let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                    if state.read_seq == seq && state.read_offset == offset {
-                        state.head_cache =
-                            Some(HeadCache { batch, ctx, seq: record_seq, record_len });
+                    if state.read_ahead.is_empty()
+                        && state.read_seq == seq
+                        && state.read_offset == offset
+                    {
+                        state.read_ahead.push_back(ReadAhead {
+                            batch,
+                            ctx,
+                            seq: record_seq,
+                            seg: seq,
+                            offset,
+                            len: record_len,
+                        });
                     }
                 }
                 ReadOutcome::Skip(delta) => {
@@ -1607,14 +1665,75 @@ impl DiskQueue {
         }
     }
 
-    /// Advances the read cursor past the cached head, returning it. `None`, and a no-op, with
-    /// nothing peeked.
+    /// The `n`-th record from the head (`0` is the head), reserving every record up to it.
+    /// Never waits for a push: `None` means not readable now.
+    ///
+    /// - `n < read_ahead.len()`: the cached record, with no I/O.
+    /// - `n == read_ahead.len()`: reads one record where the last one read ends (rolled to the
+    ///   next segment when that one is finished and not active), and caches it only if that
+    ///   position is unchanged once the read completes, so a cancelled or raced read caches
+    ///   nothing. `None` when the reader has caught up to the writer, the read fails, or the
+    ///   bytes there are corrupt to the segment's end. A corrupt span is skipped, through
+    ///   `skip_corrupt`, only once it is the head: by `peek`, or by `peek_at(0)`.
+    /// - `n > read_ahead.len()`: `None`. A consumer fills its window in order, so this never
+    ///   happens.
+    pub async fn peek_at(&self, n: usize) -> Option<StoreItem> {
+        if n == 0 {
+            // Reads the head at the commit cursor itself, so `skip_corrupt` can match it.
+            let empty = self.inner.lock().unwrap_or_else(|p| p.into_inner()).read_ahead.is_empty();
+            if empty {
+                self.roll_read_cursor();
+            }
+        }
+        let (seg, offset) = {
+            let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(cached) = state.read_ahead.get(n) {
+                return Some(cached.item());
+            }
+            if n > state.read_ahead.len() {
+                return None;
+            }
+            next_read_position(&state)?
+        };
+        match self.read_record_at(seg, offset).await {
+            ReadOutcome::Record(ctx, batch, record_seq, len) => {
+                let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if state.read_ahead.len() != n || next_read_position(&state) != Some((seg, offset))
+                {
+                    return None;
+                }
+                let entry = ReadAhead { batch, ctx, seq: record_seq, seg, offset, len };
+                let item = entry.item();
+                state.read_ahead.push_back(entry);
+                Some(item)
+            }
+            ReadOutcome::Skip(delta) => {
+                if n == 0 {
+                    self.skip_corrupt(seg, offset, delta);
+                }
+                None
+            }
+            ReadOutcome::Unavailable => None,
+        }
+    }
+
+    /// Advances the read cursor past the head, the oldest record read ahead, returning it.
+    /// `None`, and a no-op, with nothing peeked. Releases only that record's reservation; the
+    /// rest of `read_ahead` stays cached.
     pub fn commit(&self) -> Option<StoreItem> {
+        // The head can start in the segment after one the cursor finished while it was active
+        // and that has rotated away since; roll so the cursor names the head's start.
+        self.roll_read_cursor();
         let (item, record_len) = {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let cache = state.head_cache.take()?;
+            let head = state.read_ahead.pop_front()?;
+            debug_assert_eq!(
+                (state.read_seq, state.read_offset),
+                (head.seg, head.offset),
+                "the commit cursor is always at the head's start"
+            );
             state.queued_records = state.queued_records.saturating_sub(1);
-            ((cache.batch, cache.ctx, cache.seq), cache.record_len)
+            ((head.batch, head.ctx, head.seq), head.len)
         };
         self.advance_read_cursor(record_len);
         self.after_change();
@@ -2424,6 +2543,247 @@ mod tests {
         assert_eq!(marker_of(&peeked), "e");
         q.commit().unwrap();
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn read_ahead_len(q: &DiskQueue) -> usize {
+        q.inner.lock().unwrap().read_ahead.len()
+    }
+
+    #[tokio::test]
+    async fn peek_at_reads_ahead_across_a_segment_boundary_and_commit_advances_one_record_at_a_time(
+    ) {
+        let dir = scratch_dir("peek-at-read-ahead");
+        let one = raw_record(&batch("x"), ctx()).len() as u64;
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 2 * one;
+        let q = open_with(cfg);
+        let labels = ["a", "b", "c", "d", "e"];
+        for label in labels {
+            q.push((batch(label), ctx())).await;
+        }
+        assert_eq!(list_segments(&dir).unwrap(), vec![0, 1, 2], "two records per segment");
+
+        for (n, label) in labels.into_iter().enumerate() {
+            let (peeked, ..) = q.peek_at(n).await.expect("every pushed record reads ahead");
+            assert_eq!(marker_of(&peeked), label);
+        }
+        assert!(q.peek_at(5).await.is_none(), "caught up to the writer");
+        assert!(q.peek_at(7).await.is_none(), "past the read-ahead");
+        assert_eq!(read_ahead_len(&q), 5);
+
+        for (i, label) in labels.into_iter().enumerate() {
+            let (head, ..) = peek_within(&q).await.expect("the head is cached");
+            assert_eq!(marker_of(&head), label, "peek returns the reserved head");
+            let (committed, ..) = q.commit().expect("a record is read ahead");
+            assert_eq!(marker_of(&committed), label);
+            assert_eq!(read_ahead_len(&q), 4 - i, "one commit releases one record");
+            if let Some(next) = labels.get(i + 1) {
+                let (peeked, ..) = q.peek_at(0).await.expect("the rest stay cached");
+                assert_eq!(marker_of(&peeked), *next);
+            }
+        }
+        q.wait_for_persists().await;
+        assert_eq!(list_segments(&dir).unwrap(), vec![2], "consumed segments are reclaimed");
+        assert!(q.commit().is_none(), "nothing left reserved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn peek_at_follows_the_writer_after_the_active_segment_it_caught_up_to_rotates_away() {
+        let dir = scratch_dir("peek-at-follows-rotation");
+        let one = raw_record(&batch("x"), ctx()).len() as u64;
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 3 * one;
+        let q = open_with(cfg);
+        for label in ["a", "b", "c"] {
+            q.push((batch(label), ctx())).await;
+        }
+        for n in 0..3 {
+            q.peek_at(n).await.expect("queued");
+        }
+        assert!(q.peek_at(3).await.is_none(), "caught up to the end of the active segment 0");
+
+        q.push((batch("d"), ctx())).await; // rotates segment 0 away
+        assert_eq!(list_segments(&dir).unwrap(), vec![0, 1]);
+        let (peeked, ..) = q.peek_at(3).await.expect("reads on into segment 1");
+        assert_eq!(marker_of(&peeked), "d");
+
+        for label in ["a", "b", "c", "d"] {
+            assert_eq!(marker_of(&q.commit().expect("read ahead").0), label);
+        }
+
+        // With nothing read ahead, the head itself follows a rotation the same way.
+        q.push((batch("e"), ctx())).await;
+        q.push((batch("f"), ctx())).await;
+        assert_eq!(marker_of(&q.peek_at(0).await.expect("queued").0), "e");
+        assert_eq!(marker_of(&q.commit().unwrap().0), "e");
+        assert_eq!(marker_of(&q.peek_at(0).await.expect("queued").0), "f");
+        assert_eq!(marker_of(&q.commit().unwrap().0), "f");
+        q.push((batch("g"), ctx())).await; // rotates segment 1 away, the cursor at its end
+                                           // segment 0's unlink, queued when the cursor left it at the commit of `c`
+        q.wait_for_persists().await;
+        assert_eq!(list_segments(&dir).unwrap(), vec![1, 2]);
+        assert_eq!(marker_of(&q.peek_at(0).await.expect("reads on into segment 2").0), "g");
+        assert_eq!(marker_of(&q.commit().unwrap().0), "g");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The read of `b` is polled once on a runtime whose one blocking thread the test holds, so
+    /// it is parked mid-read when it is dropped.
+    #[test]
+    fn a_peek_at_cancelled_mid_read_caches_nothing_and_the_next_one_reads_the_same_record() {
+        let dir = scratch_dir("peek-at-cancelled");
+        let main = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let stalled = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let q = open(dir.clone());
+        main.block_on(async {
+            for label in ["a", "b", "c"] {
+                q.push((batch(label), ctx())).await;
+            }
+            assert_eq!(marker_of(&q.peek_at(0).await.expect("queued").0), "a");
+        });
+
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        stalled.spawn_blocking(move || {
+            let _ = gate.recv();
+        });
+        {
+            let mut read = std::pin::pin!(q.peek_at(1));
+            assert!(poll_once_in(&stalled, read.as_mut()), "the read is parked behind the gate");
+        } // dropped mid-read
+        release.send(()).unwrap();
+        drop(stalled);
+        assert_eq!(read_ahead_len(&q), 1, "the cancelled read cached nothing");
+
+        main.block_on(async {
+            assert_eq!(marker_of(&q.peek_at(1).await.expect("b reads again").0), "b");
+            assert_eq!(marker_of(&q.peek_at(2).await.expect("then c").0), "c");
+            for label in ["a", "b", "c"] {
+                assert_eq!(marker_of(&q.commit().expect("read ahead").0), label);
+            }
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Segment 0 holds `a` and then a corrupt record with nothing after it; segment 1 holds `c`.
+    #[tokio::test]
+    async fn peek_at_past_corruption_stops_the_read_ahead_until_the_corrupt_span_is_the_head() {
+        let dir = scratch_dir("peek-at-corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut corrupted = raw_record(&batch("bad"), ctx());
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xFF;
+        let mut segment0 = raw_record(&batch("a"), ctx());
+        segment0.extend_from_slice(&corrupted);
+        std::fs::write(segment_path(&dir, 0), &segment0).unwrap();
+        std::fs::write(segment_path(&dir, 1), raw_record(&batch("c"), ctx())).unwrap();
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("test", "output", "sink");
+        let q = DiskQueue::open(config(dir.clone()), telemetry, Diagnostics::new("test")).unwrap();
+        registry.drain(0);
+
+        assert_eq!(marker_of(&q.peek_at(0).await.expect("a is queued").0), "a");
+        assert!(q.peek_at(1).await.is_none(), "the corrupt span stops the read-ahead");
+        assert!(q.peek_at(1).await.is_none(), "and keeps stopping it");
+        assert_eq!(read_ahead_len(&q), 1);
+
+        assert_eq!(marker_of(&q.commit().unwrap().0), "a");
+        assert!(q.peek_at(0).await.is_none(), "the head skips the corrupt span");
+        assert_eq!(marker_of(&q.peek_at(0).await.expect("c follows it").0), "c");
+        assert_eq!(marker_of(&q.commit().unwrap().0), "c");
+
+        let events = registry.drain(0);
+        assert_eq!(
+            metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, Some(("reason", "disk_corrupt"))),
+            1.0,
+            "the span is counted once, when the head skips it"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One record per segment, and room for two.
+    #[tokio::test]
+    async fn drop_oldest_drops_the_newest_while_any_record_is_read_ahead() {
+        let dir = scratch_dir("drop-oldest-read-ahead");
+        let one = raw_record(&batch("x"), ctx()).len() as u64;
+        let mut cfg = config(dir.clone());
+        cfg.overflow = OverflowPolicy::DropOldest;
+        cfg.segment_bytes = one;
+        cfg.max_bytes = 2 * one + one / 2;
+        let (q, registry, _diag) = open_observed(cfg);
+        let dropped = |reason: &str| {
+            let events = registry.drain(0);
+            metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, Some(("reason", reason)))
+        };
+
+        q.push((batch("a"), ctx())).await;
+        q.push((batch("b"), ctx())).await;
+        q.peek_at(0).await.expect("queued");
+        q.peek_at(1).await.expect("queued");
+        q.push((batch("c"), ctx())).await;
+        assert_eq!(dropped("overflow_newest"), 1.0, "a and b are reserved, so c is rejected");
+
+        assert_eq!(marker_of(&q.commit().unwrap().0), "a");
+        q.push((batch("d"), ctx())).await; // fits: committing a reclaimed its segment
+        q.push((batch("e"), ctx())).await;
+        assert_eq!(dropped("overflow_newest"), 1.0, "b is still read ahead, so e is rejected");
+
+        assert_eq!(marker_of(&q.commit().unwrap().0), "b");
+        q.push((batch("f"), ctx())).await;
+        q.push((batch("g"), ctx())).await;
+        let events = registry.drain(0);
+        let count = |reason: &str| {
+            metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, Some(("reason", reason)))
+        };
+        assert_eq!(count("overflow_oldest"), 1.0, "nothing reserved: g evicts d");
+        assert_eq!(count("overflow_newest"), 0.0);
+        assert_eq!(drain_all(&q).await, vec!["f", "g"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn make_room_never_rotates_a_spool_with_a_record_read_ahead() {
+        let dir = scratch_dir("make-room-read-ahead");
+        let one = raw_record(&batch("x"), ctx()).len() as u64;
+        let mut cfg = config(dir.clone());
+        cfg.overflow = OverflowPolicy::DropNewest;
+        cfg.segment_bytes = 3 * one;
+        cfg.max_bytes = 3 * one;
+        let (q, registry, _diag) = open_observed(cfg);
+        for label in ["a", "b", "c"] {
+            q.push((batch(label), ctx())).await;
+        }
+        for n in 0..3 {
+            q.peek_at(n).await.expect("queued");
+        }
+        registry.drain(0);
+
+        q.push((batch("d"), ctx())).await;
+        assert_eq!(list_segments(&dir).unwrap(), vec![0], "nothing rotated under the read-ahead");
+        let events = registry.drain(0);
+        assert_eq!(
+            metric_sum(
+                &events,
+                SINK_QUEUE_METRICS.items_dropped,
+                Some(("reason", "overflow_newest"))
+            ),
+            1.0
+        );
+        for label in ["a", "b", "c"] {
+            assert_eq!(marker_of(&q.commit().expect("still reserved").0), label);
+        }
+
+        // Every record committed: now the consumed active segment is rotated away for room.
+        q.push((batch("e"), ctx())).await;
+        q.wait_for_persists().await;
+        assert_eq!(list_segments(&dir).unwrap(), vec![1]);
+        assert_eq!(drain_all(&q).await, vec!["e"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3689,6 +4049,30 @@ mod tests {
 
         let reopened = open(dir.clone());
         assert_eq!(drain_all(&reopened).await, vec!["b", "c"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn finish_with_records_read_ahead_replays_all_of_them_on_reopen() {
+        let dir = scratch_dir("finish-read-ahead");
+        let q = open(dir.clone());
+        for label in ["a", "b", "c", "d"] {
+            q.push((batch(label), ctx())).await;
+        }
+        deliver(&q, &["a"]).await;
+        for (n, label) in ["b", "c", "d"].into_iter().enumerate() {
+            let (peeked, ..) = q.peek_at(n).await.expect("queued");
+            assert_eq!(marker_of(&peeked), label);
+        }
+        assert_eq!(marker_of(&q.commit().unwrap().0), "b");
+        // As when shutdown grace expires with a window in flight: `c` and `d` were read ahead,
+        // never committed.
+        q.close();
+        q.finish().await;
+        drop(q);
+
+        let reopened = open(dir.clone());
+        assert_eq!(drain_all(&reopened).await, vec!["c", "d"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

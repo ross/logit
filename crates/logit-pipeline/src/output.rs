@@ -11,7 +11,10 @@ use logit_proto::native::SeqId;
 ///
 /// Buffering is the runtime's job: `run_output` splits into a drain half and a writer half joined
 /// around a [`crate::SinkQueue`], so the inbox keeps draining while a slow or backing-off delivery
-/// is in flight (`docs/adr/buffered-sink-delivery.md`). `send` sees one batch at a time.
+/// is in flight (`docs/adr/buffered-sink-delivery.md`). `send` sees one batch at a time. A sink
+/// whose [`Output::window`] is above 1 has several batches in flight at once through
+/// [`Output::submit`] and [`Output::await_ack`] (`docs/adr/native-hop-send-window.md`, decision
+/// 4).
 ///
 /// `send` takes `&EventBatch` so `run_output` can hand a `Delivered::Shared` branch through by
 /// reference, with no `Arc::try_unwrap` or clone however many sibling branches share it
@@ -65,9 +68,9 @@ pub trait Output {
     ///   ([`classify`]).
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()>;
 
-    /// Called once per batch by `write_loop`, before the batch's first attempt, never between its
-    /// retries: the place a sink resets per-batch state. A sink that saves the value for `send`
-    /// sees the same one on every attempt at the batch. `BatchContext` is the trace/span id plus
+    /// Called once per batch by `write_loop`, before the batch's first attempt or submission,
+    /// never between its retries or resubmissions: the place a sink resets per-batch state. A
+    /// sink that saves the value for `send` sees the same one on every attempt at the batch. `BatchContext` is the trace/span id plus
     /// which component created and last handled the batch
     /// (`docs/adr/batch-provenance-on-delivered.md`); `logit_out` threads it across the wire, and
     /// a sink with encode-side counters arms its once-per-batch accounting here
@@ -83,6 +86,55 @@ pub trait Output {
     /// the last one's number and reads as a resend.
     fn observe_batch(&mut self, ctx: BatchContext, seq: Option<SeqId>) {
         let _ = (ctx, seq);
+    }
+
+    /// How many batches `write_loop` may have submitted and unacknowledged at once. The value
+    /// may change after a connection is made, so `write_loop` reads it before every submission.
+    /// The default of 1 keeps a sink on `send`, one batch per attempt: `write_loop` calls
+    /// `submit`/`await_ack` only while this reads above 1, or while batches it observed are
+    /// still unacknowledged. A type that implements `Output` by delegating to another must
+    /// forward this, [`Output::submit`], and [`Output::await_ack`].
+    ///
+    /// **A sink that reports a window above 1 bounds itself.** `write_loop` applies the head's
+    /// remaining retry budget only to a submit with nothing in flight. Every `submit` past the
+    /// head and every `await_ack` runs under no time limit from the loop, so the sink must bound
+    /// each one on its own (a progress bound on a write, a request timeout on an ack wait), or a
+    /// stalled peer holds the sink until shutdown.
+    fn window(&self) -> usize {
+        1
+    }
+
+    /// Writes `batch` without waiting for its delivery, under a window above 1
+    /// (`docs/adr/native-hop-send-window.md`, decision 4). `ctx` and `seq` are the batch's, as
+    /// [`Output::observe_batch`] last saw them for it; a resubmitted batch isn't observed again.
+    /// `in_flight` is `write_loop`'s count of batches submitted and not yet acknowledged, so this
+    /// one is at that position from the oldest. A sink whose own count differs must fail
+    /// [`Fault::Ambiguous`], so a drifted count can't let an acknowledgment deliver a batch that
+    /// was never sent.
+    ///
+    /// A failure with `in_flight == 0` is this batch's own, classified as a `send` failure is.
+    /// A failure with batches in flight is never classified: `write_loop` stops submitting and
+    /// reads the acknowledgments already owed through [`Output::await_ack`]. Cancellable at every
+    /// await, as `send` is; a cancelled `submit` means the sink dropped its connection and nothing
+    /// is outstanding. The default calls `send`.
+    async fn submit(
+        &mut self,
+        batch: &EventBatch,
+        ctx: BatchContext,
+        seq: Option<SeqId>,
+        in_flight: usize,
+    ) -> anyhow::Result<()> {
+        let _ = (ctx, seq, in_flight);
+        self.send(batch).await
+    }
+
+    /// Waits for the oldest outstanding submission's acknowledgment: `Ok` means that batch was
+    /// delivered. Every `Err`, and every cancelled `await_ack`, means the sink dropped its
+    /// connection and nothing is outstanding, so `write_loop` submits again from the oldest
+    /// unacknowledged batch. The `Err` carries a [`Fault`], as a `send` failure does. The default
+    /// returns `Ok`, matching the default `submit`, which has already delivered.
+    async fn await_ack(&mut self) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Called once, when the sink's input has closed and `write_loop` has stopped, for a sink

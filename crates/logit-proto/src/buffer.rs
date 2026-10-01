@@ -13,8 +13,9 @@ pub enum PushOutcome<T> {
     /// Accepted with room to spare.
     Accepted,
     /// Accepted after evicting these items, oldest first (`OverflowPolicy::DropOldest`), so the
-    /// caller can count every one. Can be empty: when only a reserved head (see [`Buffer::peek`])
-    /// is left, the new item is accepted over the bound rather than evicting the reservation.
+    /// caller can count every one. Can be empty: when only reserved items (see
+    /// [`Buffer::peek_at`]) are left, the new item is accepted over the bound rather than evicting
+    /// a reservation.
     Evicted(Vec<T>),
     /// Not accepted; the item is handed back unchanged (`OverflowPolicy::DropNewest`).
     Rejected(T),
@@ -32,20 +33,33 @@ pub enum OverflowPolicy {
 
 /// A bounded, in-process queue whose consumer acknowledges (`peek`, then `commit`) instead of
 /// popping, so a failed delivery retries the same item.
+///
+/// The consumer may read ahead with `peek_at`, which reserves a prefix of the queue: every item
+/// from the head through the one it returned. `commit` removes the head and shrinks the prefix by
+/// one, so a consumer with several items in flight commits them in order.
 pub trait Buffer<T> {
     /// Pushes `item` weighing `weight` bytes (e.g. `EventBatch::estimated_heap_bytes`).
     ///
-    /// Under `DropOldest`, an overflowing push evicts from the head until the item fits, never
-    /// the reserved head (see `peek`). If nothing evictable is left, the item is accepted over
-    /// the bound anyway.
+    /// Under `DropOldest`, an overflowing push evicts the oldest unreserved items until the item
+    /// fits, never a reserved one (see `peek_at`). If nothing evictable is left, the item is
+    /// accepted over the bound anyway.
     fn push(&mut self, item: T, weight: u64) -> PushOutcome<T>;
     /// The head, without removing it; `None` iff empty.
     ///
     /// **Reserves the head against `DropOldest` eviction** until `commit()`. Without that, a
     /// `push()` between `peek()` and `commit()` could evict the item in flight, and `commit()`
     /// would remove a different one. Call `commit()` only once delivery succeeded.
-    fn peek(&mut self) -> Option<&T>;
-    /// Removes and returns the head, releasing any reservation `peek()` made, even when empty.
+    fn peek(&mut self) -> Option<&T> {
+        self.peek_at(0)
+    }
+    /// The `n`-th item from the head (`0` is the head), without removing it; `None` when
+    /// `n >= len()`, reserving nothing new.
+    ///
+    /// Reserves items `0..=n` against `DropOldest` eviction, so a consumer with `n + 1` items in
+    /// flight never has one evicted under it. A reservation is released only by `commit()`,
+    /// which releases one.
+    fn peek_at(&mut self, n: usize) -> Option<&T>;
+    /// Removes and returns the head, releasing one reservation, even when empty.
     fn commit(&mut self) -> Option<T>;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
@@ -67,8 +81,9 @@ pub struct InMemoryBuffer<T> {
     /// wrap in release and leave a `Block` push waiting forever on an empty queue.
     weight: u64,
     overflow: OverflowPolicy,
-    /// Set by `peek`, cleared by `commit`; while set, `items[0]` is never evicted.
-    head_reserved: bool,
+    /// How many items from the head `peek_at` has reserved; `items[..reserved]` is never
+    /// evicted. Raised by `peek_at`, lowered by one per `commit`; never above `items.len()`.
+    reserved: usize,
 }
 
 impl<T> InMemoryBuffer<T> {
@@ -82,7 +97,7 @@ impl<T> InMemoryBuffer<T> {
             max_weight,
             weight: 0,
             overflow,
-            head_reserved: false,
+            reserved: 0,
         }
     }
 
@@ -91,13 +106,13 @@ impl<T> InMemoryBuffer<T> {
         self.items.len() >= self.max_len || self.weight.saturating_add(weight) > self.max_weight
     }
 
-    /// Evicts from the front until `weight` fits or nothing but a reserved head is left. Returns
-    /// the evicted items, oldest first.
+    /// Evicts the oldest unreserved items until `weight` fits or nothing but reserved items is
+    /// left. Returns the evicted items, oldest first.
     fn evict_to_fit(&mut self, weight: u64) -> Vec<T> {
         let mut evicted = Vec::new();
         while self.would_overflow(weight) {
-            // A reserved head is at index 0, so evict from index 1 past it.
-            let evict_at = usize::from(self.head_reserved);
+            // The reserved prefix is `items[..reserved]`, so evict the first item past it.
+            let evict_at = self.reserved;
             if evict_at >= self.items.len() {
                 break;
             }
@@ -129,15 +144,14 @@ impl<T> Buffer<T> for InMemoryBuffer<T> {
         }
     }
 
-    fn peek(&mut self) -> Option<&T> {
-        if !self.items.is_empty() {
-            self.head_reserved = true;
-        }
-        self.items.front().map(|(item, _)| item)
+    fn peek_at(&mut self, n: usize) -> Option<&T> {
+        let (item, _) = self.items.get(n)?;
+        self.reserved = self.reserved.max(n + 1);
+        Some(item)
     }
 
     fn commit(&mut self) -> Option<T> {
-        self.head_reserved = false;
+        self.reserved = self.reserved.saturating_sub(1);
         self.items.pop_front().map(|(item, weight)| {
             self.weight = self.weight.saturating_sub(weight);
             item
@@ -301,6 +315,87 @@ mod tests {
             }
             other => panic!("expected Evicted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn peek_at_reserves_every_item_up_to_n_and_drop_oldest_evicts_past_them() {
+        let mut buf = unbounded_by_weight(4, OverflowPolicy::DropOldest);
+        for item in ["a", "b", "c", "d"] {
+            push_accepted(&mut buf, item, 1);
+        }
+
+        assert_eq!(buf.peek_at(2), Some(&"c")); // reserves a, b, c
+
+        match buf.push("e", 1) {
+            PushOutcome::Evicted(evicted) => {
+                assert_eq!(evicted, vec!["d"], "must evict d, never a reserved item")
+            }
+            other => panic!("expected Evicted, got {other:?}"),
+        }
+        assert_eq!(buf.commit(), Some("a"));
+        assert_eq!(buf.commit(), Some("b"));
+        assert_eq!(buf.commit(), Some("c"));
+        assert_eq!(buf.commit(), Some("e"));
+    }
+
+    #[test]
+    fn peek_at_past_the_end_returns_none_and_reserves_nothing_new() {
+        let mut buf = unbounded_by_weight(2, OverflowPolicy::DropOldest);
+        push_accepted(&mut buf, "a", 1);
+        push_accepted(&mut buf, "b", 1);
+
+        assert_eq!(buf.peek_at(0), Some(&"a"));
+        assert_eq!(buf.peek_at(2), None);
+        assert_eq!(buf.peek_at(usize::MAX), None);
+
+        // Only "a" is reserved, so an overflowing push evicts "b".
+        match buf.push("c", 1) {
+            PushOutcome::Evicted(evicted) => assert_eq!(evicted, vec!["b"]),
+            other => panic!("expected Evicted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_releases_one_reservation_and_leaves_the_rest() {
+        let mut buf = unbounded_by_weight(3, OverflowPolicy::DropOldest);
+        for item in ["a", "b", "c"] {
+            push_accepted(&mut buf, item, 1);
+        }
+        assert_eq!(buf.peek_at(1), Some(&"b")); // reserves a, b
+        assert_eq!(buf.commit(), Some("a")); // b stays reserved
+
+        push_accepted(&mut buf, "d", 1);
+        match buf.push("e", 1) {
+            PushOutcome::Evicted(evicted) => {
+                assert_eq!(evicted, vec!["c"], "b is still reserved; c is the oldest unreserved")
+            }
+            other => panic!("expected Evicted, got {other:?}"),
+        }
+        assert_eq!(buf.commit(), Some("b"));
+
+        // Nothing is reserved now: the oldest item goes first.
+        push_accepted(&mut buf, "f", 1);
+        match buf.push("g", 1) {
+            PushOutcome::Evicted(evicted) => assert_eq!(evicted, vec!["d"]),
+            other => panic!("expected Evicted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_every_item_reserved_drop_oldest_accepts_one_over_the_bound() {
+        let mut buf = unbounded_by_weight(2, OverflowPolicy::DropOldest);
+        push_accepted(&mut buf, "a", 1);
+        push_accepted(&mut buf, "b", 1);
+        assert_eq!(buf.peek_at(1), Some(&"b")); // reserves both
+
+        match buf.push("c", 1) {
+            PushOutcome::Evicted(evicted) => assert!(evicted.is_empty()),
+            other => panic!("expected Evicted([]), got {other:?}"),
+        }
+        assert_eq!(buf.len(), 3, "accepted one over the length bound");
+        assert_eq!(buf.commit(), Some("a"));
+        assert_eq!(buf.commit(), Some("b"));
+        assert_eq!(buf.commit(), Some("c"));
     }
 
     #[test]

@@ -950,10 +950,11 @@ fn build_spec(
                 write_config(&component.buffer),
             )
         }
-        LogitOut { endpoint, compression, tls, request_timeout } => {
+        LogitOut { endpoint, compression, tls, request_timeout, window } => {
             let mut output = LogitOutput::new(endpoint.clone())
                 .with_compression(to_native_compression(*compression))
                 .with_timeout(*request_timeout)
+                .with_window(*window)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
             if let Some(tls) = tls {
@@ -3539,6 +3540,7 @@ mod tests {
                 compression: logit_config::Compression::Lz4,
                 tls: None,
                 request_timeout: Duration::from_secs(10),
+                window: 32,
             },
         };
         assert!(matches!(
@@ -3563,6 +3565,7 @@ mod tests {
                     ..Default::default()
                 }),
                 request_timeout: Duration::from_secs(10),
+                window: 32,
             },
         };
         assert!(matches!(
@@ -4706,6 +4709,7 @@ mod tests {
                         compression: logit_config::Compression::None,
                         tls: Some(logit_config::TlsClientConfig::default()),
                         request_timeout: Duration::from_secs(10),
+                        window: 32,
                     },
                 },
             ),

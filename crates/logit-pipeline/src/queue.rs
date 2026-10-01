@@ -331,7 +331,7 @@ impl<T: Queued> BoundedQueue<T> {
 
     /// [`BoundedQueue::push`] over a whole batch. Each item gets the same admission control
     /// `push` applies: its own weight, the never-fits fallback, `Block` waiting, `DropOldest`
-    /// eviction (never the reserved head) or `DropNewest` rejection, and a drop count with its own
+    /// eviction (never a reserved item) or `DropNewest` rejection, and a drop count with its own
     /// [`Queued::units`]. Only the bookkeeping is per call: one `update_gauges` for the whole
     /// invocation, and one lock acquisition per contiguous run of items that fit
     /// (`docs/adr/udp-intake-batching-and-socket-visibility.md`, "`push_many`/`pop_many` live on
@@ -438,8 +438,8 @@ impl<T: Queued> BoundedQueue<T> {
         self.update_gauges(len, total_weight);
     }
 
-    /// Removes and returns the head (`None` on an empty queue), clearing any reservation from
-    /// [`BoundedQueue::peek`], wakes a blocked `push`, and refreshes the gauges. After a `peek`,
+    /// Removes and returns the head (`None` on an empty queue), releasing one reservation from
+    /// [`BoundedQueue::peek`] or [`BoundedQueue::peek_at`], wakes a blocked `push`, and refreshes the gauges. After a `peek`,
     /// this removes the peeked item only under `peek`'s one-consumer contract.
     pub fn commit(&self) -> Option<T> {
         let (item, len, weight) = {
@@ -492,7 +492,7 @@ impl<T: Queued> BoundedQueue<T> {
     /// against a non-empty queue. A `debug_assert!` catches it; release builds clamp it to 1.
     ///
     /// Cancellation-safe, as `pop` is: no `.await` between locking and removing, `Buffer::commit`
-    /// clears any head reservation, and the call awaits only on an iteration that removed nothing,
+    /// releases one reservation per item it removes, and the call awaits only on an iteration that removed nothing,
     /// so no item is lost into a half-filled `out`.
     pub async fn pop_many(&self, out: &mut Vec<T>, max: usize) -> usize {
         debug_assert!(max > 0, "pop_many(max = 0) would wait for an item and then remove none");
@@ -529,7 +529,7 @@ impl<T: Queued> BoundedQueue<T> {
         }
     }
 
-    /// Removes every queued item under one lock and returns them in FIFO order, clearing any head
+    /// Removes every queued item under one lock and returns them in FIFO order, clearing every
     /// reservation. For a shutdown residual drain: it never waits and wakes nobody, so it is safe
     /// from a `Drop` only when no other future of this queue is still alive. An empty queue returns
     /// an empty `Vec` (no allocation) and makes no telemetry call; otherwise the gauges update once.
@@ -560,8 +560,8 @@ impl<T: Queued> BoundedQueue<T> {
     /// that tokio behavior.
     ///
     /// A push racing a close re-checks state, sees `closed`, and makes one best-effort attempt
-    /// against the `DropOldest` fallback (see `with_metrics`): it may evict (never the reserved
-    /// head) or accept over-bound, but never panics or hangs. Callers close only after they stop
+    /// against the `DropOldest` fallback (see `with_metrics`): it may evict (never a reserved
+    /// item) or accept over-bound, but never panics or hangs. Callers close only after they stop
     /// producing, so this does not arise in practice.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
@@ -634,6 +634,16 @@ impl<T: Queued + Clone> BoundedQueue<T> {
             notified.await;
         }
     }
+
+    /// A clone of the `n`-th item from the head (`0` is the head), or `None` when fewer than
+    /// `n + 1` items are queued. Never waits. Reserves items `0..=n` against `DropOldest`
+    /// eviction (see `logit_proto::buffer::Buffer::peek_at`), so a consumer with several items in
+    /// flight commits each one it delivered, in order. [`BoundedQueue::peek`]'s one-consumer
+    /// rule applies.
+    pub fn peek_at(&self, n: usize) -> Option<T> {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.peek_at(n).cloned()
+    }
 }
 
 /// What a [`SinkStore`] hands its consumer: a batch, the [`BatchContext`] it arrived with, and
@@ -692,6 +702,18 @@ impl SinkQueue {
     /// See [`BoundedQueue::peek`], including its one-consumer rule.
     pub async fn peek(&self) -> Option<StoreItem> {
         self.queue.peek().await.map(|(batch, ctx, seq)| (batch, ctx, Some(seq)))
+    }
+
+    /// See [`BoundedQueue::peek_at`].
+    pub fn peek_at(&self, n: usize) -> Option<StoreItem> {
+        self.queue.peek_at(n).map(|(batch, ctx, seq)| (batch, ctx, Some(seq)))
+    }
+
+    /// How many batches a consumer may hold reserved with `peek_at` at once: `max_batches`, or
+    /// 1 when that is 0. Past it, a `DropOldest` push has nothing left to evict and accepts over
+    /// the bound, so a consumer that stays within it keeps the queue at most one batch over.
+    pub fn max_in_flight(&self) -> usize {
+        self.queue.max_items.max(1)
     }
 
     /// See [`BoundedQueue::commit`].
@@ -754,6 +776,29 @@ impl SinkStore {
         match self {
             SinkStore::Memory(q) => q.peek().await,
             SinkStore::Disk(q) => q.peek().await,
+        }
+    }
+
+    /// The `n`-th batch from the head (`0` is the head), reserving every batch up to it; see
+    /// [`SinkQueue::peek_at`] and `DiskQueue::peek_at`. `async` because the disk store reads a
+    /// record, but never waits for a push: `None` means not readable now (fewer than `n + 1`
+    /// batches queued, or a disk store caught up to its writer or stopped at a corrupt span).
+    /// A consumer fills its window in order, `peek_at(0)`, `peek_at(1)`, and so on.
+    pub async fn peek_at(&self, n: usize) -> Option<StoreItem> {
+        match self {
+            SinkStore::Memory(q) => q.peek_at(n),
+            SinkStore::Disk(q) => q.peek_at(n).await,
+        }
+    }
+
+    /// How many batches a consumer may hold reserved with `peek_at` at once:
+    /// [`SinkQueue::max_in_flight`] for memory, `usize::MAX` for disk: a read-ahead record stays
+    /// in its segment until committed, so reading ahead never changes what the spool holds or
+    /// what its overflow policy may drop.
+    pub fn max_in_flight(&self) -> usize {
+        match self {
+            SinkStore::Memory(q) => q.max_in_flight(),
+            SinkStore::Disk(_) => usize::MAX,
         }
     }
 
@@ -1265,6 +1310,67 @@ mod tests {
         q.push(TestItem { weight: 1, units: 5 }).await;
         let taken: Vec<u64> = q.take_all().into_iter().map(|item| item.units).collect();
         assert_eq!(taken, vec![4, 5]);
+    }
+
+    /// `peek_at` on an empty, open queue, and past the last item, is ready on its first poll:
+    /// unlike `peek`, it never waits for a push.
+    #[test]
+    fn peek_at_never_waits_on_an_empty_open_queue() {
+        let store = SinkStore::Memory(queue(10, u64::MAX, OverflowPolicy::Block));
+        let mut cx = Context::from_waker(Waker::noop());
+        let poll_now = |n: usize, cx: &mut Context<'_>| {
+            let mut fut = std::pin::pin!(store.peek_at(n));
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(item) => item.map(|(batch, ..)| batch),
+                Poll::Pending => panic!("peek_at({n}) must never wait"),
+            }
+        };
+        assert!(poll_now(0, &mut cx).is_none(), "nothing queued");
+
+        let SinkStore::Memory(q) = &store else { unreachable!() };
+        let sent = tiny_batch();
+        let mut push = std::pin::pin!(q.push((Arc::clone(&sent), ctx())));
+        assert!(push.as_mut().poll(&mut cx).is_ready(), "room for one: the push never waits");
+        assert!(Arc::ptr_eq(&poll_now(0, &mut cx).expect("the pushed batch"), &sent));
+        assert!(poll_now(1, &mut cx).is_none(), "one past the last item");
+    }
+
+    #[tokio::test]
+    async fn drop_oldest_never_evicts_a_batch_reserved_by_peek_at() {
+        let q = queue(3, u64::MAX, OverflowPolicy::DropOldest);
+        let (a, b, c, d) = (tiny_batch(), tiny_batch(), tiny_batch(), tiny_batch());
+        for sent in [&a, &b, &c] {
+            q.push((Arc::clone(sent), ctx())).await;
+        }
+        let (peeked, ..) = q.peek_at(1).expect("b is queued"); // reserves a and b
+        assert!(Arc::ptr_eq(&peeked, &b));
+
+        q.push((Arc::clone(&d), ctx())).await; // must evict c, the oldest unreserved batch
+
+        for expected in [&a, &b, &d] {
+            let (committed, ..) = q.commit().expect("should commit");
+            assert!(Arc::ptr_eq(&committed, expected), "a and b survive, c was evicted");
+        }
+        assert!(q.commit().is_none());
+    }
+
+    #[tokio::test]
+    async fn take_all_clears_every_reservation_peek_at_made() {
+        let q = test_queue(3, u64::MAX, OverflowPolicy::DropOldest);
+        for units in 1..=3 {
+            q.push(TestItem { weight: 1, units }).await;
+        }
+        assert_eq!(q.peek_at(2).expect("units=3 is queued").units, 3); // reserves all three
+        let taken: Vec<u64> = q.take_all().into_iter().map(|item| item.units).collect();
+        assert_eq!(taken, vec![1, 2, 3]);
+
+        // At capacity, a fourth push evicts the oldest. A stale reservation would protect the
+        // first items pushed after the drain and evict a newer one, or none.
+        for units in 4..=7 {
+            q.push(TestItem { weight: 1, units }).await;
+        }
+        let taken: Vec<u64> = q.take_all().into_iter().map(|item| item.units).collect();
+        assert_eq!(taken, vec![5, 6, 7]);
     }
 
     // -- `push_many` / `pop_many`: one lock and one gauge update per batch, per-item admission. --

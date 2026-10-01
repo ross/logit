@@ -470,8 +470,8 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.events.dropped{reason="script_drop"}` | count | Lua `ProcessOutcome::Drop` |
 | `logit.component.events.dropped{reason="unrouted"}` | count | `run_router` or `run_lua`: events no route or `event:to(..)` claimed, at a node with targets and no ordinary consumers. See below. |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
-| `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`) |
-| `logit.component.retries` | count | a retried delivery attempt, `deliver_with_retry` (`write_loop`) |
+| `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window` |
+| `logit.component.retries` | count | a retried delivery attempt or windowed round, `deliver_with_retry` or `deliver_window` (`write_loop`) |
 | `logit.component.errors` | count | `Output::send` failed (any attempt), or a Lua script error |
 | `logit.component.diagnostics{key=...}` | count | every `Diagnostics::warn_throttled` occurrence, throttled or not |
 | `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |
@@ -1161,7 +1161,9 @@ the property the minimal-watch-set design is for.
   `logit.input.connections.rejected{reason="limit"}` (count, the connection cap,
   `max_connections`, 1024 by default, binding). `otlp_in` and a TCP
   `syslog_in`/`graphite_in`/`statsd_in` on the shared driver record the same pair; all five reject
-  at the cap rather than queueing behind a permit.
+  at the cap rather than queueing behind a permit. Here a connection this
+  listener closed still counts, and holds its permit, while it lingers: after its last answer it
+  reads and discards until the peer closes or for `handshake_timeout`.
 - `logit.input.connections.closed{reason="idle"}` (count), the third point all five share. Here the
   idle time is measured from the last `Ack` written rather than from bytes read, because a peer
   waiting on a delayed ack isn't idle. The close writes `Reject{GOING_AWAY, "idle for <dur>"}`, the
@@ -1853,22 +1855,35 @@ attempt.
 
 `crates/logit-outputs/src/logit.rs`,
 [ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md),
-[ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md).
+[ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md),
+[ADR `native-hop-send-window`](../adr/native-hop-send-window.md).
 
 - `logit.proto.frames{direction="out",codec,compression}` and `logit.proto.frame.bytes`: the
   send-side mirror of `logit_in`'s pair.
-- `logit.output.ack.duration` (timer, one per attempt): finer-grained than layer 2's
-  `logit.component.send.duration`, because it isolates the ack wait from the
-  connect/handshake/write that can precede it on a cold connection.
+- `logit.output.ack.duration` (timer, one per `await_ack` that reads from the connection): the
+  wait for one `Ack`, finer-grained than layer 2's `logit.component.send.duration`, which times a
+  whole attempt or windowed round, connect, handshake, and writes included.
+- `logit.output.in_flight` (gauge): frames written and awaiting an `Ack`, set on every change. It
+  reads 0 after every connection drop, a cancelled call's included. A value that sits at `logit.output.window` means
+  the round trip, or the peer's forwarding, bounds this sink.
+- `logit.output.window` (gauge): the window the live connection negotiated, the smaller of the
+  configured `window` and the peer's answer, and at least 1. It reads 1 after every connection
+  drop.
 - `logit.output.reconnects` (count): every connect *after* the first whose `HelloAck` passed
   validation. A climbing count in steady state means the peer or the network, not this sink, is
   unstable.
-- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count, one per attempt
-  that returns): the `Fault` taxonomy as request-outcome classes. A connect or handshake failure
-  and a batch too large to send count as attempts, so the total equals the number of `send` calls
-  that returned. A cancelled attempt (a budget timeout, the shutdown grace) returns nothing and
-  isn't counted; `logit.component.errors` covers it. `clean` covers every failure before the frame
-  is completely written and flushed, and `ambiguous` only the ack wait
+- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count): the `Fault`
+  taxonomy as request-outcome classes, one per `submit` that fails with a `Fault` and one per
+  `await_ack` that returns. A `send` is a `submit` then an `await_ack`, so it counts once, and the total equals the
+  number of `send` calls that returned. A connect or handshake failure and a batch too large to
+  send count as failed submits. A submit that fails with frames already in flight (a stalled or
+  failed write) carries no `Fault` and isn't counted: the `await_ack`s after it count the round's
+  outcome, `ok` for each `Ack` drained and the class of the failure that ends it. A drifted
+  `in_flight` counts once, `ambiguous`, in the `submit` that finds it. A `Permanent` past the head
+  is counted when it becomes the head. A cancelled call (a budget timeout, the shutdown grace)
+  returns nothing and isn't counted; `logit.component.errors` covers it. `clean` covers every
+  failure before a frame is completely written and flushed with nothing in flight, and
+  `ambiguous` only the ack wait
   ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
   decision 6).
 

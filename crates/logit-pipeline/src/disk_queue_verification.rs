@@ -565,6 +565,9 @@ enum SpoolOp {
     /// Pushes a batch whose marker is padded by this many bytes.
     Push(usize),
     Peek,
+    /// Reads ahead to the `n`-th record from the head without waiting, reserving every record up
+    /// to it.
+    PeekAt(usize),
     Commit,
     /// Polls a push this many times, then drops it. The push runs on a second runtime whose one
     /// blocking thread first sleeps this many microseconds, so what the push handed off lands
@@ -613,6 +616,7 @@ fn spool_op() -> impl Strategy<Value = SpoolOp> {
     prop_oneof![
         6 => (0usize..300).prop_map(SpoolOp::Push),
         3 => Just(SpoolOp::Peek),
+        2 => (0usize..4).prop_map(SpoolOp::PeekAt),
         4 => Just(SpoolOp::Commit),
         2 => (0usize..300, 1u32..=6, 0u64..2000)
             .prop_map(|(size, polls, delay)| SpoolOp::CancelPush(size, polls, delay)),
@@ -656,6 +660,9 @@ struct Model {
     last_first_commit: Option<usize>,
     /// The depth the queue must report, once a reopen has set a baseline.
     depth: f64,
+    /// The ids `peek` and `peek_at` have reserved since the last reopen, head first: each commit
+    /// removes the first, and a reopen replays every one of them.
+    reserved: Vec<usize>,
 }
 
 impl Model {
@@ -799,6 +806,9 @@ fn cancel_once_rotation_created(
 /// push that was never counted queued, comes only after a reopen.
 fn on_commit(m: &mut Model, id: usize) -> Result<(), TestCaseError> {
     prop_assert!(id < m.pushes.len(), "delivered an id never pushed: {id}");
+    if !m.reserved.is_empty() {
+        prop_assert_eq!(m.reserved.remove(0), id, "commit must remove the reserved head");
+    }
     match m.committed_in[id] {
         Some(first) => {
             prop_assert!(m.epoch > first, "id {id} delivered twice with no reopen in between")
@@ -863,6 +873,7 @@ fn drive_spool_model(
         epoch: 0,
         last_first_commit: None,
         depth: 0.0,
+        reserved: Vec::new(),
     };
     let mut corrupt = 0.0;
 
@@ -924,11 +935,41 @@ fn drive_spool_model(
                     peeked.is_ok() || !m.must_deliver(),
                     "peek stopped responding with a queued record undelivered"
                 );
+                if let Ok(Some((batch, ..))) = peeked {
+                    let id = id_of(&marker_of(&batch));
+                    match m.reserved.first() {
+                        Some(&head) => prop_assert_eq!(head, id, "peek returns the reserved head"),
+                        None => m.reserved.push(id),
+                    }
+                }
+                corrupt += corrupt_count(&registry.drain(0));
+            }
+            SpoolOp::PeekAt(n) => {
+                let n = *n;
+                let peeked = rt
+                    .block_on(async { tokio::time::timeout(MODEL_TIMEOUT, q.peek_at(n)).await })
+                    .map_err(|_| TestCaseError::fail("peek_at waited"))?;
+                let id = peeked.map(|(batch, ..)| id_of(&marker_of(&batch)));
+                match (m.reserved.get(n), id) {
+                    (Some(&reserved), Some(id)) => {
+                        prop_assert_eq!(reserved, id, "a reserved record comes back unchanged")
+                    }
+                    (Some(_), None) => prop_assert!(false, "a reserved record {n} came back None"),
+                    (None, Some(id)) => {
+                        prop_assert_eq!(n, m.reserved.len(), "peek_at past the read-ahead");
+                        if let Some(&last) = m.reserved.last() {
+                            prop_assert!(id > last, "read ahead {id} after {last}: not FIFO");
+                        }
+                        m.reserved.push(id);
+                    }
+                    (None, None) => {}
+                }
                 corrupt += corrupt_count(&registry.drain(0));
             }
             SpoolOp::Commit => {
-                if let Some((batch, ..)) = q.commit() {
-                    on_commit(&mut m, id_of(&marker_of(&batch)))?;
+                match q.commit() {
+                    Some((batch, ..)) => on_commit(&mut m, id_of(&marker_of(&batch)))?,
+                    None => prop_assert!(m.reserved.is_empty(), "a reserved record wasn't there"),
                 }
                 let events = registry.drain(0);
                 corrupt += corrupt_count(&events);
@@ -989,6 +1030,8 @@ fn drive_spool_model(
                 side = side_runtime();
                 q = open(&registry);
                 m.epoch += 1;
+                // Every reserved record was never committed, so it replays.
+                m.reserved.clear();
                 let events = registry.drain(0);
                 corrupt += corrupt_count(&events);
                 let depth = depth_gauge(&events).expect("open reports the depth");
