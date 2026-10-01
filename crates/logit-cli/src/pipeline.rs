@@ -146,6 +146,13 @@ pub async fn run_pipelines(
         }
     }
 
+    // After the layer is active, so `internal`'s `logs:` captures it like any other warning.
+    if let Some(warning) =
+        fd_limit_warning(listener_connection_budget(&graph), logit_inputs::open_files_limit())
+    {
+        tracing::warn!(target: "logit", "{warning}");
+    }
+
     // Every concurrent listener on a signal kind is notified, so this doesn't consume the one
     // `run_with_telemetry` races on. Aborted once that returns.
     let kill_switch = tokio::spawn(async {
@@ -207,6 +214,51 @@ type PrepareResult =
 /// Then one process-wide [`Registry`] is built, and each component's handle serves both its own
 /// instrumentation (`build_spec`, layer 3) and the node runtime's (layer 2), so both drain from
 /// one buffer. See `docs/design/internal-telemetry.md`.
+/// The summed `max_connections` of every listener in `graph` that has connections: what it can
+/// hold open at once, one file descriptor each. A datagram `syslog_in`/`graphite_in`/`statsd_in`
+/// and a scrape-mode `prometheus_in` hold none, so they contribute nothing.
+fn listener_connection_budget(graph: &graph::Graph) -> usize {
+    use logit_config::{ComponentKind::*, GraphiteTransport, StatsdTransport, SyslogTransport};
+    graph
+        .components
+        .values()
+        .map(|component| match &component.kind {
+            SyslogIn { transport: SyslogTransport::Tcp, max_connections, .. }
+            | GraphiteIn { transport: GraphiteTransport::Tcp, max_connections, .. }
+            | StatsdIn {
+                transport: StatsdTransport::Tcp | StatsdTransport::UnixStream,
+                max_connections,
+                ..
+            }
+            | OtlpIn { max_connections, .. }
+            | DatadogIn { max_connections, .. }
+            | SplunkHecIn { max_connections, .. }
+            | LogitIn { max_connections, .. } => *max_connections,
+            DatadogTraceIn { bind, socket, max_connections, .. }
+                if bind.is_some() || socket.is_some() =>
+            {
+                *max_connections
+            }
+            PrometheusIn { bind: Some(_), max_connections, .. } => *max_connections,
+            _ => 0,
+        })
+        .fold(0, usize::saturating_add)
+}
+
+/// The startup warning for a connection budget the process's soft open-files limit can't cover,
+/// or `None` when it can or the limit is unknown or unlimited. At the limit already warns: the
+/// process holds other descriptors besides connections.
+fn fd_limit_warning(budget: usize, soft_limit: Option<u64>) -> Option<String> {
+    let limit = soft_limit?;
+    (budget as u64 >= limit).then(|| {
+        format!(
+            "listeners' max_connections total {budget} is at or above the process's open-files \
+             limit {limit}: the caps can't bind before file descriptors run out; raise the limit \
+             (ulimit -n, LimitNOFILE) or lower the caps"
+        )
+    })
+}
+
 fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<PrepareResult> {
     let graph = graph::resolve(config)?;
 
@@ -313,7 +365,7 @@ fn build_spec(
         // The transport picks the constructor and the `receive:` translation: a TCP listener has
         // no receive queue, so it takes `tcp_receive_config`, not `receive_config` (graph rule 17).
         // `tls:` is TCP-only: rules 43 and 65 reject it elsewhere, and `with_tls` refuses it again.
-        StatsdIn { bind, transport, tls, handshake_timeout, idle_timeout } => {
+        StatsdIn { bind, transport, tls, handshake_timeout, idle_timeout, max_connections } => {
             let mut input = match transport {
                 logit_config::StatsdTransport::Udp => {
                     StatsdInput::new(bind.clone()).with_receive(receive_config(&component.receive))
@@ -330,9 +382,10 @@ fn build_spec(
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
-            // No-ops under UDP, where rules 45 and 53 reject a value.
+            // No-ops under UDP, where rules 45, 53, and 74 reject a value.
             .with_handshake_timeout(*handshake_timeout)
-            .with_idle_timeout(*idle_timeout);
+            .with_idle_timeout(*idle_timeout)
+            .with_max_connections(*max_connections);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -356,8 +409,9 @@ fn build_spec(
         }
         // `GraphiteInput` picks its own driver from `transport`, so `with_receive` is safe on
         // either: rule 17 rejects the queue fields under TCP, leaving only the batch-assembly half
-        // the stream driver reads. The two timeouts are no-ops under UDP (rules 45 and 53 reject a
-        // value there); `tls:` is TCP-only (rule 43), and `with_tls` refuses it again.
+        // the stream driver reads. The two timeouts and the connection cap are no-ops under UDP
+        // (rules 45, 53, and 74 reject a value there); `tls:` is TCP-only (rule 43), and
+        // `with_tls` refuses it again.
         GraphiteIn {
             bind,
             transport,
@@ -367,6 +421,7 @@ fn build_spec(
             idle_timeout,
             max_line_bytes,
             max_frame_bytes,
+            max_connections,
         } => {
             let mut input = GraphiteInput::new(
                 bind.clone(),
@@ -379,14 +434,15 @@ fn build_spec(
             .with_max_line_bytes(*max_line_bytes as usize)
             .with_max_frame_bytes(*max_frame_bytes as usize)
             .with_handshake_timeout(*handshake_timeout)
-            .with_idle_timeout(*idle_timeout);
+            .with_idle_timeout(*idle_timeout)
+            .with_max_connections(*max_connections);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
         // The `StatsdIn` arm's shape (`docs/adr/syslog-tcp-ingress-and-tls.md`).
-        SyslogIn { bind, transport, tls, handshake_timeout, idle_timeout } => {
+        SyslogIn { bind, transport, tls, handshake_timeout, idle_timeout, max_connections } => {
             let mut input = match transport {
                 logit_config::SyslogTransport::Udp => {
                     SyslogInput::new(bind.clone()).with_receive(receive_config(&component.receive))
@@ -396,34 +452,37 @@ fn build_spec(
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
-            // No-ops under UDP, where rules 45 and 53 reject a value.
+            // No-ops under UDP, where rules 45, 53, and 74 reject a value.
             .with_handshake_timeout(*handshake_timeout)
-            .with_idle_timeout(*idle_timeout);
+            .with_idle_timeout(*idle_timeout)
+            .with_max_connections(*max_connections);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        OtlpIn { bind, protocol, tls, handshake_timeout, idle_timeout } => {
+        OtlpIn { bind, protocol, tls, handshake_timeout, idle_timeout, max_connections } => {
             let mut input = OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
                 // `OtlpInput` reads `handshake_timeout` twice: as the pre-request budget and as
                 // the grace an idle close gives `hyper` (`docs/adr/idle-connection-timeout.md`).
                 .with_handshake_timeout(*handshake_timeout)
-                .with_idle_timeout(*idle_timeout);
+                .with_idle_timeout(*idle_timeout)
+                .with_max_connections(*max_connections);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        DatadogIn { bind, tls, api_keys, handshake_timeout, idle_timeout } => {
+        DatadogIn { bind, tls, api_keys, handshake_timeout, idle_timeout, max_connections } => {
             let mut input = DatadogInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
                 // Read twice, as on `otlp_in`: the pre-request budget and an idle close's grace.
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
+                .with_max_connections(*max_connections)
                 .with_api_keys(api_keys.clone());
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
@@ -439,6 +498,7 @@ fn build_spec(
             max_pending_acks,
             handshake_timeout,
             idle_timeout,
+            max_connections,
         } => {
             let mut input = SplunkHecInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -446,6 +506,7 @@ fn build_spec(
                 // Read twice, as on `otlp_in`: the pre-request budget and an idle close's grace.
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
+                .with_max_connections(*max_connections)
                 .with_tokens(tokens.clone())
                 // Saturates on a 32-bit target: a cap past the address space is no cap.
                 .with_max_request_bytes(usize::try_from(*max_request_bytes).unwrap_or(usize::MAX))
@@ -457,13 +518,14 @@ fn build_spec(
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
         // Graph rule 64 guarantees at least one of `bind`/`socket`, and `tls` only with `bind`.
-        DatadogTraceIn { bind, socket, tls, handshake_timeout, idle_timeout } => {
+        DatadogTraceIn { bind, socket, tls, handshake_timeout, idle_timeout, max_connections } => {
             let mut input = DatadogTraceInput::new()
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
                 // Read twice, as on `otlp_in`: the pre-request budget and an idle close's grace.
                 .with_handshake_timeout(*handshake_timeout)
-                .with_idle_timeout(*idle_timeout);
+                .with_idle_timeout(*idle_timeout)
+                .with_max_connections(*max_connections);
             if let Some(bind) = bind {
                 input = input.with_bind(bind.clone());
             }
@@ -488,6 +550,7 @@ fn build_spec(
             path,
             bind_tls,
             idle_timeout,
+            max_connections,
             metadata_cache,
         } => {
             let input: Box<dyn Input + Send> = match bind {
@@ -496,6 +559,7 @@ fn build_spec(
                         .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                         .with_telemetry(telemetry.clone())
                         .with_idle_timeout(*idle_timeout)
+                        .with_max_connections(*max_connections)
                         // Unconditional: the receiver reads `max_families: 0` as off, and rule 55
                         // rejects a zero `ttl`.
                         .with_metadata_cache(metadata_cache.max_families, metadata_cache.ttl);
@@ -516,12 +580,20 @@ fn build_spec(
             };
             NodeSpec::Input(input, input_runtime_config(&component.receive))
         }
-        LogitIn { bind, tls, max_frame_bytes, handshake_timeout, idle_timeout } => {
+        LogitIn {
+            bind,
+            tls,
+            max_frame_bytes,
+            handshake_timeout,
+            idle_timeout,
+            max_connections,
+        } => {
             let mut input = LogitInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
                 .with_handshake_timeout(*handshake_timeout)
-                .with_idle_timeout(*idle_timeout);
+                .with_idle_timeout(*idle_timeout)
+                .with_max_connections(*max_connections);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -1789,6 +1861,7 @@ mod tests {
                 tls: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: None,
+                max_connections: logit_config::default_max_connections(),
             },
         }
     }
@@ -2287,6 +2360,7 @@ mod tests {
                     tls: None,
                     handshake_timeout: Duration::from_secs(5),
                     idle_timeout: None,
+                    max_connections: logit_config::default_max_connections(),
                 },
             };
             assert!(
@@ -2354,6 +2428,7 @@ mod tests {
                 path: "/api/v1/write".to_string(),
                 bind_tls: None,
                 idle_timeout: None,
+                max_connections: logit_config::default_max_connections(),
                 metadata_cache: logit_config::MetadataCacheConfig::default(),
             },
         };
@@ -2382,6 +2457,7 @@ mod tests {
                 path: "/api/v1/write".to_string(),
                 bind_tls: None,
                 idle_timeout: Some(Duration::from_secs(60)),
+                max_connections: logit_config::default_max_connections(),
                 metadata_cache: logit_config::MetadataCacheConfig::default(),
             },
         };
@@ -2463,6 +2539,7 @@ mod tests {
                 tls,
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
+                max_connections: logit_config::default_max_connections(),
                 max_line_bytes: 8192,
                 max_frame_bytes: 1 << 20,
             },
@@ -2794,6 +2871,7 @@ mod tests {
                 }),
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
+                max_connections: logit_config::default_max_connections(),
             },
         };
         assert!(matches!(
@@ -2819,6 +2897,7 @@ mod tests {
                 tls,
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
+                max_connections: logit_config::default_max_connections(),
             },
         }
     }
@@ -2910,6 +2989,7 @@ mod tests {
                 max_frame_bytes: None,
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
+                max_connections: logit_config::default_max_connections(),
             },
         };
         assert!(matches!(
@@ -2936,6 +3016,7 @@ mod tests {
                 max_frame_bytes: Some(32 * 1024 * 1024),
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
+                max_connections: logit_config::default_max_connections(),
             },
         };
         assert!(matches!(
@@ -2994,6 +3075,7 @@ mod tests {
                 tls: None,
                 handshake_timeout: Duration::from_millis(50),
                 idle_timeout: None,
+                max_connections: logit_config::default_max_connections(),
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -3015,6 +3097,7 @@ mod tests {
                 max_frame_bytes: None,
                 handshake_timeout: Duration::from_millis(50),
                 idle_timeout: None,
+                max_connections: logit_config::default_max_connections(),
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -3041,10 +3124,198 @@ mod tests {
                 }),
                 handshake_timeout: Duration::from_millis(50),
                 idle_timeout: None,
+                max_connections: logit_config::default_max_connections(),
             },
         };
         let spec = build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0;
         assert_closes_a_silent_connection(spec, &addr).await;
+    }
+
+    /// Resolves a one-listener-per-entry graph, each listener feeding one shared sink.
+    fn graph_of(listeners: &[(&str, &str)]) -> graph::Graph {
+        let mut components = HashMap::new();
+        let mut sources = Vec::new();
+        for (id, json) in listeners {
+            components.insert(id.to_string(), serde_json::from_str(json).unwrap());
+            sources.push(id.to_string());
+        }
+        components.insert(
+            "out".to_string(),
+            serde_json::from_value(serde_json::json!({"type": "null_out", "sources": sources}))
+                .unwrap(),
+        );
+        graph::resolve(Config { components, ..Config::default() }).unwrap()
+    }
+
+    #[test]
+    fn listener_connection_budget_sums_stream_listeners_and_skips_the_rest() {
+        let graph = graph_of(&[
+            ("syslog_udp", r#"{"type": "syslog_in", "bind": "127.0.0.1:0"}"#),
+            ("statsd_unix", r#"{"type": "statsd_in", "bind": "/tmp/d.sock", "transport": "unix"}"#),
+            (
+                "scrape",
+                r#"{"type": "prometheus_in", "scrape_targets": ["http://localhost:9100/metrics"]}"#,
+            ),
+            ("collectd", r#"{"type": "collectd_in", "bind": "127.0.0.1:0"}"#),
+            (
+                "syslog_tcp",
+                r#"{"type": "syslog_in", "bind": "127.0.0.1:0", "transport": "tcp",
+                    "max_connections": 3}"#,
+            ),
+            (
+                "statsd_stream",
+                r#"{"type": "statsd_in", "bind": "/tmp/s.sock", "transport": "unix_stream",
+                    "max_connections": 5}"#,
+            ),
+            ("graphite", r#"{"type": "graphite_in", "bind": "127.0.0.1:0", "max_connections": 7}"#),
+            ("logit", r#"{"type": "logit_in", "bind": "127.0.0.1:0", "max_connections": 11}"#),
+            (
+                "apm",
+                r#"{"type": "datadog_trace_in", "socket": "/tmp/apm.sock", "max_connections": 13}"#,
+            ),
+            ("receiver", r#"{"type": "prometheus_in", "bind": "127.0.0.1:0"}"#),
+        ]);
+        assert_eq!(listener_connection_budget(&graph), 3 + 5 + 7 + 11 + 13 + 1024);
+    }
+
+    #[test]
+    fn fd_limit_warning_fires_at_and_above_the_limit_only() {
+        assert_eq!(fd_limit_warning(1023, Some(1024)), None);
+        assert_eq!(fd_limit_warning(4096, None), None, "unknown or unlimited never warns");
+        let at = fd_limit_warning(1024, Some(1024)).expect("at the limit warns");
+        assert_eq!(
+            at,
+            "listeners' max_connections total 1024 is at or above the process's open-files limit \
+             1024: the caps can't bind before file descriptors run out; raise the limit (ulimit \
+             -n, LimitNOFILE) or lower the caps"
+        );
+        assert!(fd_limit_warning(2048, Some(1024)).is_some(), "above the limit warns");
+    }
+
+    // ---- `max_connections` reaches each kind of stream listener ---------------------------------
+    //
+    // As above, a boxed `dyn Input` has no field to read back. Each test configures
+    // `max_connections: 1`, holds the one permit with a first connection, and asserts the second is
+    // turned away, which the 1024 default never would.
+
+    /// Builds `kind` as component `in`, spawns it with telemetry from a fresh registry, and opens
+    /// a first connection that holds the one permit. Returns the registry and that connection.
+    async fn spawn_capped_listener(
+        kind: ComponentKind,
+        addr: &str,
+        base_dir: &Path,
+    ) -> (Arc<Registry>, tokio::net::TcpStream) {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind,
+        };
+        let registry = Registry::new();
+        let (spec, _) = build_spec("in", &component, base_dir, Some(&registry)).unwrap();
+        let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
+        input.bind().await.expect("bind should succeed");
+        let (sink, rx) = logit_pipeline::test_util::fanout_channel(16);
+        tokio::spawn(async move {
+            let _consumer = rx;
+            input.run(sink).await
+        });
+        // One byte, so a listener with a first-byte deadline keeps the connection. The accept loop
+        // takes permits one accept at a time in the kernel queue's order, so this holds the one
+        // permit before any later connection is accepted.
+        let mut first = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut first, b"<").await.unwrap();
+        (registry, first)
+    }
+
+    /// Waits for `in`'s `logit.input.connections.rejected{reason="limit"}` to reach 1.
+    async fn assert_one_limit_rejection(registry: Arc<Registry>) {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("the past-the-cap connection counted", |t| {
+                t.sum("logit.input.connections.rejected", &[("reason", "limit")]) >= 1.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.input.connections.rejected", &[("reason", "limit")]), 1.0);
+    }
+
+    #[tokio::test]
+    async fn build_spec_wires_max_connections_into_a_tcp_syslog_input() {
+        let addr = free_port().await;
+        let kind = ComponentKind::SyslogIn {
+            bind: addr.clone(),
+            transport: logit_config::SyslogTransport::Tcp,
+            tls: None,
+            handshake_timeout: logit_config::default_handshake_timeout(),
+            idle_timeout: None,
+            max_connections: 1,
+        };
+        let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
+
+        let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut second, "a past-the-cap connection").await;
+        assert_one_limit_rejection(registry).await;
+        drop(first);
+    }
+
+    /// `logit_in` tells a past-the-cap peer why: a `Reject{INTERNAL}` control frame, then a close.
+    #[tokio::test]
+    async fn build_spec_wires_max_connections_into_a_logit_input() {
+        let addr = free_port().await;
+        let kind = ComponentKind::LogitIn {
+            bind: addr.clone(),
+            tls: None,
+            max_frame_bytes: None,
+            handshake_timeout: logit_config::default_handshake_timeout(),
+            idle_timeout: None,
+            max_connections: 1,
+        };
+        let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
+
+        let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let mut wire = Vec::new();
+        tokio::time::timeout(
+            logit_pipeline::test_util::RECV_TIMEOUT,
+            tokio::io::AsyncReadExt::read_to_end(&mut second, &mut wire),
+        )
+        .await
+        .expect("a past-the-cap logit_in connection should be answered and closed")
+        .expect("reading the reject");
+        let mut wire = bytes::Bytes::from(wire);
+        let (header, mut payload) = logit_proto::frame::read_frame_with_header(&mut wire).unwrap();
+        assert_eq!(
+            header.flags & logit_proto::frame::FLAG_CONTROL,
+            logit_proto::frame::FLAG_CONTROL
+        );
+        match logit_proto::native::control::ControlMessage::decode(&mut payload).unwrap() {
+            logit_proto::native::control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, logit_proto::native::control::REJECT_INTERNAL);
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+        assert_one_limit_rejection(registry).await;
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn build_spec_wires_max_connections_into_an_otlp_input() {
+        let addr = free_port().await;
+        let kind = ComponentKind::OtlpIn {
+            bind: addr.clone(),
+            protocol: logit_config::OtlpProtocol::Http,
+            tls: None,
+            handshake_timeout: logit_config::default_handshake_timeout(),
+            idle_timeout: None,
+            max_connections: 1,
+        };
+        let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
+
+        let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut second, "a past-the-cap connection").await;
+        assert_one_limit_rejection(registry).await;
+        drop(first);
     }
 
     // ---- `idle_timeout` reaches each TCP listener that honours it -------------------------------
@@ -3091,6 +3362,7 @@ mod tests {
                 tls: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
+                max_connections: logit_config::default_max_connections(),
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -3113,6 +3385,7 @@ mod tests {
                 tls: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
+                max_connections: logit_config::default_max_connections(),
                 max_line_bytes: 8192,
                 max_frame_bytes: 1 << 20,
             },
@@ -3136,6 +3409,7 @@ mod tests {
                 tls: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
+                max_connections: logit_config::default_max_connections(),
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -3163,6 +3437,7 @@ mod tests {
                 max_frame_bytes: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
+                max_connections: logit_config::default_max_connections(),
             },
         };
         let NodeSpec::Input(mut input, _) =
@@ -3242,6 +3517,7 @@ mod tests {
                 tls: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
+                max_connections: logit_config::default_max_connections(),
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -4310,6 +4586,7 @@ mod tests {
                 tls,
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
+                max_connections: logit_config::default_max_connections(),
             },
         }
     }
