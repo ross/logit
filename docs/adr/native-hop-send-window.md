@@ -303,14 +303,17 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   head's retry budget. The head is delivered when the fill ends and its buffered `Ack` is read;
   the budget bounds retries and the head's own submit, never a step past it. Once the head is
   submitted, only a shutdown grace cancels a round.
-- **The parked-forward race grows.** The abandoned connection's task can still hold a window
-  of frames it read before the fault, and it forwards them while the new connection's resend
-  arrives. The mark stops a task only at a sequence some copy of which has already landed, so
-  two tasks parked on one full inbox can move in lockstep and forward every frame of the window
-  twice: the worst case is `window` duplicates per fault, where one frame in flight gave one.
-  Nothing is lost, and a batch's only copy never lands after a later batch, since a mark at or
-  above a sequence exists only once a copy of it landed. The `docs/known-gaps.md` entry "A
-  resend can race the frames an ended connection still holds, and be forwarded twice" says so.
+- **The parked-forward race grows.** The abandoned connection's task can still hold up to a
+  window of frames it read before the fault, and it forwards them while the new connection's
+  resend arrives. The mark stops a task only at a sequence some copy of which has already
+  landed, so the two tasks can forward the same frame once each. What ends the old task is its
+  next `Ack` write: the sender closed the socket, so that write is answered by a reset within a
+  round trip, and the task forwards the frame it was parked on plus whatever its inbox accepts
+  in about one round trip after. The hard bound is the window it holds; under the sustained
+  backpressure that parks a forward, the pace keeps it to one or two. Nothing is lost, and a
+  batch's only copy never lands after a later batch, since a mark at or above a sequence exists
+  only once a copy of it landed. The `docs/known-gaps.md` entry "A resend can race the frames
+  an ended connection still holds, and be forwarded twice" says so.
 - **The shutdown count grows.** A memory store's `finish` counts outstanding frames as
   `dropped{reason="shutdown"}`, and `flush`'s `shutdown()` can then let `logit_in` forward them.
   The over-count is at most one batch today and at most `window` with this record.
