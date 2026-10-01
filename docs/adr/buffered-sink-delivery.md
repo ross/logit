@@ -1,12 +1,15 @@
 ---
 created: 2026-09-01
-updated: 2026-09-30
+updated: 2026-10-01
 ---
 
 # Buffered, decoupled sink delivery
 
 ## Status
-Accepted
+Accepted. Superseded in part on 2026-10-01 by [ADR
+`native-hop-send-window`](native-hop-send-window.md): "every attempt, including the first, races
+the remaining budget" holds for `deliver_with_retry`; on the window path only the head's own
+submit races it, and a pipelined sink bounds every later step itself.
 
 ## Context
 
@@ -153,7 +156,10 @@ unaffected and remain in force; only its retry-budget rationale is revised, note
 retry section rather than marking it Superseded.
 
 **Revised during review, before merge: every attempt, including the first, races the remaining
-budget via `tokio::time::timeout`.** A first version awaited `output.send` un-raced, checking the
+budget via `tokio::time::timeout`.** [Superseded in part on 2026-10-01 by [ADR
+`native-hop-send-window`](native-hop-send-window.md): on the window path, a submit past the head
+and every `await_ack` run under no attempt time, so that a budget expiry can't discard an
+acknowledgment the receiver already sent; the sink bounds those steps itself.] A first version awaited `output.send` un-raced, checking the
 deadline only *after* each attempt returned — but a sink's own internal timeout (e.g.
 `InfluxDbOutput`'s 10s HTTP client timeout) can exceed a configured `retry_budget` outright, so a
 single hung attempt could blow straight through the budget before the loop ever got a chance to

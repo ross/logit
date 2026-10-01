@@ -24,6 +24,9 @@ Accepted. Supersedes in part:
 - [ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md):
   decision 7's "it isn't under the sink's `request_timeout`", for a `logit_out` write with
   frames in flight, which decision 5 bounds by progress.
+- [ADR `buffered-sink-delivery`](buffered-sink-delivery.md): "every attempt, including the
+  first, races the remaining budget", which on the window path holds for the head's own submit
+  alone (decision 4).
 
 ## Context
 
@@ -208,10 +211,10 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
     with that fault.
   - **One retry budget per head.** Its clock starts when the batch becomes the head, as today.
     On the window path the budget decides whether a failed round is retried, and bounds the
-    head's own submit and each backoff; it doesn't cut a round short. A round lasts at most the
-    head's submit, `window - 1` progress-bounded writes, and one `request_timeout` ack wait, so
-    a round can overrun the budget by that much where `deliver_with_retry` cuts an attempt at
-    the deadline.
+    head's own submit and each backoff; it never cancels anything past the head's own submit. A
+    round lasts at most the head's submit, `window - 1` progress-bounded writes, and one
+    `request_timeout` ack wait, so a round can overrun the budget by that much where
+    `deliver_with_retry` cuts an attempt at the deadline.
   - **A pipelined sink bounds itself.** A sink that reports a window above 1 bounds every
     `submit` past the head and every `await_ack` on its own, since the loop applies no attempt
     time to them.
@@ -288,7 +291,8 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
 - **A slowly draining receiver.** A receiver that forwards a frame every few seconds makes
   progress, so no write stalls, and a fill of `window - 1` frames can take longer than the
   head's retry budget. The head is delivered when the fill ends and its buffered `Ack` is read;
-  the budget bounds retries, not a round. Only a shutdown grace cancels a round.
+  the budget bounds retries and the head's own submit, never a step past it. Once the head is
+  submitted, only a shutdown grace cancels a round.
 - **The parked-forward race grows.** The abandoned connection's task can forward several
   buffered frames that race the new connection's resend, so the worst case is a few duplicates
   instead of one. It limits itself: the first forward raises the mark. The `docs/known-gaps.md`
