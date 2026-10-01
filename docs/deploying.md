@@ -2609,20 +2609,20 @@ oldest unacknowledged batch, and `logit_in` acknowledges each batch it already f
 forwarding it again. Nothing enforces the pairing; a larger window under `at_most_once` loses more
 per fault.
 
-**Sizing `request_timeout` against `buffer.retry_budget`.** Keep `request_timeout` comfortably
-under `retry_budget`. `logit_out.request_timeout` (default 10s) bounds each step of one attempt
-separately: the connect, the TLS handshake, the `HelloAck` wait, each ack wait, and at shutdown
-the close. With frames in flight it also bounds each chunk of a frame write and its flush: a write
-that accepts nothing for `request_timeout` means the receiver stopped reading. The connection then
-takes no more frames: the `Ack`s already owed are read, and the connection is dropped. The `Hello`, and a frame written with
-nothing in flight, aren't under it, since a large frame on a slow link can outlast it;
-`retry_budget` bounds them. `buffer.retry_budget`
-(default 60s; see [Sink delivery buffering](#sink-delivery-buffering)) bounds all retried attempts
-together. A `request_timeout` close to or above the retry budget leaves room for at most one attempt
-before the budget expires, which defeats retrying. With a window, the budget decides whether a
-failed round is retried; it doesn't cut a round short, so a receiver that forwards slowly can hold
-one round past it (`docs/known-gaps.md`, "A round against a slowly draining `logit_in` can outlast
-the retry budget").
+**Sizing `request_timeout` against `buffer.retry_budget`.** Keep `request_timeout` comfortably under
+`retry_budget`. `logit_out.request_timeout` (default 10s) bounds each step of one attempt
+separately: the connect, the TLS handshake, the `HelloAck` wait, each ack wait, and at shutdown the
+close. With frames in flight it also bounds each chunk of a frame write and its flush: a write that
+accepts nothing for `request_timeout` means the receiver stopped reading. The connection then takes
+no more frames: the `Ack`s already owed are read, and the connection is dropped. The `Hello`, and a
+frame written with nothing in flight, aren't under it, since a large frame on a slow link can
+outlast it; `retry_budget` bounds them. `buffer.retry_budget` (default 60s; see [Sink delivery
+buffering](#sink-delivery-buffering)) bounds all retried attempts together. A `request_timeout`
+close to or above the retry budget leaves room for at most one attempt before the budget expires,
+which defeats retrying. With a window, the budget decides whether a failed round is retried, and it
+never cuts anything past the head's own write, so a receiver that forwards slowly can hold one round
+past it (`docs/known-gaps.md`, "A round against a slowly draining `logit_in` can outlast the retry
+budget").
 
 `request_timeout` relates only loosely to the far end's handshake grace. A `logit_out` whose
 `request_timeout` is shorter than its peer's handshake patience gives up first; the connection
@@ -2717,15 +2717,17 @@ reconnecting doesn't show as `connection_error` on the far end.
 
 - `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/`permanent`, one per
   `Ack` read or ack wait that fails, plus one per failed connect or handshake, too-large batch, or
-  write that fails with nothing in flight; `clean` is any failure before the frame is fully
-  written and flushed, `ambiguous` only a lost or refused ack), `logit.output.reconnects` (should
+  write that fails with nothing in flight; `ok` is an acknowledged frame, `clean` a failure
+  before a frame was fully written with nothing in flight or a `GOING_AWAY` in place of an `Ack`,
+  `ambiguous` a lost `Ack` (a timeout, an EOF, a reset, another message) or an `in_flight` drift,
+  and `permanent` a size check at the head or a permanent reject), `logit.output.reconnects` (should
   stay near zero in steady state; a climbing count means the peer or the network is unstable),
-  `logit.output.ack.duration`, `logit.output.in_flight` (a gauge of frames awaiting an `Ack`, 0
-  with no connection; one that sits at the window means the round trip or the peer's forwarding
-  is the limit, and raising `window` helps only in the first case), and `logit.output.window` (a
-  gauge of the live connection's negotiated window, 1 with no connection, after a drop or a
-  shutdown included; below the configured `window` on a live connection means `logit_in`
-  answered less).
+  `logit.output.ack.duration`, `logit.output.in_flight` (a gauge of frames awaiting an `Ack`,
+  set from the first connection on and 0 after any drop; one that sits at the window means the
+  round trip or the peer's forwarding is the limit, and raising `window` helps only in the first
+  case), and `logit.output.window` (a gauge of the live connection's negotiated window, set from
+  the first connection on and 1 after any drop or a shutdown; below the configured `window` on a
+  live connection means `logit_in` answered less).
 - `logit_in`: `logit.input.connections` (a gauge that should match the number of connected
   `logit_out` peers), `logit.input.connections.rejected{reason="limit"}` (nonzero means the
   1024-connection cap is binding; raise it or shed load upstream), and `logit.proto.errors{reason}`

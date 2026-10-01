@@ -447,9 +447,9 @@ decision record.
     `HelloAck.window` is the offer clamped to `1..=RECEIVER_MAX_WINDOW` (1024). The sender uses
     `max(1, min(offered, answered))`, so a `HelloAck.window` of 0 reads as 1. No message grants or
     returns credit.
-  - **`GOING_AWAY` answers every unanswered frame.** `logit_in` reads nothing after writing it, so
-    every frame still unanswered on that connection was not forwarded, and `logit_out` treats each
-    as a clean fault.
+  - **`GOING_AWAY` answers every unanswered frame.** `logit_in` processes nothing after writing
+    it (the linger below only discards), so every frame still unanswered on that connection was
+    not forwarded, and `logit_out` treats each as a clean fault.
   - **`TCP_NODELAY` on both ends.** With small acks and an idle sender, Nagle's algorithm and
     delayed ACK together can add about 40 ms per ack.
   - **The listener closes with a linger.** After the handshake, every end of a connection other

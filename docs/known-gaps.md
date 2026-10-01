@@ -566,7 +566,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   ([`docs/plans/delivery-semantics.md`](plans/delivery-semantics.md), W1), set
   `buffer.delivery: at_least_once` on a sink that should resend.
 
-- ~~**The native hop has no sender identity and no deduplication.**~~ **Closed 2026-10-01:** a sink's store numbers every batch under an identity minted when it opens, `logit_out` sends the pair in each v2 frame's trailer, and `logit_in` acks a frame at or below its identity's mark without forwarding it ([ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md)). What still reaches consumers twice is in that record's decision 5 and in the parked-forward entry below.
+- ~~**The native hop has no sender identity and no deduplication.**~~ **Closed 2026-10-01:** a sink's store numbers every batch under an identity minted when it opens, `logit_out` sends the pair in each v2 frame's trailer, and `logit_in` acks a frame at or below its identity's mark without forwarding it ([ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md)). What still reaches consumers twice is in that record's decision 5 and in the entry "A resend can race the frames an ended connection still holds, and be forwarded twice" below.
 
   [ADR `delivery-semantics`](adr/delivery-semantics.md), item 7, targets effectively-once between
   `logit_out` and `logit_in`, and [ADR

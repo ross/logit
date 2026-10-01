@@ -1878,9 +1878,11 @@ attempt.
   it count the round's outcome, `ok` for each `Ack` drained and the class of the failure that ends
   it. A drifted `in_flight` counts once, `ambiguous`, in the `submit` that finds it. A `Permanent`
   past the head is counted when it becomes the head. A cancelled call (a budget timeout, the
-  shutdown grace) returns nothing and isn't counted; `logit.component.errors` covers it. `clean`
-  covers every failure before a frame is completely written and flushed with nothing in flight,
-  and `ambiguous` only the ack wait
+  shutdown grace) returns nothing and isn't counted; `logit.component.errors` covers it. `ok` is
+  an acknowledged frame; `clean` a failure before a frame was completely written and flushed with
+  nothing in flight, or a `Reject{GOING_AWAY}` read in place of an `Ack`; `ambiguous` a lost `Ack`
+  (a timeout, an EOF, a reset, another message) or an `in_flight` drift; and `permanent` a size
+  check at the head or a permanent reject
   ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
   decision 6).
 

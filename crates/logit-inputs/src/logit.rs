@@ -15,13 +15,13 @@
 //! bind-drop-rebind race. `run_until_shutdown` binds too when nobody did, for direct callers.
 //!
 //! **Ack point.** `Ack`, which carries no fields, is written in one of two cases: after
-//! `send_relayed` returns `true`, i.e. after the batch is in every open downstream inbox, or, for
-//! a frame at or below its sender's mark ("Deduplication" below), at once and with no forward. A
+//! `send_relayed` returns `true`, i.e. after the batch is in every open downstream inbox, or, for a
+//! frame at or below its sender's mark ("Deduplication" below), at once and with no forward. A
 //! stalled downstream delays the ack, which stalls the sender's `write_loop` once its window is
-//! full. That is this listener's backpressure; there is no receive-side queue the way a UDP listener has one
-//! (`crate::udp`). A frame no consumer took, because every consumer of this listener has closed,
-//! is never acked: it is answered `Reject{GOING_AWAY}`, the connection closes, its sender's mark
-//! stays where it was, and the frame's batch is counted
+//! full. That is this listener's backpressure; there is no receive-side queue the way a UDP
+//! listener has one (`crate::udp`). A frame no consumer took, because every consumer of this
+//! listener has closed, is never acked: it is answered `Reject{GOING_AWAY}`, the connection closes,
+//! its sender's mark stays where it was, and the frame's batch is counted
 //! `logit.input.batches.dropped{reason="closed_consumer"}`.
 //!
 //! **Deduplication.** A v2 frame's trailer can carry its sender's identity and sequence

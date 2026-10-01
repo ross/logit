@@ -72,7 +72,7 @@ postures.
 | Question | Decision |
 |---|---|
 | Item type held in the buffer | `Arc<EventBatch>` — an owned `EventBatch` would force the `Arc::try_unwrap`/clone ADR `arc-eventbatch-copy-on-write` exists to avoid on a shared `Delivered::Shared` branch |
-| Ack shape | `peek`/`commit` (head stays until delivery returns `Ok`), not `push`/`pop` — in-order, single in-flight batch per sink; out-of-order acks stay deferred to the wire protocol's credit-based flow control (built since: ADR `native-hop-send-window`) |
+| Ack shape | `peek`/`commit` (head stays until delivery returns `Ok`), not `push`/`pop` — in-order, single in-flight batch per sink; out-of-order acks stay deferred to the wire protocol's credit-based flow control (several batches in flight with in-order acks, built since: ADR `native-hop-send-window`; out-of-order acks were not) |
 | Where the queue lives | `Arc<Mutex<InMemoryBuffer>> + Notify`, not a second `mpsc` — `DropOldest` needs to evict the head from the producer side, and `peek`-without-remove has no channel equivalent |
 | `Block` | not part of the `Buffer` trait (sync trait, can't block) — a `SinkQueue`-level concern; the trait implements only the two dropping policies |
 | Retry ownership | relocates from `InfluxDbOutput::send` into a generic writer loop in `logit-pipeline`; sinks keep only fault *classification* |
