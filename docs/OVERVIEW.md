@@ -23,7 +23,10 @@ transport between nodes: a native wire protocol that carries the internal event 
 OpenTelemetry Protocol (OTLP) is the interoperable option at the edges. "Lossless" means field
 fidelity, as ADR [`lossless-transit`](adr/lossless-transit.md) defines it. Delivery is
 at-least-once per hop, with duplicates absorbed by the data model
-([ADR `delivery-semantics`](adr/delivery-semantics.md)).
+([ADR `delivery-semantics`](adr/delivery-semantics.md)). The native hop between two `logit` nodes
+goes further: it's effectively-once, because the receiver recognizes a resend and doesn't
+forward it again
+([ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md)).
 
 Relaying a protocol to itself is lossless. Each of these pairs is a transparent relay:
 

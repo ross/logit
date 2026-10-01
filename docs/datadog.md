@@ -155,8 +155,11 @@ send a point that far past the end of its window.
 
 The default posture is `at_least_once`, so a `5xx` or a timeout is retried. One batch goes out
 over up to eight routes, each as one or more requests (one per event, and a route over its size
-cap is split), and a retry re-sends the ones that succeeded. Datadog stores a resent series point
-once, the last write winning at its `(series, timestamp)`, but stores a resent log twice. Every
+cap is split), and a retry re-sends the ones that succeeded. A failure after any request of the
+batch was accepted counts as ambiguous ([ADR `delivery-semantics`](adr/delivery-semantics.md),
+item 9), so `at_least_once` retries it and `at_most_once` drops the batch. Datadog stores a
+resent series point once, the last write winning at its `(series, timestamp)`, but stores a
+resent log twice. Every
 other route is assumed to duplicate too: expect duplicate logs, spans, events, and checks, and
 inflated distribution point, sketch, and APM stats counts, which no upstream `aggregate` setting
 prevents. `datadog_trace_out` is the same: an Agent dedupes nothing. To drop the batch on a `5xx`

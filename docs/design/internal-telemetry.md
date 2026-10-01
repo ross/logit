@@ -1137,7 +1137,8 @@ the property the minimal-watch-set design is for.
 ##### `logit_in`
 
 `crates/logit-inputs/src/logit.rs`,
-[ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md).
+[ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md),
+[ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md).
 
 - `logit.proto.frames{direction="in",codec,compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
@@ -1848,7 +1849,8 @@ attempt.
 ##### `logit_out`
 
 `crates/logit-outputs/src/logit.rs`,
-[ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md).
+[ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md),
+[ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md).
 
 - `logit.proto.frames{direction="out",codec,compression}` and `logit.proto.frame.bytes`: the
   send-side mirror of `logit_in`'s pair.

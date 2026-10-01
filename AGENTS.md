@@ -76,7 +76,7 @@ Listeners live in `crates/logit-inputs`, codecs in `crates/logit-proto`.
 | `prometheus_in` | `crates/logit-inputs/src/prometheus.rs` | scrapes `/metrics` targets, or receives remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
 | `tail_in` | `crates/logit-inputs/src/tail/` | rotation- and checkpoint-aware file tailing | [ADR `file-tailing-and-docker-json-logs`](docs/adr/file-tailing-and-docker-json-logs.md) |
 | `docker_in` | `crates/logit-inputs/src/docker.rs` | Docker json-file container logs, enriched from a sibling `config.v2.json`; no docker socket | same ADR as `tail_in` |
-| `logit_in` | `crates/logit-inputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md) |
+| `logit_in` | `crates/logit-inputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md), [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md) |
 | `internal` | `crates/logit-inputs/src/internal.rs` | `logit` observing itself: its own telemetry as ordinary events | [ADR `internal-telemetry-as-pipeline-events`](docs/adr/internal-telemetry-as-pipeline-events.md) |
 | `generate_in` | `crates/logit-inputs/src/generate.rs` | declarative event generator for load tests | [ADR `load-test-harness`](docs/adr/load-test-harness.md) |
 
@@ -98,7 +98,7 @@ Sinks live in `crates/logit-outputs`.
 | `prometheus_out` | `crates/logit-outputs/src/prometheus.rs` | serves an exposition endpoint, or sends remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
 | `collectd_out` | `crates/logit-outputs/src/collectd.rs` | collectd's binary `network` protocol | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
 | `graphite_out` | `crates/logit-outputs/src/graphite.rs` | carbon plaintext and pickle | [ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md) |
-| `logit_out` | `crates/logit-outputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md) |
+| `logit_out` | `crates/logit-outputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md), [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md) |
 | `null_out` | `crates/logit-outputs/src/null.rs` | discards everything; a load-test sink | [ADR `load-test-harness`](docs/adr/load-test-harness.md) |
 
 ### Transforms and routing
@@ -795,12 +795,16 @@ not a style preference:
   sum is made cumulative upstream; a kind with no remedy is double-counted, as every surveyed
   sender accepts). `statsd_out` is the one exception, because a statsd line has no timestamp.
   An input's acknowledgment means the batch is in every open downstream inbox, never that a
-  sink delivered it, and the `logit_out` to `logit_in` hop targets effectively-once through a
-  sender identity and a sequence that outlives a connection.
-  "Lossless" means field fidelity, never delivery. The code doesn't do all of this yet
-  ([`docs/plans/delivery-semantics.md`](docs/plans/delivery-semantics.md)), so check
-  [ADR `delivery-semantics`](docs/adr/delivery-semantics.md) before changing a sink's posture, a
-  fault class, or what an input acknowledges.
+  sink delivered it, and an input never acknowledges a batch no consumer directly downstream
+  took. The `logit_out` to `logit_in` hop is effectively-once: a sink's store mints a sender
+  identity every time it opens and numbers its batches, the pair rides in every v2 frame's
+  trailer, outlives a reconnect, and rides a spool replay, and `logit_in` acknowledges a frame at
+  or below its sender's high-water mark without forwarding it.
+  "Lossless" means field fidelity, never delivery. Check
+  [ADR `delivery-semantics`](docs/adr/delivery-semantics.md) and
+  [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md) before
+  changing a sink's posture, a fault class, what an input acknowledges, or the native hop's
+  trailer.
 - **The threat model is accidental data, not a malicious peer.** A listener, decoder, or transform
   must survive a misconfigured sender, a wedged peer, or a corrupt file; a problem only crafted
   input can trigger is defended only when the defense is free (a branch, a counter, a timeout

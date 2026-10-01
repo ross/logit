@@ -193,6 +193,10 @@ noise sub-section after the readings explains what a wide range means.
 | `passthrough` | 25M | 3,764,588 | 3,752,746 – 3,773,927 | 0.327 | 69.5 MiB | 6.64 s |
 | `route` | 25M | 3,345,738 | 3,316,599 – 3,363,430 | 0.668 | 101.1 MiB | 7.47 s |
 
+The `native-relay` row predates
+[ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md) and is pending
+re-measurement on the perf VM; the `native-relay` reading below lists what changed.
+
 ### What moved since 2026-09-20
 
 The previous baseline ran the same suite on the same VM class at
@@ -306,7 +310,10 @@ as current. `attribute` has run on the VM for `json-parse`, `aggregate`, and `bu
 - **`native-relay`** (1.389 µs/event) is the full encode → loopback TCP → decode → ack round trip in
   one process. It lands below `json-parse-x3`/`lua` and above `json-parse` and both
   `encode-*-devnull` scenarios: a real network hop plus an ack wait still costs less than a
-  parse-heavy or Lua-heavy graph.
+  parse-heavy or Lua-heavy graph. These numbers predate
+  [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md): trailer
+  tags 3 and 4 on every frame, a mark lookup per frame at `logit_in`, and an exact-size
+  `encode_batch_v2` output buffer. They're pending re-measurement on the perf VM.
 - **`aggregate`** (0.325 µs/event) costs nearly as little as `passthrough` despite sketching a
   1000-series distribution on a 1 s flush tick. §2 shows why: almost all of it is one node's
   `DdSketch::add`, and the flush cost is amortized over ~6 ticks (the median repeat took 6.46 s).

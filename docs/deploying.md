@@ -86,6 +86,15 @@ design. What an operator needs:
   `service-lifecycle-and-output-retry`'s retry-budget rationale without superseding its other
   decisions). The one case that still exits is a sustained, purely configuration-error failure;
   see [Sink delivery buffering](#sink-delivery-buffering).
+- **An input never acknowledges a batch no consumer took.** An acknowledgment means the batch is
+  in the inbox of at least one consumer directly downstream, never that a sink delivered it. Once
+  every direct consumer has closed, as happens while a shutdown tears the graph down, an
+  acknowledging input refuses instead: `logit_in` answers `Reject{GOING_AWAY}` and closes the
+  connection, an HTTP listener answers its protocol's retryable failure (a `503`, or gRPC status
+  14), and `tail_in`/`docker_in` stop writing their checkpoint and stop. A sink closing behind an
+  open transform doesn't count: the transform took the batch. Each refused batch is counted
+  `logit.input.batches.dropped{reason="closed_consumer"}`
+  ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 3, and its W3 amendment).
 
 ## Probes and exit codes
 
@@ -240,7 +249,10 @@ the destination may receive the batch twice. `statsd_out` is the one exception a
 `at_most_once`, because a statsd line has no timestamp: a resent counter has no identity at its
 destination, so the resend adds to it. Set `buffer.delivery: at_most_once` on any other sink to
 drop a batch on its first ambiguous failure instead of risking a duplicate
-([ADR `delivery-semantics`](adr/delivery-semantics.md), item 5).
+([ADR `delivery-semantics`](adr/delivery-semantics.md), item 5). A sink that sends one batch as
+several requests (`otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`) reports a
+failure as ambiguous once any of them was accepted, so `at_least_once` resends the accepted
+requests with the rest and `at_most_once` drops the rest (item 9).
 
 A resend is harmless where the destination overwrites on identity: a sample at its
 `(series, timestamp)`, or a cumulative sum. A log or a span arrives twice. A resend double-counts
@@ -281,7 +293,10 @@ A sink that can't reach its destination drops and counts batches; it doesn't end
   configuration problem does.
 - **On SIGTERM/SIGINT**, each sink gets up to `shutdown_grace` (5s by default) to drain its queue.
   Anything still queued at that deadline, or still waiting to enter the queue, is dropped and
-  counted (a disk-backed sink spools it instead).
+  counted (a disk-backed sink spools it instead). For a disk-backed sink, the posture decides a
+  write the deadline cuts off: under `at_most_once` the batch is dropped and counted
+  `logit.component.batches.dropped{reason="shutdown"}`; under `at_least_once` it stays in the
+  spool, and the next start replays it, so a file or destination can receive that block twice.
 
 ### Sink buffer sizing: `max_bytes` × number of sinks
 
@@ -345,6 +360,14 @@ unknown outcome while the process runs, and `at_most_once` then holds across a g
 which persists the cursor. A spool under `statsd_out`, or under a sink whose destination
 aggregates a resend, can replay counters from a crash window
 ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 8).
+
+Under `logit_out`, the receiving `logit_in` narrows that window. Each spool record keeps the
+sender identity and sequence it was written with, so a `logit_in` that's still running
+acknowledges a replayed record at or below its sender's mark without forwarding it, and counts it
+`logit.input.batches.resends`. The replay still reaches `logit_in`'s consumers when that
+`logit_in` restarted, when it evicted the sender from its table, or when the record carries no
+identity and sequence, which `logit_in` always forwards (see
+[Forwarding between `logit` nodes](#forwarding-between-logit-nodes)).
 
 ```yaml
 buffer:
@@ -462,8 +485,11 @@ can't report the second number at all.
   in which the listener itself applies backpressure, and the only one in which
   `receive.push.blocked.duration` (below) records anything.
 - On SIGTERM/SIGINT, the listener gets up to `receive.shutdown_grace` (5s by default) to decode and
-  deliver what's still queued. Anything still queued at that deadline is dropped **uncounted**,
-  because nothing is left running to count it.
+  deliver what's still queued. Datagrams still queued at that deadline are dropped and counted
+  `logit.component.datagrams.dropped{reason="shutdown"}`
+  ([ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md)).
+  Events already decoded at that deadline, in a batch still being assembled or one waiting for a
+  downstream inbox, are dropped uncounted.
 
 ### Listener sizing and `SO_RCVBUF`
 
@@ -2578,21 +2604,68 @@ listener"](#idle_timeout-on-a-tcp-listener) above. Before that close, the `logit
 `Reject{GOING_AWAY, "idle for <dur>"}`, and it probes for exactly that signal before reusing a
 pooled connection, so an idle-timed-out `logit_in` costs `logit_out` a reconnect, not a lost batch.
 
-**A `logit_in` at its connection cap can cost a duplicate under the default delivery posture.** A peer
-that gets `Reject{code: REJECT_INTERNAL}` never classifies it `permanent`:
+**A `logit_in` recognizes a resend, so the default delivery posture costs no duplicate on a
+healthy hop.** A peer that gets `Reject{code: REJECT_INTERNAL}`, the answer at the connection cap,
+never classifies it `permanent`:
 
 - At the handshake, with nothing of the batch written yet, it's `clean`, and the batch is retried
   within `retry_budget`.
-- Once a frame has left on that connection, it's `ambiguous`. Under `logit_out`'s default
-  `at_least_once` posture it's retried within `retry_budget`. Until the native hop deduplicates
-  (`docs/plans/delivery-semantics.md`, W5), a resend after a lost `Ack` reaches `logit_in`'s
-  consumers twice. Set `buffer.delivery: at_most_once` on the `logit_out` component to avoid the
-  duplicate at the cost of that batch, which is then dropped and counted.
+- Once a frame has left on that connection, it's `ambiguous`, like a lost or late `Ack`. Under
+  `logit_out`'s default `at_least_once` posture it's retried within `retry_budget`, and the
+  resend carries the sender identity and sequence the first attempt did. If `logit_in` forwarded
+  the first copy, it acknowledges the resend without forwarding it again and counts it
+  `logit.input.batches.resends`.
 
-Either way the sink reconnects on its own once the peer has capacity, with no operator action. `Reject{code: REJECT_GOING_AWAY}` is different. It has three causes: the peer's own shutdown, an
+Either way the sink reconnects on its own once the peer has capacity, with no operator action.
+
+A resend still reaches `logit_in`'s consumers twice in these cases, each a duplicate rather than
+a loss:
+
+- `logit_in` restarted between the two copies; its marks live in memory.
+- `logit_in` evicted the sender from its table (`logit.input.senders.evicted`).
+- The peer is a `logit` whose connection negotiated the v1 codec, which carries no identity.
+- A load balancer sent the resend to a different `logit_in`.
+- The first copy's forward was still waiting for room in a full downstream inbox when the sender
+  gave up on its `Ack` and resent on a new connection. The second connection forwards its copy
+  too, possibly after later batches (`docs/known-gaps.md`, "A forward parked past the sender's ack
+  timeout can be forwarded twice").
+
+`Reject{code: REJECT_GOING_AWAY}` is different. It has three causes: the peer's own shutdown, an
 idle close, and no consumer taking the frame (every consumer directly downstream of `logit_in` has
 closed). `logit_in` writes it only for a frame it hasn't forwarded, so it's `clean` even after a
-frame left, and the batch is resent under either posture: `logit_out` redials and resends it.
+frame left, and the batch is resent under either posture: `logit_out` redials and resends it. For
+a frame no consumer took, `logit_in` leaves its sender's mark unchanged and closes the
+connection, so the resend is forwarded when a consumer can take it. A frame at or below its
+sender's mark always gets an `Ack`, never a `Reject`, even with no consumer open, because
+`logit_in` doesn't forward it.
+
+**Sender identity and sequence.** On a connection that negotiated the v2 codec, every frame
+`logit_out` sends carries a 16-byte sender identity and a sequence number in its trailer
+([ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md)). Each
+`logit_in` component keeps one high-water mark per identity: a frame at or below its identity's
+mark is acknowledged and not forwarded, and a frame above it is forwarded and, once a consumer
+takes it, raises the mark. What follows from that:
+
+- **The identity belongs to the sink's store.** A sink's queue, in memory or on disk, takes a
+  fresh identity every time it opens and numbers its batches from 1. A restart without
+  `buffer.disk:` is a new sender to `logit_in`, never a resend.
+- **A spool replay keeps its old identity.** A spool record keeps the identity and sequence it
+  was written with, so a replay after a crash goes out under them, and a `logit_in` that saw the
+  record recognizes it. New batches take the new identity.
+- **A dropped batch that a spool replays stays dropped.** A batch the sink gave up on (an
+  exhausted `retry_budget`, `at_most_once`, or a `drop_*` overflow) that a crash replay then sends
+  is at or below the mark once a later batch of its identity was taken, and `logit_in`
+  acknowledges it without forwarding it.
+- **An unsequenced frame is always forwarded.** A v1 frame, or a frame without a complete,
+  well-formed identity and sequence, reaches `logit_in`'s consumers every time it arrives.
+- **The table follows the connection cap, with nothing to configure.** It holds
+  `max_connections + max_connections / 4` identities (1280 at the default cap of 1024) and evicts
+  the least recently seen when full.
+- **Cloning a running process is unsupported.** A VM snapshot or a CRIU checkpoint restored
+  beside its original shares the sink's identity and sequence, and `logit_in` reads the second
+  copy's batches as resends and doesn't forward them.
+- **The sequence is never a credit.** `Ack` carries no fields, the sender still has one frame
+  outstanding, and nothing acknowledges a sequence number.
 
 **A `HelloAck` that doesn't answer the `Hello` is permanent.** A peer that acks another protocol
 version, or a codec or compression this sink didn't offer, fails every attempt `permanent`, like a
@@ -2620,6 +2693,14 @@ reconnecting doesn't show as `connection_error` on the far end.
   version-mismatched or misbehaving peer, not routine loss, except `truncated_header` and
   `truncated`, which a `logit_out` whose write failed part-way through a frame also leaves. `ack_write_stalled` is a peer that stopped reading its `Ack`s
   for `handshake_timeout`, and the connection was closed).
+- `logit_in` deduplication and refusal: `logit.input.batches.resends` (frames recognized as
+  resends and not forwarded; nonzero means senders are retrying after lost or late `Ack`s, or a
+  spool replayed after a crash), `logit.input.senders` (a gauge of the identities in the table;
+  a peer's sink restart adds one, and the old identity stays until it's evicted),
+  `logit.input.senders.evicted` (nonzero means the table was full, and an evicted sender's next
+  resend reaches consumers twice), and
+  `logit.input.batches.dropped{reason="closed_consumer"}` (frames refused because every consumer
+  directly downstream had closed; expected during a shutdown, a fault anywhere else).
 - Both sides: `logit.proto.frames{direction,codec,compression}` and `logit.proto.frame.bytes` for
   throughput.
 

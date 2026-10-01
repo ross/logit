@@ -152,16 +152,23 @@ Per [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequ
 
 ### W6: operator docs
 
-- `docs/deploying.md`: the default postures, the `logit_out` section, and "Durable buffering"
-  gain the crash window under either posture. Two statements are stale today and are fixed
-  here: UDP datagrams dropped at the grace deadline are counted, and a disk-backed sink can emit
-  `reason="shutdown"`.
-- `docs/datadog.md` and `docs/splunk.md`: the default posture.
-- `docs/OVERVIEW.md`: "lossless transport" says field fidelity, and delivery gets its own
-  sentence.
-- `docs/design/wire-protocol.md`: the native hop, after W5.
+Done. W1 through W3 landed their pieces with their own PRs, and W6 completes the rest:
 
-W6 can land in pieces with the workstream each piece describes.
+- [x] `docs/deploying.md`: the default postures with the multi-request `Ambiguous` rule, an
+  input's acknowledgment and `closed_consumer`, the crash window under either posture and the
+  native hop's narrowing of it, the counted UDP shutdown drop, a disk-backed sink's
+  `reason="shutdown"`, and the `logit_out` section's sender identity, duplicate cases, and
+  counters.
+- [x] `docs/datadog.md` and `docs/splunk.md`: the default posture and the `Ambiguous` rule.
+- [x] `docs/OVERVIEW.md`: "lossless transport" says field fidelity, delivery gets its own
+  sentence, and the native hop is effectively-once.
+- [x] `docs/design/wire-protocol.md`: the trailer's sender pair, the spool record's pair, the
+  per-identity mark at `logit_in`, the acknowledgment point's two cases, and the sequence as
+  never a credit.
+- [x] `docs/design/performance.md`: the `native-relay` numbers marked pending re-measurement.
+- [x] `docs/design/pipeline-graph.md`, `docs/design/internal-telemetry.md`, and `AGENTS.md`:
+  the native hop's acknowledgment without a forward, and the ADR cited beside the
+  native-transport record.
 
 ## Open questions
 

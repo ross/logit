@@ -180,7 +180,10 @@ before the first batch, the answer is `503` code 9 with `Retry-After: 1`. Give t
 `splunk_hec_in` a `buffer:` large enough to absorb a stall.
 
 The default posture of `splunk_hec_out` is `at_least_once`, so a `500`, a `408`, or a timeout is
-retried. Splunk indexes a resent event or span twice, and one batch can be several requests.
+retried. Splunk indexes a resent event or span twice, and one batch can be several requests. A
+failure after any request of the batch was accepted counts as ambiguous
+([ADR `delivery-semantics`](adr/delivery-semantics.md), item 9), so `at_least_once` retries it
+and `at_most_once` drops the batch.
 Whether a metrics index adds a resent running total or stores it as a second point is unmeasured.
 `buffer: {delivery: at_most_once}` drops the batch instead of risking those duplicates. A busy
 Splunk is the exception: a `429`, or a `503` code 9, says Splunk didn't take the body, so while
