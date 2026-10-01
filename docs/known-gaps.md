@@ -363,18 +363,19 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 
 ## Native wire format, `logit_in`/`logit_out`, and buffering
 
-- **Native wire protocol: the format and the transport are both done; credit-based flow control,
-  QUIC, and an OTLP passthrough codec aren't.** The codec (`crates/logit-proto/src/frame.rs`/
+- **Native wire protocol: the format, the transport, and a send window are done; QUIC and an
+  OTLP passthrough codec aren't.** The codec (`crates/logit-proto/src/frame.rs`/
   `src/native/`, [ADR `native-wire-format-encoding`](adr/native-wire-format-encoding.md)) and the
   connection layer (`logit_in`/`logit_out`, [ADR
   `native-transport-handshake-and-ack`](adr/native-transport-handshake-and-ack.md)) are real,
   tested `ComponentKind`s. Still open:
-  - **Credit-based flow control (`window` > 1).** `Hello`/`HelloAck` negotiate and record a
-    `window`, but the sender only ever has one frame outstanding. Several in-flight frames
-    acknowledged out of order need `logit-pipeline`'s `SinkQueue` to track more than one
-    outstanding batch: a real queue-shape change, not designed yet. The sequence [ADR
-    `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md) adds is a
-    deduplication identity, not a credit, and `Ack` carries no sequence.
+  - ~~**Credit-based flow control (`window` > 1).**~~ **Closed (2026-10-01).** `logit_out` keeps
+    up to a negotiated window of frames in flight (`window:`, default 32, at most 1024), and
+    `logit_in` answers a connection's frames in the order they arrive, so an empty `Ack` answers
+    the oldest unanswered frame. The window is fixed at the handshake, with no credit messages.
+    The sink's store reserves the frames in flight as a prefix from its head, and a fault resends
+    the window from the head, which `logit_in`'s high-water mark deduplicates
+    ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)).
   - **QUIC.** TCP only today; a plausible later transport upgrade, not attempted.
   - **An OTLP passthrough codec.** Whether the native protocol should carry OTLP-encoded payloads
     unmodified (a relay forwarding OTLP without re-encoding into native) is an open question in
@@ -498,10 +499,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     `delivery-semantics`](adr/delivery-semantics.md), item 3, makes end-to-end acknowledgment a
     non-goal: an input's acknowledgment means accepted into the pipeline, and this entry stays
     as the statement of that limit.
-  - **No out-of-order/credit-based acknowledgement.** `SinkQueue` is deliberately in-order and
-    single-in-flight (one queue, one writer, `peek`-then-`commit`-the-head only) until credit-based
-    flow control lands; see the "Credit-based flow control" item of the native wire protocol entry
-    in this section.
+  - ~~**No out-of-order/credit-based acknowledgement.**~~ **Closed (2026-10-01)** for several
+    batches in flight: `SinkStore::peek_at` reserves a prefix of the queue, and `logit_out`
+    commits its head on each `Ack` ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)).
+    Out-of-order acknowledgment stays out of scope by decision: `logit_in` forwards a connection's
+    frames in order, so nothing could be acknowledged out of order, and the spool would need a
+    persisted acknowledged bit per record. A batch slow to forward holds up the ones behind it.
 
 - **A TLS `logit_out` that dies inside the first record of a frame reads, at `logit_in`, as a clean
   close.** The frame's header travels in its first TLS record. If the sender's connection fails
@@ -528,6 +531,31 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   batch across the restart, set `buffer.disk:` on the `logit_out` component, which persists it
   at the read cursor.
 
+- **A shutdown with a `logit_out` window in flight can count as dropped batches that `logit_in`
+  then forwards.** At a grace cut, each frame in flight is counted
+  `logit.component.batches.dropped{reason="shutdown"}`: under `at_most_once` the cut commits it,
+  and under the default `at_least_once` it stays reserved and a memory store's `finish` counts
+  it. Those frames were written whole, and when the connection is still pooled,
+  `Output::flush`'s `shutdown()` closes it cleanly, so `logit_in` reads and forwards them. The
+  over-count is at most `window` batches, where it was at most one with one frame in flight. It
+  isn't fixed because the sink can't learn which of them `logit_in` forwarded without waiting
+  for `Ack`s past the grace. Under `at_least_once` a `buffer.disk:` store doesn't count them: it
+  replays them on the next start, and `logit_in` acknowledges any it already forwarded without
+  forwarding them again ([ADR `native-hop-send-window`](adr/native-hop-send-window.md), decision
+  6).
+
+- **A round against a slowly draining `logit_in` can outlast the retry budget.** With a window,
+  the head's `buffer.retry_budget` bounds the head's own write, each backoff, and whether a failed
+  round is retried. It never cancels a write past the head or an ack wait: cancelling either
+  would drop the connection and the `Ack`s `logit_in` already sent. A `logit_in` that forwards a
+  frame every few seconds makes progress, so no write trips `request_timeout`, and a round of
+  `window - 1` writes and the ack wait can last longer than the budget. The head is still
+  delivered once its `Ack` is read; only a shutdown grace cuts the round short. `window: 1`
+  restores the budget as a bound on each attempt
+  ([ADR `native-hop-send-window`](adr/native-hop-send-window.md), decisions 4 and 6).
+  **Revisit trigger:** an operator who needs `retry_budget` as a hard bound on one batch's time
+  in the sink at a window above 1.
+
 - ~~**Sink default postures don't follow [ADR `delivery-semantics`](adr/delivery-semantics.md) yet.**~~ **Closed 2026-09-30:** every sink defaults to `at_least_once` through `Output::default_posture`, `statsd_out` declaring `at_most_once` (ADR `delivery-semantics`, item 5).
 
   The record's item 5 makes `at_least_once` every sink's default but `statsd_out`'s.
@@ -546,25 +574,34 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   a sender identity and a sequence in each frame's v2 trailer, assigned by the sink's store, and a
   high-water mark per identity at `logit_in`. A resend after a lost `Ack` and a `buffer.disk:`
   replay after a crash are acknowledged on the mark and not forwarded; `logit.input.batches.resends`
-  counts them. Still open: the parked-forward race in the next entry, and the duplicate a
+  counts them. Still open: the resend race in the next entry, and the duplicate a
   `logit_in` restart, an evicted sender, a v1 peer, or a load balancer forwards, which the record
   accepts.
 
-- **A forward parked past the sender's ack timeout can be forwarded twice.** `logit_in` holds no
-  lock per sender identity across a forward. When a forward on one connection parks on a full
-  inbox past the sender's ack timeout, the sender redials and resends the same number, and the
-  new connection reads a mark the parked forward hasn't raised yet and forwards a second copy.
-  The consumers get a duplicate, possibly after later batches, since the parked copy can land
-  behind them. [ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md),
-  decision 7, accepts it: a per-sender lock held across the forward would close it at the cost of
-  a lock per frame, to prevent a duplicate the at-least-once target tolerates.
+- **A resend can race the frames an ended connection still holds, and be forwarded twice.**
+  `logit_in` holds no lock per sender identity across a forward, and it raises a sender's mark
+  only once a consumer takes the frame. A fault that ends a `logit_out` connection mid-window (a
+  reset, a read error, a message other than `Ack`, an ack timeout) can leave that connection's
+  task holding whole frames in its socket buffer, which it reads and forwards while the sender
+  resends the same window on a new connection. For each sequence, whichever task checks it
+  against the mark first forwards it, and the other skips it as a resend once that forward
+  raises the mark. Both forward it when both check before either forward lands, most often when
+  the old task's forward is parked on a full inbox past the sender's ack timeout. The race
+  limits itself: the first forward to land raises the mark past every lower sequence, so the
+  worst case is a few duplicates per fault, not one per frame in the window. A duplicate copy
+  can reach the consumers after later batches; a batch's only copy never does.
+  [ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md), decision 7,
+  accepts the race: a per-sender lock held across the forward would close it at the cost of a
+  lock per frame, to prevent a duplicate the at-least-once target tolerates.
+  [ADR `native-hop-send-window`](adr/native-hop-send-window.md), decision 6, keeps that with a
+  window.
 
 - ~~**`logit_in` acknowledges a batch no consumer took.**~~ **Closed 2026-09-30:** `Fanout`'s sends return whether any consumer took the batch, and `logit_in` answers `Reject{GOING_AWAY}` and closes for a frame none took. `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s receiver answer their protocol's retryable failure, and `tail_in` and `docker_in` freeze their checkpoint and stop (ADR `delivery-semantics`, item 3, and its W3 amendment).
 
 - **A disk-backed sink replays delivered and dropped batches after a crash, under either
   posture.** `commit` moves the read cursor in memory, and the cursor reaches disk on a commit
   once `checkpoint_interval` (1 s by default) has passed since the last write, on a segment
-  roll, or at shutdown, with no timer. After a crash the spool replays the batch in flight and
+  roll, or at shutdown, with no timer. After a crash the spool replays the batches in flight and
   every batch committed since the last cursor write, which after an idle period can be far
   older than the interval. `logit.component.buffer.disk.replayed` counts every record resumed
   after the cursor, so it can't separate those re-deliveries from the backlog that was never
@@ -912,8 +949,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   buffer fills and one `Ack` write stalls for `handshake_timeout`
   (`logit.proto.errors{reason="ack_write_stalled"}`). The cost is one knob covering two waits: an
   operator who raises `handshake_timeout` for slow TLS handshakes also lengthens how long a wedged
-  peer holds its connection slot. A conforming `logit_out` never trips the bound: it keeps one
-  frame in flight, so at most one unread `Ack` sits in its receive buffer, even while it's paused.
+  peer holds its connection slot. A conforming `logit_out` never trips the bound: it keeps at
+  most its window of frames in flight, so at most that many unread `Ack`s sit in its receive
+  buffer, even while it's paused. At the 1024 cap that's about 47 KB under TLS, which fits the
+  default `tcp_rmem`.
   A separate write timeout was not added. **Revisit trigger:** an operator who needs the two waits set apart.
 - **No per-listener in-flight byte budget on the HTTP listeners.** Each hyper listener
   (`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`) caps

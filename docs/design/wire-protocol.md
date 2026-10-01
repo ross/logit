@@ -377,8 +377,9 @@ decision record.
   reply.
 - **Sender identity and sequence ride in the v2 trailer.** The sink's store assigns each batch
   a 16-byte sender identity and a sequence number, and `logit_out` writes them into the v2
-  trailer. `Ack` carries no sequence: one frame is in flight per connection, so it answers the
-  one frame outstanding ([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)).
+  trailer ([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)).
+  `Ack` carries no sequence: acks arrive in frame order ("Flow control" below), so each answers the
+  oldest frame still unanswered on its connection.
   A store takes a fresh identity every time it opens, memory or disk, and numbers its batches
   from 1; a resend, on the same connection or a new one, reuses the batch's pair. Each `logit_in`
   component keeps one high-water mark per identity, in a table bounded at
@@ -387,17 +388,16 @@ decision record.
   above it is forwarded, and a consumer taking it raises the mark. An unsequenced frame (see
   "`CODEC_NATIVE_V2`: a provenance and sender trailer" above) is always forwarded. The table
   reports `logit.input.batches.resends`, `logit.input.senders`, and
-  `logit.input.senders.evicted`. No lock spans a forward, so a forward parked on a full inbox
-  past the sender's ack timeout can be forwarded again when the sender resends on a new
-  connection (`docs/known-gaps.md`, "A forward parked past the sender's ack timeout can be
-  forwarded twice").
+  `logit.input.senders.evicted`. No lock spans a forward, so a frame a connection still holds
+  after a fault ends it can be forwarded beside the sender's resend of it on a new connection
+  (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds").
 - **Acknowledgement point:** for a frame above its sender's mark, or unsequenced, after
   `Fanout::send` returns, not when it decodes. `Fanout::send` returns whether any consumer took
   the batch: if one did, `logit_in` writes `Ack`; if none did, because every direct consumer has
   closed, it writes `Reject{GOING_AWAY}` instead and closes. A frame at or below its sender's mark
   is acknowledged on the mark alone, at once and with no forward. A stalled downstream delays the
-  ack, which stalls the sender's next frame. That is the protocol's backpressure, and it's why
-  `logit_in` needs no receive-side queue the way a UDP listener does.
+  ack, which stalls the sender once its window is full. That is the protocol's backpressure, and
+  it's why `logit_in` needs no receive-side queue the way a UDP listener does.
 - **Frame bounds.** `logit_in` checks a data frame's header before reading its body:
   `uncompressed_len` against its `max_frame_bytes`, and `compressed_len` against
   `frame::compressed_bound(max_frame_bytes)`. A frame over either is answered
@@ -433,14 +433,34 @@ decision record.
 - **Every listener write is bounded.** `logit_in` writes and flushes `HelloAck`, `Ack`, and every
   `Reject` within `handshake_timeout`. A peer that stops reading its `Ack`s fills the listener's send
   buffer; the stalled write ends the connection (`logit.proto.errors{reason="ack_write_stalled"}`)
-  instead of holding its connection slot and blocking shutdown. `idle_timeout` bounds reads only.
-- **Flow control: negotiated, not yet used.** `Hello`/`HelloAck` both carry `window`, but the sender
-  keeps one frame outstanding (`docs/plans/native-transport.md`'s "In-flight" decision), and
-  `LogitOutput`'s `SinkQueue` `peek`/`commit` holds that frame for retransmit. Credit-based flow
-  control (several frames outstanding, cumulative acks) isn't built; negotiating `window` now lets
-  it land without a wire-format version bump. `docs/known-gaps.md` tracks it. The trailer's
-  sequence is a deduplication identity, never a credit: nothing acknowledges a sequence,
-  `window` stays 1, and the record that builds credit-based flow control decides its own ack form.
+  instead of holding its connection slot and blocking shutdown. A conforming peer leaves at most
+  its window of `Ack`s unread, about 47 KB at the 1024 cap under TLS, which fits the default
+  `tcp_rmem`. `idle_timeout` bounds reads only.
+- **Flow control: a negotiated window.** `logit_out` may have up to the connection's window of
+  data frames written and unanswered ([ADR `native-hop-send-window`](../adr/native-hop-send-window.md)).
+  - **Acks arrive in frame order.** This is normative. A listener answers a connection's data
+    frames, with an `Ack` or a `Reject`, in the order they arrive, so the k-th answer on a
+    connection is the k-th data frame's. `logit_in` meets it by reading, forwarding, and
+    answering one frame at a time on each connection. Nothing acknowledges out of order, and the
+    trailer's sequence is a deduplication identity, never an acknowledgment.
+  - **The window is fixed at the handshake.** `Hello.window` is what the sender offers;
+    `HelloAck.window` is the offer clamped to `1..=RECEIVER_MAX_WINDOW` (1024). The sender uses
+    `max(1, min(offered, answered))`, so a `HelloAck.window` of 0 reads as 1. No message grants or
+    returns credit.
+  - **`GOING_AWAY` answers every unanswered frame.** `logit_in` reads nothing after writing it, so
+    every frame still unanswered on that connection was not forwarded, and `logit_out` treats each
+    as a clean fault.
+  - **`TCP_NODELAY` on both ends.** With small acks and an idle sender, Nagle's algorithm and
+    delayed ACK together can add about 40 ms per ack.
+  - **The listener closes with a linger.** After the handshake, every end of a connection other
+    than a peer's close drops the connection's `Fanout` clone, shuts the stream down (`close_notify`
+    under TLS), and reads and discards until EOF or `handshake_timeout`. Closing a socket with
+    pipelined frames still unread sends a reset, which would discard the `GOING_AWAY` or `Ack`s
+    already written.
+  - **The sender's store is the retransmit state.** The sink's store reserves the frames in flight
+    as a prefix from its head (`SinkStore::peek_at`), and `commit` pops the head on each `Ack`. A
+    fault resends the window from the head, and `logit_in`'s high-water mark keeps a resent frame it
+    already forwarded from being forwarded again.
 
 ## Buffering
 
@@ -452,6 +472,7 @@ has the reasoning):
 pub trait Buffer<T> {
     fn push(&mut self, item: T, weight: u64) -> PushOutcome<T>;
     fn peek(&mut self) -> Option<&T>;  // does not remove, but reserves the head against eviction
+    fn peek_at(&mut self, n: usize) -> Option<&T>; // reserves items 0..=n, returns the n-th
     fn commit(&mut self) -> Option<T>; // removes the head, only once delivery succeeded
     fn len(&self) -> usize;
     fn weight(&self) -> u64;
@@ -461,9 +482,13 @@ pub trait Buffer<T> {
 `peek`/`commit` is the ack mechanism. A `Buffer::pop` would remove an item before delivery is
 confirmed, so a failed send would lose the batch. Instead the head stays in place across `peek`
 and retries until the caller succeeds, and only `commit` removes it. That is all of in-process
-at-least-once delivery, deliberately in order with one item in flight. The native protocol's future
-credit-based flow control will need out-of-order acks across several in-flight batches, but they
-aren't worth building before that caller exists.
+at-least-once delivery, in order.
+
+`peek_at(n)` reads ahead: it returns the n-th item from the head and reserves every item from the
+head through it against `DropOldest` eviction. A caller with several items in flight, `logit_out`
+under a send window, holds that reserved prefix, and each `commit` removes the head and shrinks the
+prefix by one. Acknowledgment stays in order: nothing commits an item behind an uncommitted one
+([ADR `native-hop-send-window`](../adr/native-hop-send-window.md), decision 3).
 
 `push` takes the item's weight in bytes, so a buffer can enforce a byte bound (for example,
 `EventBatch::estimated_heap_bytes`) alongside an item-count bound without recomputing it. Overflow

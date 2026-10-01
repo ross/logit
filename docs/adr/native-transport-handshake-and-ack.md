@@ -45,7 +45,9 @@ sequence ride in every data frame's v2 trailer, assigned by the sink's store, an
 fields.] TCP is ordered, so the Nth data frame on a connection is always
 seq N; `Ack.seq` is the cumulative count of data frames the receiver has forwarded. No seq field on
 the data frame itself, so the native-v1 payload is untouched, and a future credit window > 1 can
-use cumulative acks unchanged.
+use cumulative acks unchanged. [Superseded in part on 2026-10-01 by [ADR
+`native-hop-send-window`](native-hop-send-window.md): a window above 1 keeps `Ack` empty, with
+acks arriving in frame order, not cumulative.]
 
 **Ack point: after `Fanout::send` returns**, not after the frame is merely decoded. [Superseded
 in part on 2026-10-01 by [ADR

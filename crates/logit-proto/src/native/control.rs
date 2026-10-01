@@ -109,9 +109,9 @@ fn read_choice_list(field: Bytes, what: &str) -> Result<Vec<u8>, CodecError> {
 // -- Hello -----------------------------------------------------------------------------------
 
 /// Sent first, by the connecting side: its protocol version, every codec and compression it
-/// speaks, the largest frame it accepts, and its flow-control window. `window` is negotiated but
-/// unused; the sender keeps one frame in flight (`docs/plans/native-transport.md`'s "In-flight"
-/// decision).
+/// speaks, the largest frame it accepts, and its send window: how many frames it may have in
+/// flight before the oldest is acknowledged. The sender uses the smaller of its own and
+/// `HelloAck`'s, and at least 1 (ADR `native-hop-send-window`, decision 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
     pub version: u16,
@@ -235,8 +235,9 @@ impl HelloAck {
 // -- Ack -------------------------------------------------------------------------------------
 
 /// The frame is handled: forwarded, or recognized as a resend at or below its sender's mark and
-/// not forwarded. Names nothing: one frame is in flight per connection. Never a sequence
-/// acknowledgment (ADR `native-hop-identity-and-sequence`, decision 4).
+/// not forwarded. Names nothing: `logit_in` answers a connection's frames in the order they
+/// arrive, so the k-th `Ack` answers the k-th unanswered frame. Never a sequence acknowledgment
+/// (ADR `native-hop-send-window`, decision 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Ack;
 

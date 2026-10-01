@@ -17,8 +17,8 @@
 //! **Ack point.** `Ack`, which carries no fields, is written in one of two cases: after
 //! `send_relayed` returns `true`, i.e. after the batch is in every open downstream inbox, or, for
 //! a frame at or below its sender's mark ("Deduplication" below), at once and with no forward. A
-//! stalled downstream delays the ack, which stalls the sender's `write_loop`. That is this
-//! listener's backpressure; there is no receive-side queue the way a UDP listener has one
+//! stalled downstream delays the ack, which stalls the sender's `write_loop` once its window is
+//! full. That is this listener's backpressure; there is no receive-side queue the way a UDP listener has one
 //! (`crate::udp`). A frame no consumer took, because every consumer of this listener has closed,
 //! is never acked: it is answered `Reject{GOING_AWAY}`, the connection closes, its sender's mark
 //! stays where it was, and the frame's batch is counted
@@ -32,8 +32,9 @@
 //! is a resend: acked and not forwarded. Any other sequenced frame is forwarded, and a consumer
 //! taking it raises the mark to its sequence; gaps above the mark are ignored. An unsequenced
 //! frame (a v1 frame, or a v2 frame without a complete, well-formed pair) is always forwarded.
-//! No lock spans a forward, so a forward parked on a full inbox past the sender's ack timeout
-//! can be forwarded again when the sender resends on a new connection (`docs/known-gaps.md`).
+//! No lock spans a forward, so a frame an ended connection still holds can be forwarded beside
+//! the sender's resend of it on a new connection (`docs/known-gaps.md`, "A resend can race the
+//! frames an ended connection still holds").
 //! The identity is advisory, never trusted: a peer minting a new identity per frame costs one
 //! scan of the full table each and can evict honest senders, whose resends are then forwarded,
 //! a duplicate and never a loss. Counted as `logit.input.batches.resends`, `logit.input.senders`

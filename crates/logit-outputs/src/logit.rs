@@ -67,9 +67,9 @@
 //! (`docs/adr/native-hop-identity-and-sequence.md`). A resend still reaches `logit_in`'s consumers
 //! twice from a v1 peer (its frames are unsequenced), after a `logit_in` restart (the marks are in
 //! memory), for a sender evicted from `logit_in`'s table, behind a load balancer that sends the
-//! resend to another `logit_in`, and when the first forward is still parked as the resend arrives
-//! (`docs/known-gaps.md`, "A forward parked past the sender's ack timeout can be forwarded
-//! twice").
+//! resend to another `logit_in`, and when a connection that ended mid-window still holds the
+//! first copy as the resend arrives (`docs/known-gaps.md`, "A resend can race the frames an
+//! ended connection still holds").
 //!
 //! **Close.** `Output::flush`, called once after the last batch, shuts the pooled connection
 //! down, which under TLS sends `close_notify`. A connection dropped after a failed or cancelled

@@ -1870,14 +1870,14 @@ attempt.
   unstable.
 - `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count): the `Fault`
   taxonomy as request-outcome classes, one per `submit` that fails with a `Fault` and one per
-  `await_ack` that returns. A `send` is a `submit` then an `await_ack`, so it counts once, and the total equals the
-  number of `send` calls that returned. A connect or handshake failure and a batch too large to
-  send count as failed submits. A submit that fails with frames already in flight (a stalled or
-  failed write) carries no `Fault` and isn't counted: the `await_ack`s after it count the round's
-  outcome, `ok` for each `Ack` drained and the class of the failure that ends it. A cancelled call (a budget timeout, the shutdown grace)
-  returns nothing and isn't counted; `logit.component.errors` covers it. `clean` covers every
-  failure before a frame is completely written and flushed with nothing in flight, and
-  `ambiguous` only the ack wait
+  `await_ack` that returns. A `send` is a `submit` then an `await_ack`, so it counts once, and the
+  total equals the number of `send` calls that returned. A connect or handshake failure and a
+  batch too large to send count as failed submits. A submit that fails with frames already in
+  flight (a stalled or failed write) carries no `Fault` and isn't counted: the `await_ack`s after
+  it count the round's outcome, `ok` for each `Ack` drained and the class of the failure that ends
+  it. A cancelled call (a budget timeout, the shutdown grace) returns nothing and isn't counted;
+  `logit.component.errors` covers it. `clean` covers every failure before a frame is completely
+  written and flushed with nothing in flight, and `ambiguous` only the ack wait
   ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
   decision 6).
 

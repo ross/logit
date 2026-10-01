@@ -98,7 +98,7 @@ Sinks live in `crates/logit-outputs`.
 | `prometheus_out` | `crates/logit-outputs/src/prometheus.rs` | serves an exposition endpoint, or sends remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
 | `collectd_out` | `crates/logit-outputs/src/collectd.rs` | collectd's binary `network` protocol | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
 | `graphite_out` | `crates/logit-outputs/src/graphite.rs` | carbon plaintext and pickle | [ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md) |
-| `logit_out` | `crates/logit-outputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md), [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md) |
+| `logit_out` | `crates/logit-outputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md), [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md), [ADR `native-hop-send-window`](docs/adr/native-hop-send-window.md) |
 | `null_out` | `crates/logit-outputs/src/null.rs` | discards everything; a load-test sink | [ADR `load-test-harness`](docs/adr/load-test-harness.md) |
 
 ### Transforms and routing
@@ -419,8 +419,10 @@ Per pair:
   ([ADR `disk-backed-sink-buffer`](docs/adr/disk-backed-sink-buffer.md)).
 - **Connection**: `logit_in`/`logit_out` (`crates/logit-inputs/src/logit.rs`/
   `crates/logit-outputs/src/logit.rs`) use one TCP (optionally TLS) connection, a `Hello`/`HelloAck`
-  version/codec/compression handshake, and one native frame per batch, acknowledged before the
-  next is sent ([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md)).
+  version/codec/compression handshake, and one native frame per batch, with up to a negotiated
+  window of frames in flight, acknowledged in frame order
+  ([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md),
+  [ADR `native-hop-send-window`](docs/adr/native-hop-send-window.md)).
 
 ### Runtime and pipeline
 
@@ -557,8 +559,7 @@ the operator-facing account of all of this.
 
 ### Not yet built
 
-- Credit-based flow control beyond one frame in flight, and QUIC, for the native transport
-  (`docs/known-gaps.md`).
+- QUIC for the native transport (`docs/known-gaps.md`).
 - Prometheus native histograms, skipped and counted in both directions.
 - An Agent-equivalent Datadog trace processor (normalization, `_top_level` marking, sampling, a
   stats concentrator), so tracer spans could reach Datadog with no real Agent in the path
@@ -756,9 +757,10 @@ not a style preference:
   than through `logit_proto::buffer::Buffer<T>` -- that trait's role narrowed to `InMemoryBuffer`
   alone, since its sync/`&mut self`/generic shape turned out to be the wrong seam for an async,
   file-backed implementation. The `logit_out`/`logit_in` connection/handshake state machine is
-  built ([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md));
-  still open: credit-based flow control beyond one frame in flight, and QUIC -- don't design those
-  in passing; they're real future work, not yet started.
+  built ([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md)),
+  with a send window of frames in flight
+  ([ADR `native-hop-send-window`](docs/adr/native-hop-send-window.md)); still open: QUIC -- don't
+  design it in passing; it's real future work, not yet started.
 - **Memory behavior is measured, not assumed** — `docs/design/memory.md` records what every
   pipeline stage allocates and what `Event` costs to move, and both are enforced by tests:
   `crates/logit-core/tests/type_sizes.rs` asserts exact `size_of`s, and

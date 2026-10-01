@@ -22,7 +22,8 @@ waits for a per-batch acknowledgement before committing the batch out of its `Si
 `logit_in` listener that accepts many such connections, decodes each frame into an `EventBatch`,
 forwards it via `Fanout::send`, and acknowledges only after that send returns. Single-in-flight
 per connection in this plan; the handshake carries a `window` field so credit-based flow control
-(several unacked frames in flight, cumulative acks) is a later, additive change. This plan ends
+(several unacked frames in flight, cumulative acks) is a later, additive change (built since:
+ADR `native-hop-send-window`). This plan ends
 with `docs/known-gaps.md`'s schema-drift entry closed and a two-process forwarding example.
 
 ## What established implementations do
@@ -42,7 +43,7 @@ to); treats an ack timeout as "unknown outcome," not failure. `logit` matches th
 | Control payload | Hand-rolled TLV via `native::varint`, in `crates/logit-proto/src/native/control.rs`: `Hello { version: u16, codecs: Vec<u8>, compressions: Vec<u8>, max_frame_bytes: u32, window: u32 }`, `HelloAck { version, codec, compression, max_frame_bytes, window }`, `Ack { seq: u64 }`, `Reject { code: u16, message: String }`. Unknown TLV tags skipped, same forward-compat rule as `native/record.rs` |
 | Sequence numbers | **Implicit.** TCP is ordered; each data frame on a connection is seq `n+1`; `Ack.seq` is the cumulative count of data frames the receiver has forwarded. No seq field in the data frame, so the v1 payload is untouched and a future window > 1 uses cumulative acks unchanged |
 | Ack point | Receiver acks **after `Fanout::send` returns**, i.e. after the batch is in every downstream inbox. A stalled downstream delays the ack, which stalls the sender's `write_loop` — that *is* the backpressure, so `logit_in` needs no `ReceiveQueue`/`BatchAccumulator` and graph rule 17 keeps rejecting `receive:` on it |
-| In-flight | One frame per connection; the sender's `SinkQueue` `peek`/`commit` is the retransmit state. `window` is negotiated and recorded but the sender uses 1. Credit > 1 is out of scope and needs `logit-pipeline` queue changes (`known-gaps.md`, "No out-of-order/credit-based acknowledgement") |
+| In-flight | One frame per connection; the sender's `SinkQueue` `peek`/`commit` is the retransmit state. `window` is negotiated and recorded but the sender uses 1. Credit > 1 is out of scope and needs `logit-pipeline` queue changes (`known-gaps.md`, "No out-of-order/credit-based acknowledgement") (built since: ADR `native-hop-send-window`) |
 | Handshake | Client sends `Hello` first; server replies `HelloAck` (chosen codec/compression = intersection, its own `max_frame_bytes`, `window`) or `Reject` and closes. Version mismatch / no common codec → `Reject` → `Fault::Permanent` on the sink |
 | Compression | `logit_out.compression: none \| lz4` (reuse `logit_config::Compression`; `to_native_compression` in `crates/logit-cli/src/pipeline.rs` is the existing crossing). Negotiated down to `none` if the server doesn't offer it |
 | TLS | Symmetric `Option<...>`: `logit_out.tls: Option<TlsClientConfig>` and `logit_in.tls: Option<TlsServerConfig>` — presence turns TLS on (the `otlp_in` precedent; `otlp_out`'s scheme-selection doesn't apply since `endpoint` is a bare `host:port`, like `syslog_out`). Server name = the endpoint's host. `rustls` `ring` provider only, `tokio-rustls` `TlsConnector`/`TlsAcceptor`, no ALPN |
@@ -261,7 +262,8 @@ can be deleted outright.
 
 ## Explicitly out of scope (file in `known-gaps.md`)
 
-Credit window > 1 / cumulative acks against several in-flight frames; QUIC; an OTLP passthrough
+Credit window > 1 / cumulative acks against several in-flight frames (built since: ADR
+`native-hop-send-window`); QUIC; an OTLP passthrough
 codec on the native link; `cargo-fuzz` targets (nightly); receiver-side dedupe / idempotent batch
 ids (`duplicate_safe` stays `false`); `SO_REUSEPORT`/multi-acceptor; a `demo/` second-`logit`
 tier (the examples suffice; revisit with the demo plan).

@@ -13,7 +13,8 @@ Make the code do what [ADR `delivery-semantics`](../adr/delivery-semantics.md) d
 ## Non-goals
 
 - End-to-end acknowledgment, and an acknowledgment that waits for a sink's store (ADR item 3).
-- Credit-based flow control (`window` > 1) and QUIC on the native transport.
+- Credit-based flow control (`window` > 1) and QUIC on the native transport. (`window` > 1 built
+  since: ADR `native-hop-send-window`.)
 - Durable buffering ahead of a sink.
 - A native `dedup` transform. Deduplication here is the native hop's, on a sender's sequence.
 
@@ -164,7 +165,7 @@ Done. W1 through W3 landed their pieces with their own PRs, and W6 completes the
   sentence, and the native hop is effectively-once.
 - [x] `docs/design/wire-protocol.md`: the trailer's sender pair, the spool record's pair, the
   per-identity mark at `logit_in`, the acknowledgment point's two cases, and the sequence as
-  never a credit.
+  never a credit (`window` > 1 built since: ADR `native-hop-send-window`).
 - [x] `docs/design/performance.md`: the `native-relay` numbers marked pending re-measurement.
 - [x] `docs/design/pipeline-graph.md`, `docs/design/internal-telemetry.md`, and `AGENTS.md`:
   the native hop's acknowledgment without a forward, and the ADR cited beside the
