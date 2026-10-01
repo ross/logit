@@ -192,7 +192,7 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-outputs/src/stream.rs`
   - `docs/design/memory.md`;
   - `AGENTS.md`: the `logit_out` row's ADR list and the delivery bullet.
 - [x] Sweep every comment line the stream added for the banned words.
-- [ ] `script/cibuild` at the stack's tip, from a private `CARGO_TARGET_DIR`.
+- [x] `script/cibuild` at the stack's tip, from a private `CARGO_TARGET_DIR`.
 - [x] Record the measurements in "Findings" below, not in `docs/design/performance.md`, which
   holds VM numbers only.
 
