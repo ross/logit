@@ -94,6 +94,12 @@ pub trait Output {
     /// `submit`/`await_ack` only while this reads above 1, or while batches it observed are
     /// still unacknowledged. A type that implements `Output` by delegating to another must
     /// forward this, [`Output::submit`], and [`Output::await_ack`].
+    ///
+    /// **A sink that reports a window above 1 bounds itself.** `write_loop` applies the head's
+    /// remaining retry budget only to a submit with nothing in flight. Every `submit` past the
+    /// head and every `await_ack` runs under no time limit from the loop, so the sink must bound
+    /// each one on its own (a progress bound on a write, a request timeout on an ack wait), or a
+    /// stalled peer holds the sink until shutdown.
     fn window(&self) -> usize {
         1
     }
