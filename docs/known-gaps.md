@@ -586,10 +586,14 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   resends the same window on a new connection. For each sequence, whichever task checks it
   against the mark first forwards it, and the other skips it as a resend once that forward
   raises the mark. Both forward it when both check before either forward lands, most often when
-  the old task's forward is parked on a full inbox past the sender's ack timeout. The race
-  limits itself: the first forward to land raises the mark past every lower sequence, so the
-  worst case is a few duplicates per fault, not one per frame in the window. A duplicate copy
-  can reach the consumers after later batches; a batch's only copy never does.
+  the old task's forward is parked on a full inbox past the sender's ack timeout. A forward that
+  lands raises the mark only past its own sequence, so under sustained backpressure the two
+  tasks can move in lockstep: each checks the next sequence while the other's copy of it is
+  still queued for the inbox, and both forward it. Every frame in the window can then be
+  duplicated. The bound is `window` duplicates per fault, since each connection holds at most a
+  window, and never a loss. A duplicate copy can reach the consumers after later batches; a
+  batch's only copy never does, because the mark reaches a sequence only after a copy of it
+  landed.
   [ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md), decision 7,
   accepts the race: a per-sender lock held across the forward would close it at the cost of a
   lock per frame, to prevent a duplicate the at-least-once target tolerates.
