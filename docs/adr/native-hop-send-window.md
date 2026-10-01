@@ -303,10 +303,14 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   head's retry budget. The head is delivered when the fill ends and its buffered `Ack` is read;
   the budget bounds retries and the head's own submit, never a step past it. Once the head is
   submitted, only a shutdown grace cancels a round.
-- **The parked-forward race grows.** The abandoned connection's task can forward several
-  buffered frames that race the new connection's resend, so the worst case is a few duplicates
-  instead of one. It limits itself: the first forward raises the mark. The `docs/known-gaps.md`
-  entry "A resend can race the frames an ended connection still holds, and be forwarded twice" says so.
+- **The parked-forward race grows.** The abandoned connection's task can still hold a window
+  of frames it read before the fault, and it forwards them while the new connection's resend
+  arrives. The mark stops a task only at a sequence some copy of which has already landed, so
+  two tasks parked on one full inbox can move in lockstep and forward every frame of the window
+  twice: the worst case is `window` duplicates per fault, where one frame in flight gave one.
+  Nothing is lost, and a batch's only copy never lands after a later batch, since a mark at or
+  above a sequence exists only once a copy of it landed. The `docs/known-gaps.md` entry "A
+  resend can race the frames an ended connection still holds, and be forwarded twice" says so.
 - **The shutdown count grows.** A memory store's `finish` counts outstanding frames as
   `dropped{reason="shutdown"}`, and `flush`'s `shutdown()` can then let `logit_in` forward them.
   The over-count is at most one batch today and at most `window` with this record.
