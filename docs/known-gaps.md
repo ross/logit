@@ -579,27 +579,26 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   accepts.
 
 - **A resend can race the frames an ended connection still holds, and be forwarded twice.**
-  `logit_in` holds no lock per sender identity across a forward, and it raises a sender's mark
-  only once a consumer takes the frame. A fault that ends a `logit_out` connection mid-window (a
-  reset, a read error, a message other than `Ack`, an ack timeout) can leave that connection's
-  task holding whole frames in its socket buffer, which it reads and forwards while the sender
-  resends the same window on a new connection. For each sequence, whichever task checks it
-  against the mark first forwards it, and the other skips it as a resend once that forward
-  raises the mark. Both forward it when both check before either forward lands, most often when
-  the old task's forward is parked on a full inbox past the sender's ack timeout. Each task
-  forwards a given frame at most once, so a frame reaches the consumers at most twice. The old
-  task ends at its next `Ack` write: the sender has closed that socket, so the write meets a
-  reset within about a round trip, and the task forwards only the frame it was parked on plus
-  what its inbox accepts in that time. The hard bound is the window the old connection held;
-  under the sustained backpressure that parks a forward, that pace keeps it to one or two
-  duplicates per fault. Nothing is lost. A duplicate copy can reach the consumers after later
-  batches; a batch's only copy never does, because the mark reaches a sequence only after a copy
-  of it landed.
-  [ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md), decision 7,
-  accepts the race: a per-sender lock held across the forward would close it at the cost of a
-  lock per frame, to prevent a duplicate the at-least-once target tolerates.
-  [ADR `native-hop-send-window`](adr/native-hop-send-window.md), decision 6, keeps that with a
-  window.
+  `logit_in` holds no lock per sender identity across a forward, and it raises a sender's mark only
+  once a consumer takes the frame. A fault that ends a `logit_out` connection mid-window (a reset, a
+  read error, a message other than `Ack`, an ack timeout) can leave that connection's task holding
+  whole frames in its socket buffer, which it reads and forwards while the sender resends the same
+  window on a new connection. For each sequence, whichever task checks it against the mark first
+  forwards it, and the other skips it as a resend once that forward raises the mark. Both forward it
+  when both check before either forward lands, most often when the old task's forward is parked on a
+  full inbox past the sender's ack timeout. Each task forwards a given frame at most once per
+  connection that held it, so twice per fault, and one more time for each further connection that
+  times out on the same inbox. The old task ends at the first `Ack` write after the reset arrives:
+  the sender has closed that socket, so a write meets a reset within about a round trip, and the
+  task forwards only the frame it was parked on plus what its inbox accepts in that time. The hard
+  bound is the window the old connection held; under the sustained backpressure that parks a
+  forward, that pace keeps it to one or two duplicates per fault. Nothing is lost. A duplicate copy
+  can reach the consumers after later batches; a batch's only copy never does, because the mark
+  reaches a sequence only after a copy of it landed. [ADR
+  `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md), decision 7, accepts
+  the race: a per-sender lock held across the forward would close it at the cost of a lock per
+  frame, to prevent a duplicate the at-least-once target tolerates. [ADR
+  `native-hop-send-window`](adr/native-hop-send-window.md), decision 6, keeps that with a window.
 
 - ~~**`logit_in` acknowledges a batch no consumer took.**~~ **Closed 2026-09-30:** `Fanout`'s sends return whether any consumer took the batch, and `logit_in` answers `Reject{GOING_AWAY}` and closes for a frame none took. `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s receiver answer their protocol's retryable failure, and `tail_in` and `docker_in` freeze their checkpoint and stop (ADR `delivery-semantics`, item 3, and its W3 amendment).
 

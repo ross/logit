@@ -23,8 +23,9 @@
 //!   timeout: a frame making progress on a slow link never trips it, and a receiver parked on an
 //!   earlier frame does. A stall or a write error there marks the connection `broken` and
 //!   returns an error with no [`Fault`]: the acks already owed are still read, nothing more is
-//!   written, and the connection is dropped once none is owed. The partial frame a stall leaves
-//!   ends the connection at `logit_in` as a truncated frame.
+//!   written, and the connection is dropped once none is owed. A stall can leave the frame
+//!   part-written; `logit_in` then sees a clean close at a frame boundary, a truncated header, or
+//!   a truncated frame, by where the stall fell.
 //! - With nothing in flight the write is the "Write phase" below, as for `send`.
 //!
 //! **Lazy connect.** `LogitOutput::new` never touches the network: a peer that isn't up yet is

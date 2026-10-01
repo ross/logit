@@ -2715,19 +2715,20 @@ reconnecting doesn't show as `connection_error` on the far end.
 
 **What to watch.**
 
-- `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/`permanent`, one per
-  `Ack` read or ack wait that fails, plus one per failed connect or handshake, too-large batch, or
-  write that fails with nothing in flight; `ok` is an acknowledged frame, `clean` a failure
-  before a frame was fully written with nothing in flight or a `GOING_AWAY` in place of an `Ack`,
-  `ambiguous` a lost `Ack` (a timeout, an EOF, a reset, another message) or an `in_flight` drift,
-  and `permanent` a size check at the head or a permanent reject), `logit.output.reconnects` (should
-  stay near zero in steady state; a climbing count means the peer or the network is unstable),
-  `logit.output.ack.duration`, `logit.output.in_flight` (a gauge of frames awaiting an `Ack`,
-  set from the first connection on and 0 after any drop; one that sits at the window means the
-  round trip or the peer's forwarding is the limit, and raising `window` helps only in the first
-  case), and `logit.output.window` (a gauge of the live connection's negotiated window, set from
-  the first connection on and 1 after any drop or a shutdown; below the configured `window` on a
-  live connection means `logit_in` answered less).
+- `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/`permanent`, one per `Ack`
+  read or ack wait that fails, plus one per failed connect or handshake, too-large batch, or write
+  that fails with nothing in flight; `ok` is an acknowledged frame, `clean` a failure before a frame
+  was fully written with nothing in flight or a `GOING_AWAY` in place of an `Ack`, `ambiguous` a
+  lost `Ack` (a timeout, an EOF, a reset, another message) or an `in_flight` drift, and `permanent`
+  a size check or a frame-build error at the head, a `HelloAck` that names another version or an
+  unoffered codec or compression, or a permanent reject), `logit.output.reconnects` (should stay
+  near zero in steady state; a climbing count means the peer or the network is unstable),
+  `logit.output.ack.duration`, `logit.output.in_flight` (a gauge of frames awaiting an `Ack`, set
+  from the first connection on and 0 after any drop; one that sits at the window means the round
+  trip or the peer's forwarding is the limit, and raising `window` helps only in the first case),
+  and `logit.output.window` (a gauge of the live connection's negotiated window, set from the first
+  connection on and 1 after any drop or a shutdown; below the configured `window` on a live
+  connection means `logit_in` answered less).
 - `logit_in`: `logit.input.connections` (a gauge that should match the number of connected
   `logit_out` peers), `logit.input.connections.rejected{reason="limit"}` (nonzero means the
   1024-connection cap is binding; raise it or shed load upstream), and `logit.proto.errors{reason}`

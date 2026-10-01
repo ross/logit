@@ -1869,21 +1869,22 @@ attempt.
 - `logit.output.reconnects` (count): every connect *after* the first whose `HelloAck` passed
   validation. A climbing count in steady state means the peer or the network, not this sink, is
   unstable.
-- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count): the `Fault`
-  taxonomy as request-outcome classes, one per `submit` that fails with a `Fault` and one per
-  `await_ack` that returns. A `send` is a `submit` then an `await_ack`, so it counts once, and the
-  total equals the number of `send` calls that returned. A connect or handshake failure and a
-  batch too large to send count as failed submits. A submit that fails with frames already in
-  flight (a stalled or failed write) carries no `Fault` and isn't counted: the `await_ack`s after
-  it count the round's outcome, `ok` for each `Ack` drained and the class of the failure that ends
-  it. A drifted `in_flight` counts once, `ambiguous`, in the `submit` that finds it. A `Permanent`
-  past the head is counted when it becomes the head. A cancelled call (a budget timeout, the
-  shutdown grace) returns nothing and isn't counted; `logit.component.errors` covers it. `ok` is
-  an acknowledged frame; `clean` a failure before a frame was completely written and flushed with
-  nothing in flight, or a `Reject{GOING_AWAY}` read in place of an `Ack`; `ambiguous` a lost `Ack`
-  (a timeout, an EOF, a reset, another message) or an `in_flight` drift; and `permanent` a size
-  check at the head or a permanent reject
-  ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count): the `Fault` taxonomy
+  as request-outcome classes, one per `submit` that fails with a `Fault` and one per `await_ack`
+  that returns. A `send` is a `submit` then an `await_ack`, so it counts once, and the total equals
+  the number of `send` calls that returned. A connect or handshake failure and a batch too large to
+  send count as failed submits. A submit that fails with frames already in flight (a stalled or
+  failed write) carries no `Fault` and isn't counted: the `await_ack`s after it count the round's
+  outcome, `ok` for each `Ack` drained and the class of the failure that ends it. A drifted
+  `in_flight` counts once, `ambiguous`, in the `submit` that finds it. A `Permanent` past the head
+  is counted when it becomes the head. A cancelled call (a budget timeout, the shutdown grace)
+  returns nothing and isn't counted; `logit.component.errors` covers it. `ok` is an acknowledged
+  frame; `clean` a failure before a frame was completely written and flushed with nothing in flight,
+  or a `Reject{GOING_AWAY}` read in place of an `Ack`; `ambiguous` a lost `Ack` (a timeout, an EOF,
+  a reset, another message) or an `in_flight` drift; and `permanent` a size check or a frame-build
+  error at the head, a `HelloAck` that names another version or an unoffered codec or compression,
+  or a permanent reject ([ADR
+  `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
   decision 6).
 
 ##### `prometheus_out`
