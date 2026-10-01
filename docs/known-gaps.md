@@ -896,8 +896,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   under `idle_timeout`, holds them for up to `MAX_REQUEST_BYTES × idle_timeout` per request on an
   HTTP listener (`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`,
   `datadog_trace_in`) and up to `max_frame_bytes × idle_timeout` per frame on `logit_in`. With
-  enough connections, such a peer can hold the connection cap. A documented cost of the per-frame
-  design, not a bug, and a non-goal under
+  enough connections, such a peer can hold the connection cap (`max_connections`). A documented
+  cost of the per-frame design, not a bug, and a non-goal under
   [ADR `deployment-threat-model`](adr/deployment-threat-model.md): a total body deadline was
   declined because a slow link sending a large legitimate body looks the same
   ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md),
@@ -919,10 +919,11 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   (`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`) caps
   concurrent connections and, per connection, concurrent streams (hyper's default of 200, pinned),
   so its worst case is
-  `MAX_CONCURRENT_CONNECTIONS × MAX_CONCURRENT_STREAMS × 2 × MAX_REQUEST_BYTES`: 1024 × 200 × 2 ×
-  4 MiB = 1.6 TiB for `otlp_in`, which is why this is a follow-up and not a fix. The stream cap
-  bounds one factor of that product, not the product. A budget over the bytes held in request
-  bodies across a listener (a semaphore acquired per body chunk) would bound the product directly.
+  `max_connections × MAX_CONCURRENT_STREAMS × 2 × MAX_REQUEST_BYTES`: 1024 × 200 × 2 × 4 MiB =
+  1.6 TiB for `otlp_in` at the default `max_connections` of 1024, which is why this is a follow-up
+  and not a fix. The stream cap bounds one factor of that product, not the product. A budget over
+  the bytes held in request bodies across a listener (a semaphore acquired per body chunk) would
+  bound the product directly.
   Recorded as a follow-up, not built: it changes how every HTTP listener reads a body
   ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s "Alternatives considered"), and
   the concurrent large requests it guards against are a non-goal under
@@ -1808,8 +1809,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 
   `crates/logit-proto/tests/robustness.rs`'s `otlp_json_peak_memory_per_input_byte_is_documented`
   asserts ceilings of 24 and 128 over these two shapes, so a change that moves either ratio fails
-  a test before this entry drifts. The bound still holds: `MAX_CONCURRENT_CONNECTIONS`'s doc
-  comment (`crates/logit-inputs/src/otlp.rs`) states the worst case across all connections is a
+  a test before this entry drifts. The bound still holds: `OtlpInput::max_connections`'s field
+  doc (`crates/logit-inputs/src/otlp.rs`) states the worst case across all connections is a
   finite multiple of the protobuf path's 1.6 TiB, itself a bound rather than a memory budget
   (`MAX_CONCURRENT_STREAMS` in `crates/logit-inputs/src/http.rs` has the formula). No cap and no streaming parser are added: the
   98× shape needs crafted input, a non-goal under

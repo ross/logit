@@ -273,10 +273,11 @@ impl SyslogInput {
         self
     }
 
-    /// Test-only override of the driver's connection cap, so a test reaches it with two
-    /// connections rather than 1025. A UDP listener is left untouched.
-    #[cfg(test)]
-    fn with_max_connections(mut self, max_connections: usize) -> Self {
+    /// Caps the connections a stream listener serves at once, overriding
+    /// [`crate::DEFAULT_MAX_CONNECTIONS`]; `max_connections:` in config. Graph rule 74 rejects `0`
+    /// before it gets here. A datagram listener is left untouched: it has no connections, and
+    /// graph rule 74 rejects a non-default value there.
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_max_connections(max_connections));
         }

@@ -228,6 +228,12 @@
 //! 73. A UDP sink `endpoint` (`statsd_out`, `graphite_out`, `syslog_out` on `transport: udp`, and
 //!     `collectd_out`) on port 0, which the kernel refuses every datagram to
 //!     (`docs/adr/sink-send-path-and-attempt-accounting.md`).
+//! 74. A `max_connections` of `0` on any kind that has one, or one above
+//!     `tokio::sync::Semaphore::MAX_PERMITS` (the listener's permit counter would panic on it), or
+//!     a non-default one on a UDP `syslog_in`/`graphite_in`/`statsd_in` or a `transport: unix`
+//!     `statsd_in`, which has no connections. Compared against `default_max_connections`, so the
+//!     default stays legal everywhere (`docs/adr/syslog-tcp-ingress-and-tls.md`,
+//!     `docs/adr/native-hop-identity-and-sequence.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -236,7 +242,7 @@
 //! Sink reachability needs no rule: by 2 + 5 + 7, every acyclic chain ends, and only at a sink.
 
 use logit_config::{
-    default_handshake_timeout, default_prometheus_scrape_interval,
+    default_handshake_timeout, default_max_connections, default_prometheus_scrape_interval,
     default_prometheus_scrape_timeout, default_prometheus_write_path, BufferConfig, Component,
     ComponentKind, Compression, Config, GraphiteProtocol, GraphiteTransport, MessageMode,
     MetadataCacheConfig, ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport,
@@ -2273,6 +2279,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             path,
             bind_tls,
             idle_timeout,
+            max_connections,
             metadata_cache,
         } = &component.kind
         else {
@@ -2334,6 +2341,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 Some("bind_tls")
             } else if idle_timeout.is_some() {
                 Some("idle_timeout")
+            } else if *max_connections != default_max_connections() {
+                Some("max_connections")
             } else if *metadata_cache != MetadataCacheConfig::default() {
                 Some("metadata_cache")
             } else {
@@ -3425,6 +3434,51 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 74: `max_connections`, rule 45's checks one field over. `0` would reject every
+    // connection on accept, and a value above `Semaphore::MAX_PERMITS` would panic in the
+    // listener's `Semaphore::new` at startup, past validation. A UDP
+    // `syslog_in`/`graphite_in`/`statsd_in` (or a `transport: unix` `statsd_in`) has no
+    // connections to cap, so a non-default value there is rejected; the default stays legal. A
+    // scrape-mode `prometheus_in`'s non-default value is rule 55's wrong-mode check, which runs
+    // first.
+    for (id, component) in &components {
+        let max_connections = match &component.kind {
+            ComponentKind::SyslogIn { max_connections, .. }
+            | ComponentKind::GraphiteIn { max_connections, .. }
+            | ComponentKind::StatsdIn { max_connections, .. }
+            | ComponentKind::LogitIn { max_connections, .. }
+            | ComponentKind::OtlpIn { max_connections, .. }
+            | ComponentKind::DatadogIn { max_connections, .. }
+            | ComponentKind::DatadogTraceIn { max_connections, .. }
+            | ComponentKind::SplunkHecIn { max_connections, .. }
+            | ComponentKind::PrometheusIn { max_connections, .. } => *max_connections,
+            _ => continue,
+        };
+        if max_connections == 0 {
+            anyhow::bail!(
+                "component '{id}': 'max_connections' must be greater than 0 -- 0 would reject \
+                 every connection"
+            );
+        }
+        if max_connections > tokio::sync::Semaphore::MAX_PERMITS {
+            anyhow::bail!(
+                "component '{id}': 'max_connections' ({max_connections}) is over {}, the most \
+                 connections a listener's permit counter can hold",
+                tokio::sync::Semaphore::MAX_PERMITS
+            );
+        }
+        if max_connections == default_max_connections() {
+            continue; // a defaulted value is not a set one -- see rule 45's comment
+        }
+        if let Some((kind_name, transport)) = datagram_transport_of(&component.kind) {
+            anyhow::bail!(
+                "component '{id}': 'max_connections' needs {} -- a {transport} {kind_name} has no \
+                 connections to cap",
+                stream_transports_for(kind_name)
+            );
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is fixed here, once (see [`targets_of`]).
@@ -3464,7 +3518,7 @@ fn is_datagram_listener(kind: &ComponentKind) -> bool {
     )
 }
 
-/// Rules 45/53's datagram test for the kinds that also have a stream transport: the kind's name
+/// Rules 45/53/74's datagram test for the kinds that also have a stream transport: the kind's name
 /// and how to name its transport in the error (`"UDP"`, or `'transport: unix'` for a Unix datagram
 /// `statsd_in`), or `None` when the listener has connections.
 fn datagram_transport_of(kind: &ComponentKind) -> Option<(&'static str, &'static str)> {
@@ -3485,7 +3539,7 @@ fn datagram_transport_of(kind: &ComponentKind) -> Option<(&'static str, &'static
     }
 }
 
-/// The stream transports a rule 45/53 error points `kind_name` at.
+/// The stream transports a rule 45/53/74 error points `kind_name` at.
 fn stream_transports_for(kind_name: &str) -> &'static str {
     if kind_name == "statsd_in" {
         "'transport: tcp' or 'transport: unix_stream'"
@@ -3792,6 +3846,7 @@ mod tests {
             tls: None,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -3923,6 +3978,7 @@ mod tests {
             path: default_prometheus_write_path(),
             bind_tls: None,
             idle_timeout: None,
+            max_connections: default_max_connections(),
             metadata_cache: MetadataCacheConfig::default(),
         }
     }
@@ -3938,6 +3994,7 @@ mod tests {
             path: default_prometheus_write_path(),
             bind_tls: None,
             idle_timeout: None,
+            max_connections: default_max_connections(),
             metadata_cache: MetadataCacheConfig::default(),
         }
     }
@@ -5762,6 +5819,7 @@ mod tests {
             api_keys: api_keys.into_iter().map(String::from).collect(),
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -5834,6 +5892,7 @@ mod tests {
             max_pending_acks: 1_000_000,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -6383,6 +6442,7 @@ mod tests {
             tls: None,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -7875,6 +7935,7 @@ mod tests {
             }),
             handshake_timeout,
             idle_timeout: None,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -7889,6 +7950,7 @@ mod tests {
             tls: None,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -8448,6 +8510,7 @@ mod tests {
             max_frame_bytes,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -8459,6 +8522,7 @@ mod tests {
             max_frame_bytes: None,
             handshake_timeout,
             idle_timeout: None,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -8471,6 +8535,7 @@ mod tests {
             max_frame_bytes: None,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -8482,6 +8547,7 @@ mod tests {
             tls: None,
             handshake_timeout,
             idle_timeout: None,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -8494,6 +8560,7 @@ mod tests {
             tls: None,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -8717,6 +8784,7 @@ mod tests {
             }),
             handshake_timeout: Duration::from_secs(30),
             idle_timeout: None,
+            max_connections: default_max_connections(),
         };
         resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
             .expect("a TLS otlp_in with a real handshake_timeout should resolve");
@@ -9805,6 +9873,93 @@ mod tests {
         );
     }
 
+    // ---- Rule 74: `max_connections` on a stream listener ---------------------------------------
+
+    /// A listener of `json`'s kind, deserialized so every other field takes its real default.
+    fn listener_from_json(json: &str) -> ComponentKind {
+        serde_json::from_str::<logit_config::Component>(json).expect("should deserialize").kind
+    }
+
+    /// Rule 74: `0` would reject every connection. One parametrised test over the nine kinds,
+    /// since each variant carries its own field.
+    #[test]
+    fn a_zero_max_connections_is_rejected_on_every_kind_that_has_one() {
+        for head in [
+            r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "transport": "tcp""#,
+            r#"{"type": "graphite_in", "bind": "127.0.0.1:0""#,
+            r#"{"type": "syslog_in", "bind": "127.0.0.1:0", "transport": "tcp""#,
+            r#"{"type": "otlp_in", "bind": "127.0.0.1:0""#,
+            r#"{"type": "datadog_in", "bind": "127.0.0.1:0""#,
+            r#"{"type": "datadog_trace_in", "bind": "127.0.0.1:0""#,
+            r#"{"type": "splunk_hec_in", "bind": "127.0.0.1:0""#,
+            r#"{"type": "logit_in", "bind": "127.0.0.1:0""#,
+            r#"{"type": "prometheus_in", "bind": "127.0.0.1:0""#,
+        ] {
+            let kind = listener_from_json(&format!(r#"{head}, "max_connections": 0}}"#));
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(
+                err.contains("'max_connections' must be greater than 0"),
+                "for {head}, got: {err}"
+            );
+        }
+    }
+
+    /// Rule 74: a value the listener's `Semaphore::new` would panic on is a config error, not a
+    /// startup panic. `usize::MAX` deserializes, so the ceiling has to be checked here.
+    #[test]
+    fn a_max_connections_over_the_permit_ceiling_is_rejected() {
+        let over = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        let kind = listener_from_json(&format!(
+            r#"{{"type": "logit_in", "bind": "127.0.0.1:0", "max_connections": {over}}}"#
+        ));
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(
+            err.contains("'max_connections'") && err.contains("permit counter can hold"),
+            "got: {err}"
+        );
+        let kind = listener_from_json(&format!(
+            r#"{{"type": "logit_in", "bind": "127.0.0.1:0", "max_connections": {}}}"#,
+            tokio::sync::Semaphore::MAX_PERMITS
+        ));
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+            .expect("the ceiling itself should resolve");
+    }
+
+    /// Rule 74: a non-default `max_connections` on a UDP `statsd_in` could never take effect.
+    #[test]
+    fn a_non_default_max_connections_under_transport_udp_is_rejected() {
+        let kind = listener_from_json(
+            r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "transport": "udp",
+                "max_connections": 10}"#,
+        );
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(
+            err.contains("'max_connections' needs 'transport: tcp' or 'transport: unix_stream'")
+                && err.contains("a UDP statsd_in has no connections to cap"),
+            "got: {err}"
+        );
+    }
+
+    /// The default deserializes under UDP and resolves: rule 74 compares against
+    /// [`default_max_connections`], which the `serde` default must agree with.
+    #[test]
+    fn a_udp_statsd_in_at_the_default_max_connections_resolves_fine() {
+        let kind = listener_from_json(r#"{"type": "statsd_in", "bind": "127.0.0.1:0"}"#);
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+            .expect("a defaulted max_connections under UDP should resolve");
+    }
+
+    /// `unix_stream` is a stream transport: the cap applies there.
+    #[test]
+    fn a_max_connections_under_transport_unix_stream_resolves_fine() {
+        let kind = listener_from_json(
+            r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix_stream",
+                "max_connections": 1}"#,
+        );
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+            .expect("a unix_stream statsd_in with a real max_connections should resolve");
+    }
+
     // ---- rule 55: prometheus_in's two modes (docs/adr/prometheus-remote-write.md) --------------
 
     #[test]
@@ -9994,6 +10149,14 @@ mod tests {
                 }),
             ),
             (
+                "max_connections",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { max_connections, .. } = kind {
+                        *max_connections = 10;
+                    }
+                }),
+            ),
+            (
                 "metadata_cache",
                 Box::new(|kind: &mut ComponentKind| {
                     if let ComponentKind::PrometheusIn { metadata_cache, .. } = kind {
@@ -10141,6 +10304,7 @@ mod tests {
             }),
             handshake_timeout,
             idle_timeout: None,
+            max_connections: default_max_connections(),
             max_line_bytes,
             max_frame_bytes,
         }
@@ -10158,6 +10322,7 @@ mod tests {
             tls: None,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
+            max_connections: default_max_connections(),
             max_line_bytes: 8192,
             max_frame_bytes: 1 << 20,
         }
@@ -11147,6 +11312,7 @@ mod tests {
             max_frame_bytes: None,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
+            max_connections: default_max_connections(),
         };
         let graph = resolve(cfg(vec![
             ("gen", vec![], generate_in_with_counts(Some(2_000_000), 100, None)),
@@ -11179,6 +11345,7 @@ mod tests {
             }),
             handshake_timeout,
             idle_timeout: None,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -11193,6 +11360,7 @@ mod tests {
             tls: None,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
+            max_connections: default_max_connections(),
         }
     }
 
@@ -11310,6 +11478,7 @@ mod tests {
             tls: None,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
+            max_connections: default_max_connections(),
         }
     }
 

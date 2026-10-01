@@ -153,6 +153,13 @@
                 "null"
               ]
             },
+            "max_connections": {
+              "description": "The most connections this listener serves at once. One arriving past it is closed at once and counted `logit.input.connections.rejected{reason=\"limit\"}`, never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so keep the total across listeners under the process's `nofile` limit.\n\nStream transports only (`tcp` and `unix_stream`); a datagram listener has no connections, so a non-default value under `transport: udp` or `unix` is rejected.",
+              "default": 1024,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
             "tls": {
               "description": "Terminates TLS on this listener when present; plaintext when omitted. Requires `transport: tcp`.",
               "default": null,
@@ -231,6 +238,13 @@
                 "null"
               ]
             },
+            "max_connections": {
+              "description": "The most connections this listener serves at once. One arriving past it is closed at once and counted `logit.input.connections.rejected{reason=\"limit\"}`, never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so keep the total across listeners under the process's `nofile` limit.\n\nStream transports only (`tcp`); a datagram listener has no connections, so a non-default value under `transport: udp` is rejected.",
+              "default": 1024,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
             "max_frame_bytes": {
               "description": "The largest pickle frame this listener accepts. A frame declaring more closes the connection (`logit.input.frames.dropped{reason=\"oversize\"}`, diagnostic `framing_error`): a length-framed stream has no resync point. A byte-count string. Defaults to `\"1MiB\"`, the bound carbon's own pickle receiver inherits from Twisted, so this listener refuses the frames carbon would. Must be within `1024..=16MiB`. `protocol: pickle` only.",
               "default": "1048576",
@@ -301,6 +315,13 @@
                 "null"
               ]
             },
+            "max_connections": {
+              "description": "The most connections this listener serves at once. One arriving past it is closed at once and counted `logit.input.connections.rejected{reason=\"limit\"}`, never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so keep the total across listeners under the process's `nofile` limit.\n\nStream transports only (`tcp`); a datagram listener has no connections, so a non-default value under `transport: udp` is rejected.",
+              "default": 1024,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
             "tls": {
               "description": "Terminates TLS on this listener when present; plaintext when omitted. Requires `transport: tcp`.",
               "default": null,
@@ -352,6 +373,13 @@
                 "string",
                 "null"
               ]
+            },
+            "max_connections": {
+              "description": "The most connections this listener serves at once. One arriving past it is closed at once and counted `logit.input.connections.rejected{reason=\"limit\"}`, never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so keep the total across listeners under the process's `nofile` limit.",
+              "default": 1024,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
             },
             "protocol": {
               "default": "http",
@@ -413,6 +441,13 @@
                 "null"
               ]
             },
+            "max_connections": {
+              "description": "The most connections this listener serves at once. One arriving past it is closed at once and counted `logit.input.connections.rejected{reason=\"limit\"}`, never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so keep the total across listeners under the process's `nofile` limit.",
+              "default": 1024,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
             "tls": {
               "description": "Terminates TLS on this listener when present; plaintext when omitted.",
               "default": null,
@@ -460,6 +495,13 @@
                 "string",
                 "null"
               ]
+            },
+            "max_connections": {
+              "description": "The most connections this listener serves at once. One arriving past it is closed at once and counted `logit.input.connections.rejected{reason=\"limit\"}`, never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so keep the total across listeners under the process's `nofile` limit.\n\nCounts the TCP listener and the Unix socket together; `/info` reports it as `connection_limit`.",
+              "default": 1024,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
             },
             "socket": {
               "description": "An absolute path for a Unix stream socket, the Agent's `receiver_socket` (`/var/run/datadog/apm.socket` by default). A tracer finds it through `DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket`. The directory must exist; a stale socket file at the path is replaced, and the new one is made writable by every user (mode `0722`, the Agent's own) so unprivileged tracers can connect.",
@@ -517,6 +559,13 @@
             "max_ack_channels": {
               "description": "How many channels' acknowledgment state this listener keeps. A new channel past it evicts the channel used least recently, and polls for that channel's ids then answer `false`. Defaults to `256`; raise it when more clients than that send a channel at once. `0` is rejected.",
               "default": 256,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "max_connections": {
+              "description": "The most connections this listener serves at once. One arriving past it is closed at once and counted `logit.input.connections.rejected{reason=\"limit\"}`, never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so keep the total across listeners under the process's `nofile` limit.",
+              "default": 1024,
               "type": "integer",
               "format": "uint",
               "minimum": 0.0
@@ -725,6 +774,13 @@
                 "string",
                 "null"
               ]
+            },
+            "max_connections": {
+              "description": "The most connections this listener serves at once. One arriving past it is closed at once and counted `logit.input.connections.rejected{reason=\"limit\"}`, never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so keep the total across listeners under the process's `nofile` limit.\n\nA `logit_out` past the cap is told `Reject{INTERNAL}` and retries on its own. The resend table is sized from this value (`max_connections + max_connections / 4` sender identities).",
+              "default": 1024,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
             },
             "max_frame_bytes": {
               "description": "Caps the size (before and after decompression alike) of one frame this listener accepts, echoed to every connecting client in `HelloAck`. A byte-count string. Defaults to 64 MiB, which is also the ceiling; `0` or a larger value is rejected.",
@@ -2530,6 +2586,13 @@
               "description": "Scrape cadence. Defaults to `15s`; `0s` is rejected. Scrape mode only: a non-default value alongside `bind:` is rejected.",
               "default": "15s",
               "type": "string"
+            },
+            "max_connections": {
+              "description": "The most connections this listener serves at once. One arriving past it is closed at once and counted `logit.input.connections.rejected{reason=\"limit\"}`, never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so keep the total across listeners under the process's `nofile` limit.\n\nRemote-write receiver only (`bind:`); a non-default value alongside `scrape_targets` is rejected.",
+              "default": 1024,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
             },
             "metadata_cache": {
               "description": "What the receiver remembers about metric types between requests, so a Prometheus 1.0 sender's series decode as typed families. Receiver mode only.",
