@@ -930,13 +930,20 @@ impl InFlight {
 /// - **Fill.** While `state.outstanding` is below `min(output.window(), store.max_in_flight())`,
 ///   it submits the next item, observing it first if it hasn't been. `peek_at` returning `None`
 ///   ends the fill.
-/// - **A submit failure at the head** is the round's fault. **One past the head classifies
-///   nothing**: the fill stops and the acknowledgments already owed are read. A submit the
-///   budget cuts off is an `Ambiguous` round fault covering every item outstanding and the one
-///   being submitted.
-/// - **A failed or cut-off `await_ack`** sets `state.outstanding` to 0 and is the round's fault,
-///   covering every item that was outstanding.
+/// - **Only the head's submit has an attempt time**: the rest of the budget, as a
+///   `deliver_with_retry` attempt has. A submit past the head and `await_ack` run under none,
+///   because the sink bounds both itself (the `Output::window` contract). A budget that cut a
+///   submit past the head would drop the connection with the head's acknowledgment unread, and
+///   drop as `Ambiguous` a head the receiver had acknowledged. So the budget decides only
+///   whether a failed round is retried, and clamps the backoff; a round can outlast it by up to
+///   `window - 1` sink-bounded writes and one acknowledgment wait.
+/// - **A submit failure at the head** is the round's fault, and so is the head's submit outlasting
+///   the budget (`Ambiguous`). **A failure past the head classifies nothing**: the fill stops and
+///   the acknowledgments already owed are read.
+/// - **A failed `await_ack`** sets `state.outstanding` to 0 and is the round's fault, covering
+///   every item that was outstanding.
 ///
+/// The shutdown grace is the one thing that cuts a round short (`write_loop`'s `DeliverStep`).
 /// Before returning `Delivery::Dropped` it has set `state.at_fault`; `write_loop` commits and
 /// counts the drops. Telemetry per round matches [`deliver_with_retry`]'s per attempt: one
 /// `send.duration` sample, one `errors` per failed round, and one `retries` per retry. As there,
@@ -1013,39 +1020,35 @@ async fn window_round(
             output.observe_batch(ctx, seq);
             state.observed = position + 1;
         }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         state.submitting = true;
-        let result =
-            tokio::time::timeout(remaining, output.submit(&batch, ctx, seq, position)).await;
+        let result = if position == 0 {
+            // Nothing is in flight, so cutting this submit loses no acknowledgment.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, output.submit(&batch, ctx, seq, 0)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(anyhow::anyhow!(
+                    "submit exceeded the remaining retry budget ({remaining:?})"
+                )
+                .context(Fault::Ambiguous)),
+            }
+        } else {
+            output.submit(&batch, ctx, seq, position).await
+        };
         state.submitting = false;
         match result {
-            Ok(Ok(())) => state.outstanding += 1,
-            Ok(Err(err)) if position == 0 => {
+            Ok(()) => state.outstanding += 1,
+            Err(err) if position == 0 => {
                 state.at_fault = 1;
                 return Err(err);
             }
             // Past the head: the sink keeps its connection for the acknowledgments already owed.
-            Ok(Err(_)) => break,
-            // A cancelled submit dropped the connection, and with it every outstanding batch.
-            Err(_elapsed) => {
-                state.at_fault = position + 1;
-                state.outstanding = 0;
-                return Err(anyhow::anyhow!(
-                    "submit exceeded the remaining retry budget ({remaining:?})"
-                )
-                .context(Fault::Ambiguous));
-            }
+            Err(_) => break,
         }
     }
     debug_assert!(state.outstanding > 0, "the fill submits the head or returns its fault");
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    let err = match tokio::time::timeout(remaining, output.await_ack()).await {
-        Ok(Ok(())) => return Ok(()),
-        Ok(Err(err)) => err,
-        Err(_elapsed) => anyhow::anyhow!(
-            "acknowledgment wait exceeded the remaining retry budget ({remaining:?})"
-        )
-        .context(Fault::Ambiguous),
+    let err = match output.await_ack().await {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
     };
     state.at_fault = state.outstanding;
     state.outstanding = 0;
@@ -6249,6 +6252,8 @@ mod tests {
         submit_script: std::collections::VecDeque<Option<Fault>>,
         /// Every submit of this batch fails with this fault.
         submit_fails: Option<(u64, Fault)>,
+        /// Every submit of this batch takes this long before it writes.
+        submit_delay: Option<(u64, Duration)>,
         ack_script: AckScript,
         ack_delay: Duration,
         log: Arc<std::sync::Mutex<Vec<Call>>>,
@@ -6292,6 +6297,7 @@ mod tests {
                 pending_seq: None,
                 submit_script: std::collections::VecDeque::new(),
                 submit_fails: None,
+                submit_delay: None,
                 ack_script: AckScript::Ok,
                 ack_delay: Duration::ZERO,
                 log: Arc::clone(&log),
@@ -6374,6 +6380,11 @@ mod tests {
         ) -> anyhow::Result<()> {
             let value = value_of(batch);
             self.record(Call::Submit(value, seq.map_or(0, |s| s.seq), in_flight));
+            if let Some((v, delay)) = self.submit_delay {
+                if v == value {
+                    tokio::time::sleep(delay).await;
+                }
+            }
             self.submit_value(value, in_flight)
         }
 
@@ -6673,6 +6684,32 @@ mod tests {
         assert_eq!(log.count(&Call::Ack(2)), 1);
         assert_eq!(log.count(&Call::Ack(3)), 1);
         assert_eq!(log.count(&Call::Observe(2)), 1, "a resubmit never observes again");
+    }
+
+    /// A slowly draining receiver: the submit past the head takes twice the head's whole retry
+    /// budget, while the head's acknowledgment is already there to read. The loop never cuts
+    /// that submit, so the head is delivered, not dropped as `Ambiguous`.
+    #[tokio::test(start_paused = true)]
+    async fn a_round_that_outlasts_the_budget_still_delivers_a_head_whose_ack_arrived() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.submit_delay = Some((2, fast_retry_config().total_budget * 2));
+        let start = tokio::time::Instant::now();
+        let totals = drive_windowed(&mut output, 2, 1024, DeliveryPosture::AtMostOnce).await;
+        assert!(start.elapsed() >= fast_retry_config().total_budget * 2, "the submit ran on");
+        assert_eq!(
+            log.calls(),
+            vec![
+                Call::Observe(1),
+                Call::Submit(1, 1, 0),
+                Call::Observe(2),
+                Call::Submit(2, 2, 1),
+                Call::Ack(1),
+                Call::Ack(2),
+            ]
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 2.0);
+        assert_eq!(sent_failed(&totals), 0.0);
+        assert_eq!(totals.sum("logit.component.errors", &[]), 0.0);
     }
 
     #[tokio::test(start_paused = true)]
