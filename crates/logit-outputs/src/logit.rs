@@ -1,13 +1,31 @@
 //! `logit_out`: the native `logit`-to-`logit` sink (`docs/design/wire-protocol.md`'s "Connection
 //! protocol", `docs/adr/native-transport-handshake-and-ack.md`). One TCP (optionally TLS)
 //! connection; a `Hello`/`HelloAck` negotiates version, codec, compression, and the peer's
-//! `max_frame_bytes`; then one native frame per batch, whose `Ack` must arrive before `send`
-//! returns. One frame in flight, so an `Ack` answers the one frame outstanding and names nothing.
+//! `max_frame_bytes`, and window; then one native frame per batch. `send` is `submit` then
+//! `await_ack`: one frame, and its `Ack`.
 //!
-//! **One attempt per `send`** ([`crate::Output`]'s contract). `write_loop` owns retry and races
-//! each attempt against a timeout, so the connection is `take()`n into a local before any write
-//! and put back only on success. A cancelled attempt drops the local, closing the connection
-//! rather than leaving `self.stream` partway through a frame.
+//! **One attempt per `send`, `submit`, or `await_ack`** ([`crate::Output`]'s contract).
+//! `write_loop` owns retry and races each call against a timeout, so the connection is
+//! `take()`n into a local before any write or ack read and put back only when the call leaves it
+//! usable. A cancelled call drops the local, closing the connection rather than leaving
+//! `self.stream` partway through a frame, and every frame in flight on it with it.
+//!
+//! **Send window** (`docs/adr/native-hop-send-window.md`, decision 5). `Hello` offers the
+//! configured window and the connection uses `max(1, min(offered, answered))`. `logit_in`
+//! answers a connection's frames in the order they arrive, so an `Ack` names nothing and answers
+//! the oldest frame in flight. [`Output::submit`] writes a frame without waiting for its `Ack`;
+//! [`Output::await_ack`] reads the next one.
+//! - `submit` fails `Ambiguous`, and drops the connection, when the caller's `in_flight` differs
+//!   from the connection's count, so a drifted count can't let an `Ack` deliver a batch never
+//!   sent.
+//! - With frames in flight the probe below is skipped (it would consume an `Ack`'s byte), and
+//!   the frame is written in chunks, each `write` and the final flush bounded by the request
+//!   timeout: a frame making progress on a slow link never trips it, and a receiver parked on an
+//!   earlier frame does. A stall or a write error there marks the connection `broken` and
+//!   returns an error with no [`Fault`]: the acks already owed are still read, nothing more is
+//!   written, and the connection is dropped once none is owed. The partial frame a stall leaves
+//!   ends the connection at `logit_in` as a truncated frame.
+//! - With nothing in flight the write is the "Write phase" below, as for `send`.
 //!
 //! **Lazy connect.** `LogitOutput::new` never touches the network: a peer that isn't up yet is
 //! not a config error. A failed connection is dropped; the next `send` reconnects. The dial is
@@ -37,8 +55,10 @@
 //!   frame's tail still queued in the session, and a waiting ack read doesn't send it. ADR
 //!   `sink-send-path-and-attempt-accounting`, decisions 6 and 7, has the one residual (a TLS 1.3
 //!   `KeyUpdate` queued behind the frame).
-//! - **Ack wait**: a timeout, a read error, or a message other than `Ack` or `Reject`:
-//!   `Ambiguous`, and the connection is dropped.
+//! - **Ack wait**: a timeout, a read error, an EOF, or a message other than `Ack` or `Reject`:
+//!   `Ambiguous`, and the connection is dropped. A `Reject{GOING_AWAY}` there is `Clean` for every
+//!   frame still unanswered: `logit_in` writes it only for a frame it didn't forward and reads
+//!   nothing after it.
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
 //! retries an `Ambiguous` attempt. On a v2 connection every frame carries the sender identity and
@@ -56,18 +76,20 @@
 //! attempt closes without one, which `logit_in` reads as a close when it falls between frames.
 //!
 //! **Pooled-connection probe.** Before the first write on a connection inherited from an earlier
-//! batch, the stream gets one non-consuming `poll_read` (`crate::tls::poll_pending_close`, whose
-//! doc says why never a cancellable `timeout(read)`). An EOF, or unsolicited bytes (on this
-//! protocol, a `Reject{GOING_AWAY}` from a shutdown or a `logit_in` `idle_timeout:`,
-//! `docs/adr/idle-connection-timeout.md`), drops it and reconnects before anything leaves the
-//! host, the `Clean` path. A FIN arriving between the probe and the write is `Ambiguous` when the
+//! batch with nothing in flight, the stream gets one non-consuming `poll_read`
+//! (`crate::tls::poll_pending_close`, whose doc says why never a cancellable `timeout(read)`).
+//! An EOF, or unsolicited bytes (on this protocol, a `Reject{GOING_AWAY}` from a shutdown or a
+//! `logit_in` `idle_timeout:`, `docs/adr/idle-connection-timeout.md`), drops it and reconnects
+//! before anything leaves the host, the `Clean` path. A FIN arriving between the probe and the write is `Ambiguous` when the
 //! write completes first and the ack wait meets it, and `Clean` when the write or flush fails.
 //!
 //! **Telemetry** (`docs/design/internal-telemetry.md`'s `logit_out` section):
-//! `logit.output.requests{class}` counts every attempt that returns, once, as `ok` or the
-//! failure's `Fault` (`clean`/`ambiguous`/`permanent`); a cancelled attempt isn't counted.
-//! `logit.output.reconnects` counts every validated handshake after the first, probe-driven ones
-//! included. `logit.output.ack.duration` times the ack wait alone.
+//! `logit.output.requests{class}` counts every `submit` failure and every `await_ack` result,
+//! once, as `ok` or the failure's `Fault` (`clean`/`ambiguous`/`permanent`), so a `send` counts
+//! once; a cancelled call isn't counted. `logit.output.reconnects` counts every validated
+//! handshake after the first, probe-driven ones included. `logit.output.ack.duration` times each
+//! ack wait alone. The gauges `logit.output.in_flight` and `logit.output.window` hold the frames
+//! awaiting an `Ack` and the last negotiated window.
 
 use crate::Output;
 use anyhow::Context;
@@ -80,8 +102,9 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Bounds the TCP connect, the TLS handshake, the `HelloAck` wait, the ack wait, and the shutdown
-/// in `Output::flush`, each separately. The `Hello` and data-frame writes and flushes have only
+/// Bounds the TCP connect, the TLS handshake, the `HelloAck` wait, the ack wait, the shutdown in
+/// `Output::flush`, and, with frames in flight, each chunk of a data-frame write and its flush,
+/// each separately. The `Hello`, and a data frame written with nothing in flight, have only
 /// `write_loop`'s retry budget, the outer bound.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -106,6 +129,14 @@ struct Conn {
     codec: u8,
     /// The negotiated compression; `None` when the peer doesn't support what was offered.
     compression: Compression,
+    /// The negotiated window: `max(1, min(offered, answered))`.
+    window: usize,
+    /// Frames written whole and not yet acknowledged. `logit_in` answers a connection's frames
+    /// in the order they arrive, so the next `Ack` answers the oldest of them.
+    in_flight: usize,
+    /// A write failed or stalled with frames in flight. Nothing more is written on it; it's
+    /// kept for the acks already owed and dropped once none is.
+    broken: bool,
 }
 
 pub struct LogitOutput {
@@ -113,6 +144,8 @@ pub struct LogitOutput {
     /// Offered in `Hello`; [`Conn::compression`] may still be `None`.
     compression: Compression,
     timeout: Duration,
+    /// Offered in `Hello`; [`Conn::window`] may be smaller.
+    window: u32,
     tls: Option<TlsTarget>,
     diag: Diagnostics,
     telemetry: Telemetry,
@@ -130,7 +163,14 @@ pub struct LogitOutput {
     /// without its own `observe_batch` goes unsequenced rather than under the last batch's pair,
     /// which `logit_in` would read as a resend and not forward.
     pending_seq: Option<SeqId>,
+    /// Set when a submit with frames in flight found the connection holding a different count.
+    /// The connection was dropped, and the next `await_ack` fails `Ambiguous` rather than read
+    /// no connection as nothing outstanding.
+    drifted: bool,
 }
+
+/// The window offered when none is configured, `default_logit_out_window` in `logit-config`.
+const DEFAULT_WINDOW: u32 = 32;
 
 impl LogitOutput {
     pub fn new(endpoint: impl Into<String>) -> Self {
@@ -138,6 +178,7 @@ impl LogitOutput {
             endpoint: endpoint.into(),
             compression: Compression::None,
             timeout: DEFAULT_TIMEOUT,
+            window: DEFAULT_WINDOW,
             tls: None,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
@@ -145,7 +186,16 @@ impl LogitOutput {
             has_connected_once: false,
             pending_provenance: Provenance::default(),
             pending_seq: None,
+            drifted: false,
         }
+    }
+
+    /// Sets the window offered in `Hello` (default 32): how many frames may be in flight before
+    /// the oldest is acknowledged. The connection uses the smaller of this and the peer's answer,
+    /// and at least 1.
+    pub fn with_window(mut self, window: u32) -> Self {
+        self.window = window;
+        self
     }
 
     /// Offers `compression` in `Hello` alongside `None`; the peer may still choose `None`.
@@ -205,6 +255,7 @@ impl LogitOutput {
             target: Target::Tcp { endpoint: &self.endpoint, tls: self.tls.as_ref() },
             connect_timeout: self.timeout,
             sink: "logit_out",
+            nodelay: true,
         };
         crate::stream::connect(&dial).await
     }
@@ -220,7 +271,7 @@ impl LogitOutput {
             codecs: vec![native::CODEC_NATIVE_V2, native::CODEC_NATIVE_V1],
             compressions: vec![Compression::None as u8, self.compression as u8],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
-            window: 1,
+            window: self.window,
         };
         write_control(&mut stream, &hello)
             .await
@@ -253,6 +304,9 @@ impl LogitOutput {
         };
 
         let compression = validate_hello_ack(&ack, &hello).context(Fault::Permanent)?;
+        // A `HelloAck.window` of 0 reads as 1.
+        let window = self.window.min(ack.window).max(1) as usize;
+        self.telemetry.gauge("logit.output.window", window as f64, &[]);
 
         if self.has_connected_once {
             self.telemetry.count("logit.output.reconnects", 1.0, &[]);
@@ -265,6 +319,9 @@ impl LogitOutput {
             peer_max_frame_bytes: ack.max_frame_bytes,
             compression,
             codec: ack.codec,
+            window,
+            in_flight: 0,
+            broken: false,
         })
     }
 }
@@ -339,9 +396,16 @@ fn reject_is_permanent(code: u16) -> bool {
 }
 
 impl LogitOutput {
-    /// One attempt at `batch`, `Output::send`'s body. Every return carries a [`Fault`], which
-    /// `send` counts once as `logit.output.requests{class}`.
-    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+    /// `Output::submit`'s body: writes one frame without waiting for its `Ack`. Every failure with
+    /// `in_flight == 0` carries a [`Fault`]; a write failure or stall with frames in flight
+    /// carries none (the module doc's "Send window").
+    async fn submit_frame(
+        &mut self,
+        batch: &EventBatch,
+        ctx: BatchContext,
+        seq: Option<SeqId>,
+        in_flight: usize,
+    ) -> anyhow::Result<()> {
         // Encoded under v1 before touching the network, so an oversized batch never connects.
         // v2 is this plus a trailer, never smaller, so the pre-check holds for either codec.
         let v1_payload = native::encode_batch(batch);
@@ -358,7 +422,32 @@ impl LogitOutput {
             return Err(anyhow::anyhow!("batch too large to send")).context(Fault::Permanent);
         }
 
+        if in_flight == 0 {
+            self.drifted = false;
+        }
+        let held = self.stream.as_ref().map_or(0, |conn| conn.in_flight);
+        if in_flight != held {
+            // The caller's count can't be trusted to match an `Ack` to a batch, so neither can
+            // this connection: dropped, and the next `await_ack` fails rather than deliver.
+            self.stream = None;
+            self.drifted = in_flight > 0;
+            self.record_in_flight(0);
+            return Err(anyhow::anyhow!(
+                "submitted with {in_flight} frame(s) in flight, and the connection holds {held}"
+            ))
+            .context(Fault::Ambiguous);
+        }
+
         let mut conn = match self.stream.take() {
+            // The module doc's "Send window": nothing more is written on a broken connection.
+            Some(conn) if conn.broken => {
+                self.stream = Some(conn);
+                return Err(anyhow::anyhow!(
+                    "this connection stopped taking frames with {in_flight} in flight"
+                ));
+            }
+            // With frames in flight the probe would consume a byte of an `Ack`.
+            Some(conn) if in_flight > 0 => conn,
             // The module doc's "Pooled-connection probe": nothing is written yet, so replacing
             // the connection is the `Clean` path, counted as a reconnect.
             Some(mut conn) => {
@@ -379,7 +468,7 @@ impl LogitOutput {
         };
         // Re-encoded only on a v2 connection; a v1 connection reuses `v1_payload`.
         let payload = if conn.codec == native::CODEC_NATIVE_V2 {
-            native::encode_batch_v2(batch, self.pending_provenance, self.pending_seq)
+            native::encode_batch_v2(batch, ctx.provenance, seq)
         } else {
             v1_payload
         };
@@ -399,8 +488,14 @@ impl LogitOutput {
                 .context(Fault::Permanent);
         }
 
-        let framed = frame::write_frame_with_flags(conn.codec, conn.compression, 0, &payload)
-            .context(Fault::Permanent)?;
+        let framed = match frame::write_frame_with_flags(conn.codec, conn.compression, 0, &payload)
+        {
+            Ok(framed) => framed,
+            Err(err) => {
+                self.stream = Some(conn);
+                return Err(err).context(Fault::Permanent);
+            }
+        };
         // The peer bounds `compressed_len` by `frame::compressed_bound`, lz4's worst case over
         // the payload bound; checked here so this side never sends a frame the peer refuses.
         let compressed_len = framed.len() - frame::HEADER_LEN;
@@ -418,14 +513,24 @@ impl LogitOutput {
                 .context(Fault::Permanent);
         }
 
-        // The module doc's "Write phase": `Clean` on any failure, and the connection is dropped.
-        // Flushed outside `self.timeout`, which a large frame on a slow link can outlast; the
-        // retry budget bounds it, as it bounds the write.
-        let written = async {
-            conn.stream.write_all(&framed).await.context("writing a frame to logit_in")?;
-            conn.stream.flush().await.context("flushing a frame to logit_in")
-        };
-        written.await.context(Fault::Clean)?;
+        if in_flight == 0 {
+            // The module doc's "Write phase": `Clean` on any failure, and the connection is
+            // dropped. Flushed outside `self.timeout`, which a large frame on a slow link can
+            // outlast; the retry budget bounds it, as it bounds the write.
+            let written = async {
+                conn.stream.write_all(&framed).await.context("writing a frame to logit_in")?;
+                conn.stream.flush().await.context("flushing a frame to logit_in")
+            };
+            if let Err(err) = written.await {
+                return Err(err).context(Fault::Clean);
+            }
+        } else if let Err(err) = write_with_progress(&mut conn.stream, &framed, self.timeout).await
+        {
+            // The acks already owed still arrive; `await_ack` reads them on this connection.
+            conn.broken = true;
+            self.stream = Some(conn);
+            return Err(err);
+        }
 
         self.telemetry.count(
             "logit.proto.frames",
@@ -441,18 +546,49 @@ impl LogitOutput {
             framed.len() as f64,
             &[("direction", "out")],
         );
+        conn.in_flight += 1;
+        self.record_in_flight(conn.in_flight);
+        self.stream = Some(conn);
+        Ok(())
+    }
+
+    /// `Output::await_ack`'s body: reads the `Ack` for the oldest frame in flight. Every `Err`
+    /// carries a [`Fault`] and leaves no connection.
+    async fn read_ack(&mut self) -> anyhow::Result<()> {
+        if std::mem::take(&mut self.drifted) {
+            return Err(anyhow::anyhow!(
+                "a submit's in-flight count disagreed with the connection's, which was dropped"
+            ))
+            .context(Fault::Ambiguous);
+        }
+        // Taken into a local for the read, so a cancelled wait drops the connection.
+        let mut conn = match self.stream.take() {
+            Some(conn) if conn.in_flight > 0 => conn,
+            pooled => {
+                self.stream = pooled;
+                return Ok(());
+            }
+        };
 
         let ack_timer = self.telemetry.timer("logit.output.ack.duration");
         let ack_result = tokio::time::timeout(self.timeout, read_control(&mut conn.stream)).await;
         drop(ack_timer);
 
-        match ack_result {
-            Ok(Ok(control::ControlMessage::Ack(_))) => {}
+        let err = match ack_result {
+            Ok(Ok(control::ControlMessage::Ack(_))) => {
+                conn.in_flight -= 1;
+                self.record_in_flight(conn.in_flight);
+                // A broken connection is kept only for the acks it still owes.
+                if !(conn.broken && conn.in_flight == 0) {
+                    self.stream = Some(conn);
+                }
+                return Ok(());
+            }
             Ok(Ok(control::ControlMessage::Reject(reject))) => {
                 // `logit_in` writes `GOING_AWAY` only for a frame it didn't forward (shutdown, an
-                // idle close, or no consumer taking it), so in place of the `Ack` it means this
-                // batch never landed: `Clean`. Any other transient code after the frame left is
-                // `Ambiguous`.
+                // idle close, or no consumer taking it), and reads nothing after writing it, so
+                // in place of an `Ack` it means no frame still unanswered here landed: `Clean`.
+                // Any other transient code after a frame left is `Ambiguous`.
                 let fault = if reject_is_permanent(reject.code) {
                     Fault::Permanent
                 } else if reject.code == control::REJECT_GOING_AWAY {
@@ -460,30 +596,62 @@ impl LogitOutput {
                 } else {
                     Fault::Ambiguous
                 };
-                return Err(anyhow::anyhow!(
+                anyhow::anyhow!(
                     "logit_in rejected this connection (code {}): {}",
                     reject.code,
                     reject.message
-                ))
-                .context(fault);
+                )
+                .context(fault)
             }
             Ok(Ok(other)) => {
-                return Err(anyhow::anyhow!("expected Ack, got {other:?}"))
-                    .context(Fault::Ambiguous);
+                anyhow::anyhow!("expected Ack, got {other:?}").context(Fault::Ambiguous)
             }
-            Ok(Err(err)) => {
-                return Err(err.context("reading the ack")).context(Fault::Ambiguous);
-            }
+            Ok(Err(err)) => err.context("reading the ack").context(Fault::Ambiguous),
             Err(_elapsed) => {
-                return Err(anyhow::anyhow!("timed out waiting for the ack"))
-                    .context(Fault::Ambiguous);
+                anyhow::anyhow!("timed out waiting for the ack").context(Fault::Ambiguous)
             }
-        }
-
-        self.stream = Some(conn);
-        self.pending_seq = None;
-        Ok(())
+        };
+        self.record_in_flight(0);
+        Err(err)
     }
+
+    /// Sets the `logit.output.in_flight` gauge.
+    fn record_in_flight(&self, in_flight: usize) {
+        self.telemetry.gauge("logit.output.in_flight", in_flight as f64, &[]);
+    }
+}
+
+/// The write-chunk size with frames in flight: each chunk's write must accept something within
+/// the request timeout.
+const WRITE_CHUNK: usize = 64 * 1024;
+
+/// Writes and flushes `framed` with frames already in flight, bounding progress rather than the
+/// whole write: each `write` call, at most [`WRITE_CHUNK`] bytes, and the final flush must
+/// complete within `bound`. A large frame on a slow link makes progress and never trips it; a
+/// receiver parked on an earlier frame stops reading and does. Errors carry no [`Fault`].
+async fn write_with_progress(
+    stream: &mut Box<dyn AsyncStream>,
+    framed: &[u8],
+    bound: Duration,
+) -> anyhow::Result<()> {
+    let stalled = || anyhow::anyhow!("a frame write to logit_in made no progress for {bound:?}");
+    let mut written = 0;
+    while written < framed.len() {
+        let end = framed.len().min(written + WRITE_CHUNK);
+        let n = tokio::time::timeout(bound, stream.write(&framed[written..end]))
+            .await
+            .map_err(|_elapsed| stalled())?
+            .context("writing a frame to logit_in")?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+                .context("writing a frame to logit_in");
+        }
+        written += n;
+    }
+    tokio::time::timeout(bound, stream.flush())
+        .await
+        .map_err(|_elapsed| stalled())?
+        .context("flushing a frame to logit_in")
 }
 
 #[async_trait::async_trait]
@@ -497,15 +665,47 @@ impl Output for LogitOutput {
         self.pending_seq = seq;
     }
 
+    /// `submit` with the pending provenance and pair and nothing in flight, then `await_ack`.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let result = self.attempt(batch).await;
+        let ctx = BatchContext { provenance: self.pending_provenance, ..BatchContext::default() };
+        self.submit(batch, ctx, self.pending_seq, 0).await?;
+        self.await_ack().await?;
+        self.pending_seq = None;
+        Ok(())
+    }
+
+    /// The live connection's negotiated window, or 1 with none: a window above 1 is known only
+    /// once a `HelloAck` answers.
+    fn window(&self) -> usize {
+        self.stream.as_ref().map_or(1, |conn| conn.window)
+    }
+
+    /// Counts a failure in `logit.output.requests`; the `await_ack` after a success counts the
+    /// outcome.
+    async fn submit(
+        &mut self,
+        batch: &EventBatch,
+        ctx: BatchContext,
+        seq: Option<SeqId>,
+        in_flight: usize,
+    ) -> anyhow::Result<()> {
+        let result = self.submit_frame(batch, ctx, seq, in_flight).await;
+        if result.is_err() {
+            count_request(&self.telemetry, &result);
+        }
+        result
+    }
+
+    /// Counts every result in `logit.output.requests`, so a `send` counts once.
+    async fn await_ack(&mut self) -> anyhow::Result<()> {
+        let result = self.read_ack().await;
         count_request(&self.telemetry, &result);
         result
     }
 
     /// Shuts the pooled connection down, which under TLS sends `close_notify`, so `logit_in`
     /// reads a clean close and not `UnexpectedEof`. Bounded by `self.timeout`. A failure isn't
-    /// reported: every frame on a pooled connection is acked, so nothing is lost with it.
+    /// reported: a frame still in flight on the connection stays in the sink's store.
     async fn flush(&mut self) -> anyhow::Result<()> {
         if let Some(mut conn) = self.stream.take() {
             let _ = tokio::time::timeout(self.timeout, conn.stream.shutdown()).await;
@@ -708,12 +908,11 @@ mod tests {
         output.send(&sample_batch()).await.expect("first send should succeed");
         assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
 
-        // The listener's own live-connections gauge drops back to 0 only once its idle timer has
-        // closed the connection: `crate::listener::LiveConnections::enter`'s guard runs after
-        // `serve_connection` writes the `Reject` and returns, so the FIN is already queued here.
+        // `logit_in` counts the idle close after its `Reject` is written and flushed, so the
+        // `Reject` is already queued here; the FIN follows it, before the listener lingers.
         probe
             .wait_for("the idle connection to close", |t| {
-                t.gauge("logit.input.connections", &[]) == Some(0.0)
+                t.sum("logit.input.connections.closed", &[("reason", "idle")]) == 1.0
             })
             .await;
 
@@ -896,10 +1095,10 @@ mod tests {
 
         output.send(&sample_batch()).await.expect("first send should succeed");
         assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
-        // The gauge drops to 0 after `serve_connection` wrote the `Reject` and returned.
+        // Counted after the `Reject` is written and flushed.
         probe
             .wait_for("the idle connection to close", |t| {
-                t.gauge("logit.input.connections", &[]) == Some(0.0)
+                t.sum("logit.input.connections.closed", &[("reason", "idle")]) == 1.0
             })
             .await;
 
@@ -1877,6 +2076,9 @@ mod tests {
             peer_max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             codec: native::CODEC_NATIVE_V1,
             compression: Compression::None,
+            window: 1,
+            in_flight: 0,
+            broken: false,
         }
     }
 
@@ -2225,5 +2427,470 @@ mod tests {
             !logged.contains("tls.insecure_skip_verify is set"),
             "default settings must not warn: {logged}"
         );
+    }
+
+    // ---- the send window ------------------------------------------------------------------------
+
+    /// Accepts one connection on `listener` and answers its `Hello` with [`hello_ack_v1`] at
+    /// `window`, returning the stream and the window the `Hello` offered.
+    async fn accept_with_window(
+        listener: &TcpListener,
+        window: u32,
+    ) -> (tokio::net::TcpStream, u32) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let control::ControlMessage::Hello(hello) = read_control(&mut stream).await.unwrap() else {
+            panic!("expected Hello");
+        };
+        write_control(&mut stream, &control::HelloAck { window, ..hello_ack_v1() }).await.unwrap();
+        (stream, hello.window)
+    }
+
+    /// [`sample_batch`] with `mark` as its one event's timestamp, so a test reads which batch
+    /// arrived.
+    fn batch_marked(mark: i64) -> EventBatch {
+        let mut batch = sample_batch();
+        batch.events[0].timestamp = mark;
+        batch
+    }
+
+    /// `submit` at `in_flight` with an empty context and no sequence.
+    async fn submit_at(
+        output: &mut LogitOutput,
+        batch: &EventBatch,
+        in_flight: usize,
+    ) -> anyhow::Result<()> {
+        output.submit(batch, BatchContext::default(), None, in_flight).await
+    }
+
+    /// A peer answering window 8 reads three frames before it acks any: three `submit`s return
+    /// with nothing acked, and three `await_ack`s then deliver them.
+    #[tokio::test]
+    async fn a_negotiated_window_puts_several_frames_on_the_wire_before_the_first_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer = tokio::spawn(async move {
+            let (mut stream, offered) = accept_with_window(&listener, 8).await;
+            // A failed assertion here leaves the frames unacked, so the test times out on it.
+            assert_eq!(offered, DEFAULT_WINDOW, "the Hello offers the configured window");
+            for _ in 0..3 {
+                read_data_frame(&mut stream).await;
+            }
+            for _ in 0..3 {
+                write_control(&mut stream, &control::Ack).await.unwrap();
+            }
+            std::future::pending::<()>().await;
+        });
+        let mut probe = TelemetryProbe::new();
+        let mut output =
+            LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
+
+        for in_flight in 0..3 {
+            submit_at(&mut output, &sample_batch(), in_flight).await.expect("a submit");
+        }
+        assert_eq!(output.window(), 8, "the smaller of 32 offered and 8 answered");
+        let totals = probe.poll();
+        assert_eq!(totals.gauge("logit.output.window", &[]), Some(8.0));
+        assert_eq!(totals.gauge("logit.output.in_flight", &[]), Some(3.0));
+        assert!(!totals.has("logit.output.requests", &[]), "nothing is counted before an ack");
+
+        for _ in 0..3 {
+            tokio::time::timeout(RECV_TIMEOUT, output.await_ack())
+                .await
+                .expect("the peer acks after reading all three")
+                .expect("an Ack");
+        }
+        let totals = probe.poll();
+        assert_eq!(requests(totals), ([3.0, 0.0, 0.0, 0.0], 3.0));
+        assert_eq!(totals.gauge("logit.output.in_flight", &[]), Some(0.0));
+        assert_eq!(output.stream.as_ref().map(|conn| conn.in_flight), Some(0));
+        peer.abort();
+    }
+
+    /// A peer answering window 1 gets one frame in flight: `window()` reads 1, so `write_loop`
+    /// awaits each `Ack` before the next `submit`.
+    #[tokio::test]
+    async fn a_peer_answering_window_one_keeps_one_frame_in_flight() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = accept_with_window(&listener, 1).await;
+            loop {
+                read_data_frame(&mut stream).await;
+                write_control(&mut stream, &control::Ack).await.unwrap();
+            }
+        });
+        let mut probe = TelemetryProbe::new();
+        let mut output = LogitOutput::new(addr).with_window(16).with_telemetry(probe.telemetry(
+            "out",
+            "logit_out",
+            "sink",
+        ));
+
+        for _ in 0..3 {
+            submit_at(&mut output, &sample_batch(), 0).await.expect("a submit");
+            assert_eq!(output.window(), 1);
+            output.await_ack().await.expect("an Ack");
+        }
+        let totals = probe.poll();
+        assert_eq!(totals.gauge("logit.output.window", &[]), Some(1.0));
+        assert!(!totals.has("logit.output.reconnects", &[]));
+        peer.abort();
+    }
+
+    /// A `HelloAck.window` of 0 reads as 1, never as a window that can send nothing.
+    #[tokio::test]
+    async fn a_hello_ack_window_of_zero_is_read_as_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = accept_with_window(&listener, 0).await;
+            read_data_frame(&mut stream).await;
+            write_control(&mut stream, &control::Ack).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut output = LogitOutput::new(addr);
+
+        output.send(&sample_batch()).await.expect("one frame goes out and is acked");
+        assert_eq!(output.window(), 1);
+        peer.abort();
+    }
+
+    /// `GOING_AWAY` after some `Ack`s answers the oldest unanswered frame, and `logit_in` reads
+    /// nothing after writing it, so it is `Clean` for every frame still unanswered.
+    #[tokio::test]
+    async fn a_going_away_after_some_acks_is_clean_for_every_unanswered_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = accept_with_window(&listener, 8).await;
+            for _ in 0..3 {
+                read_data_frame(&mut stream).await;
+            }
+            write_control(&mut stream, &control::Ack).await.unwrap();
+            let reject = control::Reject {
+                code: control::REJECT_GOING_AWAY,
+                message: "listener shutting down".to_string(),
+            };
+            write_control(&mut stream, &reject).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut probe = TelemetryProbe::new();
+        let mut output =
+            LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
+
+        for in_flight in 0..3 {
+            submit_at(&mut output, &sample_batch(), in_flight).await.expect("a submit");
+        }
+        output.await_ack().await.expect("the first frame is acked");
+        let err = output.await_ack().await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Clean, "{err:#}");
+        assert!(is_retryable(classify(&err), DeliveryPosture::AtMostOnce));
+        assert!(output.stream.is_none(), "the connection is dropped with both unanswered frames");
+        assert_eq!(output.window(), 1, "no connection, no negotiated window");
+        let totals = probe.poll();
+        assert_eq!(requests(totals), ([1.0, 1.0, 0.0, 0.0], 2.0));
+        assert_eq!(totals.gauge("logit.output.in_flight", &[]), Some(0.0));
+        peer.abort();
+    }
+
+    /// An EOF with frames unanswered is `Ambiguous`, and the next `submit`, at 0 in flight,
+    /// dials a new connection.
+    #[tokio::test]
+    async fn an_eof_mid_window_is_ambiguous_and_the_next_submit_reconnects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut first, _) = accept_with_window(&listener, 8).await;
+            read_data_frame(&mut first).await;
+            read_data_frame(&mut first).await;
+            write_control(&mut first, &control::Ack).await.unwrap();
+            drop(first);
+            let (mut second, _) = accept_with_window(&listener, 8).await;
+            loop {
+                read_data_frame(&mut second).await;
+                write_control(&mut second, &control::Ack).await.unwrap();
+            }
+        });
+        let mut probe = TelemetryProbe::new();
+        let mut output =
+            LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
+
+        submit_at(&mut output, &sample_batch(), 0).await.unwrap();
+        submit_at(&mut output, &sample_batch(), 1).await.unwrap();
+        output.await_ack().await.expect("the first frame is acked");
+        let err = output.await_ack().await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Ambiguous, "{err:#}");
+        assert!(output.stream.is_none());
+
+        submit_at(&mut output, &sample_batch(), 0).await.expect("the resubmit reconnects");
+        output.await_ack().await.expect("and is acked");
+        let totals = probe.poll();
+        assert_eq!(totals.sum("logit.output.reconnects", &[]), 1.0);
+        assert_eq!(requests(totals), ([2.0, 0.0, 1.0, 0.0], 3.0));
+    }
+
+    /// A write that fails with frames in flight returns an unclassified error and leaves the
+    /// connection `broken`: the `Ack`s already owed are read on it, and it is dropped after the
+    /// last one.
+    #[tokio::test]
+    async fn a_write_failure_with_frames_in_flight_still_reads_the_acks_already_sent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_data_frame(&mut stream).await;
+            read_data_frame(&mut stream).await;
+            write_control(&mut stream, &control::Ack).await.unwrap();
+            write_control(&mut stream, &control::Ack).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (tcp, tap) = TapIo::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+        let mut probe = TelemetryProbe::new();
+        let mut output = LogitOutput::new(addr.to_string()).with_telemetry(probe.telemetry(
+            "out",
+            "logit_out",
+            "sink",
+        ));
+        output.stream = Some(Conn { window: 8, ..conn_over(tcp) });
+
+        submit_at(&mut output, &sample_batch(), 0).await.unwrap();
+        submit_at(&mut output, &sample_batch(), 1).await.unwrap();
+        tap.fail_writes_after(0);
+        let err = submit_at(&mut output, &sample_batch(), 2).await.unwrap_err();
+        assert!(err.downcast_ref::<Fault>().is_none(), "unclassified: {err:#}");
+        assert!(output.stream.as_ref().is_some_and(|conn| conn.broken && conn.in_flight == 2));
+        let again = submit_at(&mut output, &sample_batch(), 2).await.unwrap_err();
+        assert!(again.downcast_ref::<Fault>().is_none(), "nothing is written: {again:#}");
+
+        output.await_ack().await.expect("the first Ack");
+        assert!(output.stream.is_some(), "kept for the Ack still owed");
+        output.await_ack().await.expect("the second Ack");
+        assert!(output.stream.is_none(), "a broken connection is dropped once nothing is owed");
+        let totals = probe.poll();
+        assert_eq!(requests(totals), ([2.0, 0.0, 0.0, 2.0], 4.0), "two unclassified submits");
+        peer.abort();
+    }
+
+    /// A receiver parked on one frame stops reading. The next frame's write stalls, which marks
+    /// the connection `broken` once a write accepts nothing for the request timeout; the `Ack`s
+    /// already sent still deliver their frames, and only the parked frame's ack wait times out.
+    #[tokio::test]
+    async fn a_write_that_stalls_with_frames_in_flight_still_reads_the_acks_already_sent_and_times_out_only_the_parked_frame(
+    ) {
+        // A small receive buffer, inherited by the accepted socket, so the stall comes sooner.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(16).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (parked_tx, parked) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = accept_with_window(&listener, 8).await;
+            for _ in 0..3 {
+                read_data_frame(&mut stream).await;
+            }
+            write_control(&mut stream, &control::Ack).await.unwrap();
+            write_control(&mut stream, &control::Ack).await.unwrap();
+            let _ = parked_tx.send(());
+            // Parked on the third frame: no more reads, no more acks.
+            std::future::pending::<()>().await;
+        });
+        const TIMEOUT: Duration = Duration::from_millis(300);
+        let mut probe = TelemetryProbe::new();
+        let mut output = LogitOutput::new(addr)
+            .with_timeout(TIMEOUT)
+            .with_telemetry(probe.telemetry("out", "logit_out", "sink"));
+
+        for in_flight in 0..3 {
+            submit_at(&mut output, &sample_batch(), in_flight).await.unwrap();
+        }
+        parked.await.unwrap();
+        // Larger than both socket buffers can take, so the write stops making progress.
+        let large = batch_of(16 * 1024 * 1024);
+        let err = tokio::time::timeout(RECV_TIMEOUT, submit_at(&mut output, &large, 3))
+            .await
+            .expect("the progress bound ends the stalled write")
+            .unwrap_err();
+        assert!(err.downcast_ref::<Fault>().is_none(), "unclassified: {err:#}");
+        assert!(format!("{err:#}").contains("no progress"), "{err:#}");
+        assert!(output.stream.as_ref().is_some_and(|conn| conn.broken && conn.in_flight == 3));
+
+        output.await_ack().await.expect("the first frame's Ack");
+        output.await_ack().await.expect("the second frame's Ack");
+        let err = output.await_ack().await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Ambiguous, "the parked frame alone times out: {err:#}");
+        assert!(output.stream.is_none());
+        assert_eq!(requests(probe.poll()), ([2.0, 0.0, 1.0, 1.0], 4.0));
+    }
+
+    /// A `submit` whose `in_flight` isn't the connection's count fails `Ambiguous` and drops the
+    /// connection; with frames claimed in flight, the next `await_ack` fails too rather than read
+    /// no connection as an `Ack`.
+    #[tokio::test]
+    async fn a_submit_whose_in_flight_disagrees_with_the_connection_is_ambiguous() {
+        let mut output = LogitOutput::new("127.0.0.1:1");
+        let err = submit_at(&mut output, &sample_batch(), 2).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Ambiguous, "{err:#}");
+        let err = output.await_ack().await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Ambiguous, "{err:#}");
+        output.await_ack().await.expect("the failure is reported once");
+
+        let fake = FakeStream::new();
+        output.stream = Some(Conn { window: 8, in_flight: 1, ..conn_over(fake.clone()) });
+        let err = submit_at(&mut output, &sample_batch(), 0).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Ambiguous, "{err:#}");
+        assert!(output.stream.is_none(), "the connection whose count drifted is dropped");
+        assert!(fake.state().unflushed.is_empty(), "nothing is written");
+    }
+
+    /// A cancelled `await_ack` drops the connection, and with it the window: `window()` reads 1
+    /// and nothing is in flight.
+    #[tokio::test]
+    async fn a_cancelled_await_ack_drops_the_connection_and_its_window() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (read_tx, frames_read) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = accept_with_window(&listener, 8).await;
+            read_data_frame(&mut stream).await;
+            read_data_frame(&mut stream).await;
+            let _ = read_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let mut output = LogitOutput::new(addr);
+        submit_at(&mut output, &sample_batch(), 0).await.unwrap();
+        submit_at(&mut output, &sample_batch(), 1).await.unwrap();
+        assert_eq!(output.window(), 8);
+        frames_read.await.unwrap();
+
+        tokio::select! {
+            biased;
+            _ = output.await_ack() => panic!("the peer never acks"),
+            () = std::future::ready(()) => {}
+        }
+        assert!(output.stream.is_none(), "the cancelled wait dropped the connection");
+        assert_eq!(output.window(), 1);
+    }
+
+    /// Over TLS, `Ack`s written in one burst behind several frames arrive in a few records; each
+    /// `await_ack` reads one, whatever the record boundaries.
+    #[tokio::test]
+    async fn a_window_over_tls_reads_acks_buffered_behind_several_frames() {
+        let addr = spawn_tls_peer(|mut stream, _nth| async move {
+            let control::ControlMessage::Hello(_) = read_control(&mut stream).await.unwrap() else {
+                panic!("expected Hello");
+            };
+            let ack = control::HelloAck { window: 8, ..hello_ack_v1() };
+            write_control(&mut stream, &ack).await.unwrap();
+            for _ in 0..4 {
+                read_data_frame(&mut stream).await;
+            }
+            let mut acks = Vec::new();
+            for _ in 0..4 {
+                acks.extend_from_slice(
+                    &frame::write_frame_with_flags(
+                        0,
+                        Compression::None,
+                        frame::FLAG_CONTROL,
+                        &control::Ack.encode(),
+                    )
+                    .unwrap(),
+                );
+            }
+            stream.write_all(&acks).await.unwrap();
+            stream.flush().await.unwrap();
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let mut output = tls_output(addr).with_timeout(RECV_TIMEOUT);
+
+        for in_flight in 0..4 {
+            submit_at(&mut output, &sample_batch(), in_flight).await.unwrap();
+        }
+        for _ in 0..4 {
+            output.await_ack().await.expect("an Ack");
+        }
+        assert_eq!(output.stream.as_ref().map(|conn| conn.in_flight), Some(0));
+    }
+
+    /// Drives `batches` through `output` as `write_loop` does under a window: fill to
+    /// `output.window()`, then await the oldest, with each batch sequenced `seq(i)`.
+    async fn send_windowed(
+        output: &mut LogitOutput,
+        batches: &[EventBatch],
+        seq: impl Fn(usize) -> SeqId,
+    ) {
+        let (mut next, mut in_flight) = (0, 0);
+        while next < batches.len() || in_flight > 0 {
+            while next < batches.len() && (in_flight == 0 || in_flight < output.window()) {
+                output
+                    .submit(&batches[next], BatchContext::default(), Some(seq(next)), in_flight)
+                    .await
+                    .expect("a submit");
+                next += 1;
+                in_flight += 1;
+            }
+            output.await_ack().await.expect("an Ack");
+            in_flight -= 1;
+        }
+    }
+
+    /// A real `logit_in` under window 8: twenty batches, each forwarded once and in order.
+    #[tokio::test]
+    async fn a_window_against_logit_in_delivers_every_batch_once_in_order() {
+        let (addr, mut rx) = spawn_real_listener().await;
+        let collected = tokio::spawn(async move {
+            let mut marks = Vec::new();
+            for _ in 0..20 {
+                marks.push(recv_batch(&mut rx).await.events[0].timestamp);
+            }
+            assert!(rx.try_recv().is_err(), "nothing past the twentieth batch");
+            marks
+        });
+        let mut probe = TelemetryProbe::new();
+        let mut output = LogitOutput::new(addr).with_window(8).with_telemetry(probe.telemetry(
+            "out",
+            "logit_out",
+            "sink",
+        ));
+        let batches: Vec<_> = (1..=20).map(batch_marked).collect();
+
+        send_windowed(&mut output, &batches, |i| SeqId { id: [3; 16], seq: i as u64 + 1 }).await;
+
+        assert_eq!(collected.await.unwrap(), (1..=20).collect::<Vec<i64>>());
+        assert_eq!(output.window(), 8, "logit_in answers the offered window");
+        assert_eq!(requests(probe.poll()), ([20.0, 0.0, 0.0, 0.0], 20.0));
+    }
+
+    /// A connection dropped with two frames unacknowledged: both were forwarded, and the resend
+    /// from the head on a new connection, under the same pairs, is acked without a second
+    /// forward.
+    #[tokio::test]
+    async fn a_window_resent_after_a_dropped_connection_is_forwarded_once() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_real_listener_with_idle_timeout(
+            None,
+            probe.telemetry("logit_in", "logit_in", "listener"),
+        )
+        .await;
+        let mut output = LogitOutput::new(addr).with_window(8);
+        let pair = |i: usize| SeqId { id: [4; 16], seq: i as u64 + 1 };
+        let batches: Vec<_> = (1..=6).map(batch_marked).collect();
+
+        for (i, batch) in batches[..5].iter().enumerate() {
+            output.submit(batch, BatchContext::default(), Some(pair(i)), i).await.unwrap();
+        }
+        for _ in 0..3 {
+            output.await_ack().await.expect("an Ack");
+        }
+        for mark in 1..=5 {
+            assert_eq!(recv_batch(&mut rx).await.events[0].timestamp, mark);
+        }
+        output.stream = None;
+
+        send_windowed(&mut output, &batches[3..], |i| pair(i + 3)).await;
+
+        assert_eq!(recv_batch(&mut rx).await.events[0].timestamp, 6, "4 and 5 not forwarded again");
+        assert_eq!(probe.sum("logit.input.batches.resends", &[]), 2.0);
     }
 }

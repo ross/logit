@@ -1838,7 +1838,12 @@ impl StatsdOutput {
                 let target = Target::Tcp { endpoint: &self.endpoint, tls: self.tls.as_ref() };
                 #[cfg(test)]
                 let target = crate::stream::scripted_or(target, &self.dial_script);
-                let dial = Dial { target, connect_timeout: *connect_timeout, sink: "statsd_out" };
+                let dial = Dial {
+                    target,
+                    connect_timeout: *connect_timeout,
+                    sink: "statsd_out",
+                    nodelay: false,
+                };
                 let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
                 count_stream_send(&self.telemetry, self.lines.len(), result)
             }
@@ -1851,7 +1856,12 @@ impl StatsdOutput {
                 let target = Target::Unix { path: Path::new(&self.endpoint) };
                 #[cfg(test)]
                 let target = crate::stream::scripted_or(target, &self.dial_script);
-                let dial = Dial { target, connect_timeout: *connect_timeout, sink: "statsd_out" };
+                let dial = Dial {
+                    target,
+                    connect_timeout: *connect_timeout,
+                    sink: "statsd_out",
+                    nodelay: false,
+                };
                 let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
                 count_stream_send(&self.telemetry, self.lines.len(), result)
             }

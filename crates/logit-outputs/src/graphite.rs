@@ -242,7 +242,12 @@ impl GraphiteOutput {
                 let target = Target::Tcp { endpoint: &self.endpoint, tls: None };
                 #[cfg(test)]
                 let target = crate::stream::scripted_or(target, &self.dial_script);
-                let dial = Dial { target, connect_timeout: *connect_timeout, sink: "graphite_out" };
+                let dial = Dial {
+                    target,
+                    connect_timeout: *connect_timeout,
+                    sink: "graphite_out",
+                    nodelay: false,
+                };
                 let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
                 if result.is_ok() {
                     self.telemetry.count("logit.output.messages", self.buf.len() as f64, &[]);
