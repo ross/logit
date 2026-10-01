@@ -1244,7 +1244,21 @@ pub(crate) async fn write_loop(
         let (batch, ctx, seq) = match next {
             NextBatch::Batch(batch, ctx, seq) => (batch, ctx, seq),
             NextBatch::Closed => break, // queue closed and empty: nothing left to deliver.
-            NextBatch::ShutdownExpired => return Ok(()),
+            NextBatch::ShutdownExpired => {
+                // Batches a window left submitted and unacknowledged are cut off here as they
+                // are mid-round: the previous head's acknowledgment can win the deliver arm on
+                // the wake the grace expires, and this unbiased `select!` can then pick the grace.
+                // No submit is in progress between rounds.
+                drop_cut_off_at_shutdown(
+                    &store,
+                    in_flight.outstanding,
+                    posture,
+                    &telemetry,
+                    shutdown_dropped,
+                    &diag,
+                );
+                return Ok(());
+            }
         };
 
         // The sink span, the only one that carries `SpanStatus::Error` and a fault tag
@@ -5985,6 +5999,10 @@ mod tests {
         /// The sink never completes a send; shutdown grace cuts the in-flight send off with the
         /// store full and a push parked.
         GraceCutsInFlightSend,
+        /// [`ExitPath::GraceCutsInFlightSend`], cut during a submit past the head under a window:
+        /// the head is submitted and the second batch's submit never finishes. A sink with no
+        /// window never completes its send, as on that path.
+        GraceCutsInFlightSubmit,
         /// The sink fails permanently for `PERMANENT_FAILURE_WINDOW`: `write_loop` returns `Err`
         /// with the store full and a push parked.
         PermanentError,
@@ -6006,7 +6024,9 @@ mod tests {
             match path {
                 ExitPath::DrainFirst => paced(Duration::from_millis(10), None),
                 ExitPath::GraceExpiry => paced(Duration::from_millis(10), Some(Fault::Clean)),
-                ExitPath::GraceCutsInFlightSend => Box::new(NeverOutput),
+                ExitPath::GraceCutsInFlightSend | ExitPath::GraceCutsInFlightSubmit => {
+                    Box::new(NeverOutput)
+                }
                 ExitPath::PermanentError => paced(Duration::from_secs(20), Some(Fault::Permanent)),
                 ExitPath::ClosedAndEmpty => paced(Duration::ZERO, None),
             }
@@ -6034,6 +6054,14 @@ mod tests {
                     windowed(Duration::from_millis(10), AckScript::Always(Fault::Clean))
                 }
                 ExitPath::GraceCutsInFlightSend => windowed(Duration::ZERO, AckScript::Hang),
+                ExitPath::GraceCutsInFlightSubmit => {
+                    let (mut output, log) = windowed_output((4, 4));
+                    output.submit_delay = Some((2, Duration::from_secs(3600)));
+                    output.ack_script = AckScript::Hang;
+                    output.delivered = Arc::clone(delivered);
+                    drop(log);
+                    Box::new(output) as Box<dyn Output + Send>
+                }
                 ExitPath::PermanentError => {
                     windowed(Duration::from_secs(20), AckScript::Always(Fault::Permanent))
                 }
@@ -6055,6 +6083,7 @@ mod tests {
             ExitPath::DrainFirst,
             ExitPath::GraceExpiry,
             ExitPath::GraceCutsInFlightSend,
+            ExitPath::GraceCutsInFlightSubmit,
             ExitPath::PermanentError,
             ExitPath::ClosedAndEmpty,
         ] {
@@ -6068,6 +6097,7 @@ mod tests {
                         path,
                         ExitPath::GraceExpiry
                             | ExitPath::GraceCutsInFlightSend
+                            | ExitPath::GraceCutsInFlightSubmit
                             | ExitPath::PermanentError
                     );
                     let store_config = match (disk, small) {
@@ -6118,7 +6148,9 @@ mod tests {
                             drop(inbox_tx);
                             None
                         }
-                        ExitPath::GraceExpiry | ExitPath::GraceCutsInFlightSend => {
+                        ExitPath::GraceExpiry
+                        | ExitPath::GraceCutsInFlightSend
+                        | ExitPath::GraceCutsInFlightSubmit => {
                             shutdown_tx.send(true).unwrap();
                             drop(inbox_tx);
                             None
@@ -6175,7 +6207,9 @@ mod tests {
                     // send started at 100 ms.
                     if disk {
                         let cut_off = match path {
-                            ExitPath::GraceExpiry | ExitPath::GraceCutsInFlightSend => cut_off,
+                            ExitPath::GraceExpiry
+                            | ExitPath::GraceCutsInFlightSend
+                            | ExitPath::GraceCutsInFlightSubmit => cut_off,
                             ExitPath::DrainFirst
                             | ExitPath::PermanentError
                             | ExitPath::ClosedAndEmpty => 0.0,
@@ -6190,7 +6224,9 @@ mod tests {
                         ExitPath::DrainFirst | ExitPath::ClosedAndEmpty => {
                             assert_eq!(delivered, SENT as f64, "{at}")
                         }
-                        ExitPath::GraceExpiry | ExitPath::GraceCutsInFlightSend => {
+                        ExitPath::GraceExpiry
+                        | ExitPath::GraceCutsInFlightSend
+                        | ExitPath::GraceCutsInFlightSubmit => {
                             assert_eq!(delivered, 0.0, "{at}")
                         }
                         ExitPath::PermanentError => {
@@ -6710,6 +6746,123 @@ mod tests {
         assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 2.0);
         assert_eq!(sent_failed(&totals), 0.0);
         assert_eq!(totals.sum("logit.component.errors", &[]), 0.0);
+    }
+
+    /// Three batches submitted; the head's acknowledgment and the grace deadline land on the
+    /// same instant, so the `biased` deliver arm delivers the head and two stay outstanding. The
+    /// loop-top `select!` that follows is unbiased with both arms ready: the grace arm returns
+    /// from it, and the store's arm runs `deliver_window`, whose grace check returns
+    /// `GraceExpired`. Repeated so both arms are taken; each must apply the cut-off rule.
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_that_wins_the_loop_top_select_with_frames_outstanding_still_applies_the_cut_off_rule(
+    ) {
+        let grace = Duration::from_millis(100);
+        for posture in [DeliveryPosture::AtMostOnce, DeliveryPosture::AtLeastOnce] {
+            for round in 0..16 {
+                let at = format!("{posture:?}, round {round}");
+                let (mut output, log) = windowed_output((4, 4));
+                output.ack_delay = grace;
+                let registry = Registry::new();
+                let telemetry = registry.telemetry_for("out", "logit_out", "sink");
+                let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+                    SinkQueueConfig::default(),
+                    telemetry.clone(),
+                )));
+                for value in 1..=3 {
+                    store.push((one_event_batch(value as f64), BatchContext::default())).await;
+                }
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                shutdown_tx.send(true).unwrap();
+                let shutdown_dropped = AtomicU64::new(0);
+                let config = WriteLoopConfig {
+                    retry: fast_retry_config(),
+                    shutdown_grace: grace,
+                    delivery_override: Some(posture),
+                };
+                write_loop(
+                    "out".to_string(),
+                    &mut output,
+                    Arc::clone(&store),
+                    telemetry,
+                    config,
+                    shutdown_rx,
+                    &shutdown_dropped,
+                )
+                .await
+                .expect("a grace expiry is not a failure");
+                assert_eq!(log.submits(), vec![(1, 0), (2, 1), (3, 2)], "{at}");
+                assert_eq!(log.count(&Call::Ack(1)), 1, "{at}: the head's ack won its wake");
+                let totals = Totals::of(registry.drain(0));
+                assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 1.0, "{at}");
+                let shutdown =
+                    totals.sum("logit.component.batches.dropped", &[("reason", "shutdown")]);
+                let left = store.finish().await;
+                match posture {
+                    DeliveryPosture::AtMostOnce => {
+                        assert_eq!(shutdown, 2.0, "{at}: both outstanding batches, counted");
+                        assert_eq!(left, (0, 0), "{at}: committed, so a disk store can't replay");
+                    }
+                    DeliveryPosture::AtLeastOnce => {
+                        assert_eq!(shutdown, 0.0, "{at}");
+                        assert_eq!(left, (2, 2), "{at}: left reserved, for `finish` to count");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The head and the second batch are submitted; the third's submit is still writing when the
+    /// grace cuts it. That batch may have reached the receiver too, so it counts with the two
+    /// outstanding.
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_cut_during_a_submit_past_the_head_counts_that_batch_too_under_at_most_once() {
+        for posture in [DeliveryPosture::AtMostOnce, DeliveryPosture::AtLeastOnce] {
+            let (mut output, log) = windowed_output((4, 4));
+            output.submit_delay = Some((3, Duration::from_secs(3600)));
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("out", "logit_out", "sink");
+            let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+                SinkQueueConfig::default(),
+                telemetry.clone(),
+            )));
+            for value in 1..=3 {
+                store.push((one_event_batch(value as f64), BatchContext::default())).await;
+            }
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            shutdown_tx.send(true).unwrap();
+            let shutdown_dropped = AtomicU64::new(0);
+            let config = WriteLoopConfig {
+                retry: fast_retry_config(),
+                shutdown_grace: Duration::from_millis(100),
+                delivery_override: Some(posture),
+            };
+            write_loop(
+                "out".to_string(),
+                &mut output,
+                Arc::clone(&store),
+                telemetry,
+                config,
+                shutdown_rx,
+                &shutdown_dropped,
+            )
+            .await
+            .expect("a grace cut is not a failure");
+            assert_eq!(log.submits(), vec![(1, 0), (2, 1), (3, 2)], "{posture:?}");
+            assert_eq!(log.count(&Call::Ack(1)), 0, "{posture:?}: cut before any ack");
+            let totals = Totals::of(registry.drain(0));
+            let shutdown = totals.sum("logit.component.batches.dropped", &[("reason", "shutdown")]);
+            let left = store.finish().await;
+            match posture {
+                DeliveryPosture::AtMostOnce => {
+                    assert_eq!(shutdown, 3.0, "two outstanding and the one mid-submit");
+                    assert_eq!(left, (0, 0), "all three committed");
+                }
+                DeliveryPosture::AtLeastOnce => {
+                    assert_eq!(shutdown, 0.0, "nothing committed before `finish`");
+                    assert_eq!(left, (3, 3), "left reserved, for `finish` to count");
+                }
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
