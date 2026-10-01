@@ -11,8 +11,9 @@ Accepted. Superseded in part on 2026-10-01 by
 are implicit", the `Ack` entry of "Control payload", the rejected alternative "An explicit
 `seq` field on every data frame", and "Ack point", which gains a second case. Superseded in
 part on 2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md): "In-flight: one frame per
-connection, in this plan", and the deferred alternative "Building credit-based flow control
-(window > 1) now".
+connection, in this plan", the deferred alternative "Building credit-based flow control
+(window > 1) now", and the sentence of "Sequence numbers are implicit" that expects a future
+window to use cumulative acks (the acks stay empty and in frame order).
 
 ## Context
 
