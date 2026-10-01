@@ -1861,10 +1861,11 @@ attempt.
   wait for one `Ack`, finer-grained than layer 2's `logit.component.send.duration`, which times a
   whole attempt or windowed round, connect, handshake, and writes included.
 - `logit.output.in_flight` (gauge): frames written and awaiting an `Ack`, set on every change. It
-  reads 0 after a failure drops the connection. A value that sits at `logit.output.window` means
-  the round trip, or the peer's forwarding, bounds this sink.
-- `logit.output.window` (gauge): the window the last handshake negotiated, the smaller of the
-  configured `window` and the peer's answer, and at least 1.
+  reads 0 after every connection drop, a cancelled call's included. A value that sits at
+  `logit.output.window` means the round trip, or the peer's forwarding, bounds this sink.
+- `logit.output.window` (gauge): the window the live connection negotiated, the smaller of the
+  configured `window` and the peer's answer, and at least 1. It reads 1 after every connection
+  drop.
 - `logit.output.reconnects` (count): every connect *after* the first whose `HelloAck` passed
   validation. A climbing count in steady state means the peer or the network, not this sink, is
   unstable.
@@ -1875,9 +1876,11 @@ attempt.
   batch too large to send count as failed submits. A submit that fails with frames already in
   flight (a stalled or failed write) carries no `Fault` and isn't counted: the `await_ack`s after
   it count the round's outcome, `ok` for each `Ack` drained and the class of the failure that ends
-  it. A cancelled call (a budget timeout, the shutdown grace) returns nothing and isn't counted;
-  `logit.component.errors` covers it. `clean` covers every failure before a frame is completely
-  written and flushed with nothing in flight, and `ambiguous` only the ack wait
+  it. A drifted `in_flight` counts once, `ambiguous`, in the `submit` that finds it. A `Permanent`
+  past the head is counted when it becomes the head. A cancelled call (a budget timeout, the
+  shutdown grace) returns nothing and isn't counted; `logit.component.errors` covers it. `clean`
+  covers every failure before a frame is completely written and flushed with nothing in flight,
+  and `ambiguous` only the ack wait
   ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
   decision 6).
 
