@@ -1878,11 +1878,20 @@ pub enum ComponentKind {
         /// with the bundled Mozilla roots.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
-        /// Connect, handshake, and per-batch ack-wait timeout, one knob for all three. Defaults
-        /// to `10s`.
+        /// Connect, handshake, and per-batch ack-wait timeout, one knob for all three. With
+        /// batches already in flight, also how long writing the next batch may make no progress
+        /// before the connection stops taking batches. Defaults to `10s`.
         #[serde(default = "default_logit_out_request_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         request_timeout: Duration,
+        /// How many batches may be sent before the oldest is acknowledged. Raise it on a
+        /// high-latency link, where waiting for each acknowledgment before the next batch caps
+        /// throughput at one batch per round trip. `1` keeps one batch in flight. The peer may
+        /// answer a smaller window. Under `buffer.delivery: at_most_once`, a fault whose outcome
+        /// is unknown drops every batch in flight, so `1` is the safer choice there. Defaults to
+        /// `32`; must be between `1` and `1024`.
+        #[serde(default = "default_logit_out_window")]
+        window: u32,
     },
     /// A human-facing debug sink: writes every event as a readable text block to stdout (the
     /// default), stderr, or a file. The dev loop for seeing a whole pipeline's output without a
@@ -2722,6 +2731,11 @@ pub fn default_handshake_timeout() -> Duration {
 /// Mirrors `logit_outputs::logit::DEFAULT_TIMEOUT`, kept in sync by hand.
 fn default_logit_out_request_timeout() -> Duration {
     Duration::from_secs(10)
+}
+
+/// Mirrors `logit_outputs::logit::DEFAULT_WINDOW`, kept in sync by hand.
+fn default_logit_out_window() -> u32 {
+    32
 }
 
 /// Mirrors `logit_outputs::statsd::DEFAULT_MAX_PACKET_BYTES`, kept in sync by hand.
@@ -5569,14 +5583,34 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::LogitOut { endpoint, compression, tls, request_timeout } => {
+            ComponentKind::LogitOut { endpoint, compression, tls, request_timeout, window } => {
                 assert_eq!(endpoint, "central:5140");
                 assert_eq!(compression, Compression::None);
                 assert_eq!(tls, None);
                 assert_eq!(request_timeout, Duration::from_secs(10));
+                assert_eq!(window, 32);
             }
             other => panic!("expected LogitOut, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn logit_out_window_defaults_to_32() {
+        let parse = |json: &str| match serde_json::from_str::<Component>(json).unwrap().kind {
+            ComponentKind::LogitOut { window, .. } => window,
+            other => panic!("expected LogitOut, got {other:?}"),
+        };
+        assert_eq!(
+            parse(r#"{"type": "logit_out", "sources": ["in"], "endpoint": "central:5140"}"#),
+            32
+        );
+        assert_eq!(
+            parse(
+                r#"{"type": "logit_out", "sources": ["in"], "endpoint": "central:5140",
+                    "window": 1}"#
+            ),
+            1
+        );
     }
 
     #[test]

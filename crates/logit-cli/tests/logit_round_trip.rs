@@ -334,3 +334,303 @@ mod tls {
         assert_eq!(classify(&err), Fault::Clean);
     }
 }
+
+/// Through the node runtime with a send window (ADR `native-hop-send-window`): a `logit_out`
+/// with `window: 32` over a disk spool, driven by `write_loop`, in front of a real `logit_in`.
+mod window {
+    use super::*;
+    use logit_config::{BufferConfig, Component, ComponentKind, Config, ReceiveConfig};
+    use logit_pipeline::test_util::{scratch_dir, wait_until_within, TelemetryProbe, RECV_TIMEOUT};
+    use logit_pipeline::{
+        graph, DiskQueueConfig, InputRuntimeConfig, NodeSpec, OverflowPolicy, SinkStoreConfig,
+        WriteLoopConfig,
+    };
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::watch;
+
+    const BATCHES: usize = 200;
+
+    /// [`sample_batch`] with `mark` as its event's timestamp.
+    fn marked(mark: usize) -> EventBatch {
+        let mut batch = sample_batch();
+        batch.events[0].timestamp = mark as i64;
+        batch
+    }
+
+    /// Sends each batch once, then hangs until the runtime shuts it down.
+    struct BurstInput(Vec<EventBatch>);
+
+    #[async_trait::async_trait]
+    impl Input for BurstInput {
+        async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
+            for batch in self.0.drain(..) {
+                sink.send(batch).await;
+            }
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+    }
+
+    /// `in -> out`, where `out` is `output` over a disk spool in `dir`. The `in` kind only names
+    /// a listener for graph resolution; its spec is a [`BurstInput`].
+    fn specs(
+        output: LogitOutput,
+        dir: std::path::PathBuf,
+    ) -> (graph::Graph, HashMap<String, NodeSpec>) {
+        let component = |sources: Vec<String>, kind| Component {
+            buffer: BufferConfig::default(),
+            receive: ReceiveConfig::default(),
+            sources,
+            targets: Vec::new(),
+            kind,
+        };
+        let components = HashMap::from([
+            (
+                "in".to_string(),
+                component(
+                    vec![],
+                    ComponentKind::StatsdIn {
+                        bind: "127.0.0.1:0".to_string(),
+                        transport: logit_config::StatsdTransport::default(),
+                        tls: None,
+                        handshake_timeout: logit_config::default_handshake_timeout(),
+                        idle_timeout: None,
+                    },
+                ),
+            ),
+            (
+                "out".to_string(),
+                component(
+                    vec!["in".to_string()],
+                    ComponentKind::LogitOut {
+                        endpoint: "127.0.0.1:1".to_string(),
+                        compression: logit_config::Compression::None,
+                        tls: None,
+                        request_timeout: Duration::from_secs(10),
+                        window: 32,
+                    },
+                ),
+            ),
+        ]);
+        let graph = graph::resolve(Config { components, ..Default::default() })
+            .expect("the topology resolves");
+        let disk = DiskQueueConfig {
+            dir,
+            max_bytes: 64 * 1024 * 1024,
+            segment_bytes: 64 * 1024,
+            overflow: OverflowPolicy::Block,
+            compression: Compression::None,
+            checkpoint_interval: Duration::from_millis(20),
+        };
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(BurstInput((0..BATCHES).map(marked).collect())),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(output),
+                SinkStoreConfig::Disk(disk),
+                WriteLoopConfig {
+                    retry: logit_pipeline::RetryConfig {
+                        total_budget: Duration::from_secs(60),
+                        base_delay: Duration::from_millis(5),
+                        max_delay: Duration::from_millis(50),
+                    },
+                    ..WriteLoopConfig::default()
+                },
+            ),
+        );
+        (graph, specs)
+    }
+
+    /// A running `logit_in` counting into `probe`, and every mark its consumer receives, in order.
+    async fn spawn_listener(probe: &TelemetryProbe) -> (String, Arc<Mutex<Vec<i64>>>) {
+        let (addr, mut input) = bound_input(|input| {
+            input.with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"))
+        })
+        .await;
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move { input.run(Fanout::new(vec![tx])).await });
+        let marks = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&marks);
+        tokio::spawn(async move {
+            while let Some(delivered) = rx.recv().await {
+                let batch = logit_pipeline::unwrap_batch(delivered);
+                received.lock().unwrap().push(batch.events[0].timestamp);
+            }
+        });
+        (addr, marks)
+    }
+
+    /// Runs the graph until `marks` holds every batch, then shuts it down.
+    async fn run_until_delivered(
+        graph: graph::Graph,
+        specs: HashMap<String, NodeSpec>,
+        marks: &Arc<Mutex<Vec<i64>>>,
+    ) {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let run = tokio::spawn(logit_pipeline::run_with_shutdown(graph, specs, async move {
+            let _ = shutdown_rx.wait_for(|&fired| fired).await;
+        }));
+        // Spooling and sending 200 batches through a disk queue that fsyncs on rotation.
+        wait_until_within(
+            "every batch to reach logit_in's consumer",
+            Duration::from_secs(30),
+            || marks.lock().unwrap().len() >= BATCHES,
+        )
+        .await;
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(RECV_TIMEOUT, run)
+            .await
+            .expect("run finishes once shutdown fires")
+            .unwrap()
+            .expect("run completes without error");
+    }
+
+    #[tokio::test]
+    async fn a_window_of_32_through_the_runtime_forwards_every_spooled_batch_once_in_order() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, marks) = spawn_listener(&probe).await;
+        let output = LogitOutput::new(addr).with_window(32).with_telemetry(probe.telemetry(
+            "out",
+            "logit_out",
+            "sink",
+        ));
+        let dir = scratch_dir("logit-round-trip-window");
+        let (graph, specs) = specs(output, dir.clone());
+
+        run_until_delivered(graph, specs, &marks).await;
+
+        let expected: Vec<i64> = (0..BATCHES as i64).collect();
+        assert_eq!(*marks.lock().unwrap(), expected, "each batch once, in order");
+        let totals = probe.poll();
+        assert_eq!(totals.gauge("logit.output.window", &[]), Some(32.0));
+        assert!(!totals.has("logit.input.batches.resends", &[]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A relay in front of `logit_in` that can hold the acks coming back and cut every connection
+    /// open at once. Holding the acks leaves a whole window forwarded and unacknowledged; the cut
+    /// then makes the sender resend it on a new connection.
+    struct Relay {
+        addr: String,
+        hold_acks: watch::Sender<bool>,
+        cut: watch::Sender<u64>,
+    }
+
+    async fn spawn_relay(upstream: String) -> Relay {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (hold_acks, hold_rx) = watch::channel(false);
+        let (cut, cut_rx) = watch::channel(0u64);
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                tokio::spawn(relay_connection(
+                    client,
+                    upstream.clone(),
+                    cut_rx.clone(),
+                    hold_rx.clone(),
+                ));
+            }
+        });
+        Relay { addr, hold_acks, cut }
+    }
+
+    /// Relays one connection both ways until either side closes or a cut is called.
+    async fn relay_connection(
+        client: TcpStream,
+        upstream: String,
+        mut cut: watch::Receiver<u64>,
+        mut hold_acks: watch::Receiver<bool>,
+    ) {
+        let epoch = *cut.borrow_and_update();
+        let Ok(server) = TcpStream::connect(&upstream).await else { return };
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut server_read, mut server_write) = server.into_split();
+        let frames = tokio::io::copy(&mut client_read, &mut server_write);
+        let acks = async {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                let _ = hold_acks.wait_for(|&held| !held).await;
+                match server_read.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if client_write.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cut.wait_for(|&now| now != epoch) => {}
+            _ = frames => {}
+            () = acks => {}
+        }
+    }
+
+    /// The connection is cut with a full window forwarded by `logit_in` and unacknowledged at the
+    /// sender. `write_loop` resends the window from its head on a new connection, under the same
+    /// sequence numbers, and `logit_in` acknowledges each resend without forwarding it again.
+    #[tokio::test]
+    async fn a_connection_cut_mid_window_resends_the_window_and_logit_in_forwards_each_batch_once()
+    {
+        let mut probe = TelemetryProbe::new();
+        let (listener_addr, marks) = spawn_listener(&probe).await;
+        let relay = spawn_relay(listener_addr).await;
+        let output = LogitOutput::new(relay.addr.clone())
+            .with_window(32)
+            .with_telemetry(probe.telemetry("out", "logit_out", "sink"));
+        let dir = scratch_dir("logit-round-trip-window-cut");
+        let (graph, specs) = specs(output, dir.clone());
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let run = tokio::spawn(logit_pipeline::run_with_shutdown(graph, specs, async move {
+            let _ = shutdown_rx.wait_for(|&fired| fired).await;
+        }));
+
+        wait_until_within("some batches forwarded", Duration::from_secs(30), || {
+            marks.lock().unwrap().len() >= 50
+        })
+        .await;
+        relay.hold_acks.send_replace(true);
+        // The sender stops with a full window out, every frame of it forwarded and unacked.
+        wait_until_within("a full window forwarded and unacked", Duration::from_secs(30), || {
+            let totals = probe.poll();
+            let acked = totals.sum("logit.output.requests", &[("class", "ok")]) as usize;
+            totals.gauge("logit.output.in_flight", &[]) == Some(32.0)
+                && marks.lock().unwrap().len() == acked + 32
+        })
+        .await;
+        relay.cut.send_modify(|epoch| *epoch += 1);
+        relay.hold_acks.send_replace(false);
+
+        wait_until_within(
+            "every batch to reach logit_in's consumer",
+            Duration::from_secs(30),
+            || marks.lock().unwrap().len() >= BATCHES,
+        )
+        .await;
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(RECV_TIMEOUT, run)
+            .await
+            .expect("run finishes once shutdown fires")
+            .unwrap()
+            .expect("run completes without error");
+
+        let expected: Vec<i64> = (0..BATCHES as i64).collect();
+        assert_eq!(*marks.lock().unwrap(), expected, "each batch once, in order");
+        let totals = probe.poll();
+        assert_eq!(totals.sum("logit.input.batches.resends", &[]), 32.0, "the resent window");
+        assert!(totals.sum("logit.output.reconnects", &[]) >= 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

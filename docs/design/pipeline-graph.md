@@ -380,6 +380,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 72. A `stdio_out`/`file_out` `message:` other than `escaped` outside `format: human`.
 73. A UDP sink `endpoint` (`statsd_out`, `graphite_out`, or `syslog_out` on `transport: udp`, or
     `collectd_out`) on port 0.
+74. A `logit_out` `window` of `0` or past `1024`, the largest window a `logit_in` answers.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

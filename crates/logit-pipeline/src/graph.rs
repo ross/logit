@@ -228,6 +228,8 @@
 //! 73. A UDP sink `endpoint` (`statsd_out`, `graphite_out`, `syslog_out` on `transport: udp`, and
 //!     `collectd_out`) on port 0, which the kernel refuses every datagram to
 //!     (`docs/adr/sink-send-path-and-attempt-accounting.md`).
+//! 74. A `logit_out` `window` of 0, which could send nothing, or past 1024, the largest window a
+//!     `logit_in` answers (`docs/adr/native-hop-send-window.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -247,6 +249,10 @@ use logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP;
 use logit_proto::MAX_UDP_PAYLOAD_BYTES;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
+
+/// Rule 74's upper bound: `logit_in`'s `RECEIVER_MAX_WINDOW`, mirrored by hand since this crate
+/// can't depend on `logit-inputs`.
+const MAX_LOGIT_OUT_WINDOW: u32 = 1024;
 
 /// Rule 46's bound on a `graphite_in`/`graphite_out` `max_frame_bytes`. Below 1024 no real carbon
 /// pickle batch fits; above 16 MiB a frame's *declared* length is a larger allocation than any
@@ -3422,6 +3428,19 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 "component '{id}': {kind_name} 'endpoint' '{endpoint}' names port 0 -- no UDP \
                  datagram can be sent to port 0; give the receiver's port"
             );
+        }
+    }
+
+    // Rule 74: `logit_out`'s `window`. `logit_in` answers at most `RECEIVER_MAX_WINDOW`
+    // (`logit-inputs`), so a larger offer would never take effect.
+    for (id, component) in &components {
+        if let ComponentKind::LogitOut { window, .. } = &component.kind {
+            if !(1..=MAX_LOGIT_OUT_WINDOW).contains(window) {
+                anyhow::bail!(
+                    "component '{id}': logit_out 'window' is {window} -- it must be between 1 \
+                     and {MAX_LOGIT_OUT_WINDOW}"
+                );
+            }
         }
     }
 
@@ -8438,6 +8457,7 @@ mod tests {
             compression: Compression::None,
             tls,
             request_timeout: Duration::from_secs(10),
+            window: 32,
         }
     }
 
@@ -11140,6 +11160,7 @@ mod tests {
             compression: Compression::None,
             tls: None,
             request_timeout: Duration::from_secs(10),
+            window: 32,
         };
         let relay_in = ComponentKind::LogitIn {
             bind: "127.0.0.1:19001".to_string(),
@@ -11657,6 +11678,29 @@ mod tests {
             let name = kind_name(&kind);
             resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
                 .unwrap_or_else(|err| panic!("{name} should resolve, got: {err}"));
+        }
+    }
+
+    // ---- Rule 74: `logit_out`'s `window` --------------------------------------------------------
+
+    /// Rule 74: a window of 0 could send nothing, and one past 1024 is more than any `logit_in`
+    /// answers. The bounds themselves pass.
+    #[test]
+    fn a_logit_out_window_of_zero_or_past_1024_is_rejected() {
+        let with_window = |window: u32| {
+            let mut kind = logit_out_with_tls(None);
+            if let ComponentKind::LogitOut { window: w, .. } = &mut kind {
+                *w = window;
+            }
+            cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)])
+        };
+        for window in [0, 1025, u32::MAX] {
+            let err = expect_err(with_window(window));
+            assert!(err.contains("'out'") && err.contains("'window'"), "{window}: {err}");
+        }
+        for window in [1, 32, 1024] {
+            resolve(with_window(window))
+                .unwrap_or_else(|err| panic!("window {window} should resolve, got: {err}"));
         }
     }
 }

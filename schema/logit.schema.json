@@ -2088,7 +2088,7 @@
               "type": "string"
             },
             "request_timeout": {
-              "description": "Connect, handshake, and per-batch ack-wait timeout, one knob for all three. Defaults to `10s`.",
+              "description": "Connect, handshake, and per-batch ack-wait timeout, one knob for all three. With batches already in flight, also how long writing the next batch may make no progress before the connection stops taking batches. Defaults to `10s`.",
               "default": "10s",
               "type": "string"
             },
@@ -2109,6 +2109,13 @@
               "enum": [
                 "logit_out"
               ]
+            },
+            "window": {
+              "description": "How many batches may be sent before the oldest is acknowledged. Raise it on a high-latency link, where waiting for each acknowledgment before the next batch caps throughput at one batch per round trip. `1` keeps one batch in flight. The peer may answer a smaller window. Under `buffer.delivery: at_most_once`, a fault whose outcome is unknown drops every batch in flight, so `1` is the safer choice there. Defaults to `32`; must be between `1` and `1024`.",
+              "default": 32,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
             }
           }
         },
