@@ -299,7 +299,7 @@ fn sample_hello_ack() -> HelloAck {
 }
 
 fn sample_ack() -> Ack {
-    Ack { seq: 12345 }
+    Ack
 }
 
 fn sample_reject() -> Reject {

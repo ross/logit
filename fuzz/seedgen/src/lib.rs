@@ -133,7 +133,7 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
                 window: 1,
             }),
         ),
-        ("ack", ControlMessage::Ack(Ack { seq: 42 })),
+        ("ack", ControlMessage::Ack(Ack)),
         ("reject", ControlMessage::Reject(Reject { code: 1, message: "no common codec".into() })),
     ];
     for (name, message) in controls {

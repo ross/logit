@@ -9,7 +9,7 @@
 //! fails startup, and [`LogitInput::local_addr`] reads a `:0` bind's port without a
 //! bind-drop-rebind race. `run_until_shutdown` binds too when nobody did, for direct callers.
 //!
-//! **Ack point.** `Ack{seq}` is written only after `Fanout::send` returns, i.e. after the batch is
+//! **Ack point.** `Ack` is written only after `Fanout::send` returns, i.e. after the batch is
 //! in every open downstream inbox. A stalled downstream delays the ack, which stalls the sender's
 //! `write_loop`. That is this listener's backpressure; there is no receive-side queue the way a
 //! UDP listener has one (`crate::udp`). A frame no consumer took, because every consumer of this
@@ -463,7 +463,6 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // The idle clock starts at the handshake; after this, only an `Ack` write advances it.
     let mut last_progress = tokio::time::Instant::now();
 
-    let mut seq: u64 = 0;
     loop {
         // Only the header read races `shutdown` (`docs/design/pipeline-graph.md`'s "Cancellation
         // points"). This explicit check catches a shutdown
@@ -603,19 +602,15 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         // passes a v2 peer's `origin`/`previous` through untouched
         // (`docs/adr/batch-provenance-on-delivered.md`).
         if !sink.send_relayed(batch, provenance).await {
-            // Before `seq` advances, so a redialing sender's numbering and this side's agree.
             telemetry.count("logit.input.batches.dropped", 1.0, &[("reason", "closed_consumer")]);
             going_away(&mut stream, "no consumer took the batch", handshake_timeout, &telemetry)
                 .await;
             return Ok(());
         }
 
-        // `seq` is implicit: the Nth data frame on a connection is acked as N.
-        seq += 1;
         // After a forwarding `send_relayed` this is the only write: a frame is never both
         // forwarded and answered `GOING_AWAY` (module doc's "Shutdown").
-        if let Err(err) = write_control(&mut stream, &control::Ack { seq }, handshake_timeout).await
-        {
+        if let Err(err) = write_control(&mut stream, &control::Ack, handshake_timeout).await {
             if err.is::<WriteStalled>() {
                 telemetry.count("logit.proto.errors", 1.0, &[("reason", "ack_write_stalled")]);
             }
@@ -1495,8 +1490,7 @@ mod tests {
         let _ = read_control_response(&mut client).await;
 
         send_data_frame(&mut client, &sample_batch(), Compression::None).await;
-        let ack1 = read_ack(&mut client).await;
-        assert_eq!(ack1.seq, 1);
+        read_ack(&mut client).await;
 
         send_data_frame(&mut client, &sample_batch(), Compression::None).await;
         let mut buf = [0u8; 1];
@@ -1505,8 +1499,7 @@ mod tests {
         assert!(premature.is_err(), "ack for the second batch arrived before the inbox drained");
 
         recv_batch(&mut rx).await; // drains the first batch, freeing capacity
-        let ack2 = read_ack(&mut client).await;
-        assert_eq!(ack2.seq, 2);
+        read_ack(&mut client).await;
     }
 
     #[tokio::test]
@@ -1949,8 +1942,8 @@ mod tests {
         tokio::time::sleep(idle * 3).await;
 
         recv_batch(&mut rx).await; // drains the first batch, unblocking the second's send
-        assert_eq!(read_ack(&mut client).await.seq, 1, "the first ack, written long before");
-        assert_eq!(read_ack(&mut client).await.seq, 2, "and the second, after the drain");
+        read_ack(&mut client).await; // the first ack, written long before
+        read_ack(&mut client).await; // and the second, after the drain
         recv_batch(&mut rx).await;
 
         assert!(
@@ -1975,10 +1968,10 @@ mod tests {
         client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
-        for expected_seq in 1..=8u64 {
+        for _ in 0..8 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             send_data_frame(&mut client, &sample_batch(), Compression::None).await;
-            assert_eq!(read_ack(&mut client).await.seq, expected_seq);
+            read_ack(&mut client).await;
             recv_batch(&mut rx).await;
         }
 
@@ -2018,11 +2011,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         client.write_all(&framed[1..]).await.unwrap();
 
-        assert_eq!(
-            read_ack(&mut client).await.seq,
-            1,
-            "a frame whose header started arriving before the deadline must be acked"
-        );
+        // A frame whose header started arriving before the deadline must be acked.
+        read_ack(&mut client).await;
         assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
         assert!(
             !Totals::of(registry.drain(0))
@@ -2120,7 +2110,7 @@ mod tests {
         .await;
 
         send_data_frame(&mut client, &sample_batch(), Compression::None).await;
-        assert_eq!(read_ack(&mut client).await.seq, 1, "and still serving frames");
+        read_ack(&mut client).await; // and still serving frames
         recv_batch(&mut rx).await;
 
         assert!(
@@ -2239,7 +2229,7 @@ mod tests {
         const BOUND: Duration = Duration::from_millis(300);
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
-        let ack_len = control_frame_len(&control::Ack { seq: 1 });
+        let ack_len = control_frame_len(&control::Ack);
         let (mut client, server) = tokio::io::duplex(2 * ack_len);
         let (sink, mut rx) = fanout_into_channel(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2475,7 +2465,7 @@ mod tests {
         )
         .await
         .expect("the Ack reaches the client");
-        assert_eq!(reply, control::ControlMessage::Ack(control::Ack { seq: 1 }));
+        assert_eq!(reply, control::ControlMessage::Ack(control::Ack));
         recv_batch(&mut rx).await;
     }
 
@@ -2555,7 +2545,7 @@ mod tests {
         client.write_all(&sample_frame()).await.unwrap();
         assert_eq!(
             read_control_response_over(&mut client).await,
-            control::ControlMessage::Ack(control::Ack { seq: 1 })
+            control::ControlMessage::Ack(control::Ack)
         );
         drop(client);
 
@@ -2662,7 +2652,7 @@ mod tests {
         );
         client.write_all(&framed).await.unwrap();
 
-        assert_eq!(read_ack(&mut client).await.seq, 1, "the frame is acked, not rejected");
+        read_ack(&mut client).await; // the frame is acked, not rejected
         let relayed = recv_batch(&mut rx).await;
         assert_eq!(relayed.events.len(), 1);
     }

@@ -155,7 +155,7 @@ async fn a_frame_body_is_held_once_at_peak() {
     reset();
     client.write_all(&framed).await.unwrap();
     match read_control(&mut client).await {
-        control::ControlMessage::Ack(ack) => assert_eq!(ack.seq, 1),
+        control::ControlMessage::Ack(_) => {}
         other => panic!("expected Ack, got {other:?}"),
     }
     let peak = peak();
