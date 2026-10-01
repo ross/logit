@@ -308,6 +308,8 @@ line.
 | receive queue: push_many then pop_many, warm | **0** | the same hop for a whole batch of 8 (ADR `udp-intake-batching-and-socket-visibility`) -- `push_many` drains the caller's `Vec` and `pop_many` appends into one the caller clears, both keeping their capacity, so a batch costs the same nothing per datagram the single-item row above does |
 | `disk_queue`: push one batch (encode + write) | **33** | 36 -> 34 once `kv_metrics`'s two distributions became inline `Samples` (no `to_java_bytes` blob per record; same -2 as `NativeEncoder::encode` below); `native::encode_batch_v2` + `frame::write_frame` + one `write_all` -- breaks the zero-clone `Arc<EventBatch>` property by design, see `docs/adr/disk-backed-sink-buffer.md`; 25 -> 27 once `encode_batch_v2` (the provenance trailer, `docs/adr/batch-provenance-on-delivered.md`) replaced `encode_batch` here -- it builds v1's payload as its own `Bytes`, then copies it into a fresh `BytesMut` alongside the trailer rather than extending in place; 27 -> 36 with [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)'s TLV-framed records (same +9 as `NativeEncoder::encode` below); 34 -> 33 once `encode_batch_v2` sized its output to the exact payload length and wrote the trailer (provenance, then the native hop's sender identity and sequence, ADR `native-hop-identity-and-sequence`) in place: `freeze` on a `BytesMut` filled to its capacity skips the shared header a partly filled one allocates; stays 33 once `DiskQueue::push` numbers the batch (an atomic add) and writes its pair |
 | `disk_queue`: peek, cached (no re-decode) | **0** | `write_loop`'s retry loop calls `peek` once per attempt; only the first (uncached) peek after a push touches disk |
+| `disk_queue`: peek_at over a cached window (no re-decode) | **0** | three records already read ahead: each `peek_at` clones a cached record's `Arc`, so re-peeking a window after a fault decodes nothing again |
+| `sink_queue`: peek_at over a window | **0** | a memory store's `peek_at(0..3)` through `SinkStore`: one lock and one `Arc` clone per batch |
 | accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR `decoupled-listener-io` -- see below |
 | `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
 | `statsd_out` encode_into 100 events | **0** | measured through the same `FramedEncoder::encode_into` call as the syslog row (ADR `framed-encoder`), over 100 single-counter DogStatsD events: every per-metric buffer was a reused struct field from the start, and a statsd line has no timestamp to format, so a warm `MessageBuf` never touches the allocator |
@@ -1087,6 +1089,10 @@ every segment still on disk. The two figures differ on purpose: disk usage track
 written, while the in-memory figure is an estimate. A sink's queue is in memory *or* on disk, never
 both, and only one bound applies: `buffer.max_batches`/`max_bytes` are rejected alongside a
 non-default `buffer.disk` (`crates/logit-pipeline/src/graph.rs` rule 35).
+
+A disk-spooled sink also holds decoded batches in memory: every record read but not yet committed
+sits in `DiskQueue`'s `read_ahead`, so a sink with a window of batches in flight holds up to that
+window of decoded `EventBatch`es outside both bounds.
 
 **Listeners bound undecoded bytes too.** [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)
 generalizes `SinkQueue` into `BoundedQueue<T: Queued>` and weighs a UDP listener's receive queue
