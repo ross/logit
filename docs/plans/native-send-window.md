@@ -98,7 +98,10 @@ Files: `crates/logit-pipeline/src/output.rs`, `crates/logit-pipeline/src/runtime
   unchanged.
 - [ ] `deliver_window`: fill to `min(output.window(), store.max_in_flight())`, the head-only
   classification of a submit `Err`, the unclassified submit `Err` past the head, the
-  `at_most_once` whole-window drop on `Ambiguous`, and the grace rules.
+  `at_most_once` whole-window drop on `Ambiguous`, and the grace rules. The head's submit runs
+  under the head's remaining attempt time; a submit past the head and every `await_ack` run
+  under no attempt time (the sink bounds them), and the budget decides only whether a failed
+  round is retried.
 - [ ] A `deliver_window` row in `docs/design/pipeline-graph.md`'s "Cancellation points" table.
 - [ ] Tests in `runtime.rs`, with a scripted `WindowedOutput` double, `start_paused`, and
   observables, not sleeps:
@@ -112,6 +115,7 @@ Files: `crates/logit-pipeline/src/output.rs`, `crates/logit-pipeline/src/runtime
   - `a_permanent_submit_past_the_head_drops_that_batch_only_once_it_is_the_head`
   - `the_window_never_exceeds_a_memory_stores_max_batches`
   - `a_budget_exhausted_head_drops_only_the_head_under_at_least_once`
+  - `a_round_that_outlasts_the_budget_still_delivers_a_head_whose_ack_arrived`
   - `a_grace_cut_with_a_window_in_flight_counts_every_outstanding_batch_under_at_most_once_and_leaves_them_under_at_least_once`
   - `every_run_output_exit_path_reconciles_with_a_window_in_flight` (the existing matrix, with the
     windowed double)

@@ -190,22 +190,31 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
 - **Otherwise `deliver_window`**, with an effective window of
   `min(output.window(), store.max_in_flight())`:
   - **Fill.** While `outstanding < window`: `peek_at(outstanding)`, `observe_batch` if the batch
-    isn't observed yet, then `submit` under the remaining attempt time. An `Ok` increments
-    `outstanding`. With frames in flight the sink bounds its own write by progress (decision 5,
-    step 6), so the attempt time cancels a submit only when less than `request_timeout` is left
-    of the head's budget. A submit cancelled that way, past the head, is a window fault: the
-    sink dropped the connection, the acks it held unread are lost, and every frame in flight is
-    `Ambiguous`. That differs from a submit that returns `Err` past the head, below, which keeps
-    the connection.
+    isn't observed yet, then `submit`. An `Ok` increments `outstanding`. The head's submit runs
+    under the head's remaining attempt time, as a `deliver_with_retry` attempt does. A submit
+    past the head runs under no attempt time: the sink bounds it by progress (decision 5, step
+    6), and the window caps how many there are. The head's budget never cancels a write past
+    the head, so an `Ack` the receiver already sent is never lost to the budget: a round with a
+    slowly draining receiver can outlast the budget, and the head is still delivered when its
+    buffered `Ack` is read.
   - **A submit `Err` at the head** is the head's own fault, classified as today.
   - **A submit `Err` past the head classifies nothing.** The fill stops and the loop goes to
     `await_ack`. The sink keeps the connection, marked `broken` (no more writes), so the acks
     already owed are still read. A `Permanent` past the head also stops the fill; that batch
     fails again when it's the head and is dropped then.
-  - **Await.** `await_ack` under the remaining attempt time. `Ok` delivers the head. `Err` or a
-    timeout sets `outstanding` to 0, classifies the fault, and backs off and retries while the
-    fault is retryable and the head's retry budget lasts, else drops the head with that fault.
+  - **Await.** `await_ack` under no attempt time: the sink bounds it by `request_timeout`. `Ok`
+    delivers the head. `Err` sets `outstanding` to 0, classifies the fault, and backs off and
+    retries while the fault is retryable and the head's retry budget lasts, else drops the head
+    with that fault.
   - **One retry budget per head.** Its clock starts when the batch becomes the head, as today.
+    On the window path the budget decides whether a failed round is retried, and bounds the
+    head's own submit and each backoff; it doesn't cut a round short. A round lasts at most the
+    head's submit, `window - 1` progress-bounded writes, and one `request_timeout` ack wait, so
+    a round can overrun the budget by that much where `deliver_with_retry` cuts an attempt at
+    the deadline.
+  - **A pipelined sink bounds itself.** A sink that reports a window above 1 bounds every
+    `submit` past the head and every `await_ack` on its own, since the loop applies no attempt
+    time to them.
 - **Delivered and dropped.** A delivered head is committed, and on the window path `outstanding`
   and `observed` each drop by 1. A dropped head is committed as dropped. Under `at_most_once` an `Ambiguous` fault
   also commits every other outstanding item and counts each `send_failed`, since each is as
@@ -276,9 +285,10 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   batch dropped is the stuck one, as at window 1. Each retry round costs about two
   `request_timeout`s, the stalled write and then the ack wait, where window 1 pays one, and
   each costs `logit_in` one `logit.proto.errors{reason="truncated"}` for the partial frame.
-  The residual is the loop's own attempt timeout, which can cancel a write when less than
-  `request_timeout` of the head's budget is left; the head is then retried or dropped as
-  `Ambiguous` with its acks unread, after it has already failed for most of its budget.
+- **A slowly draining receiver.** A receiver that forwards a frame every few seconds makes
+  progress, so no write stalls, and a fill of `window - 1` frames can take longer than the
+  head's retry budget. The head is delivered when the fill ends and its buffered `Ack` is read;
+  the budget bounds retries, not a round. Only a shutdown grace cancels a round.
 - **The parked-forward race grows.** The abandoned connection's task can forward several
   buffered frames that race the new connection's resend, so the worst case is a few duplicates
   instead of one. It limits itself: the first forward raises the mark. The `docs/known-gaps.md`
