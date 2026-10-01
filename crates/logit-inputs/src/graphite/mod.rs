@@ -81,8 +81,8 @@
 //!
 //! ## Connections
 //!
-//! The driver's: 1024 at a time, the permit taken non-blockingly after `accept`, and a
-//! past-the-cap connection closed immediately and counted
+//! The driver's: `max_connections:` at a time (1024 by default), the permit taken non-blockingly
+//! after `accept`, and a past-the-cap connection closed immediately and counted
 //! `logit.input.connections.rejected{reason="limit"}` (carbon's wire has no way to say "try
 //! later"). `handshake_timeout:` bounds each pre-message phase independently (the TLS accept when
 //! `tls:` is set, then the wait for the first byte) and is **not** an idle timeout. The gaps after
@@ -323,10 +323,11 @@ impl GraphiteInput {
         }
     }
 
-    /// Lowers the driver's connection cap so a test reaches it with two connections, not 1025.
-    /// A no-op under UDP.
-    #[cfg(test)]
-    fn with_max_connections(mut self, max_connections: usize) -> Self {
+    /// Caps the connections a stream listener serves at once, overriding
+    /// [`crate::DEFAULT_MAX_CONNECTIONS`]; `max_connections:` in config. Graph rule 74 rejects `0`
+    /// before it gets here. A datagram listener is left untouched: it has no connections, and
+    /// graph rule 74 rejects a non-default value there.
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_max_connections(max_connections));
         }

@@ -671,6 +671,15 @@ pub enum ComponentKind {
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
+        /// The most connections this listener serves at once. One arriving past it is closed at
+        /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
+        /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
+        /// keep the total across listeners under the process's `nofile` limit.
+        ///
+        /// Stream transports only (`tcp` and `unix_stream`); a datagram listener has no
+        /// connections, so a non-default value under `transport: udp` or `unix` is rejected.
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
     },
     /// collectd's binary `network` plugin protocol over UDP.
     ///
@@ -759,6 +768,15 @@ pub enum ComponentKind {
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
+        /// The most connections this listener serves at once. One arriving past it is closed at
+        /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
+        /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
+        /// keep the total across listeners under the process's `nofile` limit.
+        ///
+        /// Stream transports only (`tcp`); a datagram listener has no connections, so a
+        /// non-default value under `transport: udp` is rejected.
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
         /// The longest plaintext line this listener assembles before dropping it and draining to
         /// the next newline (counted once as `logit.input.frames.dropped{reason="oversize"}`; the
         /// line after it still decodes). A byte-count string (`"8192"`, `"16KiB"`). Defaults to
@@ -841,6 +859,15 @@ pub enum ComponentKind {
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
+        /// The most connections this listener serves at once. One arriving past it is closed at
+        /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
+        /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
+        /// keep the total across listeners under the process's `nofile` limit.
+        ///
+        /// Stream transports only (`tcp`); a datagram listener has no connections, so a
+        /// non-default value under `transport: udp` is rejected.
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
     },
     /// OpenTelemetry Protocol (logs, metrics, and/or traces) over OTLP/HTTP (protobuf or JSON
     /// body) or OTLP/gRPC.
@@ -888,6 +915,12 @@ pub enum ComponentKind {
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
+        /// The most connections this listener serves at once. One arriving past it is closed at
+        /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
+        /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
+        /// keep the total across listeners under the process's `nofile` limit.
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
     },
     /// A stand-in for Datadog's intake API: what a Datadog Agent's `dd_url`,
     /// `logs_config.logs_dd_url`, `apm_config.apm_dd_url`, or `additional_endpoints` point at.
@@ -924,6 +957,12 @@ pub enum ComponentKind {
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
+        /// The most connections this listener serves at once. One arriving past it is closed at
+        /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
+        /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
+        /// keep the total across listeners under the process's `nofile` limit.
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
     },
     /// A stand-in for the Datadog Agent's APM receiver: what a dd-trace tracer sends its traces
     /// and client-computed stats to. Serves `/v0.3`, `/v0.4`, `/v0.5`, and `/v0.7/traces`
@@ -967,6 +1006,15 @@ pub enum ComponentKind {
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
+        /// The most connections this listener serves at once. One arriving past it is closed at
+        /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
+        /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
+        /// keep the total across listeners under the process's `nofile` limit.
+        ///
+        /// Counts the TCP listener and the Unix socket together; `/info` reports it as
+        /// `connection_limit`.
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
     },
     /// A stand-in for Splunk's HTTP Event Collector (HEC): what a HEC client's URL points at,
     /// such as Docker's `splunk` log driver, Splunk's logging libraries, the OpenTelemetry
@@ -1032,6 +1080,12 @@ pub enum ComponentKind {
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
+        /// The most connections this listener serves at once. One arriving past it is closed at
+        /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
+        /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
+        /// keep the total across listeners under the process's `nofile` limit.
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
     },
     /// Tails one or more files as a log source, one line per event; rotation-, truncation-, and
     /// checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final
@@ -1129,6 +1183,16 @@ pub enum ComponentKind {
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
+        /// The most connections this listener serves at once. One arriving past it is closed at
+        /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
+        /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
+        /// keep the total across listeners under the process's `nofile` limit.
+        ///
+        /// A `logit_out` past the cap is told `Reject{INTERNAL}` and retries on its own. The resend
+        /// table is sized from this value (`max_connections + max_connections / 4` sender
+        /// identities).
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
     },
     /// `logit` observing itself: drains every component's buffered self-telemetry on `interval`
     /// and emits it as ordinary events into the graph. At most one per config.
@@ -2176,6 +2240,15 @@ pub enum ComponentKind {
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
+        /// The most connections this listener serves at once. One arriving past it is closed at
+        /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
+        /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
+        /// keep the total across listeners under the process's `nofile` limit.
+        ///
+        /// Remote-write receiver only (`bind:`); a non-default value alongside `scrape_targets` is
+        /// rejected.
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
         /// What the receiver remembers about metric types between requests, so a Prometheus 1.0
         /// sender's series decode as typed families. Receiver mode only.
         #[serde(default)]
@@ -2719,6 +2792,13 @@ fn default_max_set_members_per_series() -> usize {
 /// crate, never the reverse, so the two are kept in sync by hand.
 fn default_syslog_connect_timeout() -> Duration {
     Duration::from_secs(5)
+}
+
+/// Every stream listener's default `max_connections:`. Mirrors
+/// `logit_inputs::DEFAULT_MAX_CONNECTIONS` by hand; `pub` so graph validation can tell a set
+/// value from a defaulted one.
+pub fn default_max_connections() -> usize {
+    1024
 }
 
 /// The one `handshake_timeout` default shared by every TCP listener kind. Mirrors
@@ -4890,7 +4970,9 @@ mod tests {
                 idle_timeout,
                 max_line_bytes,
                 max_frame_bytes,
+                max_connections,
             } => {
+                assert_eq!(max_connections, default_max_connections());
                 assert_eq!(bind, "0.0.0.0:2003");
                 assert_eq!(transport, GraphiteTransport::Tcp);
                 assert_eq!(protocol, GraphiteProtocol::Plaintext);
@@ -5077,12 +5159,20 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "syslog_in", "bind": "0.0.0.0:5514"}"#).unwrap();
         match component.kind {
-            ComponentKind::SyslogIn { bind, transport, tls, handshake_timeout, idle_timeout } => {
+            ComponentKind::SyslogIn {
+                bind,
+                transport,
+                tls,
+                handshake_timeout,
+                idle_timeout,
+                max_connections,
+            } => {
                 assert_eq!(bind, "0.0.0.0:5514");
                 assert_eq!(transport, SyslogTransport::Udp);
                 assert_eq!(tls, None);
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
                 assert_eq!(idle_timeout, None, "opt-in -- no idle timeout unless asked for");
+                assert_eq!(max_connections, default_max_connections());
             }
             other => panic!("expected SyslogIn, got {other:?}"),
         }
@@ -5129,12 +5219,20 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpIn { bind, protocol, tls, handshake_timeout, idle_timeout } => {
+            ComponentKind::OtlpIn {
+                bind,
+                protocol,
+                tls,
+                handshake_timeout,
+                idle_timeout,
+                max_connections,
+            } => {
                 assert_eq!(bind, "0.0.0.0:4317");
                 assert_eq!(protocol, OtlpProtocol::Grpc);
                 assert_eq!(tls, None);
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
                 assert_eq!(idle_timeout, None, "opt-in -- no idle timeout unless asked for");
+                assert_eq!(max_connections, default_max_connections());
             }
             other => panic!("expected OtlpIn, got {other:?}"),
         }
@@ -5244,12 +5342,14 @@ mod tests {
                 tls,
                 handshake_timeout,
                 idle_timeout,
+                max_connections,
             } => {
                 assert_eq!(bind.as_deref(), Some("127.0.0.1:8126"));
                 assert_eq!(socket.as_deref(), Some("/var/run/datadog/apm.socket"));
                 assert_eq!(tls, None);
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
                 assert_eq!(idle_timeout, None);
+                assert_eq!(max_connections, default_max_connections());
             }
             other => panic!("expected DatadogTraceIn, got {other:?}"),
         }
@@ -5276,6 +5376,7 @@ mod tests {
                 max_pending_acks,
                 handshake_timeout,
                 idle_timeout,
+                max_connections,
             } => {
                 assert_eq!(bind, "0.0.0.0:8088");
                 assert_eq!(tls, None);
@@ -5285,6 +5386,7 @@ mod tests {
                 assert_eq!(max_pending_acks, 1_000_000);
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
                 assert_eq!(idle_timeout, None);
+                assert_eq!(max_connections, default_max_connections());
             }
             other => panic!("expected SplunkHecIn, got {other:?}"),
         }
@@ -5402,12 +5504,14 @@ mod tests {
                 max_frame_bytes,
                 handshake_timeout,
                 idle_timeout,
+                max_connections,
             } => {
                 assert_eq!(bind, "0.0.0.0:5140");
                 assert_eq!(tls, None);
                 assert_eq!(max_frame_bytes, None);
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
                 assert_eq!(idle_timeout, None, "opt-in -- no idle timeout unless asked for");
+                assert_eq!(max_connections, default_max_connections());
             }
             other => panic!("expected LogitIn, got {other:?}"),
         }
@@ -5573,6 +5677,54 @@ mod tests {
                 assert_eq!(idle_timeout, Some(Duration::from_secs(600)));
             }
             other => panic!("expected OtlpIn, got {other:?}"),
+        }
+    }
+
+    /// The nine stream-listener kinds, each as a minimal JSON object, for the `max_connections`
+    /// parse tests below.
+    const STREAM_LISTENERS: [&str; 9] = [
+        r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp""#,
+        r#"{"type": "graphite_in", "bind": "0.0.0.0:2003""#,
+        r#"{"type": "syslog_in", "bind": "0.0.0.0:6514", "transport": "tcp""#,
+        r#"{"type": "otlp_in", "bind": "0.0.0.0:4318""#,
+        r#"{"type": "datadog_in", "bind": "0.0.0.0:8080""#,
+        r#"{"type": "datadog_trace_in", "bind": "0.0.0.0:8126""#,
+        r#"{"type": "splunk_hec_in", "bind": "0.0.0.0:8088""#,
+        r#"{"type": "logit_in", "bind": "0.0.0.0:5140""#,
+        r#"{"type": "prometheus_in", "bind": "0.0.0.0:9201""#,
+    ];
+
+    fn max_connections_of(kind: &ComponentKind) -> usize {
+        match kind {
+            ComponentKind::StatsdIn { max_connections, .. }
+            | ComponentKind::GraphiteIn { max_connections, .. }
+            | ComponentKind::SyslogIn { max_connections, .. }
+            | ComponentKind::OtlpIn { max_connections, .. }
+            | ComponentKind::DatadogIn { max_connections, .. }
+            | ComponentKind::DatadogTraceIn { max_connections, .. }
+            | ComponentKind::SplunkHecIn { max_connections, .. }
+            | ComponentKind::LogitIn { max_connections, .. }
+            | ComponentKind::PrometheusIn { max_connections, .. } => *max_connections,
+            other => panic!("not a stream listener: {other:?}"),
+        }
+    }
+
+    /// One `#[serde(default = ..)]` copy per kind: a typo on any one would silently change that
+    /// kind's cap, so all nine are checked.
+    #[test]
+    fn max_connections_defaults_to_1024_on_every_stream_listener() {
+        for head in STREAM_LISTENERS {
+            let component: Component = serde_json::from_str(&format!("{head}}}")).unwrap();
+            assert_eq!(max_connections_of(&component.kind), 1024, "{head}");
+        }
+    }
+
+    #[test]
+    fn max_connections_parses_on_every_stream_listener() {
+        for head in STREAM_LISTENERS {
+            let component: Component =
+                serde_json::from_str(&format!(r#"{head}, "max_connections": 7}}"#)).unwrap();
+            assert_eq!(max_connections_of(&component.kind), 7, "{head}");
         }
     }
 
@@ -6501,8 +6653,10 @@ mod tests {
                 path,
                 bind_tls,
                 idle_timeout,
+                max_connections,
                 metadata_cache,
             } => {
+                assert_eq!(max_connections, default_max_connections());
                 assert_eq!(scrape_targets, vec!["http://node-exporter:9100/metrics".to_string()]);
                 assert_eq!(interval, Duration::from_secs(15));
                 assert_eq!(timeout, Duration::from_secs(10));
@@ -6789,7 +6943,15 @@ mod tests {
         let bare: Component =
             serde_json::from_str(r#"{"type": "statsd_in", "bind": "0.0.0.0:8125"}"#).unwrap();
         match bare.kind {
-            ComponentKind::StatsdIn { bind, transport, tls, handshake_timeout, idle_timeout } => {
+            ComponentKind::StatsdIn {
+                bind,
+                transport,
+                tls,
+                handshake_timeout,
+                idle_timeout,
+                max_connections,
+            } => {
+                assert_eq!(max_connections, default_max_connections());
                 assert_eq!(bind, "0.0.0.0:8125");
                 assert_eq!(transport, StatsdTransport::Udp, "classic statsd stays the default");
                 assert_eq!(tls, None);

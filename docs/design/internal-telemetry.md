@@ -804,12 +804,13 @@ misconfiguration.
   `receive_buffer.*` all come from the shared `UdpListener`.
 - **`transport: tcp`:** no counters of its own either. It runs on the shared `TcpListener`
   (`docs/adr/graphite-carbon-relay.md`'s 2026-09-14 amendment) and reports exactly what a TCP
-  `syslog_in` reports. `logit.input.connections.rejected{reason="limit"}` is the 1024-connection cap
-  binding; the listener rejects rather than queues because carbon's wire has no way to say "try
-  later". `logit.input.frames` / `.frame.bytes` count under **both** protocols, where one frame is
-  one plaintext line or one pickle payload, counted at the size the decoder was handed (a pickle
-  frame's 4-byte length prefix is stripped first, so the count is the payload, not the wire
-  framing). `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}` and
+  `syslog_in` reports. `logit.input.connections.rejected{reason="limit"}` is the connection cap
+  (`max_connections`, 1024 by default) binding; the listener rejects rather than queues because
+  carbon's wire has no way to say "try later". `logit.input.frames` / `.frame.bytes` count under
+  **both** protocols, where one frame is one plaintext line or one pickle payload, counted at the
+  size the decoder was handed (a pickle frame's 4-byte length prefix is stripped first, so the
+  count is the payload, not the wire framing).
+  `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}` and
   `logit.component.receive.flushed{reason}` from the per-connection `BatchAccumulator` (the same
   layer-2 point a datagram listener's shared `decode_loop` records) complete the set. There's no
   receive queue on this transport, because TCP's own flow control is the backpressure, so none of
@@ -841,12 +842,13 @@ never fatal to the listener or its sibling connections.
 [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md).
 
 **The connection metrics, and one codec counter.** `logit.input.connections`,
-`logit.input.connections.rejected{reason="limit"}` (the 1024-connection cap binding), and
-`logit.input.connections.closed{reason="idle"}`, the same three points `logit_in` and the shared
-TCP driver record, for the same reason: this accept loop rejects at the cap rather than queueing
-behind a permit, so there's a refusal to count, and the gauge counts permit holders only. A
-connection past the cap is dropped before any TLS accept (OTLP has no in-band "try later" to spend
-a handshake delivering), so a rejection is never also a handshake. An idle close is
+`logit.input.connections.rejected{reason="limit"}` (the connection cap, `max_connections`, 1024
+by default, binding), and `logit.input.connections.closed{reason="idle"}`, the same three points
+`logit_in` and the shared TCP driver record, for the same reason: this accept loop rejects at the
+cap rather than queueing behind a permit, so there's a refusal to count, and the gauge counts
+permit holders only. A connection past the cap is dropped before any TLS accept (OTLP has no
+in-band "try later" to spend a handshake delivering), so a rejection is never also a handshake. An
+idle close is
 `graceful_shutdown()`, a bounded grace, then drop, the same close a stalled request body's
 `408`/`grpc-status: 4` reaches.
 
@@ -1156,9 +1158,10 @@ the property the minimal-watch-set design is for.
   `handshake_timeout`: an `Ack` (the connection ends) or a `Reject` (the connection was closing
   anyway).
 - `logit.input.connections` (gauge, sampled on every connect/disconnect) and
-  `logit.input.connections.rejected{reason="limit"}` (count, the 1024-connection cap binding).
-  `otlp_in` and a TCP `syslog_in`/`graphite_in`/`statsd_in` on the shared driver record the same
-  pair; all five reject at the cap rather than queueing behind a permit. Here a connection this
+  `logit.input.connections.rejected{reason="limit"}` (count, the connection cap,
+  `max_connections`, 1024 by default, binding). `otlp_in` and a TCP
+  `syslog_in`/`graphite_in`/`statsd_in` on the shared driver record the same pair; all five reject
+  at the cap rather than queueing behind a permit. Here a connection this
   listener closed still counts, and holds its permit, while it lingers: after its last answer it
   reads and discards until the peer closes or for `handshake_timeout`.
 - `logit.input.connections.closed{reason="idle"}` (count), the third point all five share. Here the
