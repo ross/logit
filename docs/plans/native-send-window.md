@@ -124,14 +124,14 @@ Files: `crates/logit-pipeline/src/output.rs`, `crates/logit-pipeline/src/runtime
 
 Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-outputs/src/stream.rs`,
 `crates/logit-inputs/src/logit.rs`, `crates/logit-config/src/lib.rs`,
-`crates/logit-pipeline/src/graph.rs` (rule 74), `crates/logit-cli/src/pipeline.rs`,
+`crates/logit-pipeline/src/graph.rs` (rule 75), `crates/logit-cli/src/pipeline.rs`,
 `schema/logit.schema.json`, `docs/design/internal-telemetry.md`,
 `docs/design/pipeline-graph.md`.
 
 - [x] `LogitOut.window: u32`, default 32 (`default_logit_out_window`), with its operator doc.
   Exhaustive `LogitOut {..}` patterns gain the field (in `lib.rs`, `graph.rs`, and
   `pipeline.rs`), and `conn_over` gains the new connection fields.
-- [x] Graph rule 74, `1 <= window <= 1024`, with a row in `docs/design/pipeline-graph.md`.
+- [x] Graph rule 75, `1 <= window <= 1024`, with a row in `docs/design/pipeline-graph.md`.
 - [x] `crates/logit-cli/src/pipeline.rs` passes `.with_window(*window)`; `script/schema`
   regenerates `schema/logit.schema.json`.
 - [x] `logit_out`: `Conn` gains `window`, `in_flight`, and `broken`; `submit`, `await_ack`, and

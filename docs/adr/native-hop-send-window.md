@@ -122,7 +122,7 @@ the head alone, and a fault resends the window from the head.
   (`default_logit_out_window`). The operator doc says it's the number of frames in flight before
   the oldest must be acknowledged, to raise it on a high-latency link, and that `1` keeps one
   frame in flight.
-- **Graph rule 74.** `1 <= window <= 1024`, with a row in `docs/design/pipeline-graph.md`.
+- **Graph rule 75.** `1 <= window <= 1024`, with a row in `docs/design/pipeline-graph.md`.
 - **No `logit_in` field.** The receiver's bound is the constant `RECEIVER_MAX_WINDOW`.
 - **Schema.** `crates/logit-cli/src/pipeline.rs` passes `.with_window(*window)`, and
   `script/schema` regenerates `schema/logit.schema.json`.
@@ -356,7 +356,7 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
 
 - **Code.** The store's `peek_at` and `max_in_flight`, the `Output` methods and
   `deliver_window`, `logit_out`'s window and `logit_in`'s clamp and lingering close, the config
-  field and graph rule 74, and the tests and allocation pins each workstream adds are listed
+  field and graph rule 75, and the tests and allocation pins each workstream adds are listed
   once, in [`docs/plans/native-send-window.md`](../plans/native-send-window.md).
 - **Telemetry.** `logit.component.send.duration` records one sample per windowed round, not per
   batch, for a `logit_out` with a window above 1. `logit.output.requests` counts a `submit` `Err`
