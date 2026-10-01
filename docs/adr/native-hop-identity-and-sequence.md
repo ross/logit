@@ -10,7 +10,8 @@ Accepted. Supersedes, in part, [ADR
 `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md): "Sequence numbers
 are implicit", the `Ack` entry of its control payload, its rejected alternative "An explicit
 `seq` field on every data frame", and "Ack point", which now has a second case. It narrows [ADR
-`delivery-semantics`](delivery-semantics.md), item 3, for the native hop.
+`delivery-semantics`](delivery-semantics.md) for the native hop: item 3's acknowledgment, item
+7's "Outside the window, forward", and item 8's replayed set.
 
 ## Context
 
@@ -44,8 +45,9 @@ These facts about the code fix the design:
   re-encodes the payload on every attempt (`LogitOutput::send`), so the concern behind the old
   rejected alternative, that one frame's bytes serve both a socket and a file, no longer binds.
 - **The store's pushes are sequential, and it has one per-batch hook.** `SinkStore::push` takes
-  `(Arc<EventBatch>, BatchContext)` from `drain_inbox` and, after `drain_inbox` stops, from
-  `run_output`'s shutdown sweep, which re-pushes the batch in hand and the inbox's remainder.
+  `(Arc<EventBatch>, BatchContext)` from `drain_inbox` and, for a disk store after `drain_inbox`
+  stops, from `run_output`'s shutdown sweep, which pushes the batch in hand and then the inbox's
+  remainder.
   `Output::observe_batch` runs once per batch, never between retries. `BatchContext` is pinned at
   32 bytes and `Delivered` at 72 by `fanout.rs`'s size tests, and the delivery record's item 4
   keeps identity off in-process edges.
@@ -75,9 +77,10 @@ mark per sender identity, in a table bounded by its connection cap.
 
 ### 2. A sink's store numbers what it holds
 
-- **Numbers are assigned in push order.** Pushes are sequential, `drain_inbox`'s and then the
-  shutdown sweep's, and the store, not the pusher, assigns the next number when it encodes the
-  batch (disk) or admits it (memory), advancing its counter before the push's first `.await`.
+- **Numbers are assigned in push order.** Pushes are sequential, `drain_inbox`'s and then, for
+  a disk store, the shutdown sweep's, and the store, not the pusher, assigns the next number
+  when it encodes the batch (disk) or admits it (memory), advancing its counter before the
+  push's first `.await`.
 - **A gap is legal.** A number consumed by a push that fails or is cancelled (`frame_too_large`,
   `drop_newest`, `disk_full`, a cancelled push) is never sent, and the receiver ignores the gap.
 - **The pair travels beside `BatchContext`, never on it.** The store item becomes

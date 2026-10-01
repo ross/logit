@@ -51,10 +51,9 @@ use cumulative acks unchanged.
 in part on 2026-10-01 by [ADR
 `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md): a frame at or below
 its sender's high-water mark is acknowledged on the mark alone, with no `Fanout::send`. A frame
-above it is acknowledged as written here.] A stalled
-downstream delays the ack, which stalls the sender's own delivery attempt — that *is* this
-protocol's backpressure. `logit_in` needs no receive-side queue on top of this; the ack itself is
-the queue depth of one.
+above it is acknowledged as written here.] A stalled downstream delays the ack, which stalls the
+sender's own delivery attempt — that *is* this protocol's backpressure. `logit_in` needs no
+receive-side queue on top of this; the ack itself is the queue depth of one.
 
 **Handshake.** The connecting side (`logit_out`) sends `Hello` first; the listener replies
 `HelloAck` (codec/compression = the intersection, its own `max_frame_bytes`, its own `window`) or
@@ -284,9 +283,10 @@ case of a frame at or below the mark, acknowledged with no forward.
 
 "Ack point" holds that a frame is acknowledged once the batch is in every open downstream inbox.
 `Fanout::send_relayed` now reports whether any consumer took the batch, and a batch none took is
-not acknowledged (for a frame at or below its sender's mark, which is acknowledged with no
-forward, see [ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md)): `logit_in` writes `Reject{GOING_AWAY, "no consumer took the batch"}` and closes
-the connection, before the sequence advances. `GOING_AWAY` has three causes: shutdown, an idle
+not acknowledged, except a frame at or below its sender's mark, which is acknowledged with no
+forward ([ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md)):
+`logit_in` writes `Reject{GOING_AWAY, "no consumer took the batch"}` and closes the connection,
+before the sequence advances. `GOING_AWAY` has three causes: shutdown, an idle
 close, and no consumer taking the frame. The frame wasn't forwarded, so `logit_out` classifies it
 `Clean`, redials, and resends, and the sender and receiver sequences stay aligned. The invariant
 in the 2026-09-25 amendment, that `GOING_AWAY` is written only for a frame that wasn't forwarded,

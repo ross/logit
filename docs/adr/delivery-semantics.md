@@ -222,7 +222,9 @@ are implicit".
 - **A bounded window at `logit_in`.** `logit_in` remembers, per sender identity, enough to
   recognize a resend inside a bounded window. It acknowledges a recognized resend and doesn't
   forward it.
-- **Outside the window, forward.** A frame `logit_in` can't place, from a sender it has
+- **Outside the window, forward.** [Narrowed by "Amendment: W4 decisions (2026-10-01)": a
+  frame at or below its sender's mark is not forwarded, even one the sender dropped and a spool
+  replayed.] A frame `logit_in` can't place, from a sender it has
   forgotten or older than its window, is forwarded. The target prefers the duplicate.
 - **Identity is advisory.** Under [ADR `deployment-threat-model`](deployment-threat-model.md) it
   protects against accident, not a peer that lies about who it is.
@@ -246,6 +248,8 @@ committed since the last cursor write. The cursor is written by a commit once
 shutdown, with no timer. So the batches that replay are those committed within
 `checkpoint_interval` after the last write, and after an idle period that write can be any
 age. The set includes a batch the sink delivered and a batch it dropped as `Ambiguous`.
+[Narrowed for the native hop by "Amendment: W4 decisions (2026-10-01)": `logit_in` doesn't
+forward a replayed batch at or below its sender's mark.]
 
 `buffer.disk:` with `at_most_once` stays valid. Posture governs the retry of an unknown outcome
 while the process runs, and `at_most_once` then holds across a graceful restart, which persists
