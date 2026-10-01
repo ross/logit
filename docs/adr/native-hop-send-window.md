@@ -109,7 +109,9 @@ the head alone, and a fault resends the window from the head.
 - **`logit_in` closes with a linger.** On every return of `serve_connection` after the
   handshake, `logit_in` drops its `Fanout` clone, shuts the stream down (`close_notify` under
   TLS), then reads and discards until EOF or `handshake_timeout`. That keeps a `GOING_AWAY` or
-  trailing `Ack`s from being lost to a reset.
+  trailing `Ack`s from being lost to a reset. A sender whose fill outlasts the linger meets a
+  reset after it; Linux hands a reader the bytes received before a reset, so the replies
+  written before the linger still reach it.
 - **No version bump.** `PROTOCOL_VERSION`, the frame `VERSION`, and the codec byte stay as they
   are. `logit` is pre-release, the same posture [ADR
   `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md) took.
@@ -269,10 +271,13 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
 - **`send` is `submit` then `await_ack`.** `send` calls `submit` with the pending context and
   sequence and `in_flight` 0, then `await_ack`, and clears the pending sequence on `Ok`. Direct
   callers and fake peers that answer `window: 1` see today's behavior.
-- **Counters.** `submit` counts in `logit.output.requests` only an `Err` that carries a fault;
-  an unclassified error past the head isn't a returned attempt, and the `await_ack` results
-  that drain the window count its outcome. `await_ack` counts every result, so a `send` still
-  counts once. `logit.output.ack.duration` records one
+- **Counters.** `submit` counts in `logit.output.requests` only an `Err` that carries a fault,
+  and a `Permanent` only at the head: past the head the fill stops and the batch is counted
+  once when it becomes the head. An unclassified error past the head isn't a returned attempt,
+  and the `await_ack` results that drain the window count its outcome. A drift counts once, in
+  `submit`. `await_ack` counts every other result, so a `send` still counts once. Every
+  connection drop, a cancellation included, resets `logit.output.in_flight` to 0 and
+  `logit.output.window` to 1. `logit.output.ack.duration` records one
   sample per `await_ack`. New gauges: `logit.output.in_flight` and `logit.output.window`.
 - **`logit_in`.** It adds `RECEIVER_MAX_WINDOW`, the clamp in `handshake`, `set_nodelay`, and the
   lingering close (`close_lingering(stream, bound)` after the `Fanout` clone is dropped).
