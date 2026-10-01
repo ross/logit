@@ -351,8 +351,9 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   field and graph rule 74, and the tests and allocation pins each workstream adds are listed
   once, in [`docs/plans/native-send-window.md`](../plans/native-send-window.md).
 - **Telemetry.** `logit.component.send.duration` records one sample per windowed round, not per
-  batch, for a `logit_out` with a window above 1. `logit.output.requests` counts each `submit`
-  `Err` and each `await_ack` result. `logit.output.ack.duration` records one sample per
+  batch, for a `logit_out` with a window above 1. `logit.output.requests` counts a `submit` `Err`
+  that carries a fault (a `Permanent` only at the head, a drift once) and every other
+  `await_ack` result. `logit.output.ack.duration` records one sample per
   `await_ack`. Two new gauges, `logit.output.in_flight` and `logit.output.window`, show the
   frames outstanding and the negotiated window. `docs/design/internal-telemetry.md` records all
   four.
