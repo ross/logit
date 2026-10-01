@@ -12,7 +12,7 @@
 //! | `transport:` | Driver | What it brings |
 //! |---|---|---|
 //! | `udp` (the default) | [`UdpListener<StatsdDecoder>`](crate::udp::UdpListener) | the read/decode split, the receive queue, datagram->batch assembly, `SO_RCVBUF` (`docs/adr/decoupled-listener-io.md`); the whole `receive:` block applies |
-//! | `tcp` | [`TcpListener<StatsdDecoder>`](crate::tcp::TcpListener) | an accept loop, the 1024-connection cap, a per-connection decoder clone and batch accumulator, the first-byte deadline, and, with a `tls:` block, TLS termination (`docs/adr/syslog-tcp-ingress-and-tls.md`) |
+//! | `tcp` | [`TcpListener<StatsdDecoder>`](crate::tcp::TcpListener) | an accept loop, the `max_connections:` cap, a per-connection decoder clone and batch accumulator, the first-byte deadline, and, with a `tls:` block, TLS termination (`docs/adr/syslog-tcp-ingress-and-tls.md`) |
 //! | `unix` | [`UdpListener::unix`](crate::udp::UdpListener::unix) | everything `udp` brings, on a `SOCK_DGRAM` Unix socket: the Datadog Agent's `dogstatsd_socket` |
 //! | `unix_stream` | [`TcpListener::unix`](crate::tcp::TcpListener::unix) | everything `tcp` brings but TLS and the accept-queue gauges, on a `SOCK_STREAM` Unix socket: the Agent's `dogstatsd_stream_socket` |
 //!
@@ -434,10 +434,11 @@ impl StatsdInput {
         Ok(self)
     }
 
-    /// Test-only override of the driver's connection cap, so a test reaches it with two
-    /// connections rather than 1025. A UDP listener is left untouched.
-    #[cfg(test)]
-    fn with_max_connections(mut self, max_connections: usize) -> Self {
+    /// Caps the connections a stream listener serves at once, overriding
+    /// [`crate::DEFAULT_MAX_CONNECTIONS`]; `max_connections:` in config. Graph rule 74 rejects `0`
+    /// before it gets here. A datagram listener is left untouched: it has no connections, and
+    /// graph rule 74 rejects a non-default value there.
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_max_connections(max_connections));
         }

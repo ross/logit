@@ -119,6 +119,10 @@ mod tests {
 
     #[test]
     fn the_capacity_follows_the_connection_cap() {
+        assert_eq!(
+            SenderTable::new(crate::DEFAULT_MAX_CONNECTIONS, Telemetry::default()).capacity,
+            crate::DEFAULT_MAX_CONNECTIONS + crate::DEFAULT_MAX_CONNECTIONS / 4
+        );
         assert_eq!(SenderTable::new(1024, Telemetry::default()).capacity, 1280);
         assert_eq!(SenderTable::new(1, Telemetry::default()).capacity, 1);
         assert_eq!(SenderTable::new(0, Telemetry::default()).capacity, 1);

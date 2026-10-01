@@ -27,9 +27,9 @@ components:
     #   client_ca_file: ca.pem    # omit for server-auth-only TLS; set it to require a client cert
     # Off by default, and set here because senders write on a fixed cadence: a connection quiet
     # for a minute is not coming back. It also bounds a request whose body stalls mid-upload,
-    # which otherwise holds one of the listener's 1024 connection permits until the sender goes
-    # away (docs/adr/idle-connection-timeout.md). 60s clears Prometheus's 30s default
-    # `remote_timeout`.
+    # which otherwise holds one of the listener's `max_connections` permits (1024 by default)
+    # until the sender goes away (docs/adr/idle-connection-timeout.md). 60s clears Prometheus's
+    # 30s default `remote_timeout`.
     idle_timeout: 60s
     # A 1.0 sender ships metric metadata in requests of its own, on its own schedule, so without
     # this cache nearly every request decodes as untyped series: nothing is lost, but a counter's

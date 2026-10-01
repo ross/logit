@@ -34,10 +34,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// The most concurrent HTTP/2 streams one connection may open: hyper 1.11.1's own server default,
 /// pinned here so a hyper upgrade cannot move it.
 ///
-/// A listener's worst case is `MAX_CONCURRENT_CONNECTIONS × MAX_CONCURRENT_STREAMS × 2 ×
+/// A listener's worst case is `max_connections × MAX_CONCURRENT_STREAMS × 2 ×
 /// MAX_REQUEST_BYTES`: a compressed body and its decompressed copy on every stream of every
-/// connection. For `otlp_in` that is 1024 × 200 × 2 × 4 MiB = 1.6 TiB, a bound on what peers could
-/// make the process try to allocate, not a memory budget
+/// connection. For `otlp_in` at the default cap of 1024 that is 1024 × 200 × 2 × 4 MiB =
+/// 1.6 TiB, a bound on what peers could make the process try to allocate, not a memory budget
 /// (`docs/adr/untrusted-input-bounds.md`'s "HTTP and gRPC listeners" section).
 pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 200;
 
