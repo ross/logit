@@ -2720,10 +2720,12 @@ reconnecting doesn't show as `connection_error` on the far end.
   write that fails with nothing in flight; `clean` is any failure before the frame is fully
   written and flushed, `ambiguous` only a lost or refused ack), `logit.output.reconnects` (should
   stay near zero in steady state; a climbing count means the peer or the network is unstable),
-  `logit.output.ack.duration`, `logit.output.in_flight` (a gauge of frames awaiting an `Ack`; one
-  that sits at the window means the round trip or the peer's forwarding is the limit, and raising
-  `window` helps only in the first case), and `logit.output.window` (a gauge of the negotiated
-  window; below the configured `window` means `logit_in` answered less).
+  `logit.output.ack.duration`, `logit.output.in_flight` (a gauge of frames awaiting an `Ack`, 0
+  with no connection; one that sits at the window means the round trip or the peer's forwarding
+  is the limit, and raising `window` helps only in the first case), and `logit.output.window` (a
+  gauge of the live connection's negotiated window, 1 with no connection, after a drop or a
+  shutdown included; below the configured `window` on a live connection means `logit_in`
+  answered less).
 - `logit_in`: `logit.input.connections` (a gauge that should match the number of connected
   `logit_out` peers), `logit.input.connections.rejected{reason="limit"}` (nonzero means the
   1024-connection cap is binding; raise it or shed load upstream), and `logit.proto.errors{reason}`
