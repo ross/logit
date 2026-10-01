@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-09-30
+updated: 2026-10-01
 ---
 
 # Enabling plan: delivery semantics — at-least-once per hop, and an effectively-once native hop
@@ -83,31 +83,71 @@ default drops.
 
 ### W4: the native hop's wire record
 
-A record that supersedes "Sequence numbers are implicit" in [ADR
-`native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md). It decides:
+Answered by [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md),
+which supersedes "Sequence numbers are implicit" in [ADR
+`native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md). The record
+answers each of these:
 
-- where the identity travels (`Hello`) and what it is;
-- where the sequence travels: a field on the data frame, a control frame ahead of it, or the
-  frame header's reserved bytes;
-- how a disk spool's record carries the sequence, and what an old spool's records replay as;
-- the window's size and bound per sender, the bound on senders, and eviction;
-- what `Ack.seq` means once sequences outlive a connection;
-- how a restart without a spool takes a new identity, and how a spool whose records have all
-  been unlinked recovers its next sequence number or takes a new identity too;
-- the counter for a recognized resend.
+- [x] where the identity travels and what it is (the v2 batch trailer, not `Hello`; 16 bytes,
+  fresh per store open);
+- [x] where the sequence travels (the v2 batch trailer, per frame);
+- [x] how a disk spool's record carries the sequence (inside the frame's trailer), and what an
+  old spool's records replay as (unsequenced, forwarded);
+- [x] the window's size and bound per sender (a high-water mark, one number), the bound on
+  senders (`max_connections + max_connections / 4`), and eviction (least recently seen);
+- [x] what `Ack` means once sequences outlive a connection (the frame is handled; it carries no
+  fields);
+- [x] how a restart without a spool takes a new identity, and what a spool whose records were all
+  unlinked does (takes a new identity; nothing recovers a number);
+- [x] the counter for a recognized resend (`logit.input.batches.resends`).
 
 The native-transport record rejected an explicit `seq` field so that one frame's bytes serve a
-socket and a file. W4 says whether that still holds.
+socket and a file. That no longer binds: `logit_out` re-encodes on every attempt and the spool
+decodes every record.
 
 ### W5: the native hop's implementation
 
-- `logit_out`, `logit_in`, `crates/logit-proto/src/native/control.rs`, and
-  `crates/logit-pipeline/src/disk_queue.rs`, per W4.
-- Tests: a resend after a lost `Ack` is forwarded once; a spool replay after a crash is
-  forwarded once; a frame outside the window is forwarded; a sender with a new identity isn't
-  read as a resend.
-- A fuzz target for any new decoder surface, per
+Per [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md):
+
+- **Trailer tags.** Tag 3 (sender identity, 16 bytes) and tag 4 (sequence, uvarint, first value
+  1) in `crates/logit-proto/src/native/mod.rs`, with the unsequenced rule on decode.
+- **`SeqId` beside `BatchContext`.** `SeqId { id: [u8; 16], seq: u64 }`, `Copy`, through
+  `SinkStore::push`, `peek`, and `Output::observe_batch`, never on `BatchContext` or `Delivered`.
+- **Store numbering.** A fresh identity per open and numbering in push order in
+  `crates/logit-pipeline/src/queue.rs` and `crates/logit-pipeline/src/disk_queue.rs`.
+  `parse_record` returns the pair, and `CONTEXT_LEN`'s doc names a trailer tag alongside a codec
+  byte.
+- **`Ack`.** Emptied in `crates/logit-proto/src/native/control.rs`, and the
+  `Ack.seq == conn.seq` check removed from `logit_out`.
+- **The table.** One per `logit_in` component, built in `run_until_shutdown`, with the mark
+  rule, the `max_connections + max_connections / 4` bound, and least-recently-seen eviction.
+- **Counters.** `logit.input.batches.resends`, `logit.input.senders`, and
+  `logit.input.senders.evicted`.
+- **Known gap.** A `docs/known-gaps.md` entry for the parked-forward race.
+- **Stale text.** `logit_out`'s module doc ("Ack wait" and "Delivery posture"), the module doc
+  and `Ack`'s doc in `control.rs`, and the doc on `logit_out`'s `Conn::seq`.
+- **Pins**, each updated in the same commit as `docs/design/memory.md`:
+  - `disk_queue_push_one_batch`: 34, likely 35 unless the trailer is written straight into the
+    output buffer;
+  - `disk_queue_peek_cached_costs_nothing`: stays 0, because `SeqId` is `Copy`;
+  - `the_largest_message_of_each_type_fits_the_control_message_cap`'s `Ack` literal;
+  - the `ack.seq` assertions and the `control_frame_len(&control::Ack { .. })` call in
+    `logit_in`'s tests;
+  - the exact-size spool helpers `one_counter_record_len`, `encoded_record_len`, and
+    `raw_record`.
+- **Tests:**
+  - a resend after a lost `Ack` is forwarded once;
+  - a spool replay after a crash is forwarded once;
+  - an unsequenced frame is forwarded;
+  - a new identity after a restart isn't read as a resend;
+  - a replayed record keeps its recorded identity;
+  - a batch dropped and then replayed stays dropped;
+  - a sender evicted from the table is forwarded;
+  - two `logit_in` components don't share a table.
+- **Fuzzing.** Seeds for tags 3 and 4 in the `native_batch_v2` target, per
   [ADR `out-of-ci-fuzzing`](../adr/out-of-ci-fuzzing.md).
+- **Identity independence.** Verify that `random_id_bytes` gives independent identities across
+  processes.
 - Measure the native relay on the perf VM before and after.
 
 ### W6: operator docs
@@ -129,7 +169,8 @@ W6 can land in pieces with the workstream each piece describes.
   closed consumer doesn't propagate as a shutdown signal: W3 answers the input's half only (ADR
   `delivery-semantics`, "Amendment: W3 decisions (2026-09-30)"). `splunk_hec_in` answers `500`
   code 8 for a later batch, in the same amendment.
-- **W4:** everything its list names.
+- **W4 (answered):** everything its list names, in [ADR
+  `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md).
 - **W1 (answered):** `stdio_out`'s module doc, in `crates/logit-outputs/src/stdio.rs`, now says
   that a write error is `Permanent` and never retried, that `file_out`'s failed re-open after a
   rotation is `Clean` and retries under both postures, and that posture decides only a write the

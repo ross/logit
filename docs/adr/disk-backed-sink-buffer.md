@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-09-26
+updated: 2026-10-01
 ---
 
 # Disk-backed durable buffering for a sink's delivery queue
@@ -487,3 +487,18 @@ claims in "Shutdown" above. Today a send can land in the channel after the sweep
 still drops nothing". Separately, the spool's overshoot of `disk.max_bytes` isn't bounded by the
 channel's capacity today: the inbox stays open while the sweep awaits each `store.push`, so
 producers refill it. A closed inbox can't refill, and the bound holds.
+
+## Amendment: a record carries its sender identity and sequence in the v2 trailer (2026-10-01)
+
+[ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md) has the spool
+write a sender identity and a sequence into each record's v2 trailer, as tags 3 and 4.
+
+- **Record evolution.** The 24-byte context prefix still never widens, and anything new still
+  rides inside the frame. That now includes a new tag in the v2 trailer as well as a new codec
+  byte: `native::decode_batch_v2` skips a tag it doesn't know, so an older binary replays such a
+  record without the new field, and a record written before the change replays unsequenced.
+- **Phantom records.** The known limit in "Amendment: an in-cap corrupt length is corruption,
+  not a torn tail", a resync reading a record
+  embedded in a payload as a phantom record, gains a consequence on the native hop: a phantom
+  that carries the current identity and a high number raises `logit_in`'s mark for that
+  identity, and the real records after it are then dropped as resends.

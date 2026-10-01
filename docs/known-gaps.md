@@ -372,7 +372,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - **Credit-based flow control (`window` > 1).** `Hello`/`HelloAck` negotiate and record a
     `window`, but the sender only ever has one frame outstanding. Several in-flight frames
     acknowledged out of order need `logit-pipeline`'s `SinkQueue` to track more than one
-    outstanding batch: a real queue-shape change, not designed yet.
+    outstanding batch: a real queue-shape change, not designed yet. The sequence [ADR
+    `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md) adds is a
+    deduplication identity, not a credit, and `Ack` carries no sequence.
   - **QUIC.** TCP only today; a plausible later transport upgrade, not attempted.
   - **An OTLP passthrough codec.** Whether the native protocol should carry OTLP-encoded payloads
     unmodified (a relay forwarding OTLP without re-encoding into native) is an open question in
@@ -541,9 +543,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `logit_out` and `logit_in`. As built, `Ack.seq` counts frames on one connection and restarts
   on a reconnect, and `logit_in` forwards every frame it receives. Under the default,
   `at_least_once`, a resend after a lost `Ack`, and a `buffer.disk:` replay after a crash, reach
-  `logit_in`'s consumers twice, and a `statsd_out` or an aggregated kind among them double-counts. Until the
-  wire layout has its own record (the plan's W4 and W5), `buffer.delivery: at_most_once` on a
-  `logit_out` whose far side feeds a counter sink avoids that at the cost of the batch.
+  `logit_in`'s consumers twice, and a `statsd_out` or an aggregated kind among them double-counts.
+  [ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md) decides the
+  layout: a sender identity and a sequence in each frame's v2 trailer, and a high-water mark per
+  identity at `logit_in`. The plan's W5 implements it. Until it lands,
+  `buffer.delivery: at_most_once` on a `logit_out` whose far side feeds a counter sink avoids the
+  double count at the cost of the batch.
 
 - ~~**`logit_in` acknowledges a batch no consumer took.**~~ **Closed 2026-09-30:** `Fanout`'s sends return whether any consumer took the batch, and `logit_in` answers `Reject{GOING_AWAY}` and closes for a frame none took. `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s receiver answer their protocol's retryable failure, and `tail_in` and `docker_in` freeze their checkpoint and stop (ADR `delivery-semantics`, item 3, and its W3 amendment).
 
