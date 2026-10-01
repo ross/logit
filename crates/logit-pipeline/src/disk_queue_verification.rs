@@ -264,7 +264,7 @@ fn walk_with_timeout(bytes: Vec<u8>) -> (Vec<(u64, u64, String)>, WalkOutcome) {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut emitted = Vec::new();
-        let outcome = walk_segment(&bytes, 0, |offset, _, batch, len| {
+        let outcome = walk_segment(&bytes, 0, |offset, _, batch, _, len| {
             emitted.push((offset, len, marker_of(&batch)));
         });
         let _ = tx.send((emitted, outcome));
@@ -475,13 +475,12 @@ fn seed_specs() -> Vec<RecordSpec> {
 /// the record whole where it was: the run reads as garbage after it.
 #[test]
 fn an_insert_that_reproduces_a_record_boundary_leaves_it_untouched() {
-    assert_eq!(encode(&seed_specs()).0.len(), 288, "the offset below was resolved for 288 bytes");
+    assert_eq!(encode(&seed_specs()).0.len(), 372, "the offset below was resolved for 372 bytes");
     let case = build_resolved(
         &seed_specs(),
-        // 143 is `Index(9137950036896871591).index(288 + 1)` for this 288-byte segment, as
-        // proptest 1.11's `Index::index` computes it: `(len * raw) >> 64`. It is one byte before
-        // the end of `r1` (72..144), and the run repeats that last byte.
-        Resolved::Insert { at: 143, bytes: vec![0, 129, 13, 44, 13] },
+        // 185 is one byte before the end of `r1` (93..186), and the run repeats that last byte,
+        // the sequence number 1 that ends the record's trailer.
+        Resolved::Insert { at: 185, bytes: vec![1, 129, 13, 44, 13] },
     );
     if let Err(err) = check_walk(&case) {
         panic!("{err}\n{case:?}");
@@ -535,7 +534,7 @@ fn open_and_drain(dir: &Path) -> (Vec<String>, f64, f64) {
             let next = tokio::time::timeout(WALK_TIMEOUT, q.peek())
                 .await
                 .expect("peek must not stop responding");
-            let Some((batch, _)) = next else { break };
+            let Some((batch, ..)) = next else { break };
             delivered.push(marker_of(&batch));
             q.commit().expect("commit what was just peeked");
         }
@@ -755,7 +754,7 @@ fn push_waking_if_parked(
                     biased;
                     () = push.as_mut() => break,
                     peeked = q.peek() => {
-                        if let Some((batch, _)) = peeked {
+                        if let Some((batch, ..)) = peeked {
                             q.commit().expect("commit what was just peeked");
                             committed.push(id_of(&marker_of(&batch)));
                         }
@@ -928,7 +927,7 @@ fn drive_spool_model(
                 corrupt += corrupt_count(&registry.drain(0));
             }
             SpoolOp::Commit => {
-                if let Some((batch, _)) = q.commit() {
+                if let Some((batch, ..)) = q.commit() {
                     on_commit(&mut m, id_of(&marker_of(&batch)))?;
                 }
                 let events = registry.drain(0);
@@ -941,7 +940,7 @@ fn drive_spool_model(
                 loop {
                     let wait = if m.depth > 0.0 { MODEL_TIMEOUT } else { EMPTY_PEEK_WAIT };
                     let peeked = rt.block_on(async { tokio::time::timeout(wait, q.peek()).await });
-                    let Ok(Some((batch, _))) = peeked else {
+                    let Ok(Some((batch, ..))) = peeked else {
                         prop_assert!(
                             !m.must_deliver(),
                             "peek stopped responding with a queued record undelivered"
@@ -1015,7 +1014,7 @@ fn drive_spool_model(
         if peeked.is_none() {
             break;
         }
-        let (batch, _) = q.commit().expect("commit what was just peeked");
+        let (batch, ..) = q.commit().expect("commit what was just peeked");
         on_commit(&mut m, id_of(&marker_of(&batch)))?;
     }
     q.wait_for_persists_blocking();

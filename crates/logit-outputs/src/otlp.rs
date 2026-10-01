@@ -62,7 +62,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as GrpcClient;
 use hyper_util::rt::TokioExecutor;
 use logit_core::{CountGate, Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::{BatchContext, Fault};
+use logit_pipeline::{BatchContext, Fault, SeqId};
 use logit_proto::otlp::OtlpEncoder;
 use logit_proto::{Signal, SignalEncoder};
 // For the test module's TLS server (`test_server_tls_config`); client TLS lives in `crate::tls`.
@@ -447,7 +447,7 @@ fn new_encoder(telemetry: &Telemetry, diag: &Diagnostics, gate: &CountGate) -> O
 #[async_trait::async_trait]
 impl Output for OtlpOutput {
     /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext) {
+    fn observe_batch(&mut self, _ctx: BatchContext, _seq: Option<SeqId>) {
         self.accounting.observe();
     }
 

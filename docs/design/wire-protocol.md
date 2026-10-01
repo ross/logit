@@ -76,8 +76,17 @@ it (`docs/design/pipeline-graph.md`'s "Provenance propagation",
 ```
 payload_v2 := dict | resource attrs | uvarint(event_count) | events...
             | uvarint(trailer_len) | trailer_bytes[trailer_len]
-trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*   -- tag 1 = origin, tag 2 = previous
+trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*
+                 -- tag 1 = origin, tag 2 = previous,
+                 -- tag 3 = sender identity ([u8; 16]), tag 4 = sequence (uvarint, from 1)
 ```
+
+Tags 3 and 4 are the native hop's sender identity and sequence
+([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)), written
+together or not at all. A frame without one well-formed tag 3 and one well-formed tag 4 is
+unsequenced, not malformed: a wrong-length identity, a sequence of 0 or with bytes left over, a
+lone tag, or a repeated tag decodes with no pair. A field of any tag that overruns the trailer or
+the 4096-byte field cap still fails the whole payload.
 
 `encode_batch_v2`/`decode_batch_v2` call `encode_batch`/`decode_batch` and add the trailer around
 them. The v1 encoding itself is not stable across releases: ADR `metrics-model-v2` reshaped every
@@ -350,7 +359,7 @@ decision record.
   |---|---|---|
   | `Hello` | `version`, `codecs`, `compressions`, `max_frame_bytes`, `window` | the connecting side, first |
   | `HelloAck` | `version`, `codec`, `compression`, `max_frame_bytes`, `window` | the listener, once, in reply to a valid `Hello` |
-  | `Ack` | `seq` | the listener, once per data frame forwarded |
+  | `Ack` | none | the listener, once per data frame handled: forwarded, or recognized as a resend and not forwarded |
   | `Reject` | `code`, `message` | either side, closing the connection |
 
 - **Handshake.** The connecting side sends `Hello`. The listener replies with `HelloAck` (codec
@@ -361,9 +370,10 @@ decision record.
   again. A control message is at most `control::MAX_CONTROL_MESSAGE_BYTES` (4096) bytes, and
   each side refuses a longer one on its header: `logit_in` for a `Hello`, `logit_out` for a
   reply.
-- **Sequence numbers are implicit.** TCP is ordered, so the Nth data frame on a connection is seq
-  N, and `Ack.seq` is the cumulative count the receiver has forwarded. The native payload carries
-  no transport fields.
+- **Sender identity and sequence ride in the v2 trailer.** The sink's store assigns each batch
+  a 16-byte sender identity and a sequence number, and `logit_out` writes them into the v2
+  trailer. `Ack` carries no sequence: one frame is in flight per connection, so it answers the
+  one frame outstanding ([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)).
 - **Acknowledgement point:** after the batch is in every downstream inbox (`Fanout::send` returns
   on the listener side), not when it decodes. A stalled downstream delays the ack, which stalls the
   sender's next frame. That is the protocol's backpressure, and it's why `logit_in` needs no

@@ -1,5 +1,5 @@
 //! The `logit_in`/`logit_out` control messages: `Hello`/`HelloAck` (the version, codec, and
-//! compression handshake), `Ack` (cumulative acknowledgement), and `Reject` (a clean refusal).
+//! compression handshake), `Ack` (the frame is handled), and `Reject` (a clean refusal).
 //! ADR `native-transport-handshake-and-ack` has the protocol.
 //!
 //! A control message rides in an ordinary frame with [`crate::frame::FLAG_CONTROL`] set. Its
@@ -234,32 +234,22 @@ impl HelloAck {
 
 // -- Ack -------------------------------------------------------------------------------------
 
-/// Cumulative acknowledgement: every data frame through `seq` is forwarded. Sequence numbers are
-/// implicit: TCP is ordered, so the Nth data frame on a connection is seq N.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Ack {
-    pub seq: u64,
-}
-
-const ACK_FIELD_SEQ: u8 = 1;
+/// The frame is handled: forwarded, or recognized as a resend at or below its sender's mark and
+/// not forwarded. Names nothing: one frame is in flight per connection. Never a sequence
+/// acknowledgment (ADR `native-hop-identity-and-sequence`, decision 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Ack;
 
 impl Ack {
     pub fn encode(&self) -> Bytes {
-        let mut out = BytesMut::new();
-        out.extend_from_slice(&[MSG_ACK]);
-        write_field(&mut out, ACK_FIELD_SEQ, |buf| write_uvarint(buf, self.seq));
-        out.freeze()
+        Bytes::from_static(&[MSG_ACK])
     }
 
+    /// Validates and skips every field, so a field from another protocol revision (an older
+    /// `logit_in`'s sequence at tag 1) decodes to `Ack`.
     fn decode_fields(mut body: Bytes) -> Result<Self, CodecError> {
-        let mut seq = 0u64;
-        while let Some((tag, mut field)) = read_field(&mut body)? {
-            match tag {
-                ACK_FIELD_SEQ => seq = read_uvarint(&mut field)?,
-                _unknown => {}
-            }
-        }
-        Ok(Ack { seq })
+        while let Some((_tag, _field)) = read_field(&mut body)? {}
+        Ok(Ack)
     }
 
     pub fn decode(bytes: &mut Bytes) -> Result<Self, CodecError> {
@@ -443,9 +433,15 @@ mod tests {
 
     #[test]
     fn ack_round_trips() {
-        let ack = Ack { seq: 42 };
-        let mut encoded = ack.encode();
-        assert_eq!(Ack::decode(&mut encoded).unwrap(), ack);
+        let mut encoded = Ack.encode();
+        assert_eq!(&encoded[..], &[MSG_ACK]);
+        assert_eq!(Ack::decode(&mut encoded).unwrap(), Ack);
+    }
+
+    #[test]
+    fn an_ack_carrying_an_older_seq_field_decodes() {
+        let mut bytes = Bytes::from_static(&[MSG_ACK, 1, 1, 42]);
+        assert_eq!(Ack::decode(&mut bytes).unwrap(), Ack);
     }
 
     #[test]
@@ -493,7 +489,7 @@ mod tests {
                 window: u32::MAX,
             }
             .encode(),
-            Ack { seq: u64::MAX }.encode(),
+            Ack.encode(),
             Reject { code: u16::MAX, message: "x".repeat(MAX_REJECT_MESSAGE_BYTES) }.encode(),
         ];
         let lens: Vec<usize> = largest.iter().map(Bytes::len).collect();
@@ -535,8 +531,7 @@ mod tests {
 
     #[test]
     fn decoding_the_wrong_message_type_is_a_clear_error() {
-        let ack = Ack { seq: 1 };
-        let mut encoded = ack.encode();
+        let mut encoded = Ack.encode();
         assert!(matches!(HelloAck::decode(&mut encoded), Err(CodecError::Malformed(_))));
     }
 
@@ -557,7 +552,7 @@ mod tests {
                 max_frame_bytes: 1,
                 window: 1,
             }),
-            ControlMessage::Ack(Ack { seq: 7 }),
+            ControlMessage::Ack(Ack),
             ControlMessage::Reject(Reject { code: REJECT_GOING_AWAY, message: "bye".to_string() }),
         ] {
             let mut encoded = msg.encode();

@@ -93,10 +93,13 @@ async fn round_trip_with_provenance(
         let _ = input.run(sink).await;
     });
 
-    output.observe_batch(logit_pipeline::BatchContext {
-        trace: logit_pipeline::TraceContext::new_root(),
-        provenance,
-    });
+    output.observe_batch(
+        logit_pipeline::BatchContext {
+            trace: logit_pipeline::TraceContext::new_root(),
+            provenance,
+        },
+        None,
+    );
     output.send(batch).await.expect("send should succeed against a live logit_in");
 
     // Every delivered batch is already queued, as in [`round_trip`].

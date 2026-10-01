@@ -14,9 +14,12 @@
 //!
 //! A **record** is 24 raw bytes of [`TraceContext`] (16-byte `trace_id`, 8-byte `span_id`;
 //! unversioned, see `CONTEXT_LEN`) followed by one `logit_proto::frame` native frame. The frame's
-//! codec byte (`CODEC_NATIVE_V1` or `_V2`) tells [`parse_record`] whether a
-//! [`logit_core::Provenance`] trailer follows the batch. `frame::resync` can recover past a
-//! corrupt record because `MAGIC` always immediately follows a record's 24 context bytes.
+//! codec byte (`CODEC_NATIVE_V1` or `_V2`) tells [`parse_record`] whether a v2 trailer follows the
+//! batch: its [`logit_core::Provenance`], then the native-hop sender identity and sequence the
+//! store numbered it with (`docs/adr/native-hop-identity-and-sequence.md`, decision 3). A replayed
+//! record goes out under the pair it was written with, never the reopened store's.
+//! `frame::resync` can recover past a corrupt record because `MAGIC` always immediately follows a
+//! record's 24 context bytes.
 //!
 //! **Only the read cursor is persisted.** The write side resumes at the end of the
 //! highest-numbered segment, validated frame by frame at [`DiskQueue::open`]. Every other segment
@@ -58,16 +61,17 @@ use crate::atomic_write::{self, AtomicWriteError};
 use crate::fanout::{BatchContext, TraceContext};
 use crate::fault::{sites, Op, Point};
 use crate::fault_io;
-use crate::queue::{OverflowPolicy, SINK_QUEUE_METRICS};
+use crate::queue::{Numbering, OverflowPolicy, StoreItem, SINK_QUEUE_METRICS};
 use logit_core::{Diagnostics, EventBatch, Provenance, Telemetry};
 use logit_proto::frame::{self, Compression};
-use logit_proto::native;
+use logit_proto::native::{self, SeqId};
 use logit_proto::CodecError;
 
 /// `[trace_id: 16][span_id: 8]`, ahead of the frame. Never widen it: a record carries no version,
 /// so a wider prefix would misparse every already-spooled record. Anything new rides inside the
-/// frame under a new codec byte, as `Provenance` does with `CODEC_NATIVE_V2`: a `V1` record still
-/// replays with empty provenance, and a binary that doesn't know `V2` resyncs past it
+/// frame, under a new codec byte (as `Provenance` does with `CODEC_NATIVE_V2`) or a new v2 trailer
+/// tag (as the sender identity and sequence do). A `V1` record still replays with empty
+/// provenance and no sequence, and a binary that doesn't know `V2` resyncs past it
 /// (`docs/adr/batch-provenance-on-delivered.md`).
 pub(crate) const CONTEXT_LEN: usize = 24;
 
@@ -151,13 +155,16 @@ pub(crate) fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
 }
 
 /// Parses one record (`[24-byte trace context][native frame]`) off the front of `buf`, returning
-/// its context, batch, and byte length. `Truncated` means `buf` doesn't hold a whole record yet;
-/// any other error means the bytes are wrong and the caller should resync
+/// its context, batch, recorded sequence, and byte length. `Truncated` means `buf` doesn't hold a
+/// whole record yet; any other error means the bytes are wrong and the caller should resync
 /// (`docs/design/wire-protocol.md`).
 ///
-/// `CODEC_NATIVE_V1` decodes with `Provenance::default()`, `CODEC_NATIVE_V2` with its trailer;
-/// any other codec byte is an error.
-fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, usize), CodecError> {
+/// `CODEC_NATIVE_V1` decodes with `Provenance::default()` and no sequence, `CODEC_NATIVE_V2` with
+/// its trailer, whose sequence is `None` when the record carries no well-formed pair; any other
+/// codec byte is an error.
+fn parse_record(
+    buf: &[u8],
+) -> Result<(BatchContext, Arc<EventBatch>, Option<SeqId>, usize), CodecError> {
     if buf.len() < CONTEXT_LEN {
         return Err(CodecError::Truncated { needed: CONTEXT_LEN - buf.len() });
     }
@@ -174,9 +181,9 @@ fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, usize), Co
     // No decode budget: `push` encoded this record from a batch that was already this size in
     // memory, and a budget refusal here would discard a spooled batch as corrupt.
     let budget = native::DecodeBudget::unlimited();
-    let (batch, provenance) = match codec {
+    let (batch, provenance, seq) = match codec {
         native::CODEC_NATIVE_V1 => {
-            (native::decode_batch(&mut payload, &budget)?, Provenance::default())
+            (native::decode_batch(&mut payload, &budget)?, Provenance::default(), None)
         }
         native::CODEC_NATIVE_V2 => native::decode_batch_v2(&mut payload, &budget)?,
         other => {
@@ -189,7 +196,7 @@ fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, usize), Co
     };
     let consumed_frame = before - rest.len();
     let ctx = BatchContext { trace, provenance };
-    Ok((ctx, Arc::new(batch), CONTEXT_LEN + consumed_frame))
+    Ok((ctx, Arc::new(batch), seq, CONTEXT_LEN + consumed_frame))
 }
 
 /// The result of walking every record in a byte range.
@@ -202,7 +209,7 @@ pub(crate) struct WalkOutcome {
 }
 
 /// Walks every record in `bytes` from `start_offset` (`bytes[0]` is the segment's byte 0),
-/// calling `on_record(offset, ctx, batch, len)` for each clean one.
+/// calling `on_record(offset, ctx, batch, seq, len)` for each clean one.
 ///
 /// A record that fails to parse resyncs forward with `frame::resync`, backing up over the
 /// 24-byte context prefix it doesn't know about. The scan starts `CONTEXT_LEN + 1` bytes past
@@ -224,15 +231,15 @@ pub(crate) struct WalkOutcome {
 pub(crate) fn walk_segment(
     bytes: &[u8],
     start_offset: u64,
-    mut on_record: impl FnMut(u64, BatchContext, Arc<EventBatch>, u64),
+    mut on_record: impl FnMut(u64, BatchContext, Arc<EventBatch>, Option<SeqId>, u64),
 ) -> WalkOutcome {
     let mut pos = start_offset as usize;
     let mut valid_count = 0u64;
     let mut corrupt_skipped = 0u64;
     while pos < bytes.len() {
         let err = match parse_record(&bytes[pos..]) {
-            Ok((ctx, batch, consumed)) => {
-                on_record(pos as u64, ctx, batch, consumed as u64);
+            Ok((ctx, batch, seq, consumed)) => {
+                on_record(pos as u64, ctx, batch, seq, consumed as u64);
                 valid_count += 1;
                 pos += consumed;
                 continue;
@@ -478,7 +485,7 @@ struct Segment {
 enum ReadOutcome {
     /// A record, and how far the cursor must advance to pass it (past any corrupt bytes skipped
     /// to reach it).
-    Record(BatchContext, Arc<EventBatch>, u64),
+    Record(BatchContext, Arc<EventBatch>, Option<SeqId>, u64),
     /// Corruption with no record after it before the end of the segment: advance this many bytes
     /// without delivering.
     Skip(u64),
@@ -522,6 +529,7 @@ impl WriteError {
 struct HeadCache {
     batch: Arc<EventBatch>,
     ctx: BatchContext,
+    seq: Option<SeqId>,
     record_len: u64,
 }
 
@@ -591,6 +599,9 @@ pub struct DiskQueue {
     compression: Compression,
     checkpoint_interval: Duration,
     inner: Mutex<State>,
+    /// This open's sender identity and next number. A record read back keeps the pair it was
+    /// written with; only a push takes a number from here.
+    numbering: Numbering,
     /// The persist worker, joined by `Drop` (see [`DiskQueue::stop_persist_worker`]). A `Mutex`
     /// only so a test can stop it early through `&self`.
     persist_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -666,7 +677,7 @@ impl DiskQueue {
                 if seq == active_seq {
                     let bytes = std::fs::read(&path)
                         .with_context(|| format!("reading segment {}", path.display()))?;
-                    let outcome = walk_segment(&bytes, 0, |_, _, _, _| {});
+                    let outcome = walk_segment(&bytes, 0, |_, _, _, _, _| {});
                     if outcome.good_len < on_disk_len {
                         fault_io!(
                             SEGMENT_SET_LEN,
@@ -739,7 +750,7 @@ impl DiskQueue {
                 let bytes = std::fs::read(&path)
                     .with_context(|| format!("reading segment {}", path.display()))?;
                 let usable = bytes.len().min(seg.len as usize);
-                let outcome = walk_segment(&bytes[..usable], start, |_, _, _, _| {});
+                let outcome = walk_segment(&bytes[..usable], start, |_, _, _, _, _| {});
                 replayed += outcome.valid_count;
                 corrupt_skipped_total += outcome.corrupt_skipped;
             }
@@ -822,6 +833,8 @@ impl DiskQueue {
             compression: config.compression,
             checkpoint_interval: config.checkpoint_interval,
             inner: Mutex::new(state),
+            // Minted after every fallible step, so a failed open consumes no identity.
+            numbering: Numbering::mint(),
             persist_worker: Mutex::new(Some(persist_worker)),
             #[cfg(test)]
             persist_gate,
@@ -880,14 +893,18 @@ impl DiskQueue {
     /// encoded payload exceeds `MAX_SANE_UNCOMPRESSED_LEN`, or whose write fails, is dropped and
     /// counted, never counted as queued.
     ///
+    /// **Numbering.** The batch takes the next number before anything else, so numbers follow
+    /// push order, and a push that drops the batch or is cancelled leaves a gap.
+    ///
     /// **Cancellation safety.** The record is encoded in memory first. A future dropped at any
     /// write-path `.await` keeps the write handle (see [`HeldWriteFile`]) and leaves at most a
     /// tail past [`State::needs_repair`], which the next push waits out and truncates before it
     /// writes anything.
     pub async fn push(&self, item: (Arc<EventBatch>, BatchContext)) {
+        let seq = self.numbering.next();
         let (batch, ctx) = item;
 
-        let payload = native::encode_batch_v2(&batch, ctx.provenance);
+        let payload = native::encode_batch_v2(&batch, ctx.provenance, Some(seq));
         // `write_frame` fails for a payload over `MAX_SANE_UNCOMPRESSED_LEN` and for
         // `Compression::Zstd`, which `logit_config::Compression` (where `disk.compression` comes
         // from) cannot express, so a failure here is an oversize batch.
@@ -1271,7 +1288,7 @@ impl DiskQueue {
             (state.read_seq, state.read_offset)
         };
         let (batch, len) = match self.read_record_at(seq, offset).await {
-            ReadOutcome::Record(_ctx, batch, len) => (batch, len),
+            ReadOutcome::Record(_ctx, batch, _seq, len) => (batch, len),
             ReadOutcome::Skip(delta) => return self.skip_corrupt(seq, offset, delta),
             ReadOutcome::Unavailable => return false,
         };
@@ -1317,8 +1334,8 @@ impl DiskQueue {
                 return ReadOutcome::Unavailable;
             }
             match parse_record(&buf) {
-                Ok((ctx, batch, consumed)) => {
-                    return ReadOutcome::Record(ctx, batch, consumed as u64)
+                Ok((ctx, batch, seq, consumed)) => {
+                    return ReadOutcome::Record(ctx, batch, seq, consumed as u64)
                 }
                 Err(CodecError::Truncated { needed }) if buf.len() < remaining => {
                     chunk_len = (buf.len() + needed).min(remaining);
@@ -1340,15 +1357,15 @@ impl DiskQueue {
         // counts the corrupt bytes skipped before the record, so the delta is `pos + len`. `len`
         // alone would land the cursor inside the record.
         let mut found = None;
-        let outcome = walk_segment(&whole, 0, |pos, ctx, batch, len| {
+        let outcome = walk_segment(&whole, 0, |pos, ctx, batch, seq, len| {
             if found.is_none() {
-                found = Some((ctx, batch, pos + len));
+                found = Some((ctx, batch, seq, pos + len));
             }
         });
         match found {
-            Some((ctx, batch, delta)) => {
+            Some((ctx, batch, seq, delta)) => {
                 self.count_dropped("disk_corrupt", outcome.corrupt_skipped.max(1));
-                ReadOutcome::Record(ctx, batch, delta)
+                ReadOutcome::Record(ctx, batch, seq, delta)
             }
             None => ReadOutcome::Skip(remaining as u64),
         }
@@ -1532,7 +1549,7 @@ impl DiskQueue {
     /// The head, without removing it. Cached, and reserved against `DropOldest` eviction, until
     /// [`DiskQueue::commit`], so a retry (`write_loop` peeks once per delivery attempt) costs
     /// nothing after the first. `None` once closed and empty.
-    pub async fn peek(&self) -> Option<(Arc<EventBatch>, BatchContext)> {
+    pub async fn peek(&self) -> Option<StoreItem> {
         loop {
             // Roll past a segment the reader finished while it was active and that has since
             // rotated away (see `roll_read_cursor`).
@@ -1540,7 +1557,7 @@ impl DiskQueue {
             let (cached, seq, offset, has_data) = {
                 let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(cache) = &state.head_cache {
-                    (Some((Arc::clone(&cache.batch), cache.ctx)), 0, 0, true)
+                    (Some((Arc::clone(&cache.batch), cache.ctx, cache.seq)), 0, 0, true)
                 } else {
                     let seg_len =
                         state.segments.iter().find(|s| s.seq == state.read_seq).map(|s| s.len);
@@ -1570,10 +1587,11 @@ impl DiskQueue {
             }
 
             match self.read_record_at(seq, offset).await {
-                ReadOutcome::Record(ctx, batch, record_len) => {
+                ReadOutcome::Record(ctx, batch, record_seq, record_len) => {
                     let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                     if state.read_seq == seq && state.read_offset == offset {
-                        state.head_cache = Some(HeadCache { batch, ctx, record_len });
+                        state.head_cache =
+                            Some(HeadCache { batch, ctx, seq: record_seq, record_len });
                     }
                 }
                 ReadOutcome::Skip(delta) => {
@@ -1591,12 +1609,12 @@ impl DiskQueue {
 
     /// Advances the read cursor past the cached head, returning it. `None`, and a no-op, with
     /// nothing peeked.
-    pub fn commit(&self) -> Option<(Arc<EventBatch>, BatchContext)> {
+    pub fn commit(&self) -> Option<StoreItem> {
         let (item, record_len) = {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let cache = state.head_cache.take()?;
             state.queued_records = state.queued_records.saturating_sub(1);
-            ((cache.batch, cache.ctx), cache.record_len)
+            ((cache.batch, cache.ctx, cache.seq), cache.record_len)
         };
         self.advance_read_cursor(record_len);
         self.after_change();
@@ -1750,7 +1768,7 @@ pub(crate) mod test_support {
     use crate::queue::OverflowPolicy;
     use logit_core::{AttrMap, Event, EventBatch, Provenance, Resource, Value};
     use logit_proto::frame::{self, Compression};
-    use logit_proto::native;
+    use logit_proto::native::{self, SeqId};
 
     thread_local! {
         /// Bytes `parse_record` has copied out of its input on this thread.
@@ -1768,13 +1786,17 @@ pub(crate) mod test_support {
         crate::test_util::scratch_dir(&format!("disk-queue-{label}"))
     }
 
+    /// A sequence of 1, which encodes in one byte like every number up to 127.
+    pub(crate) const SEQ_ONE: SeqId = SeqId { id: [0; 16], seq: 1 };
+
     /// The on-disk length `DiskQueue::push` writes for `batch` under `Compression::None`, for
-    /// tests in other modules that size a spool around one record.
+    /// tests in other modules that size a spool around one record. Exact for sequences 1..=127:
+    /// a larger number takes more uvarint bytes in the trailer.
     pub(crate) fn encoded_record_len(
         batch: &logit_core::EventBatch,
         provenance: logit_core::Provenance,
     ) -> u64 {
-        let payload = native::encode_batch_v2(batch, provenance);
+        let payload = native::encode_batch_v2(batch, provenance, Some(SEQ_ONE));
         let framed =
             frame::write_frame(native::CODEC_NATIVE_V2, frame::Compression::None, &payload)
                 .expect("None compression never fails");
@@ -1836,8 +1858,18 @@ pub(crate) mod test_support {
     }
 
     /// The on-disk bytes `DiskQueue::push` writes for one record, for hand-built segment files.
+    /// Carries a sequence of 1, so its length matches a pushed record's for sequences 1..=127.
     pub(crate) fn raw_record(batch: &EventBatch, ctx: BatchContext) -> Vec<u8> {
-        let payload = native::encode_batch_v2(batch, ctx.provenance);
+        raw_record_with(batch, ctx, Some(SEQ_ONE))
+    }
+
+    /// [`raw_record`] with a chosen sequence, `None` for a v2 record with no pair.
+    pub(crate) fn raw_record_with(
+        batch: &EventBatch,
+        ctx: BatchContext,
+        seq: Option<SeqId>,
+    ) -> Vec<u8> {
+        let payload = native::encode_batch_v2(batch, ctx.provenance, seq);
         let framed = frame::write_frame(native::CODEC_NATIVE_V2, Compression::None, &payload)
             .expect("None compression never fails");
         let mut record = Vec::with_capacity(CONTEXT_LEN + framed.len());
@@ -1861,7 +1893,8 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        batch, config, ctx, marker_of, metric_sum, raw_record, raw_record_v1, scratch_dir,
+        batch, config, ctx, marker_of, metric_sum, raw_record, raw_record_v1, raw_record_with,
+        scratch_dir,
     };
     use super::*;
     use crate::fault::{self, errno};
@@ -1891,9 +1924,9 @@ mod tests {
         );
 
         for label in ["a", "b", "c", "d", "e", "f", "g", "h"] {
-            let (peeked, _) = q.peek().await.expect("should peek the next batch");
+            let (peeked, ..) = q.peek().await.expect("should peek the next batch");
             assert_eq!(marker_of(&peeked), label, "delivery order must be FIFO");
-            let (committed, _) = q.commit().expect("should commit what was just peeked");
+            let (committed, ..) = q.commit().expect("should commit what was just peeked");
             assert_eq!(marker_of(&committed), label);
         }
         q.close();
@@ -1916,8 +1949,51 @@ mod tests {
 
         q.push((batch("a"), sent)).await;
 
-        let (_peeked, peeked_ctx) = q.peek().await.expect("should peek the pushed batch");
+        let (_peeked, peeked_ctx, _) = q.peek().await.expect("should peek the pushed batch");
         assert_eq!(peeked_ctx, sent, "trace and provenance should both come back unchanged");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A record read back after a restart goes out under the pair it was written with, so a
+    /// `logit_in` that saw it recognizes the replay; batches pushed after the reopen are a new
+    /// sender from 1 (`docs/adr/native-hop-identity-and-sequence.md`, decision 3).
+    #[tokio::test]
+    async fn a_replayed_record_keeps_its_recorded_identity() {
+        let dir = scratch_dir("replay-keeps-identity");
+        let q = open(dir.clone());
+        q.push((batch("a"), ctx())).await;
+        let (.., seq_a) = q.peek().await.expect("should peek a");
+        let seq_a = seq_a.expect("a pushed record carries its number");
+        assert_eq!(seq_a.seq, 1, "a freshly opened spool numbers from 1");
+        drop(q); // no commit: `a` replays
+
+        let q = open(dir.clone());
+        let (replayed, _, replayed_seq) = q.peek().await.expect("a should replay");
+        assert_eq!(marker_of(&replayed), "a");
+        assert_eq!(replayed_seq, Some(seq_a), "a replay keeps the identity and number it had");
+        q.commit().expect("should commit a");
+
+        q.push((batch("b"), ctx())).await;
+        let (next, _, next_seq) = q.peek().await.expect("should peek b");
+        assert_eq!(marker_of(&next), "b");
+        let next_seq = next_seq.expect("a pushed record carries its number");
+        assert_eq!(next_seq.seq, 1, "the reopened spool is a new sender, numbering from 1");
+        assert_ne!(next_seq.id, seq_a.id, "every open mints a new identity");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A v2 record with no sender pair replays unsequenced, for `logit_in` to forward.
+    #[tokio::test]
+    async fn a_v2_record_without_a_pair_replays_unsequenced() {
+        let dir = scratch_dir("v2-record-no-pair");
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = raw_record_with(&batch("no-pair"), ctx(), None);
+        std::fs::write(segment_path(&dir, 0), &record).unwrap();
+
+        let q = open(dir.clone());
+        let (peeked, _, seq) = q.peek().await.expect("should find the pre-existing record");
+        assert_eq!(marker_of(&peeked), "no-pair");
+        assert_eq!(seq, None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1931,10 +2007,12 @@ mod tests {
         std::fs::write(segment_path(&dir, 0), &record).unwrap();
 
         let q = open(dir.clone());
-        let (peeked, peeked_ctx) = q.peek().await.expect("should find the pre-existing record");
+        let (peeked, peeked_ctx, seq) =
+            q.peek().await.expect("should find the pre-existing record");
         assert_eq!(marker_of(&peeked), "pre-provenance");
         assert_eq!(peeked_ctx.trace, trace);
         assert_eq!(peeked_ctx.provenance, Provenance::default());
+        assert_eq!(seq, None, "a v1 record carries no sender pair and replays unsequenced");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1944,11 +2022,11 @@ mod tests {
         let q = open(dir.clone());
         q.push((batch("only"), ctx())).await;
 
-        let (first, _) = q.peek().await.unwrap();
-        let (second, _) = q.peek().await.unwrap();
+        let (first, ..) = q.peek().await.unwrap();
+        let (second, ..) = q.peek().await.unwrap();
         assert!(Arc::ptr_eq(&first, &second), "repeated peeks before commit should be cached");
 
-        let (committed, _) = q.commit().unwrap();
+        let (committed, ..) = q.commit().unwrap();
         assert!(Arc::ptr_eq(&committed, &first));
         assert!(q.commit().is_none(), "nothing left to commit");
         std::fs::remove_dir_all(&dir).ok();
@@ -1963,7 +2041,7 @@ mod tests {
             q.push((batch("b"), ctx())).await;
             q.push((batch("c"), ctx())).await;
             // Commit only the first.
-            let (peeked, _) = q.peek().await.unwrap();
+            let (peeked, ..) = q.peek().await.unwrap();
             assert_eq!(marker_of(&peeked), "a");
             q.commit().unwrap();
             q.finish().await;
@@ -1971,7 +2049,7 @@ mod tests {
 
         let q2 = open(dir.clone());
         for label in ["b", "c"] {
-            let (peeked, _) = q2.peek().await.unwrap();
+            let (peeked, ..) = q2.peek().await.unwrap();
             assert_eq!(marker_of(&peeked), label);
             q2.commit().unwrap();
         }
@@ -1998,7 +2076,7 @@ mod tests {
         let on_disk = std::fs::metadata(&path).unwrap().len();
         assert_eq!(on_disk, good.len() as u64, "the torn tail should have been truncated away");
 
-        let (peeked, _) = q.peek().await.expect("the one good record should still be there");
+        let (peeked, ..) = q.peek().await.expect("the one good record should still be there");
         assert_eq!(marker_of(&peeked), "good");
         q.commit().unwrap();
 
@@ -2029,11 +2107,11 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let q = open(dir.clone());
-        let (peeked, _) = q.peek().await.unwrap();
+        let (peeked, ..) = q.peek().await.unwrap();
         assert_eq!(marker_of(&peeked), "first");
         q.commit().unwrap();
 
-        let (peeked, _) = q.peek().await.expect("should resync past the corrupt record to third");
+        let (peeked, ..) = q.peek().await.expect("should resync past the corrupt record to third");
         assert_eq!(marker_of(&peeked), "third");
         q.commit().unwrap();
         assert!(q.commit().is_none());
@@ -2053,7 +2131,7 @@ mod tests {
         std::fs::write(&path, &record).unwrap();
 
         let q = open(dir.clone());
-        let (peeked, peeked_ctx) = q.peek().await.expect("should still find the real record");
+        let (peeked, peeked_ctx, _) = q.peek().await.expect("should still find the real record");
         assert_eq!(marker_of(&peeked), "real");
         assert_eq!(peeked_ctx, spurious_ctx);
         std::fs::remove_dir_all(&dir).ok();
@@ -2072,7 +2150,7 @@ mod tests {
         q.push((batch("first"), ctx())).await;
         q.push((batch("second"), ctx())).await;
 
-        let (peeked, _) = q.peek().await.expect("second should have survived, first evicted");
+        let (peeked, ..) = q.peek().await.expect("second should have survived, first evicted");
         assert_eq!(marker_of(&peeked), "second");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2092,13 +2170,13 @@ mod tests {
         let q = DiskQueue::open(cfg, telemetry, Diagnostics::new("test")).unwrap();
 
         q.push((batch("first"), ctx())).await;
-        let (peeked, _) = q.peek().await.expect("should peek the only batch");
+        let (peeked, ..) = q.peek().await.expect("should peek the only batch");
         assert_eq!(marker_of(&peeked), "first");
 
         // Nothing but the reserved head to evict, so this push is rejected.
         q.push((batch("second"), ctx())).await;
 
-        let (still_first, _) = q.commit().expect("the peeked batch must still be first's");
+        let (still_first, ..) = q.commit().expect("the peeked batch must still be first's");
         assert_eq!(marker_of(&still_first), "first");
 
         let events = registry.drain(0);
@@ -2126,7 +2204,7 @@ mod tests {
         q.push((batch("first"), ctx())).await;
         q.push((batch("second"), ctx())).await;
 
-        let (peeked, _) = q.peek().await.unwrap();
+        let (peeked, ..) = q.peek().await.unwrap();
         assert_eq!(marker_of(&peeked), "first", "the new push should have been rejected outright");
         q.commit().unwrap();
         q.close();
@@ -2143,7 +2221,7 @@ mod tests {
         // No cursor.json at all.
 
         let q = open(dir.clone());
-        let (peeked, _) = q.peek().await.expect("should resume from the oldest segment");
+        let (peeked, ..) = q.peek().await.expect("should resume from the oldest segment");
         assert_eq!(marker_of(&peeked), "a");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2157,7 +2235,7 @@ mod tests {
         persist_cursor(&dir, 2, 0).unwrap();
 
         let q = open(dir.clone());
-        let (peeked, _) = q.peek().await.expect("should clamp to the oldest surviving segment");
+        let (peeked, ..) = q.peek().await.expect("should clamp to the oldest surviving segment");
         assert_eq!(marker_of(&peeked), "a");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2173,7 +2251,7 @@ mod tests {
         q.push((batch("b"), ctx())).await;
         assert_eq!(list_segments(&dir).unwrap().len(), 2, "each push should have rotated");
 
-        let (peeked, _) = q.peek().await.unwrap();
+        let (peeked, ..) = q.peek().await.unwrap();
         assert_eq!(marker_of(&peeked), "a");
         q.commit().unwrap();
 
@@ -2224,9 +2302,18 @@ mod tests {
             events: vec![Event::empty(0, attrs)],
         });
         q.push((huge, ctx())).await;
+        q.push((batch("after"), ctx())).await;
 
+        let (next, _, seq) = q.peek().await.expect("the batch after should be queued");
+        assert_eq!(marker_of(&next), "after", "the oversized batch should never have been written");
+        assert_eq!(
+            seq.map(|s| s.seq),
+            Some(2),
+            "the dropped batch consumed number 1, leaving a gap the receiver ignores"
+        );
+        q.commit();
         q.close();
-        assert!(q.peek().await.is_none(), "the oversized batch should never have been written");
+        assert!(q.peek().await.is_none(), "nothing else should have been written");
         let events = registry.drain(0);
         let dropped = metric_sum(
             &events,
@@ -2305,7 +2392,7 @@ mod tests {
 
         // Catch the reader up to the end of the still-active segment 0.
         for label in ["a", "b", "c"] {
-            let (peeked, _) = q.peek().await.expect("should peek the next batch");
+            let (peeked, ..) = q.peek().await.expect("should peek the next batch");
             assert_eq!(marker_of(&peeked), label);
             q.commit().unwrap();
         }
@@ -2315,7 +2402,7 @@ mod tests {
         assert_eq!(list_segments(&dir).unwrap(), vec![0, 1], "the push above should have rotated");
 
         // Without the roll, this parks forever against a segment that never grows again.
-        let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
+        let (peeked, ..) = tokio::time::timeout(Duration::from_secs(5), q.peek())
             .await
             .expect("peek must not hang once the segment it was waiting on has rotated away")
             .expect("d should be delivered");
@@ -2330,7 +2417,7 @@ mod tests {
 
         // The queue keeps flowing afterward.
         q.push((batch("e"), ctx())).await;
-        let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
+        let (peeked, ..) = tokio::time::timeout(Duration::from_secs(5), q.peek())
             .await
             .expect("peek must not hang")
             .expect("e should be delivered");
@@ -2386,12 +2473,12 @@ mod tests {
         registry.drain(0);
 
         // The clean first record.
-        let (peeked, _) = q.peek().await.expect("good should be delivered");
+        let (peeked, ..) = q.peek().await.expect("good should be delivered");
         assert_eq!(marker_of(&peeked), "good");
         q.commit().unwrap();
 
         // This peek must take `read_record_at`'s *live* corruption-resync branch specifically.
-        let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
+        let (peeked, ..) = tokio::time::timeout(Duration::from_secs(5), q.peek())
             .await
             .expect("peek must not hang")
             .expect("should resync live past the corrupt record to next");
@@ -2399,7 +2486,7 @@ mod tests {
         q.commit().unwrap();
 
         // Reaching `last` proves the cursor didn't land inside `next`'s bytes.
-        let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
+        let (peeked, ..) = tokio::time::timeout(Duration::from_secs(5), q.peek())
             .await
             .expect("peek must not hang")
             .expect("should deliver last");
@@ -2452,11 +2539,11 @@ mod tests {
              been resynced past, not mistaken for a torn tail"
         );
 
-        let (peeked, _) = q.peek().await.expect("good should still be delivered");
+        let (peeked, ..) = q.peek().await.expect("good should still be delivered");
         assert_eq!(marker_of(&peeked), "good");
         q.commit().unwrap();
 
-        let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
+        let (peeked, ..) = tokio::time::timeout(Duration::from_secs(5), q.peek())
             .await
             .expect("peek must not hang")
             .expect("after should still be delivered -- pre-fix this would silently vanish");
@@ -2488,7 +2575,7 @@ mod tests {
     /// caller's disk assertions see every cursor persist and unlink those commits queued.
     async fn deliver(q: &DiskQueue, labels: &[&str]) {
         for label in labels {
-            let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
+            let (peeked, ..) = tokio::time::timeout(Duration::from_secs(5), q.peek())
                 .await
                 .expect("peek must not stop responding")
                 .expect("a batch should be queued");
@@ -2666,7 +2753,7 @@ mod tests {
     /// `a_compressed_len_corrupted_below_the_cap_reads_as_truncated`, on `dur/w2`, #323).
     const IN_CAP_CORRUPT_LEN: u32 = 1024 * 1024;
 
-    async fn peek_within(q: &DiskQueue) -> Option<(Arc<EventBatch>, BatchContext)> {
+    async fn peek_within(q: &DiskQueue) -> Option<StoreItem> {
         tokio::time::timeout(Duration::from_secs(5), q.peek())
             .await
             .expect("peek must not stop responding")
@@ -2739,7 +2826,7 @@ mod tests {
 
             deliver(&q, &["good"]).await;
             // Skips the garbage, crossing into segment 1, then reads `next`.
-            let (peeked, _) = peek_within(&q).await.expect("next is still queued");
+            let (peeked, ..) = peek_within(&q).await.expect("next is still queued");
             assert_eq!(marker_of(&peeked), "next");
             let drained = registry.drain(0);
             assert_eq!(
@@ -2783,7 +2870,7 @@ mod tests {
         bytes.extend_from_slice(&b);
 
         let mut emitted: Vec<(u64, u64)> = Vec::new();
-        let outcome = walk_segment(&bytes, 0, |offset, _, _, len| emitted.push((offset, len)));
+        let outcome = walk_segment(&bytes, 0, |offset, _, _, _, len| emitted.push((offset, len)));
 
         let b_at = a.len() as u64 + 1;
         assert_eq!(emitted, vec![(0, a.len() as u64), (b_at, b.len() as u64)]);
@@ -2798,7 +2885,7 @@ mod tests {
         // just past A's end, backed up by `CONTEXT_LEN`, lands inside A, and a record parses
         // there: the last bytes of A plus the filler as its context, then the real frame.
         let a = raw_record(&batch("a"), ctx());
-        let payload = native::encode_batch_v2(&batch("phantom"), Provenance::default());
+        let payload = native::encode_batch_v2(&batch("phantom"), Provenance::default(), None);
         let bare_frame =
             frame::write_frame(native::CODEC_NATIVE_V2, Compression::None, &payload).unwrap();
         for filler in 1..CONTEXT_LEN {
@@ -2807,7 +2894,8 @@ mod tests {
             bytes.extend_from_slice(&bare_frame);
 
             let mut emitted: Vec<(u64, u64)> = Vec::new();
-            let outcome = walk_segment(&bytes, 0, |offset, _, _, len| emitted.push((offset, len)));
+            let outcome =
+                walk_segment(&bytes, 0, |offset, _, _, _, len| emitted.push((offset, len)));
 
             assert_eq!(emitted, vec![(0, a.len() as u64)], "filler {filler}: only A is a record");
             assert_eq!(outcome.corrupt_skipped, 1, "filler {filler}");
@@ -2854,7 +2942,7 @@ mod tests {
         let n = 2_000;
         let (seg, record_len) = healthy_segment(n);
         let before = parse_record_copied();
-        let outcome = walk_segment(&seg, 0, |_, _, _, _| {});
+        let outcome = walk_segment(&seg, 0, |_, _, _, _, _| {});
         assert_eq!(outcome.valid_count, n as u64);
         assert_eq!(outcome.good_len, seg.len() as u64);
         assert_eq!(
@@ -2869,7 +2957,7 @@ mod tests {
         let spurious = 2_000;
         let (seg, good_frame_len) = spurious_magic_segment(spurious, 64 * 1024);
         let before = parse_record_copied();
-        let outcome = walk_segment(&seg, 0, |_, _, _, _| {});
+        let outcome = walk_segment(&seg, 0, |_, _, _, _, _| {});
         assert_eq!(outcome.valid_count, 1);
         assert_eq!(outcome.corrupt_skipped, 1);
         // The bad-magic record and each spurious candidate copy one header; the good record is
@@ -2889,7 +2977,7 @@ mod tests {
         for n in [2_000usize, 8_000, 32_000] {
             let (seg, record_len) = healthy_segment(n);
             let t = std::time::Instant::now();
-            let outcome = walk_segment(&seg, 0, |_, _, _, _| {});
+            let outcome = walk_segment(&seg, 0, |_, _, _, _, _| {});
             eprintln!(
                 "healthy: record_len={record_len} n={n} seg_bytes={} valid={} took={:?}",
                 seg.len(),
@@ -2900,7 +2988,7 @@ mod tests {
         for k in [2_000usize, 8_000, 32_000] {
             let (seg, _) = spurious_magic_segment(k, 1024 * 1024);
             let t = std::time::Instant::now();
-            let outcome = walk_segment(&seg, 0, |_, _, _, _| {});
+            let outcome = walk_segment(&seg, 0, |_, _, _, _, _| {});
             eprintln!(
                 "spurious magics: k={k} seg_bytes={} valid={} skipped={} took={:?}",
                 seg.len(),
@@ -3249,7 +3337,7 @@ mod tests {
                 logit_config::Compression::None => Compression::None,
                 logit_config::Compression::Lz4 => Compression::Lz4,
             };
-            let payload = native::encode_batch_v2(&batch("x"), Provenance::default());
+            let payload = native::encode_batch_v2(&batch("x"), Provenance::default(), None);
             frame::write_frame(native::CODEC_NATIVE_V2, compression, &payload)
                 .unwrap_or_else(|err| panic!("{configured:?} must encode: {err}"));
 
@@ -3343,7 +3431,7 @@ mod tests {
     async fn drain_all(q: &DiskQueue) -> Vec<String> {
         q.close();
         let mut delivered = Vec::new();
-        while let Some((batch, _)) = peek_within(q).await {
+        while let Some((batch, ..)) = peek_within(q).await {
             delivered.push(marker_of(&batch));
             q.commit().unwrap();
         }
@@ -3386,7 +3474,7 @@ mod tests {
             q.push((batch(label), ctx())).await;
         }
         deliver(&q, &["a"]).await;
-        let (peeked, _) = peek_within(&q).await.unwrap();
+        let (peeked, ..) = peek_within(&q).await.unwrap();
         assert_eq!(marker_of(&peeked), "b");
         q
     }
@@ -3592,7 +3680,7 @@ mod tests {
             q.push((batch(label), ctx())).await;
         }
         deliver(&q, &["a"]).await;
-        let (peeked, _) = peek_within(&q).await.unwrap();
+        let (peeked, ..) = peek_within(&q).await.unwrap();
         assert_eq!(marker_of(&peeked), "b");
         // As when shutdown grace expires mid-delivery: `b` was peeked, never committed.
         q.close();
@@ -4001,7 +4089,7 @@ mod tests {
         q.pause_persists();
         // Two rolls queue two jobs: the cursor into segment 1, then into segment 2.
         for label in ["a", "b"] {
-            let (peeked, _) = peek_within(&q).await.unwrap();
+            let (peeked, ..) = peek_within(&q).await.unwrap();
             assert_eq!(marker_of(&peeked), label);
             q.commit().unwrap();
         }

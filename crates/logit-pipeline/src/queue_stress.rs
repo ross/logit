@@ -711,7 +711,7 @@ fn disk_seq(batch: &logit_core::EventBatch) -> u64 {
 async fn drain_disk(q: &DiskQueue) -> Vec<u64> {
     q.close();
     let mut out = Vec::new();
-    while let Some((batch, _)) = q.peek().await {
+    while let Some((batch, ..)) = q.peek().await {
         out.push(disk_seq(&batch));
         q.commit().expect("a peeked head is still there to commit");
     }
@@ -768,8 +768,8 @@ fn disk_scenario(rt: &tokio::runtime::Runtime, seed: u64) {
                 }
                 let cut = pick_cut(&mut consumer_rng, scenario.cancel_per_mille);
                 match race(q.peek(), cut).await {
-                    Some(Some((peeked, _))) => {
-                        let (committed, _) = q.commit().expect("a peeked head is there to commit");
+                    Some(Some((peeked, ..))) => {
+                        let (committed, ..) = q.commit().expect("a peeked head is there to commit");
                         assert_eq!(disk_seq(&committed), disk_seq(&peeked));
                         delivered.push(disk_seq(&committed));
                     }

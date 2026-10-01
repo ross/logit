@@ -151,7 +151,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use logit_core::{Diagnostics, EventBatch, Resource, Telemetry, Value};
-use logit_pipeline::{BatchContext, Fault, Output};
+use logit_pipeline::{BatchContext, Fault, Output, SeqId};
 pub use logit_proto::datadog::traces_msgpack::TracerApiForm;
 use logit_proto::datadog::{
     is_datadog_stats, trace_chunks, DatadogEncoder, HEADER_TRACE_COUNT, TRACER_FLAG_HEADERS,
@@ -879,7 +879,7 @@ impl DatadogTraceOutput {
 #[async_trait::async_trait]
 impl Output for DatadogTraceOutput {
     /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext) {
+    fn observe_batch(&mut self, _ctx: BatchContext, _seq: Option<SeqId>) {
         self.accounting.observe();
     }
 

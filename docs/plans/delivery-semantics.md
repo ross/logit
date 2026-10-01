@@ -127,8 +127,8 @@ Per [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequ
 - **Stale text.** `logit_out`'s module doc ("Ack wait" and "Delivery posture"), the module doc
   and `Ack`'s doc in `control.rs`, and the doc on `logit_out`'s `Conn::seq`.
 - **Pins**, each updated in the same commit as `docs/design/memory.md`:
-  - `disk_queue_push_one_batch`: 34, likely 35 unless the trailer is written straight into the
-    output buffer;
+  - `disk_queue_push_one_batch`: 33, with the trailer written straight into an output buffer
+    sized to fit;
   - `disk_queue_peek_cached_costs_nothing`: stays 0, because `SeqId` is `Copy`;
   - `the_largest_message_of_each_type_fits_the_control_message_cap`'s `Ack` literal;
   - the `ack.seq` assertions and the `control_frame_len(&control::Ack { .. })` call in
