@@ -105,8 +105,9 @@ nothing else; and the hop negotiates one codec.
   `Hello` that doesn't offer it. A data frame with any other codec byte is a protocol error.
 - `Hello.codecs` and `HelloAck.codec` stay as fields. Compression is still negotiated through
   the same handshake, and a one-member list costs nothing.
-- The `codec` label on `logit.proto.errors` (at `logit_in`) and on `logit.output.requests` (at
-  `logit_out`) goes. A label with one value says nothing.
+- The `codec` label on `logit.proto.frames`, in both directions, goes. A label with one value
+  says nothing. `logit.proto.errors{reason="codec"}` stays: it counts a frame under the wrong
+  codec byte.
 - `logit_out` encodes a batch once per attempt, as a hop payload, and runs its pre-connect size
   gate on that payload. A `send` with no preceding `observe_batch` is a programming error, not an
   unsequenced send.
@@ -176,8 +177,8 @@ These look like compatibility code and aren't:
   no unsequenced rule, no window clamp, no `codec` label), every sink's `observe_batch`, the fuzz
   targets and seeds, and the perf dump reader. Allocation and size pins that trip are updated
   with `docs/design/memory.md` in the same commit.
-- **Telemetry.** `logit.proto.errors` at `logit_in` and `logit.output.requests` at `logit_out`
-  lose their `codec` label. `docs/design/internal-telemetry.md` records the change.
+- **Telemetry.** `logit.proto.frames` loses its `codec` label in both directions.
+  `docs/design/internal-telemetry.md` records the change.
 - **Operator docs.** `docs/design/wire-protocol.md` and `docs/deploying.md` describe the hop as
   two shapes and a required pair, and `docs/known-gaps.md` drops "a v1 peer" from the duplicate
   sources the mark doesn't cover.
