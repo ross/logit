@@ -179,7 +179,9 @@ this ADR's own shutdown path already closes one -- `Reject{GOING_AWAY, "idle for
 first, then the connection drops -- so a `logit_out` peer needs no new case to tell an idle close
 from an ordinary shutdown; both arrive as the identical control message. The clock is measured from
 the last `Ack` written (or the handshake, on a connection that has sent nothing yet), never from
-the last frame read: a peer waiting on an `Ack` this listener is deliberately delaying for a slow
+the last frame read [superseded on 2026-10-02 by [ADR
+`native-hop-named-acks`](native-hop-named-acks.md), decision 2: the clock runs from the last
+frame handled, since a coalesced ack can trail its frame]: a peer waiting on an `Ack` this listener is deliberately delaying for a slow
 downstream is, by this ADR's own ack-as-backpressure design, not idle, so time blocked in
 `Fanout::send` never counts against it. A frame body gets the same bound per `read` rather than in
 total.
