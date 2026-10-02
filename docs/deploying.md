@@ -2685,9 +2685,9 @@ stays in the sink's queue until its `Ack` arrives. `window: 1` keeps one frame i
 **What an `Ack` means.** An `Ack` names a sender identity and a sequence, and covers every frame of
 that identity up to the sequence that its connection carried, so one `Ack` can answer several
 frames ([ADR `native-hop-named-acks`](adr/native-hop-named-acks.md)). `logit_in` writes one per run
-of frames rather than one per frame: when it would otherwise wait for the sender's next frame, when
-the next frame comes from another identity, every 32 frames, and before any `Reject`. A sender that
-stops sending gets its `Ack` at once. On a slow consumer the sender sees its acks one forward late:
+of frames rather than one per frame, at least every 32 frames and always before a `Reject`; the
+ADR's decision 2 says when. A sender that stops sending gets its `Ack` at once, since `logit_in`
+writes it before it would wait. On a slow consumer the sender sees its acks one forward late:
 `logit_in` holds the pending `Ack` while it waits to forward the next frame already read. An `Ack`
 grants no credit; the window stays fixed at the handshake.
 

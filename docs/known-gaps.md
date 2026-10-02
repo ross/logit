@@ -375,7 +375,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     the oldest unanswered frame. The window is fixed at the handshake, with no credit messages.
     The sink's store reserves the frames in flight as a prefix from its head, and a fault resends
     the window from the head, which `logit_in`'s high-water mark deduplicates
-    ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)). Since 2026-10-02 an `Ack`
+    ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)). An `Ack`
     names an identity and a sequence and covers a run of frames, `logit_in` writes one per run,
     and a reconnect commits the frames at or below `logit_in`'s marks without resending them
     ([ADR `native-hop-named-acks`](adr/native-hop-named-acks.md)).
