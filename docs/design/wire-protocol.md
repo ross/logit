@@ -369,7 +369,11 @@ decision record.
   byte is meaningless, and its `compression` is always `none`: the messages are tiny, and
   compression is itself being negotiated. The payload is hand-rolled TLV over `native::varint`
   (`crates/logit-proto/src/native/control.rs`), with the same `tag(u8) + len(uvarint) + payload`
-  shape and skip-unknown behavior as a native `Event`'s fields:
+  shape as a native `Event`'s fields but none of their skip-unknown behavior. Every field in the
+  table is required and appears once; a missing, repeated, or unknown field, or an unknown message
+  type, is malformed ([ADR `native-hop-no-compatibility`](../adr/native-hop-no-compatibility.md),
+  decision 4). `Ack` is the message-type byte alone, and a body after it is malformed. `window` is
+  at least 1 in both `Hello` and `HelloAck`, enforced on decode:
 
   | Message | Fields | Sent by |
   |---|---|---|
@@ -383,7 +387,9 @@ decision record.
   `window`) or with `Reject`. A version mismatch or no shared codec is a clean refusal, not a
   corrupted stream. `logit_out` refuses a `HelloAck` with another `version`, or a `codec` or
   `compression` its `Hello` didn't offer, as permanent: the listener would answer the same way
-  again. A control message is at most `control::MAX_CONTROL_MESSAGE_BYTES` (4096) bytes, and
+  again. A `Hello` that fails to decode ends the connection with no reply, counted as
+  `logit.proto.errors{reason="handshake"}`; a `HelloAck` that fails to decode fails `logit_out`'s
+  connect as a clean fault. A control message is at most `control::MAX_CONTROL_MESSAGE_BYTES` (4096) bytes, and
   each side refuses a longer one on its header: `logit_in` for a `Hello`, `logit_out` for a
   reply.
 - **Sender identity and sequence ride in the hop trailer.** The sink's store assigns each
@@ -456,9 +462,9 @@ decision record.
     answering one frame at a time on each connection. Nothing acknowledges out of order, and the
     trailer's sequence is a deduplication identity, never an acknowledgment.
   - **The window is fixed at the handshake.** `Hello.window` is what the sender offers;
-    `HelloAck.window` is the offer clamped to `1..=RECEIVER_MAX_WINDOW` (1024). The sender uses
-    `max(1, min(offered, answered))`, so a `HelloAck.window` of 0 reads as 1. No message grants or
-    returns credit.
+    `HelloAck.window` is `min(offered, RECEIVER_MAX_WINDOW)`, with `RECEIVER_MAX_WINDOW` at 1024.
+    The sender uses `min(offered, answered)`. Both windows are at least 1 on the wire, so neither
+    side clamps from below. No message grants or returns credit.
   - **`GOING_AWAY` answers every unanswered frame.** `logit_in` processes nothing after writing
     it (the linger below only discards), so every frame still unanswered on that connection was
     not forwarded, and `logit_out` treats each as a clean fault.

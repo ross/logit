@@ -1151,7 +1151,10 @@ the property the minimal-watch-set design is for.
   a body. A close between frames is the ordinary end of a connection and isn't counted, including
   a TLS peer gone without `close_notify`. `too_large` is a header that declared a
   payload over `max_frame_bytes`, or a `compressed_len` over `frame::compressed_bound` of it,
-  answered `Reject{FRAME_TOO_LARGE}`. `decode_budget` is a well-formed batch that would decode
+  answered `Reject{FRAME_TOO_LARGE}`. `handshake` is any handshake that ends without a
+  `HelloAck`: no `Hello` within `handshake_timeout`, stray bytes, a header over the control-message
+  cap, a `Hello` that fails to decode (a missing, repeated, or unknown field, or a `window` of 0),
+  or a version or codec `Reject`. `decode_budget` is a well-formed batch that would decode
   past its per-frame budget (`native::DecodeBudget`), a batch too large for the frame cap it
   arrived under rather than corrupt bytes, also answered `Reject{FRAME_TOO_LARGE}`. The two
   `_write_stalled` reasons count a control write to a peer that stopped reading, abandoned after
