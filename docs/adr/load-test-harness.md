@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-09-19
+updated: 2026-10-02
 ---
 
 # A load-test harness: the real binary, a declarative event template, and CPU per event as the signal
@@ -237,6 +237,32 @@ What that ADR decides, and this one is amended by rather than contradicted:
 - **`--pin-sender`/`--pin-child`.** This ADR's "not a dedicated, pinned-core bench host" caveat
   still describes every generated scenario. A driven one is required to pin, because its numbers
   are otherwise bimodal on a heterogeneous-core box.
+
+### Extended 2026-10-02: a third kind, driven from a file
+
+`tail_in` can't be measured by either kind above: a `generate_in` never touches a file, and a
+socket isn't its intake. `Workload::File` is the third kind, and reuses the second's machinery
+rather than adding a parallel one:
+
+- **Same sidecar directory, told apart by `kind: file`.** A `perf/load/<scenario>.yaml` with
+  `kind: file` names the `tail_in` component, a line count, an optional `rotate_after`, and a line
+  model in the format the UDP specs use. A spec with no `kind:` is still a UDP one.
+- **The load is written before the spawn.** `logit-perf` renders the lines and writes them to the
+  one exact path the scenario's `tail_in` names, which must resolve under `perf/results/` (the
+  directory the harness already clears for `buffered`'s spool). Nothing is written during the
+  measured window. A rotating spec stages the replacement file under a name the path doesn't
+  match, and rotates with two renames, as logrotate's `create` mode does, once half the first file
+  is delivered.
+- **Completion is the delivered count reaching the line count.** A file scenario has no
+  `generation complete` line and no sender to return, so `run` follows the same telemetry dump the
+  UDP kind reads its denominator from, at a 100 ms drain interval, and ends `wall_s` when the
+  sink's `events.received` reaches the line count. That puts about one drain of error on `wall_s`
+  and none on CPU µs/event. Reading `tail_in`'s file offset from `/proc/<pid>/fdinfo` would resolve
+  the time more finely, but it measures reading, not delivery, and isn't available through
+  `flamegraph`'s `perf record` wrapper.
+- **The self-check is exact.** A file can't drop a line, so delivered events, `tail_in`'s line
+  count, its diagnostics, and its rotation count must each match the plan on every repeat, as
+  `--verify` demands of a UDP run.
 
 ### Open question, deliberately not decided here: when the harness runs
 

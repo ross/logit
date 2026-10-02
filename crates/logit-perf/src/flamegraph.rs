@@ -21,9 +21,11 @@
 //! (`CAP_SYS_ADMIN`, unconfined seccomp; `docs/adr/load-test-harness.md`'s "Profiling" section).
 //! Outside that image this fails up front, naming `script/perf flamegraph`.
 
+use crate::file_load::FilePlan;
 use crate::load::{CpuSet, LoadPlan};
 use crate::run::{self, Drive, SpawnConfig};
 use crate::scenario::{self, Scenario, Workload};
+use crate::telemetry_leg;
 use anyhow::{bail, Context};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -88,7 +90,7 @@ pub fn flamegraph(root: &Path, args: FlamegraphArgs) -> anyhow::Result<()> {
         );
     }
 
-    let outcome = record_and_render(&logit_bin, &scenario, &args, &perf_data, &out);
+    let outcome = record_and_render(root, &logit_bin, &scenario, &args, &perf_data, &out);
     match &outcome {
         // Only on success: a failed render's `perf.data` is a multi-minute capture worth keeping
         // to retry the fast render against.
@@ -101,6 +103,7 @@ pub fn flamegraph(root: &Path, args: FlamegraphArgs) -> anyhow::Result<()> {
 }
 
 fn record_and_render(
+    root: &Path,
     logit_bin: &Path,
     scenario: &Scenario,
     args: &FlamegraphArgs,
@@ -118,24 +121,46 @@ fn record_and_render(
     // outside `perf record`, so the capture is the receive side only. No telemetry leg: profile
     // the shipped graph, not it plus the harness's two nodes.
     let plan = match &scenario.workload {
-        Workload::Generated { .. } => None,
         Workload::Driven(_) => {
             let source = fs::read_to_string(&scenario.path)
                 .with_context(|| format!("reading {}", scenario.path.display()))?;
             Some(LoadPlan::build(&scenario.load_spec_path()?, &source)?)
         }
+        _ => None,
     };
-    let drive = match (&plan, &scenario.workload) {
-        (Some(plan), _) => Drive::Driven { plan, pin_sender: args.pin_sender.as_ref() },
-        (None, Workload::Generated { count }) => Drive::Generated { count: *count },
-        (None, Workload::Driven(_)) => unreachable!("a driven workload always builds a plan"),
+    // A file scenario is the exception to "no telemetry leg": its completion is a sink count only
+    // the leg's dump carries (`crate::file_load`), so its two nodes are in this capture.
+    let file_plan = match &scenario.workload {
+        Workload::File(_) => {
+            Some(FilePlan::build(root, &scenario.load_spec_path()?, &scenario.path)?)
+        }
+        _ => None,
+    };
+    let dump = perf_data.with_file_name("completion.native");
+    let mut config = scenario.path.clone();
+    let mut _cleanup = None;
+    if file_plan.is_some() {
+        let source = fs::read_to_string(&scenario.path)
+            .with_context(|| format!("reading {}", scenario.path.display()))?;
+        let rewritten =
+            telemetry_leg::rewrite_scenario(&source, crate::file_load::LEG_INTERVAL, &dump)?;
+        config = telemetry_leg::rewritten_config_path(scenario, "flamegraph")?;
+        _cleanup = Some(telemetry_leg::RemoveOnDrop(config.clone()));
+        fs::write(&config, &rewritten).with_context(|| format!("writing {}", config.display()))?;
+        telemetry_leg::validate(logit_bin, &config)?;
+    }
+    let drive = match (&plan, &file_plan, &scenario.workload) {
+        (Some(plan), _, _) => Drive::Driven { plan, pin_sender: args.pin_sender.as_ref() },
+        (None, Some(plan), _) => Drive::File { plan, dump: &dump },
+        (None, None, Workload::Generated { count }) => Drive::Generated { count: *count },
+        (None, None, _) => unreachable!("a driven or file workload always builds a plan"),
     };
 
     let wrapper = record_argv(args.freq, perf_data);
     let measured = run::spawn_and_measure(SpawnConfig {
         logit_bin,
         wrapper: &wrapper,
-        config: &scenario.path,
+        config: &config,
         drive,
         pin_child: args.pin_child.as_ref(),
         needs_sigterm: scenario.needs_sigterm,

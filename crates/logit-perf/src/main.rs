@@ -6,6 +6,7 @@
 
 mod attribute;
 mod compare;
+mod file_load;
 mod flamegraph;
 mod load;
 mod result;
@@ -274,7 +275,7 @@ fn run_list(root: &Path) -> anyhow::Result<()> {
         println!(
             "{:<22} {:<12} {:>22} {:>14}",
             scenario.name,
-            if scenario.workload.is_driven() { "real socket" } else { "generate_in" },
+            scenario.workload.source(),
             scenario.workload.describe(),
             if scenario.needs_sigterm { "SIGTERM" } else { "self-exits" },
         );

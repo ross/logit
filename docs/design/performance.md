@@ -163,6 +163,33 @@ capture. Read its numbers differently from every other scenario's:
   shipped rate loss-free?" Because the rates are tuned to drop a little, the healthy answer is a
   failure.
 
+### File scenarios: `tail*` ends on a delivered count, not a log line
+
+`tail` and `tail-rotate` (added 2026-10-02) measure `tail_in`'s read path: read, split, one raw
+event per line, batch, deliver to `null_out`. Like the UDP family they have no `generate_in`.
+`logit-perf` writes the tailed file before the spawn, from a slog-style JSON app-log model in
+[`perf/load/`](../../perf/load/README.md) (5M lines of 273–330 bytes, ~1.5 GiB), and `tail_in`
+reads it from its first byte. `tail-rotate` splits the same lines across a file and its
+replacement and renames one onto the other once the sink has half of the first file. Read their
+numbers this way:
+
+- **`wall_s` ends when the sink's delivered count reaches the line count.** There's no
+  `generation complete` line and no sender to return. `run` attaches the `udp-statsd*` family's
+  telemetry leg at a 100 ms drain interval and follows the dump while the child runs, so `wall_s`
+  and events/s are resolved to about one drain, ~1–2% of a 5–10 s run. CPU µs/event comes from
+  `wait4` over the whole process and has no such error.
+- **The denominator is events delivered**, read from the same leg, and the telemetry leg's cost is
+  in the child's rusage, as for `udp-statsd*`. Compare a `tail*` number with its own history only.
+- **Every run is exact.** A file loses nothing, so the sink must receive every line written,
+  `tail_in` must count every line split, it must report no diagnostics, and `tail-rotate` must count
+  the one rotation the harness made. Any other count fails the repeat.
+- **The file is in the page cache.** It's written right before the spawn, so the run measures CPU
+  on the read path, not the disk.
+- **No pinning requirement.** No sender shares the box with the child; `--pin-child` alone keeps
+  the scheduler from moving it.
+
+Their first numbers are pending a VM measurement.
+
 ## 1. Results: all seventeen scenarios, median of 5
 
 `script/perf run --repeat 5 --profile release --no-build --logit-bin perf/bins/4e08c49ef421/logit

@@ -1,0 +1,24 @@
+# `tail_in`'s read path: read, split into lines, one raw log event per line, batch, deliver.
+# null_out discards; nothing parses. There's no `generate_in`: `logit-perf` writes the file below
+# from the sidecar spec perf/load/tail.yaml before the spawn, and the run ends once the sink has
+# received every line (perf/load/README.md's "File scenarios"; docs/design/performance.md §0).
+#
+#   script/perf run --scenario tail --repeat 5 --pin-child 2,3
+#
+# The path resolves against this file's directory, so the file lands in the gitignored
+# perf/results/. The harness clears that directory before every spawn and removes it after.
+#
+# Still an ordinary `logit` config: `logit run perf/scenarios/tail.yaml` tails whatever is there,
+# which is what `script/validate` and the shipped-config test need.
+#
+# `read_from: beginning`, because the file is complete before `tail_in` binds and the default
+# `end` would skip all of it. No checkpoint: every repeat starts from an empty directory anyway.
+components:
+  app:
+    type: tail_in
+    paths: ["../results/tail-in/tail/app.log"]
+    read_from: beginning
+
+  out:
+    type: null_out
+    sources: [app]

@@ -4,19 +4,22 @@
 //! `logit-config` for a handful of map lookups. `!env` goes unresolved here; no scenario uses it,
 //! and `logit run` resolves it in the spawned binary.
 //!
-//! ## Two kinds of scenario
+//! ## Three kinds of scenario
 //!
 //! A `Generated` scenario makes its own load in-process from a `generate_in` with a finite
 //! `count`. A `Driven` one tests the socket path, so its load must arrive over a real socket from
 //! outside the process: it has no generator, and a sidecar spec under `perf/load/` tells
-//! `crate::load` what to send (docs/adr/udp-intake-batching-and-socket-visibility.md).
+//! `crate::load` what to send (docs/adr/udp-intake-batching-and-socket-visibility.md). A `File`
+//! one tests `tail_in`: its sidecar spec says `kind: file`, and `crate::file_load` writes the
+//! file the scenario tails before the spawn.
 //!
 //! **The sidecar lives in its own directory, not beside the scenario**, because both
 //! `script/validate` and `crates/logit-cli/src/config.rs`'s
 //! `every_shipped_config_loads_and_validates` glob `perf/scenarios/*.yaml`: everything there must
 //! be a valid `logit` config, and a load spec isn't one.
 
-use crate::load::{self, LoadSpec};
+use crate::file_load::{self, AnySpec, FileSpec};
+use crate::load::LoadSpec;
 use anyhow::{bail, Context};
 use serde_norway::Value;
 use std::fs;
@@ -37,21 +40,40 @@ pub enum Workload {
     /// No generator: a real listener, fed over a real socket by `crate::load` from the sidecar
     /// spec at `perf/load/<name>.yaml`.
     Driven(LoadSpec),
+    /// No generator: a `tail_in` reading a file `crate::file_load` writes from the sidecar spec
+    /// at `perf/load/<name>.yaml` (`kind: file`) before the spawn.
+    File(FileSpec),
 }
 
 impl Workload {
     /// The one-line description `run`/`list` print beside a scenario's name.
     ///
-    /// Labels the number, since one kind counts events generated and the other datagrams sent.
+    /// Labels the number, since the kinds count events generated, datagrams sent, or lines
+    /// written.
     pub fn describe(&self) -> String {
         match self {
             Workload::Generated { count } => format!("count={count}"),
             Workload::Driven(spec) => format!("datagrams={}", spec.datagrams),
+            Workload::File(spec) => match spec.rotate_after {
+                Some(_) => format!("lines={}, rotating", spec.lines),
+                None => format!("lines={}", spec.lines),
+            },
         }
     }
 
+    /// Whether the load comes from outside the process (a socket or a file) rather than a
+    /// `generate_in`. Such a scenario never self-exits.
     pub fn is_driven(&self) -> bool {
-        matches!(self, Workload::Driven(_))
+        matches!(self, Workload::Driven(_) | Workload::File(_))
+    }
+
+    /// What `list` prints as the load's source.
+    pub fn source(&self) -> &'static str {
+        match self {
+            Workload::Generated { .. } => "generate_in",
+            Workload::Driven(_) => "real socket",
+            Workload::File(_) => "file",
+        }
     }
 }
 
@@ -165,7 +187,10 @@ fn workload_for(parsed: &Parsed, spec_path: &Path) -> anyhow::Result<Workload> {
     let sidecar = spec_path.exists();
     match (parsed.generated, sidecar) {
         (Some(count), false) => Ok(Workload::Generated { count }),
-        (None, true) => Ok(Workload::Driven(load::read_spec(spec_path)?)),
+        (None, true) => Ok(match file_load::read_any_spec(spec_path)? {
+            AnySpec::Udp(spec) => Workload::Driven(spec),
+            AnySpec::File(spec) => Workload::File(spec),
+        }),
         (Some(_), true) => bail!(
             "this scenario has both a `generate_in` component and a load spec at {} -- a scenario \
              is driven one way or the other, never both. Remove the `generate_in` to make it a \

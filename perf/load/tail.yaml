@@ -1,0 +1,8 @@
+# File spec for `perf/scenarios/tail.yaml`: one file, written whole before the spawn and read from
+# its first byte. See perf/load/README.md's "File scenarios" for the format.
+kind: file
+target: app
+# ~1.5 GiB at app-log.yaml's 313-byte mean line. A first estimate for a 5-10 s run: ~7.5 s on the
+# dev laptop on battery, so it wants re-checking on the perf VM before its first recorded baseline.
+lines: 5000000
+model: app-log.yaml

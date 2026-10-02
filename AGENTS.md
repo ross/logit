@@ -544,7 +544,8 @@ the operator-facing account of all of this.
 - **Load testing**: `crates/logit-perf` (bin `logit-perf`,
   `script/perf run|compare|attribute|flamegraph|list`) is the out-of-CI load-test harness. It
   spawns the real release `logit run <config>` process against `perf/scenarios/*.yaml`, driven by
-  `generate_in` into `null_out`, and measures events/s, CPU µs/event (the regression gate), and
+  `generate_in` into `null_out` (or over a real socket for `udp-statsd*`, or from a file it writes
+  first for `tail*`), and measures events/s, CPU µs/event (the regression gate), and
   peak RSS. `attribute` decodes a temporary `internal` telemetry leg into a per-node time
   breakdown; `flamegraph` drives `perf`/`inferno` in a throwaway image. It's built and runnable by
   hand, deliberately not wired into `script/cibuild` or any schedule

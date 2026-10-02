@@ -33,7 +33,7 @@ pub fn resolve_spool_dirs(scenario: &Scenario) -> Vec<PathBuf> {
 /// Resolves `.`/`..` components as text, with no symlink resolution and no need for the path to
 /// exist. A `..` past the root is dropped, as `PathBuf::pop` does; scenario paths are always
 /// absolute (`scenario::discover` lists an absolute `dir`).
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -50,13 +50,15 @@ fn normalize(path: &Path) -> PathBuf {
 /// Refuses `resolved` unless it lands strictly inside `<root>/perf/results/` (see the module doc).
 /// `perf/results/` itself is refused, although `Path::starts_with` accepts it: it holds every
 /// scenario's JSON output and every other scenario's spool.
-fn require_within_results_dir(root: &Path, resolved: &Path) -> anyhow::Result<()> {
+///
+/// `crate::file_load` holds a `tail_in` scenario's staged files to the same rule.
+pub(crate) fn require_within_results_dir(root: &Path, resolved: &Path) -> anyhow::Result<()> {
     let results_dir = normalize(&root.join("perf/results"));
     if resolved == results_dir || !resolved.starts_with(&results_dir) {
         bail!(
-            "refusing to clear spool directory {} -- it does not resolve inside {} (a scenario's \
-             `buffer.disk.path` must keep its spool under perf/results/, the one directory this \
-             harness is allowed to clear)",
+            "refusing to clear directory {} -- it does not resolve inside {} (a sink's \
+             `buffer.disk.path` and a `tail_in` scenario's tailed file must both live under \
+             perf/results/, the one directory this harness is allowed to clear)",
             resolved.display(),
             results_dir.display(),
         );

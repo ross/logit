@@ -2,25 +2,31 @@
 //! repeat, deriving throughput, CPU, and RSS from its stderr and `wait4`
 //! (docs/adr/load-test-harness.md).
 //!
-//! ## Two shapes of run
+//! ## Three shapes of run
 //!
 //! A [`Workload::Generated`] scenario makes its own events; its `generation complete` line ends
 //! the measurement. A [`Workload::Driven`] one has no generator: the harness waits for the
 //! child's `ready` line, blasts it over a real UDP socket from `crate::load`, and the sender
-//! returning ends the measurement (docs/adr/udp-intake-batching-and-socket-visibility.md).
-//! [`Drive`] is that fork; settle, SIGTERM, and `wait4` are shared.
+//! returning ends the measurement (docs/adr/udp-intake-batching-and-socket-visibility.md). A
+//! [`Workload::File`] one has neither: `crate::file_load` writes the file its `tail_in` reads
+//! before the spawn, and the sink's count reaching the line count, read from the telemetry dump
+//! as the child runs, ends the measurement. [`Drive`] is that fork; settle, SIGTERM, and `wait4`
+//! are shared.
 //!
 //! **A driven scenario's denominator is events *delivered*, never events sent.** The kernel can
 //! drop datagrams before `logit` sees them, and the baseline is tuned into that regime, so
 //! denominating over sent would understate per-event cost by the drop rate. The delivered count
 //! is the child's own `logit.component.events.received`, read from the `crate::telemetry_leg`
-//! dump attached at run time (never shipped in the scenario YAML).
+//! dump attached at run time (never shipped in the scenario YAML). A file scenario reads the same
+//! count from the same dump.
 //!
 //! **Every driven run self-checks before its numbers are believed** (see [`self_check`]):
 //! `sent == received + kernel drops` must close, and the decoder must report no malformed lines,
 //! or the run would be benchmarking the error path. `--verify` also requires a zero-drop run to
-//! deliver the ring's event count.
+//! deliver the ring's event count. A file run is held to `crate::file_load::self_check`'s exact
+//! counts every time, since a file has no loss to tolerate.
 
+use crate::file_load::{self, FilePlan};
 use crate::load::{self, CpuSet, LoadOutcome, LoadPlan};
 use crate::result::{BinaryInfo, BoxState, GitInfo, RunReport, Sample, ScenarioReport, UdpSample};
 use crate::rusage::{self, Usage};
@@ -137,7 +143,7 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         // Rendered once per scenario: the ring is deterministic from the spec's seed, and
         // rendering it per repeat would put that work near the measured window.
         let plan = match &scenario.workload {
-            Workload::Generated { .. } => None,
+            Workload::Generated { .. } | Workload::File(_) => None,
             Workload::Driven(_) => match driven_plan(scenario, &args) {
                 Ok(plan) => Some(plan),
                 Err(err) => {
@@ -147,6 +153,35 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
                 }
             },
         };
+        let file_plan = match &scenario.workload {
+            Workload::File(_) => {
+                match scenario
+                    .load_spec_path()
+                    .and_then(|spec| FilePlan::build(root, &spec, &scenario.path))
+                {
+                    Ok(plan) => Some(plan),
+                    Err(err) => {
+                        eprintln!("   FAILED: {err:#}");
+                        any_failed = true;
+                        continue;
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(plan) = &file_plan {
+            println!(
+                "   {}: writing {} lines ({:.1} MiB, {:.0} B/line mean) to {}{}",
+                plan.spec_path.display(),
+                plan.spec.lines,
+                plan.bytes() as f64 / (1024.0 * 1024.0),
+                plan.mean_line_bytes(),
+                plan.path.display(),
+                plan.rotate_at()
+                    .map(|at| format!(", rotated once {at} events are delivered"))
+                    .unwrap_or_default(),
+            );
+        }
         if let Some(plan) = &plan {
             let expected = plan.expected();
             println!(
@@ -176,9 +211,10 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
                 scenario_failed = true;
                 break;
             }
-            let outcome = match &plan {
-                Some(plan) => run_one_driven(&logit_bin, scenario, plan, &args),
-                None => run_one_generated(&logit_bin, scenario, &args),
+            let outcome = match (&plan, &file_plan) {
+                (Some(plan), _) => run_one_driven(&logit_bin, scenario, plan, &args),
+                (None, Some(plan)) => run_one_file(&logit_bin, scenario, plan, &args),
+                (None, None) => run_one_generated(&logit_bin, scenario, &args),
             };
             match outcome {
                 Ok(sample) => {
@@ -207,10 +243,12 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         let median = crate::result::median_sample(&samples);
         let min = crate::result::min_sample(&samples);
         // Recorded so a results file is self-describing: events generated for a generated
-        // scenario, lines sent for a driven one. Lines, not datagrams: a line is one metric.
+        // scenario, lines sent for a driven one, lines written for a file one. Lines, not
+        // datagrams: a line is one metric.
         let count = match &scenario.workload {
             Workload::Generated { count } => *count,
             Workload::Driven(_) => median.udp.map(|udp| udp.sent_lines).unwrap_or_default(),
+            Workload::File(spec) => spec.lines,
         };
         reports
             .insert(scenario.name.clone(), ScenarioReport { count, repeats: samples, median, min });
@@ -414,6 +452,10 @@ pub(crate) enum Drive<'a> {
     Generated { count: u64 },
     /// Wait for `ready`, then blast `plan` from this process and stop when the sender returns.
     Driven { plan: &'a LoadPlan, pin_sender: Option<&'a CpuSet> },
+    /// Write `plan`'s files before the spawn, wait for `ready`, then follow the telemetry `dump`
+    /// until the sink has received every line, rotating the file on the way if `plan` says to.
+    /// The config must carry the telemetry leg writing `dump`.
+    File { plan: &'a FilePlan, dump: &'a Path },
 }
 
 /// One spawn-measure-shutdown cycle's inputs, shared by `run`, `crate::attribute` (the scenario
@@ -577,6 +619,58 @@ fn run_one_driven(
     match &outcome {
         // As in `attribute`: removed on success, since one invocation may run dozens of repeats,
         // and kept and named on failure for debugging.
+        Ok(_) => {
+            let _ = std::fs::remove_file(&dump_path);
+        }
+        Err(_) => eprintln!("note: the telemetry dump is left at {}", dump_path.display()),
+    }
+    outcome
+}
+
+/// One repeat of a file scenario: attach the telemetry leg at [`file_load::LEG_INTERVAL`], run
+/// until the sink has every line, then hold the dump's counts to [`file_load::self_check`].
+fn run_one_file(
+    logit_bin: &Path,
+    scenario: &Scenario,
+    plan: &FilePlan,
+    args: &RunArgs,
+) -> anyhow::Result<Sample> {
+    let source = std::fs::read_to_string(&scenario.path)
+        .with_context(|| format!("reading {}", scenario.path.display()))?;
+
+    let workdir = telemetry_leg::make_workdir("run")?;
+    let dump_path = workdir.join(format!("{}.native", scenario.name));
+    let _ = std::fs::remove_file(&dump_path);
+
+    let rewritten = telemetry_leg::rewrite_scenario(&source, file_load::LEG_INTERVAL, &dump_path)
+        .with_context(|| format!("rewriting {}", scenario.path.display()))?;
+    let config_path = telemetry_leg::rewritten_config_path(scenario, "run")?;
+    let _cleanup = RemoveOnDrop(config_path.clone());
+    std::fs::write(&config_path, &rewritten)
+        .with_context(|| format!("writing {}", config_path.display()))?;
+    telemetry_leg::validate(logit_bin, &config_path)?;
+
+    let measured = spawn_and_measure(SpawnConfig {
+        logit_bin,
+        wrapper: &[],
+        config: &config_path,
+        drive: Drive::File { plan, dump: &dump_path },
+        pin_child: args.pin_child.as_ref(),
+        needs_sigterm: true,
+        settle: args.settle,
+        timeout: args.timeout,
+        shutdown_timeout: args.shutdown_timeout,
+    })?;
+
+    let outcome = (|| -> anyhow::Result<Sample> {
+        let events = telemetry_leg::decode_dump(&dump_path, true)?;
+        let nodes = crate::attribute::aggregate(&events);
+        let delivered = crate::attribute::delivered_at_sink(&nodes, plan.spec.sink.as_deref())?;
+        let stats = file_load::tail_stats(&events, &plan.spec.target);
+        file_load::self_check(&scenario.name, plan, delivered, &stats)?;
+        Ok(measured.sample(delivered))
+    })();
+    match &outcome {
         Ok(_) => {
             let _ = std::fs::remove_file(&dump_path);
         }
@@ -764,6 +858,55 @@ fn self_check(
     Ok(())
 }
 
+/// Waits for the child's `ready` line until `deadline`, returning when it was seen.
+fn wait_for_ready(events: &mpsc::Receiver<ChildEvent>, deadline: Instant) -> Option<Instant> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match events.recv_timeout(remaining) {
+            Ok(ChildEvent::Ready(at)) => return Some(at),
+            // No generator, so this shouldn't happen; ignored rather than a panic.
+            Ok(ChildEvent::Complete { .. }) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Follows a file scenario's telemetry dump until the sink has received every line, rotating the
+/// file once on the way when the plan says to. Returns when the last line's count was seen, which
+/// is up to one drain interval after it arrived (`crate::file_load`'s module doc).
+fn follow_to_completion(
+    plan: &FilePlan,
+    dump: &Path,
+    child_end: &std::sync::OnceLock<String>,
+    deadline: Instant,
+) -> anyhow::Result<Instant> {
+    let mut follower = telemetry_leg::DumpFollower::new(dump);
+    let mut rotate_at = plan.rotate_at();
+    let mut delivered = 0;
+    loop {
+        if follower.poll()? {
+            delivered = file_load::delivered_so_far(follower.events(), plan.spec.sink.as_deref());
+        }
+        if rotate_at.is_some_and(|at| delivered >= at) {
+            plan.rotate()?;
+            rotate_at = None;
+        }
+        if delivered >= plan.spec.lines {
+            return Ok(Instant::now());
+        }
+        if let Some(cause) = child_end.get() {
+            bail!("{cause}, with {delivered} of {} lines delivered", plan.spec.lines);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "the sink had received {delivered} of {} lines when --timeout ran out",
+                plan.spec.lines
+            );
+        }
+        std::thread::sleep(file_load::POLL);
+    }
+}
+
 /// Spawns one `logit run <config>`, drives it to completion, shuts it down, and reports its
 /// `wait4` rusage. Every subcommand that runs a scenario goes through this.
 pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measured> {
@@ -778,6 +921,11 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
         timeout,
         shutdown_timeout,
     } = spawn;
+    // Before the spawn, so no write competes with the measured child; removed when this returns.
+    let _staged = match &drive {
+        Drive::File { plan, .. } => Some(plan.stage()?),
+        _ => None,
+    };
     let mut command = match wrapper.split_first() {
         Some((program, rest)) => {
             let mut command = Command::new(program);
@@ -901,24 +1049,14 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
         Drive::Driven { plan, pin_sender } => {
             // Required: there's no completion line to fall back on, and sending before the
             // socket exists would record false loss (or `ECONNREFUSED` on a connected socket).
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                match event_rx.recv_timeout(remaining) {
-                    Ok(ChildEvent::Ready(at)) => {
-                        ready_at = Some(at);
-                        break;
-                    }
-                    // No generator, so this shouldn't happen; ignored rather than a panic.
-                    Ok(ChildEvent::Complete { .. }) => continue,
-                    Err(_) => {
-                        let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
-                        bail!(
-                            "no `ready` line within {}s -- a driven scenario cannot start sending \
-                             until the listener's socket is bound; stderr:\n{stderr_text}",
-                            timeout.as_secs()
-                        );
-                    }
-                }
+            ready_at = wait_for_ready(&event_rx, deadline);
+            if ready_at.is_none() {
+                let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
+                bail!(
+                    "no `ready` line within {}s -- a driven scenario cannot start sending until \
+                     the listener's socket is bound; stderr:\n{stderr_text}",
+                    timeout.as_secs()
+                );
             }
             let abort = load::Abort { cause: &child_end };
             match load::blast(plan, pin_sender, Some(abort)) {
@@ -931,6 +1069,22 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
                     return Err(err).with_context(|| {
                         format!("blasting {} ; child stderr:\n{stderr_text}", plan.target)
                     });
+                }
+            }
+        }
+        Drive::File { plan, dump } => {
+            // The file was read from the moment `tail_in` bound, but the clock starts at `ready`,
+            // as it does for a generated scenario.
+            ready_at = wait_for_ready(&event_rx, deadline);
+            if ready_at.is_none() {
+                let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
+                bail!("no `ready` line within {}s; stderr:\n{stderr_text}", timeout.as_secs());
+            }
+            match follow_to_completion(plan, dump, &child_end, Instant::now() + timeout) {
+                Ok(at) => wall_ends_at = at,
+                Err(err) => {
+                    let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
+                    return Err(err).with_context(|| format!("child stderr:\n{stderr_text}"));
                 }
             }
         }
