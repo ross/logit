@@ -147,22 +147,23 @@ pub fn compare(a: &RunReport, b: &RunReport) -> CompareReport {
     }
     let (a_box, b_box) = (a.box_state.as_ref(), b.box_state.as_ref());
     let thp = |state: Option<&BoxState>| state.and_then(|s| s.thp_enabled.clone());
-    if thp(a_box) != thp(b_box) {
-        warnings.push(format!(
-            "comparing different transparent hugepage settings: {:?} vs {:?} -- resident-set \
-             size differs with no code change",
-            thp(a_box),
-            thp(b_box)
-        ));
+    // A side that never recorded the field (an older file) has nothing to disagree with.
+    if let (Some(a_thp), Some(b_thp)) = (thp(a_box), thp(b_box)) {
+        if a_thp != b_thp {
+            warnings.push(format!(
+                "comparing different transparent hugepage settings: `{a_thp}` vs `{b_thp}` -- \
+                 resident-set size differs with no code change"
+            ));
+        }
     }
     let rmem = |state: Option<&BoxState>| state.and_then(|s| s.rmem_max);
-    if rmem(a_box) != rmem(b_box) {
-        warnings.push(format!(
-            "comparing different net.core.rmem_max: {:?} vs {:?} -- a receive buffer clamps \
-             differently, and a UDP scenario's drop rate with it",
-            rmem(a_box),
-            rmem(b_box)
-        ));
+    if let (Some(a_rmem), Some(b_rmem)) = (rmem(a_box), rmem(b_box)) {
+        if a_rmem != b_rmem {
+            warnings.push(format!(
+                "comparing different net.core.rmem_max: {a_rmem} vs {b_rmem} -- a receive buffer \
+                 clamps differently, and a UDP scenario's drop rate with it"
+            ));
+        }
     }
     if a.profile != b.profile {
         warnings.push(format!(
@@ -445,6 +446,15 @@ mod tests {
         assert!(thp.warnings.iter().any(|w| w.contains("transparent hugepage")));
         let rmem = compare(&with(state("madvise", 212_992)), &with(state("madvise", 26_214_400)));
         assert!(rmem.warnings.iter().any(|w| w.contains("rmem_max")));
+
+        let mut unrecorded = state("always", 1);
+        unrecorded.thp_enabled = None;
+        unrecorded.rmem_max = None;
+        let partial = compare(&with(state("madvise", 212_992)), &with(unrecorded));
+        assert!(!partial.warnings.iter().any(|w| w.contains("hugepage") || w.contains("rmem")));
+
+        let whole = compare(&with(state("madvise", 212_992)), &report("h", "c", BTreeMap::new()));
+        assert!(!whole.warnings.iter().any(|w| w.contains("hugepage") || w.contains("rmem")));
     }
 
     #[test]
