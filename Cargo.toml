@@ -158,6 +158,9 @@ libc = "0.2.189"
 # and deny.toml's allowlist covers it (`aho-corasick`'s `Unlicense OR MIT` resolves through MIT,
 # exactly as the already-present `memchr` does) -- script/audit confirms, not assumes.
 regex = "1"
+# tail_in/docker_in's newline search (`LineSplitter::push`). Already in the lock via `serde_json`
+# and `regex`, so a direct dependency adds no new crate version to the graph.
+memchr = "2"
 # Leveled structured self-logging (docs/plans/operator-surface.md, ADR
 # `tracing-for-self-logging.md`), replacing `logit-core::diag::Diagnostics`'s bare `eprintln!`.
 # Already present transitively (via `hyper`/`tokio`'s own instrumentation) at this exact version --
