@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-01
+updated: 2026-10-02
 ---
 
 # Native hop identity and sequence: a per-store sender identity and sequence in the batch trailer, an `Ack` with no fields, and a high-water mark at `logit_in`
@@ -19,6 +19,9 @@ Superseded in part on 2026-10-01 by [ADR
 rule", decision 2's "A v1 connection sends unsequenced frames", decision 3's "An old spool's
 records replay unsequenced", step 1 of decision 5's algorithm, and the "The breaking change"
 consequence. A frame or record without a complete pair is malformed, not unsequenced.
+Superseded in part on 2026-10-02 by [ADR `native-hop-named-acks`](native-hop-named-acks.md):
+decision 4, "`Ack` carries no fields", and the rejected alternative "`Ack` echoing the sequence".
+`Ack` names an identity and a sequence and covers every frame of that identity at or below it.
 
 ## Context
 
@@ -136,7 +139,9 @@ mark per sender identity, in a table bounded by its connection cap.
   `native-hop-send-window`](native-hop-send-window.md): several frames can be in flight, and
   `Ack` still names nothing, because `logit_in` answers one connection's frames in order, so the
   k-th `Ack` answers the k-th unanswered frame.] It means the frame was forwarded, or recognized as a
-  resend and not forwarded. `logit_out` drops its `Ack.seq == conn.seq` check.
+  resend and not forwarded. `logit_out` drops its `Ack.seq == conn.seq` check. [Superseded on
+  2026-10-02 by [ADR `native-hop-named-acks`](native-hop-named-acks.md): `Ack { id, seq }` is
+  cumulative per identity, and `logit_out` commits the frames it names.]
 - **The acknowledgment point gains a second case.** The native-transport record's "Ack point"
   acknowledges a frame after `Fanout::send` returns, and the delivery record's item 3 says an
   acknowledgment means accepted into the pipeline. Both still hold for a frame above its mark.

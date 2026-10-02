@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-01
+updated: 2026-10-02
 ---
 
 # Native hop send window: several frames in flight, acknowledged in frame order
@@ -30,7 +30,12 @@ Accepted. Supersedes in part:
 
 Superseded in part on 2026-10-01 by [ADR
 `native-hop-no-compatibility`](native-hop-no-compatibility.md): decision 1's "A `HelloAck.window`
-of 0 reads as 1". A `window` of 0 fails to decode on either side.
+of 0 reads as 1". A `window` of 0 fails to decode on either side. Superseded in part on
+2026-10-02 by [ADR `native-hop-named-acks`](native-hop-named-acks.md): decision 1's "Acks arrive
+in frame order" (the k-th `Ack` answers the k-th unanswered frame), decision 4's "`in_flight` is
+the loop's count" drift check, decision 5's `await_ack` ("`Ack` decrements `in_flight`"), and the
+rejected alternative "`Ack` carrying the sequence". An `Ack` names an identity and a sequence,
+one ack covers a run of frames, and the sender commits by name.
 
 ## Context
 
