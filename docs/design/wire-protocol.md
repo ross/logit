@@ -431,7 +431,7 @@ decision record.
   direct consumer has closed, it writes the pending `Ack`, then `Reject{GOING_AWAY}`, and closes.
   A frame at or below its sender's mark joins the pending `Ack` on the mark alone, with no
   forward. The pending `Ack` names the last frame handled and is written, one per run of frames,
-  at the first of: the next read would wait (one non-blocking poll before each frame header), the
+  at the first of: the next read would wait (one non-blocking poll before every read), the
   next frame carries another identity, the run reaches 32 frames, or the connection is about to
   write a `Reject` or close ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md),
   decision 2). A frame already read whose forward waits holds the `Ack` for the frames before it,

@@ -591,12 +591,13 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   when both check before either forward lands, most often when the old task's forward is parked on a
   full inbox past the sender's ack timeout. Each task forwards a given frame at most once per
   connection that held it, so twice per fault, and one more time for each further connection that
-  times out on the same inbox. The old task ends at the first `Ack` write after the reset arrives,
-  and it writes a pending `Ack` at least every 32 frames: the sender has closed that socket, so a
-  write meets a reset within about a round trip, and the task forwards only the frame it was
-  parked on plus what its inbox accepts in that time. The hard
-  bound is the window the old connection held; under the sustained backpressure that parks a
-  forward, that pace keeps it to one or two duplicates per fault. Nothing is lost. A duplicate copy
+  times out on the same inbox. The old task ends at its first `Ack` write after the reset arrives:
+  the sender has closed that socket, so the write meets a reset within about a round trip. With
+  acks coalesced, that write comes when the task's next read would wait, at an identity change,
+  or at the 32-frame cap, so before it the task can forward the frame it was parked on plus every
+  frame still buffered on the closed socket, up to the cap. The hard bound is the window the old
+  connection held, and the cap keeps a run under 32; under the sustained backpressure that parks a
+  forward, each of those forwards can race the resend of the same frame. Nothing is lost. A duplicate copy
   can reach the consumers after later batches; a batch's only copy never does, because the mark
   reaches a sequence only after a copy of it landed. [ADR
   `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md), decision 7, accepts
