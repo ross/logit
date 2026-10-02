@@ -132,7 +132,7 @@ LAST_REF_SEEN=""
 build_ref() {
     local ref="$1" slug
     slug="$(slug_for_ref "${ref}")"
-    echo "== ${ref} (git ref) -> perf/bins/${slug}/logit"
+    echo "== (${PROGRESS}) ${ref} (git ref) -> perf/bins/${slug}/logit"
 
     ( cd "${LOGIT_HOME}" && git fetch --tags --prune origin ) >/dev/null
 
@@ -174,7 +174,7 @@ build_path() {
         *.tar|*.tar.gz|*.tgz)
             kind="tar"
             tree_dir="${SRCS_DIR}/${slug}"
-            echo "== ${given} (tarball) -> perf/bins/${slug}/logit"
+            echo "== (${PROGRESS}) ${given} (tarball) -> perf/bins/${slug}/logit"
             [ -f "${given}" ] || { echo "   FAILED: no such file: ${given}" >&2; return 1; }
             rm -rf "${tree_dir}"
             mkdir -p "${tree_dir}"
@@ -192,7 +192,7 @@ build_path() {
         *)
             kind="dir"
             tree_dir="${given/#\~/${HOME}}"
-            echo "== ${given} (directory) -> perf/bins/${slug}/logit"
+            echo "== (${PROGRESS}) ${given} (directory) -> perf/bins/${slug}/logit"
             [ -d "${tree_dir}" ] || { echo "   FAILED: no such directory: ${tree_dir}" >&2; return 1; }
             ;;
     esac
@@ -234,7 +234,10 @@ build_path() {
 }
 
 FAILED=0
+INDEX=0
 for source in "${SOURCES[@]}"; do
+    INDEX=$((INDEX + 1))
+    PROGRESS="${INDEX} of ${#SOURCES[@]}"
     if is_path_source "${source}"; then
         build_path "${source}" || FAILED=1
     else
