@@ -28,6 +28,10 @@ Accepted. Supersedes in part:
   first, races the remaining budget", which on the window path holds for the head's own submit
   alone (decision 4).
 
+Superseded in part on 2026-10-01 by [ADR
+`native-hop-no-compatibility`](native-hop-no-compatibility.md): decision 1's "A `HelloAck.window`
+of 0 reads as 1". A `window` of 0 fails to decode on either side.
+
 ## Context
 
 `logit_out` writes one frame, waits for `logit_in`'s `Ack`, then writes the next. Per connection
@@ -103,7 +107,9 @@ the head alone, and a fault resends the window from the head.
   default `tcp_rmem`.
 - **`logit_out` uses the smaller of the two.** It offers its configured `window` in `Hello` and
   uses `max(1, min(offered, answered))`. A `logit_in` that answers 1 gets one frame in flight. A
-  `HelloAck.window` of 0 reads as 1.
+  `HelloAck.window` of 0 reads as 1. [Superseded in part on 2026-10-01 by [ADR
+  `native-hop-no-compatibility`](native-hop-no-compatibility.md): `window` is at least 1 on
+  decode, so `logit_out` uses `min(offered, answered)` with no floor.]
 - **`TCP_NODELAY` on both ends.** `logit_out` sets it through `Dial.nodelay` in
   `crates/logit-outputs/src/stream.rs`, and `logit_in` calls `set_nodelay` on accept.
 - **`logit_in` closes with a linger.** On every return of `serve_connection` after the

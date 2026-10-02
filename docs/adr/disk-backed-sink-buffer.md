@@ -7,7 +7,10 @@ updated: 2026-10-01
 
 ## Status
 Accepted. Superseded in part on 2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md):
-"Corrections to the design sketch", item 1's list of the `SinkStore` surface.
+"Corrections to the design sketch", item 1's list of the `SinkStore` surface. Superseded in part
+on 2026-10-01 by [ADR `native-hop-no-compatibility`](native-hop-no-compatibility.md): "Record
+evolution" in the sender-identity amendment, where an older binary replays a record and a record
+written before the change replays unsequenced. A record without a complete pair is corrupt.
 
 ## Context
 
@@ -500,6 +503,10 @@ write a sender identity and a sequence into each record's v2 trailer, as tags 3 
   rides inside the frame. That now includes a new tag in the v2 trailer as well as a new codec
   byte: `native::decode_batch_v2` skips a tag it doesn't know, so an older binary replays such a
   record without the new field, and a record written before the change replays unsequenced.
+  [Superseded in part on 2026-10-01 by [ADR
+  `native-hop-no-compatibility`](native-hop-no-compatibility.md): the skip stays as torn-write
+  hygiene, but a record without a complete pair is corrupt and skipped, and no older binary is
+  a supported reader.]
 - **Phantom records.** The known limit in "Amendment: an in-cap corrupt length is corruption,
   not a torn tail", a resync reading a record
   embedded in a payload as a phantom record, gains a consequence on the native hop: a phantom

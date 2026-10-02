@@ -13,7 +13,10 @@ are implicit", the `Ack` entry of "Control payload", the rejected alternative "A
 part on 2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md): "In-flight: one frame per
 connection, in this plan", the deferred alternative "Building credit-based flow control
 (window > 1) now", and the sentence of "Sequence numbers are implicit" that expects a future
-window to use cumulative acks (the acks stay empty and in frame order).
+window to use cumulative acks (the acks stay empty and in frame order). Superseded in part on
+2026-10-01 by [ADR `native-hop-no-compatibility`](native-hop-no-compatibility.md): "Control
+payload"'s skip-unknown forward compatibility. A control message's fields are each required, and
+an unknown tag is malformed.
 
 ## Context
 
@@ -36,7 +39,9 @@ or ack) rather than a native-v1 data frame; every other bit stays reserved. This
 
 **Control payload.** Hand-rolled TLV over `native::varint` (`crates/logit-proto/src/native/
 control.rs`), the same `tag(u8) + len(uvarint) + payload` shape and skip-unknown forward
-compatibility as `native::record`: `Hello { version, codecs, compressions, max_frame_bytes, window
+compatibility as `native::record` [superseded on 2026-10-01 by [ADR
+`native-hop-no-compatibility`](native-hop-no-compatibility.md): every field required, unknown
+tags malformed]: `Hello { version, codecs, compressions, max_frame_bytes, window
 }`, `HelloAck { version, codec, compression, max_frame_bytes, window }`, `Ack { seq }`, `Reject {
 code, message }`.
 [Superseded in part on 2026-10-01 by [ADR
