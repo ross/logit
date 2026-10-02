@@ -101,11 +101,13 @@ Files: `crates/logit-inputs/src/logit.rs`, `docs/design/internal-telemetry.md`.
 
 - [ ] `serve_frames` keeps `pending: Option<(SeqId, u32)>` (the last handled frame's pair and the
   frames covered) and flushes it at the four points of the ADR's decision 2. The identity check
-  runs after decode and before `is_resend`. The read-would-block flush polls the header read once
-  (`tokio::select! { biased; .. }` against a ready future, or `std::future::poll_fn`) and flushes
-  before awaiting it; the same poll works on the TLS stream. The flush before a `Reject` lives in
-  `going_away` and `write_reject`; the flush on every other exit is best effort and doesn't change
-  the exit.
+  runs after decode and before `is_resend`. The read-would-block flush is one raw `poll_read`
+  into a fresh header buffer (`std::future::poll_fn` over `Pin::new(&mut *stream).poll_read`): a
+  `Pending` consumes nothing, plain or TLS, so the ack is written and flushed before the real
+  wait; a partial fill is passed into `read_header` so no header byte is lost. Not a
+  `tokio::select!` over `read_header`, whose dropped future would lose the bytes it had read. The
+  flush before a `Reject` lives in `going_away` and `write_reject`; the flush on every other exit
+  is best effort and doesn't change the exit.
 - [ ] `logit.input.acks` (count), recorded in `docs/design/internal-telemetry.md`'s `logit_in`
   section beside `logit.proto.frames`.
 - [ ] Tests, on observables (`TelemetryProbe`, `wait_until`), no sleeps:
@@ -128,9 +130,12 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-inputs/src/logit.rs`,
 
 - [ ] `logit_out`: when a connection is dropped with frames in flight, keep the distinct
   identities of its unacked entries as `resend_senders`; the next `handshake` sends them and
-  stores the answered marks on the new `Conn`. `submit` applies the ADR's decision 4 before
-  encoding: a covered frame is pushed `acked`, counted, and returned `Ok` with no size gate and no
-  write.
+  stores the answered marks on the new `Conn`. `submit_frame` applies the ADR's decision 4: with
+  `stream == None` and `resend_senders` non-empty it connects and handshakes before encoding,
+  then checks the head against the marks; a covered frame is pushed `acked`, counted, and
+  returned `Ok` with no encode, no size gate, and no write. With nothing to resend the existing
+  order (encode, size gate, connect) is unchanged, and a test pins that an oversized batch still
+  never connects on that path.
 - [ ] `logit_in`: `handshake` answers `marks: senders.marks(&hello.senders)`.
 - [ ] `docs/design/internal-telemetry.md`: `logit.output.batches.resumed`.
 - [ ] Tests:
@@ -151,9 +156,10 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-inputs/src/logit.rs`,
 - [ ] `docs/design/wire-protocol.md`: "Flow control" and the acknowledgement-point text (one ack
   per run; the resume); `docs/deploying.md`, forwarding section: what an ack means now, the
   resume, and that a reconnect no longer resends acknowledged frames; module docs of both hop
-  components; `docs/known-gaps.md`: add the 16-identity cap residual and reword the
-  `ack_write_stalled` reasoning for coalesced acks; `AGENTS.md`'s `logit_out`/`logit_in` rows
-  gain this ADR.
+  components; the `RECEIVER_MAX_WINDOW` doc in `crates/logit-inputs/src/logit.rs` carries the
+  named ack's size (about 80 KB for 1024 under TLS); `docs/known-gaps.md`: add the 16-identity
+  cap residual and reword the `ack_write_stalled` reasoning for coalesced, larger acks;
+  `AGENTS.md`'s `logit_out`/`logit_in` rows gain this ADR.
 - [ ] Sweep every comment line the stream added for the banned words.
 - [ ] `script/cibuild` at the stack's tip, from a private `CARGO_TARGET_DIR`.
 - [ ] Measurements in "Findings" below: loopback `native-relay` at `window: 1` and `window: 32`

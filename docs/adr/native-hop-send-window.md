@@ -113,7 +113,9 @@ head.
 - **`logit_in` answers a clamped window.** `HelloAck.window` is
   `hello.window.clamp(1, RECEIVER_MAX_WINDOW)`, with `RECEIVER_MAX_WINDOW = 1024`. At 1024 the
   unread acks a peer can leave in the listener's send buffer are about 47 KB under TLS, under the
-  default `tcp_rmem`.
+  default `tcp_rmem`. [Superseded in part on 2026-10-02 by [ADR
+  `native-hop-named-acks`](native-hop-named-acks.md): a named ack is larger, about 80 KB for
+  1024 under TLS, still under the default; the constant stays.]
 - **`logit_out` uses the smaller of the two.** It offers its configured `window` in `Hello` and
   uses `max(1, min(offered, answered))`. A `logit_in` that answers 1 gets one frame in flight. A
   `HelloAck.window` of 0 reads as 1. [Superseded in part on 2026-10-01 by [ADR

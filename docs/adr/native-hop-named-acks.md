@@ -14,8 +14,9 @@ Accepted. Supersedes in part:
   the rejected alternative "`Ack` echoing the sequence".
 - [ADR `native-hop-send-window`](native-hop-send-window.md): the Decision's "no sequence in
   `Ack`", decision 1's "Acks arrive in frame order" (the k-th `Ack` answers the k-th unanswered
-  frame), decision 4's "`in_flight` is the loop's count" drift check, decision 5's `await_ack`
-  ("`Ack` decrements `in_flight`"), and the rejected alternative "`Ack` carrying the sequence".
+  frame) and the "about 47 KB under TLS" arithmetic behind `RECEIVER_MAX_WINDOW`, decision 4's
+  "`in_flight` is the loop's count" drift check, decision 5's `await_ack` ("`Ack` decrements
+  `in_flight`"), and the rejected alternative "`Ack` carrying the sequence".
 - [ADR `native-hop-no-compatibility`](native-hop-no-compatibility.md): decision 4's "`Ack` is the
   message byte alone".
 - [ADR `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md): the `Ack`
@@ -57,9 +58,11 @@ These facts about the code fix the design:
 - **The receiver's marks are the resume information.** `SenderTable` holds one 64-bit
   mark per identity, bounded from the connection cap. A frame at or below the mark is already
   handled, whatever connection it arrives on.
-- **The sender knows which frames it will resend.** When a connection drops, `Conn.in_flight`
-  names every frame the next connection's fill will resubmit, and the write loop resubmits them
-  from the head in the same order.
+- **The sender knows which frames it will resend.** When a connection drops and the round is
+  retried, `Conn.in_flight` names every frame the next connection's fill will resubmit, and the
+  write loop resubmits them from the head in the same order. A round that isn't retried (an
+  `Ambiguous` fault under `at_most_once`, or an exhausted budget) drops them instead, and a
+  stale identity in the next `Hello` costs one lookup.
 - **Control messages are strict** (`native-hop-no-compatibility`, decision 4): every field
   required once, an unknown tag malformed. A new field on `Hello`/`HelloAck` is a required field
   on both ends, and this is a pre-release breaking change like the two before it.
@@ -100,8 +103,10 @@ reconnect commits what the receiver already holds without resending it.
   records `pending = (id, seq)` of that frame and a count of frames it covers, instead of writing.
 - **Flush points.** It writes `Ack{pending}` and flushes, then clears `pending`, at the first of:
   1. the next frame's identity differs from `pending.id`, before that frame is handled;
-  2. the next header read would block: `serve_frames` polls the read once and, if it is not
-     ready, flushes before waiting on it. A sender with nothing more to send gets its ack at
+  2. the next header read would block: `serve_frames` polls the stream once for header bytes
+     into a fresh buffer and, if that poll is pending, flushes before waiting. A pending
+     `poll_read` consumes nothing, plain or TLS, and a partial fill is carried into the header
+     read that follows, so no byte is lost. A sender with nothing more to send gets its ack at
      once; a sender streaming faster than the receiver forwards gets one ack per burst;
   3. `pending` covers `ACK_COALESCE_MAX` frames, 32, so a sender with a large window commits
      and frees store space before its window drains;
@@ -139,17 +144,20 @@ reconnect commits what the receiver already holds without resending it.
 - **`Hello.senders`**, tag 6, required: the distinct identities of the frames this connection
   will resubmit, up to `MAX_HELLO_SENDERS` (16), 16 bytes each, in in-flight order; empty when
   nothing is being resent. `logit_out` takes them from the in-flight list of the connection it
-  last dropped, which the write loop resubmits from the head. More than 16 distinct identities
+  last dropped, which a retried round resubmits from the head. More than 16 distinct identities
   in one window lists the first 16; the rest are resent and deduplicated as today.
 - **`HelloAck.marks`**, tag 6, required: one entry per `senders` identity the receiver's table
   holds, 24 bytes each (the identity, then the mark as a big-endian u64), in the order asked;
   an identity the table doesn't hold is omitted and reads as mark 0. The lookup neither inserts
   nor evicts.
-- **A frame at or below its mark is committed without a send.** `submit` checks the pair
-  against the marks before encoding; a covered frame is pushed to the in-flight list as `acked`
-  and `submit` returns `Ok` with nothing written, so `await_ack` commits it in order. The marks
-  are read at the handshake and a mark never decreases, so a covered frame is handled whatever
-  happens afterwards.
+- **A frame at or below its mark is committed without a send.** The marks exist only once the
+  new connection's handshake has run, and `submit` today encodes and size-gates a batch before
+  it connects, so an oversized batch never connects. With identities to resend and no
+  connection, `submit` connects and handshakes first, then checks the head against the marks,
+  then encodes; a covered frame is pushed to the in-flight list as `acked` and `submit` returns
+  `Ok` with nothing encoded or written, so `await_ack` commits it in order. With nothing to
+  resend the order stays encode, size gate, connect. The marks are read at the handshake and a
+  mark never decreases, so a covered frame is handled whatever happens afterwards.
 - **Counter.** `logit.output.batches.resumed` counts frames committed from a mark.
 
 ### 5. No version bump, no compatibility
@@ -205,6 +213,13 @@ code accounts for it.
   read, not per `await_ack` that returned from the list.
 - **Operator docs.** `docs/design/wire-protocol.md`'s connection protocol and
   `docs/deploying.md`'s forwarding section describe the named ack, coalescing, and the resume.
+- **The receiver's unread-ack bound grows.** A named ack is 46 to 55 bytes on the wire (a 24-byte
+  header, the message byte, the 18-byte identity field, and 3 to 12 bytes of sequence), about 70
+  to 80 bytes under TLS, against about 46 for the empty ack. With one ack per frame, the worst
+  case the send-window record sized `RECEIVER_MAX_WINDOW` by (1024 unread acks a peer leaves in
+  the listener's send buffer) grows from about 47 KB to about 80 KB, still under the default
+  `tcp_rmem`. Coalescing lowers the common case well below either. The constant stays 1024; its
+  doc and the `ack_write_stalled` reasoning in `docs/known-gaps.md` carry the new arithmetic.
 - **Known gaps.** A new residual: `Hello.senders` is capped at 16 identities, so a window
   spanning more than 16 store opens resends the rest.
 - **Measurement owed.** `native-relay` on the perf VM before and after, at `window: 1` and
