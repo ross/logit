@@ -150,6 +150,9 @@ reconnect commits what the receiver already holds without resending it.
   holds, 24 bytes each (the identity, then the mark as a big-endian u64), in the order asked;
   an identity the table doesn't hold is omitted and reads as mark 0. The lookup neither inserts
   nor evicts.
+- **Both lists decode strictly.** A `senders` or `marks` field whose length isn't a whole number
+  of entries, or that holds more than `MAX_HELLO_SENDERS` entries, is `Malformed`, under the same
+  rule every control-message field follows.
 - **A frame at or below its mark is committed without a send.** The marks exist only once the
   new connection's handshake has run, and `submit` today encodes and size-gates a batch before
   it connects, so an oversized batch never connects. With identities to resend and no
