@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-10-01
+updated: 2026-10-02
 ---
 
 # Native transport: handshake, implicit sequencing, and per-batch acknowledgement
@@ -16,7 +16,10 @@ connection, in this plan", the deferred alternative "Building credit-based flow 
 window to use cumulative acks (the acks stay empty and in frame order). Superseded in part on
 2026-10-01 by [ADR `native-hop-no-compatibility`](native-hop-no-compatibility.md): "Control
 payload"'s skip-unknown forward compatibility. A control message's fields are each required, and
-an unknown tag is malformed.
+an unknown tag is malformed. Superseded in part on 2026-10-02 by [ADR
+`native-hop-named-acks`](native-hop-named-acks.md): the `Ack` entry of "Control payload" and the
+`Hello`/`HelloAck` field lists. `Ack` is `{ id, seq }`, `Hello` gains `senders`, and `HelloAck`
+gains `marks`.
 
 ## Context
 

@@ -10,6 +10,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: native hop named acks — a cumulative `Ack { id, seq }`, coalesced at `logit_in`, and a resume mark](native-hop-named-acks.md) | 2026-10-02 | 2026-10-02 |
 | [Enabling plan: a native hop send window — several frames in flight, acknowledged in frame order](native-send-window.md) | 2026-10-01 | 2026-10-01 |
 | [Enabling plan: delivery semantics — at-least-once per hop, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-01 |
 | [Enabling plan: VictoriaMetrics — existing components verified, and zstd on remote-write](victoriametrics-interop.md) | 2026-09-24 | 2026-09-24 |
