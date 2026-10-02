@@ -20,8 +20,10 @@ rule", decision 2's "A v1 connection sends unsequenced frames", decision 3's "An
 records replay unsequenced", step 1 of decision 5's algorithm, and the "The breaking change"
 consequence. A frame or record without a complete pair is malformed, not unsequenced.
 Superseded in part on 2026-10-02 by [ADR `native-hop-named-acks`](native-hop-named-acks.md):
-decision 4, "`Ack` carries no fields", and the rejected alternative "`Ack` echoing the sequence".
-`Ack` names an identity and a sequence and covers every frame of that identity at or below it.
+decision 4, "`Ack` carries no fields" and the "nothing acknowledges a sequence" clause of "The
+sequence is a deduplication identity, never a credit", the Context's "nothing acknowledges a
+sequence", and the rejected alternative "`Ack` echoing the sequence". `Ack` names an identity and
+a sequence and covers every frame of that identity at or below it, and grants no credit.
 
 ## Context
 
@@ -37,7 +39,9 @@ frame as `Ack { seq: N }`, the count restarts on a reconnect, and `logit_in` for
 
 One constraint shapes every choice below: delivery verification must not become flow control. The
 sink sends a sequence, the receiver uses it only to recognize a resend, and nothing acknowledges a
-sequence. Credit-based flow control stays separate work.
+sequence. Credit-based flow control stays separate work. [Superseded in part on 2026-10-02 by
+[ADR `native-hop-named-acks`](native-hop-named-acks.md): `Ack` names the identity and sequence of
+the frames handled, and still grants no credit.]
 
 These facts about the code fix the design:
 
@@ -154,7 +158,9 @@ mark per sender identity, in a table bounded by its connection cap.
   2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md): `window` is
   negotiated up to 1024, with no credit messages, and acks answer frames in frame order.] Nothing
   acknowledges a sequence, `window` stays 1, and a future credit-based flow-control record
-  decides its own acknowledgment form.
+  decides its own acknowledgment form. [Superseded in part on 2026-10-02 by [ADR
+  `native-hop-named-acks`](native-hop-named-acks.md): `Ack { id, seq }` acknowledges the frames
+  it names; the "never a credit" half stands.]
 - **No version changes.** `PROTOCOL_VERSION` stays 1, the frame `VERSION` stays 1, and the codec
   byte stays `CODEC_NATIVE_V2`.
 - **Breaking change.** `logit` is pre-release, so this is a breaking change to the native wire

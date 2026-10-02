@@ -9,11 +9,13 @@ updated: 2026-10-02
 Accepted. Supersedes in part:
 
 - [ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md): decision 4,
-  "`Ack` carries no fields", and the rejected alternative "`Ack` echoing the sequence".
-- [ADR `native-hop-send-window`](native-hop-send-window.md): decision 1's "Acks arrive in frame
-  order" (the k-th `Ack` answers the k-th unanswered frame), decision 4's "`in_flight` is the
-  loop's count" drift check, decision 5's `await_ack` ("`Ack` decrements `in_flight`"), and the
-  rejected alternative "`Ack` carrying the sequence".
+  "`Ack` carries no fields" and the "nothing acknowledges a sequence" clause of "The sequence is
+  a deduplication identity, never a credit", the Context's "nothing acknowledges a sequence", and
+  the rejected alternative "`Ack` echoing the sequence".
+- [ADR `native-hop-send-window`](native-hop-send-window.md): the Decision's "no sequence in
+  `Ack`", decision 1's "Acks arrive in frame order" (the k-th `Ack` answers the k-th unanswered
+  frame), decision 4's "`in_flight` is the loop's count" drift check, decision 5's `await_ack`
+  ("`Ack` decrements `in_flight`"), and the rejected alternative "`Ack` carrying the sequence".
 - [ADR `native-hop-no-compatibility`](native-hop-no-compatibility.md): decision 4's "`Ack` is the
   message byte alone".
 - [ADR `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md): the `Ack`
@@ -29,9 +31,10 @@ acknowledgment, though, still names nothing: `Ack` is one byte, written and flus
 frame, and the sender matches acks to frames by count. Three costs follow:
 
 - **One write and one flush per frame at `logit_in`.** `serve_frames` writes `Ack` after every
-  frame and flushes it. On loopback the perf harness shows `native-relay` ack-bound, and the
-  per-frame flush is the main per-frame cost ([`docs/plans/native-send-window.md`](../plans/native-send-window.md),
-  "Findings"). Under TLS each flush is a record of its own.
+  frame and flushes it. On loopback the perf harness shows `native-relay` ack-bound
+  (`docs/design/performance.md`, "Peak RSS: what is live data and what is jemalloc retention",
+  the `logit_out` sink-queue-full row). The per-frame flush is the suspected cost; W4 of the plan
+  measures it. Under TLS each flush is a record of its own.
 - **A positional contract the sender has to defend.** The k-th `Ack` answers the k-th
   unacknowledged frame, so `logit_out` keeps `Conn.in_flight` as a count, and `submit` fails
   `Ambiguous` and drops the connection when the write loop's count disagrees with it ([ADR
@@ -71,8 +74,14 @@ reconnect commits what the receiver already holds without resending it.
 ### 1. `Ack { id, seq }` is cumulative per identity
 
 - **Wire.** `Ack` has two required fields: tag 1 `id`, the 16-byte sender identity, and tag 2
-  `seq`, a uvarint. Message byte `MSG_ACK` is unchanged. Both fields are required once, and an
-  unknown tag is `Malformed`, as for every control message.
+  `seq`, a uvarint; a `seq` of 0 is `Malformed`, as it is in a frame's trailer. Message byte
+  `MSG_ACK` is unchanged. Both fields are required once, and an unknown tag is `Malformed`, as
+  for every control message.
+- **Not a credit.** The ack names frames the receiver has handled. It grants no permission to
+  send: the window is still fixed at the handshake, and nothing in an ack changes how many frames
+  the sender may have in flight. The earlier records' "nothing acknowledges a sequence" was a
+  guard against flow control arriving through the acknowledgment, and this record keeps that
+  guard while naming the frame.
 - **Meaning.** "Every data frame of identity `id` with a sequence at or below `seq` that this
   connection carried is handled: forwarded, or recognized as a resend and not forwarded." It
   says nothing about any other identity.
@@ -196,8 +205,7 @@ code accounts for it.
   read, not per `await_ack` that returned from the list.
 - **Operator docs.** `docs/design/wire-protocol.md`'s connection protocol and
   `docs/deploying.md`'s forwarding section describe the named ack, coalescing, and the resume.
-- **Known gaps.** The "lazy ack" and "resume mark" follow-ups noted in the send-window plan
-  close. A new residual: `Hello.senders` is capped at 16 identities, so a window spanning more
-  than 16 store opens resends the rest.
+- **Known gaps.** A new residual: `Hello.senders` is capped at 16 identities, so a window
+  spanning more than 16 store opens resends the rest.
 - **Measurement owed.** `native-relay` on the perf VM before and after, at `window: 1` and
-  `window: 32`, since the per-frame flush was the ack-bound cost the send-window stream named.
+  `window: 32`, to confirm the per-frame flush was the ack-bound cost.

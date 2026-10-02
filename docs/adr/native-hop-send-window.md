@@ -31,7 +31,8 @@ Accepted. Supersedes in part:
 Superseded in part on 2026-10-01 by [ADR
 `native-hop-no-compatibility`](native-hop-no-compatibility.md): decision 1's "A `HelloAck.window`
 of 0 reads as 1". A `window` of 0 fails to decode on either side. Superseded in part on
-2026-10-02 by [ADR `native-hop-named-acks`](native-hop-named-acks.md): decision 1's "Acks arrive
+2026-10-02 by [ADR `native-hop-named-acks`](native-hop-named-acks.md): the Decision's "no
+sequence in `Ack`", decision 1's "Acks arrive
 in frame order" (the k-th `Ack` answers the k-th unanswered frame), decision 4's "`in_flight` is
 the loop's count" drift check, decision 5's `await_ack` ("`Ack` decrements `in_flight`"), and the
 rejected alternative "`Ack` carrying the sequence". An `Ack` names an identity and a sequence,
@@ -96,8 +97,11 @@ These facts about the code fix the design:
 
 `logit_out` keeps up to a negotiated window of frames in flight on one connection, and each
 `Ack` answers the oldest unanswered frame. The wire doesn't change: no credit messages, no
-sequence in `Ack`, and no version bump. The sink's store reserves a prefix of items instead of
-the head alone, and a fault resends the window from the head.
+sequence in `Ack`, and no version bump. [Superseded in part on 2026-10-02 by [ADR
+`native-hop-named-acks`](native-hop-named-acks.md): `Ack` carries an identity and a sequence and
+answers every frame of that identity at or below it; still no credit messages.] The sink's store
+reserves a prefix of items instead of the head alone, and a fault resends the window from the
+head.
 
 ### 1. Wire: no message changes
 

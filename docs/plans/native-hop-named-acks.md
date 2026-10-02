@@ -55,24 +55,21 @@ Files: `crates/logit-proto/src/native/control.rs`, `crates/logit-inputs/src/logi
 `crates/logit-pipeline/src/runtime.rs`, `crates/logit-inputs/src/logit/senders.rs`,
 `fuzz/seedgen/src/lib.rs`, `fuzz/seeds/native_control/`, `docs/design/wire-protocol.md`.
 
-- [ ] `control::Ack { id: [u8; 16], seq: u64 }`: tag 1 `id` (16 bytes), tag 2 `seq` (uvarint),
-  both required once under the strict rules `Hello`/`HelloAck`/`Reject` already follow
-  (`set_once`/`required`/`unknown_tag`); `seq` 0 is `Malformed`. `Ack::encode` writes both.
-- [ ] `Hello.senders: Vec<[u8; 16]>` as tag 6, required, 0 to `MAX_HELLO_SENDERS` (16) entries
-  of 16 bytes concatenated; a length not a multiple of 16, or over the cap, is `Malformed`.
-  `HelloAck.marks: Vec<([u8; 16], u64)>` as tag 6, required, entries of 24 bytes (identity, then
-  the mark as big-endian u64); same bounds. Both empty in W1 (`logit_out` sends `[]`, `logit_in`
-  answers `[]`); W3 fills them.
-- [ ] `MAX_CONTROL_MESSAGE_BYTES` stays 4096: the largest `Hello` is now under 300 bytes and the
-  largest `HelloAck` under 450; update the doc's arithmetic.
-- [ ] `logit_in`: `serve_frames` writes `Ack { id: seq.id, seq: seq.seq }` after each frame (one
-  per frame in W1; W2 coalesces). `SenderTable` gains `marks(&self, ids: &[[u8; 16]]) ->
-  Vec<([u8; 16], u64)>`, read-only (no insert, no eviction, no `last_seen` bump).
-- [ ] `logit_out`: `Conn.in_flight: VecDeque<InFlight { seq: SeqId, acked: bool }>`; `submit`
-  pushes; `read_ack` marks a prefix per decision 3 and fails `Ambiguous` on a shape violation;
-  `await_ack` pops an `acked` front without reading, else reads one message and applies it;
-  `record_in_flight` reports the list's length. Remove `drifted` and the `in_flight != held`
-  check. `logit.output.ack.duration` records one sample per wire read.
+- [ ] `control.rs`: `Ack`, `Hello.senders`, and `HelloAck.marks` as the ADR's decisions 1 and 4
+  lay them out, under the strict decoding `Hello`/`HelloAck`/`Reject` already use
+  (`set_once`/`required`/`unknown_tag`). A `senders` or `marks` field whose length isn't a
+  multiple of its entry size, or that holds more than `MAX_HELLO_SENDERS` entries, is
+  `Malformed`. Both lists are empty in W1 (`logit_out` sends `[]`, `logit_in` answers `[]`); W3
+  fills them.
+- [ ] `MAX_CONTROL_MESSAGE_BYTES` stays 4096; update its doc's arithmetic for the two new fields.
+- [ ] `logit_in`: `serve_frames` writes one named `Ack` per frame (W2 coalesces). `SenderTable`
+  gains a read-only `marks(&self, ids: &[[u8; 16]])` lookup: no insert, no eviction, no
+  `last_seen` bump.
+- [ ] `logit_out`: `Conn.in_flight` becomes the in-flight list of decision 3; `submit` pushes;
+  `read_ack` marks a prefix and fails `Ambiguous` on a shape violation; `await_ack` answers from
+  the list before reading the wire; `record_in_flight` reports the list's length. Remove
+  `drifted` and the `in_flight != held` check. `logit.output.ack.duration` records one sample per
+  wire read.
 - [ ] `Output::submit(&mut self, batch, ctx, seq)` loses `in_flight`; `window_round` and the
   `WindowedOutput` test double follow; `docs/design/pipeline-graph.md`'s `deliver_window` row if
   it names the argument.
@@ -103,15 +100,12 @@ Files: `crates/logit-proto/src/native/control.rs`, `crates/logit-inputs/src/logi
 Files: `crates/logit-inputs/src/logit.rs`, `docs/design/internal-telemetry.md`.
 
 - [ ] `serve_frames` keeps `pending: Option<(SeqId, u32)>` (the last handled frame's pair and the
-  frames covered). After handling a frame: if `pending` holds another identity, flush first
-  (before this frame is handled: the check runs after decode, before `is_resend`); then set or
-  extend `pending`; flush when the count reaches `ACK_COALESCE_MAX` (32).
-- [ ] The read-would-block flush: before `read_header`, if `pending` is set, poll the header
-  read once (`tokio::select! { biased; .. }` against a ready future, or `std::future::poll_fn`);
-  if it is pending, write and flush the ack, then await the read. Over TLS the same poll on the
-  TLS stream.
-- [ ] Flush before every `Reject` (`going_away`, `write_reject`) and on every exit of
-  `serve_frames` after the handshake, best effort (a failed flush there doesn't change the exit).
+  frames covered) and flushes it at the four points of the ADR's decision 2. The identity check
+  runs after decode and before `is_resend`. The read-would-block flush polls the header read once
+  (`tokio::select! { biased; .. }` against a ready future, or `std::future::poll_fn`) and flushes
+  before awaiting it; the same poll works on the TLS stream. The flush before a `Reject` lives in
+  `going_away` and `write_reject`; the flush on every other exit is best effort and doesn't change
+  the exit.
 - [ ] `logit.input.acks` (count), recorded in `docs/design/internal-telemetry.md`'s `logit_in`
   section beside `logit.proto.frames`.
 - [ ] Tests, on observables (`TelemetryProbe`, `wait_until`), no sleeps:
@@ -133,13 +127,10 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-inputs/src/logit.rs`,
 `docs/design/internal-telemetry.md`.
 
 - [ ] `logit_out`: when a connection is dropped with frames in flight, keep the distinct
-  identities of its unacked entries (in order, at most `MAX_HELLO_SENDERS`) as
-  `resend_senders`; the next `handshake` sends them in `Hello.senders` and stores
-  `HelloAck.marks` on the new `Conn` as `marks: HashMap<[u8; 16], u64>`. A fresh connection
-  with nothing to resend sends `[]`.
-- [ ] `submit`: before encoding, if `marks[seq.id] >= seq.seq`, push `InFlight { seq, acked:
-  true }`, count `logit.output.batches.resumed`, and return `Ok`. The size gate and the write
-  are skipped.
+  identities of its unacked entries as `resend_senders`; the next `handshake` sends them and
+  stores the answered marks on the new `Conn`. `submit` applies the ADR's decision 4 before
+  encoding: a covered frame is pushed `acked`, counted, and returned `Ok` with no size gate and no
+  write.
 - [ ] `logit_in`: `handshake` answers `marks: senders.marks(&hello.senders)`.
 - [ ] `docs/design/internal-telemetry.md`: `logit.output.batches.resumed`.
 - [ ] Tests:
@@ -160,10 +151,9 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-inputs/src/logit.rs`,
 - [ ] `docs/design/wire-protocol.md`: "Flow control" and the acknowledgement-point text (one ack
   per run; the resume); `docs/deploying.md`, forwarding section: what an ack means now, the
   resume, and that a reconnect no longer resends acknowledged frames; module docs of both hop
-  components; `docs/known-gaps.md`: close the lazy-ack and resume-mark follow-ups from
-  `docs/plans/native-send-window.md`'s "Findings", add the 16-identity cap residual, and reword
-  the `ack_write_stalled` reasoning for coalesced acks; `AGENTS.md`'s `logit_out`/`logit_in`
-  rows gain this ADR.
+  components; `docs/known-gaps.md`: add the 16-identity cap residual and reword the
+  `ack_write_stalled` reasoning for coalesced acks; `AGENTS.md`'s `logit_out`/`logit_in` rows
+  gain this ADR.
 - [ ] Sweep every comment line the stream added for the banned words.
 - [ ] `script/cibuild` at the stack's tip, from a private `CARGO_TARGET_DIR`.
 - [ ] Measurements in "Findings" below: loopback `native-relay` at `window: 1` and `window: 32`
