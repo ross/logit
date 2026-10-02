@@ -1,8 +1,8 @@
 # `tail`'s graph with a rotation mid-run: `tail_in` reads the first half of the lines from one
-# file, the harness renames it away and renames a replacement into place, and `tail_in` must read
-# the renamed file to its end and the replacement from its start. Read against `tail`, the
-# difference is the rotation path's cost: the rescan, the second open, the draining file's last
-# reads and its reap. The sidecar spec perf/load/tail-rotate.yaml says where the rotation falls
+# file, the harness links it aside as `app.log.1` and renames a replacement onto its path, and
+# `tail_in` must read the old file to its end and the replacement from its start. Read against
+# `tail`, the difference is the rotation path's cost: the rescan, the second open, the draining
+# file's last reads and its reap. The sidecar spec perf/load/tail-rotate.yaml says where the rotation falls
 # (perf/load/README.md's "File scenarios").
 #
 #   script/perf run --scenario tail-rotate --repeat 5 --pin-child 2,3

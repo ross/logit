@@ -6055,32 +6055,42 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn every_run_output_exit_path_reconciles_with_a_window_in_flight() {
         let output = |path: ExitPath, delivered: &Arc<AtomicU64>| {
-            let windowed = |delay, ack: AckScript| {
+            let windowed = |delay, ack: AckScript, submit_delays| {
                 let (mut output, log) = windowed_output((4, 4));
                 output.ack_delay = delay;
                 output.ack_script = ack;
+                output.submit_delays = submit_delays;
                 output.delivered = Arc::clone(delivered);
                 drop(log);
                 Box::new(output) as Box<dyn Output + Send>
             };
+            // On a grace cut, the head's 1 ms submit holds the fill until `drain_inbox` has
+            // pushed the second batch: a disk store reads and writes on blocking threads, so the
+            // fill could otherwise find it not yet readable, stop at the head, and leave one
+            // batch cut off instead of two. Pending blocking I/O holds the paused clock, so the
+            // delay can't fire before that push completes.
+            let head = (1, Duration::from_millis(1));
             match path {
-                ExitPath::DrainFirst => windowed(Duration::from_millis(10), AckScript::Ok),
+                ExitPath::DrainFirst => {
+                    windowed(Duration::from_millis(10), AckScript::Ok, Vec::new())
+                }
                 ExitPath::GraceExpiry => {
-                    windowed(Duration::from_millis(10), AckScript::Always(Fault::Clean))
+                    windowed(Duration::from_millis(10), AckScript::Always(Fault::Clean), Vec::new())
                 }
-                ExitPath::GraceCutsInFlightSend => windowed(Duration::ZERO, AckScript::Hang),
-                ExitPath::GraceCutsInFlightSubmit => {
-                    let (mut output, log) = windowed_output((4, 4));
-                    output.submit_delay = Some((2, Duration::from_secs(3600)));
-                    output.ack_script = AckScript::Hang;
-                    output.delivered = Arc::clone(delivered);
-                    drop(log);
-                    Box::new(output) as Box<dyn Output + Send>
+                ExitPath::GraceCutsInFlightSend => {
+                    windowed(Duration::ZERO, AckScript::Hang, vec![head])
                 }
-                ExitPath::PermanentError => {
-                    windowed(Duration::from_secs(20), AckScript::Always(Fault::Permanent))
-                }
-                ExitPath::ClosedAndEmpty => windowed(Duration::ZERO, AckScript::Ok),
+                ExitPath::GraceCutsInFlightSubmit => windowed(
+                    Duration::ZERO,
+                    AckScript::Hang,
+                    vec![head, (2, Duration::from_secs(3600))],
+                ),
+                ExitPath::PermanentError => windowed(
+                    Duration::from_secs(20),
+                    AckScript::Always(Fault::Permanent),
+                    Vec::new(),
+                ),
+                ExitPath::ClosedAndEmpty => windowed(Duration::ZERO, AckScript::Ok, Vec::new()),
             }
         };
         reconcile_every_exit_path(output, 2.0).await;
@@ -6303,8 +6313,8 @@ mod tests {
         submit_script: std::collections::VecDeque<Option<Fault>>,
         /// Every submit of this batch fails with this fault.
         submit_fails: Option<(u64, Fault)>,
-        /// Every submit of this batch takes this long before it writes.
-        submit_delay: Option<(u64, Duration)>,
+        /// Every submit of each listed batch takes its duration before it writes.
+        submit_delays: Vec<(u64, Duration)>,
         ack_script: AckScript,
         ack_delay: Duration,
         log: Arc<std::sync::Mutex<Vec<Call>>>,
@@ -6348,7 +6358,7 @@ mod tests {
                 pending_seq: None,
                 submit_script: std::collections::VecDeque::new(),
                 submit_fails: None,
-                submit_delay: None,
+                submit_delays: Vec::new(),
                 ack_script: AckScript::Ok,
                 ack_delay: Duration::ZERO,
                 log: Arc::clone(&log),
@@ -6425,10 +6435,8 @@ mod tests {
         ) -> anyhow::Result<()> {
             let value = value_of(batch);
             self.record(Call::Submit(value, seq.seq, self.in_flight.len()));
-            if let Some((v, delay)) = self.submit_delay {
-                if v == value {
-                    tokio::time::sleep(delay).await;
-                }
+            if let Some(&(_, delay)) = self.submit_delays.iter().find(|(v, _)| *v == value) {
+                tokio::time::sleep(delay).await;
             }
             self.submit_value(value)
         }
@@ -6737,7 +6745,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_round_that_outlasts_the_budget_still_delivers_a_head_whose_ack_arrived() {
         let (mut output, log) = windowed_output((4, 4));
-        output.submit_delay = Some((2, fast_retry_config().total_budget * 2));
+        output.submit_delays = vec![(2, fast_retry_config().total_budget * 2)];
         let start = tokio::time::Instant::now();
         let totals = drive_windowed(&mut output, 2, 1024, DeliveryPosture::AtMostOnce).await;
         assert!(start.elapsed() >= fast_retry_config().total_budget * 2, "the submit ran on");
@@ -6827,7 +6835,7 @@ mod tests {
     async fn a_grace_cut_during_a_submit_past_the_head_counts_that_batch_too_under_at_most_once() {
         for posture in [DeliveryPosture::AtMostOnce, DeliveryPosture::AtLeastOnce] {
             let (mut output, log) = windowed_output((4, 4));
-            output.submit_delay = Some((3, Duration::from_secs(3600)));
+            output.submit_delays = vec![(3, Duration::from_secs(3600))];
             let registry = Registry::new();
             let telemetry = registry.telemetry_for("out", "logit_out", "sink");
             let store = Arc::new(SinkStore::Memory(SinkQueue::new(

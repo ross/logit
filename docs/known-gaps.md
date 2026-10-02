@@ -2227,6 +2227,13 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   window is up to one `poll_interval` of writes (or one wake). See [ADR
   `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
   amendment.
+- **`logit.input.files.rotated` misses a rotation when a scan lands in logrotate `create`'s
+  rename-to-create gap.** logrotate renames the file away and creates its replacement after. A
+  scan between the two finds nothing at the path, so it retires the old inode (which drains to
+  its end) and the next scan opens the replacement at offset 0 as a new file. No line is lost;
+  only the counter misses that rotation. The `tail-rotate` perf scenario rotates by a hard link
+  then a rename so its exact rotation count can't hit this window
+  (`crates/logit-perf/src/file_load.rs`'s module doc).
 - **`tail_in` splits a line held unterminated at a clean stop into two events.** Shutdown emits the
   partial line as it stands, and the checkpoint records the end of what was read, so the rest of
   the line, written later, arrives after the restart as a line of its own. A line being dropped

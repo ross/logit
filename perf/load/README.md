@@ -357,10 +357,13 @@ exact path (no `*`, no `!env`) that resolves strictly inside `perf/results/`. Th
 that path's directory before every spawn and removes it after, because each repeat writes about
 1.5 GiB.
 
-**`rotate_after` rotates once, as logrotate's `create` mode does.** The replacement is written
-before the spawn too, as `<path>.next`. Once the sink has received half of the first file, the
-harness renames `<path>` to `<path>.1` and `<path>.next` onto `<path>`. `tail_in` has to read the
-renamed file through to its end and the replacement from its start.
+**`rotate_after` rotates once, to logrotate `create` mode's end state.** The replacement is
+written before the spawn too, as `<path>.next`. Once the sink has received half of the first
+file, the harness hard-links `<path>` as `<path>.1` and renames `<path>.next` onto `<path>`.
+`tail_in` has to read the old inode through to its end and the replacement from its start.
+logrotate itself renames first and creates after; a scan in that gap misses the rotation count
+(`docs/known-gaps.md`), and the exact self-check counts rotations, so the harness never leaves
+`<path>` missing.
 
 **The run ends when the sink has every line.** `run` attaches the UDP kind's telemetry leg at a
 100 ms drain interval and follows the dump while the child runs, so `wall_s` is resolved to about
