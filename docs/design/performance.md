@@ -170,8 +170,8 @@ event per line, batch, deliver to `null_out`. Like the UDP family they have no `
 `logit-perf` writes the tailed file before the spawn, from a slog-style JSON app-log model in
 [`perf/load/`](../../perf/load/README.md) (5M lines of 273–330 bytes, ~1.5 GiB), and `tail_in`
 reads it from its first byte. `tail-rotate` splits the same lines across a file and its
-replacement and renames one onto the other once the sink has half of the first file. Read their
-numbers this way:
+replacement, and moves the old file aside and the replacement onto its path once the sink has
+half of the first file. Read their numbers this way:
 
 - **`wall_s` ends when the sink's delivered count reaches the line count.** There's no
   `generation complete` line and no sender to return. `run` attaches the `udp-statsd*` family's

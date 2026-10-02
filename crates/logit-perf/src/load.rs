@@ -201,8 +201,16 @@ pub struct LineWeight {
 pub fn read_spec(path: &Path) -> anyhow::Result<LoadSpec> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let spec: LoadSpec =
+    let mut value: serde_norway::Value =
         serde_norway::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    // `kind: udp` names this spec's kind (`crate::file_load::read_any_spec`); it isn't a field.
+    if let Some(map) = value.as_mapping_mut() {
+        if map.get("kind").and_then(serde_norway::Value::as_str) == Some("udp") {
+            map.remove("kind");
+        }
+    }
+    let spec: LoadSpec =
+        serde_norway::from_value(value).with_context(|| format!("parsing {}", path.display()))?;
     validate_spec(&spec).with_context(|| format!("{}", path.display()))?;
     Ok(spec)
 }

@@ -251,8 +251,10 @@ rather than adding a parallel one:
   one exact path the scenario's `tail_in` names, which must resolve under `perf/results/` (the
   directory the harness already clears for `buffered`'s spool). Nothing is written during the
   measured window. A rotating spec stages the replacement file under a name the path doesn't
-  match, and rotates with two renames, as logrotate's `create` mode does, once half the first file
-  is delivered.
+  match, and rotates to logrotate `create` mode's end state once half the first file is
+  delivered: a hard link of the file at `<path>.1`, then a rename of the replacement onto the
+  path. Unlike logrotate's rename-then-create, the path never goes missing, so no scan can miss
+  the rotation the self-check counts (`docs/known-gaps.md` has that window).
 - **Completion is the delivered count reaching the line count.** A file scenario has no
   `generation complete` line and no sender to return, so `run` follows the same telemetry dump the
   UDP kind reads its denominator from, at a 100 ms drain interval, and ends `wall_s` when the

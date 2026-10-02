@@ -1,7 +1,7 @@
 # File spec for `perf/scenarios/tail-rotate.yaml`: `tail`'s lines split across a file and its
-# replacement. Once the sink has half of the first file, the harness renames it to `app.log.1` and
-# renames the already-written replacement onto `app.log`, as logrotate's `create` does. See
-# perf/load/README.md's "File scenarios".
+# replacement. Once the sink has half of the first file, the harness hard-links it as `app.log.1`
+# and renames the already-written replacement onto `app.log`: logrotate `create`'s end state,
+# reached without a moment where `app.log` is missing. See perf/load/README.md's "File scenarios".
 kind: file
 target: app
 lines: 5000000

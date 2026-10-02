@@ -72,8 +72,9 @@ pub struct RunArgs {
     /// container. A multi-source VM session points this at the `perf/bins/<slug>/logit` that
     /// `script/vm build` stashed (docs/adr/disposable-azure-perf-vm.md).
     pub logit_bin: Option<PathBuf>,
-    /// How long to wait for a scenario's `generation complete` line (generated) or `ready` line
-    /// (driven) before giving up on it as hung.
+    /// How long to wait for a scenario's `generation complete` line (generated), its `ready` line
+    /// (driven), or the sink to receive every line (file), before giving up on it as hung.
+    /// Counted from the spawn in every case.
     pub timeout: Duration,
     /// How long to wait for the process to exit after `--settle`/SIGTERM (or, for a
     /// self-exiting scenario, after the completion line) before force-killing it.
@@ -883,9 +884,18 @@ fn follow_to_completion(
     let mut follower = telemetry_leg::DumpFollower::new(dump);
     let mut rotate_at = plan.rotate_at();
     let mut delivered = 0;
+    // Why the sink's count couldn't be read at the last drain, reported if the run times out: a
+    // misnamed or ambiguous `sink:` otherwise looks like a slow run.
+    let mut sink_error: Option<anyhow::Error> = None;
     loop {
         if follower.poll()? {
-            delivered = file_load::delivered_so_far(follower.events(), plan.spec.sink.as_deref());
+            match file_load::delivered_so_far(follower.events(), plan.spec.sink.as_deref()) {
+                Ok(count) => {
+                    delivered = count;
+                    sink_error = None;
+                }
+                Err(err) => sink_error = Some(err),
+            }
         }
         if rotate_at.is_some_and(|at| delivered >= at) {
             plan.rotate()?;
@@ -898,8 +908,11 @@ fn follow_to_completion(
             bail!("{cause}, with {delivered} of {} lines delivered", plan.spec.lines);
         }
         if Instant::now() >= deadline {
+            let cause = sink_error
+                .map(|err| format!("; the sink's count was unreadable at the last drain: {err:#}"))
+                .unwrap_or_default();
             bail!(
-                "the sink had received {delivered} of {} lines when --timeout ran out",
+                "the sink had received {delivered} of {} lines when --timeout ran out{cause}",
                 plan.spec.lines
             );
         }
@@ -1080,7 +1093,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
                 let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
                 bail!("no `ready` line within {}s; stderr:\n{stderr_text}", timeout.as_secs());
             }
-            match follow_to_completion(plan, dump, &child_end, Instant::now() + timeout) {
+            match follow_to_completion(plan, dump, &child_end, deadline) {
                 Ok(at) => wall_ends_at = at,
                 Err(err) => {
                     let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);

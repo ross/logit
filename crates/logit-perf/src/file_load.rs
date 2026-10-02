@@ -21,9 +21,14 @@
 //!
 //! **Everything is written before the spawn**, so no write competes with the measured child.
 //! With `rotate_after`, the replacement file is staged beside the tailed one under a name the
-//! pattern doesn't match, and the rotation is two `rename(2)`s once the sink has received half
-//! of the first file: the tailed file to `<path>.1`, then the staged file onto `<path>`. That is
-//! logrotate's `create` sequence, with the new file arriving already written.
+//! pattern doesn't match, and the rotation runs once the sink has received half of the first
+//! file: a hard link of the tailed file at `<path>.1`, then a `rename(2)` of the staged file onto
+//! `<path>`. The result is logrotate's `create` mode (old inode at `<path>.1`, a new inode at
+//! `<path>`), but `<path>` names a file at every instant. logrotate's own sequence renames the
+//! file away first and creates the new one after, and a scan landing between the two finds
+//! nothing at `<path>`: `tail_in` then retires the old inode and opens the new one as a new file,
+//! with nothing lost but no rotation counted (`docs/known-gaps.md`). The exact self-check counts
+//! rotations, so the harness avoids that gap rather than failing a correct run on it.
 //!
 //! **The file lives under `perf/results/`**, resolved against the scenario's directory as
 //! `logit` resolves it, and its parent directory is cleared before every spawn and removed after.
@@ -306,13 +311,13 @@ impl FilePlan {
         Ok(())
     }
 
-    /// Rotates as logrotate's `create` does: the tailed file to `<path>.1`, then the staged
-    /// replacement onto `<path>`.
+    /// Rotates to logrotate `create`'s end state, the old inode at `<path>.1` and the staged
+    /// replacement at `<path>`, by a hard link then a rename rather than logrotate's rename then
+    /// create, so no scan finds `<path>` missing (see the module doc).
     pub fn rotate(&self) -> anyhow::Result<()> {
         let rotated = self.sibling(ROTATED_SUFFIX);
-        fs::rename(&self.path, &rotated).with_context(|| {
-            format!("renaming {} to {}", self.path.display(), rotated.display())
-        })?;
+        fs::hard_link(&self.path, &rotated)
+            .with_context(|| format!("linking {} as {}", self.path.display(), rotated.display()))?;
         let staged = self.sibling(STAGED_SUFFIX);
         fs::rename(&staged, &self.path)
             .with_context(|| format!("renaming {} to {}", staged.display(), self.path.display()))?;
@@ -330,9 +335,10 @@ impl Drop for Staged {
     }
 }
 
-/// The sink's delivered count so far, or 0 before any drain has carried one.
-pub fn delivered_so_far(events: &[Event], sink: Option<&str>) -> u64 {
-    crate::attribute::delivered_at_sink(&crate::attribute::aggregate(events), sink).unwrap_or(0)
+/// The sink's delivered count so far. An error before the sink's first drain is expected; one
+/// that persists (a misnamed or ambiguous `sink:`) is the caller's to report.
+pub fn delivered_so_far(events: &[Event], sink: Option<&str>) -> anyhow::Result<u64> {
+    crate::attribute::delivered_at_sink(&crate::attribute::aggregate(events), sink)
 }
 
 /// `tail_in`'s own counters, folded out of the dump for one component.
@@ -478,6 +484,22 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_kind_udp_spec_is_read_as_udp() {
+        let dir = temp_dir("udp-explicit");
+        fs::write(dir.join("m.yaml"), "lines:\n  - { weight: 1, template: \"a.{seq%3}:1|c\" }\n")
+            .unwrap();
+        let path = dir.join("s.yaml");
+        fs::write(
+            &path,
+            "kind: udp\ntarget: statsd\ndatagrams: 10\nmodel: m.yaml\ndatagram_mix:\n  - { weight: 1, single: true }\n",
+        )
+        .unwrap();
+        assert!(matches!(read_any_spec(&path).unwrap(), AnySpec::Udp(_)));
+        // `LoadPlan::build` re-reads the spec through `load::read_spec`.
+        assert_eq!(load::read_spec(&path).unwrap().datagrams, 10);
+    }
+
+    #[test]
     fn a_kind_file_spec_is_read_with_its_defaults() {
         let (_, _, spec) =
             tree("file-kind", "kind: file\ntarget: app\nlines: 10\nmodel: m.yaml\n", "x");
@@ -554,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rotating_plan_splits_its_lines_and_rotate_renames_as_logrotate_does() {
+    fn a_rotating_plan_splits_its_lines_and_rotate_ends_as_logrotate_create_does() {
         let (root, scenario, spec) = tree(
             "rotate",
             "kind: file\ntarget: app\nlines: 25\nrotate_after: 10\nring_lines: 7\nmodel: m.yaml\n",
@@ -566,8 +588,13 @@ mod tests {
         let before = fs::read(&plan.path).unwrap();
         assert_eq!(line_count(&plan.path), 10);
         assert_eq!(line_count(&plan.sibling(STAGED_SUFFIX)), 15);
+        use std::os::unix::fs::MetadataExt;
+        let old_ino = fs::metadata(&plan.path).unwrap().ino();
+        let new_ino = fs::metadata(plan.sibling(STAGED_SUFFIX)).unwrap().ino();
         plan.rotate().unwrap();
         assert_eq!(fs::read(plan.sibling(ROTATED_SUFFIX)).unwrap(), before);
+        assert_eq!(fs::metadata(plan.sibling(ROTATED_SUFFIX)).unwrap().ino(), old_ino);
+        assert_eq!(fs::metadata(&plan.path).unwrap().ino(), new_ino, "the path is the new inode");
         assert_eq!(line_count(&plan.path), 15);
         assert!(!plan.sibling(STAGED_SUFFIX).exists());
         let total = fs::metadata(&plan.path).unwrap().len()
