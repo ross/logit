@@ -2,8 +2,8 @@
 //! resends (`docs/adr/native-hop-identity-and-sequence.md`, decisions 5 and 6, and the parent
 //! module doc's "Deduplication").
 //!
-//! The lock is a `std::sync::Mutex` held only inside [`SenderTable::is_resend`] and
-//! [`SenderTable::raise`], never across an `.await`: a connection task's future must stay `Send`,
+//! The lock is a `std::sync::Mutex` held only inside [`SenderTable::is_resend`],
+//! [`SenderTable::raise`], and [`SenderTable::marks`], never across an `.await`: a connection task's future must stay `Send`,
 //! and no lock spans a forward (decision 7 accepts the race that leaves).
 
 use logit_core::Telemetry;
@@ -95,6 +95,19 @@ impl SenderTable {
         }
     }
 
+    /// The mark of each identity in `ids` the table holds, in the order asked; an identity it
+    /// doesn't hold is omitted. A read: it inserts nothing, evicts nothing, and leaves every
+    /// identity's recency alone, so a sender listing a stale identity can't keep it held
+    /// (`docs/adr/native-hop-named-acks.md`, decision 4).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "answers `Hello.senders` once the handshake resumes")
+    )]
+    pub(crate) fn marks(&self, ids: &[[u8; 16]]) -> Vec<([u8; 16], u64)> {
+        let state = self.lock();
+        ids.iter().filter_map(|id| state.entries.get(id).map(|entry| (*id, entry.mark))).collect()
+    }
+
     fn lock(&self) -> MutexGuard<'_, TableState> {
         // The state stays consistent at every point a panic could leave it.
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -153,5 +166,26 @@ mod tests {
         assert!(!table.is_resend(seq(2, 1)), "the least recently seen identity went");
         assert_eq!(probe.sum(SENDERS_EVICTED, &[]), 1.0);
         assert_eq!(probe.gauge(SENDERS, &[]), Some(2.0));
+    }
+
+    #[test]
+    fn a_marks_lookup_neither_inserts_nor_evicts_nor_touches_last_seen() {
+        let mut probe = TelemetryProbe::new();
+        let table = SenderTable::new(2, probe.telemetry("in", "logit_in", "listener"));
+        table.raise(seq(1, 4));
+        table.raise(seq(2, 9));
+        // 1 is the least recently seen; a lookup of it must not refresh it.
+        assert_eq!(
+            table.marks(&[[2; 16], [3; 16], [1; 16]]),
+            vec![([2; 16], 9), ([1; 16], 4)],
+            "held identities in the order asked, an unheld one omitted"
+        );
+        assert_eq!(table.lock().entries.len(), 2, "the unheld identity wasn't inserted");
+        assert_eq!(probe.gauge(SENDERS, &[]), Some(2.0));
+        table.raise(seq(3, 1));
+        assert!(!table.is_resend(seq(1, 1)), "1 stayed the least recently seen and went");
+        assert!(table.is_resend(seq(2, 9)));
+        assert_eq!(probe.sum(SENDERS_EVICTED, &[]), 1.0, "only the raise evicted");
+        assert!(table.marks(&[]).is_empty());
     }
 }

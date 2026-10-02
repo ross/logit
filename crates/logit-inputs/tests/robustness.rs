@@ -114,6 +114,7 @@ async fn handshake(stream: &mut TcpStream) {
         compressions: vec![0],
         max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
         window: 1,
+        senders: vec![],
     };
     write_control(stream, hello.encode()).await;
     match read_control(stream).await {
@@ -157,7 +158,7 @@ async fn a_frame_body_is_held_once_at_peak() {
     reset();
     client.write_all(&framed).await.unwrap();
     match read_control(&mut client).await {
-        control::ControlMessage::Ack(_) => {}
+        control::ControlMessage::Ack(ack) => assert_eq!((ack.id, ack.seq), (seq.id, seq.seq)),
         other => panic!("expected Ack, got {other:?}"),
     }
     let peak = peak();

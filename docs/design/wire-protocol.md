@@ -372,14 +372,17 @@ decision record.
   shape as a native `Event`'s fields but none of their skip-unknown behavior. Every field in the
   table is required and appears once; a missing, repeated, or unknown field, or an unknown message
   type, is malformed ([ADR `native-hop-no-compatibility`](../adr/native-hop-no-compatibility.md),
-  decision 4). `Ack` is the message-type byte alone, and a body after it is malformed. `window` is
-  at least 1 in both `Hello` and `HelloAck`, enforced on decode:
+  decision 4). `window` is at least 1 in both `Hello` and `HelloAck`, and `Ack.seq` at least 1, as
+  a trailer's sequence is. `Hello.senders` is a run of 16-byte identities and `HelloAck.marks` a
+  run of 24-byte entries (the identity, then the mark as a big-endian `u64`); either one holding
+  more than `MAX_HELLO_SENDERS` (16) entries, or not a whole number of them, is malformed. All of
+  this is enforced on decode:
 
   | Message | Fields | Sent by |
   |---|---|---|
-  | `Hello` | `version`, `codecs`, `compressions`, `max_frame_bytes`, `window` | the connecting side, first |
-  | `HelloAck` | `version`, `codec`, `compression`, `max_frame_bytes`, `window` | the listener, once, in reply to a valid `Hello` |
-  | `Ack` | none | the listener, once per data frame handled: forwarded, or recognized as a resend and not forwarded |
+  | `Hello` | `version`, `codecs`, `compressions`, `max_frame_bytes`, `window`, `senders` | the connecting side, first |
+  | `HelloAck` | `version`, `codec`, `compression`, `max_frame_bytes`, `window`, `marks` | the listener, once, in reply to a valid `Hello` |
+  | `Ack` | `id`, `seq` | the listener, after the data frames it names are handled: forwarded, or recognized as a resend and not forwarded |
   | `Reject` | `code`, `message` | either side, closing the connection |
 
 - **Handshake.** The connecting side sends `Hello`. The listener replies with `HelloAck` (codec
@@ -391,12 +394,16 @@ decision record.
   `logit.proto.errors{reason="handshake"}`; a `HelloAck` that fails to decode fails `logit_out`'s
   connect as a clean fault. A control message is at most `control::MAX_CONTROL_MESSAGE_BYTES` (4096) bytes, and
   each side refuses a longer one on its header: `logit_in` for a `Hello`, `logit_out` for a
-  reply.
+  reply. `Hello.senders` lists the identities of the frames a connection will resend and
+  `HelloAck.marks` answers each with the listener's mark ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 4);
+  `logit_out` sends no identities and `logit_in` answers no marks.
 - **Sender identity and sequence ride in the hop trailer.** The sink's store assigns each
   batch a 16-byte sender identity and a sequence number, and `logit_out` writes them into the
   trailer of every frame ([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)).
-  `Ack` carries no sequence: acks arrive in frame order ("Flow control" below), so each answers the
-  oldest frame still unanswered on its connection.
+  `Ack { id, seq }` names one identity and one sequence the connection carried, and means every
+  frame of that identity at or below `seq` on this connection is handled; it says nothing of any
+  other identity, and grants no credit ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 1). `seq` is a frame's own
+  sequence, never the mark, so a resend below the mark is acknowledged by its own number.
   A store takes a fresh identity every time it opens, memory or disk, and numbers its batches
   from 1; a resend, on the same connection or a new one, reuses the batch's pair. Each `logit_in`
   component keeps one high-water mark per identity, in a table bounded at
@@ -452,15 +459,22 @@ decision record.
   `Reject` within `handshake_timeout`. A peer that stops reading its `Ack`s fills the listener's send
   buffer; the stalled write ends the connection (`logit.proto.errors{reason="ack_write_stalled"}`)
   instead of holding its connection slot and blocking shutdown. A conforming peer leaves at most
-  its window of `Ack`s unread, about 47 KB at the 1024 cap under TLS, which fits the default
+  its window of `Ack`s unread, about 80 KB at the 1024 cap under TLS, which fits the default
   `tcp_rmem`. `idle_timeout` bounds reads only.
 - **Flow control: a negotiated window.** `logit_out` may have up to the connection's window of
   data frames written and unanswered ([ADR `native-hop-send-window`](../adr/native-hop-send-window.md)).
-  - **Acks arrive in frame order.** This is normative. A listener answers a connection's data
-    frames, with an `Ack` or a `Reject`, in the order they arrive, so the k-th answer on a
-    connection is the k-th data frame's. `logit_in` meets it by reading, forwarding, and
-    answering one frame at a time on each connection. Nothing acknowledges out of order, and the
-    trailer's sequence is a deduplication identity, never an acknowledgment.
+  - **Answers arrive in frame order, and an `Ack` covers one identity.** This is normative. A
+    listener answers a connection's data frames, with an `Ack` or a `Reject`, in the order they
+    arrive, and writes the `Ack` for one identity's frames before it acknowledges a frame of
+    another, so the frames an `Ack` covers are a run at the front of the sender's unanswered
+    frames. `logit_in` meets it by reading, forwarding, and answering one frame at a time on each
+    connection, with one `Ack` per frame. Nothing acknowledges out of order.
+  - **The sender commits by name.** `logit_out` keeps its frames in flight as a list in write
+    order. An `Ack` marks every entry from the front that carries its identity at or below its
+    sequence; the front entry must carry that identity and some entry that sequence, or the `Ack`
+    is a protocol error, ambiguous, and the connection is dropped. The marked entries are
+    committed one at a time, in order, so one `Ack` commits every frame it covers
+    ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 3).
   - **The window is fixed at the handshake.** `Hello.window` is what the sender offers;
     `HelloAck.window` is `min(offered, RECEIVER_MAX_WINDOW)`, with `RECEIVER_MAX_WINDOW` at 1024.
     The sender uses `min(offered, answered)`. Both windows are at least 1 on the wire, so neither
@@ -476,7 +490,8 @@ decision record.
     pipelined frames still unread sends a reset, which would discard the `GOING_AWAY` or `Ack`s
     already written.
   - **The sender's store is the retransmit state.** The sink's store reserves the frames in flight
-    as a prefix from its head (`SinkStore::peek_at`), and `commit` pops the head on each `Ack`. A
+    as a prefix from its head (`SinkStore::peek_at`), and `commit` pops the head on each frame an
+    `Ack` covers. A
     fault resends the window from the head, and `logit_in`'s high-water mark keeps a resent frame it
     already forwarded from being forwarded again.
 

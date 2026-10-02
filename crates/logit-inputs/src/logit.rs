@@ -8,14 +8,15 @@
 //! (`docs/adr/native-hop-send-window.md`). `HelloAck` answers the smaller of the `Hello`'s window
 //! and `RECEIVER_MAX_WINDOW`; a `Hello` window of 0 fails to decode, so the answer is at least 1.
 //! Nothing here tracks the window: one task per connection reads,
-//! forwards, and answers its frames one at a time, so answers leave in frame order and the k-th
-//! answer on a connection is the k-th frame's. Accepted sockets set `TCP_NODELAY`.
+//! forwards, and answers its frames one at a time, so answers leave in frame order. Each `Ack`
+//! names the frame it answers by its sender identity and sequence
+//! (`docs/adr/native-hop-named-acks.md`, decision 1). Accepted sockets set `TCP_NODELAY`.
 //!
 //! **Binding.** [`Input::bind`] opens the socket before any node task is spawned, so a taken port
 //! fails startup, and [`LogitInput::local_addr`] reads a `:0` bind's port without a
 //! bind-drop-rebind race. `run_until_shutdown` binds too when nobody did, for direct callers.
 //!
-//! **Ack point.** `Ack`, which carries no fields, is written in one of two cases: after
+//! **Ack point.** `Ack` is written in one of two cases: after
 //! `send_relayed` returns `true`, i.e. after the batch is in every open downstream inbox, or, for a
 //! frame at or below its sender's mark ("Deduplication" below), at once and with no forward. A
 //! stalled downstream delays the ack, which stalls the sender's `write_loop` once its window is
@@ -158,7 +159,7 @@ use senders::SenderTable;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The largest window `HelloAck` answers (module doc's "Send window"). A peer can leave this
-/// many `Ack`s unread in this side's send buffer, about 47 KB under TLS, under the default
+/// many `Ack`s unread in this side's send buffer, about 80 KB under TLS, under the default
 /// `tcp_rmem`.
 const RECEIVER_MAX_WINDOW: u32 = 1024;
 
@@ -715,7 +716,8 @@ async fn serve_frames<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
         // After a forwarding `send_relayed` this is the only write: a frame is never both
         // forwarded and answered `GOING_AWAY` (module doc's "Shutdown").
-        if let Err(err) = write_control(stream, &control::Ack, handshake_timeout).await {
+        let ack = control::Ack { id: seq.id, seq: seq.seq };
+        if let Err(err) = write_control(stream, &ack, handshake_timeout).await {
             if err.is::<WriteStalled>() {
                 telemetry.count("logit.proto.errors", 1.0, &[("reason", "ack_write_stalled")]);
             }
@@ -849,6 +851,9 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         compression: compression as u8,
         max_frame_bytes,
         window: hello.window.min(RECEIVER_MAX_WINDOW),
+        // No marks, whatever `Hello.senders` lists: the resume
+        // (`docs/adr/native-hop-named-acks.md`, decision 4) isn't answered here.
+        marks: vec![],
     };
     write_control(stream, &ack, handshake_timeout).await?;
     Ok(Negotiated { compression })
@@ -1283,6 +1288,7 @@ mod tests {
             compressions,
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: 1,
+            senders: vec![],
         };
         write_msg(stream, &hello).await;
     }
@@ -1307,15 +1313,22 @@ mod tests {
         }
     }
 
-    /// `batch` as one hop data frame with no provenance, under [`next_seq`].
-    fn hop_frame(batch: &EventBatch, compression: Compression) -> Bytes {
-        let payload = native::encode_hop_batch(batch, Provenance::default(), next_seq());
-        frame::write_frame(native::CODEC_HOP_BATCH, compression, &payload).unwrap()
+    /// `batch` as one hop data frame with no provenance, under [`next_seq`], and that pair.
+    fn hop_frame(batch: &EventBatch, compression: Compression) -> (Bytes, native::SeqId) {
+        let seq = next_seq();
+        let payload = native::encode_hop_batch(batch, Provenance::default(), seq);
+        (frame::write_frame(native::CODEC_HOP_BATCH, compression, &payload).unwrap(), seq)
     }
 
-    /// Writes [`hop_frame`]`(batch)`.
-    async fn send_data_frame(stream: &mut TcpStream, batch: &EventBatch, compression: Compression) {
-        stream.write_all(&hop_frame(batch, compression)).await.unwrap();
+    /// Writes [`hop_frame`]`(batch)`, returning the pair its `Ack` names.
+    async fn send_data_frame(
+        stream: &mut TcpStream,
+        batch: &EventBatch,
+        compression: Compression,
+    ) -> native::SeqId {
+        let (framed, seq) = hop_frame(batch, compression);
+        stream.write_all(&framed).await.unwrap();
+        seq
     }
 
     /// [`send_data_frame`] with `provenance` in the trailer.
@@ -1324,8 +1337,10 @@ mod tests {
         batch: &EventBatch,
         provenance: Provenance,
         compression: Compression,
-    ) {
-        send_data_frame_seq(stream, batch, provenance, next_seq(), compression).await;
+    ) -> native::SeqId {
+        let seq = next_seq();
+        send_data_frame_seq(stream, batch, provenance, seq, compression).await;
+        seq
     }
 
     /// [`send_data_frame_with`] under a chosen sender identity and sequence.
@@ -1385,7 +1400,7 @@ mod tests {
     async fn send_acked(client: &mut TcpStream, mark: i64, seq: native::SeqId) {
         let batch = batch_marked(mark);
         send_data_frame_seq(client, &batch, Provenance::default(), seq, Compression::None).await;
-        read_ack(client).await;
+        read_ack(client, seq).await;
     }
 
     /// A running `logit_in` counting into `probe`, its address, and its consumer.
@@ -1402,9 +1417,15 @@ mod tests {
         (addr, rx)
     }
 
-    async fn read_ack(stream: &mut TcpStream) -> control::Ack {
+    /// The `Ack` that names `seq`, the frame it answers.
+    fn ack_for(seq: native::SeqId) -> control::Ack {
+        control::Ack { id: seq.id, seq: seq.seq }
+    }
+
+    /// Reads the next control message and asserts it is the `Ack` naming `seq`.
+    async fn read_ack(stream: &mut TcpStream, seq: native::SeqId) {
         match read_control_response(stream).await {
-            control::ControlMessage::Ack(ack) => ack,
+            control::ControlMessage::Ack(ack) => assert_eq!(ack, ack_for(seq), "the Ack's name"),
             other => panic!("expected Ack, got {other:?}"),
         }
     }
@@ -1468,8 +1489,8 @@ mod tests {
             origin: Some(logit_core::interner::intern("remote_listener")),
             previous: Some(logit_core::interner::intern("remote_enrich")),
         };
-        send_data_frame_with(&mut client, &sample_batch(), sent, Compression::None).await;
-        read_ack(&mut client).await;
+        let seq = send_data_frame_with(&mut client, &sample_batch(), sent, Compression::None).await;
+        read_ack(&mut client, seq).await;
 
         let delivered = recv_delivered(&mut rx).await;
         let provenance = delivered.provenance();
@@ -1489,14 +1510,14 @@ mod tests {
         client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         read_control_response(&mut client).await;
 
-        send_data_frame_with(
+        let seq = send_data_frame_with(
             &mut client,
             &sample_batch(),
             Provenance::default(),
             Compression::None,
         )
         .await;
-        read_ack(&mut client).await;
+        read_ack(&mut client, seq).await;
 
         let delivered = recv_delivered(&mut rx).await;
         let provenance = delivered.provenance();
@@ -1560,6 +1581,7 @@ mod tests {
             compressions: vec![0],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: 1,
+            senders: vec![],
         };
         write_msg(&mut client, &hello).await;
         match read_control_response(&mut client).await {
@@ -1637,17 +1659,17 @@ mod tests {
         client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
-        send_data_frame(&mut client, &sample_batch(), Compression::None).await;
-        read_ack(&mut client).await;
+        let first = send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+        read_ack(&mut client, first).await;
 
-        send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+        let second = send_data_frame(&mut client, &sample_batch(), Compression::None).await;
         let mut buf = [0u8; 1];
         let premature =
             tokio::time::timeout(Duration::from_millis(150), client.read(&mut buf)).await;
         assert!(premature.is_err(), "ack for the second batch arrived before the inbox drained");
 
         recv_batch(&mut rx).await; // drains the first batch, freeing capacity
-        read_ack(&mut client).await;
+        read_ack(&mut client, second).await;
     }
 
     #[tokio::test]
@@ -1948,6 +1970,7 @@ mod tests {
             compressions: vec![0],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: 1,
+            senders: vec![],
         };
         write_msg(&mut tls_stream, &hello).await;
         match read_control_response_over(&mut tls_stream).await {
@@ -2096,14 +2119,14 @@ mod tests {
         client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
-        send_data_frame(&mut client, &sample_batch(), Compression::None).await;
-        send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+        let first = send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+        let second = send_data_frame(&mut client, &sample_batch(), Compression::None).await;
 
         tokio::time::sleep(idle * 3).await;
 
         recv_batch(&mut rx).await; // drains the first batch, unblocking the second's send
-        read_ack(&mut client).await; // the first ack, written long before
-        read_ack(&mut client).await; // and the second, after the drain
+        read_ack(&mut client, first).await; // the first ack, written long before
+        read_ack(&mut client, second).await; // and the second, after the drain
         recv_batch(&mut rx).await;
 
         assert!(
@@ -2130,8 +2153,8 @@ mod tests {
 
         for _ in 0..8 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            send_data_frame(&mut client, &sample_batch(), Compression::None).await;
-            read_ack(&mut client).await;
+            let seq = send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+            read_ack(&mut client, seq).await;
             recv_batch(&mut rx).await;
         }
 
@@ -2163,7 +2186,7 @@ mod tests {
         client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
-        let framed = hop_frame(&sample_batch(), Compression::None);
+        let (framed, seq) = hop_frame(&sample_batch(), Compression::None);
 
         tokio::time::sleep(Duration::from_millis(700)).await;
         client.write_all(&framed[..1]).await.unwrap();
@@ -2171,7 +2194,7 @@ mod tests {
         client.write_all(&framed[1..]).await.unwrap();
 
         // A frame whose header started arriving before the deadline must be acked.
-        read_ack(&mut client).await;
+        read_ack(&mut client, seq).await;
         assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
         assert!(
             !Totals::of(registry.drain(0))
@@ -2195,7 +2218,7 @@ mod tests {
         client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
-        let framed = hop_frame(&sample_batch(), Compression::None);
+        let (framed, _) = hop_frame(&sample_batch(), Compression::None);
         client.write_all(&framed[..1]).await.unwrap();
 
         expect_reject_going_away_for_idleness(&mut client, "a header that stopped arriving").await;
@@ -2226,7 +2249,7 @@ mod tests {
         let _ = read_control_response(&mut client).await;
 
         // A well-formed frame, of which only the header and one body byte are written.
-        let framed = hop_frame(&sample_batch(), Compression::None);
+        let (framed, _) = hop_frame(&sample_batch(), Compression::None);
         assert!(framed.len() > frame::HEADER_LEN + 1, "the fixture needs a multi-byte body");
         client.write_all(&framed[..frame::HEADER_LEN + 1]).await.unwrap();
 
@@ -2266,8 +2289,8 @@ mod tests {
         )
         .await;
 
-        send_data_frame(&mut client, &sample_batch(), Compression::None).await;
-        read_ack(&mut client).await; // and still serving frames
+        let seq = send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+        read_ack(&mut client, seq).await; // and still serving frames
         recv_batch(&mut rx).await;
 
         assert!(
@@ -2287,11 +2310,17 @@ mod tests {
             compressions: vec![0],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: 1,
+            senders: vec![],
         }
     }
 
     /// [`sample_batch`] as a data frame under a fresh [`next_seq`]: two calls are two batches.
     fn sample_frame() -> Bytes {
+        sample_frame_named().0
+    }
+
+    /// [`sample_frame`] and the pair its `Ack` names.
+    fn sample_frame_named() -> (Bytes, native::SeqId) {
         hop_frame(&sample_batch(), Compression::None)
     }
 
@@ -2388,7 +2417,10 @@ mod tests {
         const BOUND: Duration = Duration::from_millis(300);
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
-        let ack_len = control_frame_len(&control::Ack);
+        let (first, _) = sample_frame_named();
+        let (second, last) = sample_frame_named();
+        // The later sequence's varint is at least as long as the earlier's.
+        let ack_len = control_frame_len(&ack_for(last));
         let (mut client, server) = tokio::io::duplex(2 * ack_len);
         let (sink, mut rx) = fanout_into_channel(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2405,8 +2437,8 @@ mod tests {
 
         write_msg(&mut client, &hello()).await;
         let _ = read_control_response_over(&mut client).await;
-        client.write_all(&sample_frame()).await.unwrap();
-        client.write_all(&sample_frame()).await.unwrap();
+        client.write_all(&first).await.unwrap();
+        client.write_all(&second).await.unwrap();
         recv_batch(&mut rx).await;
         recv_batch(&mut rx).await;
         // Whether or not the second `Ack` is written yet: it fits the buffer, and no shutdown check
@@ -2483,10 +2515,12 @@ mod tests {
             write_msg(&mut client, &hello()).await;
             let _ = read_control_response_over(&mut client).await;
             tokio::task::yield_now().await; // the task parks in its `select!`
-            client.write_all(&sample_frame()).await.unwrap(); // fits the buffer: no yield
+            let (framed, seq) = sample_frame_named();
+            client.write_all(&framed).await.unwrap(); // fits the buffer: no yield
             shutdown_tx.send(true).unwrap();
             match read_control_response_over(&mut client).await {
-                control::ControlMessage::Ack(_) => {
+                control::ControlMessage::Ack(ack) => {
+                    assert_eq!(ack, ack_for(seq));
                     acked += 1;
                     assert!(rx.try_recv().is_ok(), "an acked frame was forwarded first");
                 }
@@ -2624,14 +2658,15 @@ mod tests {
         .expect("the HelloAck reaches the client");
         assert!(matches!(reply, control::ControlMessage::HelloAck(_)), "{reply:?}");
 
-        write_flushed(&mut client, &sample_frame()).await;
+        let (framed, seq) = sample_frame_named();
+        write_flushed(&mut client, &framed).await;
         let reply = tokio::time::timeout(
             logit_pipeline::test_util::RECV_TIMEOUT,
             read_control_response_over(&mut client),
         )
         .await
         .expect("the Ack reaches the client");
-        assert_eq!(reply, control::ControlMessage::Ack(control::Ack));
+        assert_eq!(reply, control::ControlMessage::Ack(ack_for(seq)));
         recv_batch(&mut rx).await;
     }
 
@@ -2709,10 +2744,11 @@ mod tests {
 
         write_msg(&mut client, &hello()).await;
         let _ = read_control_response_over(&mut client).await;
-        client.write_all(&sample_frame()).await.unwrap();
+        let (framed, seq) = sample_frame_named();
+        client.write_all(&framed).await.unwrap();
         assert_eq!(
             read_control_response_over(&mut client).await,
-            control::ControlMessage::Ack(control::Ack)
+            control::ControlMessage::Ack(ack_for(seq))
         );
         drop(client);
 
@@ -2814,7 +2850,7 @@ mod tests {
         }
 
         let batch = incompressible_batch_encoding_to(CAP as usize - 8);
-        let framed = hop_frame(&batch, Compression::Lz4);
+        let (framed, seq) = hop_frame(&batch, Compression::Lz4);
         let compressed_len = framed.len() - frame::HEADER_LEN;
         assert!(
             compressed_len > CAP as usize,
@@ -2822,7 +2858,7 @@ mod tests {
         );
         client.write_all(&framed).await.unwrap();
 
-        read_ack(&mut client).await; // the frame is acked, not rejected
+        read_ack(&mut client, seq).await; // the frame is acked, not rejected
         let relayed = recv_batch(&mut rx).await;
         assert_eq!(relayed.events.len(), 1);
     }
@@ -3020,11 +3056,12 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         tokio::spawn(async move { input.run(sink).await });
 
-        // `window` is the last field, `tag len value`, and 1 encodes as the single byte 1.
+        // `window` (`tag len value`, 1 encoding as the single byte 1) is followed only by the
+        // empty `senders` field (`tag 0`).
         let mut payload = BytesMut::from(&hello().encode()[..]);
-        let last = payload.len() - 1;
-        assert_eq!(payload[last - 2..], [5, 1, 1]);
-        payload[last] = 0;
+        let end = payload.len();
+        assert_eq!(payload[end - 5..], [5, 1, 1, 6, 0]);
+        payload[end - 3] = 0;
         let framed =
             frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &payload)
                 .unwrap();
@@ -3341,6 +3378,7 @@ mod tests {
             compressions: vec![0],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window,
+            senders: vec![],
         };
         write_msg(stream, &hello).await;
     }
@@ -3373,8 +3411,8 @@ mod tests {
     }
 
     /// Frames written back to back are forwarded and answered one at a time, in the order they
-    /// arrived: the k-th `Ack` follows the k-th frame's forward. A one-slot consumer holds the
-    /// second frame's forward until the first is taken, and its `Ack` with it.
+    /// arrived, each `Ack` naming its frame and following its forward. A one-slot consumer holds
+    /// the second frame's forward until the first is taken, and its `Ack` with it.
     #[tokio::test]
     async fn pipelined_frames_are_acked_in_frame_order() {
         let (addr, mut input) = bound_input().await;
@@ -3387,7 +3425,7 @@ mod tests {
         for mark in 1..=3 {
             pipeline_marked(&mut client, mark).await;
         }
-        read_ack(&mut client).await;
+        read_ack(&mut client, sid(9, 1)).await;
         // The second frame waits on the full consumer, so its `Ack` hasn't been written.
         let mut early = [0u8; 1];
         let pending = tokio::time::timeout(Duration::from_millis(50), client.read(&mut early));
@@ -3396,9 +3434,42 @@ mod tests {
         for mark in 1..=3 {
             assert_eq!(recv_mark(&mut rx).await, mark);
             if mark < 3 {
-                read_ack(&mut client).await;
+                read_ack(&mut client, sid(9, mark as u64 + 1)).await;
             }
         }
+    }
+
+    /// Every `Ack` names the identity and sequence of the frame it answers: forwarded frames
+    /// of two senders interleaved, and a resend below its sender's mark, which is answered by its
+    /// own sequence, never the mark.
+    #[tokio::test]
+    async fn every_ack_names_the_frame_it_answers() {
+        let (addr, mut input) = bound_input().await;
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+        let mut client = connect(&addr).await;
+        hello_offering(&mut client, 8).await;
+        let _ = read_control_response(&mut client).await;
+
+        let frames = [sid(4, 1), sid(5, 7), sid(4, 2), sid(5, 8), sid(4, 1)];
+        for (mark, seq) in frames.iter().enumerate() {
+            let batch = batch_marked(mark as i64);
+            send_data_frame_seq(
+                &mut client,
+                &batch,
+                Provenance::default(),
+                *seq,
+                Compression::None,
+            )
+            .await;
+        }
+        for seq in frames {
+            read_ack(&mut client, seq).await;
+        }
+        for mark in 0..4 {
+            assert_eq!(recv_mark(&mut rx).await, mark);
+        }
+        assert!(rx.try_recv().is_err(), "the resend of sid(4, 1) was acked, not forwarded");
     }
 
     /// A shutdown with frames buffered behind the one being forwarded: the listener answers that
@@ -3432,7 +3503,7 @@ mod tests {
         handle.await.unwrap().unwrap();
         assert_eq!(recv_mark(&mut rx).await, 1, "frees the slot the second forward waits on");
 
-        read_ack(&mut client).await;
+        read_ack(&mut client, sid(9, 2)).await;
         match read_control_response(&mut client).await {
             control::ControlMessage::Reject(reject) => {
                 assert_eq!(reject.code, control::REJECT_GOING_AWAY);
@@ -3467,7 +3538,7 @@ mod tests {
             pipeline_marked(&mut client, mark).await;
         }
         // The first batch takes the one slot; the second's forward waits on it.
-        read_ack(&mut client).await;
+        read_ack(&mut client, sid(9, 1)).await;
         drop(rx);
 
         match read_control_response(&mut client).await {

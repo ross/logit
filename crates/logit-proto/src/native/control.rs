@@ -1,6 +1,11 @@
 //! The `logit_in`/`logit_out` control messages: `Hello`/`HelloAck` (the version, codec, and
-//! compression handshake), `Ack` (the frame is handled), and `Reject` (a clean refusal).
+//! compression handshake), `Ack` (frames are handled), and `Reject` (a clean refusal).
 //! ADR `native-transport-handshake-and-ack` has the protocol.
+//!
+//! `Ack` names a sender identity and a sequence, and covers every frame of that identity at or
+//! below it (`docs/adr/native-hop-named-acks.md`, decision 1). `Hello.senders` lists the
+//! identities of the frames a connection will resend, and `HelloAck.marks` answers each with the
+//! receiver's high-water mark (the same ADR, decision 4).
 //!
 //! A control message rides in an ordinary frame with [`crate::frame::FLAG_CONTROL`] set. Its
 //! `codec` byte is meaningless, and its `compression` is always
@@ -37,10 +42,21 @@ const MAX_REJECT_MESSAGE_BYTES: usize = 1024;
 /// peer's declared count sizes an allocation.
 const MAX_CHOICE_LIST_ENTRIES: usize = 16;
 
+/// The most entries `Hello.senders` and `HelloAck.marks` may hold; more is
+/// [`CodecError::Malformed`].
+pub const MAX_HELLO_SENDERS: usize = 16;
+
+/// A sender identity's width on the wire.
+const SENDER_ID_BYTES: usize = 16;
+
+/// One `HelloAck.marks` entry: the identity, then the mark as a big-endian `u64`.
+const MARK_ENTRY_BYTES: usize = SENDER_ID_BYTES + 8;
+
 /// The longest control message payload a reader accepts, checked against a frame header before
 /// the body is allocated. The longest message this version writes is a `Reject` whose message is
-/// at [`MAX_REJECT_MESSAGE_BYTES`], 1033 bytes; the rest is headroom for a longer
-/// `Reject.message` or choice list. No valid control message reaches it, so it bounds a malformed
+/// at [`MAX_REJECT_MESSAGE_BYTES`], 1033 bytes. The largest valid `Hello` (16 senders) is 315
+/// bytes and the largest valid `HelloAck` (16 marks) is 413; the rest is headroom for a longer
+/// `Reject.message` or list. No valid control message reaches it, so it bounds a malformed
 /// length.
 pub const MAX_CONTROL_MESSAGE_BYTES: u32 = 4096;
 
@@ -122,6 +138,49 @@ fn read_window_field(field: Bytes, msg: &str) -> Result<u32, CodecError> {
     }
 }
 
+fn read_senders_field(field: Bytes) -> Result<Vec<[u8; 16]>, CodecError> {
+    if !field.len().is_multiple_of(SENDER_ID_BYTES) {
+        return Err(CodecError::Malformed(format!(
+            "Hello.senders is {} bytes, not a multiple of {SENDER_ID_BYTES}",
+            field.len()
+        )));
+    }
+    let entries = field.len() / SENDER_ID_BYTES;
+    if entries > MAX_HELLO_SENDERS {
+        return Err(CodecError::Malformed(format!(
+            "Hello.senders declares {entries} entries, over the {MAX_HELLO_SENDERS} cap"
+        )));
+    }
+    let (ids, _) = field.as_chunks::<SENDER_ID_BYTES>();
+    Ok(ids.to_vec())
+}
+
+fn read_marks_field(field: Bytes) -> Result<Vec<([u8; 16], u64)>, CodecError> {
+    if !field.len().is_multiple_of(MARK_ENTRY_BYTES) {
+        return Err(CodecError::Malformed(format!(
+            "HelloAck.marks is {} bytes, not a multiple of {MARK_ENTRY_BYTES}",
+            field.len()
+        )));
+    }
+    let entries = field.len() / MARK_ENTRY_BYTES;
+    if entries > MAX_HELLO_SENDERS {
+        return Err(CodecError::Malformed(format!(
+            "HelloAck.marks declares {entries} entries, over the {MAX_HELLO_SENDERS} cap"
+        )));
+    }
+    let (entries, _) = field.as_chunks::<MARK_ENTRY_BYTES>();
+    Ok(entries
+        .iter()
+        .map(|entry| {
+            let (id, mark) = entry.split_at(SENDER_ID_BYTES);
+            (
+                id.try_into().expect("split_at yields 16 bytes"),
+                u64::from_be_bytes(mark.try_into().expect("split_at yields 8 bytes")),
+            )
+        })
+        .collect())
+}
+
 fn read_choice_list(field: Bytes, what: &str) -> Result<Vec<u8>, CodecError> {
     if field.len() > MAX_CHOICE_LIST_ENTRIES {
         return Err(CodecError::Malformed(format!(
@@ -150,6 +209,9 @@ pub struct Hello {
     pub max_frame_bytes: u32,
     /// At least 1; a decoded 0 is [`CodecError::Malformed`].
     pub window: u32,
+    /// The distinct identities of the frames this connection will resend, in in-flight order;
+    /// empty when nothing is being resent. At most [`MAX_HELLO_SENDERS`].
+    pub senders: Vec<[u8; 16]>,
 }
 
 const HELLO_FIELD_VERSION: u8 = 1;
@@ -157,6 +219,7 @@ const HELLO_FIELD_CODECS: u8 = 2;
 const HELLO_FIELD_COMPRESSIONS: u8 = 3;
 const HELLO_FIELD_MAX_FRAME_BYTES: u8 = 4;
 const HELLO_FIELD_WINDOW: u8 = 5;
+const HELLO_FIELD_SENDERS: u8 = 6;
 
 impl Hello {
     pub fn encode(&self) -> Bytes {
@@ -168,6 +231,11 @@ impl Hello {
         write_bytes_field(&mut out, HELLO_FIELD_COMPRESSIONS, &self.compressions);
         write_u32(&mut out, HELLO_FIELD_MAX_FRAME_BYTES, self.max_frame_bytes);
         write_u32(&mut out, HELLO_FIELD_WINDOW, self.window);
+        write_field(&mut out, HELLO_FIELD_SENDERS, |buf| {
+            for id in &self.senders {
+                buf.extend_from_slice(id);
+            }
+        });
         out.freeze()
     }
 
@@ -179,6 +247,7 @@ impl Hello {
         let mut compressions = None;
         let mut max_frame_bytes = None;
         let mut window = None;
+        let mut senders = None;
         while let Some((tag, field)) = read_field(&mut body)? {
             match tag {
                 HELLO_FIELD_VERSION => {
@@ -199,6 +268,9 @@ impl Hello {
                 HELLO_FIELD_WINDOW => {
                     set_once(&mut window, read_window_field(field, MSG)?, MSG, "window")?
                 }
+                HELLO_FIELD_SENDERS => {
+                    set_once(&mut senders, read_senders_field(field)?, MSG, "senders")?
+                }
                 tag => return Err(unknown_tag(MSG, tag)),
             }
         }
@@ -208,6 +280,7 @@ impl Hello {
             compressions: required(compressions, MSG, "compressions")?,
             max_frame_bytes: required(max_frame_bytes, MSG, "max_frame_bytes")?,
             window: required(window, MSG, "window")?,
+            senders: required(senders, MSG, "senders")?,
         })
     }
 
@@ -222,8 +295,9 @@ impl Hello {
 // -- HelloAck ----------------------------------------------------------------------------------
 
 /// The listener's reply to a valid [`Hello`]: the chosen codec and compression from both sides'
-/// offers, its own frame-size ceiling, and its window, at least 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// offers, its own frame-size ceiling, its window, at least 1, and its marks for the identities
+/// `Hello.senders` listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelloAck {
     pub version: u16,
     pub codec: u8,
@@ -231,6 +305,9 @@ pub struct HelloAck {
     pub max_frame_bytes: u32,
     /// At least 1; a decoded 0 is [`CodecError::Malformed`].
     pub window: u32,
+    /// One `(identity, mark)` per `Hello.senders` identity the receiver holds, in the order
+    /// asked; an identity it doesn't hold is omitted. At most [`MAX_HELLO_SENDERS`].
+    pub marks: Vec<([u8; 16], u64)>,
 }
 
 const HELLO_ACK_FIELD_VERSION: u8 = 1;
@@ -238,6 +315,7 @@ const HELLO_ACK_FIELD_CODEC: u8 = 2;
 const HELLO_ACK_FIELD_COMPRESSION: u8 = 3;
 const HELLO_ACK_FIELD_MAX_FRAME_BYTES: u8 = 4;
 const HELLO_ACK_FIELD_WINDOW: u8 = 5;
+const HELLO_ACK_FIELD_MARKS: u8 = 6;
 
 impl HelloAck {
     pub fn encode(&self) -> Bytes {
@@ -251,6 +329,12 @@ impl HelloAck {
         });
         write_u32(&mut out, HELLO_ACK_FIELD_MAX_FRAME_BYTES, self.max_frame_bytes);
         write_u32(&mut out, HELLO_ACK_FIELD_WINDOW, self.window);
+        write_field(&mut out, HELLO_ACK_FIELD_MARKS, |buf| {
+            for (id, mark) in &self.marks {
+                buf.extend_from_slice(id);
+                buf.extend_from_slice(&mark.to_be_bytes());
+            }
+        });
         out.freeze()
     }
 
@@ -261,6 +345,7 @@ impl HelloAck {
         let mut compression = None;
         let mut max_frame_bytes = None;
         let mut window = None;
+        let mut marks = None;
         while let Some((tag, mut field)) = read_field(&mut body)? {
             match tag {
                 HELLO_ACK_FIELD_VERSION => {
@@ -276,6 +361,9 @@ impl HelloAck {
                 HELLO_ACK_FIELD_WINDOW => {
                     set_once(&mut window, read_window_field(field, MSG)?, MSG, "window")?
                 }
+                HELLO_ACK_FIELD_MARKS => {
+                    set_once(&mut marks, read_marks_field(field)?, MSG, "marks")?
+                }
                 tag => return Err(unknown_tag(MSG, tag)),
             }
         }
@@ -285,6 +373,7 @@ impl HelloAck {
             compression: required(compression, MSG, "compression")?,
             max_frame_bytes: required(max_frame_bytes, MSG, "max_frame_bytes")?,
             window: required(window, MSG, "window")?,
+            marks: required(marks, MSG, "marks")?,
         })
     }
 
@@ -296,24 +385,56 @@ impl HelloAck {
 
 // -- Ack -------------------------------------------------------------------------------------
 
-/// The frame is handled: forwarded, or recognized as a resend at or below its sender's mark and
-/// not forwarded. Names nothing: `logit_in` answers a connection's frames in the order they
-/// arrive, so the k-th `Ack` answers the k-th unanswered frame. Never a sequence acknowledgment
-/// (ADR `native-hop-send-window`, decision 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Ack;
+/// Every data frame of sender identity `id` with a sequence at or below `seq` that this
+/// connection carried is handled: forwarded, or recognized as a resend and not forwarded. `seq`
+/// is a frame the connection carried, never the receiver's mark. Grants no credit
+/// (`docs/adr/native-hop-named-acks.md`, decision 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ack {
+    pub id: [u8; 16],
+    /// At least 1; a decoded 0 is [`CodecError::Malformed`], as in a frame's trailer.
+    pub seq: u64,
+}
+
+const ACK_FIELD_ID: u8 = 1;
+const ACK_FIELD_SEQ: u8 = 2;
 
 impl Ack {
     pub fn encode(&self) -> Bytes {
-        Bytes::from_static(&[MSG_ACK])
+        debug_assert!(self.seq >= 1, "Ack.seq must be at least 1");
+        let mut out = BytesMut::new();
+        out.extend_from_slice(&[MSG_ACK]);
+        write_bytes_field(&mut out, ACK_FIELD_ID, &self.id);
+        write_field(&mut out, ACK_FIELD_SEQ, |buf| write_uvarint(buf, self.seq));
+        out.freeze()
     }
 
-    /// `Ack` is the message-type byte alone; any body is [`CodecError::Malformed`].
-    fn decode_fields(body: Bytes) -> Result<Self, CodecError> {
-        if !body.is_empty() {
-            return Err(CodecError::Malformed("Ack carries a body".to_string()));
+    fn decode_fields(mut body: Bytes) -> Result<Self, CodecError> {
+        const MSG: &str = "Ack";
+        let mut id = None;
+        let mut seq = None;
+        while let Some((tag, mut field)) = read_field(&mut body)? {
+            match tag {
+                ACK_FIELD_ID => {
+                    let value: [u8; 16] = field[..].try_into().map_err(|_| {
+                        CodecError::Malformed(format!(
+                            "Ack.id is {} bytes, not {SENDER_ID_BYTES}",
+                            field.len()
+                        ))
+                    })?;
+                    set_once(&mut id, value, MSG, "id")?
+                }
+                ACK_FIELD_SEQ => {
+                    let value = read_uvarint(&mut field)?;
+                    if value == 0 {
+                        return Err(CodecError::Malformed("Ack.seq is 0".to_string()));
+                    }
+                    set_once(&mut seq, value, MSG, "seq")?
+                }
+                tag => return Err(unknown_tag(MSG, tag)),
+            }
         }
-        Ok(Ack)
+        Ok(Ack { id: required(id, MSG, "id")?, seq: required(seq, MSG, "seq")? })
     }
 
     pub fn decode(bytes: &mut Bytes) -> Result<Self, CodecError> {
@@ -446,6 +567,7 @@ mod tests {
             compressions: vec![0, 1],
             max_frame_bytes: 64 * 1024 * 1024,
             window: 1,
+            senders: vec![],
         };
         let mut encoded = hello.encode();
         assert_eq!(Hello::decode(&mut encoded).unwrap(), hello);
@@ -459,6 +581,7 @@ mod tests {
             compressions: vec![],
             max_frame_bytes: 0,
             window: 1,
+            senders: vec![],
         };
         let mut encoded = hello.encode();
         assert_eq!(Hello::decode(&mut encoded).unwrap(), hello);
@@ -472,6 +595,7 @@ mod tests {
             compressions: vec![0],
             max_frame_bytes: 1,
             window: 1,
+            senders: vec![],
         };
         let mut encoded = hello.encode();
         assert_eq!(Hello::decode(&mut encoded).unwrap(), hello);
@@ -485,6 +609,7 @@ mod tests {
             compressions: vec![],
             max_frame_bytes: 1,
             window: 1,
+            senders: vec![],
         };
         let mut encoded = hello.encode();
         assert!(matches!(Hello::decode(&mut encoded), Err(CodecError::Malformed(_))));
@@ -498,24 +623,145 @@ mod tests {
             compression: 1,
             max_frame_bytes: 4096,
             window: 1,
+            marks: vec![],
         };
         let mut encoded = ack.encode();
         assert_eq!(HelloAck::decode(&mut encoded).unwrap(), ack);
     }
 
+    const ID: [u8; 16] = [7; 16];
+
     #[test]
-    fn ack_round_trips() {
-        let mut encoded = Ack.encode();
-        assert_eq!(&encoded[..], &[MSG_ACK]);
-        assert_eq!(Ack::decode(&mut encoded).unwrap(), Ack);
+    fn an_ack_round_trips_its_identity_and_sequence() {
+        for seq in [1, 300, u64::MAX] {
+            let ack = Ack { id: ID, seq };
+            let mut encoded = ack.encode();
+            assert_eq!(Ack::decode(&mut encoded).unwrap(), ack);
+            let mut encoded = ack.encode();
+            assert_eq!(ControlMessage::decode(&mut encoded).unwrap(), ControlMessage::Ack(ack));
+        }
     }
 
     #[test]
-    fn an_ack_with_a_body_is_malformed() {
-        let mut bytes = Bytes::from_static(&[MSG_ACK, 1, 1, 42]);
-        assert!(matches!(Ack::decode(&mut bytes), Err(CodecError::Malformed(_))));
-        let mut bytes = Bytes::from_static(&[MSG_ACK, 1, 1, 42]);
-        assert!(matches!(ControlMessage::decode(&mut bytes), Err(CodecError::Malformed(_))));
+    fn an_ack_missing_either_field_is_malformed() {
+        let mut id_only = BytesMut::from(&[MSG_ACK][..]);
+        write_bytes_field(&mut id_only, ACK_FIELD_ID, &ID);
+        let mut seq_only = BytesMut::from(&[MSG_ACK][..]);
+        write_field(&mut seq_only, ACK_FIELD_SEQ, |buf| write_uvarint(buf, 5));
+        for (bytes, missing) in
+            [(id_only, "seq"), (seq_only, "id"), (BytesMut::from(&[MSG_ACK][..]), "id")]
+        {
+            let result = Ack::decode(&mut bytes.freeze());
+            assert!(
+                matches!(&result, Err(CodecError::Malformed(m)) if m == &format!("Ack is missing {missing}")),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ack_with_a_sequence_of_zero_is_malformed() {
+        let mut bytes = BytesMut::from(&[MSG_ACK][..]);
+        write_bytes_field(&mut bytes, ACK_FIELD_ID, &ID);
+        write_field(&mut bytes, ACK_FIELD_SEQ, |buf| write_uvarint(buf, 0));
+        let result = ControlMessage::decode(&mut bytes.freeze());
+        assert!(
+            matches!(&result, Err(CodecError::Malformed(m)) if m == "Ack.seq is 0"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn an_ack_with_a_short_identity_is_malformed() {
+        for len in [0, 15, 17] {
+            let mut bytes = BytesMut::from(&[MSG_ACK][..]);
+            write_bytes_field(&mut bytes, ACK_FIELD_ID, &vec![1; len]);
+            write_field(&mut bytes, ACK_FIELD_SEQ, |buf| write_uvarint(buf, 1));
+            let result = Ack::decode(&mut bytes.freeze());
+            assert!(
+                matches!(&result, Err(CodecError::Malformed(m)) if m.starts_with("Ack.id is")),
+                "{len}: {result:?}"
+            );
+        }
+    }
+
+    fn hello_with(senders: Vec<[u8; 16]>) -> Hello {
+        Hello {
+            version: PROTOCOL_VERSION,
+            codecs: vec![1],
+            compressions: vec![0],
+            max_frame_bytes: 1024,
+            window: 1,
+            senders,
+        }
+    }
+
+    fn hello_ack_with(marks: Vec<([u8; 16], u64)>) -> HelloAck {
+        HelloAck {
+            version: PROTOCOL_VERSION,
+            codec: 1,
+            compression: 0,
+            max_frame_bytes: 1024,
+            window: 1,
+            marks,
+        }
+    }
+
+    #[test]
+    fn hello_senders_and_hello_ack_marks_round_trip() {
+        let full_senders: Vec<[u8; 16]> = (0..MAX_HELLO_SENDERS as u8).map(|i| [i; 16]).collect();
+        for senders in [vec![], full_senders.clone()] {
+            let hello = hello_with(senders);
+            assert_eq!(Hello::decode(&mut hello.encode()).unwrap(), hello);
+        }
+        let full_marks: Vec<([u8; 16], u64)> =
+            full_senders.iter().enumerate().map(|(i, id)| (*id, u64::MAX - i as u64)).collect();
+        for marks in [vec![], full_marks] {
+            let ack = hello_ack_with(marks);
+            assert_eq!(HelloAck::decode(&mut ack.encode()).unwrap(), ack);
+        }
+    }
+
+    /// Replaces the field tagged `tag` in an encoded message with `payload`.
+    fn with_raw_field(encoded: Bytes, tag: u8, payload: &[u8]) -> Bytes {
+        let mut body = encoded;
+        let msg_type = read_u8(&mut body).unwrap();
+        let mut out = BytesMut::from(&[msg_type][..]);
+        while let Some((t, field)) = read_field(&mut body).unwrap() {
+            write_bytes_field(&mut out, t, if t == tag { payload } else { &field });
+        }
+        out.freeze()
+    }
+
+    #[test]
+    fn a_senders_or_marks_list_over_the_cap_or_misaligned_is_malformed() {
+        let over = MAX_HELLO_SENDERS + 1;
+        for (payload, want) in [
+            (vec![1; SENDER_ID_BYTES * over], "over the 16 cap"),
+            (vec![1; SENDER_ID_BYTES + 1], "not a multiple of 16"),
+            (vec![1; SENDER_ID_BYTES - 1], "not a multiple of 16"),
+        ] {
+            let mut bytes =
+                with_raw_field(hello_with(vec![]).encode(), HELLO_FIELD_SENDERS, &payload);
+            let result = ControlMessage::decode(&mut bytes);
+            assert!(
+                matches!(&result, Err(CodecError::Malformed(m)) if m.starts_with("Hello.senders") && m.contains(want)),
+                "{result:?}"
+            );
+        }
+        for (payload, want) in [
+            (vec![1; MARK_ENTRY_BYTES * over], "over the 16 cap"),
+            (vec![1; MARK_ENTRY_BYTES + 16], "not a multiple of 24"),
+            (vec![1; SENDER_ID_BYTES], "not a multiple of 24"),
+        ] {
+            let mut bytes =
+                with_raw_field(hello_ack_with(vec![]).encode(), HELLO_ACK_FIELD_MARKS, &payload);
+            let result = ControlMessage::decode(&mut bytes);
+            assert!(
+                matches!(&result, Err(CodecError::Malformed(m)) if m.starts_with("HelloAck.marks") && m.contains(want)),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]
@@ -553,6 +799,7 @@ mod tests {
                 compressions: vec![u8::MAX; MAX_CHOICE_LIST_ENTRIES],
                 max_frame_bytes: u32::MAX,
                 window: u32::MAX,
+                senders: vec![[u8::MAX; 16]; MAX_HELLO_SENDERS],
             }
             .encode(),
             HelloAck {
@@ -561,13 +808,14 @@ mod tests {
                 compression: u8::MAX,
                 max_frame_bytes: u32::MAX,
                 window: u32::MAX,
+                marks: vec![([u8::MAX; 16], u64::MAX); MAX_HELLO_SENDERS],
             }
             .encode(),
-            Ack.encode(),
+            Ack { id: [u8::MAX; 16], seq: u64::MAX }.encode(),
             Reject { code: u16::MAX, message: "x".repeat(MAX_REJECT_MESSAGE_BYTES) }.encode(),
         ];
         let lens: Vec<usize> = largest.iter().map(Bytes::len).collect();
-        assert_eq!(lens.iter().max(), Some(&1033), "{lens:?}");
+        assert_eq!(lens, [315, 413, 31, 1033]);
         assert!(lens.iter().all(|&len| len <= MAX_CONTROL_MESSAGE_BYTES as usize), "{lens:?}");
     }
 
@@ -582,7 +830,7 @@ mod tests {
         assert_eq!(Reject::decode(&mut decoded.encode()).unwrap(), decoded);
     }
 
-    /// A valid `Hello`, `HelloAck`, and `Reject`, each as `(message type, fields)` with every
+    /// A valid `Hello`, `HelloAck`, `Ack`, and `Reject`, each as `(message type, fields)` with every
     /// field as its own `tag + len + payload` byte string, so a test can drop, repeat, or replace
     /// one.
     fn valid_messages() -> Vec<(u8, Vec<Bytes>)> {
@@ -598,26 +846,9 @@ mod tests {
             (msg_type, out)
         }
         vec![
-            fields(
-                Hello {
-                    version: PROTOCOL_VERSION,
-                    codecs: vec![1],
-                    compressions: vec![0],
-                    max_frame_bytes: 1024,
-                    window: 1,
-                }
-                .encode(),
-            ),
-            fields(
-                HelloAck {
-                    version: PROTOCOL_VERSION,
-                    codec: 1,
-                    compression: 0,
-                    max_frame_bytes: 1024,
-                    window: 1,
-                }
-                .encode(),
-            ),
+            fields(hello_with(vec![ID, [8; 16]]).encode()),
+            fields(hello_ack_with(vec![(ID, 3)]).encode()),
+            fields(Ack { id: ID, seq: 9 }.encode()),
             fields(Reject { code: REJECT_INTERNAL, message: "no".to_string() }.encode()),
         ]
     }
@@ -708,7 +939,7 @@ mod tests {
 
     #[test]
     fn decoding_the_wrong_message_type_is_a_clear_error() {
-        let mut encoded = Ack.encode();
+        let mut encoded = Ack { id: ID, seq: 1 }.encode();
         assert!(matches!(HelloAck::decode(&mut encoded), Err(CodecError::Malformed(_))));
     }
 
@@ -721,6 +952,7 @@ mod tests {
                 compressions: vec![0],
                 max_frame_bytes: 1,
                 window: 1,
+                senders: vec![],
             }),
             ControlMessage::HelloAck(HelloAck {
                 version: PROTOCOL_VERSION,
@@ -728,8 +960,9 @@ mod tests {
                 compression: 0,
                 max_frame_bytes: 1,
                 window: 1,
+                marks: vec![],
             }),
-            ControlMessage::Ack(Ack),
+            ControlMessage::Ack(Ack { id: ID, seq: 42 }),
             ControlMessage::Reject(Reject { code: REJECT_GOING_AWAY, message: "bye".to_string() }),
         ] {
             let mut encoded = msg.encode();
@@ -756,6 +989,7 @@ mod tests {
             compressions: vec![0, 1],
             max_frame_bytes: 4096,
             window: 1,
+            senders: vec![],
         };
         let framed =
             write_frame_with_flags(0, Compression::None, FLAG_CONTROL, &hello.encode()).unwrap();

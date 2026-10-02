@@ -3475,6 +3475,7 @@ mod tests {
             compressions: vec![0],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: 1,
+            senders: vec![],
         };
         let framed = frame::write_frame_with_flags(
             0,

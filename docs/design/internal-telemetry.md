@@ -1867,10 +1867,10 @@ attempt.
 
 - `logit.proto.frames{direction="out",compression}` and `logit.proto.frame.bytes`: the
   send-side mirror of `logit_in`'s pair.
-- `logit.output.ack.duration` (timer, one per `await_ack` that reads from the connection): the
-  wait for one `Ack`, finer-grained than layer 2's `logit.component.send.duration`, which times a
+- `logit.output.ack.duration` (timer, one sample per read of the connection for an `Ack`; an
+  `await_ack` answered by an `Ack` already read records none): the wait for one `Ack`, finer-grained than layer 2's `logit.component.send.duration`, which times a
   whole attempt or windowed round, connect, handshake, and writes included.
-- `logit.output.in_flight` (gauge): frames written and awaiting an `Ack`, set on every change. It
+- `logit.output.in_flight` (gauge): frames written and not yet committed, set on every change. It
   reads 0 after every connection drop, a cancelled call's included. A value that sits at
   `logit.output.window` means the round trip, or the peer's forwarding, bounds this sink.
 - `logit.output.window` (gauge): the window the live connection negotiated, the smaller of the
@@ -1885,13 +1885,13 @@ attempt.
   the number of `send` calls that returned. A connect or handshake failure and a batch too large to
   send count as failed submits. A submit that fails with frames already in flight (a stalled or
   failed write) carries no `Fault` and isn't counted: the `await_ack`s after it count the round's
-  outcome, `ok` for each `Ack` drained and the class of the failure that ends it. A drifted
-  `in_flight` counts once, `ambiguous`, in the `submit` that finds it. A `Permanent` past the head
+  outcome, `ok` for each frame an `Ack` commits, an `await_ack` answered by an `Ack` already read
+  included, and the class of the failure that ends it. A `Permanent` past the head
   is counted when it becomes the head. A cancelled call (a budget timeout, the shutdown grace)
   returns nothing and isn't counted; `logit.component.errors` covers it. `ok` is an acknowledged
   frame; `clean` a failure before a frame was completely written and flushed with nothing in flight,
   or a `Reject{GOING_AWAY}` read in place of an `Ack`; `ambiguous` a lost `Ack` (a timeout, an EOF,
-  a reset, another message) or an `in_flight` drift; and `permanent` a size check or a frame-build
+  a reset, another message) or an `Ack` naming no run of the frames in flight; and `permanent` a size check or a frame-build
   error at the head, a `HelloAck` that names another version or an unoffered codec or compression,
   or a permanent reject ([ADR
   `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
