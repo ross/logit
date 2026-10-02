@@ -1,12 +1,15 @@
 ---
 created: 2026-09-29
-updated: 2026-09-30
+updated: 2026-10-01
 ---
 
 # Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed
 
 ## Status
-Accepted
+Accepted. Superseded in part on 2026-10-01 by [ADR
+`native-hop-send-window`](native-hop-send-window.md): decision 7's "it isn't under the sink's
+`request_timeout`" holds for `logit_out` only while no frame is in flight; with frames in flight
+the write is bounded by progress.
 
 ## Context
 
@@ -256,7 +259,9 @@ nature. The encode-side counters are the only ones that measure the batch and no
    The flush follows the whole write, before `conn.seq` advances and before
    `logit.proto.frames` and `logit.proto.frame.bytes` count the frame, and it isn't under the
    sink's `request_timeout`: a large frame on a slow link can outlast that timeout, and the retry
-   budget bounds the flush as it bounds the write. `logit_in` flushes its own control writes
+   budget bounds the flush as it bounds the write. [Superseded in part on 2026-10-01 by [ADR
+   `native-hop-send-window`](native-hop-send-window.md): with frames in flight, `logit_out`
+   writes a frame in chunks and bounds each chunk and the flush by progress, not in total.] `logit_in` flushes its own control writes
    (`HelloAck`, `Ack`, and every `Reject`) inside the `handshake_timeout` bound its
    `write_control` already applies. With one frame in flight, a control message fits the socket
    of a peer that is waiting for it, so the listener side is a contract fix rather than an
