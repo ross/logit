@@ -7,9 +7,10 @@
 //! [`crate::frame::Compression::None`]: the messages are tiny, and compression is itself being
 //! negotiated.
 //!
-//! Every field is `tag(u8) + len(uvarint) + payload`, like [`crate::native::record`], so a field
-//! from a later protocol version is skipped whole. An unknown message type is an error (see
-//! [`ControlMessage::decode`]).
+//! Every field is `tag(u8) + len(uvarint) + payload`, like [`crate::native::record`]. Unlike a
+//! record, a control message carries its defined fields and nothing else: a missing, repeated, or
+//! unknown field is [`CodecError::Malformed`], as is an unknown message type (ADR
+//! `native-hop-no-compatibility`, decision 4).
 
 use bytes::{Bytes, BytesMut};
 
@@ -38,8 +39,9 @@ const MAX_CHOICE_LIST_ENTRIES: usize = 16;
 
 /// The longest control message payload a reader accepts, checked against a frame header before
 /// the body is allocated. The longest message this version writes is a `Reject` whose message is
-/// at [`MAX_REJECT_MESSAGE_BYTES`], 1033 bytes; the rest is room for fields a later version adds,
-/// which a reader skips.
+/// at [`MAX_REJECT_MESSAGE_BYTES`], 1033 bytes; the rest is headroom for a longer
+/// `Reject.message` or choice list. No valid control message reaches it, so it bounds a malformed
+/// length.
 pub const MAX_CONTROL_MESSAGE_BYTES: u32 = 4096;
 
 const MSG_HELLO: u8 = 1;
@@ -96,6 +98,30 @@ fn read_u32_field(mut field: Bytes) -> Result<u32, CodecError> {
     u32::try_from(v).map_err(|_| CodecError::Malformed(format!("field value {v} doesn't fit u32")))
 }
 
+/// Stores one decoded field, refusing a second occurrence of its tag.
+fn set_once<T>(slot: &mut Option<T>, value: T, msg: &str, field: &str) -> Result<(), CodecError> {
+    if slot.is_some() {
+        return Err(CodecError::Malformed(format!("{msg} repeats {field}")));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn required<T>(slot: Option<T>, msg: &str, field: &str) -> Result<T, CodecError> {
+    slot.ok_or_else(|| CodecError::Malformed(format!("{msg} is missing {field}")))
+}
+
+fn unknown_tag(msg: &str, tag: u8) -> CodecError {
+    CodecError::Malformed(format!("{msg} has an unknown field tag {tag}"))
+}
+
+fn read_window_field(field: Bytes, msg: &str) -> Result<u32, CodecError> {
+    match read_u32_field(field)? {
+        0 => Err(CodecError::Malformed(format!("{msg}.window is 0; it must be at least 1"))),
+        window => Ok(window),
+    }
+}
+
 fn read_choice_list(field: Bytes, what: &str) -> Result<Vec<u8>, CodecError> {
     if field.len() > MAX_CHOICE_LIST_ENTRIES {
         return Err(CodecError::Malformed(format!(
@@ -110,8 +136,8 @@ fn read_choice_list(field: Bytes, what: &str) -> Result<Vec<u8>, CodecError> {
 
 /// Sent first, by the connecting side: its protocol version, every codec and compression it
 /// speaks, the largest frame it accepts, and its send window: how many frames it may have in
-/// flight before the oldest is acknowledged. The sender uses the smaller of its own and
-/// `HelloAck`'s, and at least 1 (ADR `native-hop-send-window`, decision 1).
+/// flight before the oldest is acknowledged, at least 1. The sender uses the smaller of its own
+/// and `HelloAck`'s (ADR `native-hop-send-window`, decision 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
     pub version: u16,
@@ -122,6 +148,7 @@ pub struct Hello {
     /// Bounded to [`MAX_CHOICE_LIST_ENTRIES`] on decode.
     pub compressions: Vec<u8>,
     pub max_frame_bytes: u32,
+    /// At least 1; a decoded 0 is [`CodecError::Malformed`].
     pub window: u32,
 }
 
@@ -133,6 +160,7 @@ const HELLO_FIELD_WINDOW: u8 = 5;
 
 impl Hello {
     pub fn encode(&self) -> Bytes {
+        debug_assert!(self.window >= 1, "Hello.window must be at least 1");
         let mut out = BytesMut::new();
         out.extend_from_slice(&[MSG_HELLO]);
         write_u16(&mut out, HELLO_FIELD_VERSION, self.version);
@@ -145,25 +173,42 @@ impl Hello {
 
     /// Decodes the TLV fields after a message-type byte the caller already checked.
     fn decode_fields(mut body: Bytes) -> Result<Self, CodecError> {
-        let mut version = 0u16;
-        let mut codecs = Vec::new();
-        let mut compressions = Vec::new();
-        let mut max_frame_bytes = 0u32;
-        let mut window = 0u32;
+        const MSG: &str = "Hello";
+        let mut version = None;
+        let mut codecs = None;
+        let mut compressions = None;
+        let mut max_frame_bytes = None;
+        let mut window = None;
         while let Some((tag, field)) = read_field(&mut body)? {
             match tag {
-                HELLO_FIELD_VERSION => version = read_u16_field(field)?,
-                HELLO_FIELD_CODECS => codecs = read_choice_list(field, "Hello.codecs")?,
-                HELLO_FIELD_COMPRESSIONS => {
-                    compressions = read_choice_list(field, "Hello.compressions")?
+                HELLO_FIELD_VERSION => {
+                    set_once(&mut version, read_u16_field(field)?, MSG, "version")?
                 }
-                HELLO_FIELD_MAX_FRAME_BYTES => max_frame_bytes = read_u32_field(field)?,
-                HELLO_FIELD_WINDOW => window = read_u32_field(field)?,
-                // A later protocol version's field; skip it.
-                _unknown => {}
+                HELLO_FIELD_CODECS => {
+                    set_once(&mut codecs, read_choice_list(field, "Hello.codecs")?, MSG, "codecs")?
+                }
+                HELLO_FIELD_COMPRESSIONS => set_once(
+                    &mut compressions,
+                    read_choice_list(field, "Hello.compressions")?,
+                    MSG,
+                    "compressions",
+                )?,
+                HELLO_FIELD_MAX_FRAME_BYTES => {
+                    set_once(&mut max_frame_bytes, read_u32_field(field)?, MSG, "max_frame_bytes")?
+                }
+                HELLO_FIELD_WINDOW => {
+                    set_once(&mut window, read_window_field(field, MSG)?, MSG, "window")?
+                }
+                tag => return Err(unknown_tag(MSG, tag)),
             }
         }
-        Ok(Hello { version, codecs, compressions, max_frame_bytes, window })
+        Ok(Hello {
+            version: required(version, MSG, "version")?,
+            codecs: required(codecs, MSG, "codecs")?,
+            compressions: required(compressions, MSG, "compressions")?,
+            max_frame_bytes: required(max_frame_bytes, MSG, "max_frame_bytes")?,
+            window: required(window, MSG, "window")?,
+        })
     }
 
     /// Decodes a whole `Hello` payload, message-type byte included; a different message type is
@@ -177,13 +222,14 @@ impl Hello {
 // -- HelloAck ----------------------------------------------------------------------------------
 
 /// The listener's reply to a valid [`Hello`]: the chosen codec and compression from both sides'
-/// offers, its own frame-size ceiling, and its window.
+/// offers, its own frame-size ceiling, and its window, at least 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HelloAck {
     pub version: u16,
     pub codec: u8,
     pub compression: u8,
     pub max_frame_bytes: u32,
+    /// At least 1; a decoded 0 is [`CodecError::Malformed`].
     pub window: u32,
 }
 
@@ -195,6 +241,7 @@ const HELLO_ACK_FIELD_WINDOW: u8 = 5;
 
 impl HelloAck {
     pub fn encode(&self) -> Bytes {
+        debug_assert!(self.window >= 1, "HelloAck.window must be at least 1");
         let mut out = BytesMut::new();
         out.extend_from_slice(&[MSG_HELLO_ACK]);
         write_u16(&mut out, HELLO_ACK_FIELD_VERSION, self.version);
@@ -208,22 +255,37 @@ impl HelloAck {
     }
 
     fn decode_fields(mut body: Bytes) -> Result<Self, CodecError> {
-        let mut version = 0u16;
-        let mut codec = 0u8;
-        let mut compression = 0u8;
-        let mut max_frame_bytes = 0u32;
-        let mut window = 0u32;
+        const MSG: &str = "HelloAck";
+        let mut version = None;
+        let mut codec = None;
+        let mut compression = None;
+        let mut max_frame_bytes = None;
+        let mut window = None;
         while let Some((tag, mut field)) = read_field(&mut body)? {
             match tag {
-                HELLO_ACK_FIELD_VERSION => version = read_u16_field(field)?,
-                HELLO_ACK_FIELD_CODEC => codec = read_u8(&mut field)?,
-                HELLO_ACK_FIELD_COMPRESSION => compression = read_u8(&mut field)?,
-                HELLO_ACK_FIELD_MAX_FRAME_BYTES => max_frame_bytes = read_u32_field(field)?,
-                HELLO_ACK_FIELD_WINDOW => window = read_u32_field(field)?,
-                _unknown => {}
+                HELLO_ACK_FIELD_VERSION => {
+                    set_once(&mut version, read_u16_field(field)?, MSG, "version")?
+                }
+                HELLO_ACK_FIELD_CODEC => set_once(&mut codec, read_u8(&mut field)?, MSG, "codec")?,
+                HELLO_ACK_FIELD_COMPRESSION => {
+                    set_once(&mut compression, read_u8(&mut field)?, MSG, "compression")?
+                }
+                HELLO_ACK_FIELD_MAX_FRAME_BYTES => {
+                    set_once(&mut max_frame_bytes, read_u32_field(field)?, MSG, "max_frame_bytes")?
+                }
+                HELLO_ACK_FIELD_WINDOW => {
+                    set_once(&mut window, read_window_field(field, MSG)?, MSG, "window")?
+                }
+                tag => return Err(unknown_tag(MSG, tag)),
             }
         }
-        Ok(HelloAck { version, codec, compression, max_frame_bytes, window })
+        Ok(HelloAck {
+            version: required(version, MSG, "version")?,
+            codec: required(codec, MSG, "codec")?,
+            compression: required(compression, MSG, "compression")?,
+            max_frame_bytes: required(max_frame_bytes, MSG, "max_frame_bytes")?,
+            window: required(window, MSG, "window")?,
+        })
     }
 
     pub fn decode(bytes: &mut Bytes) -> Result<Self, CodecError> {
@@ -246,10 +308,11 @@ impl Ack {
         Bytes::from_static(&[MSG_ACK])
     }
 
-    /// Validates and skips every field, so a field from another protocol revision (an older
-    /// `logit_in`'s sequence at tag 1) decodes to `Ack`.
-    fn decode_fields(mut body: Bytes) -> Result<Self, CodecError> {
-        while let Some((_tag, _field)) = read_field(&mut body)? {}
+    /// `Ack` is the message-type byte alone; any body is [`CodecError::Malformed`].
+    fn decode_fields(body: Bytes) -> Result<Self, CodecError> {
+        if !body.is_empty() {
+            return Err(CodecError::Malformed("Ack carries a body".to_string()));
+        }
         Ok(Ack)
     }
 
@@ -282,12 +345,16 @@ impl Reject {
     }
 
     fn decode_fields(mut body: Bytes) -> Result<Self, CodecError> {
-        let mut code = 0u16;
-        let mut message = String::new();
+        const MSG: &str = "Reject";
+        let mut code = None;
+        let mut message: Option<String> = None;
         while let Some((tag, field)) = read_field(&mut body)? {
             match tag {
-                REJECT_FIELD_CODE => code = read_u16_field(field)?,
+                REJECT_FIELD_CODE => set_once(&mut code, read_u16_field(field)?, MSG, "code")?,
                 REJECT_FIELD_MESSAGE => {
+                    if message.is_some() {
+                        return Err(CodecError::Malformed(format!("{MSG} repeats message")));
+                    }
                     if field.len() > MAX_REJECT_MESSAGE_BYTES {
                         return Err(CodecError::Malformed(format!(
                             "Reject.message is {} bytes, over the {MAX_REJECT_MESSAGE_BYTES} \
@@ -295,19 +362,23 @@ impl Reject {
                             field.len()
                         )));
                     }
-                    message = String::from_utf8_lossy(&field).into_owned();
+                    let mut text = String::from_utf8_lossy(&field).into_owned();
                     // Each invalid byte becomes a 3-byte U+FFFD, so the lossy string can exceed
                     // the cap; cut it back so a decoded message always re-encodes within it.
-                    let mut cut = message.len().min(MAX_REJECT_MESSAGE_BYTES);
-                    while !message.is_char_boundary(cut) {
+                    let mut cut = text.len().min(MAX_REJECT_MESSAGE_BYTES);
+                    while !text.is_char_boundary(cut) {
                         cut -= 1;
                     }
-                    message.truncate(cut);
+                    text.truncate(cut);
+                    message = Some(text);
                 }
-                _unknown => {}
+                tag => return Err(unknown_tag(MSG, tag)),
             }
         }
-        Ok(Reject { code, message })
+        Ok(Reject {
+            code: required(code, MSG, "code")?,
+            message: required(message, MSG, "message")?,
+        })
     }
 
     pub fn decode(bytes: &mut Bytes) -> Result<Self, CodecError> {
@@ -338,8 +409,8 @@ impl ControlMessage {
         }
     }
 
-    /// Dispatches on the leading message-type byte. An unknown message type is `Malformed`,
-    /// unlike an unknown field, which is skipped: there's no known layout to read it by.
+    /// Dispatches on the leading message-type byte. An unknown message type is `Malformed`, as
+    /// is an unknown field inside a known one.
     pub fn decode(bytes: &mut Bytes) -> Result<Self, CodecError> {
         let msg_type = read_u8(bytes)?;
         let body = bytes.split_off(0);
@@ -387,7 +458,7 @@ mod tests {
             codecs: vec![],
             compressions: vec![],
             max_frame_bytes: 0,
-            window: 0,
+            window: 1,
         };
         let mut encoded = hello.encode();
         assert_eq!(Hello::decode(&mut encoded).unwrap(), hello);
@@ -440,9 +511,11 @@ mod tests {
     }
 
     #[test]
-    fn an_ack_carrying_an_older_seq_field_decodes() {
+    fn an_ack_with_a_body_is_malformed() {
         let mut bytes = Bytes::from_static(&[MSG_ACK, 1, 1, 42]);
-        assert_eq!(Ack::decode(&mut bytes).unwrap(), Ack);
+        assert!(matches!(Ack::decode(&mut bytes), Err(CodecError::Malformed(_))));
+        let mut bytes = Bytes::from_static(&[MSG_ACK, 1, 1, 42]);
+        assert!(matches!(ControlMessage::decode(&mut bytes), Err(CodecError::Malformed(_))));
     }
 
     #[test]
@@ -502,32 +575,135 @@ mod tests {
     /// UTF-8 conversion: 1026 bytes, which a second decode would refuse.
     #[test]
     fn a_reject_message_of_invalid_utf8_re_encodes_within_the_cap() {
-        let mut wire = vec![MSG_REJECT, REJECT_FIELD_MESSAGE, 0xd6, 0x02];
+        let mut wire = vec![MSG_REJECT, REJECT_FIELD_CODE, 1, 5, REJECT_FIELD_MESSAGE, 0xd6, 0x02];
         wire.extend(std::iter::repeat_n(0xFF, 342));
         let decoded = Reject::decode(&mut Bytes::from(wire)).unwrap();
         assert!(decoded.message.len() <= MAX_REJECT_MESSAGE_BYTES, "{}", decoded.message.len());
         assert_eq!(Reject::decode(&mut decoded.encode()).unwrap(), decoded);
     }
 
-    #[test]
-    fn an_unknown_field_tag_is_skipped_without_disturbing_known_fields() {
-        // A Hello with an unknown field tag 99 ahead of the real fields.
-        let mut out = BytesMut::new();
-        out.extend_from_slice(&[MSG_HELLO]);
-        write_field(&mut out, 99, |buf| buf.extend_from_slice(b"future field, ignore me"));
-        write_u16(&mut out, HELLO_FIELD_VERSION, PROTOCOL_VERSION);
-        write_bytes_field(&mut out, HELLO_FIELD_CODECS, &[1]);
-        write_bytes_field(&mut out, HELLO_FIELD_COMPRESSIONS, &[0]);
-        write_u32(&mut out, HELLO_FIELD_MAX_FRAME_BYTES, 1024);
-        write_u32(&mut out, HELLO_FIELD_WINDOW, 1);
-        let mut bytes = out.freeze();
+    /// A valid `Hello`, `HelloAck`, and `Reject`, each as `(message type, fields)` with every
+    /// field as its own `tag + len + payload` byte string, so a test can drop, repeat, or replace
+    /// one.
+    fn valid_messages() -> Vec<(u8, Vec<Bytes>)> {
+        fn fields(encoded: Bytes) -> (u8, Vec<Bytes>) {
+            let mut body = encoded;
+            let msg_type = read_u8(&mut body).unwrap();
+            let mut out = Vec::new();
+            while !body.is_empty() {
+                let before = body.clone();
+                read_field(&mut body).unwrap();
+                out.push(before.slice(..before.len() - body.len()));
+            }
+            (msg_type, out)
+        }
+        vec![
+            fields(
+                Hello {
+                    version: PROTOCOL_VERSION,
+                    codecs: vec![1],
+                    compressions: vec![0],
+                    max_frame_bytes: 1024,
+                    window: 1,
+                }
+                .encode(),
+            ),
+            fields(
+                HelloAck {
+                    version: PROTOCOL_VERSION,
+                    codec: 1,
+                    compression: 0,
+                    max_frame_bytes: 1024,
+                    window: 1,
+                }
+                .encode(),
+            ),
+            fields(Reject { code: REJECT_INTERNAL, message: "no".to_string() }.encode()),
+        ]
+    }
 
-        let hello = Hello::decode(&mut bytes).unwrap();
-        assert_eq!(hello.version, PROTOCOL_VERSION);
-        assert_eq!(hello.codecs, vec![1]);
-        assert_eq!(hello.compressions, vec![0]);
-        assert_eq!(hello.max_frame_bytes, 1024);
-        assert_eq!(hello.window, 1);
+    fn assemble(msg_type: u8, fields: &[Bytes]) -> Bytes {
+        let mut out = BytesMut::new();
+        out.extend_from_slice(&[msg_type]);
+        for field in fields {
+            out.extend_from_slice(field);
+        }
+        out.freeze()
+    }
+
+    #[test]
+    fn every_valid_message_decodes_from_its_fields() {
+        for (msg_type, fields) in valid_messages() {
+            let mut bytes = assemble(msg_type, &fields);
+            ControlMessage::decode(&mut bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_message_missing_any_field_is_malformed() {
+        for (msg_type, fields) in valid_messages() {
+            for drop in 0..fields.len() {
+                let mut kept = fields.clone();
+                kept.remove(drop);
+                let mut bytes = assemble(msg_type, &kept);
+                let result = ControlMessage::decode(&mut bytes);
+                assert!(
+                    matches!(&result, Err(CodecError::Malformed(m)) if m.contains("is missing")),
+                    "type {msg_type} without field {drop}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_message_repeating_any_field_is_malformed() {
+        for (msg_type, fields) in valid_messages() {
+            for repeat in 0..fields.len() {
+                let mut doubled = fields.clone();
+                doubled.push(fields[repeat].clone());
+                let mut bytes = assemble(msg_type, &doubled);
+                let result = ControlMessage::decode(&mut bytes);
+                assert!(
+                    matches!(&result, Err(CodecError::Malformed(m)) if m.contains("repeats")),
+                    "type {msg_type} with field {repeat} twice: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_field_tag_is_malformed() {
+        for (msg_type, mut fields) in valid_messages() {
+            let mut unknown = BytesMut::new();
+            write_field(&mut unknown, 99, |buf| buf.extend_from_slice(b"unknown"));
+            fields.insert(0, unknown.freeze());
+            let mut bytes = assemble(msg_type, &fields);
+            let result = ControlMessage::decode(&mut bytes);
+            assert!(
+                matches!(&result, Err(CodecError::Malformed(m)) if m.contains("unknown field tag 99")),
+                "type {msg_type}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_of_zero_is_malformed() {
+        for (msg_type, window_tag) in
+            [(MSG_HELLO, HELLO_FIELD_WINDOW), (MSG_HELLO_ACK, HELLO_ACK_FIELD_WINDOW)]
+        {
+            let (_, mut fields) =
+                valid_messages().into_iter().find(|(t, _)| *t == msg_type).unwrap();
+            let window = fields.iter().position(|f| f[0] == window_tag).unwrap();
+            let mut zero = BytesMut::new();
+            write_u32(&mut zero, window_tag, 0);
+            fields[window] = zero.freeze();
+            let mut bytes = assemble(msg_type, &fields);
+            let result = ControlMessage::decode(&mut bytes);
+            assert!(
+                matches!(&result, Err(CodecError::Malformed(m)) if m.contains("window is 0")),
+                "type {msg_type}: {result:?}"
+            );
+        }
     }
 
     #[test]

@@ -5,8 +5,9 @@
 //! `Fanout::send`, one `Ack` out.
 //!
 //! **Send window.** A peer may have several frames in flight
-//! (`docs/adr/native-hop-send-window.md`). `HelloAck` answers the `Hello`'s window clamped to
-//! `1..=RECEIVER_MAX_WINDOW`. Nothing here tracks the window: one task per connection reads,
+//! (`docs/adr/native-hop-send-window.md`). `HelloAck` answers the smaller of the `Hello`'s window
+//! and `RECEIVER_MAX_WINDOW`; a `Hello` window of 0 fails to decode, so the answer is at least 1.
+//! Nothing here tracks the window: one task per connection reads,
 //! forwards, and answers its frames one at a time, so answers leave in frame order and the k-th
 //! answer on a connection is the k-th frame's. Accepted sockets set `TCP_NODELAY`.
 //!
@@ -763,9 +764,10 @@ async fn close_idle<S: AsyncWrite + Unpin>(
 /// client can't proceed.
 ///
 /// `HelloAck` carries the best shared codec, `lz4` or no compression, this listener's
-/// `max_frame_bytes` (every later frame is bounded by it), and the offered window clamped to
-/// `1..=RECEIVER_MAX_WINDOW`. Each reply is written
-/// within `handshake_timeout` too, a fresh bound per write.
+/// `max_frame_bytes` (every later frame is bounded by it), and the smaller of the offered window
+/// and `RECEIVER_MAX_WINDOW`. A `Hello` that fails to decode, a missing field or a window of 0
+/// among the reasons, ends the connection with no reply. Each reply is written within
+/// `handshake_timeout` too, a fresh bound per write.
 async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     max_frame_bytes: u32,
@@ -846,7 +848,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         codec: native::CODEC_HOP_BATCH,
         compression: compression as u8,
         max_frame_bytes,
-        window: hello.window.clamp(1, RECEIVER_MAX_WINDOW),
+        window: hello.window.min(RECEIVER_MAX_WINDOW),
     };
     write_control(stream, &ack, handshake_timeout).await?;
     Ok(Negotiated { compression })
@@ -2951,10 +2953,10 @@ mod tests {
         assert_eq!(totals.sum("logit.proto.errors", &[("reason", "handshake")]), 2.0);
     }
 
-    /// A `Hello` is read against the control-message cap, not `max_frame_bytes`: one at the cap,
-    /// padded with a field a later protocol version might add, is answered `HelloAck`, and a header
-    /// declaring one byte more closes the connection before any body is read, counted as a
-    /// handshake error like any other bad `Hello`.
+    /// A `Hello` is read against the control-message cap, not `max_frame_bytes`: a header
+    /// declaring a body one byte over it closes the connection before any body is read, counted as
+    /// a handshake error like any other bad `Hello`. No valid control message reaches the cap (a
+    /// `Hello`'s lists are capped at 16 entries each), so it only bounds a malformed length.
     #[tokio::test]
     async fn a_hello_is_bounded_by_the_control_message_cap() {
         let cap = control::MAX_CONTROL_MESSAGE_BYTES as usize;
@@ -2967,29 +2969,13 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         tokio::spawn(async move { input.run(sink).await });
 
-        // `hello` padded with unknown field 99: tag, a 2-byte uvarint length, then bytes.
-        let mut payload = BytesMut::from(&hello().encode()[..]);
-        let pad = cap - payload.len() - 3;
-        payload.extend_from_slice(&[99, (pad as u8 & 0x7f) | 0x80, (pad >> 7) as u8]);
-        payload.extend_from_slice(&vec![0u8; pad]);
-        assert_eq!(payload.len(), cap);
-
-        let mut at_cap = connect(&addr).await;
-        let framed =
-            frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &payload)
-                .unwrap();
-        at_cap.write_all(&framed).await.unwrap();
-        match read_control_response(&mut at_cap).await {
-            control::ControlMessage::HelloAck(ack) => {
-                assert_eq!(ack.codec, native::CODEC_HOP_BATCH)
-            }
-            other => panic!("expected HelloAck at the cap, got {other:?}"),
-        }
-
-        payload.extend_from_slice(&[0]);
-        let over =
-            frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &payload)
-                .unwrap();
+        let over = frame::write_frame_with_flags(
+            0,
+            Compression::None,
+            frame::FLAG_CONTROL,
+            &vec![0u8; cap + 1],
+        )
+        .unwrap();
         let mut over_cap = connect(&addr).await;
         // The header alone: a listener that waited for the body would hold the connection open.
         over_cap.write_all(&over[..frame::HEADER_LEN]).await.unwrap();
@@ -3002,7 +2988,41 @@ mod tests {
             })
             .await;
         assert_eq!(totals.sum("logit.proto.errors", &[("reason", "handshake")]), 1.0);
-        drop(at_cap);
+    }
+
+    /// A `Hello` offering a window of 0 is malformed: the connection closes with no reply,
+    /// counted as a handshake error. `Hello::encode` refuses a 0, so the test patches the window
+    /// field's one-byte value on the wire.
+    #[tokio::test]
+    async fn a_hello_with_a_window_of_zero_is_a_protocol_error() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        // Far longer than the test waits: the close must come from the decode, not a timeout.
+        let mut input =
+            input.with_telemetry(telemetry).with_handshake_timeout(Duration::from_secs(30));
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        // `window` is the last field, `tag len value`, and 1 encodes as the single byte 1.
+        let mut payload = BytesMut::from(&hello().encode()[..]);
+        let last = payload.len() - 1;
+        assert_eq!(payload[last - 2..], [5, 1, 1]);
+        payload[last] = 0;
+        let framed =
+            frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &payload)
+                .unwrap();
+        let mut client = connect(&addr).await;
+        client.write_all(&framed).await.unwrap();
+        expect_closed(&mut client, "a Hello with a window of 0").await;
+
+        let mut probe = TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("the malformed Hello counted", |t| {
+                t.sum("logit.proto.errors", &[("reason", "handshake")]) >= 1.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "handshake")]), 1.0);
     }
 
     /// A control frame is never compressed, so a `Hello` header whose `compressed_len` is one
@@ -3272,8 +3292,7 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         tokio::spawn(async move { input.run(sink).await });
 
-        for (offered, answered) in
-            [(0, 1), (1, 1), (32, 32), (1024, 1024), (1025, 1024), (u32::MAX, 1024)]
+        for (offered, answered) in [(1, 1), (32, 32), (1024, 1024), (1025, 1024), (u32::MAX, 1024)]
         {
             let mut client = connect(&addr).await;
             hello_offering(&mut client, offered).await;

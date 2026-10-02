@@ -127,7 +127,7 @@ struct Conn {
     peer_max_frame_bytes: u32,
     /// The negotiated compression; `None` when the peer doesn't support what was offered.
     compression: Compression,
-    /// The negotiated window: `max(1, min(offered, answered))`.
+    /// The negotiated window: `min(offered, answered)`, at least 1 because both are.
     window: usize,
     /// Frames written whole and not yet acknowledged. `logit_in` answers a connection's frames
     /// in the order they arrive, so the next `Ack` answers the oldest of them.
@@ -309,8 +309,7 @@ impl LogitOutput {
         };
 
         let compression = validate_hello_ack(&ack, &hello).context(Fault::Permanent)?;
-        // A `HelloAck.window` of 0 reads as 1.
-        let window = self.window.min(ack.window).max(1) as usize;
+        let window = self.window.min(ack.window) as usize;
         self.telemetry.gauge("logit.output.window", window as f64, &[]);
 
         if self.has_connected_once {
@@ -2300,32 +2299,19 @@ mod tests {
     }
 
     /// The cap is the control-message bound, not the data-frame one: a header one byte over it is
-    /// refused before a body is read, and a message at it, padded with a field a later protocol
-    /// version might add, decodes.
+    /// refused before a body is read. No valid control message reaches the cap, so there is no
+    /// at-the-cap message to accept; it bounds a malformed length.
     #[tokio::test]
-    async fn read_control_accepts_a_message_at_the_control_message_cap_and_refuses_one_over() {
+    async fn read_control_refuses_a_header_one_byte_over_the_control_message_cap() {
         let cap = control::MAX_CONTROL_MESSAGE_BYTES as usize;
-        // A `HelloAck` padded with unknown field 99: tag, a 2-byte uvarint length, then bytes.
-        let mut payload = BytesMut::from(&hello_ack().encode()[..]);
-        let pad = cap - payload.len() - 3;
-        payload.extend_from_slice(&[99, (pad as u8 & 0x7f) | 0x80, (pad >> 7) as u8]);
-        payload.extend_from_slice(&vec![0u8; pad]);
-        assert_eq!(payload.len(), cap);
-
-        let at_cap =
-            frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &payload)
-                .unwrap();
+        let over = frame::write_frame_with_flags(
+            0,
+            Compression::None,
+            frame::FLAG_CONTROL,
+            &vec![0u8; cap + 1],
+        )
+        .unwrap();
         let (mut client, mut server) = tokio::io::duplex(2 * cap);
-        client.write_all(&at_cap).await.unwrap();
-        assert_eq!(
-            read_control(&mut server).await.unwrap(),
-            control::ControlMessage::HelloAck(hello_ack())
-        );
-
-        payload.extend_from_slice(&[0]);
-        let over =
-            frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &payload)
-                .unwrap();
         // The header alone: a reader that waited for the body would never return.
         client.write_all(&over[..frame::HEADER_LEN]).await.unwrap();
         let err = tokio::time::timeout(RECV_TIMEOUT, read_control(&mut server))
@@ -2535,22 +2521,39 @@ mod tests {
         peer.abort();
     }
 
-    /// A `HelloAck.window` of 0 reads as 1, never as a window that can send nothing.
+    /// A `HelloAck` with a window of 0 fails to decode, so the handshake fails and no frame is
+    /// written. `HelloAck::encode` refuses a 0, so the peer patches the window field's one-byte
+    /// value on the wire.
     #[tokio::test]
-    async fn a_hello_ack_window_of_zero_is_read_as_one() {
+    async fn a_hello_ack_with_a_window_of_zero_fails_the_handshake() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let peer = tokio::spawn(async move {
-            let (mut stream, _) = accept_with_window(&listener, 0).await;
-            read_data_frame(&mut stream).await;
-            write_control(&mut stream, &control::Ack).await.unwrap();
-            std::future::pending::<()>().await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let control::ControlMessage::Hello(_) = read_control(&mut stream).await.unwrap() else {
+                panic!("expected Hello");
+            };
+            // `window` is the last field, `tag len value`, and 1 encodes as the single byte 1.
+            let mut payload = BytesMut::from(&hello_ack().encode()[..]);
+            let last = payload.len() - 1;
+            assert_eq!(payload[last - 2..], [5, 1, 1]);
+            payload[last] = 0;
+            let framed =
+                frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &payload)
+                    .unwrap();
+            stream.write_all(&framed).await.unwrap();
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest).await;
+            rest
         });
         let mut output = LogitOutput::new(addr);
 
-        send_next(&mut output, &sample_batch()).await.expect("one frame goes out and is acked");
-        assert_eq!(output.window(), 1);
-        peer.abort();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("window is 0"), "{err:#}");
+        drop(output);
+        let written =
+            tokio::time::timeout(RECV_TIMEOUT, peer).await.expect("the connection closes").unwrap();
+        assert!(written.is_empty(), "no frame follows a failed handshake: {written:?}");
     }
 
     /// `GOING_AWAY` after some `Ack`s answers the oldest unanswered frame, and `logit_in` reads
