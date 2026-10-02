@@ -165,6 +165,10 @@ reconnect commits what the receiver already holds without resending it.
 - **Both lists decode strictly.** A `senders` or `marks` field whose length isn't a whole number
   of entries, or that holds more than `MAX_HELLO_SENDERS` entries, is `Malformed`, under the same
   rule every control-message field follows.
+- **Marks must answer the `Hello`.** A `HelloAck` whose marks name an identity the `Hello` didn't
+  list, or name one identity twice, doesn't answer the `Hello` and fails the attempt `Permanent`,
+  as a `HelloAck` naming an unoffered codec does. A conforming `logit_in` never sends one; the
+  class says the peer isn't a `logit_in` this sink can talk to, which a retry won't change.
 - **A frame at or below its mark is committed without a send.** The marks exist only once the
   new connection's handshake has run, and `submit` today encodes and size-gates a batch before
   it connects, so an oversized batch never connects. With identities to resend and no
