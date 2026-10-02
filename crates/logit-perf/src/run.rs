@@ -231,7 +231,7 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         profile: args.profile.clone(),
         label: args.label.clone(),
         box_state: Some(state),
-        binary: Some(binary),
+        binary,
         scenarios: reports,
     };
 
@@ -1107,12 +1107,10 @@ fn short12(sha: &str) -> String {
 /// `sha256` (a tarball or dirty-tree source has no commit).
 fn short_provenance_sha(report: &RunReport, logit_bin_overridden: bool) -> String {
     if logit_bin_overridden {
-        if let Some(binary) = &report.binary {
-            if let Some(sha) = &binary.source_sha {
-                return short12(sha);
-            }
-            return short12(&binary.sha256);
-        }
+        return match &report.binary.source_sha {
+            Some(sha) => short12(sha),
+            None => short12(&report.binary.sha256),
+        };
     }
     report.git.sha.as_deref().map(short12).unwrap_or_else(|| "unknown".to_string())
 }
@@ -1829,7 +1827,17 @@ mod tests {
         assert!(read_binary_sidecar(&bin_path).is_none());
     }
 
-    fn report_with_binary(git_sha: Option<&str>, binary: Option<BinaryInfo>) -> RunReport {
+    fn plain_binary() -> BinaryInfo {
+        BinaryInfo {
+            path: "/x/logit".to_string(),
+            sha256: "f".repeat(64),
+            source_ref: None,
+            source_sha: None,
+            built_at: None,
+        }
+    }
+
+    fn report_with_binary(git_sha: Option<&str>, binary: BinaryInfo) -> RunReport {
         RunReport {
             git: GitInfo { sha: git_sha.map(str::to_string), dirty: Some(false) },
             timestamp: "2026-09-18T00:00:00Z".to_string(),
@@ -1851,13 +1859,13 @@ mod tests {
         // populated, but its presence must not change the answer.
         let report = report_with_binary(
             Some("checkoutsha1234"),
-            Some(BinaryInfo {
+            BinaryInfo {
                 path: "/x/logit".to_string(),
                 sha256: "f".repeat(64),
                 source_ref: None,
                 source_sha: None,
                 built_at: None,
-            }),
+            },
         );
         assert_eq!(short_provenance_sha(&report, false), "checkoutsha1");
     }
@@ -1866,13 +1874,13 @@ mod tests {
     fn short_provenance_sha_prefers_the_binarys_own_source_sha_under_logit_bin() {
         let report = report_with_binary(
             Some("checkoutsha1234"),
-            Some(BinaryInfo {
+            BinaryInfo {
                 path: "/x/logit".to_string(),
                 sha256: "f".repeat(64),
                 source_ref: Some("udp/w3".to_string()),
                 source_sha: Some("binarycommitsha5678".to_string()),
                 built_at: None,
-            }),
+            },
         );
         assert_eq!(short_provenance_sha(&report, true), "binarycommit");
     }
@@ -1884,35 +1892,26 @@ mod tests {
         // gap this exists to close.
         let report = report_with_binary(
             Some("checkoutsha1234"),
-            Some(BinaryInfo {
+            BinaryInfo {
                 path: "/x/logit".to_string(),
                 sha256: "abcdef0123456789".to_string(),
                 source_ref: Some("dir".to_string()),
                 source_sha: None,
                 built_at: None,
-            }),
+            },
         );
         assert_eq!(short_provenance_sha(&report, true), "abcdef012345");
     }
 
     #[test]
-    fn short_provenance_sha_falls_back_to_git_sha_when_logit_bin_carries_no_binary_info() {
-        // Defensive: --logit-bin was used, but for some reason `binary` itself is absent (a
-        // results file this function is asked to name outside `run`'s own path). Falling back to
-        // git.sha here is better than a bare "unknown" when there's a real sha available.
-        let report = report_with_binary(Some("checkoutsha1234"), None);
-        assert_eq!(short_provenance_sha(&report, true), "checkoutsha1");
-    }
-
-    #[test]
     fn short_provenance_sha_is_unknown_with_nothing_to_go_on() {
-        let report = report_with_binary(None, None);
+        let report = report_with_binary(None, plain_binary());
         assert_eq!(short_provenance_sha(&report, false), "unknown");
     }
 
     #[test]
     fn result_filename_appends_the_label_suffix_when_present() {
-        let mut report = report_with_binary(Some("checkoutsha1234"), None);
+        let mut report = report_with_binary(Some("checkoutsha1234"), plain_binary());
         report.label = Some("baseline v2".to_string());
         let filename = result_filename(&report, 0, false);
         assert!(filename.ends_with("-checkoutsha1-baseline_v2.json"), "{filename}");
@@ -1922,13 +1921,13 @@ mod tests {
     fn result_filename_names_the_binary_not_the_checkout_under_logit_bin() {
         let report = report_with_binary(
             Some("checkoutsha1234"),
-            Some(BinaryInfo {
+            BinaryInfo {
                 path: "/x/logit".to_string(),
                 sha256: "f".repeat(64),
                 source_ref: Some("udp/w3".to_string()),
                 source_sha: Some("binarycommitsha5678".to_string()),
                 built_at: None,
-            }),
+            },
         );
         let filename = result_filename(&report, 0, true);
         assert!(filename.starts_with("19700101T000000Z-binarycommit"), "{filename}");

@@ -37,14 +37,12 @@ pub struct RunReport {
     pub profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// The box's power/thermal policy during the run; see [`BoxState`]. Absent in an older
-    /// results file.
+    /// The box's power/thermal policy during the run; see [`BoxState`]. Absent when the sysfs
+    /// reads it comes from aren't available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub box_state: Option<BoxState>,
-    /// The binary that was spawned, recorded with or without `--logit-bin`. Absent only in an
-    /// older results file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binary: Option<BinaryInfo>,
+    /// The binary that was spawned, recorded with or without `--logit-bin`.
+    pub binary: BinaryInfo,
     pub scenarios: BTreeMap<String, ScenarioReport>,
 }
 
@@ -147,8 +145,8 @@ pub struct Sample {
     /// competing processes don't inflate it.
     pub cpu_us_per_event: f64,
     /// The socket side of a real-socket (`Workload::Driven`) repeat; absent for a generated
-    /// scenario. `#[serde(default)]` keeps an older results file loadable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// scenario.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub udp: Option<UdpSample>,
 }
 
@@ -168,11 +166,7 @@ pub struct UdpSample {
     pub received_datagrams: u64,
     /// `logit.input.reads`: read syscalls the listener made. `received_datagrams / reads` is the
     /// mean fill of one `recvmmsg(2)` batch, which says whether `receive.read_batch` is the
-    /// constraint (`docs/deploying.md`'s "Listener intake").
-    ///
-    /// `#[serde(default)]` so an older results file loads; `0` means not recorded, and
-    /// [`UdpSample::mean_fill`] returns `None` for it.
-    #[serde(default)]
+    /// constraint (`docs/deploying.md`'s "Listener intake"). `0` for a run that received nothing.
     pub reads: u64,
     /// `logit.input.kernel.drops`: discarded by the kernel before a read returned them. On
     /// loopback `sent == received + this`, which `crate::run`'s self-check asserts.
@@ -190,16 +184,17 @@ pub struct UdpSample {
     /// begins dropping; these scenarios' baselines are tuned to sit near it.
     pub kernel_rcvbuf_utilization_max: f64,
     /// Datagrams/s the blast was paced at, after `--rate-scale`/`--verify`, not the spec's
-    /// `rate:`. `None` for an unpaced spec or an older results file.
+    /// `rate:`. `None` for an unpaced spec.
     ///
     /// Two runs at different scales aren't comparable and nothing else in the file says so;
     /// `compare` warns when these differ.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_rate: Option<u64>,
 }
 
 impl UdpSample {
-    /// Datagrams per read syscall, or `None` when reads weren't recorded. Read it only against the
+    /// Datagrams per read syscall, or `None` for a run with no reads (a division by zero
+    /// otherwise). Read it only against the
     /// `read_batch` that produced it, not across scenarios with different datagram sizes.
     pub fn mean_fill(&self) -> Option<f64> {
         (self.reads > 0).then(|| self.received_datagrams as f64 / self.reads as f64)
@@ -520,13 +515,13 @@ mod tests {
             profile: "release".to_string(),
             label: Some("baseline".to_string()),
             box_state: None,
-            binary: Some(BinaryInfo {
+            binary: BinaryInfo {
                 path: "/repo/target/release/logit".to_string(),
                 sha256: "d".repeat(64),
                 source_ref: Some("udp/w3".to_string()),
                 source_sha: Some("abc123".to_string()),
                 built_at: Some("2026-09-18T00:00:00Z".to_string()),
-            }),
+            },
             scenarios,
         };
 
@@ -594,28 +589,13 @@ mod tests {
     }
 
     #[test]
-    fn a_udp_sample_written_before_the_rate_scale_flag_existed_still_loads() {
-        // Exactly the `udp` block this harness wrote before `--rate-scale`: no `effective_rate`.
-        let json = r#"{
-            "sent_datagrams": 100, "sent_lines": 100, "received_datagrams": 99,
-            "kernel_dropped": 1, "queue_dropped": 0, "events_delivered": 99,
-            "send_errors": 0, "kernel_rcvbuf_utilization_max": 0.5
-        }"#;
-        let udp: UdpSample = serde_json::from_str(json).expect("an older udp block must load");
-        assert_eq!(udp.effective_rate, None);
-        assert_eq!(udp.events_delivered, 99);
-    }
-
-    #[test]
-    fn a_results_file_written_before_udp_samples_existed_still_loads() {
-        // Exactly the JSON the pre-ADR harness wrote for one repeat: no `udp` key anywhere.
+    fn a_sample_with_no_udp_block_loads() {
         let json = r#"{
             "wall_s": 2.0, "startup_s": 0.2, "user_s": 1.0, "sys_s": 1.0,
             "max_rss_bytes": 1024, "events_per_s": 500.0, "cpu_us_per_event": 4.0
         }"#;
-        let sample: Sample = serde_json::from_str(json).expect("an old sample must still load");
+        let sample: Sample = serde_json::from_str(json).unwrap();
         assert_eq!(sample.udp, None);
-        assert_eq!(sample.cpu_us_per_event, 4.0);
     }
 
     #[test]
@@ -636,11 +616,16 @@ mod tests {
             profile: "release".to_string(),
             label: None,
             box_state: None,
-            binary: None,
+            binary: BinaryInfo {
+                path: "/repo/target/release/logit".to_string(),
+                sha256: "d".repeat(64),
+                source_ref: None,
+                source_sha: None,
+                built_at: None,
+            },
             scenarios: BTreeMap::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("label"), "{json}");
-        assert!(!json.contains("\"binary\""), "{json}");
     }
 }
