@@ -3055,18 +3055,13 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   millisecond. Named as a risk at design time ([ADR `load-test-harness`](adr/load-test-harness.md),
   `docs/plans/load-test-harness.md`). Nothing shipped is affected: no `perf/scenarios/*.yaml` sets
   `rate:` (every scenario measures unthrottled, backpressure-only throughput).
-- **`RunReport.box_state` records nothing on the disposable perf VM.** `logit-perf run`'s
-  best-effort governor/EPP/platform-profile/AC-power probe (`crates/logit-perf/src/result.rs`)
-  returns an empty `{}` on every Azure guest, where that sysfs surface doesn't exist — correct for
-  what it checks, but the results JSON, now the primary provenance record for every recorded
-  number, captures nothing about the box beyond `hostname`/`cpu_model`/`nproc`. With the VM as the
-  reference box (`docs/adr/disposable-azure-perf-vm.md`), `BoxState` should also record THP setting
-  (`/sys/kernel/mm/transparent_hugepage/enabled`), `net.core.rmem_max`/`rmem_default`
-  (`/proc/sys/net/core/`), and vCPU topology (`vCPUsPerCore` — from IMDS, or `nproc` alongside
-  `/proc/cpuinfo`'s core-id fields). Each changed a finding this effort measured (THP flips the
-  `read_batch` RSS story; `rmem_max` decides whether a receive buffer clamps), and `compare` could
-  then warn on them as it does for a hostname/CPU-model mismatch. Needs a code change
-  (`crates/logit-perf/src/result.rs`'s `BoxState`, plus a `compare.rs` warning); not built.
+- **`RunReport.box_state` records the governor fields only where the box exposes them.** `logit-perf run` reads the governor, EPP, platform profile, and AC
+  power best-effort, which an Azure guest doesn't expose, so those stay absent there. It also
+  records THP `enabled` and `defrag`, `net.core.rmem_max` and `rmem_default`, the online CPU
+  count, and whether SMT is on, which the guest does expose (read inside the dev container, so
+  they are the host kernel's). `compare` warns when two files differ in THP `enabled` or
+  `rmem_max`. Not recorded: IMDS facts such as `vCPUsPerCore` and the VM size, and other kernel
+  tunables (`rmem` is the one a measured finding turned on).
 - **When and how the load-test harness runs in the ongoing development process is deliberately
   undecided.** Nightly, manually triggered, a PR gate on a `compare --threshold` regression, or
   another cadence is open future work ([ADR `load-test-harness`](adr/load-test-harness.md)'s "Open

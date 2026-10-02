@@ -6,7 +6,7 @@
 //! `--threshold` percent is a regression. `max_rss_bytes` is always reported but gates the exit
 //! code only when `--rss-threshold` is given.
 
-use crate::result::{RunReport, Sample};
+use crate::result::{BoxState, RunReport, Sample};
 use std::collections::BTreeSet;
 
 /// One scenario's before/after comparison.
@@ -143,6 +143,25 @@ pub fn compare(a: &RunReport, b: &RunReport) -> CompareReport {
             "comparing across different environments: {} ({}) vs {} ({}) -- wall-clock deltas \
              may reflect the machines, not the code; CPU us/event is the more trustworthy signal",
             a.hostname, a.cpu_model, b.hostname, b.cpu_model
+        ));
+    }
+    let (a_box, b_box) = (a.box_state.as_ref(), b.box_state.as_ref());
+    let thp = |state: Option<&BoxState>| state.and_then(|s| s.thp_enabled.clone());
+    if thp(a_box) != thp(b_box) {
+        warnings.push(format!(
+            "comparing different transparent hugepage settings: {:?} vs {:?} -- resident-set \
+             size differs with no code change",
+            thp(a_box),
+            thp(b_box)
+        ));
+    }
+    let rmem = |state: Option<&BoxState>| state.and_then(|s| s.rmem_max);
+    if rmem(a_box) != rmem(b_box) {
+        warnings.push(format!(
+            "comparing different net.core.rmem_max: {:?} vs {:?} -- a receive buffer clamps \
+             differently, and a UDP scenario's drop rate with it",
+            rmem(a_box),
+            rmem(b_box)
         ));
     }
     if a.profile != b.profile {
@@ -399,6 +418,33 @@ mod tests {
             &report("box-b", "cpu-a", scenarios),
         );
         assert!(cmp.warnings.iter().any(|w| w.contains("different environments")));
+    }
+
+    #[test]
+    fn a_thp_or_rmem_mismatch_warns_but_does_not_fail() {
+        let state = |thp: &str, rmem: u64| BoxState {
+            scaling_governor: None,
+            energy_performance_preference: None,
+            platform_profile: None,
+            on_ac_power: None,
+            thp_enabled: Some(thp.to_string()),
+            thp_defrag: None,
+            rmem_max: Some(rmem),
+            rmem_default: None,
+            online_cpus: None,
+            smt_active: None,
+        };
+        let with = |s: BoxState| {
+            let mut r = report("h", "c", BTreeMap::new());
+            r.box_state = Some(s);
+            r
+        };
+        let same = compare(&with(state("madvise", 212_992)), &with(state("madvise", 212_992)));
+        assert!(!same.warnings.iter().any(|w| w.contains("hugepage") || w.contains("rmem")));
+        let thp = compare(&with(state("madvise", 212_992)), &with(state("always", 212_992)));
+        assert!(thp.warnings.iter().any(|w| w.contains("transparent hugepage")));
+        let rmem = compare(&with(state("madvise", 212_992)), &with(state("madvise", 26_214_400)));
+        assert!(rmem.warnings.iter().any(|w| w.contains("rmem_max")));
     }
 
     #[test]

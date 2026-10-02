@@ -243,9 +243,11 @@ Before a run whose numbers you'll write down anywhere, check the reference VM:
 | Sender and child pinned to distinct physical cores | See "Pinning" below | `--pin-sender`/`--pin-child`, always |
 
 `logit-perf run` still reads governor, EPP, platform profile, and AC power best-effort into the
-results file's preamble (`box_state`). On the Azure guest, that's an **empty `{}`** in every result
+results file's preamble (`box_state`). On the Azure guest, those four are absent from every result
 file, because the guest exposes none of the `cpufreq`/`power_supply` sysfs nodes those checks read.
-That isn't a gap to work around; it's the isolation the VM is for, with no governor to drift and no
+`box_state` there still records THP `enabled`/`defrag`, `net.core.rmem_max`/`rmem_default`, the
+online CPU count, and whether SMT is on, and `compare` warns when THP `enabled` or `rmem_max`
+differ between two files. The missing governor fields aren't a gap to work around; it's the isolation the VM is for, with no governor to drift and no
 battery to run down. The laptop-era checklist this section used to carry (AC power, `performance`
 governor, energy-performance preference, ACPI platform profile, `grep MHz /proc/cpuinfo`) doesn't
 apply to a VM that exposes none of those knobs.
