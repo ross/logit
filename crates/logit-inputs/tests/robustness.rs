@@ -12,8 +12,7 @@ use logit_inputs::logit::LogitInput;
 use logit_inputs::Input;
 use logit_pipeline::Fanout;
 use logit_proto::frame::{self, Compression};
-use logit_proto::native::{self, control, NativeEncoder};
-use logit_proto::Encoder;
+use logit_proto::native::{self, control};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
@@ -111,7 +110,7 @@ async fn read_control(stream: &mut TcpStream) -> control::ControlMessage {
 async fn handshake(stream: &mut TcpStream) {
     let hello = control::Hello {
         version: control::PROTOCOL_VERSION,
-        codecs: vec![native::CODEC_NATIVE_V1],
+        codecs: vec![native::CODEC_HOP_BATCH],
         compressions: vec![0],
         max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
         window: 1,
@@ -149,7 +148,10 @@ async fn a_frame_body_is_held_once_at_peak() {
     );
     let batch =
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] };
-    let framed = NativeEncoder::new(Compression::None).encode(&batch).unwrap();
+    let seq = native::SeqId { id: [1; 16], seq: 1 };
+    let payload = native::encode_hop_batch(&batch, logit_core::Provenance::default(), seq);
+    let framed = frame::write_frame(native::CODEC_HOP_BATCH, Compression::None, &payload).unwrap();
+    drop(payload);
     drop(batch);
 
     reset();

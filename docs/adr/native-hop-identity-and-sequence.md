@@ -14,6 +14,11 @@ are implicit", the `Ack` entry of its control payload, its rejected alternative 
 7's "Outside the window, forward", and item 8's replayed set. Superseded in part on 2026-10-01 by
 [ADR `native-hop-send-window`](native-hop-send-window.md): decision 4's one-frame-in-flight reasoning and its
 "`window` stays 1" sentence, and the rejected alternative "`Ack` echoing the sequence".
+Superseded in part on 2026-10-01 by [ADR
+`native-hop-no-compatibility`](native-hop-no-compatibility.md): decision 1's "The unsequenced
+rule", decision 2's "A v1 connection sends unsequenced frames", decision 3's "An old spool's
+records replay unsequenced", step 1 of decision 5's algorithm, and the "The breaking change"
+consequence. A frame or record without a complete pair is malformed, not unsequenced.
 
 ## Context
 
@@ -76,6 +81,9 @@ mark per sender identity, in a table bounded by its connection cap.
   unsequenced, and `logit_in` forwards it. That covers a v1 codec frame, a v2 frame written
   before this record's implementation, a frame with one of the two tags missing, an identity
   that isn't 16 bytes, and a sequence of 0 or with bytes left over after its uvarint.
+  [Superseded on 2026-10-01 by [ADR
+  `native-hop-no-compatibility`](native-hop-no-compatibility.md): every one of those is a
+  malformed frame or a corrupt record. Nothing is unsequenced.]
 
 ### 2. A sink's store numbers what it holds
 
@@ -91,7 +99,8 @@ mark per sender identity, in a table bounded by its connection cap.
   `BatchContext` stays 32 bytes and `Delivered` 72.
 - **Only `logit_out` encodes it.** On a connection that negotiated `CODEC_NATIVE_V2`, `logit_out`
   writes the pair into the trailer. A v1 connection sends unsequenced frames. Every other sink
-  ignores the pair.
+  ignores the pair. [Superseded in part on 2026-10-01 by [ADR
+  `native-hop-no-compatibility`](native-hop-no-compatibility.md): there is no v1 connection.]
 - **A resend reuses the pair.** A resend inside one `deliver_with_retry` and a resend on a new
   connection carry the identity and number the batch was first given.
 - **A relay numbers its own batches.** `logit_in` never puts a decoded pair on `send_relayed`.
@@ -107,7 +116,9 @@ mark per sender identity, in a table bounded by its connection cap.
   batches start at 1 under the new identity. Replayed records precede new ones in the file, and
   each identity's numbers increase, so order within an identity holds.
 - **An old spool's records replay unsequenced.** A record written before this record's
-  implementation has no pair, and `logit_in` forwards it.
+  implementation has no pair, and `logit_in` forwards it. [Superseded on 2026-10-01 by [ADR
+  `native-hop-no-compatibility`](native-hop-no-compatibility.md): a record without a pair is
+  corrupt and skipped.]
 - **Restart without a spool.** The memory store opens with a new identity, and `logit_in` reads
   its first frame as a new sender, not a resend.
 - **Restart with a spool.** Replayed records carry their recorded identities and numbers, and new
@@ -149,7 +160,10 @@ mark per sender identity, in a table bounded by its connection cap.
 - **One table per `logit_in` component, not per process.** Two listeners can feed different
   graphs, so a frame one forwarded says nothing about the other.
 - **The per-frame algorithm.** For each decoded data frame:
-  1. If it's unsequenced, forward it as today.
+  1. If it's unsequenced, forward it as today. [Superseded on 2026-10-01 by [ADR
+     `native-hop-no-compatibility`](native-hop-no-compatibility.md): a frame without a complete
+     pair fails to decode and ends the connection as a protocol error; the algorithm is steps 2
+     and 3.]
   2. If its sequence is at or below its identity's mark, count it, write `Ack`, and don't
      forward it.
   3. Otherwise, call `send_relayed`. If a consumer took the batch, raise the mark to the larger
@@ -251,7 +265,9 @@ accepts it.
   version bump marks it: it decodes the empty `Ack` as `seq` 0, which fails its equality check,
   so it reads every attempt as `Ambiguous`. The other direction works without deduplication: an
   older `logit_in` skips the two tags and writes `Ack { seq }`, which a newer `logit_out`
-  ignores.
+  ignores. [Superseded on 2026-10-01 by [ADR
+  `native-hop-no-compatibility`](native-hop-no-compatibility.md): an `Ack` with a body is
+  malformed, and neither direction across that boundary is a supported deployment.]
 - **The residual race** stays documented in `docs/known-gaps.md` (decision 7).
 - **Operator docs (the plan's W6).** `docs/design/wire-protocol.md` and `docs/deploying.md`
   describe the native hop once the implementation lands.

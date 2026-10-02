@@ -62,7 +62,7 @@ struct RecordingOutput {
 
 #[async_trait::async_trait]
 impl Output for RecordingOutput {
-    fn observe_batch(&mut self, ctx: BatchContext, _seq: Option<logit_pipeline::SeqId>) {
+    fn observe_batch(&mut self, ctx: BatchContext, _seq: logit_pipeline::SeqId) {
         self.last_provenance = ctx.provenance;
     }
 
@@ -200,7 +200,7 @@ async fn a_route_component_splits_a_real_logit_in_stream_onto_its_targets() {
                 previous: Some(intern("tag_host")),
             },
         },
-        None,
+        logit_pipeline::SeqId { id: *b"route-round-trip", seq: 1 },
     );
     output
         .send(&tagged_batch("host"))
@@ -243,7 +243,7 @@ async fn a_route_component_splits_a_real_logit_in_stream_onto_its_targets() {
                 previous: Some(intern("tag_app")),
             },
         },
-        None,
+        logit_pipeline::SeqId { id: *b"route-round-trip", seq: 2 },
     );
     output.send(&tagged_batch("app")).await.expect("send should succeed on the reused connection");
 
@@ -272,7 +272,7 @@ async fn a_route_component_splits_a_real_logit_in_stream_onto_its_targets() {
                 previous: Some(intern("tag_unknown")),
             },
         },
-        None,
+        logit_pipeline::SeqId { id: *b"route-round-trip", seq: 3 },
     );
     output
         .send(&tagged_batch("unknown"))

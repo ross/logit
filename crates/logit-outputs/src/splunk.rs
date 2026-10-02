@@ -864,7 +864,7 @@ impl Output for SplunkHecOutput {
     }
 
     /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext, _seq: Option<SeqId>) {
+    fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
         self.accounting.observe();
     }
 

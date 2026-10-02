@@ -12,7 +12,7 @@ use logit_core::{DdSketch, EventBatch, HyperLogLog, Mapping, Provenance};
 use logit_proto::frame::{write_frame, write_frame_with_flags, Compression, FLAG_CONTROL};
 use logit_proto::native::control::{Ack, ControlMessage, Hello, HelloAck, Reject};
 use logit_proto::native::varint::write_uvarint;
-use logit_proto::native::{encode_batch, encode_batch_v2, SeqId, CODEC_NATIVE_V1, CODEC_NATIVE_V2};
+use logit_proto::native::{encode_batch, encode_hop_batch, SeqId, CODEC_BATCH, CODEC_HOP_BATCH};
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{decompress_bounded, Encoding};
 use logit_proto::prometheus::remote_write::Version;
@@ -79,36 +79,36 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
             );
         }
 
-        let v1 = encode_batch(batch);
+        let bare = encode_batch(batch);
         let provenance =
             Provenance { origin: Some(intern("seed_in")), previous: Some(intern("seed_enrich")) };
         let seq = SeqId { id: *b"seed-sender-id16", seq: 1 + i as u64 };
-        let v2 = encode_batch_v2(batch, provenance, Some(seq));
-        for (codec, payload, version) in
-            [(CODEC_NATIVE_V1, &v1, "v1"), (CODEC_NATIVE_V2, &v2, "v2")]
+        let hop = encode_hop_batch(batch, provenance, seq);
+        for (codec, payload, shape) in
+            [(CODEC_BATCH, &bare, "batch"), (CODEC_HOP_BATCH, &hop, "hop")]
         {
             for (compression, label) in [(Compression::None, "none"), (Compression::Lz4, "lz4")] {
                 let frame = write_frame(codec, compression, payload).expect("None and Lz4 encode");
                 stream.extend_from_slice(&frame);
-                add("native_frame", format!("{name}-{version}-{label}"), frame.to_vec());
+                add("native_frame", format!("{name}-{shape}-{label}"), frame.to_vec());
             }
         }
-        add("native_batch_v1", name.clone(), v1.to_vec());
-        add("native_batch_v2", name.clone(), v2.to_vec());
+        add("native_batch", name.clone(), bare.to_vec());
+        add("native_hop_batch", name.clone(), hop.to_vec());
     }
 
-    // Trailers whose sender pair is malformed, which `decode_batch_v2` reads as unsequenced
-    // rather than failing (ADR `native-hop-identity-and-sequence`, decision 1).
+    // Trailers whose sender pair is malformed, which `decode_hop_batch` rejects (ADR
+    // `native-hop-no-compatibility`, decision 2): inputs one field away from a valid pair.
     if let Some((name, batch)) = batches.first() {
-        let v1 = encode_batch(batch);
+        let bare = encode_batch(batch);
         let id: &[u8] = b"seed-sender-id16";
         let malformed: [(&str, &[TrailerField]); 3] = [
-            ("unsequenced-dup-tag", &[(3, id), (4, &[1]), (4, &[2])]),
-            ("unsequenced-id15", &[(3, &id[..15]), (4, &[1])]),
-            ("seq-trailing-byte", &[(3, id), (4, &[1, 0])]),
+            ("bad-pair-dup-tag", &[(3, id), (4, &[1]), (4, &[2])]),
+            ("bad-pair-id15", &[(3, &id[..15]), (4, &[1])]),
+            ("bad-pair-seq-trailing-byte", &[(3, id), (4, &[1, 0])]),
         ];
         for (label, fields) in malformed {
-            add("native_batch_v2", format!("{name}-{label}"), with_trailer(&v1, fields));
+            add("native_hop_batch", format!("{name}-{label}"), with_trailer(&bare, fields));
         }
     }
 
@@ -117,7 +117,7 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
             "hello",
             ControlMessage::Hello(Hello {
                 version: 1,
-                codecs: vec![CODEC_NATIVE_V2, CODEC_NATIVE_V1],
+                codecs: vec![CODEC_HOP_BATCH],
                 compressions: vec![Compression::Lz4 as u8, Compression::None as u8],
                 max_frame_bytes: 16 << 20,
                 window: 1,
@@ -127,7 +127,7 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
             "hello-ack",
             ControlMessage::HelloAck(HelloAck {
                 version: 1,
-                codec: CODEC_NATIVE_V2,
+                codec: CODEC_HOP_BATCH,
                 compression: Compression::Lz4 as u8,
                 max_frame_bytes: 16 << 20,
                 window: 1,
@@ -227,18 +227,19 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
     Ok((seeds, skipped))
 }
 
-/// One v2 trailer field, `(tag, value)`.
+/// One hop trailer field, `(tag, value)`.
 type TrailerField<'a> = (u8, &'a [u8]);
 
-/// A v1 payload followed by a v2 trailer of `fields`, each `(tag, value)` written as given.
-fn with_trailer(v1: &[u8], fields: &[TrailerField]) -> Vec<u8> {
+/// A bare batch payload followed by a hop trailer of `fields`, each `(tag, value)` written as
+/// given.
+fn with_trailer(bare: &[u8], fields: &[TrailerField]) -> Vec<u8> {
     let mut trailer = BytesMut::new();
     for (tag, value) in fields {
         trailer.extend_from_slice(&[*tag]);
         write_uvarint(&mut trailer, value.len() as u64);
         trailer.extend_from_slice(value);
     }
-    let mut out = BytesMut::from(v1);
+    let mut out = BytesMut::from(bare);
     write_uvarint(&mut out, trailer.len() as u64);
     out.extend_from_slice(&trailer);
     out.to_vec()
@@ -303,10 +304,10 @@ mod tests {
             targets,
             [
                 "hll_bytes",
-                "native_batch_v1",
-                "native_batch_v2",
+                "native_batch",
                 "native_control",
                 "native_frame",
+                "native_hop_batch",
                 "otlp_grpc",
                 "otlp_json",
                 "otlp_proto",

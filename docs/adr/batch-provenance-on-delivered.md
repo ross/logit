@@ -7,7 +7,13 @@ updated: 2026-10-01
 
 ## Status
 
-Accepted
+Accepted. Superseded in part on 2026-10-01 by [ADR
+`native-hop-no-compatibility`](native-hop-no-compatibility.md): the v1-peer case of
+`stamp_relayed`'s backfill, "Negotiation needs no new machinery", the `CODEC_NATIVE_V1` clause of
+"The disk queue's 24-byte trace-context prefix is not widened", and the two consequences about
+builds on different versions still talking and old segments staying readable. The codecs are now
+`CODEC_BATCH` (a bare batch, the file format) and `CODEC_HOP_BATCH` (with the trailer), the hop
+negotiates only the latter, and the spool parses only the latter.
 
 ## Context
 
@@ -111,7 +117,9 @@ previous = previous.or(Some(self.component))   // or, not overwrite
 A v2 peer that sent its own `origin`/`previous` gets both relayed completely untouched — the
 property this whole special case exists for. A v1 peer (whose frame carries no provenance at all)
 or a v2 peer that genuinely had none gets `logit_in`'s own id backfilled into both fields, so a
-downstream reader never sees them empty for no operator-visible reason.
+downstream reader never sees them empty for no operator-visible reason. [Superseded in part on
+2026-10-01 by [ADR `native-hop-no-compatibility`](native-hop-no-compatibility.md): there is no
+v1 peer; the backfill serves a peer whose trailer carried an empty field.]
 
 **Wire format: a new codec (`CODEC_NATIVE_V2`), not an in-place change to v1.** The native v1
 payload is positional with no forward-compatibility seam at the batch level, and
@@ -146,7 +154,9 @@ CODEC_NATIVE_V1]`; `logit_in`'s handshake already validates `Hello.codecs` again
 supports and acks the best shared choice. An unmodified old `logit_in` sees `[2, 1]`, doesn't
 recognize `2`, and acks `1` today with no code changes on that side; an unmodified old `logit_out`
 only ever offers `[1]` and gets `1` back. Either direction talks; provenance is simply absent
-whenever either side is on v1.
+whenever either side is on v1. [Superseded on 2026-10-01 by [ADR
+`native-hop-no-compatibility`](native-hop-no-compatibility.md): `logit_out` offers
+`[CODEC_HOP_BATCH]` alone and `logit_in` rejects a `Hello` without it.]
 
 **The disk queue's 24-byte trace-context prefix (`CONTEXT_LEN`) is not widened.** Records on disk
 carry no version of their own, so a wider fixed prefix would silently misparse every already
@@ -154,7 +164,10 @@ carry no version of their own, so a wider fixed prefix would silently misparse e
 Provenance rides inside the v2 frame payload instead, where the codec byte `parse_record` already
 reads makes it self-describing: `CODEC_NATIVE_V1` records decode with `Provenance::default()`,
 `CODEC_NATIVE_V2` records decode their trailer, and an already-spooled v1 record keeps replaying
-correctly forever.
+correctly forever. [Superseded in part on 2026-10-01 by [ADR
+`native-hop-no-compatibility`](native-hop-no-compatibility.md): `parse_record` decodes
+`CODEC_HOP_BATCH` only, and any other codec byte is a corrupt record. `CONTEXT_LEN` still never
+widens, as a constraint on a versionless record rather than a promise about records on disk.]
 
 [Amendment (2026-10-01): a new field can also ride as a new v2 trailer tag, with no new codec
 byte, because `decode_batch_v2` skips a tag it doesn't know; [ADR
@@ -222,8 +235,11 @@ alias could be taken.
   path, with interning happening once per node at graph build, never per batch.
 - `logit_out`/`logit_in` on different builds still talk: negotiation degrades to v1 automatically,
   with provenance simply absent, not a breaking change to the wire protocol or a forced upgrade.
+  [Superseded on 2026-10-01 by [ADR
+  `native-hop-no-compatibility`](native-hop-no-compatibility.md): one hop codec, no fallback.]
 - Existing on-disk sink-buffer segments remain fully readable after upgrade — `CONTEXT_LEN` never
   changed, and `parse_record`'s codec dispatch handles both v1 and v2 records in the same segment.
+  [Superseded on 2026-10-01 by the same record: `parse_record` decodes one codec.]
 - `Fanout` gains `with_component`, `stamp`/`stamp_relayed` (private), `send_relayed`/
   `send_relayed_blocking`. `Transform` gains `observe_provenance`. `Output` gains `observe_batch`.
   All additive — no existing public signature changed except `Delivered`'s and `SinkQueue`'s

@@ -2737,7 +2737,6 @@ a loss:
 
 - `logit_in` restarted between the two copies; its marks live in memory.
 - `logit_in` evicted the sender from its table (`logit.input.senders.evicted`).
-- The peer is a `logit` whose connection negotiated the v1 codec, which carries no identity.
 - A load balancer sent the resend to a different `logit_in`.
 - A fault ended a connection with frames still buffered at `logit_in`, and that connection's
   task forwarded one while the sender's resend of it arrived on a new connection. Both copies are
@@ -2754,8 +2753,7 @@ connection, so the resend is forwarded when a consumer can take it. A frame at o
 sender's mark that `logit_in` reads whole gets an `Ack` even with no consumer open, because
 `logit_in` doesn't forward it; it is never refused for want of a consumer.
 
-**Sender identity and sequence.** On a connection that negotiated the v2 codec, every frame
-`logit_out` sends carries a 16-byte sender identity and a sequence number in its trailer
+**Sender identity and sequence.** Every frame `logit_out` sends carries a 16-byte sender identity and a sequence number in its trailer
 ([ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md)). Each
 `logit_in` component keeps one high-water mark per identity: a frame at or below its identity's
 mark is acknowledged and not forwarded, and a frame above it is forwarded and, once a consumer
@@ -2771,8 +2769,9 @@ takes it, raises the mark. What follows from that:
   exhausted `retry_budget`, `at_most_once`, or a `drop_oldest` eviction whose cursor wasn't
   persisted) that a crash replay then sends is at or below the mark once a later batch of its
   identity was taken, and `logit_in` acknowledges it without forwarding it.
-- **An unsequenced frame is always forwarded.** A v1 frame, or a frame without a complete,
-  well-formed identity and sequence, reaches `logit_in`'s consumers every time it arrives.
+- **A frame without a complete pair is never forwarded.** A frame whose trailer lacks a
+  complete, well-formed identity and sequence is a protocol error: `logit_in` ends the connection
+  and counts it in `logit.proto.errors`.
 - **The table follows `max_connections`, with nothing further to configure.** It holds
   `max_connections + max_connections / 4` identities (1280 at the default cap of 1024) and evicts
   the least recently seen when full.
@@ -2826,7 +2825,7 @@ reconnecting doesn't show as `connection_error` on the far end.
   resend reaches consumers twice), and
   `logit.input.batches.dropped{reason="closed_consumer"}` (frames refused because every consumer
   directly downstream had closed; expected during a shutdown, a fault anywhere else).
-- Both sides: `logit.proto.frames{direction,codec,compression}` and `logit.proto.frame.bytes` for
+- Both sides: `logit.proto.frames{direction,compression}` and `logit.proto.frame.bytes` for
   throughput.
 
 `docs/known-gaps.md` tracks what's still open: `logit_in` acknowledges frames in the order they

@@ -31,8 +31,8 @@ exists or a contract other `logit` processes depend on:
   wire-breaking change that needs its own ADR, because every `logit` process must reach the same
   verdict for the same key with nothing propagated.
 - **`prometheus_in`'s TLS keys are prefixed by the mode they serve**: `scrape_tls:` for the scrape
-  client, `bind_tls:` for the remote-write server. The old bare `tls:` is gone (pre-release) with
-  no alias; don't add one back.
+  client, `bind_tls:` for the remote-write server. There is no bare `tls:` key and no alias for
+  one; don't add either.
 - **`flatten` never deletes an attribute.** It removes a source attribute only once its leaves are
   written. Last write wins on a key collision, silently, and there is deliberately no cap on how
   many keys one value can expand into beyond a fixed internal recursion-depth bound. That's a
@@ -412,15 +412,20 @@ Per pair:
   tested `Encoder`/`Decoder`: dictionary-first, hand-rolled, framed by a 24-byte header with
   CRC-32C and optional lz4. A four-arm bake-off against `rkyv`, `postcard`, and OTLP itself
   decided it ([ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md)).
-- **On disk**: `stdio_out`/`file_out` can write it as `format: native` alongside their default
-  human-readable render ([ADR `file-output-native-format`](docs/adr/file-output-native-format.md)).
-- **Disk buffer**: any sink can opt into `buffer.disk:`, a crash-recoverable disk spool over these
-  same frames that replaces that sink's in-memory delivery queue
+- **Two payload shapes**: `CODEC_BATCH` is a bare batch, the file format; `CODEC_HOP_BATCH` is a
+  batch plus a trailer of provenance and a required sender identity and sequence, what the hop
+  sends and the spool records. A hop payload without a complete pair is malformed
+  ([ADR `native-hop-no-compatibility`](docs/adr/native-hop-no-compatibility.md)).
+- **On disk**: `stdio_out`/`file_out` can write the bare shape as `format: native` alongside
+  their default human-readable render
+  ([ADR `file-output-native-format`](docs/adr/file-output-native-format.md)).
+- **Disk buffer**: any sink can opt into `buffer.disk:`, a crash-recoverable disk spool of hop
+  frames that replaces that sink's in-memory delivery queue
   ([ADR `disk-backed-sink-buffer`](docs/adr/disk-backed-sink-buffer.md)).
 - **Connection**: `logit_in`/`logit_out` (`crates/logit-inputs/src/logit.rs`/
   `crates/logit-outputs/src/logit.rs`) use one TCP (optionally TLS) connection, a `Hello`/`HelloAck`
-  version/codec/compression handshake, and one native frame per batch, with up to a negotiated
-  window of frames in flight, acknowledged in frame order
+  version/codec/compression handshake that offers and accepts the hop codec alone, and one native
+  frame per batch, with up to a negotiated window of frames in flight, acknowledged in frame order
   ([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md),
   [ADR `native-hop-send-window`](docs/adr/native-hop-send-window.md)).
 
@@ -800,7 +805,7 @@ not a style preference:
   sink delivered it, and an input never acknowledges a batch no consumer directly downstream
   took, except `logit_in`'s acknowledgment of a frame at or below its sender's mark. The
   `logit_out` to `logit_in` hop is effectively-once: a sink's store mints a sender
-  identity every time it opens and numbers its batches, the pair rides in every v2 frame's
+  identity every time it opens and numbers its batches, the pair rides in every hop frame's
   trailer, outlives a reconnect, and rides a spool replay, and `logit_in` acknowledges a frame at
   or below its sender's high-water mark without forwarding it.
   "Lossless" means field fidelity, never delivery. Check

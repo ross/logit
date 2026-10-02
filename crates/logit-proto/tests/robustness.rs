@@ -404,7 +404,7 @@ fn decode_batch_at_exactly_the_depth_cap_still_decodes() {
     assert!(native::decode_batch(&mut payload, &DecodeBudget::default()).is_ok());
 }
 
-// -- native::decode_batch_v2 ----------------------------------------------------------------
+// -- native::decode_hop_batch ---------------------------------------------------------------
 
 fn sample_provenance() -> Provenance {
     Provenance {
@@ -419,26 +419,26 @@ fn sample_seq() -> native::SeqId {
 }
 
 #[test]
-fn decode_batch_v2_survives_every_single_byte_truncation() {
-    let payload = native::encode_batch_v2(&sample_batch(), sample_provenance(), Some(sample_seq()));
+fn decode_hop_batch_survives_every_single_byte_truncation() {
+    let payload = native::encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq());
     assert_every_truncation_fails_cleanly(&payload, |bytes| {
-        native::decode_batch_v2(bytes, &DecodeBudget::default()).is_err()
+        native::decode_hop_batch(bytes, &DecodeBudget::default()).is_err()
     });
 }
 
 #[test]
-fn decode_batch_v2_survives_seeded_bit_flips() {
-    let payload = native::encode_batch_v2(&sample_batch(), sample_provenance(), Some(sample_seq()));
+fn decode_hop_batch_survives_seeded_bit_flips() {
+    let payload = native::encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq());
     assert_bit_flips_never_panic(&payload, 5000, |bytes| {
-        native::decode_batch_v2(bytes, &DecodeBudget::default()).is_ok()
+        native::decode_hop_batch(bytes, &DecodeBudget::default()).is_ok()
     });
 }
 
-/// `decode_batch_v2` rejects a plain v1 payload rather than decoding it as "no provenance".
+/// `decode_hop_batch` rejects a bare batch payload rather than decoding it as "no provenance".
 #[test]
-fn decode_batch_v2_rejects_a_plain_v1_payload() {
+fn decode_hop_batch_rejects_a_bare_batch_payload() {
     let mut payload = native::encode_batch(&sample_batch());
-    assert!(native::decode_batch_v2(&mut payload, &DecodeBudget::default()).is_err());
+    assert!(native::decode_hop_batch(&mut payload, &DecodeBudget::default()).is_err());
 }
 
 #[test]
@@ -1331,7 +1331,7 @@ fn counted_list(items: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-/// A v1 payload: `dict`, an empty resource, no scope, then `events` as a counted list.
+/// A bare batch payload: `dict`, an empty resource, no scope, then `events` as a counted list.
 fn wire_batch(dict: &[&str], events: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     uv(&mut out, dict.len() as u64);
@@ -1387,7 +1387,7 @@ fn wire_attr_event(value: Vec<u8>) -> Vec<u8> {
     tlv(2, &map)
 }
 
-fn decode_v1(payload: &[u8]) -> Result<EventBatch, CodecError> {
+fn decode_bare(payload: &[u8]) -> Result<EventBatch, CodecError> {
     native::decode_batch(&mut Bytes::copy_from_slice(payload), &DecodeBudget::default())
 }
 
@@ -1472,11 +1472,11 @@ fn every_metric_kind_rejects_trailing_bytes_in_its_body() {
         ("Summary", 9, summary),
     ];
     for (name, tag, body) in kinds {
-        assert!(decode_v1(&wire_kind_batch(tag, &body)).is_ok(), "{name}: the valid body failed");
+        assert!(decode_bare(&wire_kind_batch(tag, &body)).is_ok(), "{name}: the valid body failed");
         let mut padded = body.clone();
         padded.extend_from_slice(&[0xde, 0xad]);
         let needle = if tag == 4 { "distribution" } else { "trailing bytes" };
-        assert_malformed(decode_v1(&wire_kind_batch(tag, &padded)), needle, name);
+        assert_malformed(decode_bare(&wire_kind_batch(tag, &padded)), needle, name);
     }
 }
 
@@ -1540,41 +1540,41 @@ fn a_record_field_with_trailing_bytes_is_malformed() {
         ("TAG_MAP", wire_attr_event(tlv(9, &with_junk(&[0])))),
     ];
     for (name, event) in cases {
-        assert_malformed(decode_v1(&wire_batch(&["k"], &[event])), "trailing bytes", name);
+        assert_malformed(decode_bare(&wire_batch(&["k"], &[event])), "trailing bytes", name);
     }
 }
 
-/// Bytes after the last event (v1) or after the provenance trailer (v2) are `Malformed`: a
+/// Bytes after the last event (bare) or after the provenance trailer (hop) are `Malformed`: a
 /// payload is one batch.
 #[test]
 fn a_batch_with_bytes_after_its_last_event_is_malformed() {
-    let mut v1 = native::encode_batch(&sample_batch()).to_vec();
-    v1.extend_from_slice(b"junk");
-    assert_malformed(decode_v1(&v1), "trailing bytes", "v1");
+    let mut bare = native::encode_batch(&sample_batch()).to_vec();
+    bare.extend_from_slice(b"junk");
+    assert_malformed(decode_bare(&bare), "trailing bytes", "bare");
 
-    let mut v2 =
-        native::encode_batch_v2(&sample_batch(), sample_provenance(), Some(sample_seq())).to_vec();
-    v2.extend_from_slice(b"junk");
+    let mut hop =
+        native::encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq()).to_vec();
+    hop.extend_from_slice(b"junk");
     assert_malformed(
-        native::decode_batch_v2(&mut Bytes::from(v2), &DecodeBudget::default()),
+        native::decode_hop_batch(&mut Bytes::from(hop), &DecodeBudget::default()),
         "trailing bytes",
-        "v2",
+        "hop",
     );
 }
 
 /// The native codec is a fixed point: re-encoding what it decoded reproduces the payload byte
-/// for byte, in both codec versions.
+/// for byte, in both payload shapes.
 #[test]
 fn encode_then_decode_then_encode_is_byte_identical() {
-    let v1 = native::encode_batch(&sample_batch());
-    let decoded = decode_v1(&v1).unwrap();
-    assert_eq!(native::encode_batch(&decoded), v1);
+    let bare = native::encode_batch(&sample_batch());
+    let decoded = decode_bare(&bare).unwrap();
+    assert_eq!(native::encode_batch(&decoded), bare);
 
-    let v2 = native::encode_batch_v2(&sample_batch(), sample_provenance(), Some(sample_seq()));
+    let hop = native::encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq());
     let (decoded, provenance, seq) =
-        native::decode_batch_v2(&mut v2.clone(), &DecodeBudget::default()).unwrap();
-    assert_eq!(seq, Some(sample_seq()));
-    assert_eq!(native::encode_batch_v2(&decoded, provenance, seq), v2);
+        native::decode_hop_batch(&mut hop.clone(), &DecodeBudget::default()).unwrap();
+    assert_eq!(seq, sample_seq());
+    assert_eq!(native::encode_hop_batch(&decoded, provenance, seq), hop);
 }
 
 /// `write_frame` refuses what `read_frame` would refuse, so no writer can emit a frame over the
@@ -1594,7 +1594,7 @@ fn write_frame_refuses_a_payload_over_the_uncompressed_cap() {
 fn decode_into_holds_each_event_once_at_peak() {
     let n = 16 * 1024;
     let payload = wire_batch(&[], &vec![Vec::new(); n]);
-    let framed = frame::write_frame(native::CODEC_NATIVE_V1, Compression::None, &payload).unwrap();
+    let framed = frame::write_frame(native::CODEC_BATCH, Compression::None, &payload).unwrap();
     let mut events = Vec::new();
     let peak = peak_live_bytes(|| {
         NativeDecoder.decode_into(framed.clone(), 0, &mut events).unwrap();
@@ -1616,7 +1616,7 @@ fn decode_into_holds_each_event_once_at_peak() {
 fn a_frame_of_empty_events_is_rejected_past_the_decode_budget() {
     let n = 1 << 20;
     let payload = wire_batch(&[], &vec![Vec::new(); n]);
-    let framed = frame::write_frame(native::CODEC_NATIVE_V1, Compression::Lz4, &payload).unwrap();
+    let framed = frame::write_frame(native::CODEC_BATCH, Compression::Lz4, &payload).unwrap();
     assert!(framed.len() < 8 * 1024, "the frame is {} bytes", framed.len());
     let mut result = None;
     let peak = peak_live_bytes(|| {

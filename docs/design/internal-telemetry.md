@@ -1142,7 +1142,7 @@ the property the minimal-watch-set design is for.
 [ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md),
 [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md).
 
-- `logit.proto.frames{direction="in",codec,compression}` and `logit.proto.frame.bytes`: per-frame
+- `logit.proto.frames{direction="in",compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
 - `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated_header"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"|"ack_write_stalled"|"reject_write_stalled"}`
   (count): every way a frame or a handshake can be rejected, each its own reason so a version
@@ -1151,7 +1151,10 @@ the property the minimal-watch-set design is for.
   a body. A close between frames is the ordinary end of a connection and isn't counted, including
   a TLS peer gone without `close_notify`. `too_large` is a header that declared a
   payload over `max_frame_bytes`, or a `compressed_len` over `frame::compressed_bound` of it,
-  answered `Reject{FRAME_TOO_LARGE}`. `decode_budget` is a well-formed batch that would decode
+  answered `Reject{FRAME_TOO_LARGE}`. `handshake` is any handshake that ends without a
+  `HelloAck`: no `Hello` within `handshake_timeout`, stray bytes, a header over the control-message
+  cap, a `Hello` that fails to decode (a missing, repeated, or unknown field, or a `window` of 0),
+  or a version or codec `Reject`. `decode_budget` is a well-formed batch that would decode
   past its per-frame budget (`native::DecodeBudget`), a batch too large for the frame cap it
   arrived under rather than corrupt bytes, also answered `Reject{FRAME_TOO_LARGE}`. The two
   `_write_stalled` reasons count a control write to a peer that stopped reading, abandoned after
@@ -1858,7 +1861,7 @@ attempt.
 [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md),
 [ADR `native-hop-send-window`](../adr/native-hop-send-window.md).
 
-- `logit.proto.frames{direction="out",codec,compression}` and `logit.proto.frame.bytes`: the
+- `logit.proto.frames{direction="out",compression}` and `logit.proto.frame.bytes`: the
   send-side mirror of `logit_in`'s pair.
 - `logit.output.ack.duration` (timer, one per `await_ack` that reads from the connection): the
   wait for one `Ack`, finer-grained than layer 2's `logit.component.send.duration`, which times a

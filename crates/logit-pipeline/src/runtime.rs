@@ -1224,7 +1224,7 @@ pub(crate) async fn write_loop(
         // `deliver_with_retry` future already borrows it mutably, and the borrow checker rejects
         // a second overlapping borrow inside the macro.
         enum NextBatch {
-            Batch(Arc<EventBatch>, BatchContext, Option<SeqId>),
+            Batch(Arc<EventBatch>, BatchContext, SeqId),
             Closed,
             ShutdownExpired,
         }
@@ -6409,9 +6409,9 @@ mod tests {
             self.await_ack().await
         }
 
-        fn observe_batch(&mut self, _ctx: BatchContext, seq: Option<SeqId>) {
-            self.record(Call::Observe(seq.expect("a memory store numbers every batch").seq));
-            self.pending_seq = seq;
+        fn observe_batch(&mut self, _ctx: BatchContext, seq: SeqId) {
+            self.record(Call::Observe(seq.seq));
+            self.pending_seq = Some(seq);
         }
 
         fn window(&self) -> usize {
@@ -6426,11 +6426,11 @@ mod tests {
             &mut self,
             batch: &EventBatch,
             _ctx: BatchContext,
-            seq: Option<SeqId>,
+            seq: SeqId,
             in_flight: usize,
         ) -> anyhow::Result<()> {
             let value = value_of(batch);
-            self.record(Call::Submit(value, seq.map_or(0, |s| s.seq), in_flight));
+            self.record(Call::Submit(value, seq.seq, in_flight));
             if let Some((v, delay)) = self.submit_delay {
                 if v == value {
                     tokio::time::sleep(delay).await;

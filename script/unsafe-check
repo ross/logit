@@ -76,14 +76,14 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # 4,096: a batch of one-byte empty events at `max_len` regrows to about 56 MiB. `extra args` go to
 # `fuzz` only, never to `fuzz-tmin`.
 #
-# The two `native_batch_*` targets run in fork mode: the process-wide interner never evicts, so a
+# `native_batch` and `native_hop_batch` run in fork mode: the process-wide interner never evicts, so a
 # long-lived fuzz process accumulates every dictionary string it decodes until the arena outgrows
 # the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a
 # child fatal, as it is outside fork mode.
 FUZZ_TARGETS=(
     "native_frame|262144|65|"
-    "native_batch_v1|65536|64|-fork=1 -ignore_ooms=0"
-    "native_batch_v2|65536|64|-fork=1 -ignore_ooms=0"
+    "native_batch|65536|64|-fork=1 -ignore_ooms=0"
+    "native_hop_batch|65536|64|-fork=1 -ignore_ooms=0"
     "native_control|4096|4|"
     "sketch_bytes|65536|16|"
     "sketch_merge|65536|64|"

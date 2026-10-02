@@ -13,7 +13,7 @@ hop's sender identity and sequence in their trailer.
 magic (4 bytes)             "LGIT"
 version (u16)
 flags (u16)
-codec (u8)                  which payload encoding follows (native v1, future versions, ...)
+codec (u8)                  which payload shape follows (1 = bare batch, 2 = hop batch)
 compression (u8)            none | lz4 | zstd (reserved, not yet encodable -- see below)
 reserved (2 bytes)
 uncompressed_len (u32)
@@ -53,7 +53,7 @@ Before compression, `crates/logit-proto/src/native/` encodes each `EventBatch`
    string.
 2. **Events**, each referencing dictionary entries by `u32` index rather than repeating the string.
 
-**v1 dictionary-indexes keys, not string values.** `Value::Str`/`Value::Bytes` payloads, such as
+**The dictionary indexes keys, not string values.** `Value::Str`/`Value::Bytes` payloads, such as
 a log message or a repeated tag *value*, are written inline. Keys are the dominant repetition
 (`host`, `env`, `service.name`, and so on appear on nearly every event,
 `docs/design/data-model.md`), and indexing them costs almost nothing: the dictionary reuses the
@@ -67,50 +67,61 @@ Compression, when enabled, runs over the dictionary-encoded payload. Each writer
 `buffer.disk:`), defaulting to `none`; `logit_in` can negotiate a `logit_out`'s offer down to
 `none`.
 
-## `CODEC_NATIVE_V2`: a provenance and sender trailer
+## `CODEC_HOP_BATCH`: the hop batch and its trailer
 
-`CODEC_NATIVE_V2` carries everything v1 does plus a mandatory, length-prefixed trailer holding the
-batch's `Provenance`, the component that created the batch and the one that most recently handled
-it (`docs/design/pipeline-graph.md`'s "Provenance propagation",
+The native payload has two shapes, named by what they carry
+([ADR `native-hop-no-compatibility`](../adr/native-hop-no-compatibility.md)):
+
+- `CODEC_BATCH` (codec byte 1) is a bare batch: dictionary, resource, scope, events. It's the
+  file format (`stdio_out`/`file_out`'s `format: native`, written by `NativeEncoder` and read by
+  `NativeDecoder`) and the perf harness's telemetry dump. A file has no sender and no hop, so it
+  carries no trailer.
+- `CODEC_HOP_BATCH` (codec byte 2) is a bare batch followed by a mandatory, length-prefixed
+  trailer. It's what `logit_out` sends and what the `buffer.disk:` spool records.
+
+The trailer holds the batch's `Provenance`, the component that created the batch and the one that
+most recently handled it (`docs/design/pipeline-graph.md`'s "Provenance propagation",
 [ADR `batch-provenance-on-delivered`](../adr/batch-provenance-on-delivered.md)), and the native
 hop's sender identity and sequence:
 
 ```
-payload_v2 := dict | resource attrs | uvarint(event_count) | events...
-            | uvarint(trailer_len) | trailer_bytes[trailer_len]
+payload_hop := dict | resource attrs | uvarint(event_count) | events...
+             | uvarint(trailer_len) | trailer_bytes[trailer_len]
 trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*
                  -- tag 1 = origin, tag 2 = previous,
                  -- tag 3 = sender identity ([u8; 16]), tag 4 = sequence (uvarint, from 1)
 ```
 
 Tags 3 and 4 are the native hop's sender identity and sequence
-([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)), written
-together or not at all. A frame without one well-formed tag 3 and one well-formed tag 4 is
-unsequenced, not malformed: a wrong-length identity, a sequence of 0 or with bytes left over, a
-lone tag, or a repeated tag decodes with no pair. A field of any tag that overruns the trailer or
-the 4096-byte field cap still fails the whole payload.
+([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)), and every
+hop payload carries both. A payload without one well-formed tag 3 and one well-formed tag 4 is
+malformed: a missing or repeated tag, an identity that isn't 16 bytes, or a sequence of 0 or with
+bytes left over after its uvarint fails the decode. So does a field of any tag that overruns the
+trailer or the 4096-byte field cap. An empty provenance field writes no entry, and a tag this
+reader doesn't know is skipped by its length, which keeps a torn spool write from poisoning the
+walk.
 
-`encode_batch_v2`/`decode_batch_v2` call `encode_batch`/`decode_batch` and add the trailer around
-them. The v1 encoding itself is not stable across releases: ADR `metrics-model-v2` reshaped every
-record to TLV and added the mandatory `Scope` section (see "Record layout" below), so a frame
-encoded before that ADR doesn't decode after it. `logit` is pre-release (ADR `lossless-transit`), so
-format changes are straight reshapes with no dual-read compatibility path.
+`encode_hop_batch`/`decode_hop_batch` call `encode_batch`/`decode_batch` and add the trailer
+around them. The bare encoding itself is not stable across releases: ADR `metrics-model-v2`
+reshaped every record to TLV and added the mandatory `Scope` section (see "Record layout" below),
+so a frame encoded before that ADR doesn't decode after it. `logit` is pre-release (ADR
+`lossless-transit`), so format changes are straight reshapes with no dual-read compatibility path.
 
-**The trailer length is mandatory**, written as a single `0x00` byte when every field is absent.
-An optional trailer would let a payload truncated exactly at the trailer boundary decode as "no
-provenance" instead of failing. That breaks the format's truncation-safety invariant: every proper
-prefix of a valid encoding must fail to decode, pinned by
-`crates/logit-proto/tests/robustness.rs`'s `assert_every_truncation_fails_cleanly`. Trailer values
-are inline, not dictionary-indexed, because `origin`/`previous` are at most two strings per batch
-with nothing for a dictionary to amortize.
+**The trailer length is mandatory.** An optional trailer would let a payload truncated exactly at
+the trailer boundary decode as "no provenance" instead of failing. That breaks the format's
+truncation-safety invariant: every proper prefix of a valid encoding must fail to decode, pinned
+by `crates/logit-proto/tests/robustness.rs`'s `assert_every_truncation_fails_cleanly`. Trailer
+values are inline, not dictionary-indexed, because `origin`/`previous` are at most two strings per
+batch with nothing for a dictionary to amortize.
 
-`Hello.codecs`/`HelloAck.codec` (below) negotiate v2 when both sides offer it and fall back to v1,
-without provenance, otherwise, so neither side needs a protocol version bump. `DiskQueue`'s
-spooled records (`crates/logit-pipeline/src/disk_queue.rs`) carry the same per-record codec byte,
-so a v1 record spooled before an upgrade still replays after it. A record carries the sender
-identity and sequence it was written with, and `parse_record` returns them, so a replay after a
-crash goes out under the pair the batch first had. A record without the pair replays
-unsequenced, and `logit_in` forwards it.
+The hop negotiates one codec. `logit_out` offers `Hello.codecs = [CODEC_HOP_BATCH]`, and
+`logit_in` answers a `Hello` that doesn't offer it with `Reject{NO_COMMON_CODEC}`; there's no
+fallback to the bare shape. A data frame under any other codec byte is a protocol error. The
+`buffer.disk:` spool (`crates/logit-pipeline/src/disk_queue.rs`) parses `CODEC_HOP_BATCH` only:
+any other codec byte, or a record without a complete pair, is skipped and counted as corrupt, as a
+record with a bad CRC is. A record carries the sender identity and sequence it was written with,
+and `parse_record` returns them, so a replay after a crash goes out under the pair the batch first
+had.
 
 ## Decode amplification
 
@@ -333,7 +344,7 @@ skipping it, because a metric with no interpretable value can't be carried forwa
 **Batch grammar**, `crates/logit-proto/src/native/mod.rs`'s `encode_batch`/`decode_batch`:
 
 ```
-payload_v1 := dict | resource_section | scope_section | uvarint(event_count) | (uvarint(len) + event_body)*
+payload := dict | resource_section | scope_section | uvarint(event_count) | (uvarint(len) + event_body)*
 resource_section := uvarint(len) + resource TLV body
 scope_section := presence: u8 (0 | 1)  [+ uvarint(len) + scope TLV body]
 ```
@@ -341,7 +352,7 @@ scope_section := presence: u8 (0 | 1)  [+ uvarint(len) + scope TLV body]
 `scope_section` sits right after `resource_section`, never as an optional *trailing* section. A
 trailing one would let a payload truncated at that boundary decode as "no scope", breaking
 `robustness.rs`'s "no proper prefix of a valid encoding is itself valid" invariant, the same reason
-`CODEC_NATIVE_V2`'s trailer length is mandatory. v2 appends the provenance trailer after this.
+`CODEC_HOP_BATCH`'s trailer length is mandatory. A hop batch appends its trailer after this.
 
 ## Connection protocol
 
@@ -358,7 +369,11 @@ decision record.
   byte is meaningless, and its `compression` is always `none`: the messages are tiny, and
   compression is itself being negotiated. The payload is hand-rolled TLV over `native::varint`
   (`crates/logit-proto/src/native/control.rs`), with the same `tag(u8) + len(uvarint) + payload`
-  shape and skip-unknown behavior as a native-v1 `Event`'s fields:
+  shape as a native `Event`'s fields but none of their skip-unknown behavior. Every field in the
+  table is required and appears once; a missing, repeated, or unknown field, or an unknown message
+  type, is malformed ([ADR `native-hop-no-compatibility`](../adr/native-hop-no-compatibility.md),
+  decision 4). `Ack` is the message-type byte alone, and a body after it is malformed. `window` is
+  at least 1 in both `Hello` and `HelloAck`, enforced on decode:
 
   | Message | Fields | Sent by |
   |---|---|---|
@@ -372,12 +387,14 @@ decision record.
   `window`) or with `Reject`. A version mismatch or no shared codec is a clean refusal, not a
   corrupted stream. `logit_out` refuses a `HelloAck` with another `version`, or a `codec` or
   `compression` its `Hello` didn't offer, as permanent: the listener would answer the same way
-  again. A control message is at most `control::MAX_CONTROL_MESSAGE_BYTES` (4096) bytes, and
+  again. A `Hello` that fails to decode ends the connection with no reply, counted as
+  `logit.proto.errors{reason="handshake"}`; a `HelloAck` that fails to decode fails `logit_out`'s
+  connect as a clean fault. A control message is at most `control::MAX_CONTROL_MESSAGE_BYTES` (4096) bytes, and
   each side refuses a longer one on its header: `logit_in` for a `Hello`, `logit_out` for a
   reply.
-- **Sender identity and sequence ride in the v2 trailer.** The sink's store assigns each batch
-  a 16-byte sender identity and a sequence number, and `logit_out` writes them into the v2
-  trailer ([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)).
+- **Sender identity and sequence ride in the hop trailer.** The sink's store assigns each
+  batch a 16-byte sender identity and a sequence number, and `logit_out` writes them into the
+  trailer of every frame ([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)).
   `Ack` carries no sequence: acks arrive in frame order ("Flow control" below), so each answers the
   oldest frame still unanswered on its connection.
   A store takes a fresh identity every time it opens, memory or disk, and numbers its batches
@@ -385,14 +402,14 @@ decision record.
   component keeps one high-water mark per identity, in a table bounded at
   `max_connections + max_connections / 4` identities (1280 at the default `max_connections` of
   1024) that evicts the least recently seen when full. A frame at or below its identity's mark is
-  a resend; a frame above it is forwarded, and a consumer taking it raises the mark. An
-  unsequenced frame (see
-  "`CODEC_NATIVE_V2`: a provenance and sender trailer" above) is always forwarded. The table
+  a resend; a frame above it is forwarded, and a consumer taking it raises the mark. A frame
+  without a complete pair is malformed (see "`CODEC_HOP_BATCH`: the hop batch and its trailer"
+  above): a protocol error, counted in `logit.proto.errors`, that ends the connection. The table
   reports `logit.input.batches.resends`, `logit.input.senders`, and
   `logit.input.senders.evicted`. No lock spans a forward, so a frame a connection still holds
   after a fault ends it can be forwarded beside the sender's resend of it on a new connection
   (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds").
-- **Acknowledgement point:** for a frame above its sender's mark, or unsequenced, after
+- **Acknowledgement point:** for a frame above its sender's mark, after
   `Fanout::send` returns, not when it decodes. `Fanout::send` returns whether any consumer took
   the batch: if one did, `logit_in` writes `Ack`; if none did, because every direct consumer has
   closed, it writes `Reject{GOING_AWAY}` instead and closes. A frame at or below its sender's mark
@@ -445,9 +462,9 @@ decision record.
     answering one frame at a time on each connection. Nothing acknowledges out of order, and the
     trailer's sequence is a deduplication identity, never an acknowledgment.
   - **The window is fixed at the handshake.** `Hello.window` is what the sender offers;
-    `HelloAck.window` is the offer clamped to `1..=RECEIVER_MAX_WINDOW` (1024). The sender uses
-    `max(1, min(offered, answered))`, so a `HelloAck.window` of 0 reads as 1. No message grants or
-    returns credit.
+    `HelloAck.window` is `min(offered, RECEIVER_MAX_WINDOW)`, with `RECEIVER_MAX_WINDOW` at 1024.
+    The sender uses `min(offered, answered)`. Both windows are at least 1 on the wire, so neither
+    side clamps from below. No message grants or returns credit.
   - **`GOING_AWAY` answers every unanswered frame.** `logit_in` processes nothing after writing
     it (the linger below only discards), so every frame still unanswered on that connection was
     not forwarded, and `logit_out` treats each as a clean fault.
@@ -503,7 +520,7 @@ up isn't a policy here, because a synchronous trait can't block usefully; an asy
 The disk-backed sink buffer (`crates/logit-pipeline/src/disk_queue.rs`, ADR
 `disk-backed-sink-buffer`) doesn't implement `Buffer<T>`: the trait's sync, `&mut self`, generic
 shape is the wrong seam for real file I/O over a concrete store item, so `DiskQueue` has its own
-async surface. Both stores hold `StoreItem`, `(Arc<EventBatch>, BatchContext, Option<SeqId>)`
+async surface. Both stores hold `StoreItem`, `(Arc<EventBatch>, BatchContext, SeqId)`
 (`crates/logit-pipeline/src/queue.rs`): the batch, its context, and the sender identity and
 sequence the store gave it.
 

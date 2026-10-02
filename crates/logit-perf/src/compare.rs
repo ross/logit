@@ -159,14 +159,12 @@ pub fn compare(a: &RunReport, b: &RunReport) -> CompareReport {
     // fingerprinting skip the second build, so both labels measure one binary
     // (docs/adr/disposable-azure-perf-vm.md's "Multiple sources, one VM"). A warning, not a
     // refusal: a docs-only diff between two refs produces this too.
-    if let (Some(a_bin), Some(b_bin)) = (&a.binary, &b.binary) {
-        if a_bin.sha256 == b_bin.sha256 {
-            let short: String = a_bin.sha256.chars().take(12).collect();
-            warnings.push(format!(
-                "both sides measured the identical binary (sha256 {short}…) -- a delta between \
-                 these two results measures nothing"
-            ));
-        }
+    if a.binary.sha256 == b.binary.sha256 {
+        let short: String = a.binary.sha256.chars().take(12).collect();
+        warnings.push(format!(
+            "both sides measured the identical binary (sha256 {short}…) -- a delta between \
+             these two results measures nothing"
+        ));
     }
 
     let names: BTreeSet<&String> = a.scenarios.keys().chain(b.scenarios.keys()).collect();
@@ -303,7 +301,7 @@ mod tests {
             profile: "release".to_string(),
             label: None,
             box_state: None,
-            binary: None,
+            binary: binary(&"a".repeat(64)),
             scenarios,
         }
     }
@@ -576,9 +574,9 @@ mod tests {
     fn identical_binary_sha256_on_both_sides_warns() {
         let scenarios = BTreeMap::new();
         let mut a = report("box-a", "cpu-a", scenarios.clone());
-        a.binary = Some(binary(&"a".repeat(64)));
+        a.binary = binary(&"a".repeat(64));
         let mut b = report("box-a", "cpu-a", scenarios);
-        b.binary = Some(binary(&"a".repeat(64)));
+        b.binary = binary(&"a".repeat(64));
 
         let cmp = compare(&a, &b);
         assert!(cmp.warnings.iter().any(|w| w.contains("identical binary")), "{:?}", cmp.warnings);
@@ -588,20 +586,9 @@ mod tests {
     fn different_binary_sha256s_do_not_warn() {
         let scenarios = BTreeMap::new();
         let mut a = report("box-a", "cpu-a", scenarios.clone());
-        a.binary = Some(binary(&"a".repeat(64)));
+        a.binary = binary(&"a".repeat(64));
         let mut b = report("box-a", "cpu-a", scenarios);
-        b.binary = Some(binary(&"b".repeat(64)));
-
-        let cmp = compare(&a, &b);
-        assert!(!cmp.warnings.iter().any(|w| w.contains("identical binary")), "{:?}", cmp.warnings);
-    }
-
-    #[test]
-    fn missing_binary_info_on_either_side_does_not_warn() {
-        let scenarios = BTreeMap::new();
-        let mut a = report("box-a", "cpu-a", scenarios.clone());
-        a.binary = Some(binary(&"a".repeat(64)));
-        let b = report("box-a", "cpu-a", scenarios); // no binary block -- an old results file
+        b.binary = binary(&"b".repeat(64));
 
         let cmp = compare(&a, &b);
         assert!(!cmp.warnings.iter().any(|w| w.contains("identical binary")), "{:?}", cmp.warnings);
@@ -610,10 +597,9 @@ mod tests {
     #[test]
     fn matching_environments_have_no_warning() {
         let scenarios = BTreeMap::new();
-        let cmp = compare(
-            &report("box-a", "cpu-a", scenarios.clone()),
-            &report("box-a", "cpu-a", scenarios),
-        );
-        assert!(cmp.warnings.is_empty());
+        let a = report("box-a", "cpu-a", scenarios.clone());
+        let mut b = report("box-a", "cpu-a", scenarios);
+        b.binary = binary(&"b".repeat(64));
+        assert!(compare(&a, &b).warnings.is_empty());
     }
 }

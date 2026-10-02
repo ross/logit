@@ -16,6 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// The one batch each test sends, as its sink's store would number it.
+const ONE: logit_pipeline::SeqId = logit_pipeline::SeqId { id: *b"logit-round-trip", seq: 1 };
+
 /// Builds a `logit_in` on an ephemeral port, applies `configure` (TLS, mostly), and binds it,
 /// returning the OS-assigned address and the bound input. Binding before `run` is spawned means a
 /// `LogitOutput::send` can't race the bind.
@@ -60,6 +63,7 @@ async fn round_trip(
         let _ = input.run(sink).await;
     });
 
+    output.observe_batch(logit_pipeline::BatchContext::default(), ONE);
     output.send(batch).await.expect("send should succeed against a live logit_in");
 
     // `logit_in` writes its `Ack` after `Fanout::send` returns, and `send` returns on that `Ack`,
@@ -98,7 +102,7 @@ async fn round_trip_with_provenance(
             trace: logit_pipeline::TraceContext::new_root(),
             provenance,
         },
-        None,
+        ONE,
     );
     output.send(batch).await.expect("send should succeed against a live logit_in");
 
@@ -138,7 +142,7 @@ async fn origin_and_previous_cross_the_wire_untouched_from_a_remote_peer() {
     );
 }
 
-/// The fallback: with no provenance to relay (a v1 peer, or a v2 peer that had none), `logit_in`
+/// The fallback: with no provenance to relay (a peer whose batch had none), `logit_in`
 /// backfills its own id into both `origin` and `previous`.
 #[tokio::test]
 async fn a_batch_with_no_provenance_gets_logit_ins_own_id_backfilled() {
@@ -222,6 +226,7 @@ async fn connect_refused_is_classified_clean_against_a_real_logit_in_torn_down()
     // could be taken by another test before the connect.
     let mut output =
         LogitOutput::new("127.0.0.1:1".to_string()).with_timeout(Duration::from_millis(300));
+    output.observe_batch(logit_pipeline::BatchContext::default(), ONE);
     let err = output.send(&sample_batch()).await.unwrap_err();
     assert_eq!(classify(&err), Fault::Clean);
 }
@@ -330,6 +335,7 @@ mod tls {
             )
             .unwrap();
 
+        output.observe_batch(logit_pipeline::BatchContext::default(), ONE);
         let err = output.send(&sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Clean);
     }

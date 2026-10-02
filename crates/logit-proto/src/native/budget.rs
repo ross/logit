@@ -27,7 +27,7 @@ pub const DEFAULT_DECODE_BUDGET: u64 =
     DECODE_BUDGET_PER_FRAME_BYTE * MAX_SANE_UNCOMPRESSED_LEN as u64;
 
 /// A payload's remaining decode budget. One per payload: [`crate::native::decode_batch`] and
-/// [`crate::native::decode_batch_v2`] charge it as they read.
+/// [`crate::native::decode_hop_batch`] charge it as they read.
 #[derive(Debug)]
 pub struct DecodeBudget {
     limit: u64,

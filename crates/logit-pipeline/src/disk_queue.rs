@@ -18,11 +18,11 @@
 //!   any exit, `SIGKILL` included, so a restart needs no stale-lock cleanup.
 //!
 //! A **record** is 24 raw bytes of [`TraceContext`] (16-byte `trace_id`, 8-byte `span_id`;
-//! unversioned, see `CONTEXT_LEN`) followed by one `logit_proto::frame` native frame. The frame's
-//! codec byte (`CODEC_NATIVE_V1` or `_V2`) tells [`parse_record`] whether a v2 trailer follows the
-//! batch: its [`logit_core::Provenance`], then the native-hop sender identity and sequence the
-//! store numbered it with (`docs/adr/native-hop-identity-and-sequence.md`, decision 3). A replayed
-//! record goes out under the pair it was written with, never the reopened store's.
+//! unversioned, see `CONTEXT_LEN`) followed by one `logit_proto::frame` native frame under
+//! `CODEC_HOP_BATCH`: the batch, then a trailer with its [`logit_core::Provenance`] and the
+//! native-hop sender identity and sequence the store numbered it with
+//! (`docs/adr/native-hop-identity-and-sequence.md`, decision 3). A replayed record goes out under
+//! the pair it was written with, never the reopened store's.
 //! `frame::resync` can recover past a corrupt record because `MAGIC` always immediately follows a
 //! record's 24 context bytes.
 //!
@@ -67,17 +67,15 @@ use crate::fanout::{BatchContext, TraceContext};
 use crate::fault::{sites, Op, Point};
 use crate::fault_io;
 use crate::queue::{Numbering, OverflowPolicy, StoreItem, SINK_QUEUE_METRICS};
-use logit_core::{Diagnostics, EventBatch, Provenance, Telemetry};
+use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_proto::frame::{self, Compression};
 use logit_proto::native::{self, SeqId};
 use logit_proto::CodecError;
 
-/// `[trace_id: 16][span_id: 8]`, ahead of the frame. Never widen it: a record carries no version,
-/// so a wider prefix would misparse every already-spooled record. Anything new rides inside the
-/// frame, under a new codec byte (as `Provenance` does with `CODEC_NATIVE_V2`) or a new v2 trailer
-/// tag (as the sender identity and sequence do). A `V1` record still replays with empty
-/// provenance and no sequence, and a binary that doesn't know `V2` resyncs past it
-/// (`docs/adr/batch-provenance-on-delivered.md`).
+/// `[trace_id: 16][span_id: 8]`, ahead of the frame. Never widen it: a record carries no version
+/// of its own, and [`walk_segment`]'s resync arithmetic assumes this prefix sits right before
+/// every record's `MAGIC`. Anything new rides inside the frame as a new trailer tag, as the
+/// sender identity and sequence do (`docs/adr/native-hop-no-compatibility.md`, decision 2).
 pub(crate) const CONTEXT_LEN: usize = 24;
 
 const LOCK_FILE_NAME: &str = "lock";
@@ -164,12 +162,9 @@ pub(crate) fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
 /// whole record yet; any other error means the bytes are wrong and the caller should resync
 /// (`docs/design/wire-protocol.md`).
 ///
-/// `CODEC_NATIVE_V1` decodes with `Provenance::default()` and no sequence, `CODEC_NATIVE_V2` with
-/// its trailer, whose sequence is `None` when the record carries no well-formed pair; any other
-/// codec byte is an error.
-fn parse_record(
-    buf: &[u8],
-) -> Result<(BatchContext, Arc<EventBatch>, Option<SeqId>, usize), CodecError> {
+/// Only `CODEC_HOP_BATCH` decodes. Any other codec byte, or a trailer without a complete sender
+/// pair, is `Malformed`, so the caller skips the record as corrupt.
+fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, SeqId, usize), CodecError> {
     if buf.len() < CONTEXT_LEN {
         return Err(CodecError::Truncated { needed: CONTEXT_LEN - buf.len() });
     }
@@ -186,19 +181,13 @@ fn parse_record(
     // No decode budget: `push` encoded this record from a batch that was already this size in
     // memory, and a budget refusal here would discard a spooled batch as corrupt.
     let budget = native::DecodeBudget::unlimited();
-    let (batch, provenance, seq) = match codec {
-        native::CODEC_NATIVE_V1 => {
-            (native::decode_batch(&mut payload, &budget)?, Provenance::default(), None)
-        }
-        native::CODEC_NATIVE_V2 => native::decode_batch_v2(&mut payload, &budget)?,
-        other => {
-            return Err(CodecError::Malformed(format!(
-                "disk record declares codec {other}, expected native v1 ({}) or v2 ({})",
-                native::CODEC_NATIVE_V1,
-                native::CODEC_NATIVE_V2
-            )))
-        }
-    };
+    if codec != native::CODEC_HOP_BATCH {
+        return Err(CodecError::Malformed(format!(
+            "disk record declares codec {codec}, expected the hop batch ({})",
+            native::CODEC_HOP_BATCH
+        )));
+    }
+    let (batch, provenance, seq) = native::decode_hop_batch(&mut payload, &budget)?;
     let consumed_frame = before - rest.len();
     let ctx = BatchContext { trace, provenance };
     Ok((ctx, Arc::new(batch), seq, CONTEXT_LEN + consumed_frame))
@@ -236,7 +225,7 @@ pub(crate) struct WalkOutcome {
 pub(crate) fn walk_segment(
     bytes: &[u8],
     start_offset: u64,
-    mut on_record: impl FnMut(u64, BatchContext, Arc<EventBatch>, Option<SeqId>, u64),
+    mut on_record: impl FnMut(u64, BatchContext, Arc<EventBatch>, SeqId, u64),
 ) -> WalkOutcome {
     let mut pos = start_offset as usize;
     let mut valid_count = 0u64;
@@ -490,7 +479,7 @@ struct Segment {
 enum ReadOutcome {
     /// A record, and how far the cursor must advance to pass it (past any corrupt bytes skipped
     /// to reach it).
-    Record(BatchContext, Arc<EventBatch>, Option<SeqId>, u64),
+    Record(BatchContext, Arc<EventBatch>, SeqId, u64),
     /// Corruption with no record after it before the end of the segment: advance this many bytes
     /// without delivering.
     Skip(u64),
@@ -536,7 +525,7 @@ impl WriteError {
 struct ReadAhead {
     batch: Arc<EventBatch>,
     ctx: BatchContext,
-    seq: Option<SeqId>,
+    seq: SeqId,
     /// The segment and offset the read started at: the commit cursor's position once every
     /// record ahead of this one is committed.
     seg: u64,
@@ -950,11 +939,11 @@ impl DiskQueue {
         let seq = self.numbering.next();
         let (batch, ctx) = item;
 
-        let payload = native::encode_batch_v2(&batch, ctx.provenance, Some(seq));
+        let payload = native::encode_hop_batch(&batch, ctx.provenance, seq);
         // `write_frame` fails for a payload over `MAX_SANE_UNCOMPRESSED_LEN` and for
         // `Compression::Zstd`, which `logit_config::Compression` (where `disk.compression` comes
         // from) cannot express, so a failure here is an oversize batch.
-        let framed = match frame::write_frame(native::CODEC_NATIVE_V2, self.compression, &payload) {
+        let framed = match frame::write_frame(native::CODEC_HOP_BATCH, self.compression, &payload) {
             Ok(framed) => framed,
             Err(_) => {
                 self.count_dropped("frame_too_large", batch.events.len() as u64);
@@ -1915,9 +1904,9 @@ pub(crate) mod test_support {
         batch: &logit_core::EventBatch,
         provenance: logit_core::Provenance,
     ) -> u64 {
-        let payload = native::encode_batch_v2(batch, provenance, Some(SEQ_ONE));
+        let payload = native::encode_hop_batch(batch, provenance, SEQ_ONE);
         let framed =
-            frame::write_frame(native::CODEC_NATIVE_V2, frame::Compression::None, &payload)
+            frame::write_frame(native::CODEC_HOP_BATCH, frame::Compression::None, &payload)
                 .expect("None compression never fails");
         (CONTEXT_LEN + framed.len()) as u64
     }
@@ -1979,28 +1968,13 @@ pub(crate) mod test_support {
     /// The on-disk bytes `DiskQueue::push` writes for one record, for hand-built segment files.
     /// Carries a sequence of 1, so its length matches a pushed record's for sequences 1..=127.
     pub(crate) fn raw_record(batch: &EventBatch, ctx: BatchContext) -> Vec<u8> {
-        raw_record_with(batch, ctx, Some(SEQ_ONE))
+        let payload = native::encode_hop_batch(batch, ctx.provenance, SEQ_ONE);
+        raw_frame_record(ctx.trace, native::CODEC_HOP_BATCH, &payload)
     }
 
-    /// [`raw_record`] with a chosen sequence, `None` for a v2 record with no pair.
-    pub(crate) fn raw_record_with(
-        batch: &EventBatch,
-        ctx: BatchContext,
-        seq: Option<SeqId>,
-    ) -> Vec<u8> {
-        let payload = native::encode_batch_v2(batch, ctx.provenance, seq);
-        let framed = frame::write_frame(native::CODEC_NATIVE_V2, Compression::None, &payload)
-            .expect("None compression never fails");
-        let mut record = Vec::with_capacity(CONTEXT_LEN + framed.len());
-        record.extend_from_slice(&encode_context(ctx.trace));
-        record.extend_from_slice(&framed);
-        record
-    }
-
-    /// A `CODEC_NATIVE_V1` record, with no provenance trailer.
-    pub(crate) fn raw_record_v1(batch: &EventBatch, trace: TraceContext) -> Vec<u8> {
-        let payload = native::encode_batch(batch);
-        let framed = frame::write_frame(native::CODEC_NATIVE_V1, Compression::None, &payload)
+    /// A record of `payload` framed under `codec` as-is, for records `push` never writes.
+    pub(crate) fn raw_frame_record(trace: TraceContext, codec: u8, payload: &[u8]) -> Vec<u8> {
+        let framed = frame::write_frame(codec, Compression::None, payload)
             .expect("None compression never fails");
         let mut record = Vec::with_capacity(CONTEXT_LEN + framed.len());
         record.extend_from_slice(&encode_context(trace));
@@ -2012,12 +1986,12 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        batch, config, ctx, marker_of, metric_sum, raw_record, raw_record_v1, raw_record_with,
-        scratch_dir,
+        batch, config, ctx, marker_of, metric_sum, raw_frame_record, raw_record, scratch_dir,
+        SEQ_ONE,
     };
     use super::*;
     use crate::fault::{self, errno};
-    use logit_core::{AttrMap, Event, Registry, Resource, Value};
+    use logit_core::{AttrMap, Event, Provenance, Registry, Resource, Value};
     use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 
     fn open(dir: PathBuf) -> DiskQueue {
@@ -2082,57 +2056,69 @@ mod tests {
         let q = open(dir.clone());
         q.push((batch("a"), ctx())).await;
         let (.., seq_a) = q.peek().await.expect("should peek a");
-        let seq_a = seq_a.expect("a pushed record carries its number");
         assert_eq!(seq_a.seq, 1, "a freshly opened spool numbers from 1");
         drop(q); // no commit: `a` replays
 
         let q = open(dir.clone());
         let (replayed, _, replayed_seq) = q.peek().await.expect("a should replay");
         assert_eq!(marker_of(&replayed), "a");
-        assert_eq!(replayed_seq, Some(seq_a), "a replay keeps the identity and number it had");
+        assert_eq!(replayed_seq, seq_a, "a replay keeps the identity and number it had");
         q.commit().expect("should commit a");
 
         q.push((batch("b"), ctx())).await;
         let (next, _, next_seq) = q.peek().await.expect("should peek b");
         assert_eq!(marker_of(&next), "b");
-        let next_seq = next_seq.expect("a pushed record carries its number");
         assert_eq!(next_seq.seq, 1, "the reopened spool is a new sender, numbering from 1");
         assert_ne!(next_seq.id, seq_a.id, "every open mints a new identity");
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A v2 record with no sender pair replays unsequenced, for `logit_in` to forward.
+    /// A record `push` never writes: a hop payload whose trailer has no sender pair, and a bare
+    /// `CODEC_BATCH` frame. Each is skipped and counted as corrupt, as a bad CRC is
+    /// (`docs/adr/native-hop-no-compatibility.md`, decision 2).
     #[tokio::test]
-    async fn a_v2_record_without_a_pair_replays_unsequenced() {
-        let dir = scratch_dir("v2-record-no-pair");
-        std::fs::create_dir_all(&dir).unwrap();
-        let record = raw_record_with(&batch("no-pair"), ctx(), None);
-        std::fs::write(segment_path(&dir, 0), &record).unwrap();
-
-        let q = open(dir.clone());
-        let (peeked, _, seq) = q.peek().await.expect("should find the pre-existing record");
-        assert_eq!(marker_of(&peeked), "no-pair");
-        assert_eq!(seq, None);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// A `CODEC_NATIVE_V1` record on disk replays with empty provenance.
-    #[tokio::test]
-    async fn a_v1_codec_record_spooled_before_this_change_still_replays_with_empty_provenance() {
-        let dir = scratch_dir("v1-record-compat");
-        std::fs::create_dir_all(&dir).unwrap();
+    async fn a_record_without_a_complete_pair_is_skipped_as_corrupt() {
         let trace = TraceContext::new_root();
-        let record = raw_record_v1(&batch("pre-provenance"), trace);
-        std::fs::write(segment_path(&dir, 0), &record).unwrap();
+        let body = native::encode_batch(&batch("bad"));
+        let mut no_pair = body.to_vec();
+        // An empty trailer: its length prefix and nothing else.
+        no_pair.push(0);
+        let cases = [
+            ("no-pair", raw_frame_record(trace, native::CODEC_HOP_BATCH, &no_pair)),
+            ("bare-codec", raw_frame_record(trace, native::CODEC_BATCH, &body)),
+        ];
+        for (label, bad) in cases {
+            let dir = scratch_dir(&format!("record-{label}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut segment0 = raw_record(&batch("a"), ctx());
+            segment0.extend_from_slice(&bad);
+            std::fs::write(segment_path(&dir, 0), &segment0).unwrap();
+            std::fs::write(segment_path(&dir, 1), raw_record(&batch("c"), ctx())).unwrap();
 
-        let q = open(dir.clone());
-        let (peeked, peeked_ctx, seq) =
-            q.peek().await.expect("should find the pre-existing record");
-        assert_eq!(marker_of(&peeked), "pre-provenance");
-        assert_eq!(peeked_ctx.trace, trace);
-        assert_eq!(peeked_ctx.provenance, Provenance::default());
-        assert_eq!(seq, None, "a v1 record carries no sender pair and replays unsequenced");
-        std::fs::remove_dir_all(&dir).ok();
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("test", "output", "sink");
+            let q =
+                DiskQueue::open(config(dir.clone()), telemetry, Diagnostics::new("test")).unwrap();
+            registry.drain(0);
+
+            assert_eq!(marker_of(&q.peek_at(0).await.expect("a is queued").0), "a", "{label}");
+            assert_eq!(marker_of(&q.commit().unwrap().0), "a", "{label}");
+            assert!(q.peek_at(0).await.is_none(), "{label}: the head skips the bad record");
+            assert_eq!(marker_of(&q.peek_at(0).await.expect("c follows it").0), "c", "{label}");
+            assert_eq!(marker_of(&q.commit().unwrap().0), "c", "{label}");
+
+            let events = registry.drain(0);
+            assert_eq!(
+                metric_sum(
+                    &events,
+                    SINK_QUEUE_METRICS.items_dropped,
+                    Some(("reason", "disk_corrupt"))
+                ),
+                1.0,
+                "{label}: the bad record is counted once, as corruption"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[tokio::test]
@@ -2426,8 +2412,7 @@ mod tests {
         let (next, _, seq) = q.peek().await.expect("the batch after should be queued");
         assert_eq!(marker_of(&next), "after", "the oversized batch should never have been written");
         assert_eq!(
-            seq.map(|s| s.seq),
-            Some(2),
+            seq.seq, 2,
             "the dropped batch consumed number 1, leaving a gap the receiver ignores"
         );
         q.commit();
@@ -3245,9 +3230,9 @@ mod tests {
         // just past A's end, backed up by `CONTEXT_LEN`, lands inside A, and a record parses
         // there: the last bytes of A plus the filler as its context, then the real frame.
         let a = raw_record(&batch("a"), ctx());
-        let payload = native::encode_batch_v2(&batch("phantom"), Provenance::default(), None);
+        let payload = native::encode_hop_batch(&batch("phantom"), Provenance::default(), SEQ_ONE);
         let bare_frame =
-            frame::write_frame(native::CODEC_NATIVE_V2, Compression::None, &payload).unwrap();
+            frame::write_frame(native::CODEC_HOP_BATCH, Compression::None, &payload).unwrap();
         for filler in 1..CONTEXT_LEN {
             let mut bytes = a.clone();
             bytes.extend(std::iter::repeat_n(0x5A, filler));
@@ -3697,8 +3682,8 @@ mod tests {
                 logit_config::Compression::None => Compression::None,
                 logit_config::Compression::Lz4 => Compression::Lz4,
             };
-            let payload = native::encode_batch_v2(&batch("x"), Provenance::default(), None);
-            frame::write_frame(native::CODEC_NATIVE_V2, compression, &payload)
+            let payload = native::encode_hop_batch(&batch("x"), Provenance::default(), SEQ_ONE);
+            frame::write_frame(native::CODEC_HOP_BATCH, compression, &payload)
                 .unwrap_or_else(|err| panic!("{configured:?} must encode: {err}"));
 
             let dir = scratch_dir("every-compression");

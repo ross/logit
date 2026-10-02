@@ -299,11 +299,10 @@ fn display_optional<T: std::fmt::Display>(value: &Option<T>) -> String {
     value.as_ref().map(T::to_string).unwrap_or_else(|| "unknown".to_string())
 }
 
-/// `, binary sha256 <short>[ (<source>[ @ <short sha>])]` for `compare`'s header lines; empty
-/// when the results file has no `binary`. Under `--logit-bin` the binary can come from a
-/// different source than `git.sha` names (`result::BinaryInfo`).
-fn format_binary_provenance(binary: &Option<result::BinaryInfo>) -> String {
-    let Some(binary) = binary else { return String::new() };
+/// `, binary sha256 <short>[ (<source>[ @ <short sha>])]` for `compare`'s header lines. Under
+/// `--logit-bin` the binary can come from a different source than `git.sha` names
+/// (`result::BinaryInfo`).
+fn format_binary_provenance(binary: &result::BinaryInfo) -> String {
     let short_sha256: String = binary.sha256.chars().take(12).collect();
     match (&binary.source_ref, &binary.source_sha) {
         (Some(source), Some(sha)) => {
