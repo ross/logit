@@ -25,8 +25,8 @@ commits the frames the receiver already holds without resending them. Stream key
 
 ## Workstreams
 
-Each is one PR. W0 is docs only, so W1 branches from `main` beside it; W2, W3, and W4 each
-branch from the one before.
+Each is one PR, and each branches from the one before, W1 from W0, so the stack reads W0 to W4; a
+child PR targets its parent and is retargeted to `main` once the parent merges.
 
 | WS | Branch | Change | ADR decision |
 |---|---|---|---|
