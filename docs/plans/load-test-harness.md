@@ -79,6 +79,7 @@ Lua a scenario needs — validated the same way every other example config is.
 | `lua` | `generate_in` → `lua` (inline enrichment script) → `null_out` | The Lua hop and its event proxy | 4M | ~0.60M/s |
 | `fanout` | `passthrough`'s `generate_in` (same 6 attributes) → 3 × `null_out` | `Arc`-based fan-out to multiple sinks, read against `passthrough` | 25M | ~2.59M/s |
 | `native-relay` | `generate_in` → `logit_out` → `logit_in` → `null_out` (one graph, one process) | Native encode + decode + per-batch ack round trip | 7M | ~0.88M/s |
+| `native-relay-window1` | `native-relay` with `window: 1` on `logit_out` | The same round trip with one frame in flight, read against `native-relay`'s default window | 7M | pending VM measurement |
 | `encode-human-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: human`) | The human-readable encoder in situ | 8M | ~1.23M/s |
 | `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: native`) | The native encoder in situ | 10M | ~1.41M/s |
 | `buffered` | `passthrough`'s graph with `buffer: { disk: ... }` on the sink | Disk-backed sink-buffer spool cost | 1.2M | ~0.71M/s (median; see note) |

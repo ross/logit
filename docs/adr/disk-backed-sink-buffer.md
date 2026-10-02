@@ -6,7 +6,8 @@ updated: 2026-10-01
 # Disk-backed durable buffering for a sink's delivery queue
 
 ## Status
-Accepted
+Accepted. Superseded in part on 2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md):
+"Corrections to the design sketch", item 1's list of the `SinkStore` surface.
 
 ## Context
 
@@ -163,7 +164,9 @@ actual code; each is resolved as follows.
 
 1. **No `len`/`is_empty` on the seam.** `BoundedQueue` (the in-memory queue's own async wrapper)
    has neither, and nothing in `drain_inbox`/`write_loop`/`finish_and_flush` calls them. The
-   `SinkStore` surface is exactly `push`/`peek`/`commit`/`close`/`finish`.
+   `SinkStore` surface is exactly `push`/`peek`/`commit`/`close`/`finish`. [Superseded in part on
+   2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md): `SinkStore` gains
+   `peek_at`, which reserves a prefix of items, and `max_in_flight`.]
 2. **`commit` stays synchronous.** The sketch implied a disk `commit` might do I/O. It doesn't:
    `commit` only ever advances an in-memory read cursor, persisting the cursor file (a small,
    brief blocking write, the same trade-off `checkpoint.rs`'s own `write` already makes from async

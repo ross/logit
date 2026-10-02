@@ -356,8 +356,8 @@ spool on disk ([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md)).
 delivery from the last persisted read cursor and replays at most the batches committed since the
 last checkpoint: at-least-once, the same trade `tail_in`'s checkpoint makes.
 
-**A crash replays a window, under either posture.** After a crash, the spool replays the batch
-that was in flight and every batch committed since the last cursor write. The cursor is written
+**A crash replays a window, under either posture.** After a crash, the spool replays the batches
+that were in flight and every batch committed since the last cursor write. The cursor is written
 when a commit lands once `checkpoint_interval` has passed since the previous write, on a segment
 roll, at open, and at shutdown, with no timer. So the window is whatever committed within
 `checkpoint_interval` after the last write, and after an idle period that write can be any age.
@@ -432,7 +432,7 @@ rotation renames each retained file; `logit validate` rejects a larger value.
 `buffer.utilization`/`.bytes` are sized against `buffer.disk.max_bytes`; `batches.dropped` gains
 the `reason`s `frame_too_large`, `disk_corrupt`, `disk_full`, and `disk_io_error`; and a
 disk-backed sink emits `reason="shutdown"` only under `at_most_once`, when the shutdown grace cuts
-off a write in flight (an ambiguous outcome that posture drops). Nothing else is dropped at
+off the batches in flight (an ambiguous outcome that posture drops). Nothing else is dropped at
 shutdown, because the spool keeps it. Also watch:
 
 - `logit.component.buffer.disk.segments` (gauge): segment files currently on disk.
@@ -2663,14 +2663,46 @@ components:
       client_ca_file: /etc/logit/tls/ca.pem   # omit for server-auth-only TLS
 ```
 
-**Sizing `request_timeout` against `buffer.retry_budget`.** Keep `request_timeout` comfortably
-under `retry_budget`. `logit_out.request_timeout` (default 10s) bounds each step of one attempt
-separately: the connect, the TLS handshake, the `HelloAck` wait, and the ack wait, and at shutdown
-the close. The `Hello` and frame writes and their flushes aren't under it, since a large frame on
-a slow link can outlast it; `retry_budget` bounds them. `buffer.retry_budget`
-(default 60s; see [Sink delivery buffering](#sink-delivery-buffering)) bounds all retried attempts
-together. A `request_timeout` close to or above the retry budget leaves room for at most one attempt
-before the budget expires, which defeats retrying.
+**Send window.** `logit_out` keeps up to `window` frames in flight on one connection before it
+waits for the oldest one's `Ack` ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)).
+The default is `32`. With one frame in flight, throughput is capped at one batch per round trip,
+whatever the hardware: about 100 batches/s on a link with a 10 ms round-trip time. Raise `window`
+on a link with higher latency, up to `1024`:
+
+```yaml
+# edge
+  central_out:
+    type: logit_out
+    sources: [edge_in]
+    endpoint: central.internal:5140
+    window: 256
+```
+
+The connection uses the smaller of `window` and what `logit_in` answers, which is the offered
+window capped at `1024`. A memory buffer's `max_batches` also caps it, since a batch in flight
+stays in the sink's queue until its `Ack` arrives. `window: 1` keeps one frame in flight.
+
+**Under `buffer.delivery: at_most_once`, set `window: 1`.** An ambiguous fault (a lost or late
+`Ack`, a reset) drops every batch in flight, not only the oldest, because each one may or may not
+have been forwarded. Under the default `at_least_once`, the same fault resends the window from the
+oldest unacknowledged batch, and `logit_in` acknowledges each batch it already forwarded without
+forwarding it again. Nothing enforces the pairing; a larger window under `at_most_once` loses more
+per fault.
+
+**Sizing `request_timeout` against `buffer.retry_budget`.** Keep `request_timeout` comfortably under
+`retry_budget`. `logit_out.request_timeout` (default 10s) bounds each step of one attempt
+separately: the connect, the TLS handshake, the `HelloAck` wait, each ack wait, and at shutdown the
+close. With frames in flight it also bounds each chunk of a frame write and its flush: a write that
+accepts nothing for `request_timeout` means the receiver stopped reading. The connection then takes
+no more frames: the `Ack`s already owed are read, and the connection is dropped. The `Hello`, and a
+frame written with nothing in flight, aren't under it, since a large frame on a slow link can
+outlast it; `retry_budget` bounds them. `buffer.retry_budget` (default 60s; see [Sink delivery
+buffering](#sink-delivery-buffering)) bounds all retried attempts together. A `request_timeout`
+close to or above the retry budget leaves room for at most one attempt before the budget expires,
+which defeats retrying. With a window, the budget decides whether a failed round is retried, and it
+never cuts anything past the head's own write, so a receiver that forwards slowly can hold one round
+past it (`docs/known-gaps.md`, "A round against a slowly draining `logit_in` can outlast the retry
+budget").
 
 `request_timeout` relates only loosely to the far end's handshake grace. A `logit_out` whose
 `request_timeout` is shorter than its peer's handshake patience gives up first; the connection
@@ -2707,10 +2739,11 @@ a loss:
 - `logit_in` evicted the sender from its table (`logit.input.senders.evicted`).
 - The peer is a `logit` whose connection negotiated the v1 codec, which carries no identity.
 - A load balancer sent the resend to a different `logit_in`.
-- The first copy's forward was still waiting for room in a full downstream inbox when the sender
-  gave up on its `Ack` and resent on a new connection. The second connection forwards its copy
-  too, possibly after later batches (`docs/known-gaps.md`, "A forward parked past the sender's ack
-  timeout can be forwarded twice").
+- A fault ended a connection with frames still buffered at `logit_in`, and that connection's
+  task forwarded one while the sender's resend of it arrived on a new connection. Both copies are
+  forwarded when both are checked before either forward lands, most often when the first is
+  waiting for room in a full downstream inbox. The duplicate can arrive after later batches
+  (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds").
 
 `Reject{code: REJECT_GOING_AWAY}` is different. It has three causes: the peer's own shutdown, an
 idle close, and no consumer taking the frame (every consumer directly downstream of `logit_in` has
@@ -2746,8 +2779,9 @@ takes it, raises the mark. What follows from that:
 - **Cloning a running process is unsupported.** A VM snapshot or a CRIU checkpoint restored
   beside its original shares the sink's identity and sequence, and `logit_in` reads the second
   copy's batches as resends and doesn't forward them.
-- **The sequence is never a credit.** `Ack` carries no fields, the sender still has one frame
-  outstanding, and nothing acknowledges a sequence number.
+- **The sequence identifies a batch; it never acknowledges one.** `Ack` carries no fields. It
+  answers the oldest frame still unanswered on its connection, because `logit_in` answers a
+  connection's frames in the order they arrive.
 
 **A `HelloAck` that doesn't answer the `Hello` is permanent.** A peer that acks another protocol
 version, or a codec or compression this sink didn't offer, fails every attempt `permanent`, like a
@@ -2761,12 +2795,20 @@ reconnecting doesn't show as `connection_error` on the far end.
 
 **What to watch.**
 
-- `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/`permanent`, one per `send`
-  attempt that returns, a failed connect or handshake and a too-large batch included, so the total
-  is the number of attempts; `clean` is any failure before the frame is fully written and flushed,
-  `ambiguous` only a lost or refused ack), `logit.output.reconnects` (should stay near zero in
-  steady state; a climbing count means the peer or the network is unstable), and
-  `logit.output.ack.duration`.
+- `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/`permanent`, one per `Ack`
+  read or ack wait that fails, plus one per failed connect or handshake, too-large batch, or write
+  that fails with nothing in flight; `ok` is an acknowledged frame, `clean` a failure before a frame
+  was fully written with nothing in flight or a `GOING_AWAY` in place of an `Ack`, `ambiguous` a
+  lost `Ack` (a timeout, an EOF, a reset, another message) or an `in_flight` drift, and `permanent`
+  a size check or a frame-build error at the head, a `HelloAck` that names another version or an
+  unoffered codec or compression, or a permanent reject), `logit.output.reconnects` (should stay
+  near zero in steady state; a climbing count means the peer or the network is unstable),
+  `logit.output.ack.duration`, `logit.output.in_flight` (a gauge of frames awaiting an `Ack`, set
+  from the first connection on and 0 after any drop; one that sits at the window means the round
+  trip or the peer's forwarding is the limit, and raising `window` helps only in the first case),
+  and `logit.output.window` (a gauge of the live connection's negotiated window, set from the first
+  connection on and 1 after any drop or a shutdown; below the configured `window` on a live
+  connection means `logit_in` answered less).
 - `logit_in`: `logit.input.connections` (a gauge that should match the number of connected
   `logit_out` peers), `logit.input.connections.rejected{reason="limit"}` (nonzero means the
   `max_connections` cap is binding; raise `max_connections` or shed load upstream), and
@@ -2787,9 +2829,9 @@ reconnecting doesn't show as `connection_error` on the far end.
 - Both sides: `logit.proto.frames{direction,codec,compression}` and `logit.proto.frame.bytes` for
   throughput.
 
-`docs/known-gaps.md` tracks what's still open: there is no credit-based flow control (the sender
-never has more than one frame outstanding), and `logit_in`'s shutdown grace is fixed at 5s with no
-`receive:`-shaped knob to change it.
+`docs/known-gaps.md` tracks what's still open: `logit_in` acknowledges frames in the order they
+arrive, so a batch slow to forward holds up the ones behind it, and `logit_in`'s shutdown grace is
+fixed at 5s with no `receive:`-shaped knob to change it.
 
 ## The nginx-side recipe
 

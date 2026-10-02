@@ -9,7 +9,11 @@ updated: 2026-10-01
 Accepted. Superseded in part on 2026-10-01 by
 [ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md): "Sequence numbers
 are implicit", the `Ack` entry of "Control payload", the rejected alternative "An explicit
-`seq` field on every data frame", and "Ack point", which gains a second case.
+`seq` field on every data frame", and "Ack point", which gains a second case. Superseded in
+part on 2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md): "In-flight: one frame per
+connection, in this plan", the deferred alternative "Building credit-based flow control
+(window > 1) now", and the sentence of "Sequence numbers are implicit" that expects a future
+window to use cumulative acks (the acks stay empty and in frame order).
 
 ## Context
 
@@ -45,7 +49,9 @@ sequence ride in every data frame's v2 trailer, assigned by the sink's store, an
 fields.] TCP is ordered, so the Nth data frame on a connection is always
 seq N; `Ack.seq` is the cumulative count of data frames the receiver has forwarded. No seq field on
 the data frame itself, so the native-v1 payload is untouched, and a future credit window > 1 can
-use cumulative acks unchanged.
+use cumulative acks unchanged. [Superseded in part on 2026-10-01 by [ADR
+`native-hop-send-window`](native-hop-send-window.md): a window above 1 keeps `Ack` empty, with
+acks arriving in frame order, not cumulative.]
 
 **Ack point: after `Fanout::send` returns**, not after the frame is merely decoded. [Superseded
 in part on 2026-10-01 by [ADR
@@ -60,7 +66,10 @@ receive-side queue on top of this; the ack itself is the queue depth of one.
 `Reject` and closes. A version mismatch or no shared codec is `Reject`, not a silently-corrupted
 stream.
 
-**In-flight: one frame per connection, in this plan.** `window` is negotiated and recorded in both
+**In-flight: one frame per connection, in this plan.** [Superseded in part on 2026-10-01 by [ADR
+`native-hop-send-window`](native-hop-send-window.md): `logit_out` keeps up to the negotiated
+`window` of frames in flight, the sink's store reserves a prefix of items instead of the head,
+and acks answer frames in frame order, with no credit messages.] `window` is negotiated and recorded in both
 directions, but the sender only ever has one frame outstanding — `LogitOutput`'s own `SinkQueue`
 `peek`/`commit` is the retransmit state, and the ack point above is what makes even that one frame
 safe. Credit-based flow control (several frames outstanding, cumulative acks against them) is real,
@@ -116,7 +125,10 @@ idle keep-alive connection's `Fanout` clone open past shutdown — a real gap, t
   redundant, and leaving it off keeps the native-v1 payload itself unmodified by the transport
   layer — the same frame bytes work identically written to a file (a durable buffer) or a socket.
 - **Building credit-based flow control (window > 1) now**, per `wire-protocol.md`'s original
-  sketch. Deferred: it needs `logit-pipeline`'s `SinkQueue` to track several outstanding,
+  sketch. [Superseded in part on 2026-10-01 by [ADR
+  `native-hop-send-window`](native-hop-send-window.md): a fixed window negotiated at the
+  handshake is built, with no credit messages, over a store that reserves a prefix of items.]
+  Deferred: it needs `logit-pipeline`'s `SinkQueue` to track several outstanding,
   unacknowledged batches instead of one, a real queue-shape change out of this plan's scope. The
   handshake already negotiates and records `window` so this is additive later, not a wire-format
   break.
