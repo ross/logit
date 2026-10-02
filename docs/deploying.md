@@ -2687,9 +2687,10 @@ that identity up to the sequence that its connection carried, so one `Ack` can a
 frames ([ADR `native-hop-named-acks`](adr/native-hop-named-acks.md)). `logit_in` writes one per run
 of frames rather than one per frame, at least every 32 frames and always before a `Reject`; the
 ADR's decision 2 says when. A sender that stops sending gets its `Ack` at once, since `logit_in`
-writes it before it would wait. On a slow consumer the sender sees its acks one forward late:
-`logit_in` holds the pending `Ack` while it waits to forward the next frame already read. An `Ack`
-grants no credit; the window stays fixed at the handshake.
+writes it before it would wait. A sender streaming faster than `logit_in` forwards gets one `Ack`
+per burst, up to 32 frames, because `logit_in` keeps finding the next frame already buffered and
+holds the pending `Ack` through each forward. An `Ack` grants no credit; the window stays fixed at
+the handshake.
 
 **Under `buffer.delivery: at_most_once`, set `window: 1`.** An ambiguous fault (a lost or late
 `Ack`, a reset) drops every batch in flight, not only the oldest, because each one may or may not

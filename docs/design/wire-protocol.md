@@ -435,7 +435,8 @@ decision record.
   next frame carries another identity, the run reaches 32 frames, or the connection is about to
   write a `Reject` or close ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md),
   decision 2). A frame already read whose forward waits holds the `Ack` for the frames before it,
-  so on a slow consumer a sender sees its acks one forward late. A stalled downstream delays the
+  so a sender streaming faster than the receiver forwards gets one `Ack` per burst, up to 32
+  frames. A stalled downstream delays the
   ack, which stalls the sender once its window is full. That is the protocol's backpressure, and
   it's why `logit_in` needs no receive-side queue the way a UDP listener does.
 - **Frame bounds.** `logit_in` checks a data frame's header before reading its body:

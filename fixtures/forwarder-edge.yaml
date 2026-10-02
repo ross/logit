@@ -35,7 +35,7 @@ components:
     sources: [edge_in]
     endpoint: central:5140
     # compression: none          # none | lz4, offered in Hello; the peer may negotiate it down
-    # request_timeout: 10s        # connect, handshake, and per-batch ack wait, one knob
+    # request_timeout: 10s        # connect, handshake, and ack wait, one knob
     # tls:                        # presence turns TLS on; `endpoint` has no scheme to signal it
     #   ca_file: ca.pem
     #   cert_file: client.pem     # cert_file/key_file together, for mutual TLS
