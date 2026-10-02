@@ -105,7 +105,7 @@ impl LineSplitter {
         let mut stats = LineStats::default();
         let mut start = 0usize;
         while start < chunk.len() {
-            let nl = chunk[start..].iter().position(|&b| b == b'\n');
+            let nl = memchr::memchr(b'\n', &chunk[start..]);
             let seg_end = nl.map(|i| start + i).unwrap_or(chunk.len());
             let seg = chunk.slice(start..seg_end);
 

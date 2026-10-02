@@ -12,7 +12,7 @@ use super::checkpoint::{CheckpointStore, FileId, Head, Loaded, Retained, Source,
 use super::line::{LineSplitter, TailDecoder};
 use super::pattern::PathPattern;
 use super::TailConfig;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
 use logit_pipeline::{fault, BatchAccumulator, Fanout, FlushReason};
 use std::collections::{HashMap, HashSet};
@@ -24,6 +24,11 @@ use tokio::sync::watch;
 /// One read off a tracked file: large enough to amortize the syscall, small enough that one busy
 /// file can't starve the others in `drain`'s round robin. Not configurable.
 const READ_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Below this much spare capacity, `read_one` starts the shared read buffer on a fresh
+/// [`READ_CHUNK_BYTES`] (reclaiming the old allocation if no event still slices it). Above it,
+/// small reads (a wake per short write) share one allocation instead of taking one each.
+const READ_REFILL_BYTES: usize = 16 * 1024;
 
 /// The fault seam's point for `read_one`'s read of a tracked file.
 pub(crate) const READ: fault::Point = fault::Point::new(fault::sites::TAIL_READ, fault::Op::Read);
@@ -257,6 +262,22 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     /// last batch a consumer took, and a restart may replay lines a consumer already took. The
     /// run loop then returns `Ok`, and the node finishes.
     untaken: bool,
+    /// The buffer `read_one` reads into, shared by every tracked file. Empty between reads: each
+    /// read is split off as a frozen `Bytes` the lines slice, and the next reads go into the same
+    /// allocation's spare capacity until less than [`READ_REFILL_BYTES`] is left. An allocation
+    /// is freed once every event slicing it is gone, so one event can hold up to
+    /// [`READ_CHUNK_BYTES`] of earlier reads alive with it.
+    read_buf: BytesMut,
+    /// `read_one`'s split lines with their start offsets, empty between calls; kept for its
+    /// capacity.
+    lines: Vec<(Bytes, u64)>,
+    /// `read_one`'s decoded events, emptied by every `BatchAccumulator::absorb`; kept for its
+    /// capacity.
+    scratch: Vec<Event>,
+    /// `drain`'s per-pass file list and the files that pass found at EOF; kept for their
+    /// capacity.
+    pass_ids: Vec<FileId>,
+    pass_at_eof: Vec<FileId>,
 }
 
 impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
@@ -276,6 +297,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             scan_generation: 0,
             watcher: None,
             untaken: false,
+            read_buf: BytesMut::new(),
+            lines: Vec::new(),
+            scratch: Vec::new(),
+            pass_ids: Vec::new(),
+            pass_at_eof: Vec::new(),
         }
     }
 
@@ -1111,27 +1137,20 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             // Before the reads: a pass parked on the downstream mustn't reap on an EOF it saw
             // before the grace ran out.
             let pass_start = tokio::time::Instant::now();
-            let mut any_progress = false;
-            let mut at_eof: Vec<FileId> = Vec::new();
-            let ids: Vec<FileId> = self.files.keys().copied().collect();
-            for id in ids {
-                if *shutdown.borrow() {
-                    return DrainEnd::Shutdown;
-                }
-                // One `fstat` per pass, only while the file drains: see `recheck_length`.
-                if self.files.get(&id).is_some_and(|f| f.state == FileState::Draining) {
-                    self.recheck_length(id).await;
-                }
-                if self.read_one(id, sink).await {
-                    any_progress = true;
-                } else {
-                    at_eof.push(id);
-                }
-                if self.untaken {
-                    return DrainEnd::Untaken;
-                }
+            let mut ids = std::mem::take(&mut self.pass_ids);
+            let mut at_eof = std::mem::take(&mut self.pass_at_eof);
+            ids.clear();
+            ids.extend(self.files.keys().copied());
+            at_eof.clear();
+            let (any_progress, stopped) = self.read_pass(&ids, &mut at_eof, sink, shutdown).await;
+            if stopped.is_none() {
+                self.reap_drained(&at_eof, pass_start, sink, watcher).await;
             }
-            self.reap_drained(&at_eof, pass_start, sink, watcher).await;
+            self.pass_ids = ids;
+            self.pass_at_eof = at_eof;
+            if let Some(end) = stopped {
+                return end;
+            }
             if self.untaken {
                 return DrainEnd::Untaken;
             }
@@ -1144,6 +1163,37 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
     }
 
+    /// One round-robin pass of `drain`: a read of each file in `ids`, collecting the ones that
+    /// returned no progress in `at_eof`. Returns whether any file made progress, and why the pass
+    /// stopped before its last file, if it did.
+    async fn read_pass(
+        &mut self,
+        ids: &[FileId],
+        at_eof: &mut Vec<FileId>,
+        sink: &Fanout,
+        shutdown: &watch::Receiver<bool>,
+    ) -> (bool, Option<DrainEnd>) {
+        let mut any_progress = false;
+        for &id in ids {
+            if *shutdown.borrow() {
+                return (any_progress, Some(DrainEnd::Shutdown));
+            }
+            // One `fstat` per pass, only while the file drains: see `recheck_length`.
+            if self.files.get(&id).is_some_and(|f| f.state == FileState::Draining) {
+                self.recheck_length(id).await;
+            }
+            if self.read_one(id, sink).await {
+                any_progress = true;
+            } else {
+                at_eof.push(id);
+            }
+            if self.untaken {
+                return (any_progress, Some(DrainEnd::Untaken));
+            }
+        }
+        (any_progress, None)
+    }
+
     /// Reads one chunk from `id`, decodes its complete lines, and emits any batch that reaches a
     /// bound. Returns `false` (eligible for [`Tailer::reap_drained`]) at EOF, on a read error,
     /// or for a [`FileState::Deselected`] file. A refused emit sets [`Tailer::untaken`] and
@@ -1152,13 +1202,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         if self.files.get(&id).is_some_and(|t| t.state == FileState::Deselected) {
             return false;
         }
-        let mut chunk = vec![0u8; READ_CHUNK_BYTES];
+        if self.read_buf.capacity() < READ_REFILL_BYTES {
+            self.read_buf.reserve(READ_CHUNK_BYTES);
+        }
+        debug_assert!(self.read_buf.is_empty(), "every read is split off whole");
         let n = match self.files.get_mut(&id) {
             Some(tracked) => match logit_pipeline::fault_io!(
                 READ,
                 &tracked.path,
                 0,
-                tracked.file.read(&mut chunk).await
+                tracked.file.read_buf(&mut (&mut self.read_buf).limit(READ_CHUNK_BYTES)).await
             ) {
                 Ok(n) => n,
                 Err(err) => {
@@ -1173,10 +1226,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             return false;
         }
         let read_at = now_nanos();
-        let bytes = Bytes::copy_from_slice(&chunk[..n]);
+        let bytes = self.read_buf.split().freeze();
 
         // Each line with the file offset it starts at, for `TrackedFile::held_from`.
-        let mut lines: Vec<(Bytes, u64)> = Vec::new();
+        let mut lines = std::mem::take(&mut self.lines);
         let dropped = {
             let tracked = match self.files.get_mut(&id) {
                 Some(t) => t,
@@ -1199,13 +1252,41 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             );
         }
 
-        let mut scratch: Vec<Event> = Vec::new();
-        for (line, line_start) in lines {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let tracked_now = self.decode_lines(id, &mut lines, &mut scratch, read_at, sink).await;
+        // Both are already empty (`decode_lines` drains `lines`, and `absorb` empties `scratch`);
+        // cleared so a decoder that leaves events behind can't carry them into another file's
+        // next read.
+        lines.clear();
+        scratch.clear();
+        self.lines = lines;
+        self.scratch = scratch;
+        if !tracked_now {
+            return false;
+        }
+        if let Some(cp) = &mut self.checkpoint {
+            cp.mark_dirty();
+        }
+        true
+    }
+
+    /// `read_one`'s decode half: decodes `lines` into `scratch` and absorbs each line's events
+    /// into the file's accumulator, emitting at a bound. Stops at a refused emit
+    /// ([`Tailer::untaken`]). Returns `false` if the file stopped being tracked.
+    async fn decode_lines(
+        &mut self,
+        id: FileId,
+        lines: &mut Vec<(Bytes, u64)>,
+        scratch: &mut Vec<Event>,
+        read_at: i64,
+        sink: &Fanout,
+    ) -> bool {
+        for (line, line_start) in lines.drain(..) {
             let line = ensure_utf8(line, &mut self.diag);
             let Some(tracked) = self.files.get_mut(&id) else { return false };
             self.telemetry.count("logit.input.lines", 1.0, &[]);
             self.telemetry.count("logit.input.line.bytes", line.len() as f64, &[]);
-            let decoded = tracked.decoder.decode_line(line, read_at, &mut scratch);
+            let decoded = tracked.decoder.decode_line(line, read_at, scratch);
             // Asked after every line, rejected ones included: a rejected line can flush the held
             // run (its events are in `scratch`) or leave it, and `held_from` follows either way.
             if !tracked.decoder.holds_entry() {
@@ -1221,16 +1302,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 }
             };
             // No scope: a tailed line has no instrumentation scope.
-            if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, &mut scratch)
-            {
+            if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, scratch) {
                 if !emit(sink, &self.telemetry, batch, reason).await {
                     self.untaken = true;
                     break;
                 }
             }
-        }
-        if let Some(cp) = &mut self.checkpoint {
-            cp.mark_dirty();
         }
         true
     }

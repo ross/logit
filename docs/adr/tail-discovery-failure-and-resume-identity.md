@@ -1,6 +1,6 @@
 ---
 created: 2026-09-28
-updated: 2026-09-28
+updated: 2026-10-02
 ---
 
 # Tail discovery failure and resume identity: a failed listing is no information, and a resume verifies the file's head
@@ -299,8 +299,11 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
   ([ADR `event-sizing-and-allocation-strategy`](event-sizing-and-allocation-strategy.md)).
 - **Follow-ups, not started.**
   - TAIL-03 perf: reuse one read buffer per `Tailer` (no 64 KiB zeroing and copy per call),
-    `memchr` in `LineSplitter::push`, and `drain`'s per-pass `Vec`s hoisted. It needs a
-    `perf/scenarios/tail-*.yaml` scenario, a measurement on the perf VM, and an allocation pin.
+    `memchr` in `LineSplitter::push`, and `drain`'s per-pass `Vec`s hoisted. **Implemented,
+    pending VM confirmation**: the `tail` and `tail-rotate` scenarios measure it, and the change
+    stands once a perf VM session confirms the laptop's CPU µs/event drop. No allocation pin
+    covers the read path yet: `crates/logit-bench` calls components directly, and `read_one` is
+    reachable only through a running `Tailer`.
   - Per-stream drop state in the checkpoint, which removes the pin a never-ending line holds on
     the checkpoint.
   - A `TailDecoder` hook the splitter calls for an envelope it drops, so `docker_in` can release

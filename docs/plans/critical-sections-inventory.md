@@ -1705,6 +1705,11 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   split, drop, and batch loop: every batch's content and boundaries under `max_events` 1 and 3,
   lines over a 40-byte bound dropped and counted once per read of them, an unterminated line held
   and emitted at a clean stop or a reap, and `lines`, `line.bytes`, and flushes by reason exact.
+- **Perf follow-up (`perf/tail-read-alloc`), pending VM confirmation:** `read_one` reads into one
+  `BytesMut` per `Tailer` and splits each read off it, with no zeroing and no copy; `LineSplitter::push`
+  finds newlines with `memchr`; `drain`'s per-pass id lists and `read_one`'s line and event
+  `Vec`s are kept on the `Tailer` for their capacity. The `tail` and `tail-rotate` perf scenarios
+  measure it. Still no allocation pin for the read path.
 
 ### TAIL-04 — `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics
 - **Location:** `crates/logit-inputs/src/tail/line.rs` (`LineSplitter`, `push`,
