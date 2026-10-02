@@ -1898,9 +1898,10 @@ attempt.
   returns nothing and isn't counted; `logit.component.errors` covers it. `ok` is an acknowledged
   frame; `clean` a failure before a frame was completely written and flushed with nothing in flight,
   or a `Reject{GOING_AWAY}` read in place of an `Ack`; `ambiguous` a lost `Ack` (a timeout, an EOF,
-  a reset, another message) or an `Ack` naming no run of the frames in flight; and `permanent` a size check or a frame-build
-  error at the head, a `HelloAck` that names another version, an unoffered codec or compression,
-  or a mark for an identity `Hello.senders` didn't list, or a permanent reject ([ADR
+  a reset, another message) or an `Ack` naming no run of the frames in flight; and `permanent` a
+  size check or a frame-build error at the head, a `HelloAck` that doesn't answer the `Hello`
+  (another version, an unoffered codec or compression, a mark for an identity `Hello.senders`
+  didn't list, or two marks for one identity), or a permanent reject ([ADR
   `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
   decision 6).
 
