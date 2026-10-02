@@ -198,8 +198,8 @@ impl LogitOutput {
     }
 
     /// Sets the window offered in `Hello` (default 32): how many frames may be in flight before
-    /// the oldest is acknowledged. The connection uses the smaller of this and the peer's answer,
-    /// and at least 1.
+    /// the oldest is acknowledged. The connection uses the smaller of this and the peer's answer.
+    /// Graph rule 75 keeps the configured value at 1 or more.
     pub fn with_window(mut self, window: u32) -> Self {
         self.window = window;
         self
@@ -2522,8 +2522,8 @@ mod tests {
     }
 
     /// A `HelloAck` with a window of 0 fails to decode, so the handshake fails and no frame is
-    /// written. `HelloAck::encode` refuses a 0, so the peer patches the window field's one-byte
-    /// value on the wire.
+    /// written. `HelloAck::encode` asserts a nonzero window in debug builds, so the peer patches
+    /// the window field's one-byte value on the wire.
     #[tokio::test]
     async fn a_hello_ack_with_a_window_of_zero_fails_the_handshake() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

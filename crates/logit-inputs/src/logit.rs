@@ -2991,8 +2991,8 @@ mod tests {
     }
 
     /// A `Hello` offering a window of 0 is malformed: the connection closes with no reply,
-    /// counted as a handshake error. `Hello::encode` refuses a 0, so the test patches the window
-    /// field's one-byte value on the wire.
+    /// counted as a handshake error. `Hello::encode` asserts a nonzero window in debug builds, so
+    /// the test patches the window field's one-byte value on the wire.
     #[tokio::test]
     async fn a_hello_with_a_window_of_zero_is_a_protocol_error() {
         let registry = Registry::new();
