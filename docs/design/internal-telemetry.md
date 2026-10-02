@@ -1148,9 +1148,9 @@ the property the minimal-watch-set design is for.
   (count): every way a frame or a handshake can be rejected, each its own reason so a version
   mismatch doesn't hide behind a generic "bad frame" tag. `magic` is a frame header whose magic
   isn't `LGIT`, and `version` one whose frame version this reader doesn't understand.
-  `malformed` is a frame or hop batch that fails to parse past a valid header and CRC: bad
-  lengths, a body that doesn't decompress, an unknown compression byte, a corrupt batch body, or a
-  trailer without a complete sender identity and sequence pair. `truncated_header` is a peer that closed,
+  `malformed` is any other frame or hop batch that fails to parse: an unknown compression byte,
+  bad lengths, a body that doesn't decompress, a corrupt batch body, or a trailer without a
+  complete sender identity and sequence pair. `truncated_header` is a peer that closed,
   or a read that failed, part-way through a frame header, and `truncated` the same part-way through
   a body. A close between frames is the ordinary end of a connection and isn't counted, including
   a TLS peer gone without `close_notify`. `too_large` is a header that declared a

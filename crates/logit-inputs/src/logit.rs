@@ -1693,7 +1693,8 @@ mod tests {
     }
 
     /// A frame well under `max_frame_bytes` whose batch decodes past 4x that cap closes the
-    /// connection, counted as `decode_budget` rather than `magic` and diagnosed under its own key.
+    /// connection, counted as `decode_budget` rather than `malformed` and diagnosed under its own
+    /// key.
     #[tokio::test]
     async fn a_batch_past_the_decode_budget_is_counted_and_diagnosed_as_decode_budget() {
         let registry = Registry::new();
