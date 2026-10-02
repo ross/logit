@@ -38,8 +38,9 @@
 //! only once it has read the whole frame and checked its CRC: it has no partial decode, and it
 //! forwards before it acks. So the one `Ambiguous` window is the ack wait.
 //! - Connect, TLS, `Hello` write, or `HelloAck` read failure: `Clean`.
-//! - A `HelloAck` that doesn't answer the `Hello` (another protocol version, or a codec or
-//!   compression never offered): `Permanent`. The peer answers the same `Hello` the same way.
+//! - A `HelloAck` that doesn't answer the `Hello` (another protocol version, a codec or
+//!   compression never offered, a mark for an identity `Hello.senders` didn't list, or two marks
+//!   for one identity): `Permanent`. The peer answers the same `Hello` the same way.
 //! - A `Reject`: [`reject_is_permanent`] decides, not where it arrives.
 //!   `REJECT_VERSION_MISMATCH`/`REJECT_NO_COMMON_CODEC`/`REJECT_FRAME_TOO_LARGE` would recur
 //!   identically, so `Permanent`. Any other code (`REJECT_INTERNAL`, the peer at its connection
@@ -72,6 +73,16 @@
 //! when a connection that ended mid-window still holds the first copy as the resend arrives
 //! (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds").
 //!
+//! **Resume** (`docs/adr/native-hop-named-acks.md`, decision 4). A connection dropped by a failed
+//! ack wait leaves the distinct identities of its in-flight list, the frames the retried round
+//! resubmits, in list order and at most `MAX_HELLO_SENDERS`; the next `Hello.senders` lists
+//! them, and `HelloAck.marks` answers each one `logit_in` holds. With identities to list and no
+//! connection, `submit` connects before it encodes. A frame at or below its identity's mark is
+//! pushed `acked` with nothing encoded or written, counted as `logit.output.batches.resumed`, and
+//! `await_ack` commits it in order. The marks are read once, at the handshake. A cancelled call
+//! leaves no identities: the next connection resends every frame, and `logit_in` recognizes each
+//! by its mark.
+//!
 //! **Close.** `Output::flush`, called once after the last batch, shuts the pooled connection
 //! down, which under TLS sends `close_notify`. A connection dropped after a failed or cancelled
 //! attempt closes without one, which `logit_in` reads as a close when it falls between frames.
@@ -101,7 +112,7 @@ use logit_core::{Diagnostics, EventBatch, Provenance, Telemetry};
 use logit_pipeline::{BatchContext, Fault, SeqId};
 use logit_proto::frame::{self, Compression};
 use logit_proto::native::{self, control};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -137,6 +148,9 @@ struct Conn {
     /// A write failed or stalled with frames in flight. Nothing more is written on it; it's
     /// kept for the acks already owed and dropped once none is.
     broken: bool,
+    /// `HelloAck.marks`: per identity, the highest sequence `logit_in` had handled when this
+    /// connection's handshake ran. Never updated after it.
+    marks: HashMap<[u8; 16], u64>,
     /// Where the drop resets `logit.output.in_flight` and `logit.output.window`.
     telemetry: Telemetry,
 }
@@ -152,6 +166,26 @@ struct InFlight {
 impl Conn {
     fn nothing_in_flight(&self) -> bool {
         self.in_flight.is_empty()
+    }
+
+    /// Whether `logit_in` held `seq` at the handshake: at or below its identity's mark.
+    fn covers(&self, seq: SeqId) -> bool {
+        self.marks.get(&seq.id).is_some_and(|mark| seq.seq <= *mark)
+    }
+
+    /// The distinct identities of every frame in flight, in list order, at most
+    /// `control::MAX_HELLO_SENDERS`: the next `Hello.senders`.
+    fn resend_senders(&self) -> Vec<[u8; 16]> {
+        let mut senders: Vec<[u8; 16]> = Vec::new();
+        for entry in &self.in_flight {
+            if senders.len() == control::MAX_HELLO_SENDERS {
+                break;
+            }
+            if !senders.contains(&entry.seq.id) {
+                senders.push(entry.seq.id);
+            }
+        }
+        senders
     }
 }
 
@@ -219,6 +253,9 @@ pub struct LogitOutput {
     /// attempt succeeds, so a `send` without its own `observe_batch` fails rather than go out
     /// under the last batch's pair, which `logit_in` would read as a resend and not forward.
     pending_seq: Option<SeqId>,
+    /// The next `Hello.senders`: what the last connection dropped with frames in flight held
+    /// (the module doc's "Resume"). Cleared by the handshake that sends it.
+    resend_senders: Vec<[u8; 16]>,
 }
 
 /// The window offered when none is configured, `default_logit_out_window` in `logit-config`.
@@ -238,6 +275,7 @@ impl LogitOutput {
             has_connected_once: false,
             pending_provenance: Provenance::default(),
             pending_seq: None,
+            resend_senders: Vec::new(),
         }
     }
 
@@ -321,8 +359,7 @@ impl LogitOutput {
             compressions: vec![Compression::None as u8, self.compression as u8],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: self.window,
-            // The resume (`docs/adr/native-hop-named-acks.md`, decision 4) isn't sent.
-            senders: vec![],
+            senders: self.resend_senders.clone(),
         };
         write_control(&mut stream, &hello)
             .await
@@ -363,6 +400,7 @@ impl LogitOutput {
         } else {
             self.has_connected_once = true;
         }
+        self.resend_senders.clear();
 
         Ok(Conn {
             stream,
@@ -371,15 +409,16 @@ impl LogitOutput {
             window,
             in_flight: VecDeque::new(),
             broken: false,
+            marks: ack.marks.into_iter().collect(),
             telemetry: self.telemetry.clone(),
         })
     }
 }
 
-/// Checks that `ack` answers `hello`: the same protocol version, and a codec and compression
-/// `hello` offered. Returns the compression to frame with. `ack.marks` isn't read. A peer that answers one `Hello` this
-/// way answers every identical one the same way, so the caller's verdict is `Permanent`, like a
-/// version or codec `Reject`.
+/// Checks that `ack` answers `hello`: the same protocol version, a codec and compression `hello`
+/// offered, and marks only for identities `hello.senders` listed, each at most once. Returns the
+/// compression to frame with. A peer that answers one `Hello` this way answers every identical
+/// one the same way, so the caller's verdict is `Permanent`, like a version or codec `Reject`.
 fn validate_hello_ack(
     ack: &control::HelloAck,
     hello: &control::Hello,
@@ -397,6 +436,16 @@ fn validate_hello_ack(
             ack.codec,
             hello.codecs
         );
+    }
+    for (i, (id, _)) in ack.marks.iter().enumerate() {
+        if !hello.senders.contains(id) {
+            anyhow::bail!(
+                "logit_in answered a mark for identity {id:02x?}, which this sink's Hello didn't list"
+            );
+        }
+        if ack.marks[..i].iter().any(|(earlier, _)| earlier == id) {
+            anyhow::bail!("logit_in answered two marks for identity {id:02x?}");
+        }
     }
     match compression_from_u8(ack.compression) {
         Some(compression) if hello.compressions.contains(&ack.compression) => Ok(compression),
@@ -443,7 +492,8 @@ impl LogitOutput {
         self.stream.as_ref().is_none_or(Conn::nothing_in_flight)
     }
 
-    /// `Output::submit`'s body: writes one frame without waiting for its `Ack`. Every failure
+    /// `Output::submit`'s body: writes one frame without waiting for its `Ack`, or commits it
+    /// from the connection's marks without a write (the module doc's "Resume"). Every failure
     /// with nothing in flight carries a [`Fault`]; a write failure or stall with frames in flight
     /// carries none (the module doc's "Send window").
     async fn submit_frame(
@@ -452,8 +502,21 @@ impl LogitOutput {
         ctx: BatchContext,
         seq: SeqId,
     ) -> anyhow::Result<()> {
-        // Encoded once per attempt, before touching the network, so an oversized batch never
-        // connects.
+        // The marks exist only once a handshake has run, so a resend connects before it encodes.
+        let fresh = self.stream.is_none() && !self.resend_senders.is_empty();
+        if fresh {
+            self.stream = Some(self.connect_and_handshake().await?);
+        }
+        if let Some(conn) = self.stream.as_mut().filter(|conn| !conn.broken && conn.covers(seq)) {
+            conn.in_flight.push_back(InFlight { seq, acked: true });
+            let held = conn.in_flight.len();
+            self.telemetry.count("logit.output.batches.resumed", 1.0, &[]);
+            self.record_in_flight(held);
+            return Ok(());
+        }
+
+        // Encoded once per attempt, and with nothing to resend before touching the network, so
+        // an oversized batch never connects.
         let payload = native::encode_hop_batch(batch, ctx.provenance, seq);
         if payload.len() as u64 > frame::MAX_SANE_UNCOMPRESSED_LEN as u64 {
             self.warn_at_head(format!(
@@ -474,8 +537,9 @@ impl LogitOutput {
                     "this connection stopped taking frames with {held} in flight"
                 ));
             }
-            // With frames in flight the probe would consume a byte of an `Ack`.
-            Some(conn) if !conn.nothing_in_flight() => conn,
+            // With frames in flight the probe would consume a byte of an `Ack`; a connection
+            // handshaken by this call needs none.
+            Some(conn) if fresh || !conn.nothing_in_flight() => conn,
             // The module doc's "Pooled-connection probe": nothing is written yet, so replacing
             // the connection is the `Clean` path, counted as a reconnect.
             Some(mut conn) => {
@@ -601,6 +665,8 @@ impl LogitOutput {
                 }
             };
             if let Some(err) = err {
+                // The retried round resubmits every frame in flight from the head.
+                self.resend_senders = conn.resend_senders();
                 self.record_in_flight(0);
                 return Err(err);
             }
@@ -2099,6 +2165,7 @@ mod tests {
             window: 1,
             in_flight: VecDeque::new(),
             broken: false,
+            marks: HashMap::new(),
             telemetry: Telemetry::default(),
         }
     }
@@ -3156,5 +3223,261 @@ mod tests {
 
         assert_eq!(recv_batch(&mut rx).await.events[0].timestamp, 6, "4 and 5 not forwarded again");
         assert_eq!(probe.sum("logit.input.batches.resends", &[]), 2.0);
+    }
+
+    // ---- the resume (`docs/adr/native-hop-named-acks.md`, decision 4) -------------------------
+
+    const C: [u8; 16] = [0xC; 16];
+
+    /// What a [`resume_peer`] read, in order.
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Hello(Vec<[u8; 16]>),
+        Frame(SeqId),
+    }
+
+    /// Reads one data frame, returning its pair, or `None` once the connection ends.
+    async fn next_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Option<SeqId> {
+        let mut header = [0u8; frame::HEADER_LEN];
+        stream.read_exact(&mut header).await.ok()?;
+        let h = frame::FrameHeader::read(&mut Bytes::copy_from_slice(&header)).ok()?;
+        let mut body = vec![0u8; h.compressed_len as usize];
+        stream.read_exact(&mut body).await.ok()?;
+        let ack = ack_naming(&header, &body);
+        Some(SeqId { id: ack.id, seq: ack.seq })
+    }
+
+    /// A peer answering window 32 on every connection, reporting each `Hello.senders` and each
+    /// data frame's pair. Its `HelloAck.marks` holds each of `marks` whose identity the `Hello`
+    /// listed, in the order listed. Its first connection reads `cut.0` frames, writes `cut.1`, and
+    /// closes; every other connection acks each frame by name as it reads it.
+    async fn resume_peer(
+        marks: Vec<([u8; 16], u64)>,
+        cut: Option<(usize, Vec<control::Ack>)>,
+    ) -> (String, mpsc::UnboundedReceiver<Seen>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut cut = cut;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let Ok(control::ControlMessage::Hello(hello)) = read_control(&mut stream).await
+                else {
+                    return;
+                };
+                let answered = hello
+                    .senders
+                    .iter()
+                    .filter_map(|id| marks.iter().find(|(held, _)| held == id).copied())
+                    .collect();
+                tx.send(Seen::Hello(hello.senders)).unwrap();
+                let ack = control::HelloAck { window: 32, marks: answered, ..hello_ack() };
+                write_control(&mut stream, &ack).await.unwrap();
+                if let Some((frames, acks)) = cut.take() {
+                    for _ in 0..frames {
+                        tx.send(Seen::Frame(next_frame(&mut stream).await.unwrap())).unwrap();
+                    }
+                    for ack in &acks {
+                        write_control(&mut stream, ack).await.unwrap();
+                    }
+                    continue;
+                }
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    while let Some(seq) = next_frame(&mut stream).await {
+                        let _ = tx.send(Seen::Frame(seq));
+                        if write_control(&mut stream, &ack_for(seq)).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    async fn next_seen(rx: &mut mpsc::UnboundedReceiver<Seen>) -> Seen {
+        tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("the peer reads within RECV_TIMEOUT")
+            .expect("the peer is still running")
+    }
+
+    /// A connection dropped by a failed ack wait leaves the identities of its in-flight list,
+    /// distinct and in list order, and the next `Hello` lists them once.
+    #[tokio::test]
+    async fn a_reconnect_lists_the_identities_of_the_frames_it_will_resend() {
+        let first = [pair(A, 1), pair(A, 2), pair(B, 1), pair(B, 2), pair(C, 1)];
+        let (addr, mut rx) = resume_peer(vec![], Some((5, vec![ack_for(pair(A, 2))]))).await;
+        let mut output = LogitOutput::new(addr).with_timeout(RECV_TIMEOUT);
+        submit_pairs(&mut output, &first).await;
+        output.await_ack().await.expect("A1 is acked");
+        output.await_ack().await.expect("A2 is acked");
+        let err = output.await_ack().await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Ambiguous, "{err:#}");
+        assert!(output.stream.is_none());
+        assert_eq!(output.resend_senders, [B, C]);
+
+        submit_pairs(&mut output, &[pair(B, 1)]).await;
+        assert!(output.resend_senders.is_empty(), "the handshake that sent them clears them");
+
+        assert_eq!(next_seen(&mut rx).await, Seen::Hello(vec![]));
+        for seq in first {
+            assert_eq!(next_seen(&mut rx).await, Seen::Frame(seq));
+        }
+        assert_eq!(next_seen(&mut rx).await, Seen::Hello(vec![B, C]));
+        assert_eq!(next_seen(&mut rx).await, Seen::Frame(pair(B, 1)));
+    }
+
+    /// Frames at or below their identity's mark are pushed `acked` with nothing written, and
+    /// each `await_ack` commits one from the in-flight list, counted `ok`.
+    #[tokio::test]
+    async fn a_frame_at_or_below_its_mark_is_committed_without_a_write() {
+        let (addr, _rx) = resume_peer(vec![(A, 2)], None).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output =
+            LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
+        output.resend_senders = vec![A];
+
+        submit_pairs(&mut output, &[pair(A, 1), pair(A, 2)]).await;
+        assert_eq!(in_flight_of(&output), [(pair(A, 1), true), (pair(A, 2), true)]);
+        output.await_ack().await.expect("A1 is committed");
+        output.await_ack().await.expect("A2 is committed");
+        assert!(output.stream.as_ref().is_some_and(Conn::nothing_in_flight));
+
+        let totals = probe.poll();
+        assert_eq!(totals.sum("logit.output.batches.resumed", &[]), 2.0);
+        assert_eq!(totals.sum("logit.proto.frames", &[]), 0.0, "nothing was written");
+        assert_eq!(ack_waits(totals), 0, "nothing was read");
+        assert_eq!(requests(totals), ([2.0, 0.0, 0.0, 0.0], 2.0));
+    }
+
+    /// A frame above its identity's mark is sent and acked on the wire, after the covered one
+    /// before it commits from the list.
+    #[tokio::test]
+    async fn a_frame_above_its_mark_is_sent() {
+        let (addr, mut rx) = resume_peer(vec![(A, 1)], None).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output =
+            LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
+        output.resend_senders = vec![A];
+
+        submit_pairs(&mut output, &[pair(A, 1), pair(A, 2)]).await;
+        assert_eq!(in_flight_of(&output), [(pair(A, 1), true), (pair(A, 2), false)]);
+        output.await_ack().await.expect("A1 is committed");
+        output.await_ack().await.expect("A2 is acked");
+
+        assert_eq!(next_seen(&mut rx).await, Seen::Hello(vec![A]));
+        assert_eq!(next_seen(&mut rx).await, Seen::Frame(pair(A, 2)));
+        let totals = probe.poll();
+        assert_eq!(totals.sum("logit.output.batches.resumed", &[]), 1.0);
+        assert_eq!(requests(totals), ([2.0, 0.0, 0.0, 0.0], 2.0));
+    }
+
+    /// An identity `HelloAck.marks` omits has mark 0: every frame of it is sent.
+    #[tokio::test]
+    async fn marks_for_an_identity_the_receiver_omits_read_as_zero() {
+        let (addr, mut rx) = resume_peer(vec![(A, 5)], None).await;
+        let mut output = LogitOutput::new(addr);
+        output.resend_senders = vec![A, B];
+
+        submit_pairs(&mut output, &[pair(A, 1), pair(B, 1)]).await;
+        assert_eq!(in_flight_of(&output), [(pair(A, 1), true), (pair(B, 1), false)]);
+        output.await_ack().await.expect("A1 is committed");
+        output.await_ack().await.expect("B1 is acked");
+
+        assert_eq!(next_seen(&mut rx).await, Seen::Hello(vec![A, B]));
+        assert_eq!(next_seen(&mut rx).await, Seen::Frame(pair(B, 1)));
+    }
+
+    /// Seventeen identities in flight list the first sixteen; the seventeenth's frame is resent.
+    #[tokio::test]
+    async fn more_than_sixteen_identities_lists_the_first_sixteen_and_resends_the_rest() {
+        let ids: Vec<[u8; 16]> = (0..=control::MAX_HELLO_SENDERS as u8).map(|i| [i; 16]).collect();
+        let pairs: Vec<SeqId> = ids.iter().map(|&id| pair(id, 1)).collect();
+        let marks = ids.iter().map(|&id| (id, 1)).collect();
+        let (addr, mut rx) = resume_peer(marks, Some((pairs.len(), vec![]))).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = LogitOutput::new(addr)
+            .with_timeout(RECV_TIMEOUT)
+            .with_telemetry(probe.telemetry("out", "logit_out", "sink"));
+
+        submit_pairs(&mut output, &pairs).await;
+        output.await_ack().await.expect_err("the peer closes without an ack");
+        assert_eq!(output.resend_senders, ids[..control::MAX_HELLO_SENDERS]);
+
+        submit_pairs(&mut output, &pairs).await;
+        for _ in &pairs {
+            output.await_ack().await.expect("each frame commits");
+        }
+
+        assert_eq!(next_seen(&mut rx).await, Seen::Hello(vec![]));
+        for &seq in &pairs {
+            assert_eq!(next_seen(&mut rx).await, Seen::Frame(seq));
+        }
+        let listed = ids[..control::MAX_HELLO_SENDERS].to_vec();
+        assert_eq!(next_seen(&mut rx).await, Seen::Hello(listed));
+        let unlisted = pairs[control::MAX_HELLO_SENDERS];
+        assert_eq!(next_seen(&mut rx).await, Seen::Frame(unlisted), "only the unlisted one");
+        assert_eq!(probe.sum("logit.output.batches.resumed", &[]), 16.0);
+    }
+
+    /// With nothing to resend, a batch over the sanity cap fails `Permanent` before any connect.
+    #[tokio::test]
+    async fn an_oversized_head_with_nothing_to_resend_never_connects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut output = LogitOutput::new(listener.local_addr().unwrap().to_string());
+
+        let too_large = batch_of(frame::MAX_SANE_UNCOMPRESSED_LEN as usize + 1);
+        let err = send_next(&mut output, &too_large).await.unwrap_err();
+
+        assert_eq!(classify(&err), Fault::Permanent, "{err:#}");
+        assert!(output.stream.is_none());
+        tokio::select! {
+            biased;
+            _ = listener.accept() => panic!("an oversized batch connected"),
+            () = std::future::ready(()) => {}
+        }
+    }
+
+    /// With identities to resend, the connect comes first; a head over the sanity cap then fails
+    /// `Permanent` as it would on any connection, and the connection is kept.
+    #[tokio::test]
+    async fn an_oversized_head_with_identities_to_resend_connects_and_keeps_the_connection() {
+        let (addr, mut rx) = resume_peer(vec![], None).await;
+        let mut output = LogitOutput::new(addr);
+        output.resend_senders = vec![A];
+
+        let too_large = batch_of(frame::MAX_SANE_UNCOMPRESSED_LEN as usize + 1);
+        let err = send_next(&mut output, &too_large).await.unwrap_err();
+
+        assert_eq!(classify(&err), Fault::Permanent, "{err:#}");
+        assert!(output.stream.is_some(), "the connection made for the resend is kept");
+        assert_eq!(next_seen(&mut rx).await, Seen::Hello(vec![A]));
+    }
+
+    /// A mark for an identity the `Hello` didn't list doesn't answer it: `Permanent`, as an
+    /// unoffered codec is.
+    #[tokio::test]
+    async fn a_hello_ack_mark_for_an_unoffered_identity_is_permanent() {
+        let bad = control::HelloAck { marks: vec![(A, 1)], ..hello_ack() };
+        assert_hello_ack_is_refused_as_permanent(bad, "a mark never asked for").await;
+    }
+
+    #[test]
+    fn a_hello_ack_naming_one_identity_twice_does_not_answer_the_hello() {
+        let hello = control::Hello {
+            version: control::PROTOCOL_VERSION,
+            codecs: vec![native::CODEC_HOP_BATCH],
+            compressions: vec![0],
+            max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
+            window: 32,
+            senders: vec![A, B],
+        };
+        let once = control::HelloAck { marks: vec![(B, 3), (A, 1)], ..hello_ack() };
+        validate_hello_ack(&once, &hello).expect("each listed identity once, in any order");
+        let twice = control::HelloAck { marks: vec![(A, 1), (A, 2)], ..hello_ack() };
+        let err = validate_hello_ack(&twice, &hello).unwrap_err();
+        assert!(format!("{err:#}").contains("two marks"), "{err:#}");
     }
 }

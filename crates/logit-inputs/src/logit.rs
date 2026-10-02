@@ -504,14 +504,21 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     shutdown: watch::Receiver<bool>,
     senders: Arc<SenderTable>,
 ) -> anyhow::Result<()> {
-    let negotiated =
-        match handshake(&mut stream, max_frame_bytes, handshake_timeout, &telemetry).await {
-            Ok(n) => n,
-            Err(err) => {
-                telemetry.count("logit.proto.errors", 1.0, &[("reason", "handshake")]);
-                return Err(err);
-            }
-        };
+    let negotiated = match handshake(
+        &mut stream,
+        max_frame_bytes,
+        handshake_timeout,
+        &telemetry,
+        &senders,
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(err) => {
+            telemetry.count("logit.proto.errors", 1.0, &[("reason", "handshake")]);
+            return Err(err);
+        }
+    };
     // `sink` moves into `serve_frames` and drops when it returns, so a lingering close never
     // holds the graph's cancel-by-drop shutdown open.
     let ended = serve_frames(
@@ -932,14 +939,16 @@ async fn close_idle<S: AsyncWrite + Unpin>(
 ///
 /// `HelloAck` carries the best shared codec, `lz4` or no compression, this listener's
 /// `max_frame_bytes` (every later frame is bounded by it), and the smaller of the offered window
-/// and `RECEIVER_MAX_WINDOW`. A `Hello` that fails to decode, a missing field or a window of 0
-/// among the reasons, ends the connection with no reply. Each reply is written within
+/// and `RECEIVER_MAX_WINDOW`, and `senders`' mark for each identity `Hello.senders` lists that
+/// it holds (`docs/adr/native-hop-named-acks.md`, decision 4). A `Hello` that fails to decode, a
+/// missing field or a window of 0 among the reasons, ends the connection with no reply. Each reply is written within
 /// `handshake_timeout` too, a fresh bound per write.
 async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     max_frame_bytes: u32,
     handshake_timeout: Duration,
     telemetry: &Telemetry,
+    senders: &SenderTable,
 ) -> anyhow::Result<Negotiated> {
     let read = tokio::time::timeout(handshake_timeout, async {
         let Some(header_buf) =
@@ -1016,9 +1025,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         compression: compression as u8,
         max_frame_bytes,
         window: hello.window.min(RECEIVER_MAX_WINDOW),
-        // No marks, whatever `Hello.senders` lists: the resume
-        // (`docs/adr/native-hop-named-acks.md`, decision 4) isn't answered here.
-        marks: vec![],
+        marks: senders.marks(&hello.senders),
     };
     write_control(stream, &ack, handshake_timeout).await?;
     Ok(Negotiated { compression })
@@ -2851,6 +2858,7 @@ mod tests {
                 frame::MAX_SANE_UNCOMPRESSED_LEN,
                 HANDSHAKE_TIMEOUT,
                 &Telemetry::default(),
+                &senders(),
             )
             .await;
         });
@@ -3536,6 +3544,31 @@ mod tests {
         assert_eq!(recv_mark(&mut rx_b).await, 1);
         assert_eq!(probe_a.sum("logit.input.batches.resends", &[]), 0.0);
         assert_eq!(probe_b.sum("logit.input.batches.resends", &[]), 0.0);
+    }
+
+    /// `HelloAck.marks` answers each identity `Hello.senders` lists that the table holds, with
+    /// its mark, in the order asked; an identity it doesn't hold is omitted.
+    #[tokio::test]
+    async fn hello_ack_answers_a_mark_for_each_listed_identity_it_holds() {
+        let probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
+
+        let mut client = hop_client(&addr).await;
+        send_acked(&mut client, 1, sid(1, 4)).await;
+        send_acked(&mut client, 2, sid(2, 7)).await;
+        for mark in 1..=2 {
+            assert_eq!(recv_mark(&mut rx).await, mark);
+        }
+
+        let mut client = connect(&addr).await;
+        let hello = control::Hello { senders: vec![[2; 16], [3; 16], [1; 16]], ..hello() };
+        write_msg(&mut client, &hello).await;
+        match read_control_response(&mut client).await {
+            control::ControlMessage::HelloAck(ack) => {
+                assert_eq!(ack.marks, vec![([2; 16], 7), ([1; 16], 4)]);
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
     }
 
     // ---- the send window ------------------------------------------------------------------------

@@ -1882,6 +1882,9 @@ attempt.
 - `logit.output.reconnects` (count): every connect *after* the first whose `HelloAck` passed
   validation. A climbing count in steady state means the peer or the network, not this sink, is
   unstable.
+- `logit.output.batches.resumed` (count): frames a reconnect committed from `HelloAck.marks`
+  without resending them ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md),
+  decision 4).
 - `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count): the `Fault` taxonomy
   as request-outcome classes, one per `submit` that fails with a `Fault` and one per `await_ack`
   that returns. A `send` is a `submit` then an `await_ack`, so it counts once, and the total equals
@@ -1895,8 +1898,8 @@ attempt.
   frame; `clean` a failure before a frame was completely written and flushed with nothing in flight,
   or a `Reject{GOING_AWAY}` read in place of an `Ack`; `ambiguous` a lost `Ack` (a timeout, an EOF,
   a reset, another message) or an `Ack` naming no run of the frames in flight; and `permanent` a size check or a frame-build
-  error at the head, a `HelloAck` that names another version or an unoffered codec or compression,
-  or a permanent reject ([ADR
+  error at the head, a `HelloAck` that names another version, an unoffered codec or compression,
+  or a mark for an identity `Hello.senders` didn't list, or a permanent reject ([ADR
   `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
   decision 6).
 

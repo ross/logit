@@ -529,7 +529,7 @@ mod window {
 
     /// A relay in front of `logit_in` that can hold the acks coming back and cut every connection
     /// open at once. Holding the acks leaves a whole window forwarded and unacknowledged; the cut
-    /// then makes the sender resend it on a new connection.
+    /// then makes the sender take it to a new connection.
     struct Relay {
         addr: String,
         hold_acks: watch::Sender<bool>,
@@ -589,11 +589,11 @@ mod window {
     }
 
     /// The connection is cut with a full window forwarded by `logit_in` and unacknowledged at the
-    /// sender. `write_loop` resends the window from its head on a new connection, under the same
-    /// sequence numbers, and `logit_in` acknowledges each resend without forwarding it again.
+    /// sender. The new connection's `Hello` lists the window's identity, `HelloAck` answers its
+    /// mark, and every frame of the window commits from it with nothing resent
+    /// (`docs/adr/native-hop-named-acks.md`, decision 4).
     #[tokio::test]
-    async fn a_connection_cut_mid_window_resends_the_window_and_logit_in_forwards_each_batch_once()
-    {
+    async fn a_connection_cut_mid_window_resumes_the_window_without_resending_it() {
         let mut probe = TelemetryProbe::new();
         let (listener_addr, marks) = spawn_listener(&probe).await;
         let relay = spawn_relay(listener_addr).await;
@@ -639,7 +639,8 @@ mod window {
         let expected: Vec<i64> = (0..BATCHES as i64).collect();
         assert_eq!(*marks.lock().unwrap(), expected, "each batch once, in order");
         let totals = probe.poll();
-        assert_eq!(totals.sum("logit.input.batches.resends", &[]), 32.0, "the resent window");
+        assert_eq!(totals.sum("logit.output.batches.resumed", &[]), 32.0, "the cut window");
+        assert_eq!(totals.sum("logit.input.batches.resends", &[]), 0.0, "nothing resent");
         assert!(totals.sum("logit.output.reconnects", &[]) >= 1.0);
         std::fs::remove_dir_all(&dir).ok();
     }

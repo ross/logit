@@ -99,10 +99,6 @@ impl SenderTable {
     /// doesn't hold is omitted. A read: it inserts nothing, evicts nothing, and leaves every
     /// identity's recency alone, so a sender listing a stale identity can't keep it held
     /// (`docs/adr/native-hop-named-acks.md`, decision 4).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "answers `Hello.senders` once the handshake resumes")
-    )]
     pub(crate) fn marks(&self, ids: &[[u8; 16]]) -> Vec<([u8; 16], u64)> {
         let state = self.lock();
         ids.iter().filter_map(|id| state.entries.get(id).map(|entry| (*id, entry.mark))).collect()
