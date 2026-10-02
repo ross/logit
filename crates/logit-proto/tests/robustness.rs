@@ -285,6 +285,7 @@ fn sample_hello() -> Hello {
         compressions: vec![0, 1],
         max_frame_bytes: 4096,
         window: 1,
+        senders: vec![[3; 16]],
     }
 }
 
@@ -295,11 +296,12 @@ fn sample_hello_ack() -> HelloAck {
         compression: 1,
         max_frame_bytes: 4096,
         window: 1,
+        marks: vec![([3; 16], 7)],
     }
 }
 
 fn sample_ack() -> Ack {
-    Ack
+    Ack { id: [3; 16], seq: 7 }
 }
 
 fn sample_reject() -> Reject {

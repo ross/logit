@@ -107,12 +107,8 @@ pub trait Output {
     /// Writes `batch` without waiting for its delivery, under a window above 1
     /// (`docs/adr/native-hop-send-window.md`, decision 4). `ctx` and `seq` are the batch's, as
     /// [`Output::observe_batch`] last saw them for it; a resubmitted batch isn't observed again.
-    /// `in_flight` is `write_loop`'s count of batches submitted and not yet acknowledged, so this
-    /// one is at that position from the oldest. A sink whose own count differs must fail
-    /// [`Fault::Ambiguous`], so a drifted count can't let an acknowledgment deliver a batch that
-    /// was never sent.
     ///
-    /// A failure with `in_flight == 0` is this batch's own, classified as a `send` failure is.
+    /// A failure with nothing in flight is this batch's own, classified as a `send` failure is.
     /// A failure with batches in flight is never classified: `write_loop` stops submitting and
     /// reads the acknowledgments already owed through [`Output::await_ack`]. Cancellable at every
     /// await, as `send` is; a cancelled `submit` means the sink dropped its connection and nothing
@@ -122,9 +118,8 @@ pub trait Output {
         batch: &EventBatch,
         ctx: BatchContext,
         seq: SeqId,
-        in_flight: usize,
     ) -> anyhow::Result<()> {
-        let _ = (ctx, seq, in_flight);
+        let _ = (ctx, seq);
         self.send(batch).await
     }
 

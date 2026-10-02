@@ -1024,7 +1024,7 @@ async fn window_round(
         let result = if position == 0 {
             // Nothing is in flight, so cutting this submit loses no acknowledgment.
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, output.submit(&batch, ctx, seq, 0)).await {
+            match tokio::time::timeout(remaining, output.submit(&batch, ctx, seq)).await {
                 Ok(result) => result,
                 Err(_elapsed) => Err(anyhow::anyhow!(
                     "submit exceeded the remaining retry budget ({remaining:?})"
@@ -1032,7 +1032,7 @@ async fn window_round(
                 .context(Fault::Ambiguous)),
             }
         } else {
-            output.submit(&batch, ctx, seq, position).await
+            output.submit(&batch, ctx, seq).await
         };
         state.submitting = false;
         match result {
@@ -6266,7 +6266,8 @@ mod tests {
         Observe(u64),
         /// `send`, the fast path.
         Send(u64),
-        /// `submit(batch, _, seq, in_flight)`: `(value, seq, in_flight)`.
+        /// `submit(batch, _, seq)`: `(value, seq, in_flight)`, `in_flight` the batches the sink
+        /// held unacknowledged when it was called.
         Submit(u64, u64, usize),
         /// An `await_ack` that delivered this batch.
         Ack(u64),
@@ -6288,9 +6289,8 @@ mod tests {
     /// submission connects it and `windows.1` after, and every dropped connection goes back to
     /// `windows.0`. A failed `submit` with nothing in flight drops the connection; with batches in
     /// flight it marks it broken, failing every later submit until the acks already owed are
-    /// read. A failed or cancelled `await_ack` drops it with every batch in flight. A submit whose
-    /// `in_flight` disagrees with its own count fails `Ambiguous`. `send` is `submit` at 0 then
-    /// `await_ack`.
+    /// read. A failed or cancelled `await_ack` drops it with every batch in flight. `send` is
+    /// `submit` then `await_ack`.
     struct WindowedOutput {
         windows: (usize, usize),
         connected: bool,
@@ -6370,12 +6370,7 @@ mod tests {
             self.broken = false;
         }
 
-        fn submit_value(&mut self, value: u64, in_flight: usize) -> anyhow::Result<()> {
-            if in_flight != self.in_flight.len() {
-                self.drop_connection();
-                return Err(anyhow::anyhow!("in_flight {in_flight} disagrees with the connection"))
-                    .context(Fault::Ambiguous);
-            }
+        fn submit_value(&mut self, value: u64) -> anyhow::Result<()> {
             let scripted = self.submit_script.pop_front().flatten();
             let fault = match self.submit_fails {
                 Some((v, fault)) if v == value => Some(fault),
@@ -6405,7 +6400,7 @@ mod tests {
     impl Output for WindowedOutput {
         async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
             self.record(Call::Send(value_of(batch)));
-            self.submit_value(value_of(batch), 0)?;
+            self.submit_value(value_of(batch))?;
             self.await_ack().await
         }
 
@@ -6427,16 +6422,15 @@ mod tests {
             batch: &EventBatch,
             _ctx: BatchContext,
             seq: SeqId,
-            in_flight: usize,
         ) -> anyhow::Result<()> {
             let value = value_of(batch);
-            self.record(Call::Submit(value, seq.seq, in_flight));
+            self.record(Call::Submit(value, seq.seq, self.in_flight.len()));
             if let Some((v, delay)) = self.submit_delay {
                 if v == value {
                     tokio::time::sleep(delay).await;
                 }
             }
-            self.submit_value(value, in_flight)
+            self.submit_value(value)
         }
 
         async fn await_ack(&mut self) -> anyhow::Result<()> {

@@ -372,9 +372,9 @@ Under `logit_out`, the receiving `logit_in` narrows that window. Each spool reco
 sender identity and sequence it was written with, so a `logit_in` that's still running
 acknowledges a replayed record at or below its sender's mark without forwarding it, and counts it
 `logit.input.batches.resends`. The replay still reaches `logit_in`'s consumers when that
-`logit_in` restarted, when it evicted the sender from its table, or when the record carries no
-identity and sequence, which `logit_in` always forwards (see
-[Forwarding between `logit` nodes](#forwarding-between-logit-nodes)).
+`logit_in` restarted or when it evicted the sender from its table (see
+[Forwarding between `logit` nodes](#forwarding-between-logit-nodes)). A record without a
+complete identity and sequence is corrupt and skipped, never replayed.
 
 ```yaml
 buffer:
@@ -738,7 +738,7 @@ disable the idle timeout") and, on `syslog_in`/`graphite_in`/`statsd_in`, reject
 
 **What it bounds, and what resets it.** The clock runs only while the listener waits on the peer's
 socket. Only two things reset it: bytes read from the peer, and the listener finishing its own work
-on the connection (a batch handed downstream, a response completed, an `Ack` written). Time spent
+on the connection (a batch handed downstream, a resend recognized, a response completed). Time spent
 blocked handing a batch to a full downstream never counts, because the clock isn't re-armed until
 that work returns. So a connection stalled on backpressure never looks idle, however long the
 stall. A periodic flush tick that finds nothing to send touches neither event, so it never re-arms
@@ -749,7 +749,7 @@ the clock by itself.
 | Kind | What resets the clock | How the close happens |
 |---|---|---|
 | `syslog_in`, `graphite_in`, `statsd_in` (`transport: tcp`, the shared driver) | bytes read from the peer; an interval flush that actually emits a batch | the connection is closed directly; any complete buffered batch is flushed first |
-| `logit_in` | the handshake completing, and every `Ack` this listener writes; a peer waiting on a delayed ack is by definition not idle. A frame header whose first byte has already arrived is progress too: the absolute idle deadline bounds only the wait for that first byte, and the rest of the header — like the body — is read under the per-`read` stall bound instead, so a frame that starts arriving right at the deadline is read and acked rather than rejected after the peer already wrote it | `Reject{GOING_AWAY, "idle for <dur>"}` is written first, the same signal an ordinary shutdown sends, then the connection closes |
+| `logit_in` | the handshake completing, and every frame this listener handles: forwarded, or recognized as a resend and not forwarded. An `Ack` can trail the frames it covers, so the clock runs from the last frame handled, not the last `Ack` written; a peer waiting on a delayed ack is by definition not idle. A frame header whose first byte has already arrived is progress too: the absolute idle deadline bounds only the wait for that first byte, and the rest of the header — like the body — is read under the per-`read` stall bound instead, so a frame that starts arriving right at the deadline is read and acked rather than rejected after the peer already wrote it | `Reject{GOING_AWAY, "idle for <dur>"}` is written first, the same signal an ordinary shutdown sends, then the connection closes |
 | `otlp_in` | a request *completing* — hyper owns the bytes, so this is the finest grain visible here; a request head that dribbles in slower than `idle_timeout` on an otherwise-quiet keep-alive connection is closed by this rule, a documented narrowing; a stalled request *body* gets its own bound, `idle_timeout` itself, per read frame | `graceful_shutdown()` is called and the connection is polled for up to `handshake_timeout` (reused as the grace period — no new knob); if that grace elapses with nothing in flight the connection is dropped regardless of what the poll returned, and if a request arrives inside the grace instead, see the note below the table; a stalled body instead answers `408` (`protocol: http`) or `grpc-status: 4` (`protocol: grpc`) and closes the connection once the handler returns — that close is counted the same `reason="idle"` as any other, one policy close reached one path earlier |
 
 On `otlp_in`, a request that arrives inside the grace is served to completion, not dropped: the
@@ -2682,12 +2682,30 @@ The connection uses the smaller of `window` and what `logit_in` answers, which i
 window capped at `1024`. A memory buffer's `max_batches` also caps it, since a batch in flight
 stays in the sink's queue until its `Ack` arrives. `window: 1` keeps one frame in flight.
 
+**What an `Ack` means.** An `Ack` names a sender identity and a sequence, and covers every frame of
+that identity up to the sequence that its connection carried, so one `Ack` can answer several
+frames ([ADR `native-hop-named-acks`](adr/native-hop-named-acks.md)). `logit_in` writes one per run
+of frames rather than one per frame, at least every 32 frames and always before a `Reject`; the
+ADR's decision 2 says when. A sender that stops sending gets its `Ack` at once, since `logit_in`
+writes it before it would wait. A sender streaming faster than `logit_in` forwards gets one `Ack`
+per burst, up to 32 frames, because `logit_in` keeps finding the next frame already buffered and
+holds the pending `Ack` through each forward. An `Ack` grants no credit; the window stays fixed at
+the handshake.
+
 **Under `buffer.delivery: at_most_once`, set `window: 1`.** An ambiguous fault (a lost or late
 `Ack`, a reset) drops every batch in flight, not only the oldest, because each one may or may not
-have been forwarded. Under the default `at_least_once`, the same fault resends the window from the
-oldest unacknowledged batch, and `logit_in` acknowledges each batch it already forwarded without
-forwarding it again. Nothing enforces the pairing; a larger window under `at_most_once` loses more
-per fault.
+have been forwarded. Under the default `at_least_once`, the same fault retries the window from the
+oldest unacknowledged batch, resuming rather than resending (below). Nothing enforces the pairing;
+a larger window under `at_most_once` loses more per fault.
+
+**A reconnect resumes from `logit_in`'s marks.** When a fault drops a connection with frames in
+flight and the round is retried, the next handshake lists the sender identities of those frames,
+and `logit_in` answers its high-water mark for each one it holds. A batch at or below its
+identity's mark is one `logit_in` already handled, so `logit_out` commits it without sending it
+again and counts it `logit.output.batches.resumed`; only the batches above the mark are resent.
+The handshake lists at most 16 identities, so a window spanning more store opens than that (a long
+spool replay, say) resends the rest, and `logit_in` recognizes each by its mark without forwarding
+it. A `logit_in` that restarted holds no marks, and every batch is resent.
 
 **Sizing `request_timeout` against `buffer.retry_budget`.** Keep `request_timeout` comfortably under
 `retry_budget`. `logit_out.request_timeout` (default 10s) bounds each step of one attempt
@@ -2778,12 +2796,13 @@ takes it, raises the mark. What follows from that:
 - **Cloning a running process is unsupported.** A VM snapshot or a CRIU checkpoint restored
   beside its original shares the sink's identity and sequence, and `logit_in` reads the second
   copy's batches as resends and doesn't forward them.
-- **The sequence identifies a batch; it never acknowledges one.** `Ack` carries no fields. It
-  answers the oldest frame still unanswered on its connection, because `logit_in` answers a
-  connection's frames in the order they arrive.
+- **The sequence identifies a batch, and `Ack` names what is handled.** `Ack { id, seq }` says
+  every frame of that identity at or below `seq` on its connection is handled (see "What an `Ack`
+  means" above), and a reconnect's handshake reads the marks back to resume.
 
 **A `HelloAck` that doesn't answer the `Hello` is permanent.** A peer that acks another protocol
-version, or a codec or compression this sink didn't offer, fails every attempt `permanent`, like a
+version, a codec or compression this sink didn't offer, a mark for an identity this sink didn't
+list, or two marks for one identity fails every attempt `permanent`, like a
 `Reject` for a version mismatch: the batch is dropped, and a minute of nothing else ends the
 pipeline. A stock `logit_in` never answers this way; it points at something else on the port.
 
@@ -2798,19 +2817,25 @@ reconnecting doesn't show as `connection_error` on the far end.
   read or ack wait that fails, plus one per failed connect or handshake, too-large batch, or write
   that fails with nothing in flight; `ok` is an acknowledged frame, `clean` a failure before a frame
   was fully written with nothing in flight or a `GOING_AWAY` in place of an `Ack`, `ambiguous` a
-  lost `Ack` (a timeout, an EOF, a reset, another message) or an `in_flight` drift, and `permanent`
-  a size check or a frame-build error at the head, a `HelloAck` that names another version or an
-  unoffered codec or compression, or a permanent reject), `logit.output.reconnects` (should stay
+  lost `Ack` (a timeout, an EOF, a reset, another message) or an `Ack` naming no run of the frames
+  in flight, and `permanent`
+  a size check or a frame-build error at the head, a `HelloAck` that doesn't answer the `Hello`,
+  or a permanent reject), `logit.output.reconnects` (should stay
   near zero in steady state; a climbing count means the peer or the network is unstable),
-  `logit.output.ack.duration`, `logit.output.in_flight` (a gauge of frames awaiting an `Ack`, set
+  `logit.output.batches.resumed` (batches a reconnect committed from `logit_in`'s marks instead
+  of resending), `logit.output.ack.duration` (one sample per read of the wire for an `Ack`, so a
+  coalesced `Ack` is timed once), `logit.output.in_flight` (a gauge of frames not yet committed, set
   from the first connection on and 0 after any drop; one that sits at the window means the round
   trip or the peer's forwarding is the limit, and raising `window` helps only in the first case),
   and `logit.output.window` (a gauge of the live connection's negotiated window, set from the first
   connection on and 1 after any drop or a shutdown; below the configured `window` on a live
   connection means `logit_in` answered less).
 - `logit_in`: `logit.input.connections` (a gauge that should match the number of connected
-  `logit_out` peers), `logit.input.connections.rejected{reason="limit"}` (nonzero means the
-  `max_connections` cap is binding; raise `max_connections` or shed load upstream), and
+  `logit_out` peers), `logit.input.acks` (`Ack`s written; against
+  `logit.proto.frames{direction="in"}` it reads as frames per `Ack`, near 1 for a sender that
+  waits on each frame, higher when frames arrive faster than `logit_in` forwards them, up to 32),
+  `logit.input.connections.rejected{reason="limit"}` (nonzero means the `max_connections` cap is
+  binding; raise `max_connections` or shed load upstream), and
   `logit.proto.errors{reason}`
   (`magic`/`version`/`malformed`/`crc`/`truncated_header`/`truncated`/`too_large`/`codec`/
   `handshake`/`decode_budget`/`ack_write_stalled`/`reject_write_stalled`; any of these on a

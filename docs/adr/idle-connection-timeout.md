@@ -1,12 +1,14 @@
 ---
 created: 2026-09-14
-updated: 2026-09-30
+updated: 2026-10-02
 ---
 
 # Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe
 
 ## Status
-Accepted
+Accepted. Superseded in part on 2026-10-02 by [ADR
+`native-hop-named-acks`](native-hop-named-acks.md): "`logit_in`: idle measured from the last
+`Ack` written". The clock runs from the last frame handled.
 
 ## Context
 
@@ -120,6 +122,11 @@ first byte, or idle past an established connection) rather than reconcile two in
 timers.
 
 ### `logit_in`: idle measured from the last `Ack` written
+
+[Superseded in part on 2026-10-02 by [ADR `native-hop-named-acks`](native-hop-named-acks.md),
+decision 2: `logit_in` measures idleness from the last frame it handled, since an ack can trail
+its frame once acks are coalesced. The reasoning below is unchanged; only the clock's reference
+point moved.]
 
 This is the answer to question 2. A `logit_out` peer waiting on a delayed ack is, by definition, not
 idle -- the listener itself is the one doing the work that delays it, per

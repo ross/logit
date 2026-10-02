@@ -1140,10 +1140,14 @@ the property the minimal-watch-set design is for.
 
 `crates/logit-inputs/src/logit.rs`,
 [ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md),
-[ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md).
+[ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md),
+[ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md).
 
 - `logit.proto.frames{direction="in",compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
+- `logit.input.acks` (count): `Ack`s written, one per run of handled frames
+  ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 2). Against
+  `logit.proto.frames{direction="in"}` it shows the coalescing ratio.
 - `logit.proto.errors{reason="magic"|"version"|"malformed"|"crc"|"truncated_header"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"|"ack_write_stalled"|"reject_write_stalled"}`
   (count): every way a frame or a handshake can be rejected, each its own reason so a version
   mismatch doesn't hide behind a generic "bad frame" tag. `magic` is a frame header whose magic
@@ -1162,8 +1166,9 @@ the property the minimal-watch-set design is for.
   past its per-frame budget (`native::DecodeBudget`), a batch too large for the frame cap it
   arrived under rather than corrupt bytes, also answered `Reject{FRAME_TOO_LARGE}`. The two
   `_write_stalled` reasons count a control write to a peer that stopped reading, abandoned after
-  `handshake_timeout`: an `Ack` (the connection ends) or a `Reject` (the connection was closing
-  anyway).
+  `handshake_timeout`: an `Ack` (the connection ends; for the `Ack` written before a `Reject`, the
+  `Reject` is left out and the close ends as it would have) or a `Reject` (the connection was
+  closing anyway).
 - `logit.input.connections` (gauge, sampled on every connect/disconnect) and
   `logit.input.connections.rejected{reason="limit"}` (count, the connection cap,
   `max_connections`, 1024 by default, binding). `otlp_in` and a TCP
@@ -1172,7 +1177,7 @@ the property the minimal-watch-set design is for.
   listener closed still counts, and holds its permit, while it lingers: after its last answer it
   reads and discards until the peer closes or for `handshake_timeout`.
 - `logit.input.connections.closed{reason="idle"}` (count), the third point all five share. Here the
-  idle time is measured from the last `Ack` written rather than from bytes read, because a peer
+  idle time is measured from the last frame handled rather than from bytes read, because a peer
   waiting on a delayed ack isn't idle. The close writes `Reject{GOING_AWAY, "idle for <dur>"}`, the
   same signal an ordinary shutdown sends, and returns `Ok(())`: it's never
   `logit.proto.errors{reason="handshake"}` or any other diagnostic.
@@ -1863,14 +1868,16 @@ attempt.
 `crates/logit-outputs/src/logit.rs`,
 [ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md),
 [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md),
-[ADR `native-hop-send-window`](../adr/native-hop-send-window.md).
+[ADR `native-hop-send-window`](../adr/native-hop-send-window.md),
+[ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md).
 
 - `logit.proto.frames{direction="out",compression}` and `logit.proto.frame.bytes`: the
   send-side mirror of `logit_in`'s pair.
-- `logit.output.ack.duration` (timer, one per `await_ack` that reads from the connection): the
-  wait for one `Ack`, finer-grained than layer 2's `logit.component.send.duration`, which times a
-  whole attempt or windowed round, connect, handshake, and writes included.
-- `logit.output.in_flight` (gauge): frames written and awaiting an `Ack`, set on every change. It
+- `logit.output.ack.duration` (timer, one sample per read of the connection for an `Ack`; an
+  `await_ack` answered by an `Ack` already read records none): the wait for one `Ack`,
+  finer-grained than layer 2's `logit.component.send.duration`, which times a whole attempt or
+  windowed round, connect, handshake, and writes included.
+- `logit.output.in_flight` (gauge): frames written and not yet committed, set on every change. It
   reads 0 after every connection drop, a cancelled call's included. A value that sits at
   `logit.output.window` means the round trip, or the peer's forwarding, bounds this sink.
 - `logit.output.window` (gauge): the window the live connection negotiated, the smaller of the
@@ -1879,21 +1886,25 @@ attempt.
 - `logit.output.reconnects` (count): every connect *after* the first whose `HelloAck` passed
   validation. A climbing count in steady state means the peer or the network, not this sink, is
   unstable.
+- `logit.output.batches.resumed` (count): frames a reconnect committed from `HelloAck.marks`
+  without resending them ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md),
+  decision 4).
 - `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count): the `Fault` taxonomy
   as request-outcome classes, one per `submit` that fails with a `Fault` and one per `await_ack`
   that returns. A `send` is a `submit` then an `await_ack`, so it counts once, and the total equals
   the number of `send` calls that returned. A connect or handshake failure and a batch too large to
   send count as failed submits. A submit that fails with frames already in flight (a stalled or
   failed write) carries no `Fault` and isn't counted: the `await_ack`s after it count the round's
-  outcome, `ok` for each `Ack` drained and the class of the failure that ends it. A drifted
-  `in_flight` counts once, `ambiguous`, in the `submit` that finds it. A `Permanent` past the head
+  outcome, `ok` for each frame an `Ack` commits, an `await_ack` answered by an `Ack` already read
+  included, and the class of the failure that ends it. A `Permanent` past the head
   is counted when it becomes the head. A cancelled call (a budget timeout, the shutdown grace)
   returns nothing and isn't counted; `logit.component.errors` covers it. `ok` is an acknowledged
   frame; `clean` a failure before a frame was completely written and flushed with nothing in flight,
   or a `Reject{GOING_AWAY}` read in place of an `Ack`; `ambiguous` a lost `Ack` (a timeout, an EOF,
-  a reset, another message) or an `in_flight` drift; and `permanent` a size check or a frame-build
-  error at the head, a `HelloAck` that names another version or an unoffered codec or compression,
-  or a permanent reject ([ADR
+  a reset, another message) or an `Ack` naming no run of the frames in flight; and `permanent` a
+  size check or a frame-build error at the head, a `HelloAck` that doesn't answer the `Hello`
+  (another version, an unoffered codec or compression, a mark for an identity `Hello.senders`
+  didn't list, or two marks for one identity), or a permanent reject ([ADR
   `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
   decision 6).
 

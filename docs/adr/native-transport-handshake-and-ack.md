@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-10-01
+updated: 2026-10-02
 ---
 
 # Native transport: handshake, implicit sequencing, and per-batch acknowledgement
@@ -16,7 +16,10 @@ connection, in this plan", the deferred alternative "Building credit-based flow 
 window to use cumulative acks (the acks stay empty and in frame order). Superseded in part on
 2026-10-01 by [ADR `native-hop-no-compatibility`](native-hop-no-compatibility.md): "Control
 payload"'s skip-unknown forward compatibility. A control message's fields are each required, and
-an unknown tag is malformed.
+an unknown tag is malformed. Superseded in part on 2026-10-02 by [ADR
+`native-hop-named-acks`](native-hop-named-acks.md): the `Ack` entry of "Control payload" and the
+`Hello`/`HelloAck` field lists. `Ack` is `{ id, seq }`, `Hello` gains `senders`, and `HelloAck`
+gains `marks`.
 
 ## Context
 
@@ -176,7 +179,9 @@ this ADR's own shutdown path already closes one -- `Reject{GOING_AWAY, "idle for
 first, then the connection drops -- so a `logit_out` peer needs no new case to tell an idle close
 from an ordinary shutdown; both arrive as the identical control message. The clock is measured from
 the last `Ack` written (or the handshake, on a connection that has sent nothing yet), never from
-the last frame read: a peer waiting on an `Ack` this listener is deliberately delaying for a slow
+the last frame read [superseded on 2026-10-02 by [ADR
+`native-hop-named-acks`](native-hop-named-acks.md), decision 2: the clock runs from the last
+frame handled, since a coalesced ack can trail its frame]: a peer waiting on an `Ack` this listener is deliberately delaying for a slow
 downstream is, by this ADR's own ack-as-backpressure design, not idle, so time blocked in
 `Fanout::send` never counts against it. A frame body gets the same bound per `read` rather than in
 total.

@@ -561,11 +561,10 @@ impl Output for PrometheusOutput {
         batch: &EventBatch,
         ctx: BatchContext,
         seq: SeqId,
-        in_flight: usize,
     ) -> anyhow::Result<()> {
         match self {
-            PrometheusOutput::Expose(output) => output.submit(batch, ctx, seq, in_flight).await,
-            PrometheusOutput::Send(output) => output.submit(batch, ctx, seq, in_flight).await,
+            PrometheusOutput::Expose(output) => output.submit(batch, ctx, seq).await,
+            PrometheusOutput::Send(output) => output.submit(batch, ctx, seq).await,
         }
     }
 
