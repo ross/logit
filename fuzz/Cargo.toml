@@ -30,15 +30,15 @@ doc = false
 bench = false
 
 [[bin]]
-name = "native_batch_v1"
-path = "fuzz_targets/native_batch_v1.rs"
+name = "native_batch"
+path = "fuzz_targets/native_batch.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "native_batch_v2"
-path = "fuzz_targets/native_batch_v2.rs"
+name = "native_hop_batch"
+path = "fuzz_targets/native_hop_batch.rs"
 test = false
 doc = false
 bench = false

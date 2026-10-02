@@ -545,7 +545,7 @@ mod tests {
 
         let (codec_id, mut payload) =
             logit_proto::frame::read_frame(&mut bytes).expect("frame should read");
-        assert_eq!(codec_id, logit_proto::native::CODEC_NATIVE_V1);
+        assert_eq!(codec_id, logit_proto::native::CODEC_BATCH);
         let decoded = logit_proto::native::decode_batch(&mut payload, &Default::default())
             .expect("payload should decode");
         assert_eq!(decoded.events.len(), 1);
@@ -604,7 +604,7 @@ mod tests {
             let mut bytes = Bytes::from(std::fs::read(file_path).unwrap());
             let (codec_id, mut payload) =
                 logit_proto::frame::read_frame(&mut bytes).expect("frame should read");
-            assert_eq!(codec_id, logit_proto::native::CODEC_NATIVE_V1);
+            assert_eq!(codec_id, logit_proto::native::CODEC_BATCH);
             let decoded = logit_proto::native::decode_batch(&mut payload, &Default::default())
                 .expect("payload should decode");
             assert_eq!(

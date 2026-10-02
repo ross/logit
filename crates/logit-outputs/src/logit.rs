@@ -62,15 +62,14 @@
 //!   nothing after it.
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
-//! retries an `Ambiguous` attempt. On a v2 connection every frame carries the sender identity and
-//! sequence the sink's store gave the batch, and a resend reuses them, so `logit_in` recognizes a
-//! resend at or below its sender's mark, acks it, and doesn't forward it again
+//! retries an `Ambiguous` attempt. Every frame carries the sender identity and sequence the
+//! sink's store gave the batch, and a resend reuses them, so `logit_in` recognizes a resend at or
+//! below its sender's mark, acks it, and doesn't forward it again
 //! (`docs/adr/native-hop-identity-and-sequence.md`). A resend still reaches `logit_in`'s consumers
-//! twice from a v1 peer (its frames are unsequenced), after a `logit_in` restart (the marks are in
-//! memory), for a sender evicted from `logit_in`'s table, behind a load balancer that sends the
-//! resend to another `logit_in`, and when a connection that ended mid-window still holds the
-//! first copy as the resend arrives (`docs/known-gaps.md`, "A resend can race the frames an
-//! ended connection still holds").
+//! twice after a `logit_in` restart (the marks are in memory), for a sender evicted from
+//! `logit_in`'s table, behind a load balancer that sends the resend to another `logit_in`, and
+//! when a connection that ended mid-window still holds the first copy as the resend arrives
+//! (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds").
 //!
 //! **Close.** `Output::flush`, called once after the last batch, shuts the pooled connection
 //! down, which under TLS sends `close_notify`. A connection dropped after a failed or cancelled
@@ -126,10 +125,6 @@ struct Conn {
     /// The peer's `HelloAck.max_frame_bytes`. A larger batch is rejected locally as `Permanent`
     /// rather than sent and rejected by the peer.
     peer_max_frame_bytes: u32,
-    /// The codec `HelloAck.codec` chose: `CODEC_NATIVE_V2` (provenance, sender identity, and
-    /// sequence cross the wire) or `CODEC_NATIVE_V1`. `handshake` refuses a codec it never
-    /// offered.
-    codec: u8,
     /// The negotiated compression; `None` when the peer doesn't support what was offered.
     compression: Compression,
     /// The negotiated window: `max(1, min(offered, answered))`.
@@ -167,15 +162,13 @@ pub struct LogitOutput {
     /// Set by the first handshake that passes validation, so only later ones count as
     /// `logit.output.reconnects`.
     has_connected_once: bool,
-    /// The next batch's provenance, set by `Output::observe_batch` once per batch.
-    /// Encoded only on a `CODEC_NATIVE_V2` connection; v1 has no trailer to carry it
-    /// (`docs/adr/batch-provenance-on-delivered.md`).
+    /// The next batch's provenance, set by `Output::observe_batch` once per batch and carried in
+    /// the hop trailer (`docs/adr/batch-provenance-on-delivered.md`).
     pending_provenance: Provenance,
     /// The next batch's sender identity and sequence from the sink's store, set by
-    /// `Output::observe_batch` and encoded only on a `CODEC_NATIVE_V2` connection. Every attempt
-    /// at one batch carries the same pair; cleared once an attempt succeeds, so a batch sent
-    /// without its own `observe_batch` goes unsequenced rather than under the last batch's pair,
-    /// which `logit_in` would read as a resend and not forward.
+    /// `Output::observe_batch`. Every attempt at one batch carries the same pair; cleared once an
+    /// attempt succeeds, so a `send` without its own `observe_batch` fails rather than go out
+    /// under the last batch's pair, which `logit_in` would read as a resend and not forward.
     pending_seq: Option<SeqId>,
     /// Set when a submit with frames in flight found the connection holding a different count.
     /// The connection was dropped, and the next `await_ack` fails `Ambiguous` rather than read
@@ -280,9 +273,7 @@ impl LogitOutput {
     async fn handshake(&mut self, mut stream: Box<dyn AsyncStream>) -> anyhow::Result<Conn> {
         let hello = control::Hello {
             version: control::PROTOCOL_VERSION,
-            // v2 first: a v1-only `logit_in` acks the first codec it recognizes, so this costs
-            // nothing against an old listener and gains provenance against a new one.
-            codecs: vec![native::CODEC_NATIVE_V2, native::CODEC_NATIVE_V1],
+            codecs: vec![native::CODEC_HOP_BATCH],
             compressions: vec![Compression::None as u8, self.compression as u8],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: self.window,
@@ -332,7 +323,6 @@ impl LogitOutput {
             stream,
             peer_max_frame_bytes: ack.max_frame_bytes,
             compression,
-            codec: ack.codec,
             window,
             in_flight: 0,
             broken: false,
@@ -382,14 +372,6 @@ fn compression_from_u8(b: u8) -> Option<Compression> {
     }
 }
 
-/// The negotiated codec byte as a fixed `codec` tag string for `logit.proto.frames`.
-fn codec_tag(codec: u8) -> &'static str {
-    match codec {
-        native::CODEC_NATIVE_V2 => "native_v2",
-        _ => "native_v1",
-    }
-}
-
 fn compression_tag(compression: Compression) -> &'static str {
     match compression {
         Compression::None => "none",
@@ -418,19 +400,19 @@ impl LogitOutput {
         &mut self,
         batch: &EventBatch,
         ctx: BatchContext,
-        seq: Option<SeqId>,
+        seq: SeqId,
         in_flight: usize,
     ) -> anyhow::Result<()> {
-        // Encoded under v1 before touching the network, so an oversized batch never connects.
-        // v2 is this plus a trailer, never smaller, so the pre-check holds for either codec.
-        let v1_payload = native::encode_batch(batch);
-        if v1_payload.len() as u64 > frame::MAX_SANE_UNCOMPRESSED_LEN as u64 {
+        // Encoded once per attempt, before touching the network, so an oversized batch never
+        // connects.
+        let payload = native::encode_hop_batch(batch, ctx.provenance, seq);
+        if payload.len() as u64 > frame::MAX_SANE_UNCOMPRESSED_LEN as u64 {
             self.warn_at_head(
                 in_flight,
                 format!(
                     "batch encodes to {} bytes, over the {}-byte sanity cap -- dropping it \
                      rather than ever attempting to send it",
-                    v1_payload.len(),
+                    payload.len(),
                     frame::MAX_SANE_UNCOMPRESSED_LEN
                 ),
             );
@@ -481,13 +463,6 @@ impl LogitOutput {
             }
             None => self.connect_and_handshake().await?,
         };
-        // Re-encoded only on a v2 connection; a v1 connection reuses `v1_payload`.
-        let payload = if conn.codec == native::CODEC_NATIVE_V2 {
-            native::encode_batch_v2(batch, ctx.provenance, seq)
-        } else {
-            v1_payload
-        };
-
         let bound = conn.peer_max_frame_bytes.min(frame::MAX_SANE_UNCOMPRESSED_LEN);
         if payload.len() as u32 > bound {
             // Only this batch doesn't fit; the connection is kept and nothing is written.
@@ -503,8 +478,12 @@ impl LogitOutput {
                 .context(Fault::Permanent);
         }
 
-        let framed = match frame::write_frame_with_flags(conn.codec, conn.compression, 0, &payload)
-        {
+        let framed = match frame::write_frame_with_flags(
+            native::CODEC_HOP_BATCH,
+            conn.compression,
+            0,
+            &payload,
+        ) {
             Ok(framed) => framed,
             Err(err) => {
                 self.stream = Some(conn);
@@ -550,11 +529,7 @@ impl LogitOutput {
         self.telemetry.count(
             "logit.proto.frames",
             1.0,
-            &[
-                ("direction", "out"),
-                ("codec", codec_tag(conn.codec)),
-                ("compression", compression_tag(conn.compression)),
-            ],
+            &[("direction", "out"), ("compression", compression_tag(conn.compression))],
         );
         self.telemetry.count(
             "logit.proto.frame.bytes",
@@ -677,15 +652,19 @@ impl Output for LogitOutput {
     /// before its first attempt, so every attempt at one batch carries the same provenance and
     /// the same pair. A successful attempt clears the pair; a direct caller observes once per
     /// batch it sends.
-    fn observe_batch(&mut self, ctx: BatchContext, seq: Option<SeqId>) {
+    fn observe_batch(&mut self, ctx: BatchContext, seq: SeqId) {
         self.pending_provenance = ctx.provenance;
-        self.pending_seq = seq;
+        self.pending_seq = Some(seq);
     }
 
-    /// `submit` with the pending provenance and pair and nothing in flight, then `await_ack`.
+    /// `submit` with the pending provenance and pair and nothing in flight, then `await_ack`. A
+    /// `send` with no pair pending is a caller bug: every batch is observed before it's sent.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let Some(seq) = self.pending_seq else {
+            anyhow::bail!("logit_out: send before observe_batch, so the batch has no sequence");
+        };
         let ctx = BatchContext { provenance: self.pending_provenance, ..BatchContext::default() };
-        self.submit(batch, ctx, self.pending_seq, 0).await?;
+        self.submit(batch, ctx, seq, 0).await?;
         self.await_ack().await?;
         self.pending_seq = None;
         Ok(())
@@ -706,7 +685,7 @@ impl Output for LogitOutput {
         &mut self,
         batch: &EventBatch,
         ctx: BatchContext,
-        seq: Option<SeqId>,
+        seq: SeqId,
         in_flight: usize,
     ) -> anyhow::Result<()> {
         let result = self.submit_frame(batch, ctx, seq, in_flight).await;
@@ -847,6 +826,32 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
+    /// The next number of one sender shared by every test in this process, so no two sends
+    /// read as one resend at a real `logit_in`.
+    fn next_seq() -> SeqId {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        SeqId {
+            id: *b"logit-out-tests!",
+            seq: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// Observes `batch` under [`next_seq`] with an empty context, then sends it: what
+    /// `write_loop` does once per batch.
+    async fn send_next(output: &mut LogitOutput, batch: &EventBatch) -> anyhow::Result<()> {
+        output.observe_batch(BatchContext::default(), next_seq());
+        output.send(batch).await
+    }
+
+    /// A `send` with no `observe_batch` before it fails without connecting.
+    #[tokio::test]
+    async fn a_send_before_observe_batch_fails_without_connecting() {
+        let mut output = LogitOutput::new("127.0.0.1:1");
+        let err = output.send(&sample_batch()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("send before observe_batch"), "{err:#}");
+        assert!(output.stream.is_none());
+    }
+
     fn sample_batch() -> EventBatch {
         let mut attrs = AttrMap::new();
         attrs.insert("host", "logit-out-test");
@@ -905,9 +910,9 @@ mod tests {
         let telemetry = registry.telemetry_for("out", "logit_out", "sink");
         let mut output = LogitOutput::new(addr).with_telemetry(telemetry);
 
-        output.send(&sample_batch()).await.expect("first send should succeed");
+        send_next(&mut output, &sample_batch()).await.expect("first send should succeed");
         recv_batch(&mut rx).await;
-        output.send(&sample_batch()).await.expect("second send should succeed");
+        send_next(&mut output, &sample_batch()).await.expect("second send should succeed");
         recv_batch(&mut rx).await;
 
         let reconnects = registry
@@ -937,7 +942,7 @@ mod tests {
         let mut output =
             LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
 
-        output.send(&sample_batch()).await.expect("first send should succeed");
+        send_next(&mut output, &sample_batch()).await.expect("first send should succeed");
         assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
 
         // `logit_in` counts the idle close after its `Reject` is written and flushed, so the
@@ -948,8 +953,7 @@ mod tests {
             })
             .await;
 
-        output
-            .send(&sample_batch())
+        send_next(&mut output, &sample_batch())
             .await
             .expect("the probe should replace the closed connection before writing anything");
         assert_eq!(
@@ -997,7 +1001,7 @@ mod tests {
                 };
                 let ack = control::HelloAck {
                     version: control::PROTOCOL_VERSION,
-                    codec: native::CODEC_NATIVE_V1,
+                    codec: native::CODEC_HOP_BATCH,
                     compression: 0,
                     max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
                     window: 1,
@@ -1031,11 +1035,10 @@ mod tests {
         let mut output =
             LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
 
-        output.send(&sample_batch()).await.expect("first send should succeed");
+        send_next(&mut output, &sample_batch()).await.expect("first send should succeed");
         reject_arrived.await.expect("the peer task must signal before this test proceeds");
 
-        output
-            .send(&sample_batch())
+        send_next(&mut output, &sample_batch())
             .await
             .expect("an unsolicited Reject must cost a reconnect, not the batch");
 
@@ -1101,12 +1104,12 @@ mod tests {
         addr
     }
 
-    /// Answers a stream's `Hello` with [`hello_ack_v1`] and reads one data frame.
+    /// Answers a stream's `Hello` with [`hello_ack`] and reads one data frame.
     async fn handshake_and_read_one_frame<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) {
         let control::ControlMessage::Hello(_) = read_control(stream).await.unwrap() else {
             panic!("expected Hello");
         };
-        write_control(stream, &hello_ack_v1()).await.unwrap();
+        write_control(stream, &hello_ack()).await.unwrap();
         read_data_frame(stream).await;
     }
 
@@ -1125,7 +1128,7 @@ mod tests {
         let mut output =
             tls_output(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
 
-        output.send(&sample_batch()).await.expect("first send should succeed");
+        send_next(&mut output, &sample_batch()).await.expect("first send should succeed");
         assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
         // Counted after the `Reject` is written and flushed.
         probe
@@ -1134,8 +1137,7 @@ mod tests {
             })
             .await;
 
-        output
-            .send(&sample_batch())
+        send_next(&mut output, &sample_batch())
             .await
             .expect("the probe should replace the closed connection before writing anything");
         assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
@@ -1174,11 +1176,10 @@ mod tests {
         let mut probe = TelemetryProbe::new();
         let mut output =
             tls_output(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
-        output.send(&sample_batch()).await.expect("first send should succeed");
+        send_next(&mut output, &sample_batch()).await.expect("first send should succeed");
         reject_arrived.await.expect("the peer task signals before this test proceeds");
 
-        output
-            .send(&sample_batch())
+        send_next(&mut output, &sample_batch())
             .await
             .expect("an unsolicited Reject must cost a reconnect, not the batch");
 
@@ -1206,12 +1207,12 @@ mod tests {
             .with_timeout(RECV_TIMEOUT)
             .with_telemetry(probe.telemetry("out", "logit_out", "sink"));
 
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Ambiguous, "{err:#}");
         assert!(!is_retryable(classify(&err), DeliveryPosture::AtMostOnce));
         assert!(output.stream.is_none(), "a connection with an unresolved ack is dropped");
 
-        output.send(&sample_batch()).await.expect("the next send reconnects");
+        send_next(&mut output, &sample_batch()).await.expect("the next send reconnects");
         let totals = probe.poll();
         assert_eq!(totals.sum("logit.output.reconnects", &[]), 1.0);
         assert_eq!(requests(totals), ([1.0, 0.0, 1.0, 0.0], 2.0));
@@ -1252,7 +1253,7 @@ mod tests {
             )
             .await;
             let mut output = tls_output(addr);
-            output.send(&sample_batch()).await.expect("the send is acked");
+            send_next(&mut output, &sample_batch()).await.expect("the send is acked");
             recv_batch(&mut rx).await;
 
             if flushed {
@@ -1273,9 +1274,10 @@ mod tests {
 
     // ---- provenance / codec negotiation ------------------------------------------------------
 
-    /// A peer acking v2 gets a v2 frame carrying `observe_batch`'s provenance and sender pair.
+    /// The sink offers the hop codec alone, and its frame carries `observe_batch`'s provenance
+    /// and sender pair.
     #[tokio::test]
-    async fn a_peer_that_acks_v2_gets_a_v2_frame_with_provenance() {
+    async fn the_hop_frame_carries_provenance_and_the_sender_pair() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(async move {
@@ -1284,14 +1286,10 @@ mod tests {
             else {
                 panic!("expected Hello");
             };
-            assert!(
-                hello.codecs.contains(&native::CODEC_NATIVE_V2),
-                "this sink should offer v2: {:?}",
-                hello.codecs
-            );
+            assert_eq!(hello.codecs, [native::CODEC_HOP_BATCH], "the one codec this sink speaks");
             let ack = control::HelloAck {
                 version: control::PROTOCOL_VERSION,
-                codec: native::CODEC_NATIVE_V2,
+                codec: native::CODEC_HOP_BATCH,
                 compression: 0,
                 max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
                 window: 1,
@@ -1302,12 +1300,12 @@ mod tests {
             stream.read_exact(&mut header).await.unwrap();
             let mut header_bytes = Bytes::copy_from_slice(&header);
             let h = frame::FrameHeader::read(&mut header_bytes).unwrap();
-            assert_eq!(h.codec, native::CODEC_NATIVE_V2, "should send under the negotiated codec");
+            assert_eq!(h.codec, native::CODEC_HOP_BATCH, "should send under the negotiated codec");
             let mut body = vec![0u8; h.compressed_len as usize];
             stream.read_exact(&mut body).await.unwrap();
             let mut payload = Bytes::from(body);
             let (_batch, provenance, seq) =
-                native::decode_batch_v2(&mut payload, &Default::default()).unwrap();
+                native::decode_hop_batch(&mut payload, &Default::default()).unwrap();
 
             write_control(&mut stream, &control::Ack).await.unwrap();
             (provenance, seq)
@@ -1322,65 +1320,15 @@ mod tests {
                     previous: Some(logit_core::interner::intern("logit_out_test_previous")),
                 },
             },
-            Some(SeqId { id: [7; 16], seq: 5 }),
+            SeqId { id: [7; 16], seq: 5 },
         );
         output.send(&sample_batch()).await.expect("send should succeed");
 
         let (provenance, seq) = server.await.expect("server task should not panic");
         assert_eq!(provenance.origin_str(), Some("logit_out_test_origin"));
         assert_eq!(provenance.previous_str(), Some("logit_out_test_previous"));
-        assert_eq!(seq, Some(SeqId { id: [7; 16], seq: 5 }));
+        assert_eq!(seq, SeqId { id: [7; 16], seq: 5 });
         assert_eq!(output.pending_seq, None, "an acked attempt clears the pair");
-    }
-
-    /// A peer acking v1 gets a plain v1 frame with no trailer: no provenance, and no sender pair
-    /// even when the store gave the batch one.
-    #[tokio::test]
-    async fn a_peer_that_only_acks_v1_gets_a_plain_v1_frame() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let control::ControlMessage::Hello(_hello) = read_control(&mut stream).await.unwrap()
-            else {
-                panic!("expected Hello");
-            };
-            let ack = control::HelloAck {
-                version: control::PROTOCOL_VERSION,
-                codec: native::CODEC_NATIVE_V1,
-                compression: 0,
-                max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
-                window: 1,
-            };
-            write_control(&mut stream, &ack).await.unwrap();
-
-            let mut header = [0u8; frame::HEADER_LEN];
-            stream.read_exact(&mut header).await.unwrap();
-            let mut header_bytes = Bytes::copy_from_slice(&header);
-            let h = frame::FrameHeader::read(&mut header_bytes).unwrap();
-            assert_eq!(h.codec, native::CODEC_NATIVE_V1, "should stay on v1 against this peer");
-            let mut body = vec![0u8; h.compressed_len as usize];
-            stream.read_exact(&mut body).await.unwrap();
-            let mut payload = Bytes::from(body);
-            assert!(native::decode_batch_v2(&mut payload.clone(), &Default::default()).is_err());
-            native::decode_batch(&mut payload, &Default::default()).unwrap();
-
-            write_control(&mut stream, &control::Ack).await.unwrap();
-        });
-
-        let mut output = LogitOutput::new(addr);
-        output.observe_batch(
-            logit_pipeline::BatchContext {
-                trace: logit_pipeline::TraceContext::new_root(),
-                provenance: logit_core::Provenance {
-                    origin: Some(logit_core::interner::intern("logit_out_test_origin")),
-                    previous: None,
-                },
-            },
-            Some(SeqId { id: [7; 16], seq: 5 }),
-        );
-        output.send(&sample_batch()).await.expect("send should succeed");
-        server.await.expect("server task should not panic");
     }
 
     /// A spool that loses its cursor in a crash replays a batch `logit_in` already forwarded,
@@ -1467,7 +1415,7 @@ mod tests {
         let mut output =
             LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
 
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
 
         assert_eq!(classify(&err), Fault::Clean);
         assert_eq!(requests(probe.poll()), ([0.0, 1.0, 0.0, 0.0], 1.0));
@@ -1487,7 +1435,7 @@ mod tests {
             let mut output =
                 LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
 
-            output.send(&sample_batch()).await.unwrap_err();
+            send_next(&mut output, &sample_batch()).await.unwrap_err();
 
             let totals = probe.poll();
             assert_eq!(totals.sum("logit.output.requests", &[("class", class)]), 1.0, "{code}");
@@ -1504,16 +1452,16 @@ mod tests {
         let mut probe = TelemetryProbe::new();
         let mut output =
             LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
-        output.send(&sample_batch()).await.expect("the first send connects");
+        send_next(&mut output, &sample_batch()).await.expect("the first send connects");
         recv_batch(&mut rx).await;
 
         let over_the_sanity_cap = batch_of(frame::MAX_SANE_UNCOMPRESSED_LEN as usize + 1);
-        let err = output.send(&over_the_sanity_cap).await.unwrap_err();
+        let err = send_next(&mut output, &over_the_sanity_cap).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Permanent, "{err:#}");
         assert!(output.stream.is_some(), "the sanity-cap check runs before the pool is touched");
 
         output.stream.as_mut().unwrap().peer_max_frame_bytes = 8;
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Permanent, "{err:#}");
         assert!(output.stream.is_some(), "a batch over the peer's bound keeps the connection");
 
@@ -1541,20 +1489,20 @@ mod tests {
 
         let batch = sample_batch();
         // Clean: nothing listens.
-        output.send(&batch).await.unwrap_err();
+        send_next(&mut output, &batch).await.unwrap_err();
         output.endpoint = addr;
-        output.send(&batch).await.unwrap();
+        send_next(&mut output, &batch).await.unwrap();
         recv_batch(&mut rx).await;
         // Permanent: over the peer's bound.
         output.stream.as_mut().unwrap().peer_max_frame_bytes = 8;
-        output.send(&batch).await.unwrap_err();
+        send_next(&mut output, &batch).await.unwrap_err();
         output.stream.as_mut().unwrap().peer_max_frame_bytes = frame::MAX_SANE_UNCOMPRESSED_LEN;
-        output.send(&batch).await.unwrap();
+        send_next(&mut output, &batch).await.unwrap();
         recv_batch(&mut rx).await;
         // Ambiguous: a transient `Reject` in place of the `Ack`.
         output.stream = None;
         output.endpoint = rejecting_addr;
-        output.send(&batch).await.unwrap_err();
+        send_next(&mut output, &batch).await.unwrap_err();
 
         const SENDS: f64 = 5.0;
         assert_eq!(requests(probe.poll()), ([2.0, 1.0, 1.0, 1.0], SENDS));
@@ -1563,7 +1511,7 @@ mod tests {
     // ---- HelloAck validation --------------------------------------------------------------------
 
     /// A peer answering its first connection's `Hello` with `first` and holding it open, and
-    /// every later connection as a stock `logit_in` does: [`hello_ack_v1`], then one `Ack` per
+    /// every later connection as a stock `logit_in` does: [`hello_ack`], then one `Ack` per
     /// data frame.
     async fn spawn_peer_answering_first_with(first: control::HelloAck) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1581,7 +1529,7 @@ mod tests {
                         let _ = write_control(&mut stream, &bad).await;
                         return std::future::pending().await;
                     }
-                    write_control(&mut stream, &hello_ack_v1()).await.unwrap();
+                    write_control(&mut stream, &hello_ack()).await.unwrap();
                     loop {
                         let mut header = [0u8; frame::HEADER_LEN];
                         if stream.read_exact(&mut header).await.is_err() {
@@ -1608,12 +1556,14 @@ mod tests {
         let mut output =
             LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
 
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Permanent, "{what}: {err:#}");
         assert!(is_explicitly_permanent(&err), "{what}");
         assert!(output.stream.is_none(), "{what}: the refused connection is dropped");
 
-        output.send(&sample_batch()).await.expect("a stock logit_in's HelloAck is accepted");
+        send_next(&mut output, &sample_batch())
+            .await
+            .expect("a stock logit_in's HelloAck is accepted");
         let totals = probe.poll();
         assert!(
             !totals.has("logit.output.reconnects", &[]),
@@ -1625,26 +1575,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_hello_ack_naming_a_codec_never_offered_is_permanent() {
-        let bad = control::HelloAck { codec: 99, ..hello_ack_v1() };
+        let bad = control::HelloAck { codec: 99, ..hello_ack() };
         assert_hello_ack_is_refused_as_permanent(bad, "codec 99").await;
     }
 
     #[tokio::test]
     async fn a_hello_ack_naming_an_unknown_compression_is_permanent() {
-        let bad = control::HelloAck { compression: 7, ..hello_ack_v1() };
+        let bad = control::HelloAck { compression: 7, ..hello_ack() };
         assert_hello_ack_is_refused_as_permanent(bad, "compression 7").await;
     }
 
     /// This sink offers lz4 only when configured to; by default its `Hello` offers none.
     #[tokio::test]
     async fn a_hello_ack_naming_a_compression_never_offered_is_permanent() {
-        let bad = control::HelloAck { compression: Compression::Lz4 as u8, ..hello_ack_v1() };
+        let bad = control::HelloAck { compression: Compression::Lz4 as u8, ..hello_ack() };
         assert_hello_ack_is_refused_as_permanent(bad, "lz4 not offered").await;
     }
 
     #[tokio::test]
     async fn a_hello_ack_with_another_protocol_version_is_permanent() {
-        let bad = control::HelloAck { version: control::PROTOCOL_VERSION + 1, ..hello_ack_v1() };
+        let bad = control::HelloAck { version: control::PROTOCOL_VERSION + 1, ..hello_ack() };
         assert_hello_ack_is_refused_as_permanent(bad, "version mismatch").await;
     }
 
@@ -1662,7 +1612,7 @@ mod tests {
         let mut output = LogitOutput::new(addr);
         let batch = sample_batch();
         tokio::select! {
-            _ = output.send(&batch) => panic!("send should never resolve against a peer that never acks"),
+            _ = send_next(&mut output, &batch) => panic!("send should never resolve against a peer that never acks"),
             // Cancels only once the peer confirms the frame was read in full: had `send` been
             // cancelled any earlier, `self.stream` would trivially be `None` regardless of the
             // pooled-connection contract this test means to exercise.
@@ -1683,7 +1633,7 @@ mod tests {
         drop(listener); // nothing listens here now
 
         let mut output = LogitOutput::new(addr).with_timeout(Duration::from_millis(300));
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Clean);
     }
 
@@ -1704,7 +1654,7 @@ mod tests {
             FakePeerBehavior::AckThenClose { ack_compression } => {
                 let ack = control::HelloAck {
                     version: control::PROTOCOL_VERSION,
-                    codec: native::CODEC_NATIVE_V1,
+                    codec: native::CODEC_HOP_BATCH,
                     compression: ack_compression,
                     max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
                     window: 1,
@@ -1723,7 +1673,7 @@ mod tests {
             FakePeerBehavior::AckThenHang { ack_compression, ready } => {
                 let ack = control::HelloAck {
                     version: control::PROTOCOL_VERSION,
-                    codec: native::CODEC_NATIVE_V1,
+                    codec: native::CODEC_HOP_BATCH,
                     compression: ack_compression,
                     max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
                     window: 1,
@@ -1742,7 +1692,7 @@ mod tests {
             FakePeerBehavior::AckThenReject { code } => {
                 let ack = control::HelloAck {
                     version: control::PROTOCOL_VERSION,
-                    codec: native::CODEC_NATIVE_V1,
+                    codec: native::CODEC_HOP_BATCH,
                     compression: 0,
                     max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
                     window: 1,
@@ -1759,13 +1709,13 @@ mod tests {
                 write_control(&mut stream, &reject).await.unwrap();
             }
             FakePeerBehavior::HelloAckInPlaceOfAck => {
-                write_control(&mut stream, &hello_ack_v1()).await.unwrap();
+                write_control(&mut stream, &hello_ack()).await.unwrap();
                 let mut header = [0u8; frame::HEADER_LEN];
                 stream.read_exact(&mut header).await.unwrap();
                 let h = frame::FrameHeader::read(&mut Bytes::copy_from_slice(&header)).unwrap();
                 let mut body = vec![0u8; h.compressed_len as usize];
                 stream.read_exact(&mut body).await.unwrap();
-                write_control(&mut stream, &hello_ack_v1()).await.unwrap();
+                write_control(&mut stream, &hello_ack()).await.unwrap();
                 // Held open, so the attempt fails on the message and not on a close.
                 std::future::pending::<()>().await;
             }
@@ -1802,7 +1752,7 @@ mod tests {
         }));
 
         let mut output = LogitOutput::new(addr);
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Permanent);
         assert!(is_explicitly_permanent(&err));
     }
@@ -1819,7 +1769,7 @@ mod tests {
         }));
 
         let mut output = LogitOutput::new(addr);
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Clean);
         assert!(!is_explicitly_permanent(&err));
     }
@@ -1836,7 +1786,7 @@ mod tests {
         }));
 
         let mut output = LogitOutput::new(addr);
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Clean);
         assert!(!is_explicitly_permanent(&err));
     }
@@ -1850,7 +1800,7 @@ mod tests {
         }));
 
         let mut output = LogitOutput::new(addr);
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Ambiguous);
         assert!(!is_explicitly_permanent(&err));
     }
@@ -1862,7 +1812,7 @@ mod tests {
         tokio::spawn(fake_peer(listener, |_hello| FakePeerBehavior::HelloAckInPlaceOfAck));
 
         let mut output = LogitOutput::new(addr);
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Ambiguous, "{err:#}");
         assert!(output.stream.is_none(), "a connection with an unresolved ack must not be reused");
     }
@@ -1876,7 +1826,7 @@ mod tests {
         }));
 
         let mut output = LogitOutput::new(addr);
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Permanent);
         assert!(is_explicitly_permanent(&err));
     }
@@ -1899,7 +1849,7 @@ mod tests {
                 };
                 let ack = control::HelloAck {
                     version: control::PROTOCOL_VERSION,
-                    codec: native::CODEC_NATIVE_V1,
+                    codec: native::CODEC_HOP_BATCH,
                     compression: 0,
                     max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
                     window: 1,
@@ -1925,7 +1875,7 @@ mod tests {
 
         let mut output = LogitOutput::new(addr);
         let batch = sample_batch();
-        let err = output.send(&batch).await.unwrap_err();
+        let err = send_next(&mut output, &batch).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Clean, "{err:#}");
         assert!(is_retryable(classify(&err), DeliveryPosture::AtMostOnce));
         assert!(output.stream.is_none(), "the rejected connection is dropped");
@@ -1954,7 +1904,7 @@ mod tests {
                 };
                 let ack = control::HelloAck {
                     version: control::PROTOCOL_VERSION,
-                    codec: native::CODEC_NATIVE_V2,
+                    codec: native::CODEC_HOP_BATCH,
                     compression: 0,
                     max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
                     window: 1,
@@ -1963,7 +1913,7 @@ mod tests {
                 let mut header = [0u8; frame::HEADER_LEN];
                 stream.read_exact(&mut header).await.unwrap();
                 let h = frame::FrameHeader::read(&mut Bytes::copy_from_slice(&header)).unwrap();
-                assert_eq!(h.codec, native::CODEC_NATIVE_V2);
+                assert_eq!(h.codec, native::CODEC_HOP_BATCH);
                 let mut body = vec![0u8; h.compressed_len as usize];
                 stream.read_exact(&mut body).await.unwrap();
                 frames_tx.send(body).unwrap();
@@ -1986,7 +1936,7 @@ mod tests {
                 trace: logit_pipeline::TraceContext::new_root(),
                 provenance: Provenance::default(),
             },
-            Some(pair),
+            pair,
         );
         let batch = sample_batch();
         let err = output.send(&batch).await.unwrap_err();
@@ -1996,8 +1946,8 @@ mod tests {
         for which in ["first", "resent"] {
             let mut payload = Bytes::from(frames_rx.recv().await.unwrap());
             let (_batch, _provenance, seq) =
-                native::decode_batch_v2(&mut payload, &Default::default()).unwrap();
-            assert_eq!(seq, Some(pair), "the {which} frame");
+                native::decode_hop_batch(&mut payload, &Default::default()).unwrap();
+            assert_eq!(seq, pair, "the {which} frame");
         }
     }
 
@@ -2010,7 +1960,7 @@ mod tests {
         }));
 
         let mut output = LogitOutput::new(addr).with_timeout(Duration::from_millis(300));
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Ambiguous);
         assert!(output.stream.is_none(), "a connection with an unresolved ack must not be reused");
     }
@@ -2025,14 +1975,13 @@ mod tests {
         }));
 
         let mut output = LogitOutput::new(dead_addr).with_timeout(Duration::from_millis(300));
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Ambiguous);
         assert!(output.stream.is_none());
 
         let (real_addr, mut rx) = spawn_real_listener().await;
         output.endpoint = real_addr;
-        output
-            .send(&sample_batch())
+        send_next(&mut output, &sample_batch())
             .await
             .expect("should reconnect and succeed against a live peer");
         recv_batch(&mut rx).await;
@@ -2056,7 +2005,7 @@ mod tests {
             .with_compression(Compression::Lz4)
             .with_timeout(Duration::from_millis(300))
             .with_telemetry(telemetry);
-        let _ = output.send(&sample_batch()).await; // ambiguous (no ack) -- irrelevant here
+        let _ = send_next(&mut output, &sample_batch()).await; // ambiguous (no ack) -- irrelevant here
 
         let frames_tag = registry.drain(0).into_iter().find_map(|e| {
             let is_frames_metric = e
@@ -2076,13 +2025,13 @@ mod tests {
         let (addr, mut rx) = spawn_real_listener().await;
         let mut output = LogitOutput::new(addr);
 
-        output.send(&sample_batch()).await.expect("first send should succeed");
+        send_next(&mut output, &sample_batch()).await.expect("first send should succeed");
         recv_batch(&mut rx).await;
 
         // Lower the negotiated bound directly rather than stand up a second listener.
         output.stream.as_mut().unwrap().peer_max_frame_bytes = 8;
 
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Permanent);
         assert!(
             output.stream.is_some(),
@@ -2090,7 +2039,9 @@ mod tests {
         );
 
         output.stream.as_mut().unwrap().peer_max_frame_bytes = frame::MAX_SANE_UNCOMPRESSED_LEN;
-        output.send(&sample_batch()).await.expect("a normal batch should still send fine");
+        send_next(&mut output, &sample_batch())
+            .await
+            .expect("a normal batch should still send fine");
         recv_batch(&mut rx).await;
     }
 
@@ -2100,13 +2051,12 @@ mod tests {
     // on the data frame and nothing else. TLS cases use a real tokio-rustls pair; `FakeStream`
     // never goes under tokio-rustls (its doc says why).
 
-    /// A handshaken v1, uncompressed connection over `stream`, as [`LogitOutput::handshake`]
+    /// A handshaken, uncompressed connection over `stream`, as [`LogitOutput::handshake`]
     /// leaves one against a stock `logit_in`.
     fn conn_over(stream: impl AsyncStream + 'static) -> Conn {
         Conn {
             stream: Box::new(stream),
             peer_max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
-            codec: native::CODEC_NATIVE_V1,
             compression: Compression::None,
             window: 1,
             in_flight: 0,
@@ -2148,10 +2098,10 @@ mod tests {
     }
 
     /// The `HelloAck` a stock `logit_in` answers this sink's `Hello` with, compression off.
-    fn hello_ack_v1() -> control::HelloAck {
+    fn hello_ack() -> control::HelloAck {
         control::HelloAck {
             version: control::PROTOCOL_VERSION,
-            codec: native::CODEC_NATIVE_V1,
+            codec: native::CODEC_HOP_BATCH,
             compression: 0,
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: 1,
@@ -2194,12 +2144,14 @@ mod tests {
         let mut output = LogitOutput::new("127.0.0.1:1").with_timeout(RECV_TIMEOUT);
         output.stream = Some(conn_over(client));
         let batch = batch_of(32 * 1024);
-        let result = output.send(&batch).await;
+        let result = send_next(&mut output, &batch).await;
 
         let delivered = frames_rx.try_recv();
         assert!(delivered.is_ok(), "the peer never received a whole frame; send said {result:?}");
         result.expect("the peer acks the frame it received");
-        assert_eq!(delivered.unwrap(), native::encode_batch(&batch).to_vec());
+        let mut payload = Bytes::from(delivered.unwrap());
+        let (decoded, ..) = native::decode_hop_batch(&mut payload, &Default::default()).unwrap();
+        assert_eq!(native::encode_batch(&decoded), native::encode_batch(&batch));
         assert!(output.stream.is_some(), "an acked connection is pooled");
     }
 
@@ -2213,7 +2165,7 @@ mod tests {
         let mut output = LogitOutput::new("127.0.0.1:1");
         output.stream = Some(conn_over(fake.clone()));
 
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
 
         assert_eq!(classify(&err), Fault::Clean, "{err:#}");
         assert!(is_retryable(classify(&err), DeliveryPosture::AtMostOnce));
@@ -2229,7 +2181,7 @@ mod tests {
         let mut output = LogitOutput::new("127.0.0.1:1");
         output.stream = Some(conn_over(fake.clone()));
 
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
 
         assert_eq!(classify(&err), Fault::Clean, "{err:#}");
         assert!(has_io_error(&err, std::io::ErrorKind::WriteZero), "{err:#}");
@@ -2245,7 +2197,7 @@ mod tests {
         let mut output = LogitOutput::new("127.0.0.1:1").with_timeout(Duration::from_millis(100));
         output.stream = Some(conn_over(fake.clone()));
 
-        let err = output.send(&sample_batch()).await.unwrap_err();
+        let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
 
         assert_eq!(classify(&err), Fault::Clean, "{err:#}");
         assert!(has_io_error(&err, std::io::ErrorKind::BrokenPipe), "{err:#}");
@@ -2283,7 +2235,7 @@ mod tests {
         const PASSED: usize = 20_000;
         let before = tap.written();
         tap.fail_writes_after(PASSED);
-        let err = output.send(&batch_of(40_000)).await.unwrap_err();
+        let err = send_next(&mut output, &batch_of(40_000)).await.unwrap_err();
 
         assert_eq!(classify(&err), Fault::Clean, "{err:#}");
         assert!(has_io_error(&err, std::io::ErrorKind::BrokenPipe), "{err:#}");
@@ -2310,13 +2262,12 @@ mod tests {
             let control::ControlMessage::Hello(_) = read_control(&mut server).await.unwrap() else {
                 panic!("expected Hello");
             };
-            write_control(&mut server, &hello_ack_v1()).await.unwrap();
+            write_control(&mut server, &hello_ack()).await.unwrap();
             std::future::pending::<()>().await;
         });
 
         let mut output = LogitOutput::new("127.0.0.1:1").with_timeout(RECV_TIMEOUT);
-        let conn = output.handshake(Box::new(client)).await.expect("the HelloAck arrives");
-        assert_eq!(conn.codec, native::CODEC_NATIVE_V1);
+        output.handshake(Box::new(client)).await.expect("the HelloAck arrives");
     }
 
     // ---- read_control's own allocation bound -------------------------------------------------
@@ -2355,7 +2306,7 @@ mod tests {
     async fn read_control_accepts_a_message_at_the_control_message_cap_and_refuses_one_over() {
         let cap = control::MAX_CONTROL_MESSAGE_BYTES as usize;
         // A `HelloAck` padded with unknown field 99: tag, a 2-byte uvarint length, then bytes.
-        let mut payload = BytesMut::from(&hello_ack_v1().encode()[..]);
+        let mut payload = BytesMut::from(&hello_ack().encode()[..]);
         let pad = cap - payload.len() - 3;
         payload.extend_from_slice(&[99, (pad as u8 & 0x7f) | 0x80, (pad >> 7) as u8]);
         payload.extend_from_slice(&vec![0u8; pad]);
@@ -2368,7 +2319,7 @@ mod tests {
         client.write_all(&at_cap).await.unwrap();
         assert_eq!(
             read_control(&mut server).await.unwrap(),
-            control::ControlMessage::HelloAck(hello_ack_v1())
+            control::ControlMessage::HelloAck(hello_ack())
         );
 
         payload.extend_from_slice(&[0]);
@@ -2478,7 +2429,7 @@ mod tests {
 
     // ---- the send window ------------------------------------------------------------------------
 
-    /// Accepts one connection on `listener` and answers its `Hello` with [`hello_ack_v1`] at
+    /// Accepts one connection on `listener` and answers its `Hello` with [`hello_ack`] at
     /// `window`, returning the stream and the window the `Hello` offered.
     async fn accept_with_window(
         listener: &TcpListener,
@@ -2488,7 +2439,7 @@ mod tests {
         let control::ControlMessage::Hello(hello) = read_control(&mut stream).await.unwrap() else {
             panic!("expected Hello");
         };
-        write_control(&mut stream, &control::HelloAck { window, ..hello_ack_v1() }).await.unwrap();
+        write_control(&mut stream, &control::HelloAck { window, ..hello_ack() }).await.unwrap();
         (stream, hello.window)
     }
 
@@ -2500,13 +2451,13 @@ mod tests {
         batch
     }
 
-    /// `submit` at `in_flight` with an empty context and no sequence.
+    /// `submit` at `in_flight` with an empty context and [`next_seq`].
     async fn submit_at(
         output: &mut LogitOutput,
         batch: &EventBatch,
         in_flight: usize,
     ) -> anyhow::Result<()> {
-        output.submit(batch, BatchContext::default(), None, in_flight).await
+        output.submit(batch, BatchContext::default(), next_seq(), in_flight).await
     }
 
     /// A peer answering window 8 reads three frames before it acks any: three `submit`s return
@@ -2597,7 +2548,7 @@ mod tests {
         });
         let mut output = LogitOutput::new(addr);
 
-        output.send(&sample_batch()).await.expect("one frame goes out and is acked");
+        send_next(&mut output, &sample_batch()).await.expect("one frame goes out and is acked");
         assert_eq!(output.window(), 1);
         peer.abort();
     }
@@ -2854,7 +2805,7 @@ mod tests {
             let control::ControlMessage::Hello(_) = read_control(&mut stream).await.unwrap() else {
                 panic!("expected Hello");
             };
-            let ack = control::HelloAck { window: 8, max_frame_bytes: 4096, ..hello_ack_v1() };
+            let ack = control::HelloAck { window: 8, max_frame_bytes: 4096, ..hello_ack() };
             write_control(&mut stream, &ack).await.unwrap();
             loop {
                 read_data_frame(&mut stream).await;
@@ -2895,7 +2846,7 @@ mod tests {
             let control::ControlMessage::Hello(_) = read_control(&mut stream).await.unwrap() else {
                 panic!("expected Hello");
             };
-            let ack = control::HelloAck { window: 8, ..hello_ack_v1() };
+            let ack = control::HelloAck { window: 8, ..hello_ack() };
             write_control(&mut stream, &ack).await.unwrap();
             for _ in 0..4 {
                 read_data_frame(&mut stream).await;
@@ -2939,7 +2890,7 @@ mod tests {
         while next < batches.len() || in_flight > 0 {
             while next < batches.len() && (in_flight == 0 || in_flight < output.window()) {
                 output
-                    .submit(&batches[next], BatchContext::default(), Some(seq(next)), in_flight)
+                    .submit(&batches[next], BatchContext::default(), seq(next), in_flight)
                     .await
                     .expect("a submit");
                 next += 1;
@@ -2993,7 +2944,7 @@ mod tests {
         let batches: Vec<_> = (1..=6).map(batch_marked).collect();
 
         for (i, batch) in batches[..5].iter().enumerate() {
-            output.submit(batch, BatchContext::default(), Some(pair(i)), i).await.unwrap();
+            output.submit(batch, BatchContext::default(), pair(i), i).await.unwrap();
         }
         for _ in 0..3 {
             output.await_ack().await.expect("an Ack");

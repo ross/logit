@@ -204,9 +204,9 @@ impl Fanout {
         ctx
     }
 
-    /// `logit_in`'s rule: back-fill only what the wire didn't carry (a v1 peer, or a v2 peer with
-    /// none), so `logit_out -> logit_in` preserves a peer's `origin`/`previous` and never leaves
-    /// either empty.
+    /// `logit_in`'s rule: back-fill only what the wire didn't carry (a peer whose batch had no
+    /// `origin` or `previous`), so `logit_out -> logit_in` preserves a peer's `origin`/`previous`
+    /// and never leaves either empty.
     fn stamp_relayed(&self, mut ctx: BatchContext) -> BatchContext {
         if let Some(me) = self.component {
             ctx.provenance.origin.get_or_insert(me);
@@ -939,9 +939,9 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// `send_relayed` leaves a v2 peer's full provenance untouched.
+    /// `send_relayed` leaves a peer's full provenance untouched.
     #[tokio::test]
-    async fn send_relayed_passes_through_full_provenance_from_a_v2_peer_untouched() {
+    async fn send_relayed_passes_through_full_provenance_from_a_peer_untouched() {
         let (tx, mut rx) = mpsc::channel(1);
         let fanout = Fanout::new(vec![tx]).with_component("logit_in");
         let from_wire = logit_core::Provenance {

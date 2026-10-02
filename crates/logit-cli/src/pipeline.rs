@@ -3471,7 +3471,7 @@ mod tests {
         let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let hello = control::Hello {
             version: control::PROTOCOL_VERSION,
-            codecs: vec![native::CODEC_NATIVE_V1],
+            codecs: vec![native::CODEC_HOP_BATCH],
             compressions: vec![0],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: 1,

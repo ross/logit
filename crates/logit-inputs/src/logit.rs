@@ -24,15 +24,16 @@
 //! its sender's mark stays where it was, and the frame's batch is counted
 //! `logit.input.batches.dropped{reason="closed_consumer"}`.
 //!
-//! **Deduplication.** A v2 frame's trailer can carry its sender's identity and sequence
-//! (`docs/adr/native-hop-identity-and-sequence.md`). Each component keeps one table of
+//! **Deduplication.** Every data frame's trailer carries its sender's identity and sequence
+//! (`docs/adr/native-hop-identity-and-sequence.md`); a frame without a complete pair is
+//! malformed, a protocol error that ends the connection
+//! (`docs/adr/native-hop-no-compatibility.md`). Each component keeps one table of
 //! high-water marks, one per identity, shared by its connections and bounded at
 //! `max_connections + max_connections / 4` identities (`max_connections:` in config; 1280 at the
 //! default cap of 1024); a new identity at a full table evicts the least recently seen one. A
-//! frame at or below its identity's mark is a resend: acked and not forwarded. Any other
-//! sequenced frame is forwarded, and a consumer taking it raises the mark to its sequence; gaps
-//! above the mark are ignored. An unsequenced frame (a v1 frame, or a v2 frame without a
-//! complete, well-formed pair) is always forwarded. No lock spans a forward, so a frame an ended
+//! frame at or below its identity's mark is a resend: acked and not forwarded. Any other frame is
+//! forwarded, and a consumer taking it raises the mark to its sequence; gaps above the mark are
+//! ignored. No lock spans a forward, so a frame an ended
 //! connection still holds can be forwarded beside the sender's resend of it on a new connection
 //! (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds"). The
 //! identity is advisory, never trusted: a peer minting a new identity per frame costs one scan of
@@ -131,7 +132,7 @@
 
 use crate::Input;
 use bytes::{Bytes, BytesMut};
-use logit_core::{Diagnostics, Provenance, Telemetry};
+use logit_core::{Diagnostics, Telemetry};
 use logit_pipeline::Fanout;
 use logit_proto::frame::{self, Compression, FrameHeader};
 use logit_proto::native::{self, control};
@@ -453,12 +454,10 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     .await
 }
 
-/// What the handshake negotiated for one connection.
+/// What the handshake negotiated for one connection. The codec is always `CODEC_HOP_BATCH`;
+/// `serve_connection` checks every data frame carries it.
 struct Negotiated {
     compression: Compression,
-    /// `CODEC_NATIVE_V2` if the client offered it (so provenance crosses the wire), else
-    /// `CODEC_NATIVE_V1`. Every data frame must carry this codec; `serve_connection` checks each.
-    codec: u8,
 }
 
 fn compression_tag(compression: Compression) -> &'static str {
@@ -466,14 +465,6 @@ fn compression_tag(compression: Compression) -> &'static str {
         Compression::None => "none",
         Compression::Lz4 => "lz4",
         Compression::Zstd => "zstd",
-    }
-}
-
-/// The `logit.proto.frames` metric's `codec` tag; matches `logit_outputs::logit`'s `codec_tag`.
-fn codec_tag(codec: u8) -> &'static str {
-    match codec {
-        native::CODEC_NATIVE_V2 => "native_v2",
-        _ => "native_v1",
     }
 }
 
@@ -653,28 +644,20 @@ async fn serve_frames<S: AsyncRead + AsyncWrite + Unpin + Send>(
             // A client sends no control message after `Hello`; one here closes the connection.
             anyhow::bail!("received an unexpected control frame after the handshake");
         }
-        if header.codec != negotiated.codec {
+        if header.codec != native::CODEC_HOP_BATCH {
             telemetry.count("logit.proto.errors", 1.0, &[("reason", "codec")]);
             anyhow::bail!(
-                "frame codec byte {}, expected the negotiated codec ({})",
+                "frame codec byte {}, expected the hop batch ({})",
                 header.codec,
-                negotiated.codec
+                native::CODEC_HOP_BATCH
             );
         }
 
         // A fresh budget per frame, scaled to the cap this peer's frames arrive under.
         let budget = native::DecodeBudget::for_frame_cap(max_frame_bytes);
-        let decoded = if negotiated.codec == native::CODEC_NATIVE_V2 {
-            native::decode_batch_v2(&mut payload, &budget)
-                .map_err(|err| (err, "decoding a native v2 batch"))
-        } else {
-            native::decode_batch(&mut payload, &budget)
-                .map(|batch| (batch, Provenance::default(), None))
-                .map_err(|err| (err, "decoding a native batch"))
-        };
-        let (batch, provenance, seq) = match decoded {
+        let (batch, provenance, seq) = match native::decode_hop_batch(&mut payload, &budget) {
             Ok(decoded) => decoded,
-            Err((err, what)) => {
+            Err(err) => {
                 telemetry.count(
                     "logit.proto.errors",
                     1.0,
@@ -689,18 +672,14 @@ async fn serve_frames<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     };
                     let _ = write_reject(stream, &reject, handshake_timeout, telemetry).await;
                 }
-                return Err(anyhow::Error::new(err).context(what));
+                return Err(anyhow::Error::new(err).context("decoding a native hop batch"));
             }
         };
 
         telemetry.count(
             "logit.proto.frames",
             1.0,
-            &[
-                ("direction", "in"),
-                ("codec", codec_tag(negotiated.codec)),
-                ("compression", compression),
-            ],
+            &[("direction", "in"), ("compression", compression)],
         );
         telemetry.count(
             "logit.proto.frame.bytes",
@@ -709,16 +688,15 @@ async fn serve_frames<S: AsyncRead + AsyncWrite + Unpin + Send>(
         );
 
         // A frame at or below its sender's mark is acknowledged on the mark alone (module doc's
-        // "Deduplication"). An unsequenced frame is never a resend.
-        let resend = seq.is_some_and(|seq| senders.is_resend(seq));
+        // "Deduplication").
+        let resend = senders.is_resend(seq);
         if resend {
             telemetry.count(senders::RESENDS, 1.0, &[]);
         } else {
             // The ack point: `send_relayed` returns once every open downstream inbox has the
-            // batch. It backfills only provenance the wire didn't carry (a v1 peer, or a v2 peer
-            // with none) and passes a v2 peer's `origin`/`previous` through untouched
-            // (`docs/adr/batch-provenance-on-delivered.md`). The sender pair names this hop only
-            // and stays here; a relay's own store numbers the next.
+            // batch. It backfills an `origin` or `previous` the frame didn't carry and passes the
+            // peer's own through untouched (`docs/adr/batch-provenance-on-delivered.md`). The
+            // sender pair names this hop only and stays here; a relay's own store numbers the next.
             if !sink.send_relayed(batch, provenance).await {
                 telemetry.count(
                     "logit.input.batches.dropped",
@@ -731,9 +709,7 @@ async fn serve_frames<S: AsyncRead + AsyncWrite + Unpin + Send>(
             }
             // Only after a consumer took the batch: a batch answered `GOING_AWAY` comes back,
             // and a raised mark would drop it as a resend.
-            if let Some(seq) = seq {
-                senders.raise(seq);
-            }
+            senders.raise(seq);
         }
 
         // After a forwarding `send_relayed` this is the only write: a frame is never both
@@ -848,20 +824,15 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         );
     }
 
-    // Prefer v2 (carries provenance), else v1: a `logit_out` offering only `[1]` still talks,
-    // and one offering `[2, 1]` gets provenance (`docs/adr/batch-provenance-on-delivered.md`).
-    let codec = if hello.codecs.contains(&native::CODEC_NATIVE_V2) {
-        native::CODEC_NATIVE_V2
-    } else if hello.codecs.contains(&native::CODEC_NATIVE_V1) {
-        native::CODEC_NATIVE_V1
-    } else {
+    // One codec (`docs/adr/native-hop-no-compatibility.md`, decision 3).
+    if !hello.codecs.contains(&native::CODEC_HOP_BATCH) {
         let reject = control::Reject {
             code: control::REJECT_NO_COMMON_CODEC,
-            message: "this listener speaks native v1 or v2".to_string(),
+            message: "this listener speaks the native hop codec".to_string(),
         };
         let _ = write_reject(stream, &reject, handshake_timeout, telemetry).await;
         anyhow::bail!("client offered no codec this listener speaks: {:?}", hello.codecs);
-    };
+    }
 
     // Compression always falls back to `None`, so unlike codec it has no reject path.
     let compression = if hello.compressions.contains(&(Compression::Lz4 as u8)) {
@@ -872,13 +843,13 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
 
     let ack = control::HelloAck {
         version: control::PROTOCOL_VERSION,
-        codec,
+        codec: native::CODEC_HOP_BATCH,
         compression: compression as u8,
         max_frame_bytes,
         window: hello.window.clamp(1, RECEIVER_MAX_WINDOW),
     };
     write_control(stream, &ack, handshake_timeout).await?;
-    Ok(Negotiated { compression, codec })
+    Ok(Negotiated { compression })
 }
 
 /// A header read's idle bounds on a connection with an `idle_timeout`; `None` (unbounded) on one
@@ -1196,12 +1167,11 @@ impl ControlEncode for control::Reject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logit_core::Provenance;
     use logit_core::{AttrMap, Event, EventBatch, LogRecord, Registry, Resource, Severity, Value};
     use logit_pipeline::test_util::{
         expect_closed, expect_still_open, recv_batch, TelemetryProbe, Totals, RECV_TIMEOUT,
     };
-    use logit_proto::native::NativeEncoder;
-    use logit_proto::Encoder;
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::CertificateDer;
     use std::sync::Arc;
@@ -1310,37 +1280,52 @@ mod tests {
         control::ControlMessage::decode(&mut payload).unwrap()
     }
 
+    /// The next number of one sender shared by every test in this process, so two frames a test
+    /// sends never read as one resend.
+    fn next_seq() -> native::SeqId {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        native::SeqId {
+            id: *b"logit-in-tests!!",
+            seq: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// `batch` as one hop data frame with no provenance, under [`next_seq`].
+    fn hop_frame(batch: &EventBatch, compression: Compression) -> Bytes {
+        let payload = native::encode_hop_batch(batch, Provenance::default(), next_seq());
+        frame::write_frame(native::CODEC_HOP_BATCH, compression, &payload).unwrap()
+    }
+
+    /// Writes [`hop_frame`]`(batch)`.
     async fn send_data_frame(stream: &mut TcpStream, batch: &EventBatch, compression: Compression) {
-        let mut encoder = NativeEncoder::new(compression);
-        let framed = encoder.encode(batch).unwrap();
-        stream.write_all(&framed).await.unwrap();
+        stream.write_all(&hop_frame(batch, compression)).await.unwrap();
     }
 
-    /// [`send_data_frame`] under `CODEC_NATIVE_V2`, with a provenance trailer.
-    async fn send_data_frame_v2(
+    /// [`send_data_frame`] with `provenance` in the trailer.
+    async fn send_data_frame_with(
         stream: &mut TcpStream,
         batch: &EventBatch,
         provenance: Provenance,
         compression: Compression,
     ) {
-        send_data_frame_v2_seq(stream, batch, provenance, None, compression).await;
+        send_data_frame_seq(stream, batch, provenance, next_seq(), compression).await;
     }
 
-    /// [`send_data_frame_v2`] with a sender identity and sequence in the trailer.
-    async fn send_data_frame_v2_seq(
+    /// [`send_data_frame_with`] under a chosen sender identity and sequence.
+    async fn send_data_frame_seq(
         stream: &mut TcpStream,
         batch: &EventBatch,
         provenance: Provenance,
-        seq: Option<native::SeqId>,
+        seq: native::SeqId,
         compression: Compression,
     ) {
-        let payload = native::encode_batch_v2(batch, provenance, seq);
-        send_v2_payload(stream, &payload, compression).await;
+        let payload = native::encode_hop_batch(batch, provenance, seq);
+        send_payload(stream, &payload, compression).await;
     }
 
-    /// Frames a hand-built v2 payload, for a trailer `encode_batch_v2` never writes.
-    async fn send_v2_payload(stream: &mut TcpStream, payload: &[u8], compression: Compression) {
-        let framed = frame::write_frame(native::CODEC_NATIVE_V2, compression, payload).unwrap();
+    /// Frames a hand-built hop payload, for a trailer `encode_hop_batch` never writes.
+    async fn send_payload(stream: &mut TcpStream, payload: &[u8], compression: Compression) {
+        let framed = frame::write_frame(native::CODEC_HOP_BATCH, compression, payload).unwrap();
         stream.write_all(&framed).await.unwrap();
     }
 
@@ -1365,13 +1350,13 @@ mod tests {
         native::SeqId { id: [id; 16], seq }
     }
 
-    /// A connected, handshaken `CODEC_NATIVE_V2` client.
-    async fn v2_client(addr: &str) -> TcpStream {
+    /// A connected, handshaken client.
+    async fn hop_client(addr: &str) -> TcpStream {
         let mut client = connect(addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V2], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         match read_control_response(&mut client).await {
             control::ControlMessage::HelloAck(ack) => {
-                assert_eq!(ack.codec, native::CODEC_NATIVE_V2)
+                assert_eq!(ack.codec, native::CODEC_HOP_BATCH)
             }
             other => panic!("expected HelloAck, got {other:?}"),
         }
@@ -1380,9 +1365,9 @@ mod tests {
 
     /// Sends [`batch_marked`]`(mark)` under `seq` and waits for its `Ack`. The `Ack` follows the
     /// forward and every counter, so a test reads both right after.
-    async fn send_acked(client: &mut TcpStream, mark: i64, seq: Option<native::SeqId>) {
+    async fn send_acked(client: &mut TcpStream, mark: i64, seq: native::SeqId) {
         let batch = batch_marked(mark);
-        send_data_frame_v2_seq(client, &batch, Provenance::default(), seq, Compression::None).await;
+        send_data_frame_seq(client, &batch, Provenance::default(), seq, Compression::None).await;
         read_ack(client).await;
     }
 
@@ -1450,23 +1435,23 @@ mod tests {
 
     // ---- provenance -------------------------------------------------------------------------
 
-    /// A v2 client's `origin`/`previous` are relayed untouched.
+    /// A client's `origin`/`previous` are relayed untouched.
     #[tokio::test]
-    async fn a_v2_clients_provenance_is_relayed_untouched() {
+    async fn a_clients_provenance_is_relayed_untouched() {
         let (addr, input) = bound_input().await;
         let (sink, mut rx) = fanout_into_channel_with_component("logit_in_test", 16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V2], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         read_control_response(&mut client).await;
 
         let sent = Provenance {
             origin: Some(logit_core::interner::intern("remote_listener")),
             previous: Some(logit_core::interner::intern("remote_enrich")),
         };
-        send_data_frame_v2(&mut client, &sample_batch(), sent, Compression::None).await;
+        send_data_frame_with(&mut client, &sample_batch(), sent, Compression::None).await;
         read_ack(&mut client).await;
 
         let delivered = recv_delivered(&mut rx).await;
@@ -1475,41 +1460,25 @@ mod tests {
         assert_eq!(provenance.previous_str(), Some("remote_enrich"));
     }
 
-    /// An empty v2 provenance trailer gets this listener's id backfilled into both fields.
+    /// A trailer with no provenance gets this listener's id backfilled into both fields.
     #[tokio::test]
-    async fn a_v2_client_with_no_provenance_gets_this_listener_backfilled() {
+    async fn a_client_with_no_provenance_gets_this_listener_backfilled() {
         let (addr, input) = bound_input().await;
         let (sink, mut rx) = fanout_into_channel_with_component("logit_in_test", 16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V2], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         read_control_response(&mut client).await;
 
-        send_data_frame_v2(&mut client, &sample_batch(), Provenance::default(), Compression::None)
-            .await;
-        read_ack(&mut client).await;
-
-        let delivered = recv_delivered(&mut rx).await;
-        let provenance = delivered.provenance();
-        assert_eq!(provenance.origin_str(), Some("logit_in_test"));
-        assert_eq!(provenance.previous_str(), Some("logit_in_test"));
-    }
-
-    /// A v1 client's batch gets this listener's id backfilled into both fields.
-    #[tokio::test]
-    async fn a_v1_clients_batch_gets_this_listeners_own_provenance() {
-        let (addr, input) = bound_input().await;
-        let (sink, mut rx) = fanout_into_channel_with_component("logit_in_test", 16);
-        let mut input = input;
-        tokio::spawn(async move { input.run(sink).await });
-
-        let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
-        read_control_response(&mut client).await;
-
-        send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+        send_data_frame_with(
+            &mut client,
+            &sample_batch(),
+            Provenance::default(),
+            Compression::None,
+        )
+        .await;
         read_ack(&mut client).await;
 
         let delivered = recv_delivered(&mut rx).await;
@@ -1520,48 +1489,6 @@ mod tests {
 
     // ---- handshake ------------------------------------------------------------------------
 
-    /// A client offering both codecs negotiates v2.
-    #[tokio::test]
-    async fn a_client_offering_both_codecs_negotiates_v2() {
-        let (addr, input) = bound_input().await;
-        let (sink, _rx) = fanout_into_channel(16);
-        let mut input = input;
-        tokio::spawn(async move { input.run(sink).await });
-
-        let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V2, native::CODEC_NATIVE_V1], vec![0])
-            .await;
-        match read_control_response(&mut client).await {
-            control::ControlMessage::HelloAck(ack) => {
-                assert_eq!(ack.codec, native::CODEC_NATIVE_V2);
-            }
-            other => panic!("expected HelloAck, got {other:?}"),
-        }
-    }
-
-    /// A client offering only `[1]` still negotiates and delivers.
-    #[tokio::test]
-    async fn a_client_offering_only_v1_still_negotiates_and_talks() {
-        let (addr, input) = bound_input().await;
-        let (sink, mut rx) = fanout_into_channel(16);
-        let mut input = input;
-        tokio::spawn(async move { input.run(sink).await });
-
-        let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
-        match read_control_response(&mut client).await {
-            control::ControlMessage::HelloAck(ack) => {
-                assert_eq!(ack.codec, native::CODEC_NATIVE_V1)
-            }
-            other => panic!("expected HelloAck, got {other:?}"),
-        }
-
-        send_data_frame(&mut client, &sample_batch(), Compression::None).await;
-        read_ack(&mut client).await;
-        let batch = recv_batch(&mut rx).await;
-        assert_eq!(batch.events.len(), 1);
-    }
-
     #[tokio::test]
     async fn handshake_happy_path_returns_the_negotiated_compression() {
         let (addr, input) = bound_input().await;
@@ -1570,11 +1497,11 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0, Compression::Lz4 as u8])
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0, Compression::Lz4 as u8])
             .await;
         match read_control_response(&mut client).await {
             control::ControlMessage::HelloAck(ack) => {
-                assert_eq!(ack.codec, native::CODEC_NATIVE_V1);
+                assert_eq!(ack.codec, native::CODEC_HOP_BATCH);
                 assert_eq!(ack.compression, Compression::Lz4 as u8);
                 assert_eq!(ack.version, control::PROTOCOL_VERSION);
             }
@@ -1589,13 +1516,16 @@ mod tests {
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
 
-        let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![99], vec![0]).await;
-        match read_control_response(&mut client).await {
-            control::ControlMessage::Reject(reject) => {
-                assert_eq!(reject.code, control::REJECT_NO_COMMON_CODEC);
+        // An unknown codec, and the bare batch codec, which is the file format and not the hop's.
+        for codecs in [vec![99], vec![native::CODEC_BATCH]] {
+            let mut client = connect(&addr).await;
+            client_hello(&mut client, codecs.clone(), vec![0]).await;
+            match read_control_response(&mut client).await {
+                control::ControlMessage::Reject(reject) => {
+                    assert_eq!(reject.code, control::REJECT_NO_COMMON_CODEC, "{codecs:?}");
+                }
+                other => panic!("expected Reject for {codecs:?}, got {other:?}"),
             }
-            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -1609,7 +1539,7 @@ mod tests {
         let mut client = connect(&addr).await;
         let hello = control::Hello {
             version: control::PROTOCOL_VERSION + 1,
-            codecs: vec![native::CODEC_NATIVE_V1],
+            codecs: vec![native::CODEC_HOP_BATCH],
             compressions: vec![0],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: 1,
@@ -1651,13 +1581,13 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
         // Only a header declaring an oversized frame: a listener that waited for the body first
         // would hang here.
         let framed =
-            frame::write_frame(native::CODEC_NATIVE_V1, Compression::None, &vec![0u8; 10_000])
+            frame::write_frame(native::CODEC_HOP_BATCH, Compression::None, &vec![0u8; 10_000])
                 .unwrap();
         client.write_all(&framed[..frame::HEADER_LEN]).await.unwrap();
 
@@ -1687,7 +1617,7 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
         send_data_frame(&mut client, &sample_batch(), Compression::None).await;
@@ -1714,12 +1644,12 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
         let mut framed = BytesMut::from(
             &frame::write_frame(
-                native::CODEC_NATIVE_V1,
+                native::CODEC_HOP_BATCH,
                 Compression::None,
                 b"not a valid batch, but any bytes will do for a crc check",
             )
@@ -1761,7 +1691,7 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
         let events = (0..5).map(|i| Event::empty(i, AttrMap::new())).collect();
@@ -1810,7 +1740,7 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
         let events = (0..5).map(|i| Event::empty(i, AttrMap::new())).collect();
@@ -1858,7 +1788,7 @@ mod tests {
         let handle = tokio::spawn(async move { input.run_until_shutdown(sink, shutdown_rx).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
         shutdown_tx.send(true).unwrap();
@@ -1996,7 +1926,7 @@ mod tests {
 
         let hello = control::Hello {
             version: control::PROTOCOL_VERSION,
-            codecs: vec![native::CODEC_NATIVE_V1],
+            codecs: vec![native::CODEC_HOP_BATCH],
             compressions: vec![0],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: 1,
@@ -2004,7 +1934,7 @@ mod tests {
         write_msg(&mut tls_stream, &hello).await;
         match read_control_response_over(&mut tls_stream).await {
             control::ControlMessage::HelloAck(ack) => {
-                assert_eq!(ack.codec, native::CODEC_NATIVE_V1);
+                assert_eq!(ack.codec, native::CODEC_HOP_BATCH);
             }
             other => panic!("expected HelloAck, got {other:?}"),
         }
@@ -2087,7 +2017,7 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut quiet = connect(&addr).await;
-        client_hello(&mut quiet, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut quiet, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut quiet).await;
 
         expect_reject_going_away_for_idleness(&mut quiet, "a handshaken connection gone quiet")
@@ -2122,10 +2052,10 @@ mod tests {
             })
             .await;
         let mut second = connect(&addr).await;
-        client_hello(&mut second, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut second, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         match read_control_response(&mut second).await {
             control::ControlMessage::HelloAck(ack) => {
-                assert_eq!(ack.codec, native::CODEC_NATIVE_V1, "the permit came back");
+                assert_eq!(ack.codec, native::CODEC_HOP_BATCH, "the permit came back");
             }
             other => panic!("expected HelloAck on the second connection, got {other:?}"),
         }
@@ -2145,7 +2075,7 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
         send_data_frame(&mut client, &sample_batch(), Compression::None).await;
@@ -2177,7 +2107,7 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
         for _ in 0..8 {
@@ -2212,11 +2142,10 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
-        let mut encoder = NativeEncoder::new(Compression::None);
-        let framed = encoder.encode(&sample_batch()).unwrap();
+        let framed = hop_frame(&sample_batch(), Compression::None);
 
         tokio::time::sleep(Duration::from_millis(700)).await;
         client.write_all(&framed[..1]).await.unwrap();
@@ -2245,11 +2174,10 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
-        let mut encoder = NativeEncoder::new(Compression::None);
-        let framed = encoder.encode(&sample_batch()).unwrap();
+        let framed = hop_frame(&sample_batch(), Compression::None);
         client.write_all(&framed[..1]).await.unwrap();
 
         expect_reject_going_away_for_idleness(&mut client, "a header that stopped arriving").await;
@@ -2276,12 +2204,11 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
         // A well-formed frame, of which only the header and one body byte are written.
-        let mut encoder = NativeEncoder::new(Compression::None);
-        let framed = encoder.encode(&sample_batch()).unwrap();
+        let framed = hop_frame(&sample_batch(), Compression::None);
         assert!(framed.len() > frame::HEADER_LEN + 1, "the fixture needs a multi-byte body");
         client.write_all(&framed[..frame::HEADER_LEN + 1]).await.unwrap();
 
@@ -2310,7 +2237,7 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2334,19 +2261,20 @@ mod tests {
 
     // ---- bounded control writes, the GOING_AWAY invariant, frame bounds, and the body copy -----
 
-    /// The `Hello` every test client below sends: native v1, no compression.
-    fn hello_v1() -> control::Hello {
+    /// The `Hello` every test client below sends: the hop codec, no compression.
+    fn hello() -> control::Hello {
         control::Hello {
             version: control::PROTOCOL_VERSION,
-            codecs: vec![native::CODEC_NATIVE_V1],
+            codecs: vec![native::CODEC_HOP_BATCH],
             compressions: vec![0],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: 1,
         }
     }
 
+    /// [`sample_batch`] as a data frame under a fresh [`next_seq`]: two calls are two batches.
     fn sample_frame() -> Bytes {
-        NativeEncoder::new(Compression::None).encode(&sample_batch()).unwrap()
+        hop_frame(&sample_batch(), Compression::None)
     }
 
     /// The encoded length of `msg` as a control frame: sizes a `duplex` to hold a set number.
@@ -2394,11 +2322,11 @@ mod tests {
             senders(),
         ));
 
-        write_msg(&mut client, &hello_v1()).await;
+        write_msg(&mut client, &hello()).await;
         let _ = read_control_response(&mut client).await;
         let (unread, mut writer) = client.into_split();
-        let frame = sample_frame();
-        let spam = tokio::spawn(async move { while writer.write_all(&frame).await.is_ok() {} });
+        let spam =
+            tokio::spawn(async move { while writer.write_all(&sample_frame()).await.is_ok() {} });
         // Drains the listener's forwards and stamps the last one: the blocked `Ack` write
         // follows it.
         let last_forward = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
@@ -2457,11 +2385,10 @@ mod tests {
             senders(),
         ));
 
-        write_msg(&mut client, &hello_v1()).await;
+        write_msg(&mut client, &hello()).await;
         let _ = read_control_response_over(&mut client).await;
-        let frame = sample_frame();
-        client.write_all(&frame).await.unwrap();
-        client.write_all(&frame).await.unwrap();
+        client.write_all(&sample_frame()).await.unwrap();
+        client.write_all(&sample_frame()).await.unwrap();
         recv_batch(&mut rx).await;
         recv_batch(&mut rx).await;
         // Whether or not the second `Ack` is written yet: it fits the buffer, and no shutdown check
@@ -2494,11 +2421,11 @@ mod tests {
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.set_recv_buffer_size(4096).unwrap();
         let mut client = socket.connect(addr.parse().unwrap()).await.unwrap();
-        write_msg(&mut client, &hello_v1()).await;
+        write_msg(&mut client, &hello()).await;
         let _ = read_control_response(&mut client).await;
         let (unread, mut writer) = client.into_split();
-        let frame = sample_frame();
-        let spam = tokio::spawn(async move { while writer.write_all(&frame).await.is_ok() {} });
+        let spam =
+            tokio::spawn(async move { while writer.write_all(&sample_frame()).await.is_ok() {} });
         // Forwards stop once the listener's `Ack` write blocks.
         while tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.is_ok() {}
 
@@ -2535,7 +2462,7 @@ mod tests {
                 shutdown_rx,
                 senders(),
             ));
-            write_msg(&mut client, &hello_v1()).await;
+            write_msg(&mut client, &hello()).await;
             let _ = read_control_response_over(&mut client).await;
             tokio::task::yield_now().await; // the task parks in its `select!`
             client.write_all(&sample_frame()).await.unwrap(); // fits the buffer: no yield
@@ -2586,7 +2513,7 @@ mod tests {
             shutdown_rx,
             senders(),
         ));
-        write_msg(&mut client, &hello_v1()).await;
+        write_msg(&mut client, &hello()).await;
         let _ = read_control_response_over(&mut client).await;
 
         client.write_all(&sample_frame()).await.unwrap();
@@ -2667,7 +2594,7 @@ mod tests {
             0,
             Compression::None,
             frame::FLAG_CONTROL,
-            &hello_v1().encode(),
+            &hello().encode(),
         )
         .unwrap();
         write_flushed(&mut client, &hello).await;
@@ -2705,7 +2632,7 @@ mod tests {
             .await;
         });
 
-        let hello = control::Hello { version: control::PROTOCOL_VERSION + 1, ..hello_v1() };
+        let hello = control::Hello { version: control::PROTOCOL_VERSION + 1, ..hello() };
         let hello = frame::write_frame_with_flags(
             0,
             Compression::None,
@@ -2762,7 +2689,7 @@ mod tests {
         let (mut client, server) = tls_duplex(64 * 1024).await;
         let task = serve_over(server, registry.telemetry_for("logit_in", "logit_in", "listener"));
 
-        write_msg(&mut client, &hello_v1()).await;
+        write_msg(&mut client, &hello()).await;
         let _ = read_control_response_over(&mut client).await;
         client.write_all(&sample_frame()).await.unwrap();
         assert_eq!(
@@ -2788,14 +2715,14 @@ mod tests {
 
         let (mut tls_client, tls_server) = tls_duplex(64 * 1024).await;
         let tls_task = serve_over(tls_server, telemetry.clone());
-        write_msg(&mut tls_client, &hello_v1()).await;
+        write_msg(&mut tls_client, &hello()).await;
         let _ = read_control_response_over(&mut tls_client).await;
         write_flushed(&mut tls_client, &sample_frame()[..10]).await;
         drop(tls_client);
 
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let task = serve_over(server, telemetry);
-        write_msg(&mut client, &hello_v1()).await;
+        write_msg(&mut client, &hello()).await;
         let _ = read_control_response_over(&mut client).await;
         client.write_all(&sample_frame()[..10]).await.unwrap();
         drop(client);
@@ -2827,8 +2754,8 @@ mod tests {
             .collect()
     }
 
-    /// A one-event batch whose native v1 encoding is at most `target` bytes, within a few bytes
-    /// of it, and whose message is [`incompressible_text`].
+    /// A one-event batch whose hop encoding is at most `target` bytes under any sequence, within
+    /// a few bytes of it, and whose message is [`incompressible_text`].
     fn incompressible_batch_encoding_to(target: usize) -> EventBatch {
         let batch_with = |len: usize| {
             let mut batch = sample_batch();
@@ -2837,7 +2764,10 @@ mod tests {
         };
         let mut len = target;
         loop {
-            let encoded = native::encode_batch(&batch_with(len)).len();
+            // The largest sequence is the longest uvarint, so a real one encodes no longer.
+            let widest = native::SeqId { id: [0; 16], seq: u64::MAX };
+            let encoded =
+                native::encode_hop_batch(&batch_with(len), Provenance::default(), widest).len();
             if encoded <= target {
                 return batch_with(len);
             }
@@ -2856,7 +2786,7 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![Compression::Lz4 as u8])
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![Compression::Lz4 as u8])
             .await;
         match read_control_response(&mut client).await {
             control::ControlMessage::HelloAck(ack) => {
@@ -2866,7 +2796,7 @@ mod tests {
         }
 
         let batch = incompressible_batch_encoding_to(CAP as usize - 8);
-        let framed = NativeEncoder::new(Compression::Lz4).encode(&batch).unwrap();
+        let framed = hop_frame(&batch, Compression::Lz4);
         let compressed_len = framed.len() - frame::HEADER_LEN;
         assert!(
             compressed_len > CAP as usize,
@@ -2892,14 +2822,14 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![Compression::Lz4 as u8])
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![Compression::Lz4 as u8])
             .await;
         let _ = read_control_response(&mut client).await;
 
         // A real lz4 frame's header, its `compressed_len` (bytes 16..20) raised to one past
         // `CAP + CAP / 255 + 16`, sent with no body.
         let mut header = BytesMut::from(
-            &frame::write_frame(native::CODEC_NATIVE_V1, Compression::Lz4, &[0u8; CAP as usize])
+            &frame::write_frame(native::CODEC_HOP_BATCH, Compression::Lz4, &[0u8; CAP as usize])
                 .unwrap()[..frame::HEADER_LEN],
         );
         let over = CAP + CAP / 255 + 16 + 1;
@@ -2941,7 +2871,7 @@ mod tests {
         let handle = tokio::spawn(async move { input.run_until_shutdown(sink, shutdown_rx).await });
 
         let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut client).await;
         let frame = sample_frame();
         client.write_all(&frame[..10]).await.unwrap();
@@ -3037,8 +2967,8 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         tokio::spawn(async move { input.run(sink).await });
 
-        // `hello_v1` padded with unknown field 99: tag, a 2-byte uvarint length, then bytes.
-        let mut payload = BytesMut::from(&hello_v1().encode()[..]);
+        // `hello` padded with unknown field 99: tag, a 2-byte uvarint length, then bytes.
+        let mut payload = BytesMut::from(&hello().encode()[..]);
         let pad = cap - payload.len() - 3;
         payload.extend_from_slice(&[99, (pad as u8 & 0x7f) | 0x80, (pad >> 7) as u8]);
         payload.extend_from_slice(&vec![0u8; pad]);
@@ -3051,7 +2981,7 @@ mod tests {
         at_cap.write_all(&framed).await.unwrap();
         match read_control_response(&mut at_cap).await {
             control::ControlMessage::HelloAck(ack) => {
-                assert_eq!(ack.codec, native::CODEC_NATIVE_V1)
+                assert_eq!(ack.codec, native::CODEC_HOP_BATCH)
             }
             other => panic!("expected HelloAck at the cap, got {other:?}"),
         }
@@ -3095,7 +3025,7 @@ mod tests {
                 0,
                 Compression::Lz4,
                 frame::FLAG_CONTROL,
-                &hello_v1().encode(),
+                &hello().encode(),
             )
             .unwrap()[..frame::HEADER_LEN],
         );
@@ -3128,7 +3058,7 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
 
         let mut first = connect(&addr).await;
-        client_hello(&mut first, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut first, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         let _ = read_control_response(&mut first).await;
 
         let mut rejected = connect(&addr).await;
@@ -3149,7 +3079,7 @@ mod tests {
             })
             .await;
         let mut third = connect(&addr).await;
-        client_hello(&mut third, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        client_hello(&mut third, vec![native::CODEC_HOP_BATCH], vec![0]).await;
         match read_control_response(&mut third).await {
             control::ControlMessage::HelloAck(_) => {}
             other => {
@@ -3171,26 +3101,27 @@ mod tests {
         let mut probe = TelemetryProbe::new();
         let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
 
-        let mut first = v2_client(&addr).await;
-        send_acked(&mut first, 1, Some(sid(7, 1))).await;
+        let mut first = hop_client(&addr).await;
+        send_acked(&mut first, 1, sid(7, 1)).await;
         assert_eq!(recv_mark(&mut rx).await, 1);
         drop(first);
 
-        let mut second = v2_client(&addr).await;
-        send_acked(&mut second, 1, Some(sid(7, 1))).await;
-        send_acked(&mut second, 2, Some(sid(7, 2))).await;
+        let mut second = hop_client(&addr).await;
+        send_acked(&mut second, 1, sid(7, 1)).await;
+        send_acked(&mut second, 2, sid(7, 2)).await;
         assert_eq!(recv_mark(&mut rx).await, 2, "the resend was not forwarded");
         assert_eq!(probe.sum("logit.input.batches.resends", &[]), 1.0);
     }
 
-    /// Every malformed or missing pair is unsequenced and forwarded, a second copy included, and
-    /// a v1 connection's frames are forwarded however often they repeat.
+    /// A data frame without a complete sender pair is malformed: it's never forwarded, the
+    /// connection ends, and `logit.proto.errors` counts it. So is a data frame under the bare
+    /// batch codec.
     #[tokio::test]
-    async fn an_unsequenced_frame_is_forwarded_every_time() {
+    async fn a_frame_without_a_complete_pair_is_a_protocol_error() {
         let mut probe = TelemetryProbe::new();
         let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
 
-        // A v1 payload, then a hand-built trailer: its length (one byte, under 128) and fields.
+        // A bare payload, then a hand-built trailer: its length (one byte, under 128) and fields.
         let with_trailer = |mark: i64, trailer: &[u8]| {
             let mut payload = native::encode_batch(&batch_marked(mark)).to_vec();
             payload.push(u8::try_from(trailer.len()).unwrap());
@@ -3201,34 +3132,42 @@ mod tests {
         let seq_0 = [[3u8, 16].as_slice(), &[9; 16], &[4, 1, 0]].concat();
         let tag_4_twice = [[3u8, 16].as_slice(), &[9; 16], &[4, 1, 1, 4, 1, 2]].concat();
         let payloads = [
-            native::encode_batch_v2(&batch_marked(1), Provenance::default(), None).to_vec(),
+            with_trailer(1, &[]),
             with_trailer(2, &id_15),
             with_trailer(3, &seq_0),
             with_trailer(4, &tag_4_twice),
         ];
 
-        let mut client = v2_client(&addr).await;
-        for payload in &payloads {
-            for _ in 0..2 {
-                send_v2_payload(&mut client, payload, Compression::None).await;
-                read_ack(&mut client).await;
-            }
-        }
-        for mark in 1..=4 {
-            assert_eq!(recv_mark(&mut rx).await, mark, "first copy");
-            assert_eq!(recv_mark(&mut rx).await, mark, "second copy");
+        for (n, payload) in payloads.iter().enumerate() {
+            let mut client = hop_client(&addr).await;
+            send_payload(&mut client, payload, Compression::None).await;
+            expect_closed(&mut client, "a frame without a complete pair").await;
+            probe
+                .wait_for("the malformed frame counted", |t| {
+                    t.sum("logit.proto.errors", &[("reason", "magic")]) >= (n + 1) as f64
+                })
+                .await;
         }
 
-        let mut v1 = connect(&addr).await;
-        client_hello(&mut v1, vec![native::CODEC_NATIVE_V1], vec![0]).await;
-        read_control_response(&mut v1).await;
-        for _ in 0..2 {
-            send_data_frame(&mut v1, &batch_marked(5), Compression::None).await;
-            read_ack(&mut v1).await;
-        }
-        assert_eq!(recv_mark(&mut rx).await, 5);
-        assert_eq!(recv_mark(&mut rx).await, 5);
-        assert_eq!(probe.sum("logit.input.batches.resends", &[]), 0.0);
+        let mut bare = connect(&addr).await;
+        client_hello(&mut bare, vec![native::CODEC_HOP_BATCH], vec![0]).await;
+        read_control_response(&mut bare).await;
+        let framed = frame::write_frame(
+            native::CODEC_BATCH,
+            Compression::None,
+            &native::encode_batch(&batch_marked(5)),
+        )
+        .unwrap();
+        bare.write_all(&framed).await.unwrap();
+        expect_closed(&mut bare, "a data frame under the bare batch codec").await;
+        let totals = probe
+            .wait_for("the codec error counted", |t| {
+                t.sum("logit.proto.errors", &[("reason", "codec")]) >= 1.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "magic")]), 4.0);
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "codec")]), 1.0);
+        assert!(rx.try_recv().is_err(), "no malformed frame was forwarded");
     }
 
     /// A sender that restarts without a spool comes back under a new identity from 1, and its
@@ -3238,11 +3177,11 @@ mod tests {
         let mut probe = TelemetryProbe::new();
         let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
 
-        let mut client = v2_client(&addr).await;
+        let mut client = hop_client(&addr).await;
         for seq in 1..=3 {
-            send_acked(&mut client, seq as i64, Some(sid(1, seq))).await;
+            send_acked(&mut client, seq as i64, sid(1, seq)).await;
         }
-        send_acked(&mut client, 4, Some(sid(2, 1))).await;
+        send_acked(&mut client, 4, sid(2, 1)).await;
         for mark in 1..=4 {
             assert_eq!(recv_mark(&mut rx).await, mark);
         }
@@ -3256,10 +3195,10 @@ mod tests {
         let mut probe = TelemetryProbe::new();
         let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
 
-        let mut client = v2_client(&addr).await;
-        send_acked(&mut client, 2, Some(sid(1, 2))).await;
-        send_acked(&mut client, 1, Some(sid(1, 1))).await;
-        send_acked(&mut client, 3, Some(sid(1, 3))).await;
+        let mut client = hop_client(&addr).await;
+        send_acked(&mut client, 2, sid(1, 2)).await;
+        send_acked(&mut client, 1, sid(1, 1)).await;
+        send_acked(&mut client, 3, sid(1, 3)).await;
         assert_eq!(recv_mark(&mut rx).await, 2);
         assert_eq!(recv_mark(&mut rx).await, 3, "the number below the mark was not forwarded");
         assert_eq!(probe.sum("logit.input.batches.resends", &[]), 1.0);
@@ -3272,10 +3211,10 @@ mod tests {
         let mut probe = TelemetryProbe::new();
         let (addr, mut rx) = spawn_counted(&probe, 1).await;
 
-        let mut client = v2_client(&addr).await;
-        send_acked(&mut client, 1, Some(sid(1, 1))).await;
-        send_acked(&mut client, 2, Some(sid(2, 1))).await;
-        send_acked(&mut client, 3, Some(sid(1, 1))).await;
+        let mut client = hop_client(&addr).await;
+        send_acked(&mut client, 1, sid(1, 1)).await;
+        send_acked(&mut client, 2, sid(2, 1)).await;
+        send_acked(&mut client, 3, sid(1, 1)).await;
         for mark in 1..=3 {
             assert_eq!(recv_mark(&mut rx).await, mark);
         }
@@ -3295,10 +3234,10 @@ mod tests {
         let (addr_a, mut rx_a) = spawn_counted(&probe_a, crate::DEFAULT_MAX_CONNECTIONS).await;
         let (addr_b, mut rx_b) = spawn_counted(&probe_b, crate::DEFAULT_MAX_CONNECTIONS).await;
 
-        let mut client_a = v2_client(&addr_a).await;
-        send_acked(&mut client_a, 1, Some(sid(1, 1))).await;
-        let mut client_b = v2_client(&addr_b).await;
-        send_acked(&mut client_b, 1, Some(sid(1, 1))).await;
+        let mut client_a = hop_client(&addr_a).await;
+        send_acked(&mut client_a, 1, sid(1, 1)).await;
+        let mut client_b = hop_client(&addr_b).await;
+        send_acked(&mut client_b, 1, sid(1, 1)).await;
         assert_eq!(recv_mark(&mut rx_a).await, 1);
         assert_eq!(recv_mark(&mut rx_b).await, 1);
         assert_eq!(probe_a.sum("logit.input.batches.resends", &[]), 0.0);
@@ -3307,11 +3246,11 @@ mod tests {
 
     // ---- the send window ------------------------------------------------------------------------
 
-    /// [`client_hello`] offering `window`, v2 only.
+    /// [`client_hello`] offering `window`.
     async fn hello_offering(stream: &mut TcpStream, window: u32) {
         let hello = control::Hello {
             version: control::PROTOCOL_VERSION,
-            codecs: vec![native::CODEC_NATIVE_V2],
+            codecs: vec![native::CODEC_HOP_BATCH],
             compressions: vec![0],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window,
@@ -3319,12 +3258,12 @@ mod tests {
         write_msg(stream, &hello).await;
     }
 
-    /// [`send_data_frame_v2_seq`] of [`batch_marked`]`(mark)` under `sid(9, mark)`, without
+    /// [`send_data_frame_seq`] of [`batch_marked`]`(mark)` under `sid(9, mark)`, without
     /// waiting for its `Ack`.
     async fn pipeline_marked(client: &mut TcpStream, mark: i64) {
         let batch = batch_marked(mark);
-        let seq = Some(sid(9, mark as u64));
-        send_data_frame_v2_seq(client, &batch, Provenance::default(), seq, Compression::None).await;
+        let seq = sid(9, mark as u64);
+        send_data_frame_seq(client, &batch, Provenance::default(), seq, Compression::None).await;
     }
 
     #[tokio::test]
@@ -3393,7 +3332,7 @@ mod tests {
 
         // The first batch fills the one-slot consumer; the second's forward then waits on it,
         // with three more frames unread behind it.
-        send_acked(&mut client, 1, Some(sid(9, 1))).await;
+        send_acked(&mut client, 1, sid(9, 1)).await;
         for mark in 2..=5 {
             pipeline_marked(&mut client, mark).await;
         }
@@ -3484,7 +3423,7 @@ mod tests {
         let mut client = connect(&addr).await;
         hello_offering(&mut client, 8).await;
         let _ = read_control_response(&mut client).await;
-        send_acked(&mut client, 1, Some(sid(9, 1))).await;
+        send_acked(&mut client, 1, sid(9, 1)).await;
         assert_eq!(recv_mark(&mut rx).await, 1);
 
         shutdown_tx.send(true).unwrap();

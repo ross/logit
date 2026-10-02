@@ -447,7 +447,7 @@ fn new_encoder(telemetry: &Telemetry, diag: &Diagnostics, gate: &CountGate) -> O
 #[async_trait::async_trait]
 impl Output for OtlpOutput {
     /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext, _seq: Option<SeqId>) {
+    fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
         self.accounting.observe();
     }
 

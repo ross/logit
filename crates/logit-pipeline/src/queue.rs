@@ -647,9 +647,9 @@ impl<T: Queued + Clone> BoundedQueue<T> {
 }
 
 /// What a [`SinkStore`] hands its consumer: a batch, the [`BatchContext`] it arrived with, and
-/// its native-hop sender identity and number. The number is `None` only for a disk record
-/// written without one (`docs/adr/native-hop-identity-and-sequence.md`, decision 3).
-pub type StoreItem = (Arc<EventBatch>, BatchContext, Option<SeqId>);
+/// its native-hop sender identity and number. Every store numbers every batch it holds
+/// (`docs/adr/native-hop-no-compatibility.md`, decision 2).
+pub type StoreItem = (Arc<EventBatch>, BatchContext, SeqId);
 
 /// One store's sender identity and its next sequence number
 /// (`docs/adr/native-hop-identity-and-sequence.md`, decisions 2 and 3). Minted when the store
@@ -678,7 +678,7 @@ impl Numbering {
 /// `Output::observe_batch` its provenance (`docs/adr/batch-provenance-on-delivered.md`). The
 /// queue also numbers each batch it admits, for `logit_out`'s native hop.
 pub struct SinkQueue {
-    queue: BoundedQueue<(Arc<EventBatch>, BatchContext, SeqId)>,
+    queue: BoundedQueue<StoreItem>,
     numbering: Numbering,
 }
 
@@ -701,12 +701,12 @@ impl SinkQueue {
 
     /// See [`BoundedQueue::peek`], including its one-consumer rule.
     pub async fn peek(&self) -> Option<StoreItem> {
-        self.queue.peek().await.map(|(batch, ctx, seq)| (batch, ctx, Some(seq)))
+        self.queue.peek().await
     }
 
     /// See [`BoundedQueue::peek_at`].
     pub fn peek_at(&self, n: usize) -> Option<StoreItem> {
-        self.queue.peek_at(n).map(|(batch, ctx, seq)| (batch, ctx, Some(seq)))
+        self.queue.peek_at(n)
     }
 
     /// How many batches a consumer may hold reserved with `peek_at` at once: `max_batches`, or
@@ -718,7 +718,7 @@ impl SinkQueue {
 
     /// See [`BoundedQueue::commit`].
     pub fn commit(&self) -> Option<StoreItem> {
-        self.queue.commit().map(|(batch, ctx, seq)| (batch, ctx, Some(seq)))
+        self.queue.commit()
     }
 
     pub fn close(&self) {
@@ -1044,7 +1044,6 @@ mod tests {
 
         let (.., seq_a) = a.peek().await.expect("should peek");
         let (.., seq_b) = b.peek().await.expect("should peek");
-        let (seq_a, seq_b) = (seq_a.expect("a memory store numbers"), seq_b.expect("numbered"));
         assert_eq!((seq_a.seq, seq_b.seq), (1, 1));
         assert_ne!(seq_a.id, seq_b.id, "two queues should not share a sender identity");
     }
@@ -1057,7 +1056,7 @@ mod tests {
         }
         let mut seen = Vec::new();
         while let Some((.., seq)) = q.commit() {
-            seen.push(seq.expect("a memory store numbers every batch"));
+            seen.push(seq);
         }
         assert_eq!(seen.iter().map(|s| s.seq).collect::<Vec<_>>(), [1, 2, 3]);
         assert!(seen.iter().all(|s| s.id == seen[0].id), "one queue is one sender");
@@ -1073,7 +1072,7 @@ mod tests {
         let (.., first) = q.commit().expect("should commit");
         q.push((tiny_batch(), ctx())).await;
         let (.., third) = q.commit().expect("should commit");
-        assert_eq!((first.map(|s| s.seq), third.map(|s| s.seq)), (Some(1), Some(3)));
+        assert_eq!((first.seq, third.seq), (1, 3));
     }
 
     #[tokio::test(start_paused = true)]

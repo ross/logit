@@ -944,7 +944,7 @@ impl DatadogOutput {
 impl Output for DatadogOutput {
     /// Arms this sink's batch accounting (`crate::accounting`) and fixes the batch's send time,
     /// so every attempt at it reaches the same stale verdict (module doc's "What is never sent").
-    fn observe_batch(&mut self, _ctx: BatchContext, _seq: Option<SeqId>) {
+    fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
         self.accounting.observe();
         self.batch_now = Some((self.clock)());
     }

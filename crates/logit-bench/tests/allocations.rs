@@ -1973,7 +1973,7 @@ fn disk_queue_config(dir: std::path::PathBuf) -> logit_pipeline::DiskQueueConfig
     }
 }
 
-/// `DiskQueue::push`: `native::encode_batch_v2` (`encode_batch` plus its trailer of provenance and
+/// `DiskQueue::push`: `native::encode_hop_batch` (`encode_batch` plus its trailer of provenance and
 /// the store's sender identity and sequence, `docs/adr/batch-provenance-on-delivered.md` and
 /// `docs/adr/native-hop-identity-and-sequence.md`), `frame::write_frame`, and one `write_all` to
 /// the active segment. Taking the sequence number is an atomic add and allocates nothing. The disk buffer's ADR accepts that this encode breaks
@@ -2000,13 +2000,13 @@ fn disk_queue_push_one_batch() {
     let ((), stats) =
         measure(|| rt.block_on(queue.push((Arc::clone(&batch), BatchContext::default()))));
 
-    // Among the 33: `encode_batch_v2` builds v1's payload as its own `Bytes`, then copies it into
-    // a `BytesMut` sized to the whole payload, the trailer (provenance and the sender pair)
-    // written straight into it: 2. Sizing it to fit is what spares `freeze` a shared header. `write_field`'s
-    // temp buffers: 2 per `MetricRecord` (`write_record_list`'s per-entry length prefix, which
-    // lets a reader skip a record with unknown fields, and the `MR_KIND` field) for the four
-    // metrics, plus 1 for `LogRecord.message`: 9. The two `Samples` are written straight from
-    // their values, with no serialized sketch blob.
+    // Among the 33: `encode_hop_batch` builds the bare payload as its own `Bytes`, then copies it
+    // into a `BytesMut` sized to the whole payload, the trailer (provenance and the sender pair)
+    // written straight into it: 2. Sizing it to fit is what spares `freeze` a shared header.
+    // `write_field`'s temp buffers: 2 per `MetricRecord` (`write_record_list`'s per-entry length
+    // prefix, which lets a reader skip a record with unknown fields, and the `MR_KIND` field) for
+    // the four metrics, plus 1 for `LogRecord.message`: 9. The two `Samples` are written straight
+    // from their values, with no serialized sketch blob.
     expect_allocs("disk_queue: push one batch (encode + write)", stats, 33);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -3927,24 +3927,36 @@ fn native_decode_one_event() {
     expect_allocs("native: decode 1 event", stats, 7);
 }
 
-/// `logit_out`'s encode+frame step through the primitives it calls (`native::encode_batch`, then
-/// `frame::write_frame_with_flags`) rather than `NativeEncoder`: 30, the same two steps as
-/// [`native_encode_one_event`], pinned separately so a change to either path shows.
+/// The provenance and sender pair `logit_out` and `logit_in` pins carry, interned before any
+/// measurement.
+fn hop_trailer() -> (logit_core::Provenance, logit_proto::native::SeqId) {
+    let provenance = logit_core::Provenance {
+        origin: Some(logit_core::interner::intern("alloc_nginx_in")),
+        previous: Some(logit_core::interner::intern("alloc_enrich")),
+    };
+    (provenance, logit_proto::native::SeqId { id: [7; 16], seq: 1_000 })
+}
+
+/// `logit_out`'s encode+frame step through the primitives it calls (`native::encode_hop_batch`,
+/// then `frame::write_frame_with_flags`) rather than `NativeEncoder`, with a provenance and a
+/// sender pair, pinned separately from [`native_encode_one_event`] so a change to either path
+/// shows.
 #[test]
 fn logit_out_encode_and_frame_one_batch() {
     let batch = fixtures::nginx_batch(1);
-    let warm_payload = logit_proto::native::encode_batch(&batch);
+    let (provenance, seq) = hop_trailer();
+    let warm_payload = logit_proto::native::encode_hop_batch(&batch, provenance, seq);
     drop(logit_proto::frame::write_frame_with_flags(
-        logit_proto::native::CODEC_NATIVE_V1,
+        logit_proto::native::CODEC_HOP_BATCH,
         logit_proto::frame::Compression::None,
         0,
         &warm_payload,
     ));
 
     let (framed, stats) = measure(|| {
-        let payload = logit_proto::native::encode_batch(&batch);
+        let payload = logit_proto::native::encode_hop_batch(&batch, provenance, seq);
         logit_proto::frame::write_frame_with_flags(
-            logit_proto::native::CODEC_NATIVE_V1,
+            logit_proto::native::CODEC_HOP_BATCH,
             logit_proto::frame::Compression::None,
             0,
             &payload,
@@ -3952,36 +3964,44 @@ fn logit_out_encode_and_frame_one_batch() {
         .expect("should frame")
     });
     assert!(!framed.is_empty());
-    // Same `native::encode_batch` as `native_encode_one_event`, so the same breakdown.
-    expect_allocs("logit_out: encode + frame 1 batch", stats, 30);
+    // `native_encode_one_event`'s breakdown, plus the `BytesMut` `encode_hop_batch` copies the
+    // bare payload into beside the trailer.
+    expect_allocs("logit_out: encode + frame 1 batch", stats, 31);
 }
 
 /// `logit_in`'s read+decode step through the primitives its connection loop calls on a buffered
-/// frame (`frame::read_frame_with_header`, then `native::decode_batch`): 7, the same as
-/// [`native_decode_one_event`]. `decode_batch` returns an owned `EventBatch` that
-/// `Fanout::send` takes as-is.
+/// frame (`frame::read_frame_with_header`, then `native::decode_hop_batch`), with a provenance
+/// and a sender pair. `decode_hop_batch` returns an owned `EventBatch` that `Fanout::send` takes
+/// as-is.
 #[test]
 fn logit_in_read_and_decode_one_batch() {
     let batch = fixtures::nginx_batch(1);
-    let mut encoder = logit_proto::native::NativeEncoder::default();
-    let framed = encoder.encode(&batch).expect("should encode");
+    let (provenance, seq) = hop_trailer();
+    let payload = logit_proto::native::encode_hop_batch(&batch, provenance, seq);
+    let framed = logit_proto::frame::write_frame(
+        logit_proto::native::CODEC_HOP_BATCH,
+        logit_proto::frame::Compression::None,
+        &payload,
+    )
+    .expect("should frame");
 
     let mut warm = framed.clone();
     let (_, mut warm_payload) = logit_proto::frame::read_frame_with_header(&mut warm).unwrap();
-    drop(logit_proto::native::decode_batch(&mut warm_payload, &Default::default()));
+    drop(logit_proto::native::decode_hop_batch(&mut warm_payload, &Default::default()));
 
     let (event_count, stats) = measure(|| {
         let mut bytes = framed.clone();
         let (_, mut payload) =
             logit_proto::frame::read_frame_with_header(&mut bytes).expect("should read frame");
-        logit_proto::native::decode_batch(&mut payload, &Default::default())
+        logit_proto::native::decode_hop_batch(&mut payload, &Default::default())
             .expect("should decode")
+            .0
             .events
             .len()
     });
     assert_eq!(event_count, 1);
-    // Same `native::decode_batch` as `native_decode_one_event`, including its one-allocation
-    // `MetricList` decode.
+    // Same as `native_decode_one_event`, including its one-allocation `MetricList` decode: the
+    // trailer's strings intern to symbols the warm-up already holds.
     expect_allocs("logit_in: read + decode 1 batch", stats, 7);
 }
 

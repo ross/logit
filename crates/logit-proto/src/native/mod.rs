@@ -46,18 +46,20 @@ use crate::native::varint::{ensure_consumed, read_u8, read_uvarint, uvarint_len,
 pub use crate::native::budget::{DecodeBudget, DEFAULT_DECODE_BUDGET};
 use crate::{CodecError, Decoder, Encoder};
 
-/// The frame header's `codec` byte for this payload format, without provenance.
-pub const CODEC_NATIVE_V1: u8 = 1;
+/// The frame header's `codec` byte for a bare batch ([`encode_batch`]): the file format
+/// (`format: native`) and the perf harness's telemetry dump. A file has no sender and no hop, so
+/// it carries no trailer.
+pub const CODEC_BATCH: u8 = 1;
 
-/// [`encode_batch`]'s payload plus a mandatory length-prefixed trailer: the batch's
-/// [`Provenance`] (ADR `batch-provenance-on-delivered`), then an optional [`SeqId`] (ADR
-/// `native-hop-identity-and-sequence`).
+/// The frame header's `codec` byte for a hop batch ([`encode_hop_batch`]): [`encode_batch`]'s
+/// payload plus a mandatory length-prefixed trailer carrying the batch's [`Provenance`] (ADR
+/// `batch-provenance-on-delivered`) and its required [`SeqId`] (ADR
+/// `native-hop-identity-and-sequence`). It's what `logit_out` sends and what the disk spool
+/// records (ADR `native-hop-no-compatibility`).
 ///
-/// A separate codec rather than an optional trailer on v1, which would let a payload truncated at
-/// the trailer boundary decode as "no provenance". `Hello.codecs`/`HelloAck.codec`
-/// ([`control`]) negotiate v1 or v2; a peer offering only v1 still talks, without provenance and
-/// unsequenced.
-pub const CODEC_NATIVE_V2: u8 = 2;
+/// A separate codec rather than an optional trailer on [`CODEC_BATCH`], which would let a payload
+/// truncated at the trailer boundary decode as "no provenance".
+pub const CODEC_HOP_BATCH: u8 = 2;
 
 const TRAILER_TAG_ORIGIN: u8 = 1;
 const TRAILER_TAG_PREVIOUS: u8 = 2;
@@ -69,16 +71,17 @@ const TRAILER_TAG_SEQUENCE: u8 = 4;
 const MAX_SANE_TRAILER_FIELD_BYTES: usize = 4096;
 
 /// One batch's place on the native hop: the identity of the sink store it entered and its number
-/// there (ADR `native-hop-identity-and-sequence`). `seq` starts at 1; a decoded 0 is unsequenced.
+/// there (ADR `native-hop-identity-and-sequence`). `seq` starts at 1; a decoded 0 is malformed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SeqId {
     pub id: [u8; 16],
     pub seq: u64,
 }
 
-/// Encodes one [`EventBatch`] into the v1 payload: dictionary, len-prefixed [`Resource`] TLV,
-/// mandatory [`logit_core::Scope`] section (presence byte, then a len-prefixed TLV if present),
-/// then a counted list of len-prefixed events (`docs/design/wire-protocol.md`'s "Batch grammar").
+/// Encodes one [`EventBatch`] into the bare [`CODEC_BATCH`] payload: dictionary, len-prefixed
+/// [`Resource`] TLV, mandatory [`logit_core::Scope`] section (presence byte, then a len-prefixed
+/// TLV if present), then a counted list of len-prefixed events (`docs/design/wire-protocol.md`'s
+/// "Batch grammar").
 ///
 /// The scope section sits right after the resource, never as an optional trailing section,
 /// which would let a truncated payload decode as "no scope".
@@ -133,7 +136,7 @@ pub fn decode_batch(bytes: &mut Bytes, budget: &DecodeBudget) -> Result<EventBat
     Ok(batch)
 }
 
-/// [`decode_batch`] without the end-of-payload check, which [`decode_batch_v2`] makes after its
+/// [`decode_batch`] without the end-of-payload check, which [`decode_hop_batch`] makes after its
 /// trailer instead.
 fn decode_batch_body(bytes: &mut Bytes, budget: &DecodeBudget) -> Result<EventBatch, CodecError> {
     let dict = Dict::read(bytes, budget)?;
@@ -189,32 +192,30 @@ fn decode_batch_body(bytes: &mut Bytes, budget: &DecodeBudget) -> Result<EventBa
     Ok(EventBatch { resource, scope, events })
 }
 
-/// [`encode_batch`] followed by the [`CODEC_NATIVE_V2`] trailer: provenance, then sender
+/// [`encode_batch`] followed by the [`CODEC_HOP_BATCH`] trailer: provenance, then sender
 /// identity and sequence.
 ///
 /// The trailer is `tag(u8) + len(uvarint) + payload` entries with strings inline, not
 /// dictionary-indexed: two strings per batch give a dictionary nothing to amortize. An absent
-/// field writes no entry, but the trailer's length prefix is always written, `0x00` when empty.
-/// `seq` writes tag 3 (the 16-byte identity) and tag 4 (the sequence as a uvarint) together, or
-/// neither.
+/// provenance field writes no entry, but the trailer's length prefix is always written. `seq`
+/// always writes tag 3 (the 16-byte identity) and tag 4 (the sequence as a uvarint).
 ///
 /// The trailer's length is computed first and its fields written straight into the output: a
 /// separate trailer buffer costs allocations that `disk_queue_push_one_batch` pins.
-pub fn encode_batch_v2(batch: &EventBatch, provenance: Provenance, seq: Option<SeqId>) -> Bytes {
-    let v1 = encode_batch(batch);
+pub fn encode_hop_batch(batch: &EventBatch, provenance: Provenance, seq: SeqId) -> Bytes {
+    let body = encode_batch(batch);
 
     let origin = provenance.origin_str();
     let previous = provenance.previous_str();
     let field_len = |len: usize| 1 + uvarint_len(len as u64) + len;
-    let mut trailer_len =
-        origin.map_or(0, |s| field_len(s.len())) + previous.map_or(0, |s| field_len(s.len()));
-    if let Some(seq) = seq {
-        trailer_len += field_len(seq.id.len()) + field_len(uvarint_len(seq.seq));
-    }
+    let trailer_len = origin.map_or(0, |s| field_len(s.len()))
+        + previous.map_or(0, |s| field_len(s.len()))
+        + field_len(seq.id.len())
+        + field_len(uvarint_len(seq.seq));
 
-    let total = v1.len() + uvarint_len(trailer_len as u64) + trailer_len;
+    let total = body.len() + uvarint_len(trailer_len as u64) + trailer_len;
     let mut out = BytesMut::with_capacity(total);
-    out.extend_from_slice(&v1);
+    out.extend_from_slice(&body);
     write_uvarint(&mut out, trailer_len as u64);
     if let Some(origin) = origin {
         write_trailer_field(&mut out, TRAILER_TAG_ORIGIN, origin.as_bytes());
@@ -222,12 +223,10 @@ pub fn encode_batch_v2(batch: &EventBatch, provenance: Provenance, seq: Option<S
     if let Some(previous) = previous {
         write_trailer_field(&mut out, TRAILER_TAG_PREVIOUS, previous.as_bytes());
     }
-    if let Some(seq) = seq {
-        write_trailer_field(&mut out, TRAILER_TAG_SENDER, &seq.id);
-        // A uvarint is at most 10 bytes, so the sequence field's length prefix is one byte.
-        out.extend_from_slice(&[TRAILER_TAG_SEQUENCE, uvarint_len(seq.seq) as u8]);
-        write_uvarint(&mut out, seq.seq);
-    }
+    write_trailer_field(&mut out, TRAILER_TAG_SENDER, &seq.id);
+    // A uvarint is at most 10 bytes, so the sequence field's length prefix is one byte.
+    out.extend_from_slice(&[TRAILER_TAG_SEQUENCE, uvarint_len(seq.seq) as u8]);
+    write_uvarint(&mut out, seq.seq);
     debug_assert_eq!(out.len(), total);
     out.freeze()
 }
@@ -238,17 +237,8 @@ fn write_trailer_field(out: &mut BytesMut, tag: u8, value: &[u8]) {
     out.extend_from_slice(value);
 }
 
-/// Where one half of the sender pair stands while [`decode_batch_v2`] walks the trailer.
-enum Part<T> {
-    Absent,
-    Valid(T),
-    /// Malformed or repeated: the pair is unsequenced whatever follows.
-    Invalid,
-}
-
 /// Reads a tag-4 field as one uvarint filling the whole field, by [`read_uvarint`]'s rules. `None`
-/// on truncation, overflow, or bytes left over. Never allocates: [`read_uvarint`] formats an error
-/// string, and a malformed sequence is not an error here.
+/// on truncation, overflow, or bytes left over.
 fn parse_seq(field: &[u8]) -> Option<u64> {
     let mut result: u64 = 0;
     for (i, &byte) in field.iter().enumerate() {
@@ -266,21 +256,20 @@ fn parse_seq(field: &[u8]) -> Option<u64> {
     None
 }
 
-/// The inverse of [`encode_batch_v2`], charging `budget` as it decodes the batch; the trailer
-/// costs the budget nothing. A plain v1 payload fails here rather than decoding as "no
-/// provenance": the batch consumes all of it and the trailer-length read finds nothing. Bytes
+/// The inverse of [`encode_hop_batch`], charging `budget` as it decodes the batch; the trailer
+/// costs the budget nothing. A bare [`CODEC_BATCH`] payload fails here rather than decoding as
+/// "no provenance": the batch consumes all of it and the trailer-length read finds nothing. Bytes
 /// after the trailer are `Malformed`, as is any trailer field that overruns the trailer or the
 /// field cap, whatever its tag.
 ///
-/// The sender pair never fails a decode. It is `Some` only for one well-formed tag 3 (16 bytes)
-/// and one tag 4 (a nonzero uvarint filling its field), in either order. Anything else (one tag
-/// alone, a wrong-length identity, a sequence of 0 or with bytes left over, a repeated tag)
-/// decodes as `None`, an unsequenced batch (ADR `native-hop-identity-and-sequence`, decision 1's
-/// unsequenced rule).
-pub fn decode_batch_v2(
+/// The sender pair is required: one tag 3 (16 bytes) and one tag 4 (a nonzero uvarint filling
+/// its field), in either order. A missing or repeated tag, a wrong-length identity, or a sequence
+/// of 0, truncated, overflowing, or with bytes left over is `Malformed` (ADR
+/// `native-hop-no-compatibility`, decision 2).
+pub fn decode_hop_batch(
     bytes: &mut Bytes,
     budget: &DecodeBudget,
-) -> Result<(EventBatch, Provenance, Option<SeqId>), CodecError> {
+) -> Result<(EventBatch, Provenance, SeqId), CodecError> {
     let batch = decode_batch_body(bytes, budget)?;
 
     let trailer_len = read_uvarint(bytes)? as usize;
@@ -293,8 +282,8 @@ pub fn decode_batch_v2(
     let mut trailer = bytes.split_to(trailer_len);
 
     let mut provenance = Provenance::default();
-    let mut sender = Part::Absent;
-    let mut sequence = Part::Absent;
+    let mut sender: Option<[u8; 16]> = None;
+    let mut sequence: Option<u64> = None;
     while !trailer.is_empty() {
         let tag = read_u8(&mut trailer)?;
         let len = read_uvarint(&mut trailer)? as usize;
@@ -315,26 +304,44 @@ pub fn decode_batch_v2(
             TRAILER_TAG_ORIGIN => provenance.origin = Some(intern(trailer_str(&field)?)),
             TRAILER_TAG_PREVIOUS => provenance.previous = Some(intern(trailer_str(&field)?)),
             TRAILER_TAG_SENDER => {
-                sender = match (sender, <[u8; 16]>::try_from(&field[..])) {
-                    (Part::Absent, Ok(id)) => Part::Valid(id),
-                    _ => Part::Invalid,
+                if sender.is_some() {
+                    return Err(CodecError::Malformed(
+                        "trailer repeats the sender identity".into(),
+                    ));
                 }
+                let id = <[u8; 16]>::try_from(&field[..]).map_err(|_| {
+                    CodecError::Malformed(format!(
+                        "trailer sender identity is {} bytes, not 16",
+                        field.len()
+                    ))
+                })?;
+                sender = Some(id);
             }
             TRAILER_TAG_SEQUENCE => {
-                sequence = match (sequence, parse_seq(&field)) {
-                    (Part::Absent, Some(n)) if n != 0 => Part::Valid(n),
-                    _ => Part::Invalid,
+                if sequence.is_some() {
+                    return Err(CodecError::Malformed("trailer repeats the sequence".into()));
                 }
+                sequence = Some(match parse_seq(&field) {
+                    Some(0) => return Err(CodecError::Malformed("trailer sequence is 0".into())),
+                    Some(n) => n,
+                    None => {
+                        return Err(CodecError::Malformed(
+                            "trailer sequence is not one uvarint filling its field".into(),
+                        ));
+                    }
+                });
             }
             _unknown => { /* skipped, not rejected: torn-write hygiene (module doc) */ }
         }
     }
     ensure_consumed(bytes, "batch")?;
-    let seq = match (sender, sequence) {
-        (Part::Valid(id), Part::Valid(seq)) => Some(SeqId { id, seq }),
-        _ => None,
+    let Some(id) = sender else {
+        return Err(CodecError::Malformed("trailer has no sender identity".into()));
     };
-    Ok((batch, provenance, seq))
+    let Some(seq) = sequence else {
+        return Err(CodecError::Malformed("trailer has no sequence".into()));
+    };
+    Ok((batch, provenance, SeqId { id, seq }))
 }
 
 fn trailer_str(bytes: &[u8]) -> Result<&str, CodecError> {
@@ -342,7 +349,7 @@ fn trailer_str(bytes: &[u8]) -> Result<&str, CodecError> {
         .map_err(|e| CodecError::Malformed(format!("provenance trailer field not utf-8: {e}")))
 }
 
-/// The [`Encoder`]: [`encode_batch`]'s payload framed under [`CODEC_NATIVE_V1`].
+/// The file format's [`Encoder`]: [`encode_batch`]'s payload framed under [`CODEC_BATCH`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NativeEncoder {
     pub compression: Compression,
@@ -357,12 +364,13 @@ impl NativeEncoder {
 impl Encoder for NativeEncoder {
     fn encode(&mut self, batch: &EventBatch) -> Result<Bytes, CodecError> {
         let payload = encode_batch(batch);
-        write_frame(CODEC_NATIVE_V1, self.compression, &payload)
+        write_frame(CODEC_BATCH, self.compression, &payload)
     }
 }
 
-/// The [`Decoder`] for [`CODEC_NATIVE_V1`] frames. Ignores `received_at`: a native event keeps
-/// its original timestamp end to end. Decodes each frame under [`DEFAULT_DECODE_BUDGET`].
+/// The file format's [`Decoder`], for [`CODEC_BATCH`] frames. Ignores `received_at`: a native
+/// event keeps its original timestamp end to end. Decodes each frame under
+/// [`DEFAULT_DECODE_BUDGET`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NativeDecoder;
 
@@ -375,9 +383,9 @@ impl Decoder for NativeDecoder {
     ) -> Result<(Arc<Resource>, Option<Arc<logit_core::Scope>>), CodecError> {
         let mut bytes = bytes;
         let (codec, mut payload) = read_frame(&mut bytes)?;
-        if codec != CODEC_NATIVE_V1 {
+        if codec != CODEC_BATCH {
             return Err(CodecError::Unsupported(format!(
-                "frame codec byte {codec}, expected native v1 ({CODEC_NATIVE_V1})"
+                "frame codec byte {codec}, expected the bare native batch ({CODEC_BATCH})"
             )));
         }
         let EventBatch { resource, scope, events } =
@@ -584,12 +592,12 @@ mod tests {
 
         // A file reader loops `read_frame` to find each frame boundary.
         let (codec_a, mut payload_a) = read_frame(&mut cursor).unwrap();
-        assert_eq!(codec_a, CODEC_NATIVE_V1);
+        assert_eq!(codec_a, CODEC_BATCH);
         let decoded_a = decode_batch(&mut payload_a, &DecodeBudget::default()).unwrap();
         assert_eq!(decoded_a.events.len(), batch_a.events.len());
 
         let (codec_b, mut payload_b) = read_frame(&mut cursor).unwrap();
-        assert_eq!(codec_b, CODEC_NATIVE_V1);
+        assert_eq!(codec_b, CODEC_BATCH);
         let decoded_b = decode_batch(&mut payload_b, &DecodeBudget::default()).unwrap();
         assert_eq!(decoded_b.events.len(), 1);
         assert!(cursor.is_empty(), "both frames should be fully consumed");
@@ -602,44 +610,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn encode_decode_batch_v2_round_trips_provenance() {
-        let batch = sample_batch();
-        let provenance = sample_provenance();
-        let mut payload = encode_batch_v2(&batch, provenance, None);
-        let (decoded, decoded_provenance, seq) =
-            decode_batch_v2(&mut payload, &DecodeBudget::default()).unwrap();
-
-        assert_eq!(decoded.events.len(), batch.events.len());
-        assert_eq!(decoded_provenance, provenance);
-        assert_eq!(seq, None);
-        assert!(payload.is_empty(), "decode_batch_v2 should consume the whole payload");
-    }
-
-    #[test]
-    fn encode_decode_batch_v2_round_trips_both_fields_absent() {
-        let batch = sample_batch();
-        let mut payload = encode_batch_v2(&batch, Provenance::default(), None);
-        let (_decoded, provenance, seq) =
-            decode_batch_v2(&mut payload, &DecodeBudget::default()).unwrap();
-        assert_eq!(provenance, Provenance::default());
-        assert_eq!(seq, None);
-    }
-
     fn sample_seq() -> SeqId {
         SeqId { id: *b"mod-test-sender!", seq: 300 }
     }
 
     #[test]
-    fn encode_decode_batch_v2_round_trips_the_sender_pair() {
+    fn encode_decode_hop_batch_round_trips_provenance_and_the_pair() {
         let batch = sample_batch();
-        let mut payload = encode_batch_v2(&batch, sample_provenance(), Some(sample_seq()));
+        let mut payload = encode_hop_batch(&batch, sample_provenance(), sample_seq());
         let (decoded, provenance, seq) =
-            decode_batch_v2(&mut payload, &DecodeBudget::default()).unwrap();
+            decode_hop_batch(&mut payload, &DecodeBudget::default()).unwrap();
+
         assert_eq!(decoded.events.len(), batch.events.len());
         assert_eq!(provenance, sample_provenance());
-        assert_eq!(seq, Some(sample_seq()));
-        assert!(payload.is_empty());
+        assert_eq!(seq, sample_seq());
+        assert!(payload.is_empty(), "decode_hop_batch should consume the whole payload");
+    }
+
+    #[test]
+    fn encode_decode_hop_batch_round_trips_both_provenance_fields_absent() {
+        let batch = sample_batch();
+        let mut payload = encode_hop_batch(&batch, Provenance::default(), sample_seq());
+        let (_decoded, provenance, seq) =
+            decode_hop_batch(&mut payload, &DecodeBudget::default()).unwrap();
+        assert_eq!(provenance, Provenance::default());
+        assert_eq!(seq, sample_seq());
     }
 
     #[test]
@@ -648,33 +643,39 @@ mod tests {
         assert_eq!(std::mem::size_of::<Option<SeqId>>(), 32);
     }
 
-    /// Two absent fields encode as the one-byte `trailer_len = 0`.
+    /// An absent provenance field writes no entry: a trailer with no provenance is the pair alone.
     #[test]
-    fn an_absent_provenance_field_costs_one_byte_total() {
+    fn an_absent_provenance_field_costs_nothing() {
         let batch = sample_batch();
-        let without = encode_batch(&batch);
-        let with_empty_provenance = encode_batch_v2(&batch, Provenance::default(), None);
-        assert_eq!(with_empty_provenance.len(), without.len() + 1);
+        let pair_only = encode_hop_batch(&batch, Provenance::default(), sample_seq());
+        let origin = logit_core::interner::intern("mod_test_nginx_in");
+        let with_origin = encode_hop_batch(
+            &batch,
+            Provenance { origin: Some(origin), previous: None },
+            sample_seq(),
+        );
+        // One tag byte, a one-byte length, and the string.
+        assert_eq!(with_origin.len(), pair_only.len() + 2 + "mod_test_nginx_in".len());
     }
 
-    /// Over v1, the one-byte trailer length plus the pair's two fields: `3, 16, id[16]` and `4,
-    /// len, uvarint(seq)`.
+    /// Over the bare batch, the one-byte trailer length plus the pair's two fields: `3, 16,
+    /// id[16]` and `4, len, uvarint(seq)`.
     #[test]
-    fn a_sequenced_batch_costs_the_pair_and_nothing_more() {
+    fn a_hop_batch_costs_the_pair_and_nothing_more() {
         let batch = sample_batch();
         let without = encode_batch(&batch);
         let id = [7; 16];
-        let one = encode_batch_v2(&batch, Provenance::default(), Some(SeqId { id, seq: 1 }));
+        let one = encode_hop_batch(&batch, Provenance::default(), SeqId { id, seq: 1 });
         assert_eq!(one.len(), without.len() + 1 + 21);
-        let two_byte = encode_batch_v2(&batch, Provenance::default(), Some(SeqId { id, seq: 128 }));
+        let two_byte = encode_hop_batch(&batch, Provenance::default(), SeqId { id, seq: 128 });
         assert_eq!(two_byte.len(), without.len() + 1 + 22);
     }
 
     type TrailerField<'a> = (u8, &'a [u8]);
 
-    /// The v1 payload, a trailer of `fields` (each `(tag, value)` written as-is), as one v2
-    /// payload.
-    fn v2_with_trailer(fields: &[TrailerField]) -> Bytes {
+    /// The bare batch payload and a trailer of `fields` (each `(tag, value)` written as-is), as
+    /// one hop payload.
+    fn hop_with_trailer(fields: &[TrailerField]) -> Bytes {
         let mut trailer = BytesMut::new();
         for (tag, value) in fields {
             write_trailer_field(&mut trailer, *tag, value);
@@ -687,9 +688,9 @@ mod tests {
     }
 
     #[test]
-    fn decode_batch_v2_reads_a_malformed_pair_as_unsequenced() {
+    fn decode_hop_batch_rejects_a_malformed_pair() {
         let id: &[u8] = b"mod-test-sender!";
-        let origin: (u8, &[u8]) = (TRAILER_TAG_ORIGIN, b"mod_test_unseq_origin");
+        let origin: (u8, &[u8]) = (TRAILER_TAG_ORIGIN, b"mod_test_bad_pair_origin");
         // A 10th byte over 1 sets bits past 63.
         let mut overflowing = [0xff; 10];
         overflowing[9] = 0x02;
@@ -712,11 +713,11 @@ mod tests {
             ("duplicated sequence, first malformed", vec![origin, (3, id), (4, &[0]), (4, &[1])]),
         ];
         for (name, fields) in cases {
-            let mut payload = v2_with_trailer(fields);
-            let (_batch, provenance, seq) = decode_batch_v2(&mut payload, &DecodeBudget::default())
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(seq, None, "{name}");
-            assert_eq!(provenance.origin_str(), Some("mod_test_unseq_origin"), "{name}");
+            let mut payload = hop_with_trailer(fields);
+            match decode_hop_batch(&mut payload, &DecodeBudget::default()) {
+                Err(CodecError::Malformed(_)) => {}
+                other => panic!("{name}: expected Malformed, got {other:?}"),
+            }
         }
     }
 
@@ -724,59 +725,54 @@ mod tests {
     fn a_pair_in_reverse_tag_order_decodes() {
         let id = *b"mod-test-sender!";
         let mut payload =
-            v2_with_trailer(&[(TRAILER_TAG_SEQUENCE, &[0x80, 0x01]), (TRAILER_TAG_SENDER, &id)]);
+            hop_with_trailer(&[(TRAILER_TAG_SEQUENCE, &[0x80, 0x01]), (TRAILER_TAG_SENDER, &id)]);
         let (_batch, _provenance, seq) =
-            decode_batch_v2(&mut payload, &DecodeBudget::default()).unwrap();
-        assert_eq!(seq, Some(SeqId { id, seq: 128 }));
+            decode_hop_batch(&mut payload, &DecodeBudget::default()).unwrap();
+        assert_eq!(seq, SeqId { id, seq: 128 });
     }
 
-    /// The pair's fields obey the same cap as every trailer field: an over-cap field is
-    /// `Malformed`, not unsequenced.
+    /// The pair's fields obey the same cap as every trailer field.
     #[test]
     fn an_over_cap_sender_field_is_malformed() {
         let big = vec![0u8; MAX_SANE_TRAILER_FIELD_BYTES + 1];
-        let mut payload = v2_with_trailer(&[(TRAILER_TAG_SENDER, &big)]);
-        assert!(decode_batch_v2(&mut payload, &DecodeBudget::default()).is_err());
+        let mut payload = hop_with_trailer(&[(TRAILER_TAG_SENDER, &big)]);
+        assert!(decode_hop_batch(&mut payload, &DecodeBudget::default()).is_err());
     }
 
-    /// No proper prefix of a valid v2 encoding decodes, trailer included.
+    /// No proper prefix of a valid hop encoding decodes, trailer included.
     #[test]
-    fn decode_batch_v2_rejects_every_proper_prefix_of_a_valid_encoding() {
-        let valid = encode_batch_v2(&sample_batch(), sample_provenance(), Some(sample_seq()));
+    fn decode_hop_batch_rejects_every_proper_prefix_of_a_valid_encoding() {
+        let valid = encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq());
         for len in 0..valid.len() {
             let mut truncated = valid.slice(0..len);
             assert!(
-                decode_batch_v2(&mut truncated, &DecodeBudget::default()).is_err(),
-                "a {len}-byte truncation of a valid v2 payload decoded successfully"
+                decode_hop_batch(&mut truncated, &DecodeBudget::default()).is_err(),
+                "a {len}-byte truncation of a valid hop payload decoded successfully"
             );
         }
     }
 
-    /// A v1 payload fed to `decode_batch_v2` fails rather than decoding as "no provenance".
+    /// A bare batch payload fed to `decode_hop_batch` fails rather than decoding as "no
+    /// provenance".
     #[test]
-    fn decode_batch_v2_rejects_a_plain_v1_payload() {
-        let mut v1_payload = encode_batch(&sample_batch());
-        assert!(decode_batch_v2(&mut v1_payload, &DecodeBudget::default()).is_err());
+    fn decode_hop_batch_rejects_a_bare_batch_payload() {
+        let mut bare = encode_batch(&sample_batch());
+        assert!(decode_hop_batch(&mut bare, &DecodeBudget::default()).is_err());
     }
 
     /// An unrecognized trailer tag is skipped, not rejected.
     #[test]
-    fn decode_batch_v2_skips_an_unrecognized_trailer_tag() {
-        let batch = sample_batch();
-        let v1 = encode_batch(&batch);
-
-        let mut trailer = BytesMut::new();
-        write_trailer_field(&mut trailer, TRAILER_TAG_ORIGIN, b"mod_test_skip_origin");
-        write_trailer_field(&mut trailer, 99, b"a future field this reader doesn't know");
-
-        let mut out = BytesMut::new();
-        out.extend_from_slice(&v1);
-        write_uvarint(&mut out, trailer.len() as u64);
-        out.extend_from_slice(&trailer);
-        let mut payload = out.freeze();
-
-        let (_decoded, provenance, _seq) =
-            decode_batch_v2(&mut payload, &DecodeBudget::default()).unwrap();
+    fn decode_hop_batch_skips_an_unrecognized_trailer_tag() {
+        let id: &[u8] = b"mod-test-sender!";
+        let mut payload = hop_with_trailer(&[
+            (TRAILER_TAG_ORIGIN, b"mod_test_skip_origin"),
+            (99, b"a field this reader doesn't know"),
+            (TRAILER_TAG_SENDER, id),
+            (TRAILER_TAG_SEQUENCE, &[1]),
+        ]);
+        let (_decoded, provenance, seq) =
+            decode_hop_batch(&mut payload, &DecodeBudget::default()).unwrap();
         assert_eq!(provenance.origin_str(), Some("mod_test_skip_origin"));
+        assert_eq!(seq.seq, 1);
     }
 }

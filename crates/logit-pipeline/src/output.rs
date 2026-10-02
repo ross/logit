@@ -79,12 +79,12 @@ pub trait Output {
     /// implements `Output` by delegating to another must forward this too, or the inner sink's
     /// accounting never arms (`prometheus_out`'s `PrometheusOutput`).
     ///
-    /// `seq` is the batch's native-hop sender identity and number from the sink's store; only
-    /// `logit_out` reads it, and it never rides on `BatchContext`
-    /// (`docs/adr/native-hop-identity-and-sequence.md`). A caller outside the runtime that
-    /// passes `Some` must observe again before each new batch, or the next batch goes out under
-    /// the last one's number and reads as a resend.
-    fn observe_batch(&mut self, ctx: BatchContext, seq: Option<SeqId>) {
+    /// `seq` is the batch's native-hop sender identity and number from the sink's store, which
+    /// numbers every batch; only `logit_out` reads it, and it never rides on `BatchContext`
+    /// (`docs/adr/native-hop-identity-and-sequence.md`). A caller outside the runtime must
+    /// observe again before each new batch, or the next batch goes out under the last one's
+    /// number and reads as a resend.
+    fn observe_batch(&mut self, ctx: BatchContext, seq: SeqId) {
         let _ = (ctx, seq);
     }
 
@@ -121,7 +121,7 @@ pub trait Output {
         &mut self,
         batch: &EventBatch,
         ctx: BatchContext,
-        seq: Option<SeqId>,
+        seq: SeqId,
         in_flight: usize,
     ) -> anyhow::Result<()> {
         let _ = (ctx, seq, in_flight);
