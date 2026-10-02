@@ -13,13 +13,11 @@
 //! **Acknowledgment.** An `Ack` names a sender identity and a sequence, and answers every frame
 //! of that identity up to the sequence that this connection carried
 //! (`docs/adr/native-hop-named-acks.md`, decision 1). [`serve_frames`] writes one per run of
-//! handled frames, not one per frame (decision 2, the canonical list of flush points): a frame it
-//! handled extends the pending `Ack` to that frame's own sequence, never the mark, and the
-//! pending `Ack` is written when the next frame names another identity, when no next header has
-//! arrived yet (one non-blocking poll, [`probe_header`]), when it covers [`ACK_COALESCE_MAX`]
-//! frames, and before every `Reject` or other exit. A quiet sender gets its `Ack` at once; a
-//! sender streaming faster than this listener forwards gets one per burst. Counted as
-//! `logit.input.acks`.
+//! handled frames: each frame it handles extends a pending `Ack` to that frame's own sequence,
+//! never the mark. The pending `Ack` is written whenever the sender would otherwise wait for it
+//! (one non-blocking poll before every read, [`read_ready_or_ack`]), at an identity change, at
+//! [`ACK_COALESCE_MAX`] frames, and before any `Reject`; that ADR's decision 2 is the canonical
+//! statement. Counted as `logit.input.acks`.
 //!
 //! **Binding.** [`Input::bind`] opens the socket before any node task is spawned, so a taken port
 //! fails startup, and [`LogitInput::local_addr`] reads a `:0` bind's port without a
@@ -27,9 +25,9 @@
 //!
 //! **Ack point.** A frame joins the pending `Ack` ("Acknowledgment" above) in one of two cases:
 //! after `send_relayed` returns `true`, i.e. after the batch is in every open downstream inbox,
-//! or, for a frame at or below its sender's mark ("Deduplication" below), at once and with no
-//! forward. A stalled downstream delays the ack, which stalls the sender's `write_loop` once its
-//! window is full. That is this listener's backpressure; there is no receive-side queue the way a UDP
+//! or, for a frame at or below its sender's mark ("Deduplication" below), with no forward. A
+//! stalled downstream delays the ack, which stalls the sender's `write_loop` once its window is
+//! full. That is this listener's backpressure; there is no receive-side queue the way a UDP
 //! listener has one (`crate::udp`). A frame no consumer took, because every consumer of this
 //! listener has closed, is never acked: it is answered `Reject{GOING_AWAY}`, the connection closes,
 //! its sender's mark stays where it was, and the frame's batch is counted
@@ -77,8 +75,10 @@
 //! blocked write would hold the task, its permit, and its [`Fanout`] clone, and so the
 //! shutdown, for as long as the peer stayed connected. `idle_timeout` bounds reads only and can't
 //! reach a blocked write. A stalled `Ack` ends the connection as an error, counted as
-//! `logit.proto.errors{reason="ack_write_stalled"}`; a stalled `Reject` is abandoned, since the
-//! connection is closing anyway, and counted as `reason="reject_write_stalled"`.
+//! `logit.proto.errors{reason="ack_write_stalled"}`, except the one written before a `Reject`:
+//! that stall is counted the same way, the `Reject` is left out, and the connection ends as it
+//! would have ([`flush_then_reject`]). A stalled `Reject` is abandoned, since the connection is
+//! closing anyway, and counted as `reason="reject_write_stalled"`.
 //!
 //! **Close.** A peer that closes between frames ends the connection with `Ok(())`: an EOF, or,
 //! under TLS, `UnexpectedEof` from a peer gone without `close_notify` (a `logit_out` dropping a
@@ -120,10 +120,12 @@
 //! ("Bounded, flushed writes" above).
 //!
 //! *Measured from the last frame handled* (or from the handshake, before any frame), never from
-//! the last frame read. A peer waiting for an `Ack` is not idle: a slow downstream is delaying
-//! that ack ("Ack point" above), so this listener is the one working. Stamping the clock once the
-//! frame is handled, which follows `Fanout::send`, means time blocked in `Fanout::send` never
-//! counts against a peer. The non-blocking poll for the next header leaves the clock alone.
+//! the last frame read, and not from the last `Ack` written, which can trail its frame
+//! (`docs/adr/native-hop-named-acks.md`, decision 2). A peer waiting for an `Ack` is not idle: a
+//! slow downstream is delaying that ack ("Ack point" above), so this listener is the one working.
+//! Stamping the clock once the frame is handled, which follows `Fanout::send`, means time blocked
+//! in `Fanout::send` never counts against a peer. The non-blocking polls before each read leave
+//! the clock alone.
 //!
 //! *A header that has started arriving is progress.* The absolute deadline bounds only the wait
 //! for a frame's first byte; the rest of the header is read under the per-`read` bound a body
@@ -638,71 +640,70 @@ async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
         // `.await`.
         if *shutdown.borrow() {
             going_away(stream, pending, "listener shutting down", handshake_timeout, telemetry)
-                .await?;
+                .await;
             return Ok(Ended::Closing);
         }
 
-        // With an `Ack` owed, look for the next header without waiting: if none has arrived, the
-        // `Ack` goes out before the wait. Bytes the probe read start the header read below.
+        // With an `Ack` owed, take what has already arrived of the next header; the `Ack` goes
+        // out before any wait, here and not inside the `select!` below, where a shutdown could
+        // cancel it part-written. After this, nothing is owed or the header is whole.
         let mut header = [0u8; frame::HEADER_LEN];
-        let mut filled = 0;
-        if pending.is_some() {
-            match probe_header(stream, &mut header).await {
-                Probe::Empty => flush_ack(stream, pending, handshake_timeout, telemetry).await?,
-                Probe::Read(n) => filled = n,
-                // A close at a frame boundary, as in `read_header` (module doc's "Close").
-                Probe::Closed => return Ok(Ended::PeerClosed),
-                Probe::Failed(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Ok(Ended::PeerClosed)
-                }
-                Probe::Failed(err) => return Err(anyhow::Error::new(err)),
-            }
-        }
-
-        // `changed()`, not `wait_for`: `wait_for`'s `Ref` guard makes the `select!` future
-        // `!Send` once an arm awaits afterward, and `tokio::spawn` needs `Send`. With the check
-        // above they're equivalent, since `shutdown` flips false -> true only once.
-        //
-        // This read is also the only unbounded wait on the peer, so the idle clock lives here:
-        // [`IdleBounds`] gives an absolute deadline for the first byte, a per-`read` one after.
-        let bounds = IdleBounds::new(last_progress, idle_timeout);
-        let header_buf = tokio::select! {
-            result = read_header_rest(stream, bounds, header, filled) => {
-                match result {
-                    Ok(header_buf) => header_buf,
-                    Err(HeaderReadError::Idle(idle)) => {
-                        return close_idle(stream, pending, telemetry, idle, handshake_timeout)
-                            .await
-                            .map(|()| Ended::Closing)
+        let owed = &mut OwedAck { pending: &mut *pending, bound: handshake_timeout, telemetry };
+        let header_read = match read_ready_header(stream, &mut header, owed).await {
+            Ok(Some(frame::HEADER_LEN)) => Ok(Some(header)),
+            // `changed()`, not `wait_for`: `wait_for`'s `Ref` guard makes the `select!` future
+            // `!Send` once an arm awaits afterward, and `tokio::spawn` needs `Send`. With the
+            // check above they're equivalent, since `shutdown` flips false -> true only once.
+            //
+            // This read is also the only unbounded wait on the peer, so the idle clock lives
+            // here: [`IdleBounds`] gives an absolute deadline for the first byte, a per-`read`
+            // one after.
+            Ok(Some(filled)) => {
+                let bounds = IdleBounds::new(last_progress, idle_timeout);
+                tokio::select! {
+                    result = read_header_rest(stream, bounds, header, filled) => result,
+                    _ = shutdown.changed() => {
+                        going_away(
+                            stream,
+                            pending,
+                            "listener shutting down",
+                            handshake_timeout,
+                            telemetry,
+                        )
+                        .await;
+                        return Ok(Ended::Closing);
                     }
-                    Err(HeaderReadError::Truncated(err)) => {
-                        let reason = [("reason", "truncated_header")];
-                        telemetry.count("logit.proto.errors", 1.0, &reason);
-                        return Err(err);
-                    }
-                    Err(err) => return Err(err.into_inner()),
                 }
             }
-            _ = shutdown.changed() => {
-                going_away(stream, pending, "listener shutting down", handshake_timeout, telemetry)
-                    .await?;
+            Ok(None) => Ok(None),
+            Err(err) => Err(err),
+        };
+        let header_buf = match header_read {
+            Ok(Some(header_buf)) => header_buf,
+            // Clean close at a frame boundary: the ordinary end of a connection.
+            Ok(None) => return Ok(Ended::PeerClosed),
+            Err(HeaderReadError::Idle(idle)) => {
+                close_idle(stream, pending, telemetry, idle, handshake_timeout).await;
                 return Ok(Ended::Closing);
             }
-        };
-        let Some(header_buf) = header_buf else {
-            // Clean close at a frame boundary: the ordinary end of a connection.
-            return Ok(Ended::PeerClosed);
+            Err(HeaderReadError::Truncated(err)) => {
+                telemetry.count("logit.proto.errors", 1.0, &[("reason", "truncated_header")]);
+                return Err(err);
+            }
+            Err(err) => return Err(err.into_inner()),
         };
 
+        let owed = &mut OwedAck { pending: &mut *pending, bound: handshake_timeout, telemetry };
         let (header, mut payload) =
-            match read_frame_body(stream, header_buf, max_frame_bytes, idle_timeout).await {
+            match read_frame_body(stream, header_buf, max_frame_bytes, idle_timeout, Some(owed))
+                .await
+            {
                 Ok(v) => v,
                 // A stalled body is an idle close like a gap between frames: policy, not a
                 // fault, so no `logit.proto.errors`.
                 Err(FrameReadError::Stalled(idle)) => {
-                    return close_idle(stream, pending, telemetry, idle, handshake_timeout)
-                        .await
-                        .map(|()| Ended::Closing)
+                    close_idle(stream, pending, telemetry, idle, handshake_timeout).await;
+                    return Ok(Ended::Closing);
                 }
                 // Answered before the close, so the peer sees a permanent refusal rather than an
                 // EOF it can't tell from a crash. Nothing of the body has been read.
@@ -724,6 +725,8 @@ async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     telemetry.count("logit.proto.errors", 1.0, &[("reason", reason)]);
                     return Err(err);
                 }
+                // Counted by `flush_ack` when it stalled.
+                Err(FrameReadError::AckWrite(err)) => return Err(err),
             };
 
         if header.flags & frame::FLAG_CONTROL != 0 {
@@ -799,7 +802,7 @@ async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     handshake_timeout,
                     telemetry,
                 )
-                .await?;
+                .await;
                 return Ok(Ended::Closing);
             }
             // Only after a consumer took the batch: a batch answered `GOING_AWAY` comes back,
@@ -845,63 +848,83 @@ async fn flush_ack<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// What [`probe_header`]'s one read found.
-enum Probe {
-    /// Nothing to read yet: the read would block.
-    Empty,
-    /// The first `n` bytes of a header, now in the caller's buffer.
-    Read(usize),
-    /// EOF at a frame boundary.
-    Closed,
-    Failed(std::io::Error),
+/// The `Ack` a read owes before it waits: [`frame_loop`]'s pending run, and what
+/// [`flush_ack`] needs to write it. The handshake owes none.
+struct OwedAck<'a> {
+    pending: &'a mut Option<PendingAck>,
+    /// The connection's `handshake_timeout`, which bounds the write.
+    bound: Duration,
+    telemetry: &'a Telemetry,
 }
 
-/// Polls `stream` once for the next header's bytes, into `buf`, and never waits. A `Pending`
-/// poll consumes nothing, plain or TLS, so whatever the peer sends next is still there for the
-/// read that follows. One poll, not a `select!` over [`read_header`]: a dropped `read_header`
-/// future loses the bytes it had read.
-async fn probe_header<S: AsyncRead + Unpin>(
-    stream: &mut S,
-    buf: &mut [u8; frame::HEADER_LEN],
-) -> Probe {
-    std::future::poll_fn(|cx| {
-        let mut read_buf = tokio::io::ReadBuf::new(&mut buf[..]);
-        let probe = match std::pin::Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
-            std::task::Poll::Pending => Probe::Empty,
-            std::task::Poll::Ready(Ok(())) if read_buf.filled().is_empty() => Probe::Closed,
-            std::task::Poll::Ready(Ok(())) => Probe::Read(read_buf.filled().len()),
-            std::task::Poll::Ready(Err(err)) => Probe::Failed(err),
-        };
-        std::task::Poll::Ready(probe)
-    })
-    .await
-}
-
-/// Writes the pending `Ack`, then `Reject{GOING_AWAY, why}`, before this listener closes a
-/// connection, for a shutdown, an idle close, and a frame no consumer took alike. `logit_out`
-/// treats `REJECT_GOING_AWAY` as transient and reconnects.
+/// With an `Ack` owed, polls `stream` once for bytes into `buf` and never waits: `Ok(Some(read))`
+/// is what that poll returned, which the caller accounts for as an ordinary read. When the poll
+/// is pending, the owed `Ack` is written and `Ok(None)` tells the caller to make its waiting
+/// read; `Ok(None)` too when nothing is owed. An `Err` is the `Ack` write's failure.
 ///
-/// The `Ack` goes first, so every frame a peer reading `GOING_AWAY` still holds unanswered was
-/// never forwarded (module doc's "Shutdown"). A failed `Ack` write is returned with no `Reject`
-/// after it. The `Reject` write is bounded by `bound` and its result discarded: the connection
-/// is closing anyway, and a peer that already vanished or stopped reading is not a fault
-/// ([`write_reject`] counts a stall).
+/// A pending poll consumes nothing, plain or TLS, so whatever the peer sends next is still there
+/// for the read that follows. One poll, not a `select!` over a read: a dropped read future loses
+/// the bytes it had read.
+async fn read_ready_or_ack<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    buf: &mut [u8],
+    owed: &mut OwedAck<'_>,
+) -> anyhow::Result<Option<std::io::Result<usize>>> {
+    if owed.pending.is_none() {
+        return Ok(None);
+    }
+    let ready = std::future::poll_fn(|cx| {
+        let mut read_buf = tokio::io::ReadBuf::new(&mut *buf);
+        std::task::Poll::Ready(
+            match std::pin::Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
+                std::task::Poll::Pending => None,
+                std::task::Poll::Ready(Ok(())) => Some(Ok(read_buf.filled().len())),
+                std::task::Poll::Ready(Err(err)) => Some(Err(err)),
+            },
+        )
+    })
+    .await;
+    if ready.is_none() {
+        flush_ack(stream, owed.pending, owed.bound, owed.telemetry).await?;
+    }
+    Ok(ready)
+}
+
+/// Writes the pending `Ack`, then `reject`, before this listener closes a connection. The `Ack`
+/// goes first, so every frame a peer reading a `Reject` still holds unanswered was never
+/// forwarded (module doc's "Shutdown").
+///
+/// A failed `Ack` write, a stall among them ([`flush_ack`] counts it), leaves out the `Reject`:
+/// the peer has stopped reading or is gone. The `Reject` write is bounded by `bound` and its
+/// result discarded ([`write_reject`] counts a stall). Neither changes how the connection ends.
+async fn flush_then_reject<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    pending: &mut Option<PendingAck>,
+    reject: control::Reject,
+    bound: Duration,
+    telemetry: &Telemetry,
+) {
+    if flush_ack(stream, pending, bound, telemetry).await.is_ok() {
+        let _ = write_reject(stream, &reject, bound, telemetry).await;
+    }
+}
+
+/// [`flush_then_reject`] with `Reject{GOING_AWAY, why}`, for a shutdown, an idle close, and a
+/// frame no consumer took alike. `logit_out` treats `REJECT_GOING_AWAY` as transient and
+/// reconnects.
 async fn going_away<S: AsyncWrite + Unpin>(
     stream: &mut S,
     pending: &mut Option<PendingAck>,
     why: &str,
     bound: Duration,
     telemetry: &Telemetry,
-) -> anyhow::Result<()> {
-    flush_ack(stream, pending, bound, telemetry).await?;
+) {
     let reject = control::Reject { code: control::REJECT_GOING_AWAY, message: why.to_string() };
-    let _ = write_reject(stream, &reject, bound, telemetry).await;
-    Ok(())
+    flush_then_reject(stream, pending, reject, bound, telemetry).await;
 }
 
-/// Writes the pending `Ack`, then `Reject{FRAME_TOO_LARGE, message}`, before the connection
-/// ends with an error. A failed `Ack` write leaves out the `Reject`; the caller's error stands
-/// either way.
+/// [`flush_then_reject`] with `Reject{FRAME_TOO_LARGE, message}`, before the connection ends
+/// with the caller's error.
 async fn reject_too_large<S: AsyncWrite + Unpin>(
     stream: &mut S,
     pending: &mut Option<PendingAck>,
@@ -909,28 +932,24 @@ async fn reject_too_large<S: AsyncWrite + Unpin>(
     bound: Duration,
     telemetry: &Telemetry,
 ) {
-    if flush_ack(stream, pending, bound, telemetry).await.is_ok() {
-        let reject = control::Reject { code: control::REJECT_FRAME_TOO_LARGE, message };
-        let _ = write_reject(stream, &reject, bound, telemetry).await;
-    }
+    let reject = control::Reject { code: control::REJECT_FRAME_TOO_LARGE, message };
+    flush_then_reject(stream, pending, reject, bound, telemetry).await;
 }
 
-/// Ends a connection quiet (or mid-frame stalled) past its `idle_timeout`: tells the peer, counts
-/// `logit.input.connections.closed{reason="idle"}`, and returns `Ok(())`.
-///
-/// `Err` only when the pending `Ack`'s write failed ([`going_away`]); an idle close itself is
-/// policy, and an `Err` would reach the accept loop's `connection_error` diagnostic. The permit
-/// comes back when the task ends.
+/// Ends a connection quiet (or mid-frame stalled) past its `idle_timeout`: tells the peer
+/// ([`going_away`]) and counts `logit.input.connections.closed{reason="idle"}`. The caller
+/// returns `Ok`: an idle close is policy, a stalled write before it included, and an `Err` would
+/// reach the accept loop's `connection_error` diagnostic. The permit comes back when the task
+/// ends.
 async fn close_idle<S: AsyncWrite + Unpin>(
     stream: &mut S,
     pending: &mut Option<PendingAck>,
     telemetry: &Telemetry,
     idle: Duration,
     bound: Duration,
-) -> anyhow::Result<()> {
-    going_away(stream, pending, &format!("idle for {idle:?}"), bound, telemetry).await?;
+) {
+    going_away(stream, pending, &format!("idle for {idle:?}"), bound, telemetry).await;
     telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "idle")]);
-    Ok(())
 }
 
 /// Reads `Hello` within a fresh `handshake_timeout` (not the TLS accept's remainder; module doc's
@@ -970,7 +989,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         // `None`: the whole read is inside `handshake_timeout`.
-        read_frame_body(stream, header_buf, control::MAX_CONTROL_MESSAGE_BYTES, None)
+        read_frame_body(stream, header_buf, control::MAX_CONTROL_MESSAGE_BYTES, None, None)
             .await
             .map_err(FrameReadError::into_inner)
     });
@@ -1064,12 +1083,16 @@ enum HeaderReadError {
     /// An [`IdleBounds`] bound elapsed, first byte or later. Carries the configured
     /// `idle_timeout` for `close_idle` to name.
     Idle(Duration),
+    /// The owed `Ack`'s write failed ([`read_ready_header`]).
+    AckWrite(anyhow::Error),
 }
 
 impl HeaderReadError {
     fn into_inner(self) -> anyhow::Error {
         match self {
-            HeaderReadError::Io(err) | HeaderReadError::Truncated(err) => err,
+            HeaderReadError::Io(err)
+            | HeaderReadError::Truncated(err)
+            | HeaderReadError::AckWrite(err) => err,
             // Unreachable from today's flattening callers, which pass no bounds.
             HeaderReadError::Idle(idle) => {
                 anyhow::anyhow!("a frame header stopped arriving for {idle:?}")
@@ -1097,8 +1120,8 @@ async fn read_header<S: AsyncRead + Unpin>(
 }
 
 /// [`read_header`] with the header's first `filled` bytes already in `buf`, as
-/// [`probe_header`] leaves them. With `filled > 0` the header has started arriving, so only
-/// [`IdleBounds::stall`] applies.
+/// [`read_ready_header`] leaves them. With `filled > 0` the header has started arriving, so only
+/// [`IdleBounds::stall`] applies. It owes no `Ack`: [`read_ready_header`] wrote any before it.
 async fn read_header_rest<S: AsyncRead + Unpin>(
     stream: &mut S,
     bounds: Option<IdleBounds>,
@@ -1123,33 +1146,70 @@ async fn read_header_rest<S: AsyncRead + Unpin>(
                 }
             }
         };
-        let n = match read {
-            Ok(n) => n,
-            // A TLS peer gone without `close_notify`: a close at a frame boundary, like `Ok(0)`
-            // (module doc's "Close").
-            Err(err) if filled == 0 && err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(None)
-            }
-            Err(err) if filled == 0 => return Err(HeaderReadError::Io(anyhow::Error::new(err))),
-            Err(err) => {
-                return Err(HeaderReadError::Truncated(anyhow::Error::new(err).context(format!(
-                    "reading a frame header ({filled}/{} bytes)",
-                    frame::HEADER_LEN
-                ))))
-            }
-        };
-        if n == 0 {
-            if filled == 0 {
-                return Ok(None);
-            }
-            return Err(HeaderReadError::Truncated(anyhow::anyhow!(
-                "connection closed mid-header ({filled}/{} bytes)",
-                frame::HEADER_LEN
-            )));
+        match header_progress(read, filled)? {
+            Some(n) => filled += n,
+            None => return Ok(None),
         }
-        filled += n;
     }
     Ok(Some(buf))
+}
+
+/// While an `Ack` is owed, reads into `buf` what has already arrived of the next header, and
+/// writes the `Ack` once the next read would wait ([`read_ready_or_ack`]). Returns the bytes
+/// filled, `HEADER_LEN` for a whole header and `0` when nothing was owed, or `None` for a close
+/// at a frame boundary. Never waits on the peer, so [`frame_loop`] runs it outside its
+/// `select!` and a shutdown never cancels an `Ack` part-written.
+async fn read_ready_header<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    buf: &mut [u8; frame::HEADER_LEN],
+    owed: &mut OwedAck<'_>,
+) -> Result<Option<usize>, HeaderReadError> {
+    let mut filled = 0;
+    while filled < frame::HEADER_LEN {
+        let read = match read_ready_or_ack(stream, &mut buf[filled..], owed).await {
+            Ok(Some(read)) => read,
+            Ok(None) => break,
+            Err(err) => return Err(HeaderReadError::AckWrite(err)),
+        };
+        match header_progress(read, filled)? {
+            Some(n) => filled += n,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(filled))
+}
+
+/// One header `read`'s result with `filled` bytes already in: `Some(n)` new bytes, `None` for a
+/// clean close at a frame boundary, or the error a close or failure part-way through is.
+fn header_progress(
+    read: std::io::Result<usize>,
+    filled: usize,
+) -> Result<Option<usize>, HeaderReadError> {
+    let n = match read {
+        Ok(n) => n,
+        // A TLS peer gone without `close_notify`: a close at a frame boundary, like `Ok(0)`
+        // (module doc's "Close").
+        Err(err) if filled == 0 && err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(None)
+        }
+        Err(err) if filled == 0 => return Err(HeaderReadError::Io(anyhow::Error::new(err))),
+        Err(err) => {
+            return Err(HeaderReadError::Truncated(anyhow::Error::new(err).context(format!(
+                "reading a frame header ({filled}/{} bytes)",
+                frame::HEADER_LEN
+            ))))
+        }
+    };
+    if n == 0 {
+        if filled == 0 {
+            return Ok(None);
+        }
+        return Err(HeaderReadError::Truncated(anyhow::anyhow!(
+            "connection closed mid-header ({filled}/{} bytes)",
+            frame::HEADER_LEN
+        )));
+    }
+    Ok(Some(n))
 }
 
 /// Why [`read_frame_body`] failed, so a caller picks the `logit.proto.errors{reason}` tag without
@@ -1166,6 +1226,8 @@ enum FrameReadError {
     /// One body `read` made no progress for the whole `stall` bound. Not an error: the caller
     /// turns it into `close_idle`, which names this duration. Never reached in the handshake.
     Stalled(Duration),
+    /// The owed `Ack`'s write failed ([`read_ready_or_ack`]).
+    AckWrite(anyhow::Error),
 }
 
 impl FrameReadError {
@@ -1174,7 +1236,8 @@ impl FrameReadError {
             FrameReadError::TooLarge(e)
             | FrameReadError::Truncated(e)
             | FrameReadError::Crc(e)
-            | FrameReadError::Malformed { err: e, .. } => e,
+            | FrameReadError::Malformed { err: e, .. }
+            | FrameReadError::AckWrite(e) => e,
             // Unreachable from today's flattening callers, which pass no `stall` bound.
             FrameReadError::Stalled(idle) => {
                 anyhow::anyhow!("a frame body stopped arriving for {idle:?}")
@@ -1193,11 +1256,14 @@ impl FrameReadError {
 ///
 /// `stall` bounds each `read` of the body, not the body in total (module doc's "Idle timeout").
 /// It's the connection's `idle_timeout`; `None` (the handshake, test helpers) means unbounded.
-async fn read_frame_body<S: AsyncRead + Unpin>(
+/// With `owed`, each `read` that would wait writes the owed `Ack` first ([`read_ready_or_ack`]),
+/// so a peer that stops mid-frame still gets the `Ack` for the frames before it.
+async fn read_frame_body<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     header_buf: [u8; frame::HEADER_LEN],
     max_frame_bytes: u32,
     stall: Option<Duration>,
+    mut owed: Option<&mut OwedAck<'_>>,
 ) -> Result<(FrameHeader, Bytes), FrameReadError> {
     let mut header_bytes = Bytes::copy_from_slice(&header_buf);
     let header = FrameHeader::read(&mut header_bytes).map_err(|e| {
@@ -1233,14 +1299,21 @@ async fn read_frame_body<S: AsyncRead + Unpin>(
     full[..frame::HEADER_LEN].copy_from_slice(&header_buf);
     let mut filled = frame::HEADER_LEN;
     while filled < full.len() {
-        let read = match stall {
-            Some(stall) => {
+        let ready = match owed.as_deref_mut() {
+            Some(owed) => read_ready_or_ack(stream, &mut full[filled..], owed)
+                .await
+                .map_err(FrameReadError::AckWrite)?,
+            None => None,
+        };
+        let read = match (ready, stall) {
+            (Some(read), _) => read,
+            (None, Some(stall)) => {
                 match tokio::time::timeout(stall, stream.read(&mut full[filled..])).await {
                     Ok(read) => read,
                     Err(_elapsed) => return Err(FrameReadError::Stalled(stall)),
                 }
             }
-            None => stream.read(&mut full[filled..]).await,
+            (None, None) => stream.read(&mut full[filled..]).await,
         };
         let n = read.map_err(|e| {
             FrameReadError::Truncated(anyhow::Error::new(e).context("reading a frame body"))
@@ -1455,7 +1528,7 @@ mod tests {
             .map_err(HeaderReadError::into_inner)
             .unwrap()
             .expect("expected a frame, got a clean close");
-        read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN, None)
+        read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN, None, None)
             .await
             .map_err(FrameReadError::into_inner)
             .unwrap()
@@ -2083,7 +2156,7 @@ mod tests {
     }
 
     /// [`read_control_response`] over any stream, for the TLS tests.
-    async fn read_control_response_over<S: AsyncRead + Unpin>(
+    async fn read_control_response_over<S: AsyncRead + AsyncWrite + Unpin>(
         stream: &mut S,
     ) -> control::ControlMessage {
         let header_buf = read_header(stream, None)
@@ -2092,7 +2165,7 @@ mod tests {
             .unwrap()
             .expect("expected a frame, got a clean close");
         let (header, mut payload) =
-            read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN, None)
+            read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN, None, None)
                 .await
                 .map_err(FrameReadError::into_inner)
                 .unwrap();
@@ -2283,7 +2356,7 @@ mod tests {
     }
 
     /// Time parked in `Fanout::send` behind a full downstream never counts as idle: the clock
-    /// runs from the last `Ack`, not the last frame read.
+    /// runs from the last frame handled, not the last frame read.
     #[tokio::test]
     async fn a_connection_waiting_on_a_delayed_ack_is_not_closed_as_idle() {
         let idle = Duration::from_millis(200);
@@ -3147,7 +3220,8 @@ mod tests {
             header.copy_from_slice(&bytes[..frame::HEADER_LEN]);
             let (_client, mut server) = tokio::io::duplex(64);
             let result =
-                read_frame_body(&mut server, header, frame::MAX_SANE_UNCOMPRESSED_LEN, None).await;
+                read_frame_body(&mut server, header, frame::MAX_SANE_UNCOMPRESSED_LEN, None, None)
+                    .await;
             match result {
                 Err(FrameReadError::Malformed { reason, err }) => {
                     assert_eq!(reason, "magic", "{name}: {err:#}");
@@ -3855,7 +3929,7 @@ mod tests {
 
     /// Reads the next control message and asserts it is `Reject{GOING_AWAY}` whose message
     /// contains `why`.
-    async fn read_going_away<S: AsyncRead + Unpin>(stream: &mut S, why: &str) {
+    async fn read_going_away<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, why: &str) {
         match read_control_response_over(stream).await {
             control::ControlMessage::Reject(reject) => {
                 assert_eq!(reject.code, control::REJECT_GOING_AWAY);
@@ -3912,24 +3986,39 @@ mod tests {
         assert_eq!(recv_mark(&mut rx).await, 1);
     }
 
+    /// No `Ack` covers more than the cap. Where else a run ends isn't fixed: a write this size
+    /// can reach the listener in pieces, and every read that would wait writes the `Ack` owed so
+    /// far.
     #[tokio::test]
-    async fn a_run_longer_than_the_coalesce_cap_is_acked_every_cap_frames() {
+    async fn a_run_longer_than_the_coalesce_cap_is_acked_at_least_every_cap_frames() {
         let mut probe = TelemetryProbe::new();
         let (addr, mut rx) = spawn_coalescing(&probe).await;
         let mut client = handshaken(&addr, 128).await;
         let cap = u64::from(ACK_COALESCE_MAX);
+        let last = 2 * cap + 1;
 
-        let frames: Vec<_> = (1..=2 * cap + 1).map(|seq| sid(1, seq)).collect();
+        let frames: Vec<_> = (1..=last).map(|seq| sid(1, seq)).collect();
         client.write_all(&frames_of(&frames)).await.unwrap();
 
-        read_ack(&mut client, sid(1, cap)).await;
-        read_ack(&mut client, sid(1, 2 * cap)).await;
-        // The last, short run is written once no next frame has arrived.
-        read_ack(&mut client, sid(1, 2 * cap + 1)).await;
-        for mark in 1..=2 * cap + 1 {
+        let (mut acked, mut acks) = (0, 0u32);
+        while acked < last {
+            let ack = match read_control_response(&mut client).await {
+                control::ControlMessage::Ack(ack) => ack,
+                other => panic!("expected Ack, got {other:?}"),
+            };
+            assert_eq!(ack.id, sid(1, 0).id);
+            assert!(
+                ack.seq > acked && ack.seq - acked <= cap,
+                "an Ack for {} after one for {acked} covers more than {cap} frames",
+                ack.seq
+            );
+            (acked, acks) = (ack.seq, acks + 1);
+        }
+        for mark in 1..=last {
             assert_eq!(recv_mark(&mut rx).await, mark as i64);
         }
-        assert_eq!(probe.sum("logit.input.acks", &[]), 3.0);
+        assert!(acks >= 3, "{last} frames need at least three Acks under the cap");
+        assert_eq!(probe.sum("logit.input.acks", &[]), f64::from(acks));
     }
 
     /// A shutdown while a forward waits on a full consumer, with the `Ack` for the frames before
@@ -3959,8 +4048,8 @@ mod tests {
         assert_eq!(recv_mark(&mut rx).await, 2);
     }
 
-    /// An idle close mid-header, with the `Ack` for the frame before it pending: the `Ack` goes
-    /// out before `GOING_AWAY`.
+    /// An idle close mid-header, after a frame whose `Ack` was pending when the header started:
+    /// the `Ack` goes out before `GOING_AWAY`.
     #[tokio::test]
     async fn a_pending_ack_is_flushed_before_going_away_on_an_idle_close() {
         let (addr, input) = bound_input().await;
@@ -3969,8 +4058,8 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
         let mut client = handshaken(&addr, 8).await;
 
-        // A whole frame and the start of the next header, in one write: the probe reads those
-        // bytes, so the `Ack` is still pending when the rest of the header never comes.
+        // A whole frame and the start of the next header, in one write: the `Ack` goes out once
+        // the rest of the header would wait, and the idle close follows it.
         let mut bytes = frames_of(&[sid(1, 1)]);
         bytes.extend_from_slice(&frames_of(&[sid(1, 2)])[..10]);
         client.write_all(&bytes).await.unwrap();
@@ -4007,6 +4096,79 @@ mod tests {
         assert_eq!(recv_mark(&mut rx).await, 1);
     }
 
+    /// Two whole frames and the first `cut` bytes of a third, in one write, as a `logit_out`
+    /// whose chunked write stalls leaves them: the `Ack` naming the second arrives while the
+    /// third is incomplete, with no idle timeout to end the wait, and the connection stays open
+    /// to complete and ack the third.
+    async fn stop_mid_frame_at(cut: usize) {
+        let probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_coalescing(&probe).await;
+        let mut client = handshaken(&addr, 8).await;
+        let third = frames_of(&[sid(1, 3)]);
+        assert!(cut < third.len(), "the fixture needs a third frame longer than {cut} bytes");
+
+        let mut bytes = frames_of(&[sid(1, 1), sid(1, 2)]);
+        bytes.extend_from_slice(&third[..cut]);
+        client.write_all(&bytes).await.unwrap();
+
+        tokio::time::timeout(RECV_TIMEOUT, read_ack(&mut client, sid(1, 2)))
+            .await
+            .expect("the Ack for the whole frames goes out while the third waits");
+        assert_eq!(recv_mark(&mut rx).await, 1);
+        assert_eq!(recv_mark(&mut rx).await, 2);
+
+        client.write_all(&third[cut..]).await.unwrap();
+        tokio::time::timeout(RECV_TIMEOUT, read_ack(&mut client, sid(1, 3)))
+            .await
+            .expect("the completed third frame is acked on the same connection");
+        assert_eq!(recv_mark(&mut rx).await, 3);
+    }
+
+    #[tokio::test]
+    async fn a_sender_that_stops_mid_frame_still_gets_the_acks_for_the_frames_before_it() {
+        // A header and part of the body.
+        stop_mid_frame_at(40).await;
+    }
+
+    #[tokio::test]
+    async fn a_sender_that_stops_after_a_header_still_gets_the_acks_for_the_frames_before_it() {
+        stop_mid_frame_at(frame::HEADER_LEN).await;
+    }
+
+    #[tokio::test]
+    async fn a_sender_that_stops_mid_header_still_gets_the_acks_for_the_frames_before_it() {
+        stop_mid_frame_at(10).await;
+    }
+
+    /// The `Ack` owed before `GOING_AWAY` meets a peer that stopped reading: the stall is
+    /// counted, the `Reject` is left out, and `going_away` returns within the bound, so the
+    /// shutdown or idle close that called it ends as it would have.
+    #[tokio::test]
+    async fn a_stalled_ack_before_going_away_is_counted_and_the_reject_left_out() {
+        const BOUND: Duration = Duration::from_millis(100);
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        // Room for less than one `Ack`, and never read.
+        let (client, mut server) = tokio::io::duplex(1);
+        let mut pending = Some(PendingAck { seq: sid(1, 1), frames: 1 });
+
+        tokio::time::timeout(
+            BOUND + RECV_TIMEOUT,
+            going_away(&mut server, &mut pending, "listener shutting down", BOUND, &telemetry),
+        )
+        .await
+        .expect("going_away returns within the bound");
+
+        assert!(pending.is_none(), "the Ack is cleared, so no later exit writes it");
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "ack_write_stalled")]), 1.0);
+        assert!(
+            !totals.has("logit.proto.errors", &[("reason", "reject_write_stalled")]),
+            "no Reject was attempted after the stalled Ack"
+        );
+        drop(client);
+    }
+
     #[tokio::test]
     async fn resends_below_the_mark_are_acked_by_their_own_sequence_not_the_mark() {
         let mut probe = TelemetryProbe::new();
@@ -4023,8 +4185,8 @@ mod tests {
     }
 
     /// Over TLS, the frames of one write sit decrypted in the session's buffer after the first is
-    /// read, so the probe finds the next without touching the socket, and one `Ack` naming the
-    /// last reaches the sender, flushed through the session.
+    /// read, so the poll before the next read finds it without touching the socket, and one
+    /// `Ack` naming the last reaches the sender, flushed through the session.
     #[tokio::test]
     async fn coalesced_acks_over_tls_reach_a_sender_with_frames_still_buffered() {
         let registry = Registry::new();

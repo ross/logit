@@ -900,7 +900,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   (`syslog_in`, `graphite_in`, `statsd_in` each with `transport: tcp`, `logit_in`, `otlp_in`) take
   an opt-in `idle_timeout:`, off by default. The clock runs only while the listener waits on the
   socket, so a connection blocked handing a batch to a full downstream is never taken for a silent
-  peer; `logit_in` measures idle from its last `Ack` written, not bytes read (a peer waiting on a
+  peer; `logit_in` measures idle from the last frame it handled, not bytes read (a peer waiting on a
   delayed ack isn't idle); `otlp_in` tracks idleness at the service level (an in-flight counter,
   not an IO-level timer) instead of wrapping hyper's read loop. See [ADR
   `idle-connection-timeout`](adr/idle-connection-timeout.md) and [`docs/deploying.md`'s

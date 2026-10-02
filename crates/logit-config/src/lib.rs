@@ -1147,11 +1147,11 @@ pub enum ComponentKind {
         /// Each gets its own budget, so a TLS connection that sends no `Hello` costs up to twice
         /// this value before this listener closes it and frees its connection-cap slot.
         ///
-        /// The writes are every reply this listener sends: `HelloAck`, each frame's `Ack`, and
-        /// every `Reject`, including the one it sends on shutdown or an idle close. A write that
-        /// can't finish within this value means the peer has stopped reading: the connection
-        /// closes and frees its slot. So raising this for slow TLS handshakes also lengthens how
-        /// long a peer that stops reading holds its slot.
+        /// The writes are every reply this listener sends: `HelloAck`, the `Ack` each run of frames
+        /// gets, and every `Reject`, including the one it sends on shutdown or an idle close. A
+        /// write that can't finish within this value means the peer has stopped reading: the
+        /// connection closes and frees its slot. So raising this for slow TLS handshakes also
+        /// lengthens how long a peer that stops reading holds its slot.
         ///
         /// Not an idle timeout. Once a connection is handshaken, the gap before its next data
         /// frame is bounded by `idle_timeout` if set, and unbounded otherwise.
@@ -1169,11 +1169,11 @@ pub enum ComponentKind {
         /// peer's flush intervals, say); leave it unset for sparse or bursty senders.
         ///
         /// The clock runs only while this listener is waiting on the peer's socket, and resets
-        /// when the handshake completes and on every `Ack` this listener writes. A peer waiting
-        /// for an ack a slow downstream is delaying is not idle, so time blocked on a full
-        /// downstream never counts. A frame body that stops arriving part-way is bounded by this
-        /// value per read, not in total, so a large frame that keeps making progress is never cut
-        /// off.
+        /// when the handshake completes and on every frame this listener finishes handling. A peer
+        /// waiting for an ack a slow downstream is delaying is not idle, so time blocked on a
+        /// full downstream never counts. A frame body that stops arriving part-way is bounded by
+        /// this value per read, not in total, so a large frame that keeps making progress is
+        /// never cut off.
         ///
         /// An idle close is policy, not a fault: it is counted
         /// `logit.input.connections.closed{reason="idle"}`, never diagnosed as a
