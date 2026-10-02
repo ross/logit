@@ -527,11 +527,13 @@ mod window {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A relay in front of `logit_in` that can hold the acks coming back and cut every connection
-    /// open at once. Holding the acks leaves a whole window forwarded and unacknowledged; the cut
-    /// then makes the sender take it to a new connection.
+    /// A relay in front of `logit_in` that can hold new connections short of `logit_in`, hold the
+    /// acks coming back, and cut every connection open at once. Holding the acks leaves a whole
+    /// window forwarded and unacknowledged; the cut then makes the sender take it to a new
+    /// connection.
     struct Relay {
         addr: String,
+        hold_connections: watch::Sender<bool>,
         hold_acks: watch::Sender<bool>,
         cut: watch::Sender<u64>,
     }
@@ -539,6 +541,7 @@ mod window {
     async fn spawn_relay(upstream: String) -> Relay {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let (hold_connections, connections_rx) = watch::channel(false);
         let (hold_acks, hold_rx) = watch::channel(false);
         let (cut, cut_rx) = watch::channel(0u64);
         tokio::spawn(async move {
@@ -547,11 +550,12 @@ mod window {
                     client,
                     upstream.clone(),
                     cut_rx.clone(),
+                    connections_rx.clone(),
                     hold_rx.clone(),
                 ));
             }
         });
-        Relay { addr, hold_acks, cut }
+        Relay { addr, hold_connections, hold_acks, cut }
     }
 
     /// Relays one connection both ways until either side closes or a cut is called.
@@ -559,9 +563,11 @@ mod window {
         client: TcpStream,
         upstream: String,
         mut cut: watch::Receiver<u64>,
+        mut hold_connections: watch::Receiver<bool>,
         mut hold_acks: watch::Receiver<bool>,
     ) {
         let epoch = *cut.borrow_and_update();
+        let _ = hold_connections.wait_for(|&held| !held).await;
         let Ok(server) = TcpStream::connect(&upstream).await else { return };
         let (mut client_read, mut client_write) = client.into_split();
         let (mut server_read, mut server_write) = server.into_split();
@@ -602,10 +608,29 @@ mod window {
             .with_telemetry(probe.telemetry("out", "logit_out", "sink"));
         let dir = scratch_dir("logit-round-trip-window-cut");
         let (graph, specs) = specs(output, dir.clone());
+        // The window fill reads the spool without waiting for a push still on a blocking thread,
+        // and refills only when the head is acknowledged. A fill that caught up to the pushes
+        // just before the acks are held would leave the window short for good, so the sender
+        // gets no connection until the spool holds the burst.
+        relay.hold_connections.send_replace(true);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let run = tokio::spawn(logit_pipeline::run_with_shutdown(graph, specs, async move {
-            let _ = shutdown_rx.wait_for(|&fired| fired).await;
-        }));
+        let run = tokio::spawn(logit_pipeline::run_with_telemetry(
+            graph,
+            specs,
+            HashMap::from([("out".to_string(), probe.telemetry("out", "logit_out", "sink"))]),
+            logit_pipeline::Readiness::disabled(),
+            async move {
+                let _ = shutdown_rx.wait_for(|&fired| fired).await;
+            },
+        ));
+
+        // `drain_inbox` counts a batch received before pushing it, so every push but the last
+        // has landed.
+        wait_until_within("every batch received by out", Duration::from_secs(30), || {
+            probe.poll().sum("logit.component.batches.received", &[]) >= BATCHES as f64
+        })
+        .await;
+        relay.hold_connections.send_replace(false);
 
         wait_until_within("some batches forwarded", Duration::from_secs(30), || {
             marks.lock().unwrap().len() >= 50
