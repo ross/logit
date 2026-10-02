@@ -121,7 +121,7 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
                 compressions: vec![Compression::Lz4 as u8, Compression::None as u8],
                 max_frame_bytes: 16 << 20,
                 window: 1,
-                senders: vec![],
+                senders: vec![*b"logit-fuzz-seed!", *b"logit-fuzz-seed2"],
             }),
         ),
         (
@@ -132,7 +132,7 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
                 compression: Compression::Lz4 as u8,
                 max_frame_bytes: 16 << 20,
                 window: 1,
-                marks: vec![],
+                marks: vec![(*b"logit-fuzz-seed!", 7), (*b"logit-fuzz-seed2", 0)],
             }),
         ),
         ("ack", ControlMessage::Ack(Ack { id: *b"logit-fuzz-seed!", seq: 1 })),
