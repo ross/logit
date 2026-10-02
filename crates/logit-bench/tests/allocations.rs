@@ -2037,6 +2037,65 @@ fn disk_queue_peek_cached_costs_nothing() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `peek_at` over records already read ahead is cached the same way: a windowed sink re-peeks
+/// its whole window after a fault, and none of it may re-decode from disk.
+#[test]
+fn disk_queue_peek_at_cached_costs_nothing() {
+    let rt = disk_queue_runtime();
+    let dir = disk_scratch_dir("peek-at-cached");
+    let telemetry = Telemetry::default();
+    let queue = logit_pipeline::DiskQueue::open(
+        disk_queue_config(dir.clone()),
+        telemetry,
+        logit_core::Diagnostics::new("bench"),
+    )
+    .unwrap();
+
+    for _ in 0..3 {
+        let batch = Arc::new(fixtures::nginx_batch(1));
+        rt.block_on(queue.push((batch, BatchContext::default())));
+    }
+    // Warm: the first `peek_at` of each record does the real disk read + decode.
+    for n in 0..3 {
+        assert!(rt.block_on(queue.peek_at(n)).is_some(), "record {n} should read ahead");
+    }
+
+    let ((), stats) = measure(|| {
+        rt.block_on(async {
+            for n in 0..3 {
+                queue.peek_at(n).await;
+            }
+        });
+    });
+
+    expect_allocs("disk_queue: peek_at over a cached window (no re-decode)", stats, 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A memory store's `peek_at` clones the batch's `Arc` under the queue's lock and allocates
+/// nothing, however far into the window it reads.
+#[test]
+fn sink_queue_peek_at_costs_nothing() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let telemetry = logit_core::Telemetry::default();
+    let store = SinkStore::Memory(SinkQueue::new(SinkQueueConfig::default(), telemetry));
+    rt.block_on(async {
+        for _ in 0..3 {
+            store.push((Arc::new(fixtures::nginx_batch(1)), BatchContext::default())).await;
+        }
+    });
+
+    let ((), stats) = measure(|| {
+        rt.block_on(async {
+            for n in 0..3 {
+                assert!(store.peek_at(n).await.is_some());
+            }
+        });
+    });
+
+    expect_allocs("sink_queue: peek_at over a window", stats, 0);
+}
+
 /// The common shape (the nginx reference config's `tap`/`trimmed` split): one `Output` branch and
 /// one mutating branch off the same fan-out. The `Output` branch only borrows; the mutating branch
 /// needs an owned batch, so it goes through `unwrap_batch`.

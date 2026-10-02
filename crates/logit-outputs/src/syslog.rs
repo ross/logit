@@ -1311,7 +1311,12 @@ impl SyslogOutput {
                 let target = Target::Tcp { endpoint: &self.endpoint, tls: self.tls.as_ref() };
                 #[cfg(test)]
                 let target = crate::stream::scripted_or(target, &self.dial_script);
-                let dial = Dial { target, connect_timeout: *connect_timeout, sink: "syslog_out" };
+                let dial = Dial {
+                    target,
+                    connect_timeout: *connect_timeout,
+                    sink: "syslog_out",
+                    nodelay: false,
+                };
                 let result = pool.send(&dial, &self.frame_buf, &self.telemetry).await;
                 if result.is_ok() {
                     self.telemetry.count("logit.output.messages", self.messages.len() as f64, &[]);

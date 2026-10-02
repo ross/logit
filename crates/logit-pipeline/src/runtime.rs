@@ -14,7 +14,7 @@ use crate::graph::{Graph, Role};
 use crate::output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault};
 #[cfg(test)]
 use crate::queue::{SinkQueue, SinkQueueConfig};
-use crate::queue::{SinkStore, SinkStoreConfig};
+use crate::queue::{SinkStore, SinkStoreConfig, StoreItem};
 use crate::readiness::NodeState;
 use crate::router::{Destination, Router, RouterScratch};
 use crate::{Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
@@ -822,7 +822,8 @@ enum Delivery {
 
 /// Attempts to deliver `batch` via `output.send`, retrying per `posture`/[`is_retryable`] until
 /// either it succeeds, a failure isn't retryable, or `retry.total_budget` (a fresh budget for this
-/// call) is exhausted.
+/// call) is exhausted. [`write_loop`]'s path for a head that starts with a window of 1, nothing
+/// submitted, and nothing observed ahead of it; [`deliver_window`] is the other.
 ///
 /// Every attempt, including the first, runs under `tokio::time::timeout` of the remaining budget:
 /// a sink's own timeout (`InfluxDbOutput`'s 10 s HTTP timeout) can exceed the budget, which would
@@ -888,6 +889,201 @@ async fn deliver_with_retry(
         let backoff = backoff_for(retry, attempt).min(deadline.saturating_duration_since(now));
         telemetry.count("logit.component.retries", 1.0, &[]);
         tokio::time::sleep(backoff).await;
+    }
+}
+
+/// [`write_loop`]'s record of its window over the store's head (`docs/adr/native-hop-send-window.md`,
+/// decision 4). It outlives each [`deliver_window`] call, so a call the grace cuts off leaves it
+/// for `write_loop` to read.
+#[derive(Debug, Default)]
+struct InFlight {
+    /// Batches submitted and not yet acknowledged: always the store's first `outstanding` items.
+    /// A fault resets it to 0, since the sink dropped its connection.
+    outstanding: usize,
+    /// The store's first `observed` items have had `Output::observe_batch` called. A commit
+    /// lowers it by one; a fault doesn't reset it, so a resubmitted batch isn't observed again.
+    /// Never below `outstanding`.
+    observed: usize,
+    /// `true` while an `Output::submit` call is in flight.
+    submitting: bool,
+    /// Set by [`deliver_window`] before it returns `Delivery::Dropped`: how many of the store's
+    /// first items the fault left with an unknown outcome, the head included.
+    at_fault: usize,
+}
+
+impl InFlight {
+    /// How many of the store's first items have left the process, wholly or in part, and are
+    /// unacknowledged: what a grace cut leaves with an unknown outcome.
+    fn left_the_process(&self) -> usize {
+        self.outstanding + usize::from(self.submitting)
+    }
+}
+
+/// Delivers the store's head when [`write_loop`] doesn't take the `send` path: the sink's window
+/// is above 1, or batches are submitted or observed past the head
+/// (`docs/adr/native-hop-send-window.md`, decision 4). Fills the window from the store with
+/// `Output::submit`, then waits for the head's
+/// acknowledgment with `Output::await_ack`, retrying the round per `posture` under one budget
+/// whose clock starts here, when `head` became the head. `state.outstanding` may be above 0 on
+/// entry, from earlier heads' fills.
+///
+/// - **Fill.** While `state.outstanding` is below `min(output.window(), store.max_in_flight())`,
+///   it submits the next item, observing it first if it hasn't been. `peek_at` returning `None`
+///   ends the fill.
+/// - **Only the head's submit has an attempt time**: the rest of the budget, as a
+///   `deliver_with_retry` attempt has. A submit past the head and `await_ack` run under none,
+///   because the sink bounds both itself (the `Output::window` contract). A budget that cut a
+///   submit past the head would drop the connection with the head's acknowledgment unread, and
+///   drop as `Ambiguous` a head the receiver had acknowledged. So the budget decides only
+///   whether a failed round is retried, and clamps the backoff; a round can outlast it by up to
+///   `window - 1` sink-bounded writes and one acknowledgment wait.
+/// - **A submit failure at the head** is the round's fault, and so is the head's submit outlasting
+///   the budget (`Ambiguous`). **A failure past the head classifies nothing**: the fill stops and
+///   the acknowledgments already owed are read.
+/// - **A failed `await_ack`** sets `state.outstanding` to 0 and is the round's fault, covering
+///   every item that was outstanding.
+///
+/// The shutdown grace is the one thing that cuts a round short (`write_loop`'s `DeliverStep`).
+/// Before returning `Delivery::Dropped` it has set `state.at_fault`; `write_loop` commits and
+/// counts the drops. Telemetry per round matches [`deliver_with_retry`]'s per attempt: one
+/// `send.duration` sample, one `errors` per failed round, and one `retries` per retry. As there,
+/// a grace deadline already reached before a round returns [`Delivery::GraceExpired`] with
+/// nothing new submitted.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_window(
+    output: &mut (dyn Output + Send),
+    store: &SinkStore,
+    head: &StoreItem,
+    posture: DeliveryPosture,
+    retry: &RetryConfig,
+    telemetry: &Telemetry,
+    grace_deadline: &std::sync::OnceLock<tokio::time::Instant>,
+    state: &mut InFlight,
+) -> Delivery {
+    debug_assert!(!retry.total_budget.is_zero(), "a zero retry budget");
+    debug_assert!(!retry.max_delay.is_zero(), "a zero retry max delay");
+    let deadline = tokio::time::Instant::now() + retry.total_budget;
+    let mut attempt: u32 = 0;
+    loop {
+        if grace_deadline.get().is_some_and(|&due| tokio::time::Instant::now() >= due) {
+            return Delivery::GraceExpired;
+        }
+        attempt = attempt.saturating_add(1);
+        let timer = telemetry.timer("logit.component.send.duration");
+        let result = window_round(output, store, head, deadline, state).await;
+        drop(timer);
+
+        let Err(err) = result else {
+            return Delivery::Delivered;
+        };
+        telemetry.count("logit.component.errors", 1.0, &[]);
+        let fault = classify(&err);
+        let explicit_permanent = is_explicitly_permanent(&err);
+        if !is_retryable(fault, posture) {
+            return Delivery::Dropped { fault, explicit_permanent };
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Delivery::Dropped { fault, explicit_permanent };
+        }
+        let backoff = backoff_for(retry, attempt).min(deadline.saturating_duration_since(now));
+        telemetry.count("logit.component.retries", 1.0, &[]);
+        tokio::time::sleep(backoff).await;
+    }
+}
+
+/// One [`deliver_window`] round: the fill, then the head's `await_ack`. `Ok` means the head was
+/// acknowledged. Every `Err` has set `state.at_fault`.
+async fn window_round(
+    output: &mut (dyn Output + Send),
+    store: &SinkStore,
+    head: &StoreItem,
+    deadline: tokio::time::Instant,
+    state: &mut InFlight,
+) -> anyhow::Result<()> {
+    loop {
+        let window = output.window().min(store.max_in_flight()).max(1);
+        if state.outstanding >= window {
+            break;
+        }
+        let position = state.outstanding;
+        // The head is held already, and `peek_at(0)` would return the same item.
+        let item = match position {
+            0 => Some(head.clone()),
+            _ => store.peek_at(position).await,
+        };
+        let Some((batch, ctx, seq)) = item else {
+            break;
+        };
+        if position >= state.observed {
+            output.observe_batch(ctx, seq);
+            state.observed = position + 1;
+        }
+        state.submitting = true;
+        let result = if position == 0 {
+            // Nothing is in flight, so cutting this submit loses no acknowledgment.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, output.submit(&batch, ctx, seq, 0)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(anyhow::anyhow!(
+                    "submit exceeded the remaining retry budget ({remaining:?})"
+                )
+                .context(Fault::Ambiguous)),
+            }
+        } else {
+            output.submit(&batch, ctx, seq, position).await
+        };
+        state.submitting = false;
+        match result {
+            Ok(()) => state.outstanding += 1,
+            Err(err) if position == 0 => {
+                state.at_fault = 1;
+                return Err(err);
+            }
+            // Past the head: the sink keeps its connection for the acknowledgments already owed.
+            Err(_) => break,
+        }
+    }
+    debug_assert!(state.outstanding > 0, "the fill submits the head or returns its fault");
+    let err = match output.await_ack().await {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    state.at_fault = state.outstanding;
+    state.outstanding = 0;
+    Err(err)
+}
+
+/// At shutdown, the store's first `n` items left the process and their outcome is unknown: the
+/// `Fault::Ambiguous` case. Under at-most-once this commits each, counts it a shutdown drop, and
+/// warns. Under at-least-once it leaves them reserved: `SinkStore::finish` counts them for
+/// `Memory`, and `Disk` replays them on its next open.
+fn drop_cut_off_at_shutdown(
+    store: &SinkStore,
+    n: usize,
+    posture: DeliveryPosture,
+    telemetry: &Telemetry,
+    shutdown_dropped: &AtomicU64,
+    diag: &Diagnostics,
+) {
+    if n == 0 || is_retryable(Fault::Ambiguous, posture) {
+        return;
+    }
+    let mut batches = 0u64;
+    let mut events = 0u64;
+    for _ in 0..n {
+        if let Some((batch, ..)) = store.commit() {
+            batches += 1;
+            events += batch.events.len() as u64;
+        }
+    }
+    count_shutdown_drop(telemetry, shutdown_dropped, batches, events);
+    if batches > 0 {
+        diag.warn(format_args!(
+            "{batches} batch(es) cut off mid-send at shutdown were dropped: the destination may \
+             have taken them, and at-most-once delivery never replays them"
+        ));
     }
 }
 
@@ -975,9 +1171,17 @@ async fn finish_and_flush(
     }
 }
 
-/// Delivers from `store`'s head, one batch at a time, until `store.peek()` returns `None` (closed
-/// and empty) or shutdown grace expires. The posture is `write_config.delivery_override`, else
-/// `output.default_posture()` (`docs/adr/delivery-semantics.md`, item 5).
+/// Delivers from `store`'s head until `store.peek()` returns `None` (closed and empty) or shutdown
+/// grace expires. The posture is `write_config.delivery_override`, else `output.default_posture()`
+/// (`docs/adr/delivery-semantics.md`, item 5).
+///
+/// Each head goes one of two ways (`docs/adr/native-hop-send-window.md`, decision 4). With
+/// nothing submitted or observed past the store's head and `output.window()` at most 1, it is
+/// observed and delivered through [`deliver_with_retry`] and `output.send`, one batch at a time.
+/// Otherwise [`deliver_window`] keeps up to the window submitted ahead of it, carrying the
+/// [`InFlight`] counts from head to head. The `observed` term keeps a batch observed in an earlier
+/// window off `send`, which would observe it again and, for `logit_out`, send it under the
+/// wrong pending sequence.
 ///
 /// A failed batch is committed, counted, and warned about; the pipeline keeps running. The one
 /// exception: a run of nothing but explicitly classified `Fault::Permanent` outcomes
@@ -991,7 +1195,8 @@ async fn finish_and_flush(
 /// A send the grace cuts off mid-flight is `Fault::Ambiguous`, decided by [`is_retryable`]:
 /// under at-least-once it stays queued, under at-most-once it's committed and counted through
 /// [`count_shutdown_drop`] into `shutdown_dropped`
-/// (`docs/adr/shutdown-accounting-and-cancellation-safety.md`, decision 3).
+/// (`docs/adr/shutdown-accounting-and-cancellation-safety.md`, decision 3). Under a window, so is
+/// every batch submitted and unacknowledged, and one whose submit was cut off.
 pub(crate) async fn write_loop(
     id: String,
     output: &mut (dyn Output + Send),
@@ -1012,6 +1217,7 @@ pub(crate) async fn write_loop(
     // Turns a stream of `send_failed` warnings into two edge events: `degraded` on the first
     // failure, `recovered` on the next success.
     let mut degraded = false;
+    let mut in_flight = InFlight::default();
 
     loop {
         // Each `select!` reduces to a plain enum so no handler arm touches `output`: the
@@ -1038,7 +1244,21 @@ pub(crate) async fn write_loop(
         let (batch, ctx, seq) = match next {
             NextBatch::Batch(batch, ctx, seq) => (batch, ctx, seq),
             NextBatch::Closed => break, // queue closed and empty: nothing left to deliver.
-            NextBatch::ShutdownExpired => return Ok(()),
+            NextBatch::ShutdownExpired => {
+                // Batches a window left submitted and unacknowledged are cut off here as they
+                // are mid-round: the previous head's acknowledgment can win the deliver arm on
+                // the wake the grace expires, and this unbiased `select!` can then pick the grace.
+                // No submit is in progress between rounds.
+                drop_cut_off_at_shutdown(
+                    &store,
+                    in_flight.outstanding,
+                    posture,
+                    &telemetry,
+                    shutdown_dropped,
+                    &diag,
+                );
+                return Ok(());
+            }
         };
 
         // The sink span, the only one that carries `SpanStatus::Error` and a fault tag
@@ -1054,70 +1274,111 @@ pub(crate) async fn write_loop(
         );
         span.events(batch.events.len() as u64);
 
-        // Once per batch, before its first attempt. `logit_out` carries provenance and the
-        // store's sequence across the wire from it (`docs/adr/batch-provenance-on-delivered.md`,
-        // `docs/adr/native-hop-identity-and-sequence.md`), and a sink with encode-side counters
-        // arms its per-batch accounting (`docs/adr/sink-send-path-and-attempt-accounting.md`,
-        // decision 2).
-        output.observe_batch(ctx, seq);
-
         enum DeliverStep {
             Outcome(Delivery),
             ShutdownExpired,
         }
+        // The fast path's: `true` while `output.send` is in flight.
         let mut sending = false;
+        let fast = in_flight.outstanding == 0 && in_flight.observed == 0 && output.window() <= 1;
         // `biased`, deliver arm first; `unconstrained` grace arm: see
         // `docs/design/pipeline-graph.md`'s "Cancellation points".
-        let step = tokio::select! {
-            biased;
-            outcome = deliver_with_retry(
-                output,
-                &batch,
-                posture,
-                &write_config.retry,
-                &telemetry,
-                &shutdown_deadline,
-                &mut sending,
-            ) => DeliverStep::Outcome(outcome),
-            () = tokio::task::unconstrained(shutdown_grace_expired(
-                &mut shutdown,
-                &shutdown_deadline,
-                write_config.shutdown_grace,
-            )) => DeliverStep::ShutdownExpired,
+        let step = if fast {
+            // Once per batch, before its first attempt. `logit_out` carries provenance and the
+            // store's sequence across the wire from it (`docs/adr/batch-provenance-on-delivered.md`,
+            // `docs/adr/native-hop-identity-and-sequence.md`), and a sink with encode-side
+            // counters arms its per-batch accounting
+            // (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 2). `deliver_window`
+            // observes the batches it submits itself.
+            output.observe_batch(ctx, seq);
+            tokio::select! {
+                biased;
+                outcome = deliver_with_retry(
+                    output,
+                    &batch,
+                    posture,
+                    &write_config.retry,
+                    &telemetry,
+                    &shutdown_deadline,
+                    &mut sending,
+                ) => DeliverStep::Outcome(outcome),
+                () = tokio::task::unconstrained(shutdown_grace_expired(
+                    &mut shutdown,
+                    &shutdown_deadline,
+                    write_config.shutdown_grace,
+                )) => DeliverStep::ShutdownExpired,
+            }
+        } else {
+            let head = (Arc::clone(&batch), ctx, seq);
+            tokio::select! {
+                biased;
+                outcome = deliver_window(
+                    output,
+                    &store,
+                    &head,
+                    posture,
+                    &write_config.retry,
+                    &telemetry,
+                    &shutdown_deadline,
+                    &mut in_flight,
+                ) => DeliverStep::Outcome(outcome),
+                () = tokio::task::unconstrained(shutdown_grace_expired(
+                    &mut shutdown,
+                    &shutdown_deadline,
+                    write_config.shutdown_grace,
+                )) => DeliverStep::ShutdownExpired,
+            }
         };
         let outcome = match step {
             DeliverStep::Outcome(outcome) => outcome,
             DeliverStep::ShutdownExpired => {
-                if sending {
+                // What left the process unacknowledged: on the fast path the one send in flight,
+                // under a window every batch submitted and one whose submit was cut off.
+                let cut_off =
+                    if fast { usize::from(sending) } else { in_flight.left_the_process() };
+                if cut_off > 0 {
                     span.error();
                     span.tag("fault", fault_tag(Fault::Ambiguous));
-                    if !is_retryable(Fault::Ambiguous, posture) {
-                        store.commit();
-                        count_shutdown_drop(
-                            &telemetry,
-                            shutdown_dropped,
-                            1,
-                            batch.events.len() as u64,
-                        );
-                        diag.warn(
-                            "a batch cut off mid-send at shutdown was dropped: the destination \
-                             may have taken it, and at-most-once delivery never replays it",
-                        );
-                    }
+                    drop_cut_off_at_shutdown(
+                        &store,
+                        cut_off,
+                        posture,
+                        &telemetry,
+                        shutdown_dropped,
+                        &diag,
+                    );
                 }
-                // Any head still reserved here is benign: `SinkStore::finish` commits and
-                // counts it for `Memory`, and persists the read cursor at it for `Disk`, so it
-                // replays on the next open.
+                // Any batch still reserved here is benign: `SinkStore::finish` commits and
+                // counts it for `Memory`, and persists the read cursor at the head for `Disk`, so
+                // it replays on the next open.
                 return Ok(());
             }
         };
 
         match outcome {
             // No attempt started: left uncommitted for `finish_and_flush`, like a grace expiry
-            // between batches.
-            Delivery::GraceExpired => return Ok(()),
+            // between batches. Batches already submitted under a window left the process, and
+            // are treated as a grace cut treats them.
+            Delivery::GraceExpired => {
+                let cut_off = in_flight.outstanding;
+                if cut_off > 0 {
+                    span.error();
+                    span.tag("fault", fault_tag(Fault::Ambiguous));
+                    drop_cut_off_at_shutdown(
+                        &store,
+                        cut_off,
+                        posture,
+                        &telemetry,
+                        shutdown_dropped,
+                        &diag,
+                    );
+                }
+                return Ok(());
+            }
             Delivery::Delivered => {
                 store.commit();
+                in_flight.outstanding = in_flight.outstanding.saturating_sub(1);
+                in_flight.observed = in_flight.observed.saturating_sub(1);
                 telemetry.count("logit.component.batches.delivered", 1.0, &[]);
                 telemetry.count("logit.component.events.delivered", batch.events.len() as f64, &[]);
                 last_success = Some(tokio::time::Instant::now());
@@ -1128,17 +1389,38 @@ pub(crate) async fn write_loop(
                 }
             }
             Delivery::Dropped { fault, explicit_permanent } => {
+                debug_assert_eq!(in_flight.outstanding, 0, "a dropped round leaves nothing out");
+                // The head, then, under at-most-once, every other batch an `Ambiguous` fault
+                // left with an unknown outcome: each is as ambiguous as the head, and
+                // at-most-once never resends one. A `Clean` or `Permanent` fault, or
+                // at-least-once, drops only the head; the rest are submitted again.
+                let also_in_flight =
+                    if !fast && fault == Fault::Ambiguous && !is_retryable(fault, posture) {
+                        in_flight.at_fault.saturating_sub(1)
+                    } else {
+                        0
+                    };
+                let mut dropped_batches = 1u64;
+                let mut dropped_events = batch.events.len() as u64;
                 store.commit();
+                in_flight.observed = in_flight.observed.saturating_sub(1);
+                for _ in 0..also_in_flight {
+                    if let Some((other, ..)) = store.commit() {
+                        dropped_batches += 1;
+                        dropped_events += other.events.len() as u64;
+                    }
+                    in_flight.observed = in_flight.observed.saturating_sub(1);
+                }
                 span.error();
                 span.tag("fault", fault_tag(fault));
                 telemetry.count(
                     "logit.component.batches.dropped",
-                    1.0,
+                    dropped_batches as f64,
                     &[("reason", "send_failed")],
                 );
                 telemetry.count(
                     "logit.component.events.dropped",
-                    batch.events.len() as f64,
+                    dropped_events as f64,
                     &[("reason", "send_failed")],
                 );
                 let since_success = last_success
@@ -5732,6 +6014,10 @@ mod tests {
         /// The sink never completes a send; shutdown grace cuts the in-flight send off with the
         /// store full and a push parked.
         GraceCutsInFlightSend,
+        /// [`ExitPath::GraceCutsInFlightSend`], cut during a submit past the head under a window:
+        /// the head is submitted and the second batch's submit never finishes. A sink with no
+        /// window never completes its send, as on that path.
+        GraceCutsInFlightSubmit,
         /// The sink fails permanently for `PERMANENT_FAILURE_WINDOW`: `write_loop` returns `Err`
         /// with the store full and a push parked.
         PermanentError,
@@ -5745,11 +6031,74 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn every_run_output_exit_path_reconciles_received_against_delivered_dropped_and_spooled()
     {
+        let output = |path: ExitPath, delivered: &Arc<AtomicU64>| {
+            let paced = |delay, fail| {
+                Box::new(PacedOutput { delay, fail, delivered: Arc::clone(delivered) })
+                    as Box<dyn Output + Send>
+            };
+            match path {
+                ExitPath::DrainFirst => paced(Duration::from_millis(10), None),
+                ExitPath::GraceExpiry => paced(Duration::from_millis(10), Some(Fault::Clean)),
+                ExitPath::GraceCutsInFlightSend | ExitPath::GraceCutsInFlightSubmit => {
+                    Box::new(NeverOutput)
+                }
+                ExitPath::PermanentError => paced(Duration::from_secs(20), Some(Fault::Permanent)),
+                ExitPath::ClosedAndEmpty => paced(Duration::ZERO, None),
+            }
+        };
+        reconcile_every_exit_path(output, 1.0).await;
+    }
+
+    /// [`every_run_output_exit_path_reconciles_received_against_delivered_dropped_and_spooled`]
+    /// with a windowed sink: each path's `send` behavior moves to `await_ack`, and a grace cut
+    /// leaves both batches the small store holds submitted and unacknowledged.
+    #[tokio::test(start_paused = true)]
+    async fn every_run_output_exit_path_reconciles_with_a_window_in_flight() {
+        let output = |path: ExitPath, delivered: &Arc<AtomicU64>| {
+            let windowed = |delay, ack: AckScript| {
+                let (mut output, log) = windowed_output((4, 4));
+                output.ack_delay = delay;
+                output.ack_script = ack;
+                output.delivered = Arc::clone(delivered);
+                drop(log);
+                Box::new(output) as Box<dyn Output + Send>
+            };
+            match path {
+                ExitPath::DrainFirst => windowed(Duration::from_millis(10), AckScript::Ok),
+                ExitPath::GraceExpiry => {
+                    windowed(Duration::from_millis(10), AckScript::Always(Fault::Clean))
+                }
+                ExitPath::GraceCutsInFlightSend => windowed(Duration::ZERO, AckScript::Hang),
+                ExitPath::GraceCutsInFlightSubmit => {
+                    let (mut output, log) = windowed_output((4, 4));
+                    output.submit_delay = Some((2, Duration::from_secs(3600)));
+                    output.ack_script = AckScript::Hang;
+                    output.delivered = Arc::clone(delivered);
+                    drop(log);
+                    Box::new(output) as Box<dyn Output + Send>
+                }
+                ExitPath::PermanentError => {
+                    windowed(Duration::from_secs(20), AckScript::Always(Fault::Permanent))
+                }
+                ExitPath::ClosedAndEmpty => windowed(Duration::ZERO, AckScript::Ok),
+            }
+        };
+        reconcile_every_exit_path(output, 2.0).await;
+    }
+
+    /// The matrix behind both exit-path tests. `cut_off` is how many batches a grace cut leaves
+    /// with an unknown outcome on a small store: what a disk store under at-most-once counts as
+    /// shutdown drops.
+    async fn reconcile_every_exit_path(
+        make_output: impl Fn(ExitPath, &Arc<AtomicU64>) -> Box<dyn Output + Send>,
+        cut_off: f64,
+    ) {
         const SENT: u64 = 6;
         for path in [
             ExitPath::DrainFirst,
             ExitPath::GraceExpiry,
             ExitPath::GraceCutsInFlightSend,
+            ExitPath::GraceCutsInFlightSubmit,
             ExitPath::PermanentError,
             ExitPath::ClosedAndEmpty,
         ] {
@@ -5763,6 +6112,7 @@ mod tests {
                         path,
                         ExitPath::GraceExpiry
                             | ExitPath::GraceCutsInFlightSend
+                            | ExitPath::GraceCutsInFlightSubmit
                             | ExitPath::PermanentError
                     );
                     let store_config = match (disk, small) {
@@ -5779,24 +6129,7 @@ mod tests {
                         (false, false) => SinkStoreConfig::Memory(SinkQueueConfig::default()),
                     };
                     let double_delivered = Arc::new(AtomicU64::new(0));
-                    let paced = |delay, fail| {
-                        Box::new(PacedOutput {
-                            delay,
-                            fail,
-                            delivered: Arc::clone(&double_delivered),
-                        }) as Box<dyn Output + Send>
-                    };
-                    let output = match path {
-                        ExitPath::DrainFirst => paced(Duration::from_millis(10), None),
-                        ExitPath::GraceExpiry => {
-                            paced(Duration::from_millis(10), Some(Fault::Clean))
-                        }
-                        ExitPath::GraceCutsInFlightSend => Box::new(NeverOutput),
-                        ExitPath::PermanentError => {
-                            paced(Duration::from_secs(20), Some(Fault::Permanent))
-                        }
-                        ExitPath::ClosedAndEmpty => paced(Duration::ZERO, None),
-                    };
+                    let output = make_output(path, &double_delivered);
                     let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
                     let (shutdown_tx, shutdown_rx) = watch::channel(false);
                     let registry = Registry::new();
@@ -5830,7 +6163,9 @@ mod tests {
                             drop(inbox_tx);
                             None
                         }
-                        ExitPath::GraceExpiry | ExitPath::GraceCutsInFlightSend => {
+                        ExitPath::GraceExpiry
+                        | ExitPath::GraceCutsInFlightSend
+                        | ExitPath::GraceCutsInFlightSubmit => {
                             shutdown_tx.send(true).unwrap();
                             drop(inbox_tx);
                             None
@@ -5881,13 +6216,15 @@ mod tests {
                         double_delivered.load(std::sync::atomic::Ordering::SeqCst) as f64,
                         "{at}: batches.delivered agrees with the sink's own count"
                     );
-                    // A disk sink drops for shutdown only a send the grace cut off, and only
-                    // under at-most-once. On `GraceExpiry`, each attempt is a 10 ms send and a
-                    // 10 ms backoff from the first push, and the deadline lands 105 ms in,
-                    // during the send started at 100 ms.
+                    // A disk sink drops for shutdown only what the grace cut off, and only under
+                    // at-most-once. On `GraceExpiry`, each attempt is a 10 ms send and a 10 ms
+                    // backoff from the first push, and the deadline lands 105 ms in, during the
+                    // send started at 100 ms.
                     if disk {
                         let cut_off = match path {
-                            ExitPath::GraceExpiry | ExitPath::GraceCutsInFlightSend => 1.0,
+                            ExitPath::GraceExpiry
+                            | ExitPath::GraceCutsInFlightSend
+                            | ExitPath::GraceCutsInFlightSubmit => cut_off,
                             ExitPath::DrainFirst
                             | ExitPath::PermanentError
                             | ExitPath::ClosedAndEmpty => 0.0,
@@ -5902,7 +6239,9 @@ mod tests {
                         ExitPath::DrainFirst | ExitPath::ClosedAndEmpty => {
                             assert_eq!(delivered, SENT as f64, "{at}")
                         }
-                        ExitPath::GraceExpiry | ExitPath::GraceCutsInFlightSend => {
+                        ExitPath::GraceExpiry
+                        | ExitPath::GraceCutsInFlightSend
+                        | ExitPath::GraceCutsInFlightSubmit => {
                             assert_eq!(delivered, 0.0, "{at}")
                         }
                         ExitPath::PermanentError => {
@@ -5913,6 +6252,717 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A window of batches in flight (`docs/adr/native-hop-send-window.md`, decision 4)
+    // -----------------------------------------------------------------------------------------
+
+    /// One call [`WindowedOutput`] saw, by the batch's counter value (`1.0` is the first pushed,
+    /// which the memory store also numbers 1).
+    #[derive(Debug, Clone, PartialEq)]
+    enum Call {
+        /// `observe_batch`, by the sequence number the store gave the batch.
+        Observe(u64),
+        /// `send`, the fast path.
+        Send(u64),
+        /// `submit(batch, _, seq, in_flight)`: `(value, seq, in_flight)`.
+        Submit(u64, u64, usize),
+        /// An `await_ack` that delivered this batch.
+        Ack(u64),
+    }
+
+    /// What every `await_ack` with a batch outstanding does, after `ack_delay`.
+    #[derive(Debug, Clone)]
+    enum AckScript {
+        Ok,
+        /// One result per call, `None` delivering; `Ok` once the list runs out.
+        Calls(std::collections::VecDeque<Option<Fault>>),
+        /// Fails while this batch is the oldest outstanding; delivers any other.
+        Head(u64, Fault),
+        Always(Fault),
+        Hang,
+    }
+
+    /// A windowed sink with the contract `logit_out` has: `window()` reads `windows.0` until a
+    /// submission connects it and `windows.1` after, and every dropped connection goes back to
+    /// `windows.0`. A failed `submit` with nothing in flight drops the connection; with batches in
+    /// flight it marks it broken, failing every later submit until the acks already owed are
+    /// read. A failed or cancelled `await_ack` drops it with every batch in flight. A submit whose
+    /// `in_flight` disagrees with its own count fails `Ambiguous`. `send` is `submit` at 0 then
+    /// `await_ack`.
+    struct WindowedOutput {
+        windows: (usize, usize),
+        connected: bool,
+        broken: bool,
+        /// Batches submitted and not acknowledged, oldest first.
+        in_flight: std::collections::VecDeque<u64>,
+        /// The `seq` the last `observe_batch` saw, for `send`.
+        pending_seq: Option<SeqId>,
+        /// One result per `submit` call, `None` succeeding; success once the list runs out.
+        submit_script: std::collections::VecDeque<Option<Fault>>,
+        /// Every submit of this batch fails with this fault.
+        submit_fails: Option<(u64, Fault)>,
+        /// Every submit of this batch takes this long before it writes.
+        submit_delay: Option<(u64, Duration)>,
+        ack_script: AckScript,
+        ack_delay: Duration,
+        log: Arc<std::sync::Mutex<Vec<Call>>>,
+        /// The most batches in flight at once.
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        delivered: Arc<AtomicU64>,
+    }
+
+    struct WindowedLog {
+        log: Arc<std::sync::Mutex<Vec<Call>>>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl WindowedLog {
+        fn calls(&self) -> Vec<Call> {
+            self.log.lock().unwrap().clone()
+        }
+        fn submits(&self) -> Vec<(u64, usize)> {
+            self.calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Call::Submit(v, _, in_flight) => Some((v, in_flight)),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn count(&self, call: &Call) -> usize {
+            self.calls().iter().filter(|c| *c == call).count()
+        }
+    }
+
+    fn windowed_output(windows: (usize, usize)) -> (WindowedOutput, WindowedLog) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            WindowedOutput {
+                windows,
+                connected: false,
+                broken: false,
+                in_flight: std::collections::VecDeque::new(),
+                pending_seq: None,
+                submit_script: std::collections::VecDeque::new(),
+                submit_fails: None,
+                submit_delay: None,
+                ack_script: AckScript::Ok,
+                ack_delay: Duration::ZERO,
+                log: Arc::clone(&log),
+                peak: Arc::clone(&peak),
+                delivered: Arc::new(AtomicU64::new(0)),
+            },
+            WindowedLog { log, peak },
+        )
+    }
+
+    impl WindowedOutput {
+        fn record(&self, call: Call) {
+            self.log.lock().unwrap().push(call);
+        }
+
+        fn drop_connection(&mut self) {
+            self.in_flight.clear();
+            self.connected = false;
+            self.broken = false;
+        }
+
+        fn submit_value(&mut self, value: u64, in_flight: usize) -> anyhow::Result<()> {
+            if in_flight != self.in_flight.len() {
+                self.drop_connection();
+                return Err(anyhow::anyhow!("in_flight {in_flight} disagrees with the connection"))
+                    .context(Fault::Ambiguous);
+            }
+            let scripted = self.submit_script.pop_front().flatten();
+            let fault = match self.submit_fails {
+                Some((v, fault)) if v == value => Some(fault),
+                _ if self.broken => Some(Fault::Clean),
+                _ => scripted,
+            };
+            if let Some(fault) = fault {
+                if self.in_flight.is_empty() {
+                    self.drop_connection();
+                } else {
+                    self.broken = true;
+                }
+                return Err(anyhow::anyhow!("simulated {fault:?} submit")).context(fault);
+            }
+            self.connected = true;
+            self.in_flight.push_back(value);
+            self.peak.fetch_max(self.in_flight.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn value_of(batch: &EventBatch) -> u64 {
+        counter_value_of(batch) as u64
+    }
+
+    #[async_trait::async_trait]
+    impl Output for WindowedOutput {
+        async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+            self.record(Call::Send(value_of(batch)));
+            self.submit_value(value_of(batch), 0)?;
+            self.await_ack().await
+        }
+
+        fn observe_batch(&mut self, _ctx: BatchContext, seq: Option<SeqId>) {
+            self.record(Call::Observe(seq.expect("a memory store numbers every batch").seq));
+            self.pending_seq = seq;
+        }
+
+        fn window(&self) -> usize {
+            if self.connected {
+                self.windows.1
+            } else {
+                self.windows.0
+            }
+        }
+
+        async fn submit(
+            &mut self,
+            batch: &EventBatch,
+            _ctx: BatchContext,
+            seq: Option<SeqId>,
+            in_flight: usize,
+        ) -> anyhow::Result<()> {
+            let value = value_of(batch);
+            self.record(Call::Submit(value, seq.map_or(0, |s| s.seq), in_flight));
+            if let Some((v, delay)) = self.submit_delay {
+                if v == value {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            self.submit_value(value, in_flight)
+        }
+
+        async fn await_ack(&mut self) -> anyhow::Result<()> {
+            let Some(&head) = self.in_flight.front() else {
+                return Ok(());
+            };
+            // A cancelled wait drops the connection, as the contract says.
+            struct DropOnCancel<'a>(Option<&'a mut WindowedOutput>);
+            impl Drop for DropOnCancel<'_> {
+                fn drop(&mut self) {
+                    if let Some(output) = self.0.take() {
+                        output.drop_connection();
+                    }
+                }
+            }
+            let mut guard = DropOnCancel(Some(self));
+            let output = guard.0.as_deref_mut().expect("set above");
+            tokio::time::sleep(output.ack_delay).await;
+            let fault = match &mut output.ack_script {
+                AckScript::Ok => None,
+                AckScript::Calls(calls) => calls.pop_front().flatten(),
+                AckScript::Head(v, fault) => (*v == head).then_some(*fault),
+                AckScript::Always(fault) => Some(*fault),
+                AckScript::Hang => std::future::pending().await,
+            };
+            let output = guard.0.take().expect("set above");
+            if let Some(fault) = fault {
+                output.drop_connection();
+                return Err(anyhow::anyhow!("simulated {fault:?} ack")).context(fault);
+            }
+            output.in_flight.pop_front();
+            if output.in_flight.is_empty() && output.broken {
+                output.drop_connection();
+            }
+            output.record(Call::Ack(head));
+            output.delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Runs `write_loop` until it has drained batches `1..=n`, pushed into a memory store of
+    /// `max_batches` while it runs and then closed, under `posture`.
+    async fn drive_windowed(
+        output: &mut WindowedOutput,
+        n: u64,
+        max_batches: usize,
+        posture: DeliveryPosture,
+    ) -> Totals {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "logit_out", "sink");
+        let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+            SinkQueueConfig { max_batches, max_bytes: u64::MAX, overflow: OverflowPolicy::Block },
+            telemetry.clone(),
+        )));
+        let producer = async {
+            for value in 1..=n {
+                store.push((one_event_batch(value as f64), BatchContext::default())).await;
+            }
+            store.close();
+        };
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = WriteLoopConfig {
+            retry: fast_retry_config(),
+            delivery_override: Some(posture),
+            ..WriteLoopConfig::default()
+        };
+        let shutdown_dropped = AtomicU64::new(0);
+        let write = write_loop(
+            "out".to_string(),
+            output,
+            Arc::clone(&store),
+            telemetry,
+            config,
+            shutdown_rx,
+            &shutdown_dropped,
+        );
+        let ((), result) =
+            tokio::time::timeout(Duration::from_secs(60), async { tokio::join!(producer, write) })
+                .await
+                .expect("write_loop drains a closed store");
+        result.expect("no outcome here ends write_loop");
+        Totals::of(registry.drain(0))
+    }
+
+    fn sent_failed(totals: &Totals) -> f64 {
+        totals.sum("logit.component.batches.dropped", &[("reason", "send_failed")])
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_window_has_every_batch_submitted_before_the_first_ack() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.ack_delay = Duration::from_millis(10);
+        let totals = drive_windowed(&mut output, 3, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Call::Observe(1),
+                Call::Submit(1, 1, 0),
+                Call::Observe(2),
+                Call::Submit(2, 2, 1),
+                Call::Observe(3),
+                Call::Submit(3, 3, 2),
+                Call::Ack(1),
+                Call::Ack(2),
+                Call::Ack(3),
+            ]
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_window_of_one_calls_send_and_never_submit() {
+        let (mut output, log) = windowed_output((1, 1));
+        let totals = drive_windowed(&mut output, 3, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Call::Observe(1),
+                Call::Send(1),
+                Call::Ack(1),
+                Call::Observe(2),
+                Call::Send(2),
+                Call::Ack(2),
+                Call::Observe(3),
+                Call::Send(3),
+                Call::Ack(3),
+            ]
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0);
+    }
+
+    /// `logit_out`'s shape: a window of 1 until the first connection, then 4. The first head
+    /// goes through `send`, which connects; the rest are submitted.
+    #[tokio::test(start_paused = true)]
+    async fn a_sink_whose_window_opens_after_its_first_connection_sends_the_first_head_and_submits_the_rest(
+    ) {
+        let (mut output, log) = windowed_output((1, 4));
+        let totals = drive_windowed(&mut output, 3, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Call::Observe(1),
+                Call::Send(1),
+                Call::Ack(1),
+                Call::Observe(2),
+                Call::Submit(2, 2, 0),
+                Call::Observe(3),
+                Call::Submit(3, 3, 1),
+                Call::Ack(2),
+                Call::Ack(3),
+            ]
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observe_batch_runs_once_per_batch_under_a_window_across_resubmits() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.ack_script = AckScript::Calls([Some(Fault::Ambiguous)].into());
+        let totals = drive_windowed(&mut output, 3, 1024, DeliveryPosture::AtLeastOnce).await;
+        for value in 1..=3 {
+            assert_eq!(log.count(&Call::Observe(value)), 1, "batch {value} observed once");
+            let submits = log.submits().iter().filter(|(v, _)| *v == value).count();
+            assert_eq!(submits, 2, "batch {value} submitted, then resubmitted after the fault");
+        }
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0);
+    }
+
+    /// Four batches in flight; the first is acknowledged, then the wait for the second fails.
+    fn ack_then_fault(fault: Fault) -> (WindowedOutput, WindowedLog) {
+        let (mut output, log) = windowed_output((4, 4));
+        output.ack_script = AckScript::Calls([None, Some(fault)].into());
+        (output, log)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ambiguous_await_mid_window_under_at_least_once_resubmits_every_unacked_batch_in_order(
+    ) {
+        let (mut output, log) = ack_then_fault(Fault::Ambiguous);
+        let totals = drive_windowed(&mut output, 4, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(
+            log.submits(),
+            vec![(1, 0), (2, 1), (3, 2), (4, 3), (2, 0), (3, 1), (4, 2)],
+            "the unacknowledged 2, 3, 4 go out again, in order, from position 0"
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 4.0);
+        assert_eq!(sent_failed(&totals), 0.0);
+        assert_eq!(totals.sum("logit.component.retries", &[]), 1.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ambiguous_await_mid_window_under_at_most_once_drops_and_counts_every_unacked_batch()
+    {
+        let (mut output, log) = ack_then_fault(Fault::Ambiguous);
+        let totals = drive_windowed(&mut output, 4, 1024, DeliveryPosture::AtMostOnce).await;
+        assert_eq!(log.submits(), vec![(1, 0), (2, 1), (3, 2), (4, 3)], "nothing resubmitted");
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(sent_failed(&totals), 3.0, "2, 3, and 4 are each as ambiguous as the head");
+        assert_eq!(totals.sum("logit.component.events.dropped", &[("reason", "send_failed")]), 3.0);
+        assert_eq!(totals.sum("logit.component.retries", &[]), 0.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_clean_await_mid_window_resubmits_under_both_postures() {
+        for posture in [DeliveryPosture::AtLeastOnce, DeliveryPosture::AtMostOnce] {
+            let (mut output, log) = ack_then_fault(Fault::Clean);
+            let totals = drive_windowed(&mut output, 4, 1024, posture).await;
+            assert_eq!(
+                log.submits(),
+                vec![(1, 0), (2, 1), (3, 2), (4, 3), (2, 0), (3, 1), (4, 2)],
+                "{posture:?}"
+            );
+            assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 4.0, "{posture:?}");
+            assert_eq!(sent_failed(&totals), 0.0, "{posture:?}");
+        }
+    }
+
+    /// The third submit fails with two batches in flight: the sink keeps its connection,
+    /// broken, and `write_loop` reads the two acks owed before anything is submitted again.
+    /// Nothing is classified, so nothing counts as an error.
+    #[tokio::test(start_paused = true)]
+    async fn a_submit_failure_past_the_head_stops_the_fill_and_drains_the_acks_already_owed() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.submit_script = [None, None, Some(Fault::Clean)].into();
+        let totals = drive_windowed(&mut output, 4, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Call::Observe(1),
+                Call::Submit(1, 1, 0),
+                Call::Observe(2),
+                Call::Submit(2, 2, 1),
+                Call::Observe(3),
+                Call::Submit(3, 3, 2),
+                Call::Ack(1),
+                // Still broken: the fill stops again, and the last ack owed is read.
+                Call::Submit(3, 3, 1),
+                Call::Ack(2),
+                // Connection dropped once drained; 3 and 4 go out on the next one.
+                Call::Submit(3, 3, 0),
+                Call::Observe(4),
+                Call::Submit(4, 4, 1),
+                Call::Ack(3),
+                Call::Ack(4),
+            ]
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 4.0);
+        assert_eq!(totals.sum("logit.component.errors", &[]), 0.0);
+        assert_eq!(totals.sum("logit.component.retries", &[]), 0.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_submit_past_the_head_drops_that_batch_only_once_it_is_the_head() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.submit_fails = Some((2, Fault::Permanent));
+        let totals = drive_windowed(&mut output, 3, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Call::Observe(1),
+                Call::Submit(1, 1, 0),
+                Call::Observe(2),
+                Call::Submit(2, 2, 1),
+                Call::Ack(1),
+                // At the head now: its own fault, dropped with no retry.
+                Call::Submit(2, 2, 0),
+                Call::Observe(3),
+                Call::Submit(3, 3, 0),
+                Call::Ack(3),
+            ]
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 2.0);
+        assert_eq!(sent_failed(&totals), 1.0);
+        assert_eq!(totals.sum("logit.component.errors", &[]), 1.0, "only the head's failure");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_window_never_exceeds_a_memory_stores_max_batches() {
+        let (mut output, log) = windowed_output((8, 8));
+        output.ack_delay = Duration::from_millis(1);
+        let totals = drive_windowed(&mut output, 6, 2, DeliveryPosture::AtLeastOnce).await;
+        assert!(log.submits().iter().all(|&(_, in_flight)| in_flight < 2), "{:?}", log.submits());
+        assert_eq!(log.peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 6.0);
+    }
+
+    /// The head's ack fails `Ambiguous` until its budget runs out. Under at-least-once only the
+    /// head is dropped: the batches in flight behind it go out again and are delivered.
+    #[tokio::test(start_paused = true)]
+    async fn a_budget_exhausted_head_drops_only_the_head_under_at_least_once() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.ack_script = AckScript::Head(1, Fault::Ambiguous);
+        let totals = drive_windowed(&mut output, 3, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(sent_failed(&totals), 1.0);
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 2.0);
+        assert_eq!(log.count(&Call::Ack(2)), 1);
+        assert_eq!(log.count(&Call::Ack(3)), 1);
+        assert_eq!(log.count(&Call::Observe(2)), 1, "a resubmit never observes again");
+    }
+
+    /// A slowly draining receiver: the submit past the head takes twice the head's whole retry
+    /// budget, while the head's acknowledgment is already there to read. The loop never cuts
+    /// that submit, so the head is delivered, not dropped as `Ambiguous`.
+    #[tokio::test(start_paused = true)]
+    async fn a_round_that_outlasts_the_budget_still_delivers_a_head_whose_ack_arrived() {
+        let (mut output, log) = windowed_output((4, 4));
+        output.submit_delay = Some((2, fast_retry_config().total_budget * 2));
+        let start = tokio::time::Instant::now();
+        let totals = drive_windowed(&mut output, 2, 1024, DeliveryPosture::AtMostOnce).await;
+        assert!(start.elapsed() >= fast_retry_config().total_budget * 2, "the submit ran on");
+        assert_eq!(
+            log.calls(),
+            vec![
+                Call::Observe(1),
+                Call::Submit(1, 1, 0),
+                Call::Observe(2),
+                Call::Submit(2, 2, 1),
+                Call::Ack(1),
+                Call::Ack(2),
+            ]
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 2.0);
+        assert_eq!(sent_failed(&totals), 0.0);
+        assert_eq!(totals.sum("logit.component.errors", &[]), 0.0);
+    }
+
+    /// Three batches submitted; the head's acknowledgment and the grace deadline land on the
+    /// same instant, so the `biased` deliver arm delivers the head and two stay outstanding. The
+    /// loop-top `select!` that follows is unbiased with both arms ready: the grace arm returns
+    /// from it, and the store's arm runs `deliver_window`, whose grace check returns
+    /// `GraceExpired`. Repeated so both arms are taken; each must apply the cut-off rule.
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_that_wins_the_loop_top_select_with_frames_outstanding_still_applies_the_cut_off_rule(
+    ) {
+        let grace = Duration::from_millis(100);
+        for posture in [DeliveryPosture::AtMostOnce, DeliveryPosture::AtLeastOnce] {
+            for round in 0..16 {
+                let at = format!("{posture:?}, round {round}");
+                let (mut output, log) = windowed_output((4, 4));
+                output.ack_delay = grace;
+                let registry = Registry::new();
+                let telemetry = registry.telemetry_for("out", "logit_out", "sink");
+                let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+                    SinkQueueConfig::default(),
+                    telemetry.clone(),
+                )));
+                for value in 1..=3 {
+                    store.push((one_event_batch(value as f64), BatchContext::default())).await;
+                }
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                shutdown_tx.send(true).unwrap();
+                let shutdown_dropped = AtomicU64::new(0);
+                let config = WriteLoopConfig {
+                    retry: fast_retry_config(),
+                    shutdown_grace: grace,
+                    delivery_override: Some(posture),
+                };
+                write_loop(
+                    "out".to_string(),
+                    &mut output,
+                    Arc::clone(&store),
+                    telemetry,
+                    config,
+                    shutdown_rx,
+                    &shutdown_dropped,
+                )
+                .await
+                .expect("a grace expiry is not a failure");
+                assert_eq!(log.submits(), vec![(1, 0), (2, 1), (3, 2)], "{at}");
+                assert_eq!(log.count(&Call::Ack(1)), 1, "{at}: the head's ack won its wake");
+                let totals = Totals::of(registry.drain(0));
+                assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 1.0, "{at}");
+                let shutdown =
+                    totals.sum("logit.component.batches.dropped", &[("reason", "shutdown")]);
+                let left = store.finish().await;
+                match posture {
+                    DeliveryPosture::AtMostOnce => {
+                        assert_eq!(shutdown, 2.0, "{at}: both outstanding batches, counted");
+                        assert_eq!(left, (0, 0), "{at}: committed, so a disk store can't replay");
+                    }
+                    DeliveryPosture::AtLeastOnce => {
+                        assert_eq!(shutdown, 0.0, "{at}");
+                        assert_eq!(left, (2, 2), "{at}: left reserved, for `finish` to count");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The head and the second batch are submitted; the third's submit is still writing when the
+    /// grace cuts it. That batch may have reached the receiver too, so it counts with the two
+    /// outstanding.
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_cut_during_a_submit_past_the_head_counts_that_batch_too_under_at_most_once() {
+        for posture in [DeliveryPosture::AtMostOnce, DeliveryPosture::AtLeastOnce] {
+            let (mut output, log) = windowed_output((4, 4));
+            output.submit_delay = Some((3, Duration::from_secs(3600)));
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("out", "logit_out", "sink");
+            let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+                SinkQueueConfig::default(),
+                telemetry.clone(),
+            )));
+            for value in 1..=3 {
+                store.push((one_event_batch(value as f64), BatchContext::default())).await;
+            }
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            shutdown_tx.send(true).unwrap();
+            let shutdown_dropped = AtomicU64::new(0);
+            let config = WriteLoopConfig {
+                retry: fast_retry_config(),
+                shutdown_grace: Duration::from_millis(100),
+                delivery_override: Some(posture),
+            };
+            write_loop(
+                "out".to_string(),
+                &mut output,
+                Arc::clone(&store),
+                telemetry,
+                config,
+                shutdown_rx,
+                &shutdown_dropped,
+            )
+            .await
+            .expect("a grace cut is not a failure");
+            assert_eq!(log.submits(), vec![(1, 0), (2, 1), (3, 2)], "{posture:?}");
+            assert_eq!(log.count(&Call::Ack(1)), 0, "{posture:?}: cut before any ack");
+            let totals = Totals::of(registry.drain(0));
+            let shutdown = totals.sum("logit.component.batches.dropped", &[("reason", "shutdown")]);
+            let left = store.finish().await;
+            match posture {
+                DeliveryPosture::AtMostOnce => {
+                    assert_eq!(shutdown, 3.0, "two outstanding and the one mid-submit");
+                    assert_eq!(left, (0, 0), "all three committed");
+                }
+                DeliveryPosture::AtLeastOnce => {
+                    assert_eq!(shutdown, 0.0, "nothing committed before `finish`");
+                    assert_eq!(left, (3, 3), "left reserved, for `finish` to count");
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_cut_with_a_window_in_flight_counts_every_outstanding_batch_under_at_most_once_and_leaves_them_under_at_least_once(
+    ) {
+        for posture in [DeliveryPosture::AtMostOnce, DeliveryPosture::AtLeastOnce] {
+            let (mut output, log) = windowed_output((4, 4));
+            output.ack_script = AckScript::Hang;
+            let mut probe = TelemetryProbe::new();
+            let telemetry = probe.telemetry("out", "logit_out", "sink");
+            let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+                SinkQueueConfig::default(),
+                telemetry.clone(),
+            )));
+            for value in 1..=3 {
+                store.push((one_event_batch(value as f64), BatchContext::default())).await;
+            }
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            shutdown_tx.send(true).unwrap();
+            let shutdown_dropped = AtomicU64::new(0);
+            let config = WriteLoopConfig {
+                retry: fast_retry_config(),
+                shutdown_grace: Duration::from_millis(100),
+                delivery_override: Some(posture),
+            };
+            write_loop(
+                "out".to_string(),
+                &mut output,
+                Arc::clone(&store),
+                telemetry,
+                config,
+                shutdown_rx,
+                &shutdown_dropped,
+            )
+            .await
+            .expect("a grace cut is not a failure");
+            assert_eq!(log.submits(), vec![(1, 0), (2, 1), (3, 2)], "{posture:?}");
+            let shutdown = probe.sum("logit.component.batches.dropped", &[("reason", "shutdown")]);
+            let left = store.finish().await;
+            match posture {
+                DeliveryPosture::AtMostOnce => {
+                    assert_eq!(shutdown, 3.0, "every outstanding batch, counted");
+                    assert_eq!(shutdown_dropped.load(std::sync::atomic::Ordering::SeqCst), 3);
+                    assert_eq!(left, (0, 0), "committed");
+                }
+                DeliveryPosture::AtLeastOnce => {
+                    assert_eq!(shutdown, 0.0, "{posture:?}");
+                    assert_eq!(left, (3, 3), "left reserved, for `finish` to count");
+                }
+            }
+        }
+    }
+
+    /// The amendment to the fast path: a submit fails past the head, the acks owed are read, and
+    /// the sink drops its connection, so `window()` reads 1 with batch 3 observed and not yet
+    /// delivered. Batch 3 must go out through `submit` with its own sequence, not `send`, and
+    /// must not be observed again.
+    #[tokio::test(start_paused = true)]
+    async fn a_head_observed_in_an_earlier_window_is_submitted_with_its_own_seq_when_the_window_falls_to_one(
+    ) {
+        let (mut output, log) = windowed_output((1, 4));
+        // `send`'s submit for batch 1, then 2, then 3 fails past the head.
+        output.submit_script = [None, None, Some(Fault::Clean)].into();
+        let totals = drive_windowed(&mut output, 4, 1024, DeliveryPosture::AtLeastOnce).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Call::Observe(1),
+                Call::Send(1),
+                Call::Ack(1),
+                Call::Observe(2),
+                Call::Submit(2, 2, 0),
+                Call::Observe(3),
+                Call::Submit(3, 3, 1),
+                Call::Ack(2),
+                // `window()` reads 1 here: 3 is the head, observed, and goes through `submit`.
+                Call::Submit(3, 3, 0),
+                Call::Observe(4),
+                Call::Submit(4, 4, 1),
+                Call::Ack(3),
+                Call::Ack(4),
+            ]
+        );
+        assert_eq!(log.count(&Call::Send(3)), 0);
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 4.0);
     }
 
     /// Batch 1 fills a one-record `Block` spool and is reserved by a failing sink; batch 2 is

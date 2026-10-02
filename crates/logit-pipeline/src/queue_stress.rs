@@ -25,6 +25,11 @@
 //!   and the next push truncates it; the one exception is a trailing push nothing wrote after,
 //!   whose record `finish` flushes and the next open replays.
 //! - A cut-off `pop`, `pop_many`, or `peek` removes and reserves nothing.
+//! - A `DiskQueue::peek_at` cut off mid-read reserves nothing; the records it read before stay
+//!   reserved. A reserved record never committed replays after the next open.
+//!
+//! A single consumer also reads ahead with `peek_at` and commits a random prefix of what it read,
+//! the shape a sink with several batches in flight has.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -371,7 +376,7 @@ async fn bounded_consumer(
             tokio::task::yield_now().await;
         }
         let cut = pick_cut(&mut rng, cancel_per_mille);
-        match rng.below(if use_peek { 3 } else { 2 }) {
+        match rng.below(if use_peek { 4 } else { 2 }) {
             0 => match race(q.pop(), cut).await {
                 Some(Some(item)) => got.push(item),
                 Some(None) => break,
@@ -390,7 +395,7 @@ async fn bounded_consumer(
                     None => assert!(out.is_empty(), "a cut-off pop_many removed items"),
                 }
             }
-            _ => match race(q.peek(), cut).await {
+            2 => match race(q.peek(), cut).await {
                 Some(Some(peeked)) => {
                     let committed = q.commit().expect("a peeked head is still there to commit");
                     assert_eq!(
@@ -403,6 +408,21 @@ async fn bounded_consumer(
                 Some(None) => break,
                 None => {}
             },
+            // Reads ahead without waiting, then commits a prefix; the rest stays reserved.
+            _ => {
+                let window = 1 + rng.below(4) as usize;
+                let peeked: Vec<StressItem> = (0..window).map_while(|n| q.peek_at(n)).collect();
+                let commits = rng.below(peeked.len() as u64 + 1) as usize;
+                for expected in &peeked[..commits] {
+                    let committed = q.commit().expect("a reserved item is still there to commit");
+                    assert_eq!(
+                        (committed.producer, committed.seq),
+                        (expected.producer, expected.seq),
+                        "commit must remove the items peek_at reserved, in order"
+                    );
+                    got.push(committed);
+                }
+            }
         }
     }
     got
@@ -765,6 +785,25 @@ fn disk_scenario(rt: &tokio::runtime::Runtime, seed: u64) {
                 progress.tick(1);
                 if consumer_rng.chance(150) {
                     tokio::task::yield_now().await;
+                }
+                if consumer_rng.chance(300) {
+                    // Reads ahead in order, stopping at the first `None` or cut-off read, then
+                    // commits a prefix of what it read; the rest stays reserved.
+                    let mut window = Vec::new();
+                    for n in 0..1 + consumer_rng.below(4) as usize {
+                        let cut = pick_cut(&mut consumer_rng, scenario.cancel_per_mille);
+                        match race(q.peek_at(n), cut).await {
+                            Some(Some((peeked, ..))) => window.push(disk_seq(&peeked)),
+                            Some(None) | None => break,
+                        }
+                    }
+                    let commits = consumer_rng.below(window.len() as u64 + 1) as usize;
+                    for &expected in &window[..commits] {
+                        let (committed, ..) = q.commit().expect("a reserved record is there");
+                        assert_eq!(disk_seq(&committed), expected, "commits follow the read-ahead");
+                        delivered.push(expected);
+                    }
+                    continue;
                 }
                 let cut = pick_cut(&mut consumer_rng, scenario.cancel_per_mille);
                 match race(q.peek(), cut).await {

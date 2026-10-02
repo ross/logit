@@ -549,6 +549,33 @@ impl Output for PrometheusOutput {
         }
     }
 
+    fn window(&self) -> usize {
+        match self {
+            PrometheusOutput::Expose(output) => output.window(),
+            PrometheusOutput::Send(output) => output.window(),
+        }
+    }
+
+    async fn submit(
+        &mut self,
+        batch: &EventBatch,
+        ctx: BatchContext,
+        seq: Option<SeqId>,
+        in_flight: usize,
+    ) -> anyhow::Result<()> {
+        match self {
+            PrometheusOutput::Expose(output) => output.submit(batch, ctx, seq, in_flight).await,
+            PrometheusOutput::Send(output) => output.submit(batch, ctx, seq, in_flight).await,
+        }
+    }
+
+    async fn await_ack(&mut self) -> anyhow::Result<()> {
+        match self {
+            PrometheusOutput::Expose(output) => output.await_ack().await,
+            PrometheusOutput::Send(output) => output.await_ack().await,
+        }
+    }
+
     async fn flush(&mut self) -> anyhow::Result<()> {
         match self {
             PrometheusOutput::Expose(output) => output.flush().await,

@@ -2,8 +2,13 @@
 //! connection protocol, `docs/adr/native-transport-handshake-and-ack.md`). Accepts many TCP
 //! (optionally TLS) connections. Each speaks a `Hello`/`HelloAck` version/codec/compression
 //! handshake (`logit_proto::native::control`), then loops: one native frame in, one
-//! `Fanout::send`, one `Ack` out. One frame is in flight per connection; `HelloAck` always
-//! answers `window: 1`.
+//! `Fanout::send`, one `Ack` out.
+//!
+//! **Send window.** A peer may have several frames in flight
+//! (`docs/adr/native-hop-send-window.md`). `HelloAck` answers the `Hello`'s window clamped to
+//! `1..=RECEIVER_MAX_WINDOW`. Nothing here tracks the window: one task per connection reads,
+//! forwards, and answers its frames one at a time, so answers leave in frame order and the k-th
+//! answer on a connection is the k-th frame's. Accepted sockets set `TCP_NODELAY`.
 //!
 //! **Binding.** [`Input::bind`] opens the socket before any node task is spawned, so a taken port
 //! fails startup, and [`LogitInput::local_addr`] reads a `:0` bind's port without a
@@ -68,6 +73,12 @@
 //! connection after a failed attempt), since no frame is in flight either way. A close or read
 //! error part-way through a header is an error, counted
 //! `logit.proto.errors{reason="truncated_header"}`; part-way through a body, `reason="truncated"`.
+//!
+//! *Every other end after the handshake lingers* ([`close_lingering`]): the connection's
+//! [`Fanout`] clone is dropped first, then the stream is shut down and read to EOF or for
+//! `handshake_timeout`. A peer with frames pipelined behind the one answered leaves unread bytes,
+//! and closing over them sends a reset that discards the `GOING_AWAY` or `Ack`s already written.
+//! The permit is held through the linger.
 //!
 //! **Connection limit.** A non-blocking `try_acquire_owned` against the connection cap
 //! (`max_connections:`, 1024 by default, the [`crate::DEFAULT_MAX_CONNECTIONS`] `otlp_in` and
@@ -143,6 +154,11 @@ use senders::SenderTable;
 /// `logit_config`'s `default_handshake_timeout` mirrors this number by hand (it can't depend on
 /// this crate).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The largest window `HelloAck` answers (module doc's "Send window"). A peer can leave this
+/// many `Ack`s unread in this side's send buffer, about 47 KB under TLS, under the default
+/// `tcp_rmem`.
+const RECEIVER_MAX_WINDOW: u32 = 1024;
 
 /// Re-exported for symmetry with `crate::otlp`'s path; both share `crate::tls`'s definition.
 pub use crate::tls::TlsServerSettings;
@@ -304,6 +320,10 @@ impl Input for LogitInput {
                     continue;
                 }
             };
+
+            // An `Ack` the peer waits on can otherwise sit behind Nagle's algorithm and the
+            // peer's delayed ACK. A failure costs only that latency.
+            let _ = stream.set_nodelay(true);
 
             // `None` means past the cap. `reject_or_serve` writes the reject, after the TLS wrap
             // below rather than onto this raw `stream` (module doc's "Connection limit").
@@ -479,7 +499,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     max_frame_bytes: u32,
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     senders: Arc<SenderTable>,
 ) -> anyhow::Result<()> {
     let negotiated =
@@ -490,6 +510,62 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 return Err(err);
             }
         };
+    // `sink` moves into `serve_frames` and drops when it returns, so a lingering close never
+    // holds the graph's cancel-by-drop shutdown open.
+    let ended = serve_frames(
+        &mut stream,
+        sink,
+        &telemetry,
+        &negotiated,
+        max_frame_bytes,
+        handshake_timeout,
+        idle_timeout,
+        shutdown,
+        &senders,
+    )
+    .await;
+    if !matches!(ended, Ok(Ended::PeerClosed)) {
+        close_lingering(&mut stream, handshake_timeout).await;
+    }
+    ended.map(|_| ())
+}
+
+/// How [`serve_frames`] ended without an error.
+enum Ended {
+    /// The peer closed at a frame boundary: nothing is left to read, so no linger.
+    PeerClosed,
+    /// This listener closed the connection (shutdown, an idle close, no consumer).
+    Closing,
+}
+
+/// Closes a connection this listener is ending while the peer may still be sending: shuts the
+/// write side down (`close_notify` under TLS), then reads and discards until EOF or `bound`,
+/// whichever comes first. Closing with unread bytes in the receive buffer sends a reset, which
+/// discards the `GOING_AWAY` or trailing `Ack`s already written; a peer with a window of frames
+/// in flight leaves such bytes as a matter of course. Errors are ignored: the connection is over.
+async fn close_lingering<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, bound: Duration) {
+    let _ = tokio::time::timeout(bound, async {
+        let _ = stream.shutdown().await;
+        let mut discard = [0u8; 8192];
+        while let Ok(1..) = stream.read(&mut discard).await {}
+    })
+    .await;
+}
+
+/// The frame loop of [`serve_connection`], after the handshake: frame, `Fanout::send`, `Ack`,
+/// until close, shutdown, or idle close.
+#[allow(clippy::too_many_arguments)] // threaded through from `serve_connection`
+async fn serve_frames<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: &mut S,
+    sink: Fanout,
+    telemetry: &Telemetry,
+    negotiated: &Negotiated,
+    max_frame_bytes: u32,
+    handshake_timeout: Duration,
+    idle_timeout: Option<Duration>,
+    mut shutdown: watch::Receiver<bool>,
+    senders: &SenderTable,
+) -> anyhow::Result<Ended> {
     let compression = compression_tag(negotiated.compression);
 
     // The idle clock starts at the handshake; after this, only an `Ack` write advances it.
@@ -502,8 +578,8 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         // hasn't observed. The `borrow()` `Ref` drops at the end of the statement, before any
         // `.await`.
         if *shutdown.borrow() {
-            going_away(&mut stream, "listener shutting down", handshake_timeout, &telemetry).await;
-            return Ok(());
+            going_away(stream, "listener shutting down", handshake_timeout, telemetry).await;
+            return Ok(Ended::Closing);
         }
         // `changed()`, not `wait_for`: `wait_for`'s `Ref` guard makes the `select!` future
         // `!Send` once an arm awaits afterward, and `tokio::spawn` needs `Send`. With the check
@@ -512,11 +588,13 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         // This read is also the only unbounded wait on the peer, so the idle clock lives here:
         // [`IdleBounds`] gives an absolute deadline for the first byte, a per-`read` one after.
         let header_buf = tokio::select! {
-            result = read_header(&mut stream, IdleBounds::new(last_progress, idle_timeout)) => {
+            result = read_header(stream, IdleBounds::new(last_progress, idle_timeout)) => {
                 match result {
                     Ok(header_buf) => header_buf,
                     Err(HeaderReadError::Idle(idle)) => {
-                        return close_idle(&mut stream, &telemetry, idle, handshake_timeout).await
+                        return close_idle(stream, telemetry, idle, handshake_timeout)
+                            .await
+                            .map(|()| Ended::Closing)
                     }
                     Err(HeaderReadError::Truncated(err)) => {
                         let reason = [("reason", "truncated_header")];
@@ -527,22 +605,24 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 }
             }
             _ = shutdown.changed() => {
-                going_away(&mut stream, "listener shutting down", handshake_timeout, &telemetry).await;
-                return Ok(());
+                going_away(stream, "listener shutting down", handshake_timeout, telemetry).await;
+                return Ok(Ended::Closing);
             }
         };
         let Some(header_buf) = header_buf else {
             // Clean close at a frame boundary: the ordinary end of a connection.
-            return Ok(());
+            return Ok(Ended::PeerClosed);
         };
 
         let (header, mut payload) =
-            match read_frame_body(&mut stream, header_buf, max_frame_bytes, idle_timeout).await {
+            match read_frame_body(stream, header_buf, max_frame_bytes, idle_timeout).await {
                 Ok(v) => v,
                 // A stalled body is an idle close like a gap between frames: policy, not a
                 // fault, so no `logit.proto.errors`.
                 Err(FrameReadError::Stalled(idle)) => {
-                    return close_idle(&mut stream, &telemetry, idle, handshake_timeout).await
+                    return close_idle(stream, telemetry, idle, handshake_timeout)
+                        .await
+                        .map(|()| Ended::Closing)
                 }
                 // Answered before the close, so the peer sees a permanent refusal rather than an
                 // EOF it can't tell from a crash. Nothing of the body has been read.
@@ -552,7 +632,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         code: control::REJECT_FRAME_TOO_LARGE,
                         message: err.to_string(),
                     };
-                    let _ = write_reject(&mut stream, &reject, handshake_timeout, &telemetry).await;
+                    let _ = write_reject(stream, &reject, handshake_timeout, telemetry).await;
                     return Err(err);
                 }
                 Err(FrameReadError::Truncated(err)) => {
@@ -607,7 +687,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         code: control::REJECT_FRAME_TOO_LARGE,
                         message: err.to_string(),
                     };
-                    let _ = write_reject(&mut stream, &reject, handshake_timeout, &telemetry).await;
+                    let _ = write_reject(stream, &reject, handshake_timeout, telemetry).await;
                 }
                 return Err(anyhow::Error::new(err).context(what));
             }
@@ -645,14 +725,9 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     1.0,
                     &[("reason", "closed_consumer")],
                 );
-                going_away(
-                    &mut stream,
-                    "no consumer took the batch",
-                    handshake_timeout,
-                    &telemetry,
-                )
-                .await;
-                return Ok(());
+                going_away(stream, "no consumer took the batch", handshake_timeout, telemetry)
+                    .await;
+                return Ok(Ended::Closing);
             }
             // Only after a consumer took the batch: a batch answered `GOING_AWAY` comes back,
             // and a raised mark would drop it as a resend.
@@ -663,7 +738,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
         // After a forwarding `send_relayed` this is the only write: a frame is never both
         // forwarded and answered `GOING_AWAY` (module doc's "Shutdown").
-        if let Err(err) = write_control(&mut stream, &control::Ack, handshake_timeout).await {
+        if let Err(err) = write_control(stream, &control::Ack, handshake_timeout).await {
             if err.is::<WriteStalled>() {
                 telemetry.count("logit.proto.errors", 1.0, &[("reason", "ack_write_stalled")]);
             }
@@ -712,7 +787,8 @@ async fn close_idle<S: AsyncWrite + Unpin>(
 /// client can't proceed.
 ///
 /// `HelloAck` carries the best shared codec, `lz4` or no compression, this listener's
-/// `max_frame_bytes` (every later frame is bounded by it), and `window: 1`. Each reply is written
+/// `max_frame_bytes` (every later frame is bounded by it), and the offered window clamped to
+/// `1..=RECEIVER_MAX_WINDOW`. Each reply is written
 /// within `handshake_timeout` too, a fresh bound per write.
 async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
@@ -799,7 +875,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         codec,
         compression: compression as u8,
         max_frame_bytes,
-        window: 1,
+        window: hello.window.clamp(1, RECEIVER_MAX_WINDOW),
     };
     write_control(stream, &ack, handshake_timeout).await?;
     Ok(Negotiated { compression, codec })
@@ -1122,7 +1198,7 @@ mod tests {
     use super::*;
     use logit_core::{AttrMap, Event, EventBatch, LogRecord, Registry, Resource, Severity, Value};
     use logit_pipeline::test_util::{
-        expect_closed, expect_still_open, recv_batch, TelemetryProbe, Totals,
+        expect_closed, expect_still_open, recv_batch, TelemetryProbe, Totals, RECV_TIMEOUT,
     };
     use logit_proto::native::NativeEncoder;
     use logit_proto::Encoder;
@@ -1700,6 +1776,8 @@ mod tests {
             .expect("should observe a close within 2s")
             .unwrap();
         assert_eq!(n, 0);
+        // The listener lingers after the `Reject` until this side closes.
+        drop(client);
 
         let mut probe = TelemetryProbe::with_registry(registry);
         let totals = probe
@@ -1755,6 +1833,8 @@ mod tests {
             .expect("the connection closes right behind the Reject")
             .unwrap();
         assert_eq!(n, 0);
+        // The listener lingers after the `Reject` until this side closes.
+        drop(client);
 
         let mut probe = TelemetryProbe::with_registry(registry);
         let totals = probe
@@ -2032,7 +2112,15 @@ mod tests {
              connection_error path must not see it"
         );
 
-        // Cap 1 and `quiet` still alive: this handshakes only if the permit came back.
+        // The permit is held through the linger after the `Reject`, until `quiet` closes. Cap 1:
+        // the second connection handshakes only if the permit came back.
+        let mut probe = TelemetryProbe::with_registry(registry);
+        drop(quiet);
+        probe
+            .wait_for("the lingering connection to end", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
         let mut second = connect(&addr).await;
         client_hello(&mut second, vec![native::CODEC_NATIVE_V1], vec![0]).await;
         match read_control_response(&mut second).await {
@@ -2041,7 +2129,6 @@ mod tests {
             }
             other => panic!("expected HelloAck on the second connection, got {other:?}"),
         }
-        drop(quiet);
     }
 
     /// Time parked in `Fanout::send` behind a full downstream never counts as idle: the clock
@@ -2461,6 +2548,8 @@ mod tests {
                 control::ControlMessage::Reject(reject) => {
                     assert_eq!(reject.code, control::REJECT_GOING_AWAY);
                     going_away += 1;
+                    // The listener lingers until the peer closes.
+                    drop(client);
                     task.await.unwrap().unwrap();
                     assert!(
                         rx.try_recv().is_err(),
@@ -2509,14 +2598,16 @@ mod tests {
             }
             other => panic!("expected Reject{{GOING_AWAY}} in place of the Ack, got {other:?}"),
         }
-        tokio::time::timeout(logit_pipeline::test_util::RECV_TIMEOUT, task)
-            .await
-            .expect("the connection should end right behind the Reject")
-            .unwrap()
-            .expect("a refused frame is a clean close, not a connection error");
         let mut rest = Vec::new();
         client.read_to_end(&mut rest).await.unwrap();
         assert!(rest.is_empty(), "no Ack follows the Reject");
+        // The listener lingers until the peer closes.
+        drop(client);
+        tokio::time::timeout(logit_pipeline::test_util::RECV_TIMEOUT, task)
+            .await
+            .expect("the connection should end once the peer closes")
+            .unwrap()
+            .expect("a refused frame is a clean close, not a connection error");
         assert_eq!(
             Totals::of(registry.drain(0))
                 .sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]),
@@ -3212,5 +3303,205 @@ mod tests {
         assert_eq!(recv_mark(&mut rx_b).await, 1);
         assert_eq!(probe_a.sum("logit.input.batches.resends", &[]), 0.0);
         assert_eq!(probe_b.sum("logit.input.batches.resends", &[]), 0.0);
+    }
+
+    // ---- the send window ------------------------------------------------------------------------
+
+    /// [`client_hello`] offering `window`, v2 only.
+    async fn hello_offering(stream: &mut TcpStream, window: u32) {
+        let hello = control::Hello {
+            version: control::PROTOCOL_VERSION,
+            codecs: vec![native::CODEC_NATIVE_V2],
+            compressions: vec![0],
+            max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
+            window,
+        };
+        write_msg(stream, &hello).await;
+    }
+
+    /// [`send_data_frame_v2_seq`] of [`batch_marked`]`(mark)` under `sid(9, mark)`, without
+    /// waiting for its `Ack`.
+    async fn pipeline_marked(client: &mut TcpStream, mark: i64) {
+        let batch = batch_marked(mark);
+        let seq = Some(sid(9, mark as u64));
+        send_data_frame_v2_seq(client, &batch, Provenance::default(), seq, Compression::None).await;
+    }
+
+    #[tokio::test]
+    async fn hello_ack_answers_the_offered_window_clamped_to_the_receiver_maximum() {
+        let (addr, mut input) = bound_input().await;
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        for (offered, answered) in
+            [(0, 1), (1, 1), (32, 32), (1024, 1024), (1025, 1024), (u32::MAX, 1024)]
+        {
+            let mut client = connect(&addr).await;
+            hello_offering(&mut client, offered).await;
+            match read_control_response(&mut client).await {
+                control::ControlMessage::HelloAck(ack) => {
+                    assert_eq!(ack.window, answered, "offered {offered}")
+                }
+                other => panic!("expected HelloAck, got {other:?}"),
+            }
+        }
+    }
+
+    /// Frames written back to back are forwarded and answered one at a time, in the order they
+    /// arrived: the k-th `Ack` follows the k-th frame's forward. A one-slot consumer holds the
+    /// second frame's forward until the first is taken, and its `Ack` with it.
+    #[tokio::test]
+    async fn pipelined_frames_are_acked_in_frame_order() {
+        let (addr, mut input) = bound_input().await;
+        let (sink, mut rx) = fanout_into_channel(1);
+        tokio::spawn(async move { input.run(sink).await });
+        let mut client = connect(&addr).await;
+        hello_offering(&mut client, 8).await;
+        let _ = read_control_response(&mut client).await;
+
+        for mark in 1..=3 {
+            pipeline_marked(&mut client, mark).await;
+        }
+        read_ack(&mut client).await;
+        // The second frame waits on the full consumer, so its `Ack` hasn't been written.
+        let mut early = [0u8; 1];
+        let pending = tokio::time::timeout(Duration::from_millis(50), client.read(&mut early));
+        assert!(pending.await.is_err(), "no second Ack before the second forward");
+
+        for mark in 1..=3 {
+            assert_eq!(recv_mark(&mut rx).await, mark);
+            if mark < 3 {
+                read_ack(&mut client).await;
+            }
+        }
+    }
+
+    /// A shutdown with frames buffered behind the one being forwarded: the listener answers that
+    /// frame, writes `GOING_AWAY`, and lingers over the unread frames, so the peer reads both
+    /// answers and then an orderly EOF, not a reset.
+    #[tokio::test]
+    async fn a_shutdown_with_frames_still_buffered_reaches_the_peer_as_going_away_not_a_reset() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, input) = bound_input().await;
+        let mut input = input.with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"));
+        let (sink, mut rx) = fanout_into_channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { input.run_until_shutdown(sink, shutdown_rx).await });
+        let mut client = connect(&addr).await;
+        hello_offering(&mut client, 8).await;
+        let _ = read_control_response(&mut client).await;
+
+        // The first batch fills the one-slot consumer; the second's forward then waits on it,
+        // with three more frames unread behind it.
+        send_acked(&mut client, 1, Some(sid(9, 1))).await;
+        for mark in 2..=5 {
+            pipeline_marked(&mut client, mark).await;
+        }
+        // Counted once decoded, before the forward that waits on the full consumer.
+        probe
+            .wait_for("the second frame's forward to start", |t| {
+                t.sum("logit.proto.frames", &[("direction", "in")]) == 2.0
+            })
+            .await;
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap().unwrap();
+        assert_eq!(recv_mark(&mut rx).await, 1, "frees the slot the second forward waits on");
+
+        read_ack(&mut client).await;
+        match read_control_response(&mut client).await {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_GOING_AWAY);
+            }
+            other => panic!("expected Reject{{GOING_AWAY}}, got {other:?}"),
+        }
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(RECV_TIMEOUT, client.read_to_end(&mut rest)).await;
+        let read = read.expect("the listener shuts its side down");
+        assert!(read.is_ok(), "an orderly close, not a reset: {read:?}");
+        assert!(rest.is_empty(), "nothing after GOING_AWAY: {rest:?}");
+        assert_eq!(recv_mark(&mut rx).await, 2);
+        assert!(rx.try_recv().is_err(), "the frames behind it were never forwarded");
+    }
+
+    /// The consumer closes while a window of frames is in flight: the frame it didn't take is
+    /// answered `GOING_AWAY`, the frames behind it are never read, and the peer reads an orderly
+    /// close.
+    #[tokio::test]
+    async fn a_frame_no_consumer_took_mid_window_is_answered_going_away_and_nothing_after_it_is_forwarded(
+    ) {
+        let mut probe = TelemetryProbe::new();
+        let (addr, input) = bound_input().await;
+        let mut input = input.with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"));
+        let (sink, rx) = fanout_into_channel(1);
+        tokio::spawn(async move { input.run(sink).await });
+        let mut client = connect(&addr).await;
+        hello_offering(&mut client, 8).await;
+        let _ = read_control_response(&mut client).await;
+
+        for mark in 1..=4 {
+            pipeline_marked(&mut client, mark).await;
+        }
+        // The first batch takes the one slot; the second's forward waits on it.
+        read_ack(&mut client).await;
+        drop(rx);
+
+        match read_control_response(&mut client).await {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_GOING_AWAY);
+                assert_eq!(reject.message, "no consumer took the batch");
+            }
+            other => panic!("expected Reject{{GOING_AWAY}}, got {other:?}"),
+        }
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(RECV_TIMEOUT, client.read_to_end(&mut rest)).await;
+        assert!(read.expect("an orderly close").is_ok() && rest.is_empty());
+
+        let totals = probe.poll();
+        assert_eq!(
+            totals.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]),
+            1.0
+        );
+        assert_eq!(
+            totals.sum("logit.proto.frames", &[("direction", "in")]),
+            2.0,
+            "the frames behind the refused one are never read"
+        );
+    }
+
+    /// A connection lingering after `GOING_AWAY`, on a peer that neither reads nor closes, holds
+    /// its permit but not its `Fanout` clone: the graph closes during the linger.
+    #[tokio::test]
+    async fn the_graph_closes_while_a_connection_lingers_after_going_away() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, input) = bound_input().await;
+        // A linger that outlasts every wait below.
+        let mut input = input
+            .with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"))
+            .with_handshake_timeout(Duration::from_secs(60));
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { input.run_until_shutdown(sink, shutdown_rx).await });
+        let mut client = connect(&addr).await;
+        hello_offering(&mut client, 8).await;
+        let _ = read_control_response(&mut client).await;
+        send_acked(&mut client, 1, Some(sid(9, 1))).await;
+        assert_eq!(recv_mark(&mut rx).await, 1);
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap().unwrap();
+        let closed = tokio::time::timeout(RECV_TIMEOUT, rx.recv()).await;
+        assert!(closed.expect("the graph closes within the bound").is_none());
+        assert_eq!(
+            probe.poll().gauge("logit.input.connections", &[]),
+            Some(1.0),
+            "the connection is still lingering"
+        );
+
+        drop(client);
+        probe
+            .wait_for("the linger to end on the peer's close", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
     }
 }
