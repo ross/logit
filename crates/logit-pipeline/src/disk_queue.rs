@@ -74,8 +74,8 @@ use logit_proto::CodecError;
 
 /// `[trace_id: 16][span_id: 8]`, ahead of the frame. Never widen it: a record carries no version
 /// of its own, and [`walk_segment`]'s resync arithmetic assumes this prefix sits right before
-/// every record's `MAGIC`. Anything new rides inside the frame, as a new trailer tag (as the
-/// sender identity and sequence do) (`docs/adr/native-hop-no-compatibility.md`, decision 2).
+/// every record's `MAGIC`. Anything new rides inside the frame as a new trailer tag, as the
+/// sender identity and sequence do (`docs/adr/native-hop-no-compatibility.md`, decision 2).
 pub(crate) const CONTEXT_LEN: usize = 24;
 
 const LOCK_FILE_NAME: &str = "lock";
