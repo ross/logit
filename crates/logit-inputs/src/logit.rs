@@ -42,7 +42,10 @@
 //! default cap of 1024); a new identity at a full table evicts the least recently seen one. A
 //! frame at or below its identity's mark is a resend: acked and not forwarded. Any other frame is
 //! forwarded, and a consumer taking it raises the mark to its sequence; gaps above the mark are
-//! ignored. No lock spans a forward, so a frame an ended
+//! ignored. The same table answers a reconnecting sender's `Hello.senders` with `HelloAck.marks`
+//! ([`handshake`]), a lookup that neither inserts, evicts, nor refreshes an identity, so the
+//! sender commits what this listener already handled without resending it
+//! (`docs/adr/native-hop-named-acks.md`, decision 4). No lock spans a forward, so a frame an ended
 //! connection still holds can be forwarded beside the sender's resend of it on a new connection
 //! (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds"). The
 //! identity is advisory, never trusted: a peer minting a new identity per frame costs one scan of
@@ -2387,12 +2390,12 @@ mod tests {
         );
     }
 
-    /// Every `Ack` re-arms the clock: eight frames 100ms apart outlast a 500ms timeout until they
-    /// stop.
-    /// The 400ms margin covers scheduler lag between an `Ack` and the next frame, the one gap
-    /// that separates an ack-driven clock from an idle close.
+    /// Every frame handled re-arms the clock: eight frames 100ms apart outlast a 500ms timeout
+    /// until they stop.
+    /// The 400ms margin covers scheduler lag between handling one frame and the next, the one gap
+    /// that separates a frame-driven clock from an idle close.
     #[tokio::test]
-    async fn the_idle_clock_restarts_from_each_ack() {
+    async fn the_idle_clock_runs_from_the_last_frame_handled() {
         let (addr, input) = bound_input().await;
         let mut input = input.with_idle_timeout(Some(Duration::from_millis(500)));
         let (sink, mut rx) = fanout_into_channel(16);

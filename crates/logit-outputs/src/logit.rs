@@ -64,14 +64,15 @@
 //!   nothing after it.
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
-//! retries an `Ambiguous` attempt. Every frame carries the sender identity and sequence the
-//! sink's store gave the batch, and a resend reuses them, so `logit_in` recognizes a resend at or
-//! below its sender's mark, acks it, and doesn't forward it again
-//! (`docs/adr/native-hop-identity-and-sequence.md`). A resend still reaches `logit_in`'s consumers
-//! twice after a `logit_in` restart (the marks are in memory), for a sender evicted from
-//! `logit_in`'s table, behind a load balancer that sends the resend to another `logit_in`, and
-//! when a connection that ended mid-window still holds the first copy as the resend arrives
-//! (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds").
+//! retries an `Ambiguous` attempt. Every frame carries the sender identity and sequence the sink's
+//! store gave the batch, and a resend reuses them, so `logit_in` recognizes a resend at or below
+//! its sender's mark, acks it, and doesn't forward it again
+//! (`docs/adr/native-hop-identity-and-sequence.md`); a retried round first resumes from those marks
+//! ("Resume" below), so the frames resent are the ones the marks don't cover. A resend still
+//! reaches `logit_in`'s consumers twice after a `logit_in` restart (the marks are in memory), for a
+//! sender evicted from `logit_in`'s table, behind a load balancer that sends the resend to another
+//! `logit_in`, and when a connection that ended mid-window still holds the first copy as the resend
+//! arrives (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds").
 //!
 //! **Resume** (`docs/adr/native-hop-named-acks.md`, decision 4). A connection dropped by a failed
 //! ack wait leaves the distinct identities of its in-flight list, the frames the retried round
@@ -92,17 +93,18 @@
 //! (`crate::tls::poll_pending_close`, whose doc says why never a cancellable `timeout(read)`).
 //! An EOF, or unsolicited bytes (on this protocol, a `Reject{GOING_AWAY}` from a shutdown or a
 //! `logit_in` `idle_timeout:`, `docs/adr/idle-connection-timeout.md`), drops it and reconnects
-//! before anything leaves the host, the `Clean` path. A FIN arriving between the probe and the write is `Ambiguous` when the
-//! write completes first and the ack wait meets it, and `Clean` when the write or flush fails.
+//! before anything leaves the host, the `Clean` path. A FIN arriving between the probe and the
+//! write is `Ambiguous` when the write completes first and the ack wait meets it, and `Clean` when
+//! the write or flush fails.
 //!
 //! **Telemetry** (`docs/design/internal-telemetry.md`'s `logit_out` section):
-//! `logit.output.requests{class}` counts every `submit` failure that carries a `Fault` and
-//! every `await_ack` result, once, as `ok` or the failure's `Fault` (`clean`/`ambiguous`/`permanent`), so a `send` counts
-//! once; a cancelled call isn't counted. `logit.output.reconnects` counts every validated
-//! handshake after the first, probe-driven ones included. `logit.output.ack.duration` times each
-//! read of the wire for an ack, not an `await_ack` answered from the in-flight list. The gauges
-//! `logit.output.in_flight` and `logit.output.window` hold the frames awaiting their commit and
-//! the negotiated window, and read 0 and 1 after every connection drop. A `Permanent` past the
+//! `logit.output.requests{class}` counts every `submit` failure that carries a `Fault` and every
+//! `await_ack` result, once, as `ok` or the failure's `Fault` (`clean`/`ambiguous`/`permanent`), so
+//! a `send` counts once; a cancelled call isn't counted. `logit.output.reconnects` counts every
+//! validated handshake after the first, probe-driven ones included. `logit.output.ack.duration`
+//! times each read of the wire for an ack, not an `await_ack` answered from the in-flight list. The
+//! gauges `logit.output.in_flight` and `logit.output.window` hold the frames awaiting their commit
+//! and the negotiated window, and read 0 and 1 after every connection drop. A `Permanent` past the
 //! head is counted when it becomes the head.
 
 use crate::Output;
@@ -1608,8 +1610,7 @@ mod tests {
     // ---- HelloAck validation --------------------------------------------------------------------
 
     /// A peer answering its first connection's `Hello` with `first` and holding it open, and
-    /// every later connection as a stock `logit_in` does: [`hello_ack`], then one `Ack` per
-    /// data frame.
+    /// every later connection with [`hello_ack`], then an `Ack` naming each data frame.
     async fn spawn_peer_answering_first_with(first: control::HelloAck) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();

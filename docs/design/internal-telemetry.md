@@ -1140,7 +1140,8 @@ the property the minimal-watch-set design is for.
 
 `crates/logit-inputs/src/logit.rs`,
 [ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md),
-[ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md).
+[ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md),
+[ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md).
 
 - `logit.proto.frames{direction="in",compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
@@ -1867,13 +1868,15 @@ attempt.
 `crates/logit-outputs/src/logit.rs`,
 [ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md),
 [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md),
-[ADR `native-hop-send-window`](../adr/native-hop-send-window.md).
+[ADR `native-hop-send-window`](../adr/native-hop-send-window.md),
+[ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md).
 
 - `logit.proto.frames{direction="out",compression}` and `logit.proto.frame.bytes`: the
   send-side mirror of `logit_in`'s pair.
 - `logit.output.ack.duration` (timer, one sample per read of the connection for an `Ack`; an
-  `await_ack` answered by an `Ack` already read records none): the wait for one `Ack`, finer-grained than layer 2's `logit.component.send.duration`, which times a
-  whole attempt or windowed round, connect, handshake, and writes included.
+  `await_ack` answered by an `Ack` already read records none): the wait for one `Ack`,
+  finer-grained than layer 2's `logit.component.send.duration`, which times a whole attempt or
+  windowed round, connect, handshake, and writes included.
 - `logit.output.in_flight` (gauge): frames written and not yet committed, set on every change. It
   reads 0 after every connection drop, a cancelled call's included. A value that sits at
   `logit.output.window` means the round trip, or the peer's forwarding, bounds this sink.

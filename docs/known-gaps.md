@@ -375,7 +375,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     the oldest unanswered frame. The window is fixed at the handshake, with no credit messages.
     The sink's store reserves the frames in flight as a prefix from its head, and a fault resends
     the window from the head, which `logit_in`'s high-water mark deduplicates
-    ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)).
+    ([ADR `native-hop-send-window`](adr/native-hop-send-window.md)). Since 2026-10-02 an `Ack`
+    names an identity and a sequence and covers a run of frames, `logit_in` writes one per run,
+    and a reconnect commits the frames at or below `logit_in`'s marks without resending them
+    ([ADR `native-hop-named-acks`](adr/native-hop-named-acks.md)).
   - **QUIC.** TCP only today; a plausible later transport upgrade, not attempted.
   - **An OTLP passthrough codec.** Whether the native protocol should carry OTLP-encoded payloads
     unmodified (a relay forwarding OTLP without re-encoding into native) is an open question in
@@ -588,9 +591,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   when both check before either forward lands, most often when the old task's forward is parked on a
   full inbox past the sender's ack timeout. Each task forwards a given frame at most once per
   connection that held it, so twice per fault, and one more time for each further connection that
-  times out on the same inbox. The old task ends at the first `Ack` write after the reset arrives:
-  the sender has closed that socket, so a write meets a reset within about a round trip, and the
-  task forwards only the frame it was parked on plus what its inbox accepts in that time. The hard
+  times out on the same inbox. The old task ends at the first `Ack` write after the reset arrives,
+  and it writes a pending `Ack` at least every 32 frames: the sender has closed that socket, so a
+  write meets a reset within about a round trip, and the task forwards only the frame it was
+  parked on plus what its inbox accepts in that time. The hard
   bound is the window the old connection held; under the sustained backpressure that parks a
   forward, that pace keeps it to one or two duplicates per fault. Nothing is lost. A duplicate copy
   can reach the consumers after later batches; a batch's only copy never does, because the mark
@@ -599,6 +603,17 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   the race: a per-sender lock held across the forward would close it at the cost of a lock per
   frame, to prevent a duplicate the at-least-once target tolerates. [ADR
   `native-hop-send-window`](adr/native-hop-send-window.md), decision 6, keeps that with a window.
+
+- **A reconnect resumes at most 16 sender identities.** After a fault, `logit_out`'s next `Hello`
+  lists the identities of the frames it will resend, so `logit_in` can answer their marks and the
+  frames at or below them are committed without a send (`logit.output.batches.resumed`). The list
+  holds at most 16 identities (`MAX_HELLO_SENDERS`), so a window whose frames span more than 16
+  store opens, which takes a spool replaying records from that many earlier opens, resends the
+  frames of the 17th identity on. `logit_in` recognizes each of those by its mark and doesn't
+  forward it again, so the cost is the encode and the bytes, with the duplicate cases of the
+  entry above unchanged. Accepted in [ADR `native-hop-named-acks`](adr/native-hop-named-acks.md),
+  decision 4. **Revisit trigger:** `logit.input.batches.resends` climbing after reconnects that
+  the resume should have absorbed.
 
 - ~~**`logit_in` acknowledges a batch no consumer took.**~~ **Closed 2026-09-30:** `Fanout`'s sends return whether any consumer took the batch, and `logit_in` answers `Reject{GOING_AWAY}` and closes for a frame none took. `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s receiver answer their protocol's retryable failure, and `tail_in` and `docker_in` freeze their checkpoint and stop (ADR `delivery-semantics`, item 3, and its W3 amendment).
 
@@ -955,8 +970,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   operator who raises `handshake_timeout` for slow TLS handshakes also lengthens how long a wedged
   peer holds its connection slot. A conforming `logit_out` never trips the bound: it keeps at
   most its window of frames in flight, so at most that many unread `Ack`s sit in its receive
-  buffer, even while it's paused. At the 1024 cap that's about 80 KB under TLS, which fits the
-  default `tcp_rmem`.
+  buffer, even while it's paused. `logit_in` writes one `Ack` per run of frames, so the common
+  case is far fewer; the worst case, one `Ack` per frame, is about 80 KB at the 1024 cap under
+  TLS (a named `Ack` is about 70 to 80 bytes there), which fits the default `tcp_rmem`.
   A separate write timeout was not added. **Revisit trigger:** an operator who needs the two waits set apart.
 - **No per-listener in-flight byte budget on the HTTP listeners.** Each hyper listener
   (`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`) caps

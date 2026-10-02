@@ -76,7 +76,7 @@ Listeners live in `crates/logit-inputs`, codecs in `crates/logit-proto`.
 | `prometheus_in` | `crates/logit-inputs/src/prometheus.rs` | scrapes `/metrics` targets, or receives remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
 | `tail_in` | `crates/logit-inputs/src/tail/` | rotation- and checkpoint-aware file tailing | [ADR `file-tailing-and-docker-json-logs`](docs/adr/file-tailing-and-docker-json-logs.md) |
 | `docker_in` | `crates/logit-inputs/src/docker.rs` | Docker json-file container logs, enriched from a sibling `config.v2.json`; no docker socket | same ADR as `tail_in` |
-| `logit_in` | `crates/logit-inputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md), [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md) |
+| `logit_in` | `crates/logit-inputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md), [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md), [ADR `native-hop-named-acks`](docs/adr/native-hop-named-acks.md) |
 | `internal` | `crates/logit-inputs/src/internal.rs` | `logit` observing itself: its own telemetry as ordinary events | [ADR `internal-telemetry-as-pipeline-events`](docs/adr/internal-telemetry-as-pipeline-events.md) |
 | `generate_in` | `crates/logit-inputs/src/generate.rs` | declarative event generator for load tests | [ADR `load-test-harness`](docs/adr/load-test-harness.md) |
 
@@ -98,7 +98,7 @@ Sinks live in `crates/logit-outputs`.
 | `prometheus_out` | `crates/logit-outputs/src/prometheus.rs` | serves an exposition endpoint, or sends remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
 | `collectd_out` | `crates/logit-outputs/src/collectd.rs` | collectd's binary `network` protocol | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
 | `graphite_out` | `crates/logit-outputs/src/graphite.rs` | carbon plaintext and pickle | [ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md) |
-| `logit_out` | `crates/logit-outputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md), [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md), [ADR `native-hop-send-window`](docs/adr/native-hop-send-window.md) |
+| `logit_out` | `crates/logit-outputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md), [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md), [ADR `native-hop-send-window`](docs/adr/native-hop-send-window.md), [ADR `native-hop-named-acks`](docs/adr/native-hop-named-acks.md) |
 | `null_out` | `crates/logit-outputs/src/null.rs` | discards everything; a load-test sink | [ADR `load-test-harness`](docs/adr/load-test-harness.md) |
 
 ### Transforms and routing
@@ -426,8 +426,12 @@ Per pair:
   `crates/logit-outputs/src/logit.rs`) use one TCP (optionally TLS) connection, a `Hello`/`HelloAck`
   version/codec/compression handshake that offers and accepts the hop codec alone, and one native
   frame per batch, with up to a negotiated window of frames in flight, acknowledged in frame order
+  by a named, cumulative `Ack { id, seq }` that `logit_in` writes once per run of frames; a
+  reconnect lists its in-flight identities in `Hello` and commits every frame at or below the
+  marks `HelloAck` returns without resending it
   ([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md),
-  [ADR `native-hop-send-window`](docs/adr/native-hop-send-window.md)).
+  [ADR `native-hop-send-window`](docs/adr/native-hop-send-window.md),
+  [ADR `native-hop-named-acks`](docs/adr/native-hop-named-acks.md)).
 
 ### Runtime and pipeline
 
@@ -807,7 +811,10 @@ not a style preference:
   `logit_out` to `logit_in` hop is effectively-once: a sink's store mints a sender
   identity every time it opens and numbers its batches, the pair rides in every hop frame's
   trailer, outlives a reconnect, and rides a spool replay, and `logit_in` acknowledges a frame at
-  or below its sender's high-water mark without forwarding it.
+  or below its sender's high-water mark without forwarding it. Each `Ack` names an identity and a
+  sequence and covers that identity's frames up to it, and a reconnect resumes from `logit_in`'s
+  marks instead of resending what it already handled
+  ([ADR `native-hop-named-acks`](docs/adr/native-hop-named-acks.md)).
   "Lossless" means field fidelity, never delivery. Check
   [ADR `delivery-semantics`](docs/adr/delivery-semantics.md) and
   [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md) before

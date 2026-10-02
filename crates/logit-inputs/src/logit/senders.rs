@@ -3,8 +3,9 @@
 //! module doc's "Deduplication").
 //!
 //! The lock is a `std::sync::Mutex` held only inside [`SenderTable::is_resend`],
-//! [`SenderTable::raise`], and [`SenderTable::marks`], never across an `.await`: a connection task's future must stay `Send`,
-//! and no lock spans a forward (decision 7 accepts the race that leaves).
+//! [`SenderTable::raise`], and [`SenderTable::marks`], never across an `.await`: a connection
+//! task's future must stay `Send`, and no lock spans a forward (decision 7 accepts the race that
+//! leaves).
 
 use logit_core::Telemetry;
 use logit_proto::native::SeqId;
