@@ -1144,9 +1144,13 @@ the property the minimal-watch-set design is for.
 
 - `logit.proto.frames{direction="in",compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
-- `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated_header"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"|"ack_write_stalled"|"reject_write_stalled"}`
+- `logit.proto.errors{reason="magic"|"version"|"malformed"|"crc"|"truncated_header"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"|"ack_write_stalled"|"reject_write_stalled"}`
   (count): every way a frame or a handshake can be rejected, each its own reason so a version
-  mismatch doesn't hide behind a generic "bad frame" tag. `truncated_header` is a peer that closed,
+  mismatch doesn't hide behind a generic "bad frame" tag. `magic` is a frame header whose magic
+  isn't `LGIT`, and `version` one whose frame version this reader doesn't understand.
+  `malformed` is a frame or hop batch that fails to parse past a valid header and CRC: bad
+  lengths, a body that doesn't decompress, an unknown compression byte, a corrupt batch body, or a
+  trailer without a complete sender identity and sequence pair. `truncated_header` is a peer that closed,
   or a read that failed, part-way through a frame header, and `truncated` the same part-way through
   a body. A close between frames is the ordinary end of a connection and isn't counted, including
   a TLS peer gone without `close_notify`. `too_large` is a header that declared a
