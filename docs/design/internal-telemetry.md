@@ -1144,6 +1144,9 @@ the property the minimal-watch-set design is for.
 
 - `logit.proto.frames{direction="in",compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
+- `logit.input.acks` (count): `Ack`s written, one per run of handled frames
+  ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 2). Against
+  `logit.proto.frames{direction="in"}` it shows the coalescing ratio.
 - `logit.proto.errors{reason="magic"|"version"|"malformed"|"crc"|"truncated_header"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"|"ack_write_stalled"|"reject_write_stalled"}`
   (count): every way a frame or a handshake can be rejected, each its own reason so a version
   mismatch doesn't hide behind a generic "bad frame" tag. `magic` is a frame header whose magic
@@ -1162,8 +1165,9 @@ the property the minimal-watch-set design is for.
   past its per-frame budget (`native::DecodeBudget`), a batch too large for the frame cap it
   arrived under rather than corrupt bytes, also answered `Reject{FRAME_TOO_LARGE}`. The two
   `_write_stalled` reasons count a control write to a peer that stopped reading, abandoned after
-  `handshake_timeout`: an `Ack` (the connection ends) or a `Reject` (the connection was closing
-  anyway).
+  `handshake_timeout`: an `Ack` (the connection ends; for the `Ack` written before a `Reject`, the
+  `Reject` is left out and the close ends as it would have) or a `Reject` (the connection was
+  closing anyway).
 - `logit.input.connections` (gauge, sampled on every connect/disconnect) and
   `logit.input.connections.rejected{reason="limit"}` (count, the connection cap,
   `max_connections`, 1024 by default, binding). `otlp_in` and a TCP
@@ -1172,7 +1176,7 @@ the property the minimal-watch-set design is for.
   listener closed still counts, and holds its permit, while it lingers: after its last answer it
   reads and discards until the peer closes or for `handshake_timeout`.
 - `logit.input.connections.closed{reason="idle"}` (count), the third point all five share. Here the
-  idle time is measured from the last `Ack` written rather than from bytes read, because a peer
+  idle time is measured from the last frame handled rather than from bytes read, because a peer
   waiting on a delayed ack isn't idle. The close writes `Reject{GOING_AWAY, "idle for <dur>"}`, the
   same signal an ordinary shutdown sends, and returns `Ok(())`: it's never
   `logit.proto.errors{reason="handshake"}` or any other diagnostic.
