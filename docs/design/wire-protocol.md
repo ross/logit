@@ -467,8 +467,9 @@ decision record.
     listener answers a connection's data frames, with an `Ack` or a `Reject`, in the order they
     arrive, and writes the `Ack` for one identity's frames before it acknowledges a frame of
     another, so the frames an `Ack` covers are a run at the front of the sender's unanswered
-    frames. `logit_in` meets it by reading, forwarding, and answering one frame at a time on each
-    connection, with one `Ack` per frame. Nothing acknowledges out of order.
+    frames. `logit_in` meets it by reading and forwarding one frame at a time on each connection,
+    with one `Ack` per run of frames ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md),
+    decision 2). Nothing acknowledges out of order.
   - **The sender commits by name.** `logit_out` keeps its frames in flight as a list in write
     order. An `Ack` marks every entry from the front that carries its identity at or below its
     sequence; the front entry must carry that identity and some entry that sequence, or the `Ack`

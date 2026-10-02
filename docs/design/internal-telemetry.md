@@ -1165,8 +1165,9 @@ the property the minimal-watch-set design is for.
   past its per-frame budget (`native::DecodeBudget`), a batch too large for the frame cap it
   arrived under rather than corrupt bytes, also answered `Reject{FRAME_TOO_LARGE}`. The two
   `_write_stalled` reasons count a control write to a peer that stopped reading, abandoned after
-  `handshake_timeout`: an `Ack` (the connection ends) or a `Reject` (the connection was closing
-  anyway).
+  `handshake_timeout`: an `Ack` (the connection ends; for the `Ack` written before a `Reject`, the
+  `Reject` is left out and the close ends as it would have) or a `Reject` (the connection was
+  closing anyway).
 - `logit.input.connections` (gauge, sampled on every connect/disconnect) and
   `logit.input.connections.rejected{reason="limit"}` (count, the connection cap,
   `max_connections`, 1024 by default, binding). `otlp_in` and a TCP
