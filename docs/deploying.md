@@ -2737,7 +2737,6 @@ a loss:
 
 - `logit_in` restarted between the two copies; its marks live in memory.
 - `logit_in` evicted the sender from its table (`logit.input.senders.evicted`).
-- The peer is a `logit` whose connection negotiated the v1 codec, which carries no identity.
 - A load balancer sent the resend to a different `logit_in`.
 - A fault ended a connection with frames still buffered at `logit_in`, and that connection's
   task forwarded one while the sender's resend of it arrived on a new connection. Both copies are
