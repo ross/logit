@@ -2826,7 +2826,7 @@ reconnecting doesn't show as `connection_error` on the far end.
   resend reaches consumers twice), and
   `logit.input.batches.dropped{reason="closed_consumer"}` (frames refused because every consumer
   directly downstream had closed; expected during a shutdown, a fault anywhere else).
-- Both sides: `logit.proto.frames{direction,codec,compression}` and `logit.proto.frame.bytes` for
+- Both sides: `logit.proto.frames{direction,compression}` and `logit.proto.frame.bytes` for
   throughput.
 
 `docs/known-gaps.md` tracks what's still open: `logit_in` acknowledges frames in the order they

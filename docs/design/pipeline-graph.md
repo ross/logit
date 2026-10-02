@@ -610,10 +610,10 @@ previous = Some(self.component)              // rewritten on every send
   target; if that ever matters, it belongs in a router-side metric, not in provenance.
 
 `logit_in`'s relay (`Fanout::send_relayed`) uses a different rule, `stamp_relayed`: it back-fills
-(`or`, not overwrite) only what the wire didn't carry, so a v2 `logit_out` peer's own
+(`or`, not overwrite) only what the wire didn't carry, so a `logit_out` peer's own
 `origin`/`previous` survive the hop untouched. That is what lets a split-collection deployment
 read as one graph across `logit_out -> logit_in`. See the ADR for the wire-format decision
-(`CODEC_NATIVE_V2`) this relies on.
+(the `CODEC_HOP_BATCH` trailer) this relies on.
 
 ### Cancellation points
 

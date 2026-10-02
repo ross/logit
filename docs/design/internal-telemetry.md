@@ -1142,7 +1142,7 @@ the property the minimal-watch-set design is for.
 [ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md),
 [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md).
 
-- `logit.proto.frames{direction="in",codec,compression}` and `logit.proto.frame.bytes`: per-frame
+- `logit.proto.frames{direction="in",compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
 - `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated_header"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"|"ack_write_stalled"|"reject_write_stalled"}`
   (count): every way a frame or a handshake can be rejected, each its own reason so a version
@@ -1858,7 +1858,7 @@ attempt.
 [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md),
 [ADR `native-hop-send-window`](../adr/native-hop-send-window.md).
 
-- `logit.proto.frames{direction="out",codec,compression}` and `logit.proto.frame.bytes`: the
+- `logit.proto.frames{direction="out",compression}` and `logit.proto.frame.bytes`: the
   send-side mirror of `logit_in`'s pair.
 - `logit.output.ack.duration` (timer, one per `await_ack` that reads from the connection): the
   wait for one `Ack`, finer-grained than layer 2's `logit.component.send.duration`, which times a

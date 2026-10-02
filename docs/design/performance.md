@@ -316,7 +316,7 @@ as current. `attribute` has run on the VM for `json-parse`, `aggregate`, and `bu
   parse-heavy or Lua-heavy graph. These numbers predate
   [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md): trailer
   tags 3 and 4 on every frame, a mark lookup per frame at `logit_in`, and an exact-size
-  `encode_batch_v2` output buffer. They're pending re-measurement on the perf VM.
+  `encode_hop_batch` output buffer. They're pending re-measurement on the perf VM.
 - **`aggregate`** (0.325 µs/event) costs nearly as little as `passthrough` despite sketching a
   1000-series distribution on a 1 s flush tick. §2 shows why: almost all of it is one node's
   `DdSketch::add`, and the flush cost is amortized over ~6 ticks (the median repeat took 6.46 s).

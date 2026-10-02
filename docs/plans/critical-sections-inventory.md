@@ -283,7 +283,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [RT-10](#rt-10--run_router--route_batch-the-four-pass-partition-and-routerscratch-reuse) | P1 | `run_router` / `route_batch`: the four-pass partition and `RouterScratch` reuse | `runtime.rs` (`run_router`, `route_batch`) | unreviewed |
 | [RT-12](#rt-12--batchaccumulator-incremental-weight-tracking-and-the-resource-scope-key) | P1 | `BatchAccumulator`: incremental weight tracking and the `(resource, scope)` key | `crates/logit-pipeline/src/accumulator.rs` (`BatchAccumulator::absorb`) | unreviewed |
 | [RT-14](#rt-14--graph-rules-the-runtime-assumes-cycle-detection-target-arity-slot-order) | P1 | Graph rules the runtime *assumes* (cycle detection, target arity, slot order) | `crates/logit-pipeline/src/graph.rs` (`topological_order`, `targets_of`, `resolve`) | unreviewed |
-| [WIRE-04](#wire-04--batch-framing-v1v2-and-the-mandatory-provenance-trailer) | P1 | Batch framing v1/v2 and the mandatory provenance trailer | `crates/logit-proto/src/native/mod.rs` (`decode_batch`, `decode_batch_v2`, `CODEC_NATIVE_V2`) | unreviewed |
+| [WIRE-04](#wire-04--bare-and-hop-batch-framing-and-the-mandatory-trailer) | P1 | Bare and hop batch framing and the mandatory trailer | `crates/logit-proto/src/native/mod.rs` (`decode_batch`, `decode_hop_batch`, `CODEC_HOP_BATCH`) | unreviewed |
 | [WIRE-07](#wire-07--logit_in-accept-loop-connection-cap-bounded-tls-accept-live-connection-accounting) | P1 | `logit_in` accept loop: connection cap, bounded TLS accept, live-connection accounting | `crates/logit-inputs/src/logit.rs` (`Input::run`, `run_until_shutdown`, `reject_or_serve`) | findings → #377 |
 | [WIRE-09](#wire-09--pooled-connection-close-probe-stream-erasure-and-sni-derivation) | P1 | Pooled-connection close probe, stream erasure, and SNI derivation | `crates/logit-outputs/src/tls.rs` (`AsyncStream`, `PendingClose`, `poll_pending_close`, `host_only`) | findings → #450 |
 | [WIRE-12](#wire-12--otlp_out-grpc-round-trip-over-a-pooled-hyper-utilhyper-rustls-client-and-the-fault-table) | P1 | `otlp_out` gRPC round trip over a pooled hyper-util/hyper-rustls client, and the fault table | `crates/logit-outputs/src/otlp.rs` (`send_http`, `send_grpc`, `grpc_roundtrip`) | unreviewed |
@@ -2393,8 +2393,8 @@ surveyor's.
 - **Location:** `crates/logit-pipeline/src/disk_queue.rs` (`CONTEXT_LEN`, `encode_context`/`decode_context`,
   `parse_record`, `walk_segment`)
 - **What it does:** A record is 24 raw bytes (`trace_id` + `span_id`, unframed, unversioned) followed by one
-  `logit_proto::frame`. `parse_record` dispatches on the frame's codec byte (`CODEC_NATIVE_V1` → `decode_batch` with
-  empty provenance, `CODEC_NATIVE_V2` → `decode_batch_v2`), returning the consumed length. `walk_segment` iterates
+  `logit_proto::frame`. `parse_record` decodes a `CODEC_HOP_BATCH` frame with `decode_hop_batch`, returning the
+  consumed length; any other codec byte, or a trailer without a complete sender pair, is `Malformed`. `walk_segment` iterates
   records; a non-`Truncated` error triggers a forward scan for `frame::MAGIC`, backing up `CONTEXT_LEN` bytes to
   find the candidate record start, trying it, and continuing the scan past a spurious match.
 - **Why sensitive:** untrusted-input — corrupt bytes reach a hand-rolled scanner and then the native decoder;
@@ -2410,8 +2410,8 @@ surveyor's.
     the walk (it would double-count/replay).
   - `Truncated` is only ever produced by a genuine short buffer, never by a corrupt length field (this is what
     `MAX_SANE_COMPRESSED_LEN` guarantees — the two files must stay in step).
-  - A `CODEC_NATIVE_V1` record written by an older build still decodes (forward/backward compat across the codec
-    byte), and an unknown codec byte resyncs rather than aborting the walk.
+  - A record under any codec byte but `CODEC_HOP_BATCH`, or without a complete sender pair, is skipped as
+    corrupt and counted through `skip_corrupt`, resyncing rather than aborting the walk.
   - `CONTEXT_LEN` is never widened (its doc comment says so explicitly) — any change silently misparses every spooled
     record.
 - **Observed concerns (unverified):**
@@ -2451,7 +2451,7 @@ surveyor's.
 - **Location:** `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::push`, `last_write_error_was_disk_full`,
   `write_record`, `open_append`), and the `write_in_flight`/`write_len_before_flight`/`last_write_error_disk_full`
   fields of `State`
-- **What it does:** Encodes the batch (`encode_batch_v2` + `write_frame`), rejects anything over
+- **What it does:** Encodes the batch (`encode_hop_batch` + `write_frame`), rejects anything over
   `MAX_SANE_UNCOMPRESSED_LEN`, decides an overflow action, then appends. Before appending it repairs a tail left by
   a previously *cancelled or failed* write by `set_len`-ing the active segment back to `write_len_before_flight`.
   `write_in_flight` is set before the single `.await`ed `write_all` (+ `flush`) and cleared only on success, so a
@@ -3118,8 +3118,8 @@ surveyor's.
   the disk spool, `file_out`'s `format: native`, and `logit_in`/`logit_out`'s socket transport. The
   `Truncated` vs `Malformed` classification and `MAX_SANE_COMPRESSED_LEN` exist *because of* the disk walker
   (the comment on `frame.rs`'s `rejects_a_compressed_len_over_the_sanity_cap` says so) — a change made for the network surveyor's benefit can silently break disk recovery.
-- `logit_proto::native::{encode_batch_v2, decode_batch, decode_batch_v2, CODEC_NATIVE_V1/V2}` is the payload codec
-  for spooled records; the codec byte is the *only* versioning a disk record has (`CONTEXT_LEN` is fixed forever).
+- `logit_proto::native::{encode_hop_batch, decode_hop_batch, CODEC_HOP_BATCH}` is the payload codec for spooled
+  records; a record carries no version of its own (`CONTEXT_LEN` is fixed forever).
 - `Diagnostics::warn_throttled` keys used on these paths: `cursor_error`, `disk_io_error` (disk_queue),
   `rotate_failure`, `retention_failure` (file.rs). `SINK_QUEUE_METRICS` (`queue.rs`) is shared between the
   in-memory and disk stores, so `buffer.depth`/`bytes`/`utilization` mean different things per variant (disk's
@@ -4193,7 +4193,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     leftovers.** `read_metric_kind` checks its body after the match; `for_each_field` checks
     every field after its visitor returns (a visitor skips an unknown tag by clearing it); each
     scalar, array, and map `Value` payload is checked by `varint::ensure_consumed`; and the batch
-    is checked after `decode_batch`'s events and after `decode_batch_v2`'s trailer. `Set`'s blob
+    is checked after `decode_batch`'s events and after `decode_hop_batch`'s trailer. `Set`'s blob
     goes whole to `HyperLogLog::from_bytes`, whose own end check is W3's. Pinned by
     `every_metric_kind_rejects_trailing_bytes_in_its_body`,
     `a_record_field_with_trailing_bytes_is_malformed`, and
@@ -4228,45 +4228,45 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
 
 ---
 
-### WIRE-04 — Batch framing v1/v2 and the mandatory provenance trailer
-- **Location:** `crates/logit-proto/src/native/mod.rs` (`CODEC_NATIVE_V1`/`V2`, trailer tags,
+### WIRE-04 — Bare and hop batch framing and the mandatory trailer
+- **Location:** `crates/logit-proto/src/native/mod.rs` (`CODEC_BATCH`/`CODEC_HOP_BATCH`, trailer tags,
   `MAX_SANE_TRAILER_FIELD_BYTES`, `encode_batch`, `decode_batch`,
-  `MAX_SANE_EVENT_COUNT`, `encode_batch_v2`/`write_trailer_field`,
-  `decode_batch_v2`/`trailer_str`, `NativeDecoder::decode_into`)
+  `MAX_SANE_EVENT_COUNT`, `encode_hop_batch`/`write_trailer_field`,
+  `decode_hop_batch`/`trailer_str`, `NativeDecoder::decode_into`)
 - **What it does:** Lays out a payload as dictionary → length-prefixed resource → mandatory scope
-  presence byte → event count → length-prefixed events, with v2 appending a mandatory
-  length-prefixed provenance trailer. The "no proper prefix of a valid encoding is itself valid"
+  presence byte → event count → length-prefixed events, with the hop shape appending a mandatory
+  length-prefixed trailer of provenance and a required sender pair. The "no proper prefix of a valid encoding is itself valid"
   property is the stated reason the scope section and the trailer are both mandatory rather than
   optional-trailing.
 - **Why sensitive:** hot-path; custom; untrusted-input (`resource_len`, `scope_len`, `event_count`,
-  per-event `body_len`, `trailer_len` all off the wire); data-loss/duplication (v1-vs-v2 dispatch
-  is decided by the negotiated codec byte, not by the payload — decoding a v2 payload as v1 leaves
-  trailing bytes, decoding v1 as v2 errors); accounting (the provenance trailer is what
+  per-event `body_len`, `trailer_len` all off the wire); data-loss/duplication (the shape is decided
+  by the frame's codec byte, not by the payload — decoding a hop payload as bare leaves trailing
+  bytes, decoding a bare one as hop errors); accounting (the provenance trailer is what
   `Delivered`'s origin/previous chain is built from downstream).
 - **Invariants to verify:**
-  - No proper prefix of a valid v1 *or* v2 encoding decodes successfully (the pinned property).
+  - No proper prefix of a valid bare *or* hop encoding decodes successfully (the pinned property).
   - `decode_batch` consumes exactly the payload on a valid input — `NativeDecoder::decode_into`
-    never checks that `payload` is empty afterwards, so trailing bytes in a v1 frame
+    never checks that `payload` is empty afterwards, so trailing bytes in a bare frame
     are silently ignored.
   - `MAX_SANE_EVENT_COUNT` (16M) times the minimum per-event encoding is still bounded by the
     64 MiB frame cap; the `with_capacity(count.min(4096))` clamp holds.
-  - Unknown trailer tags are skipped whole and cannot desync the trailer loop (the `_unknown` arm in `decode_batch_v2`).
+  - Unknown trailer tags are skipped whole and cannot desync the trailer loop (the `_unknown` arm in `decode_hop_batch`).
   - `intern()` on trailer strings is bounded by `MAX_SANE_TRAILER_FIELD_BYTES` (4096) but not by
     a count — a trailer can repeat `TRAILER_TAG_ORIGIN` arbitrarily many times within
     `trailer_len`, interning each one.
 - **Observed concerns (unverified):**
   - `NativeDecoder::decode_into` ignores leftover payload bytes after `decode_batch`
     (`crates/logit-proto/src/native/mod.rs`), unlike the "consumed the whole payload" assertion in
-    the test `encode_decode_batch_v2_round_trips_provenance`.
-    A frame with a v1 payload plus junk decodes clean. **High confidence it's true; low confidence
-    it matters, since `logit_in` does not use `NativeDecoder` but calls `decode_batch` directly.**
-  - Repeated trailer tags each intern a new string into the global interner (the `TRAILER_TAG_ORIGIN`/`TRAILER_TAG_PREVIOUS` arms of `decode_batch_v2`), bounded
+    the test `encode_decode_hop_batch_round_trips_provenance_and_the_pair`.
+    A frame with a bare payload plus junk decodes clean. **High confidence it's true; low confidence
+    it matters, since `logit_in` does not use `NativeDecoder` but calls `decode_hop_batch` directly.**
+  - Repeated trailer tags each intern a new string into the global interner (the `TRAILER_TAG_ORIGIN`/`TRAILER_TAG_PREVIOUS` arms of `decode_hop_batch`), bounded
     only by `trailer_len` / 3 bytes per entry. Same unbounded-interner theme as the dictionary.
     **Medium confidence.**
 - **Existing coverage:** the in-file unit tests of `mod.rs` (round trips, empty batch, populated
-  scope, foreign codec byte, concatenated frames, v2 provenance both-present/both-absent, the
-  every-proper-prefix test `decode_batch_v2_rejects_every_proper_prefix_of_a_valid_encoding`,
-  v1-payload-rejected-by-v2, unknown trailer tag);
+  scope, foreign codec byte, concatenated frames, hop provenance both-present/both-absent, the
+  every-proper-prefix test `decode_hop_batch_rejects_every_proper_prefix_of_a_valid_encoding`,
+  bare-payload-rejected-by-hop, malformed pair rejected, unknown trailer tag);
   `crates/logit-proto/tests/robustness.rs` truncation/bit-flip/inflated-count suites.
   ADR `native-wire-format-encoding`, `docs/adr/batch-provenance-on-delivered.md`,
   `docs/design/wire-protocol.md`.

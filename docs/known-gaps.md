@@ -2903,7 +2903,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - **`logit-proto`'s `frame.rs` metrics** — listed as still a stub with nothing to instrument (see
     [Native wire format, `logit_in`/`logit_out`, and
     buffering](#native-wire-format-logit_inlogit_out-and-buffering)). Candidate names, pre-committed
-    so the builder needn't re-derive them: `logit.proto.frames{direction,codec,compression}`,
+    so the builder needn't re-derive them: `logit.proto.frames{direction,compression}`,
     `logit.proto.frame.bytes`, `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"}`.
     (`buffer.rs`'s metrics are done, at the `SinkQueue` layer, `docs/adr/buffered-sink-delivery.md`:
     `logit.component.buffer.batches`/`.bytes`/`.utilization`/`.push.blocked.duration` and new
