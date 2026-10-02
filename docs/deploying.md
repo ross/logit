@@ -372,9 +372,9 @@ Under `logit_out`, the receiving `logit_in` narrows that window. Each spool reco
 sender identity and sequence it was written with, so a `logit_in` that's still running
 acknowledges a replayed record at or below its sender's mark without forwarding it, and counts it
 `logit.input.batches.resends`. The replay still reaches `logit_in`'s consumers when that
-`logit_in` restarted, when it evicted the sender from its table, or when the record carries no
-identity and sequence, which `logit_in` always forwards (see
-[Forwarding between `logit` nodes](#forwarding-between-logit-nodes)).
+`logit_in` restarted or when it evicted the sender from its table (see
+[Forwarding between `logit` nodes](#forwarding-between-logit-nodes)). A record without a
+complete identity and sequence is corrupt and skipped, never replayed.
 
 ```yaml
 buffer:

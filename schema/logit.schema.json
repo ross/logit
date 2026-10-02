@@ -2144,7 +2144,7 @@
               "type": "string"
             },
             "request_timeout": {
-              "description": "Connect, handshake, and per-batch ack-wait timeout, one knob for all three. With batches already in flight, also how long writing the next batch may make no progress before the connection stops taking batches. Defaults to `10s`.",
+              "description": "Connect, handshake, and ack-wait timeout, one knob for all three. With batches already in flight, also how long writing the next batch may make no progress before the connection stops taking batches. Defaults to `10s`.",
               "default": "10s",
               "type": "string"
             },

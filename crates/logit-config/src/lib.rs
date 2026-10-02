@@ -1942,7 +1942,7 @@ pub enum ComponentKind {
         /// with the bundled Mozilla roots.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
-        /// Connect, handshake, and per-batch ack-wait timeout, one knob for all three. With
+        /// Connect, handshake, and ack-wait timeout, one knob for all three. With
         /// batches already in flight, also how long writing the next batch may make no progress
         /// before the connection stops taking batches. Defaults to `10s`.
         #[serde(default = "default_logit_out_request_timeout", with = "humantime_serde_duration")]
