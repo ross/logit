@@ -2812,10 +2812,12 @@ reconnecting doesn't show as `connection_error` on the far end.
   `logit_out` peers), `logit.input.connections.rejected{reason="limit"}` (nonzero means the
   `max_connections` cap is binding; raise `max_connections` or shed load upstream), and
   `logit.proto.errors{reason}`
-  (`magic`/`version`/`crc`/`truncated_header`/`truncated`/`too_large`/`codec`/`handshake`/
-  `ack_write_stalled`/`reject_write_stalled`; any of these on a healthy link points at a
-  version-mismatched or misbehaving peer, not routine loss, except `truncated_header` and
-  `truncated`, which a `logit_out` whose write failed part-way through a frame also leaves. `ack_write_stalled` is a peer that stopped reading its `Ack`s
+  (`magic`/`version`/`malformed`/`crc`/`truncated_header`/`truncated`/`too_large`/`codec`/
+  `handshake`/`decode_budget`/`ack_write_stalled`/`reject_write_stalled`; any of these on a
+  healthy link points at a version-mismatched or misbehaving peer, not routine loss, except
+  `truncated_header` and `truncated`, which a `logit_out` whose write failed part-way through a
+  frame also leaves, and `decode_budget`, a well-formed batch too large for the frame cap it
+  arrived under. `ack_write_stalled` is a peer that stopped reading its `Ack`s
   for `handshake_timeout`, and the connection was closed).
 - `logit_in` deduplication and refusal: `logit.input.batches.resends` (frames recognized as
   resends and not forwarded; nonzero means senders are retrying after lost or late `Ack`s, or a
