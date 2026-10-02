@@ -20,7 +20,10 @@ Accepted. Supersedes in part:
 - [ADR `native-hop-no-compatibility`](native-hop-no-compatibility.md): decision 4's "`Ack` is the
   message byte alone".
 - [ADR `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md): the `Ack`
-  entry of "Control payload", and `Hello`/`HelloAck`'s field lists.
+  entry of "Control payload", `Hello`/`HelloAck`'s field lists, and the idle clock's "measured
+  from the last `Ack` written".
+- [ADR `idle-connection-timeout`](idle-connection-timeout.md): "`logit_in`: idle measured from
+  the last `Ack` written". The clock runs from the last frame handled.
 
 ## Context
 
@@ -115,6 +118,15 @@ reconnect commits what the receiver already holds without resending it.
 - **The `GOING_AWAY` invariant holds.** With the pending ack flushed first, every frame still
   unanswered on a connection that read `Reject{GOING_AWAY}` was unforwarded, as [ADR
   `native-hop-send-window`](native-hop-send-window.md) decision 5 relies on.
+- **A stalled flush changes no exit.** The flush before a `Reject` is attempted first; a write
+  that stalls past `handshake_timeout` is counted `ack_write_stalled`, the `Reject` is skipped
+  because the peer has stopped reading, and the connection ends as it would have (a shutdown or
+  idle close is still a clean close, never an error).
+- **The idle clock runs from the last frame handled.** An ack can now trail its frame, so
+  `logit_in` measures idleness from the last frame it forwarded or recognized as a resend, not
+  from the last ack it wrote. [ADR `idle-connection-timeout`](idle-connection-timeout.md) and
+  [ADR `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md) said "the
+  last `Ack` written"; for a connection acked per frame the two clocks were the same.
 - **No timer.** Rule 2 gives a quiet sender its ack immediately and a busy one an ack per burst,
   and rule 3 bounds a burst, so no time-based flush is needed.
 - **Counters.** `logit.input.acks` counts acks written; against `logit.proto.frames{direction="in"}`
