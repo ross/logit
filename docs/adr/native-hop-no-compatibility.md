@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-01
+updated: 2026-10-02
 ---
 
 # Native hop: two payload shapes named by shape, every hop frame sequenced, and strict control messages
@@ -23,6 +23,10 @@ Accepted. Supersedes in part:
   change replays unsequenced.
 - [ADR `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md): "Control
   payload"'s "skip-unknown forward compatibility as `native::record`".
+
+Superseded in part on 2026-10-02 by [ADR `native-hop-named-acks`](native-hop-named-acks.md):
+decision 4's "`Ack` is the message byte alone". `Ack` carries an identity and a sequence, both
+required, under the same strict rules.
 
 ## Context
 
@@ -116,7 +120,9 @@ nothing else; and the hop negotiates one codec.
 
 - `Hello`, `HelloAck`, and `Reject` decode their defined fields, each required. An absent field
   or an unknown tag is `CodecError::Malformed`.
-- `Ack` is the message byte alone. A body is `Malformed`.
+- `Ack` is the message byte alone. A body is `Malformed`. [Superseded on 2026-10-02 by [ADR
+  `native-hop-named-acks`](native-hop-named-acks.md): `Ack` carries a required identity and
+  sequence.]
 - `window` is at least 1 in both `Hello` and `HelloAck`, enforced on decode. `logit_in` answers
   `min(hello.window, RECEIVER_MAX_WINDOW)`; `logit_out` uses `min(offered, answered)`. Graph rule
   75 keeps the configured `window` at 1 or more, so nothing else clamps.

@@ -2778,9 +2778,9 @@ takes it, raises the mark. What follows from that:
 - **Cloning a running process is unsupported.** A VM snapshot or a CRIU checkpoint restored
   beside its original shares the sink's identity and sequence, and `logit_in` reads the second
   copy's batches as resends and doesn't forward them.
-- **The sequence identifies a batch; it never acknowledges one.** `Ack` carries no fields. It
-  answers the oldest frame still unanswered on its connection, because `logit_in` answers a
-  connection's frames in the order they arrive.
+- **The sequence identifies a batch, and `Ack` names what is handled.** `Ack { id, seq }` says
+  every frame of that identity at or below `seq` on its connection is handled, so one ack can
+  cover several frames. It grants no credit: the window stays fixed at the handshake.
 
 **A `HelloAck` that doesn't answer the `Hello` is permanent.** A peer that acks another protocol
 version, or a codec or compression this sink didn't offer, fails every attempt `permanent`, like a
@@ -2798,11 +2798,12 @@ reconnecting doesn't show as `connection_error` on the far end.
   read or ack wait that fails, plus one per failed connect or handshake, too-large batch, or write
   that fails with nothing in flight; `ok` is an acknowledged frame, `clean` a failure before a frame
   was fully written with nothing in flight or a `GOING_AWAY` in place of an `Ack`, `ambiguous` a
-  lost `Ack` (a timeout, an EOF, a reset, another message) or an `in_flight` drift, and `permanent`
+  lost `Ack` (a timeout, an EOF, a reset, another message) or an `Ack` naming no run of the frames
+  in flight, and `permanent`
   a size check or a frame-build error at the head, a `HelloAck` that names another version or an
   unoffered codec or compression, or a permanent reject), `logit.output.reconnects` (should stay
   near zero in steady state; a climbing count means the peer or the network is unstable),
-  `logit.output.ack.duration`, `logit.output.in_flight` (a gauge of frames awaiting an `Ack`, set
+  `logit.output.ack.duration`, `logit.output.in_flight` (a gauge of frames not yet committed, set
   from the first connection on and 0 after any drop; one that sits at the window means the round
   trip or the peer's forwarding is the limit, and raising `window` helps only in the first case),
   and `logit.output.window` (a gauge of the live connection's negotiated window, set from the first

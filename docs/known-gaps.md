@@ -955,7 +955,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   operator who raises `handshake_timeout` for slow TLS handshakes also lengthens how long a wedged
   peer holds its connection slot. A conforming `logit_out` never trips the bound: it keeps at
   most its window of frames in flight, so at most that many unread `Ack`s sit in its receive
-  buffer, even while it's paused. At the 1024 cap that's about 47 KB under TLS, which fits the
+  buffer, even while it's paused. At the 1024 cap that's about 80 KB under TLS, which fits the
   default `tcp_rmem`.
   A separate write timeout was not added. **Revisit trigger:** an operator who needs the two waits set apart.
 - **No per-listener in-flight byte budget on the HTTP listeners.** Each hyper listener

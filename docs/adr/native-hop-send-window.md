@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-01
+updated: 2026-10-02
 ---
 
 # Native hop send window: several frames in flight, acknowledged in frame order
@@ -30,7 +30,13 @@ Accepted. Supersedes in part:
 
 Superseded in part on 2026-10-01 by [ADR
 `native-hop-no-compatibility`](native-hop-no-compatibility.md): decision 1's "A `HelloAck.window`
-of 0 reads as 1". A `window` of 0 fails to decode on either side.
+of 0 reads as 1". A `window` of 0 fails to decode on either side. Superseded in part on
+2026-10-02 by [ADR `native-hop-named-acks`](native-hop-named-acks.md): the Decision's "no
+sequence in `Ack`", decision 1's "Acks arrive
+in frame order" (the k-th `Ack` answers the k-th unanswered frame), decision 4's "`in_flight` is
+the loop's count" drift check, decision 5's `await_ack` ("`Ack` decrements `in_flight`"), and the
+rejected alternative "`Ack` carrying the sequence". An `Ack` names an identity and a sequence,
+one ack covers a run of frames, and the sender commits by name.
 
 ## Context
 
@@ -91,8 +97,11 @@ These facts about the code fix the design:
 
 `logit_out` keeps up to a negotiated window of frames in flight on one connection, and each
 `Ack` answers the oldest unanswered frame. The wire doesn't change: no credit messages, no
-sequence in `Ack`, and no version bump. The sink's store reserves a prefix of items instead of
-the head alone, and a fault resends the window from the head.
+sequence in `Ack`, and no version bump. [Superseded in part on 2026-10-02 by [ADR
+`native-hop-named-acks`](native-hop-named-acks.md): `Ack` carries an identity and a sequence and
+answers every frame of that identity at or below it; still no credit messages.] The sink's store
+reserves a prefix of items instead of the head alone, and a fault resends the window from the
+head.
 
 ### 1. Wire: no message changes
 
@@ -104,7 +113,9 @@ the head alone, and a fault resends the window from the head.
 - **`logit_in` answers a clamped window.** `HelloAck.window` is
   `hello.window.clamp(1, RECEIVER_MAX_WINDOW)`, with `RECEIVER_MAX_WINDOW = 1024`. At 1024 the
   unread acks a peer can leave in the listener's send buffer are about 47 KB under TLS, under the
-  default `tcp_rmem`.
+  default `tcp_rmem`. [Superseded in part on 2026-10-02 by [ADR
+  `native-hop-named-acks`](native-hop-named-acks.md): a named ack is larger, about 80 KB for
+  1024 under TLS, still under the default; the constant stays.]
 - **`logit_out` uses the smaller of the two.** It offers its configured `window` in `Hello` and
   uses `max(1, min(offered, answered))`. A `logit_in` that answers 1 gets one frame in flight. A
   `HelloAck.window` of 0 reads as 1. [Superseded in part on 2026-10-01 by [ADR

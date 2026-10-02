@@ -2514,13 +2514,15 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        // A 4 KiB client receive window: the listener's `Ack`s fill it, and then its own send
-        // buffer, after tens of thousands of frames.
+        // The client's receive buffer and the listener's send buffer are both capped at 4 KiB
+        // (an explicit size also turns off kernel autotuning), so the `Ack` write blocks after
+        // a few hundred frames whatever the host's `tcp_wmem`.
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.set_recv_buffer_size(4096).unwrap();
         let (client, accepted) = tokio::join!(socket.connect(addr), listener.accept());
         let mut client = client.unwrap();
         let (server, _) = accepted.unwrap();
+        socket2::SockRef::from(&server).set_send_buffer_size(4096).unwrap();
 
         let limit = Arc::new(tokio::sync::Semaphore::new(1));
         let permit = limit.clone().try_acquire_owned().unwrap();
