@@ -473,7 +473,7 @@ fn compression_tag(compression: Compression) -> &'static str {
 fn decode_error_reason(err: &CodecError) -> &'static str {
     match err {
         CodecError::BudgetExceeded { .. } => "decode_budget",
-        _ => "magic",
+        _ => "malformed",
     }
 }
 
@@ -635,8 +635,8 @@ async fn serve_frames<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     telemetry.count("logit.proto.errors", 1.0, &[("reason", "crc")]);
                     return Err(err);
                 }
-                Err(FrameReadError::Malformed(err)) => {
-                    telemetry.count("logit.proto.errors", 1.0, &[("reason", "magic")]);
+                Err(FrameReadError::Malformed { reason, err }) => {
+                    telemetry.count("logit.proto.errors", 1.0, &[("reason", reason)]);
                     return Err(err);
                 }
             };
@@ -973,7 +973,11 @@ enum FrameReadError {
     TooLarge(anyhow::Error),
     Truncated(anyhow::Error),
     Crc(anyhow::Error),
-    Malformed(anyhow::Error),
+    /// A header or body that doesn't parse: `reason` is `magic`, `version`, or `malformed`.
+    Malformed {
+        reason: &'static str,
+        err: anyhow::Error,
+    },
     /// One body `read` made no progress for the whole `stall` bound. Not an error: the caller
     /// turns it into `close_idle`, which names this duration. Never reached in the handshake.
     Stalled(Duration),
@@ -985,7 +989,7 @@ impl FrameReadError {
             FrameReadError::TooLarge(e)
             | FrameReadError::Truncated(e)
             | FrameReadError::Crc(e)
-            | FrameReadError::Malformed(e) => e,
+            | FrameReadError::Malformed { err: e, .. } => e,
             // Unreachable from today's flattening callers, which pass no `stall` bound.
             FrameReadError::Stalled(idle) => {
                 anyhow::anyhow!("a frame body stopped arriving for {idle:?}")
@@ -1012,7 +1016,17 @@ async fn read_frame_body<S: AsyncRead + Unpin>(
 ) -> Result<(FrameHeader, Bytes), FrameReadError> {
     let mut header_bytes = Bytes::copy_from_slice(&header_buf);
     let header = FrameHeader::read(&mut header_bytes).map_err(|e| {
-        FrameReadError::Malformed(anyhow::Error::new(e).context("reading a frame header"))
+        let reason = if header_buf[..4] != frame::MAGIC {
+            "magic"
+        } else if matches!(e, CodecError::Unsupported(_)) {
+            "version"
+        } else {
+            "malformed"
+        };
+        FrameReadError::Malformed {
+            reason,
+            err: anyhow::Error::new(e).context("reading a frame header"),
+        }
     })?;
 
     let bound = max_frame_bytes.min(frame::MAX_SANE_UNCOMPRESSED_LEN);
@@ -1063,9 +1077,10 @@ async fn read_frame_body<S: AsyncRead + Unpin>(
         Err(CodecError::Malformed(msg)) if msg.contains("crc32c") => {
             Err(FrameReadError::Crc(anyhow::anyhow!("crc32c mismatch -- frame is corrupt")))
         }
-        Err(err) => {
-            Err(FrameReadError::Malformed(anyhow::Error::new(err).context("reading a frame")))
-        }
+        Err(err) => Err(FrameReadError::Malformed {
+            reason: "malformed",
+            err: anyhow::Error::new(err).context("reading a frame"),
+        }),
     }
 }
 
@@ -1678,7 +1693,8 @@ mod tests {
     }
 
     /// A frame well under `max_frame_bytes` whose batch decodes past 4x that cap closes the
-    /// connection, counted as `decode_budget` rather than `magic` and diagnosed under its own key.
+    /// connection, counted as `decode_budget` rather than `malformed` and diagnosed under its own
+    /// key.
     #[tokio::test]
     async fn a_batch_past_the_decode_budget_is_counted_and_diagnosed_as_decode_budget() {
         let registry = Registry::new();
@@ -2298,13 +2314,15 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        // A 4 KiB client receive window: the listener's `Ack`s fill it, and then its own send
-        // buffer, after tens of thousands of frames.
+        // The client's receive buffer and the listener's send buffer are both capped at 4 KiB
+        // (an explicit size also turns off kernel autotuning), so the `Ack` write blocks after
+        // a few hundred frames whatever the host's `tcp_wmem`.
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.set_recv_buffer_size(4096).unwrap();
         let (client, accepted) = tokio::join!(socket.connect(addr), listener.accept());
         let mut client = client.unwrap();
         let (server, _) = accepted.unwrap();
+        socket2::SockRef::from(&server).set_send_buffer_size(4096).unwrap();
 
         let limit = Arc::new(tokio::sync::Semaphore::new(1));
         let permit = limit.clone().try_acquire_owned().unwrap();
@@ -2919,8 +2937,8 @@ mod tests {
             let result =
                 read_frame_body(&mut server, header, frame::MAX_SANE_UNCOMPRESSED_LEN, None).await;
             match result {
-                Err(FrameReadError::Malformed(err)) => {
-                    assert!(format!("{err:#}").contains("magic"), "{name}: {err:#}")
+                Err(FrameReadError::Malformed { reason, err }) => {
+                    assert_eq!(reason, "magic", "{name}: {err:#}");
                 }
                 Err(other) => panic!("{name}: expected Malformed, got {:#}", other.into_inner()),
                 Ok(_) => panic!("{name}: stray bytes parsed as a frame"),
@@ -3164,7 +3182,7 @@ mod tests {
             expect_closed(&mut client, "a frame without a complete pair").await;
             probe
                 .wait_for("the malformed frame counted", |t| {
-                    t.sum("logit.proto.errors", &[("reason", "magic")]) >= (n + 1) as f64
+                    t.sum("logit.proto.errors", &[("reason", "malformed")]) >= (n + 1) as f64
                 })
                 .await;
         }
@@ -3185,9 +3203,60 @@ mod tests {
                 t.sum("logit.proto.errors", &[("reason", "codec")]) >= 1.0
             })
             .await;
-        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "magic")]), 4.0);
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "malformed")]), 4.0);
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "magic")]), 0.0);
         assert_eq!(totals.sum("logit.proto.errors", &[("reason", "codec")]), 1.0);
         assert!(rx.try_recv().is_err(), "no malformed frame was forwarded");
+    }
+
+    /// Sends `framed` as the first data frame after a handshake, waits for the connection to
+    /// close and `reason` to be counted, and checks no other parse reason was.
+    async fn expect_frame_error(framed: &[u8], reason: &str) {
+        let mut probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
+        let mut client = hop_client(&addr).await;
+        client.write_all(framed).await.unwrap();
+        expect_closed(&mut client, reason).await;
+        let totals = probe
+            .wait_for("the frame error counted", |t| {
+                t.sum("logit.proto.errors", &[("reason", reason)]) >= 1.0
+            })
+            .await;
+        for other in ["magic", "version", "malformed", "crc", "handshake"] {
+            let want = if other == reason { 1.0 } else { 0.0 };
+            assert_eq!(totals.sum("logit.proto.errors", &[("reason", other)]), want, "{other}");
+        }
+        assert!(rx.try_recv().is_err(), "no bad frame was forwarded");
+    }
+
+    fn raw_frame(compression: Compression, payload: &[u8]) -> Vec<u8> {
+        frame::write_frame(native::CODEC_HOP_BATCH, compression, payload).unwrap().to_vec()
+    }
+
+    /// A data frame whose header magic isn't `LGIT` is counted as `magic`.
+    #[tokio::test]
+    async fn a_data_frame_with_bad_magic_counts_magic() {
+        let mut framed = raw_frame(Compression::None, &native::encode_batch(&batch_marked(1)));
+        framed[..4].copy_from_slice(b"XXXX");
+        expect_frame_error(&framed, "magic").await;
+    }
+
+    /// A data frame with an unknown frame version is counted as `version`.
+    #[tokio::test]
+    async fn a_data_frame_with_an_unknown_version_counts_version() {
+        let mut framed = raw_frame(Compression::None, &native::encode_batch(&batch_marked(1)));
+        framed[4..6].copy_from_slice(&2u16.to_le_bytes());
+        expect_frame_error(&framed, "version").await;
+    }
+
+    /// A frame whose lz4 body is garbage under a valid CRC is counted as `malformed`, not `crc`.
+    /// The frame is written uncompressed, so the CRC covers the garbage, then its compression
+    /// byte (header offset 9) is flipped to lz4.
+    #[tokio::test]
+    async fn a_data_frame_with_an_undecompressable_body_counts_malformed() {
+        let mut framed = raw_frame(Compression::None, &[0xFF; 64]);
+        framed[9] = Compression::Lz4 as u8;
+        expect_frame_error(&framed, "malformed").await;
     }
 
     /// A sender that restarts without a spool comes back under a new identity from 1, and its
