@@ -520,7 +520,7 @@ up isn't a policy here, because a synchronous trait can't block usefully; an asy
 The disk-backed sink buffer (`crates/logit-pipeline/src/disk_queue.rs`, ADR
 `disk-backed-sink-buffer`) doesn't implement `Buffer<T>`: the trait's sync, `&mut self`, generic
 shape is the wrong seam for real file I/O over a concrete store item, so `DiskQueue` has its own
-async surface. Both stores hold `StoreItem`, `(Arc<EventBatch>, BatchContext, Option<SeqId>)`
+async surface. Both stores hold `StoreItem`, `(Arc<EventBatch>, BatchContext, SeqId)`
 (`crates/logit-pipeline/src/queue.rs`): the batch, its context, and the sender identity and
 sequence the store gave it.
 
