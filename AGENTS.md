@@ -31,8 +31,7 @@ exists or a contract other `logit` processes depend on:
   wire-breaking change that needs its own ADR, because every `logit` process must reach the same
   verdict for the same key with nothing propagated.
 - **`prometheus_in`'s TLS keys are prefixed by the mode they serve**: `scrape_tls:` for the scrape
-  client, `bind_tls:` for the remote-write server. The old bare `tls:` is gone (pre-release) with
-  no alias; don't add one back.
+  client, `bind_tls:` for the remote-write server.
 - **`flatten` never deletes an attribute.** It removes a source attribute only once its leaves are
   written. Last write wins on a key collision, silently, and there is deliberately no cap on how
   many keys one value can expand into beyond a fixed internal recursion-depth bound. That's a
