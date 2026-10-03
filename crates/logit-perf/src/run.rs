@@ -1416,7 +1416,56 @@ fn box_state() -> BoxState {
         ),
         platform_profile: sysfs_line("/sys/firmware/acpi/platform_profile"),
         on_ac_power: mains,
+        thp_enabled: bracketed_line("/sys/kernel/mm/transparent_hugepage/enabled"),
+        thp_defrag: bracketed_line("/sys/kernel/mm/transparent_hugepage/defrag"),
+        rmem_max: sysfs_line("/proc/sys/net/core/rmem_max").and_then(|v| v.parse().ok()),
+        rmem_default: sysfs_line("/proc/sys/net/core/rmem_default").and_then(|v| v.parse().ok()),
+        online_cpus: sysfs_line("/sys/devices/system/cpu/online")
+            .and_then(|list| cpu_list_len(&list)),
+        smt_active: sysfs_line("/sys/devices/system/cpu/smt/active")
+            .and_then(|v| match v.as_str() {
+                "1" => Some(true),
+                "0" => Some(false),
+                _ => None,
+            })
+            .or_else(|| {
+                sysfs_line("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list")
+                    .and_then(|list| cpu_list_len(&list))
+                    .map(|siblings| siblings > 1)
+            }),
     }
+}
+
+/// The selected value of a sysfs line that brackets it among its alternatives
+/// (`always [madvise] never` is `madvise`); a line with no brackets is returned as is.
+fn parse_bracketed(line: &str) -> Option<String> {
+    let line = line.trim();
+    match (line.find('['), line.find(']')) {
+        (Some(open), Some(close)) if open < close => {
+            Some(line[open + 1..close].trim().to_string()).filter(|v| !v.is_empty())
+        }
+        _ => Some(line.to_string()).filter(|v| !v.is_empty()),
+    }
+}
+
+fn bracketed_line(path: &str) -> Option<String> {
+    sysfs_line(path).and_then(|line| parse_bracketed(&line))
+}
+
+/// The number of CPUs in a kernel CPU list such as `0-3,6,8-9`, or `None` if it doesn't parse.
+fn cpu_list_len(list: &str) -> Option<u32> {
+    let mut total = 0u32;
+    for part in list.trim().split(',') {
+        let (lo, hi) = match part.split_once('-') {
+            Some((lo, hi)) => (lo.trim().parse::<u32>().ok()?, hi.trim().parse::<u32>().ok()?),
+            None => {
+                let one = part.trim().parse::<u32>().ok()?;
+                (one, one)
+            }
+        };
+        total = total.checked_add(hi.checked_sub(lo)?.checked_add(1)?)?;
+    }
+    Some(total)
 }
 
 fn cpu_model() -> String {
@@ -1576,6 +1625,29 @@ fn format_startup(startup_s: Option<f64>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bracketed_value_is_the_selected_one() {
+        assert_eq!(super::parse_bracketed("[always] madvise never\n").as_deref(), Some("always"));
+        assert_eq!(super::parse_bracketed("always [madvise] never").as_deref(), Some("madvise"));
+        assert_eq!(super::parse_bracketed("always madvise [never]").as_deref(), Some("never"));
+        assert_eq!(super::parse_bracketed("never").as_deref(), Some("never"));
+        assert_eq!(super::parse_bracketed("  "), None);
+    }
+
+    #[test]
+    fn a_missing_bracketed_file_is_none() {
+        assert_eq!(super::bracketed_line("/nonexistent/logit-perf/thp"), None);
+    }
+
+    #[test]
+    fn cpu_lists_count_their_members() {
+        assert_eq!(super::cpu_list_len("0-7"), Some(8));
+        assert_eq!(super::cpu_list_len("0-3,6,8-9\n"), Some(7));
+        assert_eq!(super::cpu_list_len("0"), Some(1));
+        assert_eq!(super::cpu_list_len("3-1"), None);
+        assert_eq!(super::cpu_list_len("x"), None);
+    }
+
     use super::*;
     use logit_core::{AttrMap, Event, MetricRecord};
 

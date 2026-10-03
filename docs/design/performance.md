@@ -145,8 +145,9 @@ capture. Read its numbers differently from every other scenario's:
   afterwards reproduced the later numbers, so the box moved, not the code. The VM still shares
   last-level cache and memory bandwidth with other tenants, and a new `script/vm up` may land on
   different physical hardware. [`perf/load/README.md`](../../perf/load/README.md)'s "Box state" has
-  the checklist. `run` records what it can into the results file's `box_state`, which is an empty
-  `{}` on the VM: the guest exposes no `cpufreq`/`power_supply` sysfs. Tables here are labelled by
+  the checklist. `run` records what it can into the results file's `box_state`. On the VM that holds
+  THP, `rmem`, and CPU-topology facts but no governor or power fields: the guest exposes no
+  `cpufreq`/`power_supply` sysfs. Tables here are labelled by
   session, not presented as one series across days.
 - **Every run self-checks before its numbers count.** `sent == received + kernel-dropped` must
   close exactly (on loopback a datagram has nowhere else to go). The kernel socket sampler must have
@@ -824,7 +825,8 @@ for reasons that have nothing to do with the code:
   between repeats for host-maintenance headroom; sender and child pinned). `logit-perf run` still
   records governor, EPP, platform profile, and AC power best-effort into the results file's
   `box_state` and warns before the first scenario on `powersave` or battery, but the Azure guest
-  exposes none of those sysfs nodes, so on the VM `box_state` is an empty `{}`.
+  exposes none of those sysfs nodes, so on the VM `box_state` carries only THP, `rmem`, and
+  CPU-topology fields.
 - **The denominator is events *delivered* to `null_out`, and the telemetry leg that counts them
   runs inside the measured process** (§0's "Driven scenarios" has both, and the self-checks). So a
   driven scenario's absolute CPU µs/event is comparable only to its own history, never to a
@@ -857,7 +859,7 @@ capacity bisect, and the sweep repeated with THP forced to `madvise`.
 | `perf stat -e cycles true` | `<not supported>` — no virtualized PMU, as the ADR documents |
 | Swap | none configured |
 | THP | `[always] madvise never` (image default; left at `always` for the knee/half/sweep/verify tables — only the dedicated THP sweep below forces `madvise`, and restores `always` after) |
-| `box_state` (governor/EPP/AC) | empty `{}` on every result file — this Azure guest exposes no `cpufreq`/`power_supply` sysfs nodes, so nothing to warn on; by construction (dedicated VM, no other tenants visible, no throttling) this is the isolation the whole exercise is for |
+| `box_state` (governor/EPP/AC) | no governor/EPP/AC fields on a result file taken before THP/`rmem`/topology were recorded, and none on any VM file — this Azure guest exposes no `cpufreq`/`power_supply` sysfs nodes, so nothing to warn on; by construction (dedicated VM, no other tenants visible, no throttling) this is the isolation the whole exercise is for |
 | Pins | `--pin-sender 0,1 --pin-child 2,3` throughout — cores 4–7 free, unlike the 4-vCPU session |
 
 Each binary was built with its own isolated `CARGO_TARGET_DIR`, avoiding the mtime-collision hazard
@@ -1152,7 +1154,7 @@ from the raw results JSON and bench text rather than copied from any intermediat
 | `nproc` | 8 — from the same JSON |
 | `rustc` | `rustc 1.98.1 (48a229cea 2026-09-01)` — from the same JSON |
 | Profile | `release` |
-| `box_state` | empty `{}` on every result file — this guest exposes no `cpufreq`/`power_supply` sysfs, same as every other VM session in this document |
+| `box_state` | empty `{}` on every result file of this session (taken before THP/`rmem`/topology were recorded) — this guest exposes no `cpufreq`/`power_supply` sysfs, same as every other VM session in this document |
 | `main` at head | `8110aece154b1551d9335157b332101c7116e768`, `git.dirty: false` |
 | `sizing-w4`/`9a3ebc3ba294`/experiment binaries | built from the `sizing/w3c`→`sizing/w4` stack and its throwaway experiment commits (`d78c233`, `badc1c2`, `efe9b8b`, and four `EXPERIMENT`/never-merged commits) — one `sha256` per binary, recorded in each result file's `binary` block |
 
@@ -1580,7 +1582,7 @@ the Datadog JSON routes).
 | `nproc` | 8 — from the same JSON |
 | `rustc` | `rustc 1.98.1 (48a229cea 2026-09-01)` — from the same JSON |
 | Profile | `release` |
-| `box_state` | empty `{}` on every result file, same as every other VM session in this document |
+| `box_state` | empty `{}` on every result file of this session (taken before THP/`rmem`/topology were recorded), same as every other VM session in this document |
 | `main` binary | source `main`, sha `22a6b0312fbdfbfd1fdc7e8d9a88935d67189059`, sha256 `1ffe112b2ae0bfbfc168862b3b986c1888c22d658ea745783a88f8b2c5090b8d` |
 | `dd-w1` binary | source `dd/w1`, sha `d844e73bc5ebf263777e8359c70293c60508c92a`, sha256 `59e891a5895d379ab7088769a3db382767f470c30f40d469f5752722cacf00c2` |
 | `dd-w2b` binary | source `dd/w2b`, sha `c17828c604b28be0534ccbf1f262505d5d4969e7`, sha256 `6349605695d5af575a54cab4cff6ba9cdf1689d50b579aa78c3537c243bf41c0` |

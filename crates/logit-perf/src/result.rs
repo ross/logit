@@ -68,11 +68,13 @@ pub struct BinaryInfo {
     pub built_at: Option<String>,
 }
 
-/// The CPU frequency policy and power source a run was taken under, read best-effort from sysfs.
+/// The CPU frequency policy, power source, and kernel settings a run was taken under, read
+/// best-effort from sysfs and procfs.
 ///
 /// A `powersave` governor or a run on battery can move CPU µs/event by tens of percent with no
-/// code change (`perf/load/README.md`'s "Box state"). Every field is `Option`: a box or container
-/// that exposes none of this records `null`s rather than refusing to run.
+/// code change (`perf/load/README.md`'s "Box state"). The THP, `rmem`, and topology fields are the
+/// ones an Azure guest does expose. Every field is `Option`: a box or container that exposes none
+/// of this records `null`s rather than refusing to run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoxState {
     /// `/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`: `performance` or `powersave` on
@@ -90,6 +92,26 @@ pub struct BoxState {
     /// is `Mains`; found by type because its name varies (`AC`, `ACAD`, `ADP1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_ac_power: Option<bool>,
+    /// `/sys/kernel/mm/transparent_hugepage/enabled`'s selected value (`always`, `madvise`,
+    /// `never`); it changes resident-set size without any code change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thp_enabled: Option<String>,
+    /// `…/transparent_hugepage/defrag`'s selected value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thp_defrag: Option<String>,
+    /// `/proc/sys/net/core/rmem_max`, the ceiling a `SO_RCVBUF` request clamps to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rmem_max: Option<u64>,
+    /// `/proc/sys/net/core/rmem_default`, the receive buffer a socket gets without asking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rmem_default: Option<u64>,
+    /// The number of online CPUs, from `/sys/devices/system/cpu/online`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online_cpus: Option<u32>,
+    /// Whether simultaneous multithreading is on: `/sys/devices/system/cpu/smt/active`, else
+    /// whether cpu0 shares its core with another CPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smt_active: Option<bool>,
 }
 
 impl BoxState {

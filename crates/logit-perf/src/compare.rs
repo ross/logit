@@ -6,7 +6,7 @@
 //! `--threshold` percent is a regression. `max_rss_bytes` is always reported but gates the exit
 //! code only when `--rss-threshold` is given.
 
-use crate::result::{RunReport, Sample};
+use crate::result::{BoxState, RunReport, Sample};
 use std::collections::BTreeSet;
 
 /// One scenario's before/after comparison.
@@ -144,6 +144,26 @@ pub fn compare(a: &RunReport, b: &RunReport) -> CompareReport {
              may reflect the machines, not the code; CPU us/event is the more trustworthy signal",
             a.hostname, a.cpu_model, b.hostname, b.cpu_model
         ));
+    }
+    let (a_box, b_box) = (a.box_state.as_ref(), b.box_state.as_ref());
+    let thp = |state: Option<&BoxState>| state.and_then(|s| s.thp_enabled.clone());
+    // A side that never recorded the field (an older file) has nothing to disagree with.
+    if let (Some(a_thp), Some(b_thp)) = (thp(a_box), thp(b_box)) {
+        if a_thp != b_thp {
+            warnings.push(format!(
+                "comparing different transparent hugepage settings: `{a_thp}` vs `{b_thp}` -- \
+                 resident-set size differs with no code change"
+            ));
+        }
+    }
+    let rmem = |state: Option<&BoxState>| state.and_then(|s| s.rmem_max);
+    if let (Some(a_rmem), Some(b_rmem)) = (rmem(a_box), rmem(b_box)) {
+        if a_rmem != b_rmem {
+            warnings.push(format!(
+                "comparing different net.core.rmem_max: {a_rmem} vs {b_rmem} -- a receive buffer \
+                 clamps differently, and a UDP scenario's drop rate with it"
+            ));
+        }
     }
     if a.profile != b.profile {
         warnings.push(format!(
@@ -399,6 +419,42 @@ mod tests {
             &report("box-b", "cpu-a", scenarios),
         );
         assert!(cmp.warnings.iter().any(|w| w.contains("different environments")));
+    }
+
+    #[test]
+    fn a_thp_or_rmem_mismatch_warns_but_does_not_fail() {
+        let state = |thp: &str, rmem: u64| BoxState {
+            scaling_governor: None,
+            energy_performance_preference: None,
+            platform_profile: None,
+            on_ac_power: None,
+            thp_enabled: Some(thp.to_string()),
+            thp_defrag: None,
+            rmem_max: Some(rmem),
+            rmem_default: None,
+            online_cpus: None,
+            smt_active: None,
+        };
+        let with = |s: BoxState| {
+            let mut r = report("h", "c", BTreeMap::new());
+            r.box_state = Some(s);
+            r
+        };
+        let same = compare(&with(state("madvise", 212_992)), &with(state("madvise", 212_992)));
+        assert!(!same.warnings.iter().any(|w| w.contains("hugepage") || w.contains("rmem")));
+        let thp = compare(&with(state("madvise", 212_992)), &with(state("always", 212_992)));
+        assert!(thp.warnings.iter().any(|w| w.contains("transparent hugepage")));
+        let rmem = compare(&with(state("madvise", 212_992)), &with(state("madvise", 26_214_400)));
+        assert!(rmem.warnings.iter().any(|w| w.contains("rmem_max")));
+
+        let mut unrecorded = state("always", 1);
+        unrecorded.thp_enabled = None;
+        unrecorded.rmem_max = None;
+        let partial = compare(&with(state("madvise", 212_992)), &with(unrecorded));
+        assert!(!partial.warnings.iter().any(|w| w.contains("hugepage") || w.contains("rmem")));
+
+        let whole = compare(&with(state("madvise", 212_992)), &report("h", "c", BTreeMap::new()));
+        assert!(!whole.warnings.iter().any(|w| w.contains("hugepage") || w.contains("rmem")));
     }
 
     #[test]
