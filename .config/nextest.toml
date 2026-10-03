@@ -24,3 +24,9 @@ filter = '''
   | test(=a_body_arriving_in_small_writes_is_held_once)
 '''
 priority = 100
+
+# CI's runner has 4 vCPUs, and at the default of one test per CPU the run is bound by test slots,
+# not CPU: many tests spend their time waiting on sockets and timers. 16 threads measured about
+# half the wall time of the default on 4 pinned CPUs. Every other setting comes from `default`.
+[profile.ci]
+test-threads = 16

@@ -8,6 +8,9 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    env:
+      # `.config/nextest.toml`'s `ci` profile: more test threads than the runner has vCPUs.
+      NEXTEST_PROFILE: ci
     container:
       # Same image family contributors build locally (Dockerfile.dev / ADR `containerized-development`); script/common.sh
       # detects $CI (set by GitHub Actions) and runs commands directly against it instead of
