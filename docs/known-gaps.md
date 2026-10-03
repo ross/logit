@@ -2269,7 +2269,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   resume whose file is shorter than that head, differs in those bytes, or is shorter than the
   offset starts at `0`. For an offset of at most 256, every skipped byte is identical content.
   Beyond that, a new file with the same first 256 bytes skips the bytes between there and the
-  stale offset. Files that start with a timestamp or a per-file header make it unlikely. See [ADR
+  stale offset. Files that start with a timestamp or a per-file header make it unlikely. A clean
+  stop's mid-line offset, resumed this way into a file truncated and refilled while the entry was
+  unspent, splits the new generation's line at the same point as it split the old one; the halves
+  concatenate to the new line, and the old line is the copy's loss. See [ADR
   `tail-discovery-failure-and-resume-identity`](adr/tail-discovery-failure-and-resume-identity.md),
   decision 2.
 - **A directory unreadable at startup replays its files under `read_from: end` once it becomes

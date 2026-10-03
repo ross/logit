@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e9880780ca6af50557917121f0d69650bdf1824e7107f9c545fb101a9b722ba7 # shrinks to slots = 2, wildcard = false, max_events = 1, max_line_bytes = 40, ops = [AppendTorn { f: 1, len: 10, k: 1 }, CopyTruncate { f: 2, scan_fails: false }, Drain, Restart { first_scan_fails: true }, CopyTruncate { f: 1, scan_fails: true }, Append { f: 1, lens: [10] }, Append { f: 0, lens: [10] }, Append { f: 0, lens: [10] }]
