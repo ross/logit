@@ -90,7 +90,7 @@ Lua a scenario needs — validated the same way every other example config is.
 | `json-parse-app-log` | `generate_in` (`fixtures::FLAT_JSON_LOG_BODY` + `tail_in`'s `log.file.path`) → `json` → `null_out` | The parse at the commonest *measured* log width, 12 attributes (`docs/design/data-shapes.md` §5.3), read against `json-parse` | 9M | ~1.00M/s |
 | `json-parse-nested-log` | `generate_in` (`fixtures::PINO_HTTP_LOG_BODY` + the same path attribute) → `json` → `null_out` | The same parse on a *nested* record: 10 attributes but four boxed `Value::Map`s | 4.5M | ~0.55M/s |
 | `json-parse-access-log` | `generate_in` (`fixtures::POSTGRES_JSONLOG_BODY` + the same path attribute) → `json` → `null_out` | The widest, highest-rate log class, 30 attributes — the only shipped scenario whose `AttrMap` reallocs | 3M | ~0.37M/s |
-| `tail` | a file `logit-perf` writes first → `tail_in` (`read_from: beginning`) → `null_out` | `tail_in`'s read, line split, and per-line event, with nothing parsed | 5M lines | pending VM measurement |
+| `tail` | a file `logit-perf` writes first → `tail_in` (`read_from: beginning`) → `null_out` | `tail_in`'s read, line split, and per-line event, with nothing parsed | 12M lines | pending VM measurement |
 | `tail-rotate` | `tail`, with the file hard-linked aside and a replacement renamed onto its path once half of it is delivered | The rotation path on top of `tail`: the rescan, the replacement's open, the old file's drain and reap | 5M lines | pending VM measurement |
 
 The last three rows are [`docs/plans/event-sizing.md`](event-sizing.md)'s W1 (2026-09-21): three

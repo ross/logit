@@ -168,8 +168,9 @@ capture. Read its numbers differently from every other scenario's:
 `tail` and `tail-rotate` (added 2026-10-02) measure `tail_in`'s read path: read, split, one raw
 event per line, batch, deliver to `null_out`. Like the UDP family they have no `generate_in`.
 `logit-perf` writes the tailed file before the spawn, from a slog-style JSON app-log model in
-[`perf/load/`](../../perf/load/README.md) (5M lines of 273–330 bytes, ~1.5 GiB), and `tail_in`
-reads it from its first byte. `tail-rotate` splits the same lines across a file and its
+[`perf/load/`](../../perf/load/README.md) (lines of 273–330 bytes: 12M, ~3.5 GiB, for `tail`;
+5M, ~1.5 GiB, for `tail-rotate`), and `tail_in` reads it from its first byte. A repeat needs
+twice its file size free on the disk under `perf/results/`. `tail-rotate` splits the same lines across a file and its
 replacement, and moves the old file aside and the replacement onto its path once the sink has
 half of the first file. Read their numbers this way:
 

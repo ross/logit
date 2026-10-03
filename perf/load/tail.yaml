@@ -2,7 +2,9 @@
 # its first byte. See perf/load/README.md's "File scenarios" for the format.
 kind: file
 target: app
-# ~1.5 GiB at app-log.yaml's 313-byte mean line. A first estimate for a 5-10 s run: ~7.5 s on the
-# dev laptop on battery, so it wants re-checking on the perf VM before its first recorded baseline.
-lines: 5000000
+# ~3.5 GiB at app-log.yaml's 313-byte mean line, written per repeat; the harness refuses a repeat
+# with less than twice that free. Sized from the perf VM: 5M lines ran 2.4-4.0 s of wall with the
+# TAIL-03 fix, below the 5-10 s band, so 12M puts it at ~6-10 s. `tail-rotate` stays at 5M: its
+# rotation path is slower, and 5M already lands it in the band there.
+lines: 12000000
 model: app-log.yaml
