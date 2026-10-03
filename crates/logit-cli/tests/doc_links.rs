@@ -45,18 +45,29 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Blanks inline code spans so a `](` inside one is not read as a link.
-fn blank_code_spans(line: &str) -> String {
+/// Blanks inline code spans so a `](` inside one is not read as a link. `open` carries the
+/// backtick-run length of a span still open from an earlier line of the paragraph; a span closes
+/// on a run of the same length (CommonMark).
+fn blank_code_spans(line: &str, open: &mut Option<usize>) -> String {
+    let chars: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(line.len());
-    let mut in_span = false;
-    for c in line.chars() {
-        if c == '`' {
-            in_span = !in_span;
-            out.push(' ');
-        } else if in_span {
-            out.push(' ');
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '`' {
+            let start = i;
+            while i < chars.len() && chars[i] == '`' {
+                i += 1;
+            }
+            let run = i - start;
+            match *open {
+                None => *open = Some(run),
+                Some(n) if n == run => *open = None,
+                Some(_) => {}
+            }
+            out.extend(std::iter::repeat_n(' ', run));
         } else {
-            out.push(c);
+            out.push(if open.is_some() { ' ' } else { chars[i] });
+            i += 1;
         }
     }
     out
@@ -119,16 +130,21 @@ fn every_relative_markdown_link_resolves() {
         let dir = file.parent().unwrap();
         let text = fs::read_to_string(file).unwrap();
         let mut fenced = false;
+        let mut open = None;
         for (n, line) in text.lines().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
                 fenced = !fenced;
+                open = None;
                 continue;
             }
             if fenced {
                 continue;
             }
-            for raw in targets(&blank_code_spans(line)) {
+            if trimmed.is_empty() {
+                open = None;
+            }
+            for raw in targets(&blank_code_spans(line, &mut open)) {
                 let Some(path) = link_path(&raw) else { continue };
                 let resolved = match path.strip_prefix('/') {
                     Some(abs) => root.join(abs),
@@ -146,4 +162,14 @@ fn every_relative_markdown_link_resolves() {
         broken.len(),
         broken.join("\n")
     );
+}
+
+#[test]
+fn a_code_span_wrapped_across_lines_does_not_hide_a_link_on_its_closing_line() {
+    let mut open = None;
+    let first = blank_code_spans("see `statsd_in ->", &mut open);
+    assert!(targets(&first).is_empty());
+    let second = blank_code_spans("statsd_out` and [ADR](a.md) with `x](b.md)`.", &mut open);
+    assert_eq!(targets(&second), vec!["a.md".to_string()]);
+    assert_eq!(open, None);
 }

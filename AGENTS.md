@@ -712,7 +712,8 @@ Merged branches and PRs are never renamed to fit.
     date changed it. Git has that; an ADR link carries a long why.
   - No hedges or intensifiers ("exactly", "actually", "genuinely", "deliberately", "simply",
     "just", "on purpose", "load-bearing").
-  - Cite a doc by path and heading, never by line number, and code by item name. Relative markdown links are checked by `crates/logit-cli/tests/doc_links.rs`.
+  - Cite a doc by path and heading, never by line number, and code by item name. Relative
+    markdown links are checked by `crates/logit-cli/tests/doc_links.rs`.
   - One copy of a list. A module doc that describes behavior (validation rules, a codec's
     mapping table and permitted normalizations) is the canonical copy; docs, tests, and examples
     summarize it and point at it.
