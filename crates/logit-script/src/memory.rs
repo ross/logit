@@ -167,7 +167,12 @@ mod tests {
     fn a_pcall_wrapped_event_new_loop_stays_tripped() {
         let w = ScriptWorker::new(
             r#"
-            kept = {}
+            -- Local, not global: mlua's traceback searches _G for the failing
+            -- callback's name on every pcall'd error. A large global table that
+            -- the search reaches before Event, which depends on the VM's string
+            -- hash seed, makes each of the ~180k errors here walk it.
+            local kept = {}
+            function kept_len() return #kept end
             function process(event) return event end
             function flush(now)
                 for i = 1, 200000 do
@@ -180,7 +185,7 @@ mod tests {
         .unwrap();
         w.set_memory_cap(Some(4 * MIB));
         w.flush(0).expect("pcall swallows every error, so flush() itself succeeds");
-        let kept: usize = w.lua.load("return #kept").eval().unwrap();
+        let kept: usize = w.lua.load("return kept_len()").eval().unwrap();
         assert!(kept < 200_000, "the trip should have refused most constructions, kept {kept}");
         // Without the sticky trip, 200k pcall'd constructions reach several times the cap.
         let verdict = w.collect_until_under(4 * MIB, 8).unwrap();
