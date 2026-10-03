@@ -903,11 +903,22 @@ async fn assert_byte_for_byte(harness: &mut Harness, fixture: &str) {
     );
 }
 
+/// Each fixture runs on its own [`Harness`] (its own capture socket and listener), all at once,
+/// so their [`CAPTURE_QUIET`] windows overlap. A failure re-raises the fixture's own panic, which
+/// names it.
 #[tokio::test]
 async fn the_corpus_round_trips_byte_for_byte() {
-    let mut harness = Harness::new().await;
-    for fixture in BYTE_FOR_BYTE {
-        assert_byte_for_byte(&mut harness, fixture).await;
+    let mut fixtures = tokio::task::JoinSet::new();
+    for &fixture in BYTE_FOR_BYTE {
+        fixtures.spawn(async move {
+            let mut harness = Harness::new().await;
+            assert_byte_for_byte(&mut harness, fixture).await;
+        });
+    }
+    while let Some(joined) = fixtures.join_next().await {
+        if let Err(err) = joined {
+            std::panic::resume_unwind(err.into_panic());
+        }
     }
 }
 
