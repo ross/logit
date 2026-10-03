@@ -389,6 +389,8 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
 - **Operator docs.** The plan's W4 rewrites every passage that says one frame is in flight:
   module docs, `docs/design/wire-protocol.md`, `docs/deploying.md` (the `window:` field and the
   posture note), and the amended records.
-- **Measurement owed.** `native-relay` on the perf VM at `window: 1` and `window: 32`, with the
-  pending re-baseline. The plan's "Findings" section records the laptop loopback and container
-  `netem` numbers until then.
+- **Measurement.** The perf VM measured `native-relay` at `window: 1` and `window: 32` on
+  2026-10-02 (`docs/design/performance.md` §1's native-relay ladder). At this ADR's binary,
+  `window: 32` costs 1.176 µs/event against `window: 1`'s 1.371, and `window: 1` is within 1.6% of
+  the last binary before the window. The plan's "Findings" section keeps the laptop `netem`
+  numbers.

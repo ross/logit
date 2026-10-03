@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-01
+updated: 2026-10-02
 ---
 
 # Enabling plan: delivery semantics — at-least-once per hop, and an effectively-once native hop
@@ -149,7 +149,11 @@ Per [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequ
   [ADR `out-of-ci-fuzzing`](../adr/out-of-ci-fuzzing.md).
 - **Identity independence.** Verify that `random_id_bytes` gives independent identities across
   processes.
-- Measure the native relay on the perf VM before and after.
+- [x] Measure the native relay on the perf VM before and after. Done 2026-10-02
+  ([`docs/design/performance.md`](../design/performance.md) §1's native-relay ladder): the
+  delivery stack's sender identity and sequence trailer cost nothing measurable. `native-relay` reads
+  1.378 µs/event at `4e08c49e`, 1.365 after W3, and 1.350 after W4 through W6 (`958b93e7`), and
+  the later steps are the send window, encode-once, and named acks.
 
 ### W6: operator docs
 

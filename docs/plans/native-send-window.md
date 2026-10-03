@@ -254,5 +254,11 @@ window 32 and 200k at window 1):
   per RTT (100 batches/s). The window-1 arm's CPU per event is inflated by idle wake-ups per
   batch.
 
-**Owed:** `native-relay` and `native-relay-window1` on the perf VM, with the pending
-re-baseline (`docs/design/performance.md`).
+**The perf VM (2026-10-02).** The VM numbers are in
+[`docs/design/performance.md`](../design/performance.md) §1's native-relay ladder. At `99615d2c`
+(`flow/w4`), `window: 32` costs 1.176 µs/event and runs 1,451,784 events/s, and `window: 1` costs
+1.371 and runs 988,553. `window: 1` is within 1.6% on CPU of `958b93e7`, the last binary before the
+window (1.350 µs/event, 1,006,348 events/s), under the 5% gate, so the window-1 regression the
+laptop couldn't rule out doesn't show. Peak RSS rises with the window there too, 250.2 MiB at
+window 1 against 273.4 at window 32. The VM didn't re-run the `netem` window 1 against window 32
+comparison; the laptop figures above stand for it.

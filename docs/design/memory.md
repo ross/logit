@@ -21,8 +21,9 @@ change one of their numbers, change the matching table here in the same commit.
 > Timings were taken on the disposable perf VM (`docs/adr/disposable-azure-perf-vm.md`:
 > `Standard_F8as_v6`, 8 dedicated AMD EPYC 9V74 cores, SMT off), x86-64 Linux, in the dev
 > container, `bench` profile (`lto = true`, `codegen-units = 1`), system allocator, `taskset -c 2`,
-> 2026-09-20. They are divan's *fastest* column, the estimate least contaminated by noise: use them
-> to compare stages with each other, not as throughput ceilings. Don't compare them with the
+> 2026-10-02 (§2's timing table); the other timing tables are from the 2026-09-20 run. They are
+> divan's *fastest* column, the estimate least contaminated by noise: use them to compare stages
+> with each other, not as throughput ceilings. Don't compare them with the
 > pre-2026-09-20 laptop numbers; §2's timing-table note explains why. **Allocation counts are
 > exact and machine-independent.**
 
@@ -322,31 +323,39 @@ line.
 | `graphite_out` encode_into 100 `Distribution` events, `multi_value: expand` | **0** | expanding into `.count`/`.sum`/`.q*` sub-paths reads an already-built `DdSketch` in place (`expand_sketch`) -- no new sketch is built, so this costs exactly what the plaintext row above costs |
 | `graphite_out` encode_into 100 `Samples` events, `multi_value: expand` | **100** | not zero, and not meant to be: expanding a raw `Samples` record first calls `Samples::sketch()`, which builds a fresh `DdSketch` accumulator from the record's raw values -- inherent to re-summarizing on the way out, and the identical cost `influxdb_out`'s own `Samples` expansion already pays. `crate::graphite::encode`'s own module doc names this as one of its two deliberate per-record-allocation exceptions; the other, a `SetMembers` expansion's de-duplication `Vec`, has no pinned row here since nothing in this effort's fixtures exercises it, but is called out for the same reason a future fixture would need to account for it too |
 
-And the corresponding times:
+And the corresponding times, from `script/bench` on the perf VM at `d1521c5f` (2026-10-02), with
+the previous run (2026-09-20) beside each for comparison:
 
-| Stage | fastest | per event |
-|---|---:|---:|
-| `syslog_in` decode, 100 lines | 20.4 µs | 204 ns |
-| `statsd_in` decode, 100 lines | 40.1 µs | 401 ns |
-| `json` | 411 ns | 411 ns |
-| `kv_metrics` | 75.5 ns | 75.5 ns |
-| `keep` | 505 ns | 505 ns |
-| `aggregate` absorb | 891 ns | 891 ns |
-| **full ingest chain** | **2.17 µs** | ~461k lines/s/core |
-| `Event::clone` (nginx / statsd / distribution) | 316 / 126 / 97.1 ns | |
-| `stdio_out` encode, 100 events | 134.7 µs | 1.35 µs |
-| `influxdb_out` encode, 100 events | 257.1 µs | 2.57 µs |
-| `syslog_out` encode_into, 100 events | 82.4 µs | 824 ns |
-| `lua` (proxy / `to_table`) | 1.61 / 9.03 µs | |
+| Stage | fastest | per event | 2026-09-20 fastest | Δ |
+|---|---:|---:|---:|---:|
+| `syslog_in` decode, 100 lines | 21.56 µs | 216 ns | 20.4 µs | +5.7% |
+| `statsd_in` decode, 100 lines | 41.45 µs | 415 ns | 40.1 µs | +3.4% |
+| `json` | 419.4 ns | 419.4 ns | 411 ns | +2.0% |
+| `kv_metrics` | 76.11 ns | 76.11 ns | 75.5 ns | +0.8% |
+| `keep` | 520.4 ns | 520.4 ns | 505 ns | +3.0% |
+| `aggregate` absorb | 890.7 ns | 890.7 ns | 891 ns | 0.0% |
+| **full ingest chain** | **2.321 µs** | ~431k lines/s/core | 2.17 µs (~461k lines/s/core) | +7.0% |
+| `Event::clone` (nginx / statsd / distribution) | 312.1 / 130.5 / 89.61 ns | | 316 / 126 / 97.1 ns | −1.2% / +3.6% / −7.7% |
+| `stdio_out` encode, 100 events | 141.9 µs | 1.419 µs | 134.7 µs | +5.3% |
+| `stdio_out` encode, 1 event | 1.559 µs | 1.559 µs | no row | |
+| `influxdb_out` encode, 100 events | 233.3 µs | 2.333 µs | 257.1 µs | −9.3% |
+| `syslog_out` encode_into, 100 events | 82.64 µs | 826 ns | 82.4 µs | +0.3% |
+| `lua` (proxy / `to_table`) | 1.819 / 9.296 µs | | 1.61 / 9.03 µs | +13.0% / +2.9% |
 
-The `stdio_out` row predates the block render (ADR `human-render-block-format`), which writes
-several times the bytes per event, and is due a re-measure at the next perf-VM session.
+The `stdio_out` row is the block render's first timing (ADR `human-render-block-format`): +5.3%
+against its 2026-09-20 value, the same direction and size as `syslog_in` (+5.7%) and the full
+chain (+7.0%), so the render doesn't show up as a separate cost beyond the table's run-to-run
+shift. Its allocation count is unchanged at 2 per 100-event batch. There is no timing for
+`format: json`: the bench's `stdio` arm builds `EventDump::new(Format::Human)` only, and the
+allocation table above carries the `stdio_out` json row alone. The `lua` proxy's +13.0% isn't a
+reliable signal, because that row's slowest sample runs about 33 µs and its spread is wide.
 
 Every timing above comes from **one** `script/bench` run on the disposable perf VM
 (`docs/adr/disposable-azure-perf-vm.md`: `Standard_F8as_v6`, 8 dedicated EPYC 9V74 cores, SMT
-off), `taskset -c 2`, 2026-09-20. Compare rows *within* this table (`json` against `kv_metrics`,
-`stdio_out` against `influxdb_out`); don't compare a row with the pre-2026-09-20 laptop table's.
-Between the two, **both the machine and the code changed**. Optimizations landed (the interner key
+off), `taskset -c 2`, 2026-10-02; the 2026-09-20 column is the same procedure on that date. Compare
+rows *within* a column (`json` against `kv_metrics`, `stdio_out` against `influxdb_out`); don't
+compare a row with the pre-2026-09-20 laptop table's. Between the laptop table and the 2026-09-20
+run, **both the machine and the code changed**. Optimizations landed (the interner key
 cache and in-place `Transform::process` are most of why `kv_metrics` dropped 256 ns → 75.5 ns and
 `json` 535 ns → 411 ns), while `metrics-model-v2`'s TLV framing and later lossless-transit work
 pushed `influxdb_out`/`syslog_out`/`lua to_table` the other way. A single row's delta is a hardware
