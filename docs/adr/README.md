@@ -10,6 +10,7 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [Lua refusals: `Event.new` raises a refusal from a Lua shim, not as an mlua callback error](lua-refusals-raised-from-lua.md) | 2026-10-03 | 2026-10-03 |
 | [Crate layout: don't split crates to speed up the dev build](crate-layout-and-build-speed.md) | 2026-10-03 | 2026-10-03 |
 | [Release profile: fat LTO and one codegen unit, measured against thin LTO and 16 units](release-build-profile.md) | 2026-10-03 | 2026-10-03 |
 | [Native hop acks: a named cumulative `Ack`, coalesced at `logit_in`, and a resume mark in `HelloAck`](native-hop-named-acks.md) | 2026-10-02 | 2026-10-02 |
@@ -24,7 +25,7 @@ the same date, write the record, then add a row here.
 | [`stdio_out`/`file_out` gain `format: json`, and every machine reader of the text render moves to it](stream-json-format.md) | 2026-09-28 | 2026-10-02 |
 | [Test timing: wait on an observable, size every sleep, and share one set of helpers](test-timing-and-observables.md) | 2026-09-28 | 2026-09-28 |
 | [Shutdown accounting and cancellation safety: every shutdown loss counted, and one table of cancellation points](shutdown-accounting-and-cancellation-safety.md) | 2026-09-26 | 2026-09-26 |
-| [Lua scripts: stall detection, a progress-based wedge check, opt-in `max_memory`, and a table-depth cap](lua-runaway-script-bounds.md) | 2026-09-26 | 2026-09-26 |
+| [Lua scripts: stall detection, a progress-based wedge check, opt-in `max_memory`, and a table-depth cap](lua-runaway-script-bounds.md) | 2026-09-26 | 2026-10-03 |
 | [Deployment threat model: accidental data inside a trust boundary, not a malicious peer](deployment-threat-model.md) | 2026-09-25 | 2026-09-25 |
 | [Untrusted-input bounds: one set of rules for every decoder and listener a peer can reach](untrusted-input-bounds.md) | 2026-09-25 | 2026-09-25 |
 | [Out-of-CI fuzzing: a `cargo-fuzz` workspace in the unsafe-check image, with every crash landed as a stable test](out-of-ci-fuzzing.md) | 2026-09-25 | 2026-09-25 |
@@ -46,7 +47,7 @@ the same date, write the record, then add a row here.
 | [`Transform::process` transforms in place: `&mut Event -> bool`, not `Event -> Option<Event>`](in-place-transform-process.md) | 2026-09-17 | 2026-09-17 |
 | [`keep_values`: an attribute-value allowlist, and an optional normalize-before-compare step](value-allowlist-cardinality-clamp.md) | 2026-09-15 | 2026-09-15 |
 | [A Lua `flush()` runs in a root context, not the last batch's](lua-flush-root-context.md) | 2026-09-15 | 2026-09-15 |
-| [`Event.new(t)`: Lua constructs events from the table shape `event:to_table()` already emits](lua-event-constructor.md) | 2026-09-15 | 2026-09-26 |
+| [`Event.new(t)`: Lua constructs events from the table shape `event:to_table()` already emits](lua-event-constructor.md) | 2026-09-15 | 2026-10-03 |
 | [Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe](idle-connection-timeout.md) | 2026-09-14 | 2026-10-02 |
 | [`syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS](syslog-tcp-ingress-and-tls.md) | 2026-09-13 | 2026-09-14 |
 | [Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch](graphite-carbon-relay.md) | 2026-09-13 | 2026-09-30 |

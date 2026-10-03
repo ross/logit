@@ -2050,9 +2050,10 @@ async fn revoke_lua_io(io: LuaIo, telemetry: &Telemetry, shutdown_dropped: &Atom
 ///   drops its [`LuaIo`] and returns `Err`, and the join loop fails the run as it would for any
 ///   node. The thread is left running; `main`'s exit reclaims it.
 ///
-/// A loop that keeps calling `Event.new` advances the heartbeat and is never stalled or wedged;
-/// telling it from a large `flush()` would take a time limit, which
-/// `docs/adr/lua-runaway-script-bounds.md` declines.
+/// A loop that keeps constructing events with `Event.new` advances the heartbeat and is never
+/// stalled or wedged; a loop of refused calls is not progress. Telling a constructing loop from
+/// a large `flush()` would take a time limit, which `docs/adr/lua-runaway-script-bounds.md`
+/// declines.
 ///
 /// A node that isn't busy is never stalled or wedged: a thread parked sending into a full inbox is
 /// backpressure, and the sink's own grace unparks it.

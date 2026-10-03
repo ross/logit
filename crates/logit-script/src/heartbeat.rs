@@ -3,8 +3,9 @@
 //! (`docs/adr/lua-runaway-script-bounds.md`).
 //!
 //! One `u64`: bit 0 is set while the thread is inside a script call, and the upper bits count
-//! progress (each call entered, each `Event.new`, each key and each element of a returned
-//! table). The watcher compares successive reads: busy and unchanged for long enough is a stall.
+//! progress (each call entered, each `Event.new` that constructs an event, each key and each
+//! element of a returned table). The watcher compares successive reads: busy and unchanged for
+//! long enough is a stall.
 //!
 //! There is one writer, the Lua thread, so every update is a `Relaxed` load then store, never a
 //! read-modify-write. The watcher needs no ordering against other memory: it only asks whether

@@ -272,10 +272,10 @@ impl ScriptWorker {
         self
     }
 
-    /// Hands the worker the runtime's [`Heartbeat`], which it ticks once per `Event.new` call and
-    /// once per event taken from a returned table, so a long `process()`/`flush()` that is still
-    /// producing events reads as progress, not a stall. The runtime marks the call itself with
-    /// [`Heartbeat::enter`]/[`Heartbeat::leave`].
+    /// Hands the worker the runtime's [`Heartbeat`], which it ticks once per `Event.new` call that
+    /// constructs an event and once per event taken from a returned table, so a long
+    /// `process()`/`flush()` that is still producing events reads as progress, not a stall. The
+    /// runtime marks the call itself with [`Heartbeat::enter`]/[`Heartbeat::leave`].
     pub fn with_heartbeat(self, heartbeat: Arc<Heartbeat>) -> Self {
         *self.heartbeat.borrow_mut() = Some(heartbeat);
         self

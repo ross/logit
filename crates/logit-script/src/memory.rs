@@ -16,11 +16,16 @@
 //! call and allocates nothing, so the `Event.new` allocation pins don't move; a collection runs
 //! at most once per [`CALLS_PER_COLLECTION`] over-cap calls.
 //!
+//! The trip's message is formatted once, when it trips, and every later refusal in the call
+//! repeats it, so a `pcall` loop over a tripped cap interns one Lua string rather than one per
+//! call. `Event.new` ticks the heartbeat only when it constructs an event, so a refused call is
+//! not progress and a loop of them reads as a stall (`docs/adr/lua-refusals-raised-from-lua.md`).
+//!
 //! The cap bounds the VM heap only. An event proxy costs the VM about 150 bytes while its
 //! payload stays in the Rust heap, which `used_memory()` does not see.
 
 use mlua::Lua;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 /// How many over-cap `Event.new` calls may pass between two in-call collections.
 pub(crate) const CALLS_PER_COLLECTION: u32 = 1024;
@@ -30,7 +35,9 @@ pub(crate) const CALLS_PER_COLLECTION: u32 = 1024;
 #[derive(Debug, Default)]
 pub(crate) struct MemoryCap {
     cap: Cell<Option<usize>>,
-    tripped: Cell<bool>,
+    /// The `over_cap` message, set when the in-call check trips and cleared by
+    /// [`MemoryCap::reset_trip`]. `Some` is the trip.
+    trip: RefCell<Option<String>>,
     calls_since_collection: Cell<u32>,
 }
 
@@ -40,7 +47,7 @@ impl MemoryCap {
     }
 
     pub(crate) fn reset_trip(&self) {
-        self.tripped.set(false);
+        self.trip.replace(None);
     }
 
     /// `Event.new`'s check. `Ok` with no cap set, or under it.
@@ -48,8 +55,8 @@ impl MemoryCap {
         let Some(cap) = self.cap.get() else {
             return Ok(());
         };
-        if self.tripped.get() {
-            return Err(over_cap(lua.used_memory(), cap));
+        if let Some(message) = self.trip.borrow().as_ref() {
+            return Err(mlua::Error::RuntimeError(message.clone()));
         }
         let calls = self.calls_since_collection.get().saturating_add(1);
         if lua.used_memory() <= cap || calls < CALLS_PER_COLLECTION {
@@ -61,15 +68,12 @@ impl MemoryCap {
         lua.gc_collect()?;
         let used = lua.used_memory();
         if used > cap {
-            self.tripped.set(true);
-            return Err(over_cap(used, cap));
+            let message = format!("Event.new: over max_memory ({used} > {cap})");
+            self.trip.replace(Some(message.clone()));
+            return Err(mlua::Error::RuntimeError(message));
         }
         Ok(())
     }
-}
-
-fn over_cap(used: usize, cap: usize) -> mlua::Error {
-    mlua::Error::RuntimeError(format!("Event.new: over max_memory ({used} > {cap})"))
 }
 
 /// What [`crate::ScriptWorker::collect_until_under`] ended at.
@@ -83,7 +87,8 @@ pub struct GcVerdict {
 
 #[cfg(test)]
 mod tests {
-    use crate::ScriptWorker;
+    use crate::{Heartbeat, ScriptWorker};
+    use std::sync::Arc;
 
     const MIB: usize = 1024 * 1024;
 
@@ -185,6 +190,65 @@ mod tests {
         assert!(!event_new_succeeds(&w), "still tripped after the call returned");
         w.reset_memory_trip();
         assert!(event_new_succeeds(&w), "a reset trip lets the next call construct again");
+    }
+
+    /// A worker whose cap has tripped and stays tripped, outside any `process()`/`flush()`.
+    fn tripped_worker() -> ScriptWorker {
+        let w = ScriptWorker::new(RETAINING_FLUSH).unwrap();
+        w.set_memory_cap(Some(4 * MIB));
+        assert!(w.flush(0).is_err(), "a loop retaining 200k events should trip a 4 MiB cap");
+        assert!(!event_new_succeeds(&w));
+        w
+    }
+
+    #[test]
+    fn a_tripped_cap_refuses_with_the_same_message_every_time() {
+        let w = tripped_worker();
+        // The garbage between the two calls moves `used_memory()`, which the message would
+        // follow if it were formatted per call.
+        let (same, first, second): (bool, String, String) = w
+            .lua
+            .load(
+                r#"
+                local _, first = pcall(Event.new, {timestamp = "1"})
+                local junk = {}
+                for i = 1, 10000 do junk[i] = "junk" .. i end
+                local _, second = pcall(Event.new, {timestamp = "1"})
+                return rawequal(first, second), first, second
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(same, "two refusals from one trip should repeat one message: {first} / {second}");
+        assert!(first.starts_with("Event.new: over max_memory ("), "got: {first}");
+        assert!(first.ends_with(&format!("> {})", 4 * MIB)), "got: {first}");
+    }
+
+    #[test]
+    fn a_refused_event_new_does_not_tick_the_heartbeat() {
+        let heartbeat = Arc::new(Heartbeat::new());
+        let w = tripped_worker().with_heartbeat(heartbeat.clone());
+        let before = heartbeat.read();
+        w.lua.load(r#"for i = 1, 100 do pcall(Event.new, {timestamp = "1"}) end"#).exec().unwrap();
+        assert_eq!(heartbeat.read(), before, "a refused call is not progress");
+
+        // The control: once the trip is reset, one construction ticks once.
+        w.reset_memory_trip();
+        assert!(event_new_succeeds(&w));
+        assert_eq!(heartbeat.read(), before + 2);
+    }
+
+    #[test]
+    fn a_malformed_table_refusal_does_not_tick_the_heartbeat() {
+        let heartbeat = Arc::new(Heartbeat::new());
+        let w = ScriptWorker::new("function process(event) return event end")
+            .unwrap()
+            .with_heartbeat(heartbeat.clone());
+        let before = heartbeat.read();
+        w.lua.load("for i = 1, 100 do pcall(Event.new, {}) end").exec().unwrap();
+        assert_eq!(heartbeat.read(), before, "a refused call is not progress");
+        assert!(event_new_succeeds(&w));
+        assert_eq!(heartbeat.read(), before + 2);
     }
 
     #[test]

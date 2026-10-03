@@ -1,6 +1,6 @@
 ---
 created: 2026-09-15
-updated: 2026-09-26
+updated: 2026-10-03
 ---
 
 # `Event.new(t)`: Lua constructs events from the table shape `event:to_table()` already emits
@@ -210,3 +210,12 @@ Three residuals the list above lacked, each of which the test's generator leaves
   `Map{"1": 1, "3": 2}`.
 - An empty `Array` comes back an empty `Map`, the flattening Decision's "an empty table becomes
   an empty `Map`" names.
+
+## Amendment: a refusal is raised from a Lua shim (2026-10-03)
+
+`Event.new` is a Lua function wrapping the Rust constructor, and a refusal reaches the script as a
+plain string the shim raises with `error(msg, 2)`, not as an mlua callback error. A direct call's
+message gains the calling line (`script:12: Event.new: timestamp is required`); under
+`pcall(Event.new, t)` it's the bare message. The constructor's rules and messages are unchanged.
+Only a call that constructs an event ticks the stall heartbeat; a refused call is not progress.
+[ADR `lua-refusals-raised-from-lua`](lua-refusals-raised-from-lua.md) has the decision and why.

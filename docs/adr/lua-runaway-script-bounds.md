@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-09-27
+updated: 2026-10-03
 ---
 
 # Lua scripts: stall detection, a progress-based wedge check, opt-in `max_memory`, and a table-depth cap
@@ -76,7 +76,9 @@ sources, found:
    ticks it around each `process()`/`flush()` call, and inside a call too — once per `Event.new`
    and, for a returned table, once per key `events_from_table` validates and once per element
    it builds — so a `flush()` that emits many events stays a run of progress ticks, never a
-   stall, however long it takes. A
+   stall, however long it takes. **Amended 2026-10-03:** `Event.new` ticks only when it
+   constructs an event, so a refused call is not progress
+   ([ADR `lua-refusals-raised-from-lua`](lua-refusals-raised-from-lua.md), decision 5). A
    watcher task polls the heartbeat on the interval decision 2 sets; a busy bit that stops
    advancing for `stall_after` (default 10s) diagnoses `script_stalled` and moves the node to a
    `NodeState::Stalled` state. `Stalled` is reversible: the heartbeat advancing again moves the
@@ -151,6 +153,11 @@ sources, found:
      raises until the runtime clears it after the call. Without the flag,
      `pcall(Event.new, ..)` swallowed each error: 200,000 wrapped constructions reached 29 MB
      against a 4 MiB cap.
+   - *Amended 2026-10-03: a tripped refusal is cheap, fixed, and not progress.* The trip's
+     message is formatted once and repeated for the rest of the call, the refusal reaches the
+     script from a Lua shim rather than as an mlua callback error, and a refused call ticks no
+     heartbeat. [ADR `lua-refusals-raised-from-lua`](lua-refusals-raised-from-lua.md) has why:
+     mlua's per-error traceback walked the script's global tables on every caught refusal.
    - *Residual: the cap bounds the Lua VM heap only.* A retained event costs the VM about 149
      bytes while its payload stays in the Rust heap (10,000 retained 1 KiB events: 1.5 MB of VM,
      about 10 MB of Rust). Size the cap at least twice the script's steady working set, read from
@@ -281,7 +288,11 @@ sources, found:
   retains what it builds is bounded by `max_memory`'s in-call check (decision 3); the variant that
   allocates and drops without retaining stays undetected. Telling either apart from a large,
   legitimate `flush()` needs a time limit, which this record declines for the reasons decision 1
-  already gives.
+  already gives. **Amended 2026-10-03:** only a call that constructs an event ticks, so a
+  `pcall(Event.new, ..)` loop of refusals, over a tripped cap or on a malformed table, is not
+  progress and reads as a stall
+  ([ADR `lua-refusals-raised-from-lua`](lua-refusals-raised-from-lua.md)). The residual is a
+  loop that keeps constructing: one that discards what it builds, or runs with no `max_memory`.
 - `/healthz` stays `200` on a stalled node: the admin server itself is alive, and liveness and
   readiness answer different questions (decision 1). `/readyz`'s `503 stalled` is what an
   operator's own probe — the image's `HEALTHCHECK` under Docker or Swarm, or a Kubernetes

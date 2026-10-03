@@ -2783,9 +2783,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   the depth cap bounds nesting, not size; a 128-deep value a script builds does not survive a
   relay through `otlp_out -> otlp_in` (OTLP's own JSON and protobuf nesting limits, 41 and 49
   levels, are both under the cap); pure-Lua recursion through Rust/C frames can still
-  abort the process past the larger stack; and a loop that keeps calling `Event.new` advances the
-  stall heartbeat and is never caught as a stall, since telling it from a large `flush()` would
-  need a time limit, so only its memory-retaining form is bounded, by `max_memory`. And
+  abort the process past the larger stack; and a loop that keeps constructing events with
+  `Event.new` advances the stall heartbeat and is never caught as a stall, since telling it from
+  a large `flush()` would need a time limit. Its memory-retaining form is bounded by `max_memory`,
+  and a refused call is not progress, so a `pcall` loop of refusals reads as a stall
+  ([ADR `lua-refusals-raised-from-lua`](adr/lua-refusals-raised-from-lua.md)). What's left is a
+  loop that discards what it builds, or one with no `max_memory` set. And
   `max_memory` bounds the Lua VM heap only: a retained event costs the VM about 150 bytes while
   its payload stays in the Rust heap (10k retained 1 KiB events: 1.5 MB of VM, about 10 MB of
   Rust), so a script that hoards events shows in process RSS long before it trips the cap. A cap
@@ -2799,6 +2802,18 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   a channel nobody reads: counted `sent` upstream and nothing at the Lua node. It's a named
   exception in [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md), decision 1.
   Revisit if a revoked node's `dropped` count falls short of its producers' `sent` in practice.
+- **A caught error from a Rust callback other than `Event.new` costs a walk of the script's
+  global tables.** mlua 0.9.9 builds a traceback for every error a Rust callback returns, and
+  mlua-sys 0.6.8's compat53 `luaL_traceback`, which it binds for LuaJIT, names an anonymous C
+  frame by searching every global and every field of every global table. So each failed call to
+  a proxy metamethod (`__index`/`__newindex`), `event:to`, `telemetry.*`, or `print` that a
+  script catches with `pcall` costs time in proportion to its global state, and an error that
+  escapes `process()`/`flush()` pays the same once for its traceback. It's bounded per failed
+  call, not per loop iteration of a successful one, and none of these is a call a script retries
+  until it succeeds. `Event.new` raises its refusals from Lua instead
+  ([ADR `lua-refusals-raised-from-lua`](adr/lua-refusals-raised-from-lua.md)). Closing the rest
+  needs mlua-sys to bind LuaJIT's own `luaL_traceback`, which prints a C function's address and
+  searches nothing, or each callback moved onto the same Lua-shim pattern.
 - **A nonzero float under 2^-52 in magnitude reads back `0` through `Event.new`.** mlua 0.9.9's
   LuaJIT number read truncates toward zero and keeps that integer when the difference is under
   `f64::EPSILON`, so a metric value, bound, or float attribute of, say, `1e-20` — read through

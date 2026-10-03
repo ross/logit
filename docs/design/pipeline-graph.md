@@ -463,8 +463,9 @@ That watcher task also bounds a script that never returns
 
 - **Heartbeat.** The thread shares a `logit_script::Heartbeat` with its watcher: bit 0 is set
   while it is inside a `process()` or `flush()` call, and a count above it advances on each call,
-  each `Event.new`, and each event taken from a returned table. The thread marks itself idle before
-  it sends, so a thread parked on a full downstream inbox is backpressure, never a stall.
+  each `Event.new` that constructs an event, and each event taken from a returned table.
+  The thread marks itself idle before it sends, so a thread parked on a full downstream inbox is
+  backpressure, never a stall.
 - **Stall.** Busy with the value unchanged for `stall_after` (10 s) sets the node to
   `NodeState::Stalled` and logs `script_stalled`; `/readyz` reads `503 stalled` until the next
   change sets `Running` again. The phase never moves, so a stall recovers on its own.
@@ -487,7 +488,8 @@ That watcher task also bounds a script that never returns
 There is no wall-clock bound on the drain as a whole. A slow `flush()` that keeps producing events
 is progress however long it takes, and graces don't add up along a chain of Lua nodes, because
 each wedge is judged on its own node's heartbeat. The cost: a script looping over `Event.new`
-forever is progress too, and is never stalled or wedged.
+forever, constructing events, is progress too, and is never stalled or wedged; a loop of
+refused calls is not progress.
 
 Everything else runs as an ordinary tokio task: listeners, sinks, native `Send` transforms
 (`logit-transforms::Aggregator` and every other native transform in that crate), and **native

@@ -491,8 +491,9 @@ for its `stall_after` (10 s), so a stall also counts
 It reports `script_resumed` through `Diagnostics::info` when progress returns, which counts
 nothing. The node's `/readyz` state (`stalled`) is the durable signal; the diagnostic is the
 alert. A node wedged at shutdown fails the run with an error naming it, not a diagnostic key.
-A script looping over `Event.new` forever advances the heartbeat and is never stalled or
-wedged: telling it from a large `flush()` would take a time limit, which the ADR declines.
+A script looping over `Event.new` forever, constructing events, advances the heartbeat and is
+never stalled or wedged (a loop of refused calls does not advance it): telling it from a large
+`flush()` would take a time limit, which the ADR declines.
 Events it produced after its channels were revoked count as
 `events.dropped{reason="closed_consumer"}` under its own id, and the batches still waiting in its
 inbox, which it never read, count as `batches.dropped`/`events.dropped{reason="shutdown"}` under

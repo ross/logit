@@ -26,10 +26,19 @@
 //!   `timestamp`, `log.message`, a metric's `name`/`kind` and its kind's payload, and a span's
 //!   `trace_id`/`span_id`/`name` are required, as the ADR lists.
 //!
-//! Every error is an `mlua::Error::RuntimeError` prefixed `Event.new: <path> ...` down to the
+//! Every refusal is an `mlua::Error::RuntimeError` prefixed `Event.new: <path> ...` down to the
 //! field. A malformed value inside a nested attribute table, including one nested past
 //! `crate::value::MAX_TABLE_DEPTH`, converts through the proxy write path's `lua_to_value` and
 //! reports `Event.new: <path>: ` followed by that helper's message.
+//!
+//! A refusal reaches the script as a plain string that a Lua shim raises with `error(msg, 2)`,
+//! never as an `Err` from the Rust callback. mlua 0.9.9 builds a traceback for every callback
+//! `Err`, and mlua-sys 0.6.8's compat53 `luaL_traceback` searches every global table for the name
+//! of an anonymous C frame, such as `Event.new` under `pcall`. That search costs time in
+//! proportion to the script's global state on every refusal a `pcall` catches. A direct call's
+//! error reads `script:<line>: Event.new: ...`; under `pcall(Event.new, t)` it's the bare message.
+//! Any other `mlua::Error` (an allocation failure, a failing collection) stays an `Err` on mlua's
+//! path. `docs/adr/lua-refusals-raised-from-lua.md` has the decision.
 //!
 //! `metrics` builds the four raw kinds (`sum`, `gauge`, `samples`, `set_members`) and the three
 //! pre-aggregated ones (`histogram`, `exponential_histogram`, `summary`), exemplars included; the
@@ -49,7 +58,7 @@ use logit_core::{
     MetricList, MetricRecord, Samples, Severity, SpanEvent, SpanExt, SpanKind, SpanLink,
     SpanRecord, SpanStatus, Sum, Summary, Temporality, Value,
 };
-use mlua::{Lua, Table, Value as LuaValue};
+use mlua::{IntoLua, Lua, Table, Value as LuaValue};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -136,11 +145,15 @@ const CONSTRUCTIBLE_KINDS: &str =
 /// `process()`/`flush()`, and against the empty list at script top level, which runs before
 /// `ScriptWorker::with_targets` can.
 ///
-/// `heartbeat` is the worker's `ScriptWorker::heartbeat` cell, read the same way: each call ticks
-/// it, so a `flush()` constructing many events reads as progress to the runtime's stall watcher.
+/// `heartbeat` is the worker's `ScriptWorker::heartbeat` cell, read the same way: each call that
+/// constructs an event ticks it, so a `flush()` constructing many events reads as progress to the
+/// runtime's stall watcher. A refused call is not progress, so a loop of refusals doesn't.
 ///
 /// `memory` is the worker's `max_memory` state, checked on every call before anything is built
 /// (`crate::memory` has the invariant).
+///
+/// `Event.new` is [`SHIM`] wrapped around the Rust constructor, which returns a refusal as a
+/// [`Constructed::Refused`] string for the shim to raise (the module doc says why).
 pub(crate) fn install(
     lua: &Lua,
     targets: Rc<RefCell<Rc<TargetTable>>>,
@@ -148,24 +161,63 @@ pub(crate) fn install(
     memory: Rc<MemoryCap>,
 ) -> mlua::Result<()> {
     let table = lua.create_table()?;
-    let new = lua.create_function(move |lua, arg: LuaValue| {
-        if let Some(heartbeat) = heartbeat.borrow().as_ref() {
-            heartbeat.tick();
+    let inner = lua.create_function(move |lua, arg: LuaValue| {
+        let constructed = (|| {
+            memory.check(lua)?;
+            let LuaValue::Table(t) = arg else {
+                return Err(runtime_error(format!(
+                    "Event.new(t) takes a table, got {}",
+                    arg.type_name()
+                )));
+            };
+            // An `Rc` bump, not an allocation, released before `event_from_table` so a
+            // constructor error can't leave the cell borrowed.
+            let targets = targets.borrow().clone();
+            event_from_table(t).map(|event| EventProxy::with_targets(event, targets))
+        })();
+        match constructed {
+            Ok(proxy) => {
+                if let Some(heartbeat) = heartbeat.borrow().as_ref() {
+                    heartbeat.tick();
+                }
+                Ok(Constructed::Event(proxy))
+            }
+            Err(mlua::Error::RuntimeError(message)) => Ok(Constructed::Refused(message)),
+            Err(other) => Err(other),
         }
-        memory.check(lua)?;
-        let LuaValue::Table(t) = arg else {
-            return Err(runtime_error(format!(
-                "Event.new(t) takes a table, got {}",
-                arg.type_name()
-            )));
-        };
-        // An `Rc` bump, not an allocation, released before `event_from_table` so a constructor
-        // error can't leave the cell borrowed.
-        let targets = targets.borrow().clone();
-        event_from_table(t).map(|event| EventProxy::with_targets(event, targets))
     })?;
+    let new: mlua::Function = lua.load(SHIM).set_name("=Event.new").call(inner)?;
     table.set("new", new)?;
     lua.globals().set("Event", table)
+}
+
+/// The Lua side of `Event.new`, called once with the Rust constructor and returning the function
+/// scripts call. `error(e, 2)` blames the script's calling line, or adds no position when the
+/// caller is a C function such as `pcall`, and builds no traceback. `type` and `error` are
+/// upvalues so a script that reassigns either global can't change what a refusal does.
+const SHIM: &str = r#"
+local inner, type, error = ..., type, error
+return function(t)
+    local e = inner(t)
+    if type(e) == "string" then error(e, 2) end
+    return e
+end
+"#;
+
+/// What the Rust constructor returns to [`SHIM`]: the event, or a refusal's message for the shim
+/// to raise.
+enum Constructed {
+    Event(EventProxy),
+    Refused(String),
+}
+
+impl<'lua> IntoLua<'lua> for Constructed {
+    fn into_lua(self, lua: &'lua Lua) -> mlua::Result<LuaValue<'lua>> {
+        match self {
+            Constructed::Event(proxy) => proxy.into_lua(lua),
+            Constructed::Refused(message) => lua.create_string(&message).map(LuaValue::String),
+        }
+    }
 }
 
 /// Builds an [`Event`] from a table in `to_table()`'s top-level shape. See the module doc for
@@ -1383,6 +1435,47 @@ mod tests {
     fn new_err(args: &str) -> String {
         let w = worker(&format!("function process(event) return Event.new{args} end"));
         process_err(&w, Event::empty(0, AttrMap::new()))
+    }
+
+    #[test]
+    fn a_pcall_caught_refusal_is_the_bare_message_with_no_traceback() {
+        let w = worker("function process(event) return event end");
+        let (kind, message): (String, String) =
+            w.lua.load(r#"local ok, e = pcall(Event.new, {}) return type(e), e"#).eval().unwrap();
+        assert_eq!(kind, "string");
+        assert_eq!(message, "Event.new: timestamp is required");
+    }
+
+    #[test]
+    fn a_direct_call_refusal_names_the_calling_line() {
+        let w = worker("function process(event) return event end");
+        let message: String = w
+            .lua
+            .load("local ok, e = pcall(function()\n local e = Event.new{} return e end) return e")
+            .set_name("=probe")
+            .eval()
+            .unwrap();
+        assert_eq!(message, "probe:2: Event.new: timestamp is required");
+
+        // A tail call replaces the calling frame, so there's no line left to name.
+        let message: String = w
+            .lua
+            .load("local ok, e = pcall(function()\n return Event.new{} end) return e")
+            .eval()
+            .unwrap();
+        assert_eq!(message, "Event.new: timestamp is required");
+    }
+
+    #[test]
+    fn a_refusal_survives_a_script_reassigning_type_and_error() {
+        let w = worker("function process(event) return event end");
+        let (ok, message): (bool, String) = w
+            .lua
+            .load(r#"type = nil error = nil local ok, e = pcall(Event.new, {}) return ok, e"#)
+            .eval()
+            .unwrap();
+        assert!(!ok);
+        assert_eq!(message, "Event.new: timestamp is required");
     }
 
     // -- fixtures -----------------------------------------------------------------------------
