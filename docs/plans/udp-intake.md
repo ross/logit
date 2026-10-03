@@ -1,6 +1,6 @@
 ---
 created: 2026-09-18
-updated: 2026-09-18
+updated: 2026-10-02
 ---
 
 # Enabling plan: UDP intake batching and socket visibility
@@ -233,13 +233,13 @@ does not reproduce), closing that item outright.
 
 **Residual debt**, tracked in `docs/known-gaps.md` unless noted otherwise:
 
-- **A per-binary capacity metric.** The VM session calibrated its offered-load knee on `udp/w2`
-  only and ran w3/w4 at that same load; bisecting the highest loss-free offered rate separately for
-  each binary is the honest headline for syscall-bound traffic and was not done.
-- **Confirm the THP explanation for the `read_batch`-sweep RSS rise.** The VM (THP `always`) showed
-  peak RSS rising at `read_batch` 128/256, fitting a "whole huge page faulted in" hypothesis
-  (`docs/design/performance.md` §7); this wants a repeat with THP forced to `madvise`/`never` on the
-  same box to confirm.
+- ~~**A per-binary capacity metric.**~~ **Closed 2026-09-20.** The VM session bisected the highest
+  loss-free offered rate separately for each binary, and `docs/design/performance.md` §7's
+  per-binary capacity table is the result (`udp/w4` sustains 1.992× the shipped `udp-statsd-small`
+  rate against `udp/w2`'s 0.480×).
+- ~~**Confirm the THP explanation for the `read_batch`-sweep RSS rise.**~~ **Closed 2026-09-20.**
+  The same box and binary, with THP forced to `madvise`, kept peak RSS flat at 14.4–16.8 MiB across
+  the whole `read_batch` range (`docs/design/performance.md` §7's `madvise` sweep).
 - **The wakeup-cost hypothesis for small datagrams on VMs.** `udp-statsd-small`'s higher per-event
   CPU at half scale than at the knee is consistent with a fixed per-wakeup cost a virtualized guest
   pays disproportionately for at low arrival rates, but this is a hypothesis, not a measurement of

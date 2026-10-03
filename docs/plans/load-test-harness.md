@@ -78,10 +78,11 @@ Lua a scenario needs — validated the same way every other example config is.
 | `aggregate-groups` | `generate_in` (one gauge per event, a fresh resource per batch of 100 cycling 1000 distinct resources) → `aggregate` (1s window) → `null_out` | `group_for`'s lookup across 1000 `(resource, scope)` groups, read against `aggregate` | 5M | ~3.62M/s |
 | `lua` | `generate_in` → `lua` (inline enrichment script) → `null_out` | The Lua hop and its event proxy | 4M | ~0.60M/s |
 | `fanout` | `passthrough`'s `generate_in` (same 6 attributes) → 3 × `null_out` | `Arc`-based fan-out to multiple sinks, read against `passthrough` | 25M | ~2.59M/s |
-| `native-relay` | `generate_in` → `logit_out` → `logit_in` → `null_out` (one graph, one process) | Native encode + decode + ack round trip (one `Ack` per run of frames) | 7M | ~0.88M/s |
-| `native-relay-window1` | `native-relay` with `window: 1` on `logit_out` | The same round trip with one frame in flight, read against `native-relay`'s default window | 7M | pending VM measurement |
+| `native-relay` | `generate_in` → `logit_out` → `logit_in` → `null_out` (one graph, one process) | Native encode + decode + ack round trip (one `Ack` per run of frames) | 7M | ~2.39M/s (`performance.md` §1) |
+| `native-relay-window1` | `native-relay` with `window: 1` on `logit_out` | The same round trip with one frame in flight, read against `native-relay`'s default window | 7M | ~1.20M/s (`performance.md` §1) |
 | `encode-human-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: human`) | The human-readable encoder in situ | 8M | ~1.23M/s |
 | `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: native`) | The native encoder in situ | 10M | ~1.41M/s |
+| `encode-json-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: json`) | The JSON-lines encoder in situ | 8M | ~1.60M/s (`performance.md` §1) |
 | `buffered` | `passthrough`'s graph with `buffer: { disk: ... }` on the sink | Disk-backed sink-buffer spool cost | 1.2M | ~0.71M/s (median; see note) |
 | `buffered-small-segments` | `buffered` with `segment_bytes: 1MiB` | Segment-roll cost (a durable cursor persist and an unlink per roll, ~70 per run), read against `buffered` | 1.2M | ~0.65M/s (`main` and `dur/w8` alike; `performance.md` §3) |
 | `route` | `passthrough`'s `generate_in` → `route` (by `host`) → 3 × `target` → 3 × `null_out`, plus an unrouted `null_out` | The router hop and `target` delivery, read against `passthrough` | 25M | ~3.15M/s |
@@ -90,10 +91,10 @@ Lua a scenario needs — validated the same way every other example config is.
 | `json-parse-app-log` | `generate_in` (`fixtures::FLAT_JSON_LOG_BODY` + `tail_in`'s `log.file.path`) → `json` → `null_out` | The parse at the commonest *measured* log width, 12 attributes (`docs/design/data-shapes.md` §5.3), read against `json-parse` | 9M | ~1.00M/s |
 | `json-parse-nested-log` | `generate_in` (`fixtures::PINO_HTTP_LOG_BODY` + the same path attribute) → `json` → `null_out` | The same parse on a *nested* record: 10 attributes but four boxed `Value::Map`s | 4.5M | ~0.55M/s |
 | `json-parse-access-log` | `generate_in` (`fixtures::POSTGRES_JSONLOG_BODY` + the same path attribute) → `json` → `null_out` | The widest, highest-rate log class, 30 attributes — the only shipped scenario whose `AttrMap` reallocs | 3M | ~0.37M/s |
-| `tail` | a file `logit-perf` writes first → `tail_in` (`read_from: beginning`) → `null_out` | `tail_in`'s read, line split, and per-line event, with nothing parsed | 12M lines | pending VM measurement |
-| `tail-rotate` | `tail`, with the file hard-linked aside and a replacement renamed onto its path once half of it is delivered | The rotation path on top of `tail`: the rescan, the replacement's open, the old file's drain and reap | 5M lines | pending VM measurement |
+| `tail` | a file `logit-perf` writes first → `tail_in` (`read_from: beginning`) → `null_out` | `tail_in`'s read, line split, and per-line event, with nothing parsed | 12M lines | ~2.08M/s at 5M lines (`performance.md` §1) |
+| `tail-rotate` | `tail`, with the file hard-linked aside and a replacement renamed onto its path once half of it is delivered | The rotation path on top of `tail`: the rescan, the replacement's open, the old file's drain and reap | 5M lines | ~0.73M/s (`performance.md` §1) |
 
-The last three rows are [`docs/plans/event-sizing.md`](event-sizing.md)'s W1 (2026-09-21): three
+The three `json-parse-*-log` rows are [`docs/plans/event-sizing.md`](event-sizing.md)'s W1 (2026-09-21): three
 widths of the same `json` parse, so a sizing arm can be read against the bimodal log population
 `docs/design/data-shapes.md` §6 describes rather than against one shape. Their counts were first
 estimates scaled off `json-parse`'s by key count. **They have since been run** — the event-sizing
@@ -242,3 +243,8 @@ through the UDP kind's telemetry leg, reaches the line count
 spec format and the exact self-check are in `perf/load/README.md`'s "File scenarios". They exist
 first to measure the tail read path's allocation follow-up (TAIL-03 in
 [`critical-sections-inventory.md`](critical-sections-inventory.md)).
+
+The first VM run (2026-10-02) measured that follow-up: CPU µs/event fell 38.7% on `tail` and 37.3%
+on `tail-rotate` ([`docs/design/performance.md`](../design/performance.md) §1). At 5M lines `tail`
+ran 2.4–4.0 s of wall, under this plan's 5–10 s target, so the scenario now ships at 12M lines;
+`tail-rotate` was inside the target at 5M and keeps it. The VM run measured the 5M-line `tail`.

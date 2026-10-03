@@ -180,8 +180,8 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-inputs/src/logit.rs`,
 - [x] Sweep every comment line the stream added for the banned words.
 - [x] `script/cibuild` at the stack's tip, from a private `CARGO_TARGET_DIR`.
 - [x] Measurements in "Findings" below: loopback `native-relay` at `window: 1` and `window: 32`
-  before and after, and a container `netem` run at 10 ms RTT, as the send-window plan did. The
-  perf VM run is owed and batched with the pending re-baseline.
+  before and after, and a container `netem` run at 10 ms RTT, as the send-window plan did, then
+  the same on the perf VM ("W4: the perf VM re-run").
 
 ## Verification
 
@@ -245,6 +245,41 @@ two passes of `--repeat 2 --settle 2s` per arm, alternating, medians of the four
 - This run measures a steady stream under latency, not the resume's WAN benefit, which shows only
   after a fault mid-window.
 
-**Owed:** `native-relay` and `native-relay-window1` on the perf VM, before and after, with the
-pending re-baseline (`docs/design/performance.md`), and a `netem` run there at window 32 to settle
-whether the latency gap above is real.
+### W4: the perf VM re-run (2026-10-02)
+
+The VM numbers replace the laptop's for every question below. They ran on `Standard_F8as_v6`
+([`docs/design/performance.md`](../design/performance.md)'s preamble has the box facts) against
+`efd50c1e` (C-, the `main` this plan's laptop run used) and `d1521c5f` (M, with the named acks).
+The tables are in `performance.md` §1, "`native-relay` under a 10 ms round trip, and the
+coalescing sweep", and its native-relay ladder. This section records what they settle.
+
+- **Loopback, window 32.** M costs 0.858 µs/event against C-'s 0.958 (−10.4%), and runs 2,472,575
+  events/s against 1,996,994, pooled over six repeats (twelve for M). That confirms the ADR's
+  reading that the per-frame write and flush at `logit_in` bounded `native-relay`. The laptop's
+  1.14× at flat CPU per event became a CPU saving here.
+- **Loopback, window 1.** There's nothing to coalesce, and M reads +2.3% against C- (1.150 →
+  1.177 µs/event; 1,259,807 → 1,205,667 events/s), with non-overlapping repeats (1.148–1.155
+  against 1.172–1.183). It's under the 5% gate and unexplained, so it stays a note.
+- **Peak RSS at window 32.** The laptop's ~10% rise doesn't hold: pooled medians are 369.1 MiB at
+  C- and 287.7 MiB at M. RSS at this scenario is allocator retention and swings by tens of MiB
+  between runs (`performance.md` §1, "Peak RSS").
+- **Latency, window 32, 10 ms RTT (`netem`).** The gap holds and is smaller than the laptop's: C-
+  reaches 99.5% of the 3,174 batches/s ceiling, M 97.2%, and every M repeat (307,571–311,090
+  events/s) is below every C- repeat (315,938–316,017), over 8 repeats each. M costs 12.8% less CPU
+  per event (0.850 against 0.975).
+- **The coalescing ratio explains the gap, and the cap isn't the cause.** M sends one `Ack` per
+  2.54 frames on loopback and 4.07 under latency, far below the cap of 32. Smaller caps behave the
+  way that predicts: with `ACK_COALESCE_MAX` at 8 and 16, the ratio is 3.10 and 3.74 on loopback and
+  3.28 and 4.05 under latency; the share of the ceiling is 98.5% and 97.6% (M: 97.2%); and on
+  loopback the variants are inside M's own 12-repeat range (0.868 and 0.838 µs/event against M's
+  0.858, range 0.823–0.882). A cap of 8 recovers 1.3 points of the 2.3, outside M's repeat range
+  (its four repeats, 312,220–312,645 events/s, all sit above M's highest, 311,090), and gives up
+  nothing measurable on loopback; a cap of 16's +0.4 is inside that range. With the whole gap about
+  2 points, that isn't worth a change. The suspected cause is burst handling before the coalesced
+  `Ack`: a full window's burst of frames arrives together and is acked once, after its last frame,
+  which adds the burst's handling time to the round trip. The cap can't cut a burst of about four
+  frames short.
+
+**Conclusion.** The latency gap is real, about 2 points of the ceiling at 10 ms RTT.
+`ACK_COALESCE_MAX` (32) doesn't bind, and the whole gap is small, so the constant stays. The gap is tracked in [`docs/known-gaps.md`](../known-gaps.md) with the
+variant numbers.

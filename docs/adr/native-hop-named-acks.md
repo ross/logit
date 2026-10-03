@@ -241,5 +241,8 @@ code accounts for it.
   doc and the `ack_write_stalled` reasoning in `docs/known-gaps.md` carry the new arithmetic.
 - **Known gaps.** A new residual: `Hello.senders` is capped at 16 identities, so a window
   spanning more than 16 store opens resends the rest.
-- **Measurement owed.** `native-relay` on the perf VM before and after, at `window: 1` and
-  `window: 32`, to confirm the per-frame flush was the ack-bound cost.
+- **Measurement.** The perf VM confirmed the per-frame flush was the ack-bound cost: at
+  `window: 32`, `native-relay` costs 0.858 µs/event after against 0.958 before, and at `window: 1`
+  it reads +2.3% (1.150 → 1.177), under the 5% gate. Under a 10 ms round trip, coalescing costs
+  about 2 points of the ceiling (97.2% against 99.5%), and `ACK_COALESCE_MAX` isn't the cause
+  (`docs/design/performance.md` §1; the plan's "Findings" section).

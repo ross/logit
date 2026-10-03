@@ -1,6 +1,6 @@
 ---
 created: 2026-09-28
-updated: 2026-09-28
+updated: 2026-10-02
 ---
 
 # `stdio_out`/`file_out`'s human render: an exhaustive, sectioned block per event
@@ -94,8 +94,10 @@ canonical grammar; the decisions it follows:
 - `logit_config::MessageMode` and a `message:` field on `StdioOut`/`FileOut`; graph rule 72;
   `schema/logit.schema.json` regenerated.
 - `crates/logit-bench/tests/allocations.rs`'s `stdio_encode_100_events` pin and
-  `docs/design/memory.md`'s row move to the new count. The VM-measured wall-clock row predates
-  this render and is refreshed at the next perf-VM session.
+  `docs/design/memory.md`'s row move to the new count. The perf VM measured the render on
+  2026-10-02: `encode-human-devnull` costs 1.025 µs/event with the block render against 1.039
+  before it, and `docs/design/memory.md` §2's `stdio_out` timing row is +5.3% against 2026-09-20
+  (`docs/design/performance.md` §1).
 - Batch provenance (`origin`/`previous`) is the one thing the render does not show: it reaches a
   sink through `Output::observe_batch`, which `StreamOutput` doesn't implement, and
   [`batch-provenance-on-delivered`](batch-provenance-on-delivered.md) keeps it off the event.

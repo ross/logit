@@ -20,6 +20,8 @@ serde.workspace = true
 serde_json.workspace = true
 # The checkpoint's head fingerprint (docs/adr/tail-discovery-failure-and-resume-identity.md).
 twox-hash.workspace = true
+# The tail line splitter's newline search.
+memchr.workspace = true
 # otlp_in's HTTP/1.1+h2c and hand-rolled gRPC-over-HTTP/2 servers
 # (docs/adr/hand-rolled-grpc-over-hyper.md).
 hyper.workspace = true
