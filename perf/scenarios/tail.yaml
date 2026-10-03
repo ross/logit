@@ -6,7 +6,8 @@
 #   script/perf run --scenario tail --repeat 5 --pin-child 2,3
 #
 # The path resolves against this file's directory, so the file lands in the gitignored
-# perf/results/. The harness clears that directory before every spawn and removes it after.
+# perf/results/. The harness clears that directory before every spawn and removes it after. The
+# spec writes 12M lines, ~3.5 GiB per repeat, and a repeat needs twice that free on this disk.
 #
 # Still an ordinary `logit` config: `logit run perf/scenarios/tail.yaml` tails whatever is there,
 # which is what `script/validate` and the shipped-config test need.

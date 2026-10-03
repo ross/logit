@@ -181,8 +181,9 @@ capture. Read its numbers differently from every other scenario's:
 `tail` and `tail-rotate` (added 2026-10-02) measure `tail_in`'s read path: read, split, one raw
 event per line, batch, deliver to `null_out`. Like the UDP family they have no `generate_in`.
 `logit-perf` writes the tailed file before the spawn, from a slog-style JSON app-log model in
-[`perf/load/`](../../perf/load/README.md) (5M lines of 273–330 bytes, ~1.5 GiB), and `tail_in`
-reads it from its first byte. `tail-rotate` splits the same lines across a file and its
+[`perf/load/`](../../perf/load/README.md) (lines of 273–330 bytes: 12M, ~3.5 GiB, for `tail`;
+5M, ~1.5 GiB, for `tail-rotate`), and `tail_in` reads it from its first byte. A repeat needs
+twice its file size free on the disk under `perf/results/`. `tail-rotate` splits the same lines across a file and its
 replacement, and moves the old file aside and the replacement onto its path once the sink has
 half of the first file. Read their numbers this way:
 
@@ -260,7 +261,8 @@ Each cell is the median of six pooled repeats. The block render didn't slow the 
 
 ### `tail_in`: before and after the read-path fix
 
-`tail` and `tail-rotate` run 5,000,000 lines of 314 B on average (1,503.2 MiB) per repeat. "Before"
+These rows were measured at 5,000,000 lines of 314 B on average (1,503.2 MiB) per repeat for
+both scenarios; `tail` now ships at 12M lines (§0), so a rerun of it takes longer. "Before"
 is M's own binary (sha256 `bfb9e359…`, built from the scenario branch `38997c80`, which changes
 only the harness). "After" is `34bf7ec6` (sha256 `65633d93814e…`), which reuses one read buffer per
 `Tailer`, splits lines with `memchr`, and keeps its per-pass `Vec`s. Two passes of five repeats
@@ -274,8 +276,8 @@ each, with the before/after order reversed on the second pass, pool into 10 repe
 | `tail-rotate` | after | 733,974 | 0.510 (0.508 – 0.513) | 64.2 MiB | 6.81 – 7.01 s |
 
 CPU µs/event falls 38.7% on `tail` and 37.3% on `tail-rotate`, and the ranges don't overlap. Peak
-RSS is flat. `tail`'s wall time, 2.4–4.0 s, is under the 5–10 s target at 5M lines, so its line
-count is being raised; `tail-rotate` is inside the target. The `tail*` self-checks held on every
+RSS is flat. `tail`'s wall time, 2.4–4.0 s, was under the 5–10 s target at 5M lines, which is why
+its count was raised to 12M; `tail-rotate` is inside the target. The `tail*` self-checks held on every
 repeat: each run read all 5,000,000 lines, and the harness counted them through the telemetry leg
 ([§0](#file-scenarios-tail-ends-on-a-delivered-count-not-a-log-line)). These files carry an empty
 `box_state`, as the preamble says.
