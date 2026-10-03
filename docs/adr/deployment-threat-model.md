@@ -17,8 +17,8 @@ listeners are never exposed to an untrusted network.
 
 How far a decoder or listener should defend itself has been decided case by case until now:
 
-- `docs/known-gaps.md`'s interner entry accepts a never-evicting interner on the premise that
-  listeners are private, and cited no decision for that premise.
+- `docs/known-gaps/runtime.md`'s interner entry accepts a never-evicting interner on the premise
+  that listeners are private, and cited no decision for that premise.
 - [ADR `otlp-compression-and-decompression-bounds`](otlp-compression-and-decompression-bounds.md)
   caps a decompressed body at the compressed-body limit, the "compression bomb" case, without
   saying whose bomb it defends against.
@@ -36,7 +36,7 @@ Each time, the same question came up in a different form. This ADR answers it on
 - **Crafted input is defended only when the defense is free.** A problem that only crafted input
   can trigger is defended when the defense is a branch, a counter, or a timeout wrapper, with no
   hot-path or complexity cost. Otherwise it is recorded as a documented non-goal in
-  `docs/known-gaps.md`, citing this ADR.
+  `docs/known-gaps/`, citing this ADR.
 - **The operator owns the trust boundary.** Network policy, TLS with client certificates, and a
   proxy in front of a listener are the operator's tools for keeping untrusted peers out, not
   `logit`'s. [`docs/deploying.md`](../deploying.md) says so.
@@ -56,6 +56,6 @@ Each time, the same question came up in a different form. This ADR answers it on
 - A reviewer asks two questions of a proposed bound: can accidental data reach this, and is the
   defense free? A yes to the first means the bound is required. A no to the first and a no to the
   second means a known-gaps entry instead of code.
-- Every non-goal in `docs/known-gaps.md` that rests on this premise cites this ADR, so the revisit
+- Every non-goal in `docs/known-gaps/` that rests on this premise cites this ADR, so the revisit
   trigger can find them all.
 - `docs/deploying.md` tells operators to keep listeners behind their own trust boundary.

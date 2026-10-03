@@ -4,9 +4,9 @@
 //! (`docs/adr/disk-backed-sink-buffer.md`), and `DiskQueue::open` reads and CRC-walks the whole
 //! active segment on every startup, whether or not anything is left to replay. Left alone across
 //! repeats or `script/perf` invocations, the spool only grows, and each run re-validates a larger
-//! file than the last: a monotonic throughput collapse (`docs/known-gaps.md`'s `buffered` entry,
-//! `docs/design/performance.md`). Clearing it before every spawn removes the accumulation; the
-//! per-startup scan itself is still `DiskQueue::open`'s cost and open work.
+//! file than the last: a monotonic throughput collapse (`docs/known-gaps/telemetry.md`'s
+//! `DiskQueue::open` entry, `docs/design/performance.md`). Clearing it before every spawn removes
+//! the accumulation; the per-startup scan itself is still `DiskQueue::open`'s cost and open work.
 //!
 //! **Never removes anything outside `<repo root>/perf/results/`.** A scenario's `buffer.disk.path`
 //! resolves against the scenario file's directory, as `logit` resolves it

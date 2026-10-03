@@ -158,7 +158,7 @@ const ENVELOPE_SLACK_BYTES: usize = 64 * 1024;
 /// plus [`ENVELOPE_SLACK_BYTES`].
 ///
 /// The canonical copy of these numbers: `docs/adr/file-tailing-and-docker-json-logs.md`'s
-/// 2026-09-28 amendment and `docs/known-gaps.md` state the property and point here.
+/// 2026-09-28 amendment and `docs/known-gaps/tailing.md` state the property and point here.
 pub(crate) const fn envelope_cap(max_line_bytes: usize) -> usize {
     let m = if max_line_bytes > DOCKERD_FRAGMENT_BYTES {
         max_line_bytes
@@ -2192,9 +2192,9 @@ mod tests {
 
     /// A json-file line the splitter drops as over `envelope_cap`, read after a held fragment,
     /// never reaches the decoder, and the checkpoint still stops at the fragment's start. It pins
-    /// the gap in `docs/known-gaps.md`'s "An envelope over the cap is dropped by the splitter"
-    /// entry: a splitter-dropped envelope is invisible to the decoder, so the held fragment and
-    /// the next closing entry are joined across it.
+    /// the gap in `docs/known-gaps/tailing.md`'s "An envelope over the cap is dropped by the
+    /// splitter" entry: a splitter-dropped envelope is invisible to the decoder, so the held
+    /// fragment and the next closing entry are joined across it.
     #[tokio::test]
     async fn an_oversized_line_dropped_after_a_held_fragment_keeps_the_checkpoint_at_the_fragment_start(
     ) {
@@ -2725,7 +2725,8 @@ mod tests {
 
     /// An entry is matched as a name and, when it's at least 12 hex characters, as an id prefix
     /// too, so a container *named* like a hex string also selects any container whose id starts
-    /// with it (`docs/known-gaps.md`). The prefix match is case-sensitive, as ids are lowercase.
+    /// with it (`docs/known-gaps/tailing.md`). The prefix match is case-sensitive, as ids are
+    /// lowercase.
     #[test]
     fn a_hex_container_name_of_twelve_chars_matches_as_an_id_prefix() {
         let id = format!("abcdef012345{}", "0".repeat(52));

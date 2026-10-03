@@ -72,7 +72,8 @@
 //! reaches `logit_in`'s consumers twice after a `logit_in` restart (the marks are in memory), for a
 //! sender evicted from `logit_in`'s table, behind a load balancer that sends the resend to another
 //! `logit_in`, and when a connection that ended mid-window still holds the first copy as the resend
-//! arrives (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds").
+//! arrives (`docs/known-gaps/native-hop.md`, "A resend can race the frames an ended connection
+//! still holds").
 //!
 //! **Resume** (`docs/adr/native-hop-named-acks.md`, decision 4). A connection dropped by a failed
 //! ack wait leaves the distinct identities of its in-flight list, the frames the retried round

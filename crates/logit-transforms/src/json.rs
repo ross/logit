@@ -127,7 +127,8 @@ impl Transform for JsonParser {
         // Only a failed parse of invalid UTF-8 is copied and retried, and the retry lives in a
         // `#[cold]` helper so this function keeps one parse call site: a second one here stops
         // LLVM inlining `parse_object` into `process`, which costs `json-parse-x3` about 10%
-        // (`docs/known-gaps.md`'s "HTTP access logs" section).
+        // (`docs/known-gaps/transforms.md`'s "HTTP access
+        // logs" section).
         let parsed = match self.parse(&body) {
             Err(_)
                 if self.invalid_utf8 == InvalidUtf8::Replace

@@ -280,7 +280,7 @@ provide → what `http_access` derives → bounding cardinality (`routes`, `rout
 `max_length`, `keep_values`) → the `kv_metrics` + `keep` block for `http.server.request.duration`
 → cutover (two `access_log` lines side by side; watch `routed{outcome="none"}` fall) → what it
 does not do. Pointers: `docs/deploying.md`'s nginx recipe, `docs/design/data-model.md`'s
-well-known table, `docs/design/internal-telemetry.md`, `docs/known-gaps.md` (the gaps the ADR
+well-known table, `docs/design/internal-telemetry.md`, `docs/known-gaps/` (the gaps the ADR
 lists, plus the corrected `$uri`/invalid-UTF-8 entry and a narrowing of the `$host` entry),
 `AGENTS.md`, `README.md`.
 

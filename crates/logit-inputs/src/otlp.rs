@@ -140,7 +140,7 @@
 //! [ADR `otlp-json-decoding`](../../../../docs/adr/otlp-json-decoding.md) covers the JSON dialect
 //! (hex vs. base64 ids, string-or-number 64-bit fields, and why it's hand-parsed rather than
 //! generated). Every error response, on both encodings, is `text/plain`, where the spec wants a
-//! protobuf-encoded `Status`; tracked in `docs/known-gaps.md`.
+//! protobuf-encoded `Status`; tracked in `docs/known-gaps/otlp.md`.
 //!
 //! **Size and concurrency limits.** [`MAX_REQUEST_BYTES`] (4 MiB) matches the OTel collector's
 //! default `max_recv_msg_size`; a larger request is rejected (`413`/`grpc-status: 8`,
@@ -155,7 +155,7 @@
 //! `logit.input.metrics.skipped{metric_kind, reason}` telemetry, `logit-proto`'s `otlp::metrics`
 //! module doc), so there is nothing to echo. A malformed request (bad protobuf, an out-of-range
 //! span id) fails whole (`400`/`grpc-status: 3`). Threading a count through is a `SignalDecoder`
-//! API change, tracked in `docs/known-gaps.md`.
+//! API change, tracked in `docs/known-gaps/otlp.md`.
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, drive_with_idle, Activity, BodyReadError,
@@ -236,7 +236,7 @@ pub struct OtlpInput {
     /// per node, several times the source bytes for a nested OTLP payload, where
     /// `prost::Message::decode` builds the target structs directly. The bound still holds (a JSON
     /// body is capped at `MAX_REQUEST_BYTES` before parsing), so the all-JSON worst case is a
-    /// finite multiple of it; `docs/known-gaps.md`'s OTLP section has the measured multiple.
+    /// finite multiple of it; `docs/known-gaps/otlp.md`'s OTLP section has the measured multiple.
     max_connections: usize,
 }
 
@@ -874,7 +874,7 @@ fn export_response(rejected: i64, error_message: &str) -> Vec<u8> {
 /// The OTLP/JSON mirror of [`export_response`], with `rejected` always `0`. Proto3 JSON omits an
 /// unset message field, so the all-default response is `{}`, **not** an empty body:
 /// `opentelemetry-js`'s HTTP exporter parses the success body for `partialSuccess`, and
-/// `JSON.parse("")` throws. A real reject count (`docs/known-gaps.md`) would render as
+/// `JSON.parse("")` throws. A real reject count (`docs/known-gaps/otlp.md`) would render as
 /// `rejectedSpans`/`rejectedLogRecords`/`rejectedDataPoints`: the JSON key differs per
 /// [`Signal`], where the protobuf field shares one tag number across all three
 /// `Export*ServiceResponse` messages.

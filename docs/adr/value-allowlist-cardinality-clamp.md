@@ -35,7 +35,7 @@ into the header makes it effectively unbounded. That value lands directly in `ag
 `SeriesKey` (`crates/logit-transforms/src/aggregate.rs`, keyed on the whole of `event.attributes`),
 so it explodes both series count and per-window memory, and then lands again as an InfluxDB tag —
 the same fan-out `keep`'s own module doc warns about, one level further in.
-[`docs/known-gaps.md`](../known-gaps.md) records the *truncation* risk from an oversized `Host`; the
+[`docs/known-gaps/transforms.md`](../known-gaps/transforms.md#http-access-logs-nginx-haproxy-and-http_access) records the *truncation* risk from an oversized `Host`; the
 cardinality risk from a merely-junk one was never recorded anywhere.
 
 This generalizes past `Host` headers: any tag whose valid set the operator knows but the producer
@@ -202,7 +202,7 @@ meaning no normalization.
   `scale`'s ADR already states about its own in-place rewrite.
 - `fixtures/nginx-to-influxdb.yaml` gains a `bounded: keep_values` component between `trimmed`
   (`keep`) and `windowed` (`aggregate`), closing the unbounded-`host` gap
-  [`docs/known-gaps.md`](../known-gaps.md) already flags the truncation half of. `docs/known-gaps.md`
+  [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md#http-access-logs-nginx-haproxy-and-http_access) already flags the truncation half of. `docs/known-gaps/transforms.md`
   is updated to note the cardinality half is now closed by example, without removing the truncation
   entry (a different failure mode, still real, still gated by nginx's own defaults rather than
   anything `logit` does).

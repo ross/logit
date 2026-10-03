@@ -120,7 +120,7 @@ struct ContributingContexts {
 }
 
 /// Caps how many distinct contexts one series tracks between flushes. Fixed, not configurable, the
-/// same stance `docs/known-gaps.md` takes on `MAX_KEYS_PER_COMPONENT`.
+/// same stance `docs/known-gaps/telemetry.md` takes on `MAX_KEYS_PER_COMPONENT`.
 const MAX_CONTRIBUTING_CONTEXTS_PER_SERIES: usize = 8;
 
 impl ContributingContexts {

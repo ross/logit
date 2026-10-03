@@ -342,7 +342,7 @@ bounded resends a sink may make inside one attempt. This record adds none.
 
 Each of these is a workstream in
 [`docs/plans/delivery-semantics.md`](../plans/delivery-semantics.md). Until it lands, the gap is
-an entry in [`docs/known-gaps.md`](../known-gaps.md).
+an entry in [`docs/known-gaps/README.md`](../known-gaps/README.md).
 
 - `Output::duplicate_safe()` goes away, `at_least_once` becomes the runtime's default posture,
   and nine sinks change default: `otlp_out`, `splunk_hec_out`, `datadog_out`,

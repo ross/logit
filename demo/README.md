@@ -175,7 +175,7 @@ nginx's access-line spans.
 traces-only backend and would reject them. `has_signal` never forwards a metrics-only batch at
 all, so you shouldn't see any `component 'tempo_out'` send failures in steady state. Without
 `trace_only`, this interaction doesn't just log a warning: it stops `logit` a minute after
-startup. See [docs/known-gaps.md](../docs/known-gaps.md)'s "`otlp_out` aborts an entire batch's
+startup. See [docs/known-gaps/otlp.md](../docs/known-gaps/otlp.md)'s "`otlp_out` aborts a batch's
 `send`..." entry for the full account.
 
 ### The app's own traces

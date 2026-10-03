@@ -609,7 +609,7 @@ mod inotify {
     /// The purge isn't about `wd` reuse: the kernel allocates them cyclically over `1..INT_MAX`.
     ///
     /// After a malformed event the rest of the buffer is discarded, not resynchronized
-    /// (`docs/known-gaps.md`); a real inotify fd never produces one.
+    /// (`docs/known-gaps/tailing.md`); a real inotify fd never produces one.
     fn parse_events(
         buf: &[u8],
         watches: &mut HashMap<i32, (PathBuf, WatchTarget)>,

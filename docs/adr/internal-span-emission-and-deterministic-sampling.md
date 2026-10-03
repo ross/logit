@@ -15,10 +15,10 @@ Accepted
 `Delivered` and gave `Transform::process`/`ScriptWorker::process` (the non-flush path) and
 `run_output` a real parent to propagate. A follow-up PR then gave `Transform::flush` a bounded,
 best-effort `Vec<SpanLink>` per emitted event (`Aggregator`'s `ContributingContexts`). Neither PR
-emits a `SpanRecord`. `docs/known-gaps.md`'s internal-spans entry named the two remaining pieces
-explicitly: (1) nothing turns a `(context, node, batch)` visit into a real `SpanRecord`-carrying
-`Event`, and (2) span volume needs its own sampling knob, separate from `internal`'s drain
-`interval`. This ADR closes both.
+emits a `SpanRecord`. `docs/known-gaps/telemetry.md`'s internal-spans entry named the two remaining
+pieces explicitly: (1) nothing turns a `(context, node, batch)` visit into a real
+`SpanRecord`-carrying `Event`, and (2) span volume needs its own sampling knob, separate from
+`internal`'s drain `interval`. This ADR closes both.
 
 Two questions had to be settled before "emit a span" was well-defined at all: **what counts as one
 span**, and **how does a sink's span (the one that matters most — it is where `SpanStatus::Error`
@@ -247,16 +247,17 @@ thing to get from a typo rather than a deliberate "sample everything" choice.
 
 - **The listener span's window is `send` only, not decode-to-send** — `Fanout::send` has no
   visibility into how long a listener spent building the batch it's about to send
-  (`docs/known-gaps.md`'s "delivery I/O is not decoupled" entry names the listener-side half of
-  this as still open).
+  (`docs/known-gaps/telemetry.md`'s "delivery I/O is not decoupled" entry names the listener-side
+  half of this as still open).
 - **Lua `flush()` still gets a link-less root.** There is no accumulator on the Lua side `logit`
-  can inspect for contributing contexts, the same limitation `docs/known-gaps.md` already accepts
-  for `Resource` stamping (`last_resource`) — this PR gives it a real span, but not real links.
+  can inspect for contributing contexts, the same limitation `docs/known-gaps/transforms.md` already
+  accepts for `Resource` stamping (`last_resource`) — this PR gives it a real span, but not real
+  links.
 - **A `SinkQueue` entry is 24 bytes larger** — `TraceContext` inline, same trade `Delivered` itself
   already made and measured (`docs/design/memory.md`'s "Costing internal spans" section).
-- **No OTLP.** This closes item 1 of `docs/known-gaps.md`'s internal-spans list (emission); nothing
-  here exports a span anywhere. `stdio_out` (which already renders a `SpanRecord` in full) is the
-  only consumer today.
+- **No OTLP.** This closes item 1 of `docs/known-gaps/telemetry.md`'s internal-spans list
+  (emission); nothing here exports a span anywhere. `stdio_out` (which already renders a
+  `SpanRecord` in full) is the only consumer today.
 
 ## Alternatives considered
 
@@ -286,5 +287,5 @@ thing to get from a typo rather than a deliberate "sample everything" choice.
   (additive in spirit, but not source-compatible — both call sites in this crate were updated).
 - `Fanout` gains `send_with_own_context`/`send_blocking_with_own_context`; `send_with_context`/
   `send_blocking_with_context` are redefined in terms of them, same observable behavior.
-- `docs/known-gaps.md`'s internal-spans entry closes items 1 and 2 (emission, sampling); the "What
-  this doesn't do" residuals above are recorded there as the new open list.
+- `docs/known-gaps/telemetry.md`'s internal-spans entry closes items 1 and 2 (emission, sampling);
+  the "What this doesn't do" residuals above are recorded there as the new open list.

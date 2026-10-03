@@ -21,7 +21,7 @@ Related docs:
   and emits, and how each Splunk concept maps onto `logit`'s event model.
 - `crates/logit-proto/src/splunk/mod.rs`'s module doc: the canonical mapping tables and the
   permitted normalizations of the `splunk_hec_in -> splunk_hec_out` relay.
-- [`docs/known-gaps.md`](known-gaps.md)'s "Splunk" section: what isn't built or isn't verified.
+- [`docs/known-gaps/splunk.md`](known-gaps/splunk.md): what isn't built or isn't verified.
 
 ## Topologies
 
@@ -229,7 +229,7 @@ listener. Two outputs a heavy forwarder has reach `logit` instead:
   and nothing else. `logit` has no plain-lines listener to receive it, and an event with an
   embedded newline arrives as two lines.
 
-`docs/known-gaps.md`'s "Splunk" section tracks both, and Edge Processor's HEC destination.
+`docs/known-gaps/splunk.md` tracks both, and Edge Processor's HEC destination.
 
 ## Credentials
 
@@ -292,5 +292,5 @@ reaches `logit`: it sends to Splunk indexes, S3, and Observability Cloud.
 Not verified: the Observability Cloud leg (`fixtures/splunk-observability.yaml`), since no trial
 org was run; a paid Splunk Cloud stack's `http-inputs-` endpoint and its certificate; Vector's HEC
 sinks and an Edge Processor as clients; and any Splunk Enterprise release other than 10.4.3.
-`docs/known-gaps.md`'s "Splunk" section lists everything else that isn't built or isn't
+`docs/known-gaps/splunk.md` lists everything else that isn't built or isn't
 verified.

@@ -17,13 +17,13 @@ after the merge.
 
 ## Context
 
-`docs/known-gaps.md`'s **"Delivery I/O is not decoupled from event processing within a node"**
-entry was half-closed by [ADR `buffered-sink-delivery`](buffered-sink-delivery.md): `run_output` split into a
-`drain_inbox` half and a `write_loop` half sharing a `SinkQueue`, so a slow or retrying sink no
-longer stops draining its own inbox. That ADR named the other half explicitly as untouched:
-`StatsdInput::run`/`SyslogInput::run` (`crates/logit-inputs/src/{statsd,syslog}.rs`) still
-interleave `recv_from`, decode, and `Fanout::send` in one loop, byte for byte identical apart from
-the decoder type:
+The known-gaps entry **"Delivery I/O is not decoupled from event processing within a
+node"** was half-closed by [ADR `buffered-sink-delivery`](buffered-sink-delivery.md):
+`run_output` split into a `drain_inbox` half and a `write_loop` half sharing a `SinkQueue`, so a
+slow or retrying sink no longer stops draining its own inbox. That ADR named the other half
+explicitly as untouched: `StatsdInput::run`/`SyslogInput::run`
+(`crates/logit-inputs/src/{statsd,syslog}.rs`) still interleave `recv_from`, decode, and
+`Fanout::send` in one loop, byte for byte identical apart from the decoder type:
 
 ```rust
 loop {
@@ -350,11 +350,11 @@ to ignore the one warning that matters.
   techniques (rsyslog `batchSize`, gostatsd `--max-readers`), but out of scope here: `recvmmsg`
   needs raw-fd work via `try_io` plus `libc` since tokio's `UdpSocket` doesn't expose it, and
   `SO_REUSEPORT` fan-in collides with the single-`Fanout`-owns-shutdown constraint (N readers each
-  holding a `Fanout` clone). Recorded as new `docs/known-gaps.md` entries.
+  holding a `Fanout` clone). Recorded as new `docs/known-gaps/runtime.md` entries.
 - **Sampling the kernel's own per-socket drop counter** (`/proc/net/udp[6]`'s drops column).
   Genuinely valuable — almost no tool in the field does this in-process, they all tell operators to
   run `netstat -su` — but Linux-only and a separate, self-contained addition; recorded as a new
-  `docs/known-gaps.md` entry rather than folded in here.
+  `docs/known-gaps/runtime.md` entry rather than folded in here.
 
 > **Revised by [ADR `udp-intake-batching-and-socket-visibility`](udp-intake-batching-and-socket-visibility.md).**
 > Both bullets above are now designed and scheduled rather than merely deferred: `recvmmsg` batched
@@ -390,8 +390,8 @@ to ignore the one warning that matters.
 - New telemetry: `logit.component.receive.{datagrams,bytes,utilization,push.blocked.duration,latency,flushed}`,
   `logit.component.{datagrams,bytes}.dropped`, `logit.input.receive_buffer.{bytes,requested.bytes}`
   — see `docs/design/internal-telemetry.md`'s catalog.
-- `docs/known-gaps.md`: the "Delivery I/O is not decoupled…" entry is deleted (both halves closed);
-  new entries record kernel-drop visibility, `recvmmsg`, and `SO_REUSEPORT` as still open.
+- `docs/known-gaps/runtime.md`: the "Delivery I/O is not decoupled…" entry is deleted (both halves
+  closed); new entries record kernel-drop visibility, `recvmmsg`, and `SO_REUSEPORT` as still open.
 - Measured allocation change: `statsd_in`/`syslog_in` per-line decode drops from 2/1 to 1/0
   allocations in steady state (`crates/logit-bench/tests/allocations.rs`, `docs/design/memory.md`
   §2) — a strict improvement, not merely a neutral refactor, because the accumulator's own need for

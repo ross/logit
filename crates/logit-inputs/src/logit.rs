@@ -47,10 +47,10 @@
 //! sender commits what this listener already handled without resending it
 //! (`docs/adr/native-hop-named-acks.md`, decision 4). No lock spans a forward, so a frame an ended
 //! connection still holds can be forwarded beside the sender's resend of it on a new connection
-//! (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds"). The
-//! identity is advisory, never trusted: a peer minting a new identity per frame costs one scan of
-//! the full table each and can evict honest senders, whose resends are then forwarded, a
-//! duplicate and never a loss. Counted as `logit.input.batches.resends`, `logit.input.senders` (a
+//! (`docs/known-gaps/native-hop.md`, "A resend can race the frames an ended connection still
+//! holds"). The identity is advisory, never trusted: a peer minting a new identity per frame costs
+//! one scan of the full table each and can evict honest senders, whose resends are then forwarded,
+//! a duplicate and never a loss. Counted as `logit.input.batches.resends`, `logit.input.senders` (a
 //! gauge), and `logit.input.senders.evicted`.
 //!
 //! **Shutdown.** Every connection task holds its own [`Fanout`] clone, and the cancel-by-drop

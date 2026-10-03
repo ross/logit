@@ -70,7 +70,7 @@
 //!
 //! | Reason | What it counts |
 //! |---|---|
-//! | `malformed_line` | a sample line this grammar rejects: a bad name, an unterminated label set, an unparsable value or timestamp, non-UTF-8 bytes, or Prometheus 3's quoted UTF-8 name syntax (`{"my.dotted.metric"} 1`), which this codec does not implement (`docs/known-gaps.md`) |
+//! | `malformed_line` | a sample line this grammar rejects: a bad name, an unterminated label set, an unparsable value or timestamp, non-UTF-8 bytes, or Prometheus 3's quoted UTF-8 name syntax (`{"my.dotted.metric"} 1`), which this codec does not implement (`docs/known-gaps/mappings.md`) |
 //! | `malformed_metadata` | a `# HELP`/`# TYPE`/`# UNIT` line with a bad name, a missing field (a bare `# TYPE` included), or an unrecognized type keyword -- the family stays untyped rather than the body failing. Fields are separated by a run of spaces or tabs, either way |
 //! | `duplicate_type` | a second, conflicting `# TYPE` for one family; the first wins |
 //! | `duplicate_metadata` | a second `# HELP`/`# UNIT` for one family *disagreeing with the first*; the first wins. A producer repeating itself verbatim is neither counted nor an error, the same rule `duplicate_type` has always had |
@@ -902,7 +902,7 @@ impl Writer<'_> {
 /// parser fails the *entire* scrape when it isn't (`unit %q not a suffix of metric %q`) -- so a unit
 /// that doesn't fit, or one carrying anything outside `[a-zA-Z0-9_]` (`{requests}`, which would also
 /// break the line grammar), is dropped rather than emitted. Appending the unit to the metric name,
-/// as Prometheus's own OTLP translation does, is a `docs/known-gaps.md` follow-up.
+/// as Prometheus's own OTLP translation does, is a `docs/known-gaps/mappings.md` follow-up.
 fn unit_suffixes(name: &str, unit: &str) -> bool {
     if unit.is_empty() || !unit.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return false;

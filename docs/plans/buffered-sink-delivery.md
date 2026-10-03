@@ -5,7 +5,7 @@ updated: 2026-09-02
 
 # Closing plan: buffered, decoupled sink delivery
 
-`docs/known-gaps.md` carries two entries side by side: **output buffering**
+`docs/known-gaps/` carries two entries side by side: **output buffering**
 (`crates/logit-proto/src/buffer.rs`'s `Buffer` trait has no implementation) and **delivery I/O is
 not decoupled from event processing within a node** (`run_output` awaits `Output::send` inline,
 so a slow or retrying sink stops draining its own inbox). Investigating the first turns up that it
@@ -84,7 +84,7 @@ postures.
 
 | Gap | Consequence |
 |---|---|
-| `Buffer` (`crates/logit-proto/src/buffer.rs`) has no implementation | `docs/known-gaps.md`'s "Output buffering" entry |
+| `Buffer` (`crates/logit-proto/src/buffer.rs`) has no implementation | `docs/known-gaps/`'s "Output buffering" entry |
 | `run_output` awaits `Output::send` inline | the sink half of "Delivery I/O is not decoupled"; a slow/retrying sink backpressures every branch sharing its upstream |
 | `InfluxDbOutput`'s retry budget is ~5s, deliberately tight | ADR `service-lifecycle-and-output-retry`: "riding out a real outage without dropping intake needs delivery decoupled from the drain loop" |
 | A permanent `send` error ends `logit run` | one malformed batch or misconfigured sink takes the whole node down, discarding every other sink's in-flight state |
@@ -506,7 +506,7 @@ the `max_bytes` × sink-count memory implication worth sizing for, and what to a
 **Done when:** `script/schema` diff is clean, `script/cibuild` passes, and the example config's
 `buffer:` block is exercised by `script/server`.
 
-## G. Telemetry + `known-gaps.md` rewrite
+## G. Telemetry + `known-gaps/` rewrite
 
 **Goal:** make buffer state observable via the existing internal-telemetry framework, and record
 what actually closed versus what narrows.
@@ -538,7 +538,7 @@ All tag values `&'static str`, well under `MAX_KEYS_PER_COMPONENT` (1024) per si
 via `fixtures/internal-telemetry.yaml`. `logit.component.errors` keeps its existing meaning
 (incremented once per permanently-dropped batch, not once per retry attempt).
 
-Then rewrite `docs/known-gaps.md`: delete the **Output buffering** entry entirely, and delete the
+Then rewrite `docs/known-gaps/`: delete the **Output buffering** entry entirely, and delete the
 sink half of **Delivery I/O is not decoupled from event processing within a node** — narrow that
 entry to name only the still-open listener half (`StatsdInput::run` interleaving `recv_from`/
 decode/`Fanout::send`). Add three new, narrower entries: **no durable/disk-backed buffering**
@@ -551,7 +551,7 @@ in-flight batches per link is the real shape; in-order, built since: ADR
 `native-hop-send-window`). Also fold the new metrics into
 `docs/design/internal-telemetry.md`'s existing catalog.
 
-**Files:** `docs/known-gaps.md`, `docs/design/internal-telemetry.md`, plus the emit sites in
+**Files:** `docs/known-gaps/`, `docs/design/internal-telemetry.md`, plus the emit sites in
 `crates/logit-pipeline/src/sink_queue.rs` and `runtime.rs`'s `write_loop`.
 
 **Test list:** each new metric fires under the scenario that should trigger it (an overflow test

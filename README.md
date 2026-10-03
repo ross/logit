@@ -124,7 +124,7 @@ The editor-ready JSON Schema for the config is [schema/logit.schema.json](schema
 - [docs/design/](docs/design): the event model, Lua API, pipeline graph, wire protocol, internal
   telemetry, memory, and performance.
 - [docs/adr/](docs/adr): architecture decision records, one per decision.
-- [docs/known-gaps.md](docs/known-gaps.md): known limitations. Check it before reporting a bug.
+- [docs/known-gaps/](docs/known-gaps/README.md): known limitations. Check it before reporting a bug.
 
 ## Development
 

@@ -40,7 +40,7 @@ below and `docs/design/internal-telemetry.md`'s "What this is not".
 or Docker's own health-check daemon speaks to it inside the same network namespace or the same
 pod, never across a real network boundary. Adding TLS or auth would protect against a threat model
 this endpoint doesn't have and complicate exactly the deployment shapes it exists to serve — see
-`docs/known-gaps.md` for the explicit call-out.
+`docs/known-gaps/runtime.md` for the explicit call-out.
 
 **Readiness is per-process, not per-sink.** A single degraded sink does not flip `/readyz` to
 unready — that is what a sink's own `buffer:` block (retry budget, queue depth) already exists to
@@ -75,8 +75,9 @@ retrying.
 - `Dockerfile`'s `HEALTHCHECK` and `demo/compose.yaml`'s `depends_on: service_healthy` both depend
   on `admin.bind` being set in the target config — a config that omits `admin:` gets no health
   check, exactly as it does not exist today.
-- `docs/known-gaps.md` gains the explicit no-TLS/no-auth note, and the readiness-is-per-process
-  note, as permanent, intentional limitations rather than gaps to eventually close.
+- `docs/known-gaps/runtime.md` gains the explicit no-TLS/no-auth note, and the
+  readiness-is-per-process note, as permanent, intentional limitations rather than gaps to
+  eventually close.
 - A future per-sink readiness surface (e.g. per-component status in a richer probe) is additive to
   the existing `PipelineState.components` map — no schema break — should an operator's real need
   for it ever show up.

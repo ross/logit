@@ -1394,7 +1394,7 @@ fn lua_runtime_config(max_memory: Option<u64>) -> logit_pipeline::LuaRuntimeConf
 /// writes a final checkpoint, `LogitInput` closes idle connections with `Reject{GOING_AWAY}`, and
 /// `InternalInput` drains its buffered points once more. Graph rule 17 forces a non-datagram,
 /// non-tail listener's `receive` to the default, so `logit_in` and `internal` always get
-/// `ReceiveConfig::default()`'s 5s, with no knob (`docs/known-gaps.md`).
+/// `ReceiveConfig::default()`'s 5s, with no knob (`docs/known-gaps/intake.md`).
 fn input_runtime_config(receive: &logit_config::ReceiveConfig) -> InputRuntimeConfig {
     InputRuntimeConfig { shutdown_grace: receive.shutdown_grace }
 }

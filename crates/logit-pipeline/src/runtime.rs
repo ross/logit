@@ -1814,7 +1814,7 @@ fn slot_of(destination: Destination) -> usize {
 /// Mints one fresh root before `transform.flush(now)` and sends every resource group under it as
 /// siblings: one flush is one unit of work, not one hop per group. A root, not a parent, because a
 /// flush is *n*-to-1 over the batches absorbed since the last tick, with no single correct parent
-/// (`TraceContext`; `docs/known-gaps.md`'s internal-spans entry;
+/// (`TraceContext`; `docs/known-gaps/telemetry.md`'s internal-spans entry;
 /// `docs/adr/internal-span-emission-and-deterministic-sampling.md`). The contributing-context
 /// links `Transform::flush` returns per event are unioned onto the flush span, bounded by
 /// `MAX_LINKS_PER_SPAN`.

@@ -28,7 +28,7 @@
 //! - **Residual.** Only the first `min(HEAD_BYTES, offset)` bytes are compared. For an offset of
 //!   at most `HEAD_BYTES`, every skipped byte is identical content. Past it, a recycled inode
 //!   whose new content shares its first `HEAD_BYTES` bytes resumes at a stale offset
-//!   (`docs/known-gaps.md`).
+//!   (`docs/known-gaps/tailing.md`).
 //! - **Versioning.** The hash and `HEAD_BYTES` are part of format 2: changing either is a version
 //!   bump. No other version is read, so a file of any other version is unusable, and upgrading
 //!   replays every file once.

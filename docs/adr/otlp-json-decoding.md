@@ -12,8 +12,8 @@ Accepted
 
 `otlp_in` (`crates/logit-inputs/src/otlp.rs`) has shipped protobuf-only since it landed, rejecting
 `Content-Type: application/json` outright with a 415 and an explicit message
-(`docs/known-gaps.md`'s now-closed entry). That was a deliberate scope cut, not an oversight — but
-it is now a real blocker for one concrete consumer: a real OpenTelemetry-JS browser SDK, which
+(a since-closed gap). That was a deliberate scope cut, not an oversight —
+but it is now a real blocker for one concrete consumer: a real OpenTelemetry-JS browser SDK, which
 speaks only OTLP/JSON (`@opentelemetry/exporter-trace-otlp-proto` is Node-only;
 protobuf-in-the-browser has been an open upstream request since 2022,
 [open-telemetry/opentelemetry-js#3118](https://github.com/open-telemetry/opentelemetry-js/issues/3118)).
@@ -137,17 +137,17 @@ asymmetric effort spent on a field nothing downstream looks at.
 - OTLP/JSON requests decode through a `serde_json::Value` tree before ever reaching the generated
   structs, which costs more peak memory per byte than protobuf's direct `prost::Message::decode`
   under the same request-size cap (`MAX_REQUEST_BYTES` in `crates/logit-inputs/src/otlp.rs`) —
-  tracked in `docs/known-gaps.md`.
+  tracked in `docs/known-gaps/otlp.md`.
 - `otlp_in`'s 4xx/5xx error bodies stay `text/plain` on both encodings. The spec wants a
   protobuf-encoded `google.rpc.Status` message on every error response regardless of request
   encoding; `otlp_in` doesn't build one on the protobuf path today either, so this is a pre-existing
   deviation, not a regression, and building a `Status` encoder is orthogonal to decoding — tracked
-  separately in `docs/known-gaps.md` rather than folded into this change.
+  separately in `docs/known-gaps/otlp.md` rather than folded into this change.
 - Cross-origin browser access to `otlp_in` is still not possible after this change: `handle_http`
   answers any non-POST method, `OPTIONS` included, with a 404, so there is no CORS preflight
   support. A same-origin reverse proxy (what `docs/plans/browser-tracing.md` describes) remains the
   supported path for a browser client; a dedicated `cors:` config surface is a separate feature,
-  tracked in `docs/known-gaps.md`.
+  tracked in `docs/known-gaps/otlp.md`.
 - `docs/adr/committed-pregenerated-otlp-protobuf.md`'s line "the only new *runtime* dependency this
   PR adds is `prost`" is superseded by this ADR for the OTLP/JSON surface specifically — that
   sentence is left as-is there (it was true of the PR it described) rather than edited after the

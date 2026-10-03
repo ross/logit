@@ -1,9 +1,10 @@
 //! `Value` ↔ `AnyValue`, `AttrMap` ↔ `Vec<KeyValue>`, and resource and scope, shared by every
 //! signal.
 //!
-//! **`Value` ↔ `AnyValue` is total except for three one-way cases** (`docs/known-gaps.md`'s
-//! "Cross-protocol semantic gaps"). All three come from `AnyValue` having one integer variant,
-//! signed `IntValue`; fixing them would take a non-standard extension a collector couldn't read.
+//! **`Value` ↔ `AnyValue` is total except for three one-way cases**
+//! (`docs/known-gaps/mappings.md`'s "Cross-protocol semantic gaps"). All three come from `AnyValue`
+//! having one integer variant, signed `IntValue`; fixing them would take a non-standard extension a
+//! collector couldn't read.
 //! - `Value::U64` up to `i64::MAX` encodes as `IntValue` and decodes as `Value::I64`: numerically
 //!   exact, but no longer unsigned.
 //! - `Value::U64` above `i64::MAX` encodes as `DoubleValue`, exact up to 2^53 and lossy above, and

@@ -101,4 +101,4 @@ canonical grammar; the decisions it follows:
 - Batch provenance (`origin`/`previous`) is the one thing the render does not show: it reaches a
   sink through `Output::observe_batch`, which `StreamOutput` doesn't implement, and
   [`batch-provenance-on-delivered`](batch-provenance-on-delivered.md) keeps it off the event.
-  Tracked in `docs/known-gaps.md`.
+  Tracked in `docs/known-gaps/sinks.md`.

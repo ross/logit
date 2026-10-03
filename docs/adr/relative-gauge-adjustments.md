@@ -10,13 +10,14 @@ Accepted
 
 ## Context
 
-`docs/known-gaps.md` documents that `statsd_in` rejects any leading `+`/`-` on a gauge value with a
-clear decode error: per the statsd and DogStatsD specs, a leading sign means "adjust the previous
-value by this much," not "set the value to this negative/positive number." Applying a relative
-adjustment needs state the decoder doesn't have — the running value of that gauge, which belongs to
-whichever component aggregates it, not to the wire decoder. `crates/logit-transforms::Aggregator`
-now exists and is the natural place to hold that state, but until this change lands there is no
-representation in `logit_core::MetricKind` for "this is a delta, not an absolute value" to hand it.
+`docs/known-gaps/statsd.md` documents that `statsd_in` rejects any leading `+`/`-` on a gauge value
+with a clear decode error: per the statsd and DogStatsD specs, a leading sign means "adjust the
+previous value by this much," not "set the value to this negative/positive number." Applying a
+relative adjustment needs state the decoder doesn't have — the running value of that gauge, which
+belongs to whichever component aggregates it, not to the wire decoder.
+`crates/logit-transforms::Aggregator` now exists and is the natural place to hold that state, but
+until this change lands there is no representation in `logit_core::MetricKind` for "this is a delta,
+not an absolute value" to hand it.
 
 `docs/design/data-model.md` is explicit that aggregation state belongs to the `aggregate` processor,
 not to `Event`/`MetricRecord`. A statsd gauge is sticky by protocol, though — the sender transmits
@@ -104,9 +105,10 @@ rather than the generic `encode_error`) once this lands. See Consequences.
   and not taken now — see the Decision section above for the reasoning and the condition under which
   this fallback should be revisited.
 - **Reject `+`/`-` unconditionally, forever** (i.e. do nothing). Rejected: both specs define this
-  syntax, `docs/known-gaps.md` already named it as a known, closable gap, and a spec-compliant
-  DogStatsD client emitting `conns:+1|g` for a connection-count gauge is common enough that silently
-  dropping every such line is a real, avoidable data-loss gap, not a theoretical one.
+  syntax, `docs/known-gaps/statsd.md` already named it as a known, closable gap, and a
+  spec-compliant DogStatsD client emitting `conns:+1|g` for a connection-count gauge is common
+  enough that silently dropping every such line is a real, avoidable data-loss gap, not a
+  theoretical one.
 
 ## Consequences
 
@@ -135,7 +137,7 @@ rather than the generic `encode_error`) once this lands. See Consequences.
   false-positive case: resolving a `GaugeDelta` downstream, in a separate collector this `logit`
   instance forwards to, is legitimate and not visible to a single config's graph. `logit validate`
   also has no warning channel today, only pass/fail. **Deferred**, not silently skipped — tracked in
-  `docs/known-gaps.md`.
+  `docs/known-gaps/statsd.md`.
 - **The recorded size-growth fallback above did not fire, confirmed on 2026-09-11.** [ADR
   `metrics-model-v2`](metrics-model-v2.md) added four new `MetricKind` variants (`Sum`, `Samples`,
   `SetMembers`, `ExponentialHistogram`) in the same PR that reshaped `Counter` into `Sum`, and

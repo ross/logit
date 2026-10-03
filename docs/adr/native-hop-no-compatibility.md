@@ -186,7 +186,7 @@ These look like compatibility code and aren't:
 - **Telemetry.** `logit.proto.frames` loses its `codec` label in both directions.
   `docs/design/internal-telemetry.md` records the change.
 - **Operator docs.** `docs/design/wire-protocol.md` and `docs/deploying.md` describe the hop as
-  two shapes and a required pair, and `docs/known-gaps.md` drops "a v1 peer" from the duplicate
-  sources the mark doesn't cover.
+  two shapes and a required pair, and `docs/known-gaps/native-hop.md` drops "a v1 peer" from the
+  duplicate sources the mark doesn't cover.
 - **Follow-up.** With every frame sequenced, a named cumulative `Ack { id, seq }` becomes a
   strict simplification of the sender's in-flight tracking. Its own record, when it's taken up.

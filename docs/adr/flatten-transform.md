@@ -50,16 +50,16 @@ or matcher behavior:
 
 Those decisions stand and this ADR does not reopen them: nothing about decoding or field-matching
 changes. What has changed is that a fourth place asked the same question with a different answer
-available: `docs/known-gaps.md` and `docs/design/data-shapes.md`'s survey both show real,
+available: `docs/known-gaps/` and `docs/design/data-shapes.md`'s survey both show real,
 production-shaped sources (pino-http's request serializers, Kubernetes label/annotation maps,
 CloudTrail's `userIdentity` chain) landing on `logit` as nested data with **no path at all** to an
 InfluxDB tag or a Prometheus label, and `influxdb_out`'s silent drop means an operator currently has
 no signal that this even happened. The precedent for resolving that gap without relitigating the
 three rejections above is `graphite_out`'s `multi_value: expand`
-(`docs/known-gaps.md`'s Graphite section): a naming convention nothing at the far end understands is
-legitimate precisely when it is **opt-in, named, and chosen per pipeline leg** by the operator who
-placed it — and illegitimate exactly when a decoder or matcher does it on everyone's behalf, which
-is what all three prior ADRs actually rejected.
+(`docs/known-gaps/mappings.md`): a naming convention nothing at the far end
+understands is legitimate precisely when it is **opt-in, named, and chosen per pipeline leg** by the
+operator who placed it — and illegitimate exactly when a decoder or matcher does it on everyone's
+behalf, which is what all three prior ADRs actually rejected.
 
 ## Decision
 
@@ -121,7 +121,7 @@ acceptable-not-ideal call, made explicitly rather than by default.
 
 **No cap on the number of keys a value can expand into**, beyond the depth bound above. Every
 distinct flattened path is interned for the life of the process (the interner never evicts); see
-Consequences and the accompanying `docs/known-gaps.md` entry.
+Consequences and the accompanying `docs/known-gaps/runtime.md` entry.
 
 **Containers touched:** `Event.attributes` always; `Resource.attributes` behind `resource:`, via
 `map_resource` and the same one-entry `Arc::ptr_eq` cache `keep_values`/`set` use, carrying
@@ -175,9 +175,9 @@ both of which carry nesting losslessly — flattening them would be pure loss fo
   An array of N elements mints up to N new symbols on its first occurrence (`tags.0`…`tags.N-1`),
   and a map keyed by rotating identifiers (user IDs, request IDs) mints one new symbol per distinct
   key ever seen, for the life of the process. This is a known, deliberate gap — see
-  `docs/known-gaps.md`'s interner-growth entry, extended to name `flatten`'s array-index axis as
-  the one genuinely new exposure over what `json`/`syslog_in` already accept. `arrays: skip` and a
-  narrowed `attributes:` list are the operator's levers; there is no automatic one.
+  `docs/known-gaps/runtime.md`'s interner-growth entry, extended to name `flatten`'s array-index
+  axis as the one genuinely new exposure over what `json`/`syslog_in` already accept. `arrays: skip`
+  and a narrowed `attributes:` list are the operator's levers; there is no automatic one.
 - **A flattened key can silently collide with a real attribute of the same literal name**, exactly
   the ambiguity `json-parsing-into-attributes` named — accepted here, not solved, because the
   comparison at the point of use is not "nested vs. flat" but "flat vs. gone": every sink

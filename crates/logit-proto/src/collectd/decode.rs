@@ -238,7 +238,8 @@ impl CollectdDecoder {
                 self.decode_notification(bytes, message_range, sticky, received_at, out);
             }
             // Everything after an Encryption part is ciphertext and this codec holds no keys
-            // (`docs/known-gaps.md`): stop, rather than report each garbage part as malformed.
+            // (`docs/known-gaps/mappings.md`): stop, rather than report each garbage part as
+            // malformed.
             part::TYPE_ENCRYPTION => {
                 self.diag.warn_throttled(
                     "encrypted_packet_dropped",
@@ -1482,7 +1483,7 @@ pub(crate) mod tests {
                 .values(&[counter(u64::MAX), absolute(u64::MAX)])
                 .build(),
         );
-        // Precision loss above 2^53 is a known gap (`docs/known-gaps.md`), not a failure.
+        // Precision loss above 2^53 is a known gap (`docs/known-gaps/mappings.md`), not a failure.
         assert_eq!(
             events[0].metrics[0].kind,
             MetricKind::Sum(Sum {

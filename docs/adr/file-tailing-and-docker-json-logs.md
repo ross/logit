@@ -337,9 +337,9 @@ trade-off, not hidden in a compose file comment alone.
 - **Docker socket/API (`GET /containers/{id}/logs`) instead of the json-file driver.** Rejected for
   this pass: needs a client, API version negotiation against whatever daemon is running, and
   broader effective privilege (socket access, not just a read-only directory mount) for the same
-  outcome. A documented follow-up (`docs/known-gaps.md`), not ruled out permanently — it would also
-  enable metadata that isn't in `config.v2.json` and survives a `docker rename`, which this design
-  doesn't (see Consequences).
+  outcome. A documented follow-up (`docs/known-gaps/tailing.md`), not ruled out permanently — it
+  would also enable metadata that isn't in `config.v2.json` and survives a `docker rename`, which
+  this design doesn't (see Consequences).
 - **A filesystem-watch crate (`notify`) instead of hand-rolled `inotify`.** `notify`'s dependency
   tree fails `deny.toml`'s license allowlist. `libc` (already present transitively at the exact
   pinned version) is enough to call `inotify_init1`/`inotify_add_watch`/`read` directly, confined
@@ -376,7 +376,8 @@ trade-off, not hidden in a compose file comment alone.
   shape) broadly enough to be its own design, not a `docker_in`-sized increment. The demo's actual
   need — "only stdout counts as a web request" — is fully solved today by an inline `lua` component
   reading `log.iostream`, so nothing is blocked waiting on the larger change. Worth revisiting as a
-  named future idea (`docs/known-gaps.md`) if a second, unrelated need for the same shape shows up.
+  named future idea (`docs/known-gaps/tailing.md`) if a second, unrelated need for the same shape
+  shows up.
 - **A `docker rename` handled by watching for it explicitly.** Out of scope — `container.name` is
   read once, when a container's log file is first opened, and never re-read for the life of that
   handle. A rename after that point is invisible until the container restarts (a new inode, a fresh
@@ -413,7 +414,7 @@ trade-off, not hidden in a compose file comment alone.
 - `docs/OVERVIEW.md`, `README.md`, `AGENTS.md`, `docs/design/data-model.md` (new well-known
   attributes), `docs/design/internal-telemetry.md` (new metrics/diagnostics), `docs/deploying.md`
   (a new "tailing files and Docker logs" section covering the root-privilege/read-only-mount
-  requirement), and `docs/known-gaps.md` (the new gaps named throughout this record: `docker
+  requirement), and `docs/known-gaps/tailing.md` (the new gaps named throughout this record: `docker
   rename`, json-file-driver-only, `(dev, ino)` checkpoint identity, `inotify` on network/FUSE
   mounts, non-Linux poll-only, `docker_in`'s single deviation from read-time timestamps, per-input
   stream filtering, `config.v2.json`'s undocumented-format risk, named output ports as a deferred
@@ -501,8 +502,8 @@ accepts.
 **At-least-once ends at the downstream in-memory queues.** Shutdown flushes every accumulator and
 then force-writes the checkpoint, so the offset covers lines already handed to a sink's inbox. A
 sink whose own grace then drops that batch (`batches.dropped{reason="shutdown"}`) has lost it:
-the restart resumes past it. `docs/known-gaps.md` records this, along with a rotated file still
-draining at shutdown whose new name matches no pattern, which the restart never finds.
+the restart resumes past it. `docs/known-gaps/tailing.md` records this, along with a rotated file
+still draining at shutdown whose new name matches no pattern, which the restart never finds.
 
 ## Amendment: removal needs a successful listing, truncation is size-only, and a rejected json-file entry flushes the held fragments (2026-09-28)
 
@@ -524,7 +525,7 @@ offset before that check isn't detected: the tailer keeps its offset and reads f
 the new content, so the bytes before that offset aren't emitted during the run. A size comparison can't tell
 the two apart, and the inode is unchanged. A restart replays the file through the head fingerprint
 (decision 2), so those bytes arrive late. The window is one `poll_interval` or one wake, and it's a documented gap
-(`docs/known-gaps.md`); a writer that rotates by rename has no such window.
+(`docs/known-gaps/tailing.md`); a writer that rotates by rename has no such window.
 
 **"Checkpoints": unconsumed entries are persisted.** "A checkpoint write only persists the tailer's
 *currently tracked* files, so ... pruning falls out of the write contract" no longer holds. A write
@@ -561,4 +562,4 @@ stream: one partial and one `dropping` flag for each.
 once it has been draining for a `poll_interval` and a later scan has run). `read_one` reports
 a read error as EOF, because a handle that keeps erroring would never be reaped otherwise, so the
 reap drops the file's unread tail. The error is diagnosed `read_error`, and the loss is a
-documented gap (`docs/known-gaps.md`). An `Active` file is never reaped on a read error.
+documented gap (`docs/known-gaps/tailing.md`). An `Active` file is never reaped on a read error.

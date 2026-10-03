@@ -134,8 +134,8 @@ decoder now does too, rejecting only a repeated name.
   `--enable-feature=created-timestamp-zero-ingestion` against a target that exposes one, and its
   own `/metrics` doesn't.
 - **Native histograms.** `TimeSeries.histograms` is empty in every capture. `logit` skips and
-  counts them either way today (`docs/known-gaps.md`), so a fixture carrying one would exercise the
-  skip and nothing else. It belongs with the native-histogram follow-up, not here.
+  counts them either way today (`docs/known-gaps/mappings.md`), so a fixture carrying one would
+  exercise the skip and nothing else. It belongs with the native-histogram follow-up, not here.
 - **Exemplars.** Prometheus only remote-writes exemplars with `--enable-feature=exemplar-storage`
   and a target exposing them in OpenMetrics, and its own `/metrics` doesn't. The codec's own
   fixed-point suite and the round-trip test's OpenMetrics corpus cover the exemplar mapping.

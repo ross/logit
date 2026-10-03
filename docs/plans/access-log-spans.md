@@ -41,7 +41,7 @@ new `span:` block closes that gap without a new component or a second config con
   allocation test (`trace_context_mints_a_span_from_the_convention`, pinned at **1**).
 - Docs: `docs/design/data-model.md`'s "Well-known attribute names" table,
   `docs/design/internal-telemetry.md`'s catalog entry, `docs/design/lua-api.md`,
-  `docs/design/memory.md`'s allocation table, `docs/known-gaps.md` (Lua's missing span API; the
+  `docs/design/memory.md`'s allocation table, `docs/known-gaps/` (Lua's missing span API; the
   not-yet-built upstream CLIENT-span derivation; the service-graph panel item updated), `AGENTS.md`
   and `README.md`'s transform blurbs, `docs/design/pipeline-graph.md`'s rule list.
 
@@ -67,7 +67,7 @@ Deltas to the already-landed haproxy/nginx/app chain, not a rebuild of it:
   pattern the file already uses for `host`) and the timing pair `span.start_us =
   request_date(us)` / `span.duration_ms = %Ta` (see the ADR's "Producer timing model"), plus the
   finer-grained `haproxy.timer.*` attributes from `%TR`/`%Tw`/`%Tc`/`%Tr`/`%Td` (not turned into a
-  second span yet — `docs/known-gaps.md`'s new entry has the derivation for when that lands).
+  second span yet — `docs/known-gaps/`'s new entry has the derivation for when that lands).
   `option logasap` must stay unset.
 - `demo/nginx/nginx.conf`: the same `map`s as workstream B; nginx now mints and forwards its own
   span id (it currently only relays haproxy's), so the app's real OTel span parents to nginx

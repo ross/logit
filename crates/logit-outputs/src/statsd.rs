@@ -104,8 +104,9 @@
 //! `statsd_in` decodes losslessly (`docs/adr/lossless-transit.md`'s "summarization is opt-in and
 //! named"), so a `statsd_in -> statsd_out` relay with no `aggregate` round-trips a timer or set
 //! line intact. Dropped and counted (`EncodeStats::dropped_unsupported_kind`, recorded in
-//! `docs/known-gaps.md`): `Distribution`, `Set`, `Histogram`, `ExponentialHistogram`, `Summary`,
-//! and a cumulative or non-monotonic `Sum`, the kinds that exist only after some stage summarized.
+//! `docs/known-gaps/statsd.md`): `Distribution`, `Set`, `Histogram`, `ExponentialHistogram`,
+//! `Summary`, and a cumulative or non-monotonic `Sum`, the kinds that exist only after some stage
+//! summarized.
 //!
 //! **So a `statsd_in -> aggregate -> statsd_out` relay drops every timer/set metric under
 //! `aggregate`'s default summarizing config.** That default turns `Samples` into a `Distribution`
@@ -381,7 +382,7 @@ pub struct EncodeStats {
     pub dropped_gauge_delta: usize,
     /// A `NO_RECORDED_VALUE`-flagged point. statsd has no "no value here" concept, so unlike
     /// `otlp_out` this sink can't keep the point flagged; it drops it rather than write its default
-    /// value as a fabricated sample (`docs/known-gaps.md`'s cross-protocol table).
+    /// value as a fabricated sample (`docs/known-gaps/mappings.md`'s cross-protocol table).
     pub dropped_no_recorded_value: usize,
     pub dropped_unsupported_kind: usize,
     /// One bucket for every kind of unencodable input: a non-finite value in a

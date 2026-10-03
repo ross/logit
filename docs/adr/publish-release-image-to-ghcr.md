@@ -58,4 +58,4 @@ runners don't support docker-in-docker out of the box.
 - amd64-only means an Apple Silicon (or other arm64) user gets emulation or has to build locally
   via `script/image`.
 - Nothing in CI builds or smoke-tests the production `Dockerfile` outside of this manual publish —
-  `script/cibuild` still doesn't touch it (`docs/known-gaps.md`).
+  `script/cibuild` still doesn't touch it (`docs/known-gaps/runtime.md`).

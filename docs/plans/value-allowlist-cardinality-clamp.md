@@ -135,7 +135,7 @@ Inserted between `trimmed` (`keep`) and `windowed` (`aggregate`) in
 |---|---|---|---|
 | W0 | **ADR and plan.** | `docs/adr/value-allowlist-cardinality-clamp.md` (new, + row atop `docs/adr/README.md`); `docs/plans/value-allowlist-cardinality-clamp.md` (new, + row atop `docs/plans/README.md`) | — |
 | W1 | **`keep_values` — the component.** | `crates/logit-config/src/lib.rs`; `crates/logit-pipeline/src/graph.rs`; `crates/logit-transforms/src/keep_values.rs` (new); `crates/logit-transforms/src/lib.rs`; `crates/logit-cli/src/pipeline.rs`; `schema/logit.schema.json` | W0 |
-| W2 | **Docs, example, and the allocation pin.** | `fixtures/nginx-to-influxdb.yaml`; `docs/design/pipeline-graph.md`; `docs/design/internal-telemetry.md`; `docs/design/memory.md`; `crates/logit-bench/src/fixtures.rs`; `crates/logit-bench/tests/allocations.rs`; `AGENTS.md`; `docs/known-gaps.md` | W1 |
+| W2 | **Docs, example, and the allocation pin.** | `fixtures/nginx-to-influxdb.yaml`; `docs/design/pipeline-graph.md`; `docs/design/internal-telemetry.md`; `docs/design/memory.md`; `crates/logit-bench/src/fixtures.rs`; `crates/logit-bench/tests/allocations.rs`; `AGENTS.md`; `docs/known-gaps/` | W1 |
 
 Landing order: **W0 → W1 → W2**, strictly linear. Config, validation, transform and registry are one
 PR because `build_spec`'s match is exhaustive — a variant added without its arm doesn't compile, and

@@ -98,9 +98,9 @@ timestamp as the missing end, specifically so an *unchanged* nginx line carrying
 `request_time` still produces a span once `trace_context` is placed after it.
 
 **A resolved start/end further from the event's receipt time than `max_skew` (default one hour)
-is rejected, not written.** The same reasoning `docs/known-gaps.md`'s sketched `syslog_timestamp`
-transform already gives for exactly this class of risk: one sender with a badly wrong clock must
-not be able to write spans years away and quietly poison a trace store.
+is rejected, not written.** The same reasoning `docs/known-gaps/syslog.md`'s sketched
+`syslog_timestamp` transform already gives for exactly this class of risk: one sender with a badly
+wrong clock must not be able to write spans years away and quietly poison a trace store.
 
 **`mint_id: false` by default; `logit` never mints a trace id.** A missing span id, with `span:`
 configured and `mint_id: true`, is minted via the same SplitMix64 generator `logit`'s own internal
@@ -190,7 +190,7 @@ breakdown haproxy's finer timers do, for the same not-built-here reason.
 - **Resolving a partial timing failure by falling back to receipt time for everything, rather than
   skipping the event.** Rejected: silently substituting a wrong instant for a span's start or end
   is worse than a visible, countable skip — the same "silently wrong is worse than visibly
-  incomplete" instinct `docs/known-gaps.md`'s internal-spans section already states for a
+  incomplete" instinct `docs/known-gaps/telemetry.md` already states for a
   different case (picking an arbitrary contributing batch as a flush's parent).
 - **Minting a trace id when none is present, not just a span id.** Rejected outright, not just
   deferred — see the Decision section; this would fork traces silently rather than report a real
@@ -223,8 +223,8 @@ breakdown haproxy's finer timers do, for the same not-built-here reason.
   successful lift with a `span:` block stays at the same **1** allocation the log-only lift already
   had (`crates/logit-bench/tests/allocations.rs`'s `trace_context_mints_a_span_from_the_convention`).
 - Lua gains no new capability here — `event.has_span` remains the entire span surface. Recorded as
-  its own `docs/known-gaps.md` entry rather than folded into the existing trace-context one, since
-  the constraint (no accumulator, no proxy type) is different from that entry's.
+  its own `docs/known-gaps/transforms.md` entry rather than folded into the existing trace-context
+  one, since the constraint (no accumulator, no proxy type) is different from that entry's.
   **Amendment (2026-09-15):** superseded by [ADR `lua-event-constructor`](lua-event-constructor.md)
   — `event.span` became a read-only proxy in the meantime, and `Event.new(t)` now lets a script
   mint a span (and a log, and every reconstructible metric kind) from the table shape

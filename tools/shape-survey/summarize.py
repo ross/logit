@@ -288,7 +288,7 @@ def render_markdown(summary: dict) -> str:
         out.append("")
         out.append(
             "Cumulative since process start, not windowed, and over top-level keys only"
-            " (docs/known-gaps.md). `keyset_share.top1`/`top5` are the share of all events"
+            " (docs/known-gaps/transforms.md). `keyset_share.top1`/`top5` are the share of all events"
             " carried by the most common one and five key-sets."
         )
         out.append("")

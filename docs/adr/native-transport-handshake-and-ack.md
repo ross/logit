@@ -116,7 +116,7 @@ nothing to outlive the listener's own future), so each connection races its next
 a cloned shutdown signal and, once idle at a frame boundary, sends `Reject{GOING_AWAY}` and closes.
 An already-in-flight frame is allowed to finish. `otlp_in` has no such override and can leave an
 idle keep-alive connection's `Fanout` clone open past shutdown — a real gap, tracked in
-`docs/known-gaps.md`, that this design deliberately doesn't repeat.
+`docs/known-gaps/otlp.md`, that this design deliberately doesn't repeat.
 
 ## Alternatives considered
 
@@ -153,11 +153,11 @@ idle keep-alive connection's `Fanout` clone open past shutdown — a real gap, t
 - `crates/logit-inputs/src/tls.rs` / `crates/logit-outputs/src/tls.rs` (new): the TLS builders
   `otlp_in`/`otlp_out` already had, extracted so `logit_in`/`logit_out` share them rather than
   duplicating `rustls` construction a third time.
-- `docs/known-gaps.md`'s schema-drift entry ("the published schema advertises kinds the binary
-  can't run") closes outright — `logit_in`/`logit_out` were the last two declared-and-unimplemented
-  kinds. The credit-window, QUIC, and OTLP-passthrough-codec follow-ups this plan explicitly
-  deferred are recorded there instead, alongside `otlp_in`'s shutdown gap this ADR names above and
-  `logit_in`'s currently-fixed (not operator-tunable) 5s shutdown grace.
+- `docs/known-gaps/runtime.md`'s schema-drift entry ("the published schema advertises kinds the
+  binary can't run") closes outright — `logit_in`/`logit_out` were the last two
+  declared-and-unimplemented kinds. The credit-window, QUIC, and OTLP-passthrough-codec follow-ups
+  this plan explicitly deferred are recorded there instead, alongside `otlp_in`'s shutdown gap this
+  ADR names above and `logit_in`'s currently-fixed (not operator-tunable) 5s shutdown grace.
 - **Amendment (2026-09-13):** the pre-`Hello` timeout is operator-tunable now. `LogitIn` carries a
   `handshake_timeout: Duration` field (default 5s, still applied *per* pre-`Hello` phase -- the TLS
   accept, then the `Hello` read -- rather than as one shared deadline), set through
@@ -167,9 +167,9 @@ idle keep-alive connection's `Fanout` clone open past shutdown — a real gap, t
   listener in the tree: `prometheus_out`'s exposition server and the `admin:` endpoint have their
   own, separately-decided budgets; `otlp_in`'s accept loop also picked up the
   `tokio::time::timeout` around its TLS accept that this ADR's own "Connection limit" section
-  describes here, closing `docs/known-gaps.md`'s "`otlp_in`'s TLS accept has no timeout" row.
+  describes here, closing `docs/known-gaps/intake.md`'s "`otlp_in`'s TLS accept has no timeout" row.
   Graph rule 45 keeps the value non-zero. The *shutdown grace* named just above is a different
-  knob and stays fixed at 5s -- still open, still tracked in `docs/known-gaps.md`.
+  knob and stays fixed at 5s -- still open, still tracked in `docs/known-gaps/native-hop.md`.
 
 ## Amendment: `GOING_AWAY` is now also the idle-close signal, and `logit_out` probes for it (2026-09-14)
 

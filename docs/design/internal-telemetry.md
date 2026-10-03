@@ -113,8 +113,8 @@ on `Option::None`.
 compile-time-constant strings: `("class", "5xx")`, never a raw path, peer address, or anything else
 derived from traffic. The type system enforces only `'static`; review enforces the rest, and every
 shipped component follows it. It matters more here than for ordinary event attributes: the
-process-wide interner never evicts (`docs/known-gaps.md`), so a runtime-derived tag *value* leaks
-for the life of the process, as a metric name embedding a request id would.
+process-wide interner never evicts (`docs/known-gaps/runtime.md`), so a runtime-derived tag *value*
+leaks for the life of the process, as a metric name embedding a request id would.
 
 ## The buffer: coalesce between drains, using the merges `aggregate` already performs
 
@@ -355,7 +355,7 @@ Without that handle, nothing is sampled.
 | `logit.process.fds` | gauge | Open file descriptors: the entries in `/proc/self/fd`, less the one the listing holds. |
 | `logit.process.fds.limit` | gauge | The soft `Max open files` limit from `/proc/self/limits`. Not emitted when it's `unlimited`. |
 | `logit.process.cpu.seconds{mode=user\|system}` | delta counter | CPU seconds since the previous tick: `/proc/self/stat` `utime`/`stime`, over `USER_HZ` (100). |
-| `logit.process.interner.strings` | gauge | The process-wide interner's size (`interner::len()`), which never shrinks: the observability hook `docs/known-gaps.md` names. |
+| `logit.process.interner.strings` | gauge | The process-wide interner's size (`interner::len()`), which never shrinks: the observability hook `docs/known-gaps/runtime.md` names. |
 | `logit.process.uptime` | gauge | Seconds since `internal` started. |
 
 **The procfs points are Linux-only**, and each of their four sources (`status`, `stat`, `fd`,
@@ -584,7 +584,7 @@ datagram passes through.
 | `logit.component.receive.utilization` | gauge | `max(datagram ratio, byte ratio)` against the two configured bounds |
 | `logit.component.receive.push.blocked.duration` | timing | only under `overflow: block`, only when a push actually waited |
 | `logit.component.receive.latency` | timing | arrival (`Datagram::received_at`) → dequeue, per datagram — the number that says whether event timestamps are trustworthy under load |
-| `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction) or `shutdown`: datagrams read but never decoded because the listener stopped (a batch the read half never queued, a popped batch the decode half never decoded, or what the receive queue still held when the grace backstop dropped the listener). With these, `logit.input.datagrams` equals the `receive.latency` sample count plus every reason's drops. `shutdown` counts land after `internal`'s final drain, so no exported pipeline sees them; the listener also logs each at `warn` (see `docs/known-gaps.md`) |
+| `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction) or `shutdown`: datagrams read but never decoded because the listener stopped (a batch the read half never queued, a popped batch the decode half never decoded, or what the receive queue still held when the grace backstop dropped the listener). With these, `logit.input.datagrams` equals the `receive.latency` sample count plus every reason's drops. `shutdown` counts land after `internal`'s final drain, so no exported pipeline sees them; the listener also logs each at `warn` (see `docs/known-gaps/intake.md`) |
 | `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` is **a single tracked file or connection** ending and flushing its own accumulator on the way out: a `tail_in`/`docker_in` file that rotated away or was removed, or a `graphite_in` TCP connection the client closed or reset, or that was dropped for an oversize frame — in every case while the listener itself keeps running. `shutdown` is the whole component stopping. An ordinary client disconnect is `closed`, never `shutdown`. |
 | `logit.input.datagrams.truncated` | count | datagrams that arrived longer than the 65,507-byte receive slot and were delivered only as far as it holds, with the remainder discarded by the kernel. **IPv6-only, and Linux-only:** 65,507 is IPv4's maximum payload, IPv6 permits 65,527, and `MSG_TRUNC` in `recvmmsg`'s returned flags is what makes the loss visible rather than silent — a `recv_from` build has no way to see it and never reports this. Not emitted when it is zero, like every other loss counter here |
 | `logit.input.reads` | count | read syscalls the listener made — one per `recvmmsg(2)` batch on Linux, one per `recv_from` elsewhere. Exists to be a denominator: `logit.input.datagrams / logit.input.reads` is the **mean fill** of the syscall batch, the only number that says whether `receive.read_batch` is doing anything. A fill pinned at `read_batch` means the knob is the limit and raising it may help; a fill near 1 means datagrams arrive one at a time and the knob is irrelevant at any setting |
@@ -913,7 +913,7 @@ minus those of any series the model mapping then dropped. A write no consumer to
 That's the number the 2.0 `X-Prometheus-Remote-Write-Samples-Written` header reports for that
 request, by design: a counter and a header disagreeing about one request would be a puzzle with no
 right answer.
-`docs/known-gaps.md` tracks the unit difference as its own row.
+`docs/known-gaps/prometheus.md` tracks the unit difference as its own row.
 
 **The bind-mode metadata cache** is the one piece of cross-request state on this kind, and it
 reports itself:
@@ -943,7 +943,8 @@ client, with no socket of its own.
   name or value, or a label set that isn't strictly ascending by byte order. Both specs forbid a
   sender from producing these, and none is worth failing the whole request over.
 - **`skipped{reason="native_histogram"}`** (remote-write): one `histograms[]` entry. See
-  `docs/known-gaps.md`; this is also why a 2.0 response's `Histograms-Written` is always `0`.
+  `docs/known-gaps/mappings.md`; this is also why a 2.0 response's `Histograms-Written` is always
+  `0`.
 - **`degraded{reason="exemplar_dropped"}`** (remote-write): an exemplar whose series has no sample
   anywhere in the request, or whose series was itself skipped. This reason is also an encoder
   reason on the output side. It's not additive with `invalid_labels`: a series with bad labels and
@@ -1534,7 +1535,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 The sinks with encoders count the first class through a gate `Output::observe_batch` arms
 (`crates/logit-outputs/src/accounting.rs`); `stdio_out` and `file_out` count after the write that
 delivered the batch. A caller that sends without `observe_batch` counts every `send`, unless an
-earlier batch whose last attempt failed left the gate armed (`docs/known-gaps.md`, "Datadog").
+earlier batch whose last attempt failed left the gate armed (`docs/known-gaps/datadog.md`).
 `prometheus_out`'s registry mode has no gate: its `send` never fails, so nothing repeats. No sink
 counts an encode-side counter per attempt.
 
@@ -1572,8 +1573,8 @@ side's rules.
 The same four sinks, and `statsd_out` under `transport: unix`, count `logit.output.messages`,
 `logit.output.datagrams`, and `graphite_out`'s `logit.output.datapoints` for every datagram the
 kernel took, on an attempt that then failed as well as on one that succeeded: those datagrams are on
-the wire either way. A cancelled attempt counts none of them (`docs/known-gaps.md`). On a stream
-transport the same counters count only a delivered frame.
+the wire either way. A cancelled attempt counts none of them (`docs/known-gaps/intake.md`). On a
+stream transport the same counters count only a delivered frame.
 
 An attempt the runtime cancels (a budget timeout or the shutdown grace) counts no `requests` and
 none of the counts a dropped future never reaches, and `logit.component.errors` covers it. Its
@@ -1582,7 +1583,7 @@ none of the counts a dropped future never reaches, and `logit.component.errors` 
 `logit.output.requests` has two vocabularies. The stream and datagram sinks and `logit_out` tag
 one count per attempt with `class=ok|clean|ambiguous|permanent`, the `Fault` taxonomy. The HTTP
 sinks tag one count per request with its status class or `network_error`
-(`docs/known-gaps.md`, "Internal telemetry and self-logging").
+(`docs/known-gaps/telemetry.md`).
 
 ##### `influxdb_out`
 
@@ -1973,7 +1974,7 @@ Some reasons exist only on one path:
   a relay that fed it one.
 - `skipped{reason="no_timestamp"}`, `skipped{reason="invalid_labels"}` (a family with an empty
   name; `__name__` may not be empty), `degraded{reason="sub_ms_collapsed"}` (two readings of one
-  series landing on one millisecond, the later winning; `docs/known-gaps.md`), and
+  series landing on one millisecond, the later winning; `docs/known-gaps/mappings.md`), and
   `labels.dropped{reason="empty_value"}` are remote-write encode's, where the wire forbids what the
   exposition grammar merely renders differently.
 - `skipped{reason="no_recorded_value"}` means something narrower in sender mode. The encoder runs

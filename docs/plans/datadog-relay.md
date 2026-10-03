@@ -173,7 +173,7 @@ The event model already carries every Datadog field either in a typed field or i
 | span ids uint64 + `_dd.p.tid` | `[u8; 16]`/`[u8; 8]`, high bits from `_dd.p.tid`, re-emitted when nonzero | lossless |
 | span `service`, `resource`, `type`, `name` | `service.name`, `resource.name`, `span.type` attributes (the names the Agent's own OTLP receiver honors); `SpanRecord.name` | lossless, and an OTLP egress to an Agent reconstructs them for free |
 | span `error`, `meta`, `metrics`, `meta_struct`, `_sampling_priority_v1`, `_dd.*` | `status: Error`; attributes verbatim as `Str`/`F64`/`Bytes` | lossless |
-| OTel-only span fields (`kind`, `status: Ok`, `trace_state`, typed attributes) | — | Datadog can't carry them; `datadog_trace_out` counts them, a row in `known-gaps.md`'s cross-protocol table |
+| OTel-only span fields (`kind`, `status: Ok`, `trace_state`, typed attributes) | — | Datadog can't carry them; `datadog_trace_out` counts them, a row in `known-gaps/mappings.md` |
 | chunk `priority`, `origin`, `droppedTrace`, chunk `tags`; `TracerPayload` `languageName`, `languageVersion`, `tracerVersion`, `runtimeID`, `containerID`, `appVersion`, `tags`; `AgentPayload` `hostName`, `env`, `agentVersion`, `targetTPS`, `errorTPS`, `rareSamplerEnabled` | chunk fields as `datadog.chunk.*` attributes on every span of the chunk; tracer fields as `datadog.tracer.*` on the batch `Resource` (one batch per `TracerPayload`); Agent fields as `datadog.agent.*` on the `Resource` | lossless; a batch boundary per `TracerPayload` is the "batching" normalization |
 | APM stats (`StatsPayload`, and tracers' `/v0.6/stats`) | one metric event per bucket group: `Sum` `datadog.stats.hits`/`errors`/`top_level_hits` (delta, weighted), `Distribution` `datadog.stats.ok_summary`/`error_summary` decoded from the on-wire DDSketch, group keys (`service`, `name`, `resource`, `span.type`, `span.kind`, `http.status_code`, `synthetics`, peer tags, …) and payload keys (`env`, `version`, `container.id`, `datadog.tracer.lang`, …) as attributes, `Event::timestamp` = bucket start, `datadog.stats.bucket.duration` | lossless: `DdSketch` keeps the wire's own mapping (`Mapping::logarithmic`, §4) |
 | OTel-origin span through the native protocol | needs Datadog semantics synthesized: `service`/`resource`/`type`, `_top_level`, priority, and stats | not in this stack (§14); `otlp_out` carries OTel-origin spans |
@@ -303,7 +303,7 @@ the protobuf vendoring landed in W2a; msgpack is W2b's, since only traces and st
 
 ### 7. Documented recipes, not code (W8b)
 
-Each lives in [`docs/datadog.md`](../datadog.md), with the gaps in `docs/known-gaps.md`:
+Each lives in [`docs/datadog.md`](../datadog.md), with the gaps in `docs/known-gaps/`:
 
 - Agent-equivalent `h`/`ms` output: `aggregate` then a sink that renders quantiles. `aggregate`
   sends a sketch, and no option emits the Agent's five-metric set; W7b didn't need one.
@@ -438,7 +438,7 @@ the OTel-direct topology is `otlp_out`.
 | W7a | **Landed** (`dd/w7a`). Recorded fixtures from a real Agent 7.83, dd-trace-py 4.15, and the `datadog` DogStatsD client over both Unix sockets (`script/record-fixtures datadog`, `testdata/interop/datadog/`), replayed through every decoder and both pairs; fixed what the captures contradicted: `/info`'s field types, `statsd_in`'s service-check `m:`, `datadog_trace_in`'s socket mode and stats headers, `datadog_in`'s probe routes and the logs `{}` check. | M | W5, W6 |
 | W7b | **Landed** (`dd/w7b`). Trial-org end-to-end: `datadog_out` direct (series, sketches, distribution points, logs, events, checks), the stale window, dedupe, size caps; a real Agent through `datadog_in` and `datadog_out`, traces and stats included; `datadog_trace_out` and `statsd_out` into a real Agent over TCP, UDP, and its Unix sockets; log correlation; `otlp_out` agentless. Found and fixed: events must go uncompressed; the Agent's `{}` startup probe on the series routes is an empty request. Commands and outcomes in the PR. | M | W7a, W8a |
 | W8a | **Landed** (`dd/w8a`). `trace_context` `format: datadog`: decimal and 128-bit hex `dd.trace_id`, decimal `dd.span_id`, `trace_id_high`; the Datadog id parsers moved into `logit_core::trace`; `datadog_out` writes a log's `TraceRef` as hex `trace_id`/`span_id` (§8); graph rule 68; schema; the ADR `log-record-trace-context` amendment; `datadog-logs-correlation.yaml`. Split out of W8 and landed ahead of W7, which it doesn't need (§13). | S | W6 |
-| W8b | **Landed** (`dd/w8b`). `docs/datadog.md`, the operator doc: topologies, best practice both ways, the rules that lose data when missed, what's verified; `datadog-via-agent.yaml`; the Datadog columns in `telemetry-landscape.md`'s logs and traces matrices; `AGENTS.md`'s eight pairs; `known-gaps.md` consolidated; this plan's closing assessment and the ADR status lines. | M | W7b |
+| W8b | **Landed** (`dd/w8b`). `docs/datadog.md`, the operator doc: topologies, best practice both ways, the rules that lose data when missed, what's verified; `datadog-via-agent.yaml`; the Datadog columns in `telemetry-landscape.md`'s logs and traces matrices; `AGENTS.md`'s eight pairs; `known-gaps/` consolidated; this plan's closing assessment and the ADR status lines. | M | W7b |
 
 Landing order: W0 → W1 → W2a → W2b → W3 → W4a → W5 → W6 → W8a → W7a → W7b → W8b, linear; W4b
 stacks after W4a to keep the stack linear even though it depends only on W0, and W8a after W6
@@ -501,7 +501,7 @@ Each is proven by a test suite and by real traffic:
   except service checks. Its two code fixes, uncompressed events and the Agent's `{}` series
   probe, are ADR decision 14.
 
-What's left is tracked in [`docs/known-gaps.md`](../known-gaps.md)'s "Datadog" section, one entry
+What's left is tracked in [`docs/known-gaps/datadog.md`](../known-gaps/datadog.md), one entry
 each:
 
 - Agent-side routes `datadog_in` doesn't serve: v3 columnar series, the legacy TCP logs port, and
@@ -527,7 +527,7 @@ each:
   parity.
 
 Cross-protocol egress stays best-effort under ADR `lossless-transit`: the Datadog encode rows in
-`known-gaps.md`'s "Cross-protocol semantic gaps" table (OTel-only span fields, and the metric
+`known-gaps/mappings.md` (OTel-only span fields, and the metric
 kinds `datadog_out` has no route for) are counted, not closed.
 
 [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)'s Status, and

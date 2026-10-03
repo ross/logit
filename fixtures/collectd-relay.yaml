@@ -5,8 +5,8 @@
 #
 # The relay is lossless modulo the normalization list in the ADR. Encrypted packets (collectd's
 # `SecurityLevel Encrypt`) are the one input the codec can't read; the datagram's tail is dropped
-# and counted (docs/known-gaps.md). Because `collectd_out` restates elided time and interval
-# parts, budget about a third more egress bytes and packets than the fleet sends
+# and counted (docs/known-gaps/mappings.md). Because `collectd_out` restates elided time and
+# interval parts, budget about a third more egress bytes and packets than the fleet sends
 # (docs/deploying.md).
 #
 # No `aggregate`, unlike fixtures/statsd-relay.yaml: every collectd value list is already one

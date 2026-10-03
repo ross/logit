@@ -9,7 +9,7 @@
 //! `classify_transport_error`) rather than `crate::http`'s, though it reads a rejection body
 //! through `crate::http::read_body_prefix`, the same bounded read `otlp_out` uses. The
 //! classifier table is the same today, but its client never disables redirects, so it inherits
-//! `reqwest`'s `limited(10)`: a tracked gap in `docs/known-gaps.md`, closed by moving to
+//! `reqwest`'s `limited(10)`: a tracked gap in `docs/known-gaps/prometheus.md`, closed by moving to
 //! `crate::http::build_client`.
 //!
 //! [`render_tag_suffix`] never emits a `statsd.`-prefixed attribute as a tag; see its doc.
@@ -299,7 +299,8 @@ impl Encoder for InfluxLineEncoder {
                 // A `NO_RECORDED_VALUE`-flagged point has no reading, and line protocol can't
                 // carry the flag the way OTLP does, so skip it under the throttled
                 // `no_recorded_value` diagnostic rather than write its default `0` as real
-                // (`docs/known-gaps.md`'s cross-protocol table; `MetricRecord`'s `flags` doc).
+                // (`docs/known-gaps/mappings.md`'s cross-protocol table; `MetricRecord`'s `flags`
+                // doc).
                 if metric.is_no_recorded_value() {
                     self.diag.warn_throttled(
                         "no_recorded_value",

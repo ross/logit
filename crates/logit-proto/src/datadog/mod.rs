@@ -138,9 +138,9 @@
 //! 7. across routes (v1 and v2), a carrier the target has no field for is dropped and counted
 //!    `no_wire_form`, per the encode table.
 //! 8. a JSON route (v1, v2 JSON, distribution points) carries a metric value exactly: this
-//!    crate's `serde_json` dependency enables `float_roundtrip` (see `Cargo.toml` and
-//!    `docs/known-gaps.md`'s Datadog entry). The protobuf routes (v2 protobuf, sketches) never go
-//!    through that parser and carry values bit-exact either way.
+//!    crate's `serde_json` dependency enables `float_roundtrip` (see `Cargo.toml`). The protobuf
+//!    routes (v2 protobuf, sketches) never go through that parser and carry values bit-exact
+//!    either way.
 //!
 //! # Logs, events, service checks (`logs`, `events`, `service_checks`)
 //!

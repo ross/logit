@@ -12,9 +12,9 @@ Accepted
 
 `logit` has no way to say anything about itself. `Diagnostics` (`crates/logit-core/src/diag.rs`)
 prints throttled stderr lines and keeps its counts private; `interner::len()` exists as an
-explicit "observability hook" with nothing wired to it (`docs/known-gaps.md`); how many events a
-component sourced, what it dropped, how long a sink's writes take, whether a node is stalled on
-backpressure — all invisible. Operating or debugging a running pipeline means guessing.
+explicit "observability hook" with nothing wired to it (`docs/known-gaps/telemetry.md`); how many
+events a component sourced, what it dropped, how long a sink's writes take, whether a node is
+stalled on backpressure — all invisible. Operating or debugging a running pipeline means guessing.
 
 What's needed first is not a specific set of counters — that's genuinely unknown and best learned
 by running the thing — but the framework: a mechanism that makes adding a new point cheap, keeps
@@ -103,8 +103,8 @@ drop in its own telemetry (`datadog.dogstatsd.client.packets_dropped*`). A compo
 distinct `(name, tags)` keys at 1024; beyond that, a new key is dropped and the drop counted as
 `logit.internal.points.dropped{reason="cardinality"}` under that component's own identity — a
 misbehaving component (one that ignores the tag-cardinality convention: `&'static str` tag values
-only, since the process-wide interner never evicts, per `docs/known-gaps.md`) becomes visible
-instead of quietly leaking.
+only, since the process-wide interner never evicts, per `docs/known-gaps/runtime.md`) becomes
+visible instead of quietly leaking.
 
 ## Alternatives considered
 
@@ -115,10 +115,10 @@ instead of quietly leaking.
   first re-ingesting it through some other input. Emitting through the existing model and graph
   gets all of that for free.
 - **A generic `tracing`/`metrics`-crate integration, with `logit` as just another exporter
-  target.** This is real, valuable, future work (`docs/known-gaps.md` already names a `tracing`
-  migration as separate, later work) but answers a different question — how `logit`'s *own*
-  process-level logging matures — not how an operator gets a live, per-component picture of the
-  pipeline it's running today. The two aren't in tension: a future `tracing` subscriber could
+  target.** This is real, valuable, future work (`docs/known-gaps/telemetry.md` already names a
+  `tracing` migration as separate, later work) but answers a different question — how `logit`'s
+  *own* process-level logging matures — not how an operator gets a live, per-component picture of
+  the pipeline it's running today. The two aren't in tension: a future `tracing` subscriber could
   itself feed `Diagnostics`/`Telemetry`, same as any other producer.
 - **Aggregating internal points into real time windows inside the buffer itself**, rather than
   leaving that to a downstream `aggregate` component. Rejected: it would duplicate
@@ -150,7 +150,8 @@ instead of quietly leaking.
 - A future `internal_spans`/log-carrying extension is additive to the same `internal` component —
   no rename, no second listener kind — once its own gating question (trace context in `Delivered`,
   ADR `minimize-allocations-over-event-size`) is answered on its own evidence.
-- `docs/known-gaps.md`'s `interner::len()` note is closed: `internal` samples it on every tick.
+- `docs/known-gaps/telemetry.md`'s `interner::len()` note is closed: `internal` samples it on every
+  tick.
 
 ## Amendment: raw samples exist now; internal telemetry still summarizes
 

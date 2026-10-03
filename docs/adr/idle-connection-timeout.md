@@ -22,11 +22,11 @@ bounds is what happens *after* that: a connection that completes its
 handshake (or, on a plaintext listener, delivers at least one byte) and then goes silent holds its
 connection-cap permit -- 1024 on every one of the five -- indefinitely, right up to the cap itself. A
 slow-loris-shaped client can exhaust that cap with connections that will never send another byte.
-[`docs/known-gaps.md`](../known-gaps.md#tls-and-connection-lifecycle)'s "No idle-connection
-timeout on a TCP listener" entry names this gap and records that it is deliberately not a second use
-of `handshake_timeout:` -- that field landed on 2026-09-13 with this held out explicitly, because an
-idle bound is a different shape from a pre-message one and raises three design questions a knob
-can't answer on its own:
+the former "No idle-connection timeout on a TCP listener" entry in
+[`docs/known-gaps/intake.md`](../known-gaps/intake.md#tls-and-connection-lifecycle) named this gap and
+recorded that it is deliberately not a second use of `handshake_timeout:` -- that field landed on 2026-09-13 with this held out
+explicitly, because an idle bound is a different shape from a pre-message one and raises three
+design questions a knob can't answer on its own:
 
 1. **A stalled downstream must not look like a silent peer.** A connection task blocked handing a
    batch to `Fanout::send` (its `deliver` helper, `crates/logit-pipeline/src/fanout.rs`) stops
@@ -174,7 +174,7 @@ hyper-util's own pre-sniff `ReadVersion` future resolves to `Err("Cancelled")` o
 signal, and an H2 connection still mid-handshake only sets an internal `close_pending` flag rather
 than closing outright. The bounded grace-then-drop step exists precisely for those three cases,
 where `graceful_shutdown` alone would leave the connection parked. This is also the narrowing the
-residual `otlp_in` row in [`docs/known-gaps.md`](../known-gaps.md#tls-and-connection-lifecycle)
+residual `otlp_in` row in [`docs/known-gaps/intake.md`](../known-gaps/intake.md#tls-and-connection-lifecycle)
 already anticipated: `otlp_in` resets its idle clock on request *completion*, not on individual
 bytes, so a request head that dribbles in more slowly than `idle_timeout` on an otherwise-idle
 keep-alive connection is still closed -- a documented cost, not a bug. A body that stalls
@@ -224,9 +224,10 @@ comment.
 - **hyper's `header_read_timeout` + `TokioTimer` for `otlp_in`.** Verified against the pinned hyper
   1.11.1 source (`src/proto/h1/conn.rs`): the timer arms at the top of `poll_read_head`, before any
   header byte is parsed, and `State::idle` re-arms it on every idle keep-alive gap -- it is an idle
-  timeout wearing a first-head name, and `docs/known-gaps.md`'s residual row already named this same
-  finding when rejecting it as the fix for the narrower first-byte gap. It also only covers H1 (H2
-  has no equivalent knob), and bounds nothing about a request body once headers are read.
+  timeout wearing a first-head name, and `docs/known-gaps/intake.md`'s residual row already named
+  this same finding when rejecting it as the fix for the narrower first-byte gap. It also only
+  covers H1 (H2 has no equivalent knob), and bounds nothing about a request body once headers are
+  read.
 - **An IO-level wrapper around the socket, ticking a timer on every poll.** Rejected for `otlp_in`
   specifically: hyper's H1 server polls the raw socket read mid-message (`mid_message_detect_eof`'s
   `force_io_read`) to notice a peer closing while a handler runs, so a wrapper timer at that layer
@@ -237,7 +238,7 @@ comment.
   connections and lost data, exactly the outcome the no-receive-queue design
   ([ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md)) exists to prevent.
 - **A second use of `handshake_timeout`.** Rejected, and already rejected once before this ADR
-  existed: `docs/known-gaps.md`'s idle row records that decision from 2026-09-13, when
+  existed: `docs/known-gaps/intake.md`'s idle row records that decision from 2026-09-13, when
   `handshake_timeout` landed. A pre-message bound and an idle bound are different shapes -- one
   covers "never sent anything," the other "stopped sending" -- and conflating them into one knob
   would make either semantics wrong for the other case.
@@ -274,7 +275,7 @@ comment.
   with the service-level-tracker rationale and the hyper evidence above.
 - **W4** (docs closeout): a new `docs/deploying.md` section covering the semantics, the reset rule,
   and the enable-it-wherever-consistent-traffic-is-expected recommendation verbatim; both
-  `docs/known-gaps.md` rows this ADR answers (both the idle-timeout row and the `otlp_in`
+  `docs/known-gaps/intake.md` rows this ADR answers (both the idle-timeout row and the `otlp_in`
   residual row that pointed at it, under its "TLS and connection lifecycle" section) struck or
   narrowed to what remains open; the counter added to `docs/design/internal-telemetry.md`'s bullet
   for each of the five listeners, and that doc's `connection_error` wording gaining "never an idle
@@ -308,7 +309,7 @@ kept both:
   `MAX_REQUEST_BYTES × idle_timeout` on an HTTP listener, and `max_frame_bytes × idle_timeout` on
   `logit_in`. A total deadline was declined because a slow link sending a large legitimate body
   looks the same. The cost is recorded under "TLS and connection lifecycle" in
-  [`docs/known-gaps.md`](../known-gaps.md#tls-and-connection-lifecycle).
+  [`docs/known-gaps/intake.md`](../known-gaps/intake.md#tls-and-connection-lifecycle).
 
 ## Amendment: the hyper derivation re-run, and one claim corrected (2026-09-25)
 

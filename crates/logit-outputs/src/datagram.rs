@@ -23,7 +23,7 @@
 //!
 //! [`Sent`] comes back on every exit, so a sink counts what reached the wire before an error as
 //! well as on success. A cancelled send returns nothing, and its counts are lost
-//! (`docs/known-gaps.md`).
+//! (`docs/known-gaps/intake.md`).
 //!
 //! A UDP sink resolves its endpoint once per batch ([`UdpDest::resolve`]) and sends to the first
 //! IPv4 address in the answer, else the first IPv6 one ([`pick_addr`]), over an IPv4 socket bound

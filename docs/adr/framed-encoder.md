@@ -38,7 +38,7 @@ different ways, and the tree had four encoder shapes rather than one:
 4. **`prometheus_out`**, a stateful registry rendered on scrape -- no per-batch encode at all
    ([ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)).
 
-`docs/known-gaps.md` carried (3) as an open entry: "two sinks now independently need this shape,
+`docs/known-gaps/` carried (3) as an open entry: "two sinks now independently need this shape,
 which is exactly the signal that was being waited for", with the generalization "still deferred,
 but no longer for lack of a second caller to design against". The concrete trigger to stop
 deferring was a **third** framed codec: the collectd codec (PR #137, `crates/logit-proto/src/
@@ -144,5 +144,5 @@ warm-then-measure call.
   producer remains the second, unbuilt anticipation.
 - [ADR `syslog-output`](syslog-output.md), [ADR `statsd-output`](statsd-output.md), and
   [ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md) each carry an
-  amendment pointing here; `docs/known-gaps.md`'s entry and `docs/plans/lossless-transit.md`'s
+  amendment pointing here; `docs/known-gaps/`'s entry and `docs/plans/lossless-transit.md`'s
   residual item are closed.

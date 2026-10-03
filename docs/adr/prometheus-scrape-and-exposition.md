@@ -352,7 +352,7 @@ than leaving it implicit: an example config for this pair binds `127.0.0.1`, not
 first-time reader gets a safe default to start from rather than an accidental network-wide
 exposure, and an operator who needs `prometheus_out` reachable from outside the host is the one
 making that choice, not inheriting it from the example. Real TLS/auth support is tracked in
-`docs/known-gaps.md` alongside `admin:`'s own entry, not designed here.
+`docs/known-gaps/prometheus.md` alongside `admin:`'s own entry, not designed here.
 
 ### `Output::bind`
 

@@ -8,9 +8,9 @@ updated: 2026-09-14
 ## Context
 
 [ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md) decides the shape of this
-work: `syslog_in` gains `transport: tcp` (it has been UDP-only, `docs/known-gaps.md`'s
+work: `syslog_in` gains `transport: tcp` (it has been UDP-only, `docs/known-gaps/`'s
 "`syslog_in` is UDP-only" entry), and both `syslog_in` and `syslog_out` gain a `tls:` block, closing
-`docs/known-gaps.md`'s "`syslog_out` has no TLS" entry (narrowed to DTLS, which stays out of scope).
+`docs/known-gaps/`'s "`syslog_out` has no TLS" entry (narrowed to DTLS, which stays out of scope).
 This plan is the concrete build-out of that decision: what lands in which order, in which files,
 and how each piece is verified. It does not repeat the ADR's reasoning -- read that first for *why*
 each of these choices was made; this plan only orders the work that implements them.
@@ -175,8 +175,8 @@ retargeted to `main` when it merges. `git merge origin/main` to update, never re
 | W2 | `syslog_in` over TCP/TLS | `logit-inputs/src/syslog.rs`, `logit-config/src/lib.rs`, `logit-pipeline/src/graph.rs`, `logit-cli/src/pipeline.rs`, `schema/logit.schema.json`, `docs/design/pipeline-graph.md`, `docs/design/internal-telemetry.md` | W1 |
 | W3 | `syslog_out` TLS | `logit-outputs/src/{syslog,tls,logit}.rs`, `logit-config/src/lib.rs`, `graph.rs`, `pipeline.rs`, `schema/logit.schema.json`, both design docs | W0 (∥ W1/W2) |
 | W4 | Recorded rsyslog-over-TCP fixture | `script/record-fixtures`, `tools/record-fixtures/rsyslog-tcp.conf` (new), `testdata/interop/syslog/rsyslog-tcp-000.raw` + `README.md`, a framer test in `tcp.rs`, `docs/plans/recorded-interop-fixtures.md` | W1 (∥ W2/W3) |
-| W5 | Round-trip tests, example, closeout | `crates/logit-cli/tests/syslog_round_trip.rs`, `fixtures/syslog-relay.yaml` (new), `docs/known-gaps.md`, `docs/adr/syslog-output.md`, `docs/deploying.md`, `docs/design/internal-telemetry.md`, `AGENTS.md` | W2 + W3 (+ W4) |
-| W6 | Operator-configurable `handshake_timeout` on all three TCP listeners | `logit-config/src/lib.rs`, `logit-pipeline/src/graph.rs`, `logit-inputs/src/{tcp,logit,syslog,otlp}.rs`, `logit-cli/src/pipeline.rs`, `schema/logit.schema.json`, `docs/design/pipeline-graph.md`, `docs/deploying.md`, `docs/known-gaps.md`, both syslog/native ADRs, `fixtures/{syslog-relay,forwarder-central}.yaml` | W5 |
+| W5 | Round-trip tests, example, closeout | `crates/logit-cli/tests/syslog_round_trip.rs`, `fixtures/syslog-relay.yaml` (new), `docs/known-gaps/`, `docs/adr/syslog-output.md`, `docs/deploying.md`, `docs/design/internal-telemetry.md`, `AGENTS.md` | W2 + W3 (+ W4) |
+| W6 | Operator-configurable `handshake_timeout` on all three TCP listeners | `logit-config/src/lib.rs`, `logit-pipeline/src/graph.rs`, `logit-inputs/src/{tcp,logit,syslog,otlp}.rs`, `logit-cli/src/pipeline.rs`, `schema/logit.schema.json`, `docs/design/pipeline-graph.md`, `docs/deploying.md`, `docs/known-gaps/`, both syslog/native ADRs, `fixtures/{syslog-relay,forwarder-central}.yaml` | W5 |
 
 Landing order: **W0 → (W1 ∥ W3) → (W2 ∥ W4) → W5 → W6.**
 
@@ -198,7 +198,7 @@ decides for itself. **W6** is a follow-on stacked on W5: the 5s pre-message time
 driver inherited from `logit_in` becomes an operator-facing `handshake_timeout:` field on
 `syslog_in`, `logit_in`, and `otlp_in` alike (graph rule 45; both syslog and native ADRs carry a
 2026-09-13 amendment), and `otlp_in`'s previously-unbounded TLS accept is wrapped at the same time,
-closing `docs/known-gaps.md`'s row for it. It deliberately adds no idle timeout -- that row is
+closing `docs/known-gaps/`'s row for it. It deliberately adds no idle timeout -- that row is
 amended instead with the three design questions that make it its own effort.
 
 ### Per-workstream detail
@@ -243,7 +243,7 @@ corpus; a raw LF-framed client; the multiline octet case) and `mod tls` (server 
 refused + `Fault::Clean`), modelled on `logit_round_trip.rs` but using `bind()`+`local_addr()`, not
 `ephemeral_addr()`+sleep. `fixtures/syslog-relay.yaml` in `statsd-relay.yaml` style, `tls:` blocks
 commented as in `fixtures/forwarder-*.yaml`. Done: `cibuild` + `script/validate` clean; no remaining
-"`syslog_in` is UDP-only" claim outside a closed `known-gaps.md` entry.
+"`syslog_in` is UDP-only" claim outside a closed `known-gaps/` entry.
 
 **W6** -- Test list: config round-trip (default + set, all three kinds); rule 45's zero case per
 kind, the non-default-under-UDP rejection, and both accepting cases (a *deserialized* defaulted UDP
@@ -295,7 +295,7 @@ read the field back off). Done: `cibuild` clean, `script/schema` no diff after c
   message would mis-latch); mitigated by loud per-connection failure rather than silent
   misinterpretation. The ADR cites the `go-syslog`/Alloy precedent for the same detection.
 - ~~No idle-connection timeout: a handshaken-then-silent connection holds a concurrency-cap permit
-  forever, the same gap `otlp_in` already has -- one shared `known-gaps.md` row for both rather
+  forever, the same gap `otlp_in` already has -- one shared `known-gaps/` row for both rather
   than two.~~ Closed 2026-09-14 by an opt-in `idle_timeout:` field on `syslog_in` and every other
   TCP-capable listener kind ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)).
 - Per-connection batching means N connections × `batch_max_events` events can be in flight at once;

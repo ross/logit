@@ -159,8 +159,8 @@ pub struct SockMeminfo {
     pub rcvbuf: u32,
     /// `sk->sk_wmem_alloc`: bytes charged to this socket's send side. Nearly always 0 when sampled
     /// on a UDP sender, since a datagram is charged and uncharged inside one `sendmsg`; that is why
-    /// `logit` counts send errors instead (`docs/known-gaps.md`). Unread today; kept for a TCP
-    /// consumer.
+    /// `logit` counts send errors instead (`docs/known-gaps/intake.md`). Unread today; kept for a
+    /// TCP consumer.
     pub wmem_alloc: u32,
     /// `sk->sk_sndbuf`, the send-side twin of [`Self::rcvbuf`], doubled the same way.
     pub sndbuf: u32,

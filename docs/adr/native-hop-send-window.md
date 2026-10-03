@@ -58,7 +58,7 @@ resend them from:
   keeps the sequence a deduplication identity, never a credit, and leaves the acknowledgment form
   to a later record.
 - [ADR `delivery-semantics`](delivery-semantics.md), item 7, keeps `window` at 1.
-- `docs/known-gaps.md` tracks "Credit-based flow control (`window` > 1)" and "No
+- `docs/known-gaps/native-hop.md` tracks "Credit-based flow control (`window` > 1)" and "No
   out-of-order/credit-based acknowledgement".
 
 What changed: the hop is effectively-once. Every frame carries the `(sender id, seq)` its store
@@ -330,8 +330,8 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   in about one round trip after. The hard bound is the window it holds; under the sustained
   backpressure that parks a forward, the pace keeps it to one or two. Nothing is lost, and a
   batch's only copy never lands after a later batch, since a mark at or above a sequence exists
-  only once a copy of it landed. The `docs/known-gaps.md` entry "A resend can race the frames
-  an ended connection still holds, and be forwarded twice" says so.
+  only once a copy of it landed. The `docs/known-gaps/native-hop.md` entry "A resend can race the
+  frames an ended connection still holds, and be forwarded twice" says so.
 - **The shutdown count grows.** A memory store's `finish` counts outstanding frames as
   `dropped{reason="shutdown"}`, and `flush`'s `shutdown()` can then let `logit_in` forward them.
   The over-count is at most one batch today and at most `window` with this record.
@@ -382,10 +382,11 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   `await_ack`. Two new gauges, `logit.output.in_flight` and `logit.output.window`, show the
   frames outstanding and the negotiated window. `docs/design/internal-telemetry.md` records all
   four.
-- **Known gaps.** In `docs/known-gaps.md`, "Credit-based flow control (`window` > 1)" and "No
-  out-of-order/credit-based acknowledgement" close. "A resend can race the frames an ended connection still holds, and be forwarded twice" changes to the several-duplicate worst case of decision 6, and
-  the `ack_write_stalled` reasoning under "`logit_in`'s `idle_timeout` bounds reads only"
-  changes for a peer with a window of unread acks.
+- **Known gaps.** In `docs/known-gaps/native-hop.md`, "Credit-based flow control (`window` > 1)" and
+  "No out-of-order/credit-based acknowledgement" close. "A resend can race the frames an ended
+  connection still holds, and be forwarded twice" changes to the several-duplicate worst case of
+  decision 6, and the `ack_write_stalled` reasoning under "`logit_in`'s `idle_timeout` bounds reads
+  only" changes for a peer with a window of unread acks.
 - **Operator docs.** The plan's W4 rewrites every passage that says one frame is in flight:
   module docs, `docs/design/wire-protocol.md`, `docs/deploying.md` (the `window:` field and the
   posture note), and the amended records.

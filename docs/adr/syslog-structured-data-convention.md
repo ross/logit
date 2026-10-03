@@ -127,7 +127,7 @@ Per event, per `syslog.timestamp`'s shape, independent of the *input* dialect th
 
 `event.timestamp` itself is always receipt time (`docs/adr/decoupled-listener-io.md`) and this sink
 never resolves `syslog.timestamp` onto it — the opt-in `syslog_timestamp` transform
-`docs/known-gaps.md` sketches remains the place that would do that explicitly, for either
+`docs/known-gaps/syslog.md` sketches remains the place that would do that explicitly, for either
 direction, before an event reaches `syslog_out`.
 
 ### `syslog.pid`
@@ -192,8 +192,8 @@ at all.
   distinct, RFC-legal 1-to-32-byte tokens — the same exposure `json`
   ([ADR `json-parsing-into-attributes`](json-parsing-into-attributes.md)) already has today, where
   an arbitrary JSON object's keys are interned unconditionally via `AttrMap::insert` with no length
-  bound at all. `docs/known-gaps.md`'s interner entry is rewritten to name `syslog.sd` instead of
-  claiming syslog's field names are "bounded by construction."
+  bound at all. `docs/known-gaps/runtime.md`'s interner entry is rewritten to name `syslog.sd`
+  instead of claiming syslog's field names are "bounded by construction."
 - **`max_message_bytes` now counts STRUCTURED-DATA as header.** `write_rfc5424_header` appends
   STRUCTURED-DATA before `encode_event`'s length check runs, so a `syslog.sd`/`structured_data`
   element that pushes the header over `max_message_bytes` drops the whole message
@@ -215,14 +215,14 @@ at all.
     writing, since `AttrMap`/attribute iteration order is process-global intern order, not wire
     order — a relay that saw `[b@2 ..][a@1 ..]` re-emits `[a@1 ..][b@2 ..]`. A repeated
     PARAM-NAME's occurrences are emitted grouped (already grouped under one `Value::Array` by the
-    decoder), so a wire `a b a` interleaving is not preserved — see `docs/known-gaps.md`.
+    decoder), so a wire `a b a` interleaving is not preserved — see `docs/known-gaps/syslog.md`.
   - **A PARAM-VALUE's bare (non-escape) backslash is re-emitted in canonical escaped form.** RFC
     5424 section 6.3.3 declares only `\"`, `\\`, `\]` as escapes; a backslash before any other
     byte is a literal backslash followed by that byte, which `parse_param_value` keeps literally
     rather than rejecting. `syslog_out` then re-emits that literal backslash the canonical way
     (`\` → `\\`), so `p="a\xb"` relays as `p="a\\xb"` — the same PARAM-VALUE, per the RFC's own
     equivalence, just spelled the canonical way.
-- **The `syslog_timestamp` transform sketch (`docs/known-gaps.md`) remains the way to resolve
+- **The `syslog_timestamp` transform sketch (`docs/known-gaps/syslog.md`) remains the way to resolve
   `event.timestamp` from `syslog.timestamp` explicitly**, for either direction — this ADR changes
   what `syslog_out` does with `syslog.timestamp` when present, not what sets `event.timestamp`
   itself, which stays receipt time throughout the pipeline.

@@ -116,7 +116,7 @@ script copying one onto the other (`event.log.trace_id = trace.trace_id`, stampi
   `docs/design/memory.md`/`data-model.md` updated in the same commit as the model change, per
   `AGENTS.md`'s rule for exactly this kind of size-affecting change.
 - `syslog_out`/`syslog_in`/`influxdb_out` are untouched by this change. `syslog_out` has no
-  STRUCTURED-DATA emission at all today (`docs/known-gaps.md`), so a log's trace context has
+  STRUCTURED-DATA emission at all today (`docs/known-gaps/syslog.md`), so a log's trace context has
   nowhere to go over that wire yet — filed as the new residual gap, not silently dropped without a
   trace. `influxdb_out` ignores a log's fields entirely already (it only ever writes metrics), so
   nothing changes there.

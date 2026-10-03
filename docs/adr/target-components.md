@@ -251,7 +251,7 @@ what the component does to an event, the way `set`/`keep`/`scale` do. `event:to(
   branch can block a fast one. `docs/design/pipeline-graph.md`'s head-of-line warning still applies.
 - **Docs.** `component-graph-configuration` and `routing-by-condition-is-lua` each gain a dated
   amendment, not a rewrite; `pipeline-graph.md`, `lua-api.md`, `internal-telemetry.md`,
-  `memory.md`, `known-gaps.md`, `deploying.md` (the `alias` node state) updated;
+  `memory.md`, `known-gaps/`, `deploying.md` (the `alias` node state) updated;
   `fixtures/fan-out-central.yaml` rewritten onto `route` + targets with `fan-out-edge.yaml`
   untouched -- the same edge config, a central config that no longer clones.
 - **Build-out:** [`docs/plans/target-components.md`](../plans/target-components.md).

@@ -30,13 +30,14 @@ already had to qualify it once `MetricKind::Distribution` → OTLP `Summary` and
 skip showed the loss can run in the *other* direction too — `logit`'s own model, not OTLP's, can be
 the narrower one.
 
-`docs/known-gaps.md` separately catalogs a dozen losses that are each individually "deliberate,
-already-identified... accepted": `statsd_out` drops `Distribution`/`Set`/`Histogram`/`Summary`
-entirely; `syslog_out` emits no RFC 5424 STRUCTURED-DATA and re-stamps the relayed timestamp; the
-"Cross-protocol semantic gaps" table lists `Distribution`→`Summary` degradation, `Set` skip,
-`U64`/`Timestamp` collapse to `I64`, and more. None of these is wrong on its own terms — every one
-is counted and documented, per this project's own conventions — but nothing says which of them are
-acceptable forever versus which are a stated goal not yet met. This ADR settles that.
+`docs/known-gaps/mappings.md` separately catalogs a dozen losses that are each individually
+"deliberate, already-identified... accepted": `statsd_out` drops
+`Distribution`/`Set`/`Histogram`/`Summary` entirely; `syslog_out` emits no RFC 5424 STRUCTURED-DATA
+and re-stamps the relayed timestamp; the "Cross-protocol semantic gaps" table lists
+`Distribution`→`Summary` degradation, `Set` skip, `U64`/`Timestamp` collapse to `I64`, and more.
+None of these is wrong on its own terms — every one is counted and documented, per this project's
+own conventions — but nothing says which of them are acceptable forever versus which are a stated
+goal not yet met. This ADR settles that.
 
 ## Decision
 
@@ -79,9 +80,9 @@ round-trip test can assert equality against a concrete expectation rather than "
 **The internal model is a superset of every supported protocol's data model, not only OTLP's.**
 A field or semantic a protocol can carry that `Event`/`EventBatch` cannot represent at all is a
 model gap, tracked as debt against this ADR (in [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)
-and `docs/known-gaps.md`), not something a codec is free to accept quietly. This generalizes and
-amends `native-wire-format-with-otlp-bridge`'s Consequences from "must be a superset of OTLP" to
-"must be a superset of every protocol this project ships an `_in`/`_out` pair for."
+and `docs/known-gaps/mappings.md`), not something a codec is free to accept quietly. This
+generalizes and amends `native-wire-format-with-otlp-bridge`'s Consequences from "must be a superset
+of OTLP" to "must be a superset of every protocol this project ships an `_in`/`_out` pair for."
 
 **Summarization is opt-in and named.** Only a component whose stated purpose is to summarize —
 `aggregate`, or a Lua script doing the equivalent — may discard information that a lossless relay
@@ -119,8 +120,8 @@ bearing, generalized into one rule:
 metric type, a DDSketch has no statsd wire form — and that is explicitly *not* what this ADR
 requires to be lossless. What it does require: every such degradation increments a
 `logit.output.metrics.{degraded,skipped}`-style counter (the existing convention), is named in the
-receiving codec's own module doc, and appears in `docs/known-gaps.md`'s cross-protocol table. Loss
-is acceptable exactly there, and nowhere else.
+receiving codec's own module doc, and appears in `docs/known-gaps/mappings.md`'s cross-protocol
+table. Loss is acceptable exactly there, and nowhere else.
 
 **Round-trip fixed point is the test that proves this, not a design review.** Each like pair gets a
 `decode -> encode -> decode` equality test over a fixture corpus that exercises every wire feature
@@ -130,11 +131,11 @@ fixture, not after.
 
 ## Alternatives considered
 
-- **Leave every gap as an independently accepted `known-gaps.md` entry (status quo).** Rejected:
-  each new sink re-litigates the same question from scratch (this ADR exists because `statsd_out`
-  just did), and nothing stops the list from growing indefinitely in a direction no one chose on
-  purpose. An operator relaying statsd through `logit` has a reasonable expectation of fidelity that
-  the current state doesn't meet and doesn't say it's trying to meet.
+- **Leave every gap as an independently accepted `known-gaps/mappings.md` entry (status quo).**
+  Rejected: each new sink re-litigates the same question from scratch (this ADR exists because
+  `statsd_out` just did), and nothing stops the list from growing indefinitely in a direction no one
+  chose on purpose. An operator relaying statsd through `logit` has a reasonable expectation of
+  fidelity that the current state doesn't meet and doesn't say it's trying to meet.
 - **Make OTLP the internal model.** Already rejected in `native-wire-format-with-otlp-bridge` for
   performance and log-model-fit reasons; also fails this goal directly, since OTLP itself cannot
   carry a mergeable sketch, statsd's relative-gauge delta, raw unaggregated samples, or syslog
@@ -163,9 +164,9 @@ fixture, not after.
 - The native wire format (`crates/logit-proto/src/native/`) has to carry whatever the model gains;
   since `logit` is pre-release, this is a straight reshape of the record framing, not a version
   negotiation or a dual-read compatibility path.
-- `docs/known-gaps.md`'s statsd/syslog/cross-protocol entries this ADR covers are reclassified from
-  "accepted" to "tracked debt against this ADR," not removed — nothing is fixed by writing this
-  record.
+- `docs/known-gaps/mappings.md`'s statsd/syslog/cross-protocol entries this ADR covers are
+  reclassified from "accepted" to "tracked debt against this ADR," not removed — nothing is fixed by
+  writing this record.
 - `statsd-output`, `aggregation-window-semantics`, `syslog-output`, and `relative-gauge-adjustments`
   each get an amendment when their corresponding workstream lands, the same way
   `aggregation-window-semantics` already carries two amendments from later decisions.

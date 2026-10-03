@@ -65,7 +65,7 @@ once a restart policy, not a person at a terminal, is what's waiting on this pro
 **Accepted cost:** a datagram mid-`recv_from`/decode when the signal lands is dropped along with
 the cancelled future. This is the right trade — UDP is lossy by contract already; the aggregation
 window this change protects is not — but it is a real, deliberate behavior, not an oversight.
-Recorded in `docs/known-gaps.md`.
+Recorded in `docs/known-gaps/runtime.md`.
 
 ### Retry: a tight wall-clock budget, not an attempt count
 
@@ -112,7 +112,7 @@ will still exit for the supervisor to restart, exactly as it does today without 
 difference retry makes is narrower than "survives an InfluxDB outage": it's "a single transient
 failure no longer ends the process." Riding out an actual outage without dropping intake needs
 delivery decoupled from the drain loop (a real `Buffer` implementation) — out of scope here, and
-tracked as a new `docs/known-gaps.md` entry, not solved by widening the retry budget.
+tracked as a new `docs/known-gaps/runtime.md` entry, not solved by widening the retry budget.
 
 ### Diagnostics: attribution via a builder, throttling by count
 Nine `eprintln!` sites exist; six carry no component id (`InfluxDbOutput`/`InfluxLineEncoder`,
@@ -153,7 +153,7 @@ bounded under typical load.
   fix for the retry-vs-backpressure tension, and is likely the right next step, but it's real new
   design (an in-memory ring buffer or similar, an overflow policy, retry moving behind that
   boundary) that expands this workstream well past "packaging and lifecycle." Deferred, and
-  tracked as its own `docs/known-gaps.md` entry rather than folded into this ADR's scope.
+  tracked as its own `docs/known-gaps/runtime.md` entry rather than folded into this ADR's scope.
 - **A time-window rate limiter for diagnostics**, matching how most logging frameworks throttle.
   Rejected here specifically because `Transform::process` has no clock to hand it without a trait
   change that buys nothing else this workstream needs; count-based throttling meets the actual
@@ -177,12 +177,12 @@ bounded under typical load.
   types carry ~90 existing tests between them, and the builder approach churns none of them.
   `logit-cli` gains a direct `logit-core` dependency to construct `Diagnostics::new(id)` in
   `build_spec`, which now takes the component's `id` as a parameter for exactly that.
-- `docs/known-gaps.md`: the "no graceful shutdown" entry closes, replaced by the two named residual
-  gaps (dropped in-flight datagram, no `Output` close hook); the `eprintln!` entry narrows to "the
-  `tracing` migration is still outstanding"; the output-buffering entry gains a note that bounded
-  retry now exists but `Buffer`/at-least-once delivery remain unimplemented; a new entry records
-  that delivery IO is not decoupled from event processing within a node, which is what makes the
-  retry budget above tight rather than generous.
+- `docs/known-gaps/runtime.md`: the "no graceful shutdown" entry closes, replaced by the two named
+  residual gaps (dropped in-flight datagram, no `Output` close hook); the `eprintln!` entry narrows
+  to "the `tracing` migration is still outstanding"; the output-buffering entry gains a note that
+  bounded retry now exists but `Buffer`/at-least-once delivery remain unimplemented; a new entry
+  records that delivery IO is not decoupled from event processing within a node, which is what makes
+  the retry budget above tight rather than generous.
 
 ## Amendment: throttle scope is the component, not the clone (2026-09-14)
 
