@@ -9006,10 +9006,12 @@ mod tests {
         assert!(err.to_string().contains("enrich"), "{err}");
     }
 
-    /// Feeds `before` at start; once shutdown fires, waits `after_shutdown` and sends `after`.
+    /// Feeds `before` at start; once shutdown fires, waits until `readiness` reports node
+    /// `after_failed` as [`NodeState::Failed`] and sends `after`.
     struct WedgeFeedInput {
         before: Vec<EventBatch>,
-        after_shutdown: Duration,
+        readiness: watch::Receiver<crate::readiness::PipelineState>,
+        after_failed: &'static str,
         after: Option<EventBatch>,
     }
 
@@ -9029,7 +9031,11 @@ mod tests {
                 sink.send(batch).await;
             }
             let _ = shutdown.wait_for(|&due| due).await;
-            tokio::time::sleep(self.after_shutdown).await;
+            let failed = self.after_failed;
+            let _ = self
+                .readiness
+                .wait_for(|s| s.components.get(failed) == Some(&NodeState::Failed))
+                .await;
             if let Some(batch) = self.after.take() {
                 sink.send(batch).await;
             }
@@ -9075,6 +9081,7 @@ mod tests {
         let g =
             graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
+        let (readiness, rx) = Readiness::channel();
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
@@ -9082,8 +9089,10 @@ mod tests {
                 Box::new(WedgeFeedInput {
                     // The first passes through into the window; the second wedges the script.
                     before: vec![one_counter_batch("kept"), one_counter_batch("wedge")],
-                    // 1.5 s past the Lua node's 1 s grace, so this send meets a revoked inbox.
-                    after_shutdown: Duration::from_millis(2500),
+                    // The join loop marks the node failed only after the watcher's revocation
+                    // closed its inbox, so this send meets a revoked inbox.
+                    readiness: rx.clone(),
+                    after_failed: "enrich",
                     after: Some(one_counter_batch("late")),
                 }),
                 InputRuntimeConfig { shutdown_grace: Duration::from_secs(5) },
@@ -9121,7 +9130,6 @@ mod tests {
             .into_iter()
             .map(|id| (id.to_string(), probe.telemetry(id, "x", "x")))
             .collect();
-        let (readiness, rx) = Readiness::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let run_task =
             tokio::spawn(run_with_telemetry(g, specs, telemetry, readiness, async move {
@@ -9145,7 +9153,8 @@ mod tests {
             .unwrap()
             .expect_err("a wedged script fails the run");
         let elapsed = started.elapsed();
-        // The input's own 2.5 s wait bounds the run from below; the wedge adds nothing past it.
+        // The Lua node's 1 s grace, counted from its last progress, is most of the run. 4 s is
+        // under the input's and the sink's 5 s graces, so a run that waited out either fails here.
         assert!(elapsed < Duration::from_secs(4), "the run took {elapsed:?} after shutdown");
         assert!(matches!(err, RunError::Runtime(_)), "a wedge is a runtime failure: {err:?}");
         let message = err.to_string();
