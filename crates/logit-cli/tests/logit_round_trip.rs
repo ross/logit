@@ -534,16 +534,34 @@ mod window {
     struct Relay {
         addr: String,
         hold_connections: watch::Sender<bool>,
-        hold_acks: watch::Sender<bool>,
+        acks: Arc<watch::Sender<AckGate>>,
         cut: watch::Sender<u64>,
+    }
+
+    /// The relay's ack direction, shared by every connection. An `Ack` passes only while
+    /// `forwarded` is below `pass_until`, and `forwarded` is raised under the same lock before
+    /// its bytes are written, so once `forwarded` reaches `pass_until` it is frozen and no ack
+    /// past it can reach the sender.
+    struct AckGate {
+        pass_until: u64,
+        /// The highest `Ack.seq` let through. Seqs count from 1 in push order, so it is also how
+        /// many batches the sender can have seen acknowledged.
+        forwarded: u64,
+    }
+
+    impl AckGate {
+        fn holding(&self) -> bool {
+            self.forwarded >= self.pass_until
+        }
     }
 
     async fn spawn_relay(upstream: String) -> Relay {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let (hold_connections, connections_rx) = watch::channel(false);
-        let (hold_acks, hold_rx) = watch::channel(false);
+        let acks = Arc::new(watch::Sender::new(AckGate { pass_until: u64::MAX, forwarded: 0 }));
         let (cut, cut_rx) = watch::channel(0u64);
+        let gate = Arc::clone(&acks);
         tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
                 tokio::spawn(relay_connection(
@@ -551,20 +569,42 @@ mod window {
                     upstream.clone(),
                     cut_rx.clone(),
                     connections_rx.clone(),
-                    hold_rx.clone(),
+                    Arc::clone(&gate),
                 ));
             }
         });
-        Relay { addr, hold_connections, hold_acks, cut }
+        Relay { addr, hold_connections, acks, cut }
     }
 
-    /// Relays one connection both ways until either side closes or a cut is called.
+    /// Reads one control frame off `stream`: its bytes, and its seq when it is an `Ack`.
+    async fn read_control_frame(
+        stream: &mut tokio::net::tcp::OwnedReadHalf,
+    ) -> std::io::Result<(Vec<u8>, Option<u64>)> {
+        use logit_proto::frame;
+        use logit_proto::native::control::ControlMessage;
+        let mut raw = vec![0u8; frame::HEADER_LEN];
+        stream.read_exact(&mut raw).await?;
+        let header = frame::FrameHeader::read(&mut Bytes::copy_from_slice(&raw))
+            .expect("logit_in writes a valid control frame header");
+        raw.resize(frame::HEADER_LEN + header.compressed_len as usize, 0);
+        stream.read_exact(&mut raw[frame::HEADER_LEN..]).await?;
+        let (_, mut payload) = frame::read_frame_with_header(&mut Bytes::from(raw.clone()))
+            .expect("logit_in writes a valid control frame");
+        let seq = match ControlMessage::decode(&mut payload) {
+            Ok(ControlMessage::Ack(ack)) => Some(ack.seq),
+            _ => None,
+        };
+        Ok((raw, seq))
+    }
+
+    /// Relays one connection both ways until either side closes or a cut is called. The
+    /// `logit_in` side is relayed a control frame at a time, so `acks` gates whole `Ack`s.
     async fn relay_connection(
         client: TcpStream,
         upstream: String,
         mut cut: watch::Receiver<u64>,
         mut hold_connections: watch::Receiver<bool>,
-        mut hold_acks: watch::Receiver<bool>,
+        gate: Arc<watch::Sender<AckGate>>,
     ) {
         let epoch = *cut.borrow_and_update();
         let _ = hold_connections.wait_for(|&held| !held).await;
@@ -573,16 +613,27 @@ mod window {
         let (mut server_read, mut server_write) = server.into_split();
         let frames = tokio::io::copy(&mut client_read, &mut server_write);
         let acks = async {
-            let mut buf = vec![0u8; 16 * 1024];
+            let mut released = gate.subscribe();
             loop {
-                let _ = hold_acks.wait_for(|&held| !held).await;
-                match server_read.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => {
-                        if client_write.write_all(&buf[..n]).await.is_err() {
-                            return;
+                let Ok((raw, seq)) = read_control_frame(&mut server_read).await else { return };
+                if let Some(seq) = seq {
+                    loop {
+                        let mut passed = false;
+                        gate.send_if_modified(|gate| {
+                            passed = !gate.holding();
+                            if passed {
+                                gate.forwarded = gate.forwarded.max(seq);
+                            }
+                            passed
+                        });
+                        if passed {
+                            break;
                         }
+                        let _ = released.wait_for(|gate| !gate.holding()).await;
                     }
+                }
+                if client_write.write_all(&raw).await.is_err() {
+                    return;
                 }
             }
         };
@@ -613,6 +664,12 @@ mod window {
         // just before the acks are held would leave the window short for good, so the sender
         // gets no connection until the spool holds the burst.
         relay.hold_connections.send_replace(true);
+        // Acks stop at the first one covering batch 50, and only the relay can say where. The
+        // sender's own counts lag the acks it was sent: one `Ack` can sit unread in its socket,
+        // and one cumulative `Ack` marks many frames acked that it then pops one per refill, so
+        // its `in_flight` counts acked frames while it drains. A cut in either state lands on
+        // refills that are resent rather than resumed.
+        relay.acks.send_modify(|gate| gate.pass_until = 50);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let run = tokio::spawn(logit_pipeline::run_with_telemetry(
             graph,
@@ -632,21 +689,18 @@ mod window {
         .await;
         relay.hold_connections.send_replace(false);
 
-        wait_until_within("some batches forwarded", Duration::from_secs(30), || {
-            marks.lock().unwrap().len() >= 50
-        })
-        .await;
-        relay.hold_acks.send_replace(true);
-        // The sender stops with a full window out, every frame of it forwarded and unacked.
+        // With acks frozen at `forwarded`, the sender can have sent at most `forwarded + 32`
+        // batches, so `logit_in` forwarding that many means the sender sent them all and can send
+        // nothing more: a full window, forwarded and unacked. Before the ack that froze the gate,
+        // at most 49 + 32 batches were sent, so it covers at most 81 and the window ends well
+        // inside the 200.
         wait_until_within("a full window forwarded and unacked", Duration::from_secs(30), || {
-            let totals = probe.poll();
-            let acked = totals.sum("logit.output.requests", &[("class", "ok")]) as usize;
-            totals.gauge("logit.output.in_flight", &[]) == Some(32.0)
-                && marks.lock().unwrap().len() == acked + 32
+            let gate = relay.acks.borrow();
+            gate.holding() && marks.lock().unwrap().len() == gate.forwarded as usize + 32
         })
         .await;
         relay.cut.send_modify(|epoch| *epoch += 1);
-        relay.hold_acks.send_replace(false);
+        relay.acks.send_modify(|gate| gate.pass_until = u64::MAX);
 
         wait_until_within(
             "every batch to reach logit_in's consumer",

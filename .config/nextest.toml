@@ -1,0 +1,32 @@
+# On a many-core machine a workspace run is bound by its longest tests, not by the sum of all of
+# them: started late, a 4 s test finishes after everything else has. These start first. The list
+# names the tests at about 1.5 s and over on a 24-core run; a test that grows past `slow-timeout`
+# shows as SLOW in the output and belongs here, or in a fix.
+
+[profile.default]
+slow-timeout = "5s"
+
+[[profile.default.overrides]]
+filter = '''
+    binary_id(logit-proto::robustness)
+  | binary_id(/_fixed_point$/)
+  | test(/^disk_queue_verification::/)
+  | test(/^queue_stress::/)
+  | test(/_dropped_at_its_budget_/)
+  | binary_id(logit-cli::splunk_hec_in_round_trip)
+  | binary_id(logit-cli::statsd_round_trip)
+  | (package(logit-script) & test(/^(memory|lifetime_tests)::/))
+  | test(=aggregate::verification::aggregator_matches_the_reference_model)
+  | test(=runtime::tests::a_loop_that_keeps_constructing_events_is_progress_not_a_stall)
+  | test(=runtime::tests::a_progressing_flush_emitting_many_events_is_never_stalled)
+  | test(=runtime::tests::a_lua_node_blocked_on_a_full_sink_inbox_unparks_within_the_sinks_grace_and_returns_ok)
+  | test(=logit::tests::the_graph_closes_after_shutdown_with_a_peer_that_never_reads_its_acks)
+  | test(=a_body_arriving_in_small_writes_is_held_once)
+'''
+priority = 100
+
+# CI's runner has 4 vCPUs, and at the default of one test per CPU the run is bound by test slots,
+# not CPU: many tests spend their time waiting on sockets and timers. 16 threads measured about
+# half the wall time of the default on 4 pinned CPUs. Every other setting comes from `default`.
+[profile.ci]
+test-threads = 16
