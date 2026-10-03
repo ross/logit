@@ -488,7 +488,8 @@ That watcher task also bounds a script that never returns
 There is no wall-clock bound on the drain as a whole. A slow `flush()` that keeps producing events
 is progress however long it takes, and graces don't add up along a chain of Lua nodes, because
 each wedge is judged on its own node's heartbeat. The cost: a script looping over `Event.new`
-forever is progress too, and is never stalled or wedged.
+forever, constructing events, is progress too, and is never stalled or wedged; a loop of
+refused calls is not progress.
 
 Everything else runs as an ordinary tokio task: listeners, sinks, native `Send` transforms
 (`logit-transforms::Aggregator` and every other native transform in that crate), and **native

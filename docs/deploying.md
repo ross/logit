@@ -172,8 +172,8 @@ configured).
   `process()`/`flush()` call for 10 s with no progress: an infinite loop, or a pathological pattern
   match. The self-log carries a `script_stalled` warning naming the component. A script that is
   slow but still producing events (a `flush()` building a large table with `Event.new`) is
-  progress, and never reads `stalled`; so is a script looping over `Event.new` forever, which
-  nothing detects. `/healthz` stays `200`: the process is alive, and a restart alone doesn't fix a
+  progress, and never reads `stalled`; so is a script looping over `Event.new` forever while it keeps
+  constructing events, which nothing detects. A loop of refused calls reads as a stall. `/healthz` stays `200`: the process is alive, and a restart alone doesn't fix a
   script. The shipped image's `HEALTHCHECK` probes `/readyz` (`logit ready`), though, so a stalled
   script marks the container unhealthy: Swarm restarts it, and Kubernetes, probing `/readyz` for
   readiness, takes the pod out of its Service endpoints until the script resumes.
