@@ -33,6 +33,7 @@ jobs:
           path: |
             ~/.cargo/registry
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # The root manifest's [profile.*] tables decide what the cached target dir holds.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
 
       - run: ./script/cibuild
