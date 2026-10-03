@@ -514,3 +514,21 @@ fn a_script_error_traceback_names_the_script_not_a_rust_file() {
     assert!(err.contains("script:4:"), "expected the script's own line, got: {err}");
     assert!(!err.contains(".rs"), "a traceback must not cite a Rust source file: {err}");
 }
+
+#[test]
+fn an_escaping_event_new_error_names_the_script_line_not_a_rust_file() {
+    let w = worker(
+        r#"
+        function process(event)
+            local constructed = Event.new{}
+            return constructed
+        end
+        "#,
+    );
+    let err = process_err(&w, metric_event(sum_kind()));
+    assert!(
+        err.contains("script:3: Event.new: timestamp is required"),
+        "expected the calling line and the refusal, got: {err}"
+    );
+    assert!(!err.contains(".rs"), "a traceback must not cite a Rust source file: {err}");
+}
