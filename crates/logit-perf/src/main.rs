@@ -6,6 +6,7 @@
 
 mod attribute;
 mod compare;
+mod file_load;
 mod flamegraph;
 mod load;
 mod result;
@@ -45,8 +46,9 @@ enum Command {
         /// exit on its own (at least 3s for a real-socket scenario).
         #[arg(long, default_value = "1s", value_parser = parse_duration)]
         settle: Duration,
-        /// How long to wait for a scenario's `generation complete` (or, for a real-socket
-        /// scenario, `ready`) line before failing it as hung.
+        /// How long after the spawn to wait for a scenario's `generation complete` line (for a
+        /// real-socket scenario, its `ready` line; for a file scenario, every line at the sink)
+        /// before failing it as hung.
         #[arg(long, default_value = "120s", value_parser = parse_duration)]
         timeout: Duration,
         /// How long to wait for the process to exit after the load ends (and any SIGTERM) before
@@ -274,7 +276,7 @@ fn run_list(root: &Path) -> anyhow::Result<()> {
         println!(
             "{:<22} {:<12} {:>22} {:>14}",
             scenario.name,
-            if scenario.workload.is_driven() { "real socket" } else { "generate_in" },
+            scenario.workload.source(),
             scenario.workload.describe(),
             if scenario.needs_sigterm { "SIGTERM" } else { "self-exits" },
         );

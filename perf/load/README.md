@@ -30,6 +30,10 @@ script/perf run --scenario udp-statsd-small --verify         # the strict, zero-
 script/perf run --scenario udp-statsd --rate-scale 0.5       # a stable point below the drop knee
 ```
 
+The `tail*` scenarios use this directory too, for a spec with `kind: file`: their load is a file
+`logit-perf` writes before the spawn, not datagrams. [File scenarios](#file-scenarios) covers them;
+everything else here is about the UDP kind.
+
 ## The spec format
 
 ```yaml
@@ -330,3 +334,53 @@ during startup on whatever CPU the scheduler picked.
   `--allow-identical`
   ([ADR `disposable-azure-perf-vm`](../../docs/adr/disposable-azure-perf-vm.md)'s "Multiple
   sources, one VM" section).
+
+## File scenarios
+
+`tail` and `tail-rotate` measure `tail_in`'s read path, and their load is a file. A spec with
+`kind: file` tells `logit-perf` what to write (`crates/logit-perf/src/file_load.rs`):
+
+```yaml
+kind: file             # without it, a spec is the UDP kind above
+target: app            # the `tail_in` component; its one `paths:` entry is the file written
+# sink: out            # as in a UDP spec: only a multi-sink graph has to name it
+lines: 12000000        # lines written in total, and the exact count the sink must receive
+rotate_after: 6000000  # optional: the first file's share; the rest goes to its replacement
+seed: 20261002         # seeds the weighted template choice: same spec, same bytes, every run
+ring_lines: 4093       # distinct lines rendered, then cycled
+model: app-log.yaml    # weighted `lines:` templates, the format statsd-app.yaml uses
+```
+
+`target`, `lines`, and `model` are required. Unknown fields are rejected.
+
+**The file is written before the spawn**, under `perf/results/`, so no write competes with the
+measured child and the run reads from the page cache. The scenario's `tail_in` path must be one
+exact path (no `*`, no `!env`) that resolves strictly inside `perf/results/`. The harness clears
+that path's directory before every spawn and removes it after, because each repeat writes a lot:
+~3.5 GiB for `tail`'s 12M lines and ~1.5 GiB for `tail-rotate`'s 5M. Before writing, it refuses
+a repeat unless the filesystem has twice the repeat's bytes free.
+
+**`rotate_after` rotates once, to logrotate `create` mode's end state.** The replacement is
+written before the spawn too, as `<path>.next`. Once the sink has received half of the first
+file, the harness hard-links `<path>` as `<path>.1` and renames `<path>.next` onto `<path>`.
+`tail_in` has to read the old inode through to its end and the replacement from its start.
+logrotate itself renames first and creates after; a scan in that gap misses the rotation count
+(`docs/known-gaps.md`), and the exact self-check counts rotations, so the harness never leaves
+`<path>` missing.
+
+**The run ends when the sink has every line.** `run` attaches the UDP kind's telemetry leg at a
+100 ms drain interval and follows the dump while the child runs, so `wall_s` is resolved to about
+one drain. Then every repeat is held to exact counts, since a file has nothing to drop:
+
+1. The sink received exactly `lines` events.
+2. `tail_in` split exactly `lines` lines (`logit.input.lines`).
+3. `tail_in` raised no diagnostics (`bad_line`, `long_line`, `read_error`, `invalid_utf8`, ...).
+4. `tail_in` counted the rotations the harness made (`logit.input.files.rotated`).
+
+[`app-log.yaml`](app-log.yaml) is the model: `logit-bench`'s `FLAT_JSON_LOG_BODY`, a Go
+`log/slog`-style JSON line at the commonest measured log width, with its values varied. Its own
+comment has the provenance and the line lengths.
+
+```sh
+script/perf run --scenario tail --scenario tail-rotate --repeat 5 --pin-child 2,3
+```

@@ -15,9 +15,11 @@
 //!   [`TelemetryProbe`], every read of that registry goes through the probe: a direct
 //!   `registry.drain(0)` elsewhere in the test takes points the probe never sees.
 //! - Under `#[tokio::test(start_paused = true)]` the clock jumps forward whenever the runtime is
-//!   idle, so a wait on work done by a real OS thread (a blocking task, a Lua VM, the kernel)
-//!   reaches its deadline before that work finishes. Use these waits there only for work driven
-//!   by the runtime's own tasks.
+//!   idle, so a wait on work done by a plain OS thread (a Lua VM, the kernel) reaches its
+//!   deadline before that work finishes. Use these waits there only for work driven by the
+//!   runtime's own tasks. A pending `spawn_blocking` task, which every `tokio::fs` call is, holds
+//!   the clock instead; a read that never waits, such as the disk store's `peek_at`, still races
+//!   that task's push on either clock.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
