@@ -484,21 +484,38 @@ mod tests {
         assert_eq!(probe.sum("logit.output.requests", &[("class", "error")]), 0.0);
     }
 
-    /// `with_encoder`/`with_max_packet_bytes` are order-independent: an 8-byte cap drops the event
-    /// as oversize in either order.
+    /// `with_encoder`/`with_max_packet_bytes` are order-independent: an 8-byte cap makes the
+    /// encoder count the value list as `oversize_value_list` in either order. A UDP send never
+    /// errors, so only the codec's counter can show the cap was applied.
     #[tokio::test]
     async fn the_encoder_cap_is_order_independent_with_with_encoder() {
+        let registry_cap_then_encoder = Registry::new();
         let cap_then_encoder = CollectdOutput::udp("127.0.0.1:1")
             .unwrap()
             .with_max_packet_bytes(8)
-            .with_encoder(CollectdEncoder::new().with_hostname("fixture-host"));
+            .with_encoder(CollectdEncoder::new().with_hostname("fixture-host"))
+            .with_telemetry(registry_cap_then_encoder.telemetry_for("out", "collectd_out", "sink"));
+        let registry_encoder_then_cap = Registry::new();
         let encoder_then_cap = CollectdOutput::udp("127.0.0.1:1")
             .unwrap()
             .with_encoder(CollectdEncoder::new().with_hostname("fixture-host"))
-            .with_max_packet_bytes(8);
-        for mut output in [cap_then_encoder, encoder_then_cap] {
+            .with_max_packet_bytes(8)
+            .with_telemetry(registry_encoder_then_cap.telemetry_for("out", "collectd_out", "sink"));
+        for (mut output, registry) in [
+            (cap_then_encoder, registry_cap_then_encoder),
+            (encoder_then_cap, registry_encoder_then_cap),
+        ] {
             let batch = batch_with(vec![relay_event("web-1", "load", 0.5)]);
             output.send(&batch).await.expect("an all-dropped batch must not attempt any I/O");
+            assert!(
+                counted(
+                    &registry,
+                    "logit.output.metrics.skipped",
+                    ("reason", "oversize_value_list")
+                ),
+                "expected the encoder's own cap to have dropped the value list as oversize in \
+                 this ordering"
+            );
         }
     }
 

@@ -79,7 +79,7 @@
 //! | `GaugeDelta` | **skipped**, `logit.output.metrics.skipped{metric_kind="gauge_delta"}` + `warn_throttled("gauge_delta_unresolved")` (the same greppable key every other sink uses) |
 //! | `Histogram{Cumulative}` | `histogram`: running-sum buckets, `+Inf` = total, `_sum` only when `Some`; `min`/`max` dropped (known-gaps row); `prometheus.type: "gaugehistogram"` → `_gsum`/`_gcount` |
 //! | `Summary` | `summary` + `_created` (OM) |
-//! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_count`, **no `_sum`** (OpenMetrics permits omitting it; `DdSketch::sum` is exact, so this is a `docs/known-gaps.md` entry) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
+//! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_sum` + `_count`; `_sum` is [`DdSketch::sum`], exact unlike a quantile (approximate only when [`DdSketch::stats_exact`] is `false`, i.e. the sketch's stats were derived from its bins) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
 //! | `Samples` | `Samples::sketch()`, then exactly as above -- `degraded{metric_kind="samples"}` |
 //! | `Set` / `SetMembers` | `gauge` of `estimate()` / the distinct member count -- `degraded{metric_kind="set"\|"set_members"}` |
 //! | `ExponentialHistogram` | **skipped**, `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` -- neither text dialect has native-histogram syntax |
@@ -133,8 +133,8 @@
 //!   producer is the bucket it arrived on and for a non-conforming one is a relocation;
 //! - a wire `summary` with no `_sum`/`_count` re-emits `_sum 0`/`_count 0`: [`logit_core::Summary`]
 //!   holds `sum: f64`/`count: u64`, not `Option`s, so "absent" and "zero" are the same model value.
-//!   (The reverse direction is exact: a `Distribution`'s sum-less summary stays sum-less, because
-//!   that path builds the [`Point`] directly.)
+//!   (This applies to a wire `summary` only: a `Distribution` or `Samples` builds its [`Point`]
+//!   directly, with the sketch's own sum and count.)
 //!
 //! Everything else is an error or a counted skip, never a silent reinterpretation.
 
@@ -292,8 +292,7 @@ pub enum Point {
         sum: Option<f64>,
         count: u64,
     },
-    /// `sum`/`count` are `Option` because OpenMetrics permits omitting them; the
-    /// `Distribution`/`Samples` encode path emits no `_sum`.
+    /// `sum`/`count` are `Option` because OpenMetrics permits omitting them.
     Summary {
         quantiles: Vec<(f64, f64)>,
         sum: Option<f64>,
@@ -980,14 +979,13 @@ fn warn_delta(encoder: &mut PrometheusEncoder, name: &str) {
 }
 
 /// A sketch → the summary point the module doc's `Distribution`/`Samples` rows describe: the five
-/// shared [`DISTRIBUTION_QUANTILES`] and a count, with **no** `_sum`, which OpenMetrics permits.
-/// [`DdSketch::sum`] is exact, so emitting one is an open `docs/known-gaps.md` entry.
+/// shared [`DISTRIBUTION_QUANTILES`], the sketch's sum, and its count.
 fn sketch_summary(sketch: &DdSketch) -> Point {
     let quantiles = DISTRIBUTION_QUANTILES
         .iter()
         .filter_map(|q| sketch.quantile(*q).map(|v| (*q, v)))
         .collect();
-    Point::Summary { quantiles, sum: None, count: Some(sketch.count() as u64) }
+    Point::Summary { quantiles, sum: Some(sketch.sum()), count: Some(sketch.count() as u64) }
 }
 
 /// [`logit_core::Histogram`]'s per-bucket counts → the cumulative `le` counts both dialects carry,
@@ -1632,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn a_distribution_encodes_as_a_five_quantile_summary_with_no_sum_and_is_counted_degraded() {
+    fn a_distribution_encodes_as_a_five_quantile_summary_and_is_counted_degraded() {
         let mut sketch = DdSketch::new();
         for v in [1.0, 2.0, 3.0, 4.0, 5.0] {
             sketch.add(v);
@@ -1645,7 +1643,7 @@ mod tests {
         match &families[0].series[0].point {
             Point::Summary { quantiles, sum, count } => {
                 assert_eq!(quantiles.len(), DISTRIBUTION_QUANTILES.len());
-                assert_eq!(*sum, None, "a sketch has no sum to report");
+                assert_eq!(*sum, Some(15.0), "a sketch's sum is exact");
                 assert_eq!(*count, Some(5));
             }
             other => panic!("expected a summary, got {other:?}"),
@@ -1664,6 +1662,13 @@ mod tests {
             &event_with(&[], record("m", MetricKind::Samples(Samples::new([1.0, 2.0, 3.0])))),
         );
         assert_eq!(families[0].kind, FamilyType::Summary);
+        match &families[0].series[0].point {
+            Point::Summary { sum, count, .. } => {
+                assert_eq!(*sum, Some(6.0));
+                assert_eq!(*count, Some(3));
+            }
+            other => panic!("expected a summary, got {other:?}"),
+        }
         assert!(counted(&registry, "logit.output.metrics.degraded", ("metric_kind", "samples")));
     }
 

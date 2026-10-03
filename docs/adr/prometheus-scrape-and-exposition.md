@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-09-17
+updated: 2026-10-03
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -119,7 +119,7 @@ can't carry natively:
 | `GaugeDelta` | skipped, `warn_throttled("gauge_delta_unresolved")` (shared key across sinks) |
 | `Histogram{Cumulative}` | `histogram`: running-sum buckets, `+Inf` = total, `_sum` only when `Some`, `_count` = bucket total; `min`/`max` dropped (known-gaps row); `prometheus.type: gaugehistogram` → `_gsum`/`_gcount` on OM egress, `_sum`/`_count` on text egress (text has no `gaugehistogram`) |
 | `Summary` | `summary` + `_created` (OM) |
-| `Distribution(sketch)` | `summary` with `DISTRIBUTION_QUANTILES` (reused from `otlp/metrics.rs`, made `pub(crate)`) and `_count`, **no `_sum`** (a sketch has none; OM permits omission) — `degraded{metric_kind="distribution"}` |
+| `Distribution(sketch)` | `summary` with `DISTRIBUTION_QUANTILES` (reused from `otlp/metrics.rs`, made `pub(crate)`) with `_sum` and `_count` (the sketch's exact sum and count; see the 2026-10-03 amendment) — `degraded{metric_kind="distribution"}` |
 | `Samples` | `s.sketch()` then as above — `degraded{metric_kind="samples"}` |
 | `Set` / `SetMembers` | `gauge` of `estimate()` / distinct count — `degraded{metric_kind="set"\|"set_members"}` |
 | `ExponentialHistogram` | skipped, `skipped{metric_kind="exponential_histogram"}` (text has no native-histogram syntax) |
@@ -491,3 +491,10 @@ merges every `ComponentKind` variant's fields into — two fields answering to t
 a collision, not a coexistence, so this ADR's field yields the bare name. `bind`'s future "exactly
 one of `scrape_targets`/`bind`" rule (see "Remote-write forward compatibility" above) renames along
 with it.
+
+**2026-10-03 amendment:** a `Distribution` (and a `Samples`, sketched first) now emits `_sum`. The
+mapping table first said a sketch has no sum, so the summary omitted it as OpenMetrics permits.
+That was wrong: `DdSketch::sum` is an exact running sum, added on `merge`, and approximate only when
+`DdSketch::stats_exact()` is `false` (stats derived from bins after a decode). `graphite_out` and
+`splunk_hec_out` already emitted it. `prometheus_out`, `otlp_out` (whose `SummaryDataPoint.sum`
+carried `0.0`), and `influxdb_out` (a `sum=` field beside `count=` and the percentiles) now do too.
