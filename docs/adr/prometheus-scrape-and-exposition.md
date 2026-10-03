@@ -495,6 +495,6 @@ with it.
 **2026-10-03 amendment:** a `Distribution` (and a `Samples`, sketched first) now emits `_sum`. The
 mapping table first said a sketch has no sum, so the summary omitted it as OpenMetrics permits.
 That was wrong: `DdSketch::sum` is an exact running sum, added on `merge`, and approximate only when
-`DdSketch::stats_exact()` is `false` (stats derived from bins after a decode). `graphite_out`,
-`splunk_hec_out`, and `influxdb_out` already emitted it; `prometheus_out` and `otlp_out`, whose
+`DdSketch::stats_exact()` is `false` (stats derived from bins after a decode). `graphite_out` and
+`splunk_hec_out` already emitted it; `prometheus_out` and `otlp_out`, whose
 `SummaryDataPoint.sum` carried `0.0`, now do too.
