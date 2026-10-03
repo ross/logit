@@ -548,9 +548,12 @@ fn open_and_drain(dir: &Path) -> (Vec<String>, f64, f64) {
 // ---------------------------------------------------------------------------------------------
 
 const MODEL_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long a peek waits when the model has nothing that must be queued: long enough for a
-/// replayed record to be read, short enough that an empty spool costs little.
-const EMPTY_PEEK_WAIT: Duration = Duration::from_millis(20);
+/// How long a peek waits when the model has nothing that must be queued. Unloaded, a replayed
+/// record is read in microseconds, well inside it. A peek that runs past it under load caches
+/// nothing (`DiskQueue::peek` caches only once its read completes), so the model, which allows
+/// either outcome when nothing must be delivered, stays in step with the queue. Every `Peek` and
+/// every `ConsumeAll` with nothing queued pays it in full, so it is short.
+const EMPTY_PEEK_WAIT: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, Copy)]
 enum Fault {
@@ -636,8 +639,17 @@ fn bounded_spool_op() -> impl Strategy<Value = SpoolOp> {
     ]
 }
 
-/// How long a push may take before the model treats it as parked on a full spool.
-const PARK_WAIT: Duration = Duration::from_millis(50);
+/// How long a push may take before [`push_waking_if_parked`] treats it as parked on a full spool.
+/// A push slower than this that isn't parked only starts the consumer early, which the model
+/// accounts for as it does a parked push's wakeup, and a push with nothing queued still has
+/// [`MODEL_TIMEOUT`] to finish. Every parked push pays it in full, so it is short.
+const PARK_WAIT: Duration = Duration::from_millis(5);
+
+/// How long [`cancel_once_rotation_created`] polls a push for a rotation's create before it
+/// treats the push as parked and drops it. Longer than [`PARK_WAIT`]: a push dropped at this
+/// deadline never reaches the rotation the op exists to cancel inside, so the window leaves a
+/// loaded machine time for the rotation's create to land.
+const ROTATION_CANCEL_WAIT: Duration = Duration::from_millis(50);
 
 /// What the model knows about one push, by id (the push's position in the sequence).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -776,8 +788,9 @@ fn push_waking_if_parked(
 }
 
 /// Polls a push until it completes, or until a segment newer than the active one exists on disk
-/// (a rotation's create has landed), and then drops it; a push still pending after [`PARK_WAIT`]
-/// is parked on a full spool, and dropped there. Returns whether it completed.
+/// (a rotation's create has landed), and then drops it; a push still pending after
+/// [`ROTATION_CANCEL_WAIT`] is parked on a full spool, and dropped there. Returns whether it
+/// completed.
 fn cancel_once_rotation_created(
     rt: &tokio::runtime::Runtime,
     dir: &Path,
@@ -786,7 +799,7 @@ fn cancel_once_rotation_created(
 ) -> bool {
     let active = active_seq(q);
     let mut push = std::pin::pin!(q.push(item));
-    let deadline = std::time::Instant::now() + PARK_WAIT;
+    let deadline = std::time::Instant::now() + ROTATION_CANCEL_WAIT;
     while std::time::Instant::now() < deadline {
         if list_segments(dir).unwrap().last().is_some_and(|&newest| newest > active) {
             return false;
