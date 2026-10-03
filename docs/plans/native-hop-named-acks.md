@@ -269,16 +269,16 @@ coalescing sweep", and its native-relay ladder. This section records what they s
   per event (0.850 against 0.975).
 - **The coalescing ratio explains the gap, and the cap isn't the cause.** M sends one `Ack` per
   2.54 frames on loopback and 4.07 under latency, far below the cap of 32. Smaller caps behave the
-  way that predicts: with `ACK_COALESCE_MAX` at 8 and 16, the ratio is 3.10 and 3.74 on loopback
-  and 3.28 and 4.05 under latency; the share of the ceiling is 98.5% and 97.6% (M: 97.2%); and on
-  loopback the variants are inside M's own 12-repeat range (0.868 and 0.838 µs/event against
-  M's 0.858, range 0.823–0.882). A cap of 8 recovers 1.3 points of the 2.3, outside M's repeat range (its
-  four repeats, 312,220–312,645 events/s, all sit above M's highest, 311,090), and gives up
-  nothing measurable on loopback; a cap of 16's +0.4 is inside that range. With the whole gap
-  about 2 points, that isn't worth a change. The suspected
-  cause is burst handling before the coalesced `Ack`: a full window's burst of frames arrives
-  together and is acked once, after its last frame, which adds the burst's handling time to
-  the round trip. The cap can't cut a burst of about four frames short.
+  way that predicts: with `ACK_COALESCE_MAX` at 8 and 16, the ratio is 3.10 and 3.74 on loopback and
+  3.28 and 4.05 under latency; the share of the ceiling is 98.5% and 97.6% (M: 97.2%); and on
+  loopback the variants are inside M's own 12-repeat range (0.868 and 0.838 µs/event against M's
+  0.858, range 0.823–0.882). A cap of 8 recovers 1.3 points of the 2.3, outside M's repeat range
+  (its four repeats, 312,220–312,645 events/s, all sit above M's highest, 311,090), and gives up
+  nothing measurable on loopback; a cap of 16's +0.4 is inside that range. With the whole gap about
+  2 points, that isn't worth a change. The suspected cause is burst handling before the coalesced
+  `Ack`: a full window's burst of frames arrives together and is acked once, after its last frame,
+  which adds the burst's handling time to the round trip. The cap can't cut a burst of about four
+  frames short.
 
 **Conclusion.** The latency gap is real, about 2 points of the ceiling at 10 ms RTT.
 `ACK_COALESCE_MAX` (32) doesn't bind, and the whole gap is small, so the constant stays. The gap is tracked in [`docs/known-gaps.md`](../known-gaps.md) with the

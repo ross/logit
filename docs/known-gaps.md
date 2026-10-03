@@ -616,18 +616,18 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   decision 4. **Revisit trigger:** `logit.input.batches.resends` climbing after reconnects that
   the resume should have absorbed.
 
-- **Coalesced acks cost about 2 points of a window's ceiling under 10 ms RTT.** At `window: 32` and
-  a 10 ms round trip (`tc qdisc ... netem delay 5ms`), `logit_in`'s named acks
-  ([ADR `native-hop-named-acks`](adr/native-hop-named-acks.md)) reach 97.2% of the 3,174 batches/s
-  ceiling against 99.5% for per-frame acks, 8 repeats each, and every named-ack repeat is below
-  every per-frame repeat. The same acks use 12.8% less CPU per event, and on loopback they are
-  10.4% cheaper. The cause is burst handling before the coalesced `Ack`, not the coalescing cap:
-  an `Ack` covers about 4 frames under latency and about 2.5 on loopback, far below
-  `ACK_COALESCE_MAX` (32), and caps of 8 and 16 reach 98.5% and 97.6%: cap 8 recovers 1.3 points, outside M's
-  repeat range, and cap 16's +0.4 is inside it. The cap stays at 32 because the whole gap is about
-  2 points. `native-relay-window1`, where nothing coalesces, also reads +2.3% from the
-  pre-cack binary to this one (1.150 → 1.177 µs/event), under the 5% gate and unexplained.
-  Numbers: `docs/design/performance.md` §1, "`native-relay` under a 10 ms round trip"; the plan is
+- **Coalesced acks cost about 2 points of a window's ceiling under 10 ms RTT.** At `window: 32`
+  and a 10 ms round trip (`tc qdisc ... netem delay 5ms`), `logit_in`'s named acks ([ADR
+  `native-hop-named-acks`](adr/native-hop-named-acks.md)) reach 97.2% of the 3,174 batches/s ceiling
+  against 99.5% for per-frame acks, 8 repeats each, and every named-ack repeat is below every
+  per-frame repeat. The same acks use 12.8% less CPU per event, and on loopback they are 10.4%
+  cheaper. The cause is burst handling before the coalesced `Ack`, not the coalescing cap: an `Ack`
+  covers about 4 frames under latency and about 2.5 on loopback, far below `ACK_COALESCE_MAX` (32),
+  and caps of 8 and 16 reach 98.5% and 97.6%: cap 8 recovers 1.3 points, outside M's repeat range,
+  and cap 16's +0.4 is inside it. The cap stays at 32 because the whole gap is about 2 points.
+  `native-relay-window1`, where nothing coalesces, also reads +2.3% from the pre-cack binary to this
+  one (1.150 → 1.177 µs/event), under the 5% gate and unexplained. Numbers:
+  `docs/design/performance.md` §1, "`native-relay` under a 10 ms round trip"; the plan is
   [`docs/plans/native-hop-named-acks.md`](plans/native-hop-named-acks.md) "Findings".
 
 - ~~**`logit_in` acknowledges a batch no consumer took.**~~ **Closed 2026-09-30:** `Fanout`'s sends return whether any consumer took the batch, and `logit_in` answers `Reject{GOING_AWAY}` and closes for a frame none took. `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s receiver answer their protocol's retryable failure, and `tail_in` and `docker_in` freeze their checkpoint and stop (ADR `delivery-semantics`, item 3, and its W3 amendment).
@@ -2697,28 +2697,28 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `$request_uri`, never `$uri`, which removes the decoded-path source but not a client's own
   non-ASCII header bytes.
 - **`json-parse-x3` is about 10% slower than it should be, through an inlining flip that has
-  happened twice** (2026-10-02). #296 added a second parse call site to `JsonParser::process`
-  (the `invalid_utf8: replace` retry), and `json-parse-x3` went from 2.248 to 2.490 µs/event on
-  the perf VM, because LLVM stopped inlining `parse_object` into `process` and the `SmallVec`
-  insert and drop inside it became out-of-line calls. #421 moved the retry into a `#[cold]` helper
-  and restored it: B0 2.467 → 2.247 µs/event at the merge before the render redesign. **#457
-  (`d47a99b6`) then reintroduced it through the same mechanism**: 2.264 → 2.444 (+8.0%), flat to
-  `main`'s 2.502 (`docs/design/performance.md` §1, "What moved since 2026-09-28"). A `cpu-clock`
-  flamegraph pair at the two binaries shows one `AttrMap::insert_sym` frame inlined into
-  `JsonParser::process` before (6.94% of samples) and none after, with the out-of-line total
-  rising 10.75% → 16.33% (out-of-line 3.81% → 16.33%; self 9.65% → 14.95%). The likely cause, not confirmed: #457 grew two
+  happened twice** (2026-10-02). #296 added a second parse call site to `JsonParser::process` (the
+  `invalid_utf8: replace` retry), and `json-parse-x3` went from 2.248 to 2.490 µs/event on the perf
+  VM, because LLVM stopped inlining `parse_object` into `process` and the `SmallVec` insert and drop
+  inside it became out-of-line calls. #421 moved the retry into a `#[cold]` helper and restored it:
+  B0 2.467 → 2.247 µs/event at the merge before the render redesign. **#457 (`d47a99b6`) then
+  reintroduced it through the same mechanism**: 2.264 → 2.444 (+8.0%), flat to `main`'s 2.502
+  (`docs/design/performance.md` §1, "What moved since 2026-09-28"). A `cpu-clock` flamegraph pair at
+  the two binaries shows one `AttrMap::insert_sym` frame inlined into `JsonParser::process` before
+  (6.94% of samples) and none after, with total `insert_sym` time rising 10.75% → 16.33%
+  (out-of-line 3.81% → 16.33%; self 9.65% → 14.95%). The likely cause, not confirmed: #457 grew two
   `logit-core` functions that LLVM inlines into the parsers (`Telemetry`'s `count()` gained an
-  `is_muted()` branch, and `Diagnostics::warn_throttled` gained an `is_muted()` early return,
-  which `JsonParser::process` calls twice), shifting the inlining budget under `lto = true` and
-  `codegen-units = 1`. `logfmt-parse` moves the other way at the same merge (−7.9%, 1.006 →
-  0.926, `Logfmt::process` self time 14.99% → 6.42%), which fits a codegen shift rather than extra
-  work. **Open:** a fix is in progress. Single-parser `json-parse` moves less at the same merge
-  (+1.8%), because contention on the shared interner dominates `x3`'s stage cost, and reads 0.900
-  at `main` against B0's 0.917. **Also open:** `json-parse`'s unattributed +2.3% step at #298 (`c860842c`). A
-  flamegraph pair of that merge against its parent moves no json self-time frame by more than 0.4 points
-  of samples (`insert_sym` self 11.19% → 11.30%, `JsonParser::process` inclusive 48.69% →
-  47.95%), and the diff has no parse-path change, so the step is most likely LTO code layout.
-  The B0 baseline already carries it, so the 2026-10-02 session can't measure it.
+  `is_muted()` branch, and `Diagnostics::warn_throttled` gained an `is_muted()` early return, which
+  `JsonParser::process` calls twice), shifting the inlining budget under `lto = true` and
+  `codegen-units = 1`. `logfmt-parse` moves the other way at the same merge (−7.9%, 1.006 → 0.926,
+  `Logfmt::process` self time 14.99% → 6.42%), which fits a codegen shift rather than extra work.
+  **Open:** a fix is in progress. Single-parser `json-parse` moves less at the same merge (+1.8%),
+  because contention on the shared interner dominates `x3`'s stage cost, and reads 0.900 at `main`
+  against B0's 0.917. **Also open:** `json-parse`'s unattributed +2.3% step at #298 (`c860842c`). A
+  flamegraph pair of that merge against its parent moves no json self-time frame by more than 0.4
+  points of samples (`insert_sym` self 11.19% → 11.30%, `JsonParser::process` inclusive 48.69% →
+  47.95%), and the diff has no parse-path change, so the step is most likely LTO code layout. The B0
+  baseline already carries it, so the 2026-10-02 session can't measure it.
 
 ## Lua
 

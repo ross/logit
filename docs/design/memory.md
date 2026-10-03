@@ -615,12 +615,13 @@ thread divan's `AllocProfiler` watches. Measured this way:
 
 This table is from the 2026-09-20 perf-VM `script/bench` run (`taskset -c 2`), the run §2's timing
 table carried before its 2026-10-02 re-measure. Its timings don't compare with earlier laptop
-measurements, for the reason §2's note gives. One laptop result still stands, because it is *relative*: on 2026-09-17,
-on the same pinned laptop core (`taskset -c 2`, fastest of three), `process_batch` measured **469 ns
-/ 1 alloc** before `Transform::process` went in place and **431 ns / 0** after, an ~8% win from the
-removed `out` `Vec` and the removed per-event `Event` move. It wasn't re-derived on the VM, and the
-code path hasn't changed since. The 360 ns this row carried before that pair came from an earlier
-build and machine state and was never comparable to either number.
+measurements, for the reason §2's note gives. One laptop result still stands, because it is
+*relative*: on 2026-09-17, on the same pinned laptop core (`taskset -c 2`, fastest of three),
+`process_batch` measured **469 ns / 1 alloc** before `Transform::process` went in place and **431 ns
+/ 0** after, an ~8% win from the removed `out` `Vec` and the removed per-event `Event` move. It
+wasn't re-derived on the VM, and the code path hasn't changed since. The 360 ns this row carried
+before that pair came from an earlier build and machine state and was never comparable to either
+number.
 
 ### Costing internal spans: the `Delivered` trade, measured
 
