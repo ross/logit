@@ -1262,7 +1262,8 @@ mechanism is at the citation, not restated here.
   the depth cap, at 2^k nodes, and a 128-deep value a script builds does not survive a relay
   through `otlp_out -> otlp_in` (OTLP's own nesting limits, 41 and 49 levels, are both under the
   cap). A loop that keeps constructing events with `Event.new` advances the
-  heartbeat and is never a stall; a loop of refused calls is not progress. Pure-Lua recursion through Rust/C frames can still abort the process past the
+  heartbeat and is never a stall; a loop of refused calls is not progress. Pure-Lua recursion
+  through Rust/C frames can still abort the process past the
   larger stack. See [ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)'s
   Consequences.
 
