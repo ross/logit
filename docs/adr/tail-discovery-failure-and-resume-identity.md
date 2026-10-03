@@ -439,8 +439,9 @@ An independent model restates the driver's rules and, after every op, the test c
 received (content, boundaries, and per-inode order), every tracked file's offset, pending bytes,
 state, path, and head, `by_path`, the resume entries, the checkpoint on disk (and that each
 persisted offset is a line start, or the end of a prefix a clean stop emitted), and every counter
-and diagnostic key. At the end, every message is a written line or one side of a clean
-stop's split, and every complete line of an inode a pattern still reaches was received. 64 cases
+and diagnostic key. At the end, every message is a run of a written line between two points a
+clean stop split it at, including a split a later generation of the inode inherits, and every
+complete line of an inode a pattern still reaches was received. 64 cases
 run in about 1.4 s, and 1000 in about 23 s. Seven driver mutations (the reap grace, the truncation
 dirtying the checkpoint, the rotation count, the head check, the pending-bytes subtraction, the
 rebind's ownership check, the link-count check) each fail it.

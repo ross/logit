@@ -30,8 +30,9 @@
 //! - after a scan, the `by_path` invariants the driver relies on (one path per inode, only
 //!   `Active` files bound) and the `files.open` gauge.
 //!
-//! At the end, every message received is a line written, or one side of a line a clean stop
-//! split, and every complete line of an inode a pattern still reaches was received.
+//! At the end, every message received is a run of a written line between two points a clean stop
+//! split it at, including a split a later generation of the inode inherits, and every complete
+//! line of an inode a pattern still reaches was received.
 //!
 //! `PROPTEST_CASES` overrides the case count for a deeper run.
 
@@ -46,7 +47,7 @@ use logit_pipeline::fault::{self, errno};
 use logit_pipeline::test_util::{fanout_channel, TelemetryProbe};
 use logit_pipeline::{unwrap_batch, Delivered};
 use proptest::prelude::*;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::Write;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -108,8 +109,10 @@ enum Op {
     },
     /// logrotate's `copytruncate`: shift, copy `f.log` to a new `f.log.1`, truncate `f.log` in
     /// place, then scan (failing the listing if `scan_fails`). The scan checks every tracked copy
-    /// of the truncated inode, bound or draining, so a refill past its offset before the first
-    /// check, the gap size-based detection can't close, never happens here.
+    /// of the truncated inode, bound or draining. An unspent resume entry is a position no scan
+    /// checks, so a refill under a failed listing after a failed first scan is resumed through
+    /// the head fingerprint, which at an offset of at most `HEAD_BYTES` matches by construction
+    /// and inherits the clean stop's split.
     CopyTruncate {
         f: usize,
         scan_fails: bool,
@@ -267,6 +270,9 @@ struct Model {
     /// This op's expected batches, each with the inode it came from.
     out: Vec<(usize, Vec<String>)>,
     counts: Counts,
+    /// Each `(inode, offset)` a resume accepted mid-line since the last check: the line spanning
+    /// the offset is split there, in whichever generation the offset was persisted from.
+    resumed_mid_line: Vec<(usize, u64)>,
 }
 
 impl Model {
@@ -432,6 +438,10 @@ impl Model {
             None => 0,
         };
         let head = content[..offset.min(HEAD_BYTES as u64) as usize].to_vec();
+        if offset > 0 && content[offset as usize - 1] != b'\n' {
+            self.inodes[inode].splits.push(offset);
+            self.resumed_mid_line.push((inode, offset));
+        }
         self.tracked.insert(
             id,
             MTracked {
@@ -715,8 +725,9 @@ struct World {
     seq: u64,
     /// Per slot, the inode holding an unterminated line and the bytes that complete it.
     torn: Vec<Option<(usize, Vec<u8>)>>,
-    /// Every line written, with where `AppendTorn` split it.
-    written: HashMap<String, Option<usize>>,
+    /// Every line written, with the points a clean stop may have split it at: where
+    /// `AppendTorn` tore it, and where a resume inherited a split from an earlier generation.
+    written: HashMap<String, BTreeSet<usize>>,
     received: Vec<String>,
     restarts: u64,
     ticks: u64,
@@ -780,6 +791,7 @@ impl World {
             scans: 0,
             out: Vec::new(),
             counts: Counts::default(),
+            resumed_mid_line: Vec::new(),
         };
         model.scan(ScanFail::None);
         Self {
@@ -851,7 +863,7 @@ impl World {
         while text.len() < len {
             text.push('x');
         }
-        self.written.insert(text.clone(), split);
+        self.written.insert(text.clone(), split.into_iter().collect());
         let mut bytes = text.into_bytes();
         bytes.push(b'\n');
         bytes
@@ -1117,6 +1129,36 @@ impl World {
         );
 
         self.check_counts();
+        self.record_inherited_splits();
+    }
+
+    /// Records each mid-line resume's offset as a split of the line spanning it now. A refilled
+    /// inode resumed at a clean stop's offset shares the bytes before it, so the line spanning it
+    /// in the new generation is split at the same point.
+    fn record_inherited_splits(&mut self) {
+        for (inode, offset) in std::mem::take(&mut self.model.resumed_mid_line) {
+            let ctx = &self.ctx;
+            let content = &self.model.inodes[inode].content;
+            let offset = offset as usize;
+            let line_start =
+                content[..offset].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+            let text = match content[offset..].iter().position(|&b| b == b'\n') {
+                Some(nl) => String::from_utf8(content[line_start..offset + nl].to_vec()).unwrap(),
+                None => {
+                    let (f, _) = self.model.location(inode).expect("a resumed inode is linked");
+                    let (torn, rest) = self.torn[f].as_ref().expect("an unterminated line is torn");
+                    assert_eq!(*torn, inode, "{ctx}: the torn line is on the resumed inode");
+                    let mut line = content[line_start..].to_vec();
+                    line.extend_from_slice(&rest[..rest.len() - 1]);
+                    String::from_utf8(line).unwrap()
+                }
+            };
+            let splits = self
+                .written
+                .get_mut(&text)
+                .unwrap_or_else(|| panic!("{ctx}: resumed inside {text:?}, never written"));
+            splits.insert(offset - line_start);
+        }
     }
 
     fn check_counts(&mut self) {
@@ -1229,21 +1271,28 @@ impl World {
         }
     }
 
-    /// Every message is a written line or one side of a split one, and every complete line of
-    /// an inode a pattern still reaches was received, whole or as both sides of its split.
+    /// Every message is a run of a written line between two of its split points (its ends, or a
+    /// point a clean stop split it at), and every complete line of an inode a pattern still
+    /// reaches was received as a chain of such runs from its start to its end.
     fn check_end(&self) {
+        let points = |text: &str, splits: &BTreeSet<usize>| -> Vec<usize> {
+            let inner = splits.iter().copied().filter(|&k| 0 < k && k < text.len());
+            std::iter::once(0).chain(inner).chain(std::iter::once(text.len())).collect()
+        };
         let mut pieces: HashSet<&str> = HashSet::new();
-        for (text, split) in &self.written {
-            pieces.insert(text.as_str());
-            if let Some(k) = split {
-                pieces.insert(&text[..*k]);
-                pieces.insert(&text[*k..]);
+        for (text, splits) in &self.written {
+            let points = points(text, splits);
+            for (a, &i) in points.iter().enumerate() {
+                for &j in &points[a + 1..] {
+                    pieces.insert(&text[i..j]);
+                }
             }
         }
         for message in &self.received {
             assert!(pieces.contains(message.as_str()), "garbled message {message:?}");
         }
         let received: HashSet<&str> = self.received.iter().map(String::as_str).collect();
+        let none = BTreeSet::new();
         for (ix, inode) in self.model.inodes.iter().enumerate() {
             if !self.model.reachable(ix) {
                 continue;
@@ -1257,12 +1306,15 @@ impl World {
                     continue;
                 }
                 let text = std::str::from_utf8(line).unwrap();
-                let whole = received.contains(text);
-                let halves = self.written.get(text).copied().flatten().is_some_and(|k| {
-                    received.contains(&text[..k]) && received.contains(&text[k..])
-                });
+                let points = points(text, self.written.get(text).unwrap_or(&none));
+                let mut covered = vec![false; points.len()];
+                covered[0] = true;
+                for b in 1..points.len() {
+                    covered[b] = (0..b)
+                        .any(|a| covered[a] && received.contains(&text[points[a]..points[b]]));
+                }
                 assert!(
-                    whole || halves,
+                    covered[points.len() - 1],
                     "line {text:?} of reachable inode {ix} was never received"
                 );
             }
