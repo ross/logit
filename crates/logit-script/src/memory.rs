@@ -170,12 +170,12 @@ mod tests {
             -- Local, not global: mlua's traceback searches _G for the failing
             -- callback's name on every pcall'd error. A large global table that
             -- the search reaches before Event, which depends on the VM's string
-            -- hash seed, makes each of the ~180k errors here walk it.
+            -- hash seed, makes each of the ~70k errors here walk it.
             local kept = {}
             function kept_len() return #kept end
             function process(event) return event end
             function flush(now)
-                for i = 1, 200000 do
+                for i = 1, 100000 do
                     local ok, e = pcall(Event.new, {timestamp = "1"})
                     if ok then kept[#kept + 1] = e end
                 end
@@ -186,8 +186,9 @@ mod tests {
         w.set_memory_cap(Some(4 * MIB));
         w.flush(0).expect("pcall swallows every error, so flush() itself succeeds");
         let kept: usize = w.lua.load("return kept_len()").eval().unwrap();
-        assert!(kept < 200_000, "the trip should have refused most constructions, kept {kept}");
-        // Without the sticky trip, 200k pcall'd constructions reach several times the cap.
+        assert!(kept < 100_000, "the trip should have refused most constructions, kept {kept}");
+        // Without the sticky trip, 100k pcall'd constructions keep about 19 MiB, three times the
+        // bound below.
         let verdict = w.collect_until_under(4 * MIB, 8).unwrap();
         assert!(verdict.used < 6 * MIB, "the VM should stay near the cap: {verdict:?}");
 
@@ -259,13 +260,14 @@ mod tests {
     #[test]
     fn a_discarding_event_new_loop_never_trips() {
         // The collector is stopped so the garbage does cross the cap; only the in-call collection
-        // brings it back under.
+        // brings it back under. Uncollected, 80k constructions leave about 19 MiB, almost five
+        // times the cap.
         let w = ScriptWorker::new(
             r#"
             function process(event) return event end
             function flush(now)
                 collectgarbage("stop")
-                for i = 1, 200000 do local e = Event.new{timestamp = "1"} end
+                for i = 1, 80000 do local e = Event.new{timestamp = "1"} end
             end
             "#,
         )
@@ -277,7 +279,17 @@ mod tests {
 
     #[test]
     fn with_no_cap_event_new_never_checks_memory() {
-        let w = ScriptWorker::new(RETAINING_FLUSH).unwrap();
+        // 50k retained events keep about 9 MiB, over twice the 4 MiB cap the tests above set.
+        let w = ScriptWorker::new(
+            r#"
+            kept = {}
+            function process(event) return event end
+            function flush(now)
+                for i = 1, 50000 do kept[#kept + 1] = Event.new{timestamp = "1"} end
+            end
+            "#,
+        )
+        .unwrap();
         w.flush(0).expect("with no cap set, Event.new never raises over memory");
     }
 }
