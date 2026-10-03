@@ -12,7 +12,7 @@ Accepted
 `BuiltinTransformConfig::Aggregate { interval: Duration }` (`crates/logit-config/src/lib.rs`) has
 existed as a config variant since PR #8, rejected at both `logit validate` and `logit run` as "not
 implemented yet." It's the last piece of the v0.1 vertical slice
-([`tmp/0.1-status.md`](../../tmp/0.1-status.md)), and the first real consumer of two things that
+(`tmp/0.1-status.md`, not committed), and the first real consumer of two things that
 existed only in prose or as unused code before this: `DdSketch::merge`
 ([`docs/design/data-model.md`](../design/data-model.md)'s mergeable-metric-kinds design) and
 `ScriptWorker::flush()` (`crates/logit-script/src/lib.rs`, implemented and tested since the Lua

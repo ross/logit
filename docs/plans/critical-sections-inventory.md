@@ -4070,7 +4070,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   `read_frame_survives_seeded_bit_flips`, `read_frame_rejects_a_{uncompressed,compressed}_len_inflated_to_u32_max`,
   `read_frame_never_allocates_proportionally_to_a_hostile_uncompressed_len`);
   `crates/logit-bench/benches/wire_format.rs`. Governed by
-  [ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md) and
+  [ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md) and
   `docs/design/wire-protocol.md`.
 - **Suggested verification approach:** targeted review of the cap arithmetic against `lz4_flex`'s
   documented worst case; a proptest that `read_frame(write_frame(p, c)) == p` for arbitrary
@@ -4117,7 +4117,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - Re-interning an attacker-supplied dictionary cannot grow the process-global interner without
     bound across many connections (the interner never evicts — this is an unbounded-growth vector
     distinct from per-request memory caps). **Documented non-goal** under
-    [ADR `deployment-threat-model`](docs/adr/deployment-threat-model.md): `docs/known-gaps.md`'s
+    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md): `docs/known-gaps.md`'s
     interner entry names the native dictionary, and `dict.rs`'s module doc points there.
   - ✅ `Str` is UTF-8-validated (the `TAG_STR` arm of `read_value_at`) and `Bytes` deliberately is
     not. **Holds.**
@@ -4351,7 +4351,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   `a_peer_that_only_acks_v1_gets_a_plain_v1_frame`,
   `an_ack_naming_a_codec_never_offered_is_rejected`, and the `reject_*`/`a_reject_*` tests for
   each reject class).
-  [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md).
+  [ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md).
 - **Suggested verification approach:** a malicious-peer test matrix driving `LogitInput` with
   hand-built `Hello`s (absent fields, `max_frame_bytes: 0`, 16 codecs, unknown message type,
   a `Reject` where a `Hello` belongs); the mirror against `LogitOutput` with a fake listener
@@ -4436,7 +4436,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   through `no_idle_timeout_leaves_a_handshaken_connection_open`:
   going-away + permit release, delayed-ack-is-not-idle, clock restarts per ack, header arriving at
   the deadline, header stalling, body stalling, and no-idle-timeout). ADR
-  `native-transport-handshake-and-ack`, [ADR `idle-connection-timeout`](docs/adr/idle-connection-timeout.md),
+  `native-transport-handshake-and-ack`, [ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md),
   `docs/design/wire-protocol.md`.
 - **Suggested verification approach:** malicious-peer harness — N connections each sending a
   header declaring `max_frame_bytes` and then nothing, measuring RSS and virtual size; a
@@ -4854,8 +4854,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - `partial_success` is always empty on success — recorded in `docs/known-gaps.md`. **Context.**
 - **Existing coverage:** `crates/logit-inputs/src/otlp.rs` (large in-file test suite; covers
   both transports, gzip, size limits, TLS, the idle/stall paths, JSON vs protobuf dispatch).
-  [ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md),
-  [ADR `otlp-json-decoding`](docs/adr/otlp-json-decoding.md),
+  [ADR `hand-rolled-grpc-over-hyper`](../adr/hand-rolled-grpc-over-hyper.md),
+  [ADR `otlp-json-decoding`](../adr/otlp-json-decoding.md),
   `docs/adr/otlp-compression-and-decompression-bounds.md`.
 - **Suggested verification approach:** interop test against a real gRPC client (`grpcurl`, the
   OpenTelemetry Collector's `otlp` exporter, an OTel SDK) covering trailers-only errors,
@@ -5025,8 +5025,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     fields. **Observation, not a defect.**
 - **Existing coverage:** the test module in `crates/logit-outputs/src/otlp.rs` (canned HTTP and gRPC servers
   including TLS, the full fault table, partial success, headers, paths, compression).
-  [ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md),
-  [ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md),
+  [ADR `hand-rolled-grpc-over-hyper`](../adr/hand-rolled-grpc-over-hyper.md),
+  [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md),
   `docs/adr/buffered-sink-delivery.md`.
 - **Suggested verification approach:** interop test against a real OpenTelemetry Collector
   (`otlp` receiver) over both transports, plaintext and TLS, with and without gzip; a
@@ -5094,8 +5094,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   `a_tls_client_that_sends_nothing_releases_its_permit_after_the_handshake_timeout`,
   `a_tls_listener_at_its_connection_cap_rejects_over_tls_not_in_the_clear`; a real TLS listener,
   mTLS-capable test fixtures under `testdata/`), the TLS arms of the `otlp_in`/`otlp_out` in-file suites.
-  [ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md),
-  [ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md).
+  [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md),
+  [ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md).
 - **Suggested verification approach:** targeted review plus a fixture matrix — expired cert,
   wrong-hostname cert, CA-not-in-store, client cert required and absent, unparseable CA bundle,
   `cert_file` without `key_file` — asserting each fails closed with a legible error; a review of
@@ -5162,7 +5162,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   selection, 4xx/5xx classes, timeout, oversize, refused connection, resource identity, URL
   redaction, `Accept` header, two targets in one tick, telemetry classes, TLS trusted/untrusted
   CA). Integration: `crates/logit-cli/tests/prometheus_round_trip.rs`.
-  [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md).
+  [ADR `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md).
 - **Suggested verification approach:** N canned servers each serving just under 32 MiB, asserting
   peak RSS (or simply adding and testing a `JoinSet` concurrency bound); a one-hangs-one-answers
   test asserting when the fast target's batch reaches the fanout; a proptest over
@@ -5263,8 +5263,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   handshake timeout (`a_silent_connection_releases_its_permit_after_the_handshake_timeout`).
   Integration: `crates/logit-cli/tests/prometheus_remote_write_round_trip.rs`,
   `crates/logit-proto/tests/prometheus_remote_write_interop.rs`.
-  [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md),
-  [ADR `idle-connection-timeout`](docs/adr/idle-connection-timeout.md).
+  [ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md),
+  [ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md).
 - **Suggested verification approach:** drive the receiver over h2c (a `hyper` client with
   `http2_only`) opening ~100 concurrent streams each posting a near-4 MiB body, and watch RSS —
   then decide whether to set `http2_max_concurrent_streams` on the auto builder. Separately, a
