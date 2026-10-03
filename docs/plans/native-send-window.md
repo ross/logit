@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-01
+updated: 2026-10-02
 ---
 
 # Enabling plan: a native hop send window — several frames in flight, acknowledged in frame order

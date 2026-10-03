@@ -623,8 +623,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   every per-frame repeat. The same acks use 12.8% less CPU per event, and on loopback they are
   10.4% cheaper. The cause is burst handling before the coalesced `Ack`, not the coalescing cap:
   an `Ack` covers about 4 frames under latency and about 2.5 on loopback, far below
-  `ACK_COALESCE_MAX` (32), and caps of 8 and 16 recover 1.3 and 0 points (98.5% and 97.6%). The
-  cap needs no change. `native-relay-window1`, where nothing coalesces, also reads +2.3% from the
+  `ACK_COALESCE_MAX` (32), and caps of 8 and 16 reach 98.5% and 97.6%: cap 8 recovers 1.3 points, outside M's
+  repeat range, and cap 16's +0.4 is inside it. The cap stays at 32 because the whole gap is about
+  2 points. `native-relay-window1`, where nothing coalesces, also reads +2.3% from the
   pre-cack binary to this one (1.150 → 1.177 µs/event), under the 5% gate and unexplained.
   Numbers: `docs/design/performance.md` §1, "`native-relay` under a 10 ms round trip"; the plan is
   [`docs/plans/native-hop-named-acks.md`](plans/native-hop-named-acks.md) "Findings".
@@ -2705,7 +2706,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `main`'s 2.502 (`docs/design/performance.md` §1, "What moved since 2026-09-28"). A `cpu-clock`
   flamegraph pair at the two binaries shows one `AttrMap::insert_sym` frame inlined into
   `JsonParser::process` before (6.94% of samples) and none after, with the out-of-line total
-  rising 10.75% → 16.33% (self 9.65% → 14.95%). The likely cause, not confirmed: #457 grew two
+  rising 10.75% → 16.33% (out-of-line 3.81% → 16.33%; self 9.65% → 14.95%). The likely cause, not confirmed: #457 grew two
   `logit-core` functions that LLVM inlines into the parsers (`Telemetry`'s `count()` gained an
   `is_muted()` branch, and `Diagnostics::warn_throttled` gained an `is_muted()` early return,
   which `JsonParser::process` calls twice), shifting the inlining budget under `lto = true` and
@@ -2714,7 +2715,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   work. **Open:** a fix is in progress. Single-parser `json-parse` moves less at the same merge
   (+1.8%), because contention on the shared interner dominates `x3`'s stage cost, and reads 0.900
   at `main` against B0's 0.917. **Also open:** `json-parse`'s unattributed +2.3% step at #298 (`c860842c`). A
-  flamegraph pair of that merge against its parent moves no json frame by more than 0.4 points
+  flamegraph pair of that merge against its parent moves no json self-time frame by more than 0.4 points
   of samples (`insert_sym` self 11.19% → 11.30%, `JsonParser::process` inclusive 48.69% →
   47.95%), and the diff has no parse-path change, so the step is most likely LTO code layout.
   The B0 baseline already carries it, so the 2026-10-02 session can't measure it.

@@ -347,13 +347,15 @@ separately from the suite, so their cells differ from the table above in the thi
   repeats on each side don't overlap (1.148–1.155 against 1.172–1.183). It's under the 5% gate and
   stays a note, not a lead. The suite's single M row reads 1.186.
 - **`json-parse-x3`: #421 restored it, and #457 put it back.** B0 2.467 → R- 2.247 (−8.9%) is
-  the `#[cold]` retry fix from the previous baseline's bisect. It holds through R and P (2.248,
+  #421's `#[cold]` retry fix. It holds through R and P (2.248,
   2.264). Then **S rises +8.0% to 2.444** and stays there to M's 2.502. So `json-parse-x3` on
   M is not the restored number; it's B0's. A `cpu-clock` flamegraph pair at P and S (999 Hz, the
-  same two binaries) shows the same signature as the earlier one. At P, one `AttrMap::insert_sym`
+  same two binaries) shows half the earlier signature: `insert_sym` moves fully out of line, but
+  `parse_object` stacks hold (49.5% → 45.8% of samples). At P, one `AttrMap::insert_sym`
   frame is inlined into `JsonParser::process` (6.94% of samples inclusive, `SmallVec::insert`
   inlined with it) beside an out-of-line call (3.81%). At S the inlined copy is gone: every
-  `insert_sym` sample sits in the out-of-line call, total 10.75% → 16.33%, self 9.65% → 14.95%.
+  `insert_sym` sample sits in the out-of-line call: out-of-line time 3.81% → 16.33%, total
+  `insert_sym` time 10.75% → 16.33%, self 9.65% → 14.95%.
   The likely cause, not confirmed: #457 grew two `logit-core` functions that LLVM inlines into
   `JsonParser::process` and `parse_logfmt` (`Telemetry` became `{buf, gate: Option<CountGate>}`
   and `count()` gained an `is_muted()` branch; `Diagnostics::warn_throttled` gained an
@@ -361,13 +363,13 @@ separately from the suite, so their cells differ from the table above in the thi
   budget under `lto = true` and `codegen-units = 1`. That's the mechanism #296 and #421 found.
   [`docs/known-gaps.md`](../known-gaps.md) tracks it and the fix in progress.
 - **`logfmt-parse` −7.9% at the same merge, S** (1.006 → 0.926; 1,626,122 → 1,879,855 events/s),
-  flat after. The flamegraph pair shows the flip from the other side: `Logfmt::process` self time
+  flat after. In the same pair, `Logfmt::process` self time
   falls 14.99% → 6.42% (inclusive 57.81% → 52.26%), and `KeyCache::get_or_intern` becomes a separate
-  callee at 4.07%. Same cause, favorable direction.
+  callee at 4.07%. That fits the same likely codegen shift, in the favorable direction; not confirmed.
 - **`json-parse` is −0.9% against this B0** (0.915 → 0.907) and also 0.917 → 0.900 in the ladder.
   The earlier "+1.4% residual" against 2026-09-20 can't be read here, because B0 already carries
   it. The X1 flamegraph pair at #298 (`c860842c`) against its parent (`e82ff890`) moves no json
-  frame by more than 0.4 points of samples (`insert_sym` self 11.19% → 11.30%, `JsonParser::process`
+  self-time frame by more than 0.4 points of samples (`insert_sym` self 11.19% → 11.30%, `JsonParser::process`
   inclusive 48.69% → 47.95%), and #298 changes nothing on the parse path. The +2.3% step stays
   unattributed, most likely LTO code layout. `attribute` can't decode those two older binaries'
   dumps ("bad distribution blob: Version"), so the pair has only flamegraph shares, not a per-node
@@ -382,9 +384,9 @@ separately from the suite, so their cells differ from the table above in the thi
 - **Peak RSS.** `json-parse` reads +11.8% (93.5 → 104.4 MiB) in the suite, but the ladder's pooled
   `json-parse` RSS runs 99.9–109.0 MiB across all eleven binaries with no step, so it's run-to-run
   range. `native-relay` is +34% in the suite (236.1 → 317.0 MiB), while the pooled ladder reads
-  B0 235.0, F4 273.4, N 344.3, C- 369.1, M 287.7: wide, and not monotonic. The purge table in "Peak
-  RSS" below puts `native-relay` at 129.8 MiB with the allocator not retaining, the same level as
-  the `encode-*` rows, so the default-decay rise is allocator retention, not a larger live set.
+  B0 235.0, F4 273.4, N 344.3, C- 369.1, M 287.7: wide, and not monotonic. Under purge ("Peak
+  RSS" below) M reads 129.8 MiB, the `encode-*` level; with no B0 purge run, the 236.1 → 317.0 MiB
+  rise stays unattributed.
 - **Everything else is inside ±2%** on CPU, which is inside this box's repeat spread.
 
 ### `native-relay` under a 10 ms round trip, and the coalescing sweep
@@ -410,8 +412,9 @@ ran in the sweep (4 each).
 
 M is 2.3 points below C-, and every M repeat (307,571–311,090 events/s) is below every C- repeat
 (315,938–316,017), so the gap is real. It's smaller than the laptop's 95% against 91%. M costs 12.8%
-less CPU per event under latency. Cutting the cap doesn't close the gap: M/8 recovers 1.3 points
-and M/16 is inside M's own range.
+less CPU per event under latency. Cutting the cap closes little of it: M/8 recovers 1.3 points,
+outside M's repeat range (M/8's four repeats, 312,220–312,645 events/s, all sit above M's highest,
+311,090), and M/16's +0.4 is inside it.
 
 The reason is in the coalescing ratio, `logit.proto.frames{direction="in"}` per `logit.input.acks`
 over three runs per cell (C- predates the `logit.input.acks` counter and reports none):
@@ -577,11 +580,11 @@ Three findings:
   `route` from 101.6 to 55.9, `json-parse-x3` from 80.6 to 59.5, `passthrough` from 67.3 to 54.1,
   and `lua` from 67.5 to 58.6. `fanout` is the control: it retains nothing (one shared batch, freed
   once), and its RSS doesn't fall (46.9 → 49.2 MiB).
-- **`native-relay`'s default-decay rise is retention, not live data.** Its suite RSS rose from
-  236.1 MiB at B0 to 317.0 MiB at M, but under purge it sits at 129.8 MiB, the same level as the
-  `encode-*` rows. The session ran no purge on B0, so a B0-against-M purge comparison doesn't
-  exist. Likewise `json-parse`'s 93.5 → 104.4 MiB between B0 and M leaves a purge floor of 68.0
-  MiB, so about 36 MiB of M's default is allocator retention.
+- **`native-relay`'s default-decay rise stays unattributed.** Its suite RSS rose from 236.1 MiB at
+  B0 to 317.0 MiB at M. Under purge M reads 129.8 MiB, the `encode-*` level, but the session ran
+  no purge on B0, so there is no reading to compare the rise against. `json-parse` is a cleaner
+  case, because it compares M with itself: 104.4 MiB at default decay against a purge floor of
+  68.0 MiB leaves about 36 MiB of allocator retention.
 
 **The purge took effect this time.** The 2026-09-20 `suite-purge` never did: `script/perf run`'s
 `run()` helper (`script/common.sh`) invokes `docker compose run` with only one explicit `-e

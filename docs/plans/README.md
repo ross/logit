@@ -11,8 +11,8 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 | Plan | Created | Updated |
 |---|---|---|
 | [Enabling plan: native hop named acks — a cumulative `Ack { id, seq }`, coalesced at `logit_in`, and a resume mark](native-hop-named-acks.md) | 2026-10-02 | 2026-10-02 |
-| [Enabling plan: a native hop send window — several frames in flight, acknowledged in frame order](native-send-window.md) | 2026-10-01 | 2026-10-01 |
-| [Enabling plan: delivery semantics — at-least-once per hop, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-01 |
+| [Enabling plan: a native hop send window — several frames in flight, acknowledged in frame order](native-send-window.md) | 2026-10-01 | 2026-10-02 |
+| [Enabling plan: delivery semantics — at-least-once per hop, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-02 |
 | [Enabling plan: VictoriaMetrics — existing components verified, and zstd on remote-write](victoriametrics-interop.md) | 2026-09-24 | 2026-09-24 |
 | [Enabling plan: SigNoz — OTLP-native, verified, no new kind](signoz-relay.md) | 2026-09-24 | 2026-09-24 |
 | [Enabling plan: OpenSearch — SS4O documents over `_bulk`](opensearch-relay.md) | 2026-09-24 | 2026-09-24 |
@@ -23,9 +23,9 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 | [Enabling plan: `http_access` — access-log normalization from raw semconv fields](http-access-normalization.md) | 2026-09-22 | 2026-09-22 |
 | [Enabling plan: `flatten` — dotted-key expansion of nested attributes](flatten-transform.md) | 2026-09-21 | 2026-09-21 |
 | [Enabling plan: `Event` sizing and allocation strategy — a measured bake-off, then an ADR](event-sizing.md) | 2026-09-21 | 2026-09-21 |
-| [Verification plan: critical sections inventory](critical-sections-inventory.md) | 2026-09-20 | 2026-09-29 |
+| [Verification plan: critical sections inventory](critical-sections-inventory.md) | 2026-09-20 | 2026-10-02 |
 | [Enabling plan: a data-shape survey, and the `shape` component that measures it](data-shape-survey.md) | 2026-09-20 | 2026-09-20 |
-| [Enabling plan: UDP intake batching and socket visibility](udp-intake.md) | 2026-09-18 | 2026-09-18 |
+| [Enabling plan: UDP intake batching and socket visibility](udp-intake.md) | 2026-09-18 | 2026-10-02 |
 | [Enabling plan: Prometheus remote-write — receive on `prometheus_in`, send on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-09-18 |
 | [Enabling plan: `docker_in` live container identity and a minimal `inotify` watch set](docker-container-identity.md) | 2026-09-17 | 2026-09-17 |
 | [Enabling plan: `Transform::process` in place — `&mut Event -> bool`](in-place-transform-process.md) | 2026-09-17 | 2026-09-17 |
