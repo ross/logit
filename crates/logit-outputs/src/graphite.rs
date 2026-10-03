@@ -707,10 +707,12 @@ mod tests {
         });
 
         let mut output = GraphiteOutput::tcp(addr.to_string(), Duration::from_secs(2));
-        // Larger than any default send buffer or receive window, so the first `write()` is
-        // partial whatever the collector does.
+        // About 7.6 MB of ~1 KiB lines: larger than any default send buffer or receive window, so
+        // the first `write()` is partial whatever the collector does. Few long lines rather than
+        // many short ones, since building and encoding each event is the test's CPU cost.
+        let prefix = "m".repeat(1_000);
         let events: Vec<Event> =
-            (0..300_000).map(|i| gauge_event(&format!("m{i}"), i as f64)).collect();
+            (0..7_500).map(|i| gauge_event(&format!("{prefix}{i}"), i as f64)).collect();
         let batch = batch_with(events);
 
         let err = tokio::time::timeout(Duration::from_secs(10), output.send(&batch))
