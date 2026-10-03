@@ -289,6 +289,9 @@ impl FilePlan {
         }
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let staged = Staged(dir.to_path_buf());
+        // Measured after the clear, so an earlier repeat's files don't count against this one.
+        let free = free_bytes(dir)?;
+        check_free_space(dir, self.bytes(), free)?;
         let first = self.first_lines();
         self.write_lines(&self.path, 0, first)?;
         if self.spec.rotate_after.is_some() {
@@ -323,6 +326,46 @@ impl FilePlan {
             .with_context(|| format!("renaming {} to {}", staged.display(), self.path.display()))?;
         Ok(())
     }
+}
+
+/// How much free space a repeat needs, as a multiple of the bytes it writes. Twice, so the file
+/// never fills the disk the repo, the results JSON, and the telemetry dump share.
+const FREE_SPACE_FACTOR: u64 = 2;
+
+/// Bytes available to an unprivileged writer on `dir`'s filesystem (`statvfs(3)`'s `f_bavail`).
+fn free_bytes(dir: &Path) -> anyhow::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .with_context(|| format!("{} contains a NUL byte", dir.display()))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_path` is a valid NUL-terminated string for the call's duration, and `stat`
+    // points to writable memory sized for one `statvfs`, which the call fills on success.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("statvfs({})", dir.display()));
+    }
+    // SAFETY: `statvfs` returned 0, so it initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+/// Refuses a repeat that would write `needed` bytes with less than [`FREE_SPACE_FACTOR`] times
+/// that `free`.
+fn check_free_space(dir: &Path, needed: u64, free: u64) -> anyhow::Result<()> {
+    let wanted = needed.saturating_mul(FREE_SPACE_FACTOR);
+    if free < wanted {
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        bail!(
+            "{} has {:.1} GiB free, but this repeat writes {:.1} GiB and needs {FREE_SPACE_FACTOR}x \
+             that free ({:.1} GiB) -- free some space or lower the spec's `lines`",
+            dir.display(),
+            free as f64 / GIB,
+            needed as f64 / GIB,
+            wanted as f64 / GIB,
+        );
+    }
+    Ok(())
 }
 
 /// A file scenario's staged directory, removed on drop: the files run to hundreds of MiB, too
@@ -616,6 +659,15 @@ mod tests {
         let a = FilePlan::build(&root, &spec, &scenario).unwrap();
         let b = FilePlan::build(&root, &spec, &scenario).unwrap();
         assert_eq!(a.ring, b.ring);
+    }
+
+    #[test]
+    fn a_repeat_needs_twice_its_bytes_free() {
+        let dir = Path::new("/somewhere");
+        check_free_space(dir, 100, 200).expect("twice the bytes is enough");
+        let err = check_free_space(dir, 100, 199).expect_err("less than twice is refused");
+        assert!(format!("{err:#}").contains("needs 2x"), "{err:#}");
+        assert!(free_bytes(&std::env::temp_dir()).unwrap() > 0);
     }
 
     #[test]

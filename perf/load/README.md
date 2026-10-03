@@ -342,8 +342,8 @@ during startup on whatever CPU the scheduler picked.
 kind: file             # without it, a spec is the UDP kind above
 target: app            # the `tail_in` component; its one `paths:` entry is the file written
 # sink: out            # as in a UDP spec: only a multi-sink graph has to name it
-lines: 5000000         # lines written in total, and the exact count the sink must receive
-rotate_after: 2500000  # optional: the first file's share; the rest goes to its replacement
+lines: 12000000        # lines written in total, and the exact count the sink must receive
+rotate_after: 6000000  # optional: the first file's share; the rest goes to its replacement
 seed: 20261002         # seeds the weighted template choice: same spec, same bytes, every run
 ring_lines: 4093       # distinct lines rendered, then cycled
 model: app-log.yaml    # weighted `lines:` templates, the format statsd-app.yaml uses
@@ -354,8 +354,9 @@ model: app-log.yaml    # weighted `lines:` templates, the format statsd-app.yaml
 **The file is written before the spawn**, under `perf/results/`, so no write competes with the
 measured child and the run reads from the page cache. The scenario's `tail_in` path must be one
 exact path (no `*`, no `!env`) that resolves strictly inside `perf/results/`. The harness clears
-that path's directory before every spawn and removes it after, because each repeat writes about
-1.5 GiB.
+that path's directory before every spawn and removes it after, because each repeat writes a lot:
+~3.5 GiB for `tail`'s 12M lines and ~1.5 GiB for `tail-rotate`'s 5M. Before writing, it refuses
+a repeat unless the filesystem has twice the repeat's bytes free.
 
 **`rotate_after` rotates once, to logrotate `create` mode's end state.** The replacement is
 written before the spawn too, as `<path>.next`. Once the sink has received half of the first
