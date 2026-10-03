@@ -119,6 +119,12 @@ the dev build. The layout in [`docs/design/pipeline-graph.md`](../design/pipelin
   - **Profile the two large test targets.** Use `-Z self-profile` or `-Z time-passes`. They
     should show how the time divides between front end and codegen, and why moving about 8,500
     test lines out of `logit-inputs` didn't shorten its test target.
+  - **Move unit tests out of the two large crates.** Each in-file `#[cfg(test)]` module makes
+    cargo compile its crate a second time as one `lib (test)` invocation. Tests under `tests/`
+    would compile as separate binaries against the built library, but they can only reach `pub`
+    items. Profile first: if the time is codegen of dependencies' generic code, moving tests
+    won't help. Merging integration-test binaries into one per crate was measured on 2026-10-02:
+    it saved CPU time but no wall time.
   - **Build the tests without jemalloc.** `tikv-jemalloc-sys`'s build script runs 26–43 s
     alongside the test targets. It gates `logit-cli` and `logit-bench`. The `jemalloc` feature
     already has an off switch, `--no-default-features`
