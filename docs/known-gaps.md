@@ -1936,9 +1936,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 ## Prometheus
 
 - ~~**`prometheus_out`'s "a sketch has no sum" claim is stale.**~~ **Closed (2026-10-03).**
-  `prometheus_out` and `otlp_out` now emit a `Distribution`'s or `Samples`'s summary with
+  `prometheus_out`, `otlp_out`, and `influxdb_out` now emit a `Distribution`'s or `Samples`'s
   `logit_core::DdSketch::sum` (`crates/logit-core/src/sketch.rs`), exact unless
-  `DdSketch::stats_exact()` is `false`, as `graphite_out` already did.
+  `DdSketch::stats_exact()` is `false`, as `graphite_out` and `splunk_hec_out` already did.
 - **`prometheus_out` has no TLS and no auth either** (ADR `prometheus-scrape-and-exposition`'s
   "Security posture"). Anyone who can reach its `bind:` reads the entire registry: every label on
   every series the sink holds. Unlike the admin endpoint's deliberate non-goal (see "The admin

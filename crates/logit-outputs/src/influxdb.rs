@@ -545,10 +545,16 @@ fn allocate_timestamp(
 }
 
 /// `Distribution` and re-sketched `Samples` fields: `count` as an unsigned integer
-/// ([`push_uint`]) plus p50/p90/p99. `count` is unconditional, so there's always one field.
+/// ([`push_uint`]), `sum` ([`DdSketch::sum`], `0.0` for an empty sketch), then p50/p90/p99.
+/// `count` is unconditional, so there's always one field.
 fn render_sketch_fields(out: &mut String, sketch: &DdSketch) {
     out.push_str("count=");
     push_uint(out, sketch.count() as u64);
+    let sum = sketch.sum();
+    if sum.is_finite() {
+        out.push_str(",sum=");
+        push_float(out, sum);
+    }
     for q in [0.5, 0.9, 0.99] {
         if let Some(v) = sketch.quantile(q).filter(|v| v.is_finite()) {
             let percentile = (q * 100.0).round() as u32;
@@ -572,7 +578,7 @@ fn render_sketch_fields(out: &mut String, sketch: &DdSketch) {
 /// - `SetMembers` (raw members, no scalar to render) and `ExponentialHistogram` (no line-protocol
 ///   shape; `docs/plans/lossless-transit.md`) are errors, as is an unresolved `GaugeDelta`.
 ///
-/// **Field names are written unescaped.** Each is a literal (`value`, `count`) or built from
+/// **Field names are written unescaped.** Each is a literal (`value`, `count`, `sum`) or built from
 /// formatted numbers (`p50`, `bucket_1.5`, `q0.99`), and no `f64`/`u32` rendering contains a
 /// backslash, comma, equals, or space. A field name derived from user input would have to go
 /// through [`push_escaped_tag`].
@@ -799,8 +805,8 @@ mod tests {
         sketch.add(120.0);
         let out = encode(vec![metric_event("latency", MetricKind::Distribution(sketch), &[])]);
         assert!(
-            out.starts_with("latency count=1u,"),
-            "count should be an unsigned int field: {out}"
+            out.starts_with("latency count=1u,sum=120,"),
+            "count should be an unsigned int field, then the sketch's sum: {out}"
         );
         assert!(out.contains("p50="));
         assert!(out.contains("p90="));
@@ -849,8 +855,8 @@ mod tests {
             &[],
         )]);
         assert!(
-            out.starts_with("latency count=1u,"),
-            "count should be an unsigned int field: {out}"
+            out.starts_with("latency count=1u,sum=120,"),
+            "count should be an unsigned int field, then the sketch's sum: {out}"
         );
         assert!(out.contains("p50="));
     }
@@ -862,7 +868,7 @@ mod tests {
         let mut samples = logit_core::Samples::new([120.0, 130.0]);
         samples.sample_rate = f64::NAN;
         let out = encode(vec![metric_event("latency", MetricKind::Samples(samples), &[])]);
-        assert!(out.starts_with("latency count=2u,"), "got: {out}");
+        assert!(out.starts_with("latency count=2u,sum=250,"), "got: {out}");
         assert!(out.contains("p50="), "got: {out}");
     }
 

@@ -496,5 +496,5 @@ with it.
 mapping table first said a sketch has no sum, so the summary omitted it as OpenMetrics permits.
 That was wrong: `DdSketch::sum` is an exact running sum, added on `merge`, and approximate only when
 `DdSketch::stats_exact()` is `false` (stats derived from bins after a decode). `graphite_out` and
-`splunk_hec_out` already emitted it; `prometheus_out` and `otlp_out`, whose
-`SummaryDataPoint.sum` carried `0.0`, now do too.
+`splunk_hec_out` already emitted it. `prometheus_out`, `otlp_out` (whose `SummaryDataPoint.sum`
+carried `0.0`), and `influxdb_out` (a `sum=` field beside `count=` and the percentiles) now do too.
