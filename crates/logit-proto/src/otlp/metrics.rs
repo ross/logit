@@ -27,7 +27,10 @@
 //!   (`Samples::sketch`, each value weighted by `Samples::weight`), then degraded like
 //!   `Distribution`. Counts `logit.output.metrics.degraded{metric_kind="samples"}`.
 //! - `Distribution(sketch)` → `Summary` of `DISTRIBUTION_QUANTILES`: **lossy** (see "Lossy
-//!   metric kinds" below). Counts `logit.output.metrics.degraded{metric_kind="distribution"}`.
+//!   metric kinds" below). The point's `count` and `sum` are the sketch's own; `sum` is
+//!   `DdSketch::sum`, exact unlike a quantile (approximate only when `DdSketch::stats_exact` is
+//!   `false`, i.e. the sketch's stats were derived from its bins). Counts
+//!   `logit.output.metrics.degraded{metric_kind="distribution"}`.
 //! - `SetMembers(members)`, `Set(hll)`: **skipped**; OTLP has no cardinality type to carry a set
 //!   or an estimate. Counts `logit.output.metrics.skipped{metric_kind="set_members"|"set"}` and
 //!   warns, throttled.
@@ -364,7 +367,7 @@ fn distribution_summary_point(
         start_time_unix_nano,
         time_unix_nano: ts,
         count: sketch.count() as u64,
-        sum: 0.0,
+        sum: sketch.sum(),
         quantile_values,
         flags,
     }
@@ -717,6 +720,8 @@ mod tests {
         match metric.data.unwrap() {
             pb::metric::Data::Summary(s) => {
                 assert_eq!(s.data_points[0].quantile_values.len(), 5, "p50/p75/p90/p95/p99");
+                assert_eq!(s.data_points[0].count, 5);
+                assert_eq!(s.data_points[0].sum, 15.0);
             }
             other => panic!("expected Summary, got {other:?}"),
         }
@@ -767,6 +772,8 @@ mod tests {
         match metric.data.unwrap() {
             pb::metric::Data::Summary(s) => {
                 assert_eq!(s.data_points[0].quantile_values.len(), 5, "p50/p75/p90/p95/p99");
+                assert_eq!(s.data_points[0].count, 5);
+                assert_eq!(s.data_points[0].sum, 15.0);
             }
             other => panic!("expected Summary, got {other:?}"),
         }
