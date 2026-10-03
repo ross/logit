@@ -201,8 +201,16 @@ pub struct LineWeight {
 pub fn read_spec(path: &Path) -> anyhow::Result<LoadSpec> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let spec: LoadSpec =
+    let mut value: serde_norway::Value =
         serde_norway::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    // `kind: udp` names this spec's kind (`crate::file_load::read_any_spec`); it isn't a field.
+    if let Some(map) = value.as_mapping_mut() {
+        if map.get("kind").and_then(serde_norway::Value::as_str) == Some("udp") {
+            map.remove("kind");
+        }
+    }
+    let spec: LoadSpec =
+        serde_norway::from_value(value).with_context(|| format!("parsing {}", path.display()))?;
     validate_spec(&spec).with_context(|| format!("{}", path.display()))?;
     Ok(spec)
 }
@@ -262,12 +270,12 @@ fn validate_spec(spec: &LoadSpec) -> anyhow::Result<()> {
 }
 
 /// Reads and validates the line model a spec's `model:` names, resolved against the spec file's
-/// directory.
-pub fn read_model(spec_path: &Path, spec: &LoadSpec) -> anyhow::Result<LineModel> {
+/// directory. `crate::file_load`'s file specs read their model through this too.
+pub fn read_model(spec_path: &Path, model: &Path) -> anyhow::Result<LineModel> {
     let dir = spec_path
         .parent()
         .with_context(|| format!("{} has no parent directory", spec_path.display()))?;
-    let path = dir.join(&spec.model);
+    let path = dir.join(model);
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let model: LineModel =
@@ -289,8 +297,8 @@ fn validate_model(model: &LineModel) -> anyhow::Result<()> {
         }
         if line.template.contains('\n') {
             bail!(
-                "`lines[{index}].template` contains a newline -- one template is one statsd line, \
-                 and packing is `datagram_mix`'s job"
+                "`lines[{index}].template` contains a newline -- one template is one line, and \
+                 packing several into a datagram is `datagram_mix`'s job"
             );
         }
     }
@@ -352,10 +360,10 @@ pub fn target_addr(scenario_yaml: &str, target: &str) -> anyhow::Result<SocketAd
 
 /// SplitMix64: a few lines, no `rand` dependency, reproducible run to run, and good enough for
 /// weighted choice over a few thousand draws.
-struct SplitMix64(u64);
+pub(crate) struct SplitMix64(u64);
 
 impl SplitMix64 {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         SplitMix64(seed)
     }
 
@@ -368,7 +376,7 @@ impl SplitMix64 {
     }
 
     /// A weighted index into `cumulative` (a running total, last element = the sum of all weights).
-    fn weighted(&mut self, cumulative: &[u64]) -> usize {
+    pub(crate) fn weighted(&mut self, cumulative: &[u64]) -> usize {
         let total = *cumulative.last().expect("a non-empty weight list");
         let draw = self.next_u64() % total;
         cumulative.partition_point(|&bound| bound <= draw)
@@ -377,7 +385,7 @@ impl SplitMix64 {
 
 /// Running totals of `weights`, for [`SplitMix64::weighted`]. Zero-weight entries stay in place,
 /// so indices match the spec's list, and are never selected.
-fn cumulative(weights: impl Iterator<Item = u32>) -> Vec<u64> {
+pub(crate) fn cumulative(weights: impl Iterator<Item = u32>) -> Vec<u64> {
     let mut running = 0u64;
     weights
         .map(|weight| {
@@ -426,13 +434,13 @@ fn resolve_var(name: &str) -> anyhow::Result<SeqMod> {
 /// whether two tag values co-vary. Per-template counters keep templates chosen at different
 /// weights from sharing a phase.
 #[derive(Debug)]
-struct LineRenderer {
+pub(crate) struct LineRenderer {
     compiled: Compiled<SeqMod>,
     seq: u64,
 }
 
 impl LineRenderer {
-    fn compile(template: &str) -> anyhow::Result<Self> {
+    pub(crate) fn compile(template: &str) -> anyhow::Result<Self> {
         let parsed = logit_core::template::parse(template)
             .with_context(|| format!("parsing template {template:?}"))?;
         let compiled = parsed
@@ -441,7 +449,7 @@ impl LineRenderer {
         Ok(LineRenderer { compiled, seq: 0 })
     }
 
-    fn render(&mut self, out: &mut String) {
+    pub(crate) fn render(&mut self, out: &mut String) {
         let seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
         self.compiled.render(out, |var, out| {
@@ -695,7 +703,7 @@ impl LoadPlan {
     /// config `scenario_yaml`.
     pub fn build(spec_path: &Path, scenario_yaml: &str) -> anyhow::Result<LoadPlan> {
         let spec = read_spec(spec_path)?;
-        let model = read_model(spec_path, &spec)?;
+        let model = read_model(spec_path, &spec.model)?;
         let ring = Ring::render(&spec, &model)
             .with_context(|| format!("rendering the datagram ring for {}", spec_path.display()))?;
         let target = target_addr(scenario_yaml, &spec.target)?;
@@ -1664,7 +1672,7 @@ mod tests {
     fn shipped_plan(name: &str) -> (LoadSpec, Ring) {
         let spec_path = repo_root().join("perf/load").join(format!("{name}.yaml"));
         let spec = read_spec(&spec_path).expect("the shipped spec parses");
-        let model = read_model(&spec_path, &spec).expect("the shipped model parses");
+        let model = read_model(&spec_path, &spec.model).expect("the shipped model parses");
         let ring = Ring::render(&spec, &model).expect("the shipped model renders");
         (spec, ring)
     }

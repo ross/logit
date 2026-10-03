@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-09-21
+updated: 2026-10-02
 ---
 
 # Enabling plan: a load-test harness for the real `logit` binary
@@ -90,6 +90,8 @@ Lua a scenario needs — validated the same way every other example config is.
 | `json-parse-app-log` | `generate_in` (`fixtures::FLAT_JSON_LOG_BODY` + `tail_in`'s `log.file.path`) → `json` → `null_out` | The parse at the commonest *measured* log width, 12 attributes (`docs/design/data-shapes.md` §5.3), read against `json-parse` | 9M | ~1.00M/s |
 | `json-parse-nested-log` | `generate_in` (`fixtures::PINO_HTTP_LOG_BODY` + the same path attribute) → `json` → `null_out` | The same parse on a *nested* record: 10 attributes but four boxed `Value::Map`s | 4.5M | ~0.55M/s |
 | `json-parse-access-log` | `generate_in` (`fixtures::POSTGRES_JSONLOG_BODY` + the same path attribute) → `json` → `null_out` | The widest, highest-rate log class, 30 attributes — the only shipped scenario whose `AttrMap` reallocs | 3M | ~0.37M/s |
+| `tail` | a file `logit-perf` writes first → `tail_in` (`read_from: beginning`) → `null_out` | `tail_in`'s read, line split, and per-line event, with nothing parsed | 12M lines | pending VM measurement |
+| `tail-rotate` | `tail`, with the file hard-linked aside and a replacement renamed onto its path once half of it is delivered | The rotation path on top of `tail`: the rescan, the replacement's open, the old file's drain and reap | 5M lines | pending VM measurement |
 
 The last three rows are [`docs/plans/event-sizing.md`](event-sizing.md)'s W1 (2026-09-21): three
 widths of the same `json` parse, so a sizing arm can be read against the bimodal log population
@@ -229,3 +231,14 @@ one where the load arrives over a real socket, the denominator is events *delive
 generated, and a drop rate is a first-class number rather than an impossibility. The details, the
 calibration against a recorded real-client capture, and the tuning live with that plan and with
 `perf/load/README.md`, not here.
+
+## Extension, 2026-10-02: file scenarios
+
+`tail` and `tail-rotate` add a third workload kind, `Workload::File`, for `tail_in`, which neither
+a generator nor a socket reaches. `logit-perf` writes the tailed file before the spawn from a
+`kind: file` spec in `perf/load/`, and the run ends when the sink's delivered count, followed
+through the UDP kind's telemetry leg, reaches the line count
+([ADR `load-test-harness`](../adr/load-test-harness.md)'s "Extended 2026-10-02" section). The
+spec format and the exact self-check are in `perf/load/README.md`'s "File scenarios". They exist
+first to measure the tail read path's allocation follow-up (TAIL-03 in
+[`critical-sections-inventory.md`](critical-sections-inventory.md)).

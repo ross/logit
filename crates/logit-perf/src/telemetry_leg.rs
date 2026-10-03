@@ -297,6 +297,72 @@ pub fn decode_dump(path: &Path, quiet: bool) -> anyhow::Result<Vec<Event>> {
     Ok(events)
 }
 
+/// Reads a dump while the process under test is still appending to it: a `crate::file_load`
+/// scenario's completion is a sink count only the dump carries.
+///
+/// Each [`DumpFollower::poll`] decodes the whole frames appended since the last one, leaving a
+/// frame still being written for the next call. The final, whole-run read is still
+/// [`decode_dump`]'s, after shutdown.
+pub struct DumpFollower {
+    path: PathBuf,
+    /// Bytes of the dump decoded so far, always at a frame boundary.
+    offset: u64,
+    events: Vec<Event>,
+}
+
+impl DumpFollower {
+    pub fn new(path: &Path) -> Self {
+        DumpFollower { path: path.to_path_buf(), offset: 0, events: Vec::new() }
+    }
+
+    /// Every event decoded so far, in dump order.
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    /// Decodes the frames appended since the last call; returns whether there were any. A dump
+    /// that doesn't exist yet (no drain has run) has none.
+    pub fn poll(&mut self) -> anyhow::Result<bool> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = match fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(err).with_context(|| format!("opening {}", self.path.display()))
+            }
+        };
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw).with_context(|| format!("reading {}", self.path.display()))?;
+        let total = raw.len();
+        let mut bytes = Bytes::from(raw);
+        // Advanced only past whole frames: `read_frame` consumes a header before it finds the
+        // body truncated.
+        let mut consumed = 0;
+        let mut any = false;
+        while !bytes.is_empty() {
+            let (codec, mut payload) = match read_frame(&mut bytes) {
+                Ok(frame) => frame,
+                Err(CodecError::Truncated { .. }) => break,
+                Err(err) => {
+                    return Err(anyhow::Error::new(err))
+                        .with_context(|| format!("following {}", self.path.display()))
+                }
+            };
+            if codec != CODEC_BATCH {
+                bail!("a frame of {} declares codec byte {codec}", self.path.display());
+            }
+            let batch = decode_batch(&mut payload, &DecodeBudget::default())
+                .with_context(|| format!("decoding a frame of {}", self.path.display()))?;
+            self.events.extend(batch.events);
+            consumed = total - bytes.len();
+            any = true;
+        }
+        self.offset += consumed as u64;
+        Ok(any)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +462,64 @@ mod tests {
             format!("{err:#}").contains("`__perf_internal` did not land under `components:`"),
             "{err:#}"
         );
+    }
+
+    /// One bare native frame carrying `n` log events, as `file_out format: native` writes a batch.
+    fn frame_of(n: usize) -> Vec<u8> {
+        let events = (0..n)
+            .map(|i| {
+                Event::log(
+                    i as i64,
+                    logit_core::AttrMap::new(),
+                    logit_core::LogRecord {
+                        message: logit_core::Value::str("x"),
+                        severity: None,
+                        body_format: logit_core::BodyFormat::Raw,
+                        trace: None,
+                        event_name: None,
+                        observed_timestamp: 0,
+                        dropped_attributes_count: 0,
+                    },
+                )
+            })
+            .collect();
+        let batch = logit_core::EventBatch {
+            resource: std::sync::Arc::new(logit_core::Resource::default()),
+            scope: None,
+            events,
+        };
+        let payload = logit_proto::native::encode_batch(&batch);
+        logit_proto::frame::write_frame(
+            CODEC_BATCH,
+            logit_proto::frame::Compression::None,
+            &payload,
+        )
+        .unwrap()
+        .to_vec()
+    }
+
+    #[test]
+    fn a_dump_follower_decodes_whole_frames_and_waits_out_a_torn_one() {
+        let dir = std::env::temp_dir().join(format!("logit-perf-follow-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dump.native");
+        let _ = fs::remove_file(&path);
+        let mut follower = DumpFollower::new(&path);
+        assert!(!follower.poll().unwrap(), "no dump yet is no frames, not an error");
+
+        let (first, second) = (frame_of(2), frame_of(3));
+        let mut written = first.clone();
+        written.extend_from_slice(&second[..second.len() / 2]);
+        fs::write(&path, &written).unwrap();
+        assert!(follower.poll().unwrap());
+        assert_eq!(follower.events().len(), 2, "the torn second frame waits");
+
+        written.extend_from_slice(&second[second.len() / 2..]);
+        fs::write(&path, &written).unwrap();
+        assert!(follower.poll().unwrap());
+        assert_eq!(follower.events().len(), 5);
+        assert!(!follower.poll().unwrap(), "nothing new since");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

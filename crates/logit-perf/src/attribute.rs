@@ -12,8 +12,11 @@
 //!
 //! **Driven scenarios work here too.** `attribute` blasts a real-socket scenario as `run` does
 //! (`crate::run`'s `Drive::Driven`) and reads the same dump. Its count check doesn't warn about
-//! loss, which a UDP scenario is allowed; `run` checks the sent/received/dropped accounting.
+//! loss, which a UDP scenario is allowed; `run` checks the sent/received/dropped accounting. A
+//! file scenario follows this command's own dump to its completion (`crate::run`'s
+//! `Drive::File`), so its `wall_s` is resolved to `--interval`.
 
+use crate::file_load::FilePlan;
 use crate::load::{CpuSet, LoadPlan};
 use crate::run::{self, Drive, SpawnConfig};
 use crate::scenario::{self, Scenario, Workload};
@@ -78,7 +81,7 @@ pub fn attribute(root: &Path, args: AttributeArgs) -> anyhow::Result<()> {
         );
     }
 
-    let outcome = attribute_in(&logit_bin, &scenario, &args, &dump_path);
+    let outcome = attribute_in(root, &logit_bin, &scenario, &args, &dump_path);
     match &outcome {
         // Only on success: a failed run's partial dump is kept for debugging. The rewritten
         // scenario is removed either way; it's reproducible from the original.
@@ -91,6 +94,7 @@ pub fn attribute(root: &Path, args: AttributeArgs) -> anyhow::Result<()> {
 }
 
 fn attribute_in(
+    root: &Path,
     logit_bin: &Path,
     scenario: &Scenario,
     args: &AttributeArgs,
@@ -109,13 +113,21 @@ fn attribute_in(
 
     // Rendered before spawning, so a broken spec fails before a full startup.
     let plan = match &scenario.workload {
-        Workload::Generated { .. } => None,
         Workload::Driven(_) => Some(LoadPlan::build(&scenario.load_spec_path()?, &source)?),
+        _ => None,
     };
-    let drive = match (&plan, &scenario.workload) {
-        (Some(plan), _) => Drive::Driven { plan, pin_sender: args.pin_sender.as_ref() },
-        (None, Workload::Generated { count }) => Drive::Generated { count: *count },
-        (None, Workload::Driven(_)) => unreachable!("a driven workload always builds a plan"),
+    let file_plan = match &scenario.workload {
+        Workload::File(_) => {
+            Some(FilePlan::build(root, &scenario.load_spec_path()?, &scenario.path)?)
+        }
+        _ => None,
+    };
+    // A file scenario's completion is followed through this same dump, at `--interval`.
+    let drive = match (&plan, &file_plan, &scenario.workload) {
+        (Some(plan), _, _) => Drive::Driven { plan, pin_sender: args.pin_sender.as_ref() },
+        (None, Some(plan), _) => Drive::File { plan, dump: dump_path },
+        (None, None, Workload::Generated { count }) => Drive::Generated { count: *count },
+        (None, None, _) => unreachable!("a driven or file workload always builds a plan"),
     };
 
     println!(
@@ -520,6 +532,21 @@ pub fn check_counts(nodes: &BTreeMap<String, NodeStats>, workload: &Workload) ->
                  losses are expected here and are checked by `run`, not by this table",
                 spec.datagrams
             )]
+        }
+        Workload::File(spec) => {
+            let mut lines = vec![format!(
+                "events: peak node received {peak}, {} lines written to the tailed file",
+                spec.lines
+            )];
+            if peak != spec.lines {
+                lines.push(format!(
+                    "warning: the peak node's `events.received` ({peak}) does not equal the lines \
+                     written ({}) -- `run` fails this repeat; every Σ below describes a different \
+                     run than the scenario says",
+                    spec.lines
+                ));
+            }
+            return lines;
         }
         Workload::Generated { count } => *count,
     };

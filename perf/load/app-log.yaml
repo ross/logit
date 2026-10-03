@@ -1,0 +1,25 @@
+# The line model for the `tail*` file scenarios: Go `log/slog` `JSONHandler`-style application log
+# lines, the commonest measured log shape. See perf/load/README.md's "File scenarios".
+#
+# Every template is `fixtures::FLAT_JSON_LOG_BODY` (crates/logit-bench/src/fixtures.rs) with its
+# values varied: slog's three-field envelope (`time`, `level`, `msg`) plus the eight access fields
+# docs/design/data-shapes.md §5.3's surveyed apps logged, eleven fields in all. That fixture is
+# modelled, not captured; its comment has the arithmetic. Lines here run 273-330 bytes, 313 on
+# average (`logit-perf run` prints the mean it writes).
+#
+# The mix is chosen, not measured: mostly completed requests, a minority of client errors and slow
+# requests, and a few upstream failures, so line lengths vary the way a real service's do. What
+# `tail_in -> null_out` pays for is bytes and lines; it parses nothing, so the field values matter
+# only through their length. `{seq%N}` is logit_core::template's only placeholder here, and `{{`/`}}`
+# are its brace escape.
+lines:
+  - weight: 60
+    template: '{{"time":"2026-09-07T06:52:01.{seq%1000000}Z","level":"INFO","msg":"request completed","method":"GET","path":"/api/v1/orders/{seq%100}","status":200,"duration_ms":4.{seq%10},"bytes":1{seq%1000},"remote_addr":"198.51.100.{seq%250}","request_id":"c3f7a1e2-9b44-4f0a-8c2d-11f2a9d{seq%100000}","user_agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}}'
+  - weight: 20
+    template: '{{"time":"2026-09-07T06:52:01.{seq%1000000}Z","level":"INFO","msg":"request completed","method":"POST","path":"/api/v1/orders","status":201,"duration_ms":18.{seq%10},"bytes":842,"remote_addr":"198.51.100.{seq%250}","request_id":"c3f7a1e2-9b44-4f0a-8c2d-11f2a9d{seq%100000}","user_agent":"python-requests/2.32.3"}}'
+  - weight: 10
+    template: '{{"time":"2026-09-07T06:52:01.{seq%1000000}Z","level":"WARN","msg":"request rejected","method":"GET","path":"/api/v1/orders/{seq%100}","status":404,"duration_ms":1.{seq%10},"bytes":61,"remote_addr":"203.0.113.{seq%250}","request_id":"5d1e0b7a-3f22-4c19-9a6e-0b8f2c7e{seq%10000}","user_agent":"Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/131.0"}}'
+  - weight: 7
+    template: '{{"time":"2026-09-07T06:52:01.{seq%1000000}Z","level":"WARN","msg":"slow request","method":"GET","path":"/api/v1/reports/{seq%20}","status":200,"duration_ms":2{seq%1000}.5,"bytes":48{seq%1000},"remote_addr":"198.51.100.{seq%250}","request_id":"9a4c6e1f-7b30-4d85-b2a1-6c0e3f9d{seq%10000}","user_agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}}'
+  - weight: 3
+    template: '{{"time":"2026-09-07T06:52:01.{seq%1000000}Z","level":"ERROR","msg":"upstream request failed","method":"POST","path":"/api/v1/payments","status":502,"duration_ms":30{seq%100}.0,"bytes":0,"remote_addr":"198.51.100.{seq%250}","request_id":"e8b2d4c6-1a5f-4e97-8d3b-2f6a0c9e{seq%10000}","error":"dial tcp 10.0.3.17:8443: i/o timeout"}}'
