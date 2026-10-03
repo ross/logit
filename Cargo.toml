@@ -196,6 +196,24 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# proptest's input generators run unoptimized otherwise, and the proptest-heavy suites (such as
+# `logit-proto`'s `frame_fixed_point`) spend most of their time generating inputs. These crates
+# only rebuild on a cold build, so optimizing them costs nothing in the edit loop.
+[profile.dev.package.proptest]
+opt-level = 2
+
+[profile.dev.package.rand]
+opt-level = 2
+
+[profile.dev.package.rand_chacha]
+opt-level = 2
+
+[profile.dev.package.rand_core]
+opt-level = 2
+
+[profile.dev.package.rand_xorshift]
+opt-level = 2
+
 # What `script/perf flamegraph` builds against (crates/logit-perf/src/flamegraph.rs,
 # docs/adr/load-test-harness.md's "Profiling" section). A stripped release binary has no symbols
 # for `perf record` to resolve and no unwind information for `--call-graph dwarf` to walk, so a
