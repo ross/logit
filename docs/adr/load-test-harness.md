@@ -254,7 +254,7 @@ rather than adding a parallel one:
   match, and rotates to logrotate `create` mode's end state once half the first file is
   delivered: a hard link of the file at `<path>.1`, then a rename of the replacement onto the
   path. Unlike logrotate's rename-then-create, the path never goes missing, so no scan can miss
-  the rotation the self-check counts (`docs/known-gaps.md` has that window).
+  the rotation the self-check counts (`docs/known-gaps/telemetry.md` has that window).
 - **Completion is the delivered count reaching the line count.** A file scenario has no
   `generation complete` line and no sender to return, so `run` follows the same telemetry dump the
   UDP kind reads its denominator from, at a 100 ms drain interval, and ends `wall_s` when the

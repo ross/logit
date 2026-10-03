@@ -35,7 +35,7 @@ window, and the spool record to this record.
 
 As built, the wire numbers frames implicitly per connection: `logit_in` acknowledges the Nth data
 frame as `Ack { seq: N }`, the count restarts on a reconnect, and `logit_in` forwards every frame
-(`docs/known-gaps.md`, "The native hop has no sender identity and no deduplication").
+(`docs/known-gaps/native-hop.md`, "The native hop has no sender identity and no deduplication").
 
 One constraint shapes every choice below: delivery verification must not become flow control. The
 sink sends a sequence, the receiver uses it only to recognize a resend, and nothing acknowledges a
@@ -213,7 +213,7 @@ no floor or ceiling. A cap of N costs 1.25N entries of tens of bytes each.
 the old connection parks on a full inbox past the sender's ack timeout, the sender redials and
 resends the same number, and the new connection reads a mark not yet advanced and forwards a
 second copy. The target tolerates that duplicate (item 7 prefers the duplicate to a loss), and
-the implementation adds a `docs/known-gaps.md` entry for it.
+the implementation adds a `docs/known-gaps/native-hop.md` entry for it.
 
 ### 8. Counters
 
@@ -279,6 +279,6 @@ accepts it.
   ignores. [Superseded on 2026-10-01 by [ADR
   `native-hop-no-compatibility`](native-hop-no-compatibility.md): an `Ack` with a body is
   malformed, and neither direction across that boundary is a supported deployment.]
-- **The residual race** stays documented in `docs/known-gaps.md` (decision 7).
+- **The residual race** stays documented in `docs/known-gaps/native-hop.md` (decision 7).
 - **Operator docs (the plan's W6).** `docs/design/wire-protocol.md` and `docs/deploying.md`
   describe the native hop once the implementation lands.

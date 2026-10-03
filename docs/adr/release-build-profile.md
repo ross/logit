@@ -78,7 +78,7 @@ Two results are less robust:
 
 Both patterns match the code-layout sensitivity that `docs/design/performance.md` §1 ("What moved
 since 2026-09-28") records for `json-parse-x3` and `logfmt-parse`. It's tracked in
-[`docs/known-gaps.md`](../known-gaps.md)'s HTTP access logs section. The UDP statsd drop-rate
+[`docs/known-gaps/transforms.md`](../known-gaps/transforms.md#http-access-logs-nginx-haproxy-and-http_access). The UDP statsd drop-rate
 improvement is robust: the ranges don't overlap, and it held in 6 of 6 rounds.
 
 ## Decision

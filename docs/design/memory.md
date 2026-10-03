@@ -462,9 +462,9 @@ nothing honest to fixture it from.
 
 As first measured, encoding one event for InfluxDB cost **~180 allocations and 4.96 µs**: about
 twice the whole ingest chain, and sixteen times an extra fan-out clone. At the time,
-[known-gaps.md](../known-gaps.md) named `Arc<EventBatch>` copy-on-write as *the* fix for pipeline
-cost, and [pipeline-graph.md](pipeline-graph.md) called the fan-out clone "load-bearing." Both were
-second-order next to the encoder.
+[known-gaps/runtime.md](../known-gaps/runtime.md) named `Arc<EventBatch>` copy-on-write as *the* fix
+for pipeline cost, and [pipeline-graph.md](pipeline-graph.md) called the fan-out clone
+"load-bearing." Both were second-order next to the encoder.
 
 None of it was the data model. It was all in how lines were built:
 
@@ -625,10 +625,11 @@ number.
 
 ### Costing internal spans: the `Delivered` trade, measured
 
-`docs/known-gaps.md`'s internal-spans entry gated carrying trace context on `Delivered` on measured
-evidence, per [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md).
-This section is that evidence, recorded so the decision didn't have to re-derive it. The decision
-itself is [ADR `trace-context-propagation-on-delivered`](../adr/trace-context-propagation-on-delivered.md).
+`docs/known-gaps/telemetry.md`'s internal-spans entry gated carrying trace context on `Delivered` on
+measured evidence, per [ADR
+`minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md). This
+section is that evidence, recorded so the decision didn't have to re-derive it. The decision itself
+is [ADR `trace-context-propagation-on-delivered`](../adr/trace-context-propagation-on-delivered.md).
 
 **The prototype.** A 24-byte `TraceContext { trace_id: [u8; 16], span_id: [u8; 8] }` was added to
 both `Delivered` variants (`Owned(EventBatch, TraceContext)`,
@@ -671,7 +672,7 @@ propagation for the two node kinds with an unambiguous parent (`Transform::proce
 `ScriptWorker::process`'s non-flush path, and `run_output`, which needed no new wiring). Every
 allocation-count assertion held exactly against the real implementation too. See
 `docs/design/pipeline-graph.md`'s "Trace context propagation" section for the per-node-kind
-account, and `docs/known-gaps.md`'s internal-spans entry for what's still open.
+account, and `docs/known-gaps/telemetry.md`'s internal-spans entry for what's still open.
 
 [ADR `internal-span-emission-and-deterministic-sampling`](../adr/internal-span-emission-and-deterministic-sampling.md)
 then built emission (a real `Telemetry::span`/`SpanGuard`, a bounded per-component span buffer, and

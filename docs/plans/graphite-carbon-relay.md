@@ -79,7 +79,7 @@ Settled by the lead while designing (Ross can veto any at review):
 12. **Default `transport: tcp`** for both kinds — carbon's own default listener is TCP 2003.
 13. **Resource attributes become tags on egress** (same as `influxdb_out`/`statsd_out`). A bare
     `graphite_in` resource is empty so the pair stays a fixed point; cross-protocol it's a
-    `docs/known-gaps.md` row, not a normalization.
+    `docs/known-gaps/` row, not a normalization.
 14. **No path truncation.** Carbon has no length bound; whisper's 255-byte filesystem component
     limit is a known-gaps row. `/` and `\` in a path are substituted (whisper directory separators).
 15. **Sanitization counter** reuses the existing family: `logit.output.metrics.normalized
@@ -275,7 +275,7 @@ new(bind, transport, protocol) / with_diagnostics (propagates into decoder, like
 
 No shared `logit_inputs::tcp` driver is extracted yet — see decision 16 and the ADR's named
 extraction trigger (a second line-oriented TCP listener, e.g. `syslog_in` gaining TCP;
-`docs/known-gaps.md`'s "`syslog_in` is UDP-only" entry is the open row that trigger closes).
+`docs/known-gaps/`'s "`syslog_in` is UDP-only" entry is the open row that trigger closes).
 
 ### `graphite_out`: `crates/logit-outputs/src/graphite.rs`
 
@@ -382,7 +382,7 @@ _tags/_multi_value` beside `statsd_format` (`:1014`).
 | # | PR | Files | Depends |
 |---|---|---|---|
 | W0 | **Opened** (#158). **Docs** | `docs/adr/graphite-carbon-relay.md` + row atop `docs/adr/README.md`; `docs/plans/graphite-carbon-relay.md` + row atop `docs/plans/README.md`; `docs/adr/lossless-transit.md` amendment (sixth pair); `docs/design/telemetry-landscape.md` Graphite section + matrix cells; [`docs/adr/framed-encoder.md`](../adr/framed-encoder.md#consequences)'s fourth-framed-sink bullet pointed here | — |
-| W1 | **Opened** (#166). **Codec** | `crates/logit-proto/src/lib.rs`; `src/graphite/{mod,decode,encode,pickle}.rs`; `tests/graphite_fixed_point.rs`; `tests/robustness.rs` additions; `docs/design/data-model.md` (codec list + "no well-known attributes" paragraph); `docs/known-gaps.md` cross-protocol rows | W0 |
+| W1 | **Opened** (#166). **Codec** | `crates/logit-proto/src/lib.rs`; `src/graphite/{mod,decode,encode,pickle}.rs`; `tests/graphite_fixed_point.rs`; `tests/robustness.rs` additions; `docs/design/data-model.md` (codec list + "no well-known attributes" paragraph); `docs/known-gaps/` cross-protocol rows | W0 |
 | W2 | **Opened** (#169). **`graphite_in`** | `crates/logit-inputs/src/graphite/{mod,tcp}.rs`, `lib.rs`; config `GraphiteIn` + `GraphiteTransport`/`GraphiteProtocol` + defaults + tests; `graph.rs` role/kind_name/is_implemented/is_datagram_listener/is_stream_listener/new rule (input half)/rules 17-18 text + tests; CLI arm + converters + test; `script/schema`; bench fixtures (`graphite_decoder`, `graphite_pickle_decoder`, `graphite_datagram(lines)`, `graphite_pickle_frame(n)`) + `allocations.rs` decode rows + `docs/design/memory.md` §2; `pipeline-graph.md`; `internal-telemetry.md` `graphite_in`; `deploying.md` `### graphite_in` | W1 |
 | W3 | **Opened** (#170). **`graphite_out`** | `crates/logit-outputs/src/graphite.rs`, `lib.rs`; config `GraphiteOut` + `GraphiteTags`/`GraphiteMultiValue` + defaults + tests; `graph.rs` rule 38 + new rule (output half) + tests; CLI arm + converters + test; `script/schema`; bench fixtures (`graphite_encoder`, `graphite_batch(n)`, `graphite_distribution_batch(n)`) + `allocations.rs` encode rows + `memory.md` §3; `internal-telemetry.md` `graphite_out`; `deploying.md` `### graphite_out` (model: its `collectd_out` section) | W1 (‖ W2) |
 | W4a | **Opened** (#171), alongside W4b. **Recorded interop** | `script/record-fixtures` `record_graphite()` + `all=`; `tools/record-fixtures/collectd-write-graphite.conf` (collectd `write_graphite` → plaintext TCP to `capture:2003`) and `python_graphite_pickle_producer.py` (stdlib `pickle` at protocol 2 and -1, length-prefixed to `capture:2004`); `testdata/interop/graphite/{README.md,*.raw}`; `testdata/interop/README.md` row; `interop_fixture_*` tests in `logit-inputs/src/graphite/mod.rs`; `docs/plans/recorded-interop-fixtures.md` follow-on list | W2 |

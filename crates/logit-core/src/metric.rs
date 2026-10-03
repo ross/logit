@@ -54,8 +54,8 @@ pub struct MetricRecord {
     /// GAUGE `NaN` (`docs/adr/collectd-binary-relay.md`'s "NaN is a flagged point, not a dropped
     /// one"). Every other sink, and `aggregate`'s fold, must treat a flagged record as carrying no
     /// reading: skip it (counted) at a sink, pass it through unmerged (counted) at `aggregate`.
-    /// Folding in the default numeric payload would fabricate a sample. `docs/known-gaps.md`'s
-    /// cross-protocol table has the per-sink summary.
+    /// Folding in the default numeric payload would fabricate a sample.
+    /// `docs/known-gaps/mappings.md`'s cross-protocol table has the per-sink summary.
     ///
     /// Occupies padding after the three `Symbol`s, so it costs [`MetricRecord`] no size
     /// (`crates/logit-core/tests/type_sizes.rs`).
@@ -298,7 +298,7 @@ pub use crate::sketch::DdSketch;
 /// `cardinality-estimator` 1.0.3's `Array::from_vec` frees its buffer with a `Layout` computed
 /// from a rounded length; a `Vec` with more spare capacity than that is undefined behavior on
 /// drop. `HllBytesReader`'s size hint prevents it (its doc has the mechanism), so don't change
-/// that hint without reading it. `docs/known-gaps.md` tracks the upstream bug.
+/// that hint without reading it. `docs/known-gaps/runtime.md` tracks the upstream bug.
 ///
 /// **Serialization** drives the wrapped type's `serde` impl (the `with_serde` feature; the crate
 /// has no `to_bytes` and private fields) through the small hand-rolled byte codec below, built

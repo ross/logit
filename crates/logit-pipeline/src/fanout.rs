@@ -60,8 +60,8 @@ use tokio::sync::mpsc;
 /// `ScriptWorker::process`) produces a `child`. A flush (`Transform::flush`, Lua's timer-driven
 /// `flush()`) is built from however many batches arrived since the last tick, has no single
 /// parent, and mints a [`TraceContext::new_root`]
-/// (`docs/adr/trace-context-propagation-on-delivered.md`). `docs/known-gaps.md`'s internal-spans
-/// entry names what is still open.
+/// (`docs/adr/trace-context-propagation-on-delivered.md`). `docs/known-gaps/telemetry.md`'s
+/// internal-spans entry names what is still open.
 ///
 /// `Default` is the all-zero context, for tests and benches that build a `Delivered` directly;
 /// `Fanout` never uses it.

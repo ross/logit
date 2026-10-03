@@ -849,7 +849,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// offset. `scan` runs it for every `Draining` file, and `drain` before each read of one, since
     /// the drain loop runs far more often than `scan` and a refill past the offset before the
     /// first check is the one truncation size-based detection can't see
-    /// (`docs/known-gaps.md`). An `fstat` error says nothing; a later check decides.
+    /// (`docs/known-gaps/tailing.md`). An `fstat` error says nothing; a later check decides.
     async fn recheck_length(&mut self, id: FileId) {
         let Some(tracked) = self.files.get(&id) else { return };
         let Ok(meta) = tracked.file.metadata().await else { return };
@@ -1071,7 +1071,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         };
         // A failure is non-fatal (the file relies on `poll_interval`) but diagnosed: at scale
         // it's `ENOSPC` against `fs.inotify.max_user_watches`, and this diagnostic is the only
-        // sign. Registered once per tracked inode and never retried (`docs/known-gaps.md`).
+        // sign. Registered once per tracked inode and never retried (`docs/known-gaps/tailing.md`).
         let watch = match watcher.watch_file(&path) {
             Ok(watch) => watch,
             Err(err) => {
@@ -5313,8 +5313,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The documented gap in `docs/known-gaps.md`: a read error counts as EOF, so a `Draining`
-    /// file past its grace is reaped with its unread bytes.
+    /// The documented gap in `docs/known-gaps/tailing.md`: a read error counts as EOF, so a
+    /// `Draining` file past its grace is reaped with its unread bytes.
     #[tokio::test(start_paused = true)]
     async fn a_read_error_on_a_draining_file_reaps_it_and_loses_its_unread_tail() {
         let dir = scratch_dir("read-error-draining");
@@ -5494,7 +5494,7 @@ mod tests {
 
     /// A draining file truncated in place is checked by `drain` before each read, so a refill
     /// past the old offset after that check, but before any scan rebinds the file, is still read
-    /// from `0`. Only a refill before the first check goes unseen (`docs/known-gaps.md`).
+    /// from `0`. Only a refill before the first check goes unseen (`docs/known-gaps/tailing.md`).
     #[tokio::test]
     async fn a_draining_inode_truncated_and_refilled_before_its_rebind_is_read_from_zero() {
         let dir = scratch_dir("draining-truncated-refilled");
@@ -5643,7 +5643,7 @@ mod tests {
 
     /// `copytruncate` under `app.log*`: the copy is a new inode the pattern matches, so it's read
     /// from its beginning, re-emitting what the truncated original already had
-    /// (`docs/known-gaps.md`).
+    /// (`docs/known-gaps/tailing.md`).
     #[tokio::test]
     async fn copytruncate_under_a_wildcard_replays_the_copy_from_its_beginning() {
         let dir = scratch_dir("copytruncate-wildcard");
@@ -5665,7 +5665,8 @@ mod tests {
     }
 
     /// `tail_in`'s clean stop emits an unterminated last line and checkpoints past it, so the
-    /// rest of that line arrives after the restart as an event of its own (`docs/known-gaps.md`).
+    /// rest of that line arrives after the restart as an event of its own
+    /// (`docs/known-gaps/tailing.md`).
     #[tokio::test]
     async fn a_clean_restart_mid_line_emits_the_prefix_and_the_remainder_as_two_events() {
         let dir = scratch_dir("restart-mid-line");

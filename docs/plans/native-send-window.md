@@ -181,7 +181,7 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-outputs/src/stream.rs`
   - `docs/design/wire-protocol.md`: the connection section, "Flow control", and "Buffering";
   - `docs/deploying.md`, forwarding section: the `window:` field, the posture note, the
     "sequence is never a credit" bullet, and the closing paragraph;
-  - `docs/known-gaps.md`: close "Credit-based flow control (`window` > 1)" and "No
+  - `docs/known-gaps/`: close "Credit-based flow control (`window` > 1)" and "No
     out-of-order/credit-based acknowledgement"; amend "A forward parked past the sender's ack
     timeout can be forwarded twice" and the `ack_write_stalled` reasoning under "`logit_in`'s
     `idle_timeout` bounds reads only";

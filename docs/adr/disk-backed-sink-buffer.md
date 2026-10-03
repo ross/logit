@@ -21,8 +21,8 @@ in-memory `SinkQueue` and explicitly rejected disk backing *for that ADR* becaus
 whose own module doc says "this is the same format for a socket and a file … a file is a plain
 concatenation of frames — append, sequential read, `frame::resync` past a torn write," and ADR
 [`file-output-native-format`](file-output-native-format.md) already writes those frames to disk
-from `stdio_out`/`file_out`. `docs/known-gaps.md`'s "No durable (disk-backed) buffering" named
-this as real, unblocked follow-up work. This ADR designs and closes it for the sink side; the
+from `stdio_out`/`file_out`. `docs/known-gaps/native-hop.md`'s "No durable (disk-backed) buffering"
+named this as real, unblocked follow-up work. This ADR designs and closes it for the sink side; the
 listener side (`ReceiveQueue`) stays in-memory and is a separate, still-open gap.
 
 `docs/plans/durable-sink-buffer.md` is the original design sketch this ADR implements, with five
@@ -197,7 +197,7 @@ actual code; each is resolved as follows.
   `Buffer<T>` impl" above.
 - **Per-push `fsync`.** Rejected for now: real durability at a real throughput cost, better left
   as an opt-in `disk.sync: every_push` knob once there's a concrete deployment asking for it —
-  filed in `docs/known-gaps.md`.
+  filed in `docs/known-gaps/native-hop.md`.
 - **A memory-mapped segment file.** Rejected: no new dependency and no real benefit over
   sequential `write_all`/`read` for an append-then-sequential-read access pattern; memmap's value
   is random access, which this workload never does.
@@ -235,11 +235,11 @@ actual code; each is resolved as follows.
   `disk_queue_peek_cached_costs_nothing` in `crates/logit-bench/tests/allocations.rs`;
   `docs/design/memory.md` §2/§5 updated in the same commit, per this repo's exact-equality
   discipline.
-- `docs/known-gaps.md`: the durable-buffering entry narrows to receive-side-only.
+- `docs/known-gaps/native-hop.md`: the durable-buffering entry narrows to receive-side-only.
 - `docs/deploying.md`: a new "Durable buffering" subsection under "Sink delivery buffering."
-- Explicitly out of scope, filed as new `docs/known-gaps.md` entries: receive-side (`ReceiveQueue`)
-  disk backing, per-push fsync, encryption at rest, a spool shared across sinks, segment
-  compaction/rewrite, out-of-order acknowledgement (window > 1).
+- Explicitly out of scope, filed as new `docs/known-gaps/native-hop.md` entries: receive-side
+  (`ReceiveQueue`) disk backing, per-push fsync, encryption at rest, a spool shared across sinks,
+  segment compaction/rewrite, out-of-order acknowledgement (window > 1).
 
 ## Amendment: a dropped batch is committed off the spool (2026-09-24)
 

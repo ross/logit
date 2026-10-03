@@ -19,7 +19,7 @@ bundled Mozilla root set. What doesn't work:
   `crates/logit-outputs/src/otlp.rs`) -- its hand-rolled client
   ([ADR `hand-rolled-grpc-over-hyper`](hand-rolled-grpc-over-hyper.md)) drives a raw `TcpStream`
   with no TLS layer at all. Filed as a known gap ("`otlp_out` has no gRPC TLS",
-  `docs/known-gaps.md`) while evaluating whether `otlp_out` could replace the demo's
+  `docs/known-gaps/otlp.md`) while evaluating whether `otlp_out` could replace the demo's
   `syslog_out` → Alloy → Loki log leg
   ([docs/plans/otlp-logs-and-resource-identity.md](../plans/otlp-logs-and-resource-identity.md)).
 - Neither transport can trust a private CA, present a client certificate for mutual TLS, or
@@ -47,7 +47,7 @@ deprecated in its favor, so this is the one PEM parser in the graph, not a secon
 **The gRPC client's connection management moves to `hyper-util`'s pooled client, amending
 [ADR `hand-rolled-grpc-over-hyper`](hand-rolled-grpc-over-hyper.md).** That ADR's hand-rolled
 `grpc_roundtrip` opened a fresh `TcpStream` and did a fresh HTTP/2 handshake per request --
-already a filed gap ("opens a fresh connection per request", `docs/known-gaps.md`). Layering
+already a filed gap ("opens a fresh connection per request", `docs/known-gaps/otlp.md`). Layering
 `tokio-rustls` onto that same per-request connect (the known-gaps entry's own sketch) would add a
 full TLS 1.3 handshake to every one of those requests and leave the reuse gap exactly where it
 was -- the "build, test, debug, maintain" trap of extending hand-rolled infrastructure past the
@@ -114,7 +114,7 @@ An operator reaching a privately-CA'd endpoint sets `tls.ca_file` explicitly.
   transport. Revisit only if an operator need for OS-trust-store parity actually surfaces.
 - **Certificate rotation via a background reload.** Out of scope -- certs load once at
   `OtlpOutput`/`OtlpInput` construction (`logit run` startup); a renewed cert needs a restart.
-  Filed in `docs/known-gaps.md`; `rustls::ServerConfig`'s `ResolvesServerCert` (a file-watcher
+  Filed in `docs/known-gaps/otlp.md`; `rustls::ServerConfig`'s `ResolvesServerCert` (a file-watcher
   hook) or a SIGHUP-triggered reload are the shapes to reach for if this becomes real.
 
 ## Consequences
@@ -138,16 +138,16 @@ An operator reaching a privately-CA'd endpoint sets `tls.ca_file` explicitly.
   accept/reject, a plaintext client against a TLS-only listener) rather than only asserting scheme
   strings, and `crates/logit-cli/tests/otlp_round_trip.rs` gained the TLS/mTLS counterparts to its
   existing plaintext and gzip round trips.
-- `docs/known-gaps.md`'s "`otlp_out` has no gRPC TLS" and "opens a fresh connection per request"
-  entries are retired; "certificates are loaded once at startup" and "no `server_name` override"
-  are filed as new, smaller ones.
+- `docs/known-gaps/otlp.md`'s "`otlp_out` has no gRPC TLS" and "opens a fresh connection per
+  request" entries are retired; "certificates are loaded once at startup" and "no `server_name`
+  override" are filed as new, smaller ones.
 
 ## Amendment: `otlp_in` rejects at the cap and bounds a plaintext connection's first byte (2026-09-14)
 
 This ADR left `otlp_in`'s accept loop as it found it: a blocking
 `connection_limit.acquire_owned().await` after `accept`, with `handshake_timeout` (added shortly
 afterwards, alongside `syslog_in`'s TCP transport) wrapping the TLS accept and nothing else. Both
-halves of that are now changed, and `docs/known-gaps.md`'s "a plaintext `otlp_in` has no
+halves of that are now changed, and `docs/known-gaps/otlp.md`'s "a plaintext `otlp_in` has no
 pre-first-byte bound" row narrows to a much smaller residual.
 
 **Reject, don't queue.** The loop uses `try_acquire_owned`; a connection past
@@ -195,8 +195,8 @@ comment reads "Next read will start and poll the header read timeout, so we can 
 connection if another header isn't received in a timely manner." It re-arms across every idle
 keep-alive gap, which makes it an idle timeout wearing a first-head name, and a 5s one would close
 a long-interval OTLP exporter's pooled connection between exports. Idle-connection timeouts across
-all four listeners are held out for their own effort and ADR (`docs/known-gaps.md`'s
-"no idle-connection timeout on a TCP listener"); half-building one here, per transport, is exactly
+all four listeners are held out for their own effort and ADR (the "no idle-connection timeout on a TCP listener" row in
+`docs/known-gaps/intake.md`, since closed by [ADR `idle-connection-timeout`](idle-connection-timeout.md)); half-building one here, per transport, is exactly
 what that row exists to prevent. So the residual gap is now: one byte of a request head, or one
 byte of an HTTP/2 preface under `protocol: grpc` (where `http2::Builder` has no such knob at all),
 followed by silence.

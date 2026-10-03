@@ -17,8 +17,9 @@
 components:
   remote_write_in:
     type: prometheus_in
-    # `bind_tls:` gives this listener transport security, not authentication (docs/known-gaps.md):
-    # bind loopback or pod-local and front it with something that authenticates.
+    # `bind_tls:` gives this listener transport security, not authentication
+    # (docs/known-gaps/prometheus.md): bind loopback or pod-local and front it with something that
+    # authenticates.
     bind: 127.0.0.1:9201
     # path: /api/v1/write         # the one path POSTs are accepted on
     # bind_tls:                   # presence turns server TLS on for this listener

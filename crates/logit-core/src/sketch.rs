@@ -35,7 +35,7 @@
 //! takes the summary as written. A decoded `min > max` makes quantiles non-monotonic, an infinite
 //! or `NaN` `min`/`max` reaches [`DdSketch::quantile`]'s clamp unchanged, and a `count` of 0 over
 //! populated bins makes [`DdSketch::merge`] skip the sketch. None of these panics;
-//! `docs/known-gaps.md` ("Event model and interner") records them as accepted under
+//! `docs/known-gaps/runtime.md` ("Event model and interner") records them as accepted under
 //! `docs/adr/untrusted-input-bounds.md`'s "Threat model".
 
 use std::fmt;

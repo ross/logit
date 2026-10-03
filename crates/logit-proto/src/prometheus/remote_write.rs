@@ -59,7 +59,7 @@
 //! | a sample whose value is the stale NaN ([`super::STALE_NAN_BITS`]) | [`Point::Stale`] for that series in that group |
 //! | `Sample.start_timestamp` (2.0, ms, `0` = unset) | [`Series::created`] |
 //! | `Exemplar` | the shared exemplar mapping ([`assemble::exemplar_from_labels`]): `trace_id`/`span_id` → [`logit_core::TraceRef`], the rest → `filtered_attributes`. Attached in a pass of its own, once every series' samples are grouped, to the group where *that series* has a sample at the exemplar's own timestamp -- else the latest group where it has one at all. Never to a group where it has none: see [`Decoded::exemplars`] |
-//! | `histograms[]` (native histograms) | **skipped**, counted `logit.input.metrics.skipped{reason="native_histogram"}` and reported in [`Decoded::histograms_skipped`] -- `docs/known-gaps.md`'s native-histogram row |
+//! | `histograms[]` (native histograms) | **skipped**, counted `logit.input.metrics.skipped{reason="native_histogram"}` and reported in [`Decoded::histograms_skipped`] -- `docs/known-gaps/prometheus.md`'s native-histogram row |
 //!
 //! Everything else is the assembler's, unchanged: suffix routing, `le`/`quantile` stripping, the
 //! cumulative-bucket rules, the skip reasons.

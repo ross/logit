@@ -51,7 +51,7 @@ maturity, not against what today's input coverage happens to support.** `logit` 
 metrics, and traces as equally first-class (`docs/OVERVIEW.md`); a trace-heavy deployment will
 have most events carrying a span, the same way the metrics-heavy nginx reference config already
 has most metrics as distributions. That an OTLP (or other span-producing) input doesn't exist yet
-is a `v0.1` gap (`docs/known-gaps.md`), not a property of the workload — it is exactly the kind of
+is a `v0.1` gap (`docs/known-gaps/`), not a property of the workload — it is exactly the kind of
 "current implementation state" this ADR says not to design against. A payload type is either
 expected to be common once its input matures, or it isn't; there is no third position where it's
 temporarily exempt because nothing populates it yet.

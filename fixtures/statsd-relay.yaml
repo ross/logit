@@ -6,7 +6,8 @@
 #
 # `windowed` runs `aggregate`'s default `distributions: sketch`/`sets: estimate`, which summarizes
 # every timer and set into a sketch `statsd_out` has no lossless wire form for and drops, counted
-# (docs/known-gaps.md). Configure `distributions: samples`/`sets: members` to relay those raw.
+# (docs/known-gaps/statsd.md). Configure `distributions: samples`/`sets: members` to relay those
+# raw.
 components:
   statsd_in:
     type: statsd_in

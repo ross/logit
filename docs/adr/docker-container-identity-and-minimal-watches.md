@@ -18,9 +18,9 @@ discovery. Both break down on a real, churning host:
 **Identity is frozen at open.** `DockerDecoderFactory::open` reads the sibling `config.v2.json`
 once, when a container's log file is first opened, and never again. A `docker rename` is therefore
 invisible until the container is recreated — a documented gap in the original ADR's Alternatives
-section and in `docs/known-gaps.md`. Worse, a metadata read that fails even once — the container
-directory existing a moment before `config.v2.json` does, a torn read racing the daemon's own
-atomic rewrite — permanently degrades that container to a `container.id`-only resource for the
+section and in `docs/known-gaps/tailing.md`. Worse, a metadata read that fails even once — the
+container directory existing a moment before `config.v2.json` does, a torn read racing the daemon's
+own atomic rewrite — permanently degrades that container to a `container.id`-only resource for the
 life of the handle, with no retry.
 
 **The watch set doesn't scale with the host, only with `root`'s existence.** `PathPattern::
@@ -168,9 +168,10 @@ container matches.
   rename` handled by watching for it explicitly" alternative are both superseded by this record —
   marked inline there, not rewritten, per this repo's convention for a later ADR revising an
   earlier one.
-- `docs/known-gaps.md`'s `docker_in`-never-notices-a-rename entry is replaced by what's actually
-  still true: identity refresh is bounded by `poll_interval`, a rename-then-rename-back inside one
-  tick is never observed at all, and de-selection's offset retention doesn't survive a restart.
+- `docs/known-gaps/tailing.md`'s `docker_in`-never-notices-a-rename entry is replaced by what's
+  actually still true: identity refresh is bounded by `poll_interval`, a rename-then-rename-back
+  inside one tick is never observed at all, and de-selection's offset retention doesn't survive a
+  restart.
 - New `crates/logit-inputs/src/tail/driver.rs` state: `FileState::Deselected`, a `DecoderFactory::
   refresh`/`end_scan` pair (both defaulted, so `tail_in`'s own factory is untouched).
 - New telemetry: `logit.input.watch.watches` (gauge), `logit.input.files.identity_changed`,

@@ -139,7 +139,7 @@
 //! `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written`, on `4xx` as well as `2xx`
 //! as 2.0 requires, reporting what this receiver stored: zeros on a rejection, and always `0`
 //! histograms, since native histograms are skipped and counted rather than stored
-//! (`docs/known-gaps.md`). A 1.0 request gets none: 1.0 defines none.
+//! (`docs/known-gaps/prometheus.md`). A 1.0 request gets none: 1.0 defines none.
 //!
 //! *Samples-written is measured on the way out, not on the way in.* The codec's accepted count is
 //! what the assembler took, and the model mapping that runs afterwards can still drop a whole
@@ -278,8 +278,8 @@
 //! any kind** (no bearer token, no basic auth, no mutual-TLS identity check beyond `rustls`
 //! accepting a client certificate chain when `client_ca_file` is set), so anything that can reach
 //! the socket can write series into the pipeline. `admin:` and `prometheus_out`'s exposition
-//! `bind:` carry the same gap, tracked in `docs/known-gaps.md`: front it with something that
-//! authenticates, or keep it on a trusted network.
+//! `bind:` carry the same gap, tracked in `docs/known-gaps/prometheus.md`: front it with something
+//! that authenticates, or keep it on a trusted network.
 //!
 //! ## Counters
 //!

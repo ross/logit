@@ -127,7 +127,7 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
      it is never falsely rejected. A recycled inode is accepted only if its new content shares
      the first `min(256, offset)` bytes with the old file. For an offset of at most 256, that
      means every skipped byte is identical content. Past 256, two files that share their first
-     256 bytes on a recycled inode are the accepted residual in `docs/known-gaps.md`.
+     256 bytes on a recycled inode are the accepted residual in `docs/known-gaps/tailing.md`.
    - **A copytruncate-and-refill that the size check missed fails this check at restart.** The
      refilled file's head no longer matches, so it replays instead of skipping.
    - **A resume entry is spent only once the file is tracked.** That is after the open, the
@@ -278,8 +278,7 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
 - **The fault seam is no longer mutation-only.** Every discovery syscall on the tail scan path
   (`read_dir`, each iteration step, `file_type`, and `metadata`) needs a `fault::check` before
   it.
-- **Documented gaps, not fixes.** Eleven entries in `docs/known-gaps.md`'s "File tailing and
-  Docker logs" record what this stream leaves open, so a later workstream that closes one can
+- **Documented gaps, not fixes.** Eleven entries in `docs/known-gaps/tailing.md` record what this stream leaves open, so a later workstream that closes one can
   see it was expected:
   - copytruncate fast refill;
   - the 256-byte fingerprint residual;
@@ -319,7 +318,7 @@ subsection here.
 ### `tailbk/w0`: this ADR
 
 Docs only. It records the decisions above, the amendments to the tailing and fault-injection
-ADRs, eleven entries in `docs/known-gaps.md`, the telemetry names in
+ADRs, eleven entries in `docs/known-gaps/tailing.md`, the telemetry names in
 `docs/design/internal-telemetry.md`, and nine inventory items marked `in-progress` (eight TAIL
 rows and top lead 7).
 

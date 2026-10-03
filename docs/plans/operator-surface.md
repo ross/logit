@@ -8,7 +8,7 @@ updated: 2026-09-09
 ## Context
 
 Three things an orchestrator or an on-call engineer expects from a long-running collector are
-absent, and each is named in `docs/known-gaps.md` or discoverable in five minutes of running it:
+absent, and each is named in `docs/known-gaps/` or discoverable in five minutes of running it:
 
 - **No health or readiness signal.** Nothing listens for a probe; `demo/compose.yaml`'s four
   services that `depends_on: logit` all say `condition: service_started` because there is no
@@ -19,7 +19,7 @@ absent, and each is named in `docs/known-gaps.md` or discoverable in five minute
   throttles by occurrence count, and that's all: no severity, no structured fields, no filtering,
   no timestamps, no lifecycle messages (startup, bound, shutdown, sink degraded) at all. Three raw
   `eprintln!`s remain in `run_lua` (`crates/logit-pipeline/src/runtime.rs`), one per failing
-  event, unthrottled. `known-gaps.md` files the `tracing` migration as "deliberately kept as
+  event, unthrottled. `known-gaps/` files the `tracing` migration as "deliberately kept as
   separate, later work." This is that work.
 - **Exit codes don't distinguish outcomes.** Clean shutdown is 0, the double-signal kill is 130,
   and everything else — a bad config, an unbound port, a sustained permanent sink failure after
@@ -189,7 +189,7 @@ sent.
 - `docs/design/internal-telemetry.md`: "Logs" section beside "Spans"; "What this is not"
   amended (the readiness endpoint is not a scrape endpoint; the `tracing` migration has landed
   as a producer); catalog rows for `logit.internal.logs.*`.
-- `docs/known-gaps.md`: `eprintln!` entry and "Internal logs" entry closed; new entries: admin
+- `docs/known-gaps/`: `eprintln!` entry and "Internal logs" entry closed; new entries: admin
   server has no TLS/auth (loopback by design), readiness is per-process not per-sink (a
   degraded sink doesn't flip readiness — deliberate, it's what `buffer:` is for).
 - `AGENTS.md` current state; `demo/compose.yaml` healthcheck + `service_healthy` flips;
@@ -205,7 +205,7 @@ sent.
 - Exit codes by hand: bad token to InfluxDB with `retry_budget: 5s` → exits 2 after ~60 s; port
   already in use → exits 1 immediately; `kill -TERM` → 0; `kill -TERM` twice → 130.
 
-## Explicitly out of scope (file in `known-gaps.md`)
+## Explicitly out of scope (file in `known-gaps/`)
 
 TLS/auth on the admin endpoint; a `/metrics` scrape path (still rejected); config hot reload on
 SIGHUP (separate design: needs graph diffing); `logit stats` CLI reading the `Registry`

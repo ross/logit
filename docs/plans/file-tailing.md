@@ -153,7 +153,7 @@ that ADR for the full reasoning — this file tracks what's built and what's lef
   `closed`, `docker_in`'s `container.*` named as a third resource-identity category alongside "no
   claim" and "genuine self-claim"); `docs/deploying.md` (new "Tailing files and Docker logs"
   section: root/bind-mount, `read_from`/checkpoint, `watch` modes, what to watch); `docs/
-  known-gaps.md` and `docs/design/memory.md` (every gap named in the ADR's Alternatives/
+  known-gaps/` and `docs/design/memory.md` (every gap named in the ADR's Alternatives/
   Consequences sections; narrowed the existing channel-depth entry to TCP now that `tail_in`/
   `docker_in` turned out to already be batch-bounded the same way a UDP listener is, not the
   unbounded case that entry used to speculate about).

@@ -143,7 +143,7 @@ exists for the central-collector rates where per-event telemetry calls are the c
   `trace_id` key (nothing else has a `tracestate`), `logit`'s compare uses different bits (top 53
   of the low 64, inherited from `trace_is_sampled`), and adopting it means committing to a
   specific bit convention this ADR would rather not freeze on a first pass. Tracked in
-  `docs/known-gaps.md`.
+  `docs/known-gaps/transforms.md`.
 - **Hash choices.** `std`'s `DefaultHasher` documents that its algorithm may change between Rust
   releases — fatal for a cross-version contract. `ahash` says the same of itself. `xxhash-rust`
   is BSL-1.0, not on `deny.toml`'s allowlist. A hand-rolled FNV-1a with a finalizer would be
@@ -162,13 +162,14 @@ exists for the central-collector rates where per-event telemetry calls are the c
 - **The hash contract is frozen.** XXH64 seed 0 over the canonicalization table above, pinned by
   test vectors. A change is a wire-breaking change between `logit` versions and needs its own ADR.
 - `routing-by-condition-is-lua`'s Status, Context, and Decision carry "superseded in part" markers
-  pointing here. `filter`, `rename`, `throttle`, and `dedup` stay retired; `docs/known-gaps.md`'s
-  entry narrows to throttling, dedup, and operator-shaped conditions.
+  pointing here. `filter`, `rename`, `throttle`, and `dedup` stay retired;
+  `docs/known-gaps/transforms.md`'s entry narrows to throttling, dedup, and operator-shaped
+  conditions.
 - `always_keep` is per leg. An operator who wants a flagged request kept end to end places the
   same override on every sampler in the path — there is no propagated bit, by the same reasoning
-  that there is none for the rate. Recorded in `docs/known-gaps.md`.
-- No OTEP 235 interop; recorded in `docs/known-gaps.md` with the bit-convention difference, so a
-  future adoption knows what it is changing.
+  that there is none for the rate. Recorded in `docs/known-gaps/transforms.md`.
+- No OTEP 235 interop; recorded in `docs/known-gaps/transforms.md` with the bit-convention
+  difference, so a future adoption knows what it is changing.
 - `sample` is a per-event decision and never looks at a batch, so a resource-keyed sampler keeps
   or drops every event of a resource — which is the point of keying on one.
 - [`fixtures/sample-traces.yaml`](../../fixtures/sample-traces.yaml) is the runnable shape:

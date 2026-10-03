@@ -184,7 +184,7 @@ across `logit`, `app`, and `worker`, and `docker compose ps` showed all twelve c
   exercised yet" once C lands (`otlp_in` stays).
 - `demo/architecture.dot` — new nodes/edges; its own header comment already accepts drift as a
   known trade-off.
-- `AGENTS.md`, `docs/known-gaps.md` — `tail_in`'s "unexercised by the demo" note.
+- `AGENTS.md`, `docs/known-gaps/` — `tail_in`'s "unexercised by the demo" note.
 - `demo/grafana/dashboards/logit-internal.json` — panels for the new tiers.
 
 No ADR: nothing here is a new decision about `logit` itself, only about what the demo exercises.

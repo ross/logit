@@ -108,17 +108,19 @@ uniformly to all three rather than needing to be threaded through three call sit
   env-specific field will exist in config at all.
 - `!env` is invisible to `schema/logit.schema.json`: resolution happens before serde, so the
   schema describes the *substituted* shape, not the tag. A schema-aware YAML editor will flag a
-  `!env`-tagged value it can't resolve against the schema. Documented in `docs/known-gaps.md`.
+  `!env`-tagged value it can't resolve against the schema. Documented in
+  `docs/known-gaps/runtime.md`.
 - Config deserialization errors lose line/column information: `serde_norway::from_value` (needed
   to deserialize the already-resolved tree) has no source location the way
   `serde_norway::from_str` does. Partly offset by `!env`'s own errors carrying a config path
   (`components.influx_out.token`), and by the note appended when a substitution's resolved type
-  likely caused the failure. Documented in `docs/known-gaps.md`.
+  likely caused the failure. Documented in `docs/known-gaps/runtime.md`.
 - `crates/logit-pipeline/src/graph.rs` rule 8 (`is_implemented`) Debug-prints a whole
   `ComponentKind` on failure (`"kind {:?} is not implemented yet"`). Harmless today — no
   *unimplemented* kind carries a secret field — but with secrets inlined directly into fields
   rather than referenced by name, that becomes a real leak the moment one does. Documented in
-  `docs/known-gaps.md` as a rough edge to fix before any unimplemented kind gains a secret field.
+  `docs/known-gaps/runtime.md` as a rough edge to fix before any unimplemented kind gains a secret
+  field.
 - `AGENTS.md`'s "Conventions to hold to" gains a rule: config is loaded through
   `logit_cli::config::load`, never a bare `serde_norway::from_str` — otherwise `!env` and the
   unknown-tag guard silently stop applying on whichever path skips it.

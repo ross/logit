@@ -1250,9 +1250,9 @@ fn a_saturated_timestamp_relays_as_i64_max() {
 }
 
 /// OTLP/JSON parses into a whole `serde_json::Value` tree before any OTLP field is read, so its
-/// peak heap per input byte is higher than protobuf's. `docs/known-gaps.md`'s OTLP section records
-/// both measured ratios. The ceilings leave headroom over them, so a change that moves either
-/// ratio fails here instead of drifting from that entry.
+/// peak heap per input byte is higher than protobuf's. `docs/known-gaps/otlp.md`'s OTLP section
+/// records both measured ratios. The ceilings leave headroom over them, so a change that moves
+/// either ratio fails here instead of drifting from that entry.
 #[test]
 fn otlp_json_peak_memory_per_input_byte_is_documented() {
     // A real OTel SDK export (`testdata/interop/otlp/README.md` has its provenance): ordinary

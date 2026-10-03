@@ -15,7 +15,7 @@ stable-toolchain mutation suite
 ([ADR `deployment-threat-model`](deployment-threat-model.md) says why that input is accidental,
 not hostile): `crates/logit-proto/tests/robustness.rs` truncates, flips bits, inflates declared lengths,
 and nests past the depth cap, from a fixed seed. That suite finds what its author thought to
-mutate. A coverage-guided fuzzer finds the rest, and `docs/known-gaps.md` has deferred one twice:
+mutate. A coverage-guided fuzzer finds the rest, and `docs/known-gaps/` has deferred one twice:
 first because `cargo-fuzz` needs nightly and `Dockerfile.dev` is stable-only
 ([ADR `containerized-development`](containerized-development.md)), then again in
 [ADR `out-of-ci-unsafe-verification`](out-of-ci-unsafe-verification.md)'s "Alternatives
@@ -170,7 +170,7 @@ harness, not by CI.
 
 ## Consequences
 
-- `docs/known-gaps.md`'s "`cargo-fuzz` targets over the decoders" entry closes when the harness
+- `docs/known-gaps/`'s "`cargo-fuzz` targets over the decoders" entry closes when the harness
   lands. ADR `out-of-ci-unsafe-verification`'s deferral of `cargo-fuzz` is superseded by its
   amendment of the same date.
 - A decoder change that breaks the `fuzz/` build isn't caught by CI. Run

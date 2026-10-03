@@ -17,7 +17,7 @@ the timestamp, a log record's trace context, a `sum`/`gauge`'s value. There is n
 log from scratch, no way to build a metric of any kind, and no way to build a span at all —
 `event.span` is a read-only proxy precisely because "there is still no script-visible way to
 construct or mutate a span" ([`lua-api.md`](../design/lua-api.md)'s "Reading `event.span`",
-[`known-gaps.md`](../known-gaps.md)'s "narrowed to span writes/minting from Lua" entry).
+[`known-gaps/transforms.md`](../known-gaps/transforms.md#lua)'s in-place span mutation entry).
 
 The constructor was deferred, twice, under the same "design pass once a consumer needs it"
 posture `event.metrics` and `event.span` took before they landed. That posture was right for
@@ -167,9 +167,9 @@ Concretely:
   through core; `stdio_out`'s text is byte-identical.
 - Docs: `lua-api.md` gains a "Constructing events" section, `flush(now)` in the script contract,
   and `Event` in Sandboxing/Costs; its "no `Event.new(...)`-style constructor" sentence goes.
-  `known-gaps.md`'s span entry narrows from "no way to create or mutate a span" to "no in-place
-  mutation". [ADR `trace-context-span-lifting`](trace-context-span-lifting.md)'s "Lua gains no new
-  capability here" consequence is amended, dated, to point here.
+  `known-gaps/transforms.md`'s span entry narrows from "no way to create or mutate a span" to "no
+  in-place mutation". [ADR `trace-context-span-lifting`](trace-context-span-lifting.md)'s "Lua gains
+  no new capability here" consequence is amended, dated, to point here.
 - Residual, recorded rather than fixed: a `Value::Null` log `message` or span `name` reaches
   `to_table()` as an absent key and is rejected as missing on the way back; `U64`/`Timestamp`/
   UTF-8 `Bytes` attribute values flatten as described above, an `I64` past ±2^53 comes back `Str`

@@ -29,19 +29,20 @@ encoders take `&EventBatch` — so the clone buys them a guarantee they never ne
 notes the average per-branch cost went up from there too.
 
 The relative significance of this cost has moved. Before PR #26 reworked the InfluxDB encoder
-(`influxdb_out: 600x fewer allocations per batch, byte-identical output`), `docs/known-gaps.md`'s
-fan-out entry and `memory.md` both point at the encoder as the dominant cost — encoding one event
-cost roughly sixteen times what cloning it for an extra fan-out branch did, so copy-on-write here
-was true but second-order. With the encoder now down to ~0.3 allocations per event (`memory.md`
-§2), that ordering has flipped: `known-gaps.md`'s entry, as it stands today, says plainly that the
-fan-out clone is no longer the pipeline's main cost — the encoder was — but is now, in its own
-words, "one of the larger remaining costs," and that the copy-on-write change is "still worth
-making," being "strictly no worse anywhere" and freeing "every read-only sink branch entirely."
-`memory.md` §8 ranks this item accordingly: higher than the nginx numbers alone would justify, both
-because it is payload-shape-independent (§0's workload table shows every shape pays the full
-`Event` clone) and because it is worth *most* to the workload least represented in the fixtures —
-a `SpanRecord` carries `Vec<SpanEvent>`/`Vec<SpanLink>`, each with its own 400-byte `AttrMap`, so a
-span-bearing event is far more expensive to deep-clone than anything actually measured so far.
+(`influxdb_out: 600x fewer allocations per batch, byte-identical output`),
+`docs/known-gaps/runtime.md`'s fan-out entry and `memory.md` both point at the encoder as the
+dominant cost — encoding one event cost roughly sixteen times what cloning it for an extra fan-out
+branch did, so copy-on-write here was true but second-order. With the encoder now down to ~0.3
+allocations per event (`memory.md` §2), that ordering has flipped: `known-gaps/runtime.md`'s entry,
+as it stands today, says plainly that the fan-out clone is no longer the pipeline's main cost — the
+encoder was — but is now, in its own words, "one of the larger remaining costs," and that the
+copy-on-write change is "still worth making," being "strictly no worse anywhere" and freeing "every
+read-only sink branch entirely." `memory.md` §8 ranks this item accordingly: higher than the nginx
+numbers alone would justify, both because it is payload-shape-independent (§0's workload table shows
+every shape pays the full `Event` clone) and because it is worth *most* to the workload least
+represented in the fixtures — a `SpanRecord` carries `Vec<SpanEvent>`/`Vec<SpanLink>`, each with its
+own 400-byte `AttrMap`, so a span-bearing event is far more expensive to deep-clone than anything
+actually measured so far.
 
 ## Decision
 
@@ -361,8 +362,8 @@ here. Recorded as an open problem, not a specified fix — see Alternatives.
   (`crates/logit-pipeline/src/runtime.rs`) guard the two mechanisms this design rests on;
   `crates/logit-bench/tests/allocations.rs`'s five `fanout_send_*` tests put real allocation counts
   on every shape above, including both reachable outcomes of the mixed one.
-- `docs/design/memory.md` §8 item 4 and `docs/known-gaps.md`'s fan-out entry recommended this fix
-  expecting a fan-out-side saving. Round one found `Delivered` alone didn't deliver it for any
-  shape measured; round two shows it now does for an all-`Output` fan-out unconditionally, and
+- `docs/design/memory.md` §8 item 4 and `docs/known-gaps/runtime.md`'s fan-out entry recommended
+  this fix expecting a fan-out-side saving. Round one found `Delivered` alone didn't deliver it for
+  any shape measured; round two shows it now does for an all-`Output` fan-out unconditionally, and
   *can* for a mixed one depending on scheduling this design doesn't control — worth reflecting
-  `memory.md`/`known-gaps.md`'s framing to match precisely, separately, outside this ADR.
+  `memory.md`/`known-gaps/runtime.md`'s framing to match precisely, separately, outside this ADR.

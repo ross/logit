@@ -13,10 +13,10 @@ submit races it, and a pipelined sink bounds every later step itself.
 
 ## Context
 
-`docs/known-gaps.md` names two entries that turn out to be one problem. **Output buffering**:
-`crates/logit-proto/src/buffer.rs` defines a `Buffer` trait, deliberately written ahead of any
-caller, with no implementation, no ack/retry hooks, and no delivery guarantee. **Delivery I/O is
-not decoupled from event processing within a node**: `run_output`
+`docs/known-gaps/runtime.md` names two entries that turn out to be one problem. **Output
+buffering**: `crates/logit-proto/src/buffer.rs` defines a `Buffer` trait, deliberately written ahead
+of any caller, with no implementation, no ack/retry hooks, and no delivery guarantee. **Delivery I/O
+is not decoupled from event processing within a node**: `run_output`
 (`crates/logit-pipeline/src/runtime.rs`) awaits `Output::send` inline in its drain loop, so a slow
 or retrying sink stops draining its own inbox for as long as `send` takes.
 
@@ -247,8 +247,8 @@ about what `Event` costs to move, not about bounding a queue's rough footprint.
   serialization, and the payload encoding (`rkyv` vs. hand-rolled,
   `docs/design/wire-protocol.md`) is an explicit, separate, benchmark-gated decision that
   `AGENTS.md` says must not be settled in passing while implementing something else. Left as a
-  narrowed, still-open `docs/known-gaps.md` entry, and plausibly config-optional even once it
-  lands, since not every deployment needs cross-restart durability.
+  narrowed, still-open `docs/known-gaps/runtime.md` entry, and plausibly config-optional even once
+  it lands, since not every deployment needs cross-restart durability.
 - **Keep today's fail-fast on any unretryable error.** Rejected: a buffer's entire point is
   surviving what fail-fast doesn't; keeping it would mean a single malformed batch discards every
   other sink's buffered work in the same node.
@@ -295,7 +295,7 @@ about what `Event` costs to move, not about bounding a queue's rough footprint.
   single-consumer path — `crates/logit-bench/tests/allocations.rs`'s constant and
   `docs/design/memory.md`'s table updated in the same commit, per this repo's exact-equality
   discipline.
-- `docs/known-gaps.md`: the "Output buffering" entry closes; "Delivery I/O is not decoupled"
+- `docs/known-gaps/runtime.md`: the "Output buffering" entry closes; "Delivery I/O is not decoupled"
   narrows to name only the still-open listener half; three new, narrower entries record what
   remains — no durable buffering, no end-to-end acknowledgement, no out-of-order/credit-based acks.
 - `docs/adr/service-lifecycle-and-output-retry.md`: gains a note that this ADR revises its

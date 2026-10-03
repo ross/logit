@@ -188,8 +188,8 @@ everywhere.
 - **Per-server presets (`preset: nginx`), accepting native variable names.** Rejected: the
   component would then own every server's variable vocabulary and its drift; a
   `log_format`/`log-format`/`LogFormat` already lets the emitter choose its key names, so the
-  mapping is a doc snippet per server, not code. Tracked in `docs/known-gaps.md` in case a server
-  turns up whose key names are not choosable.
+  mapping is a doc snippet per server, not code. Tracked in `docs/known-gaps/transforms.md` in case
+  a server turns up whose key names are not choosable.
 - **A `logit`-specific raw namespace (`http.raw.path`) renamed to semconv by the component.**
   Rejected: a pipeline without the component would carry non-standard names, and every user
   would learn two vocabularies for one field.
@@ -272,7 +272,7 @@ everywhere.
   later defines a conflicting attribute under one of them, the rename is a breaking config change;
   pre-release, that is the accepted cost of not prefixing them `logit.` and breaking the
   unit-suffix convention `span.duration_s` already set.
-- **Known gaps**, recorded in `docs/known-gaps.md`: no per-server presets; XFF trust is
+- **Known gaps**, recorded in `docs/known-gaps/transforms.md`: no per-server presets; XFF trust is
   all-or-nothing (no trusted-proxy list, no hop count); route rules are regex-only (no path
   templates, no prefix trie) and matched O(rules) per event with no prefilter; the UA table is a
   heuristic bucket classifier, not a parser (no `user_agent.name`/`.version`, and the built-in

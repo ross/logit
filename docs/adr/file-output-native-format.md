@@ -116,5 +116,5 @@ own triggers.
   `logit-proto` dependency (previously only transitive via `logit-outputs`) since `build_spec`
   names `logit_proto::frame::Compression` directly.
 - `schema/logit.schema.json` regenerated.
-- `docs/known-gaps.md`'s `file_out`/`stdio_out` entries narrow: `format:` is no longer fixed to
-  human-readable text, though reading a native-formatted file back remains unbuilt.
+- `docs/known-gaps/sinks.md`'s `file_out`/`stdio_out` entries narrow: `format:` is no longer fixed
+  to human-readable text, though reading a native-formatted file back remains unbuilt.

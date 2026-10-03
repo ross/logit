@@ -219,7 +219,7 @@ to HAProxy's trace regardless.
   on `tempo` (`service_started` — the OTLP/HTTP leg gets its own SDK-level export retry, same
   reasoning `logit`'s own `tempo_out` dependency on `tempo` already uses) alongside `logit` (for
   the syslog leg).
-- `demo/hello/` (deleted). `demo/README.md`, `docs/known-gaps.md`, `demo/nginx/nginx.conf`
+- `demo/hello/` (deleted). `demo/README.md`, `docs/known-gaps/`, `demo/nginx/nginx.conf`
   (`proxy_pass` target) — updated for the new tier.
 - `demo/architecture.dot` (new) — a second, hand-authored diagram: the service topology one level
   up from the pipeline diagram, labeling each edge by traffic *type* (web/logging/tracing/

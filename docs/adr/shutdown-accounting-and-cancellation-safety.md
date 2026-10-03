@@ -96,7 +96,7 @@ was missing was executable evidence under real concurrency, and the shutdown acc
      decoder, including one `decode_into` rejects. Each gets one
      `logit.component.receive.latency` sample; a decode error is a throttled diagnostic, not a
      counter. `logit.input.datagrams.truncated` isn't a drop and never appears in the sum.
-   - Four losses are named exceptions, left uncounted and listed in `docs/known-gaps.md`:
+   - Four losses are named exceptions, left uncounted and listed in `docs/known-gaps/`:
      - A UDP listener's decoded events that the grace backstop drops, either held in the
        `BatchAccumulator` or parked in `emit`'s `Fanout::send`. Their datagrams already count as
        decoded, so the datagram contract still holds.
@@ -264,7 +264,7 @@ was missing was executable evidence under real concurrency, and the shutdown acc
 - `internal` can't export the counts decision 4 adds. Its `run_until_shutdown` does its final
   drain the instant the signal fires, and every one of those counts is recorded later, at the
   grace backstop or during the drain. They reach a test `Registry`, but not an exported pipeline.
-  The self-log `diag.warn` is what an operator sees, and `docs/known-gaps.md` records the gap.
+  The self-log `diag.warn` is what an operator sees, and `docs/known-gaps/` records the gap.
 - Out of this stream's scope, recorded for the sink cluster: `stdio_out`/`file_out` write in
   place with `write_all`, so when a send is cancelled mid-write and `flush()` then completes it,
   the file can hold a torn line or native frame.
@@ -429,7 +429,7 @@ contract in decision 1 holds on every exit. Three guards do the counting:
   call on an empty queue.
 
 Each guard logs a `warn` naming the count when it's nonzero, because `internal`'s final drain has
-already run by then. `docs/known-gaps.md` records that gap and the event-level losses decision 1
+already run by then. `docs/known-gaps/` records that gap and the event-level losses decision 1
 names.
 
 `decode_loop` and `tcp.rs`'s `serve_connection` now re-read the clock after an interval `emit`.
@@ -493,7 +493,7 @@ amendment:
   instead of leaving it for a new file reusing the inode to resume from.
 
 The tail rows of `docs/design/pipeline-graph.md`'s "Cancellation points" table land with it.
-`docs/known-gaps.md` records that the checkpoint is at-least-once only up to the downstream
+`docs/known-gaps/tailing.md` records that the checkpoint is at-least-once only up to the downstream
 in-memory queues, that the driver notices shutdown only between two files' reads, and that a
 rotated file still draining at shutdown whose new name matches no pattern is orphaned on restart.
 
@@ -545,7 +545,7 @@ so `docs/design/pipeline-graph.md`'s "Cancellation points" table has 42 rows. Th
   exposition deadline.
 
 Most sites lose nothing, because the dropped future is cancel-safe or its loss is answered on the
-wire so the peer resends. Four uncounted losses the audit found are now in `docs/known-gaps.md`:
+wire so the peer resends. Four uncounted losses the audit found are now in `docs/known-gaps/`:
 
 - A batch parked in `Fanout::send` when a listener's future is dropped counts as `sent` and
   reaches no consumer. The default `run_until_shutdown` drops at the signal with no grace, which

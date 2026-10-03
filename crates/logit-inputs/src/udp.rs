@@ -842,7 +842,7 @@ const READ_SYSCALL: &str = "recvfrom(2)";
 /// refusing `recvmmsg`). `recvmmsg(2)` is unconditional on Linux, so dropping
 /// `receive.read_batch` to 1 doesn't help, and the hint says so. There is no runtime fallback
 /// from `recvmmsg` to `recvmsg` (quinn#2079's pattern); that's an open decision in
-/// `docs/known-gaps.md`.
+/// `docs/known-gaps/intake.md`.
 ///
 /// The address comes from `getsockname(2)`, not the configured `bind:`: it's the one in use (a
 /// `:0` port resolved, or whichever candidate won [`bind_first_available`]).
@@ -1735,7 +1735,7 @@ impl Drop for Undecoded<'_> {
 /// `sink.send` mints a fresh [`logit_pipeline::TraceContext::new_root`] per accumulated batch, not
 /// per datagram, so a `batch_max_events` above 1 puts independently-arrived datagrams under one
 /// shared root. It's the same many-to-one gap as a stateful transform's `flush()`, tracked in
-/// `docs/known-gaps.md`'s internal-spans entry.
+/// `docs/known-gaps/telemetry.md`'s internal-spans entry.
 async fn emit(sink: &Fanout, telemetry: &Telemetry, batch: EventBatch, reason: FlushReason) {
     telemetry.count("logit.component.receive.flushed", 1.0, &[("reason", reason.as_str())]);
     sink.send(batch).await;
@@ -3257,7 +3257,7 @@ mod tests {
     /// **What the assertion rests on.** Within one batch, strict increase holds by construction:
     /// `base + i` from one clock read. Across batches it doesn't: `now_nanos()` is the wall clock
     /// (`received_at` is a wall-clock timestamp), which can step backwards by more than the `+ i`
-    /// offset between two batches. Tracked in `docs/known-gaps.md`.
+    /// offset between two batches. Tracked in `docs/known-gaps/intake.md`.
     ///
     /// Not a flake worth tightening: it takes a backwards step inside this burst's
     /// sub-millisecond window, and narrowing to within-batch windows would lose the cross-batch
@@ -4162,7 +4162,7 @@ mod tests {
 
     /// A batch whose fan-out is cut off mid-`Fanout::deliver` reaches a prefix of the consumers,
     /// and is counted `sent` and `receive.flushed` but never dropped. This pins the gap
-    /// `docs/known-gaps.md` records for the grace backstop.
+    /// `docs/known-gaps/intake.md` records for the grace backstop.
     #[tokio::test(start_paused = true)]
     async fn a_batch_cut_off_mid_fan_out_reaches_a_prefix_of_consumers() {
         let registry = logit_core::Registry::new();

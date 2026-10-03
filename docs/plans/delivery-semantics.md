@@ -52,7 +52,7 @@ the workstream it describes. W3 is independent.
 - Tests: an `Ambiguous` fault is retried by default and dropped on `statsd_out`, and
   `buffer.delivery:` overrides each.
 - Update the posture text in [ADR `buffered-sink-delivery`](../adr/buffered-sink-delivery.md) by
-  amendment, and `docs/known-gaps.md`'s "Sink default postures don't follow ADR
+  amendment, and `docs/known-gaps/`'s "Sink default postures don't follow ADR
   `delivery-semantics` yet" entry closes.
 
 W1 lands before W2 because W2 turns a `Clean` fault into an `Ambiguous` one, which the old
@@ -65,7 +65,7 @@ default drops.
   `datadog_trace_out`'s transports and both of `otlp_out`'s.
 - Tests: for each sink, a connect failure on the second request of a `send` is `Ambiguous`, and
   the same failure on the first is `Clean`.
-- The three `docs/known-gaps.md` entries close.
+- The three `docs/known-gaps/` entries close.
 
 ### W3: no acknowledgment for a batch no consumer took
 
@@ -124,7 +124,7 @@ Per [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequ
   rule, the `max_connections + max_connections / 4` bound, and least-recently-seen eviction.
 - **Counters.** `logit.input.batches.resends`, `logit.input.senders`, and
   `logit.input.senders.evicted`.
-- **Known gap.** A `docs/known-gaps.md` entry for the parked-forward race.
+- **Known gap.** A `docs/known-gaps/` entry for the parked-forward race.
 - **Stale text.** `logit_out`'s module doc ("Ack wait" and "Delivery posture"), the module doc
   and `Ack`'s doc in `control.rs`, and the doc on `logit_out`'s `Conn::seq`.
 - **Pins**, each updated in the same commit as `docs/design/memory.md`:

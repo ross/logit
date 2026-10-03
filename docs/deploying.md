@@ -1599,17 +1599,17 @@ listener here (statsd's `#tag:value`, syslog's structured-data field names) has 
 fixed by `logit`'s own decoder; `otlp_in` takes whatever a remote OTLP exporter sends.
 `crates/logit-proto/src/otlp/common.rs`'s `key_values_into_attrs` interns every OTLP
 `KeyValue.key` it decodes into the process-wide interner (`crates/logit-core/src/interner.rs`),
-which never evicts (`docs/known-gaps.md`'s interner entry). A client that sends a *different* key on
-every request (an ID embedded in a key name, a misbehaving or malicious exporter) grows that table
-for the life of the process, and nothing else stops it.
+which never evicts (`docs/known-gaps/runtime.md`'s interner entry). A client that sends a
+*different* key on every request (an ID embedded in a key name, a misbehaving or malicious exporter)
+grows that table for the life of the process, and nothing else stops it.
 
 A `keep` turns the unbounded, peer-controlled key set into a fixed, `logit`-controlled one like
 every other listener's, the same reasoning
 [`fixtures/nginx-to-influxdb.yaml`](../fixtures/nginx-to-influxdb.yaml) applies ahead of `aggregate`,
 extended to cover interning as well as series cardinality. It matters most where `otlp_in` faces
 something other than `logit`'s own trusted fleet (a third-party exporter, a multi-tenant ingest
-path); see `docs/known-gaps.md`'s interner entry for when the underlying "listeners are private by
-deployment shape" premise is worth re-checking.
+path); see `docs/known-gaps/runtime.md`'s interner entry for when the underlying "listeners are
+private by deployment shape" premise is worth re-checking.
 
 ## `otlp_in`: accepted `Content-Type`s, and what a browser client needs
 
@@ -1625,7 +1625,7 @@ CORS support (`handle_http` returns 404 for an `OPTIONS` preflight and sets no
 `Access-Control-Allow-Origin`), so a **cross-origin** browser exporter, pointed at `otlp_in`
 directly from a page on a different origin, can't reach it at all. Put a reverse proxy in front that
 shares the page's origin instead of opening `otlp_in` to arbitrary browser origins
-(`docs/known-gaps.md`).
+(`docs/known-gaps/otlp.md`).
 
 ## `otlp_in`: a request no consumer took
 
@@ -2202,7 +2202,7 @@ pipeline. So bind `127.0.0.1:9201`, as
 [`fixtures/prometheus-remote-write-receive.yaml`](../fixtures/prometheus-remote-write-receive.yaml)
 does, and put an ingress, a service mesh, or an authenticating reverse proxy in front, the same
 posture as `admin:` and `prometheus_out`'s exposition `bind:`. Making it reachable from off-host is
-a deliberate choice, not one to inherit from an example. Tracked in `docs/known-gaps.md`.
+a deliberate choice, not one to inherit from an example. Tracked in `docs/known-gaps/prometheus.md`.
 
 ```yaml
 components:
@@ -2299,10 +2299,11 @@ accept remote-write 2.0 and doesn't refuse it either. It answers a 2.0 request `
 body, stores nothing, logs nothing, and leaves its `vm_http_request_errors_total` at zero. The
 sender can't detect this: a `204` is success under both specs, and `prometheus_out` doesn't read the
 2.0 `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` response headers, so its counters report every batch
-delivered. Only a query against VictoriaMetrics shows the loss (`docs/known-gaps.md` has the row).
+delivered. Only a query against VictoriaMetrics shows the loss (`docs/known-gaps/prometheus.md` has
+the row).
 
 Native histograms are skipped and counted on both wires regardless of version
-(`docs/known-gaps.md`), so this choice doesn't affect them.
+(`docs/known-gaps/mappings.md`), so this choice doesn't affect them.
 
 **What to watch.**
 
@@ -2316,8 +2317,8 @@ Native histograms are skipped and counted on both wires regardless of version
   quotes the receiver's message, which for Prometheus and Mimir names the offending series. A `3xx`
   means the endpoint is redirecting; this client deliberately doesn't follow redirects.
 - A sender feeding one series from two upstream branches can draw out-of-order `400`s from a
-  receiver with no out-of-order window. That is the topology, not the sink; `docs/known-gaps.md` has
-  the row.
+  receiver with no out-of-order window. That is the topology, not the sink;
+  `docs/known-gaps/prometheus.md` has the row.
 
 ## VictoriaMetrics, VictoriaLogs, and VictoriaTraces
 
@@ -2373,7 +2374,7 @@ at that moment fails as ambiguous, because the server may have processed it, and
 default `at_least_once` posture retries it, at the cost of a duplicate span whenever
 VictoriaTraces had stored the first attempt. `buffer: { delivery: at_most_once }` drops the batch
 instead. The
-HTTP endpoint has neither problem (`docs/known-gaps.md`'s OTLP section has the row).
+HTTP endpoint has neither problem (`docs/known-gaps/otlp.md` has the row).
 
 ### Sending with `compression: zstd`
 
@@ -2483,9 +2484,9 @@ contradict each other.
 **What to watch.** A handshake failure on either side surfaces through the same
 `connection_error`/`network_error` diagnostics and `logit.output.requests{class="network_error"}`/
 listener-side `logit.component.diagnostics` counters as any other transport failure; there's
-nothing TLS-specific beyond that. `docs/known-gaps.md` tracks two open items: **certificates are
-read once at startup, so a renewed certificate needs a restart**, not a live reload; and `otlp_out`
-has no `server_name` override for an endpoint reached by IP or through a proxy.
+nothing TLS-specific beyond that. `docs/known-gaps/intake.md` tracks two open items: **certificates
+are read once at startup, so a renewed certificate needs a restart**, not a live reload; and
+`otlp_out` has no `server_name` override for an endpoint reached by IP or through a proxy.
 
 ### Trust boundary
 
@@ -2494,7 +2495,7 @@ peers you don't control. Each listener is built to survive accidental data, such
 misconfigured sender, a wedged peer, or a corrupt file, but not a malicious peer sending crafted
 input. Keeping untrusted peers out is your job: use network policy, TLS with `client_ca_file` so
 only peers with a certificate you issued can connect, or a proxy in front of the listener. See
-[ADR `deployment-threat-model`](adr/deployment-threat-model.md), and `docs/known-gaps.md` for
+[ADR `deployment-threat-model`](adr/deployment-threat-model.md), and `docs/known-gaps/` for
 what isn't defended.
 
 ### `syslog_out` over UDP: the message-size bound
@@ -2577,7 +2578,7 @@ listener"](#idle_timeout-on-a-tcp-listener) above.
   `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}`. There is no separate
   TLS-specific counter, as with `otlp_in`/`otlp_out`.
 
-`docs/known-gaps.md` tracks what's still open: DTLS, certificates read once at startup, and no
+`docs/known-gaps/` tracks what's still open: DTLS, certificates read once at startup, and no
 `server_name` override. `idle_timeout` covers the post-handshake idle case.
 
 A **TCP `graphite_in`** takes the identical `tls:` block, because it runs on the same listener
@@ -2720,8 +2721,8 @@ buffering](#sink-delivery-buffering)) bounds all retried attempts together. A `r
 close to or above the retry budget leaves room for at most one attempt before the budget expires,
 which defeats retrying. With a window, the budget decides whether a failed round is retried, and it
 never cuts anything past the head's own write, so a receiver that forwards slowly can hold one round
-past it (`docs/known-gaps.md`, "A round against a slowly draining `logit_in` can outlast the retry
-budget").
+past it (`docs/known-gaps/native-hop.md`, "A round against a slowly draining `logit_in` can outlast
+the retry budget").
 
 `request_timeout` relates only loosely to the far end's handshake grace. A `logit_out` whose
 `request_timeout` is shorter than its peer's handshake patience gives up first; the connection
@@ -2761,7 +2762,7 @@ a loss:
   task forwarded one while the sender's resend of it arrived on a new connection. Both copies are
   forwarded when both are checked before either forward lands, most often when the first is
   waiting for room in a full downstream inbox. The duplicate can arrive after later batches
-  (`docs/known-gaps.md`, "A resend can race the frames an ended connection still holds").
+  (`docs/known-gaps/native-hop.md`, "A resend can race the frames an ended connection still holds").
 
 `Reject{code: REJECT_GOING_AWAY}` is different. It has three causes: the peer's own shutdown, an
 idle close, and no consumer taking the frame (every consumer directly downstream of `logit_in` has
@@ -2856,9 +2857,9 @@ reconnecting doesn't show as `connection_error` on the far end.
 - Both sides: `logit.proto.frames{direction,compression}` and `logit.proto.frame.bytes` for
   throughput.
 
-`docs/known-gaps.md` tracks what's still open: `logit_in` acknowledges frames in the order they
-arrive, so a batch slow to forward holds up the ones behind it, and `logit_in`'s shutdown grace is
-fixed at 5s with no `receive:`-shaped knob to change it.
+`docs/known-gaps/native-hop.md` tracks what's still open: `logit_in` acknowledges frames in the
+order they arrive, so a batch slow to forward holds up the ones behind it, and `logit_in`'s shutdown
+grace is fixed at 5s with no `receive:`-shaped knob to change it.
 
 ## The nginx-side recipe
 
@@ -2903,12 +2904,13 @@ that window.
 
 ### The syslog message-size limit and its symptom
 
-`docs/known-gaps.md` has [the full write-up](known-gaps.md) of what happens when a syslog-bound
-access log line is too large for one datagram. It's worth reading, and more reassuring than it
-first sounds: nginx's `large_client_header_buffers` rejects an oversized request with a 400 before
-nginx builds a log line for it, which closes off the "attacker sends a huge `Host` header" vector by
-nginx's default behavior, not by anything `logit` does. The pipeline's graceful degradation on a
-truncated line from any other cause (a different unbounded field, a larger
+`docs/known-gaps/transforms.md` has
+[the full write-up](known-gaps/transforms.md#http-access-logs-nginx-haproxy-and-http_access) of what
+happens when a syslog-bound access log line is too large for one datagram. It's worth reading, and
+more reassuring than it first sounds: nginx's `large_client_header_buffers` rejects an oversized
+request with a 400 before nginx builds a log line for it, which closes off the "attacker sends a
+huge `Host` header" vector by nginx's default behavior, not by anything `logit` does. The pipeline's
+graceful degradation on a truncated line from any other cause (a different unbounded field, a larger
 `large_client_header_buffers`, a different syslog client) was verified by sending a hand-truncated
 datagram straight to `syslog_in`, bypassing nginx.
 

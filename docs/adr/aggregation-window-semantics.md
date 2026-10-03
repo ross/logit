@@ -796,8 +796,8 @@ measurement first.
 **What remains**: a memo miss still walks the group list comparing one `u64` per group, about half
 a nanosecond each, so absorb cost grows with the group count at tens of thousands of groups and
 small batches. The map is the next step if that shape shows up in a profile.
-`logit.transform.resource.groups` shows the count, and `docs/known-gaps.md`'s `aggregate` entries
-track the residual.
+`logit.transform.resource.groups` shows the count, and `docs/known-gaps/transforms.md`'s `aggregate`
+entries track the residual.
 
 ### Start time after a cap eviction
 
@@ -812,7 +812,7 @@ the stage already sees, so this costs no syscall.
 A source timestamp alone isn't enough: the previous point carries the flush clock, so a re-opening
 event's source time can precede it, run ahead of the flush, or be 0, which OTLP reads as "unknown"
 and `prometheus_out` doesn't render as `_created`. The bound assumes the flush clock doesn't step
-backwards; it is `SystemTime`, which can (`docs/known-gaps.md`).
+backwards; it is `SystemTime`, which can (`docs/known-gaps/transforms.md`).
 
 See `crates/logit-transforms/src/aggregate.rs`'s `SeriesKey`, `value_key_eq`, `scope_key_eq`,
 `group_for`, `fold_extreme`, and `Aggregator::flush` for the code this amendment describes, and

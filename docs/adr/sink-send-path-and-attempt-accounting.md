@@ -120,7 +120,7 @@ nature. The encode-side counters are the only ones that measure the batch and no
      while it's muted. An `Ok` send disarms the gate.
    - An unarmed gate never mutes. A caller of `send` that never calls `observe_batch` (a unit
      test, a benchmark, `logit_pipeline::send_batch`) sees every encode counted, unless an earlier
-     batch whose last attempt failed left the gate armed (`docs/known-gaps.md`).
+     batch whose last attempt failed left the gate armed (`docs/known-gaps/`).
    - The encode-side counts a sink emits itself (`statsd_out`'s and `syslog_out`'s `EncodeStats`,
      `influxdb_out`'s `tags.normalized`, every sink's `batch.bytes`) are skipped when `encode`
      reports a repeat. The datagram packer's over-cap skip isn't one of them: it counts per
@@ -173,7 +173,7 @@ nature. The encode-side counters are the only ones that measure the batch and no
    `observe_batch` replaces it. A `send` with no `observe_batch` reads the clock itself only when no
    earlier batch left a time behind: after a batch whose last attempt failed, the sink can't tell a
    final attempt from one the runtime will retry, so the time stays, as the armed gate does
-   (`docs/known-gaps.md`). The runtime calls `observe_batch` before every batch, so no shipped
+   (`docs/known-gaps/`). The runtime calls `observe_batch` before every batch, so no shipped
    path reaches that case. The send time is read only by the
    plan's stale filter: no payload, header, or sketch carries it. `datadog_trace_out` has no
    clock-dependent drop. (Amended by `sink/w7`.)
@@ -348,7 +348,7 @@ nature. The encode-side counters are the only ones that measure the batch and no
      counts `logit.output.messages`, `logit.output.datagrams`, and `graphite_out`'s
      `logit.output.datapoints` for the datagrams that reached the kernel before a failure. They
      are transport facts and count per attempt. A cancelled send returns nothing, so its counts
-     are lost, which `docs/known-gaps.md` records.
+     are lost, which `docs/known-gaps/` records.
    - **`count_request` moves to crate level** (`crates/logit-outputs/src/lib.rs`), shared by the
      stream driver, `logit_out`, and the datagram sinks. `collectd_out` counts through it, which
      completes decision 4.
@@ -526,7 +526,7 @@ nature. The encode-side counters are the only ones that measure the batch and no
 ## Follow-ups
 
 - Align the HTTP sinks' `logit.output.requests` vocabulary with decision 4's four fault classes
-  (`docs/known-gaps.md`, "Internal telemetry and self-logging").
+  (`docs/known-gaps/telemetry.md`).
 - How `otlp_out`, `datadog_out`, and `datadog_trace_out` classify a connect failure that
   follows an accepted request in the same `send` is decided by [ADR
   `delivery-semantics`](delivery-semantics.md), item 9, and built; see the amendments below.
@@ -1056,8 +1056,8 @@ inventory rows.
   and `a_cancelled_send_dropped_mid_await_leaves_stream_none` in `logit`'s tests. The shared dial's
   connect and handshake bounds, `logit_out`'s `HelloAck` bound, its ack wait, its shutdown bound,
   and `UnixDest`'s send timeout each have a row. The datagram send loop has no `select!` or
-  `timeout`, so it has no row; its lost counts are in `docs/known-gaps.md`.
-- **Known gaps.** The gaps the stack recorded are each in `docs/known-gaps.md` once: a grace cut
+  `timeout`, so it has no row; its lost counts are in `docs/known-gaps/`.
+- **Known gaps.** The gaps the stack recorded are each in `docs/known-gaps/` once: a grace cut
   mid-write on `logit_out`, a cancelled datagram send's lost counts, a TLS `logit_out` dying in a
   frame's first record, a connect failure `Clean` after an accepted request (three sinks), drops a
   peer or the kernel decided that repeat on retry, per-body and double-reported Datadog codec
@@ -1084,5 +1084,5 @@ moved there from `splunk.rs`. `otlp_out`, `datadog_out`, `datadog_trace_out`, an
 `splunk_hec_out` apply it on every transport each has: HTTP and gRPC for `otlp_out`, TCP and the
 Unix socket for `datadog_trace_out`. Each applies it outside the code that counts
 `logit.output.requests{class}` and `logit.output.request.bytes`, so a refused request still
-counts `network_error` and no bytes after an accepted one. The three `docs/known-gaps.md` entries
+counts `network_error` and no bytes after an accepted one. The three `docs/known-gaps/` entries
 are closed.

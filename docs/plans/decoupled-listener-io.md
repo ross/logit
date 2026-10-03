@@ -5,7 +5,7 @@ updated: 2026-09-11
 
 # Closing plan: decoupled listener I/O
 
-`docs/known-gaps.md` carried an entry describing **"Delivery I/O is not decoupled from event
+`docs/known-gaps/` carried an entry describing **"Delivery I/O is not decoupled from event
 processing within a node"** with two halves: [ADR `buffered-sink-delivery`](../adr/buffered-sink-delivery.md)
 closed the sink half; this plan closes the other. `StatsdInput::run`/`SyslogInput::run`
 (`crates/logit-inputs/src/{statsd,syslog}.rs`) were the same loop, byte for byte apart from the
@@ -31,7 +31,7 @@ loses when it can't keep up is dropped in userspace, counted, and attributable, 
 by the kernel and invisible. Decoded events amortize across datagrams into bounded batches. Both are
 config-visible per listener. It stops at the socket: reading more efficiently (`recvmmsg`), reading
 in parallel (`SO_REUSEPORT`), and observing the kernel's own drop counter are three separately
-motivated extensions recorded as new `docs/known-gaps.md` entries, not built here.
+motivated extensions recorded as new `docs/known-gaps/` entries, not built here.
 
 Each workstream below landed as its own commit on this branch (A–E together, F, then G); read the
 design docs a workstream references before touching that area again — this plan sequences work, it
@@ -59,7 +59,7 @@ blocking the reader — never `logit`'s pre-existing shape.
 | Timestamp correctness | Decode moving off the read path means `event.timestamp` would silently become decode time under backlog, breaking `syslog.rs`'s documented "receipt time" contract. `Decoder` widens to take an explicit `received_at` |
 | Where the pieces live | **Split.** The generic queue and batch accumulator are transport-agnostic — `logit-pipeline`, alongside `SinkQueue`. The UDP socket bind/`recv_from`/`SO_RCVBUF` loop is protocol-impl shaped — `logit-inputs`, per `docs/design/pipeline-graph.md`'s crate-layout rule |
 | Config surface | A new **`receive:`** block on `Component`, listener-only, flat — following `BufferConfig`'s flat precedent, not nested |
-| Kernel-drop visibility, `recvmmsg`, `SO_REUSEPORT` | **Out of scope**, recorded as new `known-gaps.md` entries |
+| Kernel-drop visibility, `recvmmsg`, `SO_REUSEPORT` | **Out of scope**, recorded as new `known-gaps/` entries |
 
 ## The constraint everything is designed around
 
@@ -118,7 +118,7 @@ D ──┘
 A (queue generalization), B (batch accumulator), C (`Decoder` timestamp widening), and D
 (`Input::run_until_shutdown` + `run_input`'s grace backstop) were mutually independent. E (the UDP
 driver, wiring A–D together) needed all four. F (config, schema, validation) needed E. G (telemetry
-catalog, docs, `known-gaps.md`, ADR `decoupled-listener-io` to Accepted) needed F. Landed as three commits: A–E
+catalog, docs, `known-gaps/`, ADR `decoupled-listener-io` to Accepted) needed F. Landed as three commits: A–E
 together, then F, then G.
 
 ---
@@ -335,7 +335,7 @@ omitted-as-`None`, unknown-field rejection); the `human_bytes::option` submodule
 passes every shipped config including the new commented `receive:` block in
 `fixtures/statsd-to-influxdb.yaml`.
 
-## G. Telemetry catalog, `known-gaps.md` rewrite, docs
+## G. Telemetry catalog, `known-gaps/` rewrite, docs
 
 **Goal:** make intake state observable through the existing framework, and record precisely what
 closed versus what remains.
@@ -360,7 +360,7 @@ namespaces; the pre-existing `logit.input.datagrams`/`.datagram.bytes` arrival c
 unqualified `batches.flushed`, because `logit.component.flush.events`/`.flush.duration` already
 mean "a stateful transform's window flush."
 
-**`docs/known-gaps.md` rewrite, as done:** the old "Delivery I/O is not decoupled…" entry deleted
+**`docs/known-gaps/` rewrite, as done:** the old "Delivery I/O is not decoupled…" entry deleted
 entirely (both halves now closed). "No durable/disk-backed buffering" amended to name the receive
 queue alongside `SinkQueue`. "No end-to-end acknowledgement" amended: the receive-side loss it named
 narrowed to kernel-side-only. "Channel depth is bounded in batches, not bytes" amended: a

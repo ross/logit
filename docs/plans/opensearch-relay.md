@@ -342,7 +342,7 @@ OpenSearch expands a dotted key into an object path, so a scalar `a` beside `a.b
 exporter's behavior; within one map, the encoder detects a prefix collision and rewrites only the
 colliding keys with Data Prepper's `@` substitution, counted. A type conflict across documents
 (a field that is a string in one and an object in the next) can't be fixed at the sink, and gets
-a row in [`docs/known-gaps.md`](../known-gaps.md).
+a row in [`docs/known-gaps/mappings.md`](../known-gaps/mappings.md).
 
 ### 10. Reuse (W2, W3, W4)
 
@@ -384,7 +384,7 @@ W1 comes before any code, because it fixes the dialect every encoder row depends
 | W4 | Metrics documents: every kind, `multi_value`, exemplars, float32 clamps, the NaN and Inf policy | M | W3 |
 | W5 | `schema: otel-v1` for traces, or a §12 entry if W1 shows it isn't needed | S | W4 |
 | W6 | Golden fixtures and a live end-to-end run (see Verification) | M | W5 |
-| W7 | `docs/opensearch.md`; `deploying.md`; `known-gaps.md` rows (structured bodies, float32 fields, key collisions, `Samples`/`Set` summaries, dropped `zero_threshold` and flags, no `opensearch_in`, no SigV4); `AGENTS.md` outputs table; [`telemetry-landscape.md`](../design/telemetry-landscape.md) cells | S | W6 |
+| W7 | `docs/opensearch.md`; `deploying.md`; `known-gaps/` rows (structured bodies, float32 fields, key collisions, `Samples`/`Set` summaries, dropped `zero_threshold` and flags, no `opensearch_in`, no SigV4); `AGENTS.md` outputs table; [`telemetry-landscape.md`](../design/telemetry-landscape.md) cells | S | W6 |
 
 Landing order: W0 → W1 → … → W7, linear. Each PR is based on and targets its parent's branch and
 is brought up to date with `git merge origin/main`, never a rebase.

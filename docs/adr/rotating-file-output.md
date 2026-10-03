@@ -11,7 +11,7 @@ Accepted
 ## Context
 
 `stdio_out`'s file target is opened once, in append mode, and held for the process's lifetime
-(`crates/logit-outputs/src/stdio.rs`, `docs/known-gaps.md`): it grows without bound, and an
+(`crates/logit-outputs/src/stdio.rs`, `docs/known-gaps/sinks.md`): it grows without bound, and an
 external log rotator that renames the file leaves `logit` writing into the unlinked inode until
 restart. That's an accepted trade-off for a debugging/dev-loop sink, which is what `stdio_out`'s
 own module doc says it is -- but it's not adequate for writing events to disk as a real
@@ -105,7 +105,7 @@ restarting against an already-large file must not get another full `max_bytes` f
 Calendar periods (`Hourly`/`Daily`), not a `Duration`: a duration measured from an arbitrary start
 (process start, first write) drifts against the wall clock, which is the opposite of what a daily
 log file is for. UTC only, never the host's local zone, matching the reasoning already recorded for
-`syslog_in`'s timestamp resolution (`docs/known-gaps.md`).
+`syslog_in`'s timestamp resolution (`docs/known-gaps/syslog.md`).
 
 **`period` is seeded from an existing file's mtime too, not just learned fresh after a restart.**
 `FileTarget::open` already seeded `written` from the file's length; `RotationState::seed_period`
@@ -246,16 +246,16 @@ in this pass (see Alternatives). Retention is `max_files` alone -- no `max_age`,
   joining `logit_proto::Encoder` is the seam a future encoder would plug into, but the native wire
   encoding is an open, benchmark-gated decision (`docs/design/wire-protocol.md`) not to be settled
   in passing, and `logit_out` is endpoint-based today, not file-based. Tracked in
-  `docs/known-gaps.md`.
+  `docs/known-gaps/sinks.md`.
 - **Timestamped rotated-file names (`events-2026-09-07.log`) instead of numbered suffixes.**
   Rejected for this pass: numbered suffixes are what let one retention rule (`max_files`) cover
   both triggers uniformly, and match `tail_in`'s existing "a `.1`-suffixed file is never matched by
   an anchored wildcard" precedent exactly. A timestamped scheme is a reasonable future addition,
-  tracked in `docs/known-gaps.md`.
+  tracked in `docs/known-gaps/sinks.md`.
 - **`max_age`-based retention, or compressing rotated files.** Both deferred: a count alone is the
   single knob most operators reach for first, and gzip compression would add background CPU work
   inside (or spawned from) a sink's write path for a feature an external tool already does well.
-  Tracked in `docs/known-gaps.md`.
+  Tracked in `docs/known-gaps/sinks.md`.
 - **SIGHUP/external-rotator reopen.** Not addressed here -- `file_out` still holds its file handle
   for the process's lifetime between its own rotations, same as `stdio_out` always has. An external
   tool rotating a `file_out`-managed file out from under it remains the same known gap `stdio_out`
@@ -284,10 +284,10 @@ in this pass (see Alternatives). Retention is `max_files` alone -- no `max_age`,
   it doesn't copy).
 - `schema/logit.schema.json` regenerated (`script/schema`) for `FileOut`/`RotateConfig`/
   `RotateInterval`.
-- `docs/known-gaps.md`'s `stdio_out` rotation entry narrows to what's still true (`stdio_out` itself
-  still has no reopen, no user-controlled format); new entries record what `file_out` still doesn't
-  do (no SIGHUP/external-rotator reopen, no compression, no `max_age`, no timestamped naming,
-  write- not boundary-triggered time rotation, no `format:`).
+- `docs/known-gaps/sinks.md`'s `stdio_out` rotation entry narrows to what's still true (`stdio_out`
+  itself still has no reopen, no user-controlled format); new entries record what `file_out` still
+  doesn't do (no SIGHUP/external-rotator reopen, no compression, no `max_age`, no timestamped
+  naming, write- not boundary-triggered time rotation, no `format:`).
 - **Rotation is now commit-point first** (this record's own correction, landing in the same PR as
   everything above): a new public `RotateOutcome` (`Rotated`/`NotRotated`) is `FileTarget::rotate`'s
   return type, replacing the old bare `Ok(())`; `StreamOutput::send` only counts
@@ -320,8 +320,7 @@ read, and an fsync per batch or per rotation would cost every deployment for a g
 them need. A sink that must survive a power loss belongs behind `buffer.disk:`
 ([ADR `disk-backed-sink-buffer`](disk-backed-sink-buffer.md)) with a destination that has its own
 durability. [ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)
-records this as its decision 6, and `docs/known-gaps.md` lists it under "File, stdio, and InfluxDB
-sinks".
+records this as its decision 6, and `docs/known-gaps/sinks.md` lists it.
 
 ## Amendment: a max_files ceiling and a symmetric truncate policy (2026-09-24)
 

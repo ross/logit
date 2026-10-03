@@ -10,10 +10,9 @@
 //!    timestamp truncated, resources reordered host-first, a repeated sketch key summed) is
 //!    applied once by the first decode and must be stable afterwards. Sketches compare through
 //!    `DdSketch`'s structural `PartialEq`, so the round trip is bin-exact. `logit-proto`'s
-//!    `serde_json` dependency enables `float_roundtrip` (`Cargo.toml`, `docs/known-gaps.md`'s
-//!    Datadog entry), an exactly-rounded float parser, so the three JSON routes (v1, v2 JSON,
-//!    distribution points) are exact `==` too, same as the two protobuf routes (v2 protobuf,
-//!    sketches).
+//!    `serde_json` dependency enables `float_roundtrip` (`Cargo.toml`), an exactly-rounded float
+//!    parser, so the three JSON routes (v1, v2 JSON, distribution points) are exact `==` too, same
+//!    as the two protobuf routes (v2 protobuf, sketches).
 //! 2. **`encode(decode(encode(d))) == encode(d)` on bytes**, the same fixed point at the wire
 //!    level, which catches an encoder that writes two byte strings for what its own decoder calls
 //!    one batch. Asserted on every route.

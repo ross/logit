@@ -12,7 +12,7 @@ LuaJIT. Read these in order before changing anything:
 3. [docs/design/](docs/design): the internal event model, the Lua scripting API, the pipeline
    component graph, the native wire protocol, and internal telemetry. These five design docs are
    load-bearing; don't improvise around them without reading them first.
-4. [docs/known-gaps.md](docs/known-gaps.md): check it before "fixing" something that looks
+4. [docs/known-gaps/](docs/known-gaps/README.md): check it before "fixing" something that looks
    broken. It's likely a documented, deliberate gap, not an oversight.
 
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
@@ -36,7 +36,7 @@ exists or a contract other `logit` processes depend on:
 - **`flatten` never deletes an attribute.** It removes a source attribute only once its leaves are
   written. Last write wins on a key collision, silently, and there is deliberately no cap on how
   many keys one value can expand into beyond a fixed internal recursion-depth bound. That's a
-  settled, documented gap (`docs/known-gaps.md`), not a missing guard.
+  settled, documented gap (`docs/known-gaps/runtime.md`), not a missing guard.
 - **`http_access` derives every value from config or a built-in table, never a capture.** It's
   best-effort per field, never drops an event, and emits no metrics (a stock `kv_metrics` + `keep`
   does that).
@@ -234,11 +234,12 @@ Datadog pairs, and [docs/plans/splunk-relay.md](docs/plans/splunk-relay.md) for 
   resource, `otel.log.*` into typed log fields), `time` parsed without an `f64`, and the
   exporter's span object decoded back to a `SpanRecord`.
 
-Residual debt lives in `docs/known-gaps.md`: post-sketch metric kinds at `statsd_out`;
-`statsd_out` carrying no `unit` and no native rename/prefix and stamping an egress timestamp only
-on a `|T`-marked line; and syslog's `event.timestamp` staying receipt time while the wire
-TIMESTAMP follows the precedence table. The Datadog pairs' and the Splunk pair's residual debt is
-in the same file's "Datadog" and "Splunk" sections, each listed by its plan's closing assessment.
+Residual debt lives in `docs/known-gaps/statsd.md` and `docs/known-gaps/syslog.md`: post-sketch
+metric kinds at `statsd_out`; `statsd_out` carrying no `unit` and no native rename/prefix and
+stamping an egress timestamp only on a `|T`-marked line; and syslog's `event.timestamp` staying
+receipt time while the wire TIMESTAMP follows the precedence table. The Datadog pairs' and the
+Splunk pair's residual debt is in `docs/known-gaps/datadog.md` and `docs/known-gaps/splunk.md`,
+each listed by its plan's closing assessment.
 
 Per pair:
 
@@ -252,7 +253,7 @@ Per pair:
   lossless modulo the ADR's permitted normalizations: multi-value lines split, and `h`/`d`
   normalize to `ms`. Only post-sketch kinds
   (`Distribution`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary`, and a cumulative or
-  non-monotonic `Sum`) are dropped and counted (`docs/known-gaps.md`).
+  non-monotonic `Sum`) are dropped and counted (`docs/known-gaps/statsd.md`).
 - **`otlp_in -> otlp_out`**: logs, metrics, and traces, over both OTLP/HTTP and a hand-rolled
   OTLP/gRPC transport. `otlp_in`'s HTTP side accepts OTLP/JSON as well as protobuf
   ([ADR `otlp-json-decoding`](docs/adr/otlp-json-decoding.md)). The protobuf types are committed
@@ -468,8 +469,8 @@ Per pair:
   process in a split-collection topology reaches the same keep/drop verdict independently with no
   propagated bit. See
   [ADR `internal-span-emission-and-deterministic-sampling`](docs/adr/internal-span-emission-and-deterministic-sampling.md)
-  and `internal-telemetry.md`'s "Spans" section. `docs/known-gaps.md`'s internal-spans entry
-  tracks what's still open: the listener span's window, and Lua `flush()`'s link-less root.
+  and `internal-telemetry.md`'s "Spans" section. `docs/known-gaps/telemetry.md`'s internal-spans
+  entry tracks what's still open: the listener span's window, and Lua `flush()`'s link-less root.
 
 ### Operator surface
 
@@ -569,7 +570,7 @@ the operator-facing account of all of this.
 
 ### Not yet built
 
-- QUIC for the native transport (`docs/known-gaps.md`).
+- QUIC for the native transport (`docs/known-gaps/native-hop.md`).
 - Prometheus native histograms, skipped and counted in both directions.
 - An Agent-equivalent Datadog trace processor (normalization, `_top_level` marking, sampling, a
   stats concentrator), so tracer spans could reach Datadog with no real Agent in the path
@@ -825,7 +826,7 @@ not a style preference:
 - **The threat model is accidental data, not a malicious peer.** A listener, decoder, or transform
   must survive a misconfigured sender, a wedged peer, or a corrupt file; a problem only crafted
   input can trigger is defended only when the defense is free (a branch, a counter, a timeout
-  wrapper), and is otherwise a documented non-goal in `docs/known-gaps.md`
+  wrapper), and is otherwise a documented non-goal in `docs/known-gaps/`
   ([ADR `deployment-threat-model`](docs/adr/deployment-threat-model.md)).
 
 ## Where things live

@@ -47,7 +47,7 @@ error by construction.
 
 **Pass through on any parse failure, never drop.** Malformed JSON, a non-object top level, or (in
 `skip_to_brace` mode) no `{` found in the message at all — every failure path returns the event
-unchanged, attributes untouched, with an `eprintln!` diagnostic (`docs/known-gaps.md`'s existing
+unchanged, attributes untouched, with an `eprintln!` diagnostic (`docs/known-gaps/`'s existing
 `eprintln!` gap, not a new one). Matches this codebase's consistent stance (`aggregate` forwards
 metric kinds it can't merge rather than dropping them, per
 [ADR `aggregation-window-semantics`](aggregation-window-semantics.md)) — losing telemetry over one malformed line is a
@@ -103,7 +103,7 @@ allocation, not the interning itself — not worth a second seed type for.
   the JSON lines and untouched events (plus one stderr line each) for the rest — this is the
   intended behavior, not a partial failure to fix.
 - A high-volume source of malformed lines produces one `eprintln!` per event, same as `aggregate`'s
-  existing kind-conflict diagnostic — cosmetic today, tracked under `docs/known-gaps.md`'s existing
+  existing kind-conflict diagnostic — cosmetic today, tracked under `docs/known-gaps/`'s existing
   "real diagnostics facility" gap rather than a new `json`-specific one.
 - No log-producing `ComponentKind` is implemented yet (`syslog_in`/`file_tail` are still
   "not implemented" stubs), so `json` cannot be exercised in a real running pipeline today — every

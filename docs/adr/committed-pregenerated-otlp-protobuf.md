@@ -101,5 +101,5 @@ files (vendored anyway, for provenance and for PR3 to reference directly).
   `HyperLogLog` cardinality estimate OTLP has no wire type for) that cannot be losslessly
   re-expressed *as* OTLP.
   Both are counted (`logit.output.metrics.degraded`/`.skipped{metric_kind}`) and documented in
-  `docs/known-gaps.md`'s "Cross-protocol semantic gaps" entry rather than silently contradicting
-  ADR `native-wire-format-with-otlp-bridge`'s claim.
+  `docs/known-gaps/mappings.md`'s "Cross-protocol semantic gaps" entry rather than silently
+  contradicting ADR `native-wire-format-with-otlp-bridge`'s claim.

@@ -47,7 +47,7 @@ section for the script-facing contract, and [data-model.md](../design/data-model
 one-line model update (a batch's `Resource` was already dynamic — `Arc`-swappable, not
 immutable — the gap was a *mutation surface*, not the data model). Kept here, in past tense, as the
 record of what workstream A originally found and how it was resolved; the finding itself is no
-longer filed in `docs/known-gaps.md`.
+longer filed in `docs/known-gaps/`.
 
 An operator now writes, for example:
 
@@ -184,14 +184,14 @@ Surfaced while checking Loki compatibility; none block the demo, all block a rea
 - `observed_time_unix_nano` always `0` on encode (`logs.rs:114`). (Landed: stamped with
   `logit_proto::now_nanos()` at encode — same workstream.)
 
-[`docs/known-gaps.md`](../known-gaps.md#otlp) already files the compression gap for `otlp_in`;
+[`docs/known-gaps/otlp.md`](../known-gaps/otlp.md) already files the compression gap for `otlp_in`;
 `otlp_out`'s half of the same gap is currently unfiled.
 
 ### Related, already filed — don't duplicate here
 
 The Tempo service-graph gap (needs `metrics_generator` + a remote-write target +
 `serviceMap.datasourceUid`, and today's demo has no cross-service trace to graph regardless) is
-already recorded in `docs/known-gaps.md` via PR #60. See that entry rather than restating it here.
+already recorded in `docs/known-gaps/` via PR #60. See that entry rather than restating it here.
 
 ## Verification
 
@@ -203,5 +203,5 @@ Documentation-only; verification here means consistency, not tests.
    `config.alloy:13-16,33-41`, `logit-internal.json:130,145,161`.
 3. The Loki `index_label`-is-resource-only claim is checked against Grafana's own OTLP-ingestion
    docs (done above), not left as an inference from behavior.
-4. `docs/known-gaps.md` bullets cross-reference this plan rather than restating its prose.
+4. `docs/known-gaps/` bullets cross-reference this plan rather than restating its prose.
 5. No code, config, or demo file touched — `git status` shows only `docs/` changes for this plan.

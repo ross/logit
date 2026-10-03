@@ -102,7 +102,7 @@ Four facts from the survey drive the shape of the decision:
    which has no public specification (a heavy forwarder's `[syslog]` output into `syslog_in` is
    the workaround); REST search export as an input; a raw-TCP line listener for a forwarder's
    `sendCookedData = false`; SignalFx's pre-OTLP JSON APIs. Each is recorded in
-   `docs/known-gaps.md` (W6).
+   `docs/known-gaps/splunk.md` (W6).
 
 10. **The encoder writes one object per `MessageBuf` entry; it isn't a `FramedEncoder`.**
     `SplunkEncoder::encode_objects` writes one HEC JSON object per payload into a
@@ -129,7 +129,7 @@ Four facts from the survey drive the shape of the decision:
     as that object's `metric_type`. The encoder writes the exporter's form: one multi-metric
     object per `metric_type` per event, `Gauge` when the event carries none. A delta or
     non-monotonic `Sum` leaves as `Sum`, counted `degraded`: HEC has no carrier for temporality
-    or monotonicity, the Graphite precedent, and a `known-gaps.md` row (W6).
+    or monotonicity, the Graphite precedent, and a `known-gaps/splunk.md` row (W6).
 
 13. **Metric names are sanitized with an `m` prefix.** Outside `[A-Za-z0-9_.:]` becomes `_`, a
     `metric_name` substring becomes `metricname`, and a leading digit or `_` gets an `m` prefix,
@@ -229,7 +229,7 @@ Four facts from the survey drive the shape of the decision:
 - A resource attribute that isn't a carrier leaves a log or metric object in `fields` and comes
   back an event attribute; only a span's `fields` return to the resource. That, `Sum`
   temporality, the multi-number kinds, and the span fields without a member are
-  cross-protocol losses for `docs/known-gaps.md` (W3 drafts the rows, W6 lands them).
+  cross-protocol losses for `docs/known-gaps/splunk.md` (W3 drafts the rows, W6 lands them).
 - A relayed metric object with no `metric_type` gains a `metric_type=Gauge` dimension in Splunk.
 - The JSON plumbing the Datadog routes used (`json_to_value`, the ordered writer) moves to
   `crate::json`, shared by both codecs, with a dotted-key `flatten_into` beside it; the
@@ -398,7 +398,7 @@ the Cloud run" section maps it item by item. By decision:
   and answers a body over it `400` code 6 naming object 0, not `413`. The sink reads that as
   object 0 failing to parse: it drops that object as `invalid_event` and resends the rest, the
   right outcome only when one object is the whole excess. The 2 MiB `max_body_bytes` default
-  sits under the cap, so the rule stands, with the sink's module doc and `docs/known-gaps.md`
+  sits under the cap, so the rule stands, with the sink's module doc and `docs/known-gaps/splunk.md`
   noting the case. The amendment "busy answers before acceptance, and an oversize code 6" below
   revises this: a code 6 naming object 0 of a body over 5 MiB is read as oversize, and the body
   split once.
@@ -426,7 +426,7 @@ Two answers the sink misread under its default at-most-once posture. By decision
   code 9 with the same meaning (the amendment "faithful listener acks and a busy /health" below),
   so a `splunk_hec_out -> splunk_hec_in` relay keeps it. `Retry-After` is ignored: `write_loop`'s
   retry loop has no seam for a server-supplied delay, and building one is out of scope
-  (`docs/known-gaps.md`, "Splunk").
+  (`docs/known-gaps/splunk.md`, "Splunk").
 - **Decision 18, code 6:** a code 6 naming object 0 of a body over
   `logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP` (5,242,880 bytes, before compression) is
   read as Splunk Cloud's oversize answer, not a bad object 0. A body of several objects is split

@@ -17,7 +17,7 @@
 //!
 //! `influxdb.rs` keeps its own `status_class`/`classify_transport_error` pair (the same table
 //! today) and builds its own client, so [`build_client`]'s redirect policy doesn't reach it, a
-//! tracked gap in `docs/known-gaps.md`.
+//! tracked gap in `docs/known-gaps/prometheus.md`.
 
 use bytes::Bytes;
 use logit_core::CountGate;

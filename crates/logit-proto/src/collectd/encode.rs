@@ -219,9 +219,9 @@ impl CollectdEncoder {
     /// `hostname:`).
     ///
     /// **Operator-supplied, with no default.** The encoder neither reads the OS hostname (deferred,
-    /// `docs/known-gaps.md`) nor invents a placeholder: a receiver keys every series on the host,
-    /// so one made-up name would merge every unlabelled sender into one host's metrics. With
-    /// nothing configured and nothing on the event, the list is dropped and counted.
+    /// `docs/known-gaps/mappings.md`) nor invents a placeholder: a receiver keys every series on
+    /// the host, so one made-up name would merge every unlabelled sender into one host's metrics.
+    /// With nothing configured and nothing on the event, the list is dropped and counted.
     ///
     /// Sanitized once, here; an empty value is the same as none.
     pub fn with_hostname(mut self, hostname: impl Into<Bytes>) -> Self {
@@ -875,8 +875,8 @@ fn resolve_value(record: &MetricRecord, ctx: &mut Ctx) -> Option<DsValue> {
 ///
 /// The bounds are inclusive and the `as` cast saturates: a wire COUNTER of `u64::MAX` decodes to
 /// the `f64` `2^64`, so an exclusive bound would drop the value it round-tripped from. Above `2^53`
-/// the value is already imprecise (`docs/known-gaps.md`), and `decode(encode(b)) == b` holds across
-/// the whole range.
+/// the value is already imprecise (`docs/known-gaps/mappings.md`), and `decode(encode(b)) == b`
+/// holds across the whole range.
 fn as_u64(value: f64, name: &str, ctx: &mut Ctx) -> Option<u64> {
     if value.is_finite() && value.fract() == 0.0 && value >= 0.0 && value <= u64::MAX as f64 {
         return Some(value as u64);
