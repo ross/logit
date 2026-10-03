@@ -9770,9 +9770,12 @@ mod tests {
                 ScriptWorker::new(script).unwrap().with_telemetry(Telemetry::default()).unwrap();
             w.collect_until_under(0, 8).unwrap().used
         };
+        // Unlimited, each of the 50 batches would force a collection. A 1 s spacing allows one per
+        // started second of the run plus the close-time one, about two in ~0.5 s. `allowed`
+        // comes from the measured run, so a slow run only raises it.
         let input = PacedInput {
-            batches: (0..100).map(|_| counter_batch_of(1)).collect(),
-            every: Duration::from_millis(20),
+            batches: (0..50).map(|_| counter_batch_of(1)).collect(),
+            every: Duration::from_millis(10),
         };
         let run = run_under_max_memory(
             "mem_paced",
@@ -9790,7 +9793,7 @@ mod tests {
         assert!(forced >= 1.0, "every batch ends over the cap");
         assert!(
             forced <= allowed,
-            "100 over-cap batches in {:?} forced {forced} collections",
+            "50 over-cap batches in {:?} forced {forced} collections",
             run.elapsed
         );
     }
