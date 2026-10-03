@@ -1706,7 +1706,8 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   lines over a 40-byte bound dropped and counted once per read of them, an unterminated line held
   and emitted at a clean stop or a reap, and `lines`, `line.bytes`, and flushes by reason exact.
 - **Perf follow-up (`perf/tail-read-alloc`), confirmed on the perf VM (2026-10-02; CPU µs/event
-  −38.7% on `tail`, −37.3% on `tail-rotate`, `docs/design/performance.md` §1):** `read_one` reads into one
+  −38.7% on `tail`, −37.3% on `tail-rotate`, `docs/design/performance.md` §1):** `read_one` reads
+  into one
   `BytesMut` per `Tailer` and splits each read off it, with no zeroing and no copy; `LineSplitter::push`
   finds newlines with `memchr`; `drain`'s per-pass id lists and `read_one`'s line and event
   `Vec`s are kept on the `Tailer` for their capacity. The `tail` and `tail-rotate` perf scenarios

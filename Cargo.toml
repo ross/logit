@@ -184,6 +184,16 @@ proptest = "1"
 lto = true
 codegen-units = 1
 
+# Line tables keep file:line in panics and backtraces, which is all the test loop reads. Full
+# DWARF made a cold `--all-targets` build about 40% slower and the target dir about 2.5x larger,
+# and third-party crates get none. For a debugger session with full info, pass
+# `--config 'profile.dev.debug=true'`.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 # What `script/perf flamegraph` builds against (crates/logit-perf/src/flamegraph.rs,
 # docs/adr/load-test-harness.md's "Profiling" section). A stripped release binary has no symbols
 # for `perf record` to resolve and no unwind information for `--call-graph dwarf` to walk, so a
