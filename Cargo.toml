@@ -180,6 +180,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"]
 # MIT OR Apache-2.0, covered by deny.toml's allowlist (`script/audit` confirms, not assumes).
 proptest = "1"
 
+# Thin LTO builds about 67 s faster than fat LTO, but the native hop then costs about 9% more CPU
+# per event. See docs/adr/release-build-profile.md for the measurements.
 [profile.release]
 lto = true
 codegen-units = 1
