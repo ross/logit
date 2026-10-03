@@ -2696,29 +2696,33 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   original bytes don't survive); and `docs/http-access-logs.md` tells nginx users to log
   `$request_uri`, never `$uri`, which removes the decoded-path source but not a client's own
   non-ASCII header bytes.
-- **`json-parse-x3` is about 10% slower than it should be, through an inlining flip that has
-  happened twice** (2026-10-02). #296 added a second parse call site to `JsonParser::process` (the
-  `invalid_utf8: replace` retry), and `json-parse-x3` went from 2.248 to 2.490 µs/event on the perf
-  VM, because LLVM stopped inlining `parse_object` into `process` and the `SmallVec` insert and drop
-  inside it became out-of-line calls. #421 moved the retry into a `#[cold]` helper and restored it:
-  B0 2.467 → 2.247 µs/event at the merge before the render redesign. **#457 (`d47a99b6`) then
-  reintroduced it through the same mechanism**: 2.264 → 2.444 (+8.0%), flat to `main`'s 2.502
-  (`docs/design/performance.md` §1, "What moved since 2026-09-28"). A `cpu-clock` flamegraph pair at
-  the two binaries shows one `AttrMap::insert_sym` frame inlined into `JsonParser::process` before
-  (6.94% of samples) and none after, with total `insert_sym` time rising 10.75% → 16.33%
-  (out-of-line 3.81% → 16.33%; self 9.65% → 14.95%). The likely cause, not confirmed: #457 grew two
-  `logit-core` functions that LLVM inlines into the parsers (`Telemetry`'s `count()` gained an
-  `is_muted()` branch, and `Diagnostics::warn_throttled` gained an `is_muted()` early return, which
-  `JsonParser::process` calls twice), shifting the inlining budget under `lto = true` and
-  `codegen-units = 1`. `logfmt-parse` moves the other way at the same merge (−7.9%, 1.006 → 0.926,
-  `Logfmt::process` self time 14.99% → 6.42%), which fits a codegen shift rather than extra work.
-  **Open:** a fix is in progress. Single-parser `json-parse` moves less at the same merge (+1.8%),
-  because contention on the shared interner dominates `x3`'s stage cost, and reads 0.900 at `main`
-  against B0's 0.917. **Also open:** `json-parse`'s unattributed +2.3% step at #298 (`c860842c`). A
-  flamegraph pair of that merge against its parent moves no json self-time frame by more than 0.4
-  points of samples (`insert_sym` self 11.19% → 11.30%, `JsonParser::process` inclusive 48.69% →
-  47.95%), and the diff has no parse-path change, so the step is most likely LTO code layout. The B0
-  baseline already carries it, so the 2026-10-02 session can't measure it.
+- **`json-parse-x3` is about 10% slower than it was before #296, and #457 brought it back
+  through code layout** (2026-10-02). #296 added a second parse call site to
+  `JsonParser::process` (the `invalid_utf8: replace` retry), and `json-parse-x3` went from 2.248
+  to 2.490 µs/event on the perf VM, because LLVM stopped inlining `parse_object` into `process`
+  and the `SmallVec` insert and drop inside it became out-of-line calls. #421 moved the retry
+  into a `#[cold]` helper and restored it: B0 2.467 → 2.247 µs/event at the merge before the
+  render redesign. **#457 (`d47a99b6`) then reintroduced the cost**: 2.264 → 2.444 (+8.0%), flat
+  to `main`'s 2.502 (`docs/design/performance.md` §1, "What moved since 2026-09-28"). This time
+  the compiler's output didn't change. A disassembly of release builds of the merge before #457
+  and of `main` finds `JsonParser::process`, `parse_object`, the `deserialize_map` visitor, and
+  the `insert_sym` copy `json` calls identical instruction for instruction, and only code
+  addresses moved. The VM's `cpu-clock` flamegraph pair shows `insert_sym` out of line at S (total
+  time 10.75% → 16.33%, out-of-line 3.81% → 16.33%, self 9.65% → 14.95%), but that reflects layout
+  and symbolization, not codegen. Forcing `insert_sym`'s loop onto one 64-byte line with `-C
+  llvm-args=-align-loops=64` cost 4.6% of `.text` and didn't recover `json-parse-x3` (+1.1%,
+  inside noise), so the loop's cache-line position alone isn't the cause. The same layout move
+  makes `logfmt-parse` faster (−7.9% on the VM, `Logfmt::process` self time 14.99% → 6.42%); on a
+  laptop (provisional, battery and `powersave`) `json-parse-x3` is 2–6% slower and `logfmt-parse`
+  6–9% faster depending on clock. **Open:** it's layout-dependent and no source-level fix is
+  known, and the `json-parse-x3` cost trades against the `logfmt-parse` gain. Revisit if a later
+  change moves it. Single-parser `json-parse` moves less at the same merge (+1.8%), because
+  contention on the shared interner dominates `x3`'s stage cost, and reads 0.900 at `main`
+  against B0's 0.917. **Also open:** `json-parse`'s unattributed +2.3% step at #298 (`c860842c`).
+  A flamegraph pair of that merge against its parent moves no json self-time frame by more than
+  0.4 points of samples (`insert_sym` self 11.19% → 11.30%, `JsonParser::process` inclusive
+  48.69% → 47.95%), and the diff has no parse-path change, so the step is most likely LTO code
+  layout. The B0 baseline already carries it, so the 2026-10-02 session can't measure it.
 
 ## Lua
 

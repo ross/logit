@@ -346,26 +346,33 @@ separately from the suite, so their cells differ from the table above in the thi
   1,205,667 events/s), where nothing coalesces at window 1 and the plan expected flat. The six
   repeats on each side don't overlap (1.148–1.155 against 1.172–1.183). It's under the 5% gate and
   stays a note, not a lead. The suite's single M row reads 1.186.
-- **`json-parse-x3`: #421 restored it, and #457 put it back.** B0 2.467 → R- 2.247 (−8.9%) is
-  #421's `#[cold]` retry fix. It holds through R and P (2.248,
-  2.264). Then **S rises +8.0% to 2.444** and stays there to M's 2.502. So `json-parse-x3` on
-  M is not the restored number; it's B0's. A `cpu-clock` flamegraph pair at P and S (999 Hz, the
-  same two binaries) shows half the earlier signature: `insert_sym` moves fully out of line, but
-  `parse_object` stacks hold (49.5% → 45.8% of samples). At P, one `AttrMap::insert_sym`
-  frame is inlined into `JsonParser::process` (6.94% of samples inclusive, `SmallVec::insert`
-  inlined with it) beside an out-of-line call (3.81%). At S the inlined copy is gone: every
-  `insert_sym` sample sits in the out-of-line call: out-of-line time 3.81% → 16.33%, total
-  `insert_sym` time 10.75% → 16.33%, self 9.65% → 14.95%.
-  The likely cause, not confirmed: #457 grew two `logit-core` functions that LLVM inlines into
-  `JsonParser::process` and `parse_logfmt` (`Telemetry` became `{buf, gate: Option<CountGate>}`
-  and `count()` gained an `is_muted()` branch; `Diagnostics::warn_throttled` gained an
-  `is_muted()` early return, and `JsonParser::process` calls it twice), which shifts the inlining
-  budget under `lto = true` and `codegen-units = 1`. That's the mechanism #296 and #421 found.
-  [`docs/known-gaps.md`](../known-gaps.md) tracks it and the fix in progress.
+- **`json-parse-x3`: #421 restored it, and #457 put it back, by code layout.** B0 2.467 → R-
+  2.247 (−8.9%) is #421's `#[cold]` retry fix. It holds through R and P (2.248, 2.264). Then
+  **S rises +8.0% to 2.444** and stays there to M's 2.502, so `json-parse-x3` on M is not the
+  restored number; it's B0's. The `cpu-clock` flamegraph pair at P and S (999 Hz, the same two
+  binaries) shows half the earlier signature: `insert_sym` moves fully out of line, but
+  `parse_object` stacks hold (49.5% → 45.8% of samples). At P, one `AttrMap::insert_sym` frame
+  is inlined into `JsonParser::process` (6.94% of samples inclusive, `SmallVec::insert` inlined
+  with it) beside an out-of-line call (3.81%). At S every `insert_sym` sample sits in the
+  out-of-line call: out-of-line time 3.81% → 16.33%, total `insert_sym` time 10.75% → 16.33%,
+  self 9.65% → 14.95%. That is what the profile showed, not what the compiler did. A laptop
+  disassembly of release builds of P and `main` (byte-identical to the VM's binaries) finds
+  `JsonParser::process`, `parse_object`, the `deserialize_map` visitor, and the `insert_sym`
+  copy that `json` calls identical instruction for instruction, with `warn_throttled` and
+  `insert_sym` out-of-line calls in both. Only code addresses moved, so the profile's
+  inline-frame difference reflects layout and symbolization, not codegen. The layout is the
+  cause, and #457 doesn't change the code that runs. Forcing `insert_sym`'s loop onto one
+  64-byte line (`-C llvm-args=-align-loops=64`, +4.6% `.text`) didn't recover `json-parse-x3`
+  (+1.1%, inside noise, while P stayed −2.4% in the same runs), so the loop's cache-line
+  position alone isn't it. The same layout move makes `json-parse-x3` 2–6% slower and
+  `logfmt-parse` 6–9% faster depending on clock; those laptop figures are provisional (battery,
+  `powersave`). There's no source-level fix.
+  [`docs/known-gaps.md`](../known-gaps.md) tracks it.
 - **`logfmt-parse` −7.9% at the same merge, S** (1.006 → 0.926; 1,626,122 → 1,879,855 events/s),
-  flat after. In the same pair, `Logfmt::process` self time
-  falls 14.99% → 6.42% (inclusive 57.81% → 52.26%), and `KeyCache::get_or_intern` becomes a separate
-  callee at 4.07%. That fits the same likely codegen shift, in the favorable direction; not confirmed.
+  flat after. In the same pair, `Logfmt::process` self time falls 14.99% → 6.42% (inclusive
+  57.81% → 52.26%), and `KeyCache::get_or_intern` becomes a separate callee at 4.07%. This is
+  the other side of the same layout move: it trades against `json-parse-x3`, and the profile
+  differences carry the same caveat.
 - **`json-parse` is −0.9% against this B0** (0.915 → 0.907) and also 0.917 → 0.900 in the ladder.
   The earlier "+1.4% residual" against 2026-09-20 can't be read here, because B0 already carries
   it. The X1 flamegraph pair at #298 (`c860842c`) against its parent (`e82ff890`) moves no json
