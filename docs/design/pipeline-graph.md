@@ -463,8 +463,9 @@ That watcher task also bounds a script that never returns
 
 - **Heartbeat.** The thread shares a `logit_script::Heartbeat` with its watcher: bit 0 is set
   while it is inside a `process()` or `flush()` call, and a count above it advances on each call,
-  each `Event.new`, and each event taken from a returned table. The thread marks itself idle before
-  it sends, so a thread parked on a full downstream inbox is backpressure, never a stall.
+  each `Event.new` that constructs an event, and each event taken from a returned table.
+  The thread marks itself idle before it sends, so a thread parked on a full downstream inbox is
+  backpressure, never a stall.
 - **Stall.** Busy with the value unchanged for `stall_after` (10 s) sets the node to
   `NodeState::Stalled` and logs `script_stalled`; `/readyz` reads `503 stalled` until the next
   change sets `Running` again. The phase never moves, so a stall recovers on its own.

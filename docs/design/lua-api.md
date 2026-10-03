@@ -1054,6 +1054,16 @@ sub-tables, the same strictness the proxies apply to an unknown field on read or
 - `Event.new: attributes.cb can't be a Lua function`
 - `Event.new: attributes.loop: can't use a table nested more than 128 levels deep as an event attribute value (does a table contain itself?)`
 
+A direct call's error carries the calling line, as `error(msg, 2)` would give it:
+`script:12: Event.new: timestamp is required`. Under `pcall(Event.new, t)`, or after a tail call
+(`return Event.new{...}`), there's no Lua caller to name, so `pcall` returns the bare string
+`Event.new: timestamp is required`, with no traceback. A refusal is raised by a small Lua wrapper
+around the Rust constructor rather than by the constructor itself, which keeps a caught refusal
+cheap however much global state the script holds
+([ADR `lua-refusals-raised-from-lua`](../adr/lua-refusals-raised-from-lua.md)). A refused call is
+not progress: only an `Event.new` that constructs an event advances the stall heartbeat, so a
+script that pcall-loops refusals reads as stalled rather than busy.
+
 Table access is raw, so a metatable on the input can't make the key check and the field reads
 disagree. Defaults exist only where core already documents one (`BodyFormat::Raw`, the zeros
 above, `MetricKind::counter`'s temporality and monotonicity, `Samples::new`'s `sample_rate`, a
@@ -1277,6 +1287,9 @@ Size the cap at least twice the script's steady working set, read from `logit.sc
 a tighter cap forces a full collection on most batches (`logit.script.vm.gc.forced`). The check
 runs after each batch and `flush()`, and inside a call in `Event.new`, which collects at most
 once per 1024 over-cap calls and, once a collection leaves the VM still over the cap, raises
-`Event.new: over max_memory (<used> > <cap>)` for the rest of that call. `MemoryVerdict` in
+`Event.new: over max_memory (<used> > <cap>)` for the rest of that call. The message is fixed
+when the check trips, so every refusal in the call repeats the same `<used>`. A refused call is
+not progress, so a script that pcall-loops `Event.new` past the trip reads as stalled rather than
+busy. `MemoryVerdict` in
 `crates/logit-pipeline/src/runtime.rs` and the module doc of `crates/logit-script/src/memory.rs`
 have the algorithm.
