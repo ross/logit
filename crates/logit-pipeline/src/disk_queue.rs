@@ -19,10 +19,11 @@
 //!
 //! A **record** is 24 raw bytes of [`TraceContext`] (16-byte `trace_id`, 8-byte `span_id`;
 //! unversioned, see `CONTEXT_LEN`) followed by one `logit_proto::frame` native frame under
-//! `CODEC_HOP_BATCH`: the batch, then a trailer with its [`logit_core::Provenance`] and the
-//! native-hop sender identity and sequence the store numbered it with
-//! (`docs/adr/native-hop-identity-and-sequence.md`, decision 3). A replayed record goes out under
-//! the pair it was written with, never the reopened store's.
+//! `CODEC_HOP_BATCH`: the native-hop sender identity and sequence the store numbered it with
+//! (`docs/adr/native-hop-identity-and-sequence.md`, decision 3), the batch, then a trailer with
+//! its [`logit_core::Provenance`]. A replayed record goes out under the pair it was written with,
+//! never the reopened store's. A record written with the pair in the trailer, the layout before
+//! `docs/adr/native-hop-ack-status.md`, doesn't parse and is skipped as corrupt.
 //! `frame::resync` can recover past a corrupt record because `MAGIC` always immediately follows a
 //! record's 24 context bytes.
 //!
@@ -74,8 +75,8 @@ use logit_proto::CodecError;
 
 /// `[trace_id: 16][span_id: 8]`, ahead of the frame. Never widen it: a record carries no version
 /// of its own, and [`walk_segment`]'s resync arithmetic assumes this prefix sits right before
-/// every record's `MAGIC`. Anything new rides inside the frame as a new trailer tag, as the
-/// sender identity and sequence do (`docs/adr/native-hop-no-compatibility.md`, decision 2).
+/// every record's `MAGIC`. Anything new rides inside the frame, in the hop payload, as the sender
+/// identity and sequence do (`docs/adr/native-hop-no-compatibility.md`, decision 2).
 pub(crate) const CONTEXT_LEN: usize = 24;
 
 const LOCK_FILE_NAME: &str = "lock";
@@ -162,8 +163,8 @@ pub(crate) fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
 /// whole record yet; any other error means the bytes are wrong and the caller should resync
 /// (`docs/design/wire-protocol.md`).
 ///
-/// Only `CODEC_HOP_BATCH` decodes. Any other codec byte, or a trailer without a complete sender
-/// pair, is `Malformed`, so the caller skips the record as corrupt.
+/// Only `CODEC_HOP_BATCH` decodes. Any other codec byte, or a payload without a complete sender
+/// pair ahead of its batch, is `Malformed`, so the caller skips the record as corrupt.
 fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, SeqId, usize), CodecError> {
     if buf.len() < CONTEXT_LEN {
         return Err(CodecError::Truncated { needed: CONTEXT_LEN - buf.len() });
@@ -1905,7 +1906,7 @@ pub(crate) mod test_support {
 
     /// The on-disk length `DiskQueue::push` writes for `batch` under `Compression::None`, for
     /// tests in other modules that size a spool around one record. Exact for sequences 1..=127:
-    /// a larger number takes more uvarint bytes in the trailer.
+    /// a larger number takes more uvarint bytes in the prefix.
     pub(crate) fn encoded_record_len(
         batch: &logit_core::EventBatch,
         provenance: logit_core::Provenance,
@@ -2079,9 +2080,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A record `push` never writes: a hop payload whose trailer has no sender pair, and a bare
-    /// `CODEC_BATCH` frame. Each is skipped and counted as corrupt, as a bad CRC is
-    /// (`docs/adr/native-hop-no-compatibility.md`, decision 2).
+    /// A record `push` never writes: a hop payload with no sender prefix, one in the layout
+    /// before the pair moved ahead of the batch (the pair in the trailer, as tags 3 and 4), and a
+    /// bare `CODEC_BATCH` frame. Each is skipped and counted as corrupt, as a bad CRC is
+    /// (`docs/adr/native-hop-no-compatibility.md`, decision 2; `docs/adr/native-hop-ack-status.md`).
     #[tokio::test]
     async fn a_record_without_a_complete_pair_is_skipped_as_corrupt() {
         let trace = TraceContext::new_root();
@@ -2089,8 +2091,15 @@ mod tests {
         let mut no_pair = body.to_vec();
         // An empty trailer: its length prefix and nothing else.
         no_pair.push(0);
+        let mut pair_in_trailer = body.to_vec();
+        // The trailer's length, tag 3 with a 16-byte identity, and tag 4 with sequence 1.
+        pair_in_trailer.push(21);
+        pair_in_trailer.extend_from_slice(&[3, 16]);
+        pair_in_trailer.extend_from_slice(&[7; 16]);
+        pair_in_trailer.extend_from_slice(&[4, 1, 1]);
         let cases = [
             ("no-pair", raw_frame_record(trace, native::CODEC_HOP_BATCH, &no_pair)),
+            ("pair-in-trailer", raw_frame_record(trace, native::CODEC_HOP_BATCH, &pair_in_trailer)),
             ("bare-codec", raw_frame_record(trace, native::CODEC_BATCH, &body)),
         ];
         for (label, bad) in cases {

@@ -136,6 +136,13 @@ pub trait Output {
     /// connection and nothing is outstanding, so `write_loop` submits again from the oldest
     /// unacknowledged batch. The `Err` carries a [`Fault`], as a `send` failure does. The default
     /// returns `Ok`, matching the default `submit`, which has already delivered.
+    ///
+    /// One exception: an `Err` that also carries [`HeadOnly`] (`.context(HeadOnly)`) settles the
+    /// oldest submission alone. The sink kept its connection, and every later submission is still
+    /// outstanding in order, so `write_loop` drops that one batch and goes on waiting for the
+    /// next. The `Fault` with it must be [`Fault::Rejected`]: a retried head would have to be
+    /// resubmitted behind batches already in flight. `logit_out` returns it for a rejected `Ack`
+    /// (`docs/adr/native-hop-ack-status.md`).
     async fn await_ack(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -192,6 +199,23 @@ impl std::fmt::Display for Fault {
         };
         f.write_str(s)
     }
+}
+
+/// Marks an [`Output::await_ack`] failure as settling the oldest submission alone, with the
+/// sink's connection and every later submission untouched (that method's doc). Travels as
+/// `anyhow` context beside a [`Fault::Rejected`], read back by [`is_head_only`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadOnly;
+
+impl std::fmt::Display for HeadOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the oldest submission alone failed")
+    }
+}
+
+/// Whether `err` carries [`HeadOnly`], by the same inherent downcast [`classify`] uses.
+pub fn is_head_only(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<HeadOnly>().is_some()
 }
 
 /// Reads `err` for an attached [`Fault`] marker (a sink's `.context(fault)`), defaulting to
@@ -295,6 +319,15 @@ mod tests {
     fn classify_defaults_to_rejected_for_an_unclassified_error() {
         let err = anyhow::anyhow!("boom, no fault attached");
         assert_eq!(classify(&err), Fault::Rejected);
+    }
+
+    #[test]
+    fn head_only_reads_back_beside_its_fault_under_further_context() {
+        let err = anyhow::anyhow!("refused").context(Fault::Rejected).context(HeadOnly);
+        let err = err.context("component 'out'");
+        assert!(is_head_only(&err));
+        assert_eq!(classify(&err), Fault::Rejected);
+        assert!(!is_head_only(&anyhow::anyhow!("boom").context(Fault::Rejected)));
     }
 
     #[test]

@@ -475,12 +475,12 @@ fn seed_specs() -> Vec<RecordSpec> {
 /// the record whole where it was: the run reads as garbage after it.
 #[test]
 fn an_insert_that_reproduces_a_record_boundary_leaves_it_untouched() {
-    assert_eq!(encode(&seed_specs()).0.len(), 372, "the offset below was resolved for 372 bytes");
+    assert_eq!(encode(&seed_specs()).0.len(), 356, "the offset below was resolved for 356 bytes");
     let case = build_resolved(
         &seed_specs(),
-        // 185 is one byte before the end of `r1` (93..186), and the run repeats that last byte,
-        // the sequence number 1 that ends the record's trailer.
-        Resolved::Insert { at: 185, bytes: vec![1, 129, 13, 44, 13] },
+        // 177 is one byte before the end of `r1` (89..178), and the run repeats that last byte,
+        // the empty provenance trailer's length 0 that ends the record.
+        Resolved::Insert { at: 177, bytes: vec![0, 129, 13, 44, 13] },
     );
     if let Err(err) = check_walk(&case) {
         panic!("{err}\n{case:?}");

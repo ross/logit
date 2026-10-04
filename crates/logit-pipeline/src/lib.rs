@@ -41,7 +41,7 @@ pub use disk_queue::{DiskQueue, DiskQueueConfig};
 pub use fanout::{BatchContext, Delivered, Edge, Fanout, SendTimeout, TraceContext};
 pub use input::{Input, InputRuntimeConfig};
 pub use logit_proto::native::SeqId;
-pub use output::{classify, is_retryable, DeliveryPosture, Fault, Output};
+pub use output::{classify, is_head_only, is_retryable, DeliveryPosture, Fault, HeadOnly, Output};
 pub use queue::{
     BoundedQueue, CountedDrain, OverflowPolicy, QueueConfig, QueueMetrics, Queued, SinkQueue,
     SinkQueueConfig, SinkStore, SinkStoreConfig, StoreItem, SINK_QUEUE_METRICS,

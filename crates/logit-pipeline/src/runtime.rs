@@ -11,7 +11,7 @@
 
 use crate::fanout::{BatchContext, Delivered, TraceContext};
 use crate::graph::{Graph, Role};
-use crate::output::{classify, is_retryable, DeliveryPosture, Fault};
+use crate::output::{classify, is_head_only, is_retryable, DeliveryPosture, Fault, HeadOnly};
 #[cfg(test)]
 use crate::queue::{SinkQueue, SinkQueueConfig};
 use crate::queue::{SinkStore, SinkStoreConfig, StoreItem};
@@ -1004,7 +1004,9 @@ impl InFlight {
 /// - **A submit failure at the head** is the round's fault. **A failure past the head classifies
 ///   nothing**: the fill stops and the acknowledgments already owed are read.
 /// - **A failed `await_ack`** sets `state.outstanding` to 0 and is the round's fault, covering
-///   every item that was outstanding.
+///   every item that was outstanding. One marked [`crate::HeadOnly`] covers the head alone and
+///   leaves `state.outstanding` counting it, for `write_loop`'s commit to lower; the items behind
+///   it stay submitted.
 ///
 /// The shutdown grace is the one thing that cuts a round short (`write_loop`'s `DeliverStep`).
 /// Before returning `Delivery::Dropped` it has set `state.at_fault`; `write_loop` commits and
@@ -1093,6 +1095,13 @@ async fn window_round(
         Ok(()) => return Ok(()),
         Err(err) => err,
     };
+    // The head alone failed and the sink kept the rest in flight: `write_loop` commits the head
+    // and lowers `outstanding` past it, as for a delivered head.
+    if is_head_only(&err) {
+        debug_assert_eq!(classify(&err), Fault::Rejected, "only a Rejected head settles alone");
+        state.at_fault = 1;
+        return Err(err);
+    }
     state.at_fault = state.outstanding;
     state.outstanding = 0;
     Err(err)
@@ -1156,16 +1165,17 @@ fn fault_tag(fault: Fault) -> &'static str {
     }
 }
 
-/// `err`'s chain as `{err:#}` prints it, minus the links that are only a [`Fault`]'s class: the
-/// line that prints it names the class once itself. A sink attaches its `Fault` as anyhow
-/// context, and that link's concrete type is anyhow's internal `ContextError`, which no
+/// `err`'s chain as `{err:#}` prints it, minus the links that are only a [`Fault`]'s class or a
+/// [`HeadOnly`] marker: the line that prints it names the class once itself. A sink attaches both
+/// as anyhow context, and that link's concrete type is anyhow's internal `ContextError`, which no
 /// `dyn Error` downcast matches ([`classify`]'s doc), so the links are matched by their text.
 fn destination_text(err: &anyhow::Error) -> String {
     const CLASSES: [Fault; 4] = [Fault::Clean, Fault::Ambiguous, Fault::Rejected, Fault::Refused];
+    let head_only = HeadOnly.to_string();
     let mut text = String::new();
     for link in err.chain() {
         let link = link.to_string();
-        if CLASSES.iter().any(|class| fault_tag(*class) == link) {
+        if CLASSES.iter().any(|class| fault_tag(*class) == link) || link == head_only {
             continue;
         }
         if !text.is_empty() {
@@ -1467,7 +1477,13 @@ pub(crate) async fn write_loop(
             }
             Delivery::Dropped { fault, err } => {
                 retrying.settle();
-                debug_assert_eq!(in_flight.outstanding, 0, "a dropped round leaves nothing out");
+                // Every dropped round leaves nothing outstanding but one whose head alone failed
+                // (`Output::await_ack`'s `HeadOnly`), which leaves the head and those behind it.
+                debug_assert!(
+                    in_flight.outstanding == 0 || is_head_only(&err),
+                    "a dropped round leaves nothing out"
+                );
+                in_flight.outstanding = in_flight.outstanding.saturating_sub(1);
                 // The head, then, under at-most-once, every other batch an `Ambiguous` fault
                 // left with an unknown outcome: each is as ambiguous as the head, and
                 // at-most-once never resends one. A `Rejected` fault drops only the head; the rest
@@ -6522,6 +6538,9 @@ mod tests {
         Calls(std::collections::VecDeque<Option<Fault>>),
         /// Fails while this batch is the oldest outstanding; delivers any other.
         Head(u64, Fault),
+        /// Fails this batch alone, `Rejected` marked `HeadOnly`, as `logit_out` does for a
+        /// rejected `Ack`: pops it and keeps the connection and the batches behind it.
+        HeadOnly(u64),
         Always(Fault),
         Hang,
     }
@@ -6688,8 +6707,15 @@ mod tests {
             let mut guard = DropOnCancel(Some(self));
             let output = guard.0.as_deref_mut().expect("set above");
             tokio::time::sleep(output.ack_delay).await;
+            if matches!(output.ack_script, AckScript::HeadOnly(v) if v == head) {
+                let output = guard.0.take().expect("set above");
+                output.in_flight.pop_front();
+                return Err(anyhow::anyhow!("simulated rejected head {head}"))
+                    .context(Fault::Rejected)
+                    .context(HeadOnly);
+            }
             let fault = match &mut output.ack_script {
-                AckScript::Ok => None,
+                AckScript::Ok | AckScript::HeadOnly(_) => None,
                 AckScript::Calls(calls) => calls.pop_front().flatten(),
                 AckScript::Head(v, fault) => (*v == head).then_some(*fault),
                 AckScript::Always(fault) => Some(*fault),
@@ -6981,6 +7007,94 @@ mod tests {
                 "{posture:?}: a resubmit never observes again"
             );
         }
+    }
+
+    /// The head's ack fails `Rejected` marked `HeadOnly`, under either posture: only the head is
+    /// dropped, and the batches behind it stay submitted and are delivered with no resubmit and
+    /// no retry (`Output::await_ack`'s doc).
+    #[tokio::test(start_paused = true)]
+    async fn a_head_only_rejection_drops_the_head_and_keeps_the_rest_in_flight() {
+        for posture in [DeliveryPosture::AtLeastOnce, DeliveryPosture::AtMostOnce] {
+            let (mut output, log) = windowed_output((4, 4));
+            output.ack_delay = Duration::from_millis(10);
+            output.ack_script = AckScript::HeadOnly(2);
+            let totals = drive_windowed(&mut output, 4, 1024, posture).await;
+            assert_eq!(
+                log.calls(),
+                vec![
+                    Call::Observe(1),
+                    Call::Submit(1, 1, 0),
+                    Call::Observe(2),
+                    Call::Submit(2, 2, 1),
+                    Call::Observe(3),
+                    Call::Submit(3, 3, 2),
+                    Call::Observe(4),
+                    Call::Submit(4, 4, 3),
+                    Call::Ack(1),
+                    Call::Ack(3),
+                    Call::Ack(4),
+                ],
+                "{posture:?}"
+            );
+            assert_eq!(
+                totals.sum("logit.component.batches.dropped", &[("reason", "rejected")]),
+                1.0,
+                "{posture:?}"
+            );
+            assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0, "{posture:?}");
+            assert_eq!(totals.sum("logit.component.retries", &[]), 0.0, "{posture:?}");
+            assert_eq!(totals.sum("logit.component.errors", &[]), 1.0, "{posture:?}");
+        }
+    }
+
+    /// A head-only rejection off a disk spool commits the head, so a restart doesn't replay it,
+    /// and the batches behind it are delivered.
+    #[tokio::test(start_paused = true)]
+    async fn a_disk_sink_commits_a_head_only_rejection_so_it_never_replays() {
+        let dir = crate::disk_queue::test_support::scratch_dir("head-only-is-committed");
+        let (mut output, log) = windowed_output((4, 4));
+        output.ack_delay = Duration::from_millis(10);
+        output.ack_script = AckScript::HeadOnly(2);
+        let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Registry::new();
+        let run = tokio::spawn(run_output(
+            "out".to_string(),
+            Box::new(output),
+            inbox_rx,
+            registry.telemetry_for("out", "logit_out", "sink"),
+            SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
+            slow_retry_write_config(Duration::from_secs(5)),
+            shutdown_rx,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        for value in [1.0, 2.0, 3.0] {
+            inbox_tx.send(counter_batch(value)).await.unwrap();
+        }
+        drop(inbox_tx);
+
+        tokio::time::timeout(Duration::from_secs(60), run)
+            .await
+            .expect("run_output must not stop responding")
+            .expect("the task must not panic")
+            .expect("a rejection doesn't fail the sink");
+
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(
+            totals.sum(
+                "logit.component.batches.dropped",
+                &[("component", "out"), ("reason", "rejected")]
+            ),
+            1.0
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 2.0);
+        assert_eq!(log.count(&Call::Ack(1)), 1);
+        assert_eq!(log.count(&Call::Ack(3)), 1);
+        assert!(
+            reopen_and_drain(&dir).await.is_empty(),
+            "the rejected head is committed, so a restart doesn't replay it"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A slowly draining receiver: the submit past the head takes a minute while the head's
