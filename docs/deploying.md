@@ -354,6 +354,22 @@ buffering:
   ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
   decision 1).
 
+### A slow or unreachable sink
+
+Under the default `overflow: block`, a sink whose buffer fills parks every branch that shares its
+upstream, including branches bound for healthy sinks. To keep one sink from stalling the others:
+
+- If the data matters and you need to ride out an outage, set `buffer.disk`. The stall waits until
+  the spool is full.
+- If the sink is best-effort, set `buffer.overflow: drop_newest` or `drop_oldest`. The sink keeps
+  draining and counts what it drops.
+
+To find the branch that is blocking, read these on the consumer, not the producer:
+`logit.component.inbox.full` (a send found the inbox full),
+`logit.component.inbox.blocked.duration` (time a send waited for room), and
+`logit.component.inbox.batches` (inbox depth). On the sink, `logit.component.buffer.utilization`
+near 1.0 confirms its buffer is the cause.
+
 ### Durable buffering
 
 An in-memory queue is lost on a restart, a `SIGKILL`, or a shutdown grace that expires mid-drain.

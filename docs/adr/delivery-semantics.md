@@ -1,13 +1,14 @@
 ---
 created: 2026-09-29
-updated: 2026-10-01
+updated: 2026-10-04
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
 
 ## Status
 Accepted. Superseded in part on 2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md):
-item 7's last line, "`window` stays 1".
+item 7's last line, "`window` stays 1". Amended on 2026-10-04: the W3 amendment's open per-edge
+`on_full` policy is closed as not planned.
 
 ## Context
 
@@ -438,3 +439,17 @@ later batch of that identity was taken, and `logit_in` doesn't forward it.
 
 Item 11's first countable replays are `logit.input.batches.resends`: frames `logit_in`
 recognizes at or below the mark, acknowledges, and doesn't forward.
+
+## Amendment: a per-edge `on_full` policy isn't planned (2026-10-04)
+
+The W3 amendment's "Scope is direct consumers" bullet left a per-edge `on_full: block | drop`
+policy open. It's closed as not planned. A sink isolates itself from its siblings with its own
+`buffer.overflow: drop_newest | drop_oldest` or `buffer.disk`, and the default `block` keeps
+`tail_in`, the TCP listeners, and the native hop lossless because the sender waits. A transform,
+Lua node, or router blocks only on its downstream, so with every sink set to drop, an
+intermediate backs up only when it is itself the bottleneck. That's a capacity matter. Finding
+the consumer that blocks a fan-out is instrumented instead: `logit.component.inbox.full`,
+`inbox.blocked.duration`, and `inbox.batches`, recorded under the consumer
+(`docs/design/internal-telemetry.md`, "Inbox side: recorded under the consumer";
+`docs/design/pipeline-graph.md`, "Backpressure"). Propagating a closure as a shutdown signal
+stays open.

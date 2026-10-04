@@ -18,7 +18,7 @@ the same date, write the record, then add a row here.
 | [Native hop send window: several frames in flight, acknowledged in frame order](native-hop-send-window.md) | 2026-10-01 | 2026-10-02 |
 | [Native hop identity and sequence: a per-store sender identity and sequence in the batch trailer, an `Ack` with no fields, and a high-water mark at `logit_in`](native-hop-identity-and-sequence.md) | 2026-10-01 | 2026-10-02 |
 | [Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed](sink-send-path-and-attempt-accounting.md) | 2026-09-29 | 2026-10-01 |
-| [Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-01 |
+| [Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-04 |
 | [Tail discovery failure and resume identity: a failed listing is no information, and a resume verifies the file's head](tail-discovery-failure-and-resume-identity.md) | 2026-09-28 | 2026-10-02 |
 | [Process-level metrics from procfs and the allocator](process-level-metrics.md) | 2026-09-28 | 2026-09-28 |
 | [`stdio_out`/`file_out`'s human render: an exhaustive, sectioned block per event](human-render-block-format.md) | 2026-09-28 | 2026-10-02 |
