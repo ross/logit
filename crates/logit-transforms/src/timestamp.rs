@@ -12,7 +12,7 @@
 //! | `F64` | `f64` seconds, fraction rounded to the nanosecond | - | - | - | - |
 //! | anything else | - | - | - | - | - |
 //!
-//! A scaled integer that overflows an `i64` of nanoseconds, and a calendar value outside it, is a
+//! A scaled integer or decimal string that overflows an `i64` of nanoseconds, and a calendar value outside it, is a
 //! skew skip on its side, not `invalid`: it parsed, and it's far from receipt.
 //!
 //! Per event, in order; the first that applies is the outcome:
@@ -37,7 +37,7 @@
 use crate::{f64_seconds_to_nanos, present_value};
 use logit_core::interner::intern;
 use logit_core::zoned::{self, Pattern, ResolveError, Zone};
-use logit_core::{parse_decimal_nanos, Event, Resource, Symbol, Telemetry, Value};
+use logit_core::{parse_decimal_nanos, DecimalError, Event, Resource, Symbol, Telemetry, Value};
 use logit_pipeline::Transform;
 use std::sync::Arc;
 use std::time::Duration;
@@ -156,7 +156,11 @@ impl TimestampResolver {
             return match value {
                 Value::Str(_) => {
                     let s = value.as_str().ok_or(Skip::Invalid)?;
-                    parse_decimal_nanos(s, scale).ok_or(Skip::Invalid)
+                    parse_decimal_nanos(s, scale).map_err(|e| match e {
+                        // The grammar has no sign, so an overflow is always in the future.
+                        DecimalError::Overflow => Skip::SkewFuture,
+                        DecimalError::Invalid => Skip::Invalid,
+                    })
                 }
                 Value::I64(n) => n.checked_mul(scale).ok_or(if *n < 0 {
                     Skip::SkewPast

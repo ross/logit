@@ -230,7 +230,7 @@ fn timing_nanos(value: &Value, unit: Unit, instant: bool) -> Option<i64> {
     match value {
         Value::I64(n) => n.checked_mul(scale),
         Value::U64(n) => i64::try_from(*n).ok()?.checked_mul(scale),
-        Value::Str(_) => parse_decimal_nanos(value.as_str()?, scale),
+        Value::Str(_) => parse_decimal_nanos(value.as_str()?, scale).ok(),
         Value::Timestamp(n) if instant && unit == Unit::Nanos => Some(*n),
         Value::F64(f) if unit == Unit::Seconds => f64_seconds_to_nanos(*f),
         _ => None,

@@ -215,28 +215,38 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Why [`parse_decimal_nanos`] refused a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecimalError {
+    /// Not the grammar, or nonzero digits finer than the target unit.
+    Invalid,
+    /// Well formed, but the count doesn't fit an `i64`.
+    Overflow,
+}
+
 /// Parses an unsigned decimal in one unit into an exact integer count of a finer unit, with no
 /// `f64`: `parse_decimal_nanos("1725400000.123456789", 1_000_000_000)` is
 /// `1_725_400_000_123_456_789`. An epoch-magnitude value like nginx's `$msec` scaled to
 /// nanoseconds has more significant digits than an `f64` holds, so a float route would round.
 ///
 /// `scale` is target units per source unit (`1_000_000_000` for seconds, `1_000` for micros).
-/// Nonzero digits past `log10(scale)` places return `None` rather than truncating; trailing zeros
-/// there are accepted. Grammar: `DIGIT+ ("." DIGIT*)?`. Any other shape, or `i64` overflow,
-/// returns `None`.
-pub fn parse_decimal_nanos(s: &str, scale: i64) -> Option<i64> {
+/// Nonzero digits past `log10(scale)` places are `Invalid` rather than truncating; trailing zeros
+/// there are accepted. Grammar: `DIGIT+ ("." DIGIT*)?`. Any other shape, or excess precision,
+/// is [`DecimalError::Invalid`]; a well-formed value whose count overflows an `i64` is
+/// [`DecimalError::Overflow`].
+pub fn parse_decimal_nanos(s: &str, scale: i64) -> Result<i64, DecimalError> {
     let (whole, frac) = match s.split_once('.') {
         Some((w, f)) => (w, f),
         None => (s, ""),
     };
     if whole.is_empty() || !whole.bytes().all(|c| c.is_ascii_digit()) {
-        return None;
+        return Err(DecimalError::Invalid);
     }
     if !frac.bytes().all(|c| c.is_ascii_digit()) {
-        return None;
+        return Err(DecimalError::Invalid);
     }
-    let whole: i64 = whole.parse().ok()?;
-    let mut out = whole.checked_mul(scale)?;
+    let whole: i64 = whole.parse().map_err(|_| DecimalError::Overflow)?;
+    let mut out = whole.checked_mul(scale).ok_or(DecimalError::Overflow)?;
     // Each fractional digit is worth `scale / 10^position` target units; stays integral.
     let mut place = scale;
     for c in frac.bytes() {
@@ -244,14 +254,17 @@ pub fn parse_decimal_nanos(s: &str, scale: i64) -> Option<i64> {
         if place == 1 {
             // Below one target unit: zero is padding, anything else is unrepresentable.
             if digit != 0 {
-                return None;
+                return Err(DecimalError::Invalid);
             }
             continue;
         }
         place /= 10;
-        out = out.checked_add(digit.checked_mul(place)?)?;
+        out = digit
+            .checked_mul(place)
+            .and_then(|d| out.checked_add(d))
+            .ok_or(DecimalError::Overflow)?;
     }
-    Some(out)
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -319,7 +332,7 @@ mod tests {
         // 19 significant digits, past an f64's ~16.
         assert_eq!(
             parse_decimal_nanos("1725400000.123456789", 1_000_000_000),
-            Some(1_725_400_000_123_456_789)
+            Ok(1_725_400_000_123_456_789)
         );
         let via_f64 = ("1725400000.123456789".parse::<f64>().unwrap() * 1e9).round() as i64;
         assert_ne!(via_f64, 1_725_400_000_123_456_789, "the f64 route really does round");
@@ -329,39 +342,59 @@ mod tests {
     fn decimal_nanos_pads_short_fractions_and_accepts_no_fraction() {
         assert_eq!(
             parse_decimal_nanos("1725400000.123", 1_000_000_000),
-            Some(1_725_400_000_123_000_000)
+            Ok(1_725_400_000_123_000_000)
         );
-        assert_eq!(parse_decimal_nanos("0.004", 1_000_000_000), Some(4_000_000));
-        assert_eq!(parse_decimal_nanos("7", 1_000_000_000), Some(7_000_000_000));
-        assert_eq!(parse_decimal_nanos("7.", 1_000_000_000), Some(7_000_000_000));
-        assert_eq!(parse_decimal_nanos("12.5", 1_000), Some(12_500));
+        assert_eq!(parse_decimal_nanos("0.004", 1_000_000_000), Ok(4_000_000));
+        assert_eq!(parse_decimal_nanos("7", 1_000_000_000), Ok(7_000_000_000));
+        assert_eq!(parse_decimal_nanos("7.", 1_000_000_000), Ok(7_000_000_000));
+        assert_eq!(parse_decimal_nanos("12.5", 1_000), Ok(12_500));
     }
 
     #[test]
     fn decimal_nanos_rejects_sub_target_unit_digits() {
-        assert_eq!(parse_decimal_nanos("1.0000000001", 1_000_000_000), None, "ten places");
+        assert_eq!(
+            parse_decimal_nanos("1.0000000001", 1_000_000_000),
+            Err(DecimalError::Invalid),
+            "ten places"
+        );
         assert_eq!(
             parse_decimal_nanos("1.0000000000", 1_000_000_000),
-            Some(1_000_000_000),
+            Ok(1_000_000_000),
             "trailing zeros past the unit are padding, not precision"
         );
-        assert_eq!(parse_decimal_nanos("1.5", 1), None, "a fraction of a nanosecond");
-        assert_eq!(parse_decimal_nanos("1.0", 1), Some(1));
-        assert_eq!(parse_decimal_nanos("1.5", 1_000), Some(1_500));
+        assert_eq!(
+            parse_decimal_nanos("1.5", 1),
+            Err(DecimalError::Invalid),
+            "a fraction of a nanosecond"
+        );
+        assert_eq!(parse_decimal_nanos("1.0", 1), Ok(1));
+        assert_eq!(parse_decimal_nanos("1.5", 1_000), Ok(1_500));
     }
 
     #[test]
     fn decimal_nanos_rejects_every_other_shape() {
         for bad in ["", ".5", "-1", "+1", "1e9", "1,5", " 1", "1 ", "abc", "1.2.3", "0x10"] {
-            assert_eq!(parse_decimal_nanos(bad, 1_000_000_000), None, "{bad:?}");
+            assert_eq!(
+                parse_decimal_nanos(bad, 1_000_000_000),
+                Err(DecimalError::Invalid),
+                "{bad:?}"
+            );
         }
     }
 
     #[test]
     fn decimal_nanos_overflow_is_none_not_a_panic() {
-        assert_eq!(parse_decimal_nanos("9223372036854775808", 1), None, "i64::MAX + 1");
-        assert_eq!(parse_decimal_nanos("9223372037", 1_000_000_000), None, "overflows on scale");
-        assert_eq!(parse_decimal_nanos("9223372036.854775807", 1_000_000_000), Some(i64::MAX));
+        assert_eq!(
+            parse_decimal_nanos("9223372036854775808", 1),
+            Err(DecimalError::Overflow),
+            "i64::MAX + 1"
+        );
+        assert_eq!(
+            parse_decimal_nanos("9223372037", 1_000_000_000),
+            Err(DecimalError::Overflow),
+            "overflows on scale"
+        );
+        assert_eq!(parse_decimal_nanos("9223372036.854775807", 1_000_000_000), Ok(i64::MAX));
     }
 
     #[test]
