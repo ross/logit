@@ -275,17 +275,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   endpoint (`docs/plans/operator-surface.md`) as speculative until an operator asks, for the
   reason ADR `internal-telemetry-as-pipeline-events` gives for not building a `Registry`
   addressable outside the pipeline.
-- **An unknown key on a component is silently ignored rather than rejected.** No `ComponentKind`
-  variant carries `#[serde(deny_unknown_fields)]` (`crates/logit-config/src/lib.rs`), so parsing
-  drops a misspelled or removed key with no error. The case that bites: `prometheus_in`'s TLS keys
-  are prefixed by mode, `scrape_tls:` (client TLS for scrapes) and `bind_tls:` (server TLS for the
-  remote-write receiver), with no alias, per
-  [ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)'s "mode-prefixed TLS keys".
-  So a bare `tls:` under a `prometheus_in` is dropped.
-  - **Consequence:** the component starts with default TLS settings, and a scrape that should
-    present a client certificate doesn't. `logit validate` can't catch it either. The same silence
-    covers any misspelled key on any `ComponentKind` variant; `TailOptions`' doc comment states it
-    for `tail_in`/`docker_in`.
 
 ## Admin endpoint, readiness, and release image
 

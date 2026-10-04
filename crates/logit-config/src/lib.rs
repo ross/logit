@@ -19,8 +19,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_components")]
     #[schemars(schema_with = "non_empty_components_schema")]
     pub components: HashMap<String, Component>,
     /// The readiness/liveness HTTP endpoint. Off unless `bind` is set. Process-level: one admin
@@ -36,6 +37,50 @@ pub struct AdminConfig {
     /// `host:port` to serve `/readyz` and `/healthz` on. Omitted (the default) means off. No TLS:
     /// bind this to loopback or a pod-local address, not to a network beyond the process's own.
     pub bind: Option<String>,
+}
+
+/// Deserializes `components:`, prefixing a component's error with its id. A flattened, tagged
+/// [`Component`] error carries no location, so without the id an unknown key in a large config
+/// names the key but not where it is. Only the id and serde's own message are printed, never a
+/// value.
+fn deserialize_components<'de, D>(deserializer: D) -> Result<HashMap<String, Component>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Components;
+
+    impl<'de> serde::de::Visitor<'de> for Components {
+        type Value = HashMap<String, Component>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of component ids to components")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            use serde::de::Error;
+            let mut components = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+            while let Some(id) = map.next_key::<String>()? {
+                let component = map.next_value::<Component>().map_err(|err| {
+                    let message = err.to_string();
+                    // serde's unknown-field message lists only the kind's own fields.
+                    let note = if message.starts_with("unknown field") {
+                        "; every component also accepts `sources`, `targets`, `buffer`, and \
+                         `receive`"
+                    } else {
+                        ""
+                    };
+                    A::Error::custom(format_args!("component `{id}`: {message}{note}"))
+                })?;
+                components.insert(id, component);
+            }
+            Ok(components)
+        }
+    }
+
+    deserializer.deserialize_map(Components)
 }
 
 fn non_empty_components_schema(generator: &mut SchemaGenerator) -> Schema {
@@ -76,6 +121,7 @@ pub struct Component {
 
 /// One `kv_metrics` entry: a metric `name`, an optional source `field`, and an optional `unit`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MetricSpec {
     /// The metric's measurement name. Must be non-empty.
     pub name: String,
@@ -150,6 +196,7 @@ pub enum FlattenKeyword {
 
 /// One field's clamp, under `keep_values`' `resource`/`attributes` maps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ValueAllowList {
     /// Rewrites applied in order before the `allow` test, and written back to the event when the
     /// result is allowed. Empty (the default) means no normalization. A repeated step is rejected.
@@ -327,6 +374,7 @@ pub enum OtlpProtocol {
 /// whose endpoint is a bare `host:port`, the block's presence is what turns TLS on, so even an
 /// empty `tls: {}` means TLS with the bundled Mozilla roots.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TlsClientConfig {
     /// PEM bundle of CA certificates to trust instead of the bundled Mozilla root set. A relative
     /// path resolves against the config file's directory. A plain string, so `!env` works on it.
@@ -361,6 +409,7 @@ impl TlsClientConfig {
 /// required: there is no plaintext fallback. A relative path resolves against the config file's
 /// directory, and every field accepts `!env`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TlsServerConfig {
     /// Certificate chain (PEM) this listener presents to every client.
     pub cert_file: String,
@@ -480,6 +529,7 @@ pub struct SampleOverride {
 /// http` only; gRPC method names are fixed by the service definitions, so a non-empty `paths:`
 /// under `protocol: grpc` is rejected.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OtlpPaths {
     #[serde(default)]
     pub logs: Option<String>,
@@ -589,8 +639,12 @@ fn default_span_sample_rate() -> f64 {
 /// A component's kind, tagged by `type` in config. Every protocol kind is suffixed `_in`/`_out`,
 /// so a listener and a sink for one protocol never collide on a tag; transform kinds take no
 /// suffix.
+// `deny_unknown_fields` covers every variant and reaches through `Component`'s flatten:
+// `Component` keeps its four common keys and hands this enum the rest, so a key neither claims is
+// an error. A variant that flattens `TailOptions` still rejects a key that neither it nor
+// `TailOptions` names.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ComponentKind {
     /// statsd / DogStatsD-style tagged metrics, over UDP (the default), TCP, or a Unix socket.
     ///
@@ -2600,7 +2654,7 @@ pub enum WatchMode {
 }
 
 /// Options shared by `tail_in` and `docker_in`, written directly on the component rather than
-/// under a sub-block. An unrecognized field here is silently ignored.
+/// under a sub-block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct TailOptions {
@@ -3020,6 +3074,7 @@ pub enum SyslogFormat {
 /// so registering a PEN with IANA, or reusing one you hold, is your decision. `logit run` rejects
 /// an invalid id at startup; `logit validate` doesn't check it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SyslogStructuredData {
     pub sd_id: String,
 }
@@ -3775,7 +3830,35 @@ mod humantime_serde_duration {
 /// workspace test compares its output with the committed `schema/logit.schema.json` and fails if
 /// it is stale.
 pub fn json_schema() -> schemars::schema::RootSchema {
-    schemars::schema_for!(Config)
+    let mut root = schemars::schema_for!(Config);
+    close_component_variants(&mut root);
+    root
+}
+
+/// Names `Component`'s common keys (`sources`, `targets`, `buffer`, `receive`) in each `oneOf`
+/// variant and closes every variant with `additionalProperties: false`, matching what
+/// deserialization accepts. schemars closes each variant from `deny_unknown_fields`, but a closed
+/// variant can't see properties declared beside the `oneOf`, and a variant with a flattened field
+/// (`tail_in`, `docker_in`) is left open. Each variant lists a common key as `true`: its shape is
+/// still checked by `Component`'s own `properties`, so the schema carries one copy of it.
+fn close_component_variants(root: &mut schemars::schema::RootSchema) {
+    use schemars::schema::SchemaObject;
+
+    let Some(Schema::Object(component)) = root.definitions.get_mut("Component") else {
+        panic!("the generated schema has no `Component` definition");
+    };
+    let common: Vec<String> = component.object().properties.keys().cloned().collect();
+    let variants = component.subschemas().one_of.as_mut().expect("`Component` has a `oneOf`");
+    for variant in variants {
+        let Schema::Object(SchemaObject { object: Some(object), .. }) = variant else {
+            panic!("every `Component` variant is an object schema");
+        };
+        for name in &common {
+            let previous = object.properties.insert(name.clone(), Schema::Bool(true));
+            assert!(previous.is_none(), "a variant field shadows the common `{name}`");
+        }
+        object.additional_properties = Some(Box::new(Schema::Bool(false)));
+    }
 }
 
 #[cfg(test)]
@@ -7024,6 +7107,162 @@ mod tests {
                     assert_eq!(transport, expected);
                 }
                 other => panic!("expected StatsdOut, got {other:?}"),
+            }
+        }
+    }
+
+    fn unknown_field_error(json: &str) -> String {
+        serde_json::from_str::<Component>(json)
+            .expect_err("an unknown key should be rejected")
+            .to_string()
+    }
+
+    /// `prometheus_in` has two TLS roles and no bare `tls:` key; one left in a config must fail
+    /// rather than start the scrape client without the operator's CA.
+    #[test]
+    fn prometheus_in_rejects_a_bare_tls_key() {
+        let err = unknown_field_error(
+            r#"{"type": "prometheus_in", "scrape_targets": ["https://node:9100/metrics"],
+                "tls": {"ca_file": "/etc/ca.pem"}}"#,
+        );
+        assert!(err.contains("unknown field `tls`"), "got: {err}");
+    }
+
+    #[test]
+    fn a_misspelled_common_key_is_rejected() {
+        let err = unknown_field_error(r#"{"type": "null_out", "source": ["gen"]}"#);
+        assert!(err.contains("unknown field `source`"), "got: {err}");
+        let err = unknown_field_error(r#"{"type": "aggregate", "source": ["gen"]}"#);
+        assert!(err.contains("unknown field `source`"), "got: {err}");
+    }
+
+    /// `Component` consumes its four common keys before the flattened, `deny_unknown_fields`
+    /// `ComponentKind` sees the rest, so the common keys must keep parsing on every shape of
+    /// variant: a field-less one, a plain one, and the two that flatten `TailOptions`.
+    #[test]
+    fn the_common_keys_parse_on_every_shape_of_kind() {
+        let common = r#""sources": ["a"], "targets": [], "buffer": {}, "receive": {}"#;
+        for kind in [
+            r#""type": "null_out""#,
+            r#""type": "keep", "fields": ["host"]"#,
+            r#""type": "statsd_in", "bind": "127.0.0.1:8125""#,
+            r#""type": "tail_in", "paths": ["/var/log/app.log"]"#,
+            r#""type": "docker_in", "discover": true"#,
+        ] {
+            let component: Component = serde_json::from_str(&format!("{{{kind}, {common}}}"))
+                .unwrap_or_else(|err| panic!("{kind}: {err}"));
+            assert_eq!(component.sources, vec!["a".to_string()], "{kind}");
+        }
+    }
+
+    #[test]
+    fn tail_in_and_docker_in_reject_an_unknown_key_and_accept_every_tail_option() {
+        let options = r#""checkpoint_path": "/var/lib/logit/tail.ckpt", "read_from": "beginning",
+            "watch": "poll", "poll_interval": "2s", "checkpoint_interval": "10s",
+            "max_line_bytes": "64KiB""#;
+        for kind in [
+            r#""type": "tail_in", "paths": ["/var/log/app.log"]"#,
+            r#""type": "docker_in", "containers": ["web"]"#,
+        ] {
+            let err = unknown_field_error(&format!(r#"{{{kind}, "read_form": "beginning"}}"#));
+            assert!(err.contains("unknown field `read_form`"), "{kind}: {err}");
+
+            let component: Component = serde_json::from_str(&format!("{{{kind}, {options}}}"))
+                .unwrap_or_else(|err| panic!("{kind}: {err}"));
+            let tail = match component.kind {
+                ComponentKind::TailIn { tail, .. } | ComponentKind::DockerIn { tail, .. } => tail,
+                other => panic!("expected a tailing kind, got {other:?}"),
+            };
+            assert_eq!(tail.checkpoint_path.as_deref(), Some("/var/lib/logit/tail.ckpt"));
+            assert_eq!(tail.read_from, ReadFrom::Beginning);
+            assert_eq!(tail.watch, WatchMode::Poll);
+            assert_eq!(tail.poll_interval, Duration::from_secs(2));
+            assert_eq!(tail.checkpoint_interval, Duration::from_secs(10));
+            assert_eq!(tail.max_line_bytes, 64 * 1024);
+        }
+    }
+
+    /// One case per nested config struct that takes a fixed set of keys.
+    #[test]
+    fn nested_config_blocks_reject_an_unknown_key() {
+        for (json, key) in [
+            (
+                r#"{"type": "kv_metrics", "sources": ["in"],
+                    "counters": [{"name": "requests", "feild": "status"}]}"#,
+                "feild",
+            ),
+            (
+                r#"{"type": "keep_values", "sources": ["in"],
+                    "attributes": {"host": {"allow": ["a"], "default": "other"}}}"#,
+                "default",
+            ),
+            (
+                r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "https://tempo:4318",
+                    "tls": {"ca": "/etc/ca.pem"}}"#,
+                "ca",
+            ),
+            (
+                r#"{"type": "logit_in", "bind": "0.0.0.0:7000",
+                    "tls": {"cert_file": "c.pem", "key_file": "k.pem", "client_ca": "ca.pem"}}"#,
+                "client_ca",
+            ),
+            (
+                r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "http://tempo:4318",
+                    "paths": {"log": "/v1/logs"}}"#,
+                "log",
+            ),
+            (
+                r#"{"type": "syslog_out", "sources": ["in"], "endpoint": "127.0.0.1:514",
+                    "structured_data": {"sd_id": "myapp@12345", "params": {}}}"#,
+                "params",
+            ),
+        ] {
+            let err = unknown_field_error(json);
+            assert!(err.contains(&format!("unknown field `{key}`")), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_top_level_key_is_rejected() {
+        let err = serde_json::from_str::<Config>(r#"{"component": {}}"#)
+            .expect_err("an unknown top-level key should be rejected");
+        assert!(err.to_string().contains("unknown field `component`"), "got: {err}");
+    }
+
+    /// A component's error names its id, and an unknown-key error points at the common keys the
+    /// kind's own list leaves out.
+    #[test]
+    fn a_component_error_names_the_component_id() {
+        let err = serde_json::from_str::<Config>(
+            r#"{"components": {
+                "gen": {"type": "generate_in"},
+                "agg": {"type": "aggregate", "source": ["gen"]},
+                "out": {"type": "null_out", "sources": ["agg"]}}}"#,
+        )
+        .expect_err("`source` should be rejected")
+        .to_string();
+        assert!(err.starts_with("component `agg`: unknown field `source`"), "got: {err}");
+        assert!(err.contains("every component also accepts `sources`"), "got: {err}");
+
+        let err = serde_json::from_str::<Config>(r#"{"components": {"t": {"type": "tail_in"}}}"#)
+            .expect_err("`paths` is required")
+            .to_string();
+        assert!(err.starts_with("component `t`: missing field `paths`"), "got: {err}");
+        assert!(!err.contains("also accepts"), "got: {err}");
+    }
+
+    /// The schema closes every variant, so it has to list the common keys on each one or it
+    /// would reject every `sources:`.
+    #[test]
+    fn every_component_variant_in_the_schema_is_closed_and_lists_the_common_keys() {
+        let schema = serde_json::to_value(json_schema()).unwrap();
+        let variants = schema["definitions"]["Component"]["oneOf"].as_array().unwrap();
+        assert!(!variants.is_empty());
+        for variant in variants {
+            let kind = &variant["properties"]["type"]["enum"][0];
+            assert_eq!(variant["additionalProperties"], false, "{kind}");
+            for key in ["sources", "targets", "buffer", "receive"] {
+                assert!(variant["properties"].get(key).is_some(), "{kind} lacks `{key}`");
             }
         }
     }
