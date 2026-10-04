@@ -40,9 +40,9 @@
 //!   `gauge_delta_unresolved`.
 //!
 //! **Lossy metric kinds.** OTLP has no mergeable-sketch type. `ExponentialHistogram` is the nearest
-//! shape, but `DdSketch` exposes no bin iteration to convert from (`logit_core::metric`), and a
-//! fabricated one would be a non-mergeable stand-in, the mistake AGENTS.md warns against for
-//! `HyperLogLog`. So `Distribution` degrades to fixed quantiles. This is the
+//! shape, but its base is `2^(2^-scale)` and a `DdSketch`'s γ isn't (1.015625 under
+//! `Mapping::agent`, `logit_core::sketch`), so converting would re-bin every bin into a different
+//! sketch rather than carry this one. So `Distribution` degrades to fixed quantiles. This is the
 //! qualification ADR `committed-pregenerated-otlp-protobuf` makes against ADR
 //! `native-wire-format-with-otlp-bridge`: `logit`'s model (raw samples and members, a mergeable
 //! sketch, a mergeable cardinality estimator) can't all be re-expressed *as* OTLP.
