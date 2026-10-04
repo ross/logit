@@ -329,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn decimal_nanos_overflow_is_none_not_a_panic() {
+    fn decimal_nanos_overflow_is_distinct_from_invalid() {
         assert_eq!(
             parse_decimal_nanos("9223372036854775808", 1),
             Err(DecimalError::Overflow),
@@ -340,7 +340,15 @@ mod tests {
             Err(DecimalError::Overflow),
             "overflows on scale"
         );
+        assert_eq!(
+            parse_decimal_nanos("9223372036.854775808", 1_000_000_000),
+            Err(DecimalError::Overflow),
+            "fraction path"
+        );
         assert_eq!(parse_decimal_nanos("9223372036.854775807", 1_000_000_000), Ok(i64::MAX));
+        for text in ["1.5", "", ".5"] {
+            assert_eq!(parse_decimal_nanos(text, 1), Err(DecimalError::Invalid), "{text:?}");
+        }
     }
 
     #[test]
