@@ -234,3 +234,33 @@ not acknowledging is the backpressure, as today. The wire form is W3's own ADR a
   pipeline ending in decision 11 of
   [ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md). It
   amends `delivery-semantics` item 2 and item 5's table. Each carries a dated pointer here.
+
+## Amendment: `otlp_out` departs from the OTLP specification's non-retryable list (2026-10-04)
+
+The [OTLP specification](https://github.com/open-telemetry/opentelemetry-proto/blob/main/docs/specification.md#failures)
+says a client MUST NOT retry three answers that the
+[retryable set](https://github.com/open-telemetry/opentelemetry-proto/blob/main/docs/specification.md#retryable-response-codes)
+leaves out: an HTTP `5xx` other than `502`, `503`, and `504` ("All other `4xx` or `5xx` response
+status codes MUST NOT be retried"), a gRPC `INTERNAL`, and a gRPC `RESOURCE_EXHAUSTED` without a
+`RetryInfo` detail. The OpenTelemetry Collector's OTLP exporters drop all three as permanent.
+
+`otlp_out` reads them as `Ambiguous` instead, the class this record's status-only default gives a
+`5xx`:
+
+- **The server failed, not the batch.** A `Rejected` answer means the destination refused this
+  batch for its own content. A `500` or an `INTERNAL` says the server couldn't process the
+  request, and a `RESOURCE_EXHAUSTED` says it ran short; none says a resend would get the same
+  answer.
+- **The specification's rule avoids a duplicate, and the posture governs duplicates.** A request
+  that failed this way may have been applied. `at_least_once` accepts that risk and retries;
+  `at_most_once` refuses it and drops ([ADR `delivery-semantics`](delivery-semantics.md), item 5).
+  Reading the answer as `Rejected` would drop the batch under both, overriding the operator's
+  choice.
+
+Consequence: under `at_least_once`, a backend that answers `RESOURCE_EXHAUSTED` for a rate limit,
+or `500` for a transient failure, as New Relic's OTLP intake documents
+([docs/plans/newrelic-relay.md](../plans/newrelic-relay.md)), holds the batch and retries it with
+backoff until the backend recovers, where the Collector would drop it; a resend can store the batch
+twice if the first attempt was applied. Under `at_most_once` the batch drops at once, counted
+`batches.dropped{reason="ambiguous_at_most_once"}`. Every other row of `otlp_out`'s table follows the
+specification; the table is `crates/logit-outputs/src/otlp.rs`'s module doc, "Response classes".

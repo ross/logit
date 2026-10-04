@@ -1719,6 +1719,22 @@ the graph down, a request is refused: HTTP `503` with `Retry-After: 1`, or gRPC 
 (`UNAVAILABLE`). Both are retryable, and OTLP exporters retry them. It's counted
 `logit.input.batches.dropped{reason="closed_consumer"}`.
 
+## `otlp_out`: a server failure is retried, not dropped
+
+The OTLP specification says a client must not retry an HTTP `5xx` other than `502`, `503`, and
+`504`, a gRPC `INTERNAL`, or a gRPC `RESOURCE_EXHAUSTED` without a `RetryInfo` detail, and the
+OpenTelemetry Collector drops all three. `otlp_out` departs from that and reads them as
+`ambiguous`: each says the server failed, not that the batch is bad. Under the default,
+`at_least_once`, the sink holds the batch and retries it with backoff, so a backend that answers
+`RESOURCE_EXHAUSTED` for a rate limit, or `500` for a transient failure, as New Relic's OTLP
+intake documents (`docs/plans/newrelic-relay.md`), gets the batch once it recovers, at the
+risk of a duplicate if the first attempt was applied. Under `buffer.delivery: at_most_once` the
+batch drops at once, counted `batches.dropped{reason="ambiguous_at_most_once"}`. See
+[ADR `sink-fault-classes`](adr/sink-fault-classes.md), "Amendment: `otlp_out` departs from the
+OTLP specification's non-retryable list (2026-10-04)", and the table in
+[`otlp.rs`](../crates/logit-outputs/src/otlp.rs)'s module doc for every answer `otlp_out`
+distinguishes.
+
 ## `datadog_in`: standing in for Datadog's intake
 
 To choose between this and the other Datadog topologies, and for the rules that lose data when

@@ -58,7 +58,9 @@
 //! **Response classes.** Each request's class, from the OTLP specification's failure rules
 //! ([OTLP/gRPC failures][grpc-failures], [OTLP/HTTP failures][http-failures]): a retryable answer
 //! is `Ambiguous`, and an answer the specification says a client "MUST NOT retry" is `Rejected`,
-//! except where it describes the path to the receiver rather than a signal. The HTTP half is
+//! except where it describes the path to the receiver rather than a signal, and except a server
+//! failure (HTTP `5xx`, gRPC `INTERNAL` and `RESOURCE_EXHAUSTED`), which stays `Ambiguous` (the
+//! rows below say why). The HTTP half is
 //! `http_status_fault`, overriding [`crate::http::classify_status`]; the gRPC half is
 //! `grpc_fault`. A `Rejected` request is counted and the send goes on to the next signal; every
 //! other class stops the send.
@@ -70,13 +72,13 @@
 //! | HTTP `400` | `Rejected` | "The client MUST NOT retry the request when it receives `HTTP 400 Bad Request`" | [bad data][bad-data] |
 //! | HTTP `401`, `403`, `404`, `501` | `Rejected` | outside the retryable set; and they name one signal's request: a credential scoped per signal, or a backend that serves only some signals (above) | [retryable response codes][retryable] |
 //! | HTTP `405`, `407` | `Refused` | a wrong method or a proxy credential describes the path to the receiver, the same for every signal and every batch; holding resends nothing the receiver refused for its content | [`crate::http::classify_status`] |
-//! | any other HTTP `4xx` or `5xx`, `500` included | `Rejected` | "All other `4xx` or `5xx` response status codes MUST NOT be retried" | [retryable response codes][retryable] |
+//! | any other HTTP `5xx` (`500`, `505`, ...) | `Ambiguous` | the specification lists these as not retryable, and `otlp_out` departs from it: a `5xx` says the server failed, not the batch, so it isn't a rejection under ADR `sink-fault-classes`; the specification's rule avoids a duplicate, which the posture governs (`at_least_once` retries, `at_most_once` drops). See `docs/adr/sink-fault-classes.md`, "Amendment: `otlp_out` departs from the OTLP specification's non-retryable list (2026-10-04)" | [retryable response codes][retryable] |
+//! | any other HTTP `4xx` | `Rejected` | "All other `4xx` or `5xx` response status codes MUST NOT be retried" | [retryable response codes][retryable] |
 //! | any HTTP `3xx` | `Rejected` | redirects are off ([`crate::http::build_client`] says why) | [all other responses][other] |
 //! | gRPC `CANCELLED`, `DEADLINE_EXCEEDED`, `ABORTED`, `OUT_OF_RANGE`, `UNAVAILABLE`, `DATA_LOSS` | `Ambiguous` | retryable in the specification's table | [OTLP/gRPC failures][grpc-failures] |
-//! | gRPC `RESOURCE_EXHAUSTED` with a `google.rpc.RetryInfo` in `grpc-status-details-bin` | `Ambiguous` | "retryable only if the server signals that the recovery from resource exhaustion is possible", by a `RetryInfo` | [OTLP/gRPC failures][grpc-failures] |
-//! | gRPC `RESOURCE_EXHAUSTED` without one | `Rejected` | "SHOULD be treated as non-retryable" | [OTLP/gRPC failures][grpc-failures] |
+//! | gRPC `RESOURCE_EXHAUSTED`, with or without a `RetryInfo`, and `INTERNAL` | `Ambiguous` | the specification lists `INTERNAL`, and `RESOURCE_EXHAUSTED` without a `RetryInfo`, as not retryable, and `otlp_out` departs from it: each says the server failed or ran short, not that the batch is bad; the posture governs the duplicate a retry risks. See `docs/adr/sink-fault-classes.md`, "Amendment: `otlp_out` departs from the OTLP specification's non-retryable list (2026-10-04)" | [OTLP/gRPC failures][grpc-failures] |
 //! | gRPC `UNAUTHENTICATED`, `PERMISSION_DENIED`, `UNIMPLEMENTED`, `NOT_FOUND` | `Rejected` | not retryable in the table; and they name one signal's request (above) | [OTLP/gRPC failures][grpc-failures] |
-//! | gRPC `INVALID_ARGUMENT`, `UNKNOWN`, `INTERNAL`, `ALREADY_EXISTS`, `FAILED_PRECONDITION`, and any code the table doesn't list | `Rejected` | not retryable in the table; an unlisted code is never retried | [OTLP/gRPC failures][grpc-failures] |
+//! | gRPC `INVALID_ARGUMENT`, `UNKNOWN`, `ALREADY_EXISTS`, `FAILED_PRECONDITION`, and any code the table doesn't list | `Rejected` | not retryable in the table; an unlisted code is never retried | [OTLP/gRPC failures][grpc-failures] |
 //! | connect refused, DNS failure, TLS handshake failure | `Clean` | no request left the process | [all other responses][other] |
 //! | timeout, a reset after the request left, a gRPC response with no `grpc-status` | `Ambiguous` | "If the server disconnects without returning a response, the client SHOULD retry" | [all other responses][other] |
 //!
@@ -456,9 +458,8 @@ impl OtlpOutput {
             self.record_partial_success(signal, rejected, &err_msg);
             Ok(())
         } else {
-            let retry_info = if status.retry_info { ", with RetryInfo" } else { "" };
             let err = anyhow::anyhow!(
-                "OTLP/gRPC {} write failed (grpc-status {code}{retry_info}): {}",
+                "OTLP/gRPC {} write failed (grpc-status {code}): {}",
                 signal.as_str(),
                 status.message,
             )
@@ -607,53 +608,35 @@ fn grpc_status_class(code: u32) -> &'static str {
     }
 }
 
-/// An OTLP/HTTP status's [`Fault`], per the module doc's "Response classes". The OTLP
-/// specification's retryable set (`429`, `502`, `503`, `504`) is `Ambiguous` and every other `4xx`
-/// or `5xx` is `Rejected`, except `405` and `407`, which keep [`classify_status`]'s `Refused`: they
-/// describe the path to the receiver, not a signal.
+/// [`classify_status`], except `401`, `403`, `404`, and `501`: they name one signal's endpoint or
+/// credential scope, not the destination, so they're `Rejected` (the module doc's "Response
+/// classes"). Every other `5xx` stays `Ambiguous`, where the OTLP specification says not to retry:
+/// the server failed, not the batch, and the posture governs a duplicate.
 fn http_status_fault(status: reqwest::StatusCode) -> Fault {
     match status.as_u16() {
-        429 | 502 | 503 | 504 => Fault::Ambiguous,
-        405 | 407 => Fault::Refused,
-        400..=599 => Fault::Rejected,
+        401 | 403 | 404 | 501 => Fault::Rejected,
         _ => classify_status(status),
     }
 }
 
-/// A gRPC response's status: `grpc-status`, `grpc-message`, and whether
-/// `grpc-status-details-bin` carries a `google.rpc.RetryInfo`.
+/// A gRPC response's status: `grpc-status` and `grpc-message`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GrpcStatus {
     code: u32,
     message: String,
-    retry_info: bool,
 }
 
-/// A gRPC status's [`Fault`], per the OTLP specification's table (the module doc's "Response
-/// classes"). The retryable codes are `Ambiguous`, `RESOURCE_EXHAUSTED` only with a `RetryInfo`
-/// detail; every other code is `Rejected`, an unlisted one included, as in
-/// `logit_pipeline::classify`: never retry what isn't known to be transient.
+/// A gRPC status's [`Fault`], per the module doc's "Response classes": the OTLP specification's
+/// retryable codes, plus `RESOURCE_EXHAUSTED` and `INTERNAL`, are `Ambiguous`; every other code is
+/// `Rejected`, an unlisted one included, as in `logit_pipeline::classify`: never retry what isn't
+/// known to be transient.
 fn grpc_fault(status: &GrpcStatus) -> Fault {
     match status.code {
-        // CANCELLED, DEADLINE_EXCEEDED, ABORTED, OUT_OF_RANGE, UNAVAILABLE, DATA_LOSS
-        1 | 4 | 10 | 11 | 14 | 15 => Fault::Ambiguous,
-        8 if status.retry_info => Fault::Ambiguous,
+        // CANCELLED, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED, ABORTED, OUT_OF_RANGE, INTERNAL,
+        // UNAVAILABLE, DATA_LOSS
+        1 | 4 | 8 | 10 | 11 | 13 | 14 | 15 => Fault::Ambiguous,
         _ => Fault::Rejected,
     }
-}
-
-/// The `type_url` an `Any` in `google.rpc.Status.details` carries for a `RetryInfo`.
-const RETRY_INFO_TYPE: &[u8] = b"type.googleapis.com/google.rpc.RetryInfo";
-
-/// Whether a `grpc-status-details-bin` value names a `RetryInfo` detail. The value is a base64
-/// `google.rpc.Status` (padded or not, per gRPC's binary-header rule); a value that doesn't
-/// decode names none. A substring test, not a decode: the `type_url` is the one fact read.
-fn names_retry_info(value: &[u8]) -> bool {
-    use base64::Engine as _;
-    let trimmed = value.strip_suffix(b"==").or(value.strip_suffix(b"=")).unwrap_or(value);
-    base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(trimmed)
-        .is_ok_and(|bytes| bytes.windows(RETRY_INFO_TYPE.len()).any(|w| w == RETRY_INFO_TYPE))
 }
 
 /// One gRPC unary round trip: send one framed request, return the response payload and its
@@ -733,16 +716,14 @@ async fn grpc_roundtrip(
     Ok((status, Bytes::copy_from_slice(response_payload)))
 }
 
-/// Reads `grpc-status`, `grpc-message`, and `grpc-status-details-bin` from headers or trailers.
+/// Reads `grpc-status` and `grpc-message` from headers or trailers.
 /// `None` if `grpc-status` is absent or not an unsigned integer: "no status here", never
 /// "status 0".
 fn grpc_status_from(headers: &HeaderMap) -> Option<GrpcStatus> {
     let code = headers.get("grpc-status")?.to_str().ok()?.parse::<u32>().ok()?;
     let message =
         headers.get("grpc-message").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    let retry_info =
-        headers.get("grpc-status-details-bin").is_some_and(|v| names_retry_info(v.as_bytes()));
-    Some(GrpcStatus { code, message, retry_info })
+    Some(GrpcStatus { code, message })
 }
 
 /// Frames `payload` as one gRPC message: `[compressed:u8][len:u32 BE][payload]`, the shape of
@@ -1258,16 +1239,6 @@ mod tests {
         message: &'static str,
         payload: Vec<u8>,
     ) -> std::net::SocketAddr {
-        canned_grpc_server_with_details(status, message, payload, None).await
-    }
-
-    /// [`canned_grpc_server`], with `details` as the `grpc-status-details-bin` trailer when set.
-    async fn canned_grpc_server_with_details(
-        status: u32,
-        message: &'static str,
-        payload: Vec<u8>,
-        details: Option<String>,
-    ) -> std::net::SocketAddr {
         use hyper::service::service_fn;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1277,19 +1248,13 @@ mod tests {
                 let Ok((stream, _)) = listener.accept().await else { return };
                 let io = TokioIo::new(stream);
                 let payload = payload.clone();
-                let details = details.clone();
                 tokio::spawn(async move {
                     let svc = service_fn(move |_req: http::Request<hyper::body::Incoming>| {
                         let payload = payload.clone();
-                        let details = details.clone();
                         async move {
                             let mut trailers = HeaderMap::new();
                             trailers.insert("grpc-status", status.to_string().parse().unwrap());
                             trailers.insert("grpc-message", message.parse().unwrap());
-                            if let Some(details) = details {
-                                trailers
-                                    .insert("grpc-status-details-bin", details.parse().unwrap());
-                            }
                             let frame = grpc_frame(&payload, false);
                             let body = TestGrpcBody {
                                 data: Some(Bytes::from(frame)),
@@ -1615,29 +1580,9 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
     }
 
-    /// A `google.rpc.Status` for `RESOURCE_EXHAUSTED` whose one detail is a `RetryInfo` asking
-    /// for a one-second delay, base64 as gRPC sends `grpc-status-details-bin`: unpadded when
-    /// `padded` is false.
-    fn retry_info_details(padded: bool) -> String {
-        use base64::Engine as _;
-        let retry_info = [0x0a, 0x02, 0x08, 0x01]; // retry_delay { seconds: 1 }
-        let mut any = vec![0x0a, RETRY_INFO_TYPE.len() as u8];
-        any.extend_from_slice(RETRY_INFO_TYPE);
-        any.extend_from_slice(&[0x12, retry_info.len() as u8]);
-        any.extend_from_slice(&retry_info);
-        let mut status = vec![0x08, 8, 0x1a, any.len() as u8];
-        status.extend_from_slice(&any);
-        if padded {
-            base64::engine::general_purpose::STANDARD.encode(status)
-        } else {
-            base64::engine::general_purpose::STANDARD_NO_PAD.encode(status)
-        }
-    }
-
-    /// The class `send` reads from a gRPC answer of `code`, with `details` as its
-    /// `grpc-status-details-bin`.
-    async fn grpc_class(code: u32, details: Option<String>) -> Fault {
-        let addr = canned_grpc_server_with_details(code, "failed", Vec::new(), details).await;
+    /// The class `send` reads from a gRPC answer of `code`.
+    async fn grpc_class(code: u32) -> Fault {
+        let addr = canned_grpc_server(code, "failed", Vec::new()).await;
         let err = grpc_output(addr).send(&metric_batch()).await.expect_err("should fail");
         logit_pipeline::classify(&err)
     }
@@ -1648,35 +1593,23 @@ mod tests {
     async fn the_grpc_retryable_codes_are_ambiguous() {
         // CANCELLED, DEADLINE_EXCEEDED, ABORTED, OUT_OF_RANGE, UNAVAILABLE, DATA_LOSS
         for code in [1, 4, 10, 11, 14, 15] {
-            assert_eq!(grpc_class(code, None).await, Fault::Ambiguous, "{code}");
+            assert_eq!(grpc_class(code).await, Fault::Ambiguous, "{code}");
         }
     }
 
+    /// The specification's non-retryable list holds these; `otlp_out` departs from it.
     #[tokio::test]
-    async fn grpc_resource_exhausted_with_retry_info_is_ambiguous() {
-        for padded in [true, false] {
-            let details = Some(retry_info_details(padded));
-            assert_eq!(grpc_class(8, details).await, Fault::Ambiguous, "padded: {padded}");
+    async fn grpc_resource_exhausted_and_internal_are_ambiguous() {
+        for code in [8, 13] {
+            assert_eq!(grpc_class(code).await, Fault::Ambiguous, "{code}");
         }
-    }
-
-    #[tokio::test]
-    async fn grpc_resource_exhausted_without_retry_info_is_rejected() {
-        assert_eq!(grpc_class(8, None).await, Fault::Rejected);
-        // A details trailer that names no RetryInfo, and one that isn't base64, name none.
-        let no_retry_info = {
-            use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD.encode([0x08, 8])
-        };
-        assert_eq!(grpc_class(8, Some(no_retry_info)).await, Fault::Rejected);
-        assert_eq!(grpc_class(8, Some("not base64!".into())).await, Fault::Rejected);
     }
 
     #[tokio::test]
     async fn the_grpc_non_retryable_codes_are_rejected() {
-        // UNKNOWN, INVALID_ARGUMENT, ALREADY_EXISTS, FAILED_PRECONDITION, INTERNAL, an unlisted code
-        for code in [2, 3, 6, 9, 13, 99] {
-            assert_eq!(grpc_class(code, None).await, Fault::Rejected, "{code}");
+        // UNKNOWN, INVALID_ARGUMENT, ALREADY_EXISTS, FAILED_PRECONDITION, an unlisted code
+        for code in [2, 3, 6, 9, 99] {
+            assert_eq!(grpc_class(code).await, Fault::Rejected, "{code}");
         }
     }
 
@@ -1688,10 +1621,16 @@ mod tests {
         for code in [429, 502, 503, 504] {
             assert_eq!(fault(code), Fault::Ambiguous, "the retryable set: {code}");
         }
+        for code in [500, 505, 511] {
+            assert_eq!(fault(code), Fault::Ambiguous, "the server failed, not the batch: {code}");
+        }
         for code in [405, 407] {
             assert_eq!(fault(code), Fault::Refused, "the path to the receiver: {code}");
         }
-        for code in [400, 408, 409, 413, 415, 422, 500, 505, 511] {
+        for code in [401, 403, 404, 501] {
+            assert_eq!(fault(code), Fault::Rejected, "one signal's request: {code}");
+        }
+        for code in [400, 408, 409, 413, 415, 422] {
             assert_eq!(fault(code), Fault::Rejected, "MUST NOT be retried: {code}");
         }
         for code in [301, 302, 307, 308] {
@@ -1700,12 +1639,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_http_500_is_rejected() {
+    async fn an_http_500_is_ambiguous() {
         const RESP_500: &str =
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let (addr, _count) = canned_http_server(vec![RESP_500]).await;
         let err = http_output(addr).send(&metric_batch()).await.expect_err("a 500 fails send");
-        assert_eq!(logit_pipeline::classify(&err), Fault::Rejected);
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
     }
 
     #[tokio::test]
