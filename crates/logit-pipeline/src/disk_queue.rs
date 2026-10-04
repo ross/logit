@@ -905,6 +905,12 @@ impl DiskQueue {
         state.diag.warn_throttled("disk_fs_error", format!("{what}: {err}"));
     }
 
+    /// How many records are queued and uncommitted, a read-ahead head included.
+    pub fn queued(&self) -> usize {
+        let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        usize::try_from(state.queued_records).unwrap_or(usize::MAX)
+    }
+
     fn after_change(&self) {
         let (total_bytes, queued_records, segment_count) = {
             let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());

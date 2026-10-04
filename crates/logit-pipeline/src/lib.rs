@@ -41,7 +41,7 @@ pub use disk_queue::{DiskQueue, DiskQueueConfig};
 pub use fanout::{BatchContext, Delivered, Edge, Fanout, SendTimeout, TraceContext};
 pub use input::{Input, InputRuntimeConfig};
 pub use logit_proto::native::SeqId;
-pub use output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault, Output};
+pub use output::{classify, is_retryable, DeliveryPosture, Fault, Output};
 pub use queue::{
     BoundedQueue, CountedDrain, OverflowPolicy, QueueConfig, QueueMetrics, Queued, SinkQueue,
     SinkQueueConfig, SinkStore, SinkStoreConfig, StoreItem, SINK_QUEUE_METRICS,
@@ -51,6 +51,5 @@ pub use router::{Destination, Router, RouterScratch};
 pub use runtime::{
     process_batch, route_batch, run, run_with_shutdown, run_with_telemetry, send_batch,
     unwrap_batch, LuaRuntimeConfig, NodeSpec, RetryConfig, RunError, WriteLoopConfig,
-    PERMANENT_FAILURE_WINDOW,
 };
 pub use transform::{FlushOutput, FlushedEvent, Transform};

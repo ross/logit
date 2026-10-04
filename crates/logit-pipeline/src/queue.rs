@@ -605,6 +605,11 @@ impl<T: Queued> BoundedQueue<T> {
 }
 
 impl<T: Queued + Clone> BoundedQueue<T> {
+    /// How many items are queued, a reserved head included.
+    pub fn queued(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
+    }
+
     /// A clone of the head, without removing it, for a caller that removes it with
     /// [`BoundedQueue::commit`] only once its action succeeds. Reserves the head against
     /// `DropOldest` eviction until that `commit`, so a delivered batch is the one committed. A
@@ -721,6 +726,11 @@ impl SinkQueue {
         self.queue.commit()
     }
 
+    /// See [`BoundedQueue::queued`].
+    pub fn queued(&self) -> usize {
+        self.queue.queued()
+    }
+
     pub fn close(&self) {
         self.queue.close()
     }
@@ -807,6 +817,15 @@ impl SinkStore {
         match self {
             SinkStore::Memory(q) => q.commit(),
             SinkStore::Disk(q) => q.commit(),
+        }
+    }
+
+    /// How many batches are queued, a reserved head included: the depth the
+    /// `logit.component.buffer.batches` gauge reports.
+    pub fn queued(&self) -> usize {
+        match self {
+            SinkStore::Memory(q) => q.queued(),
+            SinkStore::Disk(q) => q.queued(),
         }
     }
 

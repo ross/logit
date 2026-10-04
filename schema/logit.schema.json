@@ -108,13 +108,8 @@
             }
           ]
         },
-        "retry_budget": {
-          "description": "Hard ceiling on the total time spent retrying one batch, across every attempt and backoff sleep. Must be greater than `0s`. Defaults to `60s`.",
-          "default": "60s",
-          "type": "string"
-        },
         "retry_max_delay": {
-          "description": "Cap on the exponential backoff between retry attempts, which starts at 200 ms and doubles. A value below 200 ms caps every backoff. Must be greater than `0s`. Defaults to `10s`.",
+          "description": "Cap on the exponential backoff between retry attempts, which starts at 200 ms and doubles. A batch that fails retryably is retried until it's delivered or the sink shuts down, and batches queue behind it up to `max_batches` and `max_bytes`, then follow `overflow`. A value below 200 ms caps every backoff. Must be greater than `0s`. Defaults to `10s`.",
           "default": "10s",
           "type": "string"
         },
@@ -3128,7 +3123,6 @@
             "max_batches": 1024,
             "max_bytes": "67108864",
             "overflow": "block",
-            "retry_budget": "60s",
             "retry_max_delay": "10s",
             "shutdown_grace": "5s"
           },

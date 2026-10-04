@@ -1,6 +1,7 @@
 //! The `Output` trait, plus [`Fault`]/[`DeliveryPosture`]/[`is_retryable`]: the classification
 //! and policy the generic writer (`crate::runtime::write_loop`) uses to decide whether a failed
-//! `send` is worth retrying. See `docs/adr/buffered-sink-delivery.md`.
+//! `send` is worth retrying. See `docs/adr/buffered-sink-delivery.md` and
+//! `docs/adr/sink-fault-classes.md`.
 
 use crate::fanout::BatchContext;
 use logit_core::EventBatch;
@@ -21,8 +22,8 @@ use logit_proto::native::SeqId;
 /// (`docs/adr/arc-eventbatch-copy-on-write.md`).
 ///
 /// Retry is the runtime's job too. `send` is a single attempt that reports what a failure means
-/// via [`Fault`] (`.context(fault)` on the returned error); `write_loop` owns retry timing,
-/// budget, and the retryable/permanent decision, from [`is_retryable`] and the resolved
+/// via [`Fault`] (`.context(fault)` on the returned error); `write_loop` owns retry timing and
+/// the retry-or-drop decision, from [`is_retryable`] and the resolved
 /// [`DeliveryPosture`]: `buffer.delivery` when the operator set it, else
 /// [`Output::default_posture`]. A sink runs no retry loop of its own. Inside one attempt it may
 /// resend, bounded, on a verdict that proves the resend safe, or poll, bounded, for a verdict:
@@ -35,9 +36,9 @@ use logit_proto::native::SeqId;
 /// - `splunk_hec_out`'s one split of a body Splunk Cloud answered as over its cap, each half sent
 ///   once (`SplunkHecOutput::send_body`);
 /// - `otlp_out`, `datadog_out`, and `datadog_trace_out` go on to the next request when one is
-///   answered with a `Permanent` verdict that names it, count its records
-///   `records.dropped{reason="rejected"}`, and return `Ok` if any request was accepted. A verdict
-///   that refuses the sink, a `Clean`, or an `Ambiguous` stops the send
+///   answered with a [`Fault::Rejected`] verdict, count its records
+///   `records.dropped{reason="rejected"}`, and return `Ok` if any request was accepted. A
+///   `Refused`, a `Clean`, or an `Ambiguous` verdict stops the send
 ///   (`docs/adr/delivery-semantics.md`, "Amendment: per-request verdicts (2026-10-04)");
 /// - `splunk_hec_out`'s `/ack` poll under `ack: true`, until every id is acknowledged or
 ///   `ack_timeout` passes (`SplunkHecOutput::await_acks`).
@@ -64,12 +65,11 @@ pub trait Output {
     /// One delivery attempt at `batch`. `write_loop` calls it once per attempt and owns the retry
     /// (the trait doc). The contract:
     ///
-    /// - **Cancellable at every await.** Each attempt races the rest of the retry budget and the
-    ///   shutdown grace, so the future can be dropped at any await; the sink must stay usable for
-    ///   the next call (`docs/design/pipeline-graph.md`'s "Cancellation points").
+    /// - **Cancellable at every await.** Each attempt races the shutdown grace, so the future can
+    ///   be dropped at any await; the sink must stay usable for the next call (`docs/design/pipeline-graph.md`'s "Cancellation points").
     /// - **The encode is synchronous**, with no await inside it, so a sink's per-batch accounting
     ///   holds across it (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 2).
-    /// - **A failure carries a [`Fault`]**; one with none classifies `Fault::Permanent`
+    /// - **A failure carries a [`Fault`]**; one with none classifies `Fault::Rejected`
     ///   ([`classify`]).
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()>;
 
@@ -156,19 +156,27 @@ pub trait Output {
     }
 }
 
-/// What a `send` failure says about whether the destination received the batch. Only the sink
-/// can tell, so it travels out of `send` as `anyhow` context (`.context(Fault::Ambiguous)`), read
-/// back by [`classify`]. See `docs/adr/buffered-sink-delivery.md`.
+/// What a `send` failure says about the batch and the destination. Only the sink can tell, so it
+/// travels out of `send` as `anyhow` context (`.context(Fault::Ambiguous)`), read back by
+/// [`classify`]. [`is_retryable`] turns a class and a posture into the retry decision. See
+/// `docs/adr/sink-fault-classes.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
-    /// The destination provably never saw the batch (connect refused, DNS failure). Safe to retry
-    /// under any delivery posture.
+    /// The destination never saw the batch (connect refused, DNS failure). Retried under either
+    /// posture.
     Clean,
-    /// The batch may have been committed before the response was lost (timeout, 5xx, 429).
+    /// The batch may have been applied before the response was lost (timeout, `5xx`, `429`).
     /// Retried only under `DeliveryPosture::AtLeastOnce`.
     Ambiguous,
-    /// A configuration error (a 4xx other than 429). Never retried.
-    Permanent,
+    /// The destination refused this batch for its own content (a malformed body, an oversize
+    /// payload); a resend can't succeed. Never retried: `write_loop` drops it at once, so
+    /// nothing behind it waits.
+    Rejected,
+    /// The destination refuses every batch for now (credentials, an unknown tenant or bucket, a
+    /// protocol mismatch), and nothing was applied. Retried under either posture until it
+    /// succeeds or shutdown cuts it, so the head holds while the operator or the destination
+    /// fixes the cause.
+    Refused,
 }
 
 impl std::fmt::Display for Fault {
@@ -176,31 +184,24 @@ impl std::fmt::Display for Fault {
         let s = match self {
             Fault::Clean => "clean",
             Fault::Ambiguous => "ambiguous",
-            Fault::Permanent => "permanent",
+            Fault::Rejected => "rejected",
+            Fault::Refused => "refused",
         };
         f.write_str(s)
     }
 }
 
 /// Reads `err` for an attached [`Fault`] marker (a sink's `.context(fault)`), defaulting to
-/// [`Fault::Permanent`] when none is found: never retry a failure the sink didn't recognize.
+/// [`Fault::Rejected`] when none is found: a failure the sink didn't recognize is never retried.
+/// The default is a retry decision, not a claim about the destination.
 ///
 /// Not `err.chain().find_map(|e| e.downcast_ref::<Fault>())`: each link's concrete type is
 /// anyhow's internal `ContextError<Fault, _>`, so `dyn Error::downcast_ref` never matches and
-/// every error would classify `Permanent`. The inherent `anyhow::Error::downcast_ref` looks
+/// every error would classify `Rejected`. The inherent `anyhow::Error::downcast_ref` looks
 /// inside its context wrappers, through any further `.context(...)` layers stacked on top (such
 /// as `write_loop`'s `component '{id}'`).
 pub fn classify(err: &anyhow::Error) -> Fault {
-    err.downcast_ref::<Fault>().copied().unwrap_or(Fault::Permanent)
-}
-
-/// Whether `err` carries an explicit `Fault::Permanent` marker from the sink, as opposed to
-/// [`classify`]'s default when no `Fault` is attached. Only an explicit marker counts toward
-/// `write_loop`'s sustained-permanent-failure exit window: an unclassified error (`StreamOutput`'s
-/// bare I/O errors, say a full disk) is non-retryable but is not a positively identified
-/// configuration error (a bad token) that should end the process.
-pub fn is_explicitly_permanent(err: &anyhow::Error) -> bool {
-    matches!(err.downcast_ref::<Fault>(), Some(Fault::Permanent))
+    err.downcast_ref::<Fault>().copied().unwrap_or(Fault::Rejected)
 }
 
 /// Whether a sink retries an attempt whose outcome is unknown, accepting that the destination may
@@ -215,24 +216,24 @@ pub enum DeliveryPosture {
     AtMostOnce,
 }
 
-/// Whether `fault` is worth retrying under `posture` (`docs/adr/buffered-sink-delivery.md`'s
-/// table):
+/// Whether `fault` is worth retrying under `posture` (`docs/adr/sink-fault-classes.md`, "Four
+/// classes"):
 ///
 /// | `Fault` | `AtMostOnce` | `AtLeastOnce` |
 /// |---|---|---|
 /// | `Clean` | retry | retry |
 /// | `Ambiguous` | no retry | retry |
-/// | `Permanent` | no retry | no retry |
+/// | `Rejected` | no retry | no retry |
+/// | `Refused` | retry | retry |
 ///
-/// `Clean` never reached the destination, so there is nothing to duplicate. `Ambiguous` retries
-/// only once duplicates are tolerable (`AtLeastOnce`). `Permanent` is a configuration error, not
-/// a transient condition.
+/// `Clean` and `Refused` applied nothing, so a resend can't duplicate. `Ambiguous` retries only
+/// once duplicates are tolerable (`AtLeastOnce`). `Rejected` would get the same answer again.
 pub fn is_retryable(fault: Fault, posture: DeliveryPosture) -> bool {
     match (fault, posture) {
-        (Fault::Clean, _) => true,
+        (Fault::Clean | Fault::Refused, _) => true,
         (Fault::Ambiguous, DeliveryPosture::AtLeastOnce) => true,
         (Fault::Ambiguous, DeliveryPosture::AtMostOnce) => false,
-        (Fault::Permanent, _) => false,
+        (Fault::Rejected, _) => false,
     }
 }
 
@@ -240,27 +241,31 @@ pub fn is_retryable(fault: Fault, posture: DeliveryPosture) -> bool {
 mod tests {
     use super::*;
 
-    /// Pins all 6 `(Fault, DeliveryPosture)` combinations of the ADR's table.
+    /// Pins all 8 `(Fault, DeliveryPosture)` combinations of the ADR's table.
     #[test]
     fn is_retryable_matches_the_adr_table_exhaustively() {
         use DeliveryPosture::*;
         use Fault::*;
 
-        assert!(is_retryable(Clean, AtMostOnce), "Clean should retry under AtMostOnce");
-        assert!(is_retryable(Clean, AtLeastOnce), "Clean should retry under AtLeastOnce");
-        assert!(
-            !is_retryable(Ambiguous, AtMostOnce),
-            "Ambiguous should NOT retry under AtMostOnce"
-        );
-        assert!(is_retryable(Ambiguous, AtLeastOnce), "Ambiguous SHOULD retry under AtLeastOnce");
-        assert!(
-            !is_retryable(Permanent, AtMostOnce),
-            "Permanent should never retry under AtMostOnce"
-        );
-        assert!(
-            !is_retryable(Permanent, AtLeastOnce),
-            "Permanent should never retry under AtLeastOnce"
-        );
+        let table = [
+            (Clean, AtMostOnce, true),
+            (Clean, AtLeastOnce, true),
+            (Ambiguous, AtMostOnce, false),
+            (Ambiguous, AtLeastOnce, true),
+            (Rejected, AtMostOnce, false),
+            (Rejected, AtLeastOnce, false),
+            (Refused, AtMostOnce, true),
+            (Refused, AtLeastOnce, true),
+        ];
+        for (fault, posture, retry) in table {
+            assert_eq!(is_retryable(fault, posture), retry, "{fault} under {posture:?}");
+        }
+    }
+
+    #[test]
+    fn the_class_strings_are_the_telemetry_tag_values() {
+        assert_eq!(Fault::Rejected.to_string(), "rejected");
+        assert_eq!(Fault::Refused.to_string(), "refused");
     }
 
     #[test]
@@ -284,30 +289,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_defaults_to_permanent_for_an_unclassified_error() {
+    fn classify_defaults_to_rejected_for_an_unclassified_error() {
         let err = anyhow::anyhow!("boom, no fault attached");
-        assert_eq!(classify(&err), Fault::Permanent);
-    }
-
-    #[test]
-    fn an_unclassified_error_is_never_explicitly_permanent() {
-        // classify()'s default is a retry decision, not a positively identified configuration
-        // error, so it must not count toward write_loop's permanent-failure exit window.
-        let err = anyhow::anyhow!("boom, no fault attached");
-        assert_eq!(classify(&err), Fault::Permanent, "still non-retryable by default");
-        assert!(!is_explicitly_permanent(&err), "but not an explicit classification");
-    }
-
-    #[test]
-    fn a_sink_that_explicitly_classifies_permanent_is_explicitly_permanent() {
-        let err = anyhow::anyhow!("bad token").context(Fault::Permanent);
-        assert!(is_explicitly_permanent(&err));
-    }
-
-    #[test]
-    fn clean_and_ambiguous_are_never_explicitly_permanent() {
-        assert!(!is_explicitly_permanent(&anyhow::anyhow!("x").context(Fault::Clean)));
-        assert!(!is_explicitly_permanent(&anyhow::anyhow!("x").context(Fault::Ambiguous)));
+        assert_eq!(classify(&err), Fault::Rejected);
     }
 
     #[test]

@@ -3354,13 +3354,10 @@ pub struct BufferConfig {
     /// (`at_most_once`). Set it to choose for this component.
     #[serde(default)]
     pub delivery: Option<DeliveryPosture>,
-    /// Hard ceiling on the total time spent retrying one batch, across every attempt and backoff
-    /// sleep. Must be greater than `0s`. Defaults to `60s`.
-    #[serde(with = "humantime_serde_duration")]
-    #[schemars(with = "String")]
-    pub retry_budget: Duration,
     /// Cap on the exponential backoff between retry attempts, which starts at 200 ms and doubles.
-    /// A value below 200 ms caps every backoff. Must be greater than `0s`. Defaults to `10s`.
+    /// A batch that fails retryably is retried until it's delivered or the sink shuts down, and
+    /// batches queue behind it up to `max_batches` and `max_bytes`, then follow `overflow`. A
+    /// value below 200 ms caps every backoff. Must be greater than `0s`. Defaults to `10s`.
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub retry_max_delay: Duration,
@@ -3384,7 +3381,6 @@ impl Default for BufferConfig {
             max_bytes: 64 * 1024 * 1024,
             overflow: OverflowPolicy::Block,
             delivery: None,
-            retry_budget: Duration::from_secs(60),
             retry_max_delay: Duration::from_secs(10),
             shutdown_grace: Duration::from_secs(5),
             disk: None,
@@ -6519,7 +6515,7 @@ mod tests {
             r#"{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
                 "org": "org", "bucket": "bucket", "token": "TOKEN",
                 "buffer": {"max_batches": 4096, "max_bytes": "128MiB", "overflow": "drop_oldest",
-                           "delivery": "at_least_once", "retry_budget": "120s",
+                           "delivery": "at_least_once",
                            "retry_max_delay": "20s", "shutdown_grace": "10s"}}"#,
         )
         .unwrap();
@@ -6527,7 +6523,6 @@ mod tests {
         assert_eq!(component.buffer.max_bytes, 128 * 1024 * 1024);
         assert_eq!(component.buffer.overflow, OverflowPolicy::DropOldest);
         assert_eq!(component.buffer.delivery, Some(DeliveryPosture::AtLeastOnce));
-        assert_eq!(component.buffer.retry_budget, Duration::from_secs(120));
         assert_eq!(component.buffer.retry_max_delay, Duration::from_secs(20));
         assert_eq!(component.buffer.shutdown_grace, Duration::from_secs(10));
         assert_eq!(component.buffer.disk, None);
