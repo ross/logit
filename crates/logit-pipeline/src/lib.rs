@@ -51,5 +51,6 @@ pub use router::{Destination, Router, RouterScratch};
 pub use runtime::{
     process_batch, route_batch, run, run_with_shutdown, run_with_telemetry, send_batch,
     unwrap_batch, LuaRuntimeConfig, NodeSpec, RetryConfig, RunError, WriteLoopConfig,
+    PERMANENT_FAILURE_WINDOW,
 };
 pub use transform::{FlushOutput, FlushedEvent, Transform};

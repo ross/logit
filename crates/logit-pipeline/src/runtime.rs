@@ -36,7 +36,7 @@ use tokio::task::JoinSet;
 /// restart-policy supervisor to notice; one malformed batch can't kill a healthy pipeline. Not
 /// config-exposed: `logit_config::BufferConfig` doesn't surface it. See
 /// `docs/adr/buffered-sink-delivery.md`'s "Failure handling" section.
-const PERMANENT_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+pub const PERMANENT_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Bounded channel capacity between two graph nodes. Small and arbitrary: enough to smooth bursts
 /// without unbounded memory growth. Not tuned against measurements.

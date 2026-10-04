@@ -1772,9 +1772,10 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   successful response's `partial_success`, with a throttled `otlp_partial_success` diagnostic
   carrying the collector's message.
 - `logit.output.records.dropped{signal, reason="rejected"}` (count): the records of a signal's
-  request the destination answered with a `Permanent` verdict that names the request (an HTTP
-  3xx or 4xx other than 401, 403, and 413, or gRPC `INVALID_ARGUMENT`, `UNIMPLEMENTED`, or an
-  unrecognized code). The send goes on to the other signals, and returns `Ok` if any was
+  request the destination answered with a `Permanent` verdict (an HTTP 3xx or a 4xx other than
+  429, or gRPC `INVALID_ARGUMENT`, `UNIMPLEMENTED`, `UNAUTHENTICATED`, `PERMISSION_DENIED`, or an
+  unrecognized code). An auth answer is counted here too, since a credential can be scoped per
+  signal. The send goes on to the other signals, and returns `Ok` if any was
   accepted. A throttled `signal_rejected` diagnostic names the signal, the status, and the record
   count, with a hint to place `has_signal` or `keep_signals` ahead of the sink. Counts per attempt,
   whether or not the send ends `Ok`. See [ADR `delivery-semantics`](../adr/delivery-semantics.md)'s
@@ -1805,7 +1806,7 @@ One `send` is up to eight routes' requests, so every point carries `route`: `ser
 | `logit.output.records{route}` | count | entries in a request Datadog accepted: series points, samples records, and sketches by record; logs, events, checks, spans, and stats groups by event |
 | `logit.output.records.dropped{route, reason="stale"}` | count | a record outside Datadog's window at the batch's send time, read once per batch: a metric more than 1h old or 10 min ahead, a log or event more than 18h old, a check more than 10 min old; once per batch |
 | `logit.output.records.dropped{route, reason="oversize"}` | count | an event whose body alone is over the route's byte limit, once per batch; or every entry of a request Datadog answered `413`, on the attempt that got that answer |
-| `logit.output.records.dropped{route, reason="rejected"}` | count | every entry of a request Datadog answered with a 3xx or a 4xx other than 401, 403, and 413, on the attempt that got that answer. The send goes on to the next request. A `413` counts as `oversize` instead |
+| `logit.output.records.dropped{route, reason="rejected"}` | count | every entry of a request Datadog answered with a 3xx or a 4xx other than 403 and 413, on the attempt that got that answer. The send goes on to the next request. A `413` counts as `oversize` instead |
 | `logit.output.records.dropped{route="traces", reason="needs_agent_processing"\|"not_datadog_origin"}` | count | a span whose chunk's root has no `_top_level` mark: raw tracer output, or not a Datadog span at all; once per batch |
 
 A dropped record is never sent, so a `buffer.disk:` replay after a long outage shows up here as

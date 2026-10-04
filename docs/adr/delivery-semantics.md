@@ -457,15 +457,17 @@ succeeds and its metrics request fails with gRPC `UNIMPLEMENTED`. No `send` ever
 
 1. **Accepted** (2xx or gRPC `OK`, `partial_success` included): record that something was
    accepted and go on.
-2. **`Permanent` naming the request** (a 3xx, a 4xx other than 401 and 403, gRPC
-   `INVALID_ARGUMENT`, `UNIMPLEMENTED`, or an unrecognized code): count the request's records as
+2. **`Permanent` naming the request** (a 3xx, a 4xx other than `datadog_out`'s 403, gRPC
+   `INVALID_ARGUMENT`, `UNIMPLEMENTED`, or an unrecognized code; for `otlp_out` this includes
+   HTTP 401 and 403 and gRPC `UNAUTHENTICATED` and `PERMISSION_DENIED`): count the request's records as
    `logit.output.records.dropped{reason="rejected"}` on the attempt that got the verdict, remember
    the first such error, and go on to the next request. A `413` keeps its existing
    `reason="oversize"` count.
-3. **`Permanent` refusing the sink** (HTTP 401 or 403, gRPC `UNAUTHENTICATED` or
-   `PERMISSION_DENIED`, and `datadog_out`'s 403 `api_key_rejected`): stop and return it. Every
-   remaining request would get the same answer, so continuing only spends requests. A
-   `datadog_out` `events` route sends one request per event.
+3. **`Permanent` refusing the sink** (`datadog_out`'s 403 `api_key_rejected`): stop and return
+   it. A Datadog API key is org-wide, so every remaining request would get the same answer, and
+   continuing only spends requests. A `datadog_out` `events` route sends one request per event.
+   An OTLP credential can be scoped per signal (a Grafana Cloud access policy can grant
+   `traces:write` without `metrics:write`), so `otlp_out`'s auth answers fall under item 2.
 4. **`Clean` or `Ambiguous`**: stop and return it through item 9's `after_delivery` rule,
    unchanged.
 5. **End of the send**: if any request was accepted, return `Ok`, even when others were rejected.
@@ -475,8 +477,11 @@ succeeds and its metrics request fails with gRPC `UNIMPLEMENTED`. No `send` ever
 **Why `Clean` and `Ambiguous` still stop.** The runtime retries the whole batch on either, so
 attempting more requests first only adds duplicates to the retry.
 
-**Why a sink-wide refusal stops.** A credential refusal says nothing about the request that
-carried it. Going on would repeat the refusal once per remaining request.
+**Why a sink-wide refusal stops.** A refusal of Datadog's org-wide API key says nothing about
+the request that carried it. Going on would repeat the refusal once per remaining request. An
+OTLP auth answer can be scoped to one signal, so no answer to one signal says anything about
+another; a token refused on every signal still ends the send with the first rejection,
+explicitly `Permanent`, at the cost of at most two more requests per batch.
 
 **The guard.** A wholly refused batch still returns an explicitly `Permanent` error, so a bad
 token or bucket keeps tripping the guard after 60 s. A partly accepted batch returns `Ok`, so a

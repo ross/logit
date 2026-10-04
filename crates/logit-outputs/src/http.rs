@@ -203,8 +203,12 @@ pub(crate) fn after_delivery(err: anyhow::Error, sent_any: bool) -> anyhow::Erro
 }
 
 /// A marker a sink attaches with `.context(RefusesSink)` to a [`Fault::Permanent`] error that
-/// means the destination refuses the sink as a whole (a rejected credential), not the one request.
-/// [`Outcomes::note`] stops the send on it: every later request would get the same answer.
+/// means the destination refuses the sink as a whole, not the one request. [`Outcomes::note`]
+/// stops the send on it: every later request would get the same answer.
+///
+/// It is for a credential that covers every request the sink sends the same way, such as
+/// Datadog's org-wide intake API key (`datadog_out`'s 403). An OTLP credential can be scoped per
+/// signal, so `otlp_out` attaches none and an auth answer rejects only its own signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RefusesSink;
 
