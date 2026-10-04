@@ -227,7 +227,7 @@ process, not a component.
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks and Lua nodes. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
-| `retrying` | error | A sink's held head failed a retryable send; logged on the 1st, 2nd, 4th, 8th, and later doubling failure. |
+| `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
 | `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
@@ -326,9 +326,10 @@ An error the sink attaches no fault to is treated as `Rejected`.
 - `logit.component.retrying` (gauge, on the sink): `1` from the head's first retryable failure while a
   retry is pending or in flight, `0` once that head is delivered or dropped and when the write loop
   exits. `batches.dropped` stops moving during a hold, so alert on this gauge instead.
-- The `retrying` error-level line, logged on the held head's 1st, 2nd, 4th, 8th, and later
-  doubling failures, so a long hold logs roughly once every few minutes. It names the fault class,
-  the destination's error text, the failure number, and how many batches are queued.
+- The `retrying` error-level line, logged on the held head's first failure and then at most once
+  a minute while it keeps failing, however long the hold lasts. It names the fault class, the
+  destination's error text, how long the head has been held, the failure count, and how many
+  batches are queued.
 - `degraded` (warn, on the first drop) and `recovered` (info, on the first success after a drop or
   a retried failure) mark the edges.
 

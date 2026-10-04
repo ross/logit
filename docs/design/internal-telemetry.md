@@ -571,9 +571,9 @@ disk-backed sink:
 `write_loop` also writes four `Diagnostics` keys. `retrying` and `send_failed` carry the fault
 class and the destination's error text:
 
-- `retrying` (error): the held head's 1st, 2nd, 4th, 8th, and every later doubling retryable
-  failure, so a long hold logs about once every few minutes. It names the failure number and the
-  queued batch count.
+- `retrying` (error): the held head's first retryable failure, then at most once a minute while
+  it keeps failing, however long the hold lasts. It names how long the head has been held, the
+  failure count, and the queued batch count.
 - `send_failed` (warn, throttled to the 1st, 2nd, 4th, ... occurrence): each dropped batch, with
   the time since the last success.
 - `degraded` (warn): the first drop since the sink was last healthy.

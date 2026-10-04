@@ -36,6 +36,10 @@ use tokio::task::JoinSet;
 /// alert reads.
 const RETRYING_GAUGE: &str = "logit.component.retrying";
 
+/// The least time between two `retrying` lines for one held head: [`WriteLoopConfig`]'s
+/// default `retrying_log_interval`.
+const RETRYING_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Bounded channel capacity between two graph nodes. Small and arbitrary: enough to smooth bursts
 /// without unbounded memory growth. Not tuned against measurements.
 const CHANNEL_CAPACITY: usize = 64;
@@ -763,6 +767,9 @@ pub struct WriteLoopConfig {
     /// Overrides the sink's `Output::default_posture()`; `None` uses it. Set from
     /// `logit-config::BufferConfig::delivery`.
     pub delivery_override: Option<DeliveryPosture>,
+    /// The least time between two `retrying` lines while one head keeps failing. Not
+    /// config-exposed; a test sets it small.
+    pub retrying_log_interval: Duration,
 }
 
 impl Default for WriteLoopConfig {
@@ -771,6 +778,7 @@ impl Default for WriteLoopConfig {
             retry: RetryConfig::default(),
             shutdown_grace: Duration::from_secs(5),
             delivery_override: None,
+            retrying_log_interval: RETRYING_LOG_INTERVAL,
         }
     }
 }
@@ -829,39 +837,50 @@ enum Delivery {
 
 /// Announces a head that keeps failing (`docs/adr/sink-fault-classes.md`, "A hold is
 /// announced"): [`RETRYING_GAUGE`] at 1 from its first retryable failure, and an error line on
-/// its 1st, 2nd, 4th, 8th, ... failure carrying the class and the destination's text. With the
-/// backoff capped at `retry_max_delay`, that's a line every few minutes at most once a hold has
-/// lasted a while. [`Retrying::settle`] ends it when the head is delivered or dropped; dropping
-/// the value settles too, so every `write_loop` exit leaves the gauge at 0.
+/// that failure and then at most once per `interval` while the head keeps failing, each carrying
+/// the class, the destination's text, how long the head has been held, the failure count, and the
+/// queued count. Paced by time, not by failure count, so an operator tailing the log during an
+/// outage sees a line every `interval` however long it lasts. [`Retrying::settle`] ends it when
+/// the head is delivered or dropped; dropping the value settles too, so every `write_loop` exit
+/// leaves the gauge at 0.
 struct Retrying {
     telemetry: Telemetry,
     diag: Diagnostics,
+    interval: Duration,
     /// Failed attempts at the current head, retryable ones only.
     failures: u64,
+    /// When the current head first failed, and when its last line was written.
+    since: Option<tokio::time::Instant>,
+    last_line: Option<tokio::time::Instant>,
 }
 
 impl Retrying {
-    fn new(telemetry: Telemetry, diag: Diagnostics) -> Self {
-        Self { telemetry, diag, failures: 0 }
+    fn new(telemetry: Telemetry, diag: Diagnostics, interval: Duration) -> Self {
+        Self { telemetry, diag, interval, failures: 0, since: None, last_line: None }
     }
 
     /// Records a retryable failure of the head, before the backoff that precedes its retry.
     fn failed(&mut self, fault: Fault, err: &anyhow::Error, queued: usize) {
+        let now = tokio::time::Instant::now();
         self.failures += 1;
+        let since = *self.since.get_or_insert(now);
         if self.failures == 1 {
             self.telemetry.gauge(RETRYING_GAUGE, 1.0, &[]);
         }
-        if self.failures.is_power_of_two() {
-            self.diag.error(
-                "retrying",
-                format_args!(
-                    "send failed ({fault}): {}; retrying until it succeeds (failure {}, \
-                     {queued} batch(es) queued)",
-                    destination_text(err),
-                    self.failures
-                ),
-            );
+        if self.last_line.is_some_and(|last| now.duration_since(last) < self.interval) {
+            return;
         }
+        self.last_line = Some(now);
+        self.diag.error(
+            "retrying",
+            format_args!(
+                "send failed ({fault}): {}; retrying until it succeeds (held {:?}, failure {}, \
+                 {queued} batch(es) queued)",
+                destination_text(err),
+                now.duration_since(since),
+                self.failures
+            ),
+        );
     }
 
     /// Whether the current head failed at least once.
@@ -873,6 +892,8 @@ impl Retrying {
     fn settle(&mut self) {
         if self.failures > 0 {
             self.failures = 0;
+            self.since = None;
+            self.last_line = None;
             self.telemetry.gauge(RETRYING_GAUGE, 0.0, &[]);
         }
     }
@@ -1260,7 +1281,8 @@ pub(crate) async fn write_loop(
 ) {
     let posture = write_config.delivery_override.unwrap_or_else(|| output.default_posture());
     let mut diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
-    let mut retrying = Retrying::new(telemetry.clone(), diag.clone());
+    let mut retrying =
+        Retrying::new(telemetry.clone(), diag.clone(), write_config.retrying_log_interval);
 
     let mut last_success: Option<tokio::time::Instant> = None;
     // A `OnceLock`, not an `Option`: the grace arm sets it while `deliver_with_retry`, in the
@@ -4954,6 +4976,7 @@ mod tests {
             retry,
             shutdown_grace: Duration::from_secs(5),
             delivery_override: Some(posture),
+            ..WriteLoopConfig::default()
         };
         crate::test_util::drive_write_loop(
             &mut output,
@@ -5082,6 +5105,7 @@ mod tests {
             retry: fast_retry_config(),
             shutdown_grace: grace,
             delivery_override: Some(DeliveryPosture::AtMostOnce),
+            ..WriteLoopConfig::default()
         };
         let store_for_task = Arc::clone(&store);
         let shutdown_dropped = Arc::new(AtomicU64::new(0));
@@ -5389,12 +5413,15 @@ mod tests {
     struct SwitchOutput {
         verdict: Verdict,
         sent: Arc<std::sync::Mutex<Vec<f64>>>,
+        times: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
         attempted: mpsc::UnboundedSender<()>,
     }
 
     struct SwitchHandles {
         verdict: Verdict,
         sent: Arc<std::sync::Mutex<Vec<f64>>>,
+        /// When each attempt in `sent` was made.
+        times: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
         attempted: mpsc::UnboundedReceiver<()>,
     }
 
@@ -5419,14 +5446,16 @@ mod tests {
     fn switch_output(verdict: Option<Fault>) -> (SwitchOutput, SwitchHandles) {
         let verdict = Arc::new(std::sync::Mutex::new(verdict));
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let times = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (attempted_tx, attempted_rx) = mpsc::unbounded_channel();
         (
             SwitchOutput {
                 verdict: Arc::clone(&verdict),
                 sent: Arc::clone(&sent),
+                times: Arc::clone(&times),
                 attempted: attempted_tx,
             },
-            SwitchHandles { verdict, sent, attempted: attempted_rx },
+            SwitchHandles { verdict, sent, times, attempted: attempted_rx },
         )
     }
 
@@ -5434,6 +5463,7 @@ mod tests {
     impl Output for SwitchOutput {
         async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
             self.sent.lock().unwrap().push(counter_value_of(batch));
+            self.times.lock().unwrap().push(tokio::time::Instant::now());
             let _ = self.attempted.send(());
             let verdict = *self.verdict.lock().unwrap();
             match verdict {
@@ -5449,13 +5479,18 @@ mod tests {
         }
     }
 
-    /// A backoff from 10 ms to 1 s, so a minute of virtual time is tens of attempts.
+    /// The `retrying` line's pacing in [`hold_write_config`].
+    const HOLD_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+    /// A backoff from 10 ms to 1 s, so a minute of virtual time is tens of attempts, and a
+    /// `retrying` line at most every [`HOLD_LOG_INTERVAL`].
     fn hold_write_config() -> WriteLoopConfig {
         WriteLoopConfig {
             retry: RetryConfig {
                 base_delay: Duration::from_millis(10),
                 max_delay: Duration::from_secs(1),
             },
+            retrying_log_interval: HOLD_LOG_INTERVAL,
             ..WriteLoopConfig::default()
         }
     }
@@ -5571,14 +5606,58 @@ mod tests {
         assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0);
         assert_eq!(totals.sum("logit.component.batches.dropped", &[]), 0.0);
         assert_eq!(totals.gauge(RETRYING_GAUGE, &[]), Some(0.0), "lowered on delivery");
-        // One line on the 1st, 2nd, 4th, ... failure, each naming the class and the text.
-        let paced = usize::try_from(usize::BITS - failures.leading_zeros()).unwrap();
+        // A line on the first failure, then on the first failure at least an interval after the
+        // last line, each naming the class and the text. A failure is recorded at its attempt's
+        // instant: the send returns at once.
+        let times = handles.times.lock().unwrap().clone();
+        let mut paced = 0;
+        let mut last: Option<tokio::time::Instant> = None;
+        for &at in &times[..failures] {
+            if last.is_none_or(|last| at.duration_since(last) >= HOLD_LOG_INTERVAL) {
+                paced += 1;
+                last = Some(at);
+            }
+        }
+        assert!(paced >= 6, "a minute of hold at a 10 s interval: {paced} lines");
         assert_eq!(
             log_lines("refused_block", "send failed (refused): 401: token is invalid; retrying"),
             paced,
             "{failures} failures"
         );
+        assert_eq!(log_lines("refused_block", "(held 0ns, failure 1, "), 1, "the first failure");
         assert_eq!(log_lines("refused_block", "delivery succeeded after a prior failure"), 1);
+    }
+
+    /// The `retrying` line is written on a head's first failure, then at most once per interval
+    /// however many failures fall between, with how long the head has been held. A new head
+    /// starts its own pacing.
+    #[tokio::test(start_paused = true)]
+    async fn the_retrying_line_is_paced_by_time_not_by_failure_count() {
+        global_logs();
+        let interval = Duration::from_secs(10);
+        let mut retrying =
+            Retrying::new(Telemetry::default(), Diagnostics::new("retry_pace"), interval);
+        let err = anyhow::anyhow!("503: busy").context(Fault::Ambiguous);
+        let lines = || log_lines("retry_pace", "send failed (ambiguous): 503: busy; retrying");
+
+        retrying.failed(Fault::Ambiguous, &err, 1);
+        assert_eq!(lines(), 1, "the first failure");
+        for _ in 0..9 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..100 {
+                retrying.failed(Fault::Ambiguous, &err, 1);
+            }
+        }
+        assert_eq!(lines(), 1, "900 failures inside one interval write nothing");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        retrying.failed(Fault::Ambiguous, &err, 1);
+        assert_eq!(lines(), 2, "an interval after the last line");
+        assert_eq!(log_lines("retry_pace", "(held 10s, failure 902, 1 batch(es) queued)"), 1);
+
+        retrying.settle();
+        retrying.failed(Fault::Ambiguous, &err, 1);
+        assert_eq!(lines(), 3, "a new head's first failure");
+        assert_eq!(log_lines("retry_pace", "(held 0ns, failure 1, 1 batch(es) queued)"), 2);
     }
 
     /// A `Refused` head holds under `overflow: drop_oldest` too: it's reserved, so the queue
@@ -5726,6 +5805,7 @@ mod tests {
             },
             shutdown_grace: Duration::from_millis(500),
             delivery_override: None,
+            ..WriteLoopConfig::default()
         };
         let store_for_task = Arc::clone(&store);
         let handle = tokio::spawn(async move {
@@ -5770,6 +5850,7 @@ mod tests {
             },
             shutdown_grace: Duration::from_millis(100),
             delivery_override: None,
+            ..WriteLoopConfig::default()
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -5844,6 +5925,7 @@ mod tests {
             },
             shutdown_grace: Duration::from_millis(100),
             delivery_override: None,
+            ..WriteLoopConfig::default()
         };
         let store_config = SinkStoreConfig::Memory(SinkQueueConfig {
             max_batches: 1,
@@ -5950,6 +6032,7 @@ mod tests {
             },
             shutdown_grace: Duration::from_millis(100),
             delivery_override: None,
+            ..WriteLoopConfig::default()
         };
 
         // Every counter batch encodes to the same length, so this sizes the spool to one record.
@@ -6162,6 +6245,7 @@ mod tests {
             },
             shutdown_grace: grace,
             delivery_override: None,
+            ..WriteLoopConfig::default()
         }
     }
 
@@ -6956,6 +7040,7 @@ mod tests {
                     retry: fast_retry_config(),
                     shutdown_grace: grace,
                     delivery_override: Some(posture),
+                    ..WriteLoopConfig::default()
                 };
                 write_loop(
                     "out".to_string(),
@@ -7012,6 +7097,7 @@ mod tests {
                 retry: fast_retry_config(),
                 shutdown_grace: Duration::from_millis(100),
                 delivery_override: Some(posture),
+                ..WriteLoopConfig::default()
             };
             write_loop(
                 "out".to_string(),
@@ -7063,6 +7149,7 @@ mod tests {
                 retry: fast_retry_config(),
                 shutdown_grace: Duration::from_millis(100),
                 delivery_override: Some(posture),
+                ..WriteLoopConfig::default()
             };
             write_loop(
                 "out".to_string(),
@@ -7413,6 +7500,7 @@ mod tests {
             },
             shutdown_grace: Duration::from_millis(100),
             delivery_override: Some(DeliveryPosture::AtMostOnce),
+            ..WriteLoopConfig::default()
         };
         let drain_total = Arc::new(AtomicU64::new(0));
         let store_for_task = Arc::clone(&store);
@@ -7563,6 +7651,7 @@ mod tests {
                 retry,
                 shutdown_grace: grace,
                 delivery_override: Some(DeliveryPosture::AtMostOnce),
+                ..WriteLoopConfig::default()
             },
             shutdown_rx,
             Arc::new(AtomicU64::new(0)),
