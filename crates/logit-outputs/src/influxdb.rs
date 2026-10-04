@@ -2,15 +2,13 @@
 //! `Token` auth header. Matches the `influxdb` service seeded in `compose.yaml`.
 //!
 //! The reference `Encoder` sink: [`InfluxLineEncoder`] renders one opaque body per batch, and
-//! [`InfluxDbOutput::send`] makes one attempt and classifies the outcome as a [`Fault`]; retry
-//! timing belongs to `logit-pipeline`'s writer (`docs/adr/buffered-sink-delivery.md`).
+//! [`InfluxDbOutput::send`] makes one attempt and classifies the outcome as a
+//! [`logit_pipeline::Fault`]; retry timing belongs to `logit-pipeline`'s writer
+//! (`docs/adr/buffered-sink-delivery.md`).
 //!
-//! It keeps its own client and transport classifier (`status_class`,
-//! `classify_transport_error`) rather than `crate::http`'s, though it reads a rejection body
-//! through `crate::http::read_body_prefix`, the same bounded read `otlp_out` uses, and classifies
-//! a status with [`crate::http::classify_status`]. Its client never disables redirects, so it inherits
-//! `reqwest`'s `limited(10)`: a tracked gap in `docs/known-gaps/prometheus.md`, closed by moving to
-//! `crate::http::build_client`.
+//! The client, the status bucket, and the transport classifier are [`crate::http`]'s, so
+//! redirects are off ([`crate::http::build_client`] says why) and a `3xx` is the misconfigured
+//! URL it names.
 //!
 //! [`render_tag_suffix`] never emits a `statsd.`-prefixed attribute as a tag; see its doc.
 //!
@@ -42,8 +40,9 @@
 //! | `500` `internal error` | `Ambiguous` | "unexpected error writing points"; may have been applied | [write API](https://docs.influxdata.com/influxdb/v2/api/write/) |
 //! | `503` `unavailable` | `Ambiguous` | the server can't take writes for now, `Retry-After` set | [write API](https://docs.influxdata.com/influxdb/v2/api/write/) |
 //! | any other status | [`crate::http::classify_status`]'s class | undocumented on this route | -- |
-//! | connect failure, DNS failure | `Clean` | nothing left the process | `classify_transport_error` |
-//! | timeout, any other transport error | `Ambiguous` | the write may have reached the server | `classify_transport_error` |
+//! | any `3xx` | `Rejected` | redirects are off: a moved endpoint is a config change | [`crate::http::build_client`] |
+//! | connect failure, DNS failure | `Clean` | nothing left the process | [`crate::http::classify_reqwest_error`] |
+//! | timeout, any other transport error | `Ambiguous` | the write may have reached the server | [`crate::http::classify_reqwest_error`] |
 //!
 //! `Retry-After` is ignored: `write_loop`'s backoff applies.
 
@@ -56,7 +55,7 @@ use logit_core::interner::resolve;
 use logit_core::{
     DdSketch, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
 };
-use logit_pipeline::{BatchContext, Fault, SeqId};
+use logit_pipeline::{BatchContext, SeqId};
 use logit_proto::{CodecError, Encoder};
 use std::collections::HashMap;
 // `write!` into a `String`: formats straight into the output buffer, no `String` per number
@@ -92,7 +91,7 @@ impl InfluxDbOutput {
             org,
             bucket,
             token,
-            client: build_client(DEFAULT_TIMEOUT),
+            client: crate::http::build_client(DEFAULT_TIMEOUT, None),
             encoder: InfluxLineEncoder::default(),
             request_timeout: DEFAULT_TIMEOUT,
             telemetry: Telemetry::default(),
@@ -102,7 +101,7 @@ impl InfluxDbOutput {
 
     /// Overrides the default 10s request timeout. Rebuilds the underlying HTTP client.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.client = build_client(timeout);
+        self.client = crate::http::build_client(timeout, None);
         self.request_timeout = timeout;
         self
     }
@@ -120,26 +119,6 @@ impl InfluxDbOutput {
         self.telemetry = telemetry;
         self
     }
-}
-
-/// A coarse response-status bucket, `&'static str` so it's a telemetry tag value with no
-/// per-response allocation or interning.
-fn status_class(status: reqwest::StatusCode) -> &'static str {
-    match status.as_u16() / 100 {
-        1 => "1xx",
-        2 => "2xx",
-        3 => "3xx",
-        4 => "4xx",
-        5 => "5xx",
-        _ => "other",
-    }
-}
-
-fn build_client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .expect("reqwest client should build with default TLS settings")
 }
 
 impl InfluxDbOutput {
@@ -193,7 +172,7 @@ impl InfluxDbOutput {
                 self.telemetry.count(
                     "logit.output.requests",
                     1.0,
-                    &[("class", status_class(resp.status()))],
+                    &[("class", crate::http::status_class(resp.status()))],
                 );
                 Ok(())
             }
@@ -202,7 +181,7 @@ impl InfluxDbOutput {
                 self.telemetry.count(
                     "logit.output.requests",
                     1.0,
-                    &[("class", status_class(status))],
+                    &[("class", crate::http::status_class(status))],
                 );
                 // A bounded read, not `text()`: see `crate::http::read_body_prefix`.
                 let text = body_snippet(
@@ -214,7 +193,7 @@ impl InfluxDbOutput {
             }
             Err(err) => {
                 self.telemetry.count("logit.output.requests", 1.0, &[("class", "network_error")]);
-                let fault = classify_transport_error(&err);
+                let fault = crate::http::classify_reqwest_error(&err);
                 Err(anyhow::Error::new(err)).context(fault)
             }
         }
@@ -233,19 +212,6 @@ impl Output for InfluxDbOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
-    }
-}
-
-/// Classifies a failure that got no HTTP response. `is_connect()` means the connection was never
-/// established (refused, DNS failure): the destination never saw the batch, `Fault::Clean`,
-/// pinned by `connect_refused_is_reliably_classified_as_a_clean_fault`. Anything else (a timeout,
-/// a failed body read) may have reached the destination, so it's `Fault::Ambiguous`:
-/// `at_most_once`'s duplicate-safety argument depends on `Clean` never over-claiming.
-fn classify_transport_error(err: &reqwest::Error) -> Fault {
-    if err.is_connect() {
-        Fault::Clean
-    } else {
-        Fault::Ambiguous
     }
 }
 
@@ -759,6 +725,7 @@ fn push_escaped(out: &mut String, s: &str, needs_escape: &[char]) {
 mod tests {
     use super::*;
     use logit_core::{AttrMap, BodyFormat, Histogram, LogRecord, MetricKind, Summary};
+    use logit_pipeline::Fault;
     use std::sync::Arc;
 
     fn batch_with(events: Vec<Event>) -> EventBatch {
@@ -1540,6 +1507,14 @@ mod tests {
         assert_eq!(class_of(influx_error(status, body)).await.0, Fault::Ambiguous);
     }
 
+    /// A redirect isn't followed: [`class_of`] asserts the server saw one request.
+    #[tokio::test]
+    async fn a_3xx_is_rejected_and_not_followed() {
+        let response = "HTTP/1.1 302 Found\r\nLocation: /api/v2/write\r\nContent-Length: 0\r\n\
+                        Connection: close\r\n\r\n";
+        assert_eq!(class_of(response).await.0, Fault::Rejected);
+    }
+
     #[tokio::test]
     async fn a_503_unavailable_is_ambiguous() {
         let body = r#"{"code":"unavailable","message":"service unavailable"}"#;
@@ -1634,8 +1609,7 @@ mod tests {
             Fault::Clean,
             "connection-refused should classify as Clean -- if this ever fails, `is_connect()` \
              is not reliably distinguishing 'never reached the server' any more, and \
-             classify_transport_error must downgrade its mapping to Ambiguous instead (see this \
-             workstream's plan/report)"
+             crate::http::classify_reqwest_error must downgrade its mapping to Ambiguous instead"
         );
     }
 
