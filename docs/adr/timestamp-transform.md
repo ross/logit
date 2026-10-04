@@ -102,8 +102,9 @@ for that one sink.
 **RFC 3164 resolution.** The value is the 15-byte `Mmm dd hh:mm:ss`. The year is whichever of the
 receipt instant's year in `timezone`, the year before, or the year after puts the stamp closest to
 receipt; a Feb 29 candidate in a non-leap year is invalid for that candidate. Civil time is read in
-`timezone`. A DST fold picks the occurrence closest to receipt, and a DST gap takes the offset after
-the gap. A pattern with no year infers the year the same way.
+`timezone`. A DST fold picks the occurrence closest to receipt. A clock reading inside a DST gap
+keeps the offset in effect before the gap, so New York's `Mar  8 02:30:00` reads as 03:30 EDT. A
+pattern with no year infers the year the same way.
 
 **`format: rfc3339` uses jiff's RFC 3339 and Temporal parser.** It accepts a space separator, a
 lowercase `z`, and an RFC 9557 `[zone]` suffix, and it clamps a `:60` leap second to `:59`, because
@@ -115,7 +116,8 @@ own record.
 **Pattern rules.** A `{pattern: ...}` uses strftime-style directives as jiff's `fmt::strtime`
 defines them and must match the whole value. `%z`, `%:z`, or `%s` makes the result an instant, and
 `timezone` isn't read; otherwise the result is civil time in `timezone`. A pattern with no year
-infers it as RFC 3164 does. Two examples:
+infers it as RFC 3164 does, and a pattern with an offset but no year is rejected, because an instant
+can't be built without one. Two examples:
 
 | Source | Pattern |
 |---|---|
@@ -146,8 +148,8 @@ database is found, is a `logit validate` and startup error, never a per-event sk
 event looks a zone up by name, because `%Q` is rejected in patterns.
 
 **Graph rule 76** rejects an empty `from`; `max_skew: 0s`; a `timezone` that doesn't resolve; a
-`timezone` set under a format that never reads it; and a pattern that is empty, has no time of day,
-uses `%Z`, `%Q`, or `%:Q`, or fails to parse its own rendering of a reference instant.
+`timezone` set under a format that never reads it; and a pattern that is empty, has no hour and
+minute, uses `%Z`, `%Q`, or `%:Q`, or fails to parse its own rendering of a reference instant.
 
 ## Alternatives considered
 
