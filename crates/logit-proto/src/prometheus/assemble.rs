@@ -1061,7 +1061,7 @@ pub(super) fn parse_scaled_decimal(s: &str, scale: i64) -> Option<i64> {
         Some(rest) => (true, rest),
         None => (false, s.strip_prefix('+').unwrap_or(s)),
     };
-    if let Some(nanos) = parse_decimal_nanos(digits, scale) {
+    if let Ok(nanos) = parse_decimal_nanos(digits, scale) {
         return Some(if negative { -nanos } else { nanos });
     }
     let value: f64 = digits.parse().ok()?;
