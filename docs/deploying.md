@@ -2224,11 +2224,13 @@ order. An object larger than the cap alone is dropped, counted
 **Delivery.** A `429`, or a `503` code 9 ("Server is busy"), means Splunk didn't take the body:
 before any body of the batch was accepted, the batch is retried under every posture, with the
 runtime's backoff (a `Retry-After` header is ignored). `408`, other `5xx`, timeouts, and a busy
-answer after a body was accepted are retryable only under `at_least_once`; `401` and `403` are
-`refused`, with a `token_rejected` warning, and the sink holds the batch and retries it; any other
-`4xx`, `413` included, is `rejected`, dropped, and counted `logit.output.requests.rejected{code}`. A `400` code 6 is the exception: the sink drops the
-object Splunk names, counted `records.dropped{reason="invalid_event"}`, and resends the rest of
-that body once. A code 6 naming the first object of a body over 5 MiB is Splunk Cloud's oversize
+answer after a body was accepted are retryable only under `at_least_once`; a `401` or
+`403`, or a token or channel code on a `400`, is `refused`, with a `token_rejected` or
+`request_refused` warning, and the sink holds the batch and retries it; any other `4xx`, `413`
+included, is `rejected`, dropped, and counted `logit.output.requests.rejected{code}`. A `400` that
+names one object (code 6, 7, 12, 13, or 15) is the exception: the sink drops that object, counted
+`records.dropped{reason="invalid_event"}`, and resends the rest of that body once. The sink's
+module doc has the table of every HEC code it reads. A code 6 naming the first object of a body over 5 MiB is Splunk Cloud's oversize
 answer instead: the sink splits the body in two and sends each half, or drops a lone object,
 counted `records.dropped{reason="oversize"}`. The first failing request stops the rest of the
 batch. Under the default `at_least_once` posture a `500` is retried, and Splunk indexes a resent

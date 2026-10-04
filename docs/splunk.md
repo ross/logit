@@ -116,8 +116,9 @@ delta `Sum` reads in Splunk as a series of samples, not a running total: put `ag
 from the batch's resource attributes `com.splunk.index`, `com.splunk.source`,
 `com.splunk.sourcetype`, and `host.name`, so stamp them upstream with a `set` component, as
 `splunk-hec-send.yaml` does. An event without them takes the token's defaults in Splunk. An index
-the token isn't allowed to write fails the request with `400` code 7, and the objects from the
-bad one on aren't indexed; keep the `index` you stamp in the token's allowed list. Every other
+the token isn't allowed to write draws a `400` code 7 naming the object after it; `splunk_hec_out`
+drops the bad object and resends the ones after it (below); keep the `index` you stamp in the token's
+allowed list. Every other
 resource and event attribute goes out as an indexed field in `fields`, flattened to dotted keys.
 
 `splunk_hec_in` puts the same four values on the resource, so a relay keeps them.
@@ -197,11 +198,10 @@ A `400` code 6 names the first object Splunk couldn't parse in `invalid-event-nu
 from 0. Splunk Enterprise 10.4.3 indexed every object before it and none from it on. So
 `splunk_hec_out` drops that one object, counted
 `logit.output.records.dropped{reason="invalid_event"}`, and resends the objects after it, once. A
-second code 6 on the resend is rejected. The other per-object rejections (7, 12, 13, and 15) are
-rejected: Splunk indexes the objects before the bad one and none from it on, and the rest of the
-batch is dropped with them. Code 7 names the object after the bad one. `splunk_hec_out` doesn't
-write the shapes behind codes 12, 13, and 15 (a missing or blank `event`, a nested `fields`
-value), which leaves code 7, an index the token can't write.
+second such answer on the resend is rejected. The other per-object codes, 7 (an index the token
+can't write), 12, 13, and 15, get the same treatment: Splunk indexes the objects before the bad
+one and none from it on. Code 7 names the object after the bad one, and the sink reads it so. `splunk_hec_out` doesn't write the shapes behind codes 12, 13, and 15 (a
+missing or blank `event`, a nested `fields` value), which leaves code 7.
 
 `splunk_hec_in` answers a `/event` body with a syntax error the same way: it delivers the objects
 before the bad one, answers `400` code 6 naming it, and delivers nothing from it on. So a client

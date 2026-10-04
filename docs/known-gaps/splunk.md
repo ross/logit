@@ -70,15 +70,16 @@ Entry format and the other areas: [the known-gaps index](README.md).
     once.
   - **Revisit trigger:** a client that relies on Splunk's outstanding-id count, or channel churn
     that evicts live channels.
-- **HEC codes 21, 22, 24, and 25 aren't modeled, and the texts for 18 through 27 are from
-  Splunk's documentation.** `logit_proto::splunk::response`'s `HecStatus` has no entry for the
-  four, so `splunk_hec_out` counts one as `logit.output.requests.rejected{code="other"}` when it
-  arrives with a non-retryable status, and `splunk_hec_in` never answers one. `splunk_hec_in`'s
-  busy `/health` answers code 18 with the documented text. Code 28, Splunk Cloud's answer to a
-  `useACK` request without a channel, is modeled from Splunk Cloud 10.5.2605.9's verbatim reply.
-  No `script/splunk-interop` run (two Enterprise, three Cloud) provoked a code 18 through 27.
-  - **Consequence:** a rejection with one of these codes is counted under `other`, and the
-    diagnostic's body quote is what names it.
+- **The HEC codes and texts for 18 through 27 are from Splunk's documentation, unverified.**
+  `logit_proto::splunk::response`'s `HecStatus` takes them from Splunk's "Troubleshoot HTTP Event
+  Collector" table, and `splunk_hec_out` classifies codes 21 and 22 (a token refused on a `400`)
+  as `Refused` and 24 and 25 (a `200` with a capacity warning) as taken on that table's word.
+  `splunk_hec_in`'s busy `/health` answers code 18 with the documented text. Code 28, Splunk
+  Cloud's answer to a `useACK` request without a channel, is modeled from Splunk Cloud
+  10.5.2605.9's verbatim reply. No `script/splunk-interop` run (two Enterprise, three Cloud)
+  provoked a code 18 through 27.
+  - **Consequence:** a real Splunk that sends one of them with another status or meaning is
+    classified by the table, not by what it does.
   - **Revisit trigger:** a real Splunk answers one of them.
 - **Splunk Cloud's oversize answer is inferred from the body's size.** The 10.5.2605.9 trial
   stack accepted bodies up to 5,242,881 bytes and answered 6,000,000 and above with `400`
@@ -106,15 +107,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     Splunk accepts the batch or the shutdown grace cuts it.
   - **Revisit trigger:** a `Retry-After`-carrying sink that needs it honored, which would give
     `Fault` or `deliver_with_retry` a delay hint every HTTP sink could use.
-- **`splunk_hec_out` treats codes 7, 12, 13, and 15 as rejected.** Each names an object in
-  `invalid-event-number`, and Splunk 10.4.3 indexed the objects before the bad one and none from
-  it on, as with code 6. Only code 6 gets the drop-one-and-resend rule; the others fail the batch.
-  `splunk_hec_out` never writes the shapes behind 12, 13, and 15, so in practice this means code
-  7, an index the token isn't allowed to write.
-  - **Consequence:** one object with a disallowed `com.splunk.index` loses the objects after it in
-    its request and the rest of the batch.
-  - **Workaround:** keep every stamped index in the token's allowed list.
-  - **Revisit trigger:** a pipeline that mixes indexes a token can and can't write.
 - **Four `splunk_hec_out` behaviors Vector's HEC sinks have are deferred.** A comparison with
   Vector's `splunk_hec_logs` and `splunk_hec_metrics` sinks
   ([plan, "What's left"](../plans/splunk-relay.md#whats-left)) found them, and none has a user yet:
