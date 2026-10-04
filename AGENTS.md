@@ -243,11 +243,10 @@ Datadog pairs, and [docs/plans/splunk-relay.md](docs/plans/splunk-relay.md) for 
   exporter's span object decoded back to a `SpanRecord`.
 
 Residual debt lives in `docs/known-gaps/statsd.md` and `docs/known-gaps/syslog.md`: post-sketch
-metric kinds at `statsd_out`; `statsd_out` carrying no `unit` and no native rename/prefix and
-stamping an egress timestamp only on a `|T`-marked line; and syslog's `event.timestamp`
-staying receipt time, which the opt-in `timestamp` transform resolves. The Datadog pairs' and the
-Splunk pair's residual debt is in `docs/known-gaps/datadog.md` and `docs/known-gaps/splunk.md`,
-each listed by its plan's closing assessment.
+metric kinds at `statsd_out`, and `statsd_out` carrying no `unit` and no native rename/prefix and
+stamping an egress timestamp only on a `|T`-marked line. The Datadog pairs' and the Splunk pair's
+residual debt is in `docs/known-gaps/datadog.md` and `docs/known-gaps/splunk.md`, each listed by
+its plan's closing assessment.
 
 Per pair:
 
