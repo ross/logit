@@ -2098,8 +2098,8 @@ pub enum ComponentKind {
         /// TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a
         /// dropped connection) may take before `send` reports a failure. Also bounds the TLS
         /// handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice
-        /// this value. A write that accepts nothing for this long fails the attempt too, so a peer
-        /// that stops reading is retried on a fresh connection. Defaults to `5s`.
+        /// this value. A write that accepts nothing for this long fails the attempt and drops the
+        /// connection; the next attempt dials fresh. Defaults to `5s`.
         #[serde(default = "default_syslog_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
@@ -2162,9 +2162,8 @@ pub enum ComponentKind {
         /// handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice this
         /// value. Under `unix`, bounds each datagram's wait on a receiver whose queue is full (a
         /// Unix socket pushes back on the sender where UDP would drop). Under `tcp` and
-        /// `unix_stream`, a write that accepts nothing for this long fails the attempt too, so a
-        /// peer that stops reading is retried on a fresh connection. Ignored for `udp`. Defaults
-        /// to `5s`.
+        /// `unix_stream`, a write that accepts nothing for this long fails the attempt and drops
+        /// the connection; the next attempt dials fresh. Ignored for `udp`. Defaults to `5s`.
         #[serde(default = "default_statsd_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
@@ -2236,9 +2235,8 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         max_frame_bytes: u64,
         /// TCP only, ignored for UDP. How long a connect attempt may take before `send` reports a
-        /// failure. A write that accepts nothing for this long fails the attempt too, so a peer
-        /// that stops reading is retried on a fresh connection. Defaults to `5s`; `0s` is
-        /// rejected.
+        /// failure. A write that accepts nothing for this long fails the attempt and drops the
+        /// connection; the next attempt dials fresh. Defaults to `5s`; `0s` is rejected.
         #[serde(default = "default_graphite_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,

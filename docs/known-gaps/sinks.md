@@ -43,9 +43,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   A user-supplied `format:` *template* over the human render has room in the `Format` enum but
   isn't implemented.
 - **`stdio_out` to a stdout or stderr pipe has no write bound.** A pipe reader that stops
-  reading (a stalled log shipper, a paused `less`) fills the pipe, and the write never returns:
-  tokio writes stdout and stderr on a blocking thread, which a timeout can't cut, so the sink can't
-  bound the attempt as `Output::send`'s contract asks.
+  reading (a stalled log shipper, a paused `less`) fills the pipe, and the write never returns.
+  tokio writes stdout and stderr on a blocking thread: a timeout around the write would return,
+  but it can't cancel the write on that thread, and every later write queues behind it, so the
+  sink can't bound the attempt as `Output::send`'s contract asks.
   - **Consequence:** the sink holds silently until shutdown. No attempt fails, so
     `logit.component.retrying` never reads `1` and no `retrying` line is logged; the queue fills
     behind it under its `buffer:` bounds.
