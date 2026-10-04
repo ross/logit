@@ -110,8 +110,8 @@ pattern with no year infers the year the same way.
 lowercase `z`, and an RFC 9557 `[zone]` suffix, and it clamps a `:60` leap second to `:59`, because
 this format reads application logs. The syslog codec's strict RFC 5424 parser in `logit_core::time`
 (uppercase `T` and `Z` required, leap second rejected) is a different contract, and this ADR leaves
-it unchanged. The hand-rolled calendar code in `logit_core::time` is slated to move onto jiff in its
-own record.
+it unchanged. [ADR `jiff-for-calendar-time`](jiff-for-calendar-time.md) moves that parser's calendar
+math onto jiff and keeps its contract.
 
 **Pattern rules.** A `{pattern: ...}` uses strftime-style directives as jiff's `fmt::strtime`
 defines them and must match the whole value. `%z`, `%:z`, or `%s` makes the result an instant, and
