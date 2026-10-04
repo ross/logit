@@ -42,6 +42,14 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
   A user-supplied `format:` *template* over the human render has room in the `Format` enum but
   isn't implemented.
+- **`stdio_out` to a stdout or stderr pipe has no write bound.** A pipe reader that stops
+  reading (a stalled log shipper, a paused `less`) fills the pipe, and the write never returns:
+  tokio writes stdout and stderr on a blocking thread, which a timeout can't cut, so the sink can't
+  bound the attempt as `Output::send`'s contract asks.
+  - **Consequence:** the sink holds silently until shutdown. No attempt fails, so
+    `logit.component.retrying` never reads `1` and no `retrying` line is logged; the queue fills
+    behind it under its `buffer:` bounds.
+  - **Workaround:** write to a file with `file_out`, and have the reader follow the file.
 - **The human render shows everything on the event but the batch's provenance.** `stdio_out`'s
   block (ADR `human-render-block-format`) is exhaustive over `Event`, `Resource`, and `Scope`.
   A batch's `origin`/`previous` reach a sink only through `Output::observe_batch`, which

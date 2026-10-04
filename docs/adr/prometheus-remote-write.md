@@ -361,7 +361,7 @@ than letting the sink silently override an operator's value at runtime.
 only contribution is classifying the outcome into a `Fault`, exactly as `otlp_out` does:
 
 - 2xx → `Ok`.
-- 429 and 5xx → **`Fault::Ambiguous`**, via `is_retryable_http_status`
+- 429 and 5xx → **`Fault::Ambiguous`**, via `classify_status`
   (`crates/logit-outputs/src/http.rs` — that whole table hoisted out of `otlp_out` into a shared
   module when this sender landed, rather than being copied). Ambiguous, not `Clean`: the request
   reached the server and may have been partially applied.

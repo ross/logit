@@ -908,8 +908,8 @@ impl Drop for Retrying {
 /// Attempts to deliver `batch` via `output.send`, retrying per `posture`/[`is_retryable`] until
 /// it succeeds or a failure isn't retryable. [`write_loop`]'s path for a head that starts with a
 /// window of 1, nothing submitted, and nothing observed ahead of it; [`deliver_window`] is the
-/// other. An attempt runs under no runtime timeout: the sink's own transport timeout bounds it,
-/// and the shutdown grace cuts it (`write_loop`'s `DeliverStep`).
+/// other. An attempt runs under no runtime timeout: the sink bounds it (`Output::send`'s
+/// contract), and the shutdown grace cuts it (`write_loop`'s `DeliverStep`).
 ///
 /// Before every attempt, the first and each one after a backoff, a `grace_deadline` already
 /// anchored and reached returns [`Delivery::GraceExpired`] with no send started. [`write_loop`]
@@ -999,8 +999,8 @@ impl InFlight {
 /// - **Fill.** While `state.outstanding` is below `min(output.window(), store.max_in_flight())`,
 ///   it submits the next item, observing it first if it hasn't been. `peek_at` returning `None`
 ///   ends the fill.
-/// - **No submit or acknowledgment wait has a runtime timeout**: the sink bounds both itself (the
-///   `Output::window` contract).
+/// - **No submit or acknowledgment wait has a runtime timeout**: the sink bounds every write and
+///   every acknowledgment wait itself (the `Output::window` contract).
 /// - **A submit failure at the head** is the round's fault. **A failure past the head classifies
 ///   nothing**: the fill stops and the acknowledgments already owed are read.
 /// - **A failed `await_ack`** sets `state.outstanding` to 0 and is the round's fault, covering

@@ -1816,9 +1816,9 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   carrying the collector's message.
 - `logit.output.records.dropped{signal, reason="rejected"}` (count): the records of a signal's
   request the destination answered with a `Rejected` verdict (an HTTP 3xx, or a 4xx other than
-  401, 403, 405, 407, and 429; or gRPC `INVALID_ARGUMENT`, `UNIMPLEMENTED`, `NOT_FOUND`, or an
-  unrecognized code). An auth answer is `Refused` and stops the send instead. The send goes on to the other signals, and returns `Ok` if any was
-  accepted. A throttled `signal_rejected` diagnostic names the signal, the status, and the record
+  405, 407, and 429; or any gRPC status but the transient ones). An auth answer is counted here
+  too, since a credential can be scoped per signal. The send goes on to the other signals, and
+  returns `Ok` if any was accepted. A throttled `signal_rejected` diagnostic names the signal, the status, and the record
   count, with a hint to place `has_signal` or `keep_signals` ahead of the sink. Counts per attempt,
   whether or not the send ends `Ok`. See [ADR `delivery-semantics`](../adr/delivery-semantics.md)'s
   "Amendment: per-request verdicts (2026-10-04)". Every per-signal counter has a record count to
@@ -1992,7 +1992,7 @@ attempt.
 
 - `logit.output.requests{class="1xx"|"2xx"|"3xx"|"4xx"|"5xx"|"other"|"network_error"}` (count, one
   per request issued). There's no `429` class: a 429 is a `4xx`, and splitting it out would
-  contradict `is_retryable_http_status`, which reads the same status to pick the `Fault`. There's
+  contradict `classify_status`, which reads the same status to pick the `Fault`. There's
   no `timeout` class either, because a timeout is a transport error and lands in `network_error`.
   `3xx` is a real class here, because this client doesn't follow redirects. There's no `signal`
   tag, unlike `otlp_out`: this sink carries exactly one signal, and a tag that never varies is

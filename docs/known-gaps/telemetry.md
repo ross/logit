@@ -112,7 +112,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   packer's skip of an entry over the datagram cap (`oversize_datagram`).
   [internal-telemetry.md](../design/internal-telemetry.md)'s class table lists them.
   - **Consequence:** on a sink that retries, these counters read high by the number of attempts
-    that met the verdict, and the batch's own retries account for the growth.
+    that met the verdict, and the batch's own retries account for the growth. `otlp_out`'s and
+    the Datadog sinks' `records.dropped{reason="rejected"}` count a rejected request again on
+    every retry of a batch held on a later request, and a hold has no end but success or
+    shutdown, so that re-count is unbounded for as long as the hold lasts.
   - **Why it stays:** each attempt got its own answer, and a retry might get a different one, so
     counting once would need the sink to remember what an earlier attempt learned
     ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),

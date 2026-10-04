@@ -65,6 +65,10 @@ pub trait Output {
     /// One delivery attempt at `batch`. `write_loop` calls it once per attempt and owns the retry
     /// (the trait doc). The contract:
     ///
+    /// - **Bounded by the sink.** No runtime timeout wraps an attempt, so the sink bounds every
+    ///   wait on its destination itself (a request timeout, a progress bound on a write). An
+    ///   unbounded wait on a stalled peer parks the attempt until shutdown with no fault, so the
+    ///   hold is never announced.
     /// - **Cancellable at every await.** Each attempt races the shutdown grace, so the future can
     ///   be dropped at any await; the sink must stay usable for the next call (`docs/design/pipeline-graph.md`'s "Cancellation points").
     /// - **The encode is synchronous**, with no await inside it, so a sink's per-batch accounting
@@ -100,11 +104,10 @@ pub trait Output {
     /// still unacknowledged. A type that implements `Output` by delegating to another must
     /// forward this, [`Output::submit`], and [`Output::await_ack`].
     ///
-    /// **A sink that reports a window above 1 bounds itself.** `write_loop` applies the head's
-    /// remaining retry budget only to a submit with nothing in flight. Every `submit` past the
-    /// head and every `await_ack` runs under no time limit from the loop, so the sink must bound
-    /// each one on its own (a progress bound on a write, a request timeout on an ack wait), or a
-    /// stalled peer holds the sink until shutdown.
+    /// **A sink that reports a window above 1 bounds itself**, as every `send` does: no `submit`
+    /// and no `await_ack` runs under a time limit from the loop, so the sink must bound each one
+    /// on its own (a progress bound on a write, a request timeout on an ack wait), or a stalled
+    /// peer holds the sink until shutdown.
     fn window(&self) -> usize {
         1
     }

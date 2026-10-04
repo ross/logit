@@ -318,8 +318,12 @@ An error the sink attaches no fault to is treated as `Rejected`.
 - **Nothing ends the process.** A misconfigured sink, one whose token the destination refuses, for
   example, holds its queue and shows through the signals below instead of exiting. A restart-policy
   supervisor never sees it, so alert on those signals.
-- **An attempt has no runtime timeout.** The sink's own transport timeout (`request_timeout`, or
-  the HTTP client's timeouts) bounds each one. Only the shutdown grace cuts an attempt short.
+- **An attempt has no runtime timeout.** The sink's own transport timeout bounds each one:
+  `request_timeout`, the HTTP client's timeouts, or, on `syslog_out`, `statsd_out`, and
+  `graphite_out` over a stream, `connect_timeout`, which also bounds each write's progress. The
+  shutdown grace cuts an attempt short. `stdio_out` writing to a stdout or stderr pipe has no
+  bound ([`docs/known-gaps/sinks.md`](known-gaps/sinks.md)): a reader that stops reading holds
+  the sink silently until shutdown.
 
 **To see a hold:**
 

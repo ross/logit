@@ -5,7 +5,7 @@
 //! `await_ack`: one frame, and its `Ack`.
 //!
 //! **One attempt per `send`, `submit`, or `await_ack`** ([`crate::Output`]'s contract).
-//! `write_loop` owns retry and races each call against a timeout, so the connection is
+//! `write_loop` owns retry and can drop a call at the shutdown grace, so the connection is
 //! `take()`n into a local before any write or ack read and put back only when the call leaves it
 //! usable. A cancelled call drops the local, closing the connection rather than leaving
 //! `self.stream` partway through a frame, and every frame in flight on it with it.
@@ -53,7 +53,8 @@
 //! - A batch over the sanity cap or the peer's `max_frame_bytes`, or a compressed frame over
 //!   `frame::compressed_bound` of that: `Rejected`, nothing written, a pooled connection kept.
 //! - **Write phase**: any failure before the frame is completely written and flushed (a write
-//!   `Err` or `Ok(0)`, a failed flush) is `Clean`, with the `io::Error` kept, and the connection
+//!   `Err` or `Ok(0)`, a failed flush, or a write or flush that makes no progress for the request
+//!   timeout) is `Clean`, with the `io::Error` kept, and the connection
 //!   is dropped. Bytes of the frame may have left the host, but not all of them, so the peer can't
 //!   hold the batch. The flush is part of the phase because a TLS write can return with the
 //!   frame's tail still queued in the session, and a waiting ack read doesn't send it. ADR
@@ -119,12 +120,14 @@ use logit_proto::native::{self, control};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::AsyncWrite;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 /// Bounds the TCP connect, the TLS handshake, the `HelloAck` wait, the ack wait, the shutdown in
-/// `Output::flush`, and, with frames in flight, each chunk of a data-frame write and its flush,
-/// each separately. The `Hello`, and a data frame written with nothing in flight, have only
-/// `write_loop`'s retry budget, the outer bound.
+/// `Output::flush`, and the progress of every write, each separately: each chunk of the `Hello`
+/// or a data frame, and its flush, must complete within it ([`write_with_progress`]). A large
+/// frame on a slow link keeps making progress and never trips it.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `crate::tls::TlsClientSettings`, re-exported to match `crate::otlp`'s path.
@@ -133,7 +136,7 @@ pub use crate::tls::TlsClientSettings;
 // Shared with the pooled line sinks: the dial (`crate::stream`), the plain-or-TLS stream
 // erasure, and the probe of a reused connection.
 use crate::count_request;
-use crate::stream::{Dial, Target, TlsTarget};
+use crate::stream::{write_with_progress, Dial, Target, TlsTarget};
 use crate::tls::{poll_pending_close, AsyncStream, PendingClose};
 
 /// A live, handshaken connection.
@@ -353,8 +356,8 @@ impl LogitOutput {
         crate::stream::connect(&dial).await
     }
 
-    /// `Hello`/`HelloAck` over a dialed `stream`. The `HelloAck` wait is bounded by
-    /// `self.timeout`; the `Hello` write only by `write_loop`'s remaining retry budget. Counts
+    /// `Hello`/`HelloAck` over a dialed `stream`. The `Hello` write's progress and the `HelloAck`
+    /// wait are each bounded by `self.timeout`. Counts
     /// `logit.output.reconnects` from the second handshake that passes [`validate_hello_ack`] on.
     async fn handshake(&mut self, mut stream: Box<dyn AsyncStream>) -> anyhow::Result<Conn> {
         let hello = control::Hello {
@@ -365,7 +368,14 @@ impl LogitOutput {
             window: self.window,
             senders: self.resend_senders.clone(),
         };
-        write_control(&mut stream, &hello)
+        let framed = frame::write_frame_with_flags(
+            0,
+            Compression::None,
+            frame::FLAG_CONTROL,
+            &hello.encode(),
+        )
+        .context(Fault::Clean)?;
+        write_with_progress(&mut stream, &framed, self.timeout)
             .await
             .context("writing Hello to logit_in")
             .context(Fault::Clean)?;
@@ -601,18 +611,15 @@ impl LogitOutput {
         }
 
         if conn.nothing_in_flight() {
-            // The module doc's "Write phase": `Clean` on any failure, and the connection is
-            // dropped. Flushed outside `self.timeout`, which a large frame on a slow link can
-            // outlast; the retry budget bounds it, as it bounds the write.
-            let written = async {
-                conn.stream.write_all(&framed).await.context("writing a frame to logit_in")?;
-                conn.stream.flush().await.context("flushing a frame to logit_in")
-            };
-            if let Err(err) = written.await {
-                return Err(err).context(Fault::Clean);
+            // The module doc's "Write phase": `Clean` on any failure, a stall included, and the
+            // connection is dropped. `self.timeout` bounds each chunk's progress, not the whole
+            // write, so a large frame on a slow link isn't cut.
+            if let Err(err) = write_with_progress(&mut conn.stream, &framed, self.timeout).await {
+                return Err(err).context("writing a frame to logit_in").context(Fault::Clean);
             }
         } else if let Err(err) = write_with_progress(&mut conn.stream, &framed, self.timeout).await
         {
+            let err = err.context("writing a frame to logit_in");
             // The acks already owed still arrive; `await_ack` reads them on this connection.
             conn.broken = true;
             self.stream = Some(conn);
@@ -715,39 +722,6 @@ fn reject_in_place_of_ack(reject: control::Reject) -> anyhow::Error {
         .context(fault)
 }
 
-/// The write-chunk size with frames in flight: each chunk's write must accept something within
-/// the request timeout.
-const WRITE_CHUNK: usize = 64 * 1024;
-
-/// Writes and flushes `framed` with frames already in flight, bounding progress rather than the
-/// whole write: each `write` call, at most [`WRITE_CHUNK`] bytes, and the final flush must
-/// complete within `bound`. A large frame on a slow link makes progress and never trips it; a
-/// receiver parked on an earlier frame stops reading and does. Errors carry no [`Fault`].
-async fn write_with_progress(
-    stream: &mut Box<dyn AsyncStream>,
-    framed: &[u8],
-    bound: Duration,
-) -> anyhow::Result<()> {
-    let stalled = || anyhow::anyhow!("a frame write to logit_in made no progress for {bound:?}");
-    let mut written = 0;
-    while written < framed.len() {
-        let end = framed.len().min(written + WRITE_CHUNK);
-        let n = tokio::time::timeout(bound, stream.write(&framed[written..end]))
-            .await
-            .map_err(|_elapsed| stalled())?
-            .context("writing a frame to logit_in")?;
-        if n == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
-                .context("writing a frame to logit_in");
-        }
-        written += n;
-    }
-    tokio::time::timeout(bound, stream.flush())
-        .await
-        .map_err(|_elapsed| stalled())?
-        .context("flushing a frame to logit_in")
-}
-
 #[async_trait::async_trait]
 impl Output for LogitOutput {
     /// Records `ctx.provenance` and `seq` for `send`. `write_loop` calls this once per batch,
@@ -821,10 +795,11 @@ impl Output for LogitOutput {
     }
 }
 
-/// Writes and flushes one control message with [`frame::FLAG_CONTROL`] set. Flushed because every
-/// control message is followed by a wait for the peer, and a waiting TLS read doesn't send it
-/// (ADR `sink-send-path-and-attempt-accounting`, decision 7). Duplicates
-/// `logit_inputs::logit`'s `write_control` rather than add a cross-crate dependency for it.
+/// Writes and flushes one control message with [`frame::FLAG_CONTROL`] set, for the tests' fake
+/// peer. The sink writes its one control message, the `Hello`, through [`write_with_progress`],
+/// flushed because a waiting TLS read doesn't send it (ADR
+/// `sink-send-path-and-attempt-accounting`, decision 7).
+#[cfg(test)]
 async fn write_control<S: AsyncWrite + Unpin>(
     stream: &mut S,
     msg: &impl ControlEncode,
@@ -836,16 +811,16 @@ async fn write_control<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[cfg(test)]
 trait ControlEncode {
     fn encode(&self) -> Bytes;
 }
+#[cfg(test)]
 impl ControlEncode for control::Hello {
     fn encode(&self) -> Bytes {
         control::Hello::encode(self)
     }
 }
-// Only a peer writes `HelloAck`, `Reject`, and `Ack`; these impls let the tests' fake peer reuse
-// `write_control`.
 #[cfg(test)]
 impl ControlEncode for control::HelloAck {
     fn encode(&self) -> Bytes {
