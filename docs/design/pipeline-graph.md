@@ -139,6 +139,11 @@ pub enum ComponentKind {
     // `always_keep` pins flagged events through (docs/adr/consistent-sampling-component.md).
     Sample { rate: f64, key: Option<SampleKey>, missing: Option<SampleMissing>,
              always_keep: Option<SampleOverride> },
+    // Resolves `event.timestamp` from an attribute holding the sender's own stamp; an event it
+    // can't resolve is forwarded untouched and counted by reason
+    // (docs/adr/timestamp-transform.md).
+    Timestamp { from: String, format: TimestampFormat, timezone: Option<String>,
+                max_skew: Duration, keep_source: bool },
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
     // opinion of its own (that lives on `Component`, uniformly). `rename`/`filter`/`throttle`/
     // `dedup` used to be sketched here too -- retired before landing, not merely deferred: each is
@@ -164,8 +169,8 @@ collide, so the rule stays predictable when a protocol gains its second side lat
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
 `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`,
-`kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `route`, and any future native
-transform — take no suffix, because a transform has only one direction.
+`kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`, and any future
+native transform — take no suffix, because a transform has only one direction.
 
 **`interval` is a per-kind field.** `lua`/`lua_file` carry an optional flush interval
 (`docs/adr/aggregation-window-semantics.md`); `aggregate`, `internal`, `shape`, and
@@ -209,7 +214,7 @@ literal argument string.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `route`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -383,6 +388,11 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 74. A `max_connections` of `0` or above the permit counter's ceiling, or a non-default one on a UDP
     listener.
 75. A `logit_out` `window` of `0` or past `1024`, the largest window a `logit_in` answers.
+76. A `timestamp` with an empty `from`; a `max_skew` of `0s`; a `timezone` that doesn't resolve; a
+    `timezone` set under a format that never reads it (`unix_*`, `rfc3339`, or a pattern with
+    `%z`, `%:z`, or `%s`); or a pattern that is empty, has no hour and minute, uses `%Z`, `%Q`, or
+    `%:Q`, or fails to parse its own rendering of a reference instant
+    (`docs/adr/timestamp-transform.md`).
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
