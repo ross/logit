@@ -10,14 +10,32 @@
 //! Nothing here tracks the window: one task per connection reads and forwards its frames one at
 //! a time, so answers leave in frame order. Accepted sockets set `TCP_NODELAY`.
 //!
-//! **Acknowledgment.** An `Ack` names a sender identity and a sequence, and answers every frame
-//! of that identity up to the sequence that this connection carried
+//! **Acknowledgment.** An `Ack` names a sender identity and a sequence, and an accepted one
+//! answers every frame of that identity up to the sequence that this connection carried
 //! (`docs/adr/native-hop-named-acks.md`, decision 1). [`serve_frames`] writes one per run of
 //! handled frames: each frame it handles extends a pending `Ack` to that frame's own sequence,
 //! never the mark. The pending `Ack` is written whenever the sender would otherwise wait for it
 //! (one non-blocking poll before every read, [`read_ready_or_ack`]), at an identity change, at
-//! [`ACK_COALESCE_MAX`] frames, and before any `Reject`; that ADR's decision 2 is the canonical
-//! statement. Counted as `logit.input.acks`.
+//! [`ACK_COALESCE_MAX`] frames, and before any `Reject` or rejected `Ack`; that ADR's decision 2
+//! is the canonical statement. Counted as `logit.input.acks`, rejected `Ack`s included.
+//!
+//! **Refusing a frame by name** (`docs/adr/native-hop-ack-status.md`). A data frame's payload
+//! opens with its sender pair, read before the batch is decoded, so a frame this listener can't
+//! take is answered by name and the connection goes on. A rejected `Ack` settles that one frame,
+//! so the pending accepted run goes first ([`ack_rejected`]). The frame's mark is raised, as for
+//! a forward, and it's counted `logit.input.batches.dropped{reason="rejected"}`. Per case:
+//!
+//! | The frame | Answer | Connection |
+//! |---|---|---|
+//! | a body past its decode budget | `Ack{rejected(decode_budget)}` | kept |
+//! | a body that doesn't decode after its prefix | `Ack{rejected(malformed)}` | kept |
+//! | `uncompressed_len` past `max_frame_bytes`, `compressed_len` within [`frame::compressed_bound`] of it | read whole, its prefix alone decoded, `Ack{rejected(too_large)}` | kept |
+//! | `compressed_len` past that bound | `Reject{FRAME_TOO_LARGE}`, nothing of the body read | closed |
+//! | a prefix that doesn't parse, a bad CRC, the wrong codec | no answer, counted under its reason | closed |
+//! | a batch no consumer took | `Reject{GOING_AWAY}` ("Ack point" below) | closed |
+//!
+//! A frame past the compressed bound can't be read without reading past the bound, so neither
+//! its name nor where the next frame starts is known.
 //!
 //! **Binding.** [`Input::bind`] opens the socket before any node task is spawned, so a taken port
 //! fails startup, and [`LogitInput::local_addr`] reads a `:0` bind's port without a
@@ -33,16 +51,17 @@
 //! its sender's mark stays where it was, and the frame's batch is counted
 //! `logit.input.batches.dropped{reason="closed_consumer"}`.
 //!
-//! **Deduplication.** Every data frame's trailer carries its sender's identity and sequence
-//! (`docs/adr/native-hop-identity-and-sequence.md`); a frame without a complete pair is
-//! malformed, a protocol error that ends the connection
+//! **Deduplication.** Every data frame's payload opens with its sender's identity and sequence
+//! (`docs/adr/native-hop-identity-and-sequence.md`, `docs/adr/native-hop-ack-status.md`); a frame
+//! without a complete pair is malformed, a protocol error that ends the connection
 //! (`docs/adr/native-hop-no-compatibility.md`). Each component keeps one table of
 //! high-water marks, one per identity, shared by its connections and bounded at
 //! `max_connections + max_connections / 4` identities (`max_connections:` in config; 1280 at the
 //! default cap of 1024); a new identity at a full table evicts the least recently seen one. A
 //! frame at or below its identity's mark is a resend: acked and not forwarded. Any other frame is
 //! forwarded, and a consumer taking it raises the mark to its sequence; gaps above the mark are
-//! ignored. The same table answers a reconnecting sender's `Hello.senders` with `HelloAck.marks`
+//! ignored. A refused frame raises the mark too. The resend check follows the decode, so a resend
+//! whose body still fails is refused again by name rather than acknowledged on the mark. The same table answers a reconnecting sender's `Hello.senders` with `HelloAck.marks`
 //! ([`handshake`]), a lookup that neither inserts, evicts, nor refreshes an identity, so the
 //! sender commits what this listener already handled without resending it
 //! (`docs/adr/native-hop-named-acks.md`, decision 4). No lock spans a forward, so a frame an ended
@@ -65,10 +84,12 @@
 //! *`GOING_AWAY` and forwarding exclude each other.* `GOING_AWAY` is written only for a frame that
 //! wasn't forwarded, for one of three causes: shutdown (the loop-top and `select!` arms), an idle
 //! close, or no consumer taking the frame's batch (`send_relayed` returned `false`). Every other
-//! `Reject` (the past-the-cap one, the handshake's, and `FRAME_TOO_LARGE`) also goes out before
-//! the frame it answers reaches `send_relayed`, and a forwarded frame's only answer is the `Ack`
-//! covering it, written before any `Reject`. So every frame still unanswered when a `logit_out`
-//! reads `GOING_AWAY` never landed, and it resends them at any delivery posture.
+//! `Reject` (the past-the-cap one, the handshake's, and `FRAME_TOO_LARGE`) and every rejected
+//! `Ack` also goes out before the frame it answers reaches `send_relayed`, and a forwarded
+//! frame's only answer is the accepted `Ack` covering it, written before any `Reject`. So every
+//! frame still unanswered when a `logit_out` reads `GOING_AWAY` never landed, and it resends them
+//! at any delivery posture. A frame no consumer took gets `GOING_AWAY`, never a rejected `Ack`: a
+//! consumer may take it on a resend.
 //!
 //! **Bounded, flushed writes.** Every control write (`HelloAck`, `Ack`, and every `Reject`,
 //! including `GOING_AWAY`) is flushed, and the write and flush finish within `handshake_timeout`
@@ -372,6 +393,7 @@ impl Input for LogitInput {
                                     permit,
                                     sink,
                                     telemetry.clone(),
+                                    diag.clone(),
                                     max_frame_bytes,
                                     handshake_timeout,
                                     idle_timeout,
@@ -393,6 +415,7 @@ impl Input for LogitInput {
                             permit,
                             sink,
                             telemetry.clone(),
+                            diag.clone(),
                             max_frame_bytes,
                             handshake_timeout,
                             idle_timeout,
@@ -440,6 +463,7 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     sink: Fanout,
     telemetry: Telemetry,
+    diag: Diagnostics,
     max_frame_bytes: u32,
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
@@ -461,6 +485,7 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         stream,
         sink,
         telemetry.clone(),
+        diag,
         max_frame_bytes,
         handshake_timeout,
         idle_timeout,
@@ -503,6 +528,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
     sink: Fanout,
     telemetry: Telemetry,
+    mut diag: Diagnostics,
     max_frame_bytes: u32,
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
@@ -530,6 +556,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         &mut stream,
         sink,
         &telemetry,
+        &mut diag,
         &negotiated,
         max_frame_bytes,
         handshake_timeout,
@@ -577,6 +604,7 @@ async fn serve_frames<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: &mut S,
     sink: Fanout,
     telemetry: &Telemetry,
+    diag: &mut Diagnostics,
     negotiated: &Negotiated,
     max_frame_bytes: u32,
     handshake_timeout: Duration,
@@ -590,6 +618,7 @@ async fn serve_frames<S: AsyncRead + AsyncWrite + Unpin + Send>(
         &mut pending,
         sink,
         telemetry,
+        diag,
         negotiated,
         max_frame_bytes,
         handshake_timeout,
@@ -623,6 +652,7 @@ async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
     pending: &mut Option<PendingAck>,
     sink: Fanout,
     telemetry: &Telemetry,
+    diag: &mut Diagnostics,
     negotiated: &Negotiated,
     max_frame_bytes: u32,
     handshake_timeout: Duration,
@@ -697,7 +727,7 @@ async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
         };
 
         let owed = &mut OwedAck { pending: &mut *pending, bound: handshake_timeout, telemetry };
-        let (header, mut payload) =
+        let (header, body) =
             match read_frame_body(stream, header_buf, max_frame_bytes, idle_timeout, Some(owed))
                 .await
             {
@@ -709,7 +739,8 @@ async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     return Ok(Ended::Closing);
                 }
                 // Answered before the close, so the peer sees a permanent refusal rather than an
-                // EOF it can't tell from a crash. Nothing of the body has been read.
+                // EOF it can't tell from a crash. Nothing of the body has been read, so the frame
+                // can't be named, and the bytes behind it can't be found.
                 Err(FrameReadError::TooLarge(err)) => {
                     telemetry.count("logit.proto.errors", 1.0, &[("reason", "too_large")]);
                     let message = err.to_string();
@@ -745,23 +776,73 @@ async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
             );
         }
 
+        // The prefix names the frame; one that doesn't parse leaves nothing to answer by name, a
+        // protocol error that ends the connection.
+        let (mut payload, oversize) = match body {
+            FrameBody::Whole(payload) => (payload, None),
+            FrameBody::Oversize { prefix, message } => (prefix, Some(message)),
+        };
+        let seq = match native::read_hop_prefix(&mut payload) {
+            Ok(seq) => seq,
+            Err(err) => {
+                telemetry.count("logit.proto.errors", 1.0, &[("reason", "malformed")]);
+                return Err(anyhow::Error::new(err).context("reading a native hop prefix"));
+            }
+        };
+
+        // Past `max_frame_bytes` but read whole: refused by name, and the connection goes on.
+        if let Some(message) = oversize {
+            telemetry.count("logit.proto.errors", 1.0, &[("reason", "too_large")]);
+            diag.warn_throttled(
+                "frame_rejected",
+                format_args!("refusing a frame of sender sequence {}: {message}", seq.seq),
+            );
+            let status = control::AckStatus::rejected(control::ACK_REJECTED_TOO_LARGE, message);
+            ack_rejected(stream, pending, seq, status, senders, handshake_timeout, telemetry)
+                .await?;
+            last_progress = tokio::time::Instant::now();
+            continue;
+        }
+
         // A fresh budget per frame, scaled to the cap this peer's frames arrive under.
         let budget = native::DecodeBudget::for_frame_cap(max_frame_bytes);
-        let (batch, provenance, seq) = match native::decode_hop_batch(&mut payload, &budget) {
+        let (batch, provenance) = match native::decode_hop_body(&mut payload, &budget) {
             Ok(decoded) => decoded,
+            // A body past its budget, or one that doesn't decode, fails the same way on every
+            // resend: refused by name, and the connection goes on.
             Err(err) => {
-                telemetry.count(
-                    "logit.proto.errors",
-                    1.0,
-                    &[("reason", decode_error_reason(&err))],
-                );
-                // A batch past its budget would be past it on every resend, so it's answered as
-                // a frame too large: a `logit_out` drops it as rejected rather than retrying.
-                if matches!(err, CodecError::BudgetExceeded { .. }) {
-                    let message = err.to_string();
-                    reject_too_large(stream, pending, message, handshake_timeout, telemetry).await;
-                }
-                return Err(anyhow::Error::new(err).context("decoding a native hop batch"));
+                let reason = decode_error_reason(&err);
+                telemetry.count("logit.proto.errors", 1.0, &[("reason", reason)]);
+                let code = match err {
+                    CodecError::BudgetExceeded { limit } => {
+                        diag.warn_throttled(
+                            "decode_budget",
+                            format_args!(
+                                "refusing a batch that decodes past its {limit}-byte budget \
+                                 ({}x max_frame_bytes of {max_frame_bytes}); the sender's \
+                                 batches are too large for this listener",
+                                native::budget::DECODE_BUDGET_PER_FRAME_BYTE
+                            ),
+                        );
+                        control::ACK_REJECTED_DECODE_BUDGET
+                    }
+                    _ => {
+                        diag.warn_throttled(
+                            "frame_rejected",
+                            format_args!(
+                                "refusing a frame of sender sequence {} that doesn't decode: \
+                                 {err}",
+                                seq.seq
+                            ),
+                        );
+                        control::ACK_REJECTED_MALFORMED
+                    }
+                };
+                let status = control::AckStatus::rejected(code, err.to_string());
+                ack_rejected(stream, pending, seq, status, senders, handshake_timeout, telemetry)
+                    .await?;
+                last_progress = tokio::time::Instant::now();
+                continue;
             }
         };
 
@@ -840,8 +921,18 @@ async fn flush_ack<S: AsyncWrite + Unpin>(
     let Some(run) = pending.take() else {
         return Ok(());
     };
-    let ack = control::Ack { id: run.seq.id, seq: run.seq.seq };
-    if let Err(err) = write_control(stream, &ack, bound).await {
+    write_ack(stream, &control::Ack::accepted(run.seq.id, run.seq.seq), bound, telemetry).await
+}
+
+/// Writes one `Ack`, counting `logit.input.acks`, or a stall as
+/// `logit.proto.errors{reason="ack_write_stalled"}`.
+async fn write_ack<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    ack: &control::Ack,
+    bound: Duration,
+    telemetry: &Telemetry,
+) -> anyhow::Result<()> {
+    if let Err(err) = write_control(stream, ack, bound).await {
         if err.is::<WriteStalled>() {
             telemetry.count("logit.proto.errors", 1.0, &[("reason", "ack_write_stalled")]);
         }
@@ -849,6 +940,28 @@ async fn flush_ack<S: AsyncWrite + Unpin>(
     }
     telemetry.count("logit.input.acks", 1.0, &[]);
     Ok(())
+}
+
+/// Answers one frame this listener refuses by name (`docs/adr/native-hop-ack-status.md`): writes
+/// the pending accepted run first, since an accepted `Ack` covers every earlier frame of its
+/// identity and this one isn't among them, then `Ack{seq, status}` on its own. Raises `seq`'s mark,
+/// so a resend of the frame is recognized, and counts the frame
+/// `logit.input.batches.dropped{reason="rejected"}`. An `Err` is a failed write, which ends the
+/// connection.
+async fn ack_rejected<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    pending: &mut Option<PendingAck>,
+    seq: native::SeqId,
+    status: control::AckStatus,
+    senders: &SenderTable,
+    bound: Duration,
+    telemetry: &Telemetry,
+) -> anyhow::Result<()> {
+    debug_assert!(matches!(status, control::AckStatus::Rejected { .. }));
+    telemetry.count("logit.input.batches.dropped", 1.0, &[("reason", "rejected")]);
+    senders.raise(seq);
+    flush_ack(stream, pending, bound, telemetry).await?;
+    write_ack(stream, &control::Ack { id: seq.id, seq: seq.seq, status }, bound, telemetry).await
 }
 
 /// The `Ack` a read owes before it waits: [`frame_loop`]'s pending run, and what
@@ -997,7 +1110,10 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
             .map_err(FrameReadError::into_inner)
     });
     let (header, mut payload) = match read.await {
-        Ok(Ok(pair)) => pair,
+        Ok(Ok((header, FrameBody::Whole(payload)))) => (header, payload),
+        Ok(Ok((_, FrameBody::Oversize { message, .. }))) => {
+            anyhow::bail!("Hello is over the control message cap: {message}")
+        }
         Ok(Err(err)) => return Err(err),
         Err(_elapsed) => anyhow::bail!("timed out waiting for Hello"),
     };
@@ -1249,13 +1365,29 @@ impl FrameReadError {
     }
 }
 
-/// Parses `header_buf` and checks its declared lengths before reading the body:
-/// `uncompressed_len` against `max_frame_bytes` (capped at [`frame::MAX_SANE_UNCOMPRESSED_LEN`]),
-/// and `compressed_len` against [`frame::compressed_bound`] of that, since an incompressible
-/// payload at the cap grows under lz4. Then reads the body into the frame's final buffer, after a
-/// copy of the header, and hands it to [`frame::read_frame_with_header`] for its CRC,
-/// decompression, and length checks. The body is held once: peak heap is one
-/// `HEADER_LEN + compressed_len` buffer.
+/// A frame [`read_frame_body`] read whole.
+enum FrameBody {
+    /// The payload, decompressed and checked.
+    Whole(Bytes),
+    /// A frame whose `uncompressed_len` is past the bound while its `compressed_len` is within
+    /// [`frame::compressed_bound`] of it: its compressed bytes were read and CRC-checked, and only
+    /// the first [`native::HOP_PREFIX_MAX_LEN`] bytes of its payload decoded, enough to name it.
+    /// `message` says by how much it's over.
+    Oversize { prefix: Bytes, message: String },
+}
+
+/// Parses `header_buf` and checks its declared lengths before reading the body: `compressed_len`
+/// against [`frame::compressed_bound`] of `max_frame_bytes` (capped at
+/// [`frame::MAX_SANE_UNCOMPRESSED_LEN`]), since an incompressible payload at the cap grows under
+/// lz4. Past that, it fails [`FrameReadError::TooLarge`] with nothing of the body read. Then
+/// reads the body into the frame's final buffer, after a copy of the header, and hands it to
+/// [`frame::read_frame_with_header`] for its CRC, decompression, and length checks. The body is
+/// held once: peak heap is one `HEADER_LEN + compressed_len` buffer.
+///
+/// A frame within the compressed bound whose `uncompressed_len` is past `max_frame_bytes` is still
+/// read, at no more than a frame at the cap costs, and returned as [`FrameBody::Oversize`] with
+/// only its prefix decoded ([`frame::read_frame_prefix`]), so the caller answers it by name and
+/// reads on (`docs/adr/native-hop-ack-status.md`).
 ///
 /// `stall` bounds each `read` of the body, not the body in total (module doc's "Idle timeout").
 /// It's the connection's `idle_timeout`; `None` (the handshake, test helpers) means unbounded.
@@ -1267,7 +1399,7 @@ async fn read_frame_body<S: AsyncRead + AsyncWrite + Unpin>(
     max_frame_bytes: u32,
     stall: Option<Duration>,
     mut owed: Option<&mut OwedAck<'_>>,
-) -> Result<(FrameHeader, Bytes), FrameReadError> {
+) -> Result<(FrameHeader, FrameBody), FrameReadError> {
     let mut header_bytes = Bytes::copy_from_slice(&header_buf);
     let header = FrameHeader::read(&mut header_bytes).map_err(|e| {
         let reason = if header_buf[..4] != frame::MAGIC {
@@ -1285,7 +1417,7 @@ async fn read_frame_body<S: AsyncRead + AsyncWrite + Unpin>(
 
     let bound = max_frame_bytes.min(frame::MAX_SANE_UNCOMPRESSED_LEN);
     let compressed_bound = frame::compressed_bound(bound);
-    if header.uncompressed_len > bound || header.compressed_len > compressed_bound {
+    if header.compressed_len > compressed_bound {
         return Err(FrameReadError::TooLarge(anyhow::anyhow!(
             "frame declares {}/{} (uncompressed/compressed) bytes, over the \
              {bound}/{compressed_bound}-byte bound",
@@ -1293,6 +1425,7 @@ async fn read_frame_body<S: AsyncRead + AsyncWrite + Unpin>(
             header.compressed_len
         )));
     }
+    let oversize = header.uncompressed_len > bound;
 
     // A fill loop rather than `read_exact`, so each `read` carries the `stall` bound and a peer
     // that closed mid-body (`Ok(0)`, `Truncated`) stays distinct from one that stopped
@@ -1333,8 +1466,20 @@ async fn read_frame_body<S: AsyncRead + AsyncWrite + Unpin>(
     // `read_frame_with_header` re-parses the header from the front of `full`, then splits the
     // body off it for the CRC: the buffer must hold both.
     let mut full = full.freeze();
-    match frame::read_frame_with_header(&mut full) {
-        Ok((header, payload)) => Ok((header, payload)),
+    let read = if oversize {
+        frame::read_frame_prefix(&mut full, native::HOP_PREFIX_MAX_LEN).map(|(header, prefix)| {
+            let message = format!(
+                "frame declares {} uncompressed bytes, over the {bound}-byte bound",
+                header.uncompressed_len
+            );
+            (header, FrameBody::Oversize { prefix, message })
+        })
+    } else {
+        frame::read_frame_with_header(&mut full)
+            .map(|(header, payload)| (header, FrameBody::Whole(payload)))
+    };
+    match read {
+        Ok(read) => Ok(read),
         Err(CodecError::Malformed(msg)) if msg.contains("crc32c") => {
             Err(FrameReadError::Crc(anyhow::anyhow!("crc32c mismatch -- frame is corrupt")))
         }
@@ -1531,10 +1676,14 @@ mod tests {
             .map_err(HeaderReadError::into_inner)
             .unwrap()
             .expect("expected a frame, got a clean close");
-        read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN, None, None)
+        match read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN, None, None)
             .await
             .map_err(FrameReadError::into_inner)
             .unwrap()
+        {
+            (header, FrameBody::Whole(payload)) => (header, payload),
+            (_, FrameBody::Oversize { message, .. }) => panic!("an oversize frame: {message}"),
+        }
     }
 
     async fn client_hello(stream: &mut TcpStream, codecs: Vec<u8>, compressions: Vec<u8>) {
@@ -1611,7 +1760,7 @@ mod tests {
         send_payload(stream, &payload, compression).await;
     }
 
-    /// Frames a hand-built hop payload, for a trailer `encode_hop_batch` never writes.
+    /// Frames a hand-built hop payload, for a prefix or body `encode_hop_batch` never writes.
     async fn send_payload(stream: &mut TcpStream, payload: &[u8], compression: Compression) {
         let framed = frame::write_frame(native::CODEC_HOP_BATCH, compression, payload).unwrap();
         stream.write_all(&framed).await.unwrap();
@@ -1673,9 +1822,9 @@ mod tests {
         (addr, rx)
     }
 
-    /// The `Ack` that names `seq`, the frame it answers.
+    /// The accepted `Ack` that names `seq`, the frame it answers.
     fn ack_for(seq: native::SeqId) -> control::Ack {
-        control::Ack { id: seq.id, seq: seq.seq }
+        control::Ack::accepted(seq.id, seq.seq)
     }
 
     /// Reads the next control message and asserts it is the `Ack` naming `seq`.
@@ -1754,7 +1903,7 @@ mod tests {
         assert_eq!(provenance.previous_str(), Some("remote_enrich"));
     }
 
-    /// A trailer with no provenance gets this listener's id backfilled into both fields.
+    /// A frame with no provenance gets this listener's id backfilled into both fields.
     #[tokio::test]
     async fn a_client_with_no_provenance_gets_this_listener_backfilled() {
         let (addr, input) = bound_input().await;
@@ -1970,110 +2119,175 @@ mod tests {
         assert_eq!(totals.sum("logit.proto.errors", &[("reason", "crc")]), 1.0);
     }
 
-    /// A frame well under `max_frame_bytes` whose batch decodes past 4x that cap closes the
-    /// connection, counted as `decode_budget` rather than `malformed` and diagnosed under its own
-    /// key.
+    /// The rejected `Ack` that names `seq`, with `reason`.
+    fn read_rejected(ack: control::ControlMessage, seq: native::SeqId, reason: u16) -> String {
+        match ack {
+            control::ControlMessage::Ack(control::Ack {
+                id,
+                seq: named,
+                status: control::AckStatus::Rejected { reason: got, message },
+            }) => {
+                assert_eq!((id, named), (seq.id, seq.seq), "the rejected Ack's name");
+                assert_eq!(got, reason, "the rejected Ack's reason");
+                message.unwrap_or_default()
+            }
+            other => panic!("expected a rejected Ack naming {seq:?}, got {other:?}"),
+        }
+    }
+
+    /// Five empty events: past the 4 KiB decode budget of a 1 KiB `max_frame_bytes` (864 bytes
+    /// an event) in a payload of a few dozen bytes.
+    fn budget_busting_batch() -> EventBatch {
+        let events = (0..5).map(|i| Event::empty(i, AttrMap::new())).collect();
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
+    }
+
+    /// A frame well under `max_frame_bytes` whose batch decodes past 4x that cap is answered
+    /// `Ack{rejected(decode_budget)}` by name: counted `decode_budget` (not `malformed`) and
+    /// `batches.dropped{reason="rejected"}`, diagnosed under its own key, never forwarded, and
+    /// the connection carries the next frame. The mark is raised, so a resend of the refused
+    /// sequence is acknowledged without a forward.
     #[tokio::test]
-    async fn a_batch_past_the_decode_budget_is_counted_and_diagnosed_as_decode_budget() {
-        let registry = Registry::new();
-        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+    async fn a_batch_past_the_decode_budget_is_rejected_by_name_and_the_connection_goes_on() {
+        let mut probe = TelemetryProbe::new();
         let diag = Diagnostics::new("logit_in");
         let listener_diag = diag.clone();
         let (addr, input) = bound_input().await;
-        // A 4 KiB budget: five empty events (864 bytes each) exceed it in a ~10-byte payload.
-        let mut input =
-            input.with_telemetry(telemetry).with_diagnostics(diag).with_max_frame_bytes(1024);
-        let (sink, _rx) = fanout_into_channel(16);
+        let mut input = input
+            .with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"))
+            .with_diagnostics(diag)
+            .with_max_frame_bytes(1024);
+        let (sink, mut rx) = fanout_into_channel(16);
         tokio::spawn(async move { input.run(sink).await });
+        let mut client = hop_client(&addr).await;
 
-        let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
-        let _ = read_control_response(&mut client).await;
-
-        let events = (0..5).map(|i| Event::empty(i, AttrMap::new())).collect();
-        let batch = EventBatch { resource: Arc::new(Resource::default()), scope: None, events };
-        send_data_frame(&mut client, &batch, Compression::None).await;
-
-        // `a_frame_past_the_decode_budget_is_answered_frame_too_large` pins the `Reject`.
-        let _ = read_control_response(&mut client).await;
-        let mut buf = [0u8; 1];
-        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
-            .await
-            .expect("should observe a close within 2s")
-            .unwrap();
-        assert_eq!(n, 0);
-        // The listener lingers after the `Reject` until this side closes.
-        drop(client);
-
-        let mut probe = TelemetryProbe::with_registry(registry);
-        let totals = probe
-            .wait_for("the decode_budget error counted", |t| {
-                t.sum("logit.proto.errors", &[("reason", "decode_budget")]) >= 1.0
-            })
+        let refused = sid(21, 1);
+        let batch = budget_busting_batch();
+        send_data_frame_seq(&mut client, &batch, Provenance::default(), refused, Compression::None)
             .await;
-        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "decode_budget")]), 1.0);
-        // The diagnostic is reported by the accept loop's task after the connection returns, so
-        // it can follow both the count and the close.
-        logit_pipeline::test_util::wait_until("the decode_budget diagnostic", || {
-            listener_diag.occurrences("decode_budget") >= 1
-        })
-        .await;
+        let message = read_rejected(
+            read_control_response(&mut client).await,
+            refused,
+            control::ACK_REJECTED_DECODE_BUDGET,
+        );
+        assert!(message.contains("decode budget"), "{message}");
+
+        // The same connection carries the next frame.
+        send_acked(&mut client, 2, sid(21, 2)).await;
+        assert_eq!(recv_mark(&mut rx).await, 2);
+
+        // A resend of the refused sequence, its body now within the budget, is a resend.
+        send_acked(&mut client, 1, refused).await;
+        assert!(rx.try_recv().is_err(), "the refused sequence is never forwarded");
+
+        assert_eq!(probe.sum("logit.proto.errors", &[("reason", "decode_budget")]), 1.0);
+        assert!(!probe.poll().has("logit.proto.errors", &[("reason", "too_large")]));
+        assert_eq!(probe.sum("logit.input.batches.dropped", &[("reason", "rejected")]), 1.0);
+        assert_eq!(probe.sum("logit.input.batches.resends", &[]), 1.0);
         assert_eq!(listener_diag.occurrences("decode_budget"), 1);
         assert_eq!(listener_diag.occurrences("connection_error"), 0);
     }
 
-    /// A batch past its decode budget is answered `Reject{FRAME_TOO_LARGE}` before the close, so
-    /// a `logit_out` drops it as `Fault::Rejected` instead of resending it under at-least-once.
-    /// Counted once, as `decode_budget`.
+    /// A frame whose prefix names it and whose body doesn't decode is answered
+    /// `Ack{rejected(malformed)}`, and the connection carries the next frame.
     #[tokio::test]
-    async fn a_frame_past_the_decode_budget_is_answered_frame_too_large() {
-        let registry = Registry::new();
-        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+    async fn a_malformed_body_after_a_valid_prefix_is_rejected_by_name() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
+        let mut client = hop_client(&addr).await;
+
+        let refused = sid(22, 1);
+        let payload = [&refused.id[..], &[1], b"not a batch"].concat();
+        send_payload(&mut client, &payload, Compression::Lz4).await;
+        read_rejected(
+            read_control_response(&mut client).await,
+            refused,
+            control::ACK_REJECTED_MALFORMED,
+        );
+
+        send_acked(&mut client, 2, sid(22, 2)).await;
+        assert_eq!(recv_mark(&mut rx).await, 2);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(probe.sum("logit.proto.errors", &[("reason", "malformed")]), 1.0);
+        assert_eq!(probe.sum("logit.input.batches.dropped", &[("reason", "rejected")]), 1.0);
+    }
+
+    /// A frame past `max_frame_bytes` within its compressed bound is read whole, refused by name
+    /// as `Ack{rejected(too_large)}` from its prefix alone, and the connection goes on: an lz4
+    /// frame that compresses far under the cap, and an uncompressed one inside lz4's slack over
+    /// it.
+    #[tokio::test]
+    async fn a_frame_past_max_frame_bytes_within_its_compressed_bound_is_rejected_by_name() {
+        const CAP: u32 = 1024;
+        let mut probe = TelemetryProbe::new();
         let (addr, input) = bound_input().await;
-        // A 4 KiB budget: five empty events exceed it in a ~10-byte payload.
-        let mut input = input.with_telemetry(telemetry).with_max_frame_bytes(1024);
+        let mut input = input
+            .with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"))
+            .with_max_frame_bytes(CAP);
         let (sink, mut rx) = fanout_into_channel(16);
         tokio::spawn(async move { input.run(sink).await });
+        let mut client = hop_client(&addr).await;
 
-        let mut client = connect(&addr).await;
-        client_hello(&mut client, vec![native::CODEC_HOP_BATCH], vec![0]).await;
-        let _ = read_control_response(&mut client).await;
-
-        let events = (0..5).map(|i| Event::empty(i, AttrMap::new())).collect();
-        let batch = EventBatch { resource: Arc::new(Resource::default()), scope: None, events };
-        send_data_frame(&mut client, &batch, Compression::None).await;
-
-        match tokio::time::timeout(Duration::from_secs(2), read_control_response(&mut client))
-            .await
-            .expect("the listener answers within 2s")
-        {
-            control::ControlMessage::Reject(reject) => {
-                assert_eq!(reject.code, control::REJECT_FRAME_TOO_LARGE, "{}", reject.message);
-                assert!(reject.message.contains("decode budget"), "{}", reject.message);
-            }
-            other => panic!("expected Reject{{FRAME_TOO_LARGE}}, got {other:?}"),
-        }
-        let mut buf = [0u8; 1];
-        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
-            .await
-            .expect("the connection closes right behind the Reject")
-            .unwrap();
-        assert_eq!(n, 0);
-        // The listener lingers after the `Reject` until this side closes.
-        drop(client);
-
-        let mut probe = TelemetryProbe::with_registry(registry);
-        let totals = probe
-            .wait_for("the decode_budget error counted", |t| {
-                t.sum("logit.proto.errors", &[("reason", "decode_budget")]) >= 1.0
-            })
-            .await;
-        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "decode_budget")]), 1.0);
-        assert!(
-            !totals.has("logit.proto.errors", &[("reason", "too_large")]),
-            "counted once, as decode_budget"
+        // 8 KiB of one repeated byte compresses to a few dozen.
+        let lz4 = sid(23, 1);
+        let payload = [&lz4.id[..], &[1], &[b'a'; 8192]].concat();
+        send_payload(&mut client, &payload, Compression::Lz4).await;
+        let message = read_rejected(
+            read_control_response(&mut client).await,
+            lz4,
+            control::ACK_REJECTED_TOO_LARGE,
         );
-        assert!(rx.try_recv().is_err(), "nothing was forwarded");
+        assert!(message.contains("8209 uncompressed bytes"), "{message}");
+
+        // One byte over the cap, uncompressed: `compressed_len` is within `CAP + CAP / 255 + 16`.
+        let plain = sid(23, 2);
+        let payload = [&plain.id[..], &[2], &vec![0u8; CAP as usize + 1 - 17]].concat();
+        send_payload(&mut client, &payload, Compression::None).await;
+        read_rejected(
+            read_control_response(&mut client).await,
+            plain,
+            control::ACK_REJECTED_TOO_LARGE,
+        );
+
+        send_acked(&mut client, 3, sid(23, 3)).await;
+        assert_eq!(recv_mark(&mut rx).await, 3);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(probe.sum("logit.proto.errors", &[("reason", "too_large")]), 2.0);
+        assert_eq!(probe.sum("logit.input.batches.dropped", &[("reason", "rejected")]), 2.0);
+    }
+
+    /// An accepted `Ack` covers every earlier frame of its identity, so a refused frame behind a
+    /// pending run is answered after the run's `Ack`, on its own.
+    #[tokio::test]
+    async fn a_pending_accepted_run_is_flushed_before_a_rejected_ack() {
+        let (addr, input) = bound_input().await;
+        let mut input = input.with_max_frame_bytes(1024);
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+        let mut client = handshaken(&addr, 8).await;
+
+        // Two frames and a refused one, in one write, so the refused one is read while the run's
+        // `Ack` is still owed.
+        let mut bytes = frames_of(&[sid(24, 1), sid(24, 2)]);
+        let refused = sid(24, 3);
+        let payload =
+            native::encode_hop_batch(&budget_busting_batch(), Provenance::default(), refused);
+        bytes.extend_from_slice(
+            &frame::write_frame(native::CODEC_HOP_BATCH, Compression::None, &payload).unwrap(),
+        );
+        bytes.extend_from_slice(&frames_of(&[sid(24, 4)]));
+        client.write_all(&bytes).await.unwrap();
+
+        read_ack(&mut client, sid(24, 2)).await;
+        read_rejected(
+            read_control_response(&mut client).await,
+            refused,
+            control::ACK_REJECTED_DECODE_BUDGET,
+        );
+        read_ack(&mut client, sid(24, 4)).await;
+        for mark in [1, 2, 4] {
+            assert_eq!(recv_mark(&mut rx).await, mark);
+        }
     }
 
     #[tokio::test]
@@ -2167,11 +2381,14 @@ mod tests {
             .map_err(HeaderReadError::into_inner)
             .unwrap()
             .expect("expected a frame, got a clean close");
-        let (header, mut payload) =
+        let (header, FrameBody::Whole(mut payload)) =
             read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN, None, None)
                 .await
                 .map_err(FrameReadError::into_inner)
-                .unwrap();
+                .unwrap()
+        else {
+            panic!("an oversize control frame");
+        };
         assert_eq!(
             header.flags & frame::FLAG_CONTROL,
             frame::FLAG_CONTROL,
@@ -2617,6 +2834,7 @@ mod tests {
             Some(permit),
             sink,
             telemetry,
+            Diagnostics::default(),
             frame::MAX_SANE_UNCOMPRESSED_LEN,
             BOUND,
             None,
@@ -2682,6 +2900,7 @@ mod tests {
             server,
             sink,
             telemetry,
+            Diagnostics::default(),
             frame::MAX_SANE_UNCOMPRESSED_LEN,
             BOUND,
             None,
@@ -2783,6 +3002,7 @@ mod tests {
                 server,
                 sink,
                 Telemetry::default(),
+                Diagnostics::default(),
                 frame::MAX_SANE_UNCOMPRESSED_LEN,
                 HANDSHAKE_TIMEOUT,
                 None,
@@ -2836,6 +3056,7 @@ mod tests {
             server,
             sink,
             telemetry,
+            Diagnostics::default(),
             frame::MAX_SANE_UNCOMPRESSED_LEN,
             HANDSHAKE_TIMEOUT,
             None,
@@ -2912,6 +3133,7 @@ mod tests {
             server,
             sink,
             Telemetry::default(),
+            Diagnostics::default(),
             frame::MAX_SANE_UNCOMPRESSED_LEN,
             HANDSHAKE_TIMEOUT,
             None,
@@ -3001,6 +3223,7 @@ mod tests {
                 server,
                 sink,
                 telemetry,
+                Diagnostics::default(),
                 frame::MAX_SANE_UNCOMPRESSED_LEN,
                 HANDSHAKE_TIMEOUT,
                 None,
@@ -3465,35 +3688,25 @@ mod tests {
         assert_eq!(probe.sum("logit.input.batches.resends", &[]), 1.0);
     }
 
-    /// A data frame without a complete sender pair is malformed: it's never forwarded, the
-    /// connection ends, and `logit.proto.errors` counts it. So is a data frame under the bare
-    /// batch codec.
+    /// A data frame whose prefix doesn't parse can't be answered by name: it's a protocol error,
+    /// never forwarded, the connection ends, and `logit.proto.errors` counts it as `malformed`. So
+    /// is a data frame under the bare batch codec, counted as `codec`.
     #[tokio::test]
-    async fn a_frame_without_a_complete_pair_is_a_protocol_error() {
+    async fn a_frame_without_a_complete_prefix_is_a_protocol_error() {
         let mut probe = TelemetryProbe::new();
         let (addr, mut rx) = spawn_counted(&probe, crate::DEFAULT_MAX_CONNECTIONS).await;
 
-        // A bare payload, then a hand-built trailer: its length (one byte, under 128) and fields.
-        let with_trailer = |mark: i64, trailer: &[u8]| {
-            let mut payload = native::encode_batch(&batch_marked(mark)).to_vec();
-            payload.push(u8::try_from(trailer.len()).unwrap());
-            payload.extend_from_slice(trailer);
-            payload
-        };
-        let id_15 = [[3u8, 15].as_slice(), &[9; 15], &[4, 1, 1]].concat();
-        let seq_0 = [[3u8, 16].as_slice(), &[9; 16], &[4, 1, 0]].concat();
-        let tag_4_twice = [[3u8, 16].as_slice(), &[9; 16], &[4, 1, 1, 4, 1, 2]].concat();
+        let id = [9u8; 16];
         let payloads = [
-            with_trailer(1, &[]),
-            with_trailer(2, &id_15),
-            with_trailer(3, &seq_0),
-            with_trailer(4, &tag_4_twice),
+            id[..15].to_vec(),
+            id.to_vec(),
+            [&id[..], &[0x81]].concat(),
+            [&id[..], &[0], &native::encode_batch(&batch_marked(4))].concat(),
         ];
-
         for (n, payload) in payloads.iter().enumerate() {
             let mut client = hop_client(&addr).await;
             send_payload(&mut client, payload, Compression::None).await;
-            expect_closed(&mut client, "a frame without a complete pair").await;
+            expect_closed(&mut client, "a frame without a complete prefix").await;
             probe
                 .wait_for("the malformed frame counted", |t| {
                     t.sum("logit.proto.errors", &[("reason", "malformed")]) >= (n + 1) as f64
@@ -3520,6 +3733,7 @@ mod tests {
         assert_eq!(totals.sum("logit.proto.errors", &[("reason", "malformed")]), 4.0);
         assert_eq!(totals.sum("logit.proto.errors", &[("reason", "magic")]), 0.0);
         assert_eq!(totals.sum("logit.proto.errors", &[("reason", "codec")]), 1.0);
+        assert!(!totals.has("logit.input.batches.dropped", &[("reason", "rejected")]));
         assert!(rx.try_recv().is_err(), "no malformed frame was forwarded");
     }
 
