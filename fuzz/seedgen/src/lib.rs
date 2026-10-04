@@ -10,7 +10,9 @@ use bytes::{Bytes, BytesMut};
 use logit_core::interner::intern;
 use logit_core::{DdSketch, EventBatch, HyperLogLog, Mapping, Provenance};
 use logit_proto::frame::{write_frame, write_frame_with_flags, Compression, FLAG_CONTROL};
-use logit_proto::native::control::{Ack, ControlMessage, Hello, HelloAck, Reject};
+use logit_proto::native::control::{
+    Ack, AckStatus, ControlMessage, Hello, HelloAck, Reject, ACK_REJECTED_DECODE_BUDGET,
+};
 use logit_proto::native::varint::write_uvarint;
 use logit_proto::native::{encode_batch, encode_hop_batch, SeqId, CODEC_BATCH, CODEC_HOP_BATCH};
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
@@ -97,18 +99,18 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         add("native_hop_batch", name.clone(), hop.to_vec());
     }
 
-    // Trailers whose sender pair is malformed, which `decode_hop_batch` rejects (ADR
-    // `native-hop-no-compatibility`, decision 2): inputs one field away from a valid pair.
+    // Prefixes whose sender pair is malformed, which `decode_hop_batch` rejects (ADR
+    // `native-hop-no-compatibility`, decision 2): inputs one byte away from a valid pair.
     if let Some((name, batch)) = batches.first() {
         let bare = encode_batch(batch);
         let id: &[u8] = b"seed-sender-id16";
-        let malformed: [(&str, &[TrailerField]); 3] = [
-            ("bad-pair-dup-tag", &[(3, id), (4, &[1]), (4, &[2])]),
-            ("bad-pair-id15", &[(3, &id[..15]), (4, &[1])]),
-            ("bad-pair-seq-trailing-byte", &[(3, id), (4, &[1, 0])]),
+        let malformed: [(&str, &[u8]); 3] = [
+            ("bad-prefix-seq0", &[id, &[0]].concat()),
+            ("bad-prefix-id15", &id[..15]),
+            ("bad-prefix-seq-truncated", &[id, &[0x81]].concat()),
         ];
-        for (label, fields) in malformed {
-            add("native_hop_batch", format!("{name}-{label}"), with_trailer(&bare, fields));
+        for (label, prefix) in malformed {
+            add("native_hop_batch", format!("{name}-{label}"), with_prefix(prefix, &bare));
         }
     }
 
@@ -135,7 +137,15 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
                 marks: vec![(*b"logit-fuzz-seed!", 7), (*b"logit-fuzz-seed2", 0)],
             }),
         ),
-        ("ack", ControlMessage::Ack(Ack { id: *b"logit-fuzz-seed!", seq: 1 })),
+        ("ack", ControlMessage::Ack(Ack::accepted(*b"logit-fuzz-seed!", 1))),
+        (
+            "ack-rejected",
+            ControlMessage::Ack(Ack {
+                id: *b"logit-fuzz-seed!",
+                seq: 2,
+                status: AckStatus::rejected(ACK_REJECTED_DECODE_BUDGET, "over the decode budget"),
+            }),
+        ),
         ("reject", ControlMessage::Reject(Reject { code: 1, message: "no common codec".into() })),
     ];
     for (name, message) in controls {
@@ -229,21 +239,11 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
     Ok((seeds, skipped))
 }
 
-/// One hop trailer field, `(tag, value)`.
-type TrailerField<'a> = (u8, &'a [u8]);
-
-/// A bare batch payload followed by a hop trailer of `fields`, each `(tag, value)` written as
-/// given.
-fn with_trailer(bare: &[u8], fields: &[TrailerField]) -> Vec<u8> {
-    let mut trailer = BytesMut::new();
-    for (tag, value) in fields {
-        trailer.extend_from_slice(&[*tag]);
-        write_uvarint(&mut trailer, value.len() as u64);
-        trailer.extend_from_slice(value);
-    }
-    let mut out = BytesMut::from(bare);
-    write_uvarint(&mut out, trailer.len() as u64);
-    out.extend_from_slice(&trailer);
+/// `prefix` written as given, a bare batch payload, and an empty hop trailer.
+fn with_prefix(prefix: &[u8], bare: &[u8]) -> Vec<u8> {
+    let mut out = BytesMut::from(prefix);
+    out.extend_from_slice(bare);
+    write_uvarint(&mut out, 0);
     out.to_vec()
 }
 
