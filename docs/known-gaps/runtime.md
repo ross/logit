@@ -4,28 +4,19 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## Pipeline runtime and graph
 
-- **Fan-out/fan-in is unbuffered and uncoordinated** — a stalled sink backs up every branch that
-  shares an upstream with it, not only its own. The component graph (ADR
-  `component-graph-configuration`, [pipeline-graph.md](../design/pipeline-graph.md)) makes
-  arbitrary fan-out/fan-in the normal case: a sink shared by two branches, or one listener feeding
-  several filters. A per-edge `on_full: block | drop` backpressure policy is an open question, not
-  yet designed. A router plus `target` components doesn't change this: a stalled consumer of one
-  target backs up through its router into every other target's flow, like any other shared
-  upstream.
-
-  Separately, an unconditional fan-out to several mutating branches still pays a full `EventBatch`
-  clone ([ADR `arc-eventbatch-copy-on-write`](../adr/arc-eventbatch-copy-on-write.md)):
+- **An unconditional fan-out to several mutating branches pays a full `EventBatch` clone**
+  ([ADR `arc-eventbatch-copy-on-write`](../adr/arc-eventbatch-copy-on-write.md)):
   - A single-consumer edge (most edges in the shipped config) costs 0 allocations; an all-`Output`
     fan-out costs 1.
-  - A fan-out mixing one `Output` branch with one mutating branch costs 1 *or* 6 allocations,
+  - A fan-out mixing one `Output` branch with one mutating branch costs 1 *or* 4 allocations,
     depending on scheduling.
-  - A fan-out with no `Output` branch costs a full clone (6), with no path to improvement under the
+  - A fan-out with no `Output` branch costs a full clone (4), with no path to improvement under the
     current design.
 
   No single number says what fan-out costs; [memory.md](../design/memory.md) §3 has the
   shape-by-shape account. **Workaround:** split by destination to avoid the clone. A router plus
   `target` components (ADR [`target-components`](../adr/target-components.md)) costs
-  `1 + used destinations` allocations per batch, against 324 for the fan-out-plus-filters shape
+  `1 + used destinations` allocations per batch, against 194 for the fan-out-plus-filters shape
   `memory.md` §3 measures for the same split. Any destination split, whether named by an
   attribute, provenance, or resource value or by a Lua script's own decision, has that cheap,
   non-cloning answer.
@@ -284,17 +275,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   endpoint (`docs/plans/operator-surface.md`) as speculative until an operator asks, for the
   reason ADR `internal-telemetry-as-pipeline-events` gives for not building a `Registry`
   addressable outside the pipeline.
-- **An unknown key on a component is silently ignored rather than rejected.** No `ComponentKind`
-  variant carries `#[serde(deny_unknown_fields)]` (`crates/logit-config/src/lib.rs`), so parsing
-  drops a misspelled or removed key with no error. The case that bites: `prometheus_in`'s TLS keys
-  are prefixed by mode, `scrape_tls:` (client TLS for scrapes) and `bind_tls:` (server TLS for the
-  remote-write receiver), with no alias, per
-  [ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)'s "mode-prefixed TLS keys".
-  So a bare `tls:` under a `prometheus_in` is dropped.
-  - **Consequence:** the component starts with default TLS settings, and a scrape that should
-    present a client certificate doesn't. `logit validate` can't catch it either. The same silence
-    covers any misspelled key on any `ComponentKind` variant; `TailOptions`' doc comment states it
-    for `tail_in`/`docker_in`.
 
 ## Admin endpoint, readiness, and release image
 

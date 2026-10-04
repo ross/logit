@@ -64,6 +64,11 @@ docker run --rm \
 `validate_semantics` in `crates/logit-cli/src/pipeline.rs`), so a config that validates can't fail
 that stage at `run`.
 
+**An unknown key is an error.** A misspelled or removed key, on a component or in any of its
+blocks, fails `validate` with the component's id and the key, such as
+``component `scrape`: unknown field `tls` ``. Keys whose names are your data, such as `set`'s
+attributes or `headers`, take any name.
+
 **`validate` doesn't open referenced files.** `lua_file`, a `stdio_out`/`file_out` path, and
 `otlp_out`/`otlp_in`'s `tls.*_file` fields are read only when `run` constructs the component. A
 mistyped `tls.ca_file` path passes `validate` and fails at startup instead, with the path in the
@@ -350,6 +355,22 @@ buffering:
   that lists every sink counter as once per batch, once per attempt, or repeating
   ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
   decision 1).
+
+### A slow or unreachable sink
+
+Under the default `overflow: block`, a sink whose buffer fills parks every branch that shares its
+upstream, including branches bound for healthy sinks. To keep one sink from stalling the others:
+
+- If the data matters and you need to ride out an outage, set `buffer.disk`. The stall waits until
+  the spool is full.
+- If the sink is best-effort, set `buffer.overflow: drop_newest` or `drop_oldest`. The sink keeps
+  draining and counts what it drops.
+
+To find the branch that is blocking, read these on the consumer, not the producer:
+`logit.component.inbox.full` (a send found the inbox full),
+`logit.component.inbox.blocked.duration` (time a send waited for room), and
+`logit.component.inbox.batches` (inbox depth). On the sink, `logit.component.buffer.utilization`
+near 1.0 confirms its buffer is the cause.
 
 ### Durable buffering
 
