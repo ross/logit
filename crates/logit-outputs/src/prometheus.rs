@@ -140,7 +140,7 @@
 //! | `2xx` (Mimir's `202` for an HA replica it dedupes included) | `Ok` | written | [1.0 spec][rw1], [2.0 spec][rw2] |
 //! | `2xx` to a `version: 2` request from a 1.0-only receiver | `Ok` | can't be told apart: VictoriaMetrics answers it `2xx` and stores nothing (`docs/known-gaps/prometheus.md`, "VictoriaMetrics discards remote-write 2.0 silently") | `docs/plans/victoriametrics-interop.md`, "Findings" |
 //! | `400` for invalid samples: `out of order sample`, a duplicate timestamp, Mimir's `err-mimir-sample-out-of-order` and per-series limits | `Rejected` | "Receivers MUST return a HTTP 400 ... for write requests that contain any invalid samples", and senders "MUST NOT retry ... 4xx responses other than 429" | [1.0 spec][rw1], Prometheus's [`write_handler.go`][prom-handler], Mimir's [`distributor/errors.go`][mimir-errors] |
-//! | `400` whose body names a failed decompression (VictoriaMetrics' `cannot decompress snappy-encoded request`) | `Refused` | the receiver can't read this sink's `compression:`, so every batch gets the same answer | VictoriaMetrics' [`promremotewrite` stream parser][vm-parser], `client_golang`'s [`remote_api.go`][cg-remote] |
+//! | `400` whose body opens with a receiver's decompression error: VictoriaMetrics' `cannot decompress snappy-encoded request with length %d: %w` (or `zstd-encoded`), or `client_golang`'s Snappy error (`snappy: corrupt input`) | `Refused` | the receiver can't read this sink's `compression:`, so every batch gets the same answer | VictoriaMetrics' [`promremotewrite` stream parser][vm-parser], `client_golang`'s [`remote_api.go`][cg-remote] |
 //! | `401` (Mimir's `no org id` for a missing `X-Scope-OrgID`, Grafana Cloud's invalid credentials), `403`, `407` | `Refused` | a credential or tenant header the sink's `headers:` carries on every request | dskit's [`http_auth.go`][dskit-auth], [`crate::http::classify_status`] |
 //! | `404` (Prometheus without `--web.enable-remote-write-receiver`, a wrong path), `405`, `501` (Mimir's method not allowed) | `Refused` | the endpoint isn't a remote-write receiver as configured | Prometheus's [`api.go`][prom-api], [`crate::http::classify_status`] |
 //! | `409` (Thanos receive's conflict: an out-of-order or duplicate sample) | `Rejected` | about the samples, as a `400` is | Thanos's [`receive/handler.go`][thanos-handler] |
@@ -1078,11 +1078,18 @@ fn remote_write_fault(status: StatusCode, body: &str) -> Fault {
     }
 }
 
-/// Whether a `400` body names a failed decompression: VictoriaMetrics' `cannot decompress
-/// snappy-encoded request` and the `client_golang` receiver's decompress failure both carry the
-/// word.
+/// The receivers' own text for a body they couldn't decompress, matched at the start of a `400`
+/// body: VictoriaMetrics' `cannot decompress snappy-encoded request with length %d: %w` (and its
+/// `zstd-encoded` twin), and `client_golang`'s receiver, which answers the Snappy library's error,
+/// `snappy: corrupt input` and the other `snappy: ` texts. Anchored, never a word search: a
+/// per-batch `400` quotes the offending series after the receiver's own text, and a series named
+/// `envoy_http_decompressor_*` must not read as this sink's `compression:` being wrong.
+const DECOMPRESSION_PREFIXES: [&str; 2] = ["cannot decompress ", "snappy: "];
+
+/// Whether a `400` body opens with one of [`DECOMPRESSION_PREFIXES`].
 fn names_decompression(body: &str) -> bool {
-    contains_ignore_ascii_case(body, "decompress")
+    let body = body.trim_start();
+    DECOMPRESSION_PREFIXES.iter().any(|prefix| body.starts_with(prefix))
 }
 
 /// A remote-write 2.0 receiver's `X-Prometheus-Remote-Write-*-Written` counts, as a suffix for the
@@ -2573,8 +2580,29 @@ mod tests {
 
     #[tokio::test]
     async fn a_400_naming_a_failed_decompression_is_refused() {
+        let golang = "snappy: corrupt input\n";
+        assert_eq!(remote_write_class(StatusCode::BAD_REQUEST, golang).await, Fault::Refused);
+        let zstd = "cannot decompress zstd-encoded request with length 42: unexpected EOF";
+        assert_eq!(remote_write_class(StatusCode::BAD_REQUEST, zstd).await, Fault::Refused);
         let body = "cannot decompress snappy-encoded request with length 42: snappy: corrupt input";
         assert_eq!(remote_write_class(StatusCode::BAD_REQUEST, body).await, Fault::Refused);
+    }
+
+    /// A per-batch `400` that quotes a series named for decompression is about the batch: the
+    /// receiver's own text comes first, so the anchored match never sees the series name.
+    #[tokio::test]
+    async fn a_400_quoting_a_decompressed_series_stays_rejected() {
+        for body in [
+            "received a series whose number of labels exceeds the limit (actual: 31, limit: 30) \
+             series: 'envoy_http_decompressor_gzip_decompressed_bytes_total{cluster=\"a\"' \
+             (err-mimir-max-label-names-per-series). To adjust the related per-tenant limit, \
+             configure -validation.max-label-names-per-series, or contact your service \
+             administrator.",
+            "invalid labels for series, labels {__name__=\"cannot decompress \", job=\"x\"}",
+        ] {
+            let class = remote_write_class(StatusCode::BAD_REQUEST, body).await;
+            assert_eq!(class, Fault::Rejected, "{body}");
+        }
     }
 
     #[tokio::test]
