@@ -28,6 +28,8 @@ twox-hash.workspace = true
 # Calendar math, IANA zones, and strptime behind `zoned`, shared by graph validation and the
 # `timestamp` transform (`docs/adr/timestamp-transform.md`).
 jiff.workspace = true
+# `zoned`'s error types.
+thiserror.workspace = true
 
 [dev-dependencies]
 # `sketch.rs`'s property tests: every quantile within the mapping's bound of the true quantile

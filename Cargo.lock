@@ -1073,6 +1073,7 @@ dependencies = [
  "proptest",
  "serde",
  "smallvec",
+ "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
  "twox-hash",

@@ -17,6 +17,7 @@ pub mod telemetry;
 pub mod template;
 pub mod time;
 pub mod value;
+pub mod zoned;
 
 pub mod attrs;
 mod event;
