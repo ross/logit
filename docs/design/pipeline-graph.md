@@ -729,7 +729,8 @@ consumers or all closed. That answers the input's half. An acknowledging listene
 doesn't acknowledge, a batch its direct consumers have all closed: `logit_in` answers
 `GOING_AWAY`, the HTTP listeners answer `503` (gRPC `UNAVAILABLE`, `splunk_hec_in` `503` code 9
 or `500` code 8), and `tail_in` and `docker_in` freeze their checkpoint and stop. A sink closing
-behind an open transform is still acknowledged. Propagating the closure as a shutdown signal stays open and isn't built.
+behind an open transform is still acknowledged. Propagating the closure as a shutdown signal
+stays open and isn't built.
 
 **Sink-side buffering decouples a sink's inbox from its delivery**
 (`docs/adr/buffered-sink-delivery.md`). `run_output` splits into a drain half that moves batches
