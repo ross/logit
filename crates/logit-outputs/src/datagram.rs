@@ -6,14 +6,20 @@
 //! `graphite_out`) it joins entries with `\n` into datagrams of at most `cap` bytes, never
 //! splitting an entry, with no leading or trailing `\n`. Under [`Framing::OnePerEntry`]
 //! (`syslog_out`, `collectd_out`, whose encoders chose every boundary) each entry is one datagram.
-//! Each datagram then has one of three outcomes:
+//! A datagram has no application response, so the outcome of each `send` decides, for
+//! `syslog_out`, `statsd_out`, `graphite_out`, and `collectd_out` over UDP or a Unix datagram
+//! socket alike. The Evidence column names the test that pins each row.
 //!
-//! - **Sent**: its entries and their weight count as sent.
-//! - **`EMSGSIZE`** ([`is_message_too_large`]): its weight counts
-//!   `logit.output.messages.dropped{reason="oversize_datagram"}` with a throttled diagnostic, and
-//!   the batch goes on. It's a per-datagram data condition, not a `Fault`.
-//! - **Any other error** ends the batch: `Fault::Clean` while no datagram of the batch has been
-//!   sent, else `Fault::Ambiguous`.
+//! | Response | Class | Why | Evidence |
+//! |---|---|---|---|
+//! | sent | its entries and their weight count as sent | -- | `one_per_entry_never_packs` |
+//! | `EMSGSIZE` ([`is_message_too_large`]) | no fault: its weight counts `logit.output.messages.dropped{reason="oversize_datagram"}` with a throttled diagnostic, and the batch goes on | a per-datagram data condition the kernel decided, `Rejected` for that datagram alone | `only_emsgsize_is_a_message_too_large`, `the_reconnect_once_rule_survives_an_emsgsize_dropped_first_datagram` |
+//! | an entry over `cap` (the packer's backstop) | no fault: dropped and counted as `EMSGSIZE` is, its neighbours sent | the same, decided before the kernel | `an_entry_over_the_cap_is_dropped_and_counted_and_its_neighbours_are_sent` |
+//! | DNS failure, or an endpoint that resolves to no address | `Clean` | nothing of the batch was sent | `an_endpoint_that_does_not_resolve_is_clean` |
+//! | any other send error, a Unix send past `send_timeout` included, before any datagram of the batch was sent | `Clean` | nothing of the batch was sent | `emsgsize_then_a_failure_with_nothing_sent_is_clean`, `a_timed_out_unix_send_drops_the_socket_and_the_next_send_reconnects` |
+//! | the same after one was | `Ambiguous` | the receiver may hold part of the batch | `sent_then_emsgsize_then_a_failure_is_ambiguous`, `a_failure_after_two_datagrams_returns_what_the_two_carried` |
+//!
+//! A datagram the network loses after `send` returned is invisible here: UDP reports nothing back.
 //!
 //! An entry longer than `cap` never reaches the kernel. Every encoder caps its entries at the
 //! value its sink passes here, so the branch that drops one, counted like `EMSGSIZE`, is a
@@ -511,6 +517,17 @@ mod tests {
         assert_eq!(pick_addr([v4(2), v6(1), v4(1)]), Some(v4(2)), "the first IPv4 one");
         assert_eq!(pick_addr([v6(2), v6(1)]), Some(v6(2)), "the first IPv6 one");
         assert_eq!(pick_addr([]), None, "nothing to send to: resolution's error");
+    }
+
+    /// An endpoint that doesn't resolve is `Clean`: nothing of the batch was sent. One with no
+    /// port fails inside `lookup_host` before any DNS query, so the test needs no resolver.
+    #[tokio::test]
+    async fn an_endpoint_that_does_not_resolve_is_clean() {
+        let mut dest = UdpDest::bind("test_out").unwrap();
+        let Err(err) = dest.resolve("test_out", "no-port-here").await else {
+            panic!("an endpoint with no port can't resolve")
+        };
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
     }
 
     /// The socket choice behind `UdpDest::resolve`, with no packet sent, so it runs where IPv6

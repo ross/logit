@@ -3,22 +3,25 @@
 //! one frame written per `send` (ADR `sink-send-path-and-attempt-accounting`, decisions 4 to 6).
 //!
 //! A caller builds the frame with its own framing and counts its own encode-side and per-message
-//! results; [`PooledStream::send`] sees only the bytes. The driver owns the rest:
+//! results; [`PooledStream::send`] sees only the bytes. A stream has no application response, so
+//! the I/O outcome decides the class, for `syslog_out`, `statsd_out`, and `graphite_out` alike. An
+//! encode-side refusal (a message over the sink's cap) is the caller's: dropped and counted per
+//! message, never a `Fault`. The Evidence column names the test that pins each row.
 //!
-//! - **Dial** (TCP connect, TLS handshake, or Unix connect, each under `connect_timeout`):
-//!   `Fault::Clean`, not retried inside `send`.
-//! - **Probe of a reused connection** answers anything but open: no fault; the driver redials, and
-//!   the redial doesn't consume the retry.
-//! - **Plaintext first `write`** fails (`Err`, or `Ok(0)` read as `WriteZero`): retried once on
-//!   a fresh connection; a second failure is `Fault::Clean`.
-//! - **TLS first `write`** fails: `Fault::Ambiguous`, never retried.
-//! - **`write_all` of the remainder, or `flush`**, fails: `Fault::Ambiguous`, never retried.
-//! - **Any write or the flush makes no progress for `connect_timeout`**: the connection is
-//!   dropped, with no retry inside `send`. A plaintext first `write` that stalled accepted
-//!   nothing, so it's `Fault::Clean`; any other stall is `Fault::Ambiguous`. `connect_timeout` bounds each write's progress as well as each dial
-//!   phase ([`write_with_progress`]), so a peer that accepts the connection and stops reading
-//!   fails the attempt instead of parking it until shutdown; a large frame on a slow link keeps
-//!   making progress and never trips it.
+//! | Response | Class | Why | Evidence |
+//! |---|---|---|---|
+//! | dial failure: TCP connect refused, DNS failure, TLS handshake failure or stall, Unix connect, each under `connect_timeout` | `Clean`, not retried inside `send` | no byte of the frame left | `a_refused_dial_is_clean_leaves_the_pool_empty_and_counts_no_reconnect`, `a_stalled_tls_handshake_times_out_clean_within_twice_the_connect_timeout`, `unix_stream_dial_failures_are_clean` |
+//! | a reused connection's probe answers anything but open (EOF, unsolicited bytes, a reset) | no fault: the driver redials, and the redial doesn't consume the retry | the old connection was dead before this frame | `a_reused_connection_that_probes_eof_is_redialed_and_the_retry_survives`, `a_reused_connection_that_probes_unsolicited_bytes_is_redialed_and_the_retry_survives`, `unix_stream_redials_when_the_probe_finds_the_pooled_connection_closed` |
+//! | the plaintext first `write` fails (`Err`, or `Ok(0)` read as `WriteZero`) | retried once on a fresh connection; a second failure is `Clean` | a failed plaintext first write accepted nothing | `a_plaintext_first_write_error_is_retried_once_then_clean`, `a_plaintext_first_write_of_zero_bytes_is_write_zero_retried_once_then_clean`, `unix_stream_retries_a_first_write_the_peer_refused` |
+//! | the plaintext first `write` makes no progress for `connect_timeout` | `Clean`, the connection dropped | it accepted nothing | `a_stalled_plaintext_first_write_is_clean` |
+//! | the TLS first `write` fails | `Ambiguous`, never retried | rustls may have put whole records on the wire first (below) | `a_tls_write_error_is_ambiguous_and_never_retried` |
+//! | the remainder's `write_all`, or the `flush`, fails, a reset mid-frame included | `Ambiguous`, never retried | part of the frame left, and a line receiver keeps every complete line it got | `a_remainder_failure_after_a_short_first_write_is_ambiguous_and_never_resent`, `a_flush_failure_after_a_complete_write_is_ambiguous_and_drops_the_connection`, `a_real_reset_mid_frame_is_ambiguous` |
+//! | any other write, or the flush, makes no progress for `connect_timeout` | `Ambiguous`, the connection dropped | part of the frame may have left | `a_write_that_makes_no_progress_fails_ambiguous_and_the_next_send_dials_fresh` |
+//!
+//! `connect_timeout` bounds each write's progress as well as each dial phase
+//! ([`write_with_progress`]), so a peer that accepts the connection and stops reading fails the
+//! attempt instead of parking it until shutdown; a large frame on a slow link keeps making progress
+//! and never trips it (`a_slow_write_that_keeps_making_progress_is_never_cut`).
 //!
 //! A TLS write `Err` is `Ambiguous` because rustls may have put whole records on the wire first.
 //! rustls splits what each session write accepted into records of at most 16384 bytes of
