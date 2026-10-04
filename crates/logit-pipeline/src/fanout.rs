@@ -58,6 +58,7 @@ use logit_core::telemetry::Timer;
 use logit_core::{EventBatch, Provenance, SpanKind, Symbol, Telemetry};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 /// One batch's place in a trace: which trace it belongs to, and which span produced it. `Copy`,
 /// 24 bytes, carried on every [`Delivered`] whether or not anything turns it into a span.
@@ -194,17 +195,31 @@ impl Edge {
     /// so the fast path spends it with `consume_budget`: without it, a producer that always finds
     /// room never yields here.
     async fn offer(&self, item: Delivered) -> Result<(), ()> {
-        self.tx.send(item).await.map_err(|_| ())
+        tokio::task::coop::consume_budget().await;
+        match self.tx.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Closed(_)) => Err(()),
+            Err(TrySendError::Full(item)) => {
+                let _blocked = self.found_full();
+                self.tx.send(item).await.map_err(|_| ())
+            }
+        }
     }
 
     /// The `blocking_send` twin of [`Edge::offer`].
     fn offer_blocking(&self, item: Delivered) -> Result<(), ()> {
-        self.tx.blocking_send(item).map_err(|_| ())
+        match self.tx.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Closed(_)) => Err(()),
+            Err(TrySendError::Full(item)) => {
+                let _blocked = self.found_full();
+                self.tx.blocking_send(item).map_err(|_| ())
+            }
+        }
     }
 
     /// Counts one `inbox.full` on the consumer and starts its `inbox.blocked.duration` timer, which
     /// records when the caller drops it after the wait.
-    #[allow(dead_code)]
     fn found_full(&self) -> Timer {
         self.telemetry.count("logit.component.inbox.full", 1.0, &[]);
         self.telemetry.timer("logit.component.inbox.blocked.duration")
@@ -370,7 +385,15 @@ impl Fanout {
                 // `None` is a closed consumer: nothing to wait for, counted once the batch goes
                 // out. `try_reserve` can't overtake a parked reserver, and spends the budget
                 // `reserve().await` would, as in `Edge::offer`.
-                let permit = edge.tx.reserve().await.ok();
+                tokio::task::coop::consume_budget().await;
+                let permit = match edge.tx.try_reserve() {
+                    Ok(permit) => Some(permit),
+                    Err(TrySendError::Closed(())) => None,
+                    Err(TrySendError::Full(())) => {
+                        let _blocked = edge.found_full();
+                        edge.tx.reserve().await.ok()
+                    }
+                };
                 permits.push(permit);
             }
             permits
@@ -927,7 +950,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn a_full_consumer_counts_inbox_full_on_the_consumer_not_the_producer() {
         let (mut probe, fanout, mut inboxes) = probed_fanout(&["out"]);
         prefill(&fanout, 0);
@@ -944,7 +966,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn a_consumer_with_room_counts_no_inbox_full_and_no_blocked_sample() {
         let (mut probe, fanout, mut inboxes) = probed_fanout(&["out"]);
 
@@ -958,7 +979,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn a_blocked_send_records_one_inbox_blocked_duration_sample_on_the_consumer() {
         let (mut probe, fanout, mut inboxes) = probed_fanout(&["out"]);
         prefill(&fanout, 0);
@@ -980,7 +1000,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn a_blocking_send_into_a_full_consumer_counts_inbox_full_on_that_consumer() {
         let (mut probe, fanout, mut inboxes) = probed_fanout(&["out"]);
         prefill(&fanout, 0);
@@ -998,7 +1017,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn send_with_deadline_counts_inbox_full_on_the_full_consumer_only() {
         let (mut probe, fanout, mut inboxes) = probed_fanout(&["a", "b"]);
         prefill(&fanout, 1);
@@ -1017,7 +1035,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[ignore]
     async fn send_with_deadline_that_times_out_still_counts_the_inbox_full_it_observed() {
         let (mut probe, fanout, mut inboxes) = probed_fanout(&["out"]);
         prefill(&fanout, 0);
@@ -1037,7 +1054,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn a_fan_out_with_one_full_consumer_counts_inbox_full_on_that_consumer_only() {
         let (mut probe, fanout, mut inboxes) = probed_fanout(&["a", "b"]);
         prefill(&fanout, 1);

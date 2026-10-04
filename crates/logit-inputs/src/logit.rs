@@ -2716,8 +2716,12 @@ mod tests {
     /// the listener's `Fanout` within the runtime's 5s grace.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_graph_closes_after_shutdown_with_a_peer_that_never_reads_its_acks() {
+        let t0 = std::time::Instant::now();
+        let registry = Registry::new();
         let (addr, input) = bound_input().await;
-        let mut input = input.with_handshake_timeout(Duration::from_millis(300));
+        let mut input = input
+            .with_handshake_timeout(Duration::from_millis(300))
+            .with_telemetry(registry.telemetry_for("logit_in", "logit_in", "listener"));
         let (sink, mut rx) = fanout_into_channel(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move { input.run_until_shutdown(sink, shutdown_rx).await });
@@ -2727,21 +2731,54 @@ mod tests {
         let mut client = socket.connect(addr.parse().unwrap()).await.unwrap();
         write_msg(&mut client, &hello()).await;
         let _ = read_control_response(&mut client).await;
+        let t_hello = t0.elapsed();
         let (unread, writer) = client.into_split();
         let spam = tokio::spawn(spam_alternating(writer));
         // Forwards stop once the listener's `Ack` write blocks.
-        while tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.is_ok() {}
+        let mut phase1 = 0u64;
+        let mut t_last = t0.elapsed();
+        while tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.is_ok() {
+            phase1 += 1;
+            t_last = t0.elapsed();
+        }
+        let t_quiet = t0.elapsed();
+        let mid = Totals::of(registry.drain(0));
+        let mid_summary = format!(
+            "frames_in={} acks={} ack_write_stalled={} reject_write_stalled={} connections={:?}",
+            mid.sum("logit.proto.frames", &[("direction", "in")]),
+            mid.sum("logit.input.acks", &[]),
+            mid.sum("logit.proto.errors", &[("reason", "ack_write_stalled")]),
+            mid.sum("logit.proto.errors", &[("reason", "reject_write_stalled")]),
+            mid.gauge("logit.input.connections", &[]),
+        );
 
         shutdown_tx.send(true).unwrap();
         handle.await.unwrap().unwrap();
+        let t_handle = t0.elapsed();
+        let mut drained = 0u64;
         let closed = tokio::time::timeout(Duration::from_secs(5), async {
-            while rx.recv().await.is_some() {}
+            while rx.recv().await.is_some() {
+                drained += 1;
+            }
         })
         .await;
-        assert!(closed.is_ok(), "every Fanout clone must be gone within the 5s grace");
-
+        let t_closed = t0.elapsed();
+        let end = Totals::of(registry.drain(0));
+        let end_summary = format!(
+            "frames_in={} acks={} ack_write_stalled={} reject_write_stalled={} connections={:?}",
+            end.sum("logit.proto.frames", &[("direction", "in")]),
+            end.sum("logit.input.acks", &[]),
+            end.sum("logit.proto.errors", &[("reason", "ack_write_stalled")]),
+            end.sum("logit.proto.errors", &[("reason", "reject_write_stalled")]),
+            end.gauge("logit.input.connections", &[]),
+        );
         spam.abort();
         drop(unread);
+        panic!(
+            "TIMINGS hello={t_hello:?} phase1_batches={phase1} last_batch={t_last:?} quiet={t_quiet:?} \
+             handle={t_handle:?} drained={drained} closed_ok={} closed_at={t_closed:?}\nMID {mid_summary}\nEND {end_summary}",
+            closed.is_ok()
+        );
     }
 
     /// `Reject{GOING_AWAY}` answers only a frame that wasn't forwarded, so a `logit_out` may
