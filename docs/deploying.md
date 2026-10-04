@@ -340,9 +340,32 @@ An error the sink attaches no fault to is treated as `Rejected`.
 The status-only default for HTTP sinks is the `classify_status` table in
 [`crates/logit-outputs/src/http.rs`](../crates/logit-outputs/src/http.rs): `401`, `403`, `404`,
 `405`, `407`, and `501` are `Refused`; `429` and `5xx` are `Ambiguous`; other `4xx` and every
-`3xx` are `Rejected`; a connect or DNS failure is `Clean`; a request timeout is `Ambiguous`. A sink
-that reads the response body refines this, and its table is in its module doc under
-`crates/logit-outputs/src/`.
+`3xx` are `Rejected`; a connect or DNS failure is `Clean`; a request timeout is `Ambiguous`. Each
+sink refines it from what its destination documents, in a table in its module doc that cites the
+evidence for every row:
+
+- `influxdb_out`: InfluxDB's write API, in
+  [`influxdb.rs`](../crates/logit-outputs/src/influxdb.rs), "Response classes".
+- `otlp_out`: the OTLP specification's retry rules, in
+  [`otlp.rs`](../crates/logit-outputs/src/otlp.rs), "Response classes".
+- `prometheus_out`: the remote-write specifications and the common receivers' answers, in
+  [`prometheus.rs`](../crates/logit-outputs/src/prometheus.rs), "Faults, retries and duplicate
+  safety (sender mode)".
+- `datadog_out`: Datadog's intake statuses, in
+  [`datadog.rs`](../crates/logit-outputs/src/datadog.rs), "Faults, retries, and duplicate safety".
+- `datadog_trace_out`: the Agent's trace receiver, in
+  [`datadog_trace.rs`](../crates/logit-outputs/src/datadog_trace.rs), "Faults, retries, and
+  duplicate safety".
+- `splunk_hec_out`: Splunk's HEC codes, in [`splunk.rs`](../crates/logit-outputs/src/splunk.rs),
+  "Faults, retries, and duplicate safety".
+- `logit_out`: the native hop's handshake, `Reject` codes, and ack wait, in
+  [`logit.rs`](../crates/logit-outputs/src/logit.rs), "Response classes".
+- `syslog_out`, `statsd_out`, and `graphite_out` over a stream: the pooled-stream driver's I/O
+  table, in [`stream.rs`](../crates/logit-outputs/src/stream.rs).
+- `syslog_out`, `statsd_out`, `graphite_out`, and `collectd_out` over datagrams: the datagram
+  driver's table, in [`datagram.rs`](../crates/logit-outputs/src/datagram.rs).
+- `stdio_out` and `file_out`: the file and stream table, in
+  [`stdio.rs`](../crates/logit-outputs/src/stdio.rs), "Response classes".
 
 - **On SIGTERM/SIGINT**, each sink gets up to `shutdown_grace` (5s by default) to drain its queue.
   Anything still queued at that deadline, or still waiting to enter the queue, is dropped and

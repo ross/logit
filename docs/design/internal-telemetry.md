@@ -1573,7 +1573,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 |---|---|---|
 | Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.dropped`, `labels.normalized`, `spans.degraded`, `stats.skipped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"needs_agent_processing"\|"not_datadog_origin"}`; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `file.rotations`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
 | Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
-| Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `otlp_out`'s `records.rejected`; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"}` and the Datadog sinks' `records.dropped{route, reason="rejected"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_rejected`, `api_key_rejected`, `ack_unsupported`, `ack_timeout`, and `oversize` for Splunk Cloud's answer) |
+| Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `otlp_out`'s `records.rejected`; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"}` and the Datadog sinks' `records.dropped{route, reason="rejected"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `ack_unsupported`, `ack_timeout`, and `oversize` for Splunk Cloud's answer) |
 
 The sinks with encoders count the first class through a gate `Output::observe_batch` arms
 (`crates/logit-outputs/src/accounting.rs`); `stdio_out` and `file_out` count after the write that
@@ -1808,8 +1808,9 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
 - `logit.output.requests{signal, class}` (count, one per request): `signal` is `logs`, `metrics`,
   or `traces`. Over OTLP/HTTP, `class` is the status class (`"1xx"|"2xx"|"3xx"|"4xx"|"5xx"|"other"`,
   `crates/logit-outputs/src/http.rs`'s `status_class`). Over OTLP/gRPC, it's the `grpc-status`
-  name (`"ok"|"invalid_argument"|"deadline_exceeded"|"permission_denied"|"resource_exhausted"|
-  "aborted"|"unimplemented"|"internal"|"unavailable"|"unauthenticated"|"other"`). On either
+  name (`"ok"|"cancelled"|"unknown"|"invalid_argument"|"deadline_exceeded"|"permission_denied"|
+  "resource_exhausted"|"aborted"|"out_of_range"|"unimplemented"|"internal"|"unavailable"|
+  "data_loss"|"unauthenticated"|"other"`). On either
   transport, a transport error or a timeout is `network_error`.
 - `logit.output.records.rejected{signal}` (count): records a collector rejected through a
   successful response's `partial_success`, with a throttled `otlp_partial_success` diagnostic
@@ -1860,8 +1861,9 @@ The codec's own points (`logit.output.metrics.skipped`, including every kind no 
 class table above).
 
 `Diagnostics` keys, each throttled: `api_key_rejected` (a `403`: Datadog refused the key; the key
-itself is never logged), `request_rejected` (any other non-retryable `4xx` or `3xx`, quoting 256
-bytes of the body with the key redacted, and the entries dropped), and `oversize` (an event dropped for its size).
+itself is never logged), `request_refused` (a `401`, `404`, `405`, or `407`, which the sink holds
+and retries), `request_rejected` (any other non-retryable `4xx` or `3xx`, quoting 256 bytes of the
+body with the key redacted, and the entries dropped), and `oversize` (an event dropped for its size).
 
 ##### `datadog_trace_out`
 
@@ -1885,7 +1887,8 @@ request header carries it. A batch-resource carrier counts once per request body
 paragraph on Datadog codec counters above).
 
 `Diagnostics` keys, each throttled: `request_rejected` (a non-retryable `4xx`, `3xx`, or `1xx`,
-quoting 256 bytes of the body), `oversize` (a trace or stats group dropped for its size), and
+quoting 256 bytes of the body), `request_refused` (a `401`, `403`, `404`, `405`, `407`, or `415`,
+which the sink holds and retries), `oversize` (a trace or stats group dropped for its size), and
 `bad_header` (a tracer header left out because its attribute isn't a legal header value, once per
 batch).
 
@@ -1900,9 +1903,9 @@ batch).
 | `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout |
 | `logit.output.request.duration{route}` | timing | one per request |
 | `logit.output.request.bytes{route}` | count | the body as sent, after compression, for a request that got an answer or failed after it may have left (a timeout); a refused connection counts none |
-| `logit.output.records` | count | records in a body Splunk accepted: one per log or span object, one per `metric_name:` field; also the records ahead of an object a `400` code 6 named, which are assumed indexed |
+| `logit.output.records` | count | records in a body Splunk accepted: one per log or span object, one per `metric_name:` field; also the records ahead of an object a `400` per-object code (6, 7, 12, 13, or 15) named, which are assumed indexed |
 | `logit.output.records.dropped{reason="oversize"}` | count | an object larger than `max_body_bytes` alone, never sent, once per batch; or a lone object Splunk Cloud answered as over its cap (`400` code 6 at object 0 of a body over 5 MiB), on each attempt that gets that answer |
-| `logit.output.records.dropped{reason="invalid_event"}` | count | the object a `400` code 6 named, dropped before the rest of its body is resent once |
+| `logit.output.records.dropped{reason="invalid_event"}` | count | the object a `400` per-object code (6, 7, 12, 13, or 15) named, dropped before the rest of its body is resent once |
 | `logit.output.requests.rejected{code}` | count | one per `/event` request answered with a non-retryable status: `code` is the body's HEC code when Splunk documents it (`4` for an invalid token, `6` for invalid data, …), else `other` |
 | `logit.output.acks{result}` | count | under `ack: true`, one per `/event` request: `acked`, `timeout` (still unacknowledged at `ack_timeout`, which fails the batch as ambiguous), or `unsupported` (a `200` with no `ackId`, or a poll answered `400` code 14: the token doesn't acknowledge, and the request counts as delivered) |
 
@@ -1912,9 +1915,10 @@ under `multi_value`, `metrics.normalized{reason="name_sanitized"}`, `tags.droppe
 `crates/logit-proto/src/splunk/mod.rs`'s module doc and its `logs`, `metrics`, and `spans`
 submodules, under this component's id, and this sink doesn't repeat them.
 
-`Diagnostics` keys, each throttled: `token_rejected` (a `401` or `403`), `request_rejected` (any
-other non-retryable `4xx` or `3xx`, quoting 256 bytes of the body), `invalid_event` (an object
-dropped on a code 6), `oversize` (an object dropped for its size, or a body split on Splunk
+`Diagnostics` keys, each throttled: `token_rejected` (a `401` or `403`, or a token code 21 or
+22 on a `400`), `request_refused` (a channel code 10, 11, or 28, or code 16: every request would
+get it), `request_rejected` (any other non-retryable `4xx` or `3xx`, quoting 256 bytes of the
+body), `invalid_event` (an object dropped on a per-object code), `oversize` (an object dropped for its size, or a body split on Splunk
 Cloud's oversize answer), `ack_unsupported`, and `ack_timeout`. The token never appears in any of
 them. The class table above says which count once per batch: the codec's counters, and the
 `max_body_bytes` drop with its `oversize` diagnostic; everything Splunk's answer decides counts per
