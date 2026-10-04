@@ -438,9 +438,10 @@ impl OtlpOutput {
     /// One request per signal, no retry in the sink (`docs/adr/buffered-sink-delivery.md`), each
     /// verdict folded by [`Outcomes`]. A signal the destination rejects is counted
     /// `logit.output.records.dropped{signal, reason="rejected"}` by its record count on this
-    /// attempt and the next signal is sent. A `Clean` or `Ambiguous` failure stops the attempt; `write_loop` then retries the whole batch, the requests that
-    /// succeeded included (the module doc's "Delivery posture"). Every signal is encoded before
-    /// the first request, as unit 0 of the batch accounting.
+    /// attempt and the next signal is sent. A `Clean` or `Ambiguous` failure stops the attempt;
+    /// `write_loop` then retries the whole batch, the requests that succeeded included (the module
+    /// doc's "Delivery posture"). Every signal is encoded before the first request, as unit 0 of
+    /// the batch accounting.
     ///
     /// A 2xx or `OK` whose `partial_success` rejected every record counts as accepted: a resend of
     /// rejected records is only rejected again.
@@ -464,8 +465,8 @@ impl OtlpOutput {
                     "signal_rejected",
                     format_args!(
                         "OTLP {} export rejected, {records} record(s) dropped: {}; if the \
-                         destination or its credential accepts only some signals, place `has_signal` or \
-                         `keep_signals` ahead of this sink",
+                         destination or its credential accepts only some signals, place \
+                         `has_signal` or `keep_signals` ahead of this sink",
                         signal.as_str(),
                         err.root_cause(),
                     ),
