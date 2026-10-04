@@ -1,13 +1,29 @@
-//! Hand-rolled RFC 3339 UTC timestamp formatting and parsing, plus exact decimal-to-nanos.
+//! Unix-nanosecond timestamps to and from text: the RFC 3339 and RFC 3164 renders, the strict RFC
+//! 3339 parser the codecs share, and exact decimal-to-nanos.
 //!
-//! `stdio_out` formats Unix-nanosecond timestamps for humans; `syslog_in` (RFC 5424 TIMESTAMP)
-//! and `trace_context`'s span lifting (`span.*_rfc3339`, `span.*_s`,
-//! `docs/design/data-model.md`'s "Well-known attribute names") parse them. Only UTC and
-//! civil-date <-> days-since-epoch are needed, a few dozen lines of Howard Hinnant's algorithms;
-//! a `time`/`chrono` dependency would be an ADR-scale decision, as with `logit-config`'s
-//! hand-rolled duration codec.
-//!
-//! TODO: replace with a real crate once the crate list is finalized.
+//! - **jiff does the calendar math** (`docs/adr/jiff-for-calendar-time.md`): civil-date
+//!   validation, days since the epoch, and every render.
+//! - **[`parse_rfc3339_to_nanos`] is RFC 5424's grammar, not jiff's.** A codec relays what it
+//!   reads (`syslog_in`, `docker_in`, `datadog_in`, `trace_context`'s `span.*_rfc3339`), so byte
+//!   tests fix the accepted forms before jiff validates the date: uppercase `T` and `Z`, a
+//!   `±HH:MM` offset, 1-9 fractional digits, and nothing after. jiff's own RFC 3339 parser is
+//!   wider (a space separator, lowercase `z`, a `[zone]` suffix, a clamped `:60`); that leniency
+//!   belongs to the `timestamp` transform, through `crate::zoned::rfc3339_lenient`.
+//! - **[`parse_decimal_nanos`] stays hand-rolled.** It is digit-exact unit scaling, not calendar
+//!   math, and jiff has no decimal-to-nanos parse that avoids an `f64`. Its [`DecimalError`]
+//!   tells a malformed string from a well-formed one whose count overflows an `i64`.
+
+use std::fmt;
+
+use jiff::civil::DateTime;
+use jiff::fmt::strtime::BrokenDownTime;
+use jiff::fmt::temporal::DateTimePrinter;
+use jiff::fmt::StdFmtWrite;
+use jiff::tz::Offset;
+use jiff::Timestamp;
+
+/// Nine fractional digits and `Z`: the one RFC 3339 render.
+const RFC3339_PRINTER: DateTimePrinter = DateTimePrinter::new().precision(Some(9));
 
 /// Formats Unix nanoseconds as RFC 3339 in UTC (`Z`, never an offset) with nine fractional
 /// digits: `2026-08-30T18:20:41.512847391Z`. Never panics: every `i64`, including the extremes,
@@ -22,44 +38,21 @@ pub fn format_rfc3339_utc(nanos: i64) -> String {
 
 /// [`format_rfc3339_utc`], written into `out` with no allocation of its own. A `fmt::Error` from
 /// `out` is discarded; a `String` never returns one.
-pub fn write_rfc3339_utc(out: &mut impl std::fmt::Write, nanos: i64) {
-    // Euclidean, not truncating: before the epoch, `/`/`%` would give a negative remainder (-1ns
-    // as 0s and -1ns); flooring keeps `nanos_of_sec`/`secs_of_day` in `[0, N)`.
-    let secs = nanos.div_euclid(1_000_000_000);
-    let nanos_of_sec = nanos.rem_euclid(1_000_000_000) as u32;
-
-    let days = secs.div_euclid(86_400);
-    let secs_of_day = secs.rem_euclid(86_400) as u32;
-
-    let (year, month, day) = civil_from_days(days);
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-
-    let _ = write!(
-        out,
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos_of_sec:09}Z"
-    );
+pub fn write_rfc3339_utc(out: &mut impl fmt::Write, nanos: i64) {
+    let _ = RFC3339_PRINTER.print_timestamp(&timestamp_of(nanos), StdFmtWrite(out));
 }
 
-/// Days since 1970-01-01 to a proleptic-Gregorian `(year, month, day)`: Howard Hinnant's
-/// `civil_from_days` (<http://howardhinnant.github.io/date_algorithms.html#civil_from_days>),
-/// with `div_euclid`/`rem_euclid` in place of the reference's negative-`z` branch (both floor).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    // Shift the epoch to 0000-03-01 so February, with its leap day, ends the algorithm's year.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097); // 146,097 days = one 400-year Gregorian cycle
-    let doe = z.rem_euclid(146_097); // day-of-era, [0, 146096]
+/// RFC 3164's TIMESTAMP, `Mmm dd hh:mm:ss` in UTC with the day space-padded (`Sep  2 14:03:11`)
+/// and no year, written into `out` with no allocation of its own. Never panics.
+pub fn write_rfc3164_utc(out: &mut impl fmt::Write, nanos: i64) {
+    let civil = Offset::UTC.to_datetime(timestamp_of(nanos));
+    let _ = BrokenDownTime::from(civil).format("%b %e %H:%M:%S", StdFmtWrite(out));
+}
 
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // year-of-era, [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day-of-year, [0, 365]
-    let mp = (5 * doy + 2) / 153; // "March-indexed" month, [0, 11]
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // back to [1, 12], Jan/Feb last
-    let year = if month <= 2 { y + 1 } else { y }; // undo the March-1st epoch shift
-
-    (year, month, day)
+/// jiff's `Timestamp` spans about years -9999..=9999, so every `i64` of nanoseconds
+/// (1677-09-21..2262-04-11) converts.
+fn timestamp_of(nanos: i64) -> Timestamp {
+    Timestamp::from_nanosecond(i128::from(nanos)).expect("every i64 of nanoseconds is in range")
 }
 
 /// Why an RFC 3339 timestamp couldn't become an instant. The cases call for different handling:
@@ -75,144 +68,97 @@ pub enum TimestampError {
 /// Parses an RFC 3339 timestamp (RFC 5424's TIMESTAMP, and the `span.*_rfc3339` attributes) into
 /// Unix nanoseconds.
 ///
-/// Accepts an uppercase `T`, an uppercase `Z` or `+HH:MM`/`-HH:MM` offset, and 1-9 fractional
-/// digits (RFC 5424 allows six; nine is what nanoseconds hold). Rejects a nonexistent date
-/// (`2023-02-29`), an out-of-range offset, and a leap second (`:60`): RFC 5424 forbids all three,
-/// and normalizing them would attach a wrong instant. A well-formed timestamp outside roughly
-/// 1677-09-21..2262-04-11 is [`TimestampError::OutOfRange`], not `Malformed`.
+/// Accepts `YYYY-MM-DDTHH:MM:SS`, an optional `.` and 1-9 fractional digits (RFC 5424 allows six;
+/// nine is what nanoseconds hold), then `Z` or `+HH:MM`/`-HH:MM` with hours `00..=23`, and nothing
+/// else; `T` and `Z` are uppercase. Rejects a nonexistent date (`2023-02-29`) and a leap second
+/// (`:60`): RFC 5424 forbids both, and normalizing them would attach a wrong instant. A
+/// well-formed timestamp outside roughly 1677-09-21..2262-04-11 is
+/// [`TimestampError::OutOfRange`], not `Malformed`.
 pub fn parse_rfc3339_to_nanos(s: &str) -> Result<i64, TimestampError> {
-    let (days, seconds_of_day, offset_seconds, nanos_frac) =
-        parse_rfc3339_components(s).ok_or(TimestampError::Malformed)?;
-    let total_seconds = days * 86_400 + seconds_of_day - offset_seconds;
-    total_seconds
-        .checked_mul(1_000_000_000)
-        .and_then(|n| n.checked_add(nanos_frac))
-        .ok_or(TimestampError::OutOfRange)
+    let (civil, offset_seconds) =
+        parse_rfc3339_civil(s.as_bytes()).ok_or(TimestampError::Malformed)?;
+    // `duration_since` is exact across jiff's whole civil range, so a date jiff's `Timestamp`
+    // can't hold (`9999-12-31T23:59:59Z`) still reads as out of range rather than malformed.
+    let since_epoch = civil.duration_since(DateTime::constant(1970, 1, 1, 0, 0, 0, 0));
+    let nanos = since_epoch.as_nanos() - i128::from(offset_seconds) * 1_000_000_000;
+    i64::try_from(nanos).map_err(|_| TimestampError::OutOfRange)
 }
 
-/// The well-formedness half of [`parse_rfc3339_to_nanos`]: `(days since epoch, seconds of day,
-/// offset seconds, fractional nanos)`. Split out so the caller's overflow check can tell
-/// out-of-range from malformed.
-fn parse_rfc3339_components(s: &str) -> Option<(i64, i64, i64, i64)> {
-    let b = s.as_bytes();
-    if b.len() < 20 {
-        return None; // "YYYY-MM-DDTHH:MM:SSZ" is the shortest legal form.
-    }
-    let digits = |start: usize, n: usize| -> Option<i64> {
-        let slice = s.get(start..start + n)?;
-        slice.bytes().all(|c| c.is_ascii_digit()).then(|| slice.parse().ok())?
-    };
-
-    let year = digits(0, 4)?;
-    if b[4] != b'-' {
+/// The grammar half of [`parse_rfc3339_to_nanos`]: byte tests for RFC 5424's fixed layout, then
+/// jiff's `DateTime::new` for the calendar (month and day ranges, leap years, `:60`). Returns the
+/// civil time as written and the offset in seconds east of UTC.
+fn parse_rfc3339_civil(b: &[u8]) -> Option<(DateTime, i32)> {
+    // "YYYY-MM-DDTHH:MM:SSZ" is the shortest legal form.
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return None;
     }
-    let month = digits(5, 2)?;
-    if b[7] != b'-' {
-        return None;
-    }
-    let day = digits(8, 2)?;
-    // RFC 5424 (unlike RFC 3339 itself) requires uppercase `T` and `Z`.
-    if b[10] != b'T' {
-        return None;
-    }
-    let hour = digits(11, 2)?;
-    if b[13] != b':' {
-        return None;
-    }
-    let minute = digits(14, 2)?;
-    if b[16] != b':' {
-        return None;
-    }
-    let second = digits(17, 2)?;
+    let year = digits(b, 0, 4)?;
+    let month = digits(b, 5, 2)?;
+    let day = digits(b, 8, 2)?;
+    let hour = digits(b, 11, 2)?;
+    let minute = digits(b, 14, 2)?;
+    let second = digits(b, 17, 2)?;
 
     let mut idx = 19;
-    let mut nanos_frac: i64 = 0;
-    if b.get(idx) == Some(&b'.') {
+    let mut subsec: i32 = 0;
+    if b[idx] == b'.' {
         idx += 1;
-        let frac_start = idx;
+        let start = idx;
         while b.get(idx).is_some_and(u8::is_ascii_digit) {
             idx += 1;
         }
-        let frac_len = idx - frac_start;
         // 1-9 digits; RFC 5424's `TIME-SECFRAC` (`"." 1*6DIGIT`) is a subset.
-        if !(1..=9).contains(&frac_len) {
+        let len = idx - start;
+        if !(1..=9).contains(&len) {
             return None;
         }
-        let frac = &s[frac_start..idx];
-        let mut padded = [b'0'; 9];
-        for (dst, src) in padded.iter_mut().zip(frac.bytes()) {
-            *dst = src;
-        }
-        nanos_frac = std::str::from_utf8(&padded).ok()?.parse().ok()?;
+        subsec = digits(b, start, len)? * 10i32.pow(9 - len as u32);
     }
 
-    let offset_seconds: i64 = match b.get(idx) {
-        Some(b'Z') => {
-            idx += 1;
-            0
-        }
-        Some(sign @ (b'+' | b'-')) => {
-            let sign: i64 = if *sign == b'-' { -1 } else { 1 };
-            let oh = digits(idx + 1, 2)?;
-            if b.get(idx + 3) != Some(&b':') {
+    let offset_seconds = match b.get(idx)? {
+        b'Z' if idx + 1 == b.len() => 0,
+        sign @ (b'+' | b'-') if idx + 6 == b.len() && b[idx + 3] == b':' => {
+            let oh = digits(b, idx + 1, 2)?;
+            let om = digits(b, idx + 4, 2)?;
+            if oh > 23 || om > 59 {
                 return None;
             }
-            let om = digits(idx + 4, 2)?;
-            if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
-                return None;
+            let magnitude = oh * 3600 + om * 60;
+            if *sign == b'-' {
+                -magnitude
+            } else {
+                magnitude
             }
-            idx += 6;
-            sign * (oh * 3600 + om * 60)
         }
         _ => return None,
     };
-    if idx != b.len() {
-        return None; // trailing garbage
-    }
-    // RFC 5424 forbids the leap second RFC 3339 allows, so `second` stops at 59.
-    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    if day < 1 || day > days_in_month(year, month) {
-        return None;
-    }
 
-    let days = days_from_civil(year, month, day);
-    let seconds_of_day = hour * 3600 + minute * 60 + second;
-    Some((days, seconds_of_day, offset_seconds, nanos_frac))
+    // Every field is at most four digits, so the narrowing casts are lossless.
+    let civil = DateTime::new(
+        year as i16,
+        month as i8,
+        day as i8,
+        hour as i8,
+        minute as i8,
+        second as i8,
+        subsec,
+    )
+    .ok()?;
+    Some((civil, offset_seconds))
 }
 
-fn is_leap_year(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-/// Days in `month` of `y`; `0` for a month outside `1..=12`.
-fn days_in_month(y: i64, month: i64) -> i64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if is_leap_year(y) {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 0,
-    }
-}
-
-/// Howard Hinnant's `days_from_civil`, the inverse of [`civil_from_days`]: proleptic Gregorian,
-/// correct for any year (<http://howardhinnant.github.io/date_algorithms.html>).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = (m + 9) % 12; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
+/// `n` ASCII digits of `b` from `start` as a number; `None` for any other byte. `n` is at most 9,
+/// so the value fits an `i32`.
+fn digits(b: &[u8], start: usize, n: usize) -> Option<i32> {
+    b.get(start..start + n)?
+        .iter()
+        .try_fold(0i32, |acc, &c| c.is_ascii_digit().then(|| acc * 10 + i32::from(c - b'0')))
 }
 
 /// Why [`parse_decimal_nanos`] refused a string.
@@ -433,14 +379,80 @@ mod tests {
 
     #[test]
     fn i64_min_and_max_do_not_panic() {
-        // A `Value::Timestamp` is attacker-influenced; the date itself doesn't matter.
-        let _ = format_rfc3339_utc(i64::MIN);
-        let _ = format_rfc3339_utc(i64::MAX);
+        // A `Value::Timestamp` comes from the wire; both renders must cover every `i64`.
+        assert_eq!(format_rfc3339_utc(i64::MIN), "1677-09-21T00:12:43.145224192Z");
+        let mut out = String::new();
+        write_rfc3164_utc(&mut out, i64::MIN);
+        out.push('|');
+        write_rfc3164_utc(&mut out, i64::MAX);
+        assert_eq!(out, "Sep 21 00:12:43|Apr 11 23:47:16");
     }
 
     #[test]
     fn i64_max_lands_on_the_expected_far_future_date() {
         // The widely cited upper limit of 64-bit nanosecond timestamps.
         assert_eq!(format_rfc3339_utc(i64::MAX), "2262-04-11T23:47:16.854775807Z");
+    }
+
+    #[test]
+    fn the_i64_extremes_round_trip_and_one_past_is_out_of_range() {
+        for nanos in [i64::MIN, i64::MAX] {
+            assert_eq!(parse_rfc3339_to_nanos(&format_rfc3339_utc(nanos)), Ok(nanos));
+        }
+        assert_eq!(
+            parse_rfc3339_to_nanos("2262-04-11T23:47:16.854775808Z"),
+            Err(TimestampError::OutOfRange)
+        );
+        assert_eq!(
+            parse_rfc3339_to_nanos("1677-09-21T00:12:43.145224191Z"),
+            Err(TimestampError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn rfc3339_dates_past_jiffs_timestamp_range_are_out_of_range() {
+        // Valid civil dates jiff's `Timestamp` itself can't hold once the offset is applied.
+        assert_eq!(parse_rfc3339_to_nanos("9999-12-31T23:59:59Z"), Err(TimestampError::OutOfRange));
+        assert_eq!(parse_rfc3339_to_nanos("0000-01-01T00:00:00Z"), Err(TimestampError::OutOfRange));
+        assert_eq!(
+            parse_rfc3339_to_nanos("0000-01-01T00:00:00+23:59"),
+            Err(TimestampError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn rfc3339_rejects_what_jiffs_own_parser_accepts() {
+        for bad in [
+            "2024-01-01 00:00:00Z",
+            "2024-01-01T00:00:00Z[UTC]",
+            "2024-01-01T00:00:00+00:00[UTC]",
+            "2024-01-01T00:00:00,5Z",
+            "2024-01-01T00:00:00+0100",
+            "2024-01-01T00:00:00+01",
+            "2024-01-01T00:00:00+01:00:00",
+            "2024-01-01T00:00Z",
+            "20240101T000000Z",
+            "+2024-01-01T00:00:00Z",
+            "2024-01-01T00:00:00",
+            "2024-01-01T24:00:00Z",
+            "2024-01-01T00:60:00Z",
+            "2024-01-01T00:00:00+23:60",
+            "2024-01-01T00:00:00-24:00",
+        ] {
+            assert_eq!(parse_rfc3339_to_nanos(bad), Err(TimestampError::Malformed), "{bad}");
+        }
+        assert_eq!(parse_rfc3339_to_nanos("1970-01-01T23:59:00+23:59"), Ok(0));
+        assert_eq!(parse_rfc3339_to_nanos("1970-01-01T00:00:00-00:00"), Ok(0));
+    }
+
+    #[test]
+    fn rfc3164_render_space_pads_the_day() {
+        let mut out = String::new();
+        // 2026-09-02T14:03:11.999Z: the fraction is dropped, not rounded.
+        write_rfc3164_utc(&mut out, 1_788_357_791_999_000_000);
+        assert_eq!(out, "Sep  2 14:03:11");
+        out.clear();
+        write_rfc3164_utc(&mut out, -1);
+        assert_eq!(out, "Dec 31 23:59:59");
     }
 }

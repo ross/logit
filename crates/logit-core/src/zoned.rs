@@ -2,8 +2,8 @@
 //! shared by graph validation and the `timestamp` transform so one function decides what a valid
 //! zone or pattern is (`docs/adr/timestamp-transform.md`).
 //!
-//! - **jiff lives here only.** Nothing outside this module names a jiff type; callers see
-//!   [`Zone`], [`Pattern`], and unix nanoseconds as `i64`.
+//! - **No jiff type crosses the crate boundary.** Callers see [`Zone`], [`Pattern`], and unix
+//!   nanoseconds as `i64`; `crate::time` uses jiff the same way for the codecs' fixed forms.
 //! - **`UTC` and fixed offsets need no database.** `UTC` matches in any case; offsets are
 //!   `±HH:MM`, `±HHMM`, or `±HH` with hours `00..=23`. Any other name is looked up in the system
 //!   tzdb (`/usr/share/zoneinfo`, or `TZDIR`), case-insensitively. A lookup that fails against an
@@ -375,8 +375,8 @@ mod tests {
     use super::*;
     use crate::time::parse_rfc3339_to_nanos;
 
-    /// Unix nanoseconds for an RFC 3339 literal, through the crate's own hand-rolled parser so
-    /// expectations don't come from jiff.
+    /// Unix nanoseconds for an RFC 3339 literal, through the strict codec parser rather than the
+    /// lenient one under test.
     fn at(s: &str) -> i64 {
         parse_rfc3339_to_nanos(s).unwrap()
     }
