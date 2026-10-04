@@ -391,7 +391,8 @@ decision record.
   `window`) or with `Reject`. A version mismatch or no shared codec is a clean refusal, not a
   corrupted stream. `logit_out` refuses a `HelloAck` with another `version`, a `codec` or
   `compression` its `Hello` didn't offer, a mark for an identity its `Hello` didn't list, or two
-  marks for one identity, as permanent: the listener would answer the same way again. A `Hello`
+  marks for one identity, as refused: the listener would answer the same way again, so the sink
+  holds the batch and retries it. A `Hello`
   that fails to decode ends the connection with no reply, counted as
   `logit.proto.errors{reason="handshake"}`; a `HelloAck` that fails to decode fails `logit_out`'s
   connect as a clean fault. A control message is at most `control::MAX_CONTROL_MESSAGE_BYTES` (4096) bytes, and
@@ -443,7 +444,7 @@ decision record.
 - **Frame bounds.** `logit_in` checks a data frame's header before reading its body:
   `uncompressed_len` against its `max_frame_bytes`, and `compressed_len` against
   `frame::compressed_bound(max_frame_bytes)`. A frame over either is answered
-  `Reject{FRAME_TOO_LARGE}`, which `logit_out` treats as permanent. So is a batch that decodes past
+  `Reject{FRAME_TOO_LARGE}`, which `logit_out` treats as rejected and drops. So is a batch that decodes past
   its decode budget, since it would on every resend. `logit_out` checks both its
   payload and its compressed frame against the same two numbers before sending, so it never sends
   a frame the listener refuses.

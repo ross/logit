@@ -565,7 +565,22 @@ disk-backed sink:
 | `logit.component.buffer.bytes` | gauge | `EventBatch::estimated_heap_bytes` summed over what's queued (in-memory), or on-disk segment bytes (disk-backed) |
 | `logit.component.buffer.utilization` | gauge | `max(batches ratio, bytes ratio)` against the two configured bounds |
 | `logit.component.buffer.push.blocked.duration` | timing | how long a `Block`-policy push waited for room; only recorded when a push actually had to wait |
-| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `send_failed` (`write_loop`: not retryable, or retryable but the budget ran out), `shutdown` (`run_output` stopped with an in-memory queue still non-empty, or with batches that never reached the queue: left in the inbox, or held by a push abandoned at shutdown. A disk-backed sink spools those, so it emits `shutdown` only under `delivery: at_most_once`, for a send the shutdown grace cut off mid-flight, which the destination may have taken and which isn't replayed; its sink span carries `fault=ambiguous`), `frame_too_large`/`disk_corrupt`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
+| `logit.component.retrying` | gauge | `1` from the held head's first retryable failure while a retry is pending or in flight, `0` once that head is delivered or dropped and when the write loop exits. A hold drops nothing, so `batches.dropped` stays flat while this reads `1` |
+| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `rejected` (`write_loop`: the destination refused this batch for its own content, or the sink attached no fault), `ambiguous_at_most_once` (`write_loop`: a send of unknown outcome under `delivery: at_most_once`), `shutdown` (`run_output` stopped with an in-memory queue still non-empty, or with batches that never reached the queue: left in the inbox, or held by a push abandoned at shutdown. A disk-backed sink spools those, so it emits `shutdown` only under `delivery: at_most_once`, for a send the shutdown grace cut off mid-flight, which the destination may have taken and which isn't replayed; its sink span carries `fault=ambiguous`), `frame_too_large`/`disk_corrupt`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
+
+`write_loop` also writes four `Diagnostics` keys. `retrying` and `send_failed` carry the fault
+class and the destination's error text:
+
+- `retrying` (error): the held head's 1st, 2nd, 4th, 8th, and every later doubling retryable
+  failure, so a long hold logs about once every few minutes. It names the failure number and the
+  queued batch count.
+- `send_failed` (warn, throttled to the 1st, 2nd, 4th, ... occurrence): each dropped batch, with
+  the time since the last success.
+- `degraded` (warn): the first drop since the sink was last healthy.
+- `recovered` (info): the first success after a drop or a retried failure.
+
+No send outcome ends the process: a sink that can't deliver holds or drops, and the diagnostics and
+the `retrying` gauge are how it shows.
 
 Disk-backed sinks (`DiskQueue`) also emit:
 
@@ -1591,7 +1606,7 @@ batch, on `datadog_trace_out` once for each such bucket in each request.
 `max_body_bytes` is dropped before any request and counts once per batch, and a lone object Splunk
 Cloud answered as over its cap counts on each attempt that gets that answer. The Datadog sinks'
 `oversize` mixes the same two, an event too large alone and a request answered `413`; a `413` is
-`Fault::Permanent`, so its batch isn't retried.
+`Fault::Rejected`, so its batch isn't retried.
 
 `oversize_datagram` counts per attempt for both of its causes, the kernel's `EMSGSIZE` and the
 packer's skip of an entry over the cap (a backstop no encoder reaches), so a batch retried after a
@@ -1609,7 +1624,7 @@ none of the counts a dropped future never reaches, and `logit.component.errors` 
 `request.duration` timer still records, because a timer records when it drops.
 
 `logit.output.requests` has two vocabularies. The stream and datagram sinks and `logit_out` tag
-one count per attempt with `class=ok|clean|ambiguous|permanent`, the `Fault` taxonomy. The HTTP
+one count per attempt with `class=ok|clean|ambiguous|rejected|refused`, the `Fault` taxonomy. The HTTP
 sinks tag one count per request with its status class or `network_error`
 (`docs/known-gaps/telemetry.md`).
 
@@ -1655,7 +1670,7 @@ sinks tag one count per request with its status class or `network_error`
 `crates/logit-outputs/src/syslog.rs`.
 
 - `logit.output.batch.bytes` and `logit.output.request.duration`: `influxdb_out`'s shape.
-- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count): one per attempt
+- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"rejected"|"refused"}` (count): one per attempt
   that returns, on both transports, tagged with the attempt's `Fault` class
   ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
   decision 4). A failed connect or TLS handshake is an attempt and counts `clean`; an attempt the
@@ -1684,7 +1699,7 @@ sinks tag one count per request with its status class or `network_error`
 `crates/logit-outputs/src/statsd.rs`, `docs/adr/statsd-output.md`.
 
 - `logit.output.batch.bytes`, `logit.output.request.duration`, and
-  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`: `syslog_out`'s shape, on
+  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"rejected"|"refused"}`: `syslog_out`'s shape, on
   every transport.
 - `logit.output.messages`: encoded messages, one per `MessageBuf` entry, on every transport,
   matching `syslog_out`'s. Usually one entry is one statsd line. A negative-absolute-gauge metric's
@@ -1739,7 +1754,7 @@ reports through them itself, so both halves of one `send` appear under one compo
 The sink adds only what a socket send can produce and the codec can't know:
 
 - `logit.output.batch.bytes`, `logit.output.request.duration`, and
-  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`: `syslog_out`'s shape.
+  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"rejected"|"refused"}`: `syslog_out`'s shape.
 - `logit.output.messages`: value lists actually sent (the per-datagram list count each
   `logit_proto::MessageBuf<usize>` entry's meta carries, summed).
 - `logit.output.datagrams`: datagrams actually sent. Both this and `messages` are UDP concepts;
@@ -1772,7 +1787,7 @@ The sink's `with_telemetry`/`with_diagnostics` feed the codec, so both halves of
 under one component id, as for `collectd_out`. The sink adds only what a socket send can produce:
 
 - `logit.output.batch.bytes`, `logit.output.request.duration`, and
-  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`: `syslog_out`'s shape, on
+  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"rejected"|"refused"}`: `syslog_out`'s shape, on
   both transports.
 - `logit.output.reconnects` (count, TCP only): every connect *after* the first, including the
   redial after the probe finds a pooled connection closed, as for `syslog_out`.
@@ -1800,7 +1815,7 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   successful response's `partial_success`, with a throttled `otlp_partial_success` diagnostic
   carrying the collector's message.
 - `logit.output.records.dropped{signal, reason="rejected"}` (count): the records of a signal's
-  request the destination answered with a `Permanent` verdict (an HTTP 3xx or a 4xx other than
+  request the destination answered with a `Rejected` verdict (an HTTP 3xx or a 4xx other than
   429, or gRPC `INVALID_ARGUMENT`, `UNIMPLEMENTED`, `UNAUTHENTICATED`, `PERMISSION_DENIED`, or an
   unrecognized code). An auth answer is counted here too, since a credential can be scoped per
   signal. The send goes on to the other signals, and returns `Ok` if any was
@@ -1932,22 +1947,22 @@ attempt.
 - `logit.output.batches.resumed` (count): frames a reconnect committed from `HelloAck.marks`
   without resending them ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md),
   decision 4).
-- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count): the `Fault` taxonomy
+- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"rejected"|"refused"}` (count): the `Fault` taxonomy
   as request-outcome classes, one per `submit` that fails with a `Fault` and one per `await_ack`
   that returns. A `send` is a `submit` then an `await_ack`, so it counts once, and the total equals
   the number of `send` calls that returned. A connect or handshake failure and a batch too large to
   send count as failed submits. A submit that fails with frames already in flight (a stalled or
   failed write) carries no `Fault` and isn't counted: the `await_ack`s after it count the round's
   outcome, `ok` for each frame an `Ack` commits, an `await_ack` answered by an `Ack` already read
-  included, and the class of the failure that ends it. A `Permanent` past the head
-  is counted when it becomes the head. A cancelled call (a budget timeout, the shutdown grace)
+  included, and the class of the failure that ends it. A `Rejected` past the head
+  is counted when it becomes the head. A cancelled call (the shutdown grace)
   returns nothing and isn't counted; `logit.component.errors` covers it. `ok` is an acknowledged
   frame; `clean` a failure before a frame was completely written and flushed with nothing in flight,
   or a `Reject{GOING_AWAY}` read in place of an `Ack`; `ambiguous` a lost `Ack` (a timeout, an EOF,
-  a reset, another message) or an `Ack` naming no run of the frames in flight; and `permanent` a
-  size check or a frame-build error at the head, a `HelloAck` that doesn't answer the `Hello`
+  a reset, another message) or an `Ack` naming no run of the frames in flight; `rejected` a
+  size check or a frame-build error at the head, and `refused` a `HelloAck` that doesn't answer the `Hello`
   (another version, an unoffered codec or compression, a mark for an identity `Hello.senders`
-  didn't list, or two marks for one identity), or a permanent reject ([ADR
+  didn't list, or two marks for one identity), or a reject that names a protocol mismatch ([ADR
   `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
   decision 6).
 

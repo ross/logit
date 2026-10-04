@@ -62,7 +62,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** a sender learns only `max_frame_bytes` from `HelloAck`, not the budget, so
     `logit_in` can refuse a stock `logit_out` batch between roughly 10% and 100% of the cap. The
     refusal is deterministic: `logit_in` answers it with `REJECT_FRAME_TOO_LARGE`, so the sender
-    drops the batch as permanent and diagnoses it rather than retrying.
+    drops the batch as rejected and diagnoses it rather than retrying.
   - **Workaround:** change the sender's batching.
 
 - **No durable (disk-backed) buffering on the receive side.** A UDP listener's `ReceiveQueue`
@@ -142,18 +142,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     them on the next start, and `logit_in` acknowledges any it already forwarded without
     forwarding them again ([ADR `native-hop-send-window`](../adr/native-hop-send-window.md),
     decision 6).
-
-- **A round against a slowly draining `logit_in` can outlast the retry budget.** With a window,
-  the head's `buffer.retry_budget` bounds the head's own write, each backoff, and whether a failed
-  round is retried. It never cancels a write past the head or an ack wait, because cancelling
-  either would drop the connection and the `Ack`s `logit_in` already sent. A `logit_in` that
-  forwards a frame every few seconds makes progress, so no write trips `request_timeout`, and a
-  round of `window - 1` writes and the ack wait can last longer than the budget. The head is still
-  delivered once its `Ack` is read; only a shutdown grace cuts the round short.
-  - **Workaround:** `window: 1` restores the budget as a bound on each attempt
-    ([ADR `native-hop-send-window`](../adr/native-hop-send-window.md), decisions 4 and 6).
-  - **Revisit trigger:** an operator who needs `retry_budget` as a hard bound on one batch's time
-    in the sink at a window above 1.
 
 - **The native hop still forwards a duplicate after a `logit_in` restart, an evicted sender, or a
   load balancer.** `logit_in` deduplicates a resend or a `buffer.disk:` replay against a

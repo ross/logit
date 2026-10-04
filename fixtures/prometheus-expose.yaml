@@ -40,7 +40,7 @@ components:
     # max_series: 100000         # hard cap on distinct series; over it the least-recently-updated
     #                            # is evicted first and counted
     # buffer: (all defaults, docs/adr/buffered-sink-delivery.md -- max_batches 1024,
-    #          max_bytes "64MiB", overflow block, retry_budget 60s, retry_max_delay 10s,
+    #          max_bytes "64MiB", overflow block, retry_max_delay 10s,
     #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering.
     #          `send` here only replaces in-memory registry state and never fails, so the queue
     #          exists for uniformity, not because a delivery can back up.)

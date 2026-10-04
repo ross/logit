@@ -653,10 +653,10 @@ components:
   # The gate keeps the sink's input to the one signal Tempo takes. Tempo is a traces-only gRPC
   # server (it registers no `MetricsService`). `otlp_out` issues one request per signal, so an
   # `internal` metric point reaching `tempo_out` would draw a `grpc-status: 12` (UNIMPLEMENTED)
-  # answer. `otlp_out` counts those points `records.dropped{reason="rejected"}`, warns, and still
-  # delivers the batch's spans, but the rejected request repeats on every batch. A batch of only
-  # metric points would fail whole, and `write_loop` ends the process if every batch fails that
-  # way for a minute (ADR `delivery-semantics`, "Amendment: per-request verdicts (2026-10-04)").
+  # answer, which `otlp_out` reads as `Refused`: it fails the whole batch, and the sink holds and
+  # retries it, resending the spans each time, instead of delivering the spans and dropping the
+  # metrics. It never ends the process. Dropping only the refused signal is
+  # `docs/plans/sink-fault-model.md`, "W4: `otlp_out` per-signal outcomes".
   # `access_spans` needs the same gate for the same reason, because `haproxy_trace`/`nginx_trace`
   # produce metric-and-span-carrying batches, and so does `browser_spans`, even though `browser_in`
   # only ever emits traces (see `browser_spans`'s comment above).

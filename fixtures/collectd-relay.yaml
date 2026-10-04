@@ -59,7 +59,7 @@ components:
     #                            # this pipeline also carries metrics from another source; without
     #                            # it such an event is dropped and counted (reason="no_host").
     # buffer: (all defaults, docs/adr/buffered-sink-delivery.md -- max_batches 1024,
-    #          max_bytes "64MiB", overflow block, retry_budget 60s, retry_max_delay 10s,
+    #          max_bytes "64MiB", overflow block, retry_max_delay 10s,
     #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering.
     #          `delivery:` defaults to at_least_once: a resent ABSOLUTE value adds at the
     #          receiver, so put an `aggregate` with `temporality: cumulative` upstream, or set

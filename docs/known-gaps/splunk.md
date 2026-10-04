@@ -103,10 +103,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `buffer.retry_max_delay`), whatever delay Splunk asks for; the runtime's retry loop has no seam
   for a server-supplied delay.
   - **Consequence:** a retry can come sooner than Splunk asked, drawing another busy answer, until
-    the batch's retry budget runs out.
+    Splunk accepts the batch or the shutdown grace cuts it.
   - **Revisit trigger:** a `Retry-After`-carrying sink that needs it honored, which would give
     `Fault` or `deliver_with_retry` a delay hint every HTTP sink could use.
-- **`splunk_hec_out` treats codes 7, 12, 13, and 15 as permanent.** Each names an object in
+- **`splunk_hec_out` treats codes 7, 12, 13, and 15 as rejected.** Each names an object in
   `invalid-event-number`, and Splunk 10.4.3 indexed the objects before the bad one and none from
   it on, as with code 6. Only code 6 gets the drop-one-and-resend rule; the others fail the batch.
   `splunk_hec_out` never writes the shapes behind 12, 13, and 15, so in practice this means code

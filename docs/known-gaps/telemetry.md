@@ -119,7 +119,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     decision 1).
 - **The HTTP sinks' `logit.output.requests` doesn't use the four fault classes.** The stream and
   datagram sinks (`statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `logit_out`) tag
-  each attempt `class=ok|clean|ambiguous|permanent`. `influxdb_out`, `otlp_out`,
+  each attempt `class=ok|clean|ambiguous|rejected|refused`. `influxdb_out`, `otlp_out`,
   `prometheus_out`'s remote-write mode, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out`
   tag each request with its status class (`2xx`, `5xx`, `network_error`, and the gRPC status name
   for `otlp_out`) and count one per request, so a `send` that issues several requests counts

@@ -65,8 +65,7 @@ components:
     #   overflow: block        # block | drop_oldest | drop_newest
     #   # delivery: at_least_once  # at_least_once | at_most_once; omitted is at_least_once for
     #                              # every sink but statsd_out (influxdb_out's resend overwrites)
-    #   retry_budget: 60s      # wall-clock ceiling on retrying one batch before it's dropped
-    #   retry_max_delay: 10s   # backoff cap between attempts
+    #   retry_max_delay: 10s   # backoff cap; a failing head retries until it succeeds, bounded by the queue above
     #   shutdown_grace: 5s
     #   # disk:                        # opt-in durable buffering (docs/adr/disk-backed-sink-buffer.md);
     #   #                              # replaces the in-memory queue, so max_batches/max_bytes above

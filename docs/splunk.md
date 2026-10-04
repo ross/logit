@@ -197,8 +197,8 @@ A `400` code 6 names the first object Splunk couldn't parse in `invalid-event-nu
 from 0. Splunk Enterprise 10.4.3 indexed every object before it and none from it on. So
 `splunk_hec_out` drops that one object, counted
 `logit.output.records.dropped{reason="invalid_event"}`, and resends the objects after it, once. A
-second code 6 on the resend is permanent. The other per-object rejections (7, 12, 13, and 15) are
-permanent: Splunk indexes the objects before the bad one and none from it on, and the rest of the
+second code 6 on the resend is rejected. The other per-object rejections (7, 12, 13, and 15) are
+rejected: Splunk indexes the objects before the bad one and none from it on, and the rest of the
 batch is dropped with them. Code 7 names the object after the bad one. `splunk_hec_out` doesn't
 write the shapes behind codes 12, 13, and 15 (a missing or blank `event`, a nested `fields`
 value), which leaves code 7, an index the token can't write.

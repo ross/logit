@@ -81,7 +81,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   writing the same series into one `prometheus_out` can send an older sample after a newer one. A
   single chain into one `prometheus_out` can't hit this.
   - **Consequence:** a receiver with no out-of-order window (stock Prometheus, Mimir without
-    `out_of_order_time_window`) answers `400`, which the sink classifies `Fault::Permanent` and
+    `out_of_order_time_window`) answers `400`, which the sink classifies `Fault::Rejected` and
     drops.
   - **Workaround:** use a topology that doesn't split one series across branches, or a receiver
     with an out-of-order window. The sink won't buffer its way out: a reorder window is
