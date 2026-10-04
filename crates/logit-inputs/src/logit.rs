@@ -2712,36 +2712,60 @@ mod tests {
         drop(client);
     }
 
-    /// End to end: with a peer that never reads its `Ack`s connected, a shutdown still closes
-    /// the listener's `Fanout` within the runtime's 5s grace.
+    /// End to end, through the accept loop: a shutdown that fires while a peer is still
+    /// connected, still writing frames, and not reading its `Ack`s closes the listener's
+    /// `Fanout`, and the peer finds an `Ack` for every forwarded frame and then `GOING_AWAY`.
+    ///
+    /// Shutdown fires after the first forward with `rx` left full, so the connection is up and
+    /// mid-stream: the 16-deep inbox takes 16 more frames, the next parks in `send_relayed`, and
+    /// their `Ack`s fill no buffer. An `Ack` write that stalls first is
+    /// `an_ack_write_to_a_peer_that_never_reads_ends_the_connection_within_the_bound`'s case.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_graph_closes_after_shutdown_with_a_peer_that_never_reads_its_acks() {
-        let (addr, input) = bound_input().await;
-        let mut input = input.with_handshake_timeout(Duration::from_millis(300));
+        let (addr, mut input) = bound_input().await;
         let (sink, mut rx) = fanout_into_channel(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move { input.run_until_shutdown(sink, shutdown_rx).await });
 
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.set_recv_buffer_size(4096).unwrap();
-        let mut client = socket.connect(addr.parse().unwrap()).await.unwrap();
+        let mut client = connect(&addr).await;
         write_msg(&mut client, &hello()).await;
         let _ = read_control_response(&mut client).await;
         let (unread, writer) = client.into_split();
         let spam = tokio::spawn(spam_alternating(writer));
-        // Forwards stop once the listener's `Ack` write blocks.
-        while tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.is_ok() {}
+        recv_batch(&mut rx).await;
+        let mut forwarded = 1;
 
         shutdown_tx.send(true).unwrap();
         handle.await.unwrap().unwrap();
-        let closed = tokio::time::timeout(Duration::from_secs(5), async {
-            while rx.recv().await.is_some() {}
+        let closed = tokio::time::timeout(RECV_TIMEOUT, async {
+            while rx.recv().await.is_some() {
+                forwarded += 1;
+            }
         })
         .await;
-        assert!(closed.is_ok(), "every Fanout clone must be gone within the 5s grace");
+        assert!(closed.is_ok(), "every Fanout clone must be gone within {RECV_TIMEOUT:?}");
+
+        // Each frame changes identity, so each forwarded frame has an `Ack` of its own.
+        let mut peer = tokio::io::join(unread, tokio::io::sink());
+        let reject = tokio::time::timeout(RECV_TIMEOUT, async {
+            for n in 0..forwarded {
+                match read_control_response_over(&mut peer).await {
+                    control::ControlMessage::Ack(_) => {}
+                    other => panic!("Ack {n} of {forwarded} forwarded frames, got {other:?}"),
+                }
+            }
+            read_control_response_over(&mut peer).await
+        })
+        .await
+        .expect("the Acks and GOING_AWAY are already written once the Fanout has closed");
+        let control::ControlMessage::Reject(reject) = reject else {
+            panic!("expected GOING_AWAY after {forwarded} Acks, got {reject:?}");
+        };
+        assert_eq!(reject.code, control::REJECT_GOING_AWAY);
+        assert_eq!(reject.message, "listener shutting down");
 
         spam.abort();
-        drop(unread);
+        expect_closed(&mut peer, "the connection after GOING_AWAY").await;
     }
 
     /// `Reject{GOING_AWAY}` answers only a frame that wasn't forwarded, so a `logit_out` may
