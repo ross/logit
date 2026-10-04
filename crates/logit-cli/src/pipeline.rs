@@ -80,7 +80,8 @@ use logit_transforms::{
     MatchMode as TransformMatchMode, Normalize as TransformNormalize, RegexParser,
     Remove as RemoveTransform, Route as RouteTransform, Sample as SampleTransform,
     Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform,
-    SignalSet, SpanLift, TraceContext as TraceContextTransform,
+    SignalSet, SpanLift, TimestampFormat as TimestampFormatTransform, TimestampResolver,
+    TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -763,6 +764,29 @@ fn build_spec(
             ScaleTransform::new(fields.iter().map(|(k, v)| (k.clone(), *v)).collect())
                 .with_telemetry(telemetry.clone()),
         )),
+        // Rule 76 has already compiled this pattern and resolved this zone, so the errors below
+        // don't fire.
+        Timestamp { from, format, timezone, max_skew, keep_source } => {
+            let format = match format {
+                logit_config::TimestampFormat::Rfc3339 => TimestampFormatTransform::Rfc3339,
+                logit_config::TimestampFormat::Rfc3164 => TimestampFormatTransform::Rfc3164,
+                logit_config::TimestampFormat::UnixSeconds => TimestampFormatTransform::UnixSeconds,
+                logit_config::TimestampFormat::UnixMillis => TimestampFormatTransform::UnixMillis,
+                logit_config::TimestampFormat::UnixMicros => TimestampFormatTransform::UnixMicros,
+                logit_config::TimestampFormat::UnixNanos => TimestampFormatTransform::UnixNanos,
+                logit_config::TimestampFormat::Pattern(text) => TimestampFormatTransform::Pattern(
+                    logit_core::zoned::Pattern::compile(text).map_err(|e| {
+                        anyhow::anyhow!("component '{id}': timestamp 'format.pattern': {e}")
+                    })?,
+                ),
+            };
+            let zone = logit_core::zoned::Zone::parse(timezone.as_deref().unwrap_or("UTC"))
+                .map_err(|e| anyhow::anyhow!("component '{id}': timestamp 'timezone': {e}"))?;
+            NodeSpec::Transform(Box::new(
+                TimestampResolver::new(from, format, zone, *max_skew, *keep_source)
+                    .with_telemetry(telemetry.clone()),
+            ))
+        }
         // Rule 31 has already compiled this pattern, so the `?` doesn't fire.
         Regex { pattern, field } => NodeSpec::Transform(Box::new(
             RegexParser::new(pattern, field.as_deref())?.with_telemetry(telemetry.clone()),
@@ -4247,6 +4271,55 @@ mod tests {
             Some(logit_core::Value::F64(v)) => assert!((v - 12.0).abs() < 1e-9, "got {v}"),
             other => panic!("expected a scaled F64, got {other:?}"),
         }
+    }
+
+    /// Runs the built transform: `rfc3164` in `UTC` moves `event.timestamp` and keeps the
+    /// receipt time as `observed_timestamp`.
+    #[test]
+    fn build_spec_builds_a_working_timestamp_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Timestamp {
+                from: "syslog.timestamp".to_string(),
+                format: logit_config::TimestampFormat::Rfc3164,
+                timezone: Some("UTC".to_string()),
+                max_skew: logit_config::default_timestamp_max_skew(),
+                keep_source: false,
+            },
+        };
+        let NodeSpec::Transform(mut transform) =
+            build_spec("stamped", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("expected a Transform node");
+        };
+
+        // 2026-10-04T12:00:30Z receipt; the sender's stamp is 30 seconds earlier.
+        let receipt: i64 = 1_791_115_230_000_000_000;
+        let sent: i64 = receipt - 30_000_000_000;
+        let mut attrs = logit_core::AttrMap::new();
+        attrs.insert("syslog.timestamp", logit_core::Value::str("Oct  4 12:00:00"));
+        let mut event = logit_core::Event::log(
+            receipt,
+            attrs,
+            logit_core::LogRecord {
+                message: logit_core::Value::str("msg"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let resource = Arc::new(logit_core::Resource::default());
+        assert!(transform.process(&resource, &mut event), "should forward the event");
+        assert_eq!(event.timestamp, sent);
+        assert_eq!(event.log.expect("log should survive").observed_timestamp, receipt);
+        assert!(event.attributes.get("syslog.timestamp").is_none(), "source should be removed");
     }
 
     #[test]

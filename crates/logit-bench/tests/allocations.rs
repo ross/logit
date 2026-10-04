@@ -2303,6 +2303,42 @@ fn trace_context_lifts_a_valid_trace_id() {
     expect_allocs("transform: trace_context, lifting a valid trace_id", stats, 0);
 }
 
+/// `timestamp` resolving an RFC 3164 `syslog.timestamp` in a named zone
+/// (`docs/adr/timestamp-transform.md`): 0. The zone is built at construction, the calendar work in
+/// `logit_core::zoned` is arithmetic on a stack-held civil time, and the source attribute is an
+/// in-place `AttrMap::remove`.
+#[test]
+fn timestamp_rfc3164_resolves_a_syslog_stamp() {
+    let mut timestamp = fixtures::timestamp_rfc3164();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::timestamp_rfc3164_event();
+    assert!(timestamp.process(&resource, &mut warm));
+
+    let mut event = fixtures::timestamp_rfc3164_event();
+    let (forwarded, stats) = measure(|| timestamp.process(&resource, &mut event));
+    assert!(forwarded, "timestamp forwards, never absorbs");
+    assert_eq!(event.timestamp, 1_791_129_600_000_000_000, "12:00:00 EDT is 16:00:00Z");
+    assert!(event.attributes.get("syslog.timestamp").is_none(), "the source is removed");
+    expect_allocs("transform: timestamp, rfc3164 in a named zone", stats, 0);
+}
+
+/// `timestamp` resolving a `%d/%b/%Y:%H:%M:%S %z` pattern: 0, for the same reasons as the
+/// RFC 3164 pin above.
+#[test]
+fn timestamp_pattern_resolves_an_access_log_time() {
+    let mut timestamp = fixtures::timestamp_pattern();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::timestamp_pattern_event();
+    assert!(timestamp.process(&resource, &mut warm));
+
+    let mut event = fixtures::timestamp_pattern_event();
+    let (forwarded, stats) = measure(|| timestamp.process(&resource, &mut event));
+    assert!(forwarded, "timestamp forwards, never absorbs");
+    assert_eq!(event.timestamp, 1_791_115_200_000_000_000);
+    assert!(event.attributes.get("time_local").is_none(), "the source is removed");
+    expect_allocs("transform: timestamp, strptime-style pattern", stats, 0);
+}
+
 /// `trace_context` with a `span:` block, minting a `SpanRecord` from the convention attributes
 /// (`docs/adr/trace-context-span-lifting.md`): 0, as for the log-only lift above. Ids parse into
 /// stack arrays, the timing arithmetic is integer, `name` clones a pre-built `Value` (a refcount

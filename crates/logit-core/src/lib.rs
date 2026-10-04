@@ -17,6 +17,7 @@ pub mod telemetry;
 pub mod template;
 pub mod time;
 pub mod value;
+pub mod zoned;
 
 pub mod attrs;
 mod event;
@@ -42,8 +43,8 @@ pub use telemetry::{
     DEFAULT_SPAN_SAMPLE_RATE,
 };
 pub use time::{
-    format_rfc3339_utc, parse_decimal_nanos, parse_rfc3339_to_nanos, write_rfc3339_utc,
-    TimestampError,
+    format_rfc3339_utc, parse_decimal_nanos, parse_rfc3339_to_nanos, write_rfc3164_utc,
+    write_rfc3339_utc, DecimalError, TimestampError,
 };
 pub use trace::{parse_traceparent, random_id_bytes, TraceRef};
 pub use value::Value;
