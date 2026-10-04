@@ -166,7 +166,7 @@ Each item below was UNVERIFIED in `docs/plans/datadog-relay.md` or ADR
   run settled most of it (sketches and traces from a sender that isn't an Agent, zlib on
   distribution points, the size limits, series dedupe), recorded in
   `docs/plans/datadog-relay.md` and ADR `datadog-agent-and-intake-relay` rather than as fixtures. Whether the intake
-  takes a stats sketch that isn't on gamma 1.0202 is still open (`docs/known-gaps.md`).
+  takes a stats sketch that isn't on gamma 1.0202 is still open (`docs/known-gaps/datadog.md`).
 - **v0.7 traces, a `PUT`, and a second tracer language.** dd-trace-py sends neither v0.7 nor
   `PUT`; dd-trace-java and dd-trace-go would. The codec's fixed-point tests cover both forms.
 - **v1 series, distribution points, and the public API's JSON forms.** A current Agent sends

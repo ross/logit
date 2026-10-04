@@ -91,8 +91,8 @@ the stall watcher read such a loop as progress.
   `telemetry.*`, `print`) still returns its errors through mlua, so each one a script catches
   builds a traceback, with the same global-table walk for an anonymous frame. None of them is a
   call a script loops on to probe for success, and each costs one walk per failed call.
-  `docs/known-gaps.md`'s Lua section records it. Moving another callback onto this pattern
-  follows this record.
+  `docs/known-gaps/transforms.md` records it. Moving another callback onto this
+  pattern follows this record.
 - A script that pcall-loops refused `Event.new` calls, after a memory trip or on a malformed
   table, shows as `stalled` once the loop runs past the stall threshold. This amends
   [ADR `lua-runaway-script-bounds`](lua-runaway-script-bounds.md)'s "a loop that keeps calling

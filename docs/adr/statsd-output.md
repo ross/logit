@@ -176,7 +176,7 @@ downstream. Never `|T<ts>`: the classic grammar has no timestamp segment at all,
 `logit_inputs::statsd::parse_line` would silently ignore one if emitted, so it wouldn't even
 round-trip through this repo's own input — a receiver stamps with its own receipt time instead.
 `MetricRecord::unit` has no statsd wire representation either and is dropped the same way. All
-three are recorded in `docs/known-gaps.md`.
+three are recorded in `docs/known-gaps/statsd.md`.
 
 ## Alternatives considered
 
@@ -223,7 +223,7 @@ three are recorded in `docs/known-gaps.md`.
   `logit_config::StatsdFormat`/`StatsdTransport` value crosses into `logit_outputs::statsd`'s own
   mirror types.
 - `fixtures/statsd-relay.yaml` (new): a runnable relay config exercising the sink.
-- `docs/known-gaps.md`: new entries for the v1 metric-kind deferral (and its timer-drop
+- `docs/known-gaps/statsd.md`: new entries for the v1 metric-kind deferral (and its timer-drop
   consequence for the `statsd_in -> aggregate -> statsd_out` path), no egress timestamp, no
   `unit`, no metric prefix/rename anywhere in the pipeline, and no TLS/DTLS.
 
@@ -326,7 +326,7 @@ true only while every sample landing in a window shares one sample rate and the 
 `max_samples_per_series`/`max_set_members_per_series`**; once either limit is crossed, `aggregate`
 falls back to a sketch/estimate for that window regardless of the `samples`/`members` config, and
 this sink has no lossless rendering for that fallback either — it drops and counts it exactly like
-the default-summarized case (`docs/known-gaps.md`). This is [ADR `lossless-transit`](lossless-transit.md)'s
+the default-summarized case (`docs/known-gaps/statsd.md`). This is [ADR `lossless-transit`](lossless-transit.md)'s
 "summarization is opt-in and named" rule made concrete on the egress side: the sink itself never
 guessed at a sketch-to-lines mapping (still deserving its own design, per the original Decision
 section above, should a concrete consumer ever need one), and the kinds it can't encode are now
@@ -336,7 +336,7 @@ exactly the kinds *only* an explicit `aggregate` choice, or a config limit, can 
 legal DogStatsD (a repeated tag key), but `AttrMap` is a map, not a multiset, so the second
 `team:b` silently overwrites the first inside `statsd_in` itself, before this sink ever sees the
 event — `x:1|c|#team:a,team:b` relays as `x:1|c|#team:b`. Tracked as debt against
-[ADR `lossless-transit`](lossless-transit.md) in `docs/known-gaps.md`, not something this
+[ADR `lossless-transit`](lossless-transit.md) in `docs/known-gaps/statsd.md`, not something this
 amendment's carrier/sanitizer fixes touch.
 
 ### Permitted normalizations, restated for the raw shapes
@@ -723,7 +723,7 @@ path (`docs/design/internal-telemetry.md`). `connect_timeout` bounds the TCP con
 handshake as two *separate* phases, so a TLS connect can take up to twice the configured value —
 `syslog_out`'s arrangement, and `logit_out`'s before it.
 
-This closes `docs/known-gaps.md`'s "`statsd_out` has no TLS/DTLS" entry, whose other half
+This closes `docs/known-gaps/statsd.md`'s "`statsd_out` has no TLS/DTLS" entry, whose other half
 (`statsd_in`'s ingress side adopting the shared TCP listener driver) closed alongside it. DTLS
 itself stays out of scope on both halves.
 

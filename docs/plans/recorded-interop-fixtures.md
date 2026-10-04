@@ -10,7 +10,7 @@ This repo has already paid for the lesson this workstream systematizes, twice:
 - `demo/app/pages/syslog_handler.py` exists solely because Python's stdlib `SysLogHandler` appends
   a trailing NUL byte to every UDP datagram, which broke `logit`'s `json` transform — found by
   hand, by running the real demo against a real Python syslog client. Read that file's docstring.
-- `docs/known-gaps.md`'s HAProxy-native-CBOR entry (search that file for "CBOR") records a
+- `docs/known-gaps/`'s HAProxy-native-CBOR entry (search that file for "CBOR") records a
   multi-paragraph investigation of a real format's real framing behavior against `logit`'s current
   transports — the kind of finding that only comes from checking a decoder against something real.
 
@@ -284,10 +284,10 @@ landed — see the amendment at the end of this document.
 
 ## 5. Fuzz seeds — positioned for, not wired up
 
-`docs/known-gaps.md` already carries a `cargo-fuzz` entry (`crates/logit-proto/tests/robustness.rs`'s
+`docs/known-gaps/` already carries a `cargo-fuzz` entry (`crates/logit-proto/tests/robustness.rs`'s
 seeded mutation tests are the interim substitute — nightly Rust is the blocker, per
 `docs/adr/containerized-development.md`'s stable-only toolchain) and
-`docs/plans/native-transport.md` names real `cargo-fuzz` targets as a `known-gaps.md` follow-up,
+`docs/plans/native-transport.md` names real `cargo-fuzz` targets as a `known-gaps/` follow-up,
 not built there either. No `fuzz/` directory exists anywhere in this repo yet (confirmed: no
 `fuzz/`, no `cargo-fuzz` reference outside those two docs). This corpus is well-positioned to
 double as a fuzz seed corpus once that lands — real, minimal, protocol-diverse inputs are exactly

@@ -490,9 +490,9 @@ fn otlp_shatters_a_multi_payload_event_across_separate_batches() {
 
 // -- Metrics OTLP can't express at all: GaugeDelta and Set ---------------------------------------
 
-/// The encode-side gap `docs/known-gaps.md`'s "Cross-protocol semantic gaps" entry tabulates,
-/// exercised here as a bake-off comparison; `crates/logit-proto/src/otlp/metrics.rs` has its own
-/// unit tests for the OTLP side
+/// The encode-side gap `docs/known-gaps/mappings.md`'s "Cross-protocol semantic gaps" entry
+/// tabulates, exercised here as a bake-off comparison; `crates/logit-proto/src/otlp/metrics.rs` has
+/// its own unit tests for the OTLP side
 /// (`a_gauge_delta_is_skipped_and_reports_its_own_diagnostic_key`,
 /// `a_set_metric_is_skipped_and_counted_rather_than_encoded_wrongly`).
 #[test]

@@ -153,7 +153,7 @@ can read `event.has_log`/`has_metrics` and see both true on the same event.
 
 **Depends on:** nothing — independent of A, startable in parallel.
 
-**Decisions to record:** amend `docs/known-gaps.md`'s "no graceful shutdown" and "no real diagnostics
+**Decisions to record:** amend `docs/known-gaps/`'s "no graceful shutdown" and "no real diagnostics
 facility" entries to reflect what lands here; note explicitly that output *buffering* (the `Buffer`
 trait) is still out of scope even after retry/backoff lands.
 
@@ -177,7 +177,7 @@ writer is the transport decision.
 **Depends on:** A (the `Event` it constructs needs `log: Option<LogRecord>`).
 
 **Decisions to record:** none — this implements a declared kind, it doesn't decide anything new.
-Add a `docs/known-gaps.md` entry for the one deliberate limitation below.
+Add a `docs/known-gaps/` entry for the one deliberate limitation below.
 
 **Files:** `crates/logit-inputs/src/syslog.rs`, following `crates/logit-inputs/src/statsd.rs`'s
 shape exactly — a pure `SyslogDecoder` (`logit_proto::Decoder`) split from a `SyslogInput`
@@ -186,7 +186,7 @@ shape exactly — a pure `SyslogDecoder` (`logit_proto::Decoder`) split from a `
 **Behavior:**
 
 - **UDP only.** nginx's `syslog:` access-log writer is UDP-only, so TCP buys nothing for this
-  integration. Record it as a follow-up in `docs/known-gaps.md` rather than half-building it now.
+  integration. Record it as a follow-up in `docs/known-gaps/` rather than half-building it now.
 - RFC 3164 and RFC 5424 both, disambiguated per message by whether a version digit follows the
   priority tag.
 - Emits `log: Some(LogRecord { message, severity, body_format: Raw })`, with `facility`,
@@ -223,7 +223,7 @@ useful for this integration's dev loop and generally for anyone getting started 
 > already has one purpose-built machine format, InfluxDB line protocol, and NDJSON export is a
 > reasonable future `Format` variant if a real need for one shows up — it doesn't need to be the
 > *only* format `stdio_out` ever writes). The block's grammar is ADR `human-render-block-format`
-> and `crates/logit-outputs/src/human.rs`'s module doc; `docs/known-gaps.md` has the accepted
+> and `crates/logit-outputs/src/human.rs`'s module doc; `docs/known-gaps/` has the accepted
 > consequences.
 
 **Registration.** This is the first new component kind this plan adds, so the four-touchpoint
@@ -364,7 +364,7 @@ answer either way.
 - Update `README.md`'s status paragraph and `AGENTS.md`'s "Current state" section — both currently
   say `aggregate` and `json` are the only implemented transforms and statsd/InfluxDB the only
   implemented protocols; that becomes false partway through this plan.
-- Amend `docs/known-gaps.md`: close what B closes, add the syslog-TCP gap from C, leave the
+- Amend `docs/known-gaps/`: close what B closes, add the syslog-TCP gap from C, leave the
   output-buffering gap explicitly unchanged.
 - Fold or discard `docs/components.md` (currently an untracked stub listing protocols "to be
   explored") — don't leave it silently contradicting this plan once `syslog_in` is real.

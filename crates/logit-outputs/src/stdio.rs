@@ -501,8 +501,8 @@ mod tests {
         let scope = fault::scope(&dir);
         let open = Point::new(sites::FILE_OUT_ACTIVE, Op::Open);
         // Two rules failing their first hit: a rule counts only the hits no earlier rule failed,
-        // so the second rule's first hit is the second re-open (`docs/known-gaps.md`, "Pipeline
-        // runtime and graph", the `fault` seam entry).
+        // so the second rule's first hit is the second re-open (`docs/known-gaps/runtime.md`,
+        // "Pipeline runtime and graph", the `fault` seam entry).
         scope.fail_nth(open, 1, errno::EMFILE).fail_nth(open, 1, errno::EMFILE);
         let config = crate::test_support::fast_retry();
         drive_write_loop(&mut output, vec![small], config, telemetry).await.unwrap();

@@ -124,9 +124,9 @@ Compression is a sink-configured transport choice, so under
 - `ruzstd` joins the workspace as a dependency of `logit-proto`, MIT-licensed and already on
   `deny.toml`'s allow list. Its rationale comment in `Cargo.toml` scopes the earlier "zstd is
   not a dependency" note to the native frame.
-- `docs/known-gaps.md`'s Prometheus section gains three rows: an `ExponentialHistogram` can't
-  reach VictoriaMetrics's native-histogram ingest over remote-write until `logit` encodes native
-  histograms; a `Distribution` is not re-binned onto `vmrange` buckets and goes out as a
+- `docs/known-gaps/prometheus.md` gains three rows: an `ExponentialHistogram`
+  can't reach VictoriaMetrics's native-histogram ingest over remote-write until `logit` encodes
+  native histograms; a `Distribution` is not re-binned onto `vmrange` buckets and goes out as a
   five-quantile summary; and a series scraped back from `/federate` is untyped because
   VictoriaMetrics emits no `# TYPE`.
 - `docs/deploying.md`'s "Choosing `version: 1` or `2`" section stops listing VictoriaMetrics

@@ -20,8 +20,8 @@ right. What the *script* saw inside `flush()` was not: the four batch-scoped glo
 ever set before a `process()` batch, so a `flush()` read whatever the most recently processed
 batch had left behind, and `run_lua` (`crates/logit-pipeline/src/runtime.rs`) stamped the flushed
 batch with that same last-seen resource and scope (`last_resource`/`last_scope`). Three
-`docs/known-gaps.md` entries carried this as "stale during `flush()`", with the script-side
-`resource`/`scope` write inside `flush()`
+`docs/known-gaps/transforms.md` entries carried this as "stale during `flush()`", with the
+script-side `resource`/`scope` write inside `flush()`
 ([ADR `operator-declared-resource-attributes`](operator-declared-resource-attributes.md)) as the
 workaround.
 
@@ -78,9 +78,9 @@ The per-batch `process()` path is untouched.
 - A stateful script that relied on the last batch's resource reaching its flushed events now
   emits under an empty resource unless it writes `resource` in `flush()`. Pre-release, no
   compatibility shim; `docs/design/lua-api.md` says so at each global.
-- The three Lua-`flush()`-staleness entries in `docs/known-gaps.md` are closed by this ADR, and
-  [ADR `aggregation-window-semantics`](aggregation-window-semantics.md)'s "stamped with whichever
-  resource the worker most recently saw" sentence is superseded.
+- The three Lua-`flush()`-staleness entries in `docs/known-gaps/transforms.md` are closed by this
+  ADR, and [ADR `aggregation-window-semantics`](aggregation-window-semantics.md)'s "stamped with
+  whichever resource the worker most recently saw" sentence is superseded.
 - A script reading `provenance.origin` inside `flush()` to decide what to do now sees its own id,
   which is what its emission goes out stamped with on this node's own edge -- the specific
   mismatch the old provenance entry called out.

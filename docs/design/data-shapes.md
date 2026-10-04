@@ -562,10 +562,10 @@ product-scoped figure.
 - **Nothing here bounds value cardinality**, only key counts and lengths.
 - **Volume weighting does not exist.** Signal mix by respondent (metrics 95%, logs 87%, traces 57%
   of organisations, by a vendor's own survey) is not signal mix by event or by byte.
-- **The instrument has limits of its own**, recorded in `docs/known-gaps.md`: distinct-key tracking
-  is top-level only and cumulative; resource and scope width is a count without lengths; and the
-  survey's readout depends on parsing `file_out`'s human text render, the only sink that carries raw
-  `Samples` values.
+- **The instrument has limits of its own**, recorded in `docs/known-gaps/transforms.md`:
+  distinct-key tracking is top-level only and cumulative; resource and scope width is a count
+  without lengths; and the survey's readout depends on parsing `file_out`'s human text render, the
+  only sink that carries raw `Samples` values.
 
 ### Follow-ups
 

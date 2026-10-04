@@ -16,8 +16,8 @@
 components:
   from_vmagent:
     type: prometheus_in
-    # Transport security at most, never authentication (docs/known-gaps.md): bind loopback or
-    # pod-local and front it with something that authenticates.
+    # Transport security at most, never authentication (docs/known-gaps/prometheus.md): bind
+    # loopback or pod-local and front it with something that authenticates.
     bind: 127.0.0.1:9201
     # Off by default. vmagent flushes on a fixed cadence (`-remoteWrite.flushInterval`), so a
     # connection quiet for a minute isn't coming back.

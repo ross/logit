@@ -367,7 +367,7 @@ separately from the suite, so their cells differ from the table above in the thi
   position alone isn't it. The same layout move makes `json-parse-x3` 2–6% slower and
   `logfmt-parse` 6–9% faster depending on clock; those laptop figures are provisional (battery,
   `powersave`). There's no source-level fix.
-  [`docs/known-gaps.md`](../known-gaps.md) tracks it.
+  [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md) tracks it.
 - **`logfmt-parse` −7.9% at the same merge, S** (1.006 → 0.926; 1,626,122 → 1,879,855 events/s),
   flat after. In the same pair, `Logfmt::process` self time falls 14.99% → 6.42% (inclusive
   57.81% → 52.26%), and `KeyCache::get_or_intern` becomes a separate callee at 4.07%. This is
@@ -466,7 +466,7 @@ the VM for `json-parse`, `aggregate`, and `buffered`, and for `fanout` and `rout
   `json-parse` dropped sharply from the laptop's 2.054 µs/event because of the interner key-cache
   and in-place `Transform::process` work (`docs/adr/in-place-transform-process.md`). `lua`'s LuaJIT
   round trip had no equivalent optimization, so the gap between a `lua` stage and a native
-  transform that [`docs/known-gaps.md`](../known-gaps.md#transforms-predicates-and-sampling)
+  transform that [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md#transforms-predicates-and-sampling)
   documents holds by a larger factor now.
   `json-parse-x3` (2.501 µs/event, three parallel parsers sharing the interner) sits above `lua`,
   consistent with its purpose: showing shared-interner contention, not a single parse.
@@ -539,8 +539,8 @@ retiring the laptop as a reference box, not just a noisier version of the same m
 
 A variance-aware `compare` threshold (gating on each file's `min`, or per-scenario thresholds) is
 still possible future work, but its motivating case, `aggregate` tripping `--threshold 5` on its
-own noise, no longer happens on the reference box. `docs/known-gaps.md`'s harness entry says the
-same.
+own noise, no longer happens on the reference box. `docs/known-gaps/telemetry.md`'s harness entry
+says the same.
 
 ### Peak RSS: what is live data and what is jemalloc retention
 
@@ -808,7 +808,8 @@ consistent with this one within ordinary noise).
 
 What's left open is narrow: how much `DiskQueue::open`'s bounded active-segment validation scan, still
 present, contributes to a *cleared* spool's remaining spread. On this evidence, not much.
-`perf/scenarios/buffered.yaml`'s comment and `docs/known-gaps.md`'s entry carry the same account.
+`perf/scenarios/buffered.yaml`'s comment and `docs/known-gaps/telemetry.md`'s entry carry the same
+account.
 
 ### Segment rolls: `buffered-small-segments` (2026-09-24)
 
@@ -900,7 +901,7 @@ not compared.
   on different physical hardware (the ADR's "Consequences" section).
 - **Treat `buffered` with ordinary caution.** `run` clears its spool before every repeat (§3, W8,
   #165), so the accumulation artifact is gone, but its repeat spread is still wider than most
-  (`docs/known-gaps.md`'s "no cross-run noise model" entry).
+  (`docs/known-gaps/telemetry.md`'s "no cross-run noise model" entry).
 
 ## 5. Flamegraph
 
@@ -1789,7 +1790,7 @@ scenarios' YAML and `docs/plans/load-test-harness.md` already carried.
 **Result: the sketch store's cost is accepted, and `float_roundtrip`'s gate is cleared.** [ADR
 `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md) hand-rolls `DdSketch` to
 match the Datadog Agent's own bin mapping bin-for-bin; this session measures what that costs against
-`main`, and separately closes [`docs/known-gaps.md`](../known-gaps.md#datadog)'s open
+`main`, and separately settles the open
 `float_roundtrip` question (`serde_json`'s exactly-rounded float parser, enabled workspace-wide for
 the Datadog JSON routes).
 
@@ -1856,12 +1857,12 @@ the hot path — `aggregate` sketches every series, and `json-parse`'s `kv_metri
 `json-parse-access-log`, `-app-log`, `-nested-log`, `-x3`) is flat within noise end to end, `main`
 to `dd-w2b`. This is accepted: bin-for-bin Datadog parity needs the Agent's own bin mapping, and a
 cheaper store that didn't match it would relay a sketch that reads differently at Datadog's end
-([`docs/known-gaps.md`](../known-gaps.md#datadog)'s sketch-store entry).
+([`docs/known-gaps/datadog.md`](../known-gaps/datadog.md)'s sketch-store entry).
 
 `dd/w2b`'s `serde_json` `float_roundtrip` feature is flat within noise on every `json-parse*`
 scenario: the one delta that clears spread at that step, `json-parse-access-log`'s −1.89% against a
 1.61% spread, is a speedup, not the slowdown the feature's ~2×-on-float-parsing cost would predict,
-and no other `json-parse*` scenario moves with it. `docs/known-gaps.md`'s `float_roundtrip` entry
+and no other `json-parse*` scenario moves with it. The `float_roundtrip` question
 is closed on this evidence: the feature stays enabled workspace-wide with no measurable cost.
 
 Peak RSS is uninformative here: every delta, at every step, falls inside that scenario's own
@@ -1911,14 +1912,14 @@ on decode
   `buffer.disk.path` before every spawn, and both a quiet-laptop and a reference-VM `--repeat 5`
   confirmation (§3) show no decay and flat RSS. The VM pass narrowed the remaining spread to 7% on
   events/s and under 1% on CPU µs/event. What's left is product-side and small:
-  `DiskQueue::open`'s double-read startup scan (`docs/known-gaps.md`'s `buffered` entry) is no
-  longer a prime suspect for anything, just an unquantified detail.
+  `DiskQueue::open`'s double-read startup scan (`docs/known-gaps/telemetry.md`'s `buffered` entry)
+  is no longer a prime suspect for anything, just an unquantified detail.
 - **A variance-aware `compare` threshold is possible future work with no current motivating case.**
   `aggregate`'s laptop-era ~±25% repeat-to-repeat spread, the reason this item was opened, doesn't
   reproduce on the reference VM (§1's noise sub-section: two independent 5-repeat samples agree to
   within 0.7%). Gating on each file's `min` instead of the median, or per-scenario thresholds,
   remain options if a future scenario needs them; nothing in the suite does today
-  (`docs/known-gaps.md`'s harness entry).
+  (`docs/known-gaps/telemetry.md`'s harness entry).
 - **Templated metric names permanently grow the process-wide interner**, one entry per distinct
   rendering, for the life of the process (`generate_in`'s module doc; `docs/design/memory.md` §4).
   `generate_in` refuses a bare `{seq}` in a metric name for this reason, and every shipped scenario

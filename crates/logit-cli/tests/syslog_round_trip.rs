@@ -49,7 +49,7 @@
 //!    attribute iteration follows process-global intern order: `[b@2 ..][a@1 ..]` re-emits as
 //!    `[a@1 ..][b@2 ..]`. A repeated PARAM-NAME's occurrences, already one `Value::Array` after
 //!    decode, are emitted together, so a wire `a b a` interleaving becomes `a a b`
-//!    (`docs/known-gaps.md`). Fixtures: `rfc5424-example4`, `interop-logger-rfc5424-basic`.
+//!    (`docs/known-gaps/syslog.md`). Fixtures: `rfc5424-example4`, `interop-logger-rfc5424-basic`.
 //! 8. **A bare backslash in a PARAM-VALUE is re-emitted escaped.** RFC 5424 section 6.3.3 defines
 //!    only `\"`, `\\`, and `\]` as escapes, so `\x` is a literal backslash followed by `x`, which
 //!    `parse_param_value` keeps. `syslog_out` writes that backslash as `\\`: `p="a\xb"` relays as

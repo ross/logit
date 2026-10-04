@@ -146,7 +146,7 @@ defense is free, and is otherwise a documented non-goal (listed below). The deci
 ### Documented non-goals
 
 Each of these needs crafted input, and none has a free defense. Each is recorded in
-`docs/known-gaps.md`:
+`docs/known-gaps/intake.md`:
 
 - **Interning a rejected batch's dictionary.** CRC-32C already rejects accidental corruption
   before decode, so only a crafted frame interns strings from a batch that later fails ("Event
@@ -169,8 +169,8 @@ Each of these needs crafted input, and none has a free defense. Each is recorded
 
 - **A per-listener in-flight byte budget.** A semaphore over bytes held in request bodies would
   bound the product in the worst-case formula, where the stream cap bounds only one of its
-  factors. It is recorded as a follow-up in `docs/known-gaps.md` rather than built here, because
-  it changes how every HTTP listener reads a body.
+  factors. It is recorded as a follow-up in `docs/known-gaps/intake.md` rather than built here,
+  because it changes how every HTTP listener reads a body.
 - **Reject an out-of-range OTLP timestamp, or treat it as unset.** Rejecting fails a whole export
   request over one field the sender can't correct. Treating it as unset makes it look like a real
   zero, which OTLP gives a meaning (for example, "use the observed time"). Saturating keeps the
@@ -181,7 +181,7 @@ Each of these needs crafted input, and none has a free defense. Each is recorded
   by default. With `idle_timeout` unset, a stalled or dribbled body is unbounded in time. With it
   set, a peer sending one byte per frame, each slightly under the bound, holds a request for up to
   `MAX_REQUEST_BYTES × idle_timeout` on an HTTP listener and `max_frame_bytes × idle_timeout` on
-  `logit_in`. Both costs are recorded in `docs/known-gaps.md`.
+  `logit_in`. Both costs are recorded in `docs/known-gaps/intake.md`.
 - **A lower default `max_frame_bytes`.** Declined. A relay that batches aggressively needs the
   headroom, and the per-frame decode budget scales with the configured value.
 - **A listener-wide request semaphore.** Declined. A shared count of in-flight requests lets one
@@ -208,8 +208,8 @@ Each of these needs crafted input, and none has a free defense. Each is recorded
 - An OTLP sender that spells its encoding `Gzip` or `GZIP` now interoperates with `otlp_in`.
 - An OTLP timestamp past 2262-04-11 relays as 2262-04-11T23:47:16.854775807Z.
 - `docs/design/wire-protocol.md` gains each native decoder's measured expansion ratio, and
-  `docs/known-gaps.md` gains the dribbled-body cost, the in-flight byte budget follow-up, and the
-  non-goals above.
+  `docs/known-gaps/intake.md` gains the dribbled-body cost, the in-flight byte budget follow-up, and
+  the non-goals above.
 - Unchanged: `drive_with_idle`'s wait-out loop still has no ceiling. It waits for an in-flight
   request to finish before closing an idle connection, and a request blocked in `Fanout::send` is
   backpressure, not idleness ([ADR `idle-connection-timeout`](idle-connection-timeout.md)).

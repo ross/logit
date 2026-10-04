@@ -21,7 +21,8 @@ components:
 
     # Target events/s. Kept low so the example is polite on a laptop; a real scenario omits it
     # (generate as fast as backpressure allows) or sets it high. Above roughly a thousand batches
-    # per second the pacing is bursty within a millisecond; the average holds (docs/known-gaps.md).
+    # per second the pacing is bursty within a millisecond; the average holds
+    # (docs/known-gaps/telemetry.md).
     rate: 5000
 
     # Batch-level resource attributes, built once and shared by every event when all-literal. A

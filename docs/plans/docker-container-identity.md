@@ -104,7 +104,7 @@ targeting its parent's branch, brought up to date with `git merge origin/main` (
 
 ### `dkr/w4` — docs, and live verification against a real stack
 
-- `docs/known-gaps.md`: the `docker_in` rename gap replaced with what's still true (bounded by
+- `docs/known-gaps/`: the `docker_in` rename gap replaced with what's still true (bounded by
   `poll_interval`; retention doesn't survive a restart).
 - `docs/deploying.md`'s "Tailing files and Docker logs" section: what's watched vs. poll-bound;
   `metadata_error` now retries.

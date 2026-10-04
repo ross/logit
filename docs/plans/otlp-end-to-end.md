@@ -19,7 +19,7 @@ Two things had to be true before traces could leave `logit`, and neither was tru
    `run_flush` (`crates/logit-pipeline/src/runtime.rs`) threw those links away, and
    `Registry::drain` (`crates/logit-core/src/telemetry.rs`) emitted only `Event::metric`. Every
    `Event::span(...)` call in the tree was in a test or a bench fixture. This was item 1 of the
-   still-open list in `docs/known-gaps.md`'s internal-spans entry.
+   still-open list in `docs/known-gaps/`'s internal-spans entry.
 2. **There was no OTLP code at all.** `ComponentKind::OtlpIn { bind }` and `OtlpOut { endpoint }`
    were declared in `logit-config` but rejected by `graph::is_implemented`. ADR `native-wire-format-with-otlp-bridge` settled that
    OTLP is a first-class interop codec (not the internal transport) and left the gRPC-vs-HTTP
@@ -46,7 +46,7 @@ to warrant the whole session on its own.
 | OTLP signals | All three (logs, metrics, traces), both directions. |
 | OTLP transports | Both gRPC and HTTP, selected by a `protocol: grpc \| http` field on `otlp_in`/`otlp_out`, both shipped in one PR (PR3) — the demo deliberately exercises gRPC against Tempo's `:4317`, which removes the benefit a smaller HTTP-first split would otherwise have bought. |
 | Protobuf toolchain | Generated once, **committed** — no `protoc` at build time (ADR `containerized-development`). |
-| Lossy metric kinds | `Distribution`→`Summary` and `Set`→skip, both counted, matching `influxdb_out`'s existing precedent. Filed in `docs/known-gaps.md` as a "Cross-protocol semantic gaps" entry meant to grow, not a one-off footnote. |
+| Lossy metric kinds | `Distribution`→`Summary` and `Set`→skip, both counted, matching `influxdb_out`'s existing precedent. Filed in `docs/known-gaps/` as a "Cross-protocol semantic gaps" entry meant to grow, not a one-off footnote. |
 | Shape | 3 PRs (spans → OTLP codec → the two components), then a 4th for the demo. |
 | Demo scope | `otlp_out` → Tempo, over **gRPC** specifically. `otlp_in` ships tested but unexercised by the demo. |
 | Branching | One git worktree per PR, each branched off `main`. PR1 ‖ PR2 in parallel; PR3 off PR2; PR4 last. |
@@ -109,7 +109,7 @@ Non-negotiable, from `AGENTS.md`, restated here because this plan cites them rep
 
 ## PR1 — `feat/internal-span-emission`
 
-Closed item 1 of `docs/known-gaps.md`'s internal-spans list. Independent of all OTLP work — the
+Closed item 1 of `docs/known-gaps/`'s internal-spans list. Independent of all OTLP work — the
 `SpanRecord` it produces is consumed by `stdio_out`, which already rendered spans in full.
 
 **One span is one node's minted `TraceContext`** — not "one node's processing of one batch". The
@@ -172,7 +172,7 @@ of the deterministic-on-`trace_id` sampler is that it needs no propagated bit. E
 a disabled or unsampled handle is `Option::None`, so the allocation-count assertions against
 `Telemetry::default()` also held unchanged.
 
-**New residuals recorded in `known-gaps.md`** (deliberate, not oversights): the listener span's
+**New residuals recorded in `known-gaps/`** (deliberate, not oversights): the listener span's
 window is the `send` call only, not decode-to-send; Lua `flush()` still gets a link-less root (no
 accumulator exists for it, same as the pre-existing stale-context limitation); a `SinkQueue` entry
 is 24 bytes larger.
@@ -228,7 +228,7 @@ lossy** — capped at `MAX_DERIVED_BUCKETS = 512` (**also since retired** — `E
 kept as its own model variant and maps 1:1 now, W4 of
 [`docs/plans/lossless-transit.md`](lossless-transit.md)).
 
-A dedicated `docs/known-gaps.md` entry — "Cross-protocol semantic gaps" — was filed for this, meant
+A dedicated `docs/known-gaps/` entry — "Cross-protocol semantic gaps" — was filed for this, meant
 to grow as more codecs join, rather than staying scattered across doc comments.
 
 One golden-bytes fixture (`OTLP_TRACE_REQUEST`, captured from a real collector with a provenance
@@ -319,7 +319,7 @@ of `trace_out`'s batches end up traces-only and `send` succeeds. `trace_windowed
 60s `flush` still occasionally emits a real metrics-only batch that fails the same way, but the many
 successful pure-span deliveries surrounding it (roughly one every 10s) reset the guard's streak long
 before it reaches 60s. Recorded in full, including why this is specific to a mixed-signal source
-feeding a signal-partial backend rather than a general `otlp_out` problem, in `docs/known-gaps.md`'s
+feeding a signal-partial backend rather than a general `otlp_out` problem, in `docs/known-gaps/`'s
 "`otlp_out` aborts an entire batch's `send`..." entry, with the same account inline in
 `demo/logit.yaml`.
 
@@ -339,12 +339,12 @@ first-time user watching `docker compose logs -f logit` isn't alarmed by it.
 - **OTLP request compression** (gzip) on `otlp_in` — the OTel collector's default exporter sends
   it; PR3 rejects it explicitly (`415`/`grpc-status: 12`) rather than silently mishandling it.
 - **A `keep`-in-front recommendation for `otlp_in`** in `docs/deploying.md` — peer-supplied
-  attribute keys hit the never-evicting interner (`docs/known-gaps.md`), and `otlp_in` is the
+  attribute keys hit the never-evicting interner (`docs/known-gaps/`), and `otlp_in` is the
   sharpest form of that gap yet.
 - **A config-layer way to filter an event stream by which payload (log/metric/span) it carries**,
   or a per-signal partial-failure mode on `OtlpOutput::send` — either would let `trace_out` (or any
   future `otlp_out` fed a mixed-signal source) skip `trace_windowed`'s workaround entirely. Recorded
-  alongside the interaction it would fix, in `docs/known-gaps.md`.
+  alongside the interaction it would fix, in `docs/known-gaps/`.
 
 ## Verification
 

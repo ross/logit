@@ -54,8 +54,8 @@ A fourth test, `interop_fixture_notification_decodes_to_a_log_record`, does the 
 
 - **Signed and encrypted traffic** (`SecurityLevel Sign`/`Encrypt`, the 0x0200/0x0210 parts). These
   aren't captured, and a fixture couldn't exercise much: `logit` verifies no signature and holds no
-  keys (`docs/known-gaps.md`), so a signed capture would only exercise "skip a part by its length",
-  and an encrypted one "drop the rest of the datagram". Hand-built unit tests in
+  keys (`docs/known-gaps/mappings.md`), so a signed capture would only exercise "skip a part by
+  its length", and an encrypted one "drop the rest of the datagram". Hand-built unit tests in
   `crates/logit-proto/src/collectd/decode.rs` cover both, where the key material can be absent on
   purpose rather than by accident.
 - **Multi-host forwarding.** This is a collectd configured with both `Listen` and `Server`,

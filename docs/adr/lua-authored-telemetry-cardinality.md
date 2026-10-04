@@ -13,8 +13,9 @@ Accepted
 ADR `internal-telemetry-as-pipeline-events` built `logit_core::telemetry::Telemetry` around one hard rule: every metric name and tag
 is `&'static str` — a compile-time-constant string, not a runtime value. That's what bounds
 cardinality by *code* rather than by traffic, and it matters more here than in most systems: the
-process-wide attribute interner (`logit_core::interner`) never evicts (`docs/known-gaps.md`), so a
-runtime-derived string reaching it leaks for the life of the process.
+process-wide attribute interner (`logit_core::interner`) never evicts
+(`docs/known-gaps/runtime.md`), so a runtime-derived string reaching it leaks for the life of the
+process.
 
 Extending telemetry to Lua scripts (`crates/logit-script/src/telemetry.rs`, letting a `process()`/
 `flush()` call `telemetry.count(...)`/`.gauge(...)`) runs straight into that rule: a Lua script
@@ -27,9 +28,9 @@ simply doesn't reach across that boundary.
 **Round-trip every Lua-provided name and tag value through the existing interner**:
 `interner::resolve(interner::intern(s))` genuinely returns a `&'static str` — the interner's own
 permanent storage — and re-interning a string it already holds allocates nothing (measured and
-documented in `docs/known-gaps.md`'s interner section). This satisfies `Telemetry`'s type signature
-using infrastructure the codebase already has and already accepts the tradeoff on, rather than
-building a second, bespoke leak mechanism just for this path.
+documented in `docs/known-gaps/runtime.md`). This satisfies `Telemetry`'s type
+signature using infrastructure the codebase already has and already accepts the tradeoff on, rather
+than building a second, bespoke leak mechanism just for this path.
 
 **The honest consequence: cardinality safety for Lua-authored telemetry is convention-enforced,
 not type-system-enforced.** A script that writes `telemetry.count("orders.total", 1)` — a fixed
@@ -74,9 +75,9 @@ from, not by what the compiler will accept.
   for the audience that actually writes scripts — the ADR records the decision, the design doc is
   what a script author is expected to read.
 - If Lua-authored telemetry cardinality ever becomes a real operational problem (unlike the
-  Rust-side interner growth risk, which `docs/known-gaps.md` argues is unlikely to be hit first),
-  the fix is either the bounded-cache alternative above or a lint/review convention for scripts —
-  not a change to `logit_core::telemetry` itself, which stays correctly agnostic about where a
-  `&'static str` came from.
+  Rust-side interner growth risk, which `docs/known-gaps/runtime.md` argues is unlikely to be hit
+  first), the fix is either the bounded-cache alternative above or a lint/review convention for
+  scripts — not a change to `logit_core::telemetry` itself, which stays correctly agnostic about
+  where a `&'static str` came from.
 - No change to `Telemetry`'s public API or its `&'static str` signature — this ADR is entirely
   about how `crates/logit-script` satisfies that signature, not about relaxing it.

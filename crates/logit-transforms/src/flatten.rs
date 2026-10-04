@@ -5,7 +5,7 @@
 //!
 //! **Never deletes an attribute**: every source value it removes is written back, as leaves or
 //! whole. A key collision is last write wins, with no diagnostic. There is no cap on how many keys
-//! one value expands into; [`MAX_DEPTH`] is the only bound (`docs/known-gaps.md`).
+//! one value expands into; [`MAX_DEPTH`] is the only bound (`docs/known-gaps/runtime.md`).
 //!
 //! No flush state; it reuses per-instance [`Scratch`] buffers for the path and interned keys.
 

@@ -365,8 +365,8 @@ written before the spawn too, as `<path>.next`. Once the sink has received half 
 file, the harness hard-links `<path>` as `<path>.1` and renames `<path>.next` onto `<path>`.
 `tail_in` has to read the old inode through to its end and the replacement from its start.
 logrotate itself renames first and creates after; a scan in that gap misses the rotation count
-(`docs/known-gaps.md`), and the exact self-check counts rotations, so the harness never leaves
-`<path>` missing.
+(`docs/known-gaps/tailing.md`), and the exact self-check counts rotations, so the harness never
+leaves `<path>` missing.
 
 **The run ends when the sink has every line.** `run` attaches the UDP kind's telemetry leg at a
 100 ms drain interval and follows the dump while the child runs, so `wall_s` is resolved to about

@@ -242,9 +242,9 @@ accept loop to generalize from — `otlp_in`'s, itself specialized to HTTP/1.1 a
 plus `logit_in`'s own bespoke connection cap and shutdown-racing logic; neither is a plain
 line-oriented listener, so `graphite_in::tcp` would be the first of its kind, and generalizing a
 driver from a single occurrence risks guessing the wrong seams. The trigger for extracting one is
-named, not left implicit: `docs/known-gaps.md`'s open **"`syslog_in` is UDP-only"** entry ("a TCP
-accept loop would buy the driving integration nothing... [s]tays additive-later on the *input* side
-specifically") is exactly the second line-oriented TCP listener that would justify pulling
+named, not left implicit: the then-open **"`syslog_in` is UDP-only"** entry ("a
+TCP accept loop would buy the driving integration nothing... [s]tays additive-later on the *input*
+side specifically") is exactly the second line-oriented TCP listener that would justify pulling
 `graphite_in`'s accept loop, line-buffering, and oversize-line handling into a shared
 `logit_inputs::tcp` module. Until that entry closes, `crates/logit-inputs/src/graphite/tcp.rs` is
 written as its own thing, modeled on `otlp_in`'s `Input::bind` shape and `logit_in`'s connection cap

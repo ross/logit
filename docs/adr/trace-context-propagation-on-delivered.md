@@ -11,7 +11,7 @@ Accepted
 
 ## Context
 
-`docs/known-gaps.md`'s internal-spans entry gated carrying trace context on `Delivered`
+`docs/known-gaps/telemetry.md`'s internal-spans entry gated carrying trace context on `Delivered`
 (`crates/logit-pipeline/src/fanout.rs`) on measured evidence, per
 [ADR `minimize-allocations-over-event-size`](minimize-allocations-over-event-size.md): a hot-path type change must be decided on
 its own evidence, not folded into a metrics change. A dedicated costing exercise (PR #39) built a
@@ -78,7 +78,7 @@ methods, `send_with_context`/`send_blocking_with_context`, and their two call si
   potentially one span per node-visit per batch. `internal` will likely need its own knob for this,
   separate from its drain `interval`.
 - **The flush *n*-to-1 problem is not solved**, per the Decision section above — tracked in
-  `docs/known-gaps.md`'s internal-spans entry, not silently dropped.
+  `docs/known-gaps/telemetry.md`'s internal-spans entry, not silently dropped.
 - **No Lua span proxy, no `otlp_out`.** Both downstream of whether spans get emitted at all.
 
 ## Alternatives considered
@@ -87,7 +87,7 @@ methods, `send_with_context`/`send_blocking_with_context`, and their two call si
   parent.** Rejected: silently wrong is worse than visibly incomplete. An arbitrary pick would look
   like a real parent to anything consuming it later, with no signal that the relationship is
   fabricated — exactly the kind of approximation this project's stance (see the interner and
-  Lua-resource-stamping gaps in `docs/known-gaps.md`) treats as worth naming, not hiding.
+  Lua-resource-stamping gaps in `docs/known-gaps/`) treats as worth naming, not hiding.
 - **Change `Fanout::send`/`unwrap_batch`'s existing signatures** rather than adding
   `send_with_context`/`Delivered::context()` alongside them. Rejected: would force every existing
   call site (every `Input` impl, every flush path, every test constructing a `Delivered` or calling

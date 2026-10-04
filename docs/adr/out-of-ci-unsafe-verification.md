@@ -130,7 +130,7 @@ needed the capability alone.
   nightly, and could in principle live in this same image. It solves a different problem (corpus-
   driven exploration of decoder input space) from what this ADR's three tools solve (soundness
   under miri's abstract machine, debug-assertion std, and forced syscall faults), and
-  `docs/known-gaps.md`'s existing `cargo-fuzz` entry (over `crates/logit-proto`'s decoders, not
+  `docs/known-gaps/`'s existing `cargo-fuzz` entry (over `crates/logit-proto`'s decoders, not
   this `libc` surface) already tracks it as future work in its own right. Folding it into this
   image without a concrete fuzz target to build first would be scope this PR doesn't need.
 - **LD_PRELOAD/seccomp interposition** (a shim library that intercepts `recvmmsg`/`getsockopt`/

@@ -46,9 +46,10 @@ reimplementing RFC 3339 formatting.
 `syslog_in`'s own module doc explains why that attribute can't be resolved to an instant for RFC
 3164 without guessing a year and a timezone; re-emitting it here would reintroduce exactly that
 guess on the way out. Consequence: a `syslog_in -> syslog_out` relay re-stamps with `logit`'s
-receipt time rather than preserving the origin's own clock — recorded in `docs/known-gaps.md`. The
-opt-in `syslog_timestamp` transform that gap already proposes is the right place to resolve
-`syslog.timestamp` onto `event.timestamp` explicitly, for either direction.
+receipt time rather than preserving the origin's own clock — recorded in
+`docs/known-gaps/syslog.md`. The opt-in `syslog_timestamp` transform that gap already proposes is
+the right place to resolve `syslog.timestamp` onto `event.timestamp` explicitly, for either
+direction.
 
 ### Transport: both UDP and TCP
 
@@ -133,7 +134,7 @@ message at the receiver. The encoder escapes `\n`/`\r`/NUL and every other C0 co
 transport is configured. A literal backslash is deliberately **not** escaped: the demo's message
 body is a JSON document, where a real newline inside a JSON string is already the two characters
 `\` `n` on the wire, and escaping a literal backslash would double every one of them and break
-Loki's `| json` LogQL parsing on every line. Consequence, recorded in `docs/known-gaps.md`: a
+Loki's `| json` LogQL parsing on every line. Consequence, recorded in `docs/known-gaps/syslog.md`: a
 message that already contained the literal two characters `\` `n` is indistinguishable on the wire
 from one that contained a real newline.
 
@@ -229,7 +230,7 @@ stats; the only thing that changed is that there is now a trait naming the shape
   `logit_config::SyslogFormat`/`SyslogTransport`/`SyslogFacility` value crosses into
   `logit_outputs::syslog`'s own tiny mirror types, mirroring `overflow_policy`/`delivery_posture`.
 - `demo/logit.yaml`, `demo/alloy/config.alloy`: the demo's log leg goes live.
-- `docs/known-gaps.md`: new entries for no TLS, no RFC 5424 STRUCTURED-DATA emission, the
+- `docs/known-gaps/syslog.md`: new entries for no TLS, no RFC 5424 STRUCTURED-DATA emission, the
   backslash-escaping ambiguity, and the receipt-time-not-origin-time timestamp; the existing
   "syslog TCP and structured data" entry narrows to `syslog_in` staying UDP-only.
 
@@ -268,7 +269,7 @@ the byte level, rather than requiring `Value::Str` as this ADR's "Message body" 
 
 None of this changes this ADR's own decisions on format default, transport, delivery posture,
 injection safety, or sizing — see [ADR `syslog-structured-data-convention`](syslog-structured-data-convention.md)
-for the full STRUCTURED-DATA/timestamp/PROCID/MSG rules, and `docs/known-gaps.md` for which
+for the full STRUCTURED-DATA/timestamp/PROCID/MSG rules, and `docs/known-gaps/syslog.md` for which
 previously-accepted gaps this closes or narrows.
 
 ## Amendment: TLS, and `syslog_in` gaining TCP (2026-09-13)
@@ -292,8 +293,8 @@ with a `tls:` block, TLS), on the same generic stream driver
 side. The asymmetry this ADR recorded as deliberate no longer holds; see
 [ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md) for the full ingress-side design
 (RFC 6587 framing auto-detection, the connection-cap/handshake-timeout accept loop, and why no
-receive queue is needed on this transport) and `docs/known-gaps.md` for the closed/narrowed gap
-entries.
+receive queue is needed on this transport) and `docs/known-gaps/syslog.md` for the closed/narrowed
+gap entries.
 
 ## Amendment: the shared stream driver (2026-09-29)
 

@@ -3,7 +3,7 @@
 //!
 //! `!env` is resolved on the parsed [`serde_norway::Value`] tree before serde sees the document,
 //! so config types need no env-specific fields and the JSON Schema needs no widening. See
-//! `docs/adr/env-yaml-tag.md`, and `docs/known-gaps.md` for its rough edges.
+//! `docs/adr/env-yaml-tag.md`, and `docs/known-gaps/runtime.md` for its rough edges.
 //!
 //! The only place a config file is read and parsed: `logit run`, `logit validate`, and
 //! `logit graph` all go through [`load`], so `!env` and the unknown-tag guard apply to all three.

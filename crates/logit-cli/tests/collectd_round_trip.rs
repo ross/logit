@@ -293,7 +293,7 @@ fn build_in(name: &str) -> Vec<u8> {
             .build(),
 
         // Both values stay inside 2^53, where an `i64` is exact as an `f64`. Above it the model's
-        // int/double collapse moves the value, a documented gap (`docs/known-gaps.md`).
+        // int/double collapse moves the value, a documented gap (`docs/known-gaps/mappings.md`).
         "if-octets-derive" => PacketBuilder::new()
             .string(TYPE_HOST, b"web-1")
             .number(TYPE_TIME_HR, TIME_HR)

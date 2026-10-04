@@ -657,8 +657,8 @@ components:
   # consecutive failures trip `write_loop`'s ~60s sustained-permanent-failure guard
   # (`docs/adr/service-lifecycle-and-output-retry.md`, revised by
   # `docs/adr/buffered-sink-delivery.md`), ending the whole `logit` process and taking the
-  # VictoriaMetrics metrics path down with it, not just Tempo. See `docs/known-gaps.md`'s
-  # "`otlp_out` aborts an entire batch's `send`..." entry for the full account. `access_spans` needs
+  # VictoriaMetrics metrics path down with it, not just Tempo. See `docs/known-gaps/otlp.md`'s
+  # "`otlp_out` aborts a batch's `send`..." entry for the full account. `access_spans` needs
   # the same gate for the same reason, because `haproxy_trace`/`nginx_trace` produce
   # metric-and-span-carrying batches, and so does `browser_spans`, even though `browser_in` only
   # ever emits traces (see `browser_spans`'s comment above).

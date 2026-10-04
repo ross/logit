@@ -140,8 +140,7 @@ container elements, empty-container ambiguity), each deliberate and regression-t
 (`crates/logit-bench/benches/pipeline.rs`) measure the proxy against full table conversion
 directly. The proxy wins, by more for scripts that read few attributes, because `to_table`
 converts everything regardless of what the script touches. See
-[`docs/known-gaps.md`](../known-gaps.md) for the closed follow-up and [`memory.md`](memory.md)
-§2/§8 for the allocation side of the same comparison.
+[`memory.md`](memory.md) §2/§8 for the allocation side of the same comparison.
 
 ## Script contract
 
@@ -594,7 +593,7 @@ need; it isn't an oversight. Assigning to any of the three raises a "read-only f
   vocabulary in the script's own source, never one built from event data.** This is the same
   cardinality caution `telemetry.count`'s metric name carries ("Emitting telemetry from a script"
   above): a name built from a request id or order id leaks one process-wide interner entry per
-  distinct value, forever (`docs/known-gaps.md`'s interner entry).
+  distinct value, forever (`docs/known-gaps/runtime.md`'s interner entry).
 - `observed_timestamp` is read/write, a decimal-digit string, not a Lua number, for the same 2^53
   reason as `event.timestamp`. `0` (OTLP's "unset" convention) reads back as the string `"0"`, not
   `nil`: unlike `event.log` itself, this field has no "unset means absent" convention.
@@ -615,9 +614,8 @@ A script can *read* an existing span through `event.span` (read-only in place; s
 `event.span`" below) and *create* one with `Event.new` (the `span` table in "Constructing events"
 below), which takes everything `trace_context` lifts and more: `events`, `links`, a
 `parent_span_id`, an `ext`. It can't mutate an existing `event.span` field by field; to change
-one, call `Event.new(event:to_table())` with the table edited. `docs/known-gaps.md` narrowed this
-gap twice: first (in `lossless-transit`) to span writes and minting, then (in
-`lua-event-constructor`) to in-place span mutation alone.
+one, call `Event.new(event:to_table())` with the table edited. `docs/known-gaps/transforms.md`
+tracks what remains.
 
 ## Reading and writing `event.metrics`
 
@@ -716,7 +714,7 @@ any magnitude round-trips.
 `event.metrics[i].<field> is read-only on a <kind> metric`. The kind is in the message because the
 same field is writable on a different kind. **Writing `value` on `gauge_delta` is rejected too**,
 though it's readable there: `gauge_delta` is explicitly *unresolved* state that must never reach a
-sink unresolved (`docs/known-gaps.md`'s relative-gauge-adjustments entry), so there's no
+sink unresolved (`docs/known-gaps/statsd.md`'s relative-gauge-adjustments entry), so there's no
 meaningful in-place adjustment to make.
 
 **Only `sum`/`gauge` payloads are mutable in place.** A script can adjust a counter or a gauge, or
@@ -936,7 +934,7 @@ for each says why:
   the DDSketch or HyperLogLog state, so there's no shape to invert, and a sketch rebuilt from a
   count alone would misrepresent its contents.
 - `gauge_delta` raises `is not constructible from Lua -- aggregate's private intermediate, never valid at a sink`
-  ([`docs/known-gaps.md`](../known-gaps.md)'s relative-gauge-adjustments entry).
+  ([`docs/known-gaps/statsd.md`](../known-gaps/statsd.md)'s relative-gauge-adjustments entry).
 
 ### `span`
 
@@ -1254,7 +1252,8 @@ mechanism is at the citation, not restated here.
   `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md), decision 12.
 - **The interner.** Five feeders, one guarded (`telemetry`); every such string is interned for
   the life of the process, so derive names and keys from a bounded set, never from per-event data.
-  See [`known-gaps.md`](../known-gaps.md)'s interner entry for the full list.
+  See [`known-gaps/runtime.md`](../known-gaps/runtime.md#event-model-and-interner)'s interner entry
+  for the full list.
 - **Residuals.** A nonzero float under 2^-52 in magnitude reads back `0`; a `Value::Null`
   attribute/array element and an empty `Array` don't round-trip through `Event.new`
   ([ADR `lua-event-constructor`](../adr/lua-event-constructor.md)'s amendment). A table built by

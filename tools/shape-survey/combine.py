@@ -243,8 +243,8 @@ def gauges_table(runs: list[Run]) -> list[str]:
         "## Cumulative gauges (last value in each capture)",
         "",
         "Cumulative since process start, not windowed, and over top-level keys only"
-        " (`docs/known-gaps.md`). `tracking_overflow` at `1` means a cap was hit and that row's"
-        " key/key-set numbers are floors.",
+        " (`docs/known-gaps/transforms.md`). `tracking_overflow` at `1` means a cap was hit and that"
+        " row's key/key-set numbers are floors.",
         "",
         "| producer | source | tap | " + " | ".join(g.rsplit(".", 1)[-1] for g in GAUGES)
         + " | representativeness |",

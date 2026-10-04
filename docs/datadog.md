@@ -23,7 +23,7 @@ Related docs:
   decisions, including why Datadog-origin traces never go to Datadog as OTLP.
 - [`docs/plans/datadog-relay.md`](plans/datadog-relay.md): the protocol survey, what Datadog
   accepts and emits, and how each Datadog concept maps onto `logit`'s event model.
-- [`docs/known-gaps.md`](known-gaps.md)'s "Datadog" section: what isn't built or isn't verified.
+- [`docs/known-gaps/datadog.md`](known-gaps/datadog.md): what isn't built or isn't verified.
 
 ## Topologies
 
@@ -277,5 +277,5 @@ A Datadog trial org then received, and showed, what `logit` sent it:
 - `otlp_out` agentless: a span, a delta sum, and a log.
 
 The Agent's dual-shipping (`additional_endpoints`) and TLS settings against `datadog_in` are
-untested. `docs/known-gaps.md`'s "Datadog" section lists everything else that isn't built or
+untested. `docs/known-gaps/datadog.md` lists everything else that isn't built or
 isn't verified.

@@ -27,8 +27,8 @@
 //! `<path>`), but `<path>` names a file at every instant. logrotate's own sequence renames the
 //! file away first and creates the new one after, and a scan landing between the two finds
 //! nothing at `<path>`: `tail_in` then retires the old inode and opens the new one as a new file,
-//! with nothing lost but no rotation counted (`docs/known-gaps.md`). The exact self-check counts
-//! rotations, so the harness avoids that gap rather than failing a correct run on it.
+//! with nothing lost but no rotation counted (`docs/known-gaps/tailing.md`). The exact self-check
+//! counts rotations, so the harness avoids that gap rather than failing a correct run on it.
 //!
 //! **The file lives under `perf/results/`**, resolved against the scenario's directory as
 //! `logit` resolves it, and its parent directory is cleared before every spawn and removed after.

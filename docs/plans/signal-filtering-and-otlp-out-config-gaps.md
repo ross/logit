@@ -30,7 +30,7 @@ genuinely different operations:
 This retires a live workaround. `demo/logit.yaml`'s `trace_windowed` is an `aggregate` node that
 exists solely to absorb metrics before `trace_out` (Tempo, traces-only) sees them; without it every
 batch mixed signals, `send` never returned `Ok`, and `write_loop`'s sustained-failure guard killed
-the whole process a minute after startup. `docs/known-gaps.md`'s "`otlp_out` aborts an entire
+the whole process a minute after startup. `docs/known-gaps/`'s "`otlp_out` aborts an entire
 batch's `send`..." entry names "a config-layer way to filter an event stream by which payload it
 carries" as the real fix. This plan's workstream 1 is that fix.
 
@@ -184,7 +184,7 @@ the multi-payload model forces two operations rather than one; the drop-emptied-
   workaround becomes the intended mechanism, and `trace_out`'s occasional metrics-only flush
   failure disappears entirely rather than being outrun by successful sends. Metrics still reach
   InfluxDB via `self_windowed`, so nothing is lost.
-- `docs/known-gaps.md` — the "aborts an entire batch's `send`" gap itself is unchanged (the abort
+- `docs/known-gaps/` — the "aborts an entire batch's `send`" gap itself is unchanged (the abort
   behavior stays), but its demo-workaround paragraphs now describe `has_signal` as the fix rather
   than `aggregate` as a hack.
 - `docs/plans/otlp-logs-and-resource-identity.md` — workstream E's "No signal filter" bullet marked

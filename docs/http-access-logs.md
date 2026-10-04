@@ -903,7 +903,7 @@ Choices worth knowing:
 
 - `\bbot\b` rather than `bot\b`, which would match phone models like `CUBOT`.
 - Bare `bot/` alongside it, to catch `DotBot/1.2`, `Discordbot/2.0`, and other `…Bot/` tokens with
-  no word boundary before them (see `docs/known-gaps.md` for the trade-off).
+  no word boundary before them (see `docs/known-gaps/transforms.md` for the trade-off).
 - `uptimerobot` in `tool`, both because it's a synthetic monitor and because `bot/` would otherwise
   catch `UptimeRobot/2.0`.
 - `yandex` rather than `yandexbot`, since most of Yandex's robots carry no `bot` token.
@@ -1130,7 +1130,8 @@ and the corpus of real user agents and paths they were checked against are `cons
 
 ## What it does not do
 
-[`docs/known-gaps.md`](known-gaps.md) tracks each of these:
+[`docs/known-gaps/transforms.md`](known-gaps/transforms.md#http-access-logs-nginx-haproxy-and-http_access)
+tracks each of these:
 
 - **No per-server presets.** `http_access` never learns a server's native variable names; you
   write the mapping in the server's own log-format language, or, for Caddy and Traefik, in a Lua

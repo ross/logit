@@ -118,7 +118,7 @@ scraping the UI.
 ## SigNoz's data against `Event`
 
 SigNoz consumes OTLP as-is, so the fit is `otlp_out`'s fit, already recorded in
-[`known-gaps.md`](../known-gaps.md)'s cross-protocol table. This table restates the rows a SigNoz
+[`docs/known-gaps/mappings.md`](../known-gaps/mappings.md)'s cross-protocol table. This table restates the rows a SigNoz
 operator hits and adds what SigNoz does on its side.
 
 | `Event` kind | `otlp_out` today | SigNoz | Verdict |
@@ -138,7 +138,7 @@ samples` chooses between a `DDSketch` and raw values, and both reach `otlp_out` 
 W1 finds SigNoz drops or misreads `Summary`, a statsd timer has no working path into SigNoz's
 histogram views, and the follow-up is an `aggregate` option that emits explicit-bucket
 `Histogram`s from operator-declared bounds. That's a core change outside this stack, recorded in
-`known-gaps.md` by W1 if it's needed.
+`known-gaps/` by W1 if it's needed.
 
 ## Direct, or through SigNoz's collector
 
@@ -187,7 +187,7 @@ option: an output-side vocabulary quirk doesn't belong in the normalizer.
 
 The example sends statsd timers through `aggregate` as it is, so they reach SigNoz as `Summary`
 points, and the example's comment states that. If W1's item 2 finds `Summary` unusable in SigNoz,
-the example says so and `known-gaps.md` gains the row described under "SigNoz's data against
+the example says so and `known-gaps/` gains the row described under "SigNoz's data against
 `Event`"; the `aggregate` option is a follow-up, not part of this stack.
 
 ### 4. Cloud, documented but unverified (W2)
@@ -210,7 +210,7 @@ findings make one worth keeping; the default is not to ship one.
 | # | PR | Size | Depends on |
 |---|---|---|---|
 | W0 | This plan and its index row | S | — |
-| W1 | Verify against self-hosted SigNoz at the pinned tags: `otlp_out` over HTTP and gRPC with logs (`Str` and `Map` bodies, `event_name`, `observed_timestamp`), every metric kind `otlp_out` emits (a `Summary`, both `Histogram` temporalities, both `ExponentialHistogram` temporalities, a degraded `Samples`), and spans from `otlp_in`, `trace_context`, and `http_access`; read back through `/api/v5/query_range` and the UI; resolve every UNVERIFIED item and update this plan; ADR `signoz-over-otlp` and its `docs/adr/README.md` row; a `known-gaps.md` row if item 2 or 4 needs one | S | W0 |
+| W1 | Verify against self-hosted SigNoz at the pinned tags: `otlp_out` over HTTP and gRPC with logs (`Str` and `Map` bodies, `event_name`, `observed_timestamp`), every metric kind `otlp_out` emits (a `Summary`, both `Histogram` temporalities, both `ExponentialHistogram` temporalities, a degraded `Samples`), and spans from `otlp_in`, `trace_context`, and `http_access`; read back through `/api/v5/query_range` and the UI; resolve every UNVERIFIED item and update this plan; ADR `signoz-over-otlp` and its `docs/adr/README.md` row; a `known-gaps/` row if item 2 or 4 needs one | S | W0 |
 | W2 | `fixtures/signoz.yaml` (`statsd_in`, `syslog_in`, `otlp_in` → `set`, `json`, `aggregate` → `otlp_out` over gRPC to `signoz-otel-collector:4317`, with the shim from design item 2 if W1 called for it and the Cloud variant commented out); a "SigNoz" subsection in `docs/deploying.md`; `AGENTS.md`'s examples list; `SIGNOZ_INGESTION_KEY` in `every_shipped_config_loads_and_validates`'s `!env` map (`crates/logit-cli/src/config.rs`) if the example resolves it | S | W1 |
 
 Landing order: W0 → W1 → W2, linear. Each PR is based on and targets its parent's branch and is

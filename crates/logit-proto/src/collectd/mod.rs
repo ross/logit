@@ -39,7 +39,7 @@
 //! | Wire | Model | Counter / diag |
 //! |---|---|---|
 //! | Values part, N values | one `Event`, `metrics` = N records in wire order | -- |
-//! | COUNTER `u64` | `Sum { value: v as f64, Cumulative, monotonic: true }` | none (above 2⁵³ the `f64` loses precision -- `docs/known-gaps.md`, shared with OTLP's int/double collapse) |
+//! | COUNTER `u64` | `Sum { value: v as f64, Cumulative, monotonic: true }` | none (above 2⁵³ the `f64` loses precision -- `docs/known-gaps/mappings.md`, shared with OTLP's int/double collapse) |
 //! | DERIVE `i64` | `Sum { Cumulative, monotonic: false }` | none |
 //! | ABSOLUTE `u64` | `Sum { Delta, monotonic: true }` | none |
 //! | GAUGE finite/±inf | `Gauge(v)` | none |
@@ -52,7 +52,7 @@
 //! | record name, the list's type resolved in [`types_db`] with a matching data-source count **and** kinds | `<plugin>.<type>` for a one-data-source type (the lone data source, conventionally `value`, is omitted -- collectd's own `write_graphite` default), `<plugin>.<type>.<ds_name>` otherwise | -- |
 //! | record name, the type resolved but its count or kinds disagree with the wire | index naming, as above | `types_db_mismatch` -- the configured file is not the one the sender is running against, and naming from it would label a real measurement wrongly |
 //! | a part whose `len` is `< 4`, runs past the datagram, a string part with no NUL terminator, a numeric part not 12 bytes, a Values part where `len != 6 + 9 * count`, `count == 0`, `count > `[`MAX_VALUES_PER_LIST`], or an unknown data-source type byte | the rest of the datagram is abandoned; events already decoded from it are **kept** | `bad_part` when something was already decoded, else `CodecError::Malformed` (the listener's own `bad_datagram`) |
-//! | `0x0200` Signature | skipped by length, **unverified** | -- (`docs/known-gaps.md`) |
+//! | `0x0200` Signature | skipped by length, **unverified** | -- (`docs/known-gaps/mappings.md`) |
 //! | `0x0210` Encryption | the rest of the datagram is dropped | `encrypted_packet_dropped` |
 //! | `0x0101` Severity | sets sticky severity (raw `u64`); reset per datagram like every other sticky field | -- |
 //! | `0x0100` Message | dispatches a **notification**: one [`logit_core::Event::log`] built from the current sticky host/plugin/plugin_instance/type/type_instance/time/severity -- see "Notifications" below | `notification_dropped` when severity, host or the message itself fails validation |
@@ -114,7 +114,7 @@
 //! | `collectd.interval` absent | IntervalHR `0` (collectd's own "unspecified") | -- |
 //! | `collectd.interval` present but not a finite positive `F64` | IntervalHR `0` | `logit.output.tags.dropped{reason="unrepresentable"}` |
 //! | host | `collectd.host`, else `host.name`, else the encoder's [`CollectdEncoder::with_hostname`] value -- the first that survives sanitizing non-empty | -- |
-//! | none of those three present | the whole event is dropped | `logit.output.metrics.skipped{reason="no_host"}` + diag `no_host`. collectd's receiver rejects an empty host, and there is no honest substitute: this codec neither reads the OS hostname (deferred work, `docs/known-gaps.md`) nor invents a placeholder, since one made-up name would silently merge every unlabelled sender into a single host's metrics. |
+//! | none of those three present | the whole event is dropped | `logit.output.metrics.skipped{reason="no_host"}` + diag `no_host`. collectd's receiver rejects an empty host, and there is no honest substitute: this codec neither reads the OS hostname (deferred work, `docs/known-gaps/mappings.md`) nor invents a placeholder, since one made-up name would silently merge every unlabelled sender into a single host's metrics. |
 //! | `collectd.*` identity, `Str` or `Bytes` | verbatim after sanitizing; a `Bytes` is byte-verbatim (collectd's own strings are bytes, not UTF-8) | `logit.output.identity.sanitized{reason="substituted"\|"truncated"}` |
 //! | `collectd.*` identity of any other `Value` type | treated as absent | `logit.output.tags.dropped{reason="unrepresentable"}` |
 //! | every attribute outside the `collectd.` namespace | dropped -- collectd has no tag concept at all, and `host.name` is counted here too even though the host resolution above reads it | `logit.output.tags.dropped{reason="no_wire_form"}`, once per attribute per event |
@@ -122,7 +122,7 @@
 //! | a like-relay event carrying more than [`MAX_VALUES_PER_LIST`] records | the list is dropped whole | `logit.output.metrics.skipped{reason="too_many_values"}` + diag `too_many_values`. The cap is pair-wide: a longer list fits comfortably under the byte cap, but the decode side of this very codec rejects it as a malformed part -- and that abandons every unrelated list packed behind it in the same datagram. `aggregate`/`kv_metrics` can both put far more than 64 records on one event. |
 //! | a list that alone exceeds `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.skipped{reason="oversize_value_list"}` + diag `oversize_value_list` |
 //! | an event with no metrics at all, no [`ATTR_SEVERITY`] attribute (present in any form) either | skipped | [`EncodeStats::skipped_no_metrics`] (no counter of its own -- nothing was lost, there was nothing to send) |
-//! | `MetricRecord`'s `unit`, `description`, `start_timestamp`, `exemplars`; `EventBatch::scope`; `Resource::schema_url` | dropped | none; `docs/known-gaps.md` rows -- the protocol has no field for any of them |
+//! | `MetricRecord`'s `unit`, `description`, `start_timestamp`, `exemplars`; `EventBatch::scope`; `Resource::schema_url` | dropped | none; `docs/known-gaps/mappings.md` rows -- the protocol has no field for any of them |
 //! | an event with no metrics, `Event::log` set, and an [`ATTR_SEVERITY`] attribute present (any `Value` type) | a **notification**, always its own datagram: TimeHR, Severity, Host, Plugin, PluginInstance, Type, TypeInstance (the last four only when non-empty; identity written in full, no elision state read or left behind -- see below), Message | -- |
 //! | that notification's [`ATTR_SEVERITY`] is not `Value::U64` or not one of {1, 2, 4} | dropped whole | `logit.output.metrics.skipped{reason="notification_dropped"}` + diag `notification_dropped` ([`EncodeStats::dropped_notification`]) |
 //! | that notification's `LogRecord::message` is empty, or not a `Str`/`Bytes` `Value` | dropped whole | `logit.output.metrics.skipped{reason="empty_message"}` + diag `empty_message` ([`EncodeStats::dropped_empty_message`]) |

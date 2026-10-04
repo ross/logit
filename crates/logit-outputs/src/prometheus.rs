@@ -124,7 +124,7 @@
 //! `FLAG_NO_RECORDED_VALUE` is written as Prometheus's stale marker (a NaN with bit pattern
 //! `0x7ff0000000000002`) instead of skipped. That covers `Gauge`, `Sum`, and marker-untyped
 //! records only: a flagged `Histogram`/`Summary`/sketch expands to several series and one flag
-//! doesn't say which existed, so it stays skipped and counted (`docs/known-gaps.md`).
+//! doesn't say which existed, so it stays skipped and counted (`docs/known-gaps/mappings.md`).
 //!
 //! ## Faults, retries and duplicate safety (sender mode)
 //!
@@ -216,7 +216,7 @@
 //! `/readyz`, except the payload is a metric surface rather than a lifecycle word. So bind
 //! loopback or pod-local (`127.0.0.1:9464`, as every shipped example does) and front it with
 //! something that has TLS and auth. Exposing it off-host is an operator's explicit choice, not
-//! an example's default. Tracked in `docs/known-gaps.md` next to `admin:`'s row.
+//! an example's default. Tracked in `docs/known-gaps/prometheus.md` next to `admin:`'s row.
 //!
 //! Sender mode is the opposite: it dials out, an `https://` endpoint gets TLS with the bundled
 //! Mozilla roots by default, and `endpoint_tls:` adds a private CA, a client certificate for

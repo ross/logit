@@ -25,7 +25,7 @@ DISK-09, DISK-10, DISK-13, TAIL-05). Reading them against their ADRs found this:
   directory after it. Both name the tmp file with `Path::with_extension("tmp")`, so two targets
   that differ only in extension share one tmp path. The spool's `DiskQueue::finish` fsyncs the
   cursor at shutdown; nothing else does, although the disk ADR's "Durability" section and
-  `docs/known-gaps.md` both say the cursor file is `fdatasync`ed.
+  `docs/known-gaps/native-hop.md` both say the cursor file is `fdatasync`ed.
 - **The two checkpoints fail differently after a power loss.** A spool cursor that is missing,
   unparseable, or names a segment that no longer exists falls back to the oldest surviving segment
   at offset 0 (`DiskQueue::open`), so a bad cursor costs duplicates, never loss. A tail checkpoint
@@ -157,7 +157,7 @@ reviewer can check.
 6. **`file_out` makes no durability promise.** It doesn't fsync the active file, the staging
    file, or the directory. Its renames are atomic against a process crash, not a power loss. This
    is recorded as an amendment to [ADR `rotating-file-output`](rotating-file-output.md) and as a
-   `docs/known-gaps.md` entry, not changed.
+   `docs/known-gaps/sinks.md` entry, not changed.
 
 7. **`Delivery::Dropped` commits the batch for a disk-backed sink too.** `write_loop` keeps
    calling `store.commit()` on a drop, whatever the store. The spool bounds loss across a process
@@ -209,8 +209,9 @@ reviewer can check.
 ## Alternatives considered
 
 - **Per-push fsync on the spool.** Out of scope. It closes the power-loss window on the active
-  segment at a real throughput cost, and `docs/known-gaps.md` already tracks it as a possible
-  `disk.sync: every_push` knob. This ADR makes the checkpoint writes durable, not every append.
+  segment at a real throughput cost, and `docs/known-gaps/native-hop.md` already tracks it as a
+  possible `disk.sync: every_push` knob. This ADR makes the checkpoint writes durable, not every
+  append.
 - **A panic at the crash point.** Rejected. A panic can fire while the spool holds its state
   lock, which the spool recovers from a poisoned mutex with `into_inner`, so the component would
   carry on over half-updated state. It also unwinds through tokio tasks that may be mid-operation
@@ -568,4 +569,4 @@ and its tests need the same errno control.
 every discovery syscall there (`read_dir`, each iteration step, `file_type`, and `metadata`)
 needs a `fault::check` before it, or the proptest's failure operations miss it. So does each
 read of an open tail file, which is what lets a test pin the documented loss of a `Draining`
-file's unread tail on a read error (`docs/known-gaps.md`).
+file's unread tail on a read error (`docs/known-gaps/tailing.md`).

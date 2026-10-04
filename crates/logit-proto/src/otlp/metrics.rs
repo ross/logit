@@ -107,7 +107,7 @@ fn start_time(record_start: i64) -> u64 {
 }
 
 /// Drops `TraceRef.flags`: OTLP's `Exemplar` has no trace-flags field, a permanent lossy mapping
-/// (`docs/known-gaps.md`'s cross-protocol table).
+/// (`docs/known-gaps/mappings.md`'s cross-protocol table).
 fn encode_exemplar(e: &Exemplar) -> pb::Exemplar {
     let (trace_id, span_id) = match &e.trace {
         Some(t) => (t.trace_id.to_vec(), t.span_id.map(|id| id.to_vec()).unwrap_or_default()),

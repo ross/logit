@@ -262,7 +262,7 @@ the way out and needs the switch §4 describes.
 | `/raw` body | one `Str` log per line (LF-delimited; CR stripped), envelope from the query string | lossless modulo the line split, which Splunk performs too; `props.conf` multi-line rules are the operator's `regex`/Lua stage |
 | OTel span event (`event` = span object) | `SpanRecord`, decoded when the object carries `trace_id`, `span_id`, `start_time`, and `end_time`; otherwise a log with a `Map` body | lossless for the exporter's shape; anything else stays a log |
 | OTel log fields (`otel.log.severity.*`, `otel.log.name`, `trace_id`, `span_id`) | `LogRecord.severity`, `event_name`, `trace` | lossless |
-| `Histogram`, `Summary` at egress | `_bucket`/`le`, `_sum`, `_count`, `<n>_<q>`/`qt`, the OTel exporter's shape, under `multi_value: expand` (§4) | degraded, counted; a row in `known-gaps.md`'s cross-protocol table |
+| `Histogram`, `Summary` at egress | `_bucket`/`le`, `_sum`, `_count`, `<n>_<q>`/`qt`, the OTel exporter's shape, under `multi_value: expand` (§4) | degraded, counted; a row in `known-gaps/mappings.md` |
 | `Samples`, `SetMembers`, `Distribution`, `Set`, `ExponentialHistogram` at egress | `expand` renders `Samples` as `_count`/`_sum`/`_min`/`_max`, `Distribution` as `_count`/`_sum`/`_p50`/`_p90`/`_p99` (`influxdb_out`'s summary set), `Set` as the estimate, `SetMembers` as the member count; `ExponentialHistogram` skipped, as the OTel exporter does | degraded, counted |
 | cumulative `Sum` | the value as-is with `metric_type: Sum`; Splunk metrics are samples, so `mstats rate()` does the rest | lossless |
 | metric name charset | sanitizer: `/`, `-`, and other characters → `_`; a leading digit or `_` prefixed | permitted normalization |
@@ -408,7 +408,7 @@ and ADR) precedes both because the pair test needs both halves of the codec.
   framing to `/services/collector/s2s`. The protocol has no public specification; Splunk 9.1+
   requires v4 unless `enableOldS2SProtocol = true`; the open implementations are Go and stop at
   v3; Cribl's is proprietary. A `logit` S2S receiver would be a reverse-engineering project of
-  its own, recorded in `known-gaps.md` with the workarounds above (heavy forwarder `[syslog]` →
+  its own, recorded in `known-gaps/` with the workarounds above (heavy forwarder `[syslog]` →
   `syslog_in`; Edge Processor HEC → `splunk_hec_in` if W5 confirms it).
 - **REST search export** as an input: a poll-driven source over a management port Splunk
   Cloud opens by ticket; a different component shape from every listener `logit` has.
@@ -428,7 +428,7 @@ and ADR) precedes both because the pair test needs both halves of the codec.
 | W3 | `splunk_hec_out`: HEC client, body splitting, error classification, `ack:`, graph rules, schema | M | W1 |
 | W4 | `fixtures/splunk-observability.yaml`: `otlp_out` to Observability Cloud (traces over OTLP/HTTP, metrics over OTLP/HTTP), marked unverified — no trial org (Ross, 2026-09-25); verification is a follow-up | S | W3 |
 | W5 | Recorded fixtures via `script/record-fixtures` (a Splunk Enterprise container with a `useACK` token as the HEC target; producers: the OTel Collector `splunk_hec` exporter with logs, all metric kinds, and traces; Docker's `splunk` driver in each `splunk-format`; SC4S; a Java appender); the pair fixed-point test over the corpus; `splunk_hec_out` end-to-end into that container, including ack and a 400 code 6 split; UNVERIFIED items resolved in this plan | M | W2, W3 |
-| W6 | `docs/splunk.md` (operator best practices from this plan); `deploying.md`; `known-gaps.md` (S2S, REST export, raw `tcpout`, the cross-protocol rows); `AGENTS.md` tables; `telemetry-landscape.md` cells; fixtures `splunk-hec-send.yaml`, `splunk-hec-receive.yaml`, `splunk-hec-relay.yaml`; `SPLUNK_HEC_TOKEN` in `every_shipped_config_loads_and_validates`'s `!env` map (`SPLUNK_OBSERVABILITY_TOKEN` landed with W4) | S | W5 |
+| W6 | `docs/splunk.md` (operator best practices from this plan); `deploying.md`; `known-gaps/` (S2S, REST export, raw `tcpout`, the cross-protocol rows); `AGENTS.md` tables; `telemetry-landscape.md` cells; fixtures `splunk-hec-send.yaml`, `splunk-hec-receive.yaml`, `splunk-hec-relay.yaml`; `SPLUNK_HEC_TOKEN` in `every_shipped_config_loads_and_validates`'s `!env` map (`SPLUNK_OBSERVABILITY_TOKEN` landed with W4) | S | W5 |
 
 Landing order: W0 → W1 → W2 → W3 → W4 → W5 → W6, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
@@ -514,7 +514,7 @@ What the runs changed after W6, each recorded as an amendment to ADR `splunk-hec
   and warning at startup about a `max_body_bytes` above the cap.
 
 Cross-protocol egress stays best-effort under ADR `lossless-transit`: the Splunk encode and decode
-rows in `known-gaps.md`'s "Cross-protocol semantic gaps" table (non-carrier resource attributes
+rows in `known-gaps/mappings.md` (non-carrier resource attributes
 returning as event attributes, `Sum` temporality, the multi-number kinds, the span and log fields
 the exporter's objects have no member for, the `/raw` line split) are counted or documented, not
 closed.
@@ -531,11 +531,11 @@ A comparison with Vector's HEC source and sinks (2026-09-25) ranked a `/raw` egr
 extraction, which `/event?auto_extract_timestamp=true` restores. A `/raw` mode would buy only
 line-breaking props, at the cost of a partition by envelope and a second encoding. The candidate
 is instead an `auto_extract_timestamp` option on `splunk_hec_out`, not built here and tracked in
-`docs/known-gaps.md`'s "Splunk" section as a follow-up.
+`docs/known-gaps/splunk.md` as a follow-up.
 
 ### What's left
 
-A summary: [`docs/known-gaps.md`](../known-gaps.md)'s "Splunk" section is the canonical list,
+A summary: [`docs/known-gaps/splunk.md`](../known-gaps/splunk.md) is the canonical list,
 with each item's consequence and revisit trigger.
 
 Not built, by scope:

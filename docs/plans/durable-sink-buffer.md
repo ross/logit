@@ -15,7 +15,7 @@ shipped `logit_proto::native`, whose module doc says outright "this is the same 
 socket and a file … a file is a plain concatenation of frames — append, sequential read,
 `frame::resync` past a torn write," and the in-flight `format: native` work on
 `stdio_out`/`file_out` (ADR `file-output-native-format`) is already writing those frames to disk.
-`docs/known-gaps.md`'s "No durable (disk-backed) buffering" names this as "real, unblocked
+`docs/known-gaps/`'s "No durable (disk-backed) buffering" names this as "real, unblocked
 follow-up work, not designed yet." This plan designs and closes it for the sink side.
 
 **Scope.** An opt-in `buffer.disk:` block on any sink. When set, the sink's queue *is* a
@@ -167,7 +167,7 @@ reopens with the backlog intact); the abandoned-inbox sweep appends to the spool
   append/sequential-read); `docs/deploying.md` "Sink delivery buffering" gains a "Durable
   buffering" subsection (when to use it, the sizing sentence becomes RAM-or-disk per sink, the
   fsync statement, what to watch, "put it on a volume that survives the container");
-  `docs/known-gaps.md`: rewrite the durable-buffering entry to receive-side-only, note the
+  `docs/known-gaps/`: rewrite the durable-buffering entry to receive-side-only, note the
   power-loss window and the `Buffer<T>` trait's narrowed role; `docs/design/internal-telemetry.md`
   catalog rows; `docs/design/wire-protocol.md` "Buffering" section updated; `AGENTS.md` current
   state; `fixtures/` — add a commented `disk:` block to `fixtures/statsd-to-influxdb.yaml`'s
@@ -182,7 +182,7 @@ reopens with the backlog intact); the abandoned-inbox sweep appends to the spool
   in InfluxDB (compare counts), `logit.component.buffer.disk.replayed` > 0 once, then 0.
 - `script/audit` unchanged (no new dependencies).
 
-## Explicitly out of scope (file in `known-gaps.md`)
+## Explicitly out of scope (file in `known-gaps/`)
 
 Receive-side (`ReceiveQueue`) disk backing; per-push fsync; encryption at rest; a shared spool
 across sinks; compaction/rewrite of segments; out-of-order acks (window > 1) — all future.

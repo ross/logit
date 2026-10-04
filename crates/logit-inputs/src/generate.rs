@@ -51,7 +51,7 @@
 //! until `start + sent / rate`, recomputed from the run's start, so a late batch doesn't shift
 //! later deadlines and the average rate doesn't drift. The first batch goes out immediately.
 //! Above roughly 1k batches/s pacing is accurate on average but bursty within a millisecond
-//! (`docs/known-gaps.md`). Without `rate`, downstream backpressure is the only limit.
+//! (`docs/known-gaps/telemetry.md`). Without `rate`, downstream backpressure is the only limit.
 //!
 //! # Telemetry
 //!

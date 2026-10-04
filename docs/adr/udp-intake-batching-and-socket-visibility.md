@@ -22,17 +22,17 @@ through a bounded `ReceiveQueue`, and `BatchAccumulator` amortizes decoded event
 untouched is the *syscall and bookkeeping* side underneath it, shared by all four UDP inputs
 (`statsd_in`, `syslog_in`, `graphite_in`, `collectd_in`) through that same `udp.rs`:
 
-- **One `recv_from` per datagram** ([`docs/known-gaps.md`](../known-gaps.md#udp-intake)) —
-  syscall overhead is now the read half's dominant remaining cost, since a stalled downstream no
-  longer stops it running.
+- **One `recv_from` per datagram**
+  ([`docs/known-gaps/intake.md`](../known-gaps/intake.md#udp-intake)) — syscall overhead is now the
+  read half's dominant remaining cost, since a stalled downstream no longer stops it running.
 - **Three mutex-locked gauge updates per push *and* per pop**
-  ([`docs/known-gaps.md`](../known-gaps.md#udp-intake)) — `BoundedQueue::push`/`pop`
+  ([`docs/known-gaps/intake.md`](../known-gaps/intake.md#udp-intake)) — `BoundedQueue::push`/`pop`
   (`crates/logit-pipeline/src/queue.rs`) call `update_gauges` unconditionally on every
   accepted item, and `read_loop` (pushing) and `decode_loop` (popping) run concurrently against the
   identical lock.
-- **No visibility into kernel-side drops** ([`docs/known-gaps.md`](../known-gaps.md#udp-intake)) —
-  a datagram the kernel discards before `recv_from` ever returns it is invisible to `logit`
-  entirely.
+- **No visibility into kernel-side drops**
+  ([`docs/known-gaps/intake.md`](../known-gaps/intake.md#udp-intake)) — a datagram the kernel
+  discards before `recv_from` ever returns it is invisible to `logit` entirely.
 - **No perf scenario touches a real socket** — every scenario under `perf/scenarios/*.yaml`
   ([ADR `load-test-harness`](load-test-harness.md)) drives its listener through `generate_in`
   in-process; nothing exercises a UDP socket, so none of the above can be measured today.
@@ -45,9 +45,9 @@ not the sequencing.
 **This revises [ADR `decoupled-listener-io`](decoupled-listener-io.md)'s "Alternatives considered"
 section**, specifically its `recvmmsg`/`SO_REUSEPORT` bullet and its kernel-drop-counter bullet
 ([`decoupled-listener-io.md`](decoupled-listener-io.md#alternatives-considered)), both of which
-deferred with "recorded as a new `docs/known-gaps.md` entry" — this record is that deferred work,
-now designed. `decoupled-listener-io` stays **Accepted**; this repo's existing convention for a
-revision like this one is a forward-pointer left on the older record itself, not a silent one-way
+deferred with "recorded as a new `docs/known-gaps/intake.md` entry" — this record is that deferred
+work, now designed. `decoupled-listener-io` stays **Accepted**; this repo's existing convention for
+a revision like this one is a forward-pointer left on the older record itself, not a silent one-way
 reference — the `> **Revised by [ADR ...]**` blockquote `buffered-sink-delivery` added to
 [`service-lifecycle-and-output-retry.md`](service-lifecycle-and-output-retry.md#retry-a-tight-wall-clock-budget-not-an-attempt-count)
 when it revised that ADR's retry-budget section is the precedent — so `decoupled-listener-io.md`
@@ -153,8 +153,8 @@ recorded here since it widens this ADR's scope beyond its title.
 
 ### What socket visibility deliberately does not cover
 
-Three things this work does not build, each recorded as its own `docs/known-gaps.md` entry rather
-than folded in:
+Three things this work does not build, each recorded as its own `docs/known-gaps/intake.md` entry
+rather than folded in:
 
 - **UDP sink send-buffer gauges.** A sink's `wmem_alloc` is sampled almost always at or near zero
   in practice — a `sendto` either completes immediately or fails, there's no analogous "queued
@@ -466,10 +466,10 @@ call used keeps the failure behaviour identical rather than subtly narrower.
 
 ### `push_many`/`pop_many` live on `BoundedQueue` itself; `push`/`pop` untouched
 
-The gauge-update entry in [`docs/known-gaps.md`](../known-gaps.md#udp-intake) names the fix
-explicitly: gauge-update contention belongs in `BoundedQueue` itself, "not as a receive-only special
-case," because `BoundedQueue` is one implementation serving both the sink queue and the receive
-queue by design. `push_many`/`pop_many` land as new methods on `BoundedQueue<T: Queued>`
+The former gauge-update entry in [`docs/known-gaps/intake.md`](../known-gaps/intake.md#udp-intake) names
+the fix explicitly: gauge-update contention belongs in `BoundedQueue` itself, "not as a receive-only
+special case," because `BoundedQueue` is one implementation serving both the sink queue and the
+receive queue by design. `push_many`/`pop_many` land as new methods on `BoundedQueue<T: Queued>`
 (`crates/logit-pipeline/src/queue.rs`) — **not** a receive-side wrapper type — and existing
 `push`/`pop` (and every sink-side call site using them) are untouched, so the 18 existing queue
 tests keep exercising exactly the code path they always have.
@@ -648,7 +648,7 @@ at W3 and W4 so a reader can see which regime moved.
 
 ### `SO_REUSEPORT` and `UDP_GRO`: explicitly out of scope, and why they can wait
 
-Both are real, field-precedented techniques for going further than this ADR does (`docs/known-gaps.md`'s
+Both are real, field-precedented techniques for going further than this ADR does (`docs/known-gaps/intake.md`'s
 existing "One reader per UDP listener" entry already names `SO_REUSEPORT`; `UDP_GRO` — generic
 receive offload coalescing several datagrams from the same flow into one larger buffer the kernel
 hands back — is a newer mechanism neither entry above mentions yet). Both wait for the same reason:
@@ -705,9 +705,10 @@ ahead of evidence this same plan is about to produce.
   above and for the same reason: it couples timestamping to the receive path per message rather than
   staying a cheap, batch-level call.
 - **A receive-side wrapper type for `push_many`/`pop_many`, instead of adding them to `BoundedQueue`
-  itself.** Rejected — the gauge-update entry in `docs/known-gaps.md`'s "UDP intake" section is
-  explicit that the fix belongs in `BoundedQueue` itself since it serves both the sink and receive
-  queues by design; a wrapper would re-split behavior the generic type exists to keep unified.
+  itself.** Rejected — the former gauge-update entry in `docs/known-gaps/intake.md`
+  was explicit that the fix belongs in `BoundedQueue` itself since it serves both the sink and
+  receive queues by design; a wrapper would re-split behavior the generic type exists to keep
+  unified.
 - **Counting `push_many`'s cancelled remainder as a drop.** Rejected — would need re-acquiring the
   queue's lock from inside a `Drop` impl to shave an already-bounded, already-accepted,
   shutdown-path-only loss from "uncounted" to "counted"; not worth the poisoning/ordering hazard.
@@ -752,9 +753,9 @@ ahead of evidence this same plan is about to produce.
   alongside today's `Workload::Generated`; new `perf/load/*.yaml` sidecar directory and
   `perf/load/README.md`; a small committed real-client capture and its provenance, partly paying
   down `docs/plans/recorded-interop-fixtures.md`'s owed statsd producer fixtures.
-- [`docs/known-gaps.md`](../known-gaps.md#udp-intake): the kernel-drop-visibility entry and the
-  one-datagram-per-syscall entry close as their respective workstreams land (W1, W4); the
-  gauge-update-contention entry closes at W3.
+- [`docs/known-gaps/intake.md`](../known-gaps/intake.md#udp-intake): the kernel-drop-visibility
+  entry and the one-datagram-per-syscall entry close as their respective workstreams land (W1, W4);
+  the gauge-update-contention entry closes at W3.
 - Revises `decoupled-listener-io.md`'s "Alternatives considered" recvmmsg/`SO_REUSEPORT` bullet and
   kernel-drop-counter bullet — both now designed and scheduled rather than merely deferred;
   `decoupled-listener-io.md` gains a `> **Revised by ...**` forward-pointer blockquote at those
@@ -769,7 +770,8 @@ ahead of evidence this same plan is about to produce.
   sharing is not currently costing anything measurable; whether *splitting* them would buy anything
   is a separate question, and one that overlaps with `SO_REUSEPORT`'s own redesign of
   `run_until_shutdown`'s two-arm select, the `&mut self.decoder` borrow and `Fanout` ownership.
-  Recorded in `docs/known-gaps.md` next to the `SO_REUSEPORT` entry rather than designed here.
+  Recorded in `docs/known-gaps/intake.md` next to the `SO_REUSEPORT` entry rather than designed
+  here.
 
 ## As built
 
@@ -1152,7 +1154,7 @@ same socket by construction and removes the stored fd entirely.
 `crate::udp::ReceiveBufferSampler` keeps its stored fd for now: `sample_while` does not hold the
 socket, so giving it the same treatment means changing that function's signature, and its borrow is
 already enforced indirectly (the combined future carries `&socket` through the sibling `read_loop`
-arm). Tracked in [`docs/known-gaps.md`](../known-gaps.md).
+arm). Tracked in [`docs/known-gaps/intake.md`](../known-gaps/intake.md#udp-intake).
 
 ## Amendment: shutdown remainders are counted (2026-09-26)
 

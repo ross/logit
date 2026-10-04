@@ -59,7 +59,7 @@ tied to the same trace id the server side already has.
 - **Same-origin export sidesteps CORS entirely.** A browser exporter posting to `/v1/traces` on
   HAProxy's own origin, with HAProxy routing that path to `logit:4318`, never triggers a
   preflight. This still matters even with the blocker below closed: `otlp_in` remains POST-only
-  with no `OPTIONS` handling (`docs/known-gaps.md`), so a *cross-origin* exporter still fails
+  with no `OPTIONS` handling (`docs/known-gaps/`), so a *cross-origin* exporter still fails
   before sending anything at all — same-origin, via a proxy, stays the only supported shape.
 
 ## The blocker — closed
@@ -72,7 +72,7 @@ rejected `Content-Type: application/json` outright.~~
 **Closed 2026-09-10.** `otlp_in`'s HTTP transport now accepts `application/json` alongside
 protobuf, decoded through a hand-written dialect layer onto the same event model the protobuf path
 already produces — see [ADR `otlp-json-decoding`](../adr/otlp-json-decoding.md) for the design,
-and `docs/known-gaps.md` for what's still open around it (CORS, the error-body content type, and
+and `docs/known-gaps/` for what's still open around it (CORS, the error-body content type, and
 the JSON path's relative memory cost). Both shapes below are now buildable with no further `logit`
 change; see "Recommendation, updated" at the bottom for which to build.
 

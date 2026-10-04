@@ -1684,7 +1684,7 @@ fn report_buffered_tail(framer: &Framer, telemetry: &Telemetry, diag: &mut Diagn
 
 /// Sends one batch. `sink.send` mints a fresh [`logit_pipeline::TraceContext::new_root`] once
 /// per *accumulated* batch, not per frame that fed it: the many-to-one attribution gap every
-/// accumulating listener shares (`docs/known-gaps.md`'s internal-spans entry).
+/// accumulating listener shares (`docs/known-gaps/telemetry.md`'s internal-spans entry).
 async fn emit(sink: &Fanout, telemetry: &Telemetry, batch: EventBatch, reason: FlushReason) {
     telemetry.count("logit.component.receive.flushed", 1.0, &[("reason", reason.as_str())]);
     sink.send(batch).await;

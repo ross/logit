@@ -142,7 +142,7 @@ wire's grouping for `otlp_in` and `prometheus_in`, which bypass the accumulator.
   and remove the tap afterwards; the docs say so.
 - The stateful gauges are cumulative since process start, not windowed, and track top-level keys
   only — a nested map's keys are counted in its width, not added to the distinct-key set.
-  `docs/known-gaps.md` records both.
+  `docs/known-gaps/transforms.md` records both.
 - `shape`'s output vocabulary (`logit.shape.*`, the `signal`/`source`/`tap` tags) is now something
   dashboards and the survey's capture harness depend on; renaming a metric is a breaking change to
   them, pre-release or not.

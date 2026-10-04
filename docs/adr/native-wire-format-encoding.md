@@ -51,8 +51,8 @@ OTLP's wire protocol splits by signal into three separate RPCs with no way to re
 first and third are the same ADR's prediction — "OTLP's log data model doesn't fit arbitrary
 structured/unstructured logs well," "the internal model must be a superset of what OTLP can
 express" — now demonstrated against the real, shipped codec rather than argued from the spec.
-`docs/known-gaps.md`'s "Cross-protocol semantic gaps" entry already tracked the third row from the
-encode side; this ADR is the first place it's used as disqualifying evidence for OTLP as an
+`docs/known-gaps/mappings.md`'s "Cross-protocol semantic gaps" entry already tracked the third row
+from the encode side; this ADR is the first place it's used as disqualifying evidence for OTLP as an
 *internal* transport, not just a documented lossy edge of the *interop* codec.
 
 ### The bake-off
@@ -237,17 +237,17 @@ above should not be quoted as a production expectation.
 - Two new pure-Rust runtime dependencies: `lz4_flex` (compression) and `crc32c` (the frame header's
   checksum). `rkyv`, `postcard`, and the `serde` derives on `bakeoff::wire_mirror` are bake-off-only,
   living in `crates/logit-bench` (which ships in nothing).
-- `docs/known-gaps.md`'s durable-buffering and out-of-order-acknowledgement entries, both explicitly
-  blocked on this decision, are unblocked -- the encoder those items build on now exists and is
-  tested.
+- `docs/known-gaps/native-hop.md`'s durable-buffering and out-of-order-acknowledgement entries, both
+  explicitly blocked on this decision, are unblocked -- the encoder those items build on now exists
+  and is tested.
 - `DdSketch::to_java_bytes`/`DdSketch::from_java_bytes` are now public API on `logit-core`
   (`crates/logit-core/src/metric.rs`) -- the one change this ADR made to the core event model
   itself, needed because `DDSketch`'s own fields are private with no bin iteration, so a lossless
   round trip has no alternative to the blob.
 - Not built by this ADR: the connection/handshake state machine, credit-based flow control, and a
   disk-backed `Buffer<T>` implementation. `docs/design/wire-protocol.md`'s connection-protocol
-  section and the two `docs/known-gaps.md` entries above are the next work this unblocks, not work
-  this ADR does.
+  section and the two `docs/known-gaps/native-hop.md` entries above are the next work this unblocks,
+  not work this ADR does.
 
 ## Amendment: zstd enters the workspace for remote-write, not the native frame (2026-09-24)
 

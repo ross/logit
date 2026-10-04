@@ -92,13 +92,13 @@
 //! | a path empty after sanitizing | dropped | `{reason="empty_name"}` |
 //! | a plaintext line longer than `max_packet_bytes` | dropped whole, never split | `{reason="oversize_line"}` + diag `oversize_line` |
 //! | a single pickle datapoint larger than `max_frame_bytes` | dropped whole, never split | `{reason="oversize_datapoint"}` + diag `oversize_datapoint` |
-//! | `MetricRecord`'s `unit`, `description`, `start_timestamp`, `exemplars`; `EventBatch::scope`; `Resource::schema_url` | dropped | none; `docs/known-gaps.md` rows -- carbon has no field for any of them |
+//! | `MetricRecord`'s `unit`, `description`, `start_timestamp`, `exemplars`; `EventBatch::scope`; `Resource::schema_url` | dropped | none; `docs/known-gaps/mappings.md` rows -- carbon has no field for any of them |
 //! | an event with no metrics at all | skipped | [`EncodeStats::skipped_no_metrics`], no counter (nothing was lost) |
 //!
 //! Attributes in the `statsd.`/`collectd.` namespaces are **skipped uncounted**, as `influxdb_out`
 //! skips `statsd.`: they are another protocol's consumed carriers. Resource attributes *do* become
 //! tags (as at `influxdb_out`/`statsd_out`); a `graphite_in` resource is empty, so the pair stays
-//! a fixed point, and cross-protocol it is a `docs/known-gaps.md` row.
+//! a fixed point, and cross-protocol it is a `docs/known-gaps/mappings.md` row.
 //!
 //! ## Sanitization
 //!
@@ -114,8 +114,8 @@
 //!
 //! `/` and `\` are whisper's directory separators: one in a path would create a nested directory,
 //! not a series segment. There is **no path truncation**: carbon has no length bound, and whisper's
-//! 255-byte filesystem component limit is a `docs/known-gaps.md` row. A leading `~` is reserved by
-//! carbon's tag grammar; a `~` elsewhere in a tag value rides through.
+//! 255-byte filesystem component limit is a `docs/known-gaps/mappings.md` row. A leading `~` is
+//! reserved by carbon's tag grammar; a `~` elsewhere in a tag value rides through.
 //!
 //! Whitespace is [`char::is_whitespace`] (Unicode): carbon splits a *decoded* `str` with Python's
 //! `str.split()`, and [`decode`] mirrors that with [`str::split_whitespace`]. Sanitizing only ASCII

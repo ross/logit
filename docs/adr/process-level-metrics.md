@@ -15,8 +15,8 @@ tick, `logit.process.interner.strings` and `logit.process.uptime`
 Nothing else about the process is observable from `logit`'s own telemetry: not its resident memory,
 thread count, open descriptors, or CPU time.
 
-[`docs/known-gaps.md`](../known-gaps.md)'s "Internal telemetry and self-logging" section lists the
-rest as open, with two obstacles:
+[`docs/known-gaps/telemetry.md`](../known-gaps/telemetry.md#internal-telemetry-and-self-logging)
+lists the rest as open, with two obstacles:
 
 - The thread, descriptor, and CPU facts come from `/proc`, which is Linux-specific.
 - Heap statistics live in jemalloc, behind `logit-cli`'s `jemalloc` feature
@@ -135,7 +135,7 @@ The difference between `resident` and `allocated` is not a leak by itself. It co
 - Operators get six new series from any `internal` component, with no config change.
 - The procfs points are Linux-only. A non-Linux build logs one `debug` diagnostic per source and
   emits the allocator gauge alone.
-- The process-level entry in `docs/known-gaps.md`'s "Internal telemetry and self-logging" section
+- The process-level entry in `docs/known-gaps/telemetry.md`
   closes.
 - `logit-cli` gains a `tikv-jemalloc-ctl` dependency under its `jemalloc` feature. If that pulls in
   `paste`, an unmaintained proc-macro (RUSTSEC-2024-0436), `deny.toml` needs a reasoned ignore for

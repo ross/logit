@@ -230,8 +230,8 @@ sink's own optional `hostname:` config field — config-supplied only, exactly l
 `hostname:` field (`crates/logit-config/src/lib.rs`'s `SyslogOut::hostname` doc: omitted entirely
 rather than a literal `logit` default, "so a relayed line's origin is never silently overwritten
 with something that looks like a config mistake"). There is deliberately **no OS-hostname read and
-no placeholder default**: `docs/known-gaps.md` already records that an OS-hostname source is
-*deferred pending a dependency, not added as a one-off* (its `internal` resource-identity entry —
+no placeholder default**: `docs/known-gaps/telemetry.md` already records that an OS-hostname source
+is *deferred pending a dependency, not added as a one-off* (its `internal` resource-identity entry —
 "there is no OS-hostname source anywhere in the workspace"), and this pair leaves that deferral
 untouched rather than working around it with a Linux-only `/proc/sys/kernel/hostname` read of its
 own.
@@ -261,13 +261,13 @@ GAUGE-NaN equivalent on the wire and is dropped (`{reason="no_recorded_value"}`)
 
 This makes `collectd_out` the **second** sink, after `otlp_out`, whose wire has a genuine no-value
 concept. `crates/logit-core/src/metric.rs`'s `MetricRecord::flags` doc and
-`docs/known-gaps.md`'s `NO_RECORDED_VALUE` entry both currently state the rule as "every non-OTLP
-sink... must instead treat a flagged record as carrying no genuine reading" / "[o]nly `otlp_out`
-can keep a flagged point on the wire... [n]o other sink or transform has a wire/model concept of
-'no value here'." Both are narrowed by this ADR from "every non-OTLP sink" / "no other sink" to
-**"every sink whose wire has no no-value concept"** — `collectd_out`'s GAUGE-NaN re-encode is the
-second, narrower exception the existing wording didn't anticipate, not a violation of the rule
-once restated. See Consequences for where those two edits land.
+`docs/known-gaps/mappings.md`'s `NO_RECORDED_VALUE` entry both currently state the rule as "every
+non-OTLP sink... must instead treat a flagged record as carrying no genuine reading" / "[o]nly
+`otlp_out` can keep a flagged point on the wire... [n]o other sink or transform has a wire/model
+concept of 'no value here'." Both are narrowed by this ADR from "every non-OTLP sink" / "no other
+sink" to **"every sink whose wire has no no-value concept"** — `collectd_out`'s GAUGE-NaN re-encode
+is the second, narrower exception the existing wording didn't anticipate, not a violation of the
+rule once restated. See Consequences for where those two edits land.
 
 ### Sanitization
 
@@ -460,17 +460,18 @@ unchanged.
   [ADR `lossless-transit`](lossless-transit.md), alongside `statsd`, `otlp`, `syslog`, and
   `prometheus` — see [`docs/plans/collectd-binary-relay.md`](../plans/collectd-binary-relay.md) for
   the workstreams that build it.
-- Known-gaps rows, added by W1 (`docs/known-gaps.md`): `>2⁵³`-magnitude counters losing precision in
-  `Sum.value: f64` (shared with OTLP's int/double collapse); non-integral or out-of-range `Sum`
-  values dropped rather than rounded on encode; `Samples`/`Distribution`/`SetMembers`/`Set`/
-  `Histogram`/`ExponentialHistogram`/`Summary` unsupported on collectd egress; `unit`/`description`/
+- Known-gaps rows, added by W1 (`docs/known-gaps/mappings.md`): `>2⁵³`-magnitude counters losing
+  precision in `Sum.value: f64` (shared with OTLP's int/double collapse); non-integral or
+  out-of-range `Sum` values dropped rather than rounded on encode;
+  `Samples`/`Distribution`/`SetMembers`/`Set`/ `Histogram`/`ExponentialHistogram`/`Summary`
+  unsupported on collectd egress; `unit`/`description`/
   `start_timestamp`/exemplars/`Scope`/`schema_url` dropped; `MAX_VALUES_PER_LIST` (64) as a hard cap
   on data sources per list; no signing or encryption support in either direction.
 - Two existing documents get amended, not just added to, by W1: `crates/logit-core/src/metric.rs`'s
-  `MetricRecord::flags` doc and `docs/known-gaps.md`'s `NO_RECORDED_VALUE` entry both narrow from
-  "every non-OTLP sink"/"no other sink" to "every sink whose wire has no no-value concept," per
-  "NaN is a flagged point, not a dropped one" above — `collectd_out` becomes the second sink (after
-  `otlp_out`) that can keep a flagged point on the wire.
+  `MetricRecord::flags` doc and `docs/known-gaps/mappings.md`'s `NO_RECORDED_VALUE` entry both
+  narrow from "every non-OTLP sink"/"no other sink" to "every sink whose wire has no no-value
+  concept," per "NaN is a flagged point, not a dropped one" above — `collectd_out` becomes the
+  second sink (after `otlp_out`) that can keep a flagged point on the wire.
 - Multicast support lands inside the shared UDP listener (`bind_one`), not `collectd_in`-specific
   code, so `statsd_in` and `syslog_in` gain the ability to join a multicast group for free the moment
   `collectd_in`'s workstream lands, with no config or code change of their own required.

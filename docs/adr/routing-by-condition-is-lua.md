@@ -24,7 +24,7 @@ variants, carried forward purely so a config referencing one got a clear "not im
 `schema/logit.schema.json`, since the schema is generated directly from `ComponentKind`
 (ADR `config-yaml-jsonschema`) with no way for an unimplemented variant to opt out — so a
 schema-aware editor autocompletes `filter:`, and the binary then rejects the resulting config.
-`docs/known-gaps.md` did not record this; nothing else in the repo did either.
+`docs/known-gaps/transforms.md` did not record this; nothing else in the repo did either.
 
 The obvious next step was to implement them, starting with `filter`. `docs/design/pipeline-graph.md`
 calls filter components "the only branching mechanism" and "the *expected* way to express 'route by
@@ -155,7 +155,7 @@ to resume.
 - **Keep the five variants as unimplemented placeholders, unchanged.** The status quo this ADR
   replaces. Rejected: it's the thing that created the problem in the first place — a schema that
   advertises a component the binary will never build unless a config author reads
-  `docs/known-gaps.md` first.
+  `docs/known-gaps/transforms.md` first.
 
 ## Consequences
 
@@ -168,10 +168,10 @@ to resume.
   **deserialization** — `unknown variant 'filter', expected one of ...` — rather than at
   `graph::resolve`'s "kind not implemented yet." The message names valid alternatives, which is an
   improvement; the cost is that a deserialization error loses line/column once `!env` is in the
-  config's picture (`docs/known-gaps.md`'s existing entry on that), a minor regression in error
-  quality accepted in exchange for the schema no longer lying about what exists.
-- `docs/known-gaps.md` gains two entries: the schema-advertised-more-than-the-binary-runs problem
-  (narrowed, not closed — `logfmt`/`kv`/`csv`/`regex` and `logit_in`/`logit_out` remain
+  config's picture (`docs/known-gaps/transforms.md`'s existing entry on that), a minor regression in
+  error quality accepted in exchange for the schema no longer lying about what exists.
+- `docs/known-gaps/transforms.md` gains two entries: the schema-advertised-more-than-the-binary-runs
+  problem (narrowed, not closed — `logfmt`/`kv`/`csv`/`regex` and `logit_in`/`logit_out` remain
   unimplemented and still published), and the measured cost table above, so the revisit trigger has
   a fixed place to live rather than only this ADR.
 - `demo/logit.yaml`'s `nginx_stdout` is unchanged and now cites this ADR directly, so the choice

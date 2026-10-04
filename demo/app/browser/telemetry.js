@@ -34,10 +34,10 @@ const resource = resourceFromAttributes({
 });
 
 // Same-origin and relative, NOT an absolute cross-origin URL. `otlp_in` has no CORS/`OPTIONS`
-// support (docs/known-gaps.md, crates/logit-inputs/src/otlp.rs), so this must resolve against the
-// page's own origin and go through HAProxy's `/v1/*` route (demo/haproxy/haproxy.cfg's `is_otlp`
-// ACL) to reach `browser_in` (demo/logit.yaml). A cross-origin exporter would fail at preflight,
-// before `otlp_in` ever saw the real POST.
+// support (docs/known-gaps/otlp.md, crates/logit-inputs/src/otlp.rs), so this must resolve against
+// the page's own origin and go through HAProxy's `/v1/*` route (demo/haproxy/haproxy.cfg's
+// `is_otlp` ACL) to reach `browser_in` (demo/logit.yaml). A cross-origin exporter would fail at
+// preflight, before `otlp_in` ever saw the real POST.
 const exporter = new OTLPTraceExporter({ url: "/v1/traces" });
 
 const provider = new WebTracerProvider({

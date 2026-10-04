@@ -171,7 +171,7 @@ bound materialization, no `MAX_DERIVED_BUCKETS` cap — the codec's own decode-s
 to one case, a `Metric` whose `data` oneof isn't set at all); exemplars decode/encode on every kind
 that carries them on the wire (`Sum`/`Gauge`/`Histogram`/`ExponentialHistogram`) — `Summary`
 genuinely has none on the wire at all, which stays a real gap, moved into
-`docs/known-gaps.md`'s cross-protocol table as its own row rather than living here; a
+`docs/known-gaps/mappings.md` as its own row rather than living here; a
 `NumberDataPoint`'s int/double distinction still collapses to `f64` unchanged (a structural choice,
 out of this workstream's scope, not a regression); a `NO_RECORDED_VALUE`-flagged point round-trips
 flagged (`MetricRecord.flags`, `metrics-model-v2`'s W4 amendment) instead of being skipped. Scope
@@ -226,7 +226,7 @@ as the NILVALUE `-` (`write_structured_data`'s predecessor) regardless of what `
 didn't exist yet — or any other attribute might carry, so a `syslog_in -> json -> syslog_out` relay
 was strictly less than byte-for-byte even before considering `json`'s own additions;
 `syslog.timestamp` was parsed on decode but never consulted on encode, which always stamped
-`event.timestamp` (receipt time) instead — the single largest named gap in `docs/known-gaps.md`'s
+`event.timestamp` (receipt time) instead — the single largest named gap in `docs/known-gaps/`'s
 syslog section at the time. Output dialect (3164 vs. 5424) is a sink configuration choice
 independent of the input's dialect — a permitted normalization, not a bug. `syslog.severity`
 already outranked `log.severity` on encode (`resolve_severity`), which is exactly the pattern the
@@ -262,7 +262,7 @@ here too, since `file_out format: native` and `buffer.disk:` both ride this same
 
 ### Cross-protocol (best-effort, stays best-effort)
 
-`docs/known-gaps.md`'s existing "Cross-protocol semantic gaps" table (`Distribution`→OTLP
+`docs/known-gaps/mappings.md` (`Distribution`→OTLP
 `Summary`, `Set`→skip, `U64`/`Timestamp`→`I64`) is exactly what ADR `lossless-transit`'s "cross-
 protocol egress stays best-effort" clause is for — it stays, relabeled as intentional degradation
 rather than an open question, and gains one new row once `Samples` exists: a raw sample list has no
@@ -422,7 +422,7 @@ current term-by-term breakdown.
   which `parse_5424` should now stamp explicitly rather than leaving the attribute simply absent)
   renders as `-`; an absent attribute falls through to `event.timestamp` exactly as today.
   `event.timestamp` itself stays receipt time — the opt-in `syslog_timestamp` transform already
-  sketched in `docs/known-gaps.md` remains the correct place to resolve it deliberately.
+  sketched in `docs/known-gaps/` remains the correct place to resolve it deliberately.
 - `syslog.pid` becomes `Value::Str` when PROCID doesn't parse as a number, rather than being
   dropped; stays `Value::U64` when it does.
 - A non-UTF-8 syslog MSG decodes to a `Value::Bytes` message instead of rejecting the line; header
@@ -480,7 +480,7 @@ decoded, including its `events`/`links` tables. `resource` and `scope` both gain
 write starts from `Scope::default()`" case `resource` doesn't need (a batch's resource is never
 absent). `crates/logit-pipeline/src/runtime.rs`'s `run_lua` re-stamps the outgoing batch from a
 `scope` write the same way it already does for `resource`, including the same flush-time
-staleness and script-side override (`docs/known-gaps.md`).
+staleness and script-side override (`docs/known-gaps/`).
 
 Every new field and error path is covered directly in `crates/logit-script/src/proxy.rs`'s and
 `scope.rs`'s own `#[cfg(test)]` modules — no new integration-level suite, since nothing here
@@ -535,7 +535,7 @@ metric-kind fields, not just presence.
 | W5 | **Landed.** syslog pair: structured-data parse and emit, timestamp precedence and the nil case, `Value::Bytes` MSG, `Value::Str` PROCID, opt-in PEN-qualified structured-data element; `crates/logit-cli/tests/syslog_round_trip.rs` over real UDP sockets with a fixture corpus plus a `proptest` fixed point; new ADR `syslog-structured-data-convention`; amends `syslog-output` | M | W0 (parallel with W1) |
 | W6 | **Landed.** DogStatsD events and service checks, in and out: `_e{...}`/`_sc\|...` decode to `Event::log`/`Event::metric` (`event_name: None` deliberately), `statsd.event.*`/`statsd.service_check.*` carriers, canonical field order and `d:` (not `\|T`) on egress, `format: statsd` whole-event drop, first-metric-is-the-check rule; amends `statsd-output` | S | W3 |
 | W7 | **Landed.** Lua proxy: `event.log` gains `event_name`/`observed_timestamp` (read/write) and `dropped_attributes_count` (read-only); new `event.metrics` (array-like, every field readable, `value` writable on `sum`/`gauge`, `temporality`/`monotonic` writable on `sum`, everything else on every other kind read-only) and `event.span` (new, entirely read-only); `resource`/`scope` gain `schema_url` (read/write) and `dropped_attributes_count` (read-only), `scope` itself new, mirroring `resource`'s copy-on-write shape; extends `docs/design/lua-api.md`, no ADR (extension of the existing proxy design, not a new one) | M | W1 |
-| W8 | **Landed.** Closeout: `AGENTS.md`'s `statsd_out` and current-state paragraphs rewritten for the landed model, the stale `HyperLogLog` doc comment (`crates/logit-core/src/metric.rs`) and internal-telemetry's raw-sample claims (`docs/design/internal-telemetry.md`, an amendment on ADR `internal-telemetry-as-pipeline-events`) corrected, this plan's closing assessment added, and ADR `lossless-transit`'s Status marked realized — `docs/known-gaps.md`, `docs/design/data-model.md`, and the other docs a prior scoping pass verified already in sync were left alone | S | all |
+| W8 | **Landed.** Closeout: `AGENTS.md`'s `statsd_out` and current-state paragraphs rewritten for the landed model, the stale `HyperLogLog` doc comment (`crates/logit-core/src/metric.rs`) and internal-telemetry's raw-sample claims (`docs/design/internal-telemetry.md`, an amendment on ADR `internal-telemetry-as-pipeline-events`) corrected, this plan's closing assessment added, and ADR `lossless-transit`'s Status marked realized — `docs/known-gaps/`, `docs/design/data-model.md`, and the other docs a prior scoping pass verified already in sync were left alone | S | all |
 | W9 | **Landed.** A repeated DogStatsD tag key folds into a `Value::Array` at decode (`insert_tags`, mirroring `syslog_in`'s repeated-PARAM-NAME fold) instead of the last token silently winning; `statsd_out` expands an `Array`-valued attribute into one tag per element, with no dedupe on encode; `influxdb_out` and `prometheus_out` each render a multi-valued tag/label's last representable element, counted `*.{tags,labels}.normalized{reason="multi_value"}`; closes the "repeated DogStatsD tag key collapses to its last value" residual-debt item above; amends `statsd-output` and `lossless-transit` | M | W3, W6 |
 
 Landing order: W0 → W1 → (W2, W4, W5 in parallel) → W3 → W6 → W7 → W8 → W9. Each workstream is its own
@@ -582,27 +582,27 @@ or transport in between; and the `proptest`-based fixed points in `crates/logit-
 `decode(encode(x)) == x` holds beyond any hand-picked fixture.
 
 What's left is what the ADR's "cross-protocol egress stays best-effort" clause accepts,
-plus a short list of genuine model debt — both already tracked in `docs/known-gaps.md` rather than
+plus a short list of genuine model debt — both already tracked in `docs/known-gaps/` rather than
 newly discovered here:
 
 - `statsd_out` still drops post-sketch metric kinds (`Distribution`/`Set`/`Histogram`/
   `ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum`) — reachable only once
   `aggregate` has explicitly summarized, which is the ADR's own opt-in-summarization carve-out, not
-  a like-to-like loss (`docs/known-gaps.md`'s "`statsd_out` drops post-sketch metric kinds" entry).
+  a like-to-like loss (`docs/known-gaps/`'s "`statsd_out` drops post-sketch metric kinds" entry).
 - ~~`logit_proto::Encoder`'s one-`Bytes`-per-batch contract still doesn't fit `syslog_out`'s/
   `statsd_out`'s per-message framing, so both bypass the trait entirely — unchanged by this
   plan~~ — **closed as of 2026-09-12**: both now implement `logit_proto::FramedEncoder` over a
   shared `logit_proto::MessageBuf` ([ADR `framed-encoder`](../adr/framed-encoder.md)); the
-  `docs/known-gaps.md` entry is closed, with collectd's adoption as the named follow-up.
+  `docs/known-gaps/` entry is closed, with collectd's adoption as the named follow-up.
 - `statsd_out` still has no `unit` and no native metric rename/prefix, and only carries an egress
   timestamp on a `|T`-marked line — everything else is stamped with the receiver's own receipt time
-  (`docs/known-gaps.md`'s "`statsd_out` has no `unit` and no metric renaming/prefixing..." entry).
+  (`docs/known-gaps/`'s "`statsd_out` has no `unit` and no metric renaming/prefixing..." entry).
 - syslog's `event.timestamp` stays receipt time, not the sender's, even though `syslog_out`'s wire
   TIMESTAMP now follows [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)'s
-  precedence table (`docs/known-gaps.md`'s "`event.timestamp` is still receipt time..." entry).
+  precedence table (`docs/known-gaps/`'s "`event.timestamp` is still receipt time..." entry).
 - Cross-protocol egress (`P_in -> Q_out` for two different protocols) stays best-effort by design —
   a raw sample list has no OTLP wire type, a `DDSketch` has no statsd wire form — each such
-  degradation is counted and documented per the ADR's own rule, in `docs/known-gaps.md`'s
+  degradation is counted and documented per the ADR's own rule, in `docs/known-gaps/`'s
   "Cross-protocol semantic gaps" table.
 
 `docs/adr/lossless-transit.md`'s Status now records this closing assessment as the realization of

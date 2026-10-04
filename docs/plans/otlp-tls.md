@@ -8,7 +8,7 @@ updated: 2026-09-03
 ## Context
 
 [docs/plans/signal-filtering-and-otlp-out-config-gaps.md](signal-filtering-and-otlp-out-config-gaps.md)
-filed "gRPC TLS is out of scope" as its own workstream, alongside `docs/known-gaps.md`'s
+filed "gRPC TLS is out of scope" as its own workstream, alongside `docs/known-gaps/`'s
 "`otlp_out` has no gRPC TLS" entry — `otlp_out`'s HTTP transport already speaks TLS today (via
 `reqwest`'s default `rustls` backend), but its gRPC transport hard-rejects `https://` outright, and
 `otlp_in` terminates nothing. See [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md)
@@ -49,11 +49,11 @@ handshake to every request.
 - **Docs**: this plan; [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md);
   `docs/design/pipeline-graph.md`'s validation list gained rule 24 (and, in passing, the
   previously-undocumented rules 22/23 from the headers/paths workstream); `docs/deploying.md`
-  gained a TLS section; `docs/known-gaps.md`'s two TLS-shaped entries retired, two smaller ones
+  gained a TLS section; `docs/known-gaps/`'s two TLS-shaped entries retired, two smaller ones
   (startup-only cert loading, no `server_name` override) filed; `AGENTS.md`'s "Current state"
   paragraph updated.
 
-## Explicitly out of scope (filed in `docs/known-gaps.md`)
+## Explicitly out of scope (filed in `docs/known-gaps/`)
 
 - **Certificate rotation.** Loaded once at `logit run` startup; a renewed cert needs a restart.
 - **`server_name` override** for an endpoint reached by IP or through a proxy.

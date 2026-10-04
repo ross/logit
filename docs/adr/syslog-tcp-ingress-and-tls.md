@@ -11,12 +11,12 @@ Accepted
 ## Context
 
 `syslog_out` (the egress side, [ADR `syslog-output`](syslog-output.md)) has spoken TCP since it was
-built, but never TLS -- `docs/known-gaps.md`'s "`syslog_out` has no TLS" entry already names the fix
-as "config-plumbing against `TlsClientConfig`/`TlsServerConfig`... not a design decision to redo."
-When this was written, `syslog_in` (`crates/logit-inputs/src/syslog.rs`) had no TCP at all: its
-own module doc, and `ComponentKind::SyslogIn { bind: String }`'s doc comment
-(`crates/logit-config/src/lib.rs`), both said UDP-only, and `docs/known-gaps.md`'s "`syslog_in` is
-UDP-only" entry recorded why that was a
+built, but never TLS -- `docs/known-gaps/syslog.md`'s "`syslog_out` has no TLS" entry already names
+the fix as "config-plumbing against `TlsClientConfig`/`TlsServerConfig`... not a design decision to
+redo." When this was written, `syslog_in` (`crates/logit-inputs/src/syslog.rs`) had no TCP at all:
+its own module doc, and `ComponentKind::SyslogIn { bind: String }`'s doc comment
+(`crates/logit-config/src/lib.rs`), both said UDP-only, and `docs/known-gaps/syslog.md`'s
+"`syslog_in` is UDP-only" entry recorded why that was a
 deliberate, not-yet gap -- the driving integration, nginx's `syslog:` writer, is UDP-only, so a TCP
 accept loop would have bought that integration nothing. [ADR `syslog-output`](syslog-output.md)'s
 "asymmetry is deliberate" note is the same call from the egress side.
@@ -55,7 +55,7 @@ Everything this decision needs already exists in-tree and is reused, not re-deci
 `SyslogIn` gains `#[serde(default)] transport: SyslogTransport` (the same enum `syslog_out` already
 publishes -- see "Config surface" below) and `#[serde(default)] tls: Option<TlsServerConfig>`.
 `SyslogIn`'s doc comment, which at the time asserted UDP-only is deliberate, and
-`docs/known-gaps.md`'s "`syslog_in` is UDP-only" entry, and [ADR `syslog-output`](syslog-output.md)'s
+`docs/known-gaps/syslog.md`'s "`syslog_in` is UDP-only" entry, and [ADR `syslog-output`](syslog-output.md)'s
 "that asymmetry is deliberate" note, are all superseded by this decision, not merely narrowed.
 
 ### Framing is auto-detected per connection, not configured
@@ -151,8 +151,9 @@ the same time so one number and one field name cover every ingress listener kind
 non-zero and, on `transport: udp`, rejects a non-default value outright: a datagram listener has no
 connection to hand shake, so set-but-ignored would be the wrong outcome for the same reason rule 43
 refuses a `tls:` block there. What did *not* change: this is still a pre-message bound only, never
-an idle timeout on an established connection -- `docs/known-gaps.md`'s idle-connection row records
-why closing that gap is its own effort with its own ADR.
+an idle timeout on an established connection -- the idle-connection row in `docs/known-gaps/intake.md`
+recorded why closing that gap is its own effort with its own ADR, since closed by [ADR
+`idle-connection-timeout`](idle-connection-timeout.md).
 
 **One simplification against the `logit_in` template.** `logit_in` writes a clean `Reject` control
 message to a past-the-cap connection, which means doing the TLS handshake first even for a
@@ -192,9 +193,9 @@ No ALPN is offered, the same choice `logit_in`/`logit_out` already made for the 
 is not an HTTP-shaped protocol, so there is nothing for a client to negotiate down to.
 
 This reuses `logit_inputs::tls::build_server_config`/`logit_outputs::tls::build_client_config`
-and `testdata/tls/` outright -- `docs/known-gaps.md`'s existing `syslog_out` entry already names
-this as "config plumbing... not a design decision to redo," and nothing about the TCP-ingress work
-above changes that call.
+and `testdata/tls/` outright -- `docs/known-gaps/syslog.md`'s existing `syslog_out` entry already
+names this as "config plumbing... not a design decision to redo," and nothing about the TCP-ingress
+work above changes that call.
 
 ### `syslog_out`'s TCP connection becomes TLS-capable the same way `logit_out`'s does
 
@@ -315,14 +316,14 @@ a differently-shaped metric for the same event.
   already uses. No TLS-specific metric, on the same footing `docs/deploying.md`'s existing TLS
   section already gives `otlp_in`/`otlp_out`: a handshake failure surfaces through the same
   connection-error diagnostics and counters any other transport failure would.
-- `docs/known-gaps.md`: "`syslog_in` is UDP-only" and "`syslog_out` has no TLS" both close outright
-  (the latter narrowed to DTLS, which stays open as its own row). Two existing rows generalize
-  rather than close: "TLS certificates are loaded once at startup" and "no `server_name` override,"
-  both currently scoped to `otlp_in`/`otlp_out`, now also describe `syslog_in`/`syslog_out` (and
-  `logit_in`/`logit_out`), since none of those components' TLS construction differs in either
-  respect. A new row: no idle-connection timeout on a TCP listener -- a handshaken-then-silent
-  connection holds a concurrency-cap permit indefinitely, a gap this decision shares with `otlp_in`
-  rather than introducing fresh.
+- `docs/known-gaps/syslog.md`: "`syslog_in` is UDP-only" and "`syslog_out` has no TLS" both close
+  outright (the latter narrowed to DTLS, which stays open as its own row). Two existing rows
+  generalize rather than close: "TLS certificates are loaded once at startup" and "no `server_name`
+  override," both currently scoped to `otlp_in`/`otlp_out`, now also describe
+  `syslog_in`/`syslog_out` (and `logit_in`/`logit_out`), since none of those components' TLS
+  construction differs in either respect. A new row: no idle-connection timeout on a TCP listener --
+  a handshaken-then-silent connection holds a concurrency-cap permit indefinitely, a gap this
+  decision shares with `otlp_in` rather than introducing fresh.
 - `demo/` stays plaintext -- the same call [ADR `otlp-tls-and-pooled-grpc-client`](otlp-tls-and-pooled-grpc-client.md)
   made for OTLP: TLS in the demo would need a certificate story (self-signed with a trust warning,
   or a real CA) that answers a question this decision doesn't need to answer to ship TCP/TLS

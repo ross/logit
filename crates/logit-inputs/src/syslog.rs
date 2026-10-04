@@ -78,8 +78,8 @@
 //!   throttled `timestamp_out_of_range`. One that doesn't parse
 //!   ([`Malformed`](TimestampError::Malformed)) rejects the line.
 //!
-//! `docs/known-gaps.md`'s syslog entry "`event.timestamp` is still receipt time" has the full
-//! writeup and a sketched opt-in `syslog_timestamp` transform.
+//! `docs/known-gaps/syslog.md`'s syslog entry "`event.timestamp` is still receipt time" has the
+//! full writeup and a sketched opt-in `syslog_timestamp` transform.
 //!
 //! **RFC 5424 STRUCTURED-DATA becomes `syslog.sd`.** [`parse_structured_data`] is a quote-aware
 //! RFC 5424 §6.3 parser (`docs/adr/syslog-structured-data-convention.md` has the rationale):

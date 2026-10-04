@@ -267,7 +267,7 @@ event attributes and a set of resource attributes:
 every key named in its `labels:` config (opt-in, never every label; see the ADR's event/resource
 shape section). `docker_in` reads these from the sibling `config.v2.json` once per container, when
 it opens the log, and never re-reads them, so a `docker rename` after that point is not picked up,
-a known gap ([docs/known-gaps.md](../known-gaps.md)).
+a known gap ([docs/known-gaps/tailing.md](../known-gaps/tailing.md)).
 
 ### HTTP access-log names
 

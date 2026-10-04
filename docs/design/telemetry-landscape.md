@@ -131,8 +131,8 @@ References: <https://prometheus.io/docs/specs/remote_write_spec/> (1.0),
 `prometheus_in`'s `bind:` receives either on one listener, and `prometheus_out`'s `endpoint:` sends
 the one set by an explicit `version:`. **`logit` doesn't map native histograms**, the one part of
 the format it skips; they're counted in both directions and deferred to a follow-up
-(`docs/known-gaps.md`). [ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md) has the
-model mapping, the timestamp-group decomposition, and the permitted normalizations.
+(`docs/known-gaps/mappings.md`). [ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)
+has the model mapping, the timestamp-group decomposition, and the permitted normalizations.
 
 1.0: `WriteRequest{timeseries: []TimeSeries{labels, samples: []{value, timestamp_ms}, exemplars,
 histograms}, metadata}`. 2.0 replaces it with `io.prometheus.write.v2.Request`, which adds:
@@ -277,7 +277,7 @@ Cloud 10.5.2605.9 indexed 1,000 dimensions on one object. `logit`'s mapping is
 | Set/cardinality | `s` | `s` | — (an Agent sends `s` as a gauge) | — | — | — | — | — | none natively; `expand` → `.count`, else dropped | none natively; `expand` → the count, else dropped |
 | Histogram (explicit buckets) | `h` (~alias of `ms`) | `h` | — | `Histogram` | `histogram` | `_bucket{le}`/`_sum`/`_count` flat series, exactly as on exposition (supported, 1.0 and 2.0) | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.bucket_<b>`, else dropped | `_bucket{le}`/`_sum`/`_count` series (the exporter's convention, read by `histperc`) |
 | Histogram sum/count/min/max | — | — | a sketch's `cnt`/`sum`/`min`/`max` | yes | `_sum`/`_count` (no min/max) | yes | — | — | `expand` only (see row above) | `_sum`/`_count` (no min/max) |
-| Exponential/native histogram | — | — | — | `ExponentialHistogram` | native histogram ext. | yes (2.0) -- **skipped by `logit` in both directions**, counted, deferred to a follow-up (`docs/known-gaps.md`) | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.zero_count`, no buckets, else dropped | — (the exporter drops it) |
+| Exponential/native histogram | — | — | — | `ExponentialHistogram` | native histogram ext. | yes (2.0) -- **skipped by `logit` in both directions**, counted, deferred to a follow-up (`docs/known-gaps/mappings.md`) | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.zero_count`, no buckets, else dropped | — (the exporter drops it) |
 | Summary (pre-computed quantiles) | — | — | — | `Summary` | `summary` | — | — | — | none natively; `expand` → `.count`/`.sum`/`.q<q>`, else dropped | `_sum`/`_count`/`<n>_<q>{qt}` series (convention) |
 | Exemplars | — | — | — | yes | OpenMetrics only | yes, both versions (`TimeSeries.exemplars`) | — | — | — | — |
 | Unit | — | — | series `unit` | `Metric.unit` | `# UNIT` (OM) | via metadata, both versions (1.0 `MetricMetadata.unit`, 2.0 inline `Metadata`) | — | — | — | — |
@@ -492,7 +492,7 @@ support the claim that OTLP is the superset among trace formats `logit` might br
 These properties, derived from the matrices above, are what
 [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s target model is checked against.
 That plan's "Closing assessment" records how the landed model (2026-09-12) meets them and names
-the residual debt, which `docs/known-gaps.md` tracks.
+the residual debt, which `docs/known-gaps/` tracks.
 
 1. A metric point carries temporality (delta/cumulative) and monotonicity, and an optional series
    start time.

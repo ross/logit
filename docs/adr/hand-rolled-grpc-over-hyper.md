@@ -75,7 +75,7 @@ gRPC response needs exactly one.
 - **Compression is not supported.** Real gRPC/OTLP-HTTP peers commonly default to `gzip` — the OTel
   Collector's own default exporter does — so `otlp_in` rejects a `grpc-encoding`/`Content-Encoding`
   request outright (`grpc-status: 12`/`415`) rather than silently mishandling it, and `otlp_out`
-  never requests it. This is a known, documented gap (`docs/known-gaps.md`), not a bug: adding
+  never requests it. This is a known, documented gap (`docs/known-gaps/otlp.md`), not a bug: adding
   `flate2` and per-frame decompression is real, security-relevant surface (a compression bomb
   against untrusted input) that a from-scratch gRPC server shouldn't take on speculatively.
 - Every new HTTP/gRPC connection this PR's server side accepts gets its own `tokio::spawn`ed

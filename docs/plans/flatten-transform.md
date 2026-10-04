@@ -132,7 +132,7 @@ A `build_spec` arm plus `to_flatten_fields`/`to_flatten_arrays` beside `to_allow
 `docs/design/internal-telemetry.md` (the two counters, and why untagged),
 `docs/design/memory.md` (the allocation rows), `crates/logit-transforms/src/lib.rs` (crate doc +
 `mod`/`pub use`, alphabetical between `csv` and `json`), `AGENTS.md` (current-state paragraph,
-crate-layout line), `README.md`, `docs/known-gaps.md` (interner-growth entry, extending the
+crate-layout line), `README.md`, `docs/known-gaps/` (interner-growth entry, extending the
 existing `syslog.sd`/`json`/`otlp_in` bullet), `fixtures/nested-json-to-influxdb.yaml` (new
 example), `schema/logit.schema.json` (regenerated).
 
@@ -151,7 +151,7 @@ Covered automatically by `every_shipped_config_loads_and_validates`
 |---|---|---|---|
 | W0 | **ADR and plan.** | `docs/adr/flatten-transform.md` (new, + row atop `docs/adr/README.md`); `docs/plans/flatten-transform.md` (new, + row atop `docs/plans/README.md`) | — |
 | W1 | **`flatten` — the component.** | `crates/logit-core/src/attrs.rs`; `crates/logit-config/src/lib.rs`; `crates/logit-pipeline/src/graph.rs`; `crates/logit-transforms/src/flatten.rs` (new); `crates/logit-transforms/src/lib.rs`; `crates/logit-cli/src/pipeline.rs`; `schema/logit.schema.json` | W0 |
-| W2 | **Docs, example, and the allocation pins.** | `fixtures/nested-json-to-influxdb.yaml` (new); `docs/design/pipeline-graph.md`; `docs/design/internal-telemetry.md`; `docs/design/memory.md`; `crates/logit-bench/src/fixtures.rs`; `crates/logit-bench/tests/allocations.rs`; `crates/logit-transforms/src/lib.rs` (`chained_pipeline_test`); `AGENTS.md`; `README.md`; `docs/known-gaps.md` | W1 |
+| W2 | **Docs, example, and the allocation pins.** | `fixtures/nested-json-to-influxdb.yaml` (new); `docs/design/pipeline-graph.md`; `docs/design/internal-telemetry.md`; `docs/design/memory.md`; `crates/logit-bench/src/fixtures.rs`; `crates/logit-bench/tests/allocations.rs`; `crates/logit-transforms/src/lib.rs` (`chained_pipeline_test`); `AGENTS.md`; `README.md`; `docs/known-gaps/` | W1 |
 
 Landing order: **W0 → W1 → W2**, strictly linear. Config, validation, transform, and registry are
 one PR because `build_spec`'s match is exhaustive — a variant added without its arm doesn't
@@ -214,7 +214,7 @@ green, `script/validate` clean, no `type_sizes.rs` change (this component adds n
   anything this component enforces.
 - **Interner growth is unbounded by design**, beyond the fixed depth bound. `tags.0`…`tags.N-1` and
   a map keyed by rotating identifiers mint symbols that are never freed for the life of the
-  process. Documented in `docs/known-gaps.md`, not guarded.
+  process. Documented in `docs/known-gaps/`, not guarded.
 - **A flattened key can silently collide with a real attribute of the same name**, with no counter
   — a deliberate, not accidental, gap (see the ADR's Alternatives). Revisit if it turns out to
   matter in practice.

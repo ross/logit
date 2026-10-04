@@ -17,7 +17,7 @@ own `logit.*` metrics. `OtlpOutput::send` (`crates/logit-outputs/src/otlp.rs`) i
 per non-empty signal and aborts the rest on the first failure; Tempo's traces request succeeds and
 its metrics request fails with `grpc-status: 12` (`UNIMPLEMENTED`), and `write_loop`'s
 sustained-permanent-failure guard eventually ends the whole process — recorded in full in
-`docs/known-gaps.md`'s "`otlp_out` aborts an entire batch's `send`..." entry, which names "a
+`docs/known-gaps/otlp.md`'s "`otlp_out` aborts an entire batch's `send`..." entry, which names "a
 config-layer way to filter an event stream by which payload it carries" as the real fix.
 
 The obvious fix — a `signals: [traces]` field on `otlp_out` — was rejected. Filtering by signal
@@ -122,6 +122,6 @@ permissive, "forward anything with a payload" filter, not a no-op — unlike the
   {reason="absorbed"}` counter is now imprecise for these too (already true of nothing else before
   this), tracked but not fixed here; each component records its own more specific counters
   instead (`docs/design/internal-telemetry.md`).
-- `docs/known-gaps.md`'s `otlp_out` entry loses its "no signal filter" clause; the other listed
+- `docs/known-gaps/otlp.md`'s `otlp_out` entry loses its "no signal filter" clause; the other listed
   gaps (custom headers, compression, gRPC TLS, hardcoded paths, `observed_time_unix_nano`) are
   unaffected and remain filed.

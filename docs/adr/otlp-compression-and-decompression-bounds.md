@@ -20,7 +20,7 @@ ever transmitted, and `flate2` wasn't a dependency yet.
 Both sides land together here, deliberately: `otlp_out`'s compression has no way to be exercised
 end-to-end without `otlp_in` learning to decode it, and `crates/logit-cli/tests/otlp_round_trip.rs`
 — the test that proves the two halves actually interoperate, not just that each side's own unit
-tests pass in isolation — needs both. `docs/known-gaps.md`'s existing `otlp_in` entry filed the
+tests pass in isolation — needs both. `docs/known-gaps/otlp.md`'s existing `otlp_in` entry filed the
 `flate2`-as-a-dependency question as the reason compression was deferred; that reason no longer
 applies once this lands, so this ADR is also where that call gets made.
 
@@ -86,7 +86,7 @@ assuming the header and the frame always agree.
   a decision an operator is forced to discover by breakage.
 
 ## Consequences
-- `docs/known-gaps.md`'s `otlp_in` compression clause and `otlp_out`'s workstream-E compression
+- `docs/known-gaps/otlp.md`'s `otlp_in` compression clause and `otlp_out`'s workstream-E compression
   clause both close; `otlp_in`'s `partial_success`-accounting gap (a separate, unrelated limitation
   of the same module) is unaffected and stays filed.
 - `otlp_out → otlp_in` interoperates with any real OTLP collector's default gzip-sending exporter

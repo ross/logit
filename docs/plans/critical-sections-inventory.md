@@ -53,7 +53,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | # | Lead | Entry | Status |
 |---|---|---|---|
 | 1 | `DdSketch::merge` `.expect()`s matching configs, but sketches arrive decoded from peer bytes over `logit_in` / disk spool — a remote-reachable panic | CORE-05, WIRE-03 | CORE-05 side gone: the hand-rolled `DdSketch` re-bins on a mismatch instead of panicking (`f680bd06`). WIRE-03 findings → #370 (the native decoder hands a sketch blob to `DdSketch::from_bytes` whole, and a decoded sketch reaches `merge` only through `aggregate`); the replacement `DdSketch` done: findings → #369 (decoded `bin_limit` capped, Agent keys range-checked) |
-| 2 | `HyperLogLog::from_bytes` reaches an upstream allocation-layout UB (per `known-gaps.md`) from untrusted native-frame bytes | CORE-06, WIRE-03 | CORE-06 done: findings → #369 (the UB stays unreachable; Miri runs the HLL tests under two named flags; header and trailing-byte checks added). WIRE-03 findings → #370: the `METRIC_SET` blob reaches `HyperLogLog::from_bytes` whole, so the UB guard is CORE-06's |
+| 2 | `HyperLogLog::from_bytes` reaches an upstream allocation-layout UB (per `known-gaps/`) from untrusted native-frame bytes | CORE-06, WIRE-03 | CORE-06 done: findings → #369 (the UB stays unreachable; Miri runs the HLL tests under two named flags; header and trailing-byte checks added). WIRE-03 findings → #370: the `METRIC_SET` blob reaches `HyperLogLog::from_bytes` whole, so the UB guard is CORE-06's |
 | 3 | No `http2_max_concurrent_streams` on `otlp_in` or `prometheus_in`'s h2c receiver — per-listener memory worst case is under-estimated by the stream count. Correction: hyper 1.11.1's h2 server default is 200 concurrent streams per connection, not unlimited, so the documented worst case is low by a factor of 200 | WIRE-10, WIRE-11, WIRE-15 | **Done** (findings → #374): the 200 is pinned explicitly with the reset and header-list defaults, and every worst-case figure is corrected |
 | 4 | `logit_in` eagerly allocates `vec![0u8; compressed_len]` from the header (64 MiB × 1024 conns, `idle_timeout` off by default) | WIRE-06 | **Done** (findings → #372): the slowloris lead is retired under the deployment threat model; the body is now held once, and every control write is bounded |
 | 5 | Unbounded recursion: OTLP/JSON `AnyValue` decode (network), and `lua_to_value` / `value_heap_bytes` (script-built nested table; the heap walk runs on queue push) | CODEC-16, CORE-17 | CODEC-16 reviewed @dc39d1c (pinned, no change): JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under native's 128; P2, a local cap declined, tests pin both limits. CORE-17 closed, #385: `lua_to_value` caps nesting at 128 levels, native's own cap, so a script-built value (and `value_heap_bytes`'s walk of it) is bounded like every other producer's |
@@ -68,7 +68,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | **Done** (findings → #450, #451): confirmed, and statsd and syslog classified an invalid TLS server name as `Clean`; one driver (`crates/logit-outputs/src/stream.rs`, #451) replaces the three copies, graphite gains the flush and `reconnects`, and a bad server name fails startup; the TLS write semantics it relies on are pinned by tests (#450) |
 | 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | findings → #366 |
 | 16 | `parse_traceparent` slices a `str` at fixed byte offsets after only a length check — non-ASCII input can panic | CORE-11 | open |
-| 17 | The process-wide interner never evicts and is fed from the network (native dictionary entries, trailer strings, Lua `telemetry` names) | CORE-01, WIRE-02, CORE-19 | CORE-19 half `reviewed`, #392: every Lua feeder is listed in `docs/known-gaps.md`'s interner entry and `docs/design/lua-api.md`'s Limits list; the rest open |
+| 17 | The process-wide interner never evicts and is fed from the network (native dictionary entries, trailer strings, Lua `telemetry` names) | CORE-01, WIRE-02, CORE-19 | CORE-19 half `reviewed`, #392: every Lua feeder is listed in `docs/known-gaps/`'s interner entry and `docs/design/lua-api.md`'s Limits list; the rest open |
 | 18 | `influxdb_out` keeps its own `reqwest` client: default redirect policy (credential-carrying 307/308 replay) and an unbounded error-body read | SINK-08 | Partly: error-body read bounded (#332); the redirect policy is open |
 | 19 | Aggregate has two "kept in sync by comment, not compiler" pairs guarded by `unreachable!` (`passes_through`/`Accumulator::new_for`; `flush`'s `retain`/`kind_for_retained`); each becomes one `Option`-returning function, `opener_for -> Option<Opener>` for pass-through and `Accumulator::retained_kind -> Option<MetricKind>` for retention, with no `unreachable!` arm | XFORM-02, XFORM-03 | **Done**: findings → #405 (`opener_for` and `Accumulator::retained_kind`, each pinned by a table test over every kind and mode) |
 | 20 | Under `DropOldest`, one spool `push` can decode-and-evict a whole segment in one loop, because `total_bytes` shrinks only on segment deletion | DISK-05 | **Done**: confirmed and documented (#331); the `Block` park it turned up is fixed (#333) |
@@ -98,7 +98,7 @@ Repo-wide gaps that cut across entries:
   state after a `send` dropped at its ack wait. Still untested: a `logit_out` `send` dropped inside
   its frame write or flush, or during its handshake; the HTTP sinks' pooled clients after a request
   dropped mid-flight (only the gate's state after a budget cut is pinned); a sink's own torn output
-  (`stdio_out`/`file_out` can leave a torn line, in `docs/known-gaps.md`); and the uncounted losses
+  (`stdio_out`/`file_out` can leave a torn line, in `docs/known-gaps/`); and the uncounted losses
   the table names (a batch dropped inside `Fanout::send`, pinned only for a partial fan-out).
 - **Dependency bumps are re-verification triggers**: `logit-inputs/src/http.rs`'s idle/graceful
   shutdown driver is pinned by reference to hyper 1.11.1 / hyper-util 0.1.20 internals;
@@ -115,7 +115,7 @@ Repo-wide gaps that cut across entries:
 - ~~**Connection gauges are decremented by a bare statement, not a drop guard**, in all three stream
   listeners — leaks on panic.~~ **fixed (#374):** every stream input's live-connections gauge is
   a drop guard, and a test panics a connection task and reads the gauge back to zero.
-- No TLS certificate reload exists anywhere, and it is not recorded in `docs/known-gaps.md`.
+- No TLS certificate reload exists anywhere, and it is not recorded in `docs/known-gaps/`.
 
 ## Suggested session clusters
 
@@ -177,7 +177,7 @@ Update the row in the same PR that lands the session's artifact. A `reviewed @<s
 - **One session per entry or small cluster, not per file.** The entries are split by mechanism on
   purpose; a session that tries to cover all of `runtime.rs` will skim.
 - **Every session ends in a committed artifact** — a new test, a fuzz target, a proptest, a
-  fault-injection harness, an ADR amendment, or a `docs/known-gaps.md` entry. A prose-only
+  fault-injection harness, an ADR amendment, or a `docs/known-gaps/` entry. A prose-only
   "looked fine" rots; the only acceptable prose-only outcome is the `reviewed @<sha>` status row
   plus a sentence on *what was checked and how*.
 - **Verify adversarially, in a fresh context.** The reviewer's brief is to *refute* the entry's
@@ -433,7 +433,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   - ✅ `received_at` strictly increasing **within** a batch, `saturating_add` cannot saturate.
     **Holds** (`base ≈ 1.8e18`, `i ≤ 1023`). The *cross-batch* claim the test's doc made is weaker
     than it read — `now_nanos()` is the wall clock — and is now stated precisely there and tracked
-    in `docs/known-gaps.md`.
+    in `docs/known-gaps/`.
   - ✅ `MSG_TRUNC` accounting is per call, reset per call, read once per batch. **Holds**;
     `an_oversized_ipv6_datagram_is_delivered_truncated_and_counted` drives the real case.
 - **Observed concerns:**
@@ -604,7 +604,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   - A decode error drops exactly one datagram and never the rest of the batch (the `Err(err)` arm's `warn_throttled("bad_datagram", …)`).
 - **Observed concerns (unverified):**
   - *Documented:* one `TraceContext::new_root` per *accumulated* batch, so N unrelated datagrams
-    share a root (`emit`'s doc); tracked in `docs/known-gaps.md`'s internal-spans entry.
+    share a root (`emit`'s doc); tracked in `docs/known-gaps/`'s internal-spans entry.
   - *Low confidence:* `now_nanos()` is called once per datagram here *and* once per read batch in
     `BatchReader`; on a high-rate listener that is two `SystemTime::now()` syscalls/vDSO calls per
     datagram's worth of work. Not a correctness issue; worth a perf look.
@@ -628,7 +628,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   interval `emit`, so an `emit` parked past the next deadline left it already due, and the next pop
   batch flushed at once. The clock is re-read after the `emit`, here and in `tcp.rs`'s
   `serve_connection`. The events already decoded when the backstop fires (the accumulator, a
-  parked `emit`, a partial fan-out) stay uncounted, recorded in `docs/known-gaps.md`'s UDP intake
+  parked `emit`, a partial fan-out) stay uncounted, recorded in `docs/known-gaps/`'s UDP intake
   section. Tests: `a_decode_loop_dropped_mid_batch_counts_every_popped_but_undecoded_datagram`,
   `a_udp_listener_cancelled_by_the_grace_backstop_counts_what_its_queue_still_held`,
   `an_interval_emit_that_parks_past_the_deadline_does_not_flush_once_per_pop_batch` (and its
@@ -646,7 +646,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   somehow wins first it awaits `read` and never touches `decode` again — the explicit guard against
   polling an already-resolved future.
 - **Why sensitive:** concurrency (two cooperatively-scheduled halves on one task — see
-  `docs/known-gaps.md`'s "read and decode loops share one task"); shutdown ordering (the decode half
+  `docs/known-gaps/`'s "read and decode loops share one task"); shutdown ordering (the decode half
   owns the `Fanout`, so its drop is what cascades the shutdown downstream); cancellation.
 - **Invariants to verify:**
   - `decode` is never polled after it resolved (the `already_finished` `Option<result>` dance after the `select!`).
@@ -665,7 +665,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
 - **Suggested verification approach:** targeted review; optionally a loom/shuttle model of the
   close/park/wake handshake between the two halves (they share one task today, so loom adds little
   unless `decode_loop` moves onto its own task; see the "A UDP listener's read and decode loops
-  share one task" entry in [`docs/known-gaps.md`](../known-gaps.md#udp-intake)).
+  share one task" entry in [`docs/known-gaps/intake.md`](../known-gaps/intake.md#udp-intake)).
 - **Priority:** P1 — correct today and well documented, but it is the hinge the whole listener's
   shutdown ordering swings on.
 
@@ -973,7 +973,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
     (the terminator-already-buffered, `Fatal` arm) returns *without* clearing `buf`, so those bytes
     are discarded uncounted. Worth checking against the "FIN and RST agree" claim.
   - *Documented:* a connection still within its idle budget at shutdown holds things open until the
-    grace backstop — [`docs/known-gaps.md`](../known-gaps.md#native-wire-format-logit_inlogit_out-and-buffering)'s
+    grace backstop — [`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)'s
     "`otlp_in` can hold the graph open past shutdown" entry.
 - **Existing coverage:** `tcp.rs` tests: `a_clean_close_flushes_whatever_is_accumulated`,
   `an_abrupt_close_with_a_buffered_partial_frame_counts_it_truncated`,
@@ -1262,7 +1262,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
     `sampler.accept(&other_listener)` compile and silently gauge the wrong socket. `BorrowedFd<'_>`
     would have fixed the lifetime, not the identity. The TCP sampler now reads the fd off the
     `listener` argument at each sample; `ReceiveBufferSampler` keeps its stored fd
-    (`docs/known-gaps.md`).
+    (`docs/known-gaps/`).
 - **Existing coverage:** `udp.rs` tests `the_kernels_own_drops_and_receive_buffer_fill_are_reported`,
   `a_full_receive_buffer_is_reported_as_used_bytes_and_a_utilization_ratio`,
   `the_final_sample_reports_drops_that_happened_just_before_shutdown`,
@@ -1439,7 +1439,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   `SyslogDecoder::decode_into` is documented as *infallible* — so the TCP driver's `bad_frame`
   counter is never reachable for `syslog_in`, and all syslog decode failures surface as the
   decoder's own `bad_line`. That asymmetry between drivers and decoders is worth one shared check.
-- `docs/known-gaps.md` documents, as deliberate: one reader per UDP listener (no `SO_REUSEPORT`
+- `docs/known-gaps/` documents, as deliberate: one reader per UDP listener (no `SO_REUSEPORT`
   fan-out); read and decode sharing one task; the `ReceiveQueue` being in-memory only (no
   crash-recovery for intake, unlike the disk-backed *sink* buffer); `read_batch` being Linux-only;
   and a connection still within its idle budget at shutdown. None of these should be reported as
@@ -1454,7 +1454,7 @@ Area: `crates/logit-inputs/src/tail/{driver,watch,checkpoint,line,pattern,mod}.r
 Governing ADRs: [`docs/adr/file-tailing-and-docker-json-logs.md`](../adr/file-tailing-and-docker-json-logs.md)
 and its partial supersession [`docs/adr/docker-container-identity-and-minimal-watches.md`](../adr/docker-container-identity-and-minimal-watches.md).
 Telemetry contract: [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md#tail_in-and-docker_in).
-Documented deliberate gaps: [`docs/known-gaps.md`](../known-gaps.md#file-tailing-and-docker-logs).
+Documented deliberate gaps: [`docs/known-gaps/tailing.md`](../known-gaps/tailing.md).
 
 Third-party crates actually in play here: `tokio` (fs, `AsyncFd`, `select!`, `watch`), `bytes`,
 `serde`/`serde_json` (checkpoint file, `config.v2.json`, json-file envelope), and **`libc` only**
@@ -1510,8 +1510,8 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     tracked.offset` short-circuits (the early return in `reconcile_truncation`); a `copytruncate` followed quickly by enough
     writes to exceed the old offset before the next tick leaves the offset pointing into the new
     generation — lines are then silently skipped/garbled with no diagnostic. Inherent to
-    size-based detection; not listed in `known-gaps.md`. Medium confidence. Still open: now
-    recorded in `docs/known-gaps.md` ("A `copytruncate` that the writer refills past the old
+    size-based detection; not listed in `known-gaps/`. Medium confidence. Still open: now
+    recorded in `docs/known-gaps/` ("A `copytruncate` that the writer refills past the old
     offset before the next check goes undetected").
   - `scan` does blocking `read_dir`/`metadata` (and, for `docker_in`, `read` of every
     `config.v2.json`) directly on the async worker thread; `PathPattern::scan`'s doc comment argues
@@ -1561,7 +1561,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   `read_dir`, rename, `ENOENT` `stat` race reaped an inode that the next scan then replayed from
   `0` under its new name. The run also confirmed the `copytruncate` refill window, the loss under
   an exact pattern with `copytruncate`, and the `app.log*` traps for `copytruncate` and
-  `compress`, all now in `docs/known-gaps.md`. The report and raw runs are in the lead's
+  `compress`, all now in `docs/known-gaps/`. The report and raw runs are in the lead's
   `tmp/tailbk/logrotate/`, not in the repo.
 - **Verified (tailbk/w6, #447):** state-machine proptest on the real filesystem
   (`tail/driver/verification.rs`, 64 cases, 1000 run locally), whose model pins, after every op,
@@ -1610,7 +1610,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     as they're read, and that the offset is within the file; anything else starts at `0`, counted
     `logit.input.files.resume_rejected`. Not the path: a rotation while stopped is a supported
     resume. Past 256 bytes, a recycled inode sharing its first 256 bytes is the residual in
-    `docs/known-gaps.md`.
+    `docs/known-gaps/`.
   - ~~`resume` entries for inodes never rediscovered are never evicted; the map grows to the size of
     the checkpoint plus every de-selection for the life of the process. Low severity.~~
     **fixed (#444):** a de-selection retention is dropped once a scan lists its path and finds it
@@ -1793,7 +1793,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     while down, not towards duplication. The ADR's "strictly duplicates, never loss" claim
     ([`file-tailing-and-docker-json-logs.md`](../adr/file-tailing-and-docker-json-logs.md#checkpoints-optional-written-on-an-interval-only-when-dirty)) does not cover this case. High confidence the
     fsync is absent; medium on how often it matters. Compare `disk_queue.rs`, which does fsync
-    ([`known-gaps.md`](../known-gaps.md#native-wire-format-logit_inlogit_out-and-buffering)).
+    ([`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)).
   - **Blocking I/O in an `async fn`.** `write_checkpoint` is `async` but performs `std::fs::write`
     + `rename` synchronously on the runtime worker; likewise `CheckpointStore::load` inside
     `bind()`. Low severity, high confidence.
@@ -1880,7 +1880,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   three dead `shutdown_grace` copies are removed; `InputRuntimeConfig::shutdown_grace` is the one.
   Two gaps are documented, not fixed: the checkpoint is at-least-once only up to the downstream
   in-memory queues (a sink's grace drop isn't replayed), and a rotated file still draining at
-  shutdown whose new name matches no pattern is orphaned on restart (`docs/known-gaps.md`).
+  shutdown whose new name matches no pattern is orphaned on restart (`docs/known-gaps/`).
 
 ### TAIL-07 — Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area
 - **Location:** `crates/logit-inputs/src/tail/watch.rs`, `mod inotify` (the module roughly doubled
@@ -2047,7 +2047,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   `wait_for` leaves the value `true` for the next poll and for `drain`'s `borrow()`, and each
   deadline is loop state re-armed on the next iteration. `bind()`'s `expect` is unreachable:
   `run_until_shutdown` calls `bind()` first, which leaves a watcher or returns `Err`. The one
-  shutdown bound left is documented in `docs/known-gaps.md`: shutdown is noticed only between two
+  shutdown bound left is documented in `docs/known-gaps/`: shutdown is noticed only between two
   files' reads, so a parked `emit` can hold it until the backstop. The `select!` and the `drain`
   shutdown check have rows in `docs/design/pipeline-graph.md`'s "Cancellation points".
 
@@ -2121,7 +2121,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   through the real `LineSplitter` under arbitrary chunking (ran clean at `PROPTEST_CASES=2000`;
   the committed floor is 256), plus 21 new or rewritten named tests in `docker.rs`. The real `docker run` capture wasn't done; the
   interleaving is from moby's `copier.go` and `jsonfilelog`. Open gaps are in
-  `docs/known-gaps.md`.
+  `docs/known-gaps/`.
 - **Priority:** P0 — per-line parsing of container-controlled input with cross-line state; a
   reassembly bug silently corrupts message content.
 
@@ -2138,7 +2138,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   no path reached this scan via a generation counter.
 - **Why sensitive:** accounting/bookkeeping (the `Arc` identity *is* the batch boundary);
   data-loss (a de-selection closes a live file); untrusted-input (`config.v2.json` is an
-  undocumented daemon-internal format — [`known-gaps.md`](../known-gaps.md#file-tailing-and-docker-logs)); custom (stat-cache protocol,
+  undocumented daemon-internal format — [`docs/known-gaps/tailing.md`](../known-gaps/tailing.md)); custom (stat-cache protocol,
   generation eviction, image-ref splitting).
 - **Invariants to verify:**
   - An unchanged `config.v2.json` costs one `stat` per container per scan and no read, and two
@@ -2290,7 +2290,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   is on `docker_in`'s per-line path — it belongs to whoever surveys `logit-core`, but a panic or
   overflow there lands on this data path.
 - **Overlap with the UDP-intake area:** `libc` is shared between `tail/watch.rs`'s inotify backend
-  and `udp.rs`'s `recvmmsg`/`sockstat` work ([`known-gaps.md`](../known-gaps.md#udp-intake)'s closed `recvmmsg` entry cross-references them); whoever
+  and `udp.rs`'s `recvmmsg`/`sockstat` work ([`docs/known-gaps/intake.md`](../known-gaps/intake.md#udp-intake)'s closed `recvmmsg` entry cross-references them); whoever
   reviews `unsafe` should do both together.
 - **Runtime-side dependency:** `shutdown_grace` is enforced by `crates/logit-pipeline/src/runtime.rs`
   (`run_input` and `shutdown_grace_expired`), not by this driver — the "what is lost when the grace expires mid-flush" question
@@ -2346,8 +2346,8 @@ surveyor's.
   - Re-opening the same directory from a second process fails at the lock rather than corrupting.
 - **Observed concerns (unverified):**
   - The double read of every segment at/after the cursor (the validate pass over the active segment, then the replay-count block) is a
-    known, still-open startup cost (the `buffered` entry under `docs/known-gaps.md`'s
-    [Load-test harness and perf tooling](../known-gaps.md#load-test-harness-and-perf-tooling) section, not its
+    known, still-open startup cost (the `buffered` entry under `docs/known-gaps/`'s
+    [Load-test harness and perf tooling](../known-gaps/telemetry.md#load-test-harness-and-perf-tooling) section, not its
     buffering section); at the default `segment_bytes` of 64 MiB plus a backlog, `open` reads the whole backlog
     into `Vec<u8>` with `std::fs::read` — peak RSS is proportional to the largest segment. High confidence this is real; it is documented, not a surprise.
   - `persist_cursor` does `std::fs::write(tmp)` + `rename` with **no fsync of the tmp file and no fsync of
@@ -2562,7 +2562,7 @@ surveyor's.
   `a_fully_consumed_segment_is_deleted_once_commit_crosses_it`,
   `the_cursor_rolls_forward_when_a_segment_the_reader_caught_up_to_later_rotates_away`. Nothing asserts
   fsync happened. ADR: `docs/adr/disk-backed-sink-buffer.md` ("Durability"); gap:
-  [`docs/known-gaps.md`](../known-gaps.md#native-wire-format-logit_inlogit_out-and-buffering) (accepted power-loss window).
+  [`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md) (accepted power-loss window).
 - **Suggested verification approach:** `strace -e trace=fdatasync,fsync,openat,renameat,ftruncate` on a real run to
   confirm the ordering matches the ADR; a power-loss simulation (`dm-flakey` or a qemu drive with write-cache
   reordering) to confirm only the active segment's tail can be lost.
@@ -2921,7 +2921,7 @@ surveyor's.
   `a_failed_reopen_is_classified_clean_so_the_batch_is_retried_rather_than_dropped`,
   `max_files_three_keeps_exactly_the_active_file_and_two_rotated_ones`,
   `max_files_one_truncates_in_place_rather_than_ever_creating_a_dot_1`. ADR:
-  `docs/adr/rotating-file-output.md`; gaps: [`docs/known-gaps.md`](../known-gaps.md#file-stdio-and-influxdb-sinks).
+  `docs/adr/rotating-file-output.md`; gaps: [`docs/known-gaps/sinks.md`](../known-gaps/sinks.md).
 - **Suggested verification approach:** kill -9 injection at each of {rename to staging, each cascade rename, the
   oldest unlink, the re-open} followed by a restart, asserting no retained file is lost or duplicated; a bound on
   `max_files` (graph rule) if the syscall-storm concern is confirmed.
@@ -3272,7 +3272,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     simultaneously and tokio picks pseudo-randomly. Both arms map to `Ok(())`/the input's own result here, so it
     looks benign — but an input that returns `Err` at exactly the same instant can have that error swallowed by
     the grace arm. Low confidence this is reachable in practice; worth one look.
-  - **Context (documented, not a surprise):** `docs/known-gaps.md` records that a datagram in flight at signal
+  - **Context (documented, not a surprise):** `docs/known-gaps/` records that a datagram in flight at signal
     time is lost uncounted, that `otlp_in` can hold the graph open past shutdown (connection-spawned `Fanout`
     clones), and that `logit_in`/`internal` grace is fixed at 5s.
 - **Existing coverage:** `run_with_shutdown_flushes_an_in_flight_window_before_exiting`,
@@ -3334,7 +3334,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     in the *channel*, so
     that batch is never counted in `batches.dropped{reason="shutdown"}` and never reaches a `Disk` spool. This is
     the exact loss `queue.rs`'s `push_many` doc comment documents for the receive side, but it is **not** documented
-    here or in `docs/known-gaps.md`. Medium-high confidence; bounded at one batch per sink.
+    here or in `docs/known-gaps/`. Medium-high confidence; bounded at one batch per sink.
   - **Sweep-dropped batches were never counted as `received`.** `drain_inbox` is the only place
     `logit.component.batches.received`/`events.received` is incremented (its two `telemetry.count` calls); the
     sweep skips it while still counting `dropped`. So a sink can report `dropped > received`. Deliberate or not, it breaks
@@ -3627,7 +3627,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 - **Observed concerns (unverified):**
   - `run_transform`'s `flush_interval().expect(..)` panics if a transform's `flush_interval()` ever transitions `Some -> None` at runtime. No shipped
     transform does; the `expect` message says so. Low severity, worth a trait-contract note.
-  - `run_flush` deliberately mints a **root**, not a child — the *n*-to-1 gap. `docs/known-gaps.md`'s
+  - `run_flush` deliberately mints a **root**, not a child — the *n*-to-1 gap. `docs/known-gaps/`'s
     internal-spans entry records this as deliberate, so it is context, not a finding.
 - **Existing coverage:** `advancing_a_missed_flush_deadline_is_constant_time_and_preserves_cadence`,
   `run_with_shutdown_flushes_an_in_flight_window_before_exiting`,
@@ -4074,7 +4074,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   `docs/design/wire-protocol.md`.
 - **Suggested verification approach:** targeted review of the cap arithmetic against `lz4_flex`'s
   documented worst case; a proptest that `read_frame(write_frame(p, c)) == p` for arbitrary
-  payload/compression; a `cargo-fuzz` target over `read_frame` (`docs/known-gaps.md` records fuzz
+  payload/compression; a `cargo-fuzz` target over `read_frame` (`docs/known-gaps/` records fuzz
   targets as deliberately deferred for toolchain reasons — this is the highest-value place to
   revisit that); malicious-frame table test (declared lengths at/over each cap, CRC-correct
   garbage lz4).
@@ -4117,7 +4117,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - Re-interning an attacker-supplied dictionary cannot grow the process-global interner without
     bound across many connections (the interner never evicts — this is an unbounded-growth vector
     distinct from per-request memory caps). **Documented non-goal** under
-    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md): `docs/known-gaps.md`'s
+    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md): `docs/known-gaps/`'s
     interner entry names the native dictionary, and `dict.rs`'s module doc points there.
   - ✅ `Str` is UTF-8-validated (the `TAG_STR` arm of `read_value_at`) and `Bytes` deliberately is
     not. **Holds.**
@@ -4134,12 +4134,12 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - ~~`Dict::read` interns every entry into the *global* interner before any of the batch has been
     validated (`Dict::read`).~~ **Documented non-goal**, not changed: CRC-32C rejects accidental
     corruption before the dictionary is read, and a lazy interner would change the ordinary decode
-    path for a case only crafted input produces. `docs/known-gaps.md` names the native dictionary
+    path for a case only crafted input produces. `docs/known-gaps/` names the native dictionary
     as an interner feeder; `dict.rs`'s module doc points there. The dictionary's per-frame
     strings are now charged to the decode budget (WIRE-03).
   - **New, documented non-goal:** `read_attr_map_at` inserts through `AttrMap::insert_sym`, which
     is quadratic for a large map whose keys arrive in descending symbol order (refuter measured
-    80,000 keys at 3.4 s descending against 20 ms ascending). `docs/known-gaps.md` records it;
+    80,000 keys at 3.4 s descending against 20 ms ascending). `docs/known-gaps/` records it;
     `value.rs`'s module doc points there.
   - Unknown `Value` tag → `Value::Null` (the `_unknown` arm of `read_value_at`) is documented, but it means a lossy-transit
     failure that no counter records — no `logit.proto.errors` or skip counter fires.
@@ -4176,7 +4176,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   loops `count` times with no cap on `count` itself, only on the `reserve` hint);
   data-loss (an encode-side default-elision mismatch silently changes a value in transit);
   nontrivial-3p-use(cardinality-estimator) — `METRIC_SET` reaches `HyperLogLog::from_bytes`, which
-  `docs/known-gaps.md` documents as working around an upstream *undefined-behavior* allocation-layout
+  `docs/known-gaps/` documents as working around an upstream *undefined-behavior* allocation-layout
   bug reachable through exactly this decode path.
 - **Invariants to verify:**
   - For every field, "skipped on encode" ⟺ "decodes to that same default". The elision conditions
@@ -4337,7 +4337,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     listener's own ceiling is enforced. Irrelevant today (control frames are tiny) but the field
     is negotiated and then unused in one direction. **High confidence, low impact.**
   - `Hello.window`/`HelloAck.window` are negotiated and recorded but never honoured — documented
-    in `docs/known-gaps.md` as credit-based flow control being unbuilt. **Context, not a finding.**
+    in `docs/known-gaps/` as credit-based flow control being unbuilt. **Context, not a finding.**
 - **Existing coverage:** the in-file unit tests of `control.rs` (round trips including empty
   lists, at/over both caps, unknown field tag skipped, wrong message type, dispatch,
   `FLAG_CONTROL` framing);
@@ -4824,7 +4824,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     message, and non-ASCII text. No committed test pins it.
   - The 4 MiB `Limited` bounds the *compressed* body and `MAX_CONCURRENT_CONNECTIONS` bounds the
     multiplier; the JSON path's real multiple of that is explicitly unmeasured
-    (`docs/known-gaps.md`).
+    (`docs/known-gaps/`).
 - **Observed concerns (unverified):**
   - ~~Multi-frame gRPC request bodies are silently truncated to the first message (`handle_grpc`'s
     `grpc_unframe` call).~~ **fixed** (see the invariant above).
@@ -4850,8 +4850,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     `logit_proto::otlp::grpc`'s `inflate_bounded_rejects_one_byte_past_the_cap`, where `inflate`
     now lives as `inflate_bounded`.
   - Error responses on the OTLP/HTTP path are `text/plain` rather than a protobuf `Status` —
-    already recorded in `docs/known-gaps.md` as a pre-existing deviation. **Context.**
-  - `partial_success` is always empty on success — recorded in `docs/known-gaps.md`. **Context.**
+    already recorded in `docs/known-gaps/` as a pre-existing deviation. **Context.**
+  - `partial_success` is always empty on success — recorded in `docs/known-gaps/`. **Context.**
 - **Existing coverage:** `crates/logit-inputs/src/otlp.rs` (large in-file test suite; covers
   both transports, gzip, size limits, TLS, the idle/stall paths, JSON vs protobuf dispatch).
   [ADR `hand-rolled-grpc-over-hyper`](../adr/hand-rolled-grpc-over-hyper.md),
@@ -4932,10 +4932,10 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     That is the intended trade-off (better than losing the batch), but it means `idle_timeout` is
     not an upper bound on connection lifetime. **High confidence in the behavior; it is argued for
     in the comment, so this is a "confirm it's the intended contract" item.** **Holds** as the
-    contract: `docs/known-gaps.md` ("TLS and connection lifecycle") records that a handler blocked
+    contract: `docs/known-gaps/` ("TLS and connection lifecycle") records that a handler blocked
     forever in a send holds its connection and permit.
   - `otlp_in`'s accept loop (`OtlpInput::run` in `otlp.rs`) does not race shutdown at all, and connections hold
-    `Fanout` clones — already recorded in `docs/known-gaps.md` ("`otlp_in` can hold the graph open
+    `Fanout` clones — already recorded in `docs/known-gaps/` ("`otlp_in` can hold the graph open
     past shutdown"), narrowed but not closed by `idle_timeout`. **Context, documented.**
   - The `logit.input.connections` gauge decrement (`live_connections.fetch_sub` in
     `OtlpInput::run`'s spawned task) is a statement, not a guard —
@@ -5079,7 +5079,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
 - **Observed concerns (unverified):**
   - No cert/key hot reload on any listener or sink. For a long-lived collector with short-lived
     certs (ACME, SPIFFE) this is an operational cliff. I did not find it in
-    `docs/known-gaps.md`. **High confidence it is absent; medium confidence it should be a
+    `docs/known-gaps/`. **High confidence it is absent; medium confidence it should be a
     recorded gap.**
   - `apply_client_tls` (`inputs/tls.rs`) applies the client identity only when *both* `cert_file` and `key_file`
     are present; one without the other is silently ignored rather than an error (the comment
@@ -5152,9 +5152,9 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     by design, but worth stating.**
   - The scrape client follows redirects — `reqwest::Client::new()` in `PrometheusInput::new` keeps `reqwest`'s
     `limited(10)` default, unlike `crate::http::build_client` on the sink side. **Documented in
-    `docs/known-gaps.md` and ADR `prometheus-remote-write`'s Consequences; context, not new.**
+    `docs/known-gaps/` and ADR `prometheus-remote-write`'s Consequences; context, not new.**
   - `logit.input.samples` counts *series* here and *wire samples* in bind mode — a documented
-    gap ([`docs/known-gaps.md`](../known-gaps.md#prometheus)'s "`logit.input.samples` means two
+    gap ([`docs/known-gaps/prometheus.md`](../known-gaps/prometheus.md)'s "`logit.input.samples` means two
     different things depending on `prometheus_in`'s mode"). **Context.**
 - **Existing coverage:** in-file `crates/logit-inputs/src/prometheus.rs` scrape tests
   (`a_successful_text_scrape_decodes_series_and_reports_up_one` through
@@ -5339,7 +5339,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   seed not rebuilt on an identical re-declaration, the entry's own `Arc` preserved, and
   `a_request_before_the_watermark_does_not_sweep` (via the `#[cfg(test)] sweeps` counter on
   `MetadataCache`). ADR `prometheus-remote-write` ("The receiver is stateless; 1.0 typing waits for
-  a bounded metadata cache"); [`docs/known-gaps.md`](../known-gaps.md#prometheus).
+  a bounded metadata cache"); [`docs/known-gaps/prometheus.md`](../known-gaps/prometheus.md).
 - **Suggested verification approach:** a loom or plain-threads stress test hammering `seed`/`learn`
   from N threads with overlapping and disjoint family sets, asserting
   `families.len() <= max_families` and gauge agreement at quiescence; a test that seeds a family
@@ -5636,13 +5636,13 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
 **Things noticed outside this area that another surveyor should pick up.**
 1. **`logit-core`'s sketch deserializers are reached from untrusted bytes through this area.**
    `read_metric_kind` in `crates/logit-proto/src/native/record.rs` (`DdSketch::from_java_bytes` and
-   `HyperLogLog::from_bytes`) hands an attacker-controlled blob straight into `logit-core::metric`. `docs/known-gaps.md` already records
+   `HyperLogLog::from_bytes`) hands an attacker-controlled blob straight into `logit-core::metric`. `docs/known-gaps/` already records
    that `HyperLogLog::from_bytes` works around an upstream **undefined-behavior** allocation-layout
    bug in `cardinality-estimator` 1.0.3 that is "reachable through ordinary native `METRIC_SET`
    decoding". That makes `logit-core::metric`'s `HllBytesReader` a P0 for the `logit-core` surveyor,
    not a P2.
 2. **The process-global interner has no eviction and no budget**, and every decoded dictionary
-   entry, trailer string, and OTLP attribute key is interned into it permanently. `docs/known-gaps.md`
+   entry, trailer string, and OTLP attribute key is interned into it permanently. `docs/known-gaps/`
    discusses this for `otlp_in`/`json` cardinality; I did not find the native-path case named.
    Whoever surveys `logit-core::interner` should treat "a remote peer can grow it without bound"
    as in-scope.
@@ -5658,7 +5658,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
    sink-side attempt accounting does not reconcile with `logit-pipeline`'s `write_loop` view.
    Worth checking whether the other sinks have the same gap.
 5. **No TLS certificate reload anywhere** — every `ServerConfig`/`ClientConfig` is built once at
-   construction from files on disk. Not in `docs/known-gaps.md` as far as I could find; an operator
+   construction from files on disk. Not in `docs/known-gaps/` as far as I could find; an operator
    surveying `docs/deploying.md` should decide whether that belongs there.
 6. **No HTTP/2 concurrent-stream limit is set anywhere in `logit-inputs`** (grepped: no
    `max_concurrent_streams`). Both `otlp_in` (h2 and h2c) and `prometheus_in`'s remote-write
@@ -5733,14 +5733,14 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   - both final casts (`whole as i64`, `sub_nanos as i64`) saturate rather than wrap for a timestamp near/past `i64`'s range (documented as intentional/Rust `as` semantics; confirm no wrapping path was reintroduced)
   - non-finite metric *values* are rejected symmetrically in `push_datapoint`
 - **Observed concerns (unverified):** none spotted — behavior is deliberate and cross-referenced against carbon's real `MetricLineReceiver`/`TaggedSeries.parse` semantics in comments (e.g. `parse_tags` reproduces "last value wins" for duplicate tag keys to match CPython's `dict`-based parser). Low-confidence note: float-equality sentinel comparisons are a classic review flag; here it's textually justified, so likely fine but worth a verifier's explicit sign-off.
-- **Existing coverage:** `decode.rs` has a `#[cfg(test)] mod tests` (not read in full this pass). `crates/logit-proto/tests/robustness.rs` (`graphite_plaintext_survives_every_single_byte_truncation`, `graphite_plaintext_survives_seeded_bit_flips`: plaintext byte-truncation/bit-flip survival). `crates/logit-proto/tests/graphite_fixed_point.rs` round-trips including a large-timestamp fixed point (`a_large_timestamp_is_a_fixed_point`) and proptest generators. ADR `graphite-carbon-relay.md`; [`docs/known-gaps.md`](../known-gaps.md#cross-protocol-mappings)'s `encode (Graphite)` rows document the deliberate lossy cases (multi-value skip, Sum temporality drop, non-finite drop, no metadata channel, 255-byte path limit) — not surprises, accepted normalizations.
+- **Existing coverage:** `decode.rs` has a `#[cfg(test)] mod tests` (not read in full this pass). `crates/logit-proto/tests/robustness.rs` (`graphite_plaintext_survives_every_single_byte_truncation`, `graphite_plaintext_survives_seeded_bit_flips`: plaintext byte-truncation/bit-flip survival). `crates/logit-proto/tests/graphite_fixed_point.rs` round-trips including a large-timestamp fixed point (`a_large_timestamp_is_a_fixed_point`) and proptest generators. ADR `graphite-carbon-relay.md`; [`docs/known-gaps/mappings.md`](../known-gaps/mappings.md)'s `encode (Graphite)` rows document the deliberate lossy cases (multi-value skip, Sum temporality drop, non-finite drop, no metadata channel, 255-byte path limit) — not surprises, accepted normalizations.
 - **Suggested verification approach:** targeted code review of the timestamp split-arithmetic against a table of known-tricky `f64` values (sub-second fractions near precision boundaries, values near year-2038/2262 i64-nanosecond overflow); bias the existing proptest generators toward these boundary values.
 - **Priority:** P1 — untrusted input parsing with real edge-case density (float sentinels, precision-sensitive arithmetic, lossless-roundtrip claims), heavily tested already.
 
 ### CODEC-04 — Carbon plaintext/pickle encoder: tag sanitization, multi-value expansion, frame packing
 - **Location:** `crates/logit-proto/src/graphite/encode.rs` (`encode_record`, `multi`, `expand`); `encode.rs` (`Sink::emit`/`close_frame`/`payload_len` — pickle frame packing and the 4-byte length-prefix patch); `encode.rs` (`sanitize_into` and the three `is_forbidden_in_*` predicates); output glue `crates/logit-outputs/src/graphite.rs` (thin transport wrapper, no extra codec logic)
 - **What it does:** Renders `Event`/`MetricRecord`s back to carbon plaintext lines or pickle frames. Handles carbon's inability to represent multi-value metric kinds (`Samples`/`Distribution`/`Histogram`/`ExponentialHistogram`/`Summary`/`Set`/`SetMembers`) via `multi_value: skip|expand` — `skip` drops+counts, `expand` renders dotted sub-paths (`.count`, `.sum`, `.q0_5`, `.bucket_<b>`, etc.). Sanitizes path/tag bytes to carbon's allowed character set. Packs pickle datapoints into frames bounded by `max_frame_bytes`, patching a 4-byte big-endian length prefix in place once a frame closes (`payload_len() as u32` cast in `Sink::close_frame` — sound only because `max_frame_bytes` is graph-rule-capped to ≤16 MiB; verified against `crates/logit-pipeline/src/graph.rs`, `GRAPHITE_FRAME_BYTES_RANGE = 1024..=16*1024*1024`, rule 46).
-- **Why sensitive:** custom, data-loss (multi-value skip/expand is intentional and named — see known-gaps.md — but still a spot where a config choice or a future metric kind could silently lose data), lossless-roundtrip (frame-packing must keep `graphite_in -> graphite_out` byte-exact), hot-path.
+- **Why sensitive:** custom, data-loss (multi-value skip/expand is intentional and named — see known-gaps/ — but still a spot where a config choice or a future metric kind could silently lose data), lossless-roundtrip (frame-packing must keep `graphite_in -> graphite_out` byte-exact), hot-path.
 - **Invariants to verify:**
   - `payload_len() as u32` (in `Sink::close_frame`) can never truncate — depends entirely on the *external* graph-rule cap holding at every call site, not a local type-level guarantee; confirm no path constructs `GraphiteEncoder`/`Sink` bypassing graph validation
   - a pickle datapoint that can't fit an *empty* frame is dropped, never causes an infinite open/close loop (`Sink::emit`'s empty-frame fit check)
@@ -5750,7 +5750,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   - collision handling: two attributes whose *sanitized* names collide resolve deterministically (original-name sort order via `TagSlot.original`), not by interner/iteration order
   - `Value::Array` renders as its last element only, and this lossy path is counted (`tags_normalized_multi_value`)
 - **Observed concerns (unverified):** none at the code level; sanitization/collision logic reads as carefully reasoned. The `u32` cast in `Sink::close_frame` is sound only by an external invariant (graph validation) rather than a local `debug_assert!` — low-confidence maintainability gap: a future refactor constructing the encoder outside the config-validated path (a test helper, a new relay feature) could silently violate it.
-- **Existing coverage:** `crates/logit-proto/tests/graphite_fixed_point.rs` (round-trip, proptest, includes `a_sum_becomes_a_gauge_on_the_first_hop_and_is_then_a_fixed_point`, `tag_order_is_canonical_after_the_first_hop`); `crates/logit-bench/tests/allocations.rs` asserts exact allocation counts for a warm encode. ADR `graphite-carbon-relay.md`; `docs/known-gaps.md` "encode (Graphite)" rows enumerate every accepted lossy mapping.
+- **Existing coverage:** `crates/logit-proto/tests/graphite_fixed_point.rs` (round-trip, proptest, includes `a_sum_becomes_a_gauge_on_the_first_hop_and_is_then_a_fixed_point`, `tag_order_is_canonical_after_the_first_hop`); `crates/logit-bench/tests/allocations.rs` asserts exact allocation counts for a warm encode. ADR `graphite-carbon-relay.md`; `docs/known-gaps/` "encode (Graphite)" rows enumerate every accepted lossy mapping.
 - **Suggested verification approach:** code review of the `u32` cast's external-invariant dependency (consider a cheap `debug_assert!(payload_len <= u32::MAX as usize)` at the cast site); a proptest targeting attribute names crafted to collide post-sanitization (e.g. `"a.b"` and `"a!b"` both sanitizing to `"a_b"`) to confirm the tie-break is actually exercised.
 - **Priority:** P2 — mostly intentional, well-documented lossy behavior with strong round-trip coverage; the u32-cast external dependency and collision tie-break are worth a quick look but don't look actively broken.
 
@@ -5774,14 +5774,14 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 ### CODEC-06 — statsd/DogStatsD encoder — service-check status coercion and multi-value rendering
 - **Location:** `crates/logit-outputs/src/statsd.rs` (`render_service_check`, status coercion; `render_event`, event line rendering), module-wide `Samples`/`SetMembers` expansion (search `sketch()`/`raw`/`format: dogstatsd` in the same file)
 - **What it does:** The mirror of the statsd_in decoder — encodes `Event`/`MetricRecord`s back to statsd/DogStatsD wire lines, including `Sum`(delta,monotonic)/`Gauge`/`GaugeDelta`/`Samples`/`SetMembers`/events/service checks. `render_service_check` must produce a status in `0..=3`: it prefers an explicit `statsd.service_check.status` carrier if present and valid, else coerces the underlying Gauge's float value with `.round()` and a bounds check (`is_finite() && (0.0..=3.0).contains(&rounded)`) before the `rounded as u64` cast, dropping and counting otherwise.
-- **Why sensitive:** custom, lossless-roundtrip (ADR `statsd-output.md`'s round-trip claim: `statsd_in -> statsd_out` must be byte-identical modulo named normalizations), hot-path, data-loss (post-sketch kinds `Distribution`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary` and cumulative/non-monotonic `Sum` are deliberately dropped-and-counted per `docs/known-gaps.md` — confirmed documented gap, not a surprise).
+- **Why sensitive:** custom, lossless-roundtrip (ADR `statsd-output.md`'s round-trip claim: `statsd_in -> statsd_out` must be byte-identical modulo named normalizations), hot-path, data-loss (post-sketch kinds `Distribution`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary` and cumulative/non-monotonic `Sum` are deliberately dropped-and-counted per `docs/known-gaps/` — confirmed documented gap, not a surprise).
 - **Invariants to verify:**
   - the `rounded as u64` cast is only reached when `gauge_value.is_finite() && (0.0..=3.0).contains(&rounded)` — confirm this guard can't be bypassed by an intermediate NaN produced by `.round()` itself (NaN's `.round()` is NaN, which fails `is_finite()`, so this should hold, but worth an explicit test with `f64::NAN`/`f64::INFINITY`/`-0.0` as the carried gauge value)
   - a config-declared `statsd.service_check.status` carrier outside `0..=3` correctly falls through to the gauge-coercion path rather than being trusted (the `Some(s) if s <= 3 => s` arm)
   - the documented lossless round trip actually holds byte-for-byte for `format: dogstatsd` on timers/sets, and holds modulo the ADR's *named* normalizations only (multi-value line split, `h`/`d` -> `ms`) under `format: statsd`
-  - dropped post-sketch metric kinds are counted, not silently discarded (accounting invariant, per `docs/known-gaps.md`)
+  - dropped post-sketch metric kinds are counted, not silently discarded (accounting invariant, per `docs/known-gaps/`)
 - **Observed concerns (unverified):** none spotted — the status-coercion guard reads correct by inspection.
-- **Existing coverage:** `crates/logit-outputs/src/statsd.rs`'s extensive `#[cfg(test)] mod tests` (module has 5223 lines total, the bulk apparently tests). ADR `statsd-output.md` claims and documents the round-trip guarantee and its exceptions explicitly; `docs/known-gaps.md` names the dropped-kind list.
+- **Existing coverage:** `crates/logit-outputs/src/statsd.rs`'s extensive `#[cfg(test)] mod tests` (module has 5223 lines total, the bulk apparently tests). ADR `statsd-output.md` claims and documents the round-trip guarantee and its exceptions explicitly; `docs/known-gaps/` names the dropped-kind list.
 - **Suggested verification approach:** targeted unit tests feeding `f64::NAN`, `f64::INFINITY`, `f64::NEG_INFINITY`, `-0.0`, and values just outside `[0,3]` (e.g. `3.4999999`, `-0.0000001`) as the service-check gauge value; a differential round-trip test against a real DogStatsD-speaking client/agent if not already covered by an interop fixture.
 - **Priority:** P2 — well-guarded arithmetic, strong existing test file, documented (not surprising) lossy scope; no defect found.
 
@@ -5816,7 +5816,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 ### CODEC-09 — syslog encoder — structured-data escaping, header-field sanitization, and oversize/truncation handling
 - **Location:** `crates/logit-outputs/src/syslog.rs` (`encode_event`, `push_message_str`, `push_message_bytes`), `syslog.rs` (`resolve_facility`/`resolve_severity`/`write_rfc5424_header`/`write_rfc3164_header`/`sanitize_5424_field`/`sanitize_3164_token`/`is_valid_sd_name`), `syslog.rs` (`push_sd_escaped`, `write_structured_data`, `write_sd_element`, `write_sd_param`), `syslog.rs` (`sanitize_msg`/`sanitize_msg_bytes`/`truncate_on_char_boundary`/`truncate_bytes`/`frame_octet_counting`) — directly read line-by-line this pass (superseding a prior placeholder in this file that had not been).
 - **What it does:** The mirror of the syslog parser above — renders `Event`s back to RFC 3164/5424 wire lines over UDP/TCP/TLS. `resolve_facility`/`resolve_severity` reconstruct PRI from `syslog.facility`/`syslog.severity` attributes (each independently range-checked, `default_facility` clamped to `.min(23)` at construction, `SyslogEncoder::new`), so `pri = facility*8+severity` is arithmetically incapable of exceeding 191 or underflowing — the exact malformed shape the decoder rejects on ingest. Every header field (HOSTNAME/APP-NAME/PROCID/MSGID/TAG) is sanitized to `PRINTUSASCII` with a per-field byte cap (`sanitize_5424_field`/`sanitize_3164_token`, iterating `char`s but only ever pushing single-byte ASCII, so the `scratch.len() >= max_len` cap is exact, never off-by-a-multibyte-char). STRUCTURED-DATA (`write_structured_data`) sorts SD-IDs and PARAM-NAMEs by name bytes before writing (`AttrMap` iteration order is intern order, not wire order — sorting makes output a pure function of the data) and explicitly detects/avoids a collision between an origin's own `syslog.sd` element and the opt-in `structured_data` config block sharing an SD-ID (would otherwise emit a wire line the decoder's own duplicate-SD-ID rule would reject). Message bodies go through `sanitize_msg`/`sanitize_msg_bytes` (byte-level twin for non-UTF-8 `Value::Bytes`, avoiding lossy conversion) which neutralize `\n`/`\r`/NUL/other C0/DEL with backslash mnemonics — the framing-level defense (RFC 6587 octet-counting, `frame_octet_counting`) is a second, independent layer against the same message-forging class, not a redundant one. If the header alone exceeds `max_message_bytes` the whole message is dropped (counted `dropped_oversize_header`) rather than truncating a header field into something a receiver would misparse; the message body is truncated on a UTF-8 char boundary (`truncate_on_char_boundary`) or raw byte boundary (`truncate_bytes`) instead.
-- **Why sensitive:** custom, lossless-roundtrip (explicit ADR-level `syslog_in -> syslog_out` round-trip claim), data-loss (a field syslog's wire can carry but `Event` can't represent is tracked debt per AGENTS.md's "lossless-transit" rule; STRUCTURED-DATA's wire *order* for an interleaved repeated PARAM-NAME, e.g. `a b a`, is also normalized to grouped/sorted rather than preserved — documented in `docs/known-gaps.md`, not a surprise).
+- **Why sensitive:** custom, lossless-roundtrip (explicit ADR-level `syslog_in -> syslog_out` round-trip claim), data-loss (a field syslog's wire can carry but `Event` can't represent is tracked debt per AGENTS.md's "lossless-transit" rule; STRUCTURED-DATA's wire *order* for an interleaved repeated PARAM-NAME, e.g. `a b a`, is also normalized to grouped/sorted rather than preserved — documented in `docs/known-gaps/`, not a surprise).
 - **Invariants to verify:**
   - `push_sd_escaped` is the exact inverse of the decoder's `parse_param_value` unescaping: it escapes `"`/`\`/`]` per RFC 5424 §6.3.3, *and additionally* pre-converts `\n`/`\r`/NUL/other-C0/DEL to `sanitize_msg`'s own two-character mnemonics before that escaping pass runs — so a literal newline becomes the three wire bytes `\`,`\`,`n` (verified: Rust source `"\\\\n"` is literally backslash-backslash-n), which the decoder's `\\` rule folds back into two-character text `\n`, never a real newline; confirm this two-step composition is exactly symmetric with the decoder for every one of the 4 special mnemonic cases plus the generic `\xNN` case.
   - `push_message_str`/`push_message_bytes`'s budget arithmetic (`self.max_message_bytes - self.line.len()` after `self.line.push(' ')`, in both functions) can never underflow: the preceding `if self.line.len() >= self.max_message_bytes` branch (in each) already returned before the push, so post-push `line.len() <= max_message_bytes` always holds — re-derive this by hand rather than trusting the read, since it's a subtraction one line after a mutation.
@@ -5824,7 +5824,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   - `sanitize_5424_field`/`sanitize_3164_token`'s `scratch.len() >= max_len` cap (checked before each push, not after) always yields `scratch.len() <= max_len` exactly, since every pushed `char` is guaranteed single-byte (either already `PRINTUSASCII`-range ASCII, or replaced with `_`) — confirm no future edit could push a multi-byte replacement character and silently break the byte-length contract the RFC caps depend on.
   - `civil_time_of`'s Hinnant civil-from-days arithmetic and `MONTH_ABBR[(month as usize - 1).min(11)]` indexing (in `push_rfc3164_timestamp`) can't underflow/panic for any `i64` nanosecond value reachable from `event.timestamp` — checked by hand this pass: since nanosecond-`i64` inherently bounds the representable date range to roughly ±292 years, `days` stays small in magnitude regardless of how extreme the input `i64` is, so `month` is always computed in `1..=12` and the `usize` subtraction never underflows; worth a proptest over `i64::MIN`/`i64::MAX`/near-boundary values to confirm rather than rely on this hand-derivation, especially given the sibling OTLP decoder bug (this file's own entry below) can hand this encoder a corrupted-but-still-in-range `i64` timestamp.
 - **Observed concerns (unverified):** none found at high confidence after a direct line-by-line read of every function listed above — the code is as carefully guarded and as thoroughly self-documented (each function's doc comment cross-references the decoder's matching behavior and the module's own "Injection safety"/"Sizing"/"STRUCTURED-DATA" sections) as every other codec in this survey. One low-confidence note: `write_rfc5424_header`'s numeric-PID rendering (`Pid::U64`) writes the value via `{p}` with no length cap, unlike the `Pid::Str` arm which routes through `push_5424_field`'s 128-byte cap — not a real bug (`u64::MAX` is 20 ASCII digits, far under any RFC 5424 PROCID-length concern), but it is an asymmetry between the two `Pid` arms worth a verifier's explicit note rather than silent parity assumption.
-- **Existing coverage:** `crates/logit-outputs/src/syslog.rs`'s extensive `#[cfg(test)]` module (3962 lines total in the file) with dedicated tests for exactly the edge cases above: `an_embedded_newline_cannot_forge_a_second_message`, `embedded_carriage_return_and_nul_are_escaped`, `a_literal_backslash_passes_through_unescaped_so_json_bodies_stay_valid`, `a_hostname_with_space_and_non_ascii_is_sanitized`, `an_app_name_longer_than_48_bytes_is_truncated`, `an_oversize_message_is_truncated_on_a_char_boundary_not_the_header`, `an_oversize_header_drops_the_message_entirely`, `max_message_bytes_exactly_at_the_header_length_never_overflows_the_cap`, `frame_octet_counting_prefixes_each_message_with_its_exact_byte_length`, `sd_param_value_escapes_quote_backslash_and_close_bracket`, `two_sd_elements_concatenate_with_no_separator`. No dedicated fuzz/robustness-harness section (consistent with this survey's repo-wide finding that `robustness.rs` doesn't cover syslog at all, decoder or encoder). ADR `syslog-output.md`, `syslog-tcp-ingress-and-tls.md`; `docs/known-gaps.md`'s residual-debt list names the timestamp-precedence and SD-order-normalization gaps explicitly.
+- **Existing coverage:** `crates/logit-outputs/src/syslog.rs`'s extensive `#[cfg(test)]` module (3962 lines total in the file) with dedicated tests for exactly the edge cases above: `an_embedded_newline_cannot_forge_a_second_message`, `embedded_carriage_return_and_nul_are_escaped`, `a_literal_backslash_passes_through_unescaped_so_json_bodies_stay_valid`, `a_hostname_with_space_and_non_ascii_is_sanitized`, `an_app_name_longer_than_48_bytes_is_truncated`, `an_oversize_message_is_truncated_on_a_char_boundary_not_the_header`, `an_oversize_header_drops_the_message_entirely`, `max_message_bytes_exactly_at_the_header_length_never_overflows_the_cap`, `frame_octet_counting_prefixes_each_message_with_its_exact_byte_length`, `sd_param_value_escapes_quote_backslash_and_close_bracket`, `two_sd_elements_concatenate_with_no_separator`. No dedicated fuzz/robustness-harness section (consistent with this survey's repo-wide finding that `robustness.rs` doesn't cover syslog at all, decoder or encoder). ADR `syslog-output.md`, `syslog-tcp-ingress-and-tls.md`; `docs/known-gaps/`'s residual-debt list names the timestamp-precedence and SD-order-normalization gaps explicitly.
 - **Suggested verification approach:** a differential round-trip proptest (`syslog_in -> syslog_out` byte-for-byte modulo the two named normalizations) generating adversarial structured-data param values (mixed control characters, backslashes, embedded quotes) and header fields (non-ASCII, embedded `:`/`[`/`]`); a targeted unit test constructing an `i64` timestamp at/near `i64::MIN`/`i64::MAX` fed through `civil_time_of` to empirically confirm the no-panic claim above rather than rely on hand-derivation; confirmation against a real syslog-ng/rsyslog or Loki/Alloy receiver for structured-data escaping specifically (the module doc already records one real interop bug found and fixed this way — the RFC 5424 §6.4 BOM, per the comment in `encode_event` — showing this class of differential check has already paid off once here).
 - **Priority:** P2 — directly read line-by-line this pass and found to be as carefully guarded as its decoder sibling (P1), with strong existing example-based test coverage and a documented history of catching at least one real interop bug (the BOM) through exactly the kind of differential testing recommended above; downgraded from the prior placeholder's provisional P1 now that the code has actually been verified rather than assumed risky by file role alone.
 
@@ -5926,7 +5926,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **What it does:** OTLP's `AnyValue` protobuf message is recursive by design (a value can itself be an array or map of more `AnyValue`s). This hand-written JSON decoder — chosen over a `pbjson`-generated one specifically because OTLP's JSON deviates from proto3 JSON's bytes-as-base64 rule for trace/span ids (ADR `otlp-json-decoding`) — mirrors that recursive shape as ordinary Rust function-call recursion: `any_value` calls itself once per array element and once per kvlist entry, for every level of nesting a sender's JSON declares, with **no explicit depth counter or cap anywhere in this file**.
 - **Why sensitive:** untrusted-input (an `otlp_in` HTTP/JSON request body from any network sender, potentially unauthenticated), custom (hand-rolled per ADR, not generated), recursion (the exact "recursion depth" risk category this survey's brief calls out by name), and — the key comparison point — this codebase demonstrably already treats exactly this bug class as serious elsewhere: `crates/logit-proto/tests/robustness.rs` has a dedicated `decode_batch_rejects_value_nesting_past_the_depth_cap` test for the native wire format's recursive `Value::Array`/`Value::Map`, and `graphite::pickle` enforces `MAX_PICKLE_DEPTH` on open `MARK`s for the identical reason — both exist specifically to stop a crafted, deeply-nested payload from stack-overflowing the process. `any_value` has no analogous cap of its own.
 - **Invariants to verify:**
-  - whether `serde_json::from_slice::<serde_json::Value>` (the very first parse, before `any_value` ever runs) has built-in recursion-depth protection that transitively bounds how deep the resulting `Value` tree — and therefore `any_value`'s own recursion over it — can ever be. `serde_json` is understood (and [`docs/known-gaps.md`](../known-gaps.md#http-access-logs-nginx-haproxy-and-http_access)'s own unrelated HAProxy CBOR entry independently states the same belief: "`json`'s `serde_json`-based [reader] inherits [a recursion bound] for free") to enforce a default recursion limit; this survey confirmed no `unbounded_depth`/`disable_recursion_limit` feature is enabled anywhere in the workspace's `Cargo.toml` files, which is consistent with that protection being intact — **but this was reasoned about, not empirically reproduced with an actual deeply-nested payload against a running `otlp_in` listener**, and is exactly the kind of assumption a verification session should confirm by construction rather than inherit on faith.
+  - whether `serde_json::from_slice::<serde_json::Value>` (the very first parse, before `any_value` ever runs) has built-in recursion-depth protection that transitively bounds how deep the resulting `Value` tree — and therefore `any_value`'s own recursion over it — can ever be. `serde_json` is understood (and [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md#http-access-logs-nginx-haproxy-and-http_access)'s own unrelated HAProxy CBOR entry independently states the same belief: "`json`'s `serde_json`-based [reader] inherits [a recursion bound] for free") to enforce a default recursion limit; this survey confirmed no `unbounded_depth`/`disable_recursion_limit` feature is enabled anywhere in the workspace's `Cargo.toml` files, which is consistent with that protection being intact — **but this was reasoned about, not empirically reproduced with an actual deeply-nested payload against a running `otlp_in` listener**, and is exactly the kind of assumption a verification session should confirm by construction rather than inherit on faith.
   - if the `serde_json` limit does hold, what depth it actually permits (commonly cited as ~128) and whether that's small enough to guarantee no stack overflow regardless of available stack size, or merely small enough in practice today.
   - whether the equivalent *protobuf*-path `AnyValue` decoding (`crates/logit-proto/src/otlp/common.rs`, not read in depth in this pass) has the same recursive shape with no depth cap — `prost`'s own generated decode may or may not impose a limit independently of anything in this crate; if it doesn't, the protobuf path could be exposed even if the JSON path is protected by `serde_json`'s limit, since the two paths are decoded by entirely different code.
   - `hex_bytes`/`hex_decode`, read alongside this entry: correctly rejects odd-length hex, non-hex-digit bytes, and any length not exactly matching `expected_len` (16 for trace ids, 8 for span ids), with no out-of-bounds indexing (`hex_decode`'s `bytes[i+1]` access is safe because the odd-length check precedes it and the loop advances by exactly 2) — a clean contrast case showing this file's *other* logic is carefully bounds-checked, which sharpens rather than dulls the concern about the one recursive function having no analogous cap.
@@ -5951,7 +5951,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   `otlp_nesting_stays_under_the_native_depth_cap`), so a dependency bump that moves either fails
   a test. `otlp/common.rs`'s module doc records the rule. The same section's
   `otlp_json_peak_memory_per_input_byte_is_documented` pins OTLP/JSON's peak heap per input byte
-  (about 19 ordinary, 98 crafted; `docs/known-gaps.md`'s OTLP section).
+  (about 19 ordinary, 98 crafted; `docs/known-gaps/`'s OTLP section).
 
 ### CODEC-17 — OTLP decode — unguarded `u64 as i64` timestamp cast on every wire timestamp field (logs/traces/metrics)
 - **Location:** `crates/logit-proto/src/otlp/logs.rs` (`decode_log_record`'s `time_unix_nano`/`observed_time_unix_nano`, including the `observed_timestamp` field it sets); `crates/logit-proto/src/otlp/traces.rs` (`decode_span`'s `start_time_unix_nano`/`end_time_unix_nano`); `crates/logit-proto/src/otlp/metrics.rs` (`decode_exemplar` and every data-point branch of `decode_metric`: `time_unix_nano`/`start_time_unix_nano`)
@@ -5962,8 +5962,8 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   - check every other `as i64` timestamp-cast site enumerated above for the same gap — this is not one isolated line, it's the same pattern repeated across logs/traces/metrics with no shared helper, so a partial fix (e.g. only in `logs.rs`) would leave the others silently vulnerable.
   - compare against `crates/logit-inputs/src/syslog.rs`'s `parse_5424`'s explicit `TimestampError::OutOfRange` handling (this survey's syslog entry above) — that code path already recognizes exactly this failure mode for RFC 5424 TIMESTAMPs and responds with "omit the field, throttled diagnostic, keep the rest of the record" rather than a silent wraparound; the OTLP path has no equivalent.
   - confirm whether any *downstream* consumer (e.g. `aggregate`'s window bucketing, `influxdb_out`'s point timestamp) would itself panic, misbehave, or silently reorder data given a wildly out-of-range negative timestamp reaching it — i.e. whether the blast radius is "one event has a wrong timestamp" or something wider (e.g. a window keyed on timestamp behaving pathologically for one poisoned event mixed with normal ones).
-- **Observed concerns (unverified -> now verified as a real gap):** this is not a hypothetical — it was directly confirmed by reading `decode_log_record` (`if record.time_unix_nano != 0 { record.time_unix_nano as i64 } else { ... }` with no bounds check), and the equivalent pattern repeats verbatim in `traces.rs` and `metrics.rs`. Confidence: high that the cast is unguarded as read; moderate on real-world exploitability/severity, since it requires an attacker or misbehaving sender to emit a timestamp value that is already nonsensical (>287 years in the future) for it to trigger, and the consequence is a wrong timestamp on one event rather than a crash or unbounded resource use. Checked `docs/known-gaps.md` for an existing acknowledgment of this specific gap — found none; the file does document the *general* principle that receipt-time vs. sender-time handling needs care (syslog's, elsewhere), but nothing calling out OTLP's timestamp casts by name.
-- **Existing coverage:** `crates/logit-proto/src/otlp/logs.rs`, `traces.rs`, and `metrics.rs` each have a `mod tests`; these unit tests exist but (based on the test names visible via grep — `unwrap()`-heavy round-trip assertions) appear focused on the normal-range/round-trip cases, not adversarial out-of-range timestamps; no test constructing a `time_unix_nano` >= `i64::MAX` was found. `crates/logit-proto/tests/otlp_fixed_point.rs` likely covers round-trip fixed points for realistic values only (not independently re-read for this specific edge case). No `robustness.rs` coverage for OTLP at all (that file's own module doc doesn't name it). Governed by ADR `otlp-json-decoding`, `docs/design/data-model.md`; `docs/known-gaps.md`'s timestamp-precedence entries address a related-but-distinct concern (receipt vs. sender time) and do not cover this.
+- **Observed concerns (unverified -> now verified as a real gap):** this is not a hypothetical — it was directly confirmed by reading `decode_log_record` (`if record.time_unix_nano != 0 { record.time_unix_nano as i64 } else { ... }` with no bounds check), and the equivalent pattern repeats verbatim in `traces.rs` and `metrics.rs`. Confidence: high that the cast is unguarded as read; moderate on real-world exploitability/severity, since it requires an attacker or misbehaving sender to emit a timestamp value that is already nonsensical (>287 years in the future) for it to trigger, and the consequence is a wrong timestamp on one event rather than a crash or unbounded resource use. Checked `docs/known-gaps/` for an existing acknowledgment of this specific gap — found none; the file does document the *general* principle that receipt-time vs. sender-time handling needs care (syslog's, elsewhere), but nothing calling out OTLP's timestamp casts by name.
+- **Existing coverage:** `crates/logit-proto/src/otlp/logs.rs`, `traces.rs`, and `metrics.rs` each have a `mod tests`; these unit tests exist but (based on the test names visible via grep — `unwrap()`-heavy round-trip assertions) appear focused on the normal-range/round-trip cases, not adversarial out-of-range timestamps; no test constructing a `time_unix_nano` >= `i64::MAX` was found. `crates/logit-proto/tests/otlp_fixed_point.rs` likely covers round-trip fixed points for realistic values only (not independently re-read for this specific edge case). No `robustness.rs` coverage for OTLP at all (that file's own module doc doesn't name it). Governed by ADR `otlp-json-decoding`, `docs/design/data-model.md`; `docs/known-gaps/`'s timestamp-precedence entries address a related-but-distinct concern (receipt vs. sender time) and do not cover this.
 - **Suggested verification approach:** a unit test per file (logs/traces/metrics) constructing a wire message with `time_unix_nano = u64::MAX` (and `i64::MAX + 1` exactly, the boundary) and asserting the decoded `Event`'s timestamp is *not* silently negative — then decide and implement the actual desired behavior (reject the record, clamp to `i64::MAX`, or omit the field with a diagnostic, mirroring syslog's `OutOfRange` handling) and apply it uniformly across all enumerated call sites, ideally through one shared helper (`fn wire_time_to_nanos(u64) -> Option<i64>` or similar) rather than three independently-repeated bare casts.
 - **Priority:** ~~P1 — genuine, verified, previously-unflagged silent-data-corruption bug reachable from fully untrusted network input (OTLP/HTTP and OTLP/gRPC both accept arbitrary `fixed64` timestamps), inconsistent with the project's own established, more careful handling of the identical failure mode elsewhere (syslog); not P0 only because the trigger condition (a timestamp implying a date past 2262) is unusual enough that it's far more likely to surface from a buggy sender's garbage value than a deliberate attack, and the consequence is corrupted metadata on affected records rather than a crash or resource exhaustion.~~ **fixed in #366; stays P1 as the record of what it was.**
 - **Verified 2026-09-25** (#366, at `dc39d1c`): **fixed: all 17 decode sites
@@ -5986,7 +5986,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Repeated hand-rolled pattern worth tracking as one item, not many:** the raw-pointer-subtraction `slice_of` "reconstruct a zero-copy `Bytes` from a `&str`/byte-slice" trick appears near-identically in `statsd.rs`, `syslog.rs`, and `graphite/decode.rs` (each with its own independent implementation). It's sound today (every caller only ever slices a substring that was itself validated out of the original `Bytes`), but it's a single conceptual invariant spread across three files with no shared helper enforcing it — a future refactor in any one of them (e.g. introducing an owned/copied substring by mistake) would silently produce unsound pointer arithmetic with no compiler error. Worth one shared, tested utility rather than three independently-trusted copies, or at minimum one cross-file test that would catch a violation.
 - **collectd was independently read line-by-line in this pass** (superseding an earlier placeholder from a concurrent pass of this same file) and found to be **exceptionally well-guarded**, with dedicated robustness/fuzz coverage (truncation, bit-flip, and a hostile-count allocation-DoS regression test) matching or exceeding graphite's. Prometheus, OTLP, and InfluxDB/msgbuf entries below are likewise freshly read, not placeholders.
 - **Neither statsd nor syslog has a `crates/logit-proto/tests/robustness.rs` section** (confirmed by direct grep: only `native`, `control`, `graphite`, and (as of this pass) implicitly `collectd`-adjacent decoders are exercised there) — this is a genuine, real coverage gap for exactly the two protocols with the most attacker-facing custom parsing surface (DogStatsD's length-prefixed event grammar, syslog's STRUCTURED-DATA parser), not a false alarm. This is this survey's single strongest concrete recommendation: port `robustness.rs`'s truncation/bit-flip/hostile-length-counter harness to `StatsdDecoder`/`SyslogDecoder` before anything else in this list. Prometheus (text/OpenMetrics and remote-write) has no `robustness.rs` section either, per that entry's own grep — the harness's coverage stops at `native`/`control`/`graphite`/`collectd`, i.e. exactly the two oldest wire codecs plus the native format; every codec added since (statsd having predated the harness, syslog, prometheus, otlp) has none. This is a broader, repo-wide gap than any single codec entry captures on its own.
-- **Two genuinely new, previously-undocumented findings surfaced in this pass, both in OTLP:** (1) `any_value`'s JSON-decode recursion (`any_value` in `crates/logit-proto/src/otlp/json/mod.rs`) has no *local* depth bound, unlike the native wire format's `decode_batch` and graphite's `pickle` reader, both of which cap recursion/nesting explicitly — this one relies entirely on `serde_json`'s implicit limit as an unverified backstop, and is a live, provisional P0 pending a one-hour empirical check (send a deeply nested payload, see if it crashes); (2) every OTLP timestamp field's `u64 -> i64` decode cast (`logs.rs`/`metrics.rs`/`traces.rs`, ten-plus call sites) silently wraps to a negative timestamp for any wire value `>= 2^63`, with the *encode* side's `.max(0)` guard confirming the decode side's missing symmetric guard is an asymmetry rather than an intentional design (P1 — silent corruption, not a crash). Neither is in `docs/known-gaps.md`. Both are worth a follow-up session's first attention precisely because they're concrete and testable in under an hour each, unlike most of this survey's "reads fine, wants more fuzzing" findings.
+- **Two genuinely new, previously-undocumented findings surfaced in this pass, both in OTLP:** (1) `any_value`'s JSON-decode recursion (`any_value` in `crates/logit-proto/src/otlp/json/mod.rs`) has no *local* depth bound, unlike the native wire format's `decode_batch` and graphite's `pickle` reader, both of which cap recursion/nesting explicitly — this one relies entirely on `serde_json`'s implicit limit as an unverified backstop, and is a live, provisional P0 pending a one-hour empirical check (send a deeply nested payload, see if it crashes); (2) every OTLP timestamp field's `u64 -> i64` decode cast (`logs.rs`/`metrics.rs`/`traces.rs`, ten-plus call sites) silently wraps to a negative timestamp for any wire value `>= 2^63`, with the *encode* side's `.max(0)` guard confirming the decode side's missing symmetric guard is an asymmetry rather than an intentional design (P1 — silent corruption, not a crash). Neither is in `docs/known-gaps/`. Both are worth a follow-up session's first attention precisely because they're concrete and testable in under an hour each, unlike most of this survey's "reads fine, wants more fuzzing" findings.
 
 
 ---
@@ -6018,7 +6018,7 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Observed concerns (unverified):**
   - `interner::resolve` panicking plus `Symbol: Copy` means the documented retrofit cost is real; nothing enforces the "symbols are eternal" premise at a type level. Medium confidence this is exactly as documented, not worse.
   - Sorted-`Symbol` iteration order being insertion-order-dependent is stated as "deterministic" in `AttrMap::iter`'s doc comment (`crates/logit-core/src/attrs.rs`); it is deterministic *within* a process run but not across two processes that interned in different orders. Worth confirming no codec's fixed-point property (lossless-transit) depends on it. Medium confidence this is fine (codecs sort by name), but it is not argued anywhere I found.
-- **Existing coverage:** `crates/logit-core/src/interner.rs`'s `tests` module (5 unit tests, all `KeyCache`-focused); `crates/logit-core/tests/type_sizes.rs` (`symbol_is_a_niche_optimized_u32`). Governed by `docs/design/memory.md` §4 and [`docs/known-gaps.md`](../known-gaps.md#event-model-and-interner) ("The attribute/metric-name interner never frees" — documented, accepted, not a surprise).
+- **Existing coverage:** `crates/logit-core/src/interner.rs`'s `tests` module (5 unit tests, all `KeyCache`-focused); `crates/logit-core/tests/type_sizes.rs` (`symbol_is_a_niche_optimized_u32`). Governed by `docs/design/memory.md` §4 and [`docs/known-gaps/runtime.md`](../known-gaps/runtime.md#event-model-and-interner) ("The attribute/metric-name interner never frees" — documented, accepted, not a surprise).
 - **Suggested verification approach:** targeted review of every `resolve` call site for a symbol that could have come from outside this process; a long-run soak (`json`/`otlp_in` against high-key-cardinality input) watching `interner::len()` and RSS; a contention microbench of `intern` across N worker threads.
 - **Priority:** P1 — documented and accepted gap, but it is global mutable state on the hottest path and the panic-on-unknown-symbol contract is load-bearing.
 
@@ -6089,7 +6089,7 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Observed concerns (unverified):**
   - The `merge` panic above. High confidence the reasoning in `DdSketch::merge`'s doc comment ("the mismatched-config failure case can't-actually-happen") does **not** account for the `from_java_bytes` decode path; medium-to-high confidence it is genuinely reachable, contingent on what the upstream decoder does with the config. This is the single most actionable item in this area.
   - `DdSketch::from_java_bytes`'s doc says it "Fails only on a genuinely malformed blob" — it says nothing about a well-formed blob with a non-default config, which is exactly the gap.
-- **Existing coverage:** `crates/logit-core/src/metric.rs`'s `tests` module (the `add_weighted_*` and `ddsketch_*` tests) — `add_weighted` × {1, large, 0}, the relative-error-bound test, `sum` exactness across merge and across a java-bytes round trip, and the `PartialEq`-via-bytes test. No test constructs a non-default-config blob. Governed by `docs/design/data-model.md` ("metric kinds must stay mergeable"), `docs/adr/aggregation-window-semantics.md`, [`docs/known-gaps.md`](../known-gaps.md#statsd) ("Sample-rate extrapolation").
+- **Existing coverage:** `crates/logit-core/src/metric.rs`'s `tests` module (the `add_weighted_*` and `ddsketch_*` tests) — `add_weighted` × {1, large, 0}, the relative-error-bound test, `sum` exactness across merge and across a java-bytes round trip, and the `PartialEq`-via-bytes test. No test constructs a non-default-config blob. Governed by `docs/design/data-model.md` ("metric kinds must stay mergeable"), `docs/adr/aggregation-window-semantics.md`, [`docs/known-gaps/statsd.md`](../known-gaps/statsd.md) ("Sample-rate extrapolation").
 - **Suggested verification approach:** read the pinned `sketches-ddsketch` 0.4 source for `from_java_bytes`/`merge`/`Config`; if the config round-trips, write a test that decodes a foreign-config blob and merges it, then change `merge` to return a `Result` (or force a re-sketch on decode). Separately, proptest merge associativity/commutativity and the error bound.
 - **Priority:** **P0** — a reachable panic on the main data path from peer-supplied bytes, in custom glue whose safety argument has a hole.
 - **Stale (2026-09-25):** `f680bd06` replaced the `sketches_ddsketch` wrapper with the hand-rolled
@@ -6111,7 +6111,7 @@ the telemetry buffers are `std::collections::HashMap`.
   outside `1..=AGENT_INF_KEY` are now malformed (`an_agent_key_outside_the_int16_range_is_malformed`).
   `datadog_out` also drops, counted, a sketch past `MAX_DOGSKETCH_ENTRIES` instead of expanding
   large counts into unbounded `k`/`n` entries. A decoded summary stays trusted, recorded in
-  `docs/known-gaps.md`.
+  `docs/known-gaps/`.
 
 ---
 
@@ -6130,7 +6130,7 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Observed concerns (unverified):**
   - The hand-mirrored `pub(crate)` constants and the assumption about serde's allocation strategy are two independent silent-breakage vectors on a dependency bump; only the first has a guard test. Medium confidence this is the weakest link.
   - `PartialEq` is insertion-order-dependent (stated in `HyperLogLog`'s `PartialEq` doc) — documented, but if any equality assertion outside this module compares HLLs built in different orders it will be flaky. Low confidence anything does.
-- **Existing coverage:** `crates/logit-core/src/metric.rs`'s `tests` module (the `hyperloglog_*` tests and `hll_slice_len_matches_upstream_constant`) — empty estimate, accuracy on 1k distinct members, merge-is-union, byte round trips, truncated input, independently-decoded byte identity, fixed point for every representation, bad representation tags, non-power-of-two member counts (the UB pinning test), over-max array count, HLL count off-by-one, and `hll_slice_len_matches_upstream_constant`. Documented in [`docs/known-gaps.md`](../known-gaps.md#event-model-and-interner).
+- **Existing coverage:** `crates/logit-core/src/metric.rs`'s `tests` module (the `hyperloglog_*` tests and `hll_slice_len_matches_upstream_constant`) — empty estimate, accuracy on 1k distinct members, merge-is-union, byte round trips, truncated input, independently-decoded byte identity, fixed point for every representation, bad representation tags, non-power-of-two member counts (the UB pinning test), over-max array count, HLL count off-by-one, and `hll_slice_len_matches_upstream_constant`. Documented in [`docs/known-gaps/runtime.md`](../known-gaps/runtime.md#event-model-and-interner).
 - **Suggested verification approach:** **run the HLL tests under Miri and ASan specifically** (this is the one place in the area where UB is the documented failure mode); fuzz `from_bytes` with arbitrary bytes; proptest merge as a set-union law; add a guard test that pins serde's `with_capacity`-from-`size_hint` behaviour if one can be written.
 - **Priority:** **P0** — untrusted bytes feeding a codec whose stated purpose is preventing UB in a dependency, with version-pinned constants mirrored by hand.
 - **Verified 2026-09-25** (#369): the size hint is the rounded capacity, a
@@ -6158,7 +6158,7 @@ the telemetry buffers are `std::collections::HashMap`.
   - `SAMPLES_INLINE = 19` still keeps `size_of::<MetricKind>() == 176` (pinned).
   - The `MAX_WEIGHT` clamp is applied consistently with `crates/logit-inputs/src/statsd.rs`'s own `MAX_SAMPLE_WEIGHT` (the doc says W3 folded one into the other — confirm there is now one constant, not two).
 - **Observed concerns (unverified):** none spotted; the NaN reasoning is explicit and tested.
-- **Existing coverage:** `crates/logit-core/src/metric.rs`'s `tests` module (`samples_new_defaults_sample_rate_to_one`, `samples_weight_is_never_zero_and_is_clamped`, `sketch_of_a_nan_rate_samples_still_counts_every_value`, `sketch_weights_values_by_sample_rate`); `crates/logit-core/tests/type_sizes.rs` (`samples_inline_is_the_measured_constant`). Governed by [`docs/known-gaps.md`](../known-gaps.md#statsd) ("Sample-rate extrapolation"), `docs/adr/lossless-transit.md`.
+- **Existing coverage:** `crates/logit-core/src/metric.rs`'s `tests` module (`samples_new_defaults_sample_rate_to_one`, `samples_weight_is_never_zero_and_is_clamped`, `sketch_of_a_nan_rate_samples_still_counts_every_value`, `sketch_weights_values_by_sample_rate`); `crates/logit-core/tests/type_sizes.rs` (`samples_inline_is_the_measured_constant`). Governed by [`docs/known-gaps/statsd.md`](../known-gaps/statsd.md) ("Sample-rate extrapolation"), `docs/adr/lossless-transit.md`.
 - **Suggested verification approach:** proptest `weight()` over arbitrary `f64` bit patterns.
 - **Priority:** P1 — numeric edge handling on untrusted input, well argued and tested but easy to regress.
 - **Verification (agg/w2):** `metric.rs`'s properties check `weight()` in `[1, MAX_WEIGHT]` over
@@ -6224,7 +6224,7 @@ the telemetry buffers are `std::collections::HashMap`.
   - `Timer`/`SpanGuard` recording on `Drop` at a cancelled `.await` (documented in `Timer`'s doc comment) doesn't corrupt any counter that must reconcile — only distribution shape.
   - A disabled or unsampled guard allocates nothing and reads no clock (the early `SpanGuard::disabled()` returns in `Telemetry::span`).
 - **Observed concerns (unverified):** none spotted. The 53-bit choice, the NaN arm and the monotonic-end derivation are each argued in-file with a test.
-- **Existing coverage:** `crates/logit-core/src/telemetry.rs`'s `tests` module, including `a_wall_clock_moving_backward_between_start_and_finish_cannot_make_end_precede_start` and the `CLOCK_OVERRIDE` machinery. Governed by `docs/adr/internal-span-emission-and-deterministic-sampling.md`, `docs/design/internal-telemetry.md` ("Spans"). Open items tracked in [`docs/known-gaps.md`](../known-gaps.md#internal-telemetry-and-self-logging) (listener span window is `send`-only; Lua `flush()` gets a link-less root) — documented, not surprises.
+- **Existing coverage:** `crates/logit-core/src/telemetry.rs`'s `tests` module, including `a_wall_clock_moving_backward_between_start_and_finish_cannot_make_end_precede_start` and the `CLOCK_OVERRIDE` machinery. Governed by `docs/adr/internal-span-emission-and-deterministic-sampling.md`, `docs/design/internal-telemetry.md` ("Spans"). Open items tracked in [`docs/known-gaps/telemetry.md`](../known-gaps/telemetry.md#internal-telemetry-and-self-logging) (listener span window is `send`-only; Lua `flush()` gets a link-less root) — documented, not surprises.
 - **Suggested verification approach:** statistical test of `trace_is_sampled` over many random ids at several rates; property test that two independently-constructed registries agree on every id.
 - **Priority:** P1 — custom numeric sampling whose whole value is cross-process agreement.
 
@@ -6304,9 +6304,9 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Why sensitive:** unsafe/ffi (the whole Rust↔LuaJIT boundary; `PhantomData<*const ()>` is the only thing enforcing one-VM-per-worker), untrusted-input (the script is operator-supplied but arbitrary), script-triggered unbounded work, concurrency (the `!Send` marker is a hard constraint from the VM, per `AGENTS.md`).
 - **Invariants to verify:**
   - **The sandbox is actually closed.** `loadfile`/`dofile` were reachable despite `StdLib::TABLE|STRING|MATH` (reproduced in review; recorded in `remove_unsandboxed_base_globals`'s doc comment). Re-audit the full `_G` of a constructed worker for anything else that reaches the host: `os`, `io`, `debug`, `require`, `package`, `collectgarbage`, `newproxy`, `rawset`/`rawget` on protected tables, and LuaJIT's `ffi`/`jit`/`bit` in particular. ~~Confirm `ffi` is genuinely absent, not merely not-requested.~~ **Closed, one finding fixed (#388):** `the_global_table_is_exactly_the_allowlist` builds a worker as `run_lua` does and compares the whole of `_G`, read with raw `pairs`, against a sorted allowlist, then checks `bit`, `debug`, `ffi`, `io`, `jit`, `module`, `newproxy`, `os`, `package`, `require` and `rawlen` are `nil`; `ffi` is absent from the VM, not only unrequested. `newproxy` was present and is now removed: it was the only way to get a `__gc` finalizer, and one firing inside an mlua allocation crashed the process. `collectgarbage` and `coroutine` stay (ADR `lua-runaway-script-bounds`); `print`, which wrote to process stdout and so into a `stdio_out` there, now writes a self-log line (`print_writes_to_the_self_log_not_stdout`).
-  - **There is no instruction-count or memory limit.** Nothing here sets an `mlua` hook, a debug hook, or `Lua::set_memory_limit`. A script with `while true do end` hangs its worker thread forever; a script that accumulates a table across `flush()` calls grows the VM without bound (`ScriptWorker::used_memory` is *observation*, not a limit, and nothing appears to read it). Verify whether the per-`lua`-node dedicated OS thread ([`docs/known-gaps.md`](../known-gaps.md#transforms-predicates-and-sampling)) bounds the blast radius to that node, and whether shutdown can still proceed.
+  - **There is no instruction-count or memory limit.** Nothing here sets an `mlua` hook, a debug hook, or `Lua::set_memory_limit`. A script with `while true do end` hangs its worker thread forever; a script that accumulates a table across `flush()` calls grows the VM without bound (`ScriptWorker::used_memory` is *observation*, not a limit, and nothing appears to read it). Verify whether the per-`lua`-node dedicated OS thread ([`docs/known-gaps/transforms.md`](../known-gaps/transforms.md#lua)) bounds the blast radius to that node, and whether shutdown can still proceed.
     **Verified 2026-09-26 (#386), time half:** it bounded the blast radius to the node's thread, but shutdown could not proceed past it (RT-11's verdict). There is still no instruction hook, by the ADR's decision; `ScriptWorker::with_heartbeat` now ticks a `Heartbeat` once per `Event.new` and once per returned-table element, the runtime marks each call busy, and a busy heartbeat that stops moving is a stall, then a wedge after shutdown. Checked by the RT-11 tests, including a 100 000-event `flush()` under a 200 ms `stall_after` that is never reported stalled. The memory half is `luab/w4`'s `max_memory`.
-    **Verified 2026-09-26 (#391), memory half:** the VM grew without bound, as suspected; nothing read `used_memory()` back. An opt-in `max_memory` now fails the node (exit `2`, `memory_limit_exceeded`, never `thread_panicked`) when the VM stays over the cap after up to eight full collections, run after each batch's and `flush()`'s send and rate-limited to one a second, with a skipped reading deferred to the window's end; `Event.new` checks the cap on every call and stays tripped for the rest of the call, so `pcall` can't bypass it. Checked by adversarial scripts in `crates/logit-script/src/memory.rs` (a million transient strings, a retaining and a `pcall`-wrapped 200 000-event loop) and real-thread runs in `runtime.rs` (retention, garbage, `flush()`, the rate limit, the deferred verdict), each seen failing first against a mutation. Residual: the cap sees the Lua VM heap only, not a retained event's Rust payload (`docs/known-gaps.md`'s Lua entry).
+    **Verified 2026-09-26 (#391), memory half:** the VM grew without bound, as suspected; nothing read `used_memory()` back. An opt-in `max_memory` now fails the node (exit `2`, `memory_limit_exceeded`, never `thread_panicked`) when the VM stays over the cap after up to eight full collections, run after each batch's and `flush()`'s send and rate-limited to one a second, with a skipped reading deferred to the window's end; `Event.new` checks the cap on every call and stays tripped for the rest of the call, so `pcall` can't bypass it. Checked by adversarial scripts in `crates/logit-script/src/memory.rs` (a million transient strings, a retaining and a `pcall`-wrapped 200 000-event loop) and real-thread runs in `runtime.rs` (retention, garbage, `flush()`, the rate limit, the deferred verdict), each seen failing first against a mutation. Residual: the cap sees the Lua VM heap only, not a retained event's Rust payload (`docs/known-gaps/`'s Lua entry).
   - A panic inside a Rust callback cannot unwind through the Lua C frames (mlua catches these, but confirm for the `.expect()`s in `LogProxy::with_log`/`SpanProxy::with_span`).
   - `PhantomData<*const ()>` is present and nothing `unsafe impl Send`s around it.
   - `events_from_table` rejects a non-sequence table (the `{[2] = event}` silently-empty bug recorded in its doc comment) and an empty table means zero events. **Holds, and the other malformed returns now share one message (#388):** a sub-handle, `resource`, or a non-userdata element surfaced as mlua's `userdata is not expected type` or `error converting Lua integer to userdata`; each is now `process() must return nil, an event, or a table of events; got …` (or the `flush()` form), naming the type and index (`returning_a_sub_handle_is_the_contract_error`, `returning_a_non_userdata_in_a_table_is_the_contract_error`).
@@ -6397,11 +6397,11 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Invariants to verify:**
   - A disabled handle costs *nothing*: `is_enabled()` is checked before `to_str()`, before `static_str`, before `read_tags` (in both the `count` and `gauge` closures of `install`). A pipeline without an `internal` component must never grow the interner from script activity.
   - The `logit.` prefix check is applied to the name before interning (it is — `static_metric_name` returns before `static_str`), so a rejected name doesn't leak either.
-  - ~~No other Lua-reachable path interns an arbitrary script string without a guard — `Event.new` and the `MetricProxy`/`LogProxy` `__newindex` `name`/`unit`/`description`/`event_name` writes do exactly that (`LogProxy`'s `event_name` write and `MetricProxy`'s `name`/`unit`/`description` writes in `proxy.rs`; `metric_from_table`'s `name` and `symbol_field` in `construct.rs`).~~ **Retired (#392):** they do, and that unguarded interning is now the documented, accepted posture rather than an open question — see the Verified line below and `docs/known-gaps.md`'s interner entry.
+  - ~~No other Lua-reachable path interns an arbitrary script string without a guard — `Event.new` and the `MetricProxy`/`LogProxy` `__newindex` `name`/`unit`/`description`/`event_name` writes do exactly that (`LogProxy`'s `event_name` write and `MetricProxy`'s `name`/`unit`/`description` writes in `proxy.rs`; `metric_from_table`'s `name` and `symbol_field` in `construct.rs`).~~ **Retired (#392):** they do, and that unguarded interning is now the documented, accepted posture rather than an open question — see the Verified line below and `docs/known-gaps/`'s interner entry.
   - `read_tags` rejects reserved keys before interning them.
-- **Observed concerns (unverified):** ~~the guard here is thorough while the equivalent interning in `proxy.rs`/`construct.rs` has no `is_enabled`-style gate and no documented hazard note. Consistent with the interner's global "accepted" posture, but the asymmetry is worth a deliberate decision. Medium confidence.~~ **Decided, not a gap (`luab/w5`):** the asymmetry stands. `telemetry`'s guard exists because a disabled `internal` component is the common case and must cost nothing; the proxy/`construct.rs` sites always run when a script writes a name, unit, description, or attribute key, so there is no disabled state to guard. `docs/known-gaps.md`'s interner entry now lists all five feeders under the interner's accepted posture, `telemetry` named as the guarded one.
-- **Existing coverage:** `crates/logit-script/src/telemetry.rs`'s `tests` module. Governed by `docs/adr/lua-authored-telemetry-cardinality.md`, `docs/design/lua-api.md`, [`docs/known-gaps.md`](../known-gaps.md#internal-telemetry-and-self-logging).
-- **Verified 2026-09-26 (#392):** the guard ordering in `telemetry.rs` is pinned by `a_disabled_telemetry_handle_never_touches_the_interner_even_with_dynamic_looking_input` and `a_disabled_handle_never_reads_the_lua_argument_as_a_str_either` — a disabled handle interns nothing and never even UTF-8-checks its argument. The unguarded feeders (`MetricProxy`/`LogProxy` `__newindex`, `construct::metric_from_table`'s `name` directly and `unit`/`description` and `log_from_table`'s `event_name` through `symbol_field`, and every attribute key via `AttrsProxy::__newindex` or, nested, `lua_table_to_attrmap`) are documented, by decision, under the interner's accepted posture rather than gated to match `telemetry`; `docs/design/lua-api.md`'s new "Limits" list and `docs/known-gaps.md`'s interner entry are the operator-facing record.
+- **Observed concerns (unverified):** ~~the guard here is thorough while the equivalent interning in `proxy.rs`/`construct.rs` has no `is_enabled`-style gate and no documented hazard note. Consistent with the interner's global "accepted" posture, but the asymmetry is worth a deliberate decision. Medium confidence.~~ **Decided, not a gap (`luab/w5`):** the asymmetry stands. `telemetry`'s guard exists because a disabled `internal` component is the common case and must cost nothing; the proxy/`construct.rs` sites always run when a script writes a name, unit, description, or attribute key, so there is no disabled state to guard. `docs/known-gaps/`'s interner entry now lists all five feeders under the interner's accepted posture, `telemetry` named as the guarded one.
+- **Existing coverage:** `crates/logit-script/src/telemetry.rs`'s `tests` module. Governed by `docs/adr/lua-authored-telemetry-cardinality.md`, `docs/design/lua-api.md`, [`docs/known-gaps/telemetry.md`](../known-gaps/telemetry.md#internal-telemetry-and-self-logging).
+- **Verified 2026-09-26 (#392):** the guard ordering in `telemetry.rs` is pinned by `a_disabled_telemetry_handle_never_touches_the_interner_even_with_dynamic_looking_input` and `a_disabled_handle_never_reads_the_lua_argument_as_a_str_either` — a disabled handle interns nothing and never even UTF-8-checks its argument. The unguarded feeders (`MetricProxy`/`LogProxy` `__newindex`, `construct::metric_from_table`'s `name` directly and `unit`/`description` and `log_from_table`'s `event_name` through `symbol_field`, and every attribute key via `AttrsProxy::__newindex` or, nested, `lua_table_to_attrmap`) are documented, by decision, under the interner's accepted posture rather than gated to match `telemetry`; `docs/design/lua-api.md`'s new "Limits" list and `docs/known-gaps/`'s interner entry are the operator-facing record.
 - **Priority:** P1 — a documented, accepted leak path whose guards must all stay in the right order.
 
 ---
@@ -6448,7 +6448,7 @@ interner's eternal-symbols premise, `DdSketch`'s single-config premise, `LogProx
 all correct today and all silently breakable by a plausible future change. Where a cheap guard test
 exists (as `hll_slice_len_matches_upstream_constant` does), it is worth adding one.
 
-**Nothing in this area is a surprise relative to `docs/known-gaps.md`.** The interner never freeing
+**Nothing in this area is a surprise relative to `docs/known-gaps/`.** The interner never freeing
 (its "The attribute/metric-name interner never frees" entry), the `cardinality-estimator`
 allocation-layout workaround (the "`HyperLogLog::from_bytes` ... works around an upstream" entry), the
 statsd sample-rate extrapolation (the "Sample-rate extrapolation for distributions" entry), Lua's
@@ -6531,7 +6531,7 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   it before the full compare. Measured on the laptop against a rule fixed beforehand (1000 groups
   within about 1.5x of one group at 100 and 10 events per batch): the memo alone reached 4.5x at 10
   per batch, the hash-first scan 1.05x and 1.5x, and it landed. No allocation pin moved. A memo miss
-  is still O(groups) at about 1 ns per group (`docs/known-gaps.md`); the reasoning and numbers are in
+  is still O(groups) at about 1 ns per group (`docs/known-gaps/`); the reasoning and numbers are in
   ADR `aggregation-window-semantics`'s "The groups bound" section.
 
 ### XFORM-02 — Aggregate: per-event merge dispatch (`process`)
@@ -6722,7 +6722,7 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   never moves while the series lives. Rule 39 exists and is tested; it now also rejects retention
   with `max_retained_series: 0` and a zero `max_samples_per_series` or
   `max_set_members_per_series`, and `flush` `debug_assert!`s cumulative mode's bounds. Remaining,
-  in `docs/known-gaps.md`: retention counts flushes, not wall time, and the `SystemTime` flush
+  in `docs/known-gaps/`: retention counts flushes, not wall time, and the `SystemTime` flush
   clock can step backwards.
 
 ### XFORM-05 — Aggregate: contributing-context span-link bookkeeping
@@ -6779,7 +6779,7 @@ fixed:
 
 It also measured the `groups` scan: 137 ns per absorbed event at 1 group, 877 ns at 100, and
 8.6 µs at 1000, dominated by the scan from about 100 groups (#402). Open, each in
-`docs/known-gaps.md`'s `aggregate` section: the groups scan (a per-batch `Arc::ptr_eq` cache and
+`docs/known-gaps/`'s `aggregate` section: the groups scan (a per-batch `Arc::ptr_eq` cache and
 a hashed group index are the candidates, decided by a measurement on the perf VM in its own
 change); `DdSketch::merge` returning early on a sketch whose count and zero count are both 0,
 dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved; and
@@ -7053,9 +7053,9 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
 - **No `unsafe` anywhere in this crate** -- every zero-copy trick (`json`'s `borrowed_str_bytes`,
   `csv`/`logfmt`'s `Bytes::slice`) goes through safe `bytes::Bytes` APIs plus ordinary pointer
   *arithmetic for comparison only* (never dereferenced), not raw unsafe slicing.
-- **`docs/known-gaps.md` already documents** the aggregate-retention-on-by-default memory-growth
+- **`docs/known-gaps/` already documents** the aggregate-retention-on-by-default memory-growth
   change, the "A delta after eviction (the cardinality cap) or after a process restart resolves
-  against 0.0" behavior ([its "statsd" section](../known-gaps.md#statsd)), and the
+  against 0.0" behavior ([its "statsd" section](../known-gaps/statsd.md)), and the
   `cardinality-estimator` 1.0.3 allocation-layout bug workaround -- none of these were re-reported
   above as surprises; they're deliberate, tracked gaps, cited here only as context a verifier
   should already know going in.
@@ -7413,13 +7413,13 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     weren't `EMSGSIZE`.
   - ~~`is_message_too_large` is duplicated verbatim in four files (`statsd.rs`,
     `syslog.rs`, `graphite.rs`, `collectd.rs`) with a Linux-only errno 90 and an
-    `ErrorKind::InvalidInput` fallback; [`docs/known-gaps.md`](../known-gaps.md#udp-intake) already tracks the absence of
+    `ErrorKind::InvalidInput` fallback; [`docs/known-gaps/intake.md`](../known-gaps/intake.md#udp-intake) already tracks the absence of
     per-errno send accounting (`ENOBUFS` vs `EMSGSIZE` vs `ECONNREFUSED` are one undifferentiated
     failure). Listed as documented context, not a surprise.~~ **Resolved (sink/w4, #453):** one
     `is_message_too_large` in `crates/logit-outputs/src/datagram.rs` tests `EMSGSIZE` only. The
     fallback was a real defect: a Unix socket path of 108 bytes or more and a UDP endpoint on port
     0 each counted every batch `oversize_datagram` under `requests{class="ok"}`. Both are faults
-    now and graph rules 65 and 73 reject them. The per-errno gap stays in `docs/known-gaps.md`,
+    now and graph rules 65 and 73 reject them. The per-errno gap stays in `docs/known-gaps/`,
     narrowed to the failures other than `EMSGSIZE`.
   - ~~`collectd_out` has **no `flush()` override** (the `impl Output for CollectdOutput` block in `collectd.rs`) — correct for UDP, but it
     is the only sink in the family that doesn't spell the contract out.~~ **Resolved (sink/w4,
@@ -7484,7 +7484,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     `an_ipv6_udp_endpoint_is_delivered`).
   - A cancelled send: the next send starts from a clean buffer and a Unix destination keeps its
     connection (`a_send_dropped_mid_batch_leaves_a_clean_start_and_a_usable_unix_socket`). The
-    counts of what the cancelled send had sent are lost; `docs/known-gaps.md` records it.
+    counts of what the cancelled send had sent are lost; `docs/known-gaps/` records it.
   - Accounting: a failed attempt now counts what it sent (each sink's partial-send test), and
     each sink's real-`EMSGSIZE` test reconciles sent plus dropped against what was encoded, in the
     sink's unit. `collectd_out` counts `requests` under the four fault classes.
@@ -7586,7 +7586,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
 - **What it does:** Each `send` re-encodes the batch from scratch and emits every encode-side drop
   / normalization counter, then does the I/O and emits the transport counters.
 - **Why sensitive:** accounting (these counters are the *only* record of dropped metrics/messages —
-  `docs/known-gaps.md`'s cross-protocol table cites them by name); hot-path (per batch, per
+  `docs/known-gaps/mappings.md` cites them by name); hot-path (per batch, per
   attempt).
 - **Invariants to verify:**
   - A batch delivered on attempt *k* must report each encode-side drop exactly once, not *k* times.
@@ -7604,7 +7604,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     plaintext zero-byte write) therefore **double-counts every encode-side drop** —
     `logit.output.messages.dropped{reason=…}`, `logit.output.tags.dropped`,
     `logit.output.batch.bytes`. I found no ADR or known-gaps entry acknowledging this; grepping
-    `buffered-sink-delivery.md` and `known-gaps.md` for re-encode/double-count turned up nothing.
+    `buffered-sink-delivery.md` and `known-gaps/` for re-encode/double-count turned up nothing.
     High confidence on the mechanism; unverified whether anyone has measured it.
   - Symmetrically, a cancelled attempt records the drops but no `requests{class=…}`, so
     `messages + messages.dropped` need not reconcile against `requests` in either direction.
@@ -7688,7 +7688,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     batch, and again after an `Ok`), a second batch, a batch after one the budget cut off, direct
     sends after a batch that sent nothing, both builder orders after decoy handles, no handle
     builders, a `413` on a repeat attempt, and `request.bytes` on a refused connection.
-  - Recorded in `docs/known-gaps.md`, not fixed: `datadog_trace_out` returns `Clean` for a
+  - Recorded in `docs/known-gaps/`, not fixed: `datadog_trace_out` returns `Clean` for a
     connect failure after an earlier request of the same `send` was accepted, as `datadog_out`
     and `otlp_out` do.
 
@@ -7736,7 +7736,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `statsd_dialect_splits_multi_value_samples_and_normalizes_h_and_d_to_ms` (multi-value samples per
   dialect), `an_oversize_event_line_is_dropped_via_the_existing_oversize_path`).
   Integration: `crates/logit-cli/tests/statsd_round_trip.rs`. ADRs: `statsd-output`,
-  `framed-encoder`, `lossless-transit`; [`docs/known-gaps.md`](../known-gaps.md#statsd) for the post-sketch-kind and
+  `framed-encoder`, `lossless-transit`; [`docs/known-gaps/statsd.md`](../known-gaps/statsd.md) for the post-sketch-kind and
   unit/rename debt.
 - **Suggested verification approach:** Construct a realistic worst-case `Samples` record from a
   full-size `statsd_in` datagram and measure the rendered line against the default 1432 cap;

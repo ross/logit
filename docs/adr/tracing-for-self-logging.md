@@ -13,8 +13,8 @@ Accepted
 `logit_core::diag::Diagnostics` prefixes a component id and throttles by occurrence count, and
 that's all: no severity, no structured fields, no filtering, no timestamps, no lifecycle messages
 (startup, bound, shutdown, sink degraded) at all — every diagnostic is a bare `eprintln!`.
-`docs/known-gaps.md` filed the `tracing` migration as "deliberately kept as separate, later
-work," and ADR `internal-telemetry-as-pipeline-events` left the door open for exactly this: "a
+`docs/known-gaps/telemetry.md` filed the `tracing` migration as "deliberately kept as separate,
+later work," and ADR `internal-telemetry-as-pipeline-events` left the door open for exactly this: "a
 future `tracing` subscriber could itself feed `Diagnostics`/`Telemetry`, same as any other
 producer." This is that work.
 
@@ -78,4 +78,4 @@ lifecycle events extend it to *what phase the process is in*.
 - Workstream D's `TelemetryLayer` (see `docs/design/internal-telemetry.md`'s "Logs" section) is
   the producer ADR `internal-telemetry-as-pipeline-events` predicted: a `tracing_subscriber::Layer`
   feeding `Registry` the same way any other component's `Telemetry` handle does.
-- `docs/known-gaps.md`'s `eprintln!` entry is closed.
+- `docs/known-gaps/telemetry.md`'s `eprintln!` entry is closed.

@@ -31,7 +31,7 @@ Goals:
 Non-goals: `/api/v1/import/native` and VictoriaLogs' `/insert/native` (unstable by
 VictoriaMetrics's own statement); a JSON-lines `/api/v1/import` sink (nothing over
 remote-write); an `/api/v1/export` polling input (`/federate` covers live series); Prometheus
-native-histogram encoding (its own follow-up, tracked in `docs/known-gaps.md`); re-binning a
+native-histogram encoding (its own follow-up, tracked in `docs/known-gaps/`); re-binning a
 `Distribution` onto `vmrange` buckets; OpenTSDB, DataDog, and New Relic wires into
 VictoriaMetrics (each has or will have its own stream); VictoriaMetrics cluster multitenancy
 beyond what a URL path or `headers:` entry expresses.
@@ -211,7 +211,7 @@ Each item as W1 found it against the versions above; "leg N" is a row in "Findin
 | A series: labels, ms timestamp, float | metric name, attributes, `Event::timestamp` in ns, `Gauge` or `Sum` | ms truncation is the permitted normalization remote-write already has |
 | `Sum` cumulative, `Gauge`, classic `Histogram`, `Summary` | plain series, as at any Prometheus receiver | lossless from VictoriaMetrics's point of view |
 | `Sum` delta, `GaugeDelta` | skipped and counted by `prometheus_out`; VictoriaMetrics has no temporality | an `aggregate` with `temporality: cumulative` upstream, as today |
-| `ExponentialHistogram` | VictoriaMetrics accepts a remote-write native histogram and converts it to `vmrange` | blocked by `logit`'s own native-histogram gap (`docs/known-gaps.md`, Prometheus) |
+| `ExponentialHistogram` | VictoriaMetrics accepts a remote-write native histogram and converts it to `vmrange` | blocked by `logit`'s own native-histogram gap (`docs/known-gaps/`, Prometheus) |
 | `Distribution` | today a five-quantile summary; `vmrange` is also log-bucketed | re-binning not attempted; a known gap, not a loss VictoriaMetrics imposes |
 | `unit`, `description`, exemplars, `flags` | dropped by VictoriaMetrics | VictoriaMetrics's limitation, nothing to do |
 | `Resource`, `Scope` | flattened to labels by `prometheus_out` | as today |
@@ -309,7 +309,7 @@ perf-VM tool, so nothing in this stream is named `script/vm-*`.
 ### W1's legs
 
 Each becomes a row in "Findings": worked, fixed (with the commit), or gap (with the
-`docs/known-gaps.md` row W3 adds).
+`docs/known-gaps/` row W3 adds).
 
 1. `prometheus_out` `version: 1` → VictoriaMetrics `/api/v1/write`.
 2. `prometheus_out` `version: 2` → VictoriaMetrics, expecting a rejection; record the status
@@ -374,7 +374,7 @@ original `73ca4931` run):
 
 ### Gaps for W3
 
-Each becomes a `docs/known-gaps.md` row or `docs/deploying.md` guidance in W3, unless noted.
+Each becomes a `docs/known-gaps/` row or `docs/deploying.md` guidance in W3, unless noted.
 
 - **VictoriaMetrics silently discards remote-write 2.0** (leg 2). `prometheus_out` can't tell a
   `204` that stored nothing from one that stored everything, so the guide says `version: 1`
@@ -413,6 +413,6 @@ Each becomes a `docs/known-gaps.md` row or `docs/deploying.md` guidance in W3, u
   and 10 re-run, with the zstd sender accepted by VictoriaMetrics and vmagent staying on zstd
   against `prometheus_in`, counted `logit.input.writes{class="ok",encoding="zstd"}`.
 - W3: the shipped-config test and `script/validate` cover `fixtures/victoriametrics-*.yaml`;
-  each `docs/known-gaps.md` row links to the "Findings" row it comes from;
+  each `docs/known-gaps/` row links to the "Findings" row it comes from;
   `docs/deploying.md`'s "Choosing `version: 1` or `2`" no longer lists VictoriaMetrics as a
   2.0 receiver.

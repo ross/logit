@@ -356,7 +356,7 @@ untyped again; cap eviction.
   `prometheus_in(bind)`. Commands and outcome go in the PR body.
 - Examples: `fixtures/prometheus-remote-write-receive.yaml`,
   `fixtures/prometheus-remote-write-send.yaml`.
-- Docs: [`docs/known-gaps.md`](../known-gaps.md) — delete the "Prometheus remote-write is not built"
+- Docs: [`docs/known-gaps/prometheus.md`](../known-gaps/prometheus.md) — delete the "Prometheus remote-write is not built"
   row; reword the `ExponentialHistogram` row to point at the native-histogram follow-up; add rows for
   the receiver having no auth, 1.0 typing depending on the cache, stale markers for
   histogram/summary kinds being skipped, and no out-of-order handling.

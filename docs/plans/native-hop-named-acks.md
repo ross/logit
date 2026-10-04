@@ -174,7 +174,7 @@ Files: `crates/logit-outputs/src/logit.rs`, `crates/logit-inputs/src/logit.rs`,
   per run; the resume); `docs/deploying.md`, forwarding section: what an ack means now, the
   resume, and that a reconnect no longer resends acknowledged frames; module docs of both hop
   components; the `RECEIVER_MAX_WINDOW` doc in `crates/logit-inputs/src/logit.rs` carries the
-  named ack's size (about 80 KB for 1024 under TLS); `docs/known-gaps.md`: add the 16-identity
+  named ack's size (about 80 KB for 1024 under TLS); `docs/known-gaps/`: add the 16-identity
   cap residual and reword the `ack_write_stalled` reasoning for coalesced, larger acks;
   `AGENTS.md`'s `logit_out`/`logit_in` rows gain this ADR.
 - [x] Sweep every comment line the stream added for the banned words.
@@ -281,5 +281,5 @@ coalescing sweep", and its native-relay ladder. This section records what they s
   frames short.
 
 **Conclusion.** The latency gap is real, about 2 points of the ceiling at 10 ms RTT.
-`ACK_COALESCE_MAX` (32) doesn't bind, and the whole gap is small, so the constant stays. The gap is tracked in [`docs/known-gaps.md`](../known-gaps.md) with the
+`ACK_COALESCE_MAX` (32) doesn't bind, and the whole gap is small, so the constant stays. The gap is tracked in [`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md) with the
 variant numbers.

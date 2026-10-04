@@ -162,7 +162,7 @@ sources, found:
      bytes while its payload stays in the Rust heap (10,000 retained 1 KiB events: 1.5 MB of VM,
      about 10 MB of Rust). Size the cap at least twice the script's steady working set, read from
      `logit.script.vm.memory`. A script that hoards events rather than Lua values is visible in
-     process RSS, not bounded by this cap; `docs/known-gaps.md`'s Lua entry records it.
+     process RSS, not bounded by this cap; `docs/known-gaps/transforms.md`'s Lua entry records it.
 4. **A depth cap on Lua-to-Rust table conversion.** `MAX_TABLE_DEPTH = 128`, local to
    `logit-script`, matches native's `MAX_VALUE_DEPTH` so a value a script builds always decodes on
    a `logit_in` peer. A table nested past that depth is a clear conversion error, naming the
@@ -271,7 +271,7 @@ sources, found:
   in the PR that lands its artifact.
 - Interner growth from script-derived strings (`Event.new`'s and the proxy setters'
   `name`/`unit`/`description`/`event_name` fields, and nested attribute keys) stays a documented,
-  accepted residual in `docs/known-gaps.md`, citing [ADR
+  accepted residual in `docs/known-gaps/transforms.md`, citing [ADR
   `deployment-threat-model`](deployment-threat-model.md), the way `telemetry`'s own tag values
   already are. A `newproxy(true)` finalizer touching a stashed handle during collection is no
   longer possible to write at all: decision 8 removes `newproxy`, closing the class rather than
@@ -305,8 +305,9 @@ sources, found:
   not its size, so a DAG a script builds by sharing table references (`t = {a = t, b = t}`
   repeated k times) still converts, at 2^k nodes. And pure-Lua recursion through Rust/C frames can
   still abort the process past the larger stack from decision 12, at a higher level than 233. The
-  last two, and the `Event.new`-loop residual above, are recorded in `docs/known-gaps.md`'s Lua
-  entry, citing [ADR `deployment-threat-model`](deployment-threat-model.md).
+  last two, and the `Event.new`-loop residual above, are recorded in
+  `docs/known-gaps/transforms.md`'s Lua entry, citing [ADR
+  `deployment-threat-model`](deployment-threat-model.md).
 
 ## Running it
 
@@ -382,8 +383,8 @@ Filled in as each workstream lands.
   sticky trip, one pass only, no inbox sweep, a memory failure logged as a panic). CORE-15
   findings.
 - `luab/w5` (CORE-19 close, docs): #392. `docs/design/lua-api.md`'s "Costs" section renamed
-  "Limits and costs" with a new "Limits" summary; `docs/known-gaps.md`'s interner entry lists the
-  five Lua feeders, one guarded, and its Lua entry gains the sub-epsilon-float residual;
+  "Limits and costs" with a new "Limits" summary; `docs/known-gaps/runtime.md`'s interner entry
+  lists the five Lua feeders, one guarded, and its Lua entry gains the sub-epsilon-float residual;
   `docs/plans/critical-sections-inventory.md`'s CORE-19 row moves to `reviewed`, pinned by
   `telemetry.rs`'s existing `a_disabled_telemetry_handle_never_touches_the_interner_even_with_dynamic_looking_input`
   and `a_disabled_handle_never_reads_the_lua_argument_as_a_str_either`. CORE-19 reviewed, no

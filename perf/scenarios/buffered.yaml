@@ -2,8 +2,8 @@
 # (docs/adr/disk-backed-sink-buffer.md), so the gap from passthrough's numbers is the spool's own
 # cost (native-frame encode into a segment file, the periodic checkpoint write). Scenario table:
 # docs/plans/load-test-harness.md, "Scenarios"; numbers and the variance history:
-# docs/design/performance.md §3; the open startup-scan question: docs/known-gaps.md's `buffered`
-# entry.
+# docs/design/performance.md §3; the open startup-scan question: docs/known-gaps/telemetry.md's
+# `DiskQueue::open` entry.
 #
 #   script/perf run --scenario buffered
 #

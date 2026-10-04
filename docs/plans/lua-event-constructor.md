@@ -107,7 +107,7 @@ events` after "Reading `event.span`" (shape table, required/defaults, error form
 flush(now)` in the script contract, names `Event` under Sandboxing, adds a Costs row, and gives the
 telemetry section's "no clock" sentence its one exception. W3–W5 extend the section per kind; W5
 retitles "Reading `event.span`" to say constructible-via-`Event.new`, read-only in place, and narrows
-`known-gaps.md`'s span entry. W6 updates `AGENTS.md`'s current-state and constraint bullets and
+`known-gaps/`'s span entry. W6 updates `AGENTS.md`'s current-state and constraint bullets and
 `docs/design/memory.md`.
 
 ## Workstreams
@@ -119,7 +119,7 @@ retitles "Reading `event.span`" to say constructible-via-`Event.new`, read-only 
 | W2 | **`Event.new` with `timestamp`/`attributes`/`log`; install; targets cell; `flush(now)`; docs.** | `crates/logit-script/src/construct.rs` (new), `lib.rs`, `proxy.rs`, `value.rs`; `crates/logit-pipeline/src/runtime.rs`; `docs/design/lua-api.md`; `crates/logit-bench/tests/allocations.rs` (+1 additive pin); `docs/design/memory.md` | W1 |
 | W3 | **`sum`/`gauge`/`samples`/`set_members` + exemplars**; `trace_flags` added to `exemplar_to_table`. | `construct.rs`; `proxy.rs`; `lua-api.md` | W2 |
 | W4 | **`histogram`/`exponential_histogram`/`summary`.** | `construct.rs`; `lua-api.md` | W3 |
-| W5 | **Span with events and links**; span docs and `known-gaps.md` narrowing. | `construct.rs`; `proxy.rs` (doc comments); `lua-api.md`; `docs/known-gaps.md` | W4 |
+| W5 | **Span with events and links**; span docs and `known-gaps/` narrowing. | `construct.rs`; `proxy.rs` (doc comments); `lua-api.md`; `docs/known-gaps/` | W4 |
 | W6 | **Closeout.** `AGENTS.md` current state and constraints; `memory.md`; this plan's Status. | `AGENTS.md`; `docs/design/memory.md`; `docs/plans/lua-event-constructor.md` | W5 |
 
 Landing order: **W0 → W1 → W2 → W3 → W4 → W5 → W6**, strictly linear. `flush(now)` sits in W2
@@ -174,7 +174,7 @@ green.
 name}` span (defaults applied, `ext == None`); `status_message` alone boxes `ext`; a mixed
 log+metrics+span event round-trips. Errors: `end_timestamp` before `timestamp`; all-zero
 `trace_id`; bad `parent_span_id`; `events[1]` missing `name`; `links[1]` missing `span_id`; unknown
-`links[1].*` key. Done when: `script/cibuild` green; `known-gaps.md` narrowed; no remaining "no
+`links[1].*` key. Done when: `script/cibuild` green; `known-gaps/` narrowed; no remaining "no
 script-visible way to construct a span" claim outside history.
 
 **W6** — Done when: `AGENTS.md` mentions `Event.new` in the current-state narrative and the Lua
