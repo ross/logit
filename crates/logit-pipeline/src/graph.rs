@@ -250,6 +250,7 @@ use logit_config::{
     MetadataCacheConfig, ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport,
     TraceIdFormat, MAX_READ_BATCH,
 };
+use logit_core::redact;
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP;
 use logit_proto::MAX_UDP_PAYLOAD_BYTES;
@@ -1344,7 +1345,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': 'tls' is set, but 'endpoint' ({endpoint:?}) isn't \
                      'https://' -- TLS is selected by the endpoint's scheme, so a 'tls:' block \
-                     here would have no effect"
+                     here would have no effect",
+                    endpoint = redact::url(endpoint)
                 );
             }
         }
@@ -1821,7 +1823,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 if !is_absolute_http_url(target) {
                     anyhow::bail!(
                         "component '{id}': 'scrape_targets' entry {target:?} isn't an absolute \
-                         'http://' or 'https://' URL"
+                         'http://' or 'https://' URL",
+                        target = redact::url(target)
                     );
                 }
             }
@@ -2469,7 +2472,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     anyhow::bail!(
                         "component '{id}': 'endpoint' {endpoint:?} isn't an absolute 'http://' or \
                          'https://' URL -- give the receiver's full write URL, path included \
-                         (typically '/api/v1/write')"
+                         (typically '/api/v1/write')",
+                        endpoint = redact::url(endpoint)
                     );
                 }
                 if timeout.is_zero() {
@@ -2972,7 +2976,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             anyhow::bail!(
                 "component '{id}': {kind_name} '{field}' must be the socket's absolute path under \
                  'transport: {transport_name}', got '{address}' -- clients name it as \
-                 unix:///<path>"
+                 unix:///<path>",
+                address = redact::url(address)
             );
         }
         if address.len() > UNIX_SOCKET_PATH_MAX_BYTES {
@@ -3038,7 +3043,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 if !is_absolute_http_url(url) {
                     anyhow::bail!(
                         "component '{id}': datadog_out 'endpoints.{intake}' must be an absolute \
-                         http:// or https:// URL with a host, got {url:?}"
+                         http:// or https:// URL with a host, got {url:?}",
+                        url = redact::url(url)
                     );
                 }
             }
@@ -3128,7 +3134,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             if !is_absolute_http_url(endpoint) {
                 anyhow::bail!(
                     "component '{id}': datadog_trace_out 'endpoint' must be an absolute http:// \
-                     or https:// URL with a host, got {endpoint:?}"
+                     or https:// URL with a host, got {endpoint:?}",
+                    endpoint = redact::url(endpoint)
                 );
             }
         }
@@ -3307,14 +3314,16 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         if !is_absolute_http_url(endpoint) {
             anyhow::bail!(
                 "component '{id}': splunk_hec_out 'endpoint' must be an absolute http:// or \
-                 https:// URL with a host, got {endpoint:?}"
+                 https:// URL with a host, got {endpoint:?}",
+                endpoint = redact::url(endpoint)
             );
         }
         if endpoint.contains(['?', '#']) {
             anyhow::bail!(
                 "component '{id}': splunk_hec_out 'endpoint' ({endpoint:?}) has a query or \
                  fragment -- the base URL takes neither, since the sink appends '/event' and \
-                 '/ack' to it"
+                 '/ack' to it",
+                endpoint = redact::url(endpoint)
             );
         }
         let path = endpoint.to_ascii_lowercase();
@@ -3323,7 +3332,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             anyhow::bail!(
                 "component '{id}': splunk_hec_out 'endpoint' ({endpoint:?}) names a HEC route -- \
                  give the collector's base URL, ending in '/services/collector'; the sink appends \
-                 '/event' and '/ack' itself"
+                 '/event' and '/ack' itself",
+                endpoint = redact::url(endpoint)
             );
         }
         if token.is_empty() {
@@ -3383,7 +3393,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             anyhow::bail!(
                 "component '{id}': 'tls' is set, but 'endpoint' ({endpoint:?}) isn't \
                  'https://' -- TLS is selected by the endpoint's scheme, so a 'tls:' block here \
-                 would have no effect"
+                 would have no effect",
+                endpoint = redact::url(endpoint)
             );
         }
     }
@@ -3439,7 +3450,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         if let Some(Ok(0)) = port {
             anyhow::bail!(
                 "component '{id}': {kind_name} 'endpoint' '{endpoint}' names port 0 -- no UDP \
-                 datagram can be sent to port 0; give the receiver's port"
+                 datagram can be sent to port 0; give the receiver's port",
+                endpoint = redact::url(endpoint)
             );
         }
     }
@@ -6078,6 +6090,18 @@ mod tests {
                 assert!(err.contains("'/services/collector'"), "{bad:?}: {err}");
             }
         }
+    }
+
+    /// An endpoint's userinfo is masked in a validation error.
+    #[test]
+    fn a_rejected_endpoint_is_printed_without_its_userinfo() {
+        let err = splunk_hec_out_err(splunk_hec_out(
+            "https://user:hunter2@splunk:8088/services/collector/event",
+        ));
+        assert!(err.contains("names a HEC route"), "{err}");
+        assert!(err.contains("\"https://***@splunk:8088/services/collector/event\""), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+        assert!(!err.contains("user:"), "{err}");
     }
 
     /// Rule 70: the base URL takes no query or fragment; the routes are appended to it.

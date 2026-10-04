@@ -142,7 +142,7 @@ use crate::http::{
 pub use crate::tls::TlsClientSettings;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
-use logit_core::{Diagnostics, EventBatch, Telemetry};
+use logit_core::{redact, Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::{BatchContext, Fault, Output, SeqId};
 use logit_proto::splunk::response::{
     encode_ack_request, parse_ack_reply, parse_reply, HecReply, HecStatus, SPLUNK_CLOUD_BODY_CAP,
@@ -553,6 +553,7 @@ impl SplunkHecOutput {
             };
             return Ok(EventReply::Accepted { ack_id });
         }
+        let url = redact::url(&url);
         let body = read_body_prefix(response, error_read_bytes(&self.token)).await;
         let reply = parse_reply(body.as_bytes());
         let snippet = redacted_snippet(&body, &self.token);

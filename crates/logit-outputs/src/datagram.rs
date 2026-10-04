@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use logit_core::{Diagnostics, Telemetry};
+use logit_core::{redact, Diagnostics, Telemetry};
 use logit_pipeline::Fault;
 use logit_proto::MessageBuf;
 use tokio::net::{lookup_host, UdpSocket, UnixDatagram};
@@ -237,10 +237,15 @@ impl UdpDest {
             UdpDest::Sockets { v4, v6 } => {
                 let addrs = lookup_host(endpoint)
                     .await
-                    .with_context(|| format!("resolving {sink} endpoint {endpoint}"))
+                    .with_context(|| format!("resolving {sink} endpoint {}", redact::url(endpoint)))
                     .context(Fault::Clean)?;
                 let addr = pick_addr(addrs)
-                    .with_context(|| format!("{sink} endpoint {endpoint} resolved to no addresses"))
+                    .with_context(|| {
+                        format!(
+                            "{sink} endpoint {} resolved to no addresses",
+                            redact::url(endpoint)
+                        )
+                    })
                     .context(Fault::Clean)?;
                 let socket = socket_for(addr, v4, v6, sink)?;
                 Ok(DatagramDest::Udp { socket, addr })

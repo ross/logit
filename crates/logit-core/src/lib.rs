@@ -6,6 +6,7 @@
 pub mod diag;
 pub mod interner;
 pub mod provenance;
+pub mod redact;
 /// Consistent sampling's compare and frozen key hash. Not re-exported: `sampling::keep` reads
 /// better at a call site than a bare `keep`.
 pub mod sampling;

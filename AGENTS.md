@@ -704,7 +704,8 @@ Merged branches and PRs are never renamed to fit.
 - **Never print a component's config in an error, log, diagnostic, or panic outside tests**: no
   Debug of a `ComponentKind`, `Component`, or options/TLS/auth struct. `!env` inlines secrets
   into fields and nothing yet marks a field sensitive, so name the component id and its kind
-  (`graph::kind_name`), plus the one non-secret field the message needs.
+  (`graph::kind_name`), plus the one non-secret field the message needs. A URL or endpoint is
+  printed through `logit_core::redact::url`, which masks its userinfo.
 - **A test waits on an observable, never a sleep, and uses the shared helpers** in
   `logit_pipeline::test_util` (`wait_until`, `TelemetryProbe`, `recv_batch`, `spawn_input`,
   `scratch_dir`, and the rest) rather than writing its own. A sleep only sizes a negative window.

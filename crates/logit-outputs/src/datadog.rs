@@ -200,7 +200,7 @@ pub use crate::tls::TlsClientSettings;
 use anyhow::Context;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
-use logit_core::{Diagnostics, EventBatch, MetricKind, Telemetry};
+use logit_core::{redact, Diagnostics, EventBatch, MetricKind, Telemetry};
 use logit_pipeline::{BatchContext, Fault, Output, SeqId};
 use logit_proto::datadog::events::EventFormat;
 use logit_proto::datadog::{
@@ -899,6 +899,7 @@ impl DatadogOutput {
             self.telemetry.count(RECORDS, entries as f64, &tags);
             return Ok(());
         }
+        let url = redact::url(&url);
         // Bounded, and scrubbed of the key before it reaches a diagnostic or the error
         // ([`redacted_snippet`]).
         let key = self.api_key.to_str().unwrap_or_default();

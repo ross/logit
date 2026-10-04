@@ -150,7 +150,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use logit_core::{Diagnostics, EventBatch, Resource, Telemetry, Value};
+use logit_core::{redact, Diagnostics, EventBatch, Resource, Telemetry, Value};
 use logit_pipeline::{BatchContext, Fault, Output, SeqId};
 pub use logit_proto::datadog::traces_msgpack::TracerApiForm;
 use logit_proto::datadog::{
@@ -808,6 +808,7 @@ impl DatadogTraceOutput {
     ) -> anyhow::Result<()> {
         let path = route.path(self.version);
         let target = self.client.describe(path);
+        let target = redact::url(&target);
         let tags = [("route", route.name())];
         let wire_len = encoded.body.len();
         let records = encoded.meta.records;

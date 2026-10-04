@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use logit_core::Telemetry;
+use logit_core::{redact, Telemetry};
 use logit_pipeline::Fault;
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -65,7 +65,8 @@ impl TlsTarget {
         let server_name = ServerName::try_from(host.to_string()).map_err(|err| {
             anyhow::anyhow!(
                 "{sink}: endpoint {endpoint:?} has no valid TLS server name in its host \
-                 {host:?}: {err}"
+                 {host:?}: {err}",
+                endpoint = redact::url(endpoint),
             )
         })?;
         Ok(Self { config: Arc::new(config), server_name })
@@ -127,23 +128,20 @@ pub(crate) async fn connect(dial: &Dial<'_>) -> anyhow::Result<Box<dyn AsyncStre
     let sink = dial.sink;
     match dial.target {
         Target::Tcp { endpoint, tls } => {
+            let shown = redact::url(endpoint);
             let tcp = tokio::time::timeout(dial.connect_timeout, TcpStream::connect(endpoint))
                 .await
                 .map_err(|_elapsed| {
                     anyhow::anyhow!(
-                        "connecting to {sink} endpoint {endpoint} timed out after {:?}",
+                        "connecting to {sink} endpoint {shown} timed out after {:?}",
                         dial.connect_timeout
                     )
                 })
-                .and_then(|r| {
-                    r.with_context(|| format!("connecting to {sink} endpoint {endpoint}"))
-                })
+                .and_then(|r| r.with_context(|| format!("connecting to {sink} endpoint {shown}")))
                 .context(Fault::Clean)?;
             if dial.nodelay {
                 tcp.set_nodelay(true)
-                    .with_context(|| {
-                        format!("setting TCP_NODELAY toward {sink} endpoint {endpoint}")
-                    })
+                    .with_context(|| format!("setting TCP_NODELAY toward {sink} endpoint {shown}"))
                     .context(Fault::Clean)?;
             }
             match tls {
@@ -401,6 +399,24 @@ mod tests {
         assert!(pool.is_empty());
         assert_one_request(&mut probe, "clean");
         assert_eq!(reconnects(&mut probe), 0.0);
+    }
+
+    /// A failed dial names the endpoint with its userinfo masked, whether resolution fails or the
+    /// connect timeout fires first.
+    #[tokio::test]
+    async fn a_failed_dial_prints_the_endpoint_without_its_userinfo() {
+        let dial = Dial {
+            target: Target::Tcp { endpoint: "tcp://user:hunter2@127.0.0.1:1", tls: None },
+            connect_timeout: Duration::from_secs(1),
+            sink: "test_out",
+            nodelay: false,
+        };
+
+        let err = connect(&dial).await.err().expect("the endpoint isn't a socket address");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("test_out endpoint tcp://***@127.0.0.1:1"), "{message}");
+        assert!(!message.contains("hunter2"), "{message}");
     }
 
     // -- The probe of a reused connection ---------------------------------------------------------
