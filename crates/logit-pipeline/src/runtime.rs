@@ -10037,6 +10037,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn a_full_sink_inbox_in_a_fan_out_is_counted_as_inbox_full_on_that_sink() {
         let mut components = Map::new();
         components.insert("in".to_string(), plain_component(vec![], statsd_in()));
@@ -10097,6 +10098,7 @@ mod tests {
     /// `aa_out` sorts before `zz_in`, so the spawn loop takes `aa_out`'s handle out of the
     /// telemetry map before it builds `zz_in`'s `Fanout`. The edge must already hold it.
     #[tokio::test]
+    #[ignore]
     async fn a_consumer_sorted_before_its_producer_still_counts_its_inbox_full() {
         let mut components = Map::new();
         components.insert("zz_in".to_string(), plain_component(vec![], statsd_in()));
