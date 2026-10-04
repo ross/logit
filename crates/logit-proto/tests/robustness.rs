@@ -32,7 +32,9 @@ use logit_proto::otlp::generated::opentelemetry::proto::resource::v1 as otlp_res
 use logit_proto::otlp::generated::opentelemetry::proto::trace::v1 as otlp_trace;
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{self, DecompressError, Encoding};
-use logit_proto::{CodecError, Decoder, Encoder, Signal, SignalDecoder, SignalEncoder};
+use logit_proto::{
+    CodecError, Decoder, Encoder, Signal, SignalDecoder, SignalEncoder, SignalPayload,
+};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
@@ -1235,7 +1237,9 @@ fn a_saturated_timestamp_relays_as_i64_max() {
         let first = OtlpDecoder::new().decode_signal(signal, body).unwrap();
         let mut relayed = Vec::new();
         for batch in &first {
-            for (signal, bytes) in OtlpEncoder::new().encode_signals(batch).unwrap() {
+            for SignalPayload { signal, bytes, .. } in
+                OtlpEncoder::new().encode_signals(batch).unwrap()
+            {
                 if signal == Signal::Logs {
                     let wire: otlp_logs::LogsData = prost::Message::decode(bytes.clone()).unwrap();
                     let record = &wire.resource_logs[0].scope_logs[0].log_records[0];

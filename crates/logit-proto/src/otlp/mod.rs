@@ -36,7 +36,7 @@ pub mod traces;
 /// encoder never emits, such as a timestamp past `i64::MAX`.
 pub mod generated;
 
-use crate::{CodecError, Signal, SignalDecoder, SignalEncoder};
+use crate::{CodecError, Signal, SignalDecoder, SignalEncoder, SignalPayload};
 use bytes::Bytes;
 use generated::opentelemetry::proto::logs::v1 as logs_pb;
 use generated::opentelemetry::proto::metrics::v1 as metrics_pb;
@@ -72,7 +72,7 @@ impl OtlpEncoder {
 }
 
 impl SignalEncoder for OtlpEncoder {
-    fn encode_signals(&mut self, batch: &EventBatch) -> Result<Vec<(Signal, Bytes)>, CodecError> {
+    fn encode_signals(&mut self, batch: &EventBatch) -> Result<Vec<SignalPayload>, CodecError> {
         let resource = common::resource_to_pb(&batch.resource);
         let resource_schema_url =
             batch.resource.schema_url.as_ref().map(common::bytes_to_string).unwrap_or_default();
@@ -106,6 +106,7 @@ impl SignalEncoder for OtlpEncoder {
 
         let mut payloads = Vec::with_capacity(3);
         if !log_records.is_empty() {
+            let records = log_records.len();
             let data = logs_pb::LogsData {
                 resource_logs: vec![logs_pb::ResourceLogs {
                     resource: Some(resource.clone()),
@@ -117,9 +118,14 @@ impl SignalEncoder for OtlpEncoder {
                     schema_url: resource_schema_url.clone(),
                 }],
             };
-            payloads.push((Signal::Logs, Bytes::from(data.encode_to_vec())));
+            payloads.push(SignalPayload {
+                signal: Signal::Logs,
+                bytes: Bytes::from(data.encode_to_vec()),
+                records,
+            });
         }
         if !spans.is_empty() {
+            let records = spans.len();
             let data = trace_pb::TracesData {
                 resource_spans: vec![trace_pb::ResourceSpans {
                     resource: Some(resource.clone()),
@@ -131,9 +137,14 @@ impl SignalEncoder for OtlpEncoder {
                     schema_url: resource_schema_url.clone(),
                 }],
             };
-            payloads.push((Signal::Traces, Bytes::from(data.encode_to_vec())));
+            payloads.push(SignalPayload {
+                signal: Signal::Traces,
+                bytes: Bytes::from(data.encode_to_vec()),
+                records,
+            });
         }
         if !metric_points.is_empty() {
+            let records = metric_points.len();
             let data = metrics_pb::MetricsData {
                 resource_metrics: vec![metrics_pb::ResourceMetrics {
                     resource: Some(resource),
@@ -145,7 +156,11 @@ impl SignalEncoder for OtlpEncoder {
                     schema_url: resource_schema_url,
                 }],
             };
-            payloads.push((Signal::Metrics, Bytes::from(data.encode_to_vec())));
+            payloads.push(SignalPayload {
+                signal: Signal::Metrics,
+                bytes: Bytes::from(data.encode_to_vec()),
+                records,
+            });
         }
         Ok(payloads)
     }
@@ -359,7 +374,7 @@ mod tests {
 
         let mut encoder = OtlpEncoder::new();
         let payloads = encoder.encode_signals(&batch(vec![log, metric, span])).unwrap();
-        let signals: Vec<Signal> = payloads.iter().map(|(s, _)| *s).collect();
+        let signals: Vec<Signal> = payloads.iter().map(|p| p.signal).collect();
         assert_eq!(signals.len(), 3, "got signals: {signals:?}");
         assert!(signals.contains(&Signal::Logs));
         assert!(signals.contains(&Signal::Metrics));
@@ -371,6 +386,63 @@ mod tests {
         let mut encoder = OtlpEncoder::new();
         let payloads = encoder.encode_signals(&batch(vec![])).unwrap();
         assert!(payloads.is_empty(), "got: {payloads:?}");
+    }
+
+    #[test]
+    fn payload_record_counts_are_the_encoded_records_after_skips() {
+        let log = || {
+            Event::log(
+                1,
+                AttrMap::new(),
+                LogRecord {
+                    message: Value::str("hi"),
+                    severity: None,
+                    body_format: logit_core::BodyFormat::Raw,
+                    trace: None,
+                    event_name: None,
+                    observed_timestamp: 0,
+                    dropped_attributes_count: 0,
+                },
+            )
+        };
+        let metric = |kind: MetricKind| {
+            Event::metric(
+                2,
+                AttrMap::new(),
+                MetricRecord::new(logit_core::interner::intern("m"), kind),
+            )
+        };
+        let span = Event::span(
+            3,
+            AttrMap::new(),
+            logit_core::SpanRecord {
+                trace_id: [1; 16],
+                span_id: [2; 8],
+                parent_span_id: None,
+                name: Value::str("s"),
+                kind: logit_core::SpanKind::Internal,
+                status: logit_core::SpanStatus::Ok,
+                events: Vec::new(),
+                links: Vec::new(),
+                end_timestamp: 4,
+                flags: 0,
+                ext: None,
+            },
+        );
+        let events = vec![
+            log(),
+            metric(MetricKind::counter(1.0)),
+            span,
+            metric(MetricKind::SetMembers(vec![Bytes::from_static(b"a")])),
+            log(),
+            metric(MetricKind::counter(2.0)),
+        ];
+
+        let mut encoder = OtlpEncoder::new();
+        let payloads = encoder.encode_signals(&batch(events)).unwrap();
+        let summary: Vec<(Signal, usize)> =
+            payloads.iter().map(|p| (p.signal, p.records)).collect();
+        assert_eq!(summary, vec![(Signal::Logs, 2), (Signal::Traces, 1), (Signal::Metrics, 2)]);
     }
 
     #[test]
@@ -432,8 +504,8 @@ mod tests {
             .unwrap();
 
         // One TracesData carrying both ResourceSpans, as a batching intermediary sends.
-        let data_a = trace_pb::TracesData::decode(bytes_a[0].1.clone()).unwrap();
-        let data_b = trace_pb::TracesData::decode(bytes_b[0].1.clone()).unwrap();
+        let data_a = trace_pb::TracesData::decode(bytes_a[0].bytes.clone()).unwrap();
+        let data_b = trace_pb::TracesData::decode(bytes_b[0].bytes.clone()).unwrap();
         let mut combined = data_a;
         combined.resource_spans.extend(data_b.resource_spans);
         let combined_bytes = Bytes::from(combined.encode_to_vec());
@@ -651,7 +723,7 @@ mod tests {
 
         let mut encoder = OtlpEncoder::new();
         let payloads = encoder.encode_signals(&input_batch).unwrap();
-        let (_, bytes) = payloads.into_iter().find(|(s, _)| *s == Signal::Traces).unwrap();
+        let bytes = payloads.into_iter().find(|p| p.signal == Signal::Traces).unwrap().bytes;
 
         let mut decoder = OtlpDecoder::new();
         let batches = decoder.decode_signal(Signal::Traces, bytes).unwrap();

@@ -509,8 +509,8 @@ trait Decoder { fn decode(&mut self, bytes: Bytes) -> Result<EventBatch>; }
 
 // One opaque blob per batch: the native protocol, InfluxDB line protocol, stdio/file.
 trait Encoder { fn encode(&mut self, batch: &EventBatch) -> Result<Bytes>; }
-// One payload per signal: OTLP, whose logs/metrics/traces are three RPCs.
-trait SignalEncoder { fn encode_signals(&mut self, batch: &EventBatch) -> Result<Vec<(Signal, Bytes)>>; }
+// One payload per signal, with its record count: OTLP, whose logs/metrics/traces are three RPCs.
+trait SignalEncoder { fn encode_signals(&mut self, batch: &EventBatch) -> Result<Vec<SignalPayload>>; }
 // N framed messages per batch, never failing, per-message drops counted: syslog, statsd.
 trait FramedEncoder { type Meta; type Stats; fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf<Self::Meta>) -> Self::Stats; }
 ```

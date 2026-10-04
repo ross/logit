@@ -8,9 +8,14 @@
 //! ambiguous, every other 4xx is permanent, only a connect failure is clean. Two copies of one
 //! table are two things to drift.
 //!
-//! [`after_delivery`] is the `Fault` rule every sink that sends one batch as several requests
-//! applies, whatever carries the request: `otlp_out`'s gRPC and `datadog_trace_out`'s Unix socket
-//! go over `hyper`, not `reqwest`.
+//! [`Outcomes`] is the verdict rule every sink that sends one batch as several requests applies,
+//! whatever carries the request (`otlp_out`'s gRPC and `datadog_trace_out`'s Unix socket go over
+//! `hyper`, not `reqwest`). Each request's verdict stands on its own: a `Fault::Permanent` that
+//! names one request is counted by the sink and the send goes on to the next request; a refusal of
+//! the sink as a whole ([`RefusesSink`]), a `Fault::Clean`, or a `Fault::Ambiguous` stops the send,
+//! the last two through [`after_delivery`]. The send succeeds when any request was accepted, and
+//! fails with the first rejection when none was. See `docs/adr/delivery-semantics.md`'s
+//! "Amendment: per-request verdicts (2026-10-04)".
 //!
 //! [`split_encode`] is the request splitter `datadog_out` and `datadog_trace_out` share: both cut a
 //! batch into requests under a per-route entry count and body size.
@@ -197,6 +202,86 @@ pub(crate) fn after_delivery(err: anyhow::Error, sent_any: bool) -> anyhow::Erro
     }
 }
 
+/// A marker a sink attaches with `.context(RefusesSink)` to a [`Fault::Permanent`] error that
+/// means the destination refuses the sink as a whole, not the one request. [`Outcomes::note`]
+/// stops the send on it: every later request would get the same answer.
+///
+/// It is for a credential that covers every request the sink sends the same way, such as
+/// Datadog's org-wide intake API key (`datadog_out`'s 403). An OTLP credential can be scoped per
+/// signal, so `otlp_out` attaches none and an auth answer rejects only its own signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefusesSink;
+
+impl std::fmt::Display for RefusesSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the destination refuses this sink")
+    }
+}
+
+/// The verdicts of the requests one `send` issued, folded into the send's result.
+///
+/// | A request's result | [`Outcomes::note`] |
+/// |---|---|
+/// | `Ok` | notes it accepted; the send goes on |
+/// | explicit [`Fault::Permanent`] without [`RefusesSink`] | calls `on_rejected` (the sink counts the request's records there), keeps the first such error; the send goes on |
+/// | explicit [`Fault::Permanent`] with [`RefusesSink`] | stops the send with the error unchanged |
+/// | [`Fault::Clean`] or [`Fault::Ambiguous`] | stops the send through [`after_delivery`] |
+/// | no `Fault` attached | stops the send with the error unchanged |
+///
+/// An error with no `Fault` is not a destination's verdict on the request, so it isn't counted as
+/// a rejection; [`logit_pipeline::classify`] still reads it as `Permanent`.
+///
+/// [`Outcomes::finish`] ends a send that wasn't stopped: `Ok` when any request was accepted, even
+/// with rejections beside it; the first rejection when none was, still explicitly `Permanent`, so a
+/// wholly refused batch counts toward `write_loop`'s sustained-permanent-failure window; `Ok` when
+/// there were no requests.
+#[derive(Debug, Default)]
+pub(crate) struct Outcomes {
+    accepted: bool,
+    first_rejected: Option<anyhow::Error>,
+}
+
+impl Outcomes {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Folds one request's `result` in. `Ok(())` means the send goes on; `Err` is the send's
+    /// result, to return at once. `on_rejected` runs only for a rejection the send continues past.
+    pub(crate) fn note(
+        &mut self,
+        result: anyhow::Result<()>,
+        on_rejected: impl FnOnce(&anyhow::Error),
+    ) -> anyhow::Result<()> {
+        let err = match result {
+            Ok(()) => {
+                self.accepted = true;
+                return Ok(());
+            }
+            Err(err) => err,
+        };
+        match err.downcast_ref::<Fault>() {
+            Some(Fault::Permanent) if err.downcast_ref::<RefusesSink>().is_none() => {
+                on_rejected(&err);
+                if self.first_rejected.is_none() {
+                    self.first_rejected = Some(err);
+                }
+                Ok(())
+            }
+            Some(Fault::Permanent) | None => Err(err),
+            Some(Fault::Clean | Fault::Ambiguous) => Err(after_delivery(err, self.accepted)),
+        }
+    }
+
+    /// The send's result once every request was noted without a stop.
+    pub(crate) fn finish(self) -> anyhow::Result<()> {
+        match self.first_rejected {
+            Some(err) if !self.accepted => Err(err),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// One route's request limits; `usize::MAX` is no limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Caps {
@@ -323,6 +408,117 @@ mod tests {
         assert!(is_retryable_http_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
         assert!(is_retryable_http_status(reqwest::StatusCode::SERVICE_UNAVAILABLE));
         assert!(!is_retryable_http_status(reqwest::StatusCode::BAD_REQUEST));
+    }
+
+    fn failed(fault: Fault) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("request failed").context(fault))
+    }
+
+    fn refused() -> anyhow::Result<()> {
+        failed(Fault::Permanent).map_err(|err| err.context(RefusesSink))
+    }
+
+    /// Notes `result`, returning the send's next step and whether `on_rejected` ran.
+    fn note(outcomes: &mut Outcomes, result: anyhow::Result<()>) -> (anyhow::Result<()>, bool) {
+        let mut rejected = false;
+        let next = outcomes.note(result, |_| rejected = true);
+        (next, rejected)
+    }
+
+    #[test]
+    fn a_send_with_no_requests_is_ok() {
+        assert!(Outcomes::new().finish().is_ok());
+    }
+
+    #[test]
+    fn accepted_requests_finish_ok() {
+        let mut outcomes = Outcomes::new();
+        let (next, rejected) = note(&mut outcomes, Ok(()));
+        assert!(next.is_ok() && !rejected);
+        assert!(outcomes.finish().is_ok());
+    }
+
+    /// A rejection beside an accepted request is counted, and the send still succeeds.
+    #[test]
+    fn a_rejection_continues_and_an_accepted_request_makes_the_send_ok() {
+        for accepted_first in [true, false] {
+            let mut outcomes = Outcomes::new();
+            if accepted_first {
+                assert!(note(&mut outcomes, Ok(())).0.is_ok());
+            }
+            let (next, rejected) = note(&mut outcomes, failed(Fault::Permanent));
+            assert!(next.is_ok(), "a rejection does not stop the send");
+            assert!(rejected, "on_rejected runs for a rejection");
+            if !accepted_first {
+                assert!(note(&mut outcomes, Ok(())).0.is_ok());
+            }
+            assert!(outcomes.finish().is_ok(), "accepted_first: {accepted_first}");
+        }
+    }
+
+    /// With nothing accepted, the send fails with the first rejection, explicitly permanent.
+    #[test]
+    fn rejections_alone_finish_with_the_first_explicitly_permanent() {
+        let mut outcomes = Outcomes::new();
+        let first = Err(anyhow::anyhow!("first").context(Fault::Permanent));
+        assert!(note(&mut outcomes, first).0.is_ok());
+        assert!(note(&mut outcomes, failed(Fault::Permanent)).0.is_ok());
+        let err = outcomes.finish().unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+        assert!(logit_pipeline::is_explicitly_permanent(&err));
+        assert!(format!("{err:#}").contains("first"), "the first rejection is kept: {err:#}");
+    }
+
+    /// A refusal of the sink stops the send unchanged, before or after an accepted request.
+    #[test]
+    fn a_refusal_of_the_sink_stops_the_send_unchanged() {
+        for accepted_first in [false, true] {
+            let mut outcomes = Outcomes::new();
+            if accepted_first {
+                assert!(note(&mut outcomes, Ok(())).0.is_ok());
+            }
+            let (next, rejected) = note(&mut outcomes, refused());
+            let err = next.unwrap_err();
+            assert!(!rejected, "a refusal is not counted as a rejection");
+            assert!(err.downcast_ref::<RefusesSink>().is_some());
+            assert!(logit_pipeline::is_explicitly_permanent(&err));
+        }
+    }
+
+    /// `Clean` stops the send, and becomes `Ambiguous` once a request was accepted; `Ambiguous`
+    /// stops it unchanged. A rejection alone doesn't make `Clean` ambiguous: nothing was taken.
+    #[test]
+    fn clean_and_ambiguous_stop_the_send_through_after_delivery() {
+        let cases = [
+            (false, Fault::Clean, Fault::Clean),
+            (true, Fault::Clean, Fault::Ambiguous),
+            (false, Fault::Ambiguous, Fault::Ambiguous),
+            (true, Fault::Ambiguous, Fault::Ambiguous),
+        ];
+        for (accepted_first, fault, want) in cases {
+            let mut outcomes = Outcomes::new();
+            assert!(note(&mut outcomes, failed(Fault::Permanent)).0.is_ok());
+            if accepted_first {
+                assert!(note(&mut outcomes, Ok(())).0.is_ok());
+            }
+            let (next, rejected) = note(&mut outcomes, failed(fault));
+            assert!(!rejected);
+            assert_eq!(
+                logit_pipeline::classify(&next.unwrap_err()),
+                want,
+                "accepted_first: {accepted_first}, fault: {fault}"
+            );
+        }
+    }
+
+    /// An error with no `Fault` is no destination verdict: it stops the send unchanged.
+    #[test]
+    fn an_unclassified_error_stops_the_send_unchanged() {
+        let mut outcomes = Outcomes::new();
+        let (next, rejected) = note(&mut outcomes, Err(anyhow::anyhow!("encode failed")));
+        let err = next.unwrap_err();
+        assert!(!rejected);
+        assert!(!logit_pipeline::is_explicitly_permanent(&err));
     }
 
     fn fake_encode(items: &[u32]) -> Option<Encoded> {

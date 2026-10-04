@@ -19,6 +19,8 @@ its metrics request fails with `grpc-status: 12` (`UNIMPLEMENTED`), and `write_l
 sustained-permanent-failure guard eventually ends the whole process — recorded in full in
 `docs/known-gaps/otlp.md`'s "`otlp_out` aborts an entire batch's `send`..." entry, which names "a
 config-layer way to filter an event stream by which payload it carries" as the real fix.
+[Closed 2026-10-04 by ADR `delivery-semantics`'s "Amendment: per-request verdicts (2026-10-04)":
+the gap entry is deleted, and the guard no longer trips on a signal-partial backend.]
 
 The obvious fix — a `signals: [traces]` field on `otlp_out` — was rejected. Filtering by signal
 type is pipeline composition, not sink configuration: the same need would recur on every future

@@ -174,9 +174,10 @@ nginx's access-line spans.
 (`type: has_signal`) drops the metric-only ones before they reach `tempo_out`, because Tempo is a
 traces-only backend and would reject them. `has_signal` never forwards a metrics-only batch at
 all, so you shouldn't see any `component 'tempo_out'` send failures in steady state. Without
-`trace_only`, this interaction doesn't just log a warning: it stops `logit` a minute after
-startup. See [docs/known-gaps/otlp.md](../docs/known-gaps/otlp.md)'s "`otlp_out` aborts a batch's
-`send`..." entry for the full account.
+`trace_only`, each mixed batch would still deliver its spans, but `otlp_out` would send a metrics
+request Tempo rejects on every batch, count the points `records.dropped{reason="rejected"}`, and
+warn. See [ADR `delivery-semantics`](../docs/adr/delivery-semantics.md)'s "Amendment: per-request
+verdicts (2026-10-04)".
 
 ### The app's own traces
 

@@ -272,6 +272,10 @@ Under item 5 these sinks retry an `Ambiguous` fault by default, so the rule cost
 operator who sets `at_most_once` on one gets what the posture says: no resend of an accepted
 request, and the loss of the requests that hadn't gone.
 
+[Narrowed by "Amendment: per-request verdicts (2026-10-04)": a `Permanent` verdict that names one
+request no longer stops the send, so the rule above applies to `Clean` and `Ambiguous` faults
+only.]
+
 ### 10. A replaying input is at-least-once up to the in-memory queues
 
 `tail_in` and `docker_in` checkpoint an offset once its lines are acknowledged as item 3
@@ -453,3 +457,65 @@ the consumer that blocks a fan-out is instrumented instead: `logit.component.inb
 (`docs/design/internal-telemetry.md`, "Inbox side: recorded under the consumer";
 `docs/design/pipeline-graph.md`, "Backpressure"). Propagating a closure as a shutdown signal
 stays open.
+
+## Amendment: per-request verdicts (2026-10-04)
+
+A `send` that issues several requests used to stop at the first failing request. Against a
+destination that accepts only some of the signals or routes a batch carries, that made a
+well-formed batch fail on every attempt, even though part of it had landed. `otlp_out` fed by
+`internal` and sent to Tempo, which accepts traces only, is the case: each batch's traces request
+succeeds and its metrics request fails with gRPC `UNIMPLEMENTED`. No `send` ever returned `Ok`, so
+[ADR `buffered-sink-delivery`](buffered-sink-delivery.md)'s sustained-permanent-failure guard
+(`PERMANENT_FAILURE_WINDOW`, 60 s) ended the process.
+
+`otlp_out`, `datadog_out`, and `datadog_trace_out` now treat each request's verdict on its own:
+
+1. **Accepted** (2xx or gRPC `OK`, `partial_success` included): record that something was
+   accepted and go on.
+2. **`Permanent` naming the request** (a 3xx, a 4xx other than `datadog_out`'s 403, gRPC
+   `INVALID_ARGUMENT`, `UNIMPLEMENTED`, or an unrecognized code; for `otlp_out` this includes
+   HTTP 401 and 403 and gRPC `UNAUTHENTICATED` and `PERMISSION_DENIED`): count the request's records as
+   `logit.output.records.dropped{reason="rejected"}` on the attempt that got the verdict, remember
+   the first such error, and go on to the next request. A `413` keeps its existing
+   `reason="oversize"` count.
+3. **`Permanent` refusing the sink** (`datadog_out`'s 403 `api_key_rejected`): stop and return
+   it. A Datadog API key is org-wide, so every remaining request would get the same answer, and
+   continuing only spends requests. A `datadog_out` `events` route sends one request per event.
+   An OTLP credential can be scoped per signal (a Grafana Cloud access policy can grant
+   `traces:write` without `metrics:write`), so `otlp_out`'s auth answers fall under item 2.
+4. **`Clean` or `Ambiguous`**: stop and return it through item 9's `after_delivery` rule,
+   unchanged.
+5. **End of the send**: if any request was accepted, return `Ok`, even when others were rejected.
+   If none was accepted and some were rejected, return the first rejected error, still
+   explicitly `Permanent`.
+
+**Why `Clean` and `Ambiguous` still stop.** The runtime retries the whole batch on either, so
+attempting more requests first only adds duplicates to the retry.
+
+**Why a sink-wide refusal stops.** A refusal of Datadog's org-wide API key says nothing about
+the request that carried it. Going on would repeat the refusal once per remaining request. An
+OTLP auth answer can be scoped to one signal, so no answer to one signal says anything about
+another; a token refused on every signal still ends the send with the first rejection,
+explicitly `Permanent`, at the cost of at most two more requests per batch.
+
+**The guard.** A wholly refused batch still returns an explicitly `Permanent` error, so a bad
+token or bucket keeps tripping the guard after 60 s. A partly accepted batch returns `Ok`, so a
+signal-partial destination can't trip it. A batch the destination refuses whole, such as a
+metrics-only batch into Tempo, still fails and is dropped, and the guard trips only when every
+batch for 60 s is one of those. That is the misconfiguration the guard exists to catch. The
+operator remedy for a mixed source is `has_signal` or `keep_signals` ahead of the sink, which
+`otlp_out` names in its throttled `signal_rejected` warning. The Datadog sinks reuse their
+`request_rejected` diagnostic.
+
+**Counting.** `records.dropped{reason="rejected"}` is a server-verdict drop, so it counts per
+attempt, whether or not the send ends `Ok` ([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md),
+decision 1). Layer 2's `events.dropped{reason="send_failed"}` counts the batch only when the whole
+send failed. A partly accepted batch is delivered modulo these counted losses, the posture
+OTLP `partial_success` and Splunk's code 6 already have.
+
+**Not covered.** `splunk_hec_out` keeps item 9's stop-at-first-failure behavior. Its bodies are
+chunks of one route, and its `400` handling is code-specific. Applying the rule there is a
+follow-up that has to account for the code 6 resend and the `Clean` rule for a busy answer before
+anything is accepted.
+
+There is no config knob.

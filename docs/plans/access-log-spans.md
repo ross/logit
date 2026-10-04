@@ -79,7 +79,7 @@ Deltas to the already-landed haproxy/nginx/app chain, not a rebuild of it:
   `haproxy_trace`/`nginx_trace` gain `span: {kind: server, name: http.request}`; a new
   `keep_signals: [logs]` stage in front of `loki_out` (Loki's OTLP endpoint is logs-only, and
   `otlp_out` aborts the whole `send` on any one failing signal — see the existing `trace_only`
-  comment in that file for the precedent); a new `keep_signals: [traces]` stage from
+  comment in that file for the precedent) [Closed 2026-10-04 by ADR `delivery-semantics`'s "Amendment: per-request verdicts (2026-10-04)": `otlp_out` no longer aborts a `send` on a request that names itself as rejected, so a signal-partial backend no longer trips the guard. The gate described here still saves a rejected request per batch.]; a new `keep_signals: [traces]` stage from
   `haproxy_trace`/`nginx_trace` feeding `tempo_out` alongside the existing `trace_only` (`internal`)
   source. The metrics leg (`nginx_scale`/`*_metrics`/`trimmed`/`windowed`) is untouched.
 - `demo/grafana/`: the Loki datasource's body-regex derived-field fallback updated for the dotted

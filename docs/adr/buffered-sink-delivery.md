@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-10-01
+updated: 2026-10-04
 ---
 
 # Buffered, decoupled sink delivery
@@ -361,3 +361,9 @@ is a per-sink policy, chosen in three layers".
 The `Fault` table is unchanged. The code has `Output::default_posture()`, whose trait default is
 `at_least_once` and which `statsd_out` overrides; `buffer.delivery:` overrides either per
 component.
+
+## Amendment: the guard and per-request verdicts (2026-10-04)
+
+[ADR `delivery-semantics`](delivery-semantics.md)'s "Amendment: per-request verdicts (2026-10-04)"
+removes the guard's documented false positive, a signal-partial backend fed mixed signals: a send
+that had any request accepted returns `Ok`, and only a wholly refused batch reaches the guard.

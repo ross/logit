@@ -5006,7 +5006,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     the whole batch, so a mixed log+metric+trace batch duplicates the signals that already
     succeeded on every retry. Documented in `duplicate_safe`'s own doc comment, but it means a
     3-signal batch has a 3× worse duplication profile than a 1-signal one. **High confidence;
-    documented, but worth quantifying.**
+    documented, but worth quantifying.** [Narrowed 2026-10-04 by ADR `delivery-semantics`'s "Amendment: per-request verdicts (2026-10-04)": a `Permanent` verdict naming one signal no longer aborts the send, so only a `Clean` or `Ambiguous` failure retries the batch with the accepted signals.]
   - `grpc_status_from` returns `None` for a non-numeric `grpc-status`, which then falls through to
     the trailers and possibly to "carried no grpc-status" → `Ambiguous` (retry). A server sending
     a malformed status therefore causes retries rather than a permanent failure.

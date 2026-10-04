@@ -105,7 +105,7 @@ fn otlp_decode_100(bencher: Bencher, shape: Shape) {
     let payloads = bakeoff::otlp_encode(&shape.batch(100));
     bencher.bench_local(|| {
         let mut decoder = logit_proto::otlp::OtlpDecoder::new();
-        for (signal, bytes) in divan::black_box(payloads.clone()) {
+        for logit_proto::SignalPayload { signal, bytes, .. } in divan::black_box(payloads.clone()) {
             let _ = logit_proto::SignalDecoder::decode_signal(&mut decoder, signal, bytes);
         }
     });
@@ -179,7 +179,7 @@ fn encoded_bytes(shape: Shape) {
                 logit_proto::native::NativeEncoder::new(logit_proto::frame::Compression::Lz4);
             logit_proto::Encoder::encode(&mut encoder, &batch).expect("native lz4 encode").len()
         };
-        let otlp: usize = bakeoff::otlp_encode(&batch).iter().map(|(_, b)| b.len()).sum();
+        let otlp: usize = bakeoff::otlp_encode(&batch).iter().map(|p| p.bytes.len()).sum();
         let rkyv = bakeoff::rkyv_encode(&batch).len();
         let postcard = bakeoff::postcard_encode(&batch).len();
         println!(

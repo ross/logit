@@ -990,7 +990,7 @@ mod tests {
             )],
         };
         let payloads = logit_proto::SignalEncoder::encode_signals(&mut encoder, &batch).unwrap();
-        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Traces).unwrap();
+        let body = payloads.into_iter().find(|p| p.signal == Signal::Traces).unwrap().bytes;
 
         let response = post_raw(
             &addr,
@@ -1295,7 +1295,7 @@ mod tests {
             )],
         };
         let payloads = logit_proto::SignalEncoder::encode_signals(&mut encoder, &batch).unwrap();
-        payloads.into_iter().find(|(s, _)| *s == Signal::Traces).unwrap().1.to_vec()
+        payloads.into_iter().find(|p| p.signal == Signal::Traces).unwrap().bytes.to_vec()
     }
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {
@@ -1446,8 +1446,8 @@ mod tests {
         // field is `repeated ResourceSpans resource_spans = 1`, and concatenated encodings of a
         // message are a valid merge.
         let mut combined_bytes = Vec::new();
-        combined_bytes.extend_from_slice(&bytes_a[0].1);
-        combined_bytes.extend_from_slice(&bytes_b[0].1);
+        combined_bytes.extend_from_slice(&bytes_a[0].bytes);
+        combined_bytes.extend_from_slice(&bytes_b[0].bytes);
 
         let response = post_raw(
             &addr,
@@ -1763,7 +1763,7 @@ mod tests {
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
             logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
-        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap();
+        let body = payloads.into_iter().find(|p| p.signal == Signal::Metrics).unwrap().bytes;
 
         let connector = tls_connector(None).await;
         let response = post_raw_tls(
@@ -1911,7 +1911,7 @@ mod tests {
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
             logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
-        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap();
+        let body = payloads.into_iter().find(|p| p.signal == Signal::Metrics).unwrap().bytes;
         let connector = tls_connector(None).await;
         let response = post_raw_tls(
             &connector,
@@ -2012,7 +2012,7 @@ mod tests {
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
             logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
-        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap();
+        let body = payloads.into_iter().find(|p| p.signal == Signal::Metrics).unwrap().bytes;
         let response = post_raw(
             &addr,
             "/v1/metrics",
@@ -2039,7 +2039,7 @@ mod tests {
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
             logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
-        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap();
+        let body = payloads.into_iter().find(|p| p.signal == Signal::Metrics).unwrap().bytes;
 
         let head = format!(
             "POST /v1/metrics HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: \
@@ -2073,7 +2073,7 @@ mod tests {
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
             logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
-        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap();
+        let body = payloads.into_iter().find(|p| p.signal == Signal::Metrics).unwrap().bytes;
 
         let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let io = TokioIo::new(stream);
@@ -2171,7 +2171,7 @@ mod tests {
             let mut encoder = logit_proto::otlp::OtlpEncoder::new();
             let payloads =
                 logit_proto::SignalEncoder::encode_signals(&mut encoder, &batch).unwrap();
-            body.extend_from_slice(&payloads[0].1);
+            body.extend_from_slice(&payloads[0].bytes);
         }
         body
     }
@@ -2244,7 +2244,7 @@ mod tests {
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
             logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
-        payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap().1
+        payloads.into_iter().find(|p| p.signal == Signal::Metrics).unwrap().bytes
     }
 
     /// [`post_raw`]'s keep-alive half: one complete HTTP/1.1 POST on an open stream with **no**

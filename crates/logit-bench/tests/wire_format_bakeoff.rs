@@ -410,7 +410,7 @@ fn otlp_degrades_samples_to_a_summary_and_skips_set_members() {
     let mut encoder = logit_proto::otlp::OtlpEncoder::new();
     let payloads = encoder.encode_signals(&set_members_batch).expect("otlp encode");
     assert!(
-        payloads.iter().all(|(signal, _)| *signal != Signal::Metrics),
+        payloads.iter().all(|p| p.signal != Signal::Metrics),
         "SetMembers should be skipped like Set, producing no Metrics payload"
     );
 }
@@ -514,9 +514,9 @@ fn native_postcard_and_rkyv_preserve_gauge_delta_and_set_identity_that_otlp_drop
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads = encoder.encode_signals(&batch).expect("otlp encode");
         assert!(
-            payloads.iter().all(|(signal, _)| *signal != Signal::Metrics),
+            payloads.iter().all(|p| p.signal != Signal::Metrics),
             "OTLP should produce no Metrics payload for a kind it can't express -- got {:?}",
-            payloads.iter().map(|(s, _)| s).collect::<Vec<_>>()
+            payloads.iter().map(|p| &p.signal).collect::<Vec<_>>()
         );
     }
 }

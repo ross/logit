@@ -34,6 +34,11 @@ use logit_proto::native::SeqId;
 ///   (`SplunkHecOutput::send_once`);
 /// - `splunk_hec_out`'s one split of a body Splunk Cloud answered as over its cap, each half sent
 ///   once (`SplunkHecOutput::send_body`);
+/// - `otlp_out`, `datadog_out`, and `datadog_trace_out` go on to the next request when one is
+///   answered with a `Permanent` verdict that names it, count its records
+///   `records.dropped{reason="rejected"}`, and return `Ok` if any request was accepted. A verdict
+///   that refuses the sink, a `Clean`, or an `Ambiguous` stops the send
+///   (`docs/adr/delivery-semantics.md`, "Amendment: per-request verdicts (2026-10-04)");
 /// - `splunk_hec_out`'s `/ack` poll under `ack: true`, until every id is acknowledged or
 ///   `ack_timeout` passes (`SplunkHecOutput::await_acks`).
 #[async_trait::async_trait]

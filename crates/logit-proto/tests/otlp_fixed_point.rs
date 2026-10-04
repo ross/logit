@@ -228,9 +228,11 @@ fn span_batch() -> EventBatch {
 fn assert_fixed_point(signal: Signal, batch: EventBatch) {
     let mut encoder = OtlpEncoder::new();
     let payloads = encoder.encode_signals(&batch).expect("encode must succeed");
-    let (found_signal, bytes) =
-        payloads.into_iter().find(|(s, _)| *s == signal).expect("expected signal payload missing");
-    assert_eq!(found_signal, signal);
+    let bytes = payloads
+        .into_iter()
+        .find(|p| p.signal == signal)
+        .expect("expected signal payload missing")
+        .bytes;
 
     // Property 1: decode(encode(b)) == vec![b].
     let mut decoder = OtlpDecoder::new();
@@ -240,10 +242,11 @@ fn assert_fixed_point(signal: Signal, batch: EventBatch) {
     // Property 2: encode(decode(encode(b))) == encode(b), on bytes.
     let mut re_encoder = OtlpEncoder::new();
     let re_payloads = re_encoder.encode_signals(&decoded[0]).expect("re-encode must succeed");
-    let (_, re_bytes) = re_payloads
+    let re_bytes = re_payloads
         .into_iter()
-        .find(|(s, _)| *s == signal)
-        .expect("expected signal payload missing");
+        .find(|p| p.signal == signal)
+        .expect("expected signal payload missing")
+        .bytes;
     assert_eq!(re_bytes, bytes, "encode(decode(encode(b))) must equal encode(b) on bytes");
 }
 

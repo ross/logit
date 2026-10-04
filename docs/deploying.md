@@ -264,8 +264,10 @@ destination, so the resend adds to it. Set `buffer.delivery: at_most_once` on an
 drop a batch on its first ambiguous failure instead of risking a duplicate
 ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 5). A sink that sends one batch as
 several requests (`otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`) reports a
-failure as ambiguous once any of them was accepted, so `at_least_once` resends the accepted
-requests with the rest and `at_most_once` drops the rest (item 9).
+retryable failure as ambiguous once any of them was accepted, so `at_least_once` resends the
+accepted requests with the rest and `at_most_once` drops the rest (item 9). A request the
+destination rejects by name (a `4xx` other than an auth refusal) is counted and skipped, except
+at `splunk_hec_out`, and the send succeeds if any request was accepted.
 
 A resend is harmless where the destination overwrites on identity: a sample at its
 `(series, timestamp)`, or a cumulative sum. A log or a span arrives twice. A resend double-counts
@@ -1919,10 +1921,12 @@ event too large to send alone is dropped and counted `records.dropped{reason="ov
 | traces | 3,200,000 bytes uncompressed |
 
 **Delivery.** One batch goes out over up to eight routes, each as one or more requests (one per
-event, and a route over its size cap is split), sent one after another. The first that fails
-stops the rest, and the whole batch is retried or dropped as one. `408`, `429`, and `5xx` answers
-and timeouts are retryable; `413` counts the request's entries `oversize`; any other `4xx` isn't
-retried. A retry re-sends the requests that succeeded, so the default posture, `at_least_once`,
+event, and a route over its size cap is split), sent one after another. A `408`, `429`, or `5xx`
+answer or a timeout stops the rest, and the whole batch is retried or dropped as one. A `403`
+(a rejected API key) also stops the rest. A `413` counts the request's entries `oversize`, and any
+other `4xx` or `3xx` counts them `records.dropped{reason="rejected"}`; neither is retried, and the
+send goes on to the next request. The send is delivered if any request was accepted, and fails
+as a permanent fault only when none was. A retry re-sends the requests that succeeded, so the default posture, `at_least_once`,
 can deliver a resend. A trial org stored a resent series point once, the last write winning at
 its `(series, timestamp)`, and an identical log twice. Assume every other route (distribution
 points, sketches, events, checks, traces, stats) stores a resend again: none was measured.
@@ -2016,8 +2020,10 @@ itself (`content-type`, `user-agent`, and every `datadog-*` or `x-datadog-*` hea
 Agent's `max_request_bytes`. A trace too large to send alone is dropped and counted
 `logit.output.records.dropped{reason="oversize"}`.
 
-**Delivery.** Traces go first, then stats. The first request that fails stops the rest, and the
-batch is retried or dropped as one. `408`, `429`, `5xx`, and timeouts are retryable; a refused
+**Delivery.** Traces go first, then stats. A request that fails with a retryable error stops the
+rest, and the batch is retried or dropped as one. A `413` counts `oversize`, and any other `4xx`
+counts `records.dropped{reason="rejected"}` and goes on to the next request; the send is
+delivered if either request was accepted. `408`, `429`, `5xx`, and timeouts are retryable; a refused
 connection or a missing socket file is retried under every posture before any request of the
 batch was accepted, and after one is retryable like a timeout; any other `4xx` isn't retried.
 An Agent dedupes nothing, so under the default `at_least_once` posture a resend stores its spans
@@ -2373,8 +2379,10 @@ Runnable configs:
 
 **Run one `otlp_out` per product, each behind a `keep_signals`.** One `otlp_out` posts every signal
 it carries to one host, and a product answers a signal it doesn't ingest with a `404`, which is a
-permanent fault that drops the whole batch, including the signals it did store. Split the flow with
-`keep_signals` (or `has_signal`) so each sink sees only its product's signal.
+permanent fault. `otlp_out` counts that signal's records `records.dropped{reason="rejected"}`,
+warns, and still sends the other signals, but the request is wasted on every batch. Split the flow
+with `keep_signals` (or `has_signal`) so each sink sees only its product's signal. A batch the
+product refuses whole still fails and is dropped.
 
 **Put `aggregate` with `temporality: cumulative` ahead of metrics bound for VictoriaMetrics.**
 VictoriaMetrics keeps no temporality. A delta `Sum` sent over OTLP is stored as its raw

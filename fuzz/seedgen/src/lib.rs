@@ -16,7 +16,7 @@ use logit_proto::native::{encode_batch, encode_hop_batch, SeqId, CODEC_BATCH, CO
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{decompress_bounded, Encoding};
 use logit_proto::prometheus::remote_write::Version;
-use logit_proto::{Signal, SignalEncoder};
+use logit_proto::{Signal, SignalEncoder, SignalPayload};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
@@ -68,7 +68,7 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         let payloads = OtlpEncoder::new()
             .encode_signals(batch)
             .map_err(|e| std::io::Error::other(format!("encoding {name}: {e}")))?;
-        for (signal, body) in payloads {
+        for SignalPayload { signal, bytes: body, .. } in payloads {
             let selector = SIGNALS.iter().find(|(s, _, _)| *s == signal).map(|s| s.2).unwrap();
             add("otlp_proto", name.clone(), prefixed(selector, &body));
             add("otlp_grpc", format!("{name}-plain"), prefixed(selector, &grpc_frame(0, &body)));
