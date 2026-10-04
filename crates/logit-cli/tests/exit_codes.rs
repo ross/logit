@@ -1,8 +1,9 @@
 //! `docs/deploying.md`'s exit-code table against the real binary (ADR
 //! `service-lifecycle-and-output-retry`): exit 1 for a startup failure, 0 for a clean finish.
-//! Exit 2, a runtime failure after ready, needs 60 real seconds of `PERMANENT_FAILURE_WINDOW`, so
-//! `logit-pipeline`'s paused-clock `a_sustained_permanent_sink_failure_returns_runtime_not_startup`
-//! and the unit test on `RunError::exit_code` cover it instead.
+//! Exit 2, a runtime failure after ready, needs a listener or Lua node to fail mid-run, which no
+//! shipped component does on demand, so `logit-pipeline`'s
+//! `a_listener_failing_after_ready_flips_failed_and_returns_runtime` and the unit test on
+//! `RunError::exit_code` cover it instead. A sink failure never ends the run.
 
 use std::io::Write;
 use std::path::PathBuf;

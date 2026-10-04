@@ -3369,6 +3369,22 @@ pub struct BufferConfig {
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub shutdown_grace: Duration,
+    /// How long the sink must see nothing but rejections that no retry can fix (a `401`, a
+    /// `403`, a `400`) with no successful delivery before it backs off. Until then each rejected
+    /// batch is dropped and counted. Backed off, the sink stops sending every batch: it holds the
+    /// batch at the head of its queue, drops nothing, and resends that batch every
+    /// `backoff_interval` until the destination accepts it. Meanwhile the queue fills under its
+    /// `overflow` policy; under `block`, a full queue holds back the components that feed this
+    /// sink, and through them the inputs. Must be greater than `0s`. Defaults to `60s`.
+    #[serde(with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub backoff_after: Duration,
+    /// How often a backed-off sink resends the batch at the head of its queue to see whether the
+    /// destination accepts it again. The first success delivers it and the queue behind it, and
+    /// ends the backoff. Must be greater than `0s`. Defaults to `60s`.
+    #[serde(with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub backoff_interval: Duration,
     /// Disk-backed durable buffering, opt-in. Omitted (the default) keeps the in-memory queue.
     /// Present, it replaces that queue with a disk spool at `disk.path`; `max_batches`/`max_bytes`
     /// are rejected at anything but their defaults alongside it, since the disk bound replaces
@@ -3387,6 +3403,8 @@ impl Default for BufferConfig {
             retry_budget: Duration::from_secs(60),
             retry_max_delay: Duration::from_secs(10),
             shutdown_grace: Duration::from_secs(5),
+            backoff_after: Duration::from_secs(60),
+            backoff_interval: Duration::from_secs(60),
             disk: None,
         }
     }

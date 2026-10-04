@@ -172,7 +172,7 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
         // One `write_all` and one `flush` per batch, so nothing sits in tokio's buffer between
         // batches. `flush` is not `fsync`: the OS page cache still holds the bytes. A write error
         // carries no `Fault`, so the runtime doesn't retry the batch, and it doesn't count toward
-        // the permanent-failure exit either (`logit_pipeline::output::is_explicitly_permanent`).
+        // the streak that backs a sink off either (`logit_pipeline::output::is_explicitly_permanent`).
         // A failed re-open after rotation is the exception: `Fault::Clean` (`FileTarget::rotate`).
         match &mut self.target {
             Target::Stdout(w) => {

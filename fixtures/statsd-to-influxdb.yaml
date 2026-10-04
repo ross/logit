@@ -64,6 +64,8 @@ components:
     #   retry_budget: 60s      # wall-clock ceiling on retrying one batch before it's dropped
     #   retry_max_delay: 10s   # backoff cap between retry attempts
     #   shutdown_grace: 5s     # how long SIGTERM waits for the queue to drain before dropping the rest
+    #   backoff_after: 60s     # this long of nothing but rejections (401/403/400) and the sink holds its queue
+    #   backoff_interval: 60s  # how often a backed-off sink resends its held batch to see if it's accepted
     #   # disk:                        # opt-in durable buffering (docs/adr/disk-backed-sink-buffer.md);
     #   #                              # replaces the in-memory queue, so max_batches/max_bytes stay at their defaults
     #   #   path: spool/influxdb_out   # required, resolved relative to this config file's own directory

@@ -190,10 +190,11 @@ pub fn classify(err: &anyhow::Error) -> Fault {
 }
 
 /// Whether `err` carries an explicit `Fault::Permanent` marker from the sink, as opposed to
-/// [`classify`]'s default when no `Fault` is attached. Only an explicit marker counts toward
-/// `write_loop`'s sustained-permanent-failure exit window: an unclassified error (`StreamOutput`'s
-/// bare I/O errors, say a full disk) is non-retryable but is not a positively identified
-/// configuration error (a bad token) that should end the process.
+/// [`classify`]'s default when no `Fault` is attached. Only an explicit marker counts toward the
+/// streak after which `write_loop` backs off and holds its queue
+/// (`docs/adr/sink-rejection-backoff.md`): an unclassified error (`StreamOutput`'s bare I/O
+/// errors, say a full disk) is non-retryable but is not a positively identified rejection (a bad
+/// token), and a stream of them is dropped batch by batch instead.
 pub fn is_explicitly_permanent(err: &anyhow::Error) -> bool {
     matches!(err.downcast_ref::<Fault>(), Some(Fault::Permanent))
 }
@@ -286,8 +287,8 @@ mod tests {
 
     #[test]
     fn an_unclassified_error_is_never_explicitly_permanent() {
-        // classify()'s default is a retry decision, not a positively identified configuration
-        // error, so it must not count toward write_loop's permanent-failure exit window.
+        // classify()'s default is a retry decision, not a positively identified rejection, so it
+        // must not count toward write_loop's backoff streak.
         let err = anyhow::anyhow!("boom, no fault attached");
         assert_eq!(classify(&err), Fault::Permanent, "still non-retryable by default");
         assert!(!is_explicitly_permanent(&err), "but not an explicit classification");

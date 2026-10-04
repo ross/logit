@@ -496,6 +496,7 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
 | `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window` |
 | `logit.component.retries` | count | a retried delivery attempt or windowed round, `deliver_with_retry` or `deliver_window` (`write_loop`) |
+| `logit.component.backoff` | gauge | `write_loop`: `1` while the sink is backed off after nothing but rejections, holding its queue and probing the head once per `buffer.backoff_interval`, else `0` ([ADR `sink-rejection-backoff`](../adr/sink-rejection-backoff.md)). Written when the sink backs off, at each failed probe, and when backoff ends, so a drain between two writes carries no point. Nothing is dropped while it reads `1`, so `batches.dropped{reason="send_failed"}` stops moving and this gauge and `buffer.utilization` are the signals |
 | `logit.component.errors` | count | `Output::send` failed (any attempt), or a Lua script error |
 | `logit.component.diagnostics{key=...}` | count | every `Diagnostics::warn_throttled` occurrence, throttled or not |
 | `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |

@@ -43,7 +43,10 @@
 //! 15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0`: no batch could ever be queued.
 //!     Or its `buffer.retry_budget` or `buffer.retry_max_delay` of `0s`: a zero budget times out
 //!     every attempt before it starts, and a zero delay retries with no pause until the budget
-//!     ends (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 10).
+//!     ends (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 10). Or its
+//!     `buffer.backoff_after` or `buffer.backoff_interval` of `0s`: a zero `backoff_after` backs
+//!     off on the first rejection, and a zero interval resends the held batch with no pause
+//!     (`docs/adr/sink-rejection-backoff.md`).
 //! 16. An `internal` `span_sample_rate` that is non-finite or outside `[0, 1]`: a typo, not a value
 //!     to clamp (NaN would keep every span).
 //! 17. A non-default `receive:` outside a datagram, stream, or tail listener (explicit predicates,
@@ -977,6 +980,18 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': 'buffer.retry_max_delay' must be greater than 0s -- 0 \
                      would retry a failing batch with no pause until its retry budget ran out"
+                );
+            }
+            if component.buffer.backoff_after.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': 'buffer.backoff_after' must be greater than 0s -- 0 would \
+                     back off on the first rejected batch"
+                );
+            }
+            if component.buffer.backoff_interval.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': 'buffer.backoff_interval' must be greater than 0s -- 0 \
+                     would resend a rejected batch with no pause"
                 );
             }
         }
@@ -7686,6 +7701,36 @@ mod tests {
         ]));
         assert!(err.contains("'out'"), "got: {err}");
         assert!(err.contains("'buffer.retry_max_delay' must be greater than 0s"), "got: {err}");
+    }
+
+    #[test]
+    fn a_sinks_buffer_with_a_zero_backoff_after_is_rejected() {
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            (
+                "out",
+                vec!["in"],
+                sink(),
+                BufferConfig { backoff_after: Duration::ZERO, ..BufferConfig::default() },
+            ),
+        ]));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("'buffer.backoff_after' must be greater than 0s"), "got: {err}");
+    }
+
+    #[test]
+    fn a_sinks_buffer_with_a_zero_backoff_interval_is_rejected() {
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            (
+                "out",
+                vec!["in"],
+                sink(),
+                BufferConfig { backoff_interval: Duration::ZERO, ..BufferConfig::default() },
+            ),
+        ]));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("'buffer.backoff_interval' must be greater than 0s"), "got: {err}");
     }
 
     /// The smallest nonzero values pass: a `retry_max_delay` below the 200 ms base delay is a

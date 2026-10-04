@@ -1242,6 +1242,8 @@ fn write_config(buffer: &BufferConfig) -> WriteLoopConfig {
         },
         shutdown_grace: buffer.shutdown_grace,
         delivery_override: buffer.delivery.map(delivery_posture),
+        backoff_after: buffer.backoff_after,
+        backoff_interval: buffer.backoff_interval,
     }
 }
 
@@ -3587,6 +3589,8 @@ mod tests {
                 retry_budget: Duration::from_secs(120),
                 retry_max_delay: Duration::from_secs(20),
                 shutdown_grace: Duration::from_secs(10),
+                backoff_after: Duration::from_secs(90),
+                backoff_interval: Duration::from_secs(30),
                 disk: None,
             },
             receive: logit_config::ReceiveConfig::default(),
@@ -3619,6 +3623,8 @@ mod tests {
             "base_delay is not config-exposed -- always the default"
         );
         assert_eq!(write_config.shutdown_grace, Duration::from_secs(10));
+        assert_eq!(write_config.backoff_after, Duration::from_secs(90));
+        assert_eq!(write_config.backoff_interval, Duration::from_secs(30));
         assert_eq!(
             write_config.delivery_override,
             Some(logit_pipeline::DeliveryPosture::AtLeastOnce)

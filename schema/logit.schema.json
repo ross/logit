@@ -63,6 +63,16 @@
       "description": "Per-sink delivery buffer. Meaningful only on a sink; a non-default block on any other kind is rejected. Every field defaults, so the block is never required.",
       "type": "object",
       "properties": {
+        "backoff_after": {
+          "description": "How long the sink must see nothing but rejections that no retry can fix (a `401`, a `403`, a `400`) with no successful delivery before it backs off. Until then each rejected batch is dropped and counted. Backed off, the sink stops sending every batch: it holds the batch at the head of its queue, drops nothing, and resends that batch every `backoff_interval` until the destination accepts it. Meanwhile the queue fills under its `overflow` policy; under `block`, a full queue holds back the components that feed this sink, and through them the inputs. Must be greater than `0s`. Defaults to `60s`.",
+          "default": "60s",
+          "type": "string"
+        },
+        "backoff_interval": {
+          "description": "How often a backed-off sink resends the batch at the head of its queue to see whether the destination accepts it again. The first success delivers it and the queue behind it, and ends the backoff. Must be greater than `0s`. Defaults to `60s`.",
+          "default": "60s",
+          "type": "string"
+        },
         "delivery": {
           "description": "What the sink does with a batch whose delivery outcome is unknown, such as a timeout or a `5xx`. Omitted, the sink resends it (`at_least_once`), except `statsd_out`, which drops it (`at_most_once`). Set it to choose for this component.",
           "default": null,
@@ -3123,6 +3133,8 @@
         "buffer": {
           "description": "Per-sink delivery buffer. Meaningful only on a sink: a non-default block on any other kind is rejected.",
           "default": {
+            "backoff_after": "60s",
+            "backoff_interval": "60s",
             "delivery": null,
             "disk": null,
             "max_batches": 1024,

@@ -905,8 +905,7 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), logit_pipeline::Fault::Clean);
         assert!(
             !logit_pipeline::is_explicitly_permanent(&err),
-            "a transient re-open failure must never trip write_loop's sustained-permanent-\
-             failure exit window"
+            "a transient re-open failure must never count toward the streak that backs a sink off"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -30,13 +30,10 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
-/// How long permanent (`Fault::Permanent`) send failures may repeat, with no intervening
-/// successful delivery, before `write_loop` returns `Err`, ending `run_output` and the whole
-/// pipeline. A misconfigured sink (bad token, bad bucket) still fails loudly enough for a
-/// restart-policy supervisor to notice; one malformed batch can't kill a healthy pipeline. Not
-/// config-exposed: `logit_config::BufferConfig` doesn't surface it. See
-/// `docs/adr/buffered-sink-delivery.md`'s "Failure handling" section.
-const PERMANENT_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// The gauge `write_loop` sets to 1 when its sink backs off and to 0 when it leaves backoff
+/// (`docs/adr/sink-rejection-backoff.md`). While backed off nothing is dropped, so
+/// `batches.dropped` stops moving and this gauge and `buffer.utilization` are what an alert reads.
+const BACKOFF_GAUGE: &str = "logit.component.backoff";
 
 /// Bounded channel capacity between two graph nodes. Small and arbitrary: enough to smooth bursts
 /// without unbounded memory growth. Not tuned against measurements.
@@ -552,10 +549,10 @@ async fn run_output(
         &shutdown_dropped_batches,
     ));
 
-    // Not `tokio::join!`: `write_loop` can return early (a permanent failure, or shutdown grace
-    // expiring) while `inbox` stays open, as it does under every real listener. `drain_inbox`
-    // can't learn its consumer gave up, and under `Block` would park forever pushing into a queue
-    // nothing drains, hanging this task and `run`.
+    // Not `tokio::join!`: `write_loop` can return early (shutdown grace expiring) while `inbox`
+    // stays open, as it does under every real listener. `drain_inbox` can't learn its consumer
+    // gave up, and under `Block` would park forever pushing into a queue nothing drains, hanging
+    // this task and `run`.
     //
     // If `write` finishes first, a still-pending `drain` is dropped and never polled again; the
     // sweep below counts what it left in `inbox`. (When `write` finished by draining to
@@ -771,6 +768,13 @@ pub struct WriteLoopConfig {
     /// Overrides the sink's `Output::default_posture()`; `None` uses it. Set from
     /// `logit-config::BufferConfig::delivery`.
     pub delivery_override: Option<DeliveryPosture>,
+    /// How long a run of nothing but explicit `Fault::Permanent` outcomes, with no success, lasts
+    /// before `write_loop` stops dropping and holds its head (`docs/adr/sink-rejection-backoff.md`).
+    /// Graph rule 15 rejects zero.
+    pub backoff_after: Duration,
+    /// How often a backed-off `write_loop` delivers its held head again. Graph rule 15 rejects
+    /// zero.
+    pub backoff_interval: Duration,
 }
 
 impl Default for WriteLoopConfig {
@@ -779,6 +783,8 @@ impl Default for WriteLoopConfig {
             retry: RetryConfig::default(),
             shutdown_grace: Duration::from_secs(5),
             delivery_override: None,
+            backoff_after: Duration::from_secs(60),
+            backoff_interval: Duration::from_secs(60),
         }
     }
 }
@@ -824,12 +830,15 @@ impl Default for LuaRuntimeConfig {
 enum Delivery {
     Delivered,
     /// Never delivered: `fault` wasn't retryable, or the budget ran out. The caller commits and
-    /// counts it. `explicit_permanent` is narrower than `fault == Fault::Permanent`: true only
-    /// when the sink attached `Fault::Permanent` itself, not when `classify` defaulted to it.
-    /// Only `write_loop`'s fatal streak uses it.
+    /// counts it, unless the sink is backing off, when it holds it uncommitted.
+    /// `explicit_permanent` is narrower than `fault == Fault::Permanent`: true only when the sink
+    /// attached `Fault::Permanent` itself, not when `classify` defaulted to it. Only
+    /// `write_loop`'s backoff streak uses it. `err` is the last attempt's error, for the backoff
+    /// diagnostics.
     Dropped {
         fault: Fault,
         explicit_permanent: bool,
+        err: anyhow::Error,
     },
     /// The shutdown grace deadline had passed before an attempt, so none was started. The
     /// batch never left the process; the caller leaves it uncommitted and counts nothing.
@@ -895,12 +904,12 @@ async fn deliver_with_retry(
         let fault = classify(&err);
         let explicit_permanent = is_explicitly_permanent(&err);
         if !is_retryable(fault, posture) {
-            return Delivery::Dropped { fault, explicit_permanent };
+            return Delivery::Dropped { fault, explicit_permanent, err };
         }
 
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Delivery::Dropped { fault, explicit_permanent };
+            return Delivery::Dropped { fault, explicit_permanent, err };
         }
         let backoff = backoff_for(retry, attempt).min(deadline.saturating_duration_since(now));
         telemetry.count("logit.component.retries", 1.0, &[]);
@@ -996,12 +1005,12 @@ async fn deliver_window(
         let fault = classify(&err);
         let explicit_permanent = is_explicitly_permanent(&err);
         if !is_retryable(fault, posture) {
-            return Delivery::Dropped { fault, explicit_permanent };
+            return Delivery::Dropped { fault, explicit_permanent, err };
         }
 
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Delivery::Dropped { fault, explicit_permanent };
+            return Delivery::Dropped { fault, explicit_permanent, err };
         }
         let backoff = backoff_for(retry, attempt).min(deadline.saturating_duration_since(now));
         telemetry.count("logit.component.retries", 1.0, &[]);
@@ -1200,11 +1209,15 @@ async fn finish_and_flush(
 /// wrong pending sequence.
 ///
 /// A failed batch is committed, counted, and warned about; the pipeline keeps running. The one
-/// exception: a run of nothing but explicitly classified `Fault::Permanent` outcomes
-/// ([`is_explicitly_permanent`]) lasting [`PERMANENT_FAILURE_WINDOW`] returns `Err`, ending the
-/// pipeline. A success, a budget-exhausted `Clean`/`Ambiguous` fault, or an unclassified error
-/// that only defaulted to `Permanent` resets the streak: only a positively identified config
-/// error counts.
+/// exception is backoff (`docs/adr/sink-rejection-backoff.md`): once a run of nothing but
+/// explicitly classified `Fault::Permanent` outcomes ([`is_explicitly_permanent`]) has lasted
+/// `write_config.backoff_after`, the failing head is held instead: left uncommitted and
+/// uncounted, with the [`BACKOFF_GAUGE`] at 1, and delivered again once per
+/// `write_config.backoff_interval`. A success ends backoff and the queue drains behind it; a
+/// non-permanent failure ends it too, and that head is dropped as any other. A success, a
+/// budget-exhausted `Clean`/`Ambiguous` fault, or an unclassified error that only defaulted to
+/// `Permanent` resets the streak: only a positively identified rejection counts. Sink failures
+/// never end the pipeline.
 ///
 /// Never drains the queue or calls `output.flush()`; [`finish_and_flush`] does, and says why.
 /// Returns `Ok(())` when shutdown grace expires: an incomplete drain on shutdown isn't a failure.
@@ -1234,8 +1247,30 @@ pub(crate) async fn write_loop(
     // failure, `recovered` on the next success.
     let mut degraded = false;
     let mut in_flight = InFlight::default();
+    // `Some` while backed off: when the held head is next delivered.
+    let mut next_probe: Option<tokio::time::Instant> = None;
 
     loop {
+        if let Some(due) = next_probe {
+            // Unbiased; `unconstrained` grace arm: see `docs/design/pipeline-graph.md`'s
+            // "Cancellation points".
+            let grace_expired = tokio::select! {
+                () = tokio::time::sleep_until(due) => false,
+                () = tokio::task::unconstrained(shutdown_grace_expired(
+                    &mut shutdown,
+                    &shutdown_deadline,
+                    write_config.shutdown_grace,
+                )) => true,
+            };
+            if grace_expired {
+                // As the between-batches grace arm below, with nothing submitted: the held head
+                // stays uncommitted for `finish_and_flush`, which counts it (`Memory`) or leaves
+                // it spooled (`Disk`).
+                debug_assert_eq!(in_flight.outstanding, 0, "a held head leaves nothing out");
+                return Ok(());
+            }
+        }
+
         // Each `select!` reduces to a plain enum so no handler arm touches `output`: the
         // `deliver_with_retry` future already borrows it mutably, and the borrow checker rejects
         // a second overlapping borrow inside the macro.
@@ -1398,14 +1433,81 @@ pub(crate) async fn write_loop(
                 telemetry.count("logit.component.batches.delivered", 1.0, &[]);
                 telemetry.count("logit.component.events.delivered", batch.events.len() as f64, &[]);
                 last_success = Some(tokio::time::Instant::now());
-                permanent_streak_since = None;
-                if degraded {
+                let streak = permanent_streak_since.take();
+                if next_probe.take().is_some() {
+                    telemetry.gauge(BACKOFF_GAUGE, 0.0, &[]);
+                    let rejected_for = streak.map(|since| since.elapsed()).unwrap_or_default();
+                    degraded = false;
+                    diag.info(
+                        "recovered",
+                        format_args!(
+                            "the destination accepted the held batch after rejecting every batch \
+                             for {rejected_for:?}; backoff ended"
+                        ),
+                    );
+                } else if degraded {
                     degraded = false;
                     diag.info("recovered", "delivery succeeded after a prior failure");
                 }
             }
-            Delivery::Dropped { fault, explicit_permanent } => {
+            Delivery::Dropped { fault, explicit_permanent, err } => {
                 debug_assert_eq!(in_flight.outstanding, 0, "a dropped round leaves nothing out");
+                let since_success = || {
+                    last_success
+                        .map(|t| format!("{:?} ago", t.elapsed()))
+                        .unwrap_or_else(|| "never".to_string())
+                };
+                if explicit_permanent {
+                    let now = tokio::time::Instant::now();
+                    let since = *permanent_streak_since.get_or_insert(now);
+                    let rejected_for = now.duration_since(since);
+                    if next_probe.is_some() || rejected_for >= write_config.backoff_after {
+                        // Hold the head: no commit, no drop counted. Marking it observed keeps
+                        // the next attempt off the `send` path (`fast` above), so it goes
+                        // through `deliver_window`, which skips `observe_batch` for an item
+                        // below `in_flight.observed`: `Output::observe_batch` runs once per
+                        // batch, never between attempts. A window-1 sink's default
+                        // `submit`/`await_ack` are `send` and `Ok`. After a windowed round
+                        // `observed` already covers the head, so this raises it only after the
+                        // `send` path.
+                        in_flight.observed = in_flight.observed.max(1);
+                        span.error();
+                        span.tag("fault", fault_tag(fault));
+                        telemetry.gauge(BACKOFF_GAUGE, 1.0, &[]);
+                        let interval = write_config.backoff_interval;
+                        // Unthrottled: paced by `backoff_interval`.
+                        if next_probe.is_none() {
+                            diag.error(
+                                "backoff",
+                                format_args!(
+                                    "the destination has rejected every batch for \
+                                     {rejected_for:?} ({err:#}); holding the queue and retrying \
+                                     every {interval:?} (last successful delivery: {})",
+                                    since_success()
+                                ),
+                            );
+                        } else {
+                            diag.error(
+                                "backoff",
+                                format_args!(
+                                    "still rejected after {rejected_for:?}: {err:#}; {} batches \
+                                     held",
+                                    store.queued()
+                                ),
+                            );
+                        }
+                        degraded = true;
+                        next_probe = Some(now + interval);
+                        continue;
+                    }
+                } else {
+                    // Anything short of an explicit rejection breaks the streak (see this
+                    // function's doc), and with it any backoff.
+                    permanent_streak_since = None;
+                    if next_probe.take().is_some() {
+                        telemetry.gauge(BACKOFF_GAUGE, 0.0, &[]);
+                    }
+                }
                 // The head, then, under at-most-once, every other batch an `Ambiguous` fault
                 // left with an unknown outcome: each is as ambiguous as the head, and
                 // at-most-once never resends one. A `Clean` or `Permanent` fault, or
@@ -1439,35 +1541,17 @@ pub(crate) async fn write_loop(
                     dropped_events as f64,
                     &[("reason", "send_failed")],
                 );
-                let since_success = last_success
-                    .map(|t| format!("{:?} ago", t.elapsed()))
-                    .unwrap_or_else(|| "never".to_string());
                 diag.warn_throttled(
                     "send_failed",
                     format_args!(
                         "batch dropped after a {fault} send failure (last successful delivery: \
-                         {since_success})"
+                         {})",
+                        since_success()
                     ),
                 );
                 if !degraded {
                     degraded = true;
                     diag.warn("degraded");
-                }
-
-                if explicit_permanent {
-                    let now = tokio::time::Instant::now();
-                    let since = *permanent_streak_since.get_or_insert(now);
-                    if now.duration_since(since) >= PERMANENT_FAILURE_WINDOW {
-                        return Err(anyhow::anyhow!(
-                            "permanent send failures for at least {PERMANENT_FAILURE_WINDOW:?} \
-                             with no successful delivery"
-                        ))
-                        .with_context(|| format!("component '{id}'"));
-                    }
-                } else {
-                    // Anything short of an explicit config error breaks the streak (see this
-                    // function's doc).
-                    permanent_streak_since = None;
                 }
             }
         }
@@ -2778,7 +2862,7 @@ mod tests {
     use crate::graph;
     use crate::queue::OverflowPolicy;
     use crate::readiness::Phase;
-    use crate::test_util::{TelemetryProbe, Totals};
+    use crate::test_util::{wait_until, TelemetryProbe, Totals};
     use logit_config::{Component, ComponentKind, Config};
     use logit_core::{AttrMap, Event, MetricKind, Provenance, Registry, SpanLink, SpanStatus};
     use std::collections::HashMap as Map;
@@ -4769,8 +4853,8 @@ mod tests {
         let outcome = tokio::time::timeout(Duration::from_millis(200), run_task).await;
         assert!(
             outcome.is_err(),
-            "run should still be running -- a permanently failing sink with no sustained \
-             60s-window trip must not end the pipeline just because its input stays live"
+            "run should still be running -- a failing sink never ends the pipeline, and a live \
+             input keeps its queue open"
         );
         abort_handle.abort();
     }
@@ -4933,6 +5017,7 @@ mod tests {
             retry,
             shutdown_grace: Duration::from_secs(5),
             delivery_override: Some(posture),
+            ..WriteLoopConfig::default()
         };
         crate::test_util::drive_write_loop(&mut output, batches, write_config, Telemetry::default())
             .await
@@ -5065,7 +5150,7 @@ mod tests {
         assert!(
             matches!(
                 outcome,
-                Delivery::Dropped { fault: Fault::Ambiguous, explicit_permanent: false }
+                Delivery::Dropped { fault: Fault::Ambiguous, explicit_permanent: false, .. }
             ),
             "the budget's timeout is Ambiguous"
         );
@@ -5226,7 +5311,7 @@ mod tests {
             posture,
         )
         .await
-        .expect("a single permanent failure should not itself trip the failure window");
+        .expect("a single permanent failure is dropped, never a reason to back off");
         assert_eq!(
             handles.attempts.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -5302,53 +5387,336 @@ mod tests {
         );
     }
 
-    /// Explicit `Permanent` failures spanning `PERMANENT_FAILURE_WINDOW`, idle gap included, end
-    /// `write_loop` with `Err`.
-    #[tokio::test(start_paused = true)]
-    async fn sustained_permanent_failures_end_write_loop_once_the_failure_window_elapses() {
-        let (output, mut handles) = faulty_output(Fault::Permanent, u32::MAX);
-        let telemetry = Telemetry::default();
+    /// What [`BackoffOutput`] answers every `send` with, switchable mid-test.
+    const REJECT: u8 = 0;
+    const ACCEPT: u8 = 1;
+    const UNCLASSIFIED: u8 = 2;
+
+    /// Answers every `send` per a shared mode: an explicit `Permanent` rejection, a success, or an
+    /// error with no `Fault`. Logs each sent batch's counter value and counts `observe_batch`.
+    struct BackoffOutput {
+        mode: Arc<std::sync::atomic::AtomicU8>,
+        observed: Arc<std::sync::atomic::AtomicU32>,
+        sent: Arc<std::sync::Mutex<Vec<f64>>>,
+        attempted: mpsc::UnboundedSender<()>,
+    }
+
+    struct BackoffHandles {
+        mode: Arc<std::sync::atomic::AtomicU8>,
+        observed: Arc<std::sync::atomic::AtomicU32>,
+        sent: Arc<std::sync::Mutex<Vec<f64>>>,
+        attempted: mpsc::UnboundedReceiver<()>,
+    }
+
+    impl BackoffHandles {
+        fn set(&self, mode: u8) {
+            self.mode.store(mode, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn observed(&self) -> u32 {
+            self.observed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn sent(&self) -> Vec<f64> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    fn backoff_output() -> (BackoffOutput, BackoffHandles) {
+        let mode = Arc::new(std::sync::atomic::AtomicU8::new(REJECT));
+        let observed = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (attempted_tx, attempted_rx) = mpsc::unbounded_channel();
+        (
+            BackoffOutput {
+                mode: Arc::clone(&mode),
+                observed: Arc::clone(&observed),
+                sent: Arc::clone(&sent),
+                attempted: attempted_tx,
+            },
+            BackoffHandles { mode, observed, sent, attempted: attempted_rx },
+        )
+    }
+
+    #[async_trait::async_trait]
+    impl Output for BackoffOutput {
+        fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
+            self.observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(counter_value_of(batch));
+            let _ = self.attempted.send(());
+            match self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+                REJECT => Err(anyhow::anyhow!("401 unauthorized")).context(Fault::Permanent),
+                ACCEPT => Ok(()),
+                _ => Err(anyhow::anyhow!("a bare I/O error, no Fault attached")),
+            }
+        }
+    }
+
+    /// Backoff after 10 s of rejections, a probe every 30 s: distinct from each other and from
+    /// the 60 s defaults, so a test reads which one fired.
+    fn backoff_write_config() -> WriteLoopConfig {
+        WriteLoopConfig {
+            retry: fast_retry_config(),
+            backoff_after: Duration::from_secs(10),
+            backoff_interval: Duration::from_secs(30),
+            ..WriteLoopConfig::default()
+        }
+    }
+
+    /// How many self-log lines for component `id` contain `text`.
+    fn log_lines(id: &str, text: &str) -> usize {
+        let logs = String::from_utf8_lossy(&global_logs().0.lock().unwrap()).into_owned();
+        let component = format!("component={id}");
+        logs.lines().filter(|l| l.contains(&component) && l.contains(text)).count()
+    }
+
+    /// A `write_loop` over `output` and a fresh memory store, spawned. The store, the telemetry
+    /// probe the loop counts into under `id`, and the task.
+    fn spawn_backoff_write_loop(
+        id: &'static str,
+        output: BackoffOutput,
+    ) -> (Arc<SinkStore>, TelemetryProbe, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        global_logs();
+        let probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry(id, "influxdb_out", "sink");
         let store = Arc::new(SinkStore::Memory(SinkQueue::new(
             SinkQueueConfig::default(),
             telemetry.clone(),
         )));
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        store.push((one_event_batch(1.0), TraceContext::default().into())).await;
-
         let store_for_task = Arc::clone(&store);
         // `write_loop` borrows `output`; moving it into the block makes the future `'static`.
         let handle = tokio::spawn(async move {
             let mut output = output;
-            write_loop(
-                "out".to_string(),
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let result = write_loop(
+                id.to_string(),
                 &mut output,
                 store_for_task,
                 telemetry,
-                WriteLoopConfig::default(),
+                backoff_write_config(),
                 shutdown_rx,
                 &AtomicU64::new(0),
             )
-            .await
+            .await;
+            drop(shutdown_tx);
+            result
         });
+        (store, probe, handle)
+    }
 
-        handles.attempted.recv().await.expect("the first permanent failure should have happened");
-
+    /// Rejects batch 1 (dropped, the streak starts), waits out `backoff_after`, then has batch 2
+    /// rejected and held, with batch 3 queued behind it.
+    async fn reach_backoff(
+        store: &SinkStore,
+        probe: &mut TelemetryProbe,
+        handles: &mut BackoffHandles,
+    ) {
+        store.push((one_event_batch(1.0), TraceContext::default().into())).await;
+        handles.attempted.recv().await.expect("batch 1's attempt");
         // An idle gap doesn't reset the streak.
-        tokio::time::sleep(PERMANENT_FAILURE_WINDOW).await;
-
+        tokio::time::sleep(backoff_write_config().backoff_after).await;
         store.push((one_event_batch(2.0), TraceContext::default().into())).await;
-        store.close();
+        store.push((one_event_batch(3.0), TraceContext::default().into())).await;
+        handles.attempted.recv().await.expect("batch 2's attempt");
+        probe.wait_for("the sink to back off", |t| t.gauge(BACKOFF_GAUGE, &[]) == Some(1.0)).await;
+    }
 
-        let result = tokio::time::timeout(Duration::from_secs(5), handle)
-            .await
-            .expect("write_loop should not hang")
-            .expect("the task should not panic");
-        assert!(
-            result.is_err(),
-            "permanent failures spanning the whole window with no success should end write_loop \
-             with Err"
+    /// Explicit `Permanent` rejections spanning `backoff_after`, idle gap included, hold the
+    /// head: nothing more is dropped, the queue keeps it, and `write_loop` keeps running.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejection_streak_reaching_backoff_after_holds_the_head_instead_of_dropping_it() {
+        let (output, mut handles) = backoff_output();
+        let (store, mut probe, handle) = spawn_backoff_write_loop("backoff_hold", output);
+        reach_backoff(&store, &mut probe, &mut handles).await;
+
+        assert_eq!(store.queued(), 2, "batch 2 held at the head, batch 3 behind it");
+        let totals = probe.poll();
+        assert_eq!(
+            totals.sum("logit.component.batches.dropped", &[("reason", "send_failed")]),
+            1.0,
+            "only batch 1, rejected before the streak reached backoff_after, is dropped"
         );
+        assert_eq!(totals.sum("logit.component.events.dropped", &[]), 1.0);
+        assert_eq!(log_lines("backoff_hold", "holding the queue and retrying every 30s"), 1);
+        assert_eq!(log_lines("backoff_hold", "401 unauthorized"), 1, "the rejection is named");
+
+        // No attempt until the interval elapses.
+        tokio::time::sleep(backoff_write_config().backoff_interval - Duration::from_secs(1)).await;
+        assert_eq!(handles.sent(), vec![1.0, 2.0], "nothing is attempted between probes");
+        assert!(!handle.is_finished(), "a backed-off sink never ends write_loop");
+        assert_eq!(store.queued(), 2);
+        handle.abort();
+    }
+
+    /// A probe resends the held head once per `backoff_interval` without observing it again,
+    /// and the first success delivers it and the queue behind it, in order, ending backoff.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_resends_the_held_head_each_interval_and_a_success_drains_the_queue() {
+        let (output, mut handles) = backoff_output();
+        let (store, mut probe, handle) = spawn_backoff_write_loop("backoff_probe", output);
+        reach_backoff(&store, &mut probe, &mut handles).await;
+        let held_at = tokio::time::Instant::now();
+        assert_eq!(handles.observed(), 2, "batches 1 and 2, once each");
+
+        // The first probe: still rejected.
+        handles.attempted.recv().await.expect("the first probe");
+        let interval = backoff_write_config().backoff_interval;
+        assert!(held_at.elapsed() >= interval, "no probe before the interval");
+        assert_eq!(handles.sent(), vec![1.0, 2.0, 2.0], "the probe resends the held head");
+        assert_eq!(handles.observed(), 2, "a probe never observes the held head again");
+        probe
+            .wait_for("the still-rejected line", |_| {
+                log_lines("backoff_probe", "still rejected after 40s: ") == 1
+            })
+            .await;
+        assert_eq!(log_lines("backoff_probe", "2 batches held"), 1);
+        assert_eq!(store.queued(), 2);
+
+        // The next probe is accepted.
+        handles.set(ACCEPT);
+        handles.attempted.recv().await.expect("the second probe");
+        assert!(held_at.elapsed() >= interval * 2, "one probe per interval");
+        handles.attempted.recv().await.expect("batch 3, right behind it");
+        store.close();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("write_loop drains the closed queue and returns")
+            .expect("the task should not panic")
+            .expect("write_loop returns Ok");
+
+        assert_eq!(
+            handles.sent(),
+            vec![1.0, 2.0, 2.0, 2.0, 3.0],
+            "in order, batch 2 once delivered"
+        );
+        assert_eq!(handles.observed(), 3, "each batch observed once, across both probes");
+        let totals = probe.poll();
+        assert_eq!(totals.gauge(BACKOFF_GAUGE, &[]), Some(0.0), "backoff ended");
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 2.0);
+        assert_eq!(totals.sum("logit.component.batches.dropped", &[]), 1.0, "batch 1 alone");
+        assert_eq!(log_lines("backoff_probe", "backoff ended"), 1, "the `recovered` line");
+    }
+
+    /// A probe failing with anything but an explicit rejection breaks the streak: backoff ends,
+    /// and that head and the next are dropped the ordinary way.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_failing_without_an_explicit_rejection_leaves_backoff_and_drops_normally() {
+        let (output, mut handles) = backoff_output();
+        let (store, mut probe, handle) = spawn_backoff_write_loop("backoff_leave", output);
+        reach_backoff(&store, &mut probe, &mut handles).await;
+
+        handles.set(UNCLASSIFIED);
+        store.close();
+        // A sink still backed off would keep probing batch 2 forever over the closed queue.
+        tokio::time::timeout(backoff_write_config().backoff_interval * 2, handle)
+            .await
+            .expect("write_loop drops batches 2 and 3 and returns")
+            .expect("the task should not panic")
+            .expect("write_loop returns Ok");
+
+        assert_eq!(handles.sent(), vec![1.0, 2.0, 2.0, 3.0]);
+        assert_eq!(handles.observed(), 3, "batch 2 observed once, though attempted twice");
+        let totals = probe.poll();
+        assert_eq!(totals.gauge(BACKOFF_GAUGE, &[]), Some(0.0), "backoff ended");
+        assert_eq!(
+            totals.sum("logit.component.batches.dropped", &[("reason", "send_failed")]),
+            3.0,
+            "batch 1 before backoff, batches 2 and 3 after it"
+        );
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 0.0);
+    }
+
+    /// Shutdown during backoff: the grace bounds the wait for the next probe, and the held head
+    /// and the queue behind it are left for `finish_and_flush`. A memory sink counts them
+    /// `shutdown`; a disk sink keeps them spooled, and they replay on the next open.
+    async fn shutdown_while_backed_off(store_config: SinkStoreConfig) -> Totals {
+        let (output, mut handles) = backoff_output();
+        let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Registry::new();
+        let write_config = WriteLoopConfig {
+            backoff_after: Duration::from_secs(1),
+            backoff_interval: Duration::from_secs(60),
+            ..slow_retry_write_config(Duration::from_secs(5), Duration::from_secs(5))
+        };
+        let run = tokio::spawn(run_output(
+            "out".to_string(),
+            Box::new(output),
+            inbox_rx,
+            registry.telemetry_for("out", "influxdb_out", "sink"),
+            store_config,
+            write_config,
+            shutdown_rx,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        inbox_tx.send(counter_batch(1.0)).await.unwrap();
+        handles.attempted.recv().await.expect("batch 1's attempt");
+        tokio::time::sleep(write_config.backoff_after).await;
+        inbox_tx.send(counter_batch(2.0)).await.unwrap();
+        inbox_tx.send(counter_batch(3.0)).await.unwrap();
+        handles.attempted.recv().await.expect("batch 2's attempt");
+        let mut totals = Totals::default();
+        wait_until("the sink to back off", || {
+            totals.fold(registry.drain(0));
+            totals.gauge(BACKOFF_GAUGE, &[("component", "out")]) == Some(1.0)
+        })
+        .await;
+
+        let signalled = tokio::time::Instant::now();
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run_output must not stop responding")
+            .expect("the task must not panic")
+            .expect("shutdown during backoff ends run_output with Ok");
+        assert!(
+            signalled.elapsed() < write_config.backoff_interval,
+            "the grace, not the probe, ends the wait"
+        );
+        drop(inbox_tx);
+        assert_eq!(handles.sent(), vec![1.0, 2.0], "no probe ran");
+        totals.fold(registry.drain(0));
+        assert_eq!(
+            totals.sum(
+                "logit.component.batches.dropped",
+                &[("component", "out"), ("reason", "send_failed")]
+            ),
+            1.0,
+            "batch 1 alone"
+        );
+        totals
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_backoff_counts_a_memory_sinks_held_batches_shutdown() {
+        let totals =
+            shutdown_while_backed_off(SinkStoreConfig::Memory(SinkQueueConfig::default())).await;
+        assert_eq!(
+            totals.sum(
+                "logit.component.batches.dropped",
+                &[("component", "out"), ("reason", "shutdown")]
+            ),
+            2.0,
+            "the held head and the batch behind it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_backoff_leaves_a_disk_sinks_held_batches_spooled_for_replay() {
+        let dir = crate::disk_queue::test_support::scratch_dir("backoff-shutdown");
+        let totals =
+            shutdown_while_backed_off(SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)))
+                .await;
+        assert_eq!(
+            totals.sum(
+                "logit.component.batches.dropped",
+                &[("component", "out"), ("reason", "shutdown")]
+            ),
+            0.0
+        );
+        assert_eq!(reopen_and_drain(&dir).await, vec![2.0, 3.0], "replayed on the next open");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// One scripted outcome per `send` (`None` succeeds), repeating the last entry once exhausted.
@@ -5373,7 +5741,9 @@ mod tests {
         }
     }
 
-    /// A success resets the permanent-failure streak.
+    /// A success resets the permanent-failure streak: a rejection after it is dropped, not held.
+    /// A sink that backed off instead would keep probing past the closed queue, and the
+    /// `timeout` below would fail.
     #[tokio::test(start_paused = true)]
     async fn a_success_inside_the_window_resets_the_permanent_failure_streak() {
         let telemetry = Telemetry::default();
@@ -5408,8 +5778,8 @@ mod tests {
         });
         attempted_rx.recv().await.expect("attempt 1 (failing) should have happened");
 
-        // Past the window, but the next batch succeeds before it's checked again.
-        tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
+        // Past `backoff_after`, but the next batch succeeds before it's checked again.
+        tokio::time::sleep(WriteLoopConfig::default().backoff_after * 2).await;
         // attempt 2: success -- resets the streak
         store.push((one_event_batch(2.0), TraceContext::default().into())).await;
         attempted_rx.recv().await.expect("attempt 2 (succeeding) should have happened");
@@ -5425,8 +5795,8 @@ mod tests {
             .expect("the task should not panic");
         assert!(
             result.is_ok(),
-            "a success inside the window should reset the permanent-failure streak, so a fresh \
-             isolated failure right after must not immediately trip Err"
+            "a success should reset the permanent-failure streak, so a fresh isolated failure \
+             right after is dropped, not held for a probe that would outlive the closed queue"
         );
     }
 
@@ -5443,9 +5813,10 @@ mod tests {
         }
     }
 
-    /// An unclassified error, though non-retryable, never counts toward the failure window.
+    /// An unclassified error, though non-retryable, never counts toward the streak that backs a
+    /// sink off: every one is dropped, so `write_loop` drains the closed queue and returns.
     #[tokio::test(start_paused = true)]
-    async fn an_unclassified_error_never_trips_the_permanent_failure_window() {
+    async fn an_unclassified_error_never_backs_a_sink_off() {
         let telemetry = Telemetry::default();
         let store = Arc::new(SinkStore::Memory(SinkQueue::new(
             SinkQueueConfig::default(),
@@ -5472,7 +5843,7 @@ mod tests {
         });
         attempted_rx.recv().await.expect("the first attempt should have happened");
 
-        tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
+        tokio::time::sleep(WriteLoopConfig::default().backoff_after * 2).await;
         store.push((one_event_batch(2.0), TraceContext::default().into())).await;
         attempted_rx.recv().await.expect("a later attempt should have happened");
         store.close();
@@ -5483,8 +5854,7 @@ mod tests {
             .expect("the task should not panic");
         assert!(
             result.is_ok(),
-            "an unclassified error must never trip the sustained-permanent-failure exit window, \
-             no matter how long it repeats"
+            "an unclassified error must never back a sink off, no matter how long it repeats"
         );
     }
 
@@ -5506,7 +5876,8 @@ mod tests {
         }
     }
 
-    /// A budget-exhausted `Ambiguous` drop resets the permanent-failure streak like a success.
+    /// A budget-exhausted `Ambiguous` drop resets the permanent-failure streak like a success:
+    /// the `Permanent` rejection after it is dropped, not held, so `write_loop` returns.
     #[tokio::test(start_paused = true)]
     async fn a_budget_exhausted_ambiguous_drop_resets_the_permanent_failure_streak_like_success_does(
     ) {
@@ -5546,9 +5917,9 @@ mod tests {
         });
         attempted_rx.recv().await.expect("attempt 1 (Permanent) should have happened");
 
-        // Past the window; batch 2 then exhausts its 50 ms budget and is dropped. The 200 ms
-        // sleep guarantees that drop is committed before batch 3 is pushed.
-        tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
+        // Past `backoff_after`; batch 2 then exhausts its 50 ms budget and is dropped. The
+        // 200 ms sleep guarantees that drop is committed before batch 3 is pushed.
+        tokio::time::sleep(WriteLoopConfig::default().backoff_after * 2).await;
         store.push((one_event_batch(2.0), TraceContext::default().into())).await;
         attempted_rx.recv().await.expect("batch 2's first attempt should have happened");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -5565,7 +5936,7 @@ mod tests {
         assert!(
             result.is_ok(),
             "a budget-exhausted Ambiguous drop should reset the permanent-failure streak, so a \
-             fresh isolated Permanent failure right after must not immediately trip Err"
+             fresh isolated Permanent failure right after is dropped, not held"
         );
     }
 
@@ -5591,6 +5962,7 @@ mod tests {
             },
             shutdown_grace: Duration::from_millis(500),
             delivery_override: None,
+            ..WriteLoopConfig::default()
         };
         let store_for_task = Arc::clone(&store);
         let handle = tokio::spawn(async move {
@@ -5637,6 +6009,7 @@ mod tests {
             },
             shutdown_grace: Duration::from_millis(100),
             delivery_override: None,
+            ..WriteLoopConfig::default()
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -5712,6 +6085,7 @@ mod tests {
             },
             shutdown_grace: Duration::from_millis(100),
             delivery_override: None,
+            ..WriteLoopConfig::default()
         };
         let store_config = SinkStoreConfig::Memory(SinkQueueConfig {
             max_batches: 1,
@@ -5819,6 +6193,7 @@ mod tests {
             },
             shutdown_grace: Duration::from_millis(100),
             delivery_override: None,
+            ..WriteLoopConfig::default()
         };
 
         // Every counter batch encodes to the same length, so this sizes the spool to one record.
@@ -6031,7 +6406,7 @@ mod tests {
                 max_delay: Duration::from_millis(10),
             },
             shutdown_grace: grace,
-            delivery_override: None,
+            ..WriteLoopConfig::default()
         }
     }
 
@@ -6048,9 +6423,9 @@ mod tests {
         /// the head is submitted and the second batch's submit never finishes. A sink with no
         /// window never completes its send, as on that path.
         GraceCutsInFlightSubmit,
-        /// The sink fails permanently for `PERMANENT_FAILURE_WINDOW`: `write_loop` returns `Err`
-        /// with the store full and a push parked.
-        PermanentError,
+        /// The sink rejects every batch (`Fault::Permanent`) until it backs off and holds its
+        /// head, with the store full and a push parked; shutdown grace then ends the backoff wait.
+        Backoff,
         /// The inbox closes and the sink delivers everything: `write_loop` sees closed and empty.
         ClosedAndEmpty,
     }
@@ -6072,7 +6447,7 @@ mod tests {
                 ExitPath::GraceCutsInFlightSend | ExitPath::GraceCutsInFlightSubmit => {
                     Box::new(NeverOutput)
                 }
-                ExitPath::PermanentError => paced(Duration::from_secs(20), Some(Fault::Permanent)),
+                ExitPath::Backoff => paced(Duration::from_secs(20), Some(Fault::Permanent)),
                 ExitPath::ClosedAndEmpty => paced(Duration::ZERO, None),
             }
         };
@@ -6115,7 +6490,7 @@ mod tests {
                     AckScript::Hang,
                     vec![head, (2, Duration::from_secs(3600))],
                 ),
-                ExitPath::PermanentError => windowed(
+                ExitPath::Backoff => windowed(
                     Duration::from_secs(20),
                     AckScript::Always(Fault::Permanent),
                     Vec::new(),
@@ -6139,7 +6514,7 @@ mod tests {
             ExitPath::GraceExpiry,
             ExitPath::GraceCutsInFlightSend,
             ExitPath::GraceCutsInFlightSubmit,
-            ExitPath::PermanentError,
+            ExitPath::Backoff,
             ExitPath::ClosedAndEmpty,
         ] {
             for posture in [DeliveryPosture::AtLeastOnce, DeliveryPosture::AtMostOnce] {
@@ -6153,7 +6528,7 @@ mod tests {
                         ExitPath::GraceExpiry
                             | ExitPath::GraceCutsInFlightSend
                             | ExitPath::GraceCutsInFlightSubmit
-                            | ExitPath::PermanentError
+                            | ExitPath::Backoff
                     );
                     let store_config = match (disk, small) {
                         (true, true) => SinkStoreConfig::Disk(disk_store_config(
@@ -6174,6 +6549,7 @@ mod tests {
                     let (shutdown_tx, shutdown_rx) = watch::channel(false);
                     let registry = Registry::new();
                     let drain_total = Arc::new(AtomicU64::new(0));
+                    let mut early_totals: Option<Totals> = None;
                     let run = tokio::spawn(run_output(
                         "out".to_string(),
                         output,
@@ -6196,36 +6572,50 @@ mod tests {
                     }
                     // Lets `drain_inbox` fill the store and park on its next push.
                     tokio::time::sleep(Duration::from_millis(5)).await;
-                    // `PermanentError` keeps the inbox open, as a live listener would: only the
-                    // permanent streak ends it.
-                    let held_open = match path {
+                    // `Backoff` keeps the inbox open, as a live listener would, until the sink has
+                    // backed off; then shutdown ends it.
+                    match path {
                         ExitPath::DrainFirst | ExitPath::ClosedAndEmpty => {
                             drop(inbox_tx);
-                            None
                         }
                         ExitPath::GraceExpiry
                         | ExitPath::GraceCutsInFlightSend
                         | ExitPath::GraceCutsInFlightSubmit => {
                             shutdown_tx.send(true).unwrap();
                             drop(inbox_tx);
-                            None
                         }
-                        ExitPath::PermanentError => Some(inbox_tx),
-                    };
+                        ExitPath::Backoff => {
+                            // Each 20 s send is rejected: batches 1 to 3 are dropped, and the
+                            // fourth, 60 s into the streak, is held. Polled once a virtual second.
+                            let started = tokio::time::Instant::now();
+                            let mut backed_off = Totals::default();
+                            loop {
+                                backed_off.fold(registry.drain(0));
+                                if backed_off.gauge(BACKOFF_GAUGE, &[]) == Some(1.0) {
+                                    break;
+                                }
+                                assert!(
+                                    started.elapsed() < Duration::from_secs(600),
+                                    "{at}: the sink never backed off"
+                                );
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                            // Drained above, so folded back into the totals read below.
+                            early_totals = Some(backed_off);
+                            shutdown_tx.send(true).unwrap();
+                            drop(inbox_tx);
+                        }
+                    }
 
                     let result = tokio::time::timeout(Duration::from_secs(600), run)
                         .await
                         .unwrap_or_else(|_| panic!("{at}: run_output stopped responding"))
                         .expect("the task must not panic");
-                    assert_eq!(
-                        result.is_err(),
-                        matches!(path, ExitPath::PermanentError),
-                        "{at}: exit result {result:?}"
-                    );
-                    drop(held_open);
+                    assert!(result.is_ok(), "{at}: exit result {result:?}");
                     drop(shutdown_tx);
 
-                    let totals = Totals::of(registry.drain(0));
+                    let mut totals = early_totals.unwrap_or_default();
+                    totals.fold(registry.drain(0));
                     let count = |name: &str| totals.sum(name, &[("component", "out")]);
                     let received = count("logit.component.batches.received");
                     let delivered = count("logit.component.batches.delivered");
@@ -6265,9 +6655,9 @@ mod tests {
                             ExitPath::GraceExpiry
                             | ExitPath::GraceCutsInFlightSend
                             | ExitPath::GraceCutsInFlightSubmit => cut_off,
-                            ExitPath::DrainFirst
-                            | ExitPath::PermanentError
-                            | ExitPath::ClosedAndEmpty => 0.0,
+                            ExitPath::DrainFirst | ExitPath::Backoff | ExitPath::ClosedAndEmpty => {
+                                0.0
+                            }
                         };
                         let expected = match posture {
                             DeliveryPosture::AtMostOnce => cut_off,
@@ -6284,8 +6674,9 @@ mod tests {
                         | ExitPath::GraceCutsInFlightSubmit => {
                             assert_eq!(delivered, 0.0, "{at}")
                         }
-                        ExitPath::PermanentError => {
-                            assert!(send_failed >= 4.0 && send_failed < SENT as f64, "{at}")
+                        ExitPath::Backoff => {
+                            assert_eq!(delivered, 0.0, "{at}");
+                            assert_eq!(send_failed, 3.0, "{at}: the held head is not dropped");
                         }
                     }
                     std::fs::remove_dir_all(&dir).ok();
@@ -6825,6 +7216,7 @@ mod tests {
                     retry: fast_retry_config(),
                     shutdown_grace: grace,
                     delivery_override: Some(posture),
+                    ..WriteLoopConfig::default()
                 };
                 write_loop(
                     "out".to_string(),
@@ -6882,6 +7274,7 @@ mod tests {
                 retry: fast_retry_config(),
                 shutdown_grace: Duration::from_millis(100),
                 delivery_override: Some(posture),
+                ..WriteLoopConfig::default()
             };
             write_loop(
                 "out".to_string(),
@@ -6934,6 +7327,7 @@ mod tests {
                 retry: fast_retry_config(),
                 shutdown_grace: Duration::from_millis(100),
                 delivery_override: Some(posture),
+                ..WriteLoopConfig::default()
             };
             write_loop(
                 "out".to_string(),
@@ -7286,6 +7680,7 @@ mod tests {
             },
             shutdown_grace: Duration::from_millis(100),
             delivery_override: Some(DeliveryPosture::AtMostOnce),
+            ..WriteLoopConfig::default()
         };
         let drain_total = Arc::new(AtomicU64::new(0));
         let store_for_task = Arc::clone(&store);
@@ -7438,6 +7833,7 @@ mod tests {
                 retry,
                 shutdown_grace: grace,
                 delivery_override: Some(DeliveryPosture::AtMostOnce),
+                ..WriteLoopConfig::default()
             },
             shutdown_rx,
             Arc::new(AtomicU64::new(0)),
@@ -7882,10 +8278,10 @@ mod tests {
         }
     }
 
-    /// When one sink fails, a healthy sibling still delivers its queued batches before exit.
+    /// A sink backing off after nothing but rejections ends nothing: a healthy sibling keeps
+    /// delivering, and the run keeps going.
     #[tokio::test(start_paused = true)]
-    async fn a_healthy_sinks_buffered_batches_are_still_delivered_after_a_sibling_sink_trips_the_permanent_failure_window(
-    ) {
+    async fn a_healthy_sink_keeps_delivering_while_a_sibling_sink_is_backed_off() {
         let mut components = Map::new();
         components.insert(
             "bad_in".to_string(),
@@ -7976,7 +8372,7 @@ mod tests {
                     max_bytes: u64::MAX,
                     overflow: OverflowPolicy::Block,
                 }),
-                // The gate stays shut past bad's 60 s window; a default budget or grace would
+                // The gate stays shut until bad has backed off, 60 s in; a default budget would
                 // time this send out first.
                 WriteLoopConfig {
                     retry: RetryConfig {
@@ -7984,7 +8380,7 @@ mod tests {
                         ..RetryConfig::default()
                     },
                     shutdown_grace: Duration::from_secs(3600),
-                    delivery_override: None,
+                    ..WriteLoopConfig::default()
                 },
             ),
         );
@@ -7992,8 +8388,9 @@ mod tests {
         let registry = Registry::new();
         let mut telemetry: HashMap<String, Telemetry> = HashMap::new();
         telemetry.insert("good".to_string(), registry.telemetry_for("good", "x", "sink"));
+        telemetry.insert("bad".to_string(), registry.telemetry_for("bad", "x", "sink"));
 
-        let run_task = tokio::spawn(run_with_telemetry(
+        let mut run_task = tokio::spawn(run_with_telemetry(
             g,
             specs,
             telemetry,
@@ -8024,7 +8421,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        // Trip "bad"'s permanent-failure window, ending its task with Err.
+        // Back "bad" off: a rejection, `backoff_after` of nothing else, then a second rejection.
         bad_tx
             .send(EventBatch {
                 resource: Arc::new(Resource::default()),
@@ -8033,7 +8430,7 @@ mod tests {
             })
             .expect("bad_in's receiver should still be alive");
         bad_handles.attempted.recv().await.expect("bad's first attempt should have happened");
-        tokio::time::sleep(PERMANENT_FAILURE_WINDOW).await;
+        tokio::time::sleep(WriteLoopConfig::default().backoff_after).await;
         bad_tx
             .send(EventBatch {
                 resource: Arc::new(Resource::default()),
@@ -8045,18 +8442,19 @@ mod tests {
             .attempted
             .recv()
             .await
-            .expect("bad's second (window-tripping) attempt should have happened");
+            .expect("bad's second (held) attempt should have happened");
+        let mut probe = TelemetryProbe::with_registry(Arc::clone(&registry));
+        probe
+            .wait_for("bad to back off", |t| {
+                t.gauge(BACKOFF_GAUGE, &[("component", "bad")]) == Some(1.0)
+            })
+            .await;
 
-        // Lets the join loop observe bad's failure and fire shutdown.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // Opened only after shutdown fired, so good's delivery can't have finished earlier.
         gate.open();
-
         for i in 0..3 {
             let received = tokio::time::timeout(Duration::from_secs(5), delivered_rx.recv())
                 .await
-                .expect("good's already-queued batches should still be delivered, not aborted")
+                .expect("good's queued batches should be delivered while bad is backed off")
                 .expect("the channel should not have closed");
             match &received.events[0].metrics[0].kind {
                 MetricKind::Sum(s) => {
@@ -8066,159 +8464,89 @@ mod tests {
             }
         }
 
-        let result = tokio::time::timeout(Duration::from_secs(10), run_task)
+        // Across bad's next probe, still rejected, good takes a new batch and the run goes on.
+        good_tx
+            .send(EventBatch {
+                resource: Arc::new(Resource::default()),
+                scope: None,
+                events: vec![counter_event("hits", 3.0)],
+            })
+            .expect("good_in's receiver should still be alive");
+        tokio::time::timeout(Duration::from_secs(5), delivered_rx.recv())
             .await
-            .expect("run_with_telemetry should not hang once every task has actually finished")
-            .expect("task should not panic");
-        let err =
-            result.expect_err("bad's sustained permanent failures should still end run with Err");
-        assert!(err.to_string().contains("bad"), "the returned error should be bad's, got: {err}");
+            .expect("good keeps delivering new batches")
+            .expect("the channel should not have closed");
+        bad_handles.attempted.recv().await.expect("bad's first probe");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut run_task).await.is_err(),
+            "a backed-off sink must not end the run"
+        );
+        run_task.abort();
     }
 
-    /// Always fails `Fault::Permanent`; the second `send` first sleeps for `delay`.
-    struct DelayedSecondFailureOutput {
+    /// Fails `delay` after it starts, ignoring the shutdown signal until then, as a listener
+    /// still draining at shutdown would.
+    struct DelayedErrInput {
         delay: Duration,
-        calls: Arc<std::sync::atomic::AtomicU32>,
     }
 
     #[async_trait::async_trait]
-    impl Output for DelayedSecondFailureOutput {
-        async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
-            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if n == 1 {
-                tokio::time::sleep(self.delay).await;
-            }
-            Err(anyhow::anyhow!("simulated permanent failure #{n}")).context(Fault::Permanent)
+    impl Input for DelayedErrInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            tokio::time::sleep(self.delay).await;
+            anyhow::bail!("failed after {:?}", self.delay)
+        }
+
+        async fn run_until_shutdown(
+            &mut self,
+            sink: Fanout,
+            _shutdown: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            self.run(sink).await
         }
     }
 
-    /// Both sinks fail permanently: `bad1`'s failure window trips at 60 s and `bad2`'s at 61 s.
-    /// The join loop returns `bad1`'s error, and `bad2`'s later one doesn't overwrite it.
+    /// Both listeners fail: `bad1` at 60 s and `bad2` at 61 s, inside the shutdown grace that
+    /// `bad1`'s failure starts. The join loop returns `bad1`'s error, and `bad2`'s later one
+    /// doesn't overwrite it.
     #[tokio::test(start_paused = true)]
     async fn run_with_telemetry_returns_the_first_failure_not_a_later_cascading_one() {
         let mut components = Map::new();
+        components.insert("bad1".to_string(), plain_component(vec![], statsd_in()));
+        components.insert("bad2".to_string(), plain_component(vec![], statsd_in()));
         components.insert(
-            "bad1_in".to_string(),
-            Component {
-                buffer: logit_config::BufferConfig::default(),
-                receive: logit_config::ReceiveConfig::default(),
-                sources: vec![],
-                targets: Vec::new(),
-                kind: ComponentKind::StatsdIn {
-                    bind: "127.0.0.1:0".to_string(),
-                    transport: logit_config::StatsdTransport::default(),
-                    tls: None,
-                    handshake_timeout: logit_config::default_handshake_timeout(),
-                    idle_timeout: None,
-                    max_connections: logit_config::default_max_connections(),
-                },
-            },
-        );
-        components.insert(
-            "bad1".to_string(),
-            Component {
-                buffer: logit_config::BufferConfig::default(),
-                receive: logit_config::ReceiveConfig::default(),
-                sources: vec!["bad1_in".to_string()],
-                targets: Vec::new(),
-                kind: influxdb_out(),
-            },
-        );
-        components.insert(
-            "bad2_in".to_string(),
-            Component {
-                buffer: logit_config::BufferConfig::default(),
-                receive: logit_config::ReceiveConfig::default(),
-                sources: vec![],
-                targets: Vec::new(),
-                kind: ComponentKind::StatsdIn {
-                    bind: "127.0.0.1:0".to_string(),
-                    transport: logit_config::StatsdTransport::default(),
-                    tls: None,
-                    handshake_timeout: logit_config::default_handshake_timeout(),
-                    idle_timeout: None,
-                    max_connections: logit_config::default_max_connections(),
-                },
-            },
-        );
-        components.insert(
-            "bad2".to_string(),
-            Component {
-                buffer: logit_config::BufferConfig::default(),
-                receive: logit_config::ReceiveConfig::default(),
-                sources: vec!["bad2_in".to_string()],
-                targets: Vec::new(),
-                kind: influxdb_out(),
-            },
+            "out".to_string(),
+            plain_component(vec!["bad1".to_string(), "bad2".to_string()], influxdb_out()),
         );
         let g =
             graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
-        let (bad1_tx, bad1_rx) = mpsc::unbounded_channel();
-        let (bad2_tx, bad2_rx) = mpsc::unbounded_channel();
-
-        // The budget outlasts `bad2`'s 61 s send, which would otherwise time out as `Ambiguous`
-        // and reset its failure streak. The grace keeps one sink's failure-triggered shutdown
-        // from cutting the other's delay short.
-        let generous = WriteLoopConfig {
-            retry: RetryConfig {
-                total_budget: Duration::from_secs(3600),
-                ..RetryConfig::default()
-            },
-            shutdown_grace: Duration::from_secs(3600),
-            delivery_override: None,
-        };
-
+        // The grace keeps `bad1`'s failure-triggered shutdown from cancelling `bad2` before it
+        // fails.
+        let grace = InputRuntimeConfig { shutdown_grace: Duration::from_secs(3600) };
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
-            "bad1_in".to_string(),
-            NodeSpec::Input(Box::new(ChannelInput { rx: bad1_rx }), InputRuntimeConfig::default()),
-        );
-        specs.insert(
             "bad1".to_string(),
-            NodeSpec::Output(
-                Box::new(DelayedSecondFailureOutput {
-                    delay: PERMANENT_FAILURE_WINDOW,
-                    calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-                }),
-                SinkStoreConfig::Memory(SinkQueueConfig::default()),
-                generous,
-            ),
-        );
-        specs.insert(
-            "bad2_in".to_string(),
-            NodeSpec::Input(Box::new(ChannelInput { rx: bad2_rx }), InputRuntimeConfig::default()),
+            NodeSpec::Input(Box::new(DelayedErrInput { delay: Duration::from_secs(60) }), grace),
         );
         specs.insert(
             "bad2".to_string(),
+            NodeSpec::Input(Box::new(DelayedErrInput { delay: Duration::from_secs(61) }), grace),
+        );
+        let (tx, _out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
             NodeSpec::Output(
-                Box::new(DelayedSecondFailureOutput {
-                    delay: PERMANENT_FAILURE_WINDOW + Duration::from_secs(1),
-                    calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-                }),
+                Box::new(RecordingOutput { tx }),
                 SinkStoreConfig::Memory(SinkQueueConfig::default()),
-                generous,
+                WriteLoopConfig::default(),
             ),
         );
-
-        // Senders dropped up front, so both inputs finish on their own.
-        for tx in [&bad1_tx, &bad2_tx] {
-            for i in 0..2 {
-                tx.send(EventBatch {
-                    resource: Arc::new(Resource::default()),
-                    scope: None,
-                    events: vec![counter_event("hits", i as f64)],
-                })
-                .expect("receiver should still be alive");
-            }
-        }
-        drop(bad1_tx);
-        drop(bad2_tx);
 
         let run_task = tokio::spawn(run(g, specs));
 
         // On the same virtual clock, so the timeout must exceed both delays.
-        let result = tokio::time::timeout(PERMANENT_FAILURE_WINDOW * 2, run_task)
+        let result = tokio::time::timeout(Duration::from_secs(120), run_task)
             .await
             .expect(
                 "run should not hang -- it must still terminate in bounded time once every \
@@ -10307,9 +10635,10 @@ mod tests {
             .expect("a clean run");
     }
 
-    /// A sustained permanent sink failure ends `run` with an error naming the sink.
+    /// A sink rejecting every batch backs off and never ends `run`: exit code 2 is for a listener
+    /// or Lua failure (`a_listener_failing_after_ready_flips_failed_and_returns_runtime`).
     #[tokio::test(start_paused = true)]
-    async fn a_sustained_permanent_sink_failure_returns_runtime_not_startup() {
+    async fn a_sustained_permanent_sink_failure_never_ends_run() {
         let mut components = Map::new();
         components.insert("bad_in".to_string(), plain_component(vec![], statsd_in()));
         components
@@ -10334,7 +10663,7 @@ mod tests {
             ),
         );
 
-        let run_task = tokio::spawn(run(g, specs));
+        let mut run_task = tokio::spawn(run(g, specs));
 
         bad_tx
             .send(EventBatch {
@@ -10344,7 +10673,8 @@ mod tests {
             })
             .expect("bad_in's receiver should still be alive");
         bad_handles.attempted.recv().await.expect("bad's first attempt should have happened");
-        tokio::time::sleep(PERMANENT_FAILURE_WINDOW).await;
+        let backoff = WriteLoopConfig::default();
+        tokio::time::sleep(backoff.backoff_after).await;
         bad_tx
             .send(EventBatch {
                 resource: Arc::new(Resource::default()),
@@ -10356,16 +10686,16 @@ mod tests {
             .attempted
             .recv()
             .await
-            .expect("bad's second (window-tripping) attempt should have happened");
+            .expect("bad's second (held) attempt should have happened");
+        for probe in 1..=3 {
+            bad_handles.attempted.recv().await.unwrap_or_else(|| panic!("probe {probe}"));
+        }
+        assert!(
+            tokio::time::timeout(backoff.backoff_interval / 2, &mut run_task).await.is_err(),
+            "three probes in, still rejected, the run goes on"
+        );
         drop(bad_tx);
-
-        // `run` flattens `RunError`; `run_error_exit_codes` covers the typed variant.
-        let result = tokio::time::timeout(PERMANENT_FAILURE_WINDOW * 2, run_task)
-            .await
-            .expect("run should not hang")
-            .expect("task should not panic");
-        let err = result.expect_err("a sustained permanent failure should still end run with Err");
-        assert!(err.to_string().contains("bad"), "the error should name bad, got: {err}");
+        run_task.abort();
     }
 
     /// Exit codes match `docs/deploying.md`: 1 for startup, 2 for runtime.
