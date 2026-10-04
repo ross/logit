@@ -1815,10 +1815,9 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   successful response's `partial_success`, with a throttled `otlp_partial_success` diagnostic
   carrying the collector's message.
 - `logit.output.records.dropped{signal, reason="rejected"}` (count): the records of a signal's
-  request the destination answered with a `Rejected` verdict (an HTTP 3xx or a 4xx other than
-  429, or gRPC `INVALID_ARGUMENT`, `UNIMPLEMENTED`, `UNAUTHENTICATED`, `PERMISSION_DENIED`, or an
-  unrecognized code). An auth answer is counted here too, since a credential can be scoped per
-  signal. The send goes on to the other signals, and returns `Ok` if any was
+  request the destination answered with a `Rejected` verdict (an HTTP 3xx, or a 4xx other than
+  401, 403, 405, 407, and 429; or gRPC `INVALID_ARGUMENT`, `UNIMPLEMENTED`, `NOT_FOUND`, or an
+  unrecognized code). An auth answer is `Refused` and stops the send instead. The send goes on to the other signals, and returns `Ok` if any was
   accepted. A throttled `signal_rejected` diagnostic names the signal, the status, and the record
   count, with a hint to place `has_signal` or `keep_signals` ahead of the sink. Counts per attempt,
   whether or not the send ends `Ok`. See [ADR `delivery-semantics`](../adr/delivery-semantics.md)'s

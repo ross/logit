@@ -2415,10 +2415,10 @@ Runnable configs:
 [`fixtures/victoriametrics-vmagent-receive.yaml`](../fixtures/victoriametrics-vmagent-receive.yaml).
 
 **Run one `otlp_out` per product, each behind a `keep_signals`.** One `otlp_out` posts every signal
-it carries to one host, and a product answers a signal it doesn't ingest with a `404`, which is a
-`refused` fault: the whole batch fails, and the sink holds and retries it instead of sending the
-other signals. Split the flow with `keep_signals` (or `has_signal`) so each sink sees only its
-product's signal.
+it carries to one host, and a product answers a signal it doesn't ingest with a `404`, which `otlp_out` reads as `rejected`
+for that signal. `otlp_out` counts that signal's records `records.dropped{reason="rejected"}`,
+warns, and still sends the other signals, but the request is wasted on every batch. Split the flow
+with `keep_signals` (or `has_signal`) so each sink sees only its product's signal.
 
 **Put `aggregate` with `temporality: cumulative` ahead of metrics bound for VictoriaMetrics.**
 VictoriaMetrics keeps no temporality. A delta `Sum` sent over OTLP is stored as its raw

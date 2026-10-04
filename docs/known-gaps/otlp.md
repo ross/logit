@@ -72,6 +72,20 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** VictoriaTraces sending a `GOAWAY` (the upstream fix). Whether `otlp_out`
     should retry a gRPC request that got no response frame before the connection closed is a
     larger question: without a `GOAWAY`, the request may have been processed.
+- **`otlp_out` gives the runtime one verdict per batch, not one per signal.** A traces-only
+  backend (Tempo) answers a metrics or logs request with gRPC `UNIMPLEMENTED` or HTTP `404`, which
+  `otlp_out` reads as `Rejected` for that signal (`crates/logit-outputs/src/otlp.rs`'s module doc,
+  "A signal the backend doesn't serve"). A mixed batch delivers its traces and counts the other
+  signals' records `logit.output.records.dropped{signal, reason="rejected"}`; a batch carrying
+  only signals the backend doesn't serve is dropped, counted
+  `logit.component.batches.dropped{reason="rejected"}`. Neither holds the queue or ends the
+  process.
+  - **Consequence:** every mixed batch spends a request the backend refuses, and a retryable
+    failure on one signal retries the whole batch, resending the signals already accepted.
+  - **Workaround:** `has_signal` or `keep_signals` ahead of the sink, as `demo/logit.yaml`'s
+    `trace_only` does.
+  - **To close:** per-signal outcomes ([`docs/plans/sink-fault-model.md`](../plans/sink-fault-model.md),
+    "W4: `otlp_out` per-signal outcomes").
 - **An OTLP timestamp past `i64::MAX` saturates to `i64::MAX`.** A wire timestamp
   (`time_unix_nano`, `observed_time_unix_nano`, `start_time_unix_nano`, and the span, span event,
   and exemplar times) past `i64::MAX` nanoseconds decodes as `i64::MAX` through one helper
