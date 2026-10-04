@@ -1,6 +1,6 @@
 ---
 created: 2026-09-04
-updated: 2026-09-18
+updated: 2026-10-04
 ---
 
 # `trace_context` grows a `span:` block, and a native `traceparent` parser
@@ -98,8 +98,8 @@ timestamp as the missing end, specifically so an *unchanged* nginx line carrying
 `request_time` still produces a span once `trace_context` is placed after it.
 
 **A resolved start/end further from the event's receipt time than `max_skew` (default one hour)
-is rejected, not written.** The same reasoning `docs/known-gaps/syslog.md`'s sketched
-`syslog_timestamp` transform already gives for exactly this class of risk: one sender with a badly
+is rejected, not written.** The same reasoning the `timestamp` transform
+([ADR `timestamp-transform`](timestamp-transform.md)) gives for this class of risk: one sender with a badly
 wrong clock must not be able to write spans years away and quietly poison a trace store.
 
 **`mint_id: false` by default; `logit` never mints a trace id.** A missing span id, with `span:`
