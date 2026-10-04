@@ -1,0 +1,42 @@
+# Resolving the sender's own timestamp (docs/adr/timestamp-transform.md): `syslog_in` stamps
+# `event.timestamp` with receipt time and keeps the sender's stamp as `syslog.timestamp`. A
+# `timestamp` component puts the sender's instant on `event.timestamp`, so a backlog replayed after
+# an outage lands at the time it happened, not the time it arrived.
+# Self-contained: one UDP listener on loopback and stdout; no other service.
+#
+#   syslog (syslog_in, udp 127.0.0.1:5514) ─> resolved (timestamp) ─> out (stdio_out, json)
+#
+#   logit run fixtures/syslog-timestamp.yaml
+#   logger --rfc3164 -d -n 127.0.0.1 -P 5514 "hello"
+#
+# The JSON line's `timestamp` is the sender's stamp read as New York time, and
+# `observed_timestamp` is the receipt time, which the component moves there. The stamp is on the
+# line as the `syslog.timestamp` attribute too, because `keep_source: true` retains it.
+components:
+  syslog:
+    type: syslog_in
+    bind: 127.0.0.1:5514
+
+  resolved:
+    type: timestamp
+    sources: [syslog]
+    # An RFC 5424 sender on this listener resolves too: its stamp is already a typed instant, so
+    # `format` and `timezone` only apply to RFC 3164 senders.
+    from: syslog.timestamp
+    format: rfc3164
+    # RFC 3164 carries no year and no zone. `timezone` is the zone these senders' clocks run in;
+    # the default is UTC, never the host's zone, and a wrong zone shifts every event silently.
+    timezone: America/New_York
+    # A resolved instant further than this from receipt is not applied (the event passes through
+    # with receipt time). The default is long enough for an overnight backlog drain, and tight
+    # enough to catch a sender with a badly wrong clock.
+    max_skew: 24h
+    # Keeps `syslog.timestamp`. A `syslog_out` after this component writes it verbatim on RFC 3164;
+    # with a non-UTC `timezone` and `keep_source: false` it would re-render in UTC instead.
+    keep_source: true
+
+  out:
+    type: stdio_out
+    sources: [resolved]
+    target: stdout
+    format: json
