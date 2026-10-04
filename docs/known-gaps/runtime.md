@@ -263,12 +263,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   mode that substituted a placeholder for a missing variable was tried and reverted (ADR
   `env-yaml-tag`'s Alternatives). **Workaround:** render a copy of the config with placeholder
   values filled in.
-- **Graph rule 8's error Debug-prints a whole `ComponentKind`**
-  (`"kind {:?} is not implemented yet"`, `crates/logit-pipeline/src/graph.rs`) — unreachable
-  today, because `is_implemented` lists every `ComponentKind`. `!env` inlines secrets into fields
-  (ADR `env-yaml-tag`) rather than referencing them by name, so this becomes a leak the moment a
-  kind with a secret field joins `ComponentKind` before `is_implemented` lists it. **Fix before
-  that happens:** redact, or print only the kind's name, instead of a blanket `{:?}`.
 - **`!env` is invisible to `schema/logit.schema.json`**
   ([ADR `env-yaml-tag`](../adr/env-yaml-tag.md)) — resolution happens on the parsed YAML tree
   before serde sees it (`crates/logit-cli/src/config.rs`), so the schema describes the

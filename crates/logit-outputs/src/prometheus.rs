@@ -236,7 +236,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use logit_core::{Diagnostics, Event, EventBatch, Exemplar, Telemetry};
+use logit_core::{redact, Diagnostics, Event, EventBatch, Exemplar, Telemetry};
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::prometheus::compression::{self, Encoding};
 use logit_proto::prometheus::{
@@ -1023,7 +1023,7 @@ impl RemoteWriteOutput {
                     "remote_write_rejected",
                     format_args!(
                         "remote-write to {} failed ({status}): {snippet}{hint}",
-                        self.endpoint
+                        redact::url(&self.endpoint)
                     ),
                 );
                 Err(anyhow::anyhow!("remote-write failed ({status}): {snippet}{hint}"))
