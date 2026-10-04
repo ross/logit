@@ -164,7 +164,9 @@
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] | stops |
 //!
 //! `Clean` and `Refused` mean Datadog holds nothing of the batch, so once a request was accepted a
-//! connect failure or a refusal on a later one is `Ambiguous` ([`crate::http::after_delivery`]). Redirects aren't
+//! connect failure or a refusal on a later one is `Ambiguous` ([`crate::http::after_delivery`]):
+//! a route answered `Refused` after another route was accepted retries the whole batch under
+//! `at_least_once`, the accepted routes included, and drops it under `at_most_once`. Redirects aren't
 //! followed ([`crate::http::build_client`] says why).
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),

@@ -200,7 +200,10 @@ substance.
 ### W4: `otlp_out` per-signal outcomes (`fault/w4`)
 
 `OtlpOutput::attempt` sends every non-empty signal and reports per request: a `Rejected` signal
-is dropped and counted for that signal alone, the others are delivered. Closes
+is dropped and counted for that signal alone, the others are delivered. That covers a credential
+scoped per signal too: `otlp_out` reads HTTP `401`/`403` and gRPC
+`UNAUTHENTICATED`/`PERMISSION_DENIED` as `Rejected` for that signal's request, since an OTLP
+credential can grant one signal and not another. Closes
 `docs/known-gaps/otlp.md`'s mixed-signal entry; `demo/logit.yaml`'s `trace_only` gate becomes a
 noise filter rather than a correctness requirement, and its comment says so.
 

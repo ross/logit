@@ -21,20 +21,26 @@
 //! warns (throttled, `signal_rejected`), and the send goes on to the next signal. A backend that
 //! takes only some signals (Tempo takes traces) fed a mixed batch delivers what it takes when it
 //! answers the others with a rejection, and the send succeeds. A send fails `Rejected` only when
-//! every signal was rejected. A `Refused` answer (a credential refused) stops the send: the
-//! runtime holds the batch and retries it. Once an earlier signal was accepted it stops the send
-//! as `Ambiguous` instead ([`crate::http::after_delivery`]), so an at-most-once sink drops the
-//! batch rather than resend what was applied.
+//! every signal was rejected. A `Refused` answer (HTTP `405` or `407`) stops the send: the runtime
+//! holds the batch and retries it. Once an earlier signal was accepted it stops the send as
+//! `Ambiguous` instead ([`crate::http::after_delivery`]), so an at-most-once sink drops the batch
+//! rather than resend what was applied.
 //!
-//! **A signal the backend doesn't serve is `Rejected`, not `Refused`.** gRPC `UNIMPLEMENTED` and
-//! `NOT_FOUND`, and HTTP `404` and `501`, which the shared driver reads as `Refused`
-//! ([`crate::http::classify_status`]), name one signal's endpoint here, not the destination: a
-//! traces-only backend (Tempo) answers its metrics and logs requests this way and takes its
-//! traces. Read as `Refused`, they would hold a mixed batch forever. As `Rejected` they count that
-//! signal's records and the send goes on, so a mixed batch delivers its traces. A batch whose
-//! every signal the backend doesn't serve is dropped whole, counted
-//! `batches.dropped{reason="rejected"}`, as is the rest of the batch when such an answer arrives
-//! before any accepted request: until `attempt` reports per signal
+//! **An answer that names one signal is `Rejected`, not `Refused`.** The shared driver reads HTTP
+//! `401`, `403`, `404`, and `501` as `Refused` ([`crate::http::classify_status`]); here they, and
+//! gRPC `UNAUTHENTICATED`, `PERMISSION_DENIED`, `UNIMPLEMENTED`, and `NOT_FOUND`, describe one
+//! signal's request, not the destination:
+//! - a traces-only backend (Tempo) answers its metrics and logs requests with `UNIMPLEMENTED` or
+//!   `404` and takes its traces;
+//! - an OTLP credential can be scoped per signal (a Grafana Cloud access policy can grant
+//!   `traces:write` without `metrics:write`), so a credential answer refuses that signal's
+//!   endpoint only.
+//!
+//! Read as `Refused`, they would hold a mixed batch forever, or, after an accepted signal, retry it
+//! as `Ambiguous` and resend the accepted signal on every retry. As `Rejected` they count that
+//! signal's records and the send goes on, so a mixed batch delivers what the backend takes. A
+//! batch whose every signal is answered this way is dropped whole, counted
+//! `batches.dropped{reason="rejected"}`: until `attempt` reports per signal
 //! (`docs/plans/sink-fault-model.md`, "W4: `otlp_out` per-signal outcomes"), a whole-batch verdict
 //! is the only one the runtime sees. `has_signal` or `keep_signals` ahead of the sink keeps the
 //! other signals off it.
@@ -59,10 +65,10 @@
 //! | Connect refused, DNS failure, after one was | `Ambiguous` | stops |
 //! | Request timeout | `Ambiguous` | stops |
 //! | HTTP 429 or any 5xx; gRPC `UNAVAILABLE`/`RESOURCE_EXHAUSTED`/`DEADLINE_EXCEEDED`/`ABORTED`/`INTERNAL` | `Ambiguous` | stops |
-//! | HTTP 401/403/405/407; gRPC `UNAUTHENTICATED`/`PERMISSION_DENIED`, before any request was accepted | `Refused` | stops |
+//! | HTTP 405/407, before any request was accepted | `Refused` | stops |
 //! | The same, after one was | `Ambiguous` | stops |
 //! | Any HTTP 3xx (redirects are off; [`crate::http::build_client`] says why) | `Rejected` | goes on, the signal counted `rejected` |
-//! | HTTP 404/501; gRPC `UNIMPLEMENTED`/`NOT_FOUND`: a signal the backend doesn't serve | `Rejected` | goes on, the signal counted `rejected` |
+//! | HTTP 401/403/404/501; gRPC `UNAUTHENTICATED`/`PERMISSION_DENIED`/`UNIMPLEMENTED`/`NOT_FOUND`: an answer that names one signal | `Rejected` | goes on, the signal counted `rejected` |
 //! | Any other HTTP 4xx; gRPC `INVALID_ARGUMENT` | `Rejected` | goes on, the signal counted `rejected` |
 //! | Any other gRPC status (an unrecognized code is not retried) | `Rejected` | goes on, the signal counted `rejected` |
 //!
@@ -580,25 +586,26 @@ fn grpc_status_class(code: u32) -> &'static str {
     }
 }
 
-/// [`classify_status`], except `404` and `501`: they name one signal's endpoint, not the
-/// destination, so they're `Rejected` (the module doc's "A signal the backend doesn't serve").
+/// [`classify_status`], except `401`, `403`, `404`, and `501`: they name one signal's endpoint or
+/// credential scope, not the destination, so they're `Rejected` (the module doc's "An answer
+/// that names one signal").
 fn http_status_fault(status: reqwest::StatusCode) -> Fault {
     match status.as_u16() {
-        404 | 501 => Fault::Rejected,
+        401 | 403 | 404 | 501 => Fault::Rejected,
         _ => classify_status(status),
     }
 }
 
 /// Maps a gRPC status code to a [`Fault`] per the module doc's table. An unlisted code is
 /// `Rejected`, as in `logit_pipeline::classify`: never retry what isn't known to be transient.
-/// `UNIMPLEMENTED` and `NOT_FOUND` are `Rejected` for the same reason as [`http_status_fault`]'s
-/// `404` and `501`.
+/// `UNAUTHENTICATED`, `PERMISSION_DENIED`, `UNIMPLEMENTED`, and `NOT_FOUND` are `Rejected` for the
+/// same reason as [`http_status_fault`]'s overrides.
 fn grpc_fault(code: u32) -> Fault {
     match code {
         14 | 8 | 4 | 10 | 13 => Fault::Ambiguous, // UNAVAILABLE, RESOURCE_EXHAUSTED,
         // DEADLINE_EXCEEDED, ABORTED, INTERNAL
-        16 | 7 => Fault::Refused, // UNAUTHENTICATED, PERMISSION_DENIED
-        _ => Fault::Rejected,     // UNIMPLEMENTED, NOT_FOUND, INVALID_ARGUMENT, and the rest
+        _ => Fault::Rejected, // UNAUTHENTICATED, PERMISSION_DENIED, UNIMPLEMENTED, NOT_FOUND,
+                              // INVALID_ARGUMENT, and the rest
     }
 }
 
@@ -1558,20 +1565,11 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Rejected);
     }
 
+    /// A signal the backend doesn't serve, or a credential that doesn't cover it, is that
+    /// request's rejection, not a refusal of the sink.
     #[tokio::test]
-    async fn grpc_refusing_statuses_are_classified_refused() {
-        for code in [7, 16] {
-            let addr = canned_grpc_server(code, "refused", Vec::new()).await;
-            let mut output = grpc_output(addr);
-            let err = output.send(&metric_batch()).await.expect_err("should fail");
-            assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{code}");
-        }
-    }
-
-    /// A signal the backend doesn't serve is that request's rejection, not a refusal of the sink.
-    #[tokio::test]
-    async fn grpc_unimplemented_and_not_found_are_classified_rejected() {
-        for code in [5, 12] {
+    async fn grpc_per_signal_answers_are_classified_rejected() {
+        for code in [5, 7, 12, 16] {
             let addr = canned_grpc_server(code, "unknown service", Vec::new()).await;
             let mut output = grpc_output(addr);
             let err = output.send(&metric_batch()).await.expect_err("should fail");
@@ -1581,12 +1579,12 @@ mod tests {
 
     /// The HTTP side's override of the shared driver's table.
     #[test]
-    fn http_404_and_501_are_rejected_and_the_rest_follow_the_driver() {
-        for code in [404, 501] {
+    fn http_per_signal_statuses_are_rejected_and_the_rest_follow_the_driver() {
+        for code in [401, 403, 404, 501] {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
             assert_eq!(http_status_fault(status), Fault::Rejected, "{code}");
         }
-        for code in [400, 401, 403, 405, 407, 429, 503] {
+        for code in [400, 405, 407, 429, 503] {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
             assert_eq!(http_status_fault(status), classify_status(status), "{code}");
         }
@@ -2251,60 +2249,67 @@ mod tests {
         assert_eq!(log.lock().unwrap().len(), 1);
     }
 
-    /// An auth answer or a missing endpoint on one signal after an accepted one stops the send
-    /// there, counts nothing as rejected, and sends no later signal. It's `Ambiguous`, not
-    /// `Refused`: the accepted signal was applied, so an at-most-once sink must not resend it.
+    /// HTTP 401 and 403 on one signal reject that signal alone: a credential can be scoped per
+    /// signal, so the others are sent and the send succeeds.
     #[tokio::test]
-    async fn an_http_refusing_answer_stops_the_send_refused() {
+    async fn an_http_auth_answer_on_one_signal_rejects_that_signal_alone() {
         for status in [401, 403] {
-            let (addr, log) = http_by_signal(200, status, 200).await;
+            let (addr, log) = http_by_signal(200, 200, status).await;
             let mut probe = TelemetryProbe::new();
             let mut output = instrumented_http(addr, &probe);
-            let err = output.send(&all_three_signals_batch()).await.unwrap_err();
-            assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{status}: {err:#}");
-            assert_eq!(log.lock().unwrap().len(), 2, "{status}: logs, then the refused traces");
+            output
+                .send(&all_three_signals_batch())
+                .await
+                .expect("accepted signals make the send Ok");
+            assert_eq!(log.lock().unwrap().len(), 3, "{status}: every signal is sent");
             let sums = drained(&mut probe);
-            assert_eq!(
-                sum_of(&sums, DROPPED, &[("reason", "rejected")]),
-                0.0,
-                "{status}: {sums:?}"
-            );
+            let metrics = [("signal", "metrics"), ("reason", "rejected")];
+            assert_eq!(sum_of(&sums, DROPPED, &metrics), 1.0, "{status}: {sums:?}");
+            let rejected = [("reason", "rejected")];
+            assert_eq!(sum_of(&sums, DROPPED, &rejected), 1.0, "{status}: {sums:?}");
         }
     }
 
-    /// gRPC `PERMISSION_DENIED` on one signal after an accepted one stops the send, `Ambiguous`,
-    /// as an HTTP 403 does.
+    /// A credential granting traces but not metrics: traces `OK` and metrics `PERMISSION_DENIED`
+    /// leave the send `Ok`, the metric points counted rejected.
     #[tokio::test]
-    async fn a_grpc_permission_denied_stops_the_send_refused() {
+    async fn a_grpc_permission_denied_on_one_signal_rejects_that_signal_alone() {
         let (addr, log) =
             grpc_server_answering(|_, path| if path.contains("TraceService") { 0 } else { 7 })
                 .await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented(grpc_output(addr), &probe);
-        let err = output.send(&traces_and_metrics_batch()).await.unwrap_err();
-        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
-        assert_eq!(log.lock().unwrap().len(), 2, "traces, then the refused metrics");
+        output.send(&traces_and_metrics_batch()).await.expect("accepted traces make the send Ok");
+        assert_eq!(log.lock().unwrap().len(), 2, "both signals are sent");
         let sums = drained(&mut probe);
-        assert_eq!(sum_of(&sums, DROPPED, &[("reason", "rejected")]), 0.0, "{sums:?}");
+        let metrics = [("signal", "metrics"), ("reason", "rejected")];
+        assert_eq!(sum_of(&sums, DROPPED, &metrics), 1.0, "{sums:?}");
+        assert_eq!(sum_of(&sums, DROPPED, &[("reason", "rejected")]), 1.0, "{sums:?}");
     }
 
-    /// A token refused on the first signal stops the send before any other request.
+    /// A token refused on every signal: every request is sent, and the send fails `Rejected`, so
+    /// the runtime drops the batch rather than hold it.
     #[tokio::test]
-    async fn an_http_auth_answer_on_every_signal_stops_after_the_first_request() {
+    async fn an_auth_answer_on_every_signal_fails_the_send_rejected() {
         for status in [401, 403] {
             let (addr, log) = http_by_signal(status, status, status).await;
             let err = http_output(addr).send(&all_three_signals_batch()).await.unwrap_err();
-            assert_eq!(err.downcast_ref::<Fault>(), Some(&Fault::Refused), "{status}: {err:#}");
-            assert_eq!(log.lock().unwrap().len(), 1, "{status}");
+            assert_eq!(logit_pipeline::classify(&err), Fault::Rejected, "{status}: {err:#}");
+            assert_eq!(log.lock().unwrap().len(), 3, "{status}: every signal is sent");
         }
-    }
-
-    /// gRPC `UNAUTHENTICATED` stops the send `Refused` after the first request.
-    #[tokio::test]
-    async fn a_grpc_unauthenticated_stops_the_send_after_the_first_request() {
         let (addr, log) = grpc_server_answering(|_, _| 16).await;
         let err = grpc_output(addr).send(&all_three_signals_batch()).await.unwrap_err();
-        assert_eq!(err.downcast_ref::<Fault>(), Some(&Fault::Refused), "{err:#}");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Rejected, "{err:#}");
+        assert_eq!(log.lock().unwrap().len(), 3, "every signal is sent");
+    }
+
+    /// A `405` names the destination, not one signal: the shared driver's `Refused` stops the send
+    /// before any later signal, and the runtime holds the batch.
+    #[tokio::test]
+    async fn an_http_405_stops_the_send_refused() {
+        let (addr, log) = http_by_signal(405, 200, 200).await;
+        let err = http_output(addr).send(&all_three_signals_batch()).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
         assert_eq!(log.lock().unwrap().len(), 1);
     }
 

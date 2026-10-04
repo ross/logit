@@ -115,7 +115,9 @@
 //!
 //! `Clean` and `Refused` mean the Agent holds nothing of the batch, so once a request was accepted
 //! a connect failure or a refusal on a later one is `Ambiguous` ([`crate::http::after_delivery`]),
-//! on either transport.
+//! on either transport: a route answered `Refused` after another route was accepted retries the
+//! whole batch under `at_least_once`, the accepted routes included, and drops it under
+//! `at_most_once`.
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
 //! retries an `Ambiguous` attempt, and a batch can be two requests, so a retry after the second

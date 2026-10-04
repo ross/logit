@@ -73,11 +73,14 @@ Entry format and the other areas: [the known-gaps index](README.md).
     should retry a gRPC request that got no response frame before the connection closed is a
     larger question: without a `GOAWAY`, the request may have been processed.
 - **`otlp_out` gives the runtime one verdict per batch, not one per signal.** A traces-only
-  backend (Tempo) answers a metrics or logs request with gRPC `UNIMPLEMENTED` or HTTP `404`, which
-  `otlp_out` reads as `Rejected` for that signal (`crates/logit-outputs/src/otlp.rs`'s module doc,
-  "A signal the backend doesn't serve"). A mixed batch delivers its traces and counts the other
-  signals' records `logit.output.records.dropped{signal, reason="rejected"}`; a batch carrying
-  only signals the backend doesn't serve is dropped, counted
+  backend (Tempo) answers a metrics or logs request with gRPC `UNIMPLEMENTED` or HTTP `404`, and a
+  credential scoped per signal (a Grafana Cloud access policy granting `traces:write` without
+  `metrics:write`) answers the other signals with HTTP `401`/`403` or gRPC
+  `UNAUTHENTICATED`/`PERMISSION_DENIED`. `otlp_out` reads each as `Rejected` for that signal
+  (`crates/logit-outputs/src/otlp.rs`'s module doc, "An answer that names one signal"). A mixed
+  batch delivers the signals the backend takes and counts the others' records
+  `logit.output.records.dropped{signal, reason="rejected"}`; a batch carrying only signals answered
+  this way is dropped, counted
   `logit.component.batches.dropped{reason="rejected"}`. Neither holds the queue or ends the
   process.
   - **Consequence:** every mixed batch spends a request the backend refuses, and a retryable
