@@ -553,3 +553,13 @@ statements above change:
 ## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
 
 `Output::duplicate_safe()` and `DeliveryPosture::from_duplicate_safe` are gone. `at_least_once` is now every sink's default posture, so `prometheus_out` keeps the posture this section argues for through the runtime default rather than through a `true` from `duplicate_safe()`. The argument that a replayed request is an idempotent overwrite is unchanged. See [`delivery-semantics.md`](delivery-semantics.md) item 5.
+
+## Amendment: the sender's response classes (2026-10-04)
+
+"The sink does not retry" reads every answer through the status table `otlp_out` used. Under
+[ADR `sink-fault-classes`](sink-fault-classes.md) each sink keeps its own table, and the two now
+differ: `otlp_out` follows the OTLP specification's retry rules, and this sender reads a `415`, and
+a `400` whose body names a failed decompression, as `Refused`, since both answer the sink's
+`version:` or `compression:` rather than the batch. The table, with its evidence, is the
+"Faults, retries and duplicate safety (sender mode)" section of
+`crates/logit-outputs/src/prometheus.rs`'s module doc.

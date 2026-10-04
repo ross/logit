@@ -2,11 +2,9 @@
 //! response status for telemetry, and turning a status or a transport error into a
 //! [`logit_pipeline::Fault`].
 //!
-//! Shared, not copied, because `prometheus_out`'s remote-write sender's `Fault` table *is*
-//! `otlp_out`'s, by name in
-//! [ADR `prometheus-remote-write`](../../../docs/adr/prometheus-remote-write.md): [`classify_status`]
-//! is the one status table, and only a connect failure is clean. Two copies of one table are two
-//! things to drift.
+//! Shared, not copied: [`classify_status`] is the one status-only table, the class of every
+//! response a sink's own table doesn't name, and only a connect failure is clean. Two copies of
+//! one table are two things to drift.
 //!
 //! [`Outcomes`] is the verdict rule every sink that sends one batch as several requests applies,
 //! whatever carries the request (`otlp_out`'s gRPC and `datadog_trace_out`'s Unix socket go over
