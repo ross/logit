@@ -1,7 +1,16 @@
 //! [`Fanout`]: the outbound side of a graph node. Every non-sink component (listener, transform,
-//! Lua stage) sends what it produces through one of these -- one `mpsc::Sender` per consumer,
-//! resolved from the inverted `sources` relation at graph-build time
-//! (`docs/design/pipeline-graph.md`'s "Runtime model").
+//! Lua stage) sends what it produces through one of these -- one [`Edge`] per consumer, resolved
+//! from the inverted `sources` relation at graph-build time
+//! (`docs/design/pipeline-graph.md`'s "Runtime model"). An edge is the consumer's inbox `Sender`
+//! plus the consumer's own telemetry handle.
+//!
+//! **A full inbox is recorded under the consumer, not the producer.** The producer's
+//! `logit.component.send.blocked.duration` covers the whole send, across every consumer, so it
+//! can't say which consumer of a fan-out is the one blocking. Each edge therefore records, under
+//! its consumer's component id, `logit.component.inbox.full` (a count of sends that found that
+//! inbox full, on any send path) and `logit.component.inbox.blocked.duration` (how long a send
+//! waited for room in it, recorded only when it waited). A full inbox still makes the producer
+//! wait; nothing is dropped.
 //!
 //! The channel payload is [`Delivered`], not a bare `EventBatch`
 //! (`docs/adr/arc-eventbatch-copy-on-write.md`). The move-vs-clone rule: an edge with one
@@ -45,9 +54,11 @@
 
 use logit_core::interner::intern;
 use logit_core::random_id_bytes;
+use logit_core::telemetry::Timer;
 use logit_core::{EventBatch, Provenance, SpanKind, Symbol, Telemetry};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 /// One batch's place in a trace: which trace it belongs to, and which span produced it. `Copy`,
 /// 24 bytes, carried on every [`Delivered`] whether or not anything turns it into a span.
@@ -153,6 +164,67 @@ impl std::fmt::Display for SendTimeout {
 
 impl std::error::Error for SendTimeout {}
 
+/// One outbound edge of a [`Fanout`]: the consumer's inbox `Sender` and the consumer's telemetry
+/// handle, under which the edge records `logit.component.inbox.full` and
+/// `logit.component.inbox.blocked.duration` (the module doc says why they belong to the consumer).
+#[derive(Clone)]
+pub struct Edge {
+    tx: mpsc::Sender<Delivered>,
+    telemetry: Telemetry,
+}
+
+impl Edge {
+    /// An edge into `tx` whose consumer handle is [`Telemetry::default`] (disabled).
+    pub fn new(tx: mpsc::Sender<Delivered>) -> Self {
+        Self { tx, telemetry: Telemetry::default() }
+    }
+
+    /// Attaches the consuming component's telemetry handle.
+    pub fn with_telemetry(mut self, consumer: Telemetry) -> Self {
+        self.telemetry = consumer;
+        self
+    }
+
+    /// Sends `item`, waiting for room when the inbox is full. `Err` is a closed consumer.
+    ///
+    /// tokio's bounded channel hands a released slot to its queued senders before it adds the slot
+    /// to the free count (`batch_semaphore::Semaphore::add_permits_locked`), so the `try_send`
+    /// fast path never overtakes a sender already parked on this inbox.
+    ///
+    /// `send().await` spends one unit of the task's cooperative budget and `try_send` spends none,
+    /// so the fast path spends it with `consume_budget`: without it, a producer that always finds
+    /// room never yields here.
+    async fn offer(&self, item: Delivered) -> Result<(), ()> {
+        match self.tx.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Closed(_)) => Err(()),
+            Err(TrySendError::Full(item)) => {
+                let _blocked = self.found_full();
+                self.tx.send(item).await.map_err(|_| ())
+            }
+        }
+    }
+
+    /// The `blocking_send` twin of [`Edge::offer`].
+    fn offer_blocking(&self, item: Delivered) -> Result<(), ()> {
+        match self.tx.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Closed(_)) => Err(()),
+            Err(TrySendError::Full(item)) => {
+                let _blocked = self.found_full();
+                self.tx.blocking_send(item).map_err(|_| ())
+            }
+        }
+    }
+
+    /// Counts one `inbox.full` on the consumer and starts its `inbox.blocked.duration` timer, which
+    /// records when the caller drops it after the wait.
+    fn found_full(&self) -> Timer {
+        self.telemetry.count("logit.component.inbox.full", 1.0, &[]);
+        self.telemetry.timer("logit.component.inbox.blocked.duration")
+    }
+}
+
 /// A node's outbound edges. Fan-in is N cloned `Sender`s feeding one inbox and needs nothing
 /// here. Fan-out moves the batch through a single-consumer edge and pays for an `Arc` only on a
 /// real fan-out.
@@ -161,9 +233,13 @@ impl std::error::Error for SendTimeout {}
 /// records the uniform sent/blocked telemetry (`docs/design/internal-telemetry.md`) for all of
 /// them. [`Fanout::with_telemetry`] attaches the producing component's handle;
 /// [`Fanout::default`]/[`Fanout::new`] leave it [`Telemetry::default`] (disabled).
+///
+/// Each [`Edge`] carries its consumer's handle, which [`Fanout::from_edges`] takes and
+/// [`Fanout::new`] leaves disabled. The inbox metrics an edge records go to that handle, never to
+/// the producer's.
 #[derive(Clone, Default)]
 pub struct Fanout {
-    consumers: Vec<mpsc::Sender<Delivered>>,
+    consumers: Vec<Edge>,
     telemetry: Telemetry,
     /// This node's id, interned once at graph-build time so stamping never interns on the hot
     /// path. `None` (a `Fanout` built without `with_component`, as tests do) makes stamping inert:
@@ -172,8 +248,14 @@ pub struct Fanout {
 }
 
 impl Fanout {
+    /// A `Fanout` over bare `Sender`s, every edge with disabled consumer telemetry.
     pub fn new(consumers: Vec<mpsc::Sender<Delivered>>) -> Self {
-        Self { consumers, telemetry: Telemetry::default(), component: None }
+        Self::from_edges(consumers.into_iter().map(Edge::new).collect())
+    }
+
+    /// A `Fanout` over edges that each carry their consumer's telemetry handle.
+    pub fn from_edges(edges: Vec<Edge>) -> Self {
+        Self { consumers: edges, telemetry: Telemetry::default(), component: None }
     }
 
     /// Attaches the producing component's telemetry handle.
@@ -274,6 +356,12 @@ impl Fanout {
     /// A closed consumer is skipped and counted `events.dropped{reason="closed_consumer"}`, as in
     /// `deliver`, but only once the batch goes out. `Ok(false)` is a batch no consumer took (there
     /// are none, or every one is closed), which the calling listener refuses to its client.
+    ///
+    /// A consumer found full counts `inbox.full` on that consumer when the reservation finds it
+    /// full, and that count stays on a timeout: it records the consumer's state, not a send. That
+    /// consumer's `inbox.blocked.duration` timer is dropped with the cancelled reservation on a
+    /// timeout, so its sample is the time until the cancel, as `Timer`'s doc describes for any
+    /// cancelled wait.
     pub async fn send_with_deadline(
         &self,
         batch: EventBatch,
@@ -292,9 +380,19 @@ impl Fanout {
         let mut unsent = Unsent(Some((span, timer)));
         let reserve_all = async {
             let mut permits = Vec::with_capacity(self.consumers.len());
-            for tx in &self.consumers {
-                // `Err` is a closed consumer: nothing to wait for, counted once the batch goes out.
-                permits.push(tx.reserve().await.ok());
+            for edge in &self.consumers {
+                // `None` is a closed consumer: nothing to wait for, counted once the batch goes
+                // out. `try_reserve` can't overtake a parked reserver, and spends the budget
+                // `reserve().await` would, as in `Edge::offer`.
+                let permit = match edge.tx.try_reserve() {
+                    Ok(permit) => Some(permit),
+                    Err(TrySendError::Closed(())) => None,
+                    Err(TrySendError::Full(())) => {
+                        let _blocked = edge.found_full();
+                        edge.tx.reserve().await.ok()
+                    }
+                };
+                permits.push(permit);
             }
             permits
         };
@@ -351,7 +449,7 @@ impl Fanout {
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         if rest.is_empty() {
-            if last.send(Delivered::Owned(batch, ctx)).await.is_err() {
+            if last.offer(Delivered::Owned(batch, ctx)).await.is_err() {
                 self.record_dropped_on_close(n);
                 return false;
             }
@@ -359,14 +457,14 @@ impl Fanout {
         }
         let batch = Arc::new(batch);
         let mut taken = false;
-        for tx in rest {
-            if tx.send(Delivered::Shared(batch.clone(), ctx)).await.is_err() {
+        for edge in rest {
+            if edge.offer(Delivered::Shared(batch.clone(), ctx)).await.is_err() {
                 self.record_dropped_on_close(n);
             } else {
                 taken = true;
             }
         }
-        if last.send(Delivered::Shared(batch, ctx)).await.is_err() {
+        if last.offer(Delivered::Shared(batch, ctx)).await.is_err() {
             self.record_dropped_on_close(n);
         } else {
             taken = true;
@@ -414,7 +512,7 @@ impl Fanout {
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         if rest.is_empty() {
-            if last.blocking_send(Delivered::Owned(batch, ctx)).is_err() {
+            if last.offer_blocking(Delivered::Owned(batch, ctx)).is_err() {
                 self.record_dropped_on_close(n);
                 return false;
             }
@@ -422,14 +520,14 @@ impl Fanout {
         }
         let batch = Arc::new(batch);
         let mut taken = false;
-        for tx in rest {
-            if tx.blocking_send(Delivered::Shared(batch.clone(), ctx)).is_err() {
+        for edge in rest {
+            if edge.offer_blocking(Delivered::Shared(batch.clone(), ctx)).is_err() {
                 self.record_dropped_on_close(n);
             } else {
                 taken = true;
             }
         }
-        if last.blocking_send(Delivered::Shared(batch, ctx)).is_err() {
+        if last.offer_blocking(Delivered::Shared(batch, ctx)).is_err() {
             self.record_dropped_on_close(n);
         } else {
             taken = true;
@@ -807,6 +905,167 @@ mod tests {
         assert_eq!((a, b), (false, false), "every consumer or none has the batch (a, b)");
         assert_eq!(probe_a.capacity(), 1, "a's reserved slot must be released, not leaked");
         assert_nothing_recorded_as_sent(&registry.drain(0));
+    }
+
+    const INBOX_FULL: &str = "logit.component.inbox.full";
+    const INBOX_BLOCKED: &str = "logit.component.inbox.blocked.duration";
+
+    /// A probe, a producer `Fanout` with its own handle under `in`, and one capacity-1 inbox per
+    /// consumer id, each edge carrying that consumer's handle.
+    fn probed_fanout(
+        consumers: &[&'static str],
+    ) -> (crate::test_util::TelemetryProbe, Fanout, Vec<mpsc::Receiver<Delivered>>) {
+        let probe = crate::test_util::TelemetryProbe::new();
+        let mut edges = Vec::new();
+        let mut inboxes = Vec::new();
+        for id in consumers {
+            let (tx, rx) = mpsc::channel(1);
+            edges.push(Edge::new(tx).with_telemetry(probe.telemetry(id, "influxdb_out", "sink")));
+            inboxes.push(rx);
+        }
+        let producer = probe.telemetry("in", "statsd_in", "listener");
+        (probe, Fanout::from_edges(edges).with_telemetry(producer), inboxes)
+    }
+
+    /// Fills consumer `consumer`'s capacity-1 inbox through its bare `Sender`, so the prefill
+    /// records nothing.
+    fn prefill(fanout: &Fanout, consumer: usize) {
+        let tx = &fanout.consumers[consumer].tx;
+        tx.try_send(Delivered::Owned(batch(1), BatchContext::default())).expect("prefill");
+    }
+
+    /// How many `timing` samples named `name` were recorded under component `id`.
+    fn timings_on(events: &[logit_core::Event], name: &str, id: &str) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                e.attributes.iter().any(|(key, value)| {
+                    logit_core::interner::resolve(key) == "component" && value.as_str() == Some(id)
+                })
+            })
+            .map(|e| timing_count(std::slice::from_ref(e), name))
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn a_full_consumer_counts_inbox_full_on_the_consumer_not_the_producer() {
+        let (mut probe, fanout, mut inboxes) = probed_fanout(&["out"]);
+        prefill(&fanout, 0);
+
+        let send = tokio::spawn(async move { fanout.send(batch(2)).await });
+        probe
+            .wait_for("out's inbox.full", |t| t.sum(INBOX_FULL, &[("component", "out")]) == 1.0)
+            .await;
+        inboxes[0].recv().await.expect("the prefill");
+        assert!(send.await.expect("send task"), "out took the batch once it had room");
+
+        assert_eq!(probe.sum(INBOX_FULL, &[("component", "in")]), 0.0, "never on the producer");
+        assert_eq!(probe.sum(INBOX_FULL, &[]), 1.0, "one send found one full inbox");
+    }
+
+    #[tokio::test]
+    async fn a_consumer_with_room_counts_no_inbox_full_and_no_blocked_sample() {
+        let (mut probe, fanout, mut inboxes) = probed_fanout(&["out"]);
+
+        assert!(fanout.send(batch(2)).await);
+        inboxes[0].recv().await.expect("out should receive");
+
+        let totals = probe.poll();
+        assert_eq!(totals.sum("logit.component.batches.sent", &[]), 1.0, "telemetry is on");
+        assert_eq!(totals.sum(INBOX_FULL, &[]), 0.0);
+        assert!(!totals.has(INBOX_BLOCKED, &[]), "no wait, so no blocked sample");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_send_records_one_inbox_blocked_duration_sample_on_the_consumer() {
+        let (mut probe, fanout, mut inboxes) = probed_fanout(&["out"]);
+        prefill(&fanout, 0);
+
+        let send = tokio::spawn(async move { fanout.send(batch(3)).await });
+        probe
+            .wait_for("out's inbox.full", |t| t.sum(INBOX_FULL, &[("component", "out")]) == 1.0)
+            .await;
+        inboxes[0].recv().await.expect("the prefill");
+        assert!(send.await.expect("send task"));
+        let Delivered::Owned(sent, _) = inboxes[0].recv().await.expect("the blocked batch") else {
+            panic!("one consumer gets the batch moved");
+        };
+        assert_eq!(sent.events.len(), 3);
+
+        let events = &probe.poll().events;
+        assert_eq!(timings_on(events, INBOX_BLOCKED, "out"), 1);
+        assert_eq!(timings_on(events, INBOX_BLOCKED, "in"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_blocking_send_into_a_full_consumer_counts_inbox_full_on_that_consumer() {
+        let (mut probe, fanout, mut inboxes) = probed_fanout(&["out"]);
+        prefill(&fanout, 0);
+
+        let send = tokio::task::spawn_blocking(move || fanout.send_blocking(batch(1)));
+        probe
+            .wait_for("out's inbox.full", |t| t.sum(INBOX_FULL, &[("component", "out")]) == 1.0)
+            .await;
+        inboxes[0].recv().await.expect("the prefill");
+        assert!(send.await.expect("blocking send task"), "out took the batch once it had room");
+        inboxes[0].recv().await.expect("the blocked batch");
+
+        assert_eq!(timings_on(&probe.poll().events, INBOX_BLOCKED, "out"), 1);
+        assert_eq!(probe.sum(INBOX_FULL, &[("component", "in")]), 0.0);
+    }
+
+    #[tokio::test]
+    async fn send_with_deadline_counts_inbox_full_on_the_full_consumer_only() {
+        let (mut probe, fanout, mut inboxes) = probed_fanout(&["a", "b"]);
+        prefill(&fanout, 1);
+
+        let send =
+            tokio::spawn(async move { fanout.send_with_deadline(batch(1), in_ms(60_000)).await });
+        probe.wait_for("b's inbox.full", |t| t.sum(INBOX_FULL, &[("component", "b")]) == 1.0).await;
+        inboxes[1].recv().await.expect("b's prefill");
+        assert_eq!(send.await.expect("send task"), Ok(true));
+        inboxes[0].recv().await.expect("a should receive");
+        inboxes[1].recv().await.expect("b should receive");
+
+        assert_eq!(probe.sum(INBOX_FULL, &[("component", "a")]), 0.0, "a always had room");
+        assert_eq!(timings_on(&probe.totals().events, INBOX_BLOCKED, "a"), 0);
+        assert_eq!(timings_on(&probe.totals().events, INBOX_BLOCKED, "b"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_with_deadline_that_times_out_still_counts_the_inbox_full_it_observed() {
+        let (mut probe, fanout, mut inboxes) = probed_fanout(&["out"]);
+        prefill(&fanout, 0);
+
+        assert_eq!(fanout.send_with_deadline(batch(1), in_ms(100)).await, Err(SendTimeout));
+        inboxes[0].recv().await.expect("the prefill");
+        assert!(inboxes[0].try_recv().is_err(), "the timed-out batch is never enqueued");
+
+        let totals = probe.poll();
+        assert_eq!(totals.sum(INBOX_FULL, &[("component", "out")]), 1.0);
+        assert_nothing_recorded_as_sent(&totals.events);
+        assert_eq!(
+            timings_on(&totals.events, INBOX_BLOCKED, "out"),
+            1,
+            "the cancelled wait records its time until the cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fan_out_with_one_full_consumer_counts_inbox_full_on_that_consumer_only() {
+        let (mut probe, fanout, mut inboxes) = probed_fanout(&["a", "b"]);
+        prefill(&fanout, 1);
+
+        let send = tokio::spawn(async move { fanout.send(batch(1)).await });
+        probe.wait_for("b's inbox.full", |t| t.sum(INBOX_FULL, &[("component", "b")]) == 1.0).await;
+        inboxes[1].recv().await.expect("b's prefill");
+        assert!(send.await.expect("send task"));
+        inboxes[0].recv().await.expect("a should receive");
+        inboxes[1].recv().await.expect("b should receive");
+
+        assert_eq!(probe.sum(INBOX_FULL, &[("component", "a")]), 0.0, "a always had room");
+        assert_eq!(timings_on(&probe.totals().events, INBOX_BLOCKED, "a"), 0);
+        assert_eq!(timings_on(&probe.totals().events, INBOX_BLOCKED, "b"), 1);
     }
 
     /// `send` mints a fresh root every call.
