@@ -693,7 +693,11 @@ Merged branches and PRs are never renamed to fit.
   ([ADR `config-yaml-jsonschema`](docs/adr/config-yaml-jsonschema.md)) — the published schema is generated from
   the Rust types specifically so it can't drift. If `schemars` needs a hint `serde` doesn't give it
   (as with the hand-rolled `Duration` codec in `logit-config`), add `#[schemars(with = "...")]`
-  alongside `#[serde(with = "...")]` rather than dropping the derive.
+  alongside `#[serde(with = "...")]` rather than dropping the derive. A config struct with a
+  fixed set of keys also carries `#[serde(deny_unknown_fields)]`, so a typo fails `logit validate`
+  instead of being dropped; a map whose keys are the operator's data stays open. A new
+  `ComponentKind` variant gets this from the enum, flattened fields included, and
+  `json_schema()` closes its schema variant to match.
 - **Stub code says so.** Unimplemented pieces are `todo!()` with a comment pointing at the design
   doc section and, where relevant, what to build next — see `logit-script`, `logit-proto`, and the
   `statsd`/`influxdb` stubs. Follow that pattern for new stubs rather than silently returning a

@@ -1,6 +1,6 @@
 ---
 created: 2026-08-28
-updated: 2026-09-11
+updated: 2026-10-04
 ---
 
 # Configuration: YAML with a generated JSON Schema
@@ -35,3 +35,33 @@ in 2024.
   validation for free.
 - Inline Lua in YAML needs a documented multiline-string convention (YAML block scalars) as well as
   the file-reference form, both covered in the schema.
+
+## Amendment: unknown keys are rejected (2026-10-04)
+
+An unknown key anywhere in a config file is a deserialization error, so `logit validate` and
+`logit run` fail at load and name it. A key `logit` doesn't read is either a typo or a field that
+no longer exists, and dropping it starts the component with a default the operator didn't choose:
+a bare `tls:` under `prometheus_in`, whose keys are `scrape_tls:` and `bind_tls:`, started the
+scrape client without the operator's CA.
+
+- **Every fixed-shape config type carries `#[serde(deny_unknown_fields)]`.** Free-form maps whose
+  keys are the operator's data (`set`'s attributes, `headers`, `routes`, and the like) stay open.
+- **`ComponentKind` denies at the enum.** `Component` flattens the `type`-tagged enum beside its
+  four common keys (`sources`, `targets`, `buffer`, `receive`). serde gives `Component` those keys
+  first and hands the enum the rest, so the enum's container attribute rejects anything no variant
+  field names. The same holds for `tail_in` and `docker_in`, which flatten `TailOptions`: serde
+  documents `deny_unknown_fields` with `flatten` as unsupported, but serde_derive rejects whatever
+  the flattened fields leave unclaimed, and `logit-config`'s tests pin that for both kinds and for
+  every shape of variant.
+- **A component's error names its id.** A flattened, tagged enum's error carries no location, so
+  `Config` deserializes `components:` itself and prefixes each error with
+  ``component `<id>`:``. An unknown-key error also notes the four common keys, which serde's
+  "expected one of" list for the kind omits. Only the id and the key are printed, never a value.
+- **The schema matches.** `logit_config::json_schema()` post-processes `Component` so every `oneOf`
+  variant has `additionalProperties: false` and lists the four common keys (as `true`, since
+  `Component`'s own `properties` already describe their shape). An editor then flags the same keys
+  `logit validate` rejects.
+
+Rejected: a hand-written `Deserialize` for `Component` that peels the common keys off a map and
+deserializes `ComponentKind` from the remainder. The derive already does that once the enum
+denies, and a hand-written impl is one more place a new common key has to be added.

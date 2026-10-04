@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-09-13
+updated: 2026-10-04
 ---
 
 # `target` components: named destinations a router directs events into, beside `sources:`
@@ -115,10 +115,13 @@ below); its unrouted events are dropped and counted,
 `logit.component.events.dropped{reason="unrouted"}`, never silently.
 
 **`targets:` is a `Component` field, beside `sources:`/`buffer:`/`receive:`, not a field on the
-Lua variants.** `ComponentKind` variants cannot `deny_unknown_fields` (a serde limitation with
-`flatten`, recorded at `TailOptions`), so a `targets:` on the wrong kind would be silently
-ignored -- exactly the failure rules 14/17/33 exist to catch for `buffer:`/`receive:`/
-`compression:`. On `Component` it is rejectable by the same rule shape. `route` never sets it:
+Lua variants.** A variant field would make `targets:` an unknown key on every other kind, a
+parse error that names the key but not the rule. On `Component` it parses everywhere, and the
+graph rejects it on the wrong kind by the same rule shape rules 14/17/33 use for `buffer:`/
+`receive:`/`compression:`. (This ADR first argued that `ComponentKind` variants couldn't deny
+unknown fields; they can, and do: see
+[ADR `config-yaml-jsonschema`](config-yaml-jsonschema.md)'s "unknown keys are rejected"
+amendment.) `route` never sets it:
 its edges derive from `routes:`' values, so there is nothing to repeat.
 
 **Why this is not the "named outlets" `component-graph-configuration` rejected.** That rejection

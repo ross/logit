@@ -23,6 +23,7 @@
       }
     }
   },
+  "additionalProperties": false,
   "definitions": {
     "AdminConfig": {
       "description": "The `admin:` block. Every field defaults, so omitting the block leaves the admin server off.",
@@ -140,6 +141,7 @@
             "bind": {
               "type": "string"
             },
+            "buffer": true,
             "handshake_timeout": {
               "description": "How long one connection has, per pre-message phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for the connection's first byte. Each phase gets its own budget, so a silent TLS connection costs up to twice this value. Defaults to `5s`; `0s` is rejected. `transport: tcp` or `unix_stream` only: a non-default value under `transport: udp` or `unix` is rejected.\n\nNot an idle timeout. Once a connection has sent its first byte, the gap before its next line is bounded by `idle_timeout` if set, and unbounded otherwise.",
               "default": "5s",
@@ -160,6 +162,9 @@
               "format": "uint",
               "minimum": 0.0
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "tls": {
               "description": "Terminates TLS on this listener when present; plaintext when omitted. Requires `transport: tcp`.",
               "default": null,
@@ -186,7 +191,8 @@
                 "statsd_in"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "collectd's binary `network` plugin protocol over UDP.\n\n`bind` is an ordinary `host:port`; collectd's own default port is `25826`. When the address is a multicast group (collectd's defaults are `239.192.74.66` and `ff18::efc0:4a42`), the listener sets `SO_REUSEADDR`, binds the unspecified address on that port, and joins the group on the default interface. There is no `multicast:` field; the address says it. Such a listener also accepts unicast datagrams sent to that port from any source: joining a group is additive, not a filter.\n\n`types_db` names zero or more collectd `types.db` files (relative paths resolve against the config file's directory), read at startup and merged in order, later files overriding earlier ones. They supply data-source names only: a value list whose type resolves with a matching data-source count and kinds is named `<plugin>.<type>.<ds_name>` rather than `<plugin>.<type>.<i>` (a single-data-source list is `<plugin>.<type>` either way). A missing or unparseable file fails startup. Names never change what `collectd_out` puts back on the wire; it re-encodes from the `collectd.*` attributes. collectd's own `types.db` is GPL-licensed and not shipped with `logit`; point this at the installed copy.",
@@ -199,6 +205,10 @@
             "bind": {
               "type": "string"
             },
+            "buffer": true,
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
@@ -212,7 +222,8 @@
                 "type": "string"
               }
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Graphite/Carbon metric ingress: carbon's plaintext line protocol or its pickle batch protocol, over TCP or UDP.\n\n`bind` is an ordinary `host:port`; carbon's own plaintext port is `2003` and its pickle port is `2004`. There is no `prefix:`/`template:` field and no `graphite.*` attribute namespace: a datapoint's dotted path is the metric name and its `;k=v` tags are event attributes, so a `lua`/`set` stage that renames the metric renames the wire path.\n\n`transport: tcp` (the default, carbon's own) runs an accept loop with no receive queue (TCP's own flow control is the backpressure), so only `receive:`'s batch-assembly and `shutdown_grace` fields apply to it. `transport: udp` runs the datagram listener and takes the whole `receive:` block. `protocol: pickle` requires `transport: tcp`: carbon's 4-byte length prefix has no meaning in a self-delimiting datagram.\n\n`tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS listener. It applies to `transport: tcp` only; `tls:` under `transport: udp` is rejected. Carbon senders have no TLS of their own, so this is for a `logit`-to-`logit` or stunnel-shaped relay hop.",
@@ -225,6 +236,7 @@
             "bind": {
               "type": "string"
             },
+            "buffer": true,
             "handshake_timeout": {
               "description": "How long one connection has, per pre-message phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for the connection's first byte. Each phase gets its own budget, so a silent TLS connection costs up to twice this value. Defaults to `5s`; `0s` is rejected. `transport: tcp` only: a non-default value under `transport: udp` is rejected.\n\nNot an idle timeout. Once a connection has sent its first byte, the gap before its next datapoint is bounded by `idle_timeout` if set, and unbounded otherwise.",
               "default": "5s",
@@ -263,6 +275,9 @@
                 }
               ]
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "tls": {
               "description": "Terminates TLS on this listener when present; plaintext when omitted. Requires `transport: tcp`.",
               "default": null,
@@ -289,7 +304,8 @@
                 "graphite_in"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "RFC 3164 / RFC 5424 syslog, over UDP (the default) or TCP. RFC 5424 STRUCTURED-DATA is parsed into `syslog.sd` either way.\n\nUnder `transport: tcp` each connection's framing is detected from its first byte and latched for that connection's life: an ASCII digit means RFC 6587 octet-counting (`MSG-LEN SP MSG`, what `syslog_out` emits, and the only framing that can carry a message containing a newline); anything else means LF-delimited framing (rsyslog's `omfwd` default). There is no `framing:` field. A frame over 64 KiB, or a malformed octet count, closes that one connection.\n\n`tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS listener. It applies to `transport: tcp` only (RFC 5425); `tls:` under `transport: udp` is rejected.\n\nA TCP listener has no receive queue (the connection's own flow control is the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply per connection: N live connections can hold up to N times `batch_max_events` in flight.",
@@ -302,6 +318,7 @@
             "bind": {
               "type": "string"
             },
+            "buffer": true,
             "handshake_timeout": {
               "description": "How long one connection has, per pre-message phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for the connection's first byte. Each phase gets its own budget, so a silent TLS connection costs up to twice this value. Defaults to `5s`; `0s` is rejected. `transport: tcp` only: a non-default value under `transport: udp` is rejected.\n\nNot an idle timeout. Once a connection has sent its first byte, the gap before its next frame is bounded by `idle_timeout` if set, and unbounded otherwise.",
               "default": "5s",
@@ -322,6 +339,9 @@
               "format": "uint",
               "minimum": 0.0
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "tls": {
               "description": "Terminates TLS on this listener when present; plaintext when omitted. Requires `transport: tcp`.",
               "default": null,
@@ -348,7 +368,8 @@
                 "syslog_in"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "OpenTelemetry Protocol (logs, metrics, and/or traces) over OTLP/HTTP (protobuf or JSON body) or OTLP/gRPC.",
@@ -361,6 +382,7 @@
             "bind": {
               "type": "string"
             },
+            "buffer": true,
             "handshake_timeout": {
               "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected.\n\nNot an idle timeout. Once a connection has produced one byte, the quiet gaps between requests are bounded by `idle_timeout` if set, and by nothing otherwise.\n\nAlso the grace period an idle close gives the HTTP server to shut the connection down before it is dropped.",
               "default": "5s",
@@ -389,6 +411,9 @@
                 }
               ]
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "tls": {
               "description": "Terminates TLS on this listener, under either `protocol`, when present; plaintext when omitted.",
               "default": null,
@@ -407,7 +432,8 @@
                 "otlp_in"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A stand-in for Datadog's intake API: what a Datadog Agent's `dd_url`, `logs_config.logs_dd_url`, `apm_config.apm_dd_url`, or `additional_endpoints` point at. Serves series (v1 and v2), distribution points, sketches, service checks, events, logs, APM traces, and APM stats over HTTP, decompressing gzip, deflate, and zstd. Host and inventory metadata are acknowledged and discarded. A request on a known path with the wrong method gets `405`; a request on any other path gets `404`, so an Agent reports a route this listener doesn't speak rather than having it silently dropped. When the pipeline can't take a request's data within 5s, the request gets `503` with `Retry-After: 1`, and the Agent retries it.",
@@ -428,6 +454,7 @@
             "bind": {
               "type": "string"
             },
+            "buffer": true,
             "handshake_timeout": {
               "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
               "default": "5s",
@@ -448,6 +475,9 @@
               "format": "uint",
               "minimum": 0.0
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "tls": {
               "description": "Terminates TLS on this listener when present; plaintext when omitted.",
               "default": null,
@@ -466,7 +496,8 @@
                 "datadog_in"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A stand-in for the Datadog Agent's APM receiver: what a dd-trace tracer sends its traces and client-computed stats to. Serves `/v0.3`, `/v0.4`, `/v0.5`, and `/v0.7/traces` (msgpack), `/v0.6/stats`, and `/info`, over TCP (`bind`), a Unix stream socket (`socket`), or both at once; at least one is required. Every span is kept: the reply sets every service's sampling rate to 1.0. Profiling, debugger, and `evp_proxy` uploads are answered `200` and discarded; telemetry, Remote Configuration, and the other trace forms get `404`. A request the pipeline can't take within 2s gets `503`, which a tracer retries a few times and then drops. Spans pass through unprocessed (no obfuscation, normalization, or stats), so send them to a real Agent (`datadog_trace_out`) or `otlp_out`, never straight to `datadog_out`.",
@@ -483,6 +514,7 @@
                 "null"
               ]
             },
+            "buffer": true,
             "handshake_timeout": {
               "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, and otherwise the wait for its first byte. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
               "default": "5s",
@@ -503,6 +535,7 @@
               "format": "uint",
               "minimum": 0.0
             },
+            "receive": true,
             "socket": {
               "description": "An absolute path for a Unix stream socket, the Agent's `receiver_socket` (`/var/run/datadog/apm.socket` by default). A tracer finds it through `DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket`. The directory must exist; a stale socket file at the path is replaced, and the new one is made writable by every user (mode `0722`, the Agent's own) so unprivileged tracers can connect.",
               "default": null,
@@ -511,6 +544,8 @@
                 "null"
               ]
             },
+            "sources": true,
+            "targets": true,
             "tls": {
               "description": "Terminates TLS on the `bind` listener when present; plaintext when omitted. Requires `bind`: the Unix socket is always plaintext.",
               "default": null,
@@ -529,7 +564,8 @@
                 "datadog_trace_in"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A stand-in for Splunk's HTTP Event Collector (HEC): what a HEC client's URL points at, such as Docker's `splunk` log driver, Splunk's logging libraries, the OpenTelemetry Collector's `splunk_hec` exporter, or Vector. Serves `/services/collector/event` (and `/services/collector`) with concatenated or array JSON bodies, `/services/collector/raw` with one log per line and `host`, `source`, `sourcetype`, and `index` from the query string, `/services/collector/ack`, and `/services/collector/health`, answering Splunk's own `{\"text\",\"code\"}` bodies. Decompresses gzip; any other `Content-Encoding` gets `415`. A request that names a channel gets an `ackId`, counted from 0 per channel, once the pipeline has taken its data; `/ack` reports each id `true` once on the channel that issued it, as a Splunk token with indexer acknowledgment does, and needs a channel. The envelope's `host`, `source`, `sourcetype`, and `index` become the resource attributes `host.name`, `com.splunk.source`, `com.splunk.sourcetype`, and `com.splunk.index`. When the pipeline can't start taking a request's data within 5s, the request gets `503` code 9 with `Retry-After: 1`, nothing of it is delivered, and the client retries it; once part of a request is taken, the rest waits for the pipeline and the request gets `200`. After a `503`, `/health` answers `503` code 18 for 5s, or until a later request is taken.",
@@ -543,6 +579,7 @@
               "description": "The `host:port` to listen on. Splunk's HEC port is `8088`.",
               "type": "string"
             },
+            "buffer": true,
             "handshake_timeout": {
               "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
               "default": "5s",
@@ -582,6 +619,9 @@
               "default": "5242880",
               "type": "string"
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "tls": {
               "description": "Terminates TLS on this listener when present; plaintext when omitted. Splunk serves HEC over HTTPS by default, so a client pointed at `https://` needs this.",
               "default": null,
@@ -608,7 +648,8 @@
                 "splunk_hec_in"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Tails one or more files as a log source, one line per event; rotation-, truncation-, and checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final path component (`/var/log/app/*.log`) and matches any run of non-`/` characters. An empty list or entry is rejected.",
@@ -618,6 +659,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "checkpoint_interval": {
               "description": "How long a dirty checkpoint may sit before being flushed to disk, in addition to a flush on every file close and at shutdown. Not \"every line\": a checkpoint only bounds how much a crash can replay, and replay is safe for an at-least-once pipeline. Defaults to `5s`; `0s` is rejected.",
               "default": "5s",
@@ -655,6 +697,9 @@
                 }
               ]
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
@@ -669,7 +714,8 @@
                 }
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Tails Docker's json-file container logs (`<root>/<id>/<id>-json.log`) and stamps per-container resource attributes read from the sibling `config.v2.json`. No docker socket and no HTTP client. Takes the same tailing options as `tail_in`.",
@@ -678,6 +724,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "checkpoint_interval": {
               "description": "How long a dirty checkpoint may sit before being flushed to disk, in addition to a flush on every file close and at shutdown. Not \"every line\": a checkpoint only bounds how much a crash can replay, and replay is safe for an at-least-once pipeline. Defaults to `5s`; `0s` is rejected.",
               "default": "5s",
@@ -730,11 +777,14 @@
                 }
               ]
             },
+            "receive": true,
             "root": {
               "description": "The Docker daemon's container-state directory. Defaults to `/var/lib/docker/containers`, right for stock native-Linux Docker only; rootless Docker, Podman, and Docker Desktop use a different layout or log format. Must be non-empty.",
               "default": "/var/lib/docker/containers",
               "type": "string"
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
@@ -749,7 +799,8 @@
                 }
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "The native `logit`-to-`logit` protocol: one TCP (optionally TLS) listener accepting many connections, each handshaking with `Hello`/`HelloAck` and acknowledging every frame.",
@@ -762,6 +813,7 @@
             "bind": {
               "type": "string"
             },
+            "buffer": true,
             "handshake_timeout": {
               "description": "Bounds each pre-`Hello` phase of a connection and each write this listener makes to the peer. Defaults to `5s`; `0s` is rejected.\n\nThe pre-`Hello` phases are the TLS accept when `tls:` is set, then the `Hello` read. Each gets its own budget, so a TLS connection that sends no `Hello` costs up to twice this value before this listener closes it and frees its connection-cap slot.\n\nThe writes are every reply this listener sends: `HelloAck`, the `Ack` each run of frames gets, and every `Reject`, including the one it sends on shutdown or an idle close. A write that can't finish within this value means the peer has stopped reading: the connection closes and frees its slot. So raising this for slow TLS handshakes also lengthens how long a peer that stops reading holds its slot.\n\nNot an idle timeout. Once a connection is handshaken, the gap before its next data frame is bounded by `idle_timeout` if set, and unbounded otherwise.",
               "default": "5s",
@@ -790,6 +842,9 @@
                 "null"
               ]
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "tls": {
               "description": "Terminates TLS on this listener when present; plaintext when omitted.",
               "default": null,
@@ -808,7 +863,8 @@
                 "logit_in"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "`logit` observing itself: drains every component's buffered self-telemetry on `interval` and emits it as ordinary events into the graph. At most one per config.",
@@ -818,6 +874,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "interval": {
               "description": "The drain cadence for every component's buffered points, and the sampling tick for process-level metrics (resident memory, CPU time, threads, open files, interner size, uptime). Should divide evenly into any downstream `aggregate` interval, or the two windows beat against each other. `0s` is rejected.",
               "type": "string"
@@ -831,19 +888,23 @@
                 }
               ]
             },
+            "receive": true,
+            "sources": true,
             "span_sample_rate": {
               "description": "Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per `trace_id` the same way at every node, so a kept trace is kept at every hop. Defaults to `0.1`: spans cost one per node visit per batch, where metric points coalesce between drains. `0.0` turns spans off; `1.0` keeps everything, for a demo or debugging config that wants full traces. Distinct from the `sample` transform, which samples your application's events by a hashed key.",
               "default": 0.1,
               "type": "number",
               "format": "double"
             },
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "internal"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Inline Lua source (a YAML block scalar in practice).",
@@ -853,6 +914,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "interval": {
               "description": "Runs this component's `flush()`, if the script defines one, on this interval. Omitted means the component never ticks, the same as a script with no `flush()`. `0s` is rejected.",
               "default": null,
@@ -869,16 +931,20 @@
                 "null"
               ]
             },
+            "receive": true,
             "script": {
               "type": "string"
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "lua"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A `.lua` file path, relative to the config file. Takes the same `interval` and `max_memory` as `lua`.",
@@ -888,6 +954,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "interval": {
               "default": null,
               "type": [
@@ -905,13 +972,17 @@
                 "null"
               ]
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "lua_file"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "The windowed aggregator (counters, gauges, sets, distributions). Flushes every `interval`; `0s` is rejected.",
@@ -921,6 +992,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "distributions": {
               "description": "Whether a raw samples series (statsd `ms`/`h`/`d`) absorbs into this window as a sketch (`sketch`, the default: error-bounded quantiles, no raw values retained) or keeps its raw observations for the whole window (`samples`), falling back to a sketch, counted, when `max_samples_per_series` is exceeded or an incoming record's `sample_rate` disagrees with the series' first one. `samples` is the lossless option: a downstream `logit` re-sketching with a different accuracy target, or a sink that wants the individual values, only has that choice under `samples`.",
               "default": "sketch",
@@ -954,6 +1026,7 @@
               "format": "uint",
               "minimum": 0.0
             },
+            "receive": true,
             "series_retention": {
               "description": "How many consecutive windows a series with no new data is retained past its last update. Lets a relative gauge adjustment arriving in a later window resolve against the value last held, and under `temporality: cumulative` keeps a `Sum`/`Histogram`'s running total alive across the window boundary. Defaults to `5`. `0` disables retention (every series is drained every window) and is rejected together with `temporality: cumulative`, which would otherwise emit each window's delta labelled as a cumulative total. Counts flushes, not wall time: a flush delayed past its interval still counts once.",
               "default": 5,
@@ -970,6 +1043,8 @@
                 }
               ]
             },
+            "sources": true,
+            "targets": true,
             "temporality": {
               "description": "Whether each window's emitted `Sum`/`Histogram` is that window's own increment (`delta`, the default: tumbling, self-contained) or a running total since the series was first seen (`cumulative`, what OTLP and Prometheus carry, and what `prometheus_out` requires).",
               "default": "delta",
@@ -985,7 +1060,8 @@
                 "aggregate"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Parses a log record's message as JSON, merging the resulting key/values into the event's attributes. A failed parse passes the event through untouched.",
@@ -994,6 +1070,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "invalid_utf8": {
               "description": "What to do with a message that is not valid UTF-8: `reject` (the default: the parse fails and the event passes through untouched) or `replace` (retry on a copy with every invalid sequence replaced by U+FFFD).",
               "default": "reject",
@@ -1003,18 +1080,22 @@
                 }
               ]
             },
+            "receive": true,
             "skip_to_brace": {
               "description": "Skip everything before the first `{` and parse from there, for lines with a non-JSON prefix (`2026-08-29 INFO {\"a\":1}`). Off by default: the whole line is the JSON.",
               "default": false,
               "type": "boolean"
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "json"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Splits a log record's message as one CSV row, merging the named columns into the event's attributes. Columns are positional, declared in config; there is no header-row mode, and every field stays a string.",
@@ -1024,6 +1105,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "columns": {
               "description": "Attribute names for each field, left to right. Required and non-empty; an empty entry or a duplicate entry is rejected (a duplicate would silently overwrite the earlier column on every event).",
               "type": "array",
@@ -1038,13 +1120,17 @@
               "maxLength": 1,
               "minLength": 1
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "csv"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Turns attributes already on an event (typically merged there by `json`) into metrics on that same event. A missing or non-numeric attribute is a silent skip for that entry. At least one of `counters`/`gauges`/`distributions` must be non-empty. There is no `tags:` field: every metrics sink already reads `event.attributes`, so tag selection is `keep`'s job.",
@@ -1053,6 +1139,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "counters": {
               "default": [],
               "type": "array",
@@ -1074,13 +1161,17 @@
                 "$ref": "#/definitions/MetricSpec"
               }
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "kv_metrics"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Retains only the named attributes, dropping the rest: an allowlist, so a new field appearing in a log format later cannot silently become a new tag dimension. Place it before `aggregate`, whose series key includes every attribute, to bound series cardinality and per-window memory. An empty `fields` list is legal and drops every attribute.",
@@ -1090,19 +1181,24 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "fields": {
               "type": "array",
               "items": {
                 "type": "string"
               }
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "keep"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Drops the named attributes, keeping the rest.",
@@ -1112,19 +1208,24 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "fields": {
               "type": "array",
               "items": {
                 "type": "string"
               }
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "remove"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Stamps constant values onto every event's attributes and/or the batch's resource. A configured value overwrites whatever the wire carried under the same key. At least one of `resource`/`attributes` must be non-empty.",
@@ -1141,6 +1242,8 @@
                 "$ref": "#/definitions/SetValue"
               }
             },
+            "buffer": true,
+            "receive": true,
             "resource": {
               "description": "Applied once per batch, to the batch's resource, which every event in the batch shares.",
               "default": {},
@@ -1149,13 +1252,16 @@
                 "$ref": "#/definitions/SetValue"
               }
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "set"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Lifts an application trace/span reference off an event's attributes onto its log record, for the common \"my JSON log body already has a `trace.id` field\" case, and with a `span:` block also turns that log line into a real span on the same event: an access log's ids plus its own start/end/duration become a span whose start is the event's timestamp. Reads the well-known attribute names by default (`traceparent`, `trace.id`, `trace.flags`, `span.id`, `span.parent_id`, `span.name`, `span.kind`, `span.status`, `span.start`/`span.end`/`span.duration` and their unit-suffixed forms); `trace_id`, `span_id`, and `flags` rename the three id sources. `format: datadog` reads the ids a Datadog tracer injects into its logs (`dd.trace_id`, `dd.span_id`) instead. A successful lift overwrites any trace reference the log already had. An event with no log, or with missing or unparseable attributes, passes through untouched; it is never an error.",
@@ -1164,6 +1270,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "flags": {
               "description": "The attribute holding the W3C trace flags (0-255, decimal, never hex). Defaults to `trace.flags` (no lookup under `format: datadog`); `null` disables the lookup, and an empty string is rejected. A `traceparent` attribute supplies the flags when this one is absent.",
               "type": [
@@ -1185,6 +1292,8 @@
               "default": false,
               "type": "boolean"
             },
+            "receive": true,
+            "sources": true,
             "span": {
               "description": "Opt in to minting a span from the lifted ids plus the event's `span.start`/`span.end`/ `span.duration` attributes (any two). Absent (the default) means a log-only lift.",
               "default": null,
@@ -1204,6 +1313,7 @@
                 "null"
               ]
             },
+            "targets": true,
             "trace_id": {
               "description": "The attribute holding the trace id, in `format`'s grammar. Defaults to `trace.id` (`dd.trace_id` under `format: datadog`); an empty string is rejected. A `traceparent` attribute supplies the trace id when this one is absent.",
               "default": null,
@@ -1226,7 +1336,8 @@
                 "trace_context"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Multiplies named numeric attributes by a constant factor, in place: unit conversion (nginx's `request_time` in seconds to milliseconds, say) without a Lua script. A missing or non-numeric attribute is a silent skip for that field, never a dropped event.",
@@ -1236,6 +1347,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "fields": {
               "description": "Attribute name to multiplication factor. At least one entry is required; an empty name or a non-finite factor is rejected.",
               "type": "object",
@@ -1244,13 +1356,17 @@
                 "format": "double"
               }
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "scale"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Forwards an event carrying a wanted signal and drops the rest: `signals: [traces]` ahead of a traces-only sink, say, fed from a source whose events also carry metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event carrying a listed signal is forwarded as it arrived, unlisted signals included. `mode: only` also requires the event carry nothing outside `signals`. Place `keep_signals`/`drop_signals` ahead of this instead if unwanted payloads must be stripped rather than tolerated. `signals` may not be empty.",
@@ -1260,6 +1376,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "mode": {
               "default": "any_of",
               "allOf": [
@@ -1268,19 +1385,23 @@
                 }
               ]
             },
+            "receive": true,
             "signals": {
               "type": "array",
               "items": {
                 "$ref": "#/definitions/Signal"
               }
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "has_signal"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Retains only the listed signals' payloads on every event, clearing the rest: an allowlist, `keep`'s relationship to `remove`. Unlike `has_signal`, this mutates: an event carrying a log and derived metrics loses the metrics under `signals: [logs]` but keeps the log. An event left with no payload is dropped. `signals` may not be empty (that would drop every event) and may not name all three signals (a no-op).",
@@ -1290,19 +1411,24 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
+            "receive": true,
             "signals": {
               "type": "array",
               "items": {
                 "$ref": "#/definitions/Signal"
               }
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "keep_signals"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Clears the listed signals' payloads on every event, keeping the rest: the mirror of `keep_signals`. An event left with no payload is dropped. `signals` may not be empty (a no-op) and may not name all three signals (that would drop every event).",
@@ -1312,19 +1438,24 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
+            "receive": true,
             "signals": {
               "type": "array",
               "items": {
                 "$ref": "#/definitions/Signal"
               }
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "drop_signals"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Forwards an event whose batch resource and/or own attributes match every configured pair, dropping the rest. The config is `set`'s: `resource:`/`attributes:` maps of the same literals, so this matches on what `set` can stamp. Never mutates a forwarded event.\n\nA map is a conjunction: every pair listed, across both maps, must match; there is no `or`. A configured key the event or resource doesn't carry never matches, and \"key present with any value\" is not expressible. Values coerce across numeric representations (`status: 200` matches an integer, float, or string `200`), but a boolean never coerces, and two strings are never compared numerically. At least one of `resource`/`attributes` must be non-empty, every key must be non-empty, and every numeric value must be finite.",
@@ -1340,6 +1471,8 @@
                 "$ref": "#/definitions/SetValue"
               }
             },
+            "buffer": true,
+            "receive": true,
             "resource": {
               "default": {},
               "type": "object",
@@ -1347,13 +1480,16 @@
                 "$ref": "#/definitions/SetValue"
               }
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "has_attributes"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Drops an event whose batch resource and/or own attributes match every configured pair, forwarding the rest: the complement of `has_attributes` on the same config, taken as a whole, not per pair. An event matching some but not all configured pairs is forwarded, and so is one that never carried a configured key; read it as \"this event isn't one of the ones told to drop\", the else-branch of a `has_attributes` fan-out. Same matching rules and validation as `has_attributes`.",
@@ -1369,6 +1505,8 @@
                 "$ref": "#/definitions/SetValue"
               }
             },
+            "buffer": true,
+            "receive": true,
             "resource": {
               "default": {},
               "type": "object",
@@ -1376,13 +1514,16 @@
                 "$ref": "#/definitions/SetValue"
               }
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "drop_attributes"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Clamps attribute (and/or resource-attribute) values to a per-field allow-list: `keep`'s value-side sibling, for a tag whose valid set you know but the producer doesn't enforce (a `Host` header against a handful of real vhosts, say). A value not in a field's `allow` becomes that field's `other`, or is removed if `other` is absent. Never drops an event. An attribute the event doesn't carry is a silent no-op for that field, never a stamp. At least one of `resource`/`attributes` must be non-empty, and no field name may be empty.",
@@ -1399,6 +1540,8 @@
                 "$ref": "#/definitions/ValueAllowList"
               }
             },
+            "buffer": true,
+            "receive": true,
             "resource": {
               "description": "Applied once per batch, to the batch's resource.",
               "default": {},
@@ -1407,13 +1550,16 @@
                 "$ref": "#/definitions/ValueAllowList"
               }
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "keep_values"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Forwards an event whose batch's `origin`/`previous` match a configured list: `origin` is the component that created the batch and `previous` the one that most recently handled it, not event data. Never mutates a forwarded event.\n\nEach field is a list of alternatives, OR'd within the field; the two fields AND together when both are configured. An empty list means \"not checked\" for that field. At least one of `origin`/`previous` must be non-empty, and no entry may be an empty string.",
@@ -1422,6 +1568,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "origin": {
               "default": [],
               "type": "array",
@@ -1436,13 +1583,17 @@
                 "type": "string"
               }
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "has_provenance"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Drops an event whose batch's `origin`/`previous` match a configured list, forwarding the rest: the complement of `has_provenance` on the same config, taken as a whole, not per field. A batch matching only one of two configured fields is forwarded, and so is one that never carried a configured value; read it as \"this batch isn't one of the ones told to drop\". Same matching rules and validation as `has_provenance`.",
@@ -1451,6 +1602,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "origin": {
               "default": [],
               "type": "array",
@@ -1465,13 +1617,17 @@
                 "type": "string"
               }
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "drop_provenance"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Equality-only routing: one key read per event, one target per matching value. There is no predicate language; use `lua` for a condition. An event whose key is absent, or whose value no route names, is unrouted: it goes to this component's ordinary consumers, or is dropped and counted (`logit.component.events.dropped{reason=\"unrouted\"}`) if it has none.",
@@ -1482,9 +1638,11 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "by": {
               "$ref": "#/definitions/RouteBy"
             },
+            "receive": true,
             "routes": {
               "description": "Value to target id. Several values may name one target. The router's edges derive from these values, so there is no separate `targets:` list. Must be non-empty, with no empty key or value, and every value must name a `target` component.",
               "type": "object",
@@ -1492,13 +1650,16 @@
                 "type": "string"
               }
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "route"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Parses a log record's message as logfmt (`level=info msg=\"hello world\" dur=3ms`), merging the resulting key/values into the event's attributes. Additive, and a failed parse passes the event through, like `json`.",
@@ -1512,13 +1673,18 @@
               "default": false,
               "type": "boolean"
             },
+            "buffer": true,
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "logfmt"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Parses a log record's message as literal `key<kv_sep>value` pairs separated by `pair_sep` (`a=1&b=2`, `a: 1, b: 2`), with no quoting and no escapes, unlike `logfmt`. Both separators are required and must differ; an empty separator, or a `kv_sep` that contains `pair_sep`, is rejected.",
@@ -1534,6 +1700,7 @@
               "default": false,
               "type": "boolean"
             },
+            "buffer": true,
             "kv_sep": {
               "description": "Separator between a key and its value, within one pair. The first occurrence in a segment splits it, so `a=b=c` yields `a` -> `b=c`.",
               "type": "string"
@@ -1542,13 +1709,17 @@
               "description": "Separator between one pair and the next. Whitespace around each key and value is trimmed, so `\", \"` and `\",\"` behave the same on `a=1, b=2`.",
               "type": "string"
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "kv"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Matches a pattern against a log message (or, with `field:`, a named attribute), turning every named capture group (`(?P<name>...)` or `(?<name>...)`) into an attribute of that name; an unnamed group is grouping/alternation only. The pattern is compiled by `logit validate`, so an invalid pattern, or one with no named capture group, is a validation error rather than a run-time surprise.",
@@ -1558,6 +1729,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "field": {
               "description": "The attribute to match against, instead of the log message. Absent (the default) reads the log message, like `json`; an empty name is rejected. Use it when an earlier `json` has already lifted the text to match into an attribute.",
               "default": null,
@@ -1570,13 +1742,17 @@
               "description": "The pattern. Every named capture group becomes an attribute; first match only. A non-matching line, or one with no `field` attribute, passes through unchanged with no diagnostic, only the `logit.transform.matched{,.skipped}` counters.",
               "type": "string"
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "regex"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Rewrites every event it sees into a measurement of that event's shape (attribute and nested-map counts, key/value byte lengths, value types, metric and span widths) and, on its `interval`, emits per-batch and cumulative measurements (events and resource/scope attributes per batch; distinct keys, distinct key-sets, and the share of events the most common one and five key-sets carry). The original payload is dropped, so place this on its own branch of a fan-out, never in the flow it measures.\n\nIt emits counts and lengths only: never an attribute key, an attribute value, a log body, or a metric name from an observed event, in any metric, tag, diagnostic, or telemetry point. That is what lets its output leave an environment the traffic itself can't.\n\nDistribution-shaped quantities go out as raw samples; put an `aggregate` downstream to summarize them.",
@@ -1585,6 +1761,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "interval": {
               "description": "How often the per-batch and cumulative measurements are emitted. Defaults to `10s`; `0s` is rejected. The per-event measurements ride out on the events themselves and never wait for this.",
               "default": "10s",
@@ -1604,6 +1781,7 @@
               "format": "uint",
               "minimum": 0.0
             },
+            "receive": true,
             "resource": {
               "description": "Whether the batch's resource is forwarded (`keep`) or replaced with an empty one (`drop`, the default). The batch's scope always passes through: it names an instrumentation library rather than carrying payload.",
               "default": "drop",
@@ -1613,13 +1791,16 @@
                 }
               ]
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "shape"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Rewrites a nested map or array attribute into flat, dot-joined keys: `{\"foo\": {\"key\": \"bar\"}}` becomes `foo.key = \"bar\"`, `{\"tags\": [\"a\",\"b\"]}` becomes `tags.0`/`tags.1`, and the two compose (`{\"items\": [{\"name\": \"x\"}]}` becomes `items.0.name`). `influxdb_out`, `statsd_out`, `prometheus_out`, `graphite_out`, and `collectd_out` each drop a nested attribute outright, so this is how nested JSON/OTLP data becomes a tag on any of them. Never drops an event, and never removes an attribute that wasn't itself nested. Last write wins on a key collision, silently.",
@@ -1646,6 +1827,8 @@
                 }
               ]
             },
+            "buffer": true,
+            "receive": true,
             "resource": {
               "description": "Also expand the batch's resource attributes, under the same rules, once per batch. `none` by default: a resource is a small, mostly operator-declared identity map that is rarely nested. Scope attributes are never touched.",
               "default": "none",
@@ -1655,13 +1838,16 @@
                 }
               ]
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "flatten"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Normalizes a web server's access line, logged under raw OTel semconv attribute names, into its conformant form: composites (`http.request.line`, `url.original`) decomposed into whichever atomic fields are absent, numerics coerced to integers (`\"000\"` becomes `0`), durations in any unit spelling (`_ms`, `_us`, unsuffixed nanoseconds) converted to `_s`, an unknown method rewritten to `_OTHER` with the raw value kept as `http.request.method_original`, `HTTP/` stripped off the protocol version, semconv's sensitive `url.query` values redacted, every free-text field capped and control-byte-cleaned, plus a small, bounded derived set: `user_agent.class`, `http.route`, `error.type`, `span.name`, `span.status`, and the `span.duration_s` mirror `trace_context` resolves a span from. Place it between `json` and `trace_context`. Every canonical name is also accepted with each `.` spelled `-` (`url-path`, `http-request-header-x-forwarded-for`), for an emitter whose key grammar forbids dots (HAProxy's `%{+json}o`); the dotted spelling wins when both are present.\n\nBest-effort per field, never all-or-nothing and never a dropped event: a value that doesn't parse is left as it arrived and counted, while every other field is still normalized. An absent field produces nothing: no default `url.scheme`, no invented route. Every field is optional, and a bare `type: http_access` is meaningful (the built-in user-agent table and default caps still apply).",
@@ -1670,6 +1856,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "forwarded": {
               "description": "Present only to opt in to overwriting `client.address` from the first hop of `http.request.header.x-forwarded-for`. Off by default, since the header is client-supplied.",
               "default": null,
@@ -1692,6 +1879,7 @@
                 "minimum": 0.0
               }
             },
+            "receive": true,
             "redact_query": {
               "description": "Extra `url.query` keys whose values are replaced with `REDACTED`, beyond semconv's seven (`AWSAccessKeyId`, `Signature`, `sig`, `X-Goog-Signature`, `X-Amz-Signature`, `X-Amz-Credential`, `X-Amz-Security-Token`). Matched ASCII-case-insensitively. An empty entry is rejected.",
               "default": [],
@@ -1716,6 +1904,8 @@
                 "$ref": "#/definitions/HttpRouteRule"
               }
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
@@ -1730,7 +1920,8 @@
                 "$ref": "#/definitions/UserAgentRule"
               }
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Keeps a fraction of events, consistently. With `key:` set, the key's value is hashed (XXH64, seed 0, over a fixed canonical byte form; a frozen cross-version contract) and compared against `rate`, so every event sharing a key (every span and log of one trace, under `key: trace_id`) gets the same verdict in every `logit` process that sees it, with nothing propagated between them. With no `key:`, each event is an independent draw. `always_keep:` pins flagged events through regardless. Never mutates an event.",
@@ -1752,6 +1943,7 @@
                 }
               ]
             },
+            "buffer": true,
             "key": {
               "description": "What to hash. Absent means an independent draw per event. An empty field name is rejected.",
               "default": null,
@@ -1781,13 +1973,17 @@
               "type": "number",
               "format": "double"
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "sample"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "InfluxDB 2.x line protocol over HTTP, with bounded output retry.",
@@ -1803,9 +1999,13 @@
             "bucket": {
               "type": "string"
             },
+            "buffer": true,
             "org": {
               "type": "string"
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "token": {
               "description": "The API token. A plain string: write `!env INFLUXDB_TOKEN` to pull it from the environment rather than inlining it. `!env` works on `url`/`org`/`bucket` too.",
               "type": "string"
@@ -1819,7 +2019,8 @@
             "url": {
               "type": "string"
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "OTLP logs, metrics, and traces over OTLP/HTTP or OTLP/gRPC. TLS is selected by `endpoint`'s `https://` scheme.",
@@ -1829,6 +2030,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "compression": {
               "description": "Gzips request bodies on both transports. Defaults to `none`; most receivers (the OTel Collector's included) accept both, so change this only for a bandwidth-constrained link.",
               "default": "none",
@@ -1870,6 +2072,9 @@
                 }
               ]
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "tls": {
               "description": "Tunes TLS on an `https://` endpoint. A non-default block under a plain `http://`/`grpc://` endpoint is rejected.",
               "default": {
@@ -1890,7 +2095,8 @@
                 "otlp_out"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's intake API, one request per route a batch needs. Host, service, source, and tags come from each event's attributes and resource, so stamp them upstream with `set`. Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service checks) are dropped and counted before sending. Traces go out only once a Datadog Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.",
@@ -1904,6 +2110,7 @@
               "description": "The Datadog API key, sent as `DD-API-KEY` on every request and never logged. Take it from the environment (`!env DD_API_KEY`) rather than writing it into the file. An empty key, or one with leading or trailing whitespace, is rejected.",
               "type": "string"
             },
+            "buffer": true,
             "compression": {
               "description": "How request bodies are compressed. `gzip`, the default, gzips every route except distribution points, which are zlib-deflated, and events, which Datadog accepts only uncompressed; `none` sends every body uncompressed.",
               "default": "gzip",
@@ -1934,11 +2141,14 @@
                 "type": "string"
               }
             },
+            "receive": true,
             "site": {
               "description": "The Datadog site your organization is on: `datadoghq.com` (the default), `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com`, `ap2.datadoghq.com`, `ddog-gov.com`, and so on. Requests go to `https://api.<site>`, `https://http-intake.logs.<site>`, and `https://trace.agent.<site>`. A bare domain: no scheme and no `/`.",
               "default": "datadoghq.com",
               "type": "string"
             },
+            "sources": true,
+            "targets": true,
             "timeout": {
               "description": "Timeout for one request. Defaults to `10s`; `0s` is rejected.",
               "default": "10s",
@@ -1964,7 +2174,8 @@
                 "datadog_out"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Sends APM traces and tracer-computed stats to a Datadog Agent's trace API (port 8126, or its Unix socket), as a dd-trace tracer does: the sending half of `datadog_trace_in`, so a tracer's spans can pass through `logit` on their way to a real Agent, which still does all trace processing. Spans and stats are sent as they arrive; nothing is sampled, normalized, or derived, so a span that didn't come from a Datadog tracer arrives with empty service, resource, and type fields: send OpenTelemetry spans with `otlp_out` instead. Set `endpoint` or `socket`, not both.",
@@ -1973,6 +2184,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "compression": {
               "description": "How request bodies are compressed: `none` (the default, what tracers send) or `gzip`, worth it only when the Agent is across a slow link.",
               "default": "none",
@@ -1998,6 +2210,7 @@
                 "type": "string"
               }
             },
+            "receive": true,
             "socket": {
               "description": "The absolute path of the Agent's trace Unix socket (its `receiver_socket`, `/var/run/datadog/apm.socket` by default), instead of `endpoint`.",
               "default": null,
@@ -2006,6 +2219,8 @@
                 "null"
               ]
             },
+            "sources": true,
+            "targets": true,
             "timeout": {
               "description": "Timeout for one request. Defaults to `10s`; `0s` is rejected.",
               "default": "10s",
@@ -2040,7 +2255,8 @@
                 }
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed by both sees one schema. Spans go out as ordinary events: Splunk has no trace store. Each event's `index`, `source`, `sourcetype`, and `host` come from the batch's resource attributes `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and `host.name`: set them upstream with `set`. Every other attribute goes out as an indexed field. A failure Splunk may have partly applied (a `5xx`, a timeout) resends the batch, which Splunk may index twice; `buffer.delivery: at_most_once` drops it instead.",
@@ -2064,6 +2280,7 @@
                 "null"
               ]
             },
+            "buffer": true,
             "compression": {
               "description": "How request bodies are compressed: `gzip` (the default) or `none`.",
               "default": "gzip",
@@ -2091,6 +2308,9 @@
                 }
               ]
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "timeout": {
               "description": "Timeout for one request. Defaults to `10s`; `0s` is rejected.",
               "default": "10s",
@@ -2120,7 +2340,8 @@
                 "splunk_hec_out"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS) connection, one native frame per batch, one `Ack` before that batch counts as delivered.",
@@ -2130,6 +2351,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "compression": {
               "description": "Offered in this sink's `Hello`; the peer may negotiate it down to `none` if it doesn't support `lz4`.",
               "default": "none",
@@ -2143,11 +2365,14 @@
               "description": "`host:port`. Resolved at connect time, never at config-load time: a peer that isn't up yet is not a config error.",
               "type": "string"
             },
+            "receive": true,
             "request_timeout": {
               "description": "Connect, handshake, and ack-wait timeout, one knob for all three. With batches already in flight, also how long writing the next batch may make no progress before the connection stops taking batches. Defaults to `10s`.",
               "default": "10s",
               "type": "string"
             },
+            "sources": true,
+            "targets": true,
             "tls": {
               "description": "Turns on TLS for this connection when present, and makes it required: a bare `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots.",
               "default": null,
@@ -2173,7 +2398,8 @@
               "format": "uint32",
               "minimum": 0.0
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A human-facing debug sink: writes every event as a readable text block to stdout (the default), stderr, or a file. The dev loop for seeing a whole pipeline's output without a real backend.",
@@ -2182,6 +2408,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "compression": {
               "description": "Per-frame compression under `format: native`. A non-`none` value under any other format is rejected.",
               "default": "none",
@@ -2209,6 +2436,8 @@
                 }
               ]
             },
+            "receive": true,
+            "sources": true,
             "target": {
               "default": "stdout",
               "allOf": [
@@ -2217,13 +2446,15 @@
                 }
               ]
             },
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "stdio_out"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A rotating file sink: size- and/or calendar-interval-triggered rotation with logrotate-style numbered-suffix retention. Renders the same human-readable text `stdio_out` does by default, one JSON object per event per line under `format: json`, or `logit`'s native wire format under `format: native`.",
@@ -2233,6 +2464,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "compression": {
               "description": "Per-frame compression under `format: native`. A non-`none` value under any other format is rejected.",
               "default": "none",
@@ -2264,6 +2496,7 @@
               "description": "The active file. A relative path resolves against the config file's directory.",
               "type": "string"
             },
+            "receive": true,
             "rotate": {
               "default": {
                 "interval": null,
@@ -2276,13 +2509,16 @@
                 }
               ]
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "file_out"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "RFC 3164 / RFC 5424 syslog egress over UDP or TCP, the mirror of `syslog_in` and a real relay: header fields round-trip from an event's `syslog.*` attributes when present, falling back to `facility`, `hostname`, and `app_name` only when an event carries none (one that never passed through `syslog_in`, say).",
@@ -2300,6 +2536,7 @@
                 "null"
               ]
             },
+            "buffer": true,
             "connect_timeout": {
               "description": "TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a dropped connection) may take before `send` reports a failure. Also bounds the TLS handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice this value. Defaults to `5s`.",
               "default": "5s",
@@ -2340,6 +2577,8 @@
               "default": "8192",
               "type": "string"
             },
+            "receive": true,
+            "sources": true,
             "structured_data": {
               "description": "Opt-in RFC 5424 STRUCTURED-DATA element built from an event's own non-`syslog.*` attributes. Absent (the default) emits no such element; a `syslog.sd` attribute (round-tripped from `syslog_in`) still renders regardless. Ignored under `format: rfc3164`, which has no STRUCTURED-DATA field.",
               "default": null,
@@ -2352,6 +2591,7 @@
                 }
               ]
             },
+            "targets": true,
             "tls": {
               "description": "Turns on TLS for this connection when present (RFC 5425, syslog over TLS over TCP), and makes it required: a bare `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. `transport: tcp` only; `tls:` under `transport: udp` is rejected.",
               "default": null,
@@ -2378,7 +2618,8 @@
                 "syslog_out"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "statsd / DogStatsD egress over UDP, TCP, or a Unix socket, the mirror of `statsd_in` and a real relay: names, values, and tags round-trip through the decoder on the other end.\n\nUnder `transport: unix` each packet is one datagram sent to the socket; under `transport: unix_stream` each packet is preceded by its length as a 4-byte little-endian integer, on a connection opened on the first send and reopened after an error, as under TCP.\n\nUnlike every other sink, `buffer.delivery` defaults to `at_most_once` here: a statsd line usually carries no timestamp, so a resent counter adds to the destination's total again.",
@@ -2388,6 +2629,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "connect_timeout": {
               "description": "How long a connect attempt (including a reconnect after a dropped connection) may take before `send` reports a failure, under `tcp` and `unix_stream`. Also bounds the TLS handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice this value. Under `unix`, bounds each datagram's wait on a receiver whose queue is full (a Unix socket pushes back on the sender where UDP would drop). Ignored for `udp`. Defaults to `5s`.",
               "default": "5s",
@@ -2411,11 +2653,14 @@
               "default": "1432",
               "type": "string"
             },
+            "receive": true,
             "relative_gauges": {
               "description": "Encodes a relative gauge adjustment (statsd's `+n`/`-n` syntax) natively as a signed value, instead of dropping it with a `gauge_delta_unresolved` diagnostic. Off by default: a delta reaching any sink usually means the pipeline is missing an `aggregate`, so this is an opt-in relay behavior.",
               "default": false,
               "type": "boolean"
             },
+            "sources": true,
+            "targets": true,
             "tls": {
               "description": "Turns on TLS for this connection when present, and makes it required: a bare `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. `transport: tcp` only; `tls:` under any other transport is rejected. No statsd client speaks TLS, so this is for a `logit`-to-`logit` or stunnel-shaped relay hop.",
               "default": null,
@@ -2442,7 +2687,8 @@
                 "statsd_out"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "collectd binary `network` plugin egress, the mirror of `collectd_in` and a real relay: identity, values, and kinds round-trip through the decoder on the other end. UDP only: collectd's `network` plugin has no TCP mode.",
@@ -2452,6 +2698,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "endpoint": {
               "description": "`host:port`. Resolved at send time, never at config-load time. Port 0 is rejected, and a name that resolves to both IPv4 and IPv6 addresses is sent to the first IPv4 one.",
               "type": "string"
@@ -2469,13 +2716,17 @@
               "default": "1452",
               "type": "string"
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "collectd_out"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Carbon plaintext or pickle egress, the mirror of `graphite_in` and a real relay: path, tags, value, and timestamp round-trip through the decoder on the other end. Both transports are supported; `protocol: pickle` requires `transport: tcp`.",
@@ -2485,6 +2736,7 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
             "connect_timeout": {
               "description": "TCP only, ignored for UDP. How long a connect attempt may take before `send` reports a failure. Defaults to `5s`; `0s` is rejected.",
               "default": "5s",
@@ -2521,6 +2773,8 @@
                 }
               ]
             },
+            "receive": true,
+            "sources": true,
             "tags": {
               "description": "Whether to render event attributes as carbon tags. `carbon` (the default) writes `;name=value` in ascending name order; `drop` is the escape hatch for a pre-1.1 Graphite, whose whisper backend would otherwise take the `;` into a directory name.",
               "default": "carbon",
@@ -2530,6 +2784,7 @@
                 }
               ]
             },
+            "targets": true,
             "transport": {
               "default": "tcp",
               "allOf": [
@@ -2544,7 +2799,8 @@
                 "graphite_out"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Prometheus metrics, in one of two modes chosen by which field is set. `scrape_targets:` scrapes `/metrics` endpoints on `interval`, the way Prometheus's own server does, parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each target's response declares in its `Content-Type`, and synthesizes `up`, `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. `bind:` receives remote-write, accepting 1.0 and 2.0 requests on one listener. Set exactly one of the two; a non-default field belonging to the other mode is rejected rather than ignored. A receiver synthesizes no `up`/`scrape_*` series, and holds one piece of cross-request state: `metadata_cache`.",
@@ -2573,6 +2829,7 @@
                 }
               ]
             },
+            "buffer": true,
             "headers": {
               "description": "Extra headers sent on every scrape request. A name this input reserves (`accept`, `user-agent`, `content-type`, `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting with `:`) is rejected, as are two keys naming the same header once case is ignored. Scrape mode only.",
               "default": {},
@@ -2618,6 +2875,7 @@
               "default": "/api/v1/write",
               "type": "string"
             },
+            "receive": true,
             "scrape_targets": {
               "description": "Scrape mode: absolute `http://`/`https://` URLs with a non-empty host. Non-empty selects scrape mode.",
               "default": [],
@@ -2640,6 +2898,8 @@
                 }
               ]
             },
+            "sources": true,
+            "targets": true,
             "timeout": {
               "description": "Per-request timeout. Defaults to `10s`; `0s` is rejected. Scrape mode only.",
               "default": "10s",
@@ -2651,7 +2911,8 @@
                 "prometheus_in"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A synthetic event source for load testing. No socket and no decoder: it renders a declarative `event:` template as fast as `count`/`rate` allow, so a scenario measures the runtime and the components under test rather than a generator process and a kernel socket buffer. There is no shape preset: the template plus an ordinary `json`/`regex`/`kv_metrics` stage downstream composes any shape a scenario needs.",
@@ -2667,6 +2928,7 @@
               "format": "uint",
               "minimum": 0.0
             },
+            "buffer": true,
             "count": {
               "description": "Total events to generate, after which the input exits and the process shuts down cleanly. Exact: the last batch is short rather than rounded up, so a scenario's derived events/s and CPU-per-event count what was produced. Omitted means unbounded (a soak run, or one a profiler attaches to). `0` is rejected.",
               "default": null,
@@ -2700,6 +2962,7 @@
               "format": "uint64",
               "minimum": 0.0
             },
+            "receive": true,
             "resource": {
               "description": "Resource attributes for every generated event: literal keys, templated values (`{seq}`/`{seq%N}`, the same substitution `event:` uses). An empty key is rejected.\n\nA resource is batch-level, not per event, so in resource position `seq` is the batch ordinal (0, 1, 2, ...), not the event counter. That is the feature: the event counter advances by `batch` each batch, so `{seq%10}` over it under `batch: 100` would render `0` forever. Over the ordinal, `resource: { host: \"h{seq%10}\" }` means ten distinct resources cycling one per batch, what a scenario measuring resource grouping wants, costing one attribute map per batch and nothing per event. An all-literal resource is built once at startup and shared by every batch.",
               "default": {},
@@ -2708,13 +2971,16 @@
                 "type": "string"
               }
             },
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "generate_in"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Prometheus metrics, in one of two sink modes chosen by which field is set. `bind:` serves an exposition endpoint: a registry of current series rendered on demand, in whichever text dialect the scraping client's `Accept` negotiates. `endpoint:` sends remote-write: each batch is POSTed to a remote-write receiver, with no retry in the sink. Set exactly one of the two; a non-default field belonging to the other mode is rejected rather than ignored. Delta metrics are skipped and counted; put an `aggregate` with `temporality: cumulative` upstream.",
@@ -2731,6 +2997,7 @@
                 "null"
               ]
             },
+            "buffer": true,
             "compression": {
               "description": "How each remote-write request body is compressed. `snappy`, the default, is the Snappy block format both remote-write specs mandate, and every receiver accepts it. `zstd` is the VictoriaMetrics remote write protocol: the same 1.0 request compressed with zstd instead, which VictoriaMetrics, vmagent, and `logit`'s own `prometheus_in` accept and Prometheus and Mimir reject. There is no negotiation and no fallback: a receiver that rejects `zstd` fails every batch, so pick what the receiver accepts. `zstd` needs `version: 1`. Sender mode only.",
               "default": "snappy",
@@ -2787,6 +3054,9 @@
               "default": "/metrics",
               "type": "string"
             },
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "timeout": {
               "description": "Per-request timeout on the remote-write POST. Defaults to `10s`; `0s` is rejected. Sender mode only.",
               "default": "10s",
@@ -2805,7 +3075,8 @@
               "format": "uint8",
               "minimum": 0.0
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A sink that drops everything, as cheaply as the runtime allows; the sink end of the load-test harness. It measures everything upstream of a sink without a real one's encoder, socket, or filesystem in the number, while the runtime's own telemetry still counts what it received. No fields: a scenario that wants an encoder in the measurement uses `file_out` to `/dev/null` instead.",
@@ -2814,13 +3085,18 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "null_out"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A named destination a router directs events into. No fields and no `sources:`: a target is fed by a router that names it, never by naming anything itself, and must be directed to by at least one router. Downstream components read it like any other component, by listing it in their own `sources:`.",
@@ -2829,13 +3105,18 @@
             "type"
           ],
           "properties": {
+            "buffer": true,
+            "receive": true,
+            "sources": true,
+            "targets": true,
             "type": {
               "type": "string",
               "enum": [
                 "target"
               ]
             }
-          }
+          },
+          "additionalProperties": false
         }
       ],
       "properties": {
@@ -3399,7 +3680,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "NormalizeStep": {
       "description": "A rewrite `keep_values` applies to a field's value before testing it against `allow`. A list, so further steps can be added beside `lower`.",
@@ -3446,7 +3728,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "OtlpProtocol": {
       "description": "Which OTLP transport a component speaks. Both carry identical protobuf payloads and differ only in framing and endpoint shape.",
@@ -4015,7 +4298,8 @@
         "sd_id": {
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "SyslogTransport": {
       "description": "The transport `syslog_in` listens on and `syslog_out` sends over. `udp` (the default) is what nginx's `syslog:` writer and most senders speak; a datagram sent before the receiver is up is lost. `tcp` is the reliable, framed transport, and what `tls:` (RFC 5425) needs underneath it. `syslog_out` always emits octet-counted frames; `syslog_in` accepts either RFC 6587 framing, detected per connection.",
@@ -4058,7 +4342,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "TlsServerConfig": {
       "description": "Server-side TLS for a listener. Its presence turns TLS on for that listener and makes it required: there is no plaintext fallback. A relative path resolves against the config file's directory, and every field accepts `!env`.",
@@ -4084,7 +4369,8 @@
           "description": "Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`.",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "TraceIdFormat": {
       "description": "`trace_context`'s id grammar, which also picks its field-name defaults.",
@@ -4156,7 +4442,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "WatchMode": {
       "description": "How a tailed source notices new lines and new or removed files.",

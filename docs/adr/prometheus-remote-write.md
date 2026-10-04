@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-09-30
+updated: 2026-10-04
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -508,9 +508,10 @@ hand-written `generated/mod.rs` mirrors OTLP's `#[path]`/`#[rustfmt::skip]` nest
   (`degraded{reason="sub_ms_collapsed"}`) — the one permitted normalization that loses a *reading*
   rather than a rendering; a closed fanout during shutdown still answers `204`, which is
   `docs/design/pipeline-graph.md`'s own closed-downstream open question reaching a transport with a
-  wire acknowledgement to be wrong about; `tls:` written under `prometheus_in` is silently ignored,
-  since no `ComponentKind` variant denies unknown fields, which makes this rename the one most
-  likely to be hit that way; `influxdb_out` and `prometheus_in`'s scrape client still follow HTTP
+  wire acknowledgement to be wrong about; `tls:` written under `prometheus_in` was silently
+  ignored, since no `ComponentKind` variant denied unknown fields (now rejected at load, per
+  [ADR `config-yaml-jsonschema`](config-yaml-jsonschema.md)'s "unknown keys are rejected"
+  amendment); `influxdb_out` and `prometheus_in`'s scrape client still follow HTTP
   redirects, where `otlp_out` and this sender share a client that does not; and
   `logit.input.samples` counts wire samples in bind mode against series in scrape mode, one
   counter name with two units on one kind. The native-histogram gap is the reworded row below

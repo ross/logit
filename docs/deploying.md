@@ -64,6 +64,11 @@ docker run --rm \
 `validate_semantics` in `crates/logit-cli/src/pipeline.rs`), so a config that validates can't fail
 that stage at `run`.
 
+**An unknown key is an error.** A misspelled or removed key, on a component or in any of its
+blocks, fails `validate` with the component's id and the key, such as
+``component `scrape`: unknown field `tls` ``. Keys whose names are your data, such as `set`'s
+attributes or `headers`, take any name.
+
 **`validate` doesn't open referenced files.** `lua_file`, a `stdio_out`/`file_out` path, and
 `otlp_out`/`otlp_in`'s `tls.*_file` fields are read only when `run` constructs the component. A
 mistyped `tls.ca_file` path passes `validate` and fails at startup instead, with the path in the
