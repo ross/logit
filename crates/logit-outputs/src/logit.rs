@@ -14,11 +14,17 @@
 //! configured window and the connection uses `max(1, min(offered, answered))`.
 //! [`Output::submit`] writes a frame without waiting for its `Ack` and appends its sender pair
 //! to the connection's in-flight list; [`Output::await_ack`] commits the oldest.
-//! - **Acks name frames** (`docs/adr/native-hop-named-acks.md`, decision 3). An `Ack { id, seq }`
-//!   covers every frame of identity `id` at or below `seq`, so one `Ack` marks a prefix of the
-//!   list. The front entry must carry `id` and an entry must carry `seq` itself; any other `Ack`
-//!   is `Ambiguous` and drops the connection. `await_ack` pops a front entry already marked
-//!   without reading the wire, so one `Ack` answers as many `await_ack`s as it covers frames.
+//! - **Acks name frames** (`docs/adr/native-hop-named-acks.md`, decision 3). An accepted
+//!   `Ack { id, seq }` covers every frame of identity `id` at or below `seq`, so one `Ack` marks a
+//!   prefix of the list. The front entry must carry `id` and an entry must carry `seq` itself; any
+//!   other `Ack` is `Ambiguous` and drops the connection. `await_ack` pops a front entry already
+//!   marked without reading the wire, so one `Ack` answers as many `await_ack`s as it covers
+//!   frames.
+//! - **A rejected `Ack` settles the head alone** (`docs/adr/native-hop-ack-status.md`). It must
+//!   name the front entry, unmarked; `await_ack` pops it and returns `Fault::Rejected` marked
+//!   [`HeadOnly`], with `logit_in`'s reason and message, and keeps the connection and every frame
+//!   behind the head. A rejected `Ack` naming anything else is `Ambiguous` and drops the
+//!   connection.
 //! - With frames in flight the probe below is skipped (it would consume an `Ack`'s byte), and
 //!   the frame is written in chunks, each `write` and the final flush bounded by the request
 //!   timeout: a frame making progress on a slow link never trips it, and a receiver parked on an
@@ -45,8 +51,10 @@
 //! |---|---|---|---|
 //! | connect, TLS, `Hello` write, or `HelloAck` read failure | `Clean` | no frame left the process | `connect_refused_is_classified_clean`, `the_hello_is_flushed_before_the_hello_ack_wait` |
 //! | a `HelloAck` that doesn't answer the `Hello`: another protocol version, a codec or compression never offered, a mark for an identity `Hello.senders` didn't list, or two marks for one identity | `Refused` | the peer answers the same `Hello` the same way, so every batch would get it; the runtime holds and retries, which succeeds once the peer or the config changes | `a_hello_ack_with_another_protocol_version_is_refused`, `a_hello_ack_naming_a_codec_never_offered_is_refused`, `a_hello_ack_naming_a_compression_never_offered_is_refused`, `a_hello_ack_mark_for_an_unoffered_identity_is_refused` |
-//! | `Reject{VERSION_MISMATCH}` or `Reject{NO_COMMON_CODEC}`, anywhere | `Refused` | the peer can't speak this sink's version or any codec it offers: the same for every batch | `reject_version_mismatch_is_refused`, `each_handshake_reject_code_reads_as_its_class` |
-//! | `Reject{FRAME_TOO_LARGE}`, anywhere | `Rejected` | about this frame: past the peer's cap or decode budget, as it would be on every resend | `a_reject_frame_too_large_after_the_frame_was_sent_is_still_rejected`, `each_handshake_reject_code_reads_as_its_class` |
+//! | `Reject{VERSION_MISMATCH}` or `Reject{NO_COMMON_CODEC}`, anywhere | `Refused` | the peer can't speak this sink's version or any codec it offers: the same for every batch (`docs/adr/native-hop-ack-status.md`, "A `Hello` refusal is `Refused`") | `reject_version_mismatch_is_refused`, `each_handshake_reject_code_reads_as_its_class` |
+//! | `Reject{FRAME_TOO_LARGE}`, anywhere | `Rejected` | about this frame: its header declared more than the peer reads, as it would on every resend | `a_reject_frame_too_large_after_the_frame_was_sent_is_still_rejected`, `each_handshake_reject_code_reads_as_its_class` |
+//! | a rejected `Ack` naming the head (`too_large`, `decode_budget`, `malformed`, or a code a newer peer adds) | `Rejected` for the head alone, marked `HeadOnly`; the connection and the frames behind it kept | `logit_in` read the frame's sender pair, dropped it, and raised its mark: a resend would be refused again or acknowledged unforwarded | `a_rejected_ack_naming_the_head_drops_it_alone_and_keeps_the_connection`, `a_batch_logit_in_refuses_by_name_fails_alone_in_its_window` |
+//! | a rejected `Ack` naming any other frame | `Ambiguous`, the connection dropped | the peer's answers no longer match the frames in flight | `a_rejected_ack_not_naming_the_head_is_ambiguous_and_drops_the_connection` |
 //! | `Reject{INTERNAL}` (the peer at its connection cap), `Reject{GOING_AWAY}` (shutting down, an idle close, no consumer to take a frame), or a code a newer peer adds, at the handshake | `Clean` | transient, and no frame left | `reject_internal_at_the_handshake_is_clean_not_refused`, `reject_going_away_at_the_handshake_is_clean_not_refused`, `each_handshake_reject_code_reads_as_its_class` |
 //! | `Reject{GOING_AWAY}` in place of an `Ack` | `Clean` for every frame still unanswered | `logit_in` writes it only for a frame it didn't forward (its module doc's "Shutdown") and reads nothing after it, so the batch never landed and is resent at any posture | `a_going_away_in_place_of_an_ack_is_a_clean_fault_and_the_batch_is_resent` |
 //! | any other transient `Reject` in place of an `Ack` | `Ambiguous` | the frame left, and the peer may have forwarded it | `a_reject_internal_after_the_frame_was_sent_is_ambiguous` |
@@ -103,7 +111,7 @@ use crate::Output;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 use logit_core::{Diagnostics, EventBatch, Provenance, Telemetry};
-use logit_pipeline::{BatchContext, Fault, SeqId};
+use logit_pipeline::{BatchContext, Fault, HeadOnly, SeqId};
 use logit_proto::frame::{self, Compression};
 use logit_proto::native::{self, control};
 use std::collections::{HashMap, VecDeque};
@@ -218,6 +226,48 @@ fn mark_acked(in_flight: &mut VecDeque<InFlight>, ack: control::Ack) -> anyhow::
     Ok(())
 }
 
+/// Applies a rejected `Ack` naming `id`/`seq` to `in_flight` (`docs/adr/native-hop-ack-status.md`):
+/// it settles the front entry alone, so it must name that entry, which no earlier `Ack` marked.
+/// Pops it on a match. Any other rejected `Ack` means the connection can't be trusted.
+fn settle_rejected(
+    in_flight: &mut VecDeque<InFlight>,
+    id: [u8; 16],
+    seq: u64,
+) -> anyhow::Result<()> {
+    match in_flight.front() {
+        Some(front) if front.seq == SeqId { id, seq } && !front.acked => {
+            in_flight.pop_front();
+            Ok(())
+        }
+        Some(front) => anyhow::bail!(
+            "logit_in rejected sequence {seq} of {id:02x?}, and the oldest frame in flight is \
+             sequence {} of {:02x?}",
+            front.seq.seq,
+            front.seq.id
+        ),
+        None => anyhow::bail!("logit_in rejected sequence {seq} with no frame in flight"),
+    }
+}
+
+/// The error for the head `logit_in` refused by name: `Fault::Rejected`, marked [`HeadOnly`]
+/// because the connection and the frames behind the head are untouched. Carries the reason and
+/// `logit_in`'s message, which the runtime's `send_failed` diagnostic prints.
+fn rejected_head(seq: u64, reason: u16, message: Option<&str>) -> anyhow::Error {
+    let reason = match reason {
+        control::ACK_REJECTED_TOO_LARGE => "too_large".to_string(),
+        control::ACK_REJECTED_DECODE_BUDGET => "decode_budget".to_string(),
+        control::ACK_REJECTED_MALFORMED => "malformed".to_string(),
+        other => format!("code {other}"),
+    };
+    let err = match message {
+        Some(message) if !message.is_empty() => {
+            anyhow::anyhow!("logit_in rejected sequence {seq} ({reason}): {message}")
+        }
+        _ => anyhow::anyhow!("logit_in rejected sequence {seq} ({reason})"),
+    };
+    err.context(Fault::Rejected).context(HeadOnly)
+}
+
 impl Drop for Conn {
     /// Every drop, a cancelled call's included, leaves nothing in flight and no negotiated
     /// window, so the gauges say so rather than keep the dropped connection's last values.
@@ -242,7 +292,7 @@ pub struct LogitOutput {
     /// `logit.output.reconnects`.
     has_connected_once: bool,
     /// The next batch's provenance, set by `Output::observe_batch` once per batch and carried in
-    /// the hop trailer (`docs/adr/batch-provenance-on-delivered.md`).
+    /// the hop payload's trailer (`docs/adr/batch-provenance-on-delivered.md`).
     pending_provenance: Provenance,
     /// The next batch's sender identity and sequence from the sink's store, set by
     /// `Output::observe_batch`. Every attempt at one batch carries the same pair; cleared once an
@@ -633,7 +683,9 @@ impl LogitOutput {
 
     /// `Output::await_ack`'s body: commits the oldest frame in flight, from the in-flight list
     /// when an earlier `Ack` already named it, otherwise by reading one control message. Every
-    /// `Err` carries a [`Fault`] and leaves no connection.
+    /// `Err` carries a [`Fault`]. A rejected `Ack` naming the oldest frame pops it and returns
+    /// `Fault::Rejected` marked [`HeadOnly`], keeping the connection and every frame behind it;
+    /// every other `Err` leaves no connection.
     async fn read_ack(&mut self) -> anyhow::Result<()> {
         // Taken into a local for the read, so a cancelled wait drops the connection.
         let mut conn = match self.stream.take() {
@@ -650,6 +702,22 @@ impl LogitOutput {
                 tokio::time::timeout(self.timeout, read_control(&mut conn.stream)).await;
             drop(ack_timer);
             let err = match ack_result {
+                Ok(Ok(control::ControlMessage::Ack(control::Ack {
+                    id,
+                    seq,
+                    status: control::AckStatus::Rejected { reason, message },
+                }))) => match settle_rejected(&mut conn.in_flight, id, seq) {
+                    // The head alone failed: the frames behind it are still in flight on a
+                    // connection that stays usable.
+                    Ok(()) => {
+                        self.record_in_flight(conn.in_flight.len());
+                        if !(conn.broken && conn.in_flight.is_empty()) {
+                            self.stream = Some(conn);
+                        }
+                        return Err(rejected_head(seq, reason, message.as_deref()));
+                    }
+                    Err(err) => Some(err.context(Fault::Ambiguous)),
+                },
                 Ok(Ok(control::ControlMessage::Ack(ack))) => mark_acked(&mut conn.in_flight, ack)
                     .err()
                     .map(|err| err.context(Fault::Ambiguous)),
@@ -2206,7 +2274,7 @@ mod tests {
         (body, ack)
     }
 
-    /// The `Ack` a stock `logit_in` answers the data frame `header` + `body` with: its trailer's
+    /// The `Ack` a stock `logit_in` answers the data frame `header` + `body` with: its prefix's
     /// sender identity and sequence.
     fn ack_naming(header: &[u8; frame::HEADER_LEN], body: &[u8]) -> control::Ack {
         let mut full = BytesMut::from(&header[..]);
@@ -2217,7 +2285,7 @@ mod tests {
     }
 
     fn ack_for(seq: SeqId) -> control::Ack {
-        control::Ack { id: seq.id, seq: seq.seq }
+        control::Ack::accepted(seq.id, seq.seq)
     }
 
     /// Whether `err`'s chain holds an `io::Error` of `kind`.
@@ -3012,6 +3080,107 @@ mod tests {
             );
             assert!(output.stream.is_none(), "{sent:?} acked {acked}");
         }
+    }
+
+    /// A rejected `Ack` naming `seq` with `reason` and `message`.
+    fn rejected_for(seq: SeqId, reason: u16, message: &str) -> control::Ack {
+        control::Ack {
+            id: seq.id,
+            seq: seq.seq,
+            status: control::AckStatus::rejected(reason, message),
+        }
+    }
+
+    /// A rejected `Ack` naming the head drops that frame alone: `Fault::Rejected` marked
+    /// `HeadOnly`, with `logit_in`'s reason and message in the error. The connection and the
+    /// frames behind the head stay, and the next `Ack` commits them with no reconnect.
+    #[tokio::test]
+    async fn a_rejected_ack_naming_the_head_drops_it_alone_and_keeps_the_connection() {
+        let acks = vec![
+            rejected_for(pair(A, 1), control::ACK_REJECTED_DECODE_BUDGET, "over the budget"),
+            ack_for(pair(A, 3)),
+        ];
+        let addr = peer_acking_after(3, acks).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output =
+            LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
+        submit_pairs(&mut output, &[pair(A, 1), pair(A, 2), pair(A, 3)]).await;
+
+        let err = output.await_ack().await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Rejected, "{err:#}");
+        assert!(logit_pipeline::is_head_only(&err), "{err:#}");
+        let text = format!("{err:#}");
+        assert!(text.contains("sequence 1 (decode_budget): over the budget"), "{text}");
+        assert_eq!(in_flight_of(&output), [(pair(A, 2), false), (pair(A, 3), false)]);
+
+        output.await_ack().await.expect("A2");
+        output.await_ack().await.expect("A3");
+        assert!(in_flight_of(&output).is_empty(), "the connection is kept");
+        let totals = probe.poll();
+        assert_eq!(requests(totals), ([2.0, 0.0, 0.0, 1.0, 0.0], 3.0));
+        assert_eq!(totals.sum("logit.output.reconnects", &[]), 0.0);
+    }
+
+    /// A rejected `Ack` settles one frame, the head: one naming any other frame, or a head an
+    /// earlier `Ack` already marked, is a protocol error, `Ambiguous`, and drops the connection.
+    #[tokio::test]
+    async fn a_rejected_ack_not_naming_the_head_is_ambiguous_and_drops_the_connection() {
+        let reason = control::ACK_REJECTED_MALFORMED;
+        for (acks, what) in [
+            (vec![rejected_for(pair(A, 2), reason, "")], "past the head"),
+            (vec![rejected_for(pair(B, 1), reason, "")], "another identity"),
+            (vec![rejected_for(pair(A, 9), reason, "")], "not in flight"),
+        ] {
+            let addr = peer_acking_after(2, acks).await;
+            let mut output = LogitOutput::new(addr);
+            submit_pairs(&mut output, &[pair(A, 1), pair(A, 2)]).await;
+            let err = output.await_ack().await.unwrap_err();
+            assert_eq!(classify(&err), Fault::Ambiguous, "{what}: {err:#}");
+            assert!(!logit_pipeline::is_head_only(&err), "{what}");
+            assert!(output.stream.is_none(), "{what}: the connection is dropped");
+        }
+    }
+
+    /// Against a real `logit_in`, a batch past its decode budget among two that aren't, in one
+    /// window: the refused one fails alone, the two others are delivered, and nothing reconnects.
+    #[tokio::test]
+    async fn a_batch_logit_in_refuses_by_name_fails_alone_in_its_window() {
+        let mut input = LogitInput::new("127.0.0.1:0").with_max_frame_bytes(1024);
+        input.bind().await.expect("bind should succeed");
+        let addr = input.local_addr().expect("a bound address").to_string();
+        let (tx, mut rx) = mpsc::channel(16);
+        let sink = Fanout::new(vec![tx]);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut probe = TelemetryProbe::new();
+        let mut output = LogitOutput::new(addr).with_window(8).with_telemetry(probe.telemetry(
+            "out",
+            "logit_out",
+            "sink",
+        ));
+        // Five empty events decode past a 1 KiB cap's 4 KiB budget in a few dozen bytes, under
+        // `logit_out`'s own size check.
+        let events = (0..5).map(|i| Event::empty(i, AttrMap::new())).collect();
+        let refused = EventBatch { resource: Arc::new(Resource::default()), scope: None, events };
+        let pairs = [pair(A, 1), pair(A, 2), pair(A, 3)];
+        // The first submit has nothing in flight and connects, so the window is known after it.
+        for (seq, batch) in pairs.iter().zip([&sample_batch(), &refused, &sample_batch()]) {
+            output.submit(batch, BatchContext::default(), *seq).await.expect("a submit");
+        }
+
+        output.await_ack().await.expect("A1");
+        let err = output.await_ack().await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Rejected, "{err:#}");
+        assert!(logit_pipeline::is_head_only(&err), "{err:#}");
+        assert!(format!("{err:#}").contains("(decode_budget)"), "{err:#}");
+        output.await_ack().await.expect("A3");
+
+        assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
+        assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
+        assert!(rx.try_recv().is_err(), "the refused batch was never forwarded");
+        let totals = probe.poll();
+        assert_eq!(requests(totals), ([2.0, 0.0, 0.0, 1.0, 0.0], 3.0));
+        assert_eq!(totals.sum("logit.output.reconnects", &[]), 0.0);
     }
 
     /// One `Ack` covering three frames answers three `await_ack`s with one wire read: the second
