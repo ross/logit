@@ -155,14 +155,21 @@ and in an amendment to the sink's own record:
   `Refused` (`crates/logit-outputs/src/prometheus.rs`, "Faults, retries and duplicate safety
   (sender mode)"; [ADR `prometheus-remote-write`](prometheus-remote-write.md), "Amendment: the
   sender's response classes (2026-10-04)").
-- `splunk_hec_out`: a `400` with HEC code 7, 12, 13, or 15 drops the one object it names, and a
-  `400` with code 10, 11, 16, 21, 22, or 28 is `Refused` (`crates/logit-outputs/src/splunk.rs`,
-  "Faults, retries, and duplicate safety"; [ADR `splunk-hec-relay`](splunk-hec-relay.md),
-  "Amendment: response classes from the HEC code (2026-10-04)").
-- `datadog_trace_out`: an Agent's `429` is `Clean` before any request of the send was accepted,
-  and a `415` is `Refused` (`crates/logit-outputs/src/datadog_trace.rs`, "Faults, retries, and
+- `splunk_hec_out`: a `400` with HEC code 6, 7, 12, 13, or 15 drops the one object it names; a
+  `400` with code 10, 11, 16, 21, 22, or 28 is `Refused`; a `408` and a `501` are `Ambiguous`; and a
+  `429`, or a `503` with code 9 or no HEC body, is `Clean` before any request of the send was
+  accepted (`crates/logit-outputs/src/splunk.rs`, "Faults, retries, and duplicate safety";
+  [ADR `splunk-hec-relay`](splunk-hec-relay.md), "Amendment: response classes from the HEC code
+  (2026-10-04)").
+- `datadog_out`: a `408` and a `501` are `Ambiguous`, as Datadog documents a `408` as retryable
+  and a `5xx` as a server failure (`crates/logit-outputs/src/datadog.rs`, "Faults, retries, and
   duplicate safety"; [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md),
   "Amendment: response classes (2026-10-04)").
+- `datadog_trace_out`: an Agent's `429` is `Clean` before any request of the send was accepted, a
+  `415` is `Refused`, and a `408` and a `501` are `Ambiguous`
+  (`crates/logit-outputs/src/datadog_trace.rs`, "Faults, retries, and duplicate safety";
+  [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md), "Amendment: response
+  classes (2026-10-04)").
 - `otlp_out`: an HTTP `401`, `403`, `404`, or `501` names one signal and is `Rejected`, and a
   server failure stays `Ambiguous` where the OTLP specification says not to retry it
   (`crates/logit-outputs/src/otlp.rs`, "Response classes"; "Amendment: `otlp_out` departs from the
