@@ -111,7 +111,7 @@ Agreed with Ross on 2026-10-04; the ADR records the reasoning.
    protocol mismatch, an unknown tenant, an unknown bucket) is `Refused`, the same as a connection
    failure or bad credentials. Each sink classifies from everything its destination gives it
    (status, error code in the body, text), and W2's survey records the mapping per sink with its
-   evidence. A response a sink can't attribute is an open question below.
+   evidence. A response a sink can't attribute is settled below ("Settled in W0", item 1).
 3. **No retry budget, no streak, no probe state.** A retryable fault (`Clean`, `Refused`, and
    `Ambiguous` under `at_least_once`) retries the head immediately, then with exponential backoff
    from `base_delay` to `retry_max_delay`, indefinitely. The queue's `buffer:` bounds the cost.
@@ -131,14 +131,15 @@ Agreed with Ross on 2026-10-04; the ADR records the reasoning.
 
 ### W0: ADR and this plan (`fault/w0`)
 
-Write `docs/adr/sink-fault-classes.md` from `docs/adr/TEMPLATE.md`: the four classes, the no-exit
-rule, indefinite retry bounded by the buffer, the per-sink attribution rule, the announcements,
-order kept. It supersedes the `Permanent` rule, the retry budget, and the rejected "never exit"
-alternative in `buffered-sink-delivery`, the outage paragraph in
-`service-lifecycle-and-output-retry`, and the pipeline ending in decision 11 of
-`sink-send-path-and-attempt-accounting`; each gets an `updated:` and a pointer. Amend
-`delivery-semantics` item 2 (the "`retry_budget` ran out" loss goes away) and item 5's table.
-Settle the open questions below in the ADR. No code.
+[ADR `sink-fault-classes`](../adr/sink-fault-classes.md), from `docs/adr/TEMPLATE.md`: the four
+classes, the no-exit rule, indefinite retry bounded by the buffer, the per-sink attribution rule
+and the HTTP driver's status-only default, the announcements, order kept. It supersedes the
+`Permanent` rule, the retry budget, and the rejected "never exit" alternative in
+`buffered-sink-delivery`, the outage paragraph in `service-lifecycle-and-output-retry`, and the
+pipeline ending in decision 11 of `sink-send-path-and-attempt-accounting`; each carries an
+`updated:` and a dated pointer. It amends `delivery-semantics` item 2 (the "`retry_budget` ran
+out" loss goes away) and item 5's table. The questions this plan opened are settled below. No
+code.
 
 ### W1: runtime (`fault/w1`)
 
@@ -147,33 +148,45 @@ Settle the open questions below in the ADR. No code.
   for an error the sink didn't recognize). `is_explicitly_permanent` goes away.
 - `is_retryable`: `Clean` and `Refused` under both postures, `Ambiguous` under `at_least_once`,
   `Rejected` under neither.
+- A mechanical first mapping, so the crate compiles with `Permanent` gone: the shared HTTP driver
+  returns the ADR's status-only default (`401`, `403`, `404`, `405`, `407`, `501` are `Refused`;
+  `429` and `5xx` stay `Ambiguous`; every other `4xx` and `3xx` is `Rejected`), `RefusesSink` is
+  replaced by `Refused`, `logit_out`'s handshake rejects become `Refused`, and every other
+  `Fault::Permanent` becomes `Rejected`. The `class` label's `permanent` value is renamed with the
+  variant. Body-aware refinement is W2's, not W1's.
 - `write_loop`: remove `PERMANENT_FAILURE_WINDOW` and the `Err` return (cherry-pick #522's
   commit for this and its tests); `deliver_with_retry`/`deliver_window` lose the budget deadline
   and retry until success or shutdown, with the backoff schedule unchanged; the shutdown grace
   still cuts a retry (`Delivery::GraceExpired`, `Fault::Ambiguous` for an in-flight send).
-- `BufferConfig`: remove `retry_budget`; keep `retry_max_delay`; graph rule 15 narrows to it.
-  Regenerate the schema.
-- Telemetry and diagnostics per decisions 4 and 5; `docs/design/internal-telemetry.md` rows.
+- `BufferConfig`: remove `retry_budget`; keep `retry_max_delay`; graph rule 15's zero-duration
+  clause narrows to it. Regenerate the schema.
+- Telemetry and diagnostics per decisions 4 and 5: `batches.dropped{reason="rejected"}`, the
+  throttled diagnostic carrying the destination's text, the paced error line while a head holds,
+  and the `logit.component.retrying` gauge; `docs/design/internal-telemetry.md` rows.
 - Tests: the retry-budget tests become retry-until-success and retry-cut-by-grace tests; a
   `Rejected` batch drops at once with the reason and text; a `Refused` head holds while the queue
-  fills under `block` and evicts under `drop_oldest`; shutdown accounting for a held head (memory
-  counts `shutdown`, disk spools); a sibling sink keeps delivering; the run never ends for a sink.
+  fills under `block` and evicts under `drop_oldest`; the gauge rises on the first failure and
+  falls on delivery or drop; shutdown accounting for a held head (memory counts `shutdown`, disk
+  spools); a sibling sink keeps delivering; the run never ends for a sink.
 - Operator docs: `docs/deploying.md`'s "Sink failure semantics" and the exit-code table (reuse
   #522's prose), `docs/known-gaps/otlp.md`'s Tempo entry, `demo/logit.yaml`'s `trace_only`
   comment, `docs/design/pipeline-graph.md`'s cancellation-points rows.
 
 ### W2: per-sink classification (`fault/w2`)
 
-For each of `influxdb_out`, `otlp_out` (HTTP and gRPC), `prometheus_out` (remote-write),
-`datadog_out`, `datadog_trace_out`, `splunk_hec_out`, `logit_out`, and the shared HTTP driver
-(`crates/logit-outputs/src/http.rs`): a table in the module doc mapping every response the sink
-distinguishes to a class, with the destination's documentation as evidence (InfluxDB's JSON
-`code`, Datadog's per-product retry guide, Splunk's HEC codes, the OTLP spec's retryable set, the
-remote-write spec, Loki's status page). The stream-and-datagram sinks (`syslog_out`, `statsd_out`,
-`graphite_out`, `collectd_out`, `file_out`, `stdio_out`) have no application response and classify
-by I/O error only: a connect failure is `Clean`, a mid-write failure `Ambiguous`, a local
-encode-side refusal `Rejected`. Each table has a test per row. Tempo's `UNIMPLEMENTED` for
-metrics is `Rejected` for that signal's request, which W4 makes per signal.
+The evidence-backed refinement of W1's mechanical mapping. For each of `influxdb_out`, `otlp_out`
+(HTTP and gRPC), `prometheus_out` (remote-write), `datadog_out`, `datadog_trace_out`,
+`splunk_hec_out`, `logit_out`, and the shared HTTP driver (`crates/logit-outputs/src/http.rs`): a
+table in the module doc mapping every response the sink distinguishes to a class, with the
+destination's documentation as evidence (InfluxDB's JSON `code`, Datadog's per-product retry
+guide, Splunk's HEC codes, the OTLP spec's retryable set, the remote-write spec, Loki's status
+page), and a test per row. This is where a `400` whose body names an unknown bucket or tenant
+becomes `Refused`, and where a sink whose destination answers `404` per request overrides the
+driver's default. `docs/deploying.md` points at the tables; there is no second copy. The
+stream-and-datagram sinks (`syslog_out`, `statsd_out`, `graphite_out`, `collectd_out`, `file_out`,
+`stdio_out`) have no application response and classify by I/O error only: a connect failure is
+`Clean`, a mid-write failure `Ambiguous`, a local encode-side refusal `Rejected`. Tempo's
+`UNIMPLEMENTED` for metrics is `Rejected` for that signal's request, which W4 makes per signal.
 
 ### W3: native hop acknowledgment status (`fault/w3`)
 
@@ -199,20 +212,24 @@ exit, `fixtures/statsd-to-influxdb.yaml`'s `buffer:` example, `AGENTS.md`'s runt
 its invariants list (a reviewer checks a sink's class mapping first on any change to a sink's
 response handling).
 
-## Open questions
+## Settled in W0
 
-1. **A response the sink can't attribute.** A bare `400` with no body a sink can read: `Rejected`
-   (drop; what every peer does, and the specs' definition) or `Refused` (hold; safe if it's a
-   destination fault, a wedge if a stream of bad batches)? Leaning `Rejected`, with each sink
-   reading as much of the body as its destination documents, and the ADR saying why.
-2. **A bounded guard against misattribution.** With no probe state, a `Refused` head that is in
-   truth a bad batch holds forever. A cap on consecutive refusals of one head before it's dropped
-   (Alloy's `max_backoff_retries` shape) would bound that at the cost of one batch per cap during
-   a real outage. Decide in W0 whether W2's attribution is trusted alone.
-3. **`Ambiguous` under `at_least_once`, forever.** A destination that answers `5xx` on every
-   attempt now holds the head indefinitely where it dropped after 60 s. That's the peers'
-   behavior and the buffer bounds it; confirm it in the ADR, including for `logit_out`.
-4. **Where the per-sink table lives.** Module doc per sink (one copy, pointed at from
-   `docs/deploying.md`), or one table in the ADR. Leaning module doc, per the comment rules.
-5. **The gauge's name.** `logit.component.retrying` (1 while the head has failed at least once
-   and is being retried) or reuse `degraded`. One name, in `internal-telemetry.md`.
+Agreed with Ross on 2026-10-04 and recorded in [ADR `sink-fault-classes`](../adr/sink-fault-classes.md).
+
+1. **A response the sink can't attribute** (a bare `400` with no body it can read) is `Rejected`:
+   what every peer does and what the remote-write and Loki specifications define. But a status
+   that describes the destination rather than the request holds even with no body: the shared
+   HTTP driver's status-only default reads `401`, `403`, `404`, `405`, `407`, and `501` as
+   `Refused`, `429` and `5xx` as `Ambiguous`, and every other `4xx` and `3xx` as `Rejected`. A
+   sink's body-aware table (W2) overrides the default.
+2. **No bounded guard against misattribution.** A cap on consecutive refusals turns every real
+   outage into one lost batch per cap; the hold is visible through the gauge and the paced error
+   line, and a dead-letter path is the remedy for what a table can't resolve.
+3. **`Ambiguous` under `at_least_once` retries forever**, `logit_out` included, with `at_most_once`
+   the opt-out.
+4. **The per-sink table lives in each sink's module doc**, pointed at from `docs/deploying.md`.
+5. **The gauge is `logit.component.retrying`**: `1` while the head has failed at least once and a
+   retry is pending or in flight. `degraded` is a per-record codec counter and isn't reused.
+6. **W1 maps mechanically, W2 refines with evidence.** Twelve files construct `Fault::Permanent`,
+   so W1 can't remove it without a first mapping; it uses the driver default above and makes every
+   other `Permanent` a `Rejected`, and W2 writes the tables.

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-01
+updated: 2026-10-04
 ---
 
 # Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed
@@ -1086,3 +1086,13 @@ Unix socket for `datadog_trace_out`. Each applies it outside the code that count
 `logit.output.requests{class}` and `logit.output.request.bytes`, so a refused request still
 counts `network_error` and no bytes after an accepted one. The three `docs/known-gaps/` entries
 are closed.
+
+## Amendment: a refused handshake holds, and nothing ends the pipeline (2026-10-04)
+
+Decision 11's last sentence is superseded by [ADR `sink-fault-classes`](sink-fault-classes.md):
+`PERMANENT_FAILURE_WINDOW` is gone, and no run of sink outcomes ends the pipeline. A `HelloAck`
+that doesn't answer the `Hello`, and a `REJECT_VERSION_MISMATCH` or `REJECT_NO_COMMON_CODEC`
+reject, are the peer refusing every frame, so each is `Refused`: the head holds and retries with
+backoff, bounded by the sink's `buffer:`. `logit_out`'s pre-connect too-large error is `Rejected`,
+dropped at once, where decision 3's `class=permanent` accounting read `Permanent`. The
+`class` label's `permanent` value is renamed with the variant in W1 of the `fault/` stream.

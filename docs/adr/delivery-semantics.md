@@ -519,3 +519,21 @@ follow-up that has to account for the code 6 resend and the `Clean` rule for a b
 anything is accepted.
 
 There is no config knob.
+
+## Amendment: four fault classes (2026-10-04)
+
+[ADR `sink-fault-classes`](sink-fault-classes.md) replaces `Permanent` with `Rejected` and
+`Refused`, removes `buffer.retry_budget`, and removes the process exit. Two items here change:
+
+- Item 2's first permitted loss, "a batch whose `buffer.retry_budget` ran out, or whose fault is
+  `Permanent`", becomes "a batch whose fault is `Rejected`": the destination refused that batch for
+  its own content. A `Clean`, `Refused`, or (under `at_least_once`) `Ambiguous` fault retries until
+  it succeeds or shutdown cuts it, so no loss arises from a budget.
+- Item 5's closing paragraph, the `Fault` table: `Clean` and `Refused` retry under both postures,
+  `Ambiguous` under `at_least_once`, and `Rejected` under neither. An `Ambiguous` fault under
+  `at_least_once` retries indefinitely, `logit_out` included; `at_most_once` remains the opt-out
+  that drops it at once.
+
+The per-request verdicts amendment above reads with `Rejected` for "`Permanent` naming the
+request" and `Refused` for "`Permanent` refusing the sink"; its guard paragraph describes the
+process exit this record removes.
