@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-01
+updated: 2026-10-04
 ---
 
 # Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed
@@ -374,6 +374,8 @@ nature. The encode-side counters are the only ones that measure the batch and no
     then treats a peer that keeps answering this way like one that keeps sending a version
     reject: each attempt is explicitly `Permanent`, the batch is dropped, and after
     `PERMANENT_FAILURE_WINDOW` (60 s) of nothing but such outcomes the pipeline ends.
+    Superseded by [ADR `sink-rejection-backoff`](sink-rejection-backoff.md): after that streak
+    the sink backs off and holds its queue; the pipeline doesn't end.
 12. **`logit_out` sends `close_notify`, and `logit_in` reads a close between frames as a close
     under TLS too.** Before this, `logit_out` never shut its stream down, so under TLS every
     disconnect reached `logit_in` as `UnexpectedEof`, which `serve_connection` returned as an

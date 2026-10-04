@@ -16,7 +16,8 @@ events happen to carry. This is more than a demo inconvenience: `demo/logit.yaml
 own `logit.*` metrics. `OtlpOutput::send` (`crates/logit-outputs/src/otlp.rs`) issues one request
 per non-empty signal and aborts the rest on the first failure; Tempo's traces request succeeds and
 its metrics request fails with `grpc-status: 12` (`UNIMPLEMENTED`), and `write_loop`'s
-sustained-permanent-failure guard eventually ends the whole process — recorded in full in
+sustained-permanent-failure guard eventually ends the whole process (today it backs the sink off
+instead, per [ADR `sink-rejection-backoff`](sink-rejection-backoff.md)) — recorded in full in
 `docs/known-gaps/otlp.md`'s "`otlp_out` aborts an entire batch's `send`..." entry, which names "a
 config-layer way to filter an event stream by which payload it carries" as the real fix.
 

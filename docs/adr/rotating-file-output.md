@@ -178,8 +178,9 @@ successful re-open -- never a handle to an already-rotated-away file, since the 
 exactly that rename, not discovered stale later. A failed re-open therefore means the batch that
 triggered rotation provably never reached any file: safe to retry under either delivery posture.
 Per `logit_pipeline::output`'s `is_explicitly_permanent` doc comment, only an *explicit*
-`Fault::Permanent` classification should ever count toward `write_loop`'s sustained-permanent-
-failure exit window -- a transient re-open failure (most likely ENOSPC/EMFILE-class, since the
+`Fault::Permanent` classification should ever count toward `write_loop`'s all-permanent streak
+(the backoff trigger since [ADR `sink-rejection-backoff`](sink-rejection-backoff.md)) -- a
+transient re-open failure (most likely ENOSPC/EMFILE-class, since the
 directory itself was just proven writable by the rename that preceded it) is a very different
 situation from a real configuration error, and must never be mistaken for one just because it
 wasn't explicitly classified `Clean`. `FileTarget::write_all`/`FileTarget::flush` (replacing the old

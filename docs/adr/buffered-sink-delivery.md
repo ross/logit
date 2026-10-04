@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-10-01
+updated: 2026-10-04
 ---
 
 # Buffered, decoupled sink delivery
@@ -9,7 +9,9 @@ updated: 2026-10-01
 Accepted. Superseded in part on 2026-10-01 by [ADR
 `native-hop-send-window`](native-hop-send-window.md): "every attempt, including the first, races
 the remaining budget" holds for `deliver_with_retry`; on the window path only the head's own
-submit races it, and a pipelined sink bounds every later step itself.
+submit races it, and a pipelined sink bounds every later step itself. Superseded in part on
+2026-10-04 by [ADR `sink-rejection-backoff`](sink-rejection-backoff.md): a sink that sees only
+`Permanent` failures backs off and holds its queue instead of ending the process.
 
 ## Context
 
@@ -183,6 +185,10 @@ deliberately holding unwritten data. New rule:
   sink (bad token, bad bucket) still fails loudly enough for a restart-policy supervisor to notice;
   one malformed batch cannot kill an otherwise-healthy pipeline.
 
+  > Superseded by [ADR `sink-rejection-backoff`](sink-rejection-backoff.md): the process no
+  > longer exits. After the same streak, the sink holds its queue head and probes it once per
+  > interval.
+
 **Revised during review, before merge, on two points both stemming from the same root cause:**
 `classify`'s default-to-`Permanent` for an *unclassified* error (one with no `Fault` attached at
 all -- `StdioOutput`'s bare I/O errors, say) is a retry decision ("never retry a failure the sink
@@ -195,6 +201,10 @@ literal success reset it. Both are fixed by a narrower `is_explicitly_permanent`
 satisfies -- `classify`'s default never does. The 60-second window now accumulates across a run of
 nothing *but* the sink explicitly saying "this is a config error"; a `Clean`/`Ambiguous`
 budget-exhaustion, or an unclassified drop, resets it exactly like a success does.
+
+> Superseded in part by [ADR `sink-rejection-backoff`](sink-rejection-backoff.md):
+> `is_explicitly_permanent` and the reset rule stand, but the streak now puts the sink into
+> backoff instead of ending the process.
 
 ### `Output::flush` and a bounded shutdown grace
 
@@ -256,6 +266,8 @@ about what `Event` costs to move, not about bounding a queue's rough footprint.
   bucket would then be visible only in metrics and logs, never in the exit code a restart-policy
   supervisor actually watches. The ~60s permanent-failure window is the compromise: fails loudly
   enough to notice, slowly enough that one poison batch can't take down a healthy pipeline.
+  Superseded by [ADR `sink-rejection-backoff`](sink-rejection-backoff.md), which adopts this
+  option: one sink's rejections took every other sink's data with them.
 - **A generic `ack(id)` API supporting several in-flight, out-of-order batches per sink.** Rejected
   as premature: there is exactly one writer per `SinkQueue`, so in-order commit-the-head is the
   honest shape for what exists today. Out-of-order acknowledgement is real future scope for the

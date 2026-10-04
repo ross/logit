@@ -290,6 +290,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   self-logging sense) doesn't flip `/readyz` to unready; a sink's own `buffer:` block (retry
   budget, queue depth) exists to absorb that. `/readyz`'s `degraded` is reserved for a node that
   has exited with an error, not one that's behind.
+  - A sink backed off after nothing but rejections
+    ([ADR `sink-rejection-backoff`](../adr/sink-rejection-backoff.md)) shows nowhere on `/readyz`
+    or `/healthz` either. Its signals are the `logit.component.backoff` gauge, the `backoff` error
+    line, and `logit.component.buffer.utilization`.
   - The one non-exited not-ready answer is `503 stalled`, for a `lua`/`lua_file` component inside
     a script call with no progress
     ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)). It clears when the

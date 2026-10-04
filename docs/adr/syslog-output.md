@@ -72,8 +72,8 @@ below.
 **No `Permanent` fault is ever emitted by this sink.** There is no syslog equivalent of a bad
 token or a 4xx — a connect or write failure always means "can't reach the destination right now,"
 never "this destination will never accept this data." A persistent failure degrades to dropping
-with counters and throttled diagnostics; it does not eventually trip
-`docs/adr/buffered-sink-delivery.md`'s sustained-permanent-failure exit window.
+with counters and throttled diagnostics; it never counts toward the all-permanent streak that
+backs a sink off ([ADR `sink-rejection-backoff`](sink-rejection-backoff.md)).
 
 **A bounded reconnect exception to "one attempt per `send`."** ADR `buffered-sink-delivery` makes `Output::send` a
 single attempt, with retry timing owned entirely by the generic writer. A persistent TCP

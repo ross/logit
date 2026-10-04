@@ -113,7 +113,7 @@ configured, answers readiness and liveness probes. See
 |---|---|
 | `0` | Clean shutdown — a signal arrived, every listener drained, every sink flushed. |
 | `1` | A startup failure — a bad config, a port already in use, a bad `lua_file`, a bad `--log-level`. Nothing was ever running. |
-| `2` | A runtime failure after the process reported ready — a sustained, purely-configuration-error sink failure (see [Sink delivery buffering](#sink-delivery-buffering) below), a listener's accept loop dying, a `lua`/`lua_file` component's thread panicking (a script's own `process()`/`flush()` errors are not this: they're logged and counted, never fatal), a `lua`/`lua_file` component's VM still over its `max_memory` after a full garbage collection (logged `memory_limit_exceeded`), or a script still wedged inside `process()`/`flush()` with no progress 2 s after shutdown began, which `logit` exits without (see [What to watch on `/readyz`](#what-to-watch-on-readyz)). |
+| `2` | A runtime failure after the process reported ready — a listener's accept loop dying, a `lua`/`lua_file` component's thread panicking (a script's own `process()`/`flush()` errors are not this: they're logged and counted, never fatal), a `lua`/`lua_file` component's VM still over its `max_memory` after a full garbage collection (logged `memory_limit_exceeded`), or a script still wedged inside `process()`/`flush()` with no progress 2 s after shutdown began, which `logit` exits without (see [What to watch on `/readyz`](#what-to-watch-on-readyz)). |
 | `130` | A second SIGTERM/SIGINT arrived before a graceful drain finished. |
 
 To enable the probe endpoint, add a top-level `admin:` block:
@@ -170,9 +170,9 @@ configured).
 
 ### What to watch on `/readyz`
 
-- **`/readyz` stuck at `503 degraded`** means a node has failed, not that a sink is retrying. See
-  [Sink failure semantics](#sink-failure-semantics-degrade-to-dropping-dont-exit) for what does
-  and doesn't trip it.
+- **`/readyz` stuck at `503 degraded`** means a node has failed, not that a sink is retrying or
+  backed off. A sink failure never trips it; see
+  [Sink failure semantics](#sink-failure-semantics-drop-or-back-off-never-exit).
 - **`/readyz` at `503 stalled`** means a `lua`/`lua_file` script has been inside one
   `process()`/`flush()` call for 10 s with no progress: an infinite loop, or a pathological pattern
   match. The self-log carries a `script_stalled` warning naming the component. A script that is
@@ -227,7 +227,8 @@ process, not a component.
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks and Lua nodes. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
 | `degraded` | warn | A sink's first dropped batch (its retry budget exhausted) since it was last healthy. |
-| `recovered` | info | A sink's first successful delivery after `degraded`. |
+| `backoff` | error | A sink has seen only rejections for `buffer.backoff_after` and is now holding its queue; logged again on each failed probe. See [Sink failure semantics](#sink-failure-semantics-drop-or-back-off-never-exit). |
+| `recovered` | info | A sink's first successful delivery after `degraded` or `backoff`. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
 Outside the lifecycle events, `logit run` can log one startup `warn` before `ready`: when the
@@ -286,9 +287,11 @@ queue that fills behind that batch backs up into the inputs. Watch
 `logit.component.buffer.utilization`, and lower `retry_budget` or choose a `drop_*` policy if
 intake matters more than the batch.
 
-### Sink failure semantics: degrade to dropping, don't exit
+### Sink failure semantics: drop or back off, never exit
 
-A sink that can't reach its destination drops and counts batches; it doesn't end `logit run`:
+A sink failure never ends `logit run`. A sink that can't reach its destination drops and counts
+batches, and a sink whose destination rejects everything backs off and holds its queue
+([ADR `sink-rejection-backoff`](adr/sink-rejection-backoff.md)):
 
 - **A retryable failure** (per the sink's fault classification and delivery posture) is retried
   within `retry_budget` (60s by default), then the batch is dropped and counted. The backoff
@@ -298,12 +301,29 @@ A sink that can't reach its destination drops and counts batches; it doesn't end
 - **A non-retryable failure**, including retry-budget exhaustion, drops the batch, counts it, and
   logs a throttled warning. The writer moves on to the next batch; the rest of the pipeline and
   every other sink keep running.
-- **The one exception exits the process.** If a sink sees *only* configuration-error failures (a
-  bad token, a bad bucket: failures no retry can fix) for a sustained ~60-second window with no
-  success in between, `logit run` exits. This is deliberate: a misconfigured sink should fail
-  loudly enough for a restart-policy supervisor to notice, not drop every batch forever. A slow or
-  temporarily down destination never trips this; only a failure `logit` can identify as a
-  configuration problem does.
+- **A sink that sees only rejections backs off.** A rejection is a failure no retry can fix: a
+  `401`, a `403`, a `400`, or the gRPC equivalent. If a sink sees nothing but rejections for
+  `backoff_after` (60s by default) with no success in between, it stops attempting every batch:
+  - It holds the rejected batch at the head of its queue instead of dropping it. Batches that
+    arrive keep entering the queue (memory or `buffer.disk:`) under its `overflow` policy.
+  - Once per `backoff_interval` (60s by default), it sends the held batch again. On success it
+    logs `recovered` and drains the queue at normal speed. Another rejection keeps it backed off.
+    Any other failure drops the batch and returns the sink to normal delivery.
+  - It logs an `error` with the key `backoff` when it backs off and on each failed probe, and sets
+    the gauge `logit.component.backoff` to `1` until it recovers.
+  - While a sink is backed off, `logit.component.batches.dropped{reason="send_failed"}` stops
+    moving. Alert on `logit.component.backoff` and `logit.component.buffer.utilization` instead;
+    `/readyz` doesn't show it.
+
+  A slow or temporarily down destination never backs a sink off, and neither does one rejected
+  batch: any other outcome, including a success, restarts the streak. `logit validate` rejects
+  `backoff_after: 0s` and `backoff_interval: 0s`.
+
+  **A backed-off sink fills its queue.** Under the default `overflow: block`, the full queue backs
+  up into every sibling sink fed by the same source and into the inputs, the same as a destination
+  that fails ambiguously on every attempt. To keep the rest of the pipeline moving, set
+  `overflow: drop_oldest` and accept the evicted batches as a counted loss. To ride out a long
+  rejection with no loss, add `buffer.disk:`, which holds up to `disk.max_bytes`.
 - **On SIGTERM/SIGINT**, each sink gets up to `shutdown_grace` (5s by default) to drain its queue.
   Anything still queued at that deadline, or still waiting to enter the queue, is dropped and
   counted (a disk-backed sink spools it instead). For a disk-backed sink, the posture decides a

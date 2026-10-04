@@ -1,6 +1,6 @@
 ---
 created: 2026-08-30
-updated: 2026-09-14
+updated: 2026-10-04
 ---
 
 # Service lifecycle: signal-driven shutdown and bounded output retry
@@ -113,6 +113,8 @@ difference retry makes is narrower than "survives an InfluxDB outage": it's "a s
 failure no longer ends the process." Riding out an actual outage without dropping intake needs
 delivery decoupled from the drain loop (a real `Buffer` implementation) — out of scope here, and
 tracked as a new `docs/known-gaps/runtime.md` entry, not solved by widening the retry budget.
+Superseded by [ADR `buffered-sink-delivery`](buffered-sink-delivery.md) and [ADR
+`sink-rejection-backoff`](sink-rejection-backoff.md): no sink failure ends the process.
 
 ### Diagnostics: attribution via a builder, throttling by count
 Nine `eprintln!` sites exist; six carry no component id (`InfluxDbOutput`/`InfluxLineEncoder`,

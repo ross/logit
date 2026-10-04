@@ -653,11 +653,10 @@ components:
   # This gate is load-bearing, not hygiene. `otlp_out` issues one request per signal and aborts the
   # rest of a `send` call on the first failing one (`crates/logit-outputs/src/otlp.rs`'s module
   # doc), and Tempo is a traces-only gRPC server (it registers no `MetricsService`). An `internal`
-  # metric point reaching `tempo_out` would fail with `grpc-status: 12` (UNIMPLEMENTED), and enough
-  # consecutive failures trip `write_loop`'s ~60s sustained-permanent-failure guard
-  # (`docs/adr/service-lifecycle-and-output-retry.md`, revised by
-  # `docs/adr/buffered-sink-delivery.md`), ending the whole `logit` process and taking the
-  # VictoriaMetrics metrics path down with it, not just Tempo. See `docs/known-gaps/otlp.md`'s
+  # metric point reaching `tempo_out` would fail with `grpc-status: 12` (UNIMPLEMENTED), and after
+  # ~60s of nothing but such failures `tempo_out` backs off and holds its queue
+  # (`docs/adr/sink-rejection-backoff.md`): traces stop reaching Tempo, and the full queue backs up
+  # into `self`, stalling the VictoriaMetrics metrics path too. See `docs/known-gaps/otlp.md`'s
   # "`otlp_out` aborts a batch's `send`..." entry for the full account. `access_spans` needs
   # the same gate for the same reason, because `haproxy_trace`/`nginx_trace` produce
   # metric-and-span-carrying batches, and so does `browser_spans`, even though `browser_in` only
