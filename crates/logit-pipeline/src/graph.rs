@@ -854,10 +854,14 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 8: kind implemented.
+    // Rule 8: kind implemented. The message names the kind, never `{:?}` of it: `!env` inlines
+    // secrets into config fields, and a `ComponentKind`'s Debug prints every one.
     for (id, component) in &components {
         if !is_implemented(&component.kind) {
-            anyhow::bail!("component '{id}': kind {:?} is not implemented yet", component.kind);
+            anyhow::bail!(
+                "component '{id}': kind '{}' is not implemented yet",
+                kind_name(&component.kind)
+            );
         }
     }
 
@@ -7193,6 +7197,19 @@ mod tests {
         let out = splunk_hec_out("https://splunk:8088/services/collector");
         assert_eq!(kind_name(&out), "splunk_hec_out");
         assert_eq!(role(&out), Role::Sink);
+    }
+
+    /// Rule 8's message names a kind through `kind_name`. A kind's Debug carries its secrets (a
+    /// `!env`-resolved token here); its name never does.
+    #[test]
+    fn kind_name_carries_no_config_field() {
+        for (kind, token) in [
+            (sink(), "TOKEN"),
+            (splunk_hec_out("https://splunk:8088"), "11111111-2222-3333-4444-555555555555"),
+        ] {
+            assert!(format!("{kind:?}").contains(token));
+            assert!(!kind_name(&kind).contains(token), "{} leaks its token", kind_name(&kind));
+        }
     }
 
     /// A valid router -> target config resolves (rules 47-51).
