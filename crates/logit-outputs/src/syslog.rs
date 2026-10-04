@@ -29,8 +29,11 @@
 //! - An absent attribute, or any other variant, falls through.
 //!
 //! `event.timestamp` stays receipt time (`docs/adr/decoupled-listener-io.md`); this sink never
-//! resolves `syslog.timestamp` onto it. The opt-in `syslog_timestamp` transform sketched in
-//! `docs/known-gaps/syslog.md` is where that would happen, before an event reaches this sink.
+//! resolves `syslog.timestamp` onto it. The `timestamp` transform (`format: rfc3164`, `from:
+//! syslog.timestamp`, `docs/adr/timestamp-transform.md`) does that before an event reaches this
+//! sink. It removes the source attribute unless `keep_source: true`, and a removed attribute
+//! re-renders from `event.timestamp` in UTC. Set `keep_source: true` when the transform's
+//! `timezone:` isn't UTC, so a 3164 output still writes the sender's original token.
 //!
 //! ## Header-field precedence
 //!
