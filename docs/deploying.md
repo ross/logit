@@ -324,6 +324,14 @@ batches, and a sink whose destination rejects everything backs off and holds its
   that fails ambiguously on every attempt. To keep the rest of the pipeline moving, set
   `overflow: drop_oldest` and accept the evicted batches as a counted loss. To ride out a long
   rejection with no loss, add `buffer.disk:`, which holds up to `disk.max_bytes`.
+
+  **A backed-off sink probes with the held batch alone.** If the destination rejects that batch
+  for its own content (an oversized or malformed batch at the head), every probe fails on it and
+  the sink stays backed off until a restart, even once the destination accepts everything else;
+  the `backoff` error line names the rejection. And because the held batch is never committed, a
+  run whose inputs finish on their own (a `generate_in` with `count:`) doesn't exit while a sink
+  is backed off; a SIGTERM ends it inside `shutdown_grace`. Both are recorded in
+  [`docs/known-gaps/runtime.md`](known-gaps/runtime.md).
 - **On SIGTERM/SIGINT**, each sink gets up to `shutdown_grace` (5s by default) to drain its queue.
   Anything still queued at that deadline, or still waiting to enter the queue, is dropped and
   counted (a disk-backed sink spools it instead). For a disk-backed sink, the posture decides a

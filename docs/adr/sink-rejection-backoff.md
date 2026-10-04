@@ -149,3 +149,10 @@ A backed-off sink isn't visible on `/readyz` or `/healthz`: neither reports per-
   process.
 - An operator who relied on exit code `2` to restart a misconfigured sink must alert on
   `logit.component.backoff` or the `backoff` error line instead.
+- The probe is the held batch alone. A held batch the destination rejects for its own content (a
+  `413`, a `400` for bad line protocol, `logit_out`'s own size cap) fails every probe, so the sink
+  stays backed off until a restart even once the destination is healthy. And a run whose inputs
+  finish on their own doesn't exit while a sink is backed off, since the held head keeps
+  `store.peek()` from reporting a closed, empty queue; a signal ends it inside the shutdown grace.
+  Both are tracked in `docs/known-gaps/runtime.md`, "A backed-off sink holds one batch, and probes
+  with that batch alone", with the candidate remedies for the first.

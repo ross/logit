@@ -122,6 +122,30 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit:** if a documented script runs `logit-outputs` tests under plain `cargo test`. The
     fix then is a test that doesn't depend on a thread-local subscriber, such as one reading
     `Diagnostics::occurrences`.
+- **A backed-off sink holds one batch, and probes with that batch alone**
+  ([ADR `sink-rejection-backoff`](../adr/sink-rejection-backoff.md)). Two consequences follow
+  from "hold the head, resend it every `backoff_interval`":
+  - **A held batch the destination rejects for its own content wedges the sink.** The streak is
+    made of explicit `Fault::Permanent` outcomes, and sinks classify per-batch content rejections
+    that way too: `influxdb_out` maps every 4xx but 429 (a `400` for bad line protocol, a `413`),
+    `datadog_trace_out` maps `413`, and `logit_out` refuses a batch over its size cap before any
+    I/O. Sixty seconds of such rejections backs the sink off holding one of them, and a token
+    outage that ends with a malformed batch at the head does the same. Every probe then fails on
+    the held batch itself, so the sink never recovers without a restart, even once the destination
+    accepts everything else; under `overflow: block` its full queue stalls the siblings and the
+    inputs. The signals are the `logit.component.backoff` gauge and the `backoff` error line, whose
+    text names the rejection.
+    - **To close:** bound the probes one held batch gets before it is dropped and counted, with the
+      next batch becoming the held head; or, on a rejected probe, send the next queued batch once
+      and drop the head only when that one is accepted (not order-safe for `logit_out`, whose
+      sequence numbers must leave in order).
+  - **A run whose inputs finish never exits while a sink is backed off.** `write_loop` ends on its
+    own only when `store.peek()` returns `None` on a closed queue, and a held head is never
+    committed, so a `generate_in` run with `count:` (or any input that finishes) feeding a
+    rejecting sink runs until SIGTERM/SIGINT. No shipped scenario hits it: `null_out` and
+    `file_out` never reject, and the `logit_out` perf scenarios send SIGTERM. A signal ends the
+    run inside `shutdown_grace`, with the held batches counted `dropped{reason="shutdown"}` or,
+    under `buffer.disk:`, spooled for the next run.
 
 ## Event model and interner
 
