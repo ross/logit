@@ -405,7 +405,9 @@ Grouping the decoded points by their `component` attribute turns the tables belo
 table: events in/out, Σ `process.duration`, Σ `send.blocked.duration`, Σ `send.duration`, peak
 `buffer.utilization`, and drops by `reason`. A one-line verdict names the node with the largest Σ
 process time, plus each node that spent time blocked in `send`. For a blocked node, the constraint
-is that node's *consumer*, not the node reporting the time.
+is that node's *consumer*, not the node reporting the time. A consumer's
+`inbox.blocked.duration` names that constraint directly, so read it before tracing the graph by
+hand.
 
 The tool depends on exactly two things from this document: the `component`/`kind`/`role` identity
 on every point, and the shutdown drain above. Without the final tick, a short scenario loses its
@@ -455,6 +457,28 @@ every producer the send-side numbers for free:
 | `logit.component.events.sent` | count | events in that batch |
 | `logit.component.send.blocked.duration` | timing | time spent inside one `Fanout::send` call (all consumers) |
 | `logit.component.events.dropped{reason="closed_consumer"}` | count | a consumer's channel was already closed |
+
+#### Inbox side: recorded under the consumer
+
+`send.blocked.duration` is the producer's total and can't say which consumer it waited on. The
+inbox metrics are recorded under the *consumer's* component id by the same send paths
+(`Fanout::send*`, the blocking Lua path, and `Fanout::send_with_deadline`), so the consumer that
+constrains its producer is the one that carries them:
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.component.inbox.full` | count | a send found this inbox full, on any send path |
+| `logit.component.inbox.blocked.duration` | timing | time a send waited for room in this inbox. Recorded only when the send waited, whereas the producer's `send.blocked.duration` records a sample on every send |
+| `logit.component.inbox.batches` | gauge | the inbox's depth, sampled after each receive (`run_transform`, `run_router`, `run_lua`, and a sink's `drain_inbox`). A consumer parked in a full downstream send, or a sink parked on its full store, receives nothing and so reports no new depth; its `inbox.full` and `inbox.blocked.duration` are the signal then |
+
+A send tries the inbox first. On a full inbox it counts `inbox.full`, starts the consumer's blocked
+timer, and waits as before. A `Fanout::send_with_deadline` that times out sends nothing, but an
+`inbox.full` it observed stays counted, because that observes the consumer's state and isn't a
+send. The consumer's blocked timer, dropped by the timeout, records the time to cancel.
+
+A sink's own `buffer.overflow: drop_newest | drop_oldest` keeps its inbox draining, so such a sink
+shows `inbox.full` only briefly. A sink under the default `overflow: block` shows sustained
+`inbox.full` once its buffer fills (`buffer.utilization` at 1.0).
 
 #### Receive and processing side: the node loops
 
@@ -1000,6 +1024,10 @@ that timed out is counted only under `batches.dropped{reason="busy"}`, never und
 several batches can still be answered `503` after some of them were fully delivered; those count as
 `batches.sent`, and the Agent's retry delivers them again (the module doc's "Backpressure" section,
 [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md) decision 5).
+
+A timed-out `send_with_deadline` counts nothing sent, but an `inbox.full` it observed stays counted
+under the consumer, and the consumer's `inbox.blocked.duration` records the time until the timeout
+cancelled the wait.
 
 The codec's own counters (a series, sketch, log, event, check, span, or stats group dropped while
 the rest of a request decodes) are in the [`datadog` codec section](#datadog), under this

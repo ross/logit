@@ -17,7 +17,7 @@ use crate::queue::{SinkQueue, SinkQueueConfig};
 use crate::queue::{SinkStore, SinkStoreConfig, StoreItem};
 use crate::readiness::NodeState;
 use crate::router::{Destination, Router, RouterScratch};
-use crate::{Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
+use crate::{Edge, Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
 use anyhow::Context;
 use logit_core::{Diagnostics, Event, EventBatch, Resource, Scope, SpanKind, Telemetry};
 use logit_proto::native::SeqId;
@@ -211,7 +211,7 @@ pub async fn run_with_telemetry(
         readiness.set_node(id, NodeState::Bound);
     }
 
-    let mut senders: HashMap<String, mpsc::Sender<Delivered>> = HashMap::with_capacity(ids.len());
+    let mut edges: HashMap<String, Edge> = HashMap::with_capacity(ids.len());
     let mut inboxes: HashMap<String, mpsc::Receiver<Delivered>> = HashMap::with_capacity(ids.len());
     for id in &ids {
         // No channel for a `target`: it declares no `sources:` and nothing may name one as a
@@ -221,7 +221,10 @@ pub async fn run_with_telemetry(
             continue;
         }
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        senders.insert(id.clone(), tx);
+        // Captured here, before the spawn loop's `telemetry.remove`, so a producer sorted after
+        // its consumer still finds the consumer's handle.
+        let consumer = telemetry.get(id).cloned().unwrap_or_default();
+        edges.insert(id.clone(), Edge::new(tx).with_telemetry(consumer));
         inboxes.insert(id.clone(), rx);
     }
 
@@ -238,9 +241,10 @@ pub async fn run_with_telemetry(
         if component.role() != Role::Target {
             continue;
         }
-        let fanout = Fanout::new(component.consumers.iter().map(|c| senders[c].clone()).collect())
-            .with_component(id)
-            .with_telemetry(telemetry.get(id).cloned().unwrap_or_default());
+        let fanout =
+            Fanout::from_edges(component.consumers.iter().map(|c| edges[c].clone()).collect())
+                .with_component(id)
+                .with_telemetry(telemetry.get(id).cloned().unwrap_or_default());
         target_fanouts.insert(id.clone(), fanout);
         // Never `Running`/`Finished`/`Failed`: those transitions all come from a `JoinSet` entry,
         // and a target has no task to have one (`NodeState::Alias`'s own doc comment).
@@ -263,9 +267,10 @@ pub async fn run_with_telemetry(
             continue;
         }
         let node_telemetry = telemetry.remove(&id).unwrap_or_default();
-        let fanout = Fanout::new(component.consumers.iter().map(|c| senders[c].clone()).collect())
-            .with_component(&id)
-            .with_telemetry(node_telemetry.clone());
+        let fanout =
+            Fanout::from_edges(component.consumers.iter().map(|c| edges[c].clone()).collect())
+                .with_component(&id)
+                .with_telemetry(node_telemetry.clone());
         let inbox = inboxes.remove(&id).expect("an inbox was created for every id above");
         let spec = specs
             .remove(&id)
@@ -407,10 +412,10 @@ pub async fn run_with_telemetry(
         }
     }
 
-    // Every `Fanout` holds its own `Sender` clones; these are construction scaffolding. Left
-    // alive, each is an extra `Sender` on every channel, so no inbox ever closes, the shutdown
-    // cascade never fires, and `run` hangs.
-    drop(senders);
+    // Every `Fanout` holds its own `Edge` clones; these are construction scaffolding. Each edge
+    // holds a `Sender`, so left alive, each is an extra `Sender` on every channel, no inbox ever
+    // closes, the shutdown cascade never fires, and `run` hangs.
+    drop(edges);
     // Same rule for targets: each router holds its own clone of a target's `Fanout`. Left alive,
     // these keep every target consumer's inbox open and `run` hangs past the target.
     // `a_router_exiting_closes_its_targets_consumers_inboxes` pins it under a timeout.
@@ -691,6 +696,7 @@ pub async fn drain_inbox(
     in_hand: &InHand,
 ) {
     while let Some(delivered) = inbox.recv().await {
+        sample_inbox_depth(inbox, &telemetry);
         // Read before `unwrap_batch_arc` consumes `delivered`. The store carries it with the
         // batch so `write_loop`'s sink span has a parent and `Output::observe_batch` gets the
         // batch's provenance.
@@ -703,6 +709,16 @@ pub async fn drain_inbox(
         *in_hand.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
     store.close();
+}
+
+/// Records `logit.component.inbox.batches`, how many batches are still waiting in `inbox`, under
+/// the node's own `telemetry`. Called after each successful receive, so the gauge reads the
+/// backlog a node leaves behind it as it works; a node parked in a full downstream send records
+/// nothing new until it receives again.
+fn sample_inbox_depth(inbox: &mpsc::Receiver<Delivered>, telemetry: &Telemetry) {
+    if telemetry.is_enabled() {
+        telemetry.gauge("logit.component.inbox.batches", inbox.len() as f64, &[]);
+    }
 }
 
 /// The batch [`drain_inbox`] is pushing into its store, if a push is in progress. `run_output`
@@ -1530,6 +1546,7 @@ async fn run_transform(
             }
             return Ok(());
         };
+        sample_inbox_depth(&inbox, &telemetry);
         // Read before `unwrap_batch` consumes `batch`. Everything this call emits comes from this
         // one batch, so it's the unambiguous parent (`TraceContext`); `run_flush` has no single
         // parent and mints a root. `parent.provenance` passes through unchanged, for
@@ -1624,6 +1641,7 @@ async fn run_router(
     let mut scratch = RouterScratch::new(targets.len());
 
     while let Some(batch) = inbox.recv().await {
+        sample_inbox_depth(&inbox, &telemetry);
         // Every partition comes from this one batch: the unambiguous parent, as in
         // `run_transform`.
         let parent = batch.batch_context();
@@ -2455,7 +2473,13 @@ fn run_lua_loop(
                 return Ok(());
             };
             match wait {
-                None => io.inbox.blocking_recv(),
+                None => {
+                    let batch = io.inbox.blocking_recv();
+                    if batch.is_some() {
+                        sample_inbox_depth(&io.inbox, &telemetry);
+                    }
+                    batch
+                }
                 Some(wait) => {
                     // The `async` block is required: `tokio::time::timeout` builds its `Sleep`
                     // eagerly, which panics outside a runtime context. Inside the block it's
@@ -2463,7 +2487,12 @@ fn run_lua_loop(
                     match runtime
                         .block_on(async { tokio::time::timeout(wait, io.inbox.recv()).await })
                     {
-                        Ok(batch) => batch,
+                        Ok(batch) => {
+                            if batch.is_some() {
+                                sample_inbox_depth(&io.inbox, &telemetry);
+                            }
+                            batch
+                        }
                         Err(_elapsed) => continue,
                     }
                 }
@@ -2929,7 +2958,7 @@ mod tests {
         }
     }
 
-    /// `run` drops its scaffolding `senders`, so inboxes close and `run` returns after the input.
+    /// `run` drops its scaffolding `edges`, so inboxes close and `run` returns after the input.
     #[tokio::test]
     async fn run_returns_once_the_only_input_finishes_instead_of_hanging() {
         let mut components = Map::new();
@@ -9971,6 +10000,177 @@ mod tests {
             0.0
         );
         assert_eq!(rx.borrow().components.get("enrich"), Some(&NodeState::Finished));
+    }
+
+    /// A sink spec over [`NeverOutput`] whose store holds two batches, so its inbox fills soon
+    /// after.
+    fn stuck_sink() -> NodeSpec {
+        NodeSpec::Output(
+            Box::new(NeverOutput),
+            SinkStoreConfig::Memory(SinkQueueConfig {
+                max_batches: 2,
+                max_bytes: u64::MAX,
+                overflow: OverflowPolicy::Block,
+            }),
+            WriteLoopConfig { shutdown_grace: Duration::from_millis(100), ..Default::default() },
+        )
+    }
+
+    /// Runs `g` under `specs` with a probe handle for every id in `ids`, returning the probe and
+    /// the run's task, which the test aborts once it has read what it needs.
+    fn run_probed(
+        g: Graph,
+        specs: HashMap<String, NodeSpec>,
+        ids: &[&str],
+    ) -> (TelemetryProbe, tokio::task::JoinHandle<Result<(), RunError>>) {
+        let probe = TelemetryProbe::new();
+        let telemetry: HashMap<String, Telemetry> =
+            ids.iter().map(|id| (id.to_string(), probe.telemetry(id, "x", "x"))).collect();
+        let run = tokio::spawn(run_with_telemetry(
+            g,
+            specs,
+            telemetry,
+            Readiness::disabled(),
+            std::future::pending(),
+        ));
+        (probe, run)
+    }
+
+    #[tokio::test]
+    async fn a_full_sink_inbox_in_a_fan_out_is_counted_as_inbox_full_on_that_sink() {
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        for sink in ["stuck", "good"] {
+            components
+                .insert(sink.to_string(), plain_component(vec!["in".to_string()], influxdb_out()));
+        }
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let (feed, rx) = mpsc::unbounded_channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(ChannelInput { rx }), InputRuntimeConfig::default()),
+        );
+        specs.insert("stuck".to_string(), stuck_sink());
+        let (tx, _good_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "good".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let (mut probe, run) = run_probed(g, specs, &["in", "stuck", "good"]);
+        // One batch at a time, each waited on until `good` has it, so `good`'s inbox never holds
+        // more than one and only `stuck`'s can fill.
+        let stuck_full =
+            |t: &Totals| t.sum("logit.component.inbox.full", &[("component", "stuck")]);
+        for k in 1..=200 {
+            feed.send(one_counter_batch("hits")).expect("the input is running");
+            let totals = probe
+                .wait_for("good to receive the batch, or stuck's inbox to fill", |t| {
+                    stuck_full(t) > 0.0
+                        || t.sum("logit.component.batches.received", &[("component", "good")])
+                            >= f64::from(k)
+                })
+                .await;
+            if stuck_full(totals) > 0.0 {
+                break;
+            }
+        }
+        run.abort();
+
+        let totals = probe.poll();
+        assert!(stuck_full(totals) > 0.0, "stuck's inbox filled within 200 batches");
+        assert_eq!(totals.sum("logit.component.inbox.full", &[("component", "good")]), 0.0);
+        assert_eq!(
+            totals.sum("logit.component.inbox.full", &[("component", "in")]),
+            0.0,
+            "never on the producer"
+        );
+    }
+
+    /// `aa_out` sorts before `zz_in`, so the spawn loop takes `aa_out`'s handle out of the
+    /// telemetry map before it builds `zz_in`'s `Fanout`. The edge must already hold it.
+    #[tokio::test]
+    async fn a_consumer_sorted_before_its_producer_still_counts_its_inbox_full() {
+        let mut components = Map::new();
+        components.insert("zz_in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "aa_out".to_string(),
+            plain_component(vec!["zz_in".to_string()], influxdb_out()),
+        );
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let batches: Vec<EventBatch> = (0..200).map(|_| one_counter_batch("hits")).collect();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "zz_in".to_string(),
+            NodeSpec::Input(Box::new(BurstInput { batches }), InputRuntimeConfig::default()),
+        );
+        specs.insert("aa_out".to_string(), stuck_sink());
+
+        let (mut probe, run) = run_probed(g, specs, &["zz_in", "aa_out"]);
+        probe
+            .wait_for("aa_out's inbox.full", |t| {
+                t.sum("logit.component.inbox.full", &[("component", "aa_out")]) > 0.0
+            })
+            .await;
+        run.abort();
+    }
+
+    #[tokio::test]
+    async fn inbox_depth_is_sampled_on_receive() {
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        // `Json` is an arity placeholder; the `MutatingTransform` spec is what runs.
+        components.insert(
+            "xform".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Json { skip_to_brace: false, invalid_utf8: Default::default() },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["xform".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let batches: Vec<EventBatch> = (0..3).map(|_| one_counter_batch("hits")).collect();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(BurstInput { batches }), InputRuntimeConfig::default()),
+        );
+        specs.insert("xform".to_string(), NodeSpec::Transform(Box::new(MutatingTransform)));
+        let (tx, _out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let (mut probe, run) = run_probed(g, specs, &["in", "xform", "out"]);
+        let depth = "logit.component.inbox.batches";
+        probe
+            .wait_for("an inbox depth sample from xform and out", |t| {
+                t.has(depth, &[("component", "xform")]) && t.has(depth, &[("component", "out")])
+            })
+            .await;
+        run.abort();
+
+        let totals = probe.totals();
+        assert!(totals.gauge(depth, &[("component", "xform")]).is_some(), "a gauge, not a sum");
+        assert!(totals.gauge(depth, &[("component", "out")]).is_some(), "a gauge, not a sum");
+        assert!(!totals.has(depth, &[("component", "in")]), "a listener's inbox is never fed");
     }
 
     #[tokio::test(flavor = "multi_thread")]

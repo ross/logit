@@ -399,6 +399,8 @@ component is one that appears in several `sources` lists, with nothing to specia
 
 - **Each component is a node** with one inbox (`mpsc::Receiver`, capacity `CHANNEL_CAPACITY`, 64)
   and a `Fanout`: one `mpsc::Sender` per consumer, resolved from the inverted `sources` relation.
+  Each edge also carries the consumer's telemetry handle, so a send that finds the inbox full
+  records `inbox.full` and `inbox.blocked.duration` under the consumer, not the producer.
 - **Fan-in is free**: N sources into one component is N cloned `Sender`s feeding the same inbox. A
   `target` that several routers direct at is fan-in by the same mechanism: each router holds a
   clone of that target's senders ([ADR `target-components`](../adr/target-components.md)).
@@ -641,7 +643,7 @@ A bare file name is under `crates/logit-pipeline/src/` or `crates/logit-inputs/s
 | `runtime.rs`, `run_lua_loop` | `block_on(timeout(wait, io.inbox.recv()))` until the next flush or deferred `max_memory` verdict, on the Lua OS thread | The timeout firing drops a pending `recv` | `mpsc::Receiver::recv` is cancel-safe, as in `run_transform`. The `io` lock is held across the wait, and `watch_lua_thread` takes it only from a busy node, so the two never contend |
 | `runtime.rs`, `watch_lua_thread` | `biased`: `done_rx`, then `shutdown.changed()` (until the signal is seen), then `ticker.tick()` | A tick or `changed` winning drops the other of those two; `done_rx` is polled by reference and never dropped. `done_rx` winning drops a tick and a `changed` | `Interval::tick` and `watch::Receiver::changed` are cancel-safe. `biased` means a thread that has reported is never read as wedged by a tick in the same wake. The wedge verdict's `revoke_lua_io` runs in the tick arm's body, after the `select!` has picked it |
 | `input.rs`, `Input::run_until_shutdown` (default) | Unbiased: `run`, `shutdown.wait_for` | The signal winning drops `run` at once, with no grace: a batch parked in `Fanout::send`, and whatever `run` held before sending it | The default serves listeners with no receive-side buffer: `prometheus_in` in scrape mode (a scrape in flight and its `JoinSet`), `generate_in`, and the accept loops of `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s receiver, whose connection tasks are spawned and outlive the drop. A dropped `Fanout::send` has already counted `batches.sent`: an uncounted loss (`docs/known-gaps/runtime.md`, "Pipeline runtime and graph") |
-| `fanout.rs`, `Fanout::send_with_deadline` | `timeout_at(deadline, reserve_all)`, a permit on every consumer | The deadline firing drops the partial permit set | Dropping a permit releases its slot, so no consumer receives the batch, and nothing is counted sent. `send_with_deadline` takes the batch by value and drops it here, uncounted: `crate::http`'s `deliver_with_deadline` returns an `Undelivered` (`Busy(n)` or `Closed(n)`, the batches left undelivered), `datadog_in` and `datadog_trace_in` answer their client `503`, and the client resends |
+| `fanout.rs`, `Fanout::send_with_deadline` | `timeout_at(deadline, reserve_all)`, a permit on every consumer | The deadline firing drops the partial permit set | Dropping a permit releases its slot, so no consumer receives the batch, and nothing is counted sent. An `inbox.full` it observed before the deadline stays counted, because that observes the consumer's state and isn't a send, and a consumer's blocked timer dropped by the timeout records the time to cancel. `send_with_deadline` takes the batch by value and drops it here, uncounted: `crate::http`'s `deliver_with_deadline` returns an `Undelivered` (`Busy(n)` or `Closed(n)`, the batches left undelivered), `datadog_in` and `datadog_trace_in` answer their client `503`, and the client resends |
 | `udp.rs`, `UdpListener::drive` | Unbiased: `read` (`read_loop_sampled`), `decode` (`decode_loop`) | Neither: the loser is awaited to the end | `read` finishing (a fatal socket error, or `shutdown`) closes the queue, so `decode` drains what `read` queued, flushes its accumulator, and returns; `decode` can't finish first while `read` runs. A grace-backstop drop of `drive` is counted by `ResidualOnDrop`, declared before both futures so it drops after them: it closes the queue and counts what it still holds as `datagrams.dropped{reason="shutdown"}` |
 | `udp.rs`, `read_loop` (read) | Unbiased: `BatchReader::read_batch`, `shutdown.wait_for` | Shutdown winning drops a `read_batch` | `read_batch` runs the syscall and returns in one poll, so a dropped read took nothing off the socket |
 | `udp.rs`, `read_loop` (push) | Unbiased: `ReceiveQueue::push_many`, `shutdown.wait_for` | Shutdown winning drops a `push_many` that was polled (the `Vec` is empty) or never polled (the whole batch is still in it) | A polled `push_many` counts its remainder through its `CountedDrain`. `ReadHalf`'s `Drop` counts what the batch still holds, which covers the never-polled case and the future being dropped at the coop-budget yield between read and push. Both count `datagrams.dropped{reason="shutdown"}`, and `ReadHalf` closes the queue on every exit, the only signal `decode_loop` has that nothing more will arrive. The dropped-future case is reachable under `receive.shutdown_grace: 0s` |
@@ -689,7 +691,14 @@ topology, not a rare one, with these consequences:
 
 - **Backpressure crosses branches.** A stalled sink backs up through every branch that shares an
   upstream with it, not only its own path. That is correct bounded-channel behavior, but one slow
-  destination can head-of-line-block telemetry bound for an unrelated, healthy one.
+  destination can head-of-line-block telemetry bound for an unrelated, healthy one. A sink isolates
+  itself: `buffer.overflow: drop_newest | drop_oldest` keeps its inbox draining and counts what it
+  drops, and `buffer.disk` defers the stall until the spool is full. The default `overflow: block`
+  keeps `tail_in`, TCP listeners, and the native hop lossless, because the sender waits. With every
+  sink set to drop, a transform, Lua node, or router backs up only when it is itself the
+  bottleneck, which is a capacity matter. To find which branch is blocking, read
+  `logit.component.inbox.full`, `inbox.blocked.duration`, and `inbox.batches` on the consumers
+  ([internal-telemetry.md](internal-telemetry.md), "Inbox side: recorded under the consumer").
 - **Fan-out cost depends on shape.** Without a routing primitive (which ADR
   `component-graph-configuration` ruled out), every extra consumer once cloned the outgoing
   `EventBatch` — a deep `Vec<Event>` clone. That clone was load-bearing, not incidental: it makes
@@ -702,9 +711,9 @@ topology, not a rare one, with these consequences:
   three rounds of measurement behind these numbers) keeps that isolation and changes the cost:
   - A single-consumer edge (most edges in the shipped config) and an all-`Output` fan-out are free
     or near-free.
-  - A fan-out mixing an `Output` branch with a mutating branch is racy: 1 or 6 allocations,
+  - A fan-out mixing an `Output` branch with a mutating branch is racy: 1 or 4 allocations,
     decided by real scheduling, never a fixed number.
-  - A fan-out with no `Output` branch still pays the full clone (6 allocations, one worse than the
+  - A fan-out with no `Output` branch still pays the full clone (4 allocations, one worse than the
     pre-`Arc` code), with no path to improvement under the current design.
 
   There is no single "fan-out cost"; `docs/design/memory.md` §3 has the account by shape.
@@ -720,8 +729,7 @@ consumers or all closed. That answers the input's half. An acknowledging listene
 doesn't acknowledge, a batch its direct consumers have all closed: `logit_in` answers
 `GOING_AWAY`, the HTTP listeners answer `503` (gRPC `UNAVAILABLE`, `splunk_hec_in` `503` code 9
 or `500` code 8), and `tail_in` and `docker_in` freeze their checkpoint and stop. A sink closing
-behind an open transform is still acknowledged. Propagating the closure as a shutdown signal, and
-a per-edge `on_full: block | drop` policy, stay open; neither is built.
+behind an open transform is still acknowledged. Propagating the closure as a shutdown signal stays open and isn't built.
 
 **Sink-side buffering decouples a sink's inbox from its delivery**
 (`docs/adr/buffered-sink-delivery.md`). `run_output` splits into a drain half that moves batches
