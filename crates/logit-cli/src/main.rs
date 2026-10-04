@@ -130,14 +130,15 @@ fn check_ready(admin: &str) -> anyhow::Result<String> {
         .enable_all()
         .build()
         .context("building the tokio runtime")?;
+    let shown = logit_core::redact::url(admin);
     runtime.block_on(async {
         let uri: hyper::Uri = format!("{}/readyz", admin.trim_end_matches('/'))
             .parse()
-            .with_context(|| format!("--admin: '{admin}' is not a valid URL"))?;
+            .with_context(|| format!("--admin: '{shown}' is not a valid URL"))?;
         let client = Client::builder(TokioExecutor::new())
             .build_http::<http_body_util::Empty<bytes::Bytes>>();
         let response =
-            client.get(uri).await.with_context(|| format!("requesting {admin}/readyz"))?;
+            client.get(uri).await.with_context(|| format!("requesting {shown}/readyz"))?;
         let status = response.status();
         let body = response
             .into_body()

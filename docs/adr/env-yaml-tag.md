@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-08-30
+updated: 2026-10-03
 ---
 
 # Secrets in config: a general `!env` YAML tag, not per-field `*_env` indirection
@@ -118,9 +118,9 @@ uniformly to all three rather than needing to be threaded through three call sit
 - `crates/logit-pipeline/src/graph.rs` rule 8 (`is_implemented`) Debug-prints a whole
   `ComponentKind` on failure (`"kind {:?} is not implemented yet"`). Harmless today — no
   *unimplemented* kind carries a secret field — but with secrets inlined directly into fields
-  rather than referenced by name, that becomes a real leak the moment one does. Documented in
-  `docs/known-gaps/runtime.md` as a rough edge to fix before any unimplemented kind gains a secret
-  field.
+  rather than referenced by name, that becomes a real leak the moment one does. [Amendment
+  (2026-10-03): rule 8 now prints only the kind's name, and `AGENTS.md`'s "Conventions to hold
+  to" forbids printing a component's config in any error, log, or panic outside tests.]
 - `AGENTS.md`'s "Conventions to hold to" gains a rule: config is loaded through
   `logit_cli::config::load`, never a bare `serde_norway::from_str` — otherwise `!env` and the
   unknown-tag guard silently stop applying on whichever path skips it.

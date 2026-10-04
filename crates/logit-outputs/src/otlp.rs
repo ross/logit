@@ -61,7 +61,7 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as GrpcClient;
 use hyper_util::rt::TokioExecutor;
-use logit_core::{CountGate, Diagnostics, EventBatch, Telemetry};
+use logit_core::{redact, CountGate, Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::{BatchContext, Fault, SeqId};
 use logit_proto::otlp::OtlpEncoder;
 use logit_proto::{Signal, SignalEncoder};
@@ -388,8 +388,9 @@ impl OtlpOutput {
                     &[("signal", signal.as_str()), ("class", "network_error")],
                 );
                 return Err(anyhow::anyhow!(
-                    "OTLP/gRPC {} request to {base} timed out",
-                    signal.as_str()
+                    "OTLP/gRPC {} request to {} timed out",
+                    signal.as_str(),
+                    redact::url(&base),
                 ))
                 .context(Fault::Ambiguous);
             }
@@ -581,8 +582,10 @@ async fn grpc_roundtrip(
     let uri: http::Uri = format!("{base}{}", signal.grpc_method()).parse().map_err(|e| {
         (
             Fault::Permanent,
-            anyhow::Error::new(e)
-                .context(format!("building the OTLP/gRPC request URI from endpoint {base:?}")),
+            anyhow::Error::new(e).context(format!(
+                "building the OTLP/gRPC request URI from endpoint {:?}",
+                redact::url(base)
+            )),
         )
     })?;
     let mut req = http::Request::builder()
