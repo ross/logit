@@ -2586,7 +2586,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_404_from_a_disabled_receiver_is_refused() {
-        let body = "remote write receiver needs to be enabled with --web.enable-remote-write-receiver";
+        let body =
+            "remote write receiver needs to be enabled with --web.enable-remote-write-receiver";
         assert_eq!(remote_write_class(StatusCode::NOT_FOUND, body).await, Fault::Refused);
     }
 
@@ -2604,9 +2605,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_415_unsupported_media_type_is_refused() {
-        let body = "io.prometheus.write.v2.Request protobuf message is not accepted by this server; \
+        let body =
+            "io.prometheus.write.v2.Request protobuf message is not accepted by this server; \
                     only accepts prometheus.WriteRequest";
-        assert_eq!(remote_write_class(StatusCode::UNSUPPORTED_MEDIA_TYPE, body).await, Fault::Refused);
+        assert_eq!(
+            remote_write_class(StatusCode::UNSUPPORTED_MEDIA_TYPE, body).await,
+            Fault::Refused
+        );
     }
 
     /// A 2.0 receiver's written counts ride on the error; the class stays the status's.
@@ -2614,7 +2619,8 @@ mod tests {
     fn a_partial_write_quotes_the_written_counts() {
         let mut headers = HeaderMap::new();
         headers.insert("x-prometheus-remote-write-samples-written", HeaderValue::from_static("3"));
-        headers.insert("x-prometheus-remote-write-exemplars-written", HeaderValue::from_static("0"));
+        headers
+            .insert("x-prometheus-remote-write-exemplars-written", HeaderValue::from_static("0"));
         assert_eq!(written_counts(&headers), " (the receiver wrote 3 samples, 0 exemplars)");
         assert_eq!(written_counts(&HeaderMap::new()), "");
         assert_eq!(remote_write_fault(StatusCode::BAD_REQUEST, "bad sample"), Fault::Rejected);

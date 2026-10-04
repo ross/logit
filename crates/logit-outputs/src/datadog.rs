@@ -1539,9 +1539,10 @@ mod tests {
     #[tokio::test]
     async fn a_refused_route_after_an_accepted_route_is_ambiguous() {
         for status in [403, 404] {
-            let (addr, log) =
-                intake(move |path| (if path == "/api/v2/series" { 202 } else { status }, String::new()))
-                    .await;
+            let (addr, log) = intake(move |path| {
+                (if path == "/api/v2/series" { 202 } else { status }, String::new())
+            })
+            .await;
             let b = batch(vec![gauge(NOW), log_event(NOW, "after")]);
             let err = sink(addr).send_at(&b, NOW).await.unwrap_err();
             assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{status}: {err:#}");

@@ -77,11 +77,8 @@ impl HecStatus {
     pub const SHUTTING_DOWN: HecStatus =
         HecStatus { code: 23, http: 503, text: "Server is shutting down" };
     /// A `200`: the body was taken, with a warning.
-    pub const QUEUE_NEARING_CAPACITY: HecStatus = HecStatus {
-        code: 24,
-        http: 200,
-        text: "HEC queue is approaching its capacity limit",
-    };
+    pub const QUEUE_NEARING_CAPACITY: HecStatus =
+        HecStatus { code: 24, http: 200, text: "HEC queue is approaching its capacity limit" };
     /// A `200`: the body was taken, with a warning.
     pub const ACK_NEARING_CAPACITY: HecStatus =
         HecStatus { code: 25, http: 200, text: "HEC ACK is approaching its capacity limit" };
