@@ -286,10 +286,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   process's own network namespace. `prometheus_out`'s exposition endpoint is the *deferred*
   version of this gap; see "`prometheus_out` has no TLS and no auth either" under
   [Prometheus](prometheus.md).
-- **Readiness is per-process, not per-sink.** A single sink stuck retrying (`degraded`, in the
-  self-logging sense) doesn't flip `/readyz` to unready; a sink's own `buffer:` block (retry
-  budget, queue depth) exists to absorb that. `/readyz`'s `degraded` is reserved for a node that
-  has exited with an error, not one that's behind.
+- **Readiness is per-process, not per-sink.** A single sink holding its queue while its
+  destination refuses it doesn't flip `/readyz` to unready; the sink's `buffer:` block bounds what
+  the hold accumulates, and the `logit.component.retrying` gauge and the paced `retrying` error
+  line are what an alert watches ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md)).
+  `/readyz`'s `degraded` is reserved for a node that has exited with an error, not one that's
+  behind.
   - The one non-exited not-ready answer is `503 stalled`, for a `lua`/`lua_file` component inside
     a script call with no progress
     ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)). It clears when the
