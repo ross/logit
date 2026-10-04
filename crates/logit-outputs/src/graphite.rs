@@ -54,7 +54,7 @@
 //!
 //! Transport-level only; the codec documents its own. `logit.output.batch.bytes` (only when there
 //! is something to send), `logit.output.request.duration`,
-//! `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`, `logit.output.messages`
+//! `logit.output.requests{class="ok"|"clean"|"ambiguous"|"rejected"|"refused"}`, `logit.output.messages`
 //! (entries sent), `logit.output.datapoints` (Σ sent entries' meta; equals `messages` for
 //! plaintext), `logit.output.datagrams` (UDP only), `logit.output.reconnects` (TCP, every connect
 //! after the first), and the `oversize_datagram` drop above. On UDP the sent counts include what

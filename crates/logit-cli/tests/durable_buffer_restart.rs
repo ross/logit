@@ -183,7 +183,6 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
                 SinkStoreConfig::Disk(disk_config),
                 WriteLoopConfig {
                     retry: logit_pipeline::RetryConfig {
-                        total_budget: Duration::from_secs(3600),
                         base_delay: Duration::from_millis(5),
                         max_delay: Duration::from_millis(5),
                     },

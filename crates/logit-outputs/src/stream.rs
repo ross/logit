@@ -331,7 +331,7 @@ mod tests {
     };
 
     const FRAME: &[u8] = b"a:1|c\nb:2|c\n";
-    const CLASSES: [&str; 4] = ["ok", "clean", "ambiguous", "permanent"];
+    const CLASSES: [&str; 5] = ["ok", "clean", "ambiguous", "rejected", "refused"];
 
     fn scripted(script: &ScriptedDial) -> Dial<'_> {
         Dial {

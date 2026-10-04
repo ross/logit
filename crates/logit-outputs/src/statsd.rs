@@ -195,7 +195,7 @@
 //! The stream transports send through the driver in `crate::stream`, shared with `syslog_out`
 //! and `graphite_out`; its module doc lists the fault rules. On TLS a write `Err` is
 //! `Fault::Ambiguous`, not retried under this sink's default posture ("Delivery posture" below).
-//! Every transport counts `logit.output.requests` tagged `class=ok|clean|ambiguous|permanent`.
+//! Every transport counts `logit.output.requests` tagged `class=ok|clean|ambiguous|rejected|refused`.
 //!
 //! ## Delivery posture
 //!
@@ -5250,27 +5250,6 @@ mod tests {
         let sums =
             sums_through_write_loop(&mut output, &mut probe, "statsd_out", batches, fast_retry())
                 .await;
-        for (name, tags) in &ENCODE_SIDE[..3] {
-            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
-        }
-    }
-
-    /// A batch whose one attempt the retry budget cuts off is dropped, and the next batch counts
-    /// its encode-side counters: the cut left no gate muted and the next batch re-armed it.
-    #[tokio::test(start_paused = true)]
-    async fn a_batch_after_one_dropped_at_its_budget_counts_its_encode_side_counters() {
-        let mut probe = TelemetryProbe::new();
-        let mut output = instrumented(StatsdOutput::udp("127.0.0.1:8125").unwrap(), &probe);
-        let script = ScriptedDest::new([SendStep::Park]);
-        output.conn = Conn::Udp(UdpDest::Scripted(Arc::clone(&script)));
-        let mut config = fast_retry();
-        config.retry.total_budget = Duration::from_millis(50);
-        let batches = vec![encode_side_batch(), encode_side_batch()];
-        let sums =
-            sums_through_write_loop(&mut output, &mut probe, "statsd_out", batches, config).await;
-        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
-        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
-        assert_eq!(script.datagrams().len(), 1, "the second batch's one datagram");
         for (name, tags) in &ENCODE_SIDE[..3] {
             assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
         }

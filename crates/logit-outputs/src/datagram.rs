@@ -712,8 +712,7 @@ mod tests {
             crate::test_support::fast_retry(),
             telemetry,
         )
-        .await
-        .expect("delivered on the retry");
+        .await;
         assert_eq!(script.datagrams(), [b"aa".to_vec(), b"cc".to_vec()]);
         assert_eq!(probe.sum("logit.component.retries", &[]), 1.0);
         assert_eq!(

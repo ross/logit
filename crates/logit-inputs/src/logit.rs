@@ -756,7 +756,7 @@ async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     &[("reason", decode_error_reason(&err))],
                 );
                 // A batch past its budget would be past it on every resend, so it's answered as
-                // a frame too large: a `logit_out` drops it as permanent rather than retrying.
+                // a frame too large: a `logit_out` drops it as rejected rather than retrying.
                 if matches!(err, CodecError::BudgetExceeded { .. }) {
                     let message = err.to_string();
                     reject_too_large(stream, pending, message, handshake_timeout, telemetry).await;
@@ -2023,7 +2023,7 @@ mod tests {
     }
 
     /// A batch past its decode budget is answered `Reject{FRAME_TOO_LARGE}` before the close, so
-    /// a `logit_out` drops it as `Fault::Permanent` instead of resending it under at-least-once.
+    /// a `logit_out` drops it as `Fault::Rejected` instead of resending it under at-least-once.
     /// Counted once, as `decode_budget`.
     #[tokio::test]
     async fn a_frame_past_the_decode_budget_is_answered_frame_too_large() {

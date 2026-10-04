@@ -2,8 +2,7 @@
 //! a channel, [`http_recorder`] for the HTTP sinks, which records each request and answers it by
 //! its index, [`answers_once`] and [`answers_once_unix`], which answer one request and refuse the
 //! next connect, and the `testdata/tls` fixtures a TLS collector and client are built from. The
-//! attempt-accounting helpers run a sink through the real write loop and compare its counters;
-//! [`HUNG_REQUEST_BUDGET`] is the retry budget for an HTTP request that never answers. Also the
+//! attempt-accounting helpers run a sink through the real write loop and compare its counters. Also the
 //! stream doubles: [`FakeStream`] for the sinks' plaintext `Box<dyn AsyncStream>` seam,
 //! [`ScriptedDial`] for the fresh connections `crate::stream`'s driver dials, and [`tls_pair`]
 //! with [`TapIo`] for tests that need real tokio-rustls behavior. [`ScriptedDest`] is the datagram
@@ -735,26 +734,10 @@ const PER_ATTEMPT: [&str; 4] = [
     "logit.component.retries",
 ];
 
-/// The retry budget for an HTTP sink's test whose first request never answers, so the budget cuts
-/// the attempt off: 2 s of real time. A paused clock can't stand in, because it runs past the HTTP
-/// client's own timers while socket I/O is in flight.
-///
-/// - Above it, the sink's request timeout (10 s by default: `otlp_out`'s `DEFAULT_TIMEOUT`,
-///   `prometheus_out`'s `DEFAULT_ENDPOINT_TIMEOUT`, and the `DEFAULT_TIMEOUT` of `splunk_hec_out`,
-///   `datadog_out`, and `datadog_trace_out`) is 8 s away, so the budget, not the client, ends the
-///   hung request.
-/// - Below it, a loopback connect and write take milliseconds, so the first request is on the wire
-///   and recorded long before the budget ends, and the next batch's request, which gets its own
-///   budget, finishes well inside it on a loaded machine.
-/// - `drive_write_loop`'s ceiling, `RECV_TIMEOUT` (5 s) plus one budget per batch, is 9 s for the
-///   two batches these tests send, above the one cut-off budget and the delivered batch together.
-pub(crate) const HUNG_REQUEST_BUDGET: Duration = Duration::from_secs(2);
-
 /// A write-loop config whose retries take a millisecond.
 pub(crate) fn fast_retry() -> logit_pipeline::WriteLoopConfig {
     logit_pipeline::WriteLoopConfig {
         retry: logit_pipeline::RetryConfig {
-            total_budget: Duration::from_secs(5),
             base_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(1),
         },
@@ -772,9 +755,7 @@ pub(crate) async fn sums_through_write_loop<O: logit_pipeline::Output + Send>(
     config: logit_pipeline::WriteLoopConfig,
 ) -> Sums {
     let telemetry = probe.telemetry("out", kind, "sink");
-    logit_pipeline::test_util::drive_write_loop(output, batches, config, telemetry)
-        .await
-        .expect("write_loop ends Ok");
+    logit_pipeline::test_util::drive_write_loop(output, batches, config, telemetry).await;
     probe.poll().sums().map(|(name, tags, v)| ((name.to_string(), tags.to_vec()), v)).collect()
 }
 
@@ -1050,6 +1031,15 @@ pub(crate) fn recorded_paths(log: &[Recorded]) -> Vec<&str> {
 /// The bodies of the requests in `log` to `path`, in arrival order.
 pub(crate) fn bodies(log: &[Recorded], path: &str) -> Vec<Vec<u8>> {
     log.iter().filter(|r| r.path == path).map(|r| r.body.clone()).collect()
+}
+
+/// [`fast_retry`] with `delivery: at_most_once` set as an override: an `Ambiguous` failure drops the
+/// batch instead of retrying it, so a test can end a batch's life on a `5xx`.
+pub(crate) fn at_most_once() -> logit_pipeline::WriteLoopConfig {
+    logit_pipeline::WriteLoopConfig {
+        delivery_override: Some(logit_pipeline::DeliveryPosture::AtMostOnce),
+        ..fast_retry()
+    }
 }
 
 /// [`fast_retry`] with `delivery: at_least_once` set as an override, so a test that retries an

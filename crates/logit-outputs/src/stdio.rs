@@ -15,7 +15,7 @@
 //! which.
 //!
 //! **Delivery posture**, for `stdio_out` and `file_out` alike. A write error carries no `Fault`,
-//! so it classifies `Permanent` and is never retried; a failed re-open after rotation is `Clean`
+//! so it classifies `Rejected` and is never retried; a failed re-open after rotation is `Clean`
 //! and is retried under both postures (`FileTarget::rotate`). The one case the posture decides is
 //! a write the shutdown grace cuts off, which is `Ambiguous`: under the default, `at_least_once`
 //! (`docs/adr/delivery-semantics.md`, item 5), the batch stays queued, so a `buffer.disk:` spool
@@ -171,8 +171,7 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
 
         // One `write_all` and one `flush` per batch, so nothing sits in tokio's buffer between
         // batches. `flush` is not `fsync`: the OS page cache still holds the bytes. A write error
-        // carries no `Fault`, so the runtime doesn't retry the batch, and it doesn't count toward
-        // the permanent-failure exit either (`logit_pipeline::output::is_explicitly_permanent`).
+        // carries no `Fault`, so the runtime classifies it `Rejected` and doesn't retry the batch.
         // A failed re-open after rotation is the exception: `Fault::Clean` (`FileTarget::rotate`).
         match &mut self.target {
             Target::Stdout(w) => {
@@ -505,7 +504,7 @@ mod tests {
         // "Pipeline runtime and graph", the `fault` seam entry).
         scope.fail_nth(open, 1, errno::EMFILE).fail_nth(open, 1, errno::EMFILE);
         let config = crate::test_support::fast_retry();
-        drive_write_loop(&mut output, vec![small], config, telemetry).await.unwrap();
+        drive_write_loop(&mut output, vec![small], config, telemetry).await;
         drop(scope);
 
         let totals = probe.poll();

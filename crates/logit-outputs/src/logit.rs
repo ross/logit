@@ -40,17 +40,18 @@
 //! - Connect, TLS, `Hello` write, or `HelloAck` read failure: `Clean`.
 //! - A `HelloAck` that doesn't answer the `Hello` (another protocol version, a codec or
 //!   compression never offered, a mark for an identity `Hello.senders` didn't list, or two marks
-//!   for one identity): `Permanent`. The peer answers the same `Hello` the same way.
-//! - A `Reject`: [`reject_is_permanent`] decides, not where it arrives.
-//!   `REJECT_VERSION_MISMATCH`/`REJECT_NO_COMMON_CODEC`/`REJECT_FRAME_TOO_LARGE` would recur
-//!   identically, so `Permanent`. Any other code (`REJECT_INTERNAL`, the peer at its connection
+//!   for one identity): `Refused`. The peer answers the same `Hello` the same way, so the runtime
+//!   holds the batch and retries, which succeeds once the peer or the config changes.
+//! - A `Reject`: [`reject_fault`] decides, not where it arrives.
+//!   `REJECT_VERSION_MISMATCH`/`REJECT_NO_COMMON_CODEC` would recur identically for every batch,
+//!   so `Refused`; `REJECT_FRAME_TOO_LARGE` is about the one batch, so `Rejected`. Any other code (`REJECT_INTERNAL`, the peer at its connection
 //!   cap; `REJECT_GOING_AWAY`, the peer shutting down, closing an idle connection, or finding no
 //!   consumer to take a frame; a code a newer peer adds) is transient: `Clean` at the handshake.
 //!   After a data frame left, `REJECT_GOING_AWAY` is still `Clean`: `logit_in` writes it only for
 //!   a frame it didn't forward (its module doc's "Shutdown"), so the batch never landed and is
 //!   resent at any delivery posture. Any other transient code there is `Ambiguous`.
 //! - A batch over the sanity cap or the peer's `max_frame_bytes`, or a compressed frame over
-//!   `frame::compressed_bound` of that: `Permanent`, nothing written, a pooled connection kept.
+//!   `frame::compressed_bound` of that: `Rejected`, nothing written, a pooled connection kept.
 //! - **Write phase**: any failure before the frame is completely written and flushed (a write
 //!   `Err` or `Ok(0)`, a failed flush) is `Clean`, with the `io::Error` kept, and the connection
 //!   is dropped. Bytes of the frame may have left the host, but not all of them, so the peer can't
@@ -100,13 +101,13 @@
 //!
 //! **Telemetry** (`docs/design/internal-telemetry.md`'s `logit_out` section):
 //! `logit.output.requests{class}` counts every `submit` failure that carries a `Fault` and every
-//! `await_ack` result, once, as `ok` or the failure's `Fault` (`clean`/`ambiguous`/`permanent`), so
+//! `await_ack` result, once, as `ok` or the failure's `Fault` (`clean`/`ambiguous`/`rejected`/`refused`), so
 //! a `send` counts once; a cancelled call isn't counted. `logit.output.reconnects` counts every
 //! validated handshake after the first, probe-driven ones included. `logit.output.ack.duration`
 //! times each read of the wire for an ack, not an `await_ack` answered from the in-flight list. The
 //! gauges `logit.output.in_flight` and `logit.output.window` hold the frames awaiting their commit
-//! and the negotiated window, and read 0 and 1 after every connection drop. A `Permanent` past the
-//! head is counted when it becomes the head.
+//! and the negotiated window, and read 0 and 1 after every connection drop. A `Rejected` or `Refused` past
+//! the head is counted when it becomes the head.
 
 use crate::Output;
 use anyhow::Context;
@@ -138,7 +139,7 @@ use crate::tls::{poll_pending_close, AsyncStream, PendingClose};
 /// A live, handshaken connection.
 struct Conn {
     stream: Box<dyn AsyncStream>,
-    /// The peer's `HelloAck.max_frame_bytes`. A larger batch is rejected locally as `Permanent`
+    /// The peer's `HelloAck.max_frame_bytes`. A larger batch is rejected locally as `Rejected`
     /// rather than sent and rejected by the peer.
     peer_max_frame_bytes: u32,
     /// The negotiated compression; `None` when the peer doesn't support what was offered.
@@ -379,8 +380,7 @@ impl LogitOutput {
             control::ControlMessage::HelloAck(ack) => ack,
             control::ControlMessage::Reject(reject) => {
                 // Nothing of this batch was written, so a transient reject is `Clean`.
-                let fault =
-                    if reject_is_permanent(reject.code) { Fault::Permanent } else { Fault::Clean };
+                let fault = reject_fault(reject.code).unwrap_or(Fault::Clean);
                 return Err(anyhow::anyhow!(
                     "logit_in rejected this connection (code {}): {}",
                     reject.code,
@@ -394,7 +394,7 @@ impl LogitOutput {
             }
         };
 
-        let compression = validate_hello_ack(&ack, &hello).context(Fault::Permanent)?;
+        let compression = validate_hello_ack(&ack, &hello).context(Fault::Refused)?;
         let window = self.window.min(ack.window) as usize;
         self.telemetry.gauge("logit.output.window", window as f64, &[]);
 
@@ -421,7 +421,7 @@ impl LogitOutput {
 /// Checks that `ack` answers `hello`: the same protocol version, a codec and compression `hello`
 /// offered, and marks only for identities `hello.senders` listed, each at most once. Returns the
 /// compression to frame with. A peer that answers one `Hello` this way answers every identical
-/// one the same way, so the caller's verdict is `Permanent`, like a version or codec `Reject`.
+/// one the same way, so the caller's verdict is `Refused`, like a version or codec `Reject`.
 fn validate_hello_ack(
     ack: &control::HelloAck,
     hello: &control::Hello,
@@ -477,16 +477,17 @@ fn compression_tag(compression: Compression) -> &'static str {
     }
 }
 
-/// Whether retrying the identical `Hello` or frame would hit this `Reject` again, the only case
-/// that justifies `Fault::Permanent`. Any other code, including one a newer peer adds
-/// (`Reject.code` is a u16 so reasons can be added without a version bump), is transient.
-fn reject_is_permanent(code: u16) -> bool {
-    matches!(
-        code,
-        control::REJECT_VERSION_MISMATCH
-            | control::REJECT_NO_COMMON_CODEC
-            | control::REJECT_FRAME_TOO_LARGE
-    )
+/// The fault of a `Reject` that retrying the identical `Hello` or frame would hit again: `Refused`
+/// when the peer would refuse every batch (a version or codec it can't speak), `Rejected` when it
+/// refuses this frame (one too large for it). `None` for any other code, including one a newer peer
+/// adds (`Reject.code` is a u16 so reasons can be added without a version bump), which is
+/// transient.
+fn reject_fault(code: u16) -> Option<Fault> {
+    match code {
+        control::REJECT_VERSION_MISMATCH | control::REJECT_NO_COMMON_CODEC => Some(Fault::Refused),
+        control::REJECT_FRAME_TOO_LARGE => Some(Fault::Rejected),
+        _ => None,
+    }
 }
 
 impl LogitOutput {
@@ -528,7 +529,7 @@ impl LogitOutput {
                 payload.len(),
                 frame::MAX_SANE_UNCOMPRESSED_LEN
             ));
-            return Err(anyhow::anyhow!("batch too large to send")).context(Fault::Permanent);
+            return Err(anyhow::anyhow!("batch too large to send")).context(Fault::Rejected);
         }
 
         let mut conn = match self.stream.take() {
@@ -570,7 +571,7 @@ impl LogitOutput {
                 payload.len()
             ));
             return Err(anyhow::anyhow!("batch too large for this connection"))
-                .context(Fault::Permanent);
+                .context(Fault::Rejected);
         }
 
         let framed = match frame::write_frame_with_flags(
@@ -582,7 +583,7 @@ impl LogitOutput {
             Ok(framed) => framed,
             Err(err) => {
                 self.stream = Some(conn);
-                return Err(err).context(Fault::Permanent);
+                return Err(err).context(Fault::Rejected);
             }
         };
         // The peer bounds `compressed_len` by `frame::compressed_bound`, lz4's worst case over
@@ -596,7 +597,7 @@ impl LogitOutput {
                 frame::compressed_bound(bound)
             ));
             return Err(anyhow::anyhow!("compressed batch too large for this connection"))
-                .context(Fault::Permanent);
+                .context(Fault::Rejected);
         }
 
         if conn.nothing_in_flight() {
@@ -703,8 +704,8 @@ impl LogitOutput {
 /// after writing it, so there it means no frame still unanswered here landed: `Clean`. Any other
 /// transient code after a frame left is `Ambiguous`.
 fn reject_in_place_of_ack(reject: control::Reject) -> anyhow::Error {
-    let fault = if reject_is_permanent(reject.code) {
-        Fault::Permanent
+    let fault = if let Some(fault) = reject_fault(reject.code) {
+        fault
     } else if reject.code == control::REJECT_GOING_AWAY {
         Fault::Clean
     } else {
@@ -779,8 +780,8 @@ impl Output for LogitOutput {
 
     /// Counts a failure that carries a [`Fault`] in `logit.output.requests`. A failure with
     /// frames in flight carries none and isn't counted: the `await_ack`s after it count the
-    /// round's outcome, as the `await_ack` after a success does. A `Permanent` past the head is
-    /// counted only once its batch is the head: `write_loop` stops the fill there and submits
+    /// round's outcome, as the `await_ack` after a success does. A `Rejected` or `Refused` past the
+    /// head is counted only once its batch is the head: `write_loop` stops the fill there and submits
     /// that batch again each round until then.
     async fn submit(
         &mut self,
@@ -791,7 +792,7 @@ impl Output for LogitOutput {
         let at_head = self.nothing_in_flight();
         let result = self.submit_frame(batch, ctx, seq).await;
         let counted = match result.as_ref().map_err(|err| err.downcast_ref::<Fault>()) {
-            Err(Some(Fault::Permanent)) => at_head,
+            Err(Some(Fault::Rejected | Fault::Refused)) => at_head,
             Err(Some(_)) => true,
             Ok(()) | Err(None) => false,
         };
@@ -913,9 +914,7 @@ mod tests {
     use logit_inputs::logit::{LogitInput, TlsServerSettings};
     use logit_inputs::Input;
     use logit_pipeline::test_util::{TelemetryProbe, RECV_TIMEOUT};
-    use logit_pipeline::{
-        classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fanout,
-    };
+    use logit_pipeline::{classify, is_retryable, DeliveryPosture, Fanout};
     use rustls_pki_types::ServerName;
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
@@ -1314,7 +1313,7 @@ mod tests {
         send_next(&mut output, &sample_batch()).await.expect("the next send reconnects");
         let totals = probe.poll();
         assert_eq!(totals.sum("logit.output.reconnects", &[]), 1.0);
-        assert_eq!(requests(totals), ([1.0, 0.0, 1.0, 0.0], 2.0));
+        assert_eq!(requests(totals), ([1.0, 0.0, 1.0, 0.0, 0.0], 2.0));
     }
 
     // ---- close_notify ------------------------------------------------------------------------
@@ -1500,8 +1499,8 @@ mod tests {
     // ---- logit.output.requests: one count per returned attempt ------------------------------
 
     /// Every `logit.output.requests` point by class, and their total.
-    fn requests(totals: &logit_pipeline::test_util::Totals) -> ([f64; 4], f64) {
-        let by_class = ["ok", "clean", "ambiguous", "permanent"]
+    fn requests(totals: &logit_pipeline::test_util::Totals) -> ([f64; 5], f64) {
+        let by_class = ["ok", "clean", "ambiguous", "rejected", "refused"]
             .map(|class| totals.sum("logit.output.requests", &[("class", class)]));
         (by_class, totals.sum("logit.output.requests", &[]))
     }
@@ -1518,13 +1517,13 @@ mod tests {
         let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
 
         assert_eq!(classify(&err), Fault::Clean);
-        assert_eq!(requests(probe.poll()), ([0.0, 1.0, 0.0, 0.0], 1.0));
+        assert_eq!(requests(probe.poll()), ([0.0, 1.0, 0.0, 0.0, 0.0], 1.0));
     }
 
     #[tokio::test]
     async fn a_handshake_reject_counts_one_request_of_its_class() {
         for (code, class) in
-            [(control::REJECT_VERSION_MISMATCH, "permanent"), (control::REJECT_INTERNAL, "clean")]
+            [(control::REJECT_VERSION_MISMATCH, "refused"), (control::REJECT_INTERNAL, "clean")]
         {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap().to_string();
@@ -1543,11 +1542,11 @@ mod tests {
         }
     }
 
-    /// Both reachable too-large returns count `permanent` and keep a pooled connection. The
+    /// Both reachable too-large returns count `rejected` and keep a pooled connection. The
     /// third, a compressed frame over `frame::compressed_bound`, can't be reached with lz4: that
     /// bound is lz4's worst case over a payload the check before it already bounded.
     #[tokio::test]
-    async fn each_too_large_return_counts_one_permanent_request_and_keeps_the_connection() {
+    async fn each_too_large_return_counts_one_rejected_request_and_keeps_the_connection() {
         let (addr, mut rx) = spawn_real_listener().await;
         let mut probe = TelemetryProbe::new();
         let mut output =
@@ -1557,15 +1556,15 @@ mod tests {
 
         let over_the_sanity_cap = batch_of(frame::MAX_SANE_UNCOMPRESSED_LEN as usize + 1);
         let err = send_next(&mut output, &over_the_sanity_cap).await.unwrap_err();
-        assert_eq!(classify(&err), Fault::Permanent, "{err:#}");
+        assert_eq!(classify(&err), Fault::Rejected, "{err:#}");
         assert!(output.stream.is_some(), "the sanity-cap check runs before the pool is touched");
 
         output.stream.as_mut().unwrap().peer_max_frame_bytes = 8;
         let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
-        assert_eq!(classify(&err), Fault::Permanent, "{err:#}");
+        assert_eq!(classify(&err), Fault::Rejected, "{err:#}");
         assert!(output.stream.is_some(), "a batch over the peer's bound keeps the connection");
 
-        assert_eq!(requests(probe.poll()), ([1.0, 0.0, 0.0, 2.0], 3.0));
+        assert_eq!(requests(probe.poll()), ([1.0, 0.0, 0.0, 2.0, 0.0], 3.0));
     }
 
     /// Over a run of every kind of outcome, the `requests` total is the number of `send` calls.
@@ -1593,7 +1592,7 @@ mod tests {
         output.endpoint = addr;
         send_next(&mut output, &batch).await.unwrap();
         recv_batch(&mut rx).await;
-        // Permanent: over the peer's bound.
+        // Rejected: over the peer's bound.
         output.stream.as_mut().unwrap().peer_max_frame_bytes = 8;
         send_next(&mut output, &batch).await.unwrap_err();
         output.stream.as_mut().unwrap().peer_max_frame_bytes = frame::MAX_SANE_UNCOMPRESSED_LEN;
@@ -1605,7 +1604,7 @@ mod tests {
         send_next(&mut output, &batch).await.unwrap_err();
 
         const SENDS: f64 = 5.0;
-        assert_eq!(requests(probe.poll()), ([2.0, 1.0, 1.0, 1.0], SENDS));
+        assert_eq!(requests(probe.poll()), ([2.0, 1.0, 1.0, 1.0, 0.0], SENDS));
     }
 
     // ---- HelloAck validation --------------------------------------------------------------------
@@ -1646,18 +1645,17 @@ mod tests {
         addr
     }
 
-    /// A `HelloAck` that doesn't answer this sink's `Hello` fails the attempt `Permanent`, as a
+    /// A `HelloAck` that doesn't answer this sink's `Hello` fails the attempt `Refused`, as a
     /// version or codec `Reject` does, and never counts as a connection: the next handshake that
     /// passes is this sink's first, not a reconnect.
-    async fn assert_hello_ack_is_refused_as_permanent(bad: control::HelloAck, what: &str) {
+    async fn assert_hello_ack_is_refused(bad: control::HelloAck, what: &str) {
         let addr = spawn_peer_answering_first_with(bad).await;
         let mut probe = TelemetryProbe::new();
         let mut output =
             LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
 
         let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
-        assert_eq!(classify(&err), Fault::Permanent, "{what}: {err:#}");
-        assert!(is_explicitly_permanent(&err), "{what}");
+        assert_eq!(classify(&err), Fault::Refused, "{what}: {err:#}");
         assert!(output.stream.is_none(), "{what}: the refused connection is dropped");
 
         send_next(&mut output, &sample_batch())
@@ -1668,33 +1666,33 @@ mod tests {
             !totals.has("logit.output.reconnects", &[]),
             "{what}: a refused handshake is not a connection"
         );
-        assert_eq!(totals.sum("logit.output.requests", &[("class", "permanent")]), 1.0, "{what}");
+        assert_eq!(totals.sum("logit.output.requests", &[("class", "refused")]), 1.0, "{what}");
         assert_eq!(totals.sum("logit.output.requests", &[("class", "ok")]), 1.0, "{what}");
     }
 
     #[tokio::test]
-    async fn a_hello_ack_naming_a_codec_never_offered_is_permanent() {
+    async fn a_hello_ack_naming_a_codec_never_offered_is_refused() {
         let bad = control::HelloAck { codec: 99, ..hello_ack() };
-        assert_hello_ack_is_refused_as_permanent(bad, "codec 99").await;
+        assert_hello_ack_is_refused(bad, "codec 99").await;
     }
 
     #[tokio::test]
-    async fn a_hello_ack_naming_an_unknown_compression_is_permanent() {
+    async fn a_hello_ack_naming_an_unknown_compression_is_refused() {
         let bad = control::HelloAck { compression: 7, ..hello_ack() };
-        assert_hello_ack_is_refused_as_permanent(bad, "compression 7").await;
+        assert_hello_ack_is_refused(bad, "compression 7").await;
     }
 
     /// This sink offers lz4 only when configured to; by default its `Hello` offers none.
     #[tokio::test]
-    async fn a_hello_ack_naming_a_compression_never_offered_is_permanent() {
+    async fn a_hello_ack_naming_a_compression_never_offered_is_refused() {
         let bad = control::HelloAck { compression: Compression::Lz4 as u8, ..hello_ack() };
-        assert_hello_ack_is_refused_as_permanent(bad, "lz4 not offered").await;
+        assert_hello_ack_is_refused(bad, "lz4 not offered").await;
     }
 
     #[tokio::test]
-    async fn a_hello_ack_with_another_protocol_version_is_permanent() {
+    async fn a_hello_ack_with_another_protocol_version_is_refused() {
         let bad = control::HelloAck { version: control::PROTOCOL_VERSION + 1, ..hello_ack() };
-        assert_hello_ack_is_refused_as_permanent(bad, "version mismatch").await;
+        assert_hello_ack_is_refused(bad, "version mismatch").await;
     }
 
     #[tokio::test]
@@ -1843,7 +1841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reject_version_mismatch_is_permanent_and_explicitly_so() {
+    async fn reject_version_mismatch_is_refused() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(fake_peer(listener, |_hello| {
@@ -1855,12 +1853,11 @@ mod tests {
 
         let mut output = LogitOutput::new(addr);
         let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
-        assert_eq!(classify(&err), Fault::Permanent);
-        assert!(is_explicitly_permanent(&err));
+        assert_eq!(classify(&err), Fault::Refused);
     }
 
     #[tokio::test]
-    async fn reject_internal_at_the_handshake_is_clean_not_permanent() {
+    async fn reject_internal_at_the_handshake_is_clean_not_refused() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(fake_peer(listener, |_hello| {
@@ -1873,11 +1870,10 @@ mod tests {
         let mut output = LogitOutput::new(addr);
         let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Clean);
-        assert!(!is_explicitly_permanent(&err));
     }
 
     #[tokio::test]
-    async fn reject_going_away_at_the_handshake_is_clean_not_permanent() {
+    async fn reject_going_away_at_the_handshake_is_clean_not_refused() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(fake_peer(listener, |_hello| {
@@ -1890,7 +1886,6 @@ mod tests {
         let mut output = LogitOutput::new(addr);
         let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Clean);
-        assert!(!is_explicitly_permanent(&err));
     }
 
     #[tokio::test]
@@ -1904,7 +1899,6 @@ mod tests {
         let mut output = LogitOutput::new(addr);
         let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Ambiguous);
-        assert!(!is_explicitly_permanent(&err));
     }
 
     #[tokio::test]
@@ -1920,7 +1914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reject_frame_too_large_after_the_frame_was_sent_is_still_permanent() {
+    async fn a_reject_frame_too_large_after_the_frame_was_sent_is_still_rejected() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(fake_peer(listener, |_hello| FakePeerBehavior::AckThenReject {
@@ -1929,8 +1923,7 @@ mod tests {
 
         let mut output = LogitOutput::new(addr);
         let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
-        assert_eq!(classify(&err), Fault::Permanent);
-        assert!(is_explicitly_permanent(&err));
+        assert_eq!(classify(&err), Fault::Rejected);
     }
 
     /// `logit_in` writes `Reject{GOING_AWAY}` only before the frame it answers is forwarded
@@ -2127,7 +2120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_batch_is_permanent_and_the_connection_is_kept() {
+    async fn an_oversized_batch_is_rejected_and_the_connection_is_kept() {
         let (addr, mut rx) = spawn_real_listener().await;
         let mut output = LogitOutput::new(addr);
 
@@ -2138,7 +2131,7 @@ mod tests {
         output.stream.as_mut().unwrap().peer_max_frame_bytes = 8;
 
         let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
-        assert_eq!(classify(&err), Fault::Permanent);
+        assert_eq!(classify(&err), Fault::Rejected);
         assert!(
             output.stream.is_some(),
             "an oversized batch must not drop an otherwise-good connection"
@@ -2606,7 +2599,7 @@ mod tests {
                 .expect("an Ack");
         }
         let totals = probe.poll();
-        assert_eq!(requests(totals), ([3.0, 0.0, 0.0, 0.0], 3.0));
+        assert_eq!(requests(totals), ([3.0, 0.0, 0.0, 0.0, 0.0], 3.0));
         assert_eq!(totals.gauge("logit.output.in_flight", &[]), Some(0.0));
         assert_eq!(output.stream.as_ref().map(|conn| conn.in_flight.len()), Some(0));
         peer.abort();
@@ -2712,7 +2705,7 @@ mod tests {
         assert!(output.stream.is_none(), "the connection is dropped with both unanswered frames");
         assert_eq!(output.window(), 1, "no connection, no negotiated window");
         let totals = probe.poll();
-        assert_eq!(requests(totals), ([1.0, 1.0, 0.0, 0.0], 2.0));
+        assert_eq!(requests(totals), ([1.0, 1.0, 0.0, 0.0, 0.0], 2.0));
         assert_eq!(totals.gauge("logit.output.in_flight", &[]), Some(0.0));
         peer.abort();
     }
@@ -2750,7 +2743,7 @@ mod tests {
         output.await_ack().await.expect("and is acked");
         let totals = probe.poll();
         assert_eq!(totals.sum("logit.output.reconnects", &[]), 1.0);
-        assert_eq!(requests(totals), ([2.0, 0.0, 1.0, 0.0], 3.0));
+        assert_eq!(requests(totals), ([2.0, 0.0, 1.0, 0.0, 0.0], 3.0));
     }
 
     /// A write that fails with frames in flight returns an unclassified error and leaves the
@@ -2796,7 +2789,7 @@ mod tests {
         let totals = probe.poll();
         assert_eq!(
             requests(totals),
-            ([2.0, 0.0, 0.0, 0.0], 2.0),
+            ([2.0, 0.0, 0.0, 0.0, 0.0], 2.0),
             "an unclassified submit counts none"
         );
         peer.abort();
@@ -2856,7 +2849,7 @@ mod tests {
         assert!(output.stream.is_none());
         assert_eq!(
             requests(probe.poll()),
-            ([2.0, 0.0, 1.0, 0.0], 3.0),
+            ([2.0, 0.0, 1.0, 0.0, 0.0], 3.0),
             "the stalled submit counts nothing; the drained acks count ok, the parked frame ambiguous"
         );
     }
@@ -2964,7 +2957,7 @@ mod tests {
         output.await_ack().await.expect("the head is acked");
         assert_eq!(in_flight_of(&output), [(pair(A, 2), false)]);
         let totals = probe.poll();
-        assert_eq!(requests(totals), ([1.0, 0.0, 0.0, 0.0], 1.0));
+        assert_eq!(requests(totals), ([1.0, 0.0, 0.0, 0.0, 0.0], 1.0));
         assert_eq!(totals.gauge("logit.output.in_flight", &[]), Some(1.0));
     }
 
@@ -2991,7 +2984,7 @@ mod tests {
         output.await_ack().await.expect("B1");
         assert!(in_flight_of(&output).is_empty());
         let totals = probe.poll();
-        assert_eq!(requests(totals), ([4.0, 0.0, 0.0, 0.0], 4.0));
+        assert_eq!(requests(totals), ([4.0, 0.0, 0.0, 0.0, 0.0], 4.0));
         assert_eq!(ack_waits(totals), 2, "one wire read per Ack");
     }
 
@@ -3010,7 +3003,7 @@ mod tests {
         assert!(format!("{err:#}").contains("oldest frame in flight"), "{err:#}");
         assert!(output.stream.is_none(), "the connection is dropped");
         let totals = probe.poll();
-        assert_eq!(requests(totals), ([0.0, 0.0, 1.0, 0.0], 1.0));
+        assert_eq!(requests(totals), ([0.0, 0.0, 1.0, 0.0, 0.0], 1.0));
         assert_eq!(totals.gauge("logit.output.in_flight", &[]), Some(0.0));
     }
 
@@ -3054,16 +3047,16 @@ mod tests {
         }
         assert!(in_flight_of(&output).is_empty());
         let totals = probe.poll();
-        assert_eq!(requests(totals), ([3.0, 0.0, 0.0, 0.0], 3.0), "each counts once, as ok");
+        assert_eq!(requests(totals), ([3.0, 0.0, 0.0, 0.0, 0.0], 3.0), "each counts once, as ok");
         assert_eq!(ack_waits(totals), 1, "one wire read");
         assert_eq!(totals.gauge("logit.output.in_flight", &[]), Some(0.0));
     }
 
-    /// A batch over the peer's bound past the head fails `Permanent` with no count and no warning:
+    /// A batch over the peer's bound past the head fails `Rejected` with no count and no warning:
     /// `write_loop` stops the fill there and submits it again each round, and it is counted and
     /// warned once, when it is the head.
     #[tokio::test]
-    async fn a_permanent_frame_past_the_head_is_counted_once_when_it_becomes_the_head() {
+    async fn a_rejected_frame_past_the_head_is_counted_once_when_it_becomes_the_head() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let peer = tokio::spawn(async move {
@@ -3089,7 +3082,7 @@ mod tests {
         submit_next(&mut output, &sample_batch()).await.unwrap();
         for _round in 0..2 {
             let err = submit_next(&mut output, &oversized).await.unwrap_err();
-            assert_eq!(classify(&err), Fault::Permanent, "{err:#}");
+            assert_eq!(classify(&err), Fault::Rejected, "{err:#}");
         }
         assert!(!probe.poll().has("logit.output.requests", &[]), "nothing counted past the head");
         assert_eq!(diag.occurrences("frame_too_large"), 0, "nor warned");
@@ -3097,9 +3090,9 @@ mod tests {
         output.await_ack().await.unwrap();
 
         let err = submit_next(&mut output, &oversized).await.unwrap_err();
-        assert_eq!(classify(&err), Fault::Permanent, "{err:#}");
+        assert_eq!(classify(&err), Fault::Rejected, "{err:#}");
         assert!(output.stream.is_some(), "the connection is kept");
-        assert_eq!(requests(probe.poll()), ([2.0, 0.0, 0.0, 1.0], 3.0));
+        assert_eq!(requests(probe.poll()), ([2.0, 0.0, 0.0, 1.0, 0.0], 3.0));
         assert_eq!(diag.occurrences("frame_too_large"), 1);
         peer.abort();
     }
@@ -3192,7 +3185,7 @@ mod tests {
 
         assert_eq!(collected.await.unwrap(), (1..=20).collect::<Vec<i64>>());
         assert_eq!(output.window(), 8, "logit_in answers the offered window");
-        assert_eq!(requests(probe.poll()), ([20.0, 0.0, 0.0, 0.0], 20.0));
+        assert_eq!(requests(probe.poll()), ([20.0, 0.0, 0.0, 0.0, 0.0], 20.0));
     }
 
     /// A connection dropped with two frames unacknowledged: both were forwarded, and the resend
@@ -3351,7 +3344,7 @@ mod tests {
         assert_eq!(totals.sum("logit.output.batches.resumed", &[]), 2.0);
         assert_eq!(totals.sum("logit.proto.frames", &[]), 0.0, "nothing was written");
         assert_eq!(ack_waits(totals), 0, "nothing was read");
-        assert_eq!(requests(totals), ([2.0, 0.0, 0.0, 0.0], 2.0));
+        assert_eq!(requests(totals), ([2.0, 0.0, 0.0, 0.0, 0.0], 2.0));
     }
 
     /// A frame above its identity's mark is sent and acked on the wire, after the covered one
@@ -3373,7 +3366,7 @@ mod tests {
         assert_eq!(next_seen(&mut rx).await, Seen::Frame(pair(A, 2)));
         let totals = probe.poll();
         assert_eq!(totals.sum("logit.output.batches.resumed", &[]), 1.0);
-        assert_eq!(requests(totals), ([2.0, 0.0, 0.0, 0.0], 2.0));
+        assert_eq!(requests(totals), ([2.0, 0.0, 0.0, 0.0, 0.0], 2.0));
     }
 
     /// An identity `HelloAck.marks` omits has mark 0: every frame of it is sent.
@@ -3424,7 +3417,7 @@ mod tests {
         assert_eq!(probe.sum("logit.output.batches.resumed", &[]), 16.0);
     }
 
-    /// With nothing to resend, a batch over the sanity cap fails `Permanent` before any connect.
+    /// With nothing to resend, a batch over the sanity cap fails `Rejected` before any connect.
     #[tokio::test]
     async fn an_oversized_head_with_nothing_to_resend_never_connects() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3433,7 +3426,7 @@ mod tests {
         let too_large = batch_of(frame::MAX_SANE_UNCOMPRESSED_LEN as usize + 1);
         let err = send_next(&mut output, &too_large).await.unwrap_err();
 
-        assert_eq!(classify(&err), Fault::Permanent, "{err:#}");
+        assert_eq!(classify(&err), Fault::Rejected, "{err:#}");
         assert!(output.stream.is_none());
         tokio::select! {
             biased;
@@ -3443,7 +3436,7 @@ mod tests {
     }
 
     /// With identities to resend, the connect comes first; a head over the sanity cap then fails
-    /// `Permanent` as it would on any connection, and the connection is kept.
+    /// `Rejected` as it would on any connection, and the connection is kept.
     #[tokio::test]
     async fn an_oversized_head_with_identities_to_resend_connects_and_keeps_the_connection() {
         let (addr, mut rx) = resume_peer(vec![], None).await;
@@ -3453,17 +3446,17 @@ mod tests {
         let too_large = batch_of(frame::MAX_SANE_UNCOMPRESSED_LEN as usize + 1);
         let err = send_next(&mut output, &too_large).await.unwrap_err();
 
-        assert_eq!(classify(&err), Fault::Permanent, "{err:#}");
+        assert_eq!(classify(&err), Fault::Rejected, "{err:#}");
         assert!(output.stream.is_some(), "the connection made for the resend is kept");
         assert_eq!(next_seen(&mut rx).await, Seen::Hello(vec![A]));
     }
 
-    /// A mark for an identity the `Hello` didn't list doesn't answer it: `Permanent`, as an
+    /// A mark for an identity the `Hello` didn't list doesn't answer it: `Refused`, as an
     /// unoffered codec is.
     #[tokio::test]
-    async fn a_hello_ack_mark_for_an_unoffered_identity_is_permanent() {
+    async fn a_hello_ack_mark_for_an_unoffered_identity_is_refused() {
         let bad = control::HelloAck { marks: vec![(A, 1)], ..hello_ack() };
-        assert_hello_ack_is_refused_as_permanent(bad, "a mark never asked for").await;
+        assert_hello_ack_is_refused(bad, "a mark never asked for").await;
     }
 
     #[test]

@@ -167,7 +167,7 @@
 //! `crate::stream`, shared with `statsd_out` and `graphite_out`; its module doc lists the
 //! fault rules. On TLS a write `Err` is `Fault::Ambiguous`, and on both a batch is called
 //! delivered only after a flush. Both transports count `logit.output.requests` tagged
-//! `class=ok|clean|ambiguous|permanent`.
+//! `class=ok|clean|ambiguous|rejected|refused`.
 //!
 //! ## Delivery posture
 //!
@@ -2145,11 +2145,11 @@ mod tests {
         .with_tls(&tls_settings(|t| t.ca_file = Some("ca.pem".to_string())), &testdata_dir())
         .expect("a tls: block on the TCP transport is legal");
         let batch = batch_with(vec![log_event(0, "rejected", None)]);
-        // Usually `Ok`, but a fast RST can fail the write; either way never `Permanent`.
+        // Usually `Ok`, but a fast RST can fail the write; either way never `Rejected` or `Refused`.
         if let Err(err) = output.send(&batch).await {
             assert!(
                 matches!(logit_pipeline::classify(&err), Fault::Clean | Fault::Ambiguous),
-                "a rejected-handshake write is never Permanent: {err:?}"
+                "a rejected-handshake write is never rejected or refused: {err:?}"
             );
         }
         drop(output);
@@ -2256,7 +2256,7 @@ mod tests {
         if let Err(err) = &result {
             assert!(
                 matches!(logit_pipeline::classify(err), Fault::Clean | Fault::Ambiguous),
-                "a failed cleartext write is never Permanent: {err:?}"
+                "a failed cleartext write is never rejected or refused: {err:?}"
             );
         }
         drop(output);

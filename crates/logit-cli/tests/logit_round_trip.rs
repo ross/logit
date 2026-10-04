@@ -447,7 +447,6 @@ mod window {
                 SinkStoreConfig::Disk(disk),
                 WriteLoopConfig {
                     retry: logit_pipeline::RetryConfig {
-                        total_budget: Duration::from_secs(60),
                         base_delay: Duration::from_millis(5),
                         max_delay: Duration::from_millis(50),
                     },

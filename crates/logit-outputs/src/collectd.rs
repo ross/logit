@@ -40,7 +40,7 @@
 //!
 //! Transport-level only; the codec documents its own. `logit.output.batch.bytes` (only when there
 //! is something to send), `logit.output.request.duration`,
-//! `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`, `logit.output.messages`
+//! `logit.output.requests{class="ok"|"clean"|"ambiguous"|"rejected"|"refused"}`, `logit.output.messages`
 //! (Σ sent entries' meta) and `logit.output.datagrams`, both counting what reached the kernel
 //! before a failure too, and the `oversize_datagram` drop above.
 //!

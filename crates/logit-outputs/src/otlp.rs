@@ -16,18 +16,19 @@
 //! **One `send`, several requests.** An [`EventBatch`] mixes logs, metrics, and spans (ADR
 //! `multi-payload-events`), but OTLP is three services, so `send` issues one request per
 //! non-empty signal [`logit_proto::SignalEncoder::encode_signals`] returns, sequentially. Each
-//! request's verdict stands on its own ([`crate::http::Outcomes`]): a `Permanent` answer to one
+//! request's verdict stands on its own ([`crate::http::Outcomes`]): a `Rejected` answer to one
 //! signal counts that signal's records as `logit.output.records.dropped{signal, reason="rejected"}`,
 //! warns (throttled, `signal_rejected`), and the send goes on to the next signal. A backend that
-//! takes only some signals (Tempo takes traces) fed a mixed batch delivers what it takes, and the
-//! send succeeds. A send fails `Permanent` only when every signal was rejected. An auth answer
-//! (HTTP 401/403, gRPC `UNAUTHENTICATED`/`PERMISSION_DENIED`) is a rejection of that one signal
-//! too: a credential can be scoped per signal (a Grafana Cloud access policy granting
-//! `traces:write` without `metrics:write`), so no answer to one signal says anything about another.
-//! A token refused on every signal still ends the send with the first rejection, explicitly
-//! `Permanent`, so a bad token still trips `write_loop`'s sustained-permanent-failure guard, at
-//! the cost of at most two more requests per batch. A
-//! `Clean` or `Ambiguous` failure stops the send, and a retry resends the whole batch, the signals
+//! takes only some signals (Tempo takes traces) fed a mixed batch delivers what it takes when it
+//! answers the others with a rejection, and the send succeeds. A send fails `Rejected` only when
+//! every signal was rejected. A `Refused` answer (an auth answer, a missing endpoint, an
+//! unimplemented method) stops the send: the runtime holds the batch and retries it. Once an
+//! earlier signal was accepted it stops the send as `Ambiguous` instead
+//! ([`crate::http::after_delivery`]), so an at-most-once sink drops the batch rather than resend
+//! what was applied. A traces-only backend fed a mixed batch answers the other signals this way,
+//! and the batch is retried or dropped whole; `has_signal` or `keep_signals` ahead of the sink
+//! keeps the other signals off it.
+//! A `Clean` or `Ambiguous` failure stops the send, and a retry resends the whole batch, the signals
 //! whose requests succeeded included. See `docs/adr/delivery-semantics.md`'s "Amendment:
 //! per-request verdicts (2026-10-04)".
 //!
@@ -48,10 +49,11 @@
 //! | Connect refused, DNS failure, after one was | `Ambiguous` | stops |
 //! | Request timeout | `Ambiguous` | stops |
 //! | HTTP 429 or any 5xx; gRPC `UNAVAILABLE`/`RESOURCE_EXHAUSTED`/`DEADLINE_EXCEEDED`/`ABORTED`/`INTERNAL` | `Ambiguous` | stops |
-//! | HTTP 401/403; gRPC `UNAUTHENTICATED`/`PERMISSION_DENIED` (a credential can be scoped per signal) | `Permanent` | goes on, the signal counted `rejected` |
-//! | Any HTTP 3xx (redirects are off; [`crate::http::build_client`] says why) | `Permanent` | goes on, the signal counted `rejected` |
-//! | Any other HTTP 4xx; gRPC `INVALID_ARGUMENT`/`UNIMPLEMENTED` | `Permanent` | goes on, the signal counted `rejected` |
-//! | Any other gRPC status (never retry an unrecognized code) | `Permanent` | goes on, the signal counted `rejected` |
+//! | HTTP 401/403/404/405/407/501; gRPC `UNAUTHENTICATED`/`PERMISSION_DENIED`/`UNIMPLEMENTED`/`NOT_FOUND`, before any request was accepted | `Refused` | stops |
+//! | The same, after one was | `Ambiguous` | stops |
+//! | Any HTTP 3xx (redirects are off; [`crate::http::build_client`] says why) | `Rejected` | goes on, the signal counted `rejected` |
+//! | Any other HTTP 4xx; gRPC `INVALID_ARGUMENT` | `Rejected` | goes on, the signal counted `rejected` |
+//! | Any other gRPC status (an unrecognized code is not retried) | `Rejected` | goes on, the signal counted `rejected` |
 //!
 //! A send whose every request was rejected returns the first rejection; one with any request
 //! accepted returns `Ok`.
@@ -90,7 +92,7 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::http::{
-    body_snippet, build_client, classify_reqwest_error, is_retryable_http_status, read_body_prefix,
+    body_snippet, build_client, classify_reqwest_error, classify_status, read_body_prefix,
     status_class, Outcomes, ERROR_BODY_SNIPPET_BYTES,
 };
 use std::collections::HashMap;
@@ -351,11 +353,7 @@ impl OtlpOutput {
                     &read_body_prefix(resp, ERROR_BODY_SNIPPET_BYTES).await,
                     ERROR_BODY_SNIPPET_BYTES,
                 );
-                let fault = if is_retryable_http_status(status) {
-                    Fault::Ambiguous
-                } else {
-                    Fault::Permanent
-                };
+                let fault = classify_status(status);
                 let err = anyhow::anyhow!(
                     "OTLP/HTTP {} write failed ({status}): {text}",
                     signal.as_str()
@@ -572,13 +570,14 @@ fn grpc_status_class(code: u32) -> &'static str {
 }
 
 /// Maps a gRPC status code to a [`Fault`] per the module doc's table. An unlisted code is
-/// `Permanent`, as in `logit_pipeline::classify`: never retry what isn't known to be transient.
+/// `Rejected`, as in `logit_pipeline::classify`: never retry what isn't known to be transient.
 fn grpc_fault(code: u32) -> Fault {
     match code {
         14 | 8 | 4 | 10 | 13 => Fault::Ambiguous, // UNAVAILABLE, RESOURCE_EXHAUSTED,
         // DEADLINE_EXCEEDED, ABORTED, INTERNAL
-        _ => Fault::Permanent, // INVALID_ARGUMENT, UNAUTHENTICATED, PERMISSION_DENIED,
-                               // UNIMPLEMENTED, and every other/unrecognized code
+        16 | 7 | 12 | 5 => Fault::Refused, // UNAUTHENTICATED, PERMISSION_DENIED,
+        // UNIMPLEMENTED, NOT_FOUND
+        _ => Fault::Rejected, // INVALID_ARGUMENT and every other/unrecognized code
     }
 }
 
@@ -620,7 +619,7 @@ async fn grpc_roundtrip(
     let body = Full::new(Bytes::from(grpc_frame(&framed_payload, compressed)));
     let uri: http::Uri = format!("{base}{}", signal.grpc_method()).parse().map_err(|e| {
         (
-            Fault::Permanent,
+            Fault::Rejected,
             anyhow::Error::new(e).context(format!(
                 "building the OTLP/gRPC request URI from endpoint {:?}",
                 redact::url(base)
@@ -996,11 +995,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_400_response_is_classified_permanent() {
+    async fn a_400_response_is_classified_rejected() {
         let (addr, _count) = canned_http_server(vec![RESP_400]).await;
         let mut output = http_output(addr);
         let err = output.send(&metric_batch()).await.expect_err("a 400 should fail send");
-        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+        assert_eq!(logit_pipeline::classify(&err), Fault::Rejected);
     }
 
     #[tokio::test]
@@ -1531,19 +1530,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_invalid_argument_is_classified_permanent() {
+    async fn grpc_invalid_argument_is_classified_rejected() {
         let addr = canned_grpc_server(3, "invalid argument", Vec::new()).await;
         let mut output = grpc_output(addr);
         let err = output.send(&metric_batch()).await.expect_err("should fail");
-        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+        assert_eq!(logit_pipeline::classify(&err), Fault::Rejected);
     }
 
     #[tokio::test]
-    async fn grpc_unimplemented_is_classified_permanent() {
-        let addr = canned_grpc_server(12, "unimplemented", Vec::new()).await;
-        let mut output = grpc_output(addr);
-        let err = output.send(&metric_batch()).await.expect_err("should fail");
-        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+    async fn grpc_refusing_statuses_are_classified_refused() {
+        for code in [5, 7, 12, 16] {
+            let addr = canned_grpc_server(code, "refused", Vec::new()).await;
+            let mut output = grpc_output(addr);
+            let err = output.send(&metric_batch()).await.expect_err("should fail");
+            assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{code}");
+        }
     }
 
     #[tokio::test]
@@ -1874,7 +1875,7 @@ mod tests {
         http_recorder, sum_of, sums_through_write_loop, RecordLog, Reply, SumSeries, Sums,
     };
     use logit_pipeline::test_util::TelemetryProbe;
-    use logit_pipeline::{DeliveryPosture, WriteLoopConfig, PERMANENT_FAILURE_WINDOW};
+    use logit_pipeline::{DeliveryPosture, WriteLoopConfig};
 
     /// A gauge delta the codec skips with its diagnostic, and nothing else: a batch that sends no
     /// request.
@@ -2018,31 +2019,27 @@ mod tests {
         }
     }
 
-    /// A batch whose one request never answers is cut off by the retry budget and dropped, and
-    /// the next batch counts its encode-side counters.
+    /// A batch whose one request is answered `503` is dropped under `at_most_once`, and the next
+    /// batch counts its encode-side counters.
     #[tokio::test]
-    async fn an_otlp_batch_after_one_dropped_at_its_budget_counts_encode_side() {
-        let (addr, log) =
-            http_recorder(
-                |n, _, _| {
-                    if n == 0 {
-                        Reply::Hang
-                    } else {
-                        Reply::Answer(200, Vec::new())
-                    }
-                },
-            )
-            .await;
+    async fn an_otlp_batch_after_one_dropped_counts_encode_side() {
+        let (addr, log) = http_recorder(|n, _, _| {
+            if n == 0 {
+                Reply::Answer(503, Vec::new())
+            } else {
+                Reply::Answer(200, Vec::new())
+            }
+        })
+        .await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented_http(addr, &probe);
-        let mut config = fast_retry();
-        config.retry.total_budget = crate::test_support::HUNG_REQUEST_BUDGET;
+        let config = crate::test_support::at_most_once();
         let batches = vec![encode_side_batch(), encode_side_batch()];
         let sums =
             sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, config).await;
         assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
         assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
-        assert_eq!(log.lock().unwrap().len(), 2, "the hung request, then the second batch's");
+        assert_eq!(log.lock().unwrap().len(), 2, "the failed request, then the second batch's");
         for (name, tags) in ENCODE_SIDE {
             assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
         }
@@ -2137,7 +2134,7 @@ mod tests {
     /// A rejected signal between two accepted ones is counted, and the send succeeds.
     #[tokio::test]
     async fn an_http_signal_rejected_between_accepted_ones_is_counted_and_the_send_succeeds() {
-        let (addr, log) = http_by_signal(200, 404, 200).await;
+        let (addr, log) = http_by_signal(200, 400, 200).await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented_http(addr, &probe);
         output.send(&all_three_signals_batch()).await.expect("accepted signals make the send Ok");
@@ -2158,7 +2155,7 @@ mod tests {
     /// leaves the send `Ok`.
     #[tokio::test]
     async fn a_grpc_metrics_rejection_after_accepted_signals_leaves_the_send_ok() {
-        let (addr, log) = recording_grpc_server(&[0, 0, 12]).await;
+        let (addr, log) = recording_grpc_server(&[0, 0, 3]).await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented(grpc_output(addr), &probe);
         output.send(&all_three_signals_batch()).await.expect("accepted signals make the send Ok");
@@ -2169,15 +2166,14 @@ mod tests {
         assert_eq!(sum_of(&sums, DROPPED, &[("reason", "rejected")]), 1.0, "{sums:?}");
     }
 
-    /// Every signal rejected: each is counted, and the send fails explicitly `Permanent`.
+    /// Every signal rejected: each is counted, and the send fails `Rejected`.
     #[tokio::test]
-    async fn every_grpc_signal_rejected_fails_the_send_explicitly_permanent() {
-        let (addr, log) = recording_grpc_server(&[12]).await;
+    async fn every_grpc_signal_rejected_fails_the_send_rejected() {
+        let (addr, log) = recording_grpc_server(&[3]).await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented(grpc_output(addr), &probe);
         let err = output.send(&all_three_signals_batch()).await.unwrap_err();
-        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent, "{err:#}");
-        assert!(logit_pipeline::is_explicitly_permanent(&err), "{err:#}");
+        assert_eq!(err.downcast_ref::<Fault>(), Some(&Fault::Rejected), "{err:#}");
         assert!(format!("{err:#}").contains("logs"), "the first rejection is returned: {err:#}");
         assert_eq!(log.lock().unwrap().len(), 3, "every signal is tried");
         let sums = drained(&mut probe);
@@ -2190,7 +2186,7 @@ mod tests {
     /// An `Ambiguous` answer after a rejection stops the send `Ambiguous`, the rejection counted.
     #[tokio::test]
     async fn an_ambiguous_answer_after_a_rejection_stops_the_send_ambiguous() {
-        let (addr, log) = http_by_signal(200, 404, 503).await;
+        let (addr, log) = http_by_signal(200, 400, 503).await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented_http(addr, &probe);
         let err = output.send(&all_three_signals_batch()).await.unwrap_err();
@@ -2210,69 +2206,61 @@ mod tests {
         assert_eq!(log.lock().unwrap().len(), 1);
     }
 
-    /// HTTP 401 and 403 on one signal reject that signal alone: a credential can be scoped per
-    /// signal, so the others are sent and the send succeeds.
+    /// An auth answer or a missing endpoint on one signal after an accepted one stops the send
+    /// there, counts nothing as rejected, and sends no later signal. It's `Ambiguous`, not
+    /// `Refused`: the accepted signal was applied, so an at-most-once sink must not resend it.
     #[tokio::test]
-    async fn an_http_auth_answer_on_one_signal_rejects_that_signal_alone() {
-        for status in [401, 403] {
-            let (addr, log) = http_by_signal(200, 200, status).await;
+    async fn an_http_refusing_answer_stops_the_send_refused() {
+        for status in [401, 403, 404] {
+            let (addr, log) = http_by_signal(200, status, 200).await;
             let mut probe = TelemetryProbe::new();
             let mut output = instrumented_http(addr, &probe);
-            output
-                .send(&all_three_signals_batch())
-                .await
-                .expect("accepted signals make the send Ok");
-            assert_eq!(log.lock().unwrap().len(), 3, "{status}: every signal is sent");
+            let err = output.send(&all_three_signals_batch()).await.unwrap_err();
+            assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{status}: {err:#}");
+            assert_eq!(log.lock().unwrap().len(), 2, "{status}: logs, then the refused traces");
             let sums = drained(&mut probe);
-            let metrics = [("signal", "metrics"), ("reason", "rejected")];
-            assert_eq!(sum_of(&sums, DROPPED, &metrics), 1.0, "{status}: {sums:?}");
-            let rejected = [("reason", "rejected")];
-            assert_eq!(sum_of(&sums, DROPPED, &rejected), 1.0, "{status}: {sums:?}");
+            assert_eq!(
+                sum_of(&sums, DROPPED, &[("reason", "rejected")]),
+                0.0,
+                "{status}: {sums:?}"
+            );
         }
     }
 
-    /// A credential granting traces but not metrics: traces `OK` and metrics `PERMISSION_DENIED`
-    /// leave the send `Ok`, the metric points counted rejected.
+    /// gRPC `PERMISSION_DENIED` on one signal after an accepted one stops the send, `Ambiguous`,
+    /// as an HTTP 403 does.
     #[tokio::test]
-    async fn a_grpc_permission_denied_on_one_signal_rejects_that_signal_alone() {
+    async fn a_grpc_permission_denied_stops_the_send_refused() {
         let (addr, log) =
             grpc_server_answering(|_, path| if path.contains("TraceService") { 0 } else { 7 })
                 .await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented(grpc_output(addr), &probe);
-        output.send(&traces_and_metrics_batch()).await.expect("accepted traces make the send Ok");
-        assert_eq!(log.lock().unwrap().len(), 2, "both signals are sent");
+        let err = output.send(&traces_and_metrics_batch()).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        assert_eq!(log.lock().unwrap().len(), 2, "traces, then the refused metrics");
         let sums = drained(&mut probe);
-        let metrics = [("signal", "metrics"), ("reason", "rejected")];
-        assert_eq!(sum_of(&sums, DROPPED, &metrics), 1.0, "{sums:?}");
-        assert_eq!(sum_of(&sums, DROPPED, &[("reason", "rejected")]), 1.0, "{sums:?}");
+        assert_eq!(sum_of(&sums, DROPPED, &[("reason", "rejected")]), 0.0, "{sums:?}");
     }
 
-    /// A token refused on every signal: every request is sent, and the send fails explicitly
-    /// `Permanent`, so a bad token still counts toward `write_loop`'s permanent-failure window.
+    /// A token refused on the first signal stops the send before any other request.
     #[tokio::test]
-    async fn an_http_auth_answer_on_every_signal_fails_the_send_explicitly_permanent() {
+    async fn an_http_auth_answer_on_every_signal_stops_after_the_first_request() {
         for status in [401, 403] {
             let (addr, log) = http_by_signal(status, status, status).await;
-            let mut probe = TelemetryProbe::new();
-            let mut output = instrumented_http(addr, &probe);
-            let err = output.send(&all_three_signals_batch()).await.unwrap_err();
-            assert!(logit_pipeline::is_explicitly_permanent(&err), "{status}: {err:#}");
-            assert_eq!(log.lock().unwrap().len(), 3, "{status}: every signal is sent");
-            let sums = drained(&mut probe);
-            let rejected = [("reason", "rejected")];
-            assert_eq!(sum_of(&sums, DROPPED, &rejected), 3.0, "{status}: {sums:?}");
+            let err = http_output(addr).send(&all_three_signals_batch()).await.unwrap_err();
+            assert_eq!(err.downcast_ref::<Fault>(), Some(&Fault::Refused), "{status}: {err:#}");
+            assert_eq!(log.lock().unwrap().len(), 1, "{status}");
         }
     }
 
-    /// gRPC `UNAUTHENTICATED` on every signal fails the send explicitly `Permanent` after every
-    /// request was sent, as an HTTP 401 on every signal does.
+    /// gRPC `UNAUTHENTICATED` stops the send `Refused` after the first request.
     #[tokio::test]
-    async fn a_grpc_unauthenticated_on_every_signal_fails_the_send_explicitly_permanent() {
+    async fn a_grpc_unauthenticated_stops_the_send_after_the_first_request() {
         let (addr, log) = grpc_server_answering(|_, _| 16).await;
         let err = grpc_output(addr).send(&all_three_signals_batch()).await.unwrap_err();
-        assert!(logit_pipeline::is_explicitly_permanent(&err), "{err:#}");
-        assert_eq!(log.lock().unwrap().len(), 3, "every signal is sent");
+        assert_eq!(err.downcast_ref::<Fault>(), Some(&Fault::Refused), "{err:#}");
+        assert_eq!(log.lock().unwrap().len(), 1);
     }
 
     /// One span and one counter point: what a mixed `internal` batch sends a trace backend.
@@ -2280,61 +2268,5 @@ mod tests {
         let mut batch = all_three_signals_batch();
         batch.events.retain(|event| event.log.is_none());
         batch
-    }
-
-    /// `inner`, with every `send` after the first waiting `gap` first.
-    struct Spaced<O> {
-        inner: O,
-        gap: Duration,
-        sends: usize,
-    }
-
-    #[async_trait::async_trait]
-    impl<O: Output + Send> Output for Spaced<O> {
-        fn observe_batch(&mut self, ctx: BatchContext, seq: SeqId) {
-            self.inner.observe_batch(ctx, seq);
-        }
-
-        async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-            if self.sends > 0 {
-                tokio::time::sleep(self.gap).await;
-            }
-            self.sends += 1;
-            self.inner.send(batch).await
-        }
-    }
-
-    /// Mixed traces and metrics into a backend that takes only traces, for longer than the
-    /// runtime's permanent-failure window: every batch is delivered with its metric points counted
-    /// rejected, and `write_loop` ends `Ok` instead of ending the process.
-    #[tokio::test(start_paused = true)]
-    async fn a_trace_only_backend_fed_mixed_batches_never_trips_the_permanent_failure_window() {
-        let (addr, log) =
-            grpc_server_answering(|_, path| if path.contains("TraceService") { 0 } else { 12 })
-                .await;
-        let mut probe = TelemetryProbe::new();
-        // Each batch waits the window plus one second of virtual time, so the metric
-        // rejections span more than the window: under a rule that read them as a sink failure,
-        // the streak would have ended `write_loop`. The margin is one second so the test proves
-        // the crossing, not the boundary.
-        let gap = PERMANENT_FAILURE_WINDOW + Duration::from_secs(1);
-        let mut output = Spaced { inner: instrumented(grpc_output(addr), &probe), gap, sends: 0 };
-        const BATCHES: usize = 3;
-        let batches = (0..BATCHES).map(|_| traces_and_metrics_batch()).collect();
-        let mut config = fast_retry();
-        // `drive_write_loop`'s ceiling grows with the retry budget; the gaps are virtual time.
-        config.retry.total_budget = gap * 2;
-        let sums =
-            sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, config).await;
-        assert_eq!(
-            log.lock().unwrap().len(),
-            2 * BATCHES,
-            "one traces and one metrics request each"
-        );
-        let delivered = sum_of(&sums, "logit.component.batches.delivered", &[]);
-        assert_eq!(delivered, BATCHES as f64, "{sums:?}");
-        let metrics = [("signal", "metrics"), ("reason", "rejected")];
-        assert_eq!(sum_of(&sums, DROPPED, &metrics), BATCHES as f64, "{sums:?}");
-        assert_eq!(output.inner.diag.occurrences("signal_rejected"), BATCHES as u64);
     }
 }

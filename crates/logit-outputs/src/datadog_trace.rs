@@ -99,20 +99,23 @@
 //! next request; a `Clean` or `Ambiguous` failure stops the send, and `write_loop` retries the
 //! whole batch, re-sending any request that had already succeeded. The send succeeds when any
 //! request was accepted, and fails with the first rejection when every request was rejected. The
-//! Agent's API has no credential, so no answer refuses the sink as a whole.
+//! Agent's API has no credential, so only a status that says the endpoint or method isn't there
+//! refuses the sink as a whole.
 //!
 //! | Outcome | Result | The rest of the `send` |
 //! |---|---|---|
 //! | 2xx | `Ok` | goes on |
 //! | 408, 429, any 5xx | [`Fault::Ambiguous`] | stops |
-//! | 413 | [`Fault::Permanent`], and the request's records counted `records.dropped{reason="oversize"}` | goes on |
-//! | any other 1xx, 3xx, or 4xx | [`Fault::Permanent`], the request's records counted `records.dropped{reason="rejected"}`, with a throttled `request_rejected` diagnostic quoting the first 256 bytes of the body | goes on |
+//! | 401, 403, 404, 405, 407, 501 | [`Fault::Refused`], per [`crate::http::classify_status`], with a throttled `request_refused` diagnostic quoting the first 256 bytes of the body | stops |
+//! | 413 | [`Fault::Rejected`], and the request's records counted `records.dropped{reason="oversize"}` | goes on |
+//! | any other 1xx, 3xx, or 4xx | [`Fault::Rejected`], the request's records counted `records.dropped{reason="rejected"}`, with a throttled `request_rejected` diagnostic quoting the first 256 bytes of the body | goes on |
 //! | connect failure (refused, no such socket file), before any request of this `send` was accepted | [`Fault::Clean`] | stops |
 //! | connect failure after one was | [`Fault::Ambiguous`] | stops |
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] | stops |
 //!
-//! `Clean` means the Agent holds nothing of the batch, so once a request was accepted a connect
-//! failure on a later one is `Ambiguous` ([`crate::http::after_delivery`]), on either transport.
+//! `Clean` and `Refused` mean the Agent holds nothing of the batch, so once a request was accepted
+//! a connect failure or a refusal on a later one is `Ambiguous` ([`crate::http::after_delivery`]),
+//! on either transport.
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
 //! retries an `Ambiguous` attempt, and a batch can be two requests, so a retry after the second
@@ -873,18 +876,27 @@ impl DatadogTraceOutput {
                          {snippet}"
                     ),
                 );
-                Fault::Permanent
+                Fault::Rejected
             }
-            _ => {
-                self.dropped(route, "rejected", records);
-                self.diag.warn_throttled(
-                    "request_rejected",
-                    format_args!(
-                        "{target} answered {status}, {records} record(s) dropped: {snippet}"
-                    ),
-                );
-                Fault::Permanent
-            }
+            _ => match crate::http::classify_status(status) {
+                Fault::Refused => {
+                    self.diag.warn_throttled(
+                        "request_refused",
+                        format_args!("{target} answered {status}: {snippet}"),
+                    );
+                    Fault::Refused
+                }
+                _ => {
+                    self.dropped(route, "rejected", records);
+                    self.diag.warn_throttled(
+                        "request_rejected",
+                        format_args!(
+                            "{target} answered {status}, {records} record(s) dropped: {snippet}"
+                        ),
+                    );
+                    Fault::Rejected
+                }
+            },
         };
         Err(anyhow::anyhow!(
             "datadog_trace_out: {} request to {target} failed ({status}): {snippet}",
@@ -1342,8 +1354,11 @@ mod tests {
         for status in [408, 429, 500, 503] {
             assert_eq!(fault_for(status).await, Fault::Ambiguous, "{status}");
         }
-        for status in [301, 400, 404, 413] {
-            assert_eq!(fault_for(status).await, Fault::Permanent, "{status}");
+        for status in [301, 400, 413] {
+            assert_eq!(fault_for(status).await, Fault::Rejected, "{status}");
+        }
+        for status in [401, 404] {
+            assert_eq!(fault_for(status).await, Fault::Refused, "{status}");
         }
     }
 
@@ -1379,15 +1394,15 @@ mod tests {
         assert_eq!(total(&points, RECORDS, &[("route", "stats")]), 1.0);
     }
 
-    /// Both requests rejected: each is counted, and the send fails explicitly `Permanent`.
+    /// Both requests rejected: each is counted, and the send fails `Rejected`.
     #[tokio::test]
-    async fn rejected_traces_and_stats_fail_the_send_permanent() {
+    async fn rejected_traces_and_stats_fail_the_send_rejected() {
         let (addr, log) = agent(|_| (400, String::new())).await;
         let (registry, mut out) = metered(sink(addr));
         let mut events = two_traces().events;
         events.push(stats_event());
         let err = out.send(&batch(events)).await.unwrap_err();
-        assert!(logit_pipeline::is_explicitly_permanent(&err), "{err:#}");
+        assert_eq!(err.downcast_ref::<Fault>(), Some(&Fault::Rejected), "{err:#}");
         assert!(format!("{err:#}").contains("traces"), "the first rejection: {err:#}");
         assert_eq!(captured(&log).len(), 2);
         let points = registry.drain(0);
@@ -1555,9 +1570,9 @@ mod tests {
 
     use crate::test_support::{
         assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch,
-        at_least_once, bodies, fast_retry, http_recorder, per_path_recorder, recorded_paths,
-        refused_addr, sum_of, sums_through_write_loop, Recorded, Reply as Answer, SumSeries, Sums,
-        HUNG_REQUEST_BUDGET,
+        at_least_once, at_most_once, bodies, fast_retry, http_recorder, per_path_recorder,
+        recorded_paths, refused_addr, sum_of, sums_through_write_loop, Recorded, Reply as Answer,
+        SumSeries, Sums,
     };
     use logit_pipeline::test_util::TelemetryProbe;
     use logit_pipeline::WriteLoopConfig;
@@ -1741,15 +1756,19 @@ mod tests {
         }
     }
 
-    /// A batch whose stats request never answers is cut off by the retry budget and dropped, and
-    /// the next batch counts its encode-side counters.
+    /// A batch whose stats request is answered `503` is dropped under `at_most_once`, and the next
+    /// batch counts its encode-side counters.
     #[tokio::test]
-    async fn a_trace_batch_after_one_dropped_at_its_budget_counts_encode_side() {
-        let script = |p: &str, k| if p == STATS && k == 0 { Answer::Hang } else { accepted() };
-        let mut config = fast_retry();
-        config.retry.total_budget = HUNG_REQUEST_BUDGET;
+    async fn a_trace_batch_after_one_dropped_counts_encode_side() {
+        let script = |p: &str, k| {
+            if p == STATS && k == 0 {
+                Answer::Answer(503, Vec::new())
+            } else {
+                accepted()
+            }
+        };
         let batches = vec![encode_side_batch(), encode_side_batch()];
-        let (sums, log) = run_agent(script, batches, config, instrumented).await;
+        let (sums, log) = run_agent(script, batches, at_most_once(), instrumented).await;
         let (one, _) =
             run_agent(|_, _| accepted(), vec![encode_side_batch()], fast_retry(), instrumented)
                 .await;

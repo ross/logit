@@ -5,10 +5,10 @@
 //! [`InfluxDbOutput::send`] makes one attempt and classifies the outcome as a [`Fault`]; retry
 //! timing belongs to `logit-pipeline`'s writer (`docs/adr/buffered-sink-delivery.md`).
 //!
-//! It keeps its own client and classifier (`status_class`, `is_retryable_status`,
+//! It keeps its own client and transport classifier (`status_class`,
 //! `classify_transport_error`) rather than `crate::http`'s, though it reads a rejection body
-//! through `crate::http::read_body_prefix`, the same bounded read `otlp_out` uses. The
-//! classifier table is the same today, but its client never disables redirects, so it inherits
+//! through `crate::http::read_body_prefix`, the same bounded read `otlp_out` uses, and classifies
+//! a status with [`crate::http::classify_status`]. Its client never disables redirects, so it inherits
 //! `reqwest`'s `limited(10)`: a tracked gap in `docs/known-gaps/prometheus.md`, closed by moving to
 //! `crate::http::build_client`.
 //!
@@ -41,13 +41,6 @@ use std::time::Duration;
 /// `reqwest` has no request timeout by default; without one, a server that accepts the connection
 /// but never responds hangs `send`, and the pipeline worker driving it, forever.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// 429 (InfluxDB's rate-limit response) and any 5xx are transient, [`Fault::Ambiguous`]; 429 is
-/// the one 4xx exception (ADR `service-lifecycle-and-output-retry`). Every other 4xx is a config
-/// error (bad org, bucket, or token), [`Fault::Permanent`].
-fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    status.is_server_error() || status.as_u16() == 429
-}
 
 pub struct InfluxDbOutput {
     url: String,
@@ -190,8 +183,7 @@ impl InfluxDbOutput {
                     &read_body_prefix(resp, ERROR_BODY_SNIPPET_BYTES).await,
                     ERROR_BODY_SNIPPET_BYTES,
                 );
-                let fault =
-                    if is_retryable_status(status) { Fault::Ambiguous } else { Fault::Permanent };
+                let fault = crate::http::classify_status(status);
                 Err(anyhow::anyhow!("InfluxDB write failed ({status}): {text}")).context(fault)
             }
             Err(err) => {
@@ -1419,22 +1411,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_400_response_is_classified_permanent() {
+    async fn a_400_response_is_classified_rejected() {
         let (addr, count) = canned_server(vec![RESP_400]).await;
         let mut output = output_against(addr).await;
 
         let err = output.send(&one_metric_batch()).await.expect_err("a 400 should fail send");
-        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+        assert_eq!(logit_pipeline::classify(&err), Fault::Rejected);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one attempt");
     }
 
     #[tokio::test]
-    async fn a_401_response_is_classified_permanent() {
+    async fn a_401_response_is_classified_refused() {
         let (addr, count) = canned_server(vec![RESP_401]).await;
         let mut output = output_against(addr).await;
 
         let err = output.send(&one_metric_batch()).await.expect_err("a 401 should fail send");
-        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+        assert_eq!(logit_pipeline::classify(&err), Fault::Refused);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one attempt");
     }
 
@@ -1445,7 +1437,7 @@ mod tests {
         let mut output = output_against(addr).await;
 
         let err = output.send(&one_metric_batch()).await.expect_err("a 400 should fail send");
-        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+        assert_eq!(logit_pipeline::classify(&err), Fault::Rejected);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one attempt");
         // `.context(fault)` makes `err`'s own `Display` the `Fault` alone; the send message with
         // the quoted body is the wrapped cause.

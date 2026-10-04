@@ -1037,7 +1037,7 @@ pub fn encode_counted(
         // -- which is what makes "keep the last" below mean "the latest reading wins".
         out.samples.sort_by_key(|sample| sample.timestamp_ms);
         // One label set may not carry two samples at one timestamp: Prometheus and Mimir answer
-        // `400 duplicate sample for timestamp`, which the sender classifies as permanent and the
+        // `400 duplicate sample for timestamp`, which the sender classifies as rejected and the
         // whole batch is dropped -- so a pair of readings a microsecond apart would cost every
         // other series in the request too. The wire has millisecond resolution and the model has
         // nanosecond, so any sub-millisecond source (`statsd_in` gauges, `internal`) reaches this.
