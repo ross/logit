@@ -20,6 +20,32 @@
 //! the top of every `encode`, so a retry re-encodes the same body byte for byte, and InfluxDB
 //! treats an identical `(measurement, tag set, timestamp)` write as an overwrite, not a second
 //! point.
+//!
+//! ## Response classes
+//!
+//! A non-2xx answer carries InfluxDB's error JSON (`code`, `message`, and `line` on a parse
+//! error), which the error and the `send_failed` warning quote, read bounded
+//! ([`crate::http::read_body_prefix`]). On `/api/v2/write` each documented status maps to one
+//! `code`, so the status decides the class and every row is [`crate::http::classify_status`]'s:
+//! no documented `400` names an unknown bucket or org, and no documented `404` names the body.
+//!
+//! | Response | Class | Why | Evidence |
+//! |---|---|---|---|
+//! | `204` | `Ok` | every point written (OSS) or queued (Cloud) | [write API](https://docs.influxdata.com/influxdb/v2/api/write/) |
+//! | `400` `invalid` (`unable to parse ...`, with `line`) | `Rejected` | malformed line protocol: "all data rejected", and a resend parses the same | [troubleshoot writes](https://docs.influxdata.com/influxdb/v2/write-data/troubleshoot/) |
+//! | `401` `unauthorized` (`unauthorized access`) | `Refused` | a missing or unknown token, or one without access to the org and bucket: every batch gets it | [write API](https://docs.influxdata.com/influxdb/v2/api/write/) |
+//! | `403` `forbidden` (`insufficient permissions for write`) | `Refused` | the token can't write the bucket | `checkBucketWritePermissions` in [`http/write_handler.go`](https://github.com/influxdata/influxdb/blob/master/http/write_handler.go) |
+//! | `404` `not found` (`bucket not found`, `organization name "..." not found`) | `Refused` | the configured `org` or `bucket` doesn't exist: every batch gets it until the operator creates it | [write API](https://docs.influxdata.com/influxdb/v2/api/write/), `decodeWriteRequest` in [`http/write_handler.go`](https://github.com/influxdata/influxdb/blob/master/http/write_handler.go) |
+//! | `413` | `Rejected` | the body is over the server's limit, "no data written"; a smaller batch would land | [write API](https://docs.influxdata.com/influxdb/v2/api/write/) |
+//! | `422` `unprocessable entity` (`failure writing points to database`, a partial write such as points outside the bucket's retention) | `Rejected` | the server applied what it could and refused the rest for its content; a resend repeats the refusal and overwrites what landed | [write API](https://docs.influxdata.com/influxdb/v2/api/write/), [troubleshoot writes](https://docs.influxdata.com/influxdb/v2/write-data/troubleshoot/) |
+//! | `429` `too many requests` (Cloud) | `Ambiguous` | a rate or quota limit, `Retry-After` set; the next attempt may land | [write API](https://docs.influxdata.com/influxdb/v2/api/write/) |
+//! | `500` `internal error` | `Ambiguous` | "unexpected error writing points"; may have been applied | [write API](https://docs.influxdata.com/influxdb/v2/api/write/) |
+//! | `503` `unavailable` | `Ambiguous` | the server can't take writes for now, `Retry-After` set | [write API](https://docs.influxdata.com/influxdb/v2/api/write/) |
+//! | any other status | [`crate::http::classify_status`]'s class | undocumented on this route | -- |
+//! | connect failure, DNS failure | `Clean` | nothing left the process | `classify_transport_error` |
+//! | timeout, any other transport error | `Ambiguous` | the write may have reached the server | `classify_transport_error` |
+//!
+//! `Retry-After` is ignored: `write_loop`'s backoff applies.
 
 use crate::accounting::BatchAccounting;
 use crate::http::{body_snippet, read_body_prefix, ERROR_BODY_SNIPPET_BYTES};
@@ -1428,6 +1454,97 @@ mod tests {
         let err = output.send(&one_metric_batch()).await.expect_err("a 401 should fail send");
         assert_eq!(logit_pipeline::classify(&err), Fault::Refused);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one attempt");
+    }
+
+    /// A canned response carrying InfluxDB's error JSON, leaked so [`canned_server`] can hold it.
+    fn influx_error(status: &str, body: &str) -> &'static str {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        Box::leak(response.into_boxed_str())
+    }
+
+    /// The class `send` reads from one canned InfluxDB answer, and the error's text.
+    async fn class_of(response: &'static str) -> (Fault, String) {
+        let (addr, count) = canned_server(vec![response]).await;
+        let mut output = output_against(addr).await;
+        let err = output.send(&one_metric_batch()).await.expect_err("a non-2xx fails send");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "one attempt");
+        (logit_pipeline::classify(&err), format!("{err:#}"))
+    }
+
+    // One test per row of the module doc's "Response classes" table, each answering the body
+    // InfluxDB documents for it.
+
+    #[tokio::test]
+    async fn a_400_invalid_parse_error_is_rejected() {
+        let body = r#"{"code":"invalid","message":"unable to parse 'x value=': missing field value","line":1}"#;
+        let (fault, text) = class_of(influx_error("400 Bad Request", body)).await;
+        assert_eq!(fault, Fault::Rejected);
+        assert!(text.contains("unable to parse"), "the message is quoted: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_401_unauthorized_is_refused() {
+        let body = r#"{"code":"unauthorized","message":"unauthorized access"}"#;
+        assert_eq!(class_of(influx_error("401 Unauthorized", body)).await.0, Fault::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_403_forbidden_is_refused() {
+        let body = r#"{"code":"forbidden","message":"insufficient permissions for write"}"#;
+        assert_eq!(class_of(influx_error("403 Forbidden", body)).await.0, Fault::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_404_bucket_not_found_is_refused() {
+        let body = r#"{"code":"not found","message":"bucket not found"}"#;
+        let (fault, text) = class_of(influx_error("404 Not Found", body)).await;
+        assert_eq!(fault, Fault::Refused);
+        assert!(text.contains("bucket not found"), "the message is quoted: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_404_organization_not_found_is_refused() {
+        let body = r#"{"code":"not found","message":"organization name \"org\" not found"}"#;
+        assert_eq!(class_of(influx_error("404 Not Found", body)).await.0, Fault::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_413_too_large_is_rejected() {
+        let body = r#"{"code":"request too large","message":"unable to read data: points batch is too large"}"#;
+        let status = "413 Payload Too Large";
+        assert_eq!(class_of(influx_error(status, body)).await.0, Fault::Rejected);
+    }
+
+    #[tokio::test]
+    async fn a_422_unprocessable_entity_is_rejected() {
+        let body = r#"{"code":"unprocessable entity","message":"failure writing points to database: partial write: points beyond retention policy dropped=1"}"#;
+        let status = "422 Unprocessable Entity";
+        assert_eq!(class_of(influx_error(status, body)).await.0, Fault::Rejected);
+    }
+
+    #[tokio::test]
+    async fn a_429_too_many_requests_is_ambiguous() {
+        let body = r#"{"code":"too many requests","message":"org exceeded write limits"}"#;
+        let status = "429 Too Many Requests";
+        assert_eq!(class_of(influx_error(status, body)).await.0, Fault::Ambiguous);
+    }
+
+    #[tokio::test]
+    async fn a_500_internal_error_is_ambiguous() {
+        let body = r#"{"code":"internal error","message":"unexpected error writing points to database","err":"engine: timeout"}"#;
+        let status = "500 Internal Server Error";
+        assert_eq!(class_of(influx_error(status, body)).await.0, Fault::Ambiguous);
+    }
+
+    #[tokio::test]
+    async fn a_503_unavailable_is_ambiguous() {
+        let body = r#"{"code":"unavailable","message":"service unavailable"}"#;
+        let status = "503 Service Unavailable";
+        assert_eq!(class_of(influx_error(status, body)).await.0, Fault::Ambiguous);
     }
 
     /// A rejection body is quoted verbatim in the error message when it fits the snippet bound.

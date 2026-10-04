@@ -17,6 +17,21 @@
 //! fails with the first rejection when none was. See `docs/adr/delivery-semantics.md`'s
 //! "Amendment: per-request verdicts (2026-10-04)".
 //!
+//! **How a sink overrides the status table.** [`classify_status`] reads the status alone, and is
+//! the class of every response a sink's own table doesn't name. A sink whose destination says
+//! more, in a documented body code, a header, or the protocol's own retry rules, reads the body
+//! with [`read_body_prefix`] (bounded; [`redacted_snippet`] when the body may echo a secret),
+//! matches the rows its destination documents, and falls through to [`classify_status`] for the
+//! rest. Each sink records its rows in a `Response | Class | Why | Evidence` table in its module
+//! doc, one test per row:
+//!
+//! - `influxdb_out`: [`crate::influxdb`], "Response classes"
+//! - `otlp_out`: [`crate::otlp`], "Response classes"
+//! - `prometheus_out`: [`crate::prometheus`], "Faults, retries and duplicate safety (sender mode)"
+//! - `datadog_out`: [`crate::datadog`], "Faults, retries, and duplicate safety"
+//! - `datadog_trace_out`: [`crate::datadog_trace`], "Faults, retries, and duplicate safety"
+//! - `splunk_hec_out`: [`crate::splunk`], "Faults, retries, and duplicate safety"
+//!
 //! [`split_encode`] is the request splitter `datadog_out` and `datadog_trace_out` share: both cut a
 //! batch into requests under a per-route entry count and body size.
 //!
