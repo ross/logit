@@ -186,7 +186,7 @@ use crate::human::render_value_inline;
 use crate::stream::{Dial, PooledStream, Target, TlsTarget};
 use crate::Output;
 use anyhow::Context;
-use logit_core::time::format_rfc3339_utc;
+use logit_core::time::{format_rfc3339_utc, write_rfc3164_utc};
 use logit_core::{interner, AttrMap, Diagnostics, Event, EventBatch, Severity, Telemetry, Value};
 use logit_pipeline::{BatchContext, SeqId};
 use logit_proto::{FramedEncoder, MessageBuf, MAX_UDP_PAYLOAD_BYTES};
@@ -981,34 +981,7 @@ const MONTH_ABBR: [&str; 12] =
 
 /// `Mmm dd hh:mm:ss` (space-padded day), UTC, no year (RFC 3164's TIMESTAMP has none).
 fn push_rfc3164_timestamp(out: &mut String, nanos: i64) {
-    let (month, day, hour, minute, second) = civil_time_of(nanos);
-    let _ = write!(
-        out,
-        "{} {day:2} {hour:02}:{minute:02}:{second:02}",
-        MONTH_ABBR[(month as usize - 1).min(11)]
-    );
-}
-
-/// UTC `(month, day, hour, minute, second)` for a Unix-nanosecond timestamp, by Howard Hinnant's
-/// civil-from-days algorithm. Not shared with `logit_core::time`, which returns only a whole RFC
-/// 3339 string.
-fn civil_time_of(nanos: i64) -> (u32, u32, u32, u32, u32) {
-    let secs = nanos.div_euclid(1_000_000_000);
-    let days = secs.div_euclid(86_400);
-    let secs_of_day = secs.rem_euclid(86_400) as u32;
-
-    let z = days + 719_468;
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-    (month, day, hour, minute, second)
+    write_rfc3164_utc(out, nanos);
 }
 
 /// Renders a log message's `Value` before [`sanitize_msg`]'s pass; `Str` is verbatim (module
