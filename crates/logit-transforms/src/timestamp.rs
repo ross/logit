@@ -12,8 +12,9 @@
 //! | `F64` | `f64` seconds, fraction rounded to the nanosecond | - | - | - | - |
 //! | anything else | - | - | - | - | - |
 //!
-//! A scaled integer or decimal string that overflows an `i64` of nanoseconds, and a calendar value outside it, is a
-//! skew skip on its side, not `invalid`: it parsed, and it's far from receipt.
+//! A scaled integer or decimal string that overflows an `i64` of nanoseconds, and a calendar
+//! value outside it, is a skew skip on its side, not `invalid`: it parsed, and it's far from
+//! receipt.
 //!
 //! Per event, in order; the first that applies is the outcome:
 //!
@@ -417,6 +418,19 @@ mod tests {
             outcome(TimestampFormat::Rfc3339, Value::str("2300-01-01T00:00:00Z")),
             Err("skew_future")
         );
+    }
+
+    #[test]
+    fn an_overflowing_decimal_string_is_skew_future() {
+        for text in ["10000000000", "9223372036.854775808"] {
+            assert_eq!(
+                outcome(TimestampFormat::UnixSeconds, Value::str(text)),
+                Err("skew_future"),
+                "{text}"
+            );
+        }
+        assert_eq!(outcome(TimestampFormat::UnixNanos, Value::str("1.5")), Err("invalid"));
+        assert_eq!(outcome(TimestampFormat::UnixSeconds, Value::str("1e9")), Err("invalid"));
     }
 
     #[test]
