@@ -3840,15 +3840,27 @@ mod human_bytes {
     }
 }
 
-/// Minimal `humantime`-flavored `(de)serialize` for `Duration` fields (`10s`, `1m`, ...), so
-/// config keeps human-readable durations without an external crate for one helper.
-/// TODO: replace with the `humantime-serde` crate once the crate list is finalized.
+/// `(de)serialize` for `Duration` fields over jiff's friendly duration format
+/// (`docs/adr/jiff-for-calendar-time.md`).
+///
+/// - **Accepted**: one or more `<number><unit>` designators, optionally space-separated (`10s`,
+///   `1h30m`, `1h 30m`, `90 seconds`). Units are `ns`, `us`, `ms`, `s`, `m`/`min`, `h`, and `d`
+///   (24 hours), plus jiff's long labels for each. The smallest unit may carry a 1-9 digit
+///   fraction (`1.5s`, `0.5h`) when it is hours or smaller. Surrounding whitespace is trimmed.
+/// - **Rejected**: weeks, months, and years (their length is a calendar question), a negative
+///   value (`-5s`, `5s ago`), and a bare number. Zero is the field's rule to reject, not the codec's.
+/// - **Serialized** in compact designator form with no spaces: `10s`, `100ms`, `1h30m`, `48h`.
 mod humantime_serde_duration {
     use super::*;
+    use jiff::fmt::friendly::{Spacing, SpanParser, SpanPrinter};
+    use jiff::{SignedDuration, SpanRelativeTo};
     use serde::{de::Error as _, Deserializer, Serializer};
 
+    static PARSER: SpanParser = SpanParser::new();
+    static PRINTER: SpanPrinter = SpanPrinter::new().spacing(Spacing::None);
+
     pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("{}s", d.as_secs_f64()))
+        s.serialize_str(&PRINTER.unsigned_duration_to_string(d))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
@@ -3856,21 +3868,23 @@ mod humantime_serde_duration {
         parse(&raw).map_err(D::Error::custom)
     }
 
-    fn parse(raw: &str) -> Result<Duration, String> {
-        let (num, unit) = raw.trim().split_at(
-            raw.trim()
-                .find(|c: char| !c.is_ascii_digit() && c != '.')
-                .ok_or_else(|| "expected a number followed by a unit, e.g. 10s".to_string())?,
-        );
-        let n: f64 = num.parse().map_err(|e| format!("{e}"))?;
-        let secs = match unit {
-            "ms" => n / 1000.0,
-            "s" => n,
-            "m" => n * 60.0,
-            "h" => n * 3600.0,
-            other => return Err(format!("unknown duration unit '{other}'")),
-        };
-        Ok(Duration::from_secs_f64(secs))
+    pub(super) fn parse(raw: &str) -> Result<Duration, String> {
+        let span = PARSER
+            .parse_span(raw.trim())
+            .map_err(|e| format!("invalid duration '{raw}', expected e.g. 10s or 1h30m: {e}"))?;
+        if span.get_years() != 0 || span.get_months() != 0 || span.get_weeks() != 0 {
+            return Err(format!(
+                "invalid duration '{raw}': weeks, months, and years aren't fixed lengths; use d, h, \
+                 m, s, or ms"
+            ));
+        }
+        if span.is_negative() {
+            return Err(format!("invalid duration '{raw}': must not be negative"));
+        }
+        let signed: SignedDuration = span
+            .to_duration(SpanRelativeTo::days_are_24_hours())
+            .map_err(|e| format!("invalid duration '{raw}': {e}"))?;
+        Duration::try_from(signed).map_err(|e| format!("invalid duration '{raw}': {e}"))
     }
 
     /// The same codec for `Option<Duration>` fields. A nested module because `#[serde(with =
@@ -3889,6 +3903,93 @@ mod humantime_serde_duration {
         pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
             let raw: Option<String> = Option::deserialize(d)?;
             raw.map(|raw| parse(&raw).map_err(D::Error::custom)).transpose()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn ms(n: u64) -> Duration {
+            Duration::from_millis(n)
+        }
+
+        #[test]
+        fn every_four_unit_form_parses_to_its_duration() {
+            for (raw, want) in [
+                ("10s", ms(10_000)),
+                ("0s", Duration::ZERO),
+                ("100ms", ms(100)),
+                ("1m", ms(60_000)),
+                ("2h", ms(7_200_000)),
+                ("1.5s", ms(1_500)),
+                ("0.5m", ms(30_000)),
+                ("1.5h", ms(5_400_000)),
+                ("0.25ms", Duration::from_micros(250)),
+                ("2.000s", ms(2_000)),
+                ("007s", ms(7_000)),
+                (" 10s ", ms(10_000)),
+            ] {
+                assert_eq!(parse(raw), Ok(want), "{raw:?}");
+            }
+        }
+
+        #[test]
+        fn days_compound_forms_and_finer_units_parse() {
+            for (raw, want) in [
+                ("2d", ms(2 * 86_400_000)),
+                ("1d12h", ms(36 * 3_600_000)),
+                ("1h30m", ms(5_400_000)),
+                ("1h 30m", ms(5_400_000)),
+                ("90 seconds", ms(90_000)),
+                ("5min", ms(300_000)),
+                ("250us", Duration::from_micros(250)),
+                ("10ns", Duration::from_nanos(10)),
+                ("1s500ms", ms(1_500)),
+            ] {
+                assert_eq!(parse(raw), Ok(want), "{raw:?}");
+            }
+        }
+
+        #[test]
+        fn calendar_units_negatives_and_bare_numbers_are_rejected() {
+            for raw in [
+                "1w",
+                "1mo",
+                "1y",
+                "-5s",
+                "5s ago",
+                "10",
+                "",
+                "s",
+                "1e3s",
+                "1.5d",
+                "1.5.5s",
+                "10S",
+                "1.0000000001s",
+                ".5s",
+                "5.s",
+            ] {
+                assert!(parse(raw).is_err(), "{raw:?} should be rejected");
+            }
+        }
+
+        #[test]
+        fn serializes_in_compact_designator_form_that_parses_back() {
+            #[derive(serde::Serialize)]
+            struct W(#[serde(with = "super")] Duration);
+            for (d, want) in [
+                (ms(10_000), "10s"),
+                (Duration::ZERO, "0s"),
+                (ms(100), "100ms"),
+                (ms(1_500), "1s500ms"),
+                (ms(5_400_000), "1h30m"),
+                (ms(2 * 86_400_000), "48h"),
+            ] {
+                let json = serde_json::to_string(&W(d)).unwrap();
+                assert_eq!(json, format!("\"{want}\""));
+                assert_eq!(parse(want), Ok(d), "{want} parses back");
+            }
         }
     }
 }

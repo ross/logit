@@ -678,8 +678,8 @@ backpressure), but its accept queue has the same shape of problem:
 A stream listener has no receive queue (its connection's flow control is the backpressure), but a
 connection can open and then say nothing while holding one of the listener's
 `max_connections` permits. `syslog_in`, `graphite_in`, and `statsd_in` (each with `transport: tcp`),
-`logit_in`, and `otlp_in` bound that with `handshake_timeout:`, **5s by default**, a humantime
-string like `connect_timeout`:
+`logit_in`, and `otlp_in` bound that with `handshake_timeout:`, **5s by default**, a duration
+string (`5s`, `1m`, `1h30m`) like `connect_timeout`:
 
 ```yaml
 components:

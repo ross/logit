@@ -699,7 +699,7 @@ Merged branches and PRs are never renamed to fit.
 - **Every config type derives `Serialize + Deserialize + JsonSchema` together**
   ([ADR `config-yaml-jsonschema`](docs/adr/config-yaml-jsonschema.md)) — the published schema is generated from
   the Rust types specifically so it can't drift. If `schemars` needs a hint `serde` doesn't give it
-  (as with the hand-rolled `Duration` codec in `logit-config`), add `#[schemars(with = "...")]`
+  (as with the jiff-backed `Duration` codec in `logit-config`), add `#[schemars(with = "...")]`
   alongside `#[serde(with = "...")]` rather than dropping the derive. A config struct with a
   fixed set of keys also carries `#[serde(deny_unknown_fields)]`, so a typo fails `logit validate`
   instead of being dropped; a map whose keys are the operator's data stays open. A new
