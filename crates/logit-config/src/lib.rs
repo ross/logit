@@ -3470,9 +3470,9 @@ pub struct ReceiveConfig {
     /// The read half owns one slab of `read_batch` x 65,507-byte slots per listener: 4 MiB of
     /// address space at the default, 64 MiB at the ceiling. Only the pages a datagram is written
     /// into are faulted in, so the resident cost tracks real datagram sizes. A shutdown landing
-    /// mid-push drops whatever the read half was holding, uncounted: up to `read_batch`
-    /// datagrams, on the shutdown path only. A `read_batch` larger than `max_datagrams` is legal:
-    /// the batch is admitted item by item under `overflow`.
+    /// mid-push drops whatever the read half was holding, up to `read_batch` datagrams, and
+    /// counts them in `logit.component.datagrams.dropped{reason="shutdown"}`. A `read_batch`
+    /// larger than `max_datagrams` is legal: the batch is admitted item by item under `overflow`.
     pub read_batch: usize,
 }
 

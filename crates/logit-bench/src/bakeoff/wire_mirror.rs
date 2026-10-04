@@ -204,11 +204,10 @@ pub enum WireMetricKind {
     GaugeDelta(f64),
     Samples(WireSamples),
     /// `DdSketch::to_bytes()`: the canonical, cross-language blob `logit_proto::native` also
-    /// uses, since `DDSketch`'s fields are private with no bin iteration
-    /// (`crates/logit-core/src/metric.rs`).
+    /// uses (`crates/logit-core/src/sketch.rs`).
     Distribution(Vec<u8>),
     SetMembers(Vec<Vec<u8>>),
-    /// `HyperLogLog::to_bytes()`, for the same reason as `Distribution` above.
+    /// `HyperLogLog::to_bytes()`, the blob `logit_proto::native` also uses.
     Set(Vec<u8>),
     Histogram(WireHistogram),
     ExponentialHistogram(WireExpHistogram),

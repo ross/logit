@@ -4074,10 +4074,9 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   `docs/design/wire-protocol.md`.
 - **Suggested verification approach:** targeted review of the cap arithmetic against `lz4_flex`'s
   documented worst case; a proptest that `read_frame(write_frame(p, c)) == p` for arbitrary
-  payload/compression; a `cargo-fuzz` target over `read_frame` (`docs/known-gaps/` records fuzz
-  targets as deliberately deferred for toolchain reasons — this is the highest-value place to
-  revisit that); malicious-frame table test (declared lengths at/over each cap, CRC-correct
-  garbage lz4).
+  payload/compression; a `cargo-fuzz` target over `read_frame` (built: `fuzz/fuzz_targets/`'s
+  `native_frame`, [ADR `out-of-ci-fuzzing`](../adr/out-of-ci-fuzzing.md)); malicious-frame table
+  test (declared lengths at/over each cap, CRC-correct garbage lz4).
 - **Priority:** P0 — every byte of the native path crosses this, the logic is entirely custom, and
   a length/classification error means silent spool truncation or an allocation DoS.
 
@@ -4336,8 +4335,9 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - `logit_in` never uses the client's `Hello.max_frame_bytes` to bound its own writes; only the
     listener's own ceiling is enforced. Irrelevant today (control frames are tiny) but the field
     is negotiated and then unused in one direction. **High confidence, low impact.**
-  - `Hello.window`/`HelloAck.window` are negotiated and recorded but never honoured — documented
-    in `docs/known-gaps/` as credit-based flow control being unbuilt. **Context, not a finding.**
+  - ~~`Hello.window`/`HelloAck.window` are negotiated and recorded but never honoured.~~ Built:
+    `logit_out` keeps up to the negotiated window of frames in flight
+    ([ADR `native-hop-send-window`](../adr/native-hop-send-window.md)). **Context, not a finding.**
 - **Existing coverage:** the in-file unit tests of `control.rs` (round trips including empty
   lists, at/over both caps, unknown field tag skipped, wrong message type, dispatch,
   `FLAG_CONTROL` framing);
