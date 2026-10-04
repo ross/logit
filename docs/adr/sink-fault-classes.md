@@ -148,6 +148,26 @@ here", and a sink's table maps each to the class it means. The `RefusesSink` mar
 driver, which the per-request verdicts amendment introduced for `datadog_out`'s `403`, is
 replaced by the `Refused` class.
 
+The rows where a sink departs from this status-only default, each recorded in its sink's table
+and in an amendment to the sink's own record:
+
+- `prometheus_out`: a `415`, and a `400` that opens with a receiver's decompression error, are
+  `Refused` (`crates/logit-outputs/src/prometheus.rs`, "Faults, retries and duplicate safety
+  (sender mode)"; [ADR `prometheus-remote-write`](prometheus-remote-write.md), "Amendment: the
+  sender's response classes (2026-10-04)").
+- `splunk_hec_out`: a `400` with HEC code 7, 12, 13, or 15 drops the one object it names, and a
+  `400` with code 10, 11, 16, 21, 22, or 28 is `Refused` (`crates/logit-outputs/src/splunk.rs`,
+  "Faults, retries, and duplicate safety"; [ADR `splunk-hec-relay`](splunk-hec-relay.md),
+  "Amendment: response classes from the HEC code (2026-10-04)").
+- `datadog_trace_out`: an Agent's `429` is `Clean` before any request of the send was accepted,
+  and a `415` is `Refused` (`crates/logit-outputs/src/datadog_trace.rs`, "Faults, retries, and
+  duplicate safety"; [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md),
+  "Amendment: response classes (2026-10-04)").
+- `otlp_out`: an HTTP `401`, `403`, `404`, or `501` names one signal and is `Rejected`, and a
+  server failure stays `Ambiguous` where the OTLP specification says not to retry it
+  (`crates/logit-outputs/src/otlp.rs`, "Response classes"; "Amendment: `otlp_out` departs from the
+  OTLP specification's non-retryable list (2026-10-04)", below).
+
 Sinks with no application response (`syslog_out`, `statsd_out`, `graphite_out`, `collectd_out`,
 `file_out`, `stdio_out`) classify by I/O error alone: a connect failure is `Clean`, a mid-write
 failure `Ambiguous`, and a local encode-side refusal `Rejected`.

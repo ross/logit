@@ -558,8 +558,11 @@ statements above change:
 
 "The sink does not retry" reads every answer through the status table `otlp_out` used. Under
 [ADR `sink-fault-classes`](sink-fault-classes.md) each sink keeps its own table, and the two now
-differ: `otlp_out` follows the OTLP specification's retry rules, and this sender reads a `415`, and
-a `400` whose body names a failed decompression, as `Refused`, since both answer the sink's
-`version:` or `compression:` rather than the batch. The table, with its evidence, is the
+differ: `otlp_out` reads a server failure (an HTTP `5xx`, gRPC `INTERNAL` or
+`RESOURCE_EXHAUSTED`) as `Ambiguous` where the OTLP specification says not to retry it
+([ADR `sink-fault-classes`](sink-fault-classes.md), "Amendment: `otlp_out` departs from the OTLP
+specification's non-retryable list (2026-10-04)"), and this sender reads a `415`, and a `400`
+whose body opens with a receiver's decompression error, as `Refused`, since both answer the
+sink's `version:` or `compression:` rather than the batch. The table, with its evidence, is the
 "Faults, retries and duplicate safety (sender mode)" section of
 `crates/logit-outputs/src/prometheus.rs`'s module doc.
