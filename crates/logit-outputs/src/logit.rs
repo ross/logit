@@ -34,36 +34,25 @@
 //! `crate::stream::connect`, shared with the pooled line sinks; the handshake after it is this
 //! module's.
 //!
-//! **Fault classification.** A fault says what the peer can hold, and `logit_in` holds a batch
-//! only once it has read the whole frame and checked its CRC: it has no partial decode, and it
-//! forwards before it acks. So the one `Ambiguous` window is the ack wait.
-//! - Connect, TLS, `Hello` write, or `HelloAck` read failure: `Clean`.
-//! - A `HelloAck` that doesn't answer the `Hello` (another protocol version, a codec or
-//!   compression never offered, a mark for an identity `Hello.senders` didn't list, or two marks
-//!   for one identity): `Refused`. The peer answers the same `Hello` the same way, so the runtime
-//!   holds the batch and retries, which succeeds once the peer or the config changes.
-//! - A `Reject`: [`reject_fault`] decides, not where it arrives.
-//!   `REJECT_VERSION_MISMATCH`/`REJECT_NO_COMMON_CODEC` would recur identically for every batch,
-//!   so `Refused`; `REJECT_FRAME_TOO_LARGE` is about the one batch, so `Rejected`. Any other code (`REJECT_INTERNAL`, the peer at its connection
-//!   cap; `REJECT_GOING_AWAY`, the peer shutting down, closing an idle connection, or finding no
-//!   consumer to take a frame; a code a newer peer adds) is transient: `Clean` at the handshake.
-//!   After a data frame left, `REJECT_GOING_AWAY` is still `Clean`: `logit_in` writes it only for
-//!   a frame it didn't forward (its module doc's "Shutdown"), so the batch never landed and is
-//!   resent at any delivery posture. Any other transient code there is `Ambiguous`.
-//! - A batch over the sanity cap or the peer's `max_frame_bytes`, or a compressed frame over
-//!   `frame::compressed_bound` of that: `Rejected`, nothing written, a pooled connection kept.
-//! - **Write phase**: any failure before the frame is completely written and flushed (a write
-//!   `Err` or `Ok(0)`, a failed flush, or a write or flush that makes no progress for the request
-//!   timeout) is `Clean`, with the `io::Error` kept, and the connection
-//!   is dropped. Bytes of the frame may have left the host, but not all of them, so the peer can't
-//!   hold the batch. The flush is part of the phase because a TLS write can return with the
-//!   frame's tail still queued in the session, and a waiting ack read doesn't send it. ADR
-//!   `sink-send-path-and-attempt-accounting`, decisions 6 and 7, has the one residual (a TLS 1.3
-//!   `KeyUpdate` queued behind the frame).
-//! - **Ack wait**: a timeout, a read error, an EOF, or a message other than `Ack` or `Reject`:
-//!   `Ambiguous`, and the connection is dropped. A `Reject{GOING_AWAY}` there is `Clean` for every
-//!   frame still unanswered: `logit_in` writes it only for a frame it didn't forward and reads
-//!   nothing after it.
+//! **Response classes.** A class says what the peer can hold, and `logit_in` holds a batch only
+//! once it has read the whole frame and checked its CRC: it has no partial decode, and it forwards
+//! before it acks. So the one `Ambiguous` window is the ack wait. A `Reject` is classed by its
+//! code ([`reject_fault`]), not where it arrives, except the transient codes, which depend on
+//! whether a data frame had left. The wire is `docs/design/wire-protocol.md`, "Connection
+//! protocol". The Evidence column names the test that pins each row.
+//!
+//! | Response | Class | Why | Evidence |
+//! |---|---|---|---|
+//! | connect, TLS, `Hello` write, or `HelloAck` read failure | `Clean` | no frame left the process | `connect_refused_is_classified_clean`, `the_hello_is_flushed_before_the_hello_ack_wait` |
+//! | a `HelloAck` that doesn't answer the `Hello`: another protocol version, a codec or compression never offered, a mark for an identity `Hello.senders` didn't list, or two marks for one identity | `Refused` | the peer answers the same `Hello` the same way, so every batch would get it; the runtime holds and retries, which succeeds once the peer or the config changes | `a_hello_ack_with_another_protocol_version_is_refused`, `a_hello_ack_naming_a_codec_never_offered_is_refused`, `a_hello_ack_naming_a_compression_never_offered_is_refused`, `a_hello_ack_mark_for_an_unoffered_identity_is_refused` |
+//! | `Reject{VERSION_MISMATCH}` or `Reject{NO_COMMON_CODEC}`, anywhere | `Refused` | the peer can't speak this sink's version or any codec it offers: the same for every batch | `reject_version_mismatch_is_refused`, `each_handshake_reject_code_reads_as_its_class` |
+//! | `Reject{FRAME_TOO_LARGE}`, anywhere | `Rejected` | about this frame: past the peer's cap or decode budget, as it would be on every resend | `a_reject_frame_too_large_after_the_frame_was_sent_is_still_rejected`, `each_handshake_reject_code_reads_as_its_class` |
+//! | `Reject{INTERNAL}` (the peer at its connection cap), `Reject{GOING_AWAY}` (shutting down, an idle close, no consumer to take a frame), or a code a newer peer adds, at the handshake | `Clean` | transient, and no frame left | `reject_internal_at_the_handshake_is_clean_not_refused`, `reject_going_away_at_the_handshake_is_clean_not_refused`, `each_handshake_reject_code_reads_as_its_class` |
+//! | `Reject{GOING_AWAY}` in place of an `Ack` | `Clean` for every frame still unanswered | `logit_in` writes it only for a frame it didn't forward (its module doc's "Shutdown") and reads nothing after it, so the batch never landed and is resent at any posture | `a_going_away_in_place_of_an_ack_is_a_clean_fault_and_the_batch_is_resent` |
+//! | any other transient `Reject` in place of an `Ack` | `Ambiguous` | the frame left, and the peer may have forwarded it | `a_reject_internal_after_the_frame_was_sent_is_ambiguous` |
+//! | a batch over the sanity cap or the peer's `max_frame_bytes`, or a compressed frame over `frame::compressed_bound` of that | `Rejected`, nothing written, a pooled connection kept | this batch can't be sent to this peer | `an_oversized_batch_is_rejected_and_the_connection_is_kept`, `each_too_large_return_counts_one_rejected_request_and_keeps_the_connection` |
+//! | **write phase**: any failure before the frame is completely written and flushed (a write `Err` or `Ok(0)`, a failed flush, or a write or flush that makes no progress for the request timeout) | `Clean`, the `io::Error` kept, the connection dropped | bytes of the frame may have left, but not all of them, so the peer can't hold the batch. The flush is part of the phase because a TLS write can return with the frame's tail still queued in the session; ADR `sink-send-path-and-attempt-accounting`, decisions 6 and 7, has the one residual (a TLS 1.3 `KeyUpdate` queued behind the frame) | `a_write_that_fails_part_way_through_the_frame_is_clean_and_keeps_the_io_error`, `a_first_write_of_zero_bytes_is_clean_and_keeps_the_io_error`, `a_failed_flush_is_clean_and_drops_the_connection`, `a_tls_write_error_after_a_whole_record_left_is_clean_and_logit_in_forwards_nothing` |
+//! | **ack wait**: a timeout, a read error, an EOF, or a message other than `Ack` or `Reject` | `Ambiguous`, the connection dropped | the whole frame left and the peer may have forwarded it | `an_ack_that_never_arrives_is_classified_ambiguous`, `a_peer_that_never_acks_is_ambiguous_and_the_next_send_reconnects`, `a_message_other_than_ack_or_reject_after_the_frame_is_ambiguous` |
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
 //! retries an `Ambiguous` attempt. Every frame carries the sender identity and sequence the sink's
@@ -1829,6 +1818,26 @@ mod tests {
         let mut output = LogitOutput::new(addr);
         let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Refused);
+    }
+
+    /// The handshake rows of the module doc's "Response classes" table that the tests around this
+    /// one don't name: each `Reject` code a peer answers a `Hello` with, and its class.
+    #[tokio::test]
+    async fn each_handshake_reject_code_reads_as_its_class() {
+        for (code, want) in [
+            (control::REJECT_NO_COMMON_CODEC, Fault::Refused),
+            (control::REJECT_FRAME_TOO_LARGE, Fault::Rejected),
+            (999, Fault::Clean),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            tokio::spawn(fake_peer(listener, move |_hello| {
+                FakePeerBehavior::Reject(control::Reject { code, message: "no".to_string() })
+            }));
+            let mut output = LogitOutput::new(addr);
+            let err = send_next(&mut output, &sample_batch()).await.unwrap_err();
+            assert_eq!(classify(&err), want, "code {code}");
+        }
     }
 
     #[tokio::test]
