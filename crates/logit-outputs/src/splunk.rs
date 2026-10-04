@@ -74,9 +74,9 @@
 //! | `400` code 6 naming object 0 of a body over [`SPLUNK_CLOUD_BODY_CAP`] before compression | `Rejected` for its size: a body of several objects is split in two and each half sent, with a throttled `oversize` diagnostic; a half answered so again is `Rejected`. A body of one object is dropped, counted `records.dropped{reason="oversize"}` | Splunk Cloud's answer to an oversize body | `docs/plans/splunk-relay.md`, "Settled by the Cloud run (2026-09-26)" |
 //! | `429` (codes 26, 27), or `503` code 9 or with no HEC body, before any `/event` request of this `send` was accepted | `Clean` | Splunk didn't take the body: its queue or ack channel is full, or it's busy ([`is_busy`]) | [HEC codes][hec-codes] |
 //! | the same after one was | `Ambiguous` | Splunk holds part of the batch ([`after_delivery`]) | -- |
-//! | `500` code 8, `503` codes 18 to 20 and 23, `408`, any other `5xx` | `Ambiguous` | may have indexed: code 8 says nothing either way, and 18 to 20 and 23 are `/health` and shutdown answers Splunk doesn't document on `/event` | [HEC codes][hec-codes] |
+//! | `500` code 8, `503` codes 18 to 20 and 23, `408`, any other `5xx`, `501` included | `Ambiguous` | may have indexed: code 8 says nothing either way, and 18 to 20 and 23 are `/health` and shutdown answers Splunk doesn't document on `/event` | [HEC codes][hec-codes] |
 //! | `400` code 5 (no data), 14 (ACK disabled, an `/ack` answer), a per-object code with no or an out-of-range object number, or no HEC code | `Rejected`, with a throttled `request_rejected` diagnostic | about this request: the sink never sends an empty body or polls `/ack` from `/event`, and the status alone can't say more | [`crate::http::classify_status`] |
-//! | `404`, `405`, `407`, `501` | `Refused`, with a throttled `request_rejected` diagnostic | the endpoint isn't a HEC collector as configured | [`crate::http::classify_status`] |
+//! | `404`, `405`, `407` | `Refused`, with a throttled `request_rejected` diagnostic | the endpoint isn't a HEC collector as configured | [`crate::http::classify_status`] |
 //! | any other `3xx` or `4xx` | `Rejected`, with a throttled `request_rejected` diagnostic | about this request; redirects are off | [`crate::http::classify_status`] |
 //! | connect failure, before any `/event` request of this `send` was accepted | `Clean` | nothing left the process | -- |
 //! | connect failure after one was (a 2xx, or a per-object answer whose objects ahead count as delivered) | `Ambiguous` | Splunk holds part of the batch | -- |
@@ -1256,13 +1256,14 @@ mod tests {
             (502, String::new()),
             (503, body(18)),
             (504, String::new()),
+            (501, String::new()),
         ] {
             assert_eq!(fault_for(status, &body).await, Fault::Ambiguous, "{status} {body}");
         }
         for status in [301, 400, 413] {
             assert_eq!(fault_for(status, "").await, Fault::Rejected, "{status}");
         }
-        for status in [401, 403, 404] {
+        for status in [401, 403, 404, 405, 407] {
             assert_eq!(fault_for(status, "").await, Fault::Refused, "{status}");
         }
         // A code 6 with no object number, or none in range, is rejected too.
