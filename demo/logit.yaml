@@ -473,17 +473,18 @@ components:
         browser_in,
       ]
 
-  # Loki's OTLP ingestion accepts logs only (it registers no `TracesService`/`MetricsService`), and
-  # `otlp_out` aborts an entire batch's `send` on the first signal request that fails
-  # (`crates/logit-outputs/src/otlp.rs`'s module doc; `trace_only`/`tempo_out` below apply the same
-  # reasoning to Tempo). `haproxy_trace`/`nginx_trace` produce span-only events, so `loki_out`
-  # needs this `keep_signals: [logs]` gate in front of it. `keep_signals` clears the payload slots
-  # it isn't given (ADR `signal-filtering-components`), so every log that reaches `loki_out` keeps
-  # its log payload intact, without the span-only events that would trip Loki's `send`. `self`
-  # (below) joins the same gate for the same reason: it emits points, spans, *and* logs
-  # (docs/plans/operator-surface.md) through this one component, and `keep_signals: [logs]` lets
-  # `logit`'s own self-diagnostics reach Loki without also sending `loki_out` a metric point or a
-  # span it would reject.
+  # Loki's OTLP ingestion accepts logs only (it registers no `TracesService`/`MetricsService`).
+  # `otlp_out` counts a signal Loki rejects `records.dropped{reason="rejected"}` and warns, so a
+  # span or metric point reaching `loki_out` doesn't fail the logs beside it, but the request is
+  # wasted on every batch (ADR `delivery-semantics`, "Amendment: per-request verdicts
+  # (2026-10-04)"; `trace_only`/`tempo_out` below apply the same reasoning to Tempo).
+  # `haproxy_trace`/`nginx_trace` produce span-only events, so this `keep_signals: [logs]` gate in
+  # front of `loki_out` keeps the sink's input to the one signal Loki takes. `keep_signals` clears
+  # the payload slots it isn't given (ADR `signal-filtering-components`), so every log that
+  # reaches `loki_out` keeps its log payload intact. `self` (below) joins the same gate: it emits
+  # points, spans, *and* logs (docs/plans/operator-surface.md) through this one component, and
+  # `keep_signals: [logs]` lets `logit`'s own self-diagnostics reach Loki without also sending
+  # `loki_out` a metric point or a span it would reject.
   logs_only:
     type: keep_signals
     sources:
@@ -512,12 +513,11 @@ components:
     sources: [haproxy_trace, nginx_trace]
     signals: [traces]
 
-  # Same reasoning as `trace_only`/`access_spans`, applied to `browser_in`: `otlp_out` aborts
-  # `tempo_out`'s entire batch send on the first signal request that fails
-  # (`crates/logit-outputs/src/otlp.rs`'s module doc), and Tempo registers no `MetricsService`.
-  # The browser only ever sends traces here, but this config makes that structural rather than
+  # Same reasoning as `trace_only`/`access_spans`, applied to `browser_in`: Tempo registers no
+  # `MetricsService`, so a metric point reaching `tempo_out` costs a rejected request. The
+  # browser only ever sends traces here, but this config makes that structural rather than
   # incidental for every source feeding `tempo_out`: `keep_signals` costs nothing and rules the
-  # failure mode out by construction, rather than relying on a well-behaved sender.
+  # rejected request out by construction, rather than relying on a well-behaved sender.
   browser_spans:
     type: keep_signals
     sources: [browser_in]
@@ -650,18 +650,16 @@ components:
   # reaches `tempo_out` arrives exactly as `self` produced it. See
   # `docs/adr/signal-filtering-components.md`.
   #
-  # This gate is load-bearing, not hygiene. `otlp_out` issues one request per signal and aborts the
-  # rest of a `send` call on the first failing one (`crates/logit-outputs/src/otlp.rs`'s module
-  # doc), and Tempo is a traces-only gRPC server (it registers no `MetricsService`). An `internal`
-  # metric point reaching `tempo_out` would fail with `grpc-status: 12` (UNIMPLEMENTED), and enough
-  # consecutive failures trip `write_loop`'s ~60s sustained-permanent-failure guard
-  # (`docs/adr/service-lifecycle-and-output-retry.md`, revised by
-  # `docs/adr/buffered-sink-delivery.md`), ending the whole `logit` process and taking the
-  # VictoriaMetrics metrics path down with it, not just Tempo. See `docs/known-gaps/otlp.md`'s
-  # "`otlp_out` aborts a batch's `send`..." entry for the full account. `access_spans` needs
-  # the same gate for the same reason, because `haproxy_trace`/`nginx_trace` produce
-  # metric-and-span-carrying batches, and so does `browser_spans`, even though `browser_in` only
-  # ever emits traces (see `browser_spans`'s comment above).
+  # The gate keeps the sink's input to the one signal Tempo takes. Tempo is a traces-only gRPC
+  # server (it registers no `MetricsService`). `otlp_out` issues one request per signal, so an
+  # `internal` metric point reaching `tempo_out` would draw a `grpc-status: 12` (UNIMPLEMENTED)
+  # answer. `otlp_out` counts those points `records.dropped{reason="rejected"}`, warns, and still
+  # delivers the batch's spans, but the rejected request repeats on every batch. A batch of only
+  # metric points would fail whole, and `write_loop` ends the process if every batch fails that
+  # way for a minute (ADR `delivery-semantics`, "Amendment: per-request verdicts (2026-10-04)").
+  # `access_spans` needs the same gate for the same reason, because `haproxy_trace`/`nginx_trace`
+  # produce metric-and-span-carrying batches, and so does `browser_spans`, even though `browser_in`
+  # only ever emits traces (see `browser_spans`'s comment above).
   trace_only:
     type: has_signal
     sources: [self]

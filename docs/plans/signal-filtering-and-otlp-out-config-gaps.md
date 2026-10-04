@@ -34,6 +34,8 @@ the whole process a minute after startup. `docs/known-gaps/`'s "`otlp_out` abort
 batch's `send`..." entry names "a config-layer way to filter an event stream by which payload it
 carries" as the real fix. This plan's workstream 1 is that fix.
 
+[Closed 2026-10-04 by ADR `delivery-semantics`'s "Amendment: per-request verdicts (2026-10-04)": `otlp_out` no longer aborts a `send` on a request that names itself as rejected, so a signal-partial backend no longer trips the guard. The gate described here still saves a rejected request per batch.]
+
 The remaining in-scope `otlp_out` items — custom headers, gzip compression, configurable per-signal
 paths, and `observed_time_unix_nano` — are ordinary config surface: none blocks the demo, all block
 a real deployment. **gRPC TLS is out of scope** and stays a filed known gap; it needs a
@@ -186,7 +188,7 @@ the multi-payload model forces two operations rather than one; the drop-emptied-
   InfluxDB via `self_windowed`, so nothing is lost.
 - `docs/known-gaps/` — the "aborts an entire batch's `send`" gap itself is unchanged (the abort
   behavior stays), but its demo-workaround paragraphs now describe `has_signal` as the fix rather
-  than `aggregate` as a hack.
+  than `aggregate` as a hack. [Closed 2026-10-04 by ADR `delivery-semantics`'s "Amendment: per-request verdicts (2026-10-04)": `otlp_out` no longer aborts a `send` on a request that names itself as rejected, so a signal-partial backend no longer trips the guard. The gate described here still saves a rejected request per batch.]
 - `docs/plans/otlp-logs-and-resource-identity.md` — workstream E's "No signal filter" bullet marked
   landed, pointing at the new ADR.
 - `AGENTS.md`'s "Current state" paragraph and its `logit-transforms` line in "Where things live" —

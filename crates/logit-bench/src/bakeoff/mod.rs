@@ -45,12 +45,12 @@ pub fn native_decode(bytes: Bytes) -> EventBatch {
 // -- otlp: the interop control arm ---------------------------------------------------------------
 
 /// Encodes `batch` the way `otlp_out` would: `SignalEncoder::encode_signals` producing zero to
-/// three separate payloads, each tagged with its [`logit_proto::Signal`]. `encode_signals`
+/// three separate payloads, each a [`logit_proto::SignalPayload`] tagged with its signal. `encode_signals`
 /// guarantees no ordering across signals, so a caller decoding them back ([`otlp_round_trip`])
 /// must keep the tag, not assume a position. Returned individually, not concatenated: one
 /// `EventBatch` becoming several wire messages is part of what this arm costs, in bytes (repeated
 /// resource/scope framing per payload) and in fidelity.
-pub fn otlp_encode(batch: &EventBatch) -> Vec<(logit_proto::Signal, Bytes)> {
+pub fn otlp_encode(batch: &EventBatch) -> Vec<logit_proto::SignalPayload> {
     let mut encoder = OtlpEncoder::new();
     encoder.encode_signals(batch).expect("otlp encode")
 }
@@ -62,7 +62,7 @@ pub fn otlp_encode(batch: &EventBatch) -> Vec<(logit_proto::Signal, Bytes)> {
 pub fn otlp_round_trip(batch: &EventBatch) -> Vec<EventBatch> {
     let mut decoder = OtlpDecoder::new();
     let mut out = Vec::new();
-    for (signal, bytes) in otlp_encode(batch) {
+    for logit_proto::SignalPayload { signal, bytes, .. } in otlp_encode(batch) {
         out.extend(decoder.decode_signal(signal, bytes).expect("otlp decode"));
     }
     out

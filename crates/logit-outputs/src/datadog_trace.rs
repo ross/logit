@@ -93,22 +93,26 @@
 //!
 //! ## Faults, retries, and duplicate safety
 //!
-//! **One `send` is one attempt per request**, traces then stats. The first failing request aborts
-//! the rest, and `write_loop` retries the whole batch, re-sending any request that had already
-//! succeeded (`otlp_out`'s rule).
+//! **One `send` is one attempt per request**, traces then stats, **and each request's verdict
+//! stands on its own** ([`Outcomes`]; `docs/adr/delivery-semantics.md`'s "Amendment: per-request
+//! verdicts (2026-10-04)"). A request the Agent rejects is counted and the send goes on to the
+//! next request; a `Clean` or `Ambiguous` failure stops the send, and `write_loop` retries the
+//! whole batch, re-sending any request that had already succeeded. The send succeeds when any
+//! request was accepted, and fails with the first rejection when every request was rejected. The
+//! Agent's API has no credential, so no answer refuses the sink as a whole.
 //!
-//! | Outcome | Result |
-//! |---|---|
-//! | 2xx | `Ok` |
-//! | 408, 429, any 5xx | [`Fault::Ambiguous`] |
-//! | 413 | [`Fault::Permanent`], and the request's records counted `records.dropped{reason="oversize"}` |
-//! | any other 1xx, 3xx, or 4xx | [`Fault::Permanent`], with a throttled `request_rejected` diagnostic quoting the first 256 bytes of the body |
-//! | connect failure (refused, no such socket file), before any request of this `send` was accepted | [`Fault::Clean`] |
-//! | connect failure after one was | [`Fault::Ambiguous`] |
-//! | any other transport error, timeout included | [`Fault::Ambiguous`] |
+//! | Outcome | Result | The rest of the `send` |
+//! |---|---|---|
+//! | 2xx | `Ok` | goes on |
+//! | 408, 429, any 5xx | [`Fault::Ambiguous`] | stops |
+//! | 413 | [`Fault::Permanent`], and the request's records counted `records.dropped{reason="oversize"}` | goes on |
+//! | any other 1xx, 3xx, or 4xx | [`Fault::Permanent`], the request's records counted `records.dropped{reason="rejected"}`, with a throttled `request_rejected` diagnostic quoting the first 256 bytes of the body | goes on |
+//! | connect failure (refused, no such socket file), before any request of this `send` was accepted | [`Fault::Clean`] | stops |
+//! | connect failure after one was | [`Fault::Ambiguous`] | stops |
+//! | any other transport error, timeout included | [`Fault::Ambiguous`] | stops |
 //!
 //! `Clean` means the Agent holds nothing of the batch, so once a request was accepted a connect
-//! failure on a later one is `Ambiguous` ([`after_delivery`]), on either transport.
+//! failure on a later one is `Ambiguous` ([`crate::http::after_delivery`]), on either transport.
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
 //! retries an `Ambiguous` attempt, and a batch can be two requests, so a retry after the second
@@ -124,7 +128,7 @@
 //! | `logit.output.request.duration{route}` | one timer per request |
 //! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; not for a refused connection or a missing socket file |
 //! | `logit.output.records{route}` | spans (`traces`) or stats groups (`stats`) in a request the Agent accepted |
-//! | `logit.output.records.dropped{route, reason="oversize"}` | as above |
+//! | `logit.output.records.dropped{route, reason}` | `oversize` or `rejected`, as above |
 //!
 //! Plus everything [`DatadogEncoder`] counts itself (`logit.output.spans.degraded`,
 //! `logit.output.stats.*`, `logit.output.tags.dropped`), which this sink doesn't repeat.
@@ -134,13 +138,13 @@
 //! stats group too large alone, and the `bad_header` diagnostic count on the unit's first encode,
 //! once per batch. A bisection's re-encodes count nothing ([`crate::http::split_encode`]). The
 //! encoder's counters for the batch resource count once per request of up to
-//! [`MAX_TRACES_PER_REQUEST`], not once per batch. The transport counters and a `413`'s
-//! `oversize` count per attempt.
+//! [`MAX_TRACES_PER_REQUEST`], not once per batch. The transport counters, a `413`'s `oversize`,
+//! and a rejected request's `rejected` count per attempt.
 
 use crate::accounting::BatchAccounting;
 use crate::http::{
-    after_delivery, body_snippet, build_client, classify_reqwest_error, read_body_prefix,
-    split_encode, status_class, Caps, Encoded, ERROR_BODY_SNIPPET_BYTES,
+    body_snippet, build_client, classify_reqwest_error, read_body_prefix, split_encode,
+    status_class, Caps, Encoded, Outcomes, ERROR_BODY_SNIPPET_BYTES,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -595,7 +599,11 @@ impl DatadogTraceOutput {
     /// The trace route's requests: the batch's span events other than APM stats, one item per
     /// trace so a trace is never split. The encode and the tracer headers are [`TRACES_UNIT`]:
     /// the oversize drops and the `bad_header` diagnostic count on its first encode only.
-    async fn send_traces(&mut self, batch: &EventBatch, sent_any: &mut bool) -> anyhow::Result<()> {
+    async fn send_traces(
+        &mut self,
+        batch: &EventBatch,
+        outcomes: &mut Outcomes,
+    ) -> anyhow::Result<()> {
         let resource = &batch.resource;
         let chunks: Vec<Vec<usize>> = trace_chunks(batch)
             .into_iter()
@@ -649,14 +657,18 @@ impl DatadogTraceOutput {
         for (_, encoded) in split.requests {
             let mut headers = headers.clone();
             headers.insert(HEADER_TRACE_COUNT, HeaderValue::from(encoded.meta.traces));
-            self.post(Route::Traces, headers, encoded, sent_any).await?;
+            self.post(Route::Traces, headers, encoded, outcomes).await?;
         }
         Ok(())
     }
 
     /// The stats route's requests: one item per APM stats event (a stats group). The encode is
     /// [`STATS_UNIT`]: the oversize drops count on its first encode only.
-    async fn send_stats(&mut self, batch: &EventBatch, sent_any: &mut bool) -> anyhow::Result<()> {
+    async fn send_stats(
+        &mut self,
+        batch: &EventBatch,
+        outcomes: &mut Outcomes,
+    ) -> anyhow::Result<()> {
         let items: Vec<usize> = (0..batch.events.len())
             .filter(|&i| is_datadog_stats(&batch.resource, &batch.events[i]))
             .collect();
@@ -695,7 +707,7 @@ impl DatadogTraceOutput {
             }
         }
         for (_, encoded) in split.requests {
-            self.post(Route::Stats, HeaderMap::new(), encoded, sent_any).await?;
+            self.post(Route::Stats, HeaderMap::new(), encoded, outcomes).await?;
         }
         Ok(())
     }
@@ -769,37 +781,36 @@ impl DatadogTraceOutput {
         headers
     }
 
-    /// One attempt: traces, then stats. `sent_any` says whether a request of this attempt was
-    /// accepted ([`DatadogTraceOutput::post`]).
+    /// One attempt: traces, then stats, every request's verdict folded into `outcomes`
+    /// ([`DatadogTraceOutput::post`]).
     async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let mut sent_any = false;
-        self.send_traces(batch, &mut sent_any).await?;
-        self.send_stats(batch, &mut sent_any).await
+        let mut outcomes = Outcomes::new();
+        self.send_traces(batch, &mut outcomes).await?;
+        self.send_stats(batch, &mut outcomes).await?;
+        outcomes.finish()
     }
 
-    /// One request ([`DatadogTraceOutput::request`]), whose failure is `Ambiguous` rather than
-    /// `Clean` once an earlier request of the attempt was accepted ([`after_delivery`]). Sets
-    /// `sent_any` when this one is.
+    /// One request ([`DatadogTraceOutput::request`]), its result folded into `outcomes`: `Ok`
+    /// to go on, a rejection included (`request` counted it), or the error that stops the
+    /// attempt, whose `Clean` is `Ambiguous` once an earlier request of the attempt was accepted
+    /// ([`crate::http::after_delivery`]).
     async fn post(
         &mut self,
         route: Route,
         protocol: HeaderMap,
         encoded: Encoded<RequestMeta>,
-        sent_any: &mut bool,
+        outcomes: &mut Outcomes,
     ) -> anyhow::Result<()> {
-        match self.request(route, protocol, encoded).await {
-            Ok(()) => {
-                *sent_any = true;
-                Ok(())
-            }
-            Err(err) => Err(after_delivery(err, *sent_any)),
-        }
+        let result = self.request(route, protocol, encoded).await;
+        outcomes.note(result, |_| {})
     }
 
     /// One request, one attempt (module doc's "Faults, retries, and duplicate safety").
     /// `request.bytes` counts a request that may have left: any answer, and any error but a
     /// [`Fault::Clean`] one, which never connected. The counters follow this request's own fault,
-    /// before [`DatadogTraceOutput::post`] applies [`after_delivery`].
+    /// before [`DatadogTraceOutput::post`] folds it into the attempt. A rejection counts the
+    /// request's records dropped here, `oversize` for a `413` and `rejected` for any other 1xx,
+    /// 3xx, or 4xx.
     async fn request(
         &mut self,
         route: Route,
@@ -857,14 +868,20 @@ impl DatadogTraceOutput {
                 self.dropped(route, "oversize", records);
                 self.diag.warn_throttled(
                     "request_rejected",
-                    format_args!("{target} answered 413, request too large: {snippet}"),
+                    format_args!(
+                        "{target} answered 413, request too large, {records} record(s) dropped: \
+                         {snippet}"
+                    ),
                 );
                 Fault::Permanent
             }
             _ => {
+                self.dropped(route, "rejected", records);
                 self.diag.warn_throttled(
                     "request_rejected",
-                    format_args!("{target} answered {status}: {snippet}"),
+                    format_args!(
+                        "{target} answered {status}, {records} record(s) dropped: {snippet}"
+                    ),
                 );
                 Fault::Permanent
             }
@@ -884,9 +901,10 @@ impl Output for DatadogTraceOutput {
         self.accounting.observe();
     }
 
-    /// Traces, then stats, one request at a time; the first failure aborts the rest (module doc's
-    /// "Faults, retries, and duplicate safety"). An `Ok` disarms the batch accounting on every
-    /// path, a batch that sent nothing included.
+    /// Traces, then stats, one request at a time; a rejected request is counted and the rest go
+    /// on, and a `Clean` or `Ambiguous` failure stops the send (module doc's "Faults, retries, and
+    /// duplicate safety"). An `Ok` disarms the batch accounting on every path, a batch that sent
+    /// nothing included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
@@ -1329,16 +1347,64 @@ mod tests {
         }
     }
 
-    /// A failing trace request aborts the stats request after it.
+    /// An `Ambiguous` trace request aborts the stats request after it: the retry resends the
+    /// whole batch anyway.
     #[tokio::test]
     async fn a_failing_trace_request_aborts_the_stats_request() {
         let (addr, log) =
             agent(|path| (if path == "/v0.4/traces" { 500 } else { 200 }, String::new())).await;
         let mut events = two_traces().events;
         events.push(stats_event());
-        sink(addr).send(&batch(events)).await.unwrap_err();
+        let err = sink(addr).send(&batch(events)).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
         let paths: Vec<_> = captured(&log).iter().map(|c| c.path.clone()).collect();
         assert_eq!(paths, ["/v0.4/traces"]);
+    }
+
+    /// A rejected trace request is counted and the stats request is still sent; the accepted
+    /// stats make the send `Ok`.
+    #[tokio::test]
+    async fn a_rejected_trace_request_is_counted_and_the_stats_are_still_sent() {
+        let (addr, log) =
+            agent(|path| (if path == "/v0.4/traces" { 400 } else { 200 }, String::new())).await;
+        let (registry, mut out) = metered(sink(addr));
+        let mut events = two_traces().events;
+        events.push(stats_event());
+        out.send(&batch(events)).await.expect("the accepted stats make the send Ok");
+        let paths: Vec<_> = captured(&log).iter().map(|c| c.path.clone()).collect();
+        assert_eq!(paths, ["/v0.4/traces", "/v0.6/stats"]);
+        let points = registry.drain(0);
+        let rejected = [("route", "traces"), ("reason", "rejected")];
+        assert_eq!(total(&points, RECORDS_DROPPED, &rejected), 3.0, "three spans");
+        assert_eq!(total(&points, RECORDS, &[("route", "stats")]), 1.0);
+    }
+
+    /// Both requests rejected: each is counted, and the send fails explicitly `Permanent`.
+    #[tokio::test]
+    async fn rejected_traces_and_stats_fail_the_send_permanent() {
+        let (addr, log) = agent(|_| (400, String::new())).await;
+        let (registry, mut out) = metered(sink(addr));
+        let mut events = two_traces().events;
+        events.push(stats_event());
+        let err = out.send(&batch(events)).await.unwrap_err();
+        assert!(logit_pipeline::is_explicitly_permanent(&err), "{err:#}");
+        assert!(format!("{err:#}").contains("traces"), "the first rejection: {err:#}");
+        assert_eq!(captured(&log).len(), 2);
+        let points = registry.drain(0);
+        let traces = [("route", "traces"), ("reason", "rejected")];
+        assert_eq!(total(&points, RECORDS_DROPPED, &traces), 3.0);
+        let stats = [("route", "stats"), ("reason", "rejected")];
+        assert_eq!(total(&points, RECORDS_DROPPED, &stats), 1.0);
+    }
+
+    /// A `413` counts `oversize` alone, never `rejected` as well.
+    #[tokio::test]
+    async fn a_413_is_not_also_counted_rejected() {
+        let (addr, _log) = agent(|_| (413, String::new())).await;
+        let (registry, mut out) = metered(sink(addr));
+        out.send(&two_traces()).await.unwrap_err();
+        let points = registry.drain(0);
+        assert_eq!(total(&points, RECORDS_DROPPED, &[("reason", "rejected")]), 0.0);
     }
 
     /// A 413 counts the request's spans oversize, and the request by its class.

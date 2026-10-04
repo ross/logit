@@ -323,6 +323,8 @@ feeding a signal-partial backend rather than a general `otlp_out` problem, in `d
 "`otlp_out` aborts an entire batch's `send`..." entry, with the same account inline in
 `demo/logit.yaml`.
 
+[Closed 2026-10-04 by ADR `delivery-semantics`'s "Amendment: per-request verdicts (2026-10-04)": `otlp_out` no longer aborts a `send` on a request that names itself as rejected, so a signal-partial backend no longer trips the guard. The gate described here still saves a rejected request per batch.]
+
 **`demo/README.md`**'s "What isn't wired yet" section was rewritten: traces work now, the Tempo row
 in the URL table stopped saying "empty," and `syslog_out`/Loki is the one remaining open leg —
 along with a note on the (harmless, at-most-once-a-minute) `trace_out` warning above, so a

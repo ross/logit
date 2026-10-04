@@ -2,32 +2,6 @@
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
-- **`otlp_out` aborts a batch's `send` on the first signal request that fails, and against a
-  signal-partial backend fed by a mixed-signal source that can end the process.**
-  `OtlpOutput::attempt` (`crates/logit-outputs/src/otlp.rs`) issues one request per non-empty
-  signal, sequentially in `encode_signals`' fixed order (traces before metrics), and
-  `?`-propagates the first failure without attempting the rest.
-  - **Consequence:** `internal` doesn't distinguish signals: every drain carries spans plus
-    `logit`'s own `logit.*` metrics. Tempo is traces-only (a `TraceService`, no
-    `MetricsService`), so a mixed batch's traces request succeeds and its metrics request fails
-    with `grpc-status: 12` (`UNIMPLEMENTED`, `Fault::Permanent`, not retried). `write_loop` drops
-    the whole batch, though its traces already reached Tempo. When every batch mixes both signals
-    (an `otlp_out` fed straight from `internal`), `send` never returns `Ok`, and `write_loop`'s
-    sustained-permanent-failure guard (`PERMANENT_FAILURE_WINDOW`, 60 s, in
-    `crates/logit-pipeline/src/runtime.rs`;
-    [ADR `buffered-sink-delivery`](../adr/buffered-sink-delivery.md)) ends the process about a
-    minute after startup, taking every other sink with it. The guard exists for a real
-    misconfiguration (a bad token, a bad bucket); it can't tell that from two signals reaching a
-    backend that wants one, a false positive.
-  - **Workaround:** filter at the config layer with `has_signal` (or `keep_signals`/
-    `drop_signals`, [ADR `signal-filtering-components`](../adr/signal-filtering-components.md)).
-    `demo/logit.yaml` puts `trace_only` (`type: has_signal`, `signals: [traces]`) between `self`
-    and `tempo_out`, so no metrics-only batch reaches `tempo_out` and the guard has nothing to trip
-    on. A production `otlp_out` whose source carries only signals its destination accepts never
-    hits this.
-  - **To close:** a per-signal partial-failure mode on `OtlpOutput::attempt` that doesn't abort
-    sibling signals, and doesn't let one incompatible signal trip the sustained-failure guard for
-    signals that are succeeding.
 - **`otlp_in`'s `partial_success` response is always empty.** OTLP's
   `Export*ServiceResponse.partial_success` lets a receiver accept most of a request while
   reporting rejected records. `otlp_out` implements the reading half

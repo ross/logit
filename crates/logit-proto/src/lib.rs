@@ -179,17 +179,24 @@ impl Signal {
     }
 }
 
+/// One [`Signal`]'s encoded request body and how many records it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalPayload {
+    pub signal: Signal,
+    pub bytes: bytes::Bytes,
+    /// Log records, spans, or metric points in `bytes`, after the codec's own skips, so a sink
+    /// that loses this payload to a destination's verdict can count what it lost.
+    pub records: usize,
+}
+
 /// Splits one [`EventBatch`] into one payload per [`Signal`].
 ///
 /// OTLP has no single message type a batch maps onto, and each payload needs a per-signal
 /// destination rather than a message boundary.
 pub trait SignalEncoder {
-    /// Encodes `batch` into zero or more `(Signal, bytes)` payloads, one per non-empty signal. An
-    /// empty batch yields none, never an empty OTLP request.
-    fn encode_signals(
-        &mut self,
-        batch: &EventBatch,
-    ) -> Result<Vec<(Signal, bytes::Bytes)>, CodecError>;
+    /// Encodes `batch` into zero or more payloads, one per non-empty signal. An empty batch
+    /// yields none, never an empty OTLP request.
+    fn encode_signals(&mut self, batch: &EventBatch) -> Result<Vec<SignalPayload>, CodecError>;
 }
 
 /// The mirror of [`SignalEncoder`].

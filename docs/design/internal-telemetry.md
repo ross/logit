@@ -1530,7 +1530,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 |---|---|---|
 | Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.dropped`, `labels.normalized`, `spans.degraded`, `stats.skipped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"needs_agent_processing"\|"not_datadog_origin"}`; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `file.rotations`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
 | Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
-| Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `otlp_out`'s `records.rejected`; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `invalid_event`, `token_rejected`, `request_rejected`, `api_key_rejected`, `ack_unsupported`, `ack_timeout`, and `oversize` for Splunk Cloud's answer) |
+| Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `otlp_out`'s `records.rejected`; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"}` and the Datadog sinks' `records.dropped{route, reason="rejected"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_rejected`, `api_key_rejected`, `ack_unsupported`, `ack_timeout`, and `oversize` for Splunk Cloud's answer) |
 
 The sinks with encoders count the first class through a gate `Output::observe_batch` arms
 (`crates/logit-outputs/src/accounting.rs`); `stdio_out` and `file_out` count after the write that
@@ -1771,6 +1771,16 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
 - `logit.output.records.rejected{signal}` (count): records a collector rejected through a
   successful response's `partial_success`, with a throttled `otlp_partial_success` diagnostic
   carrying the collector's message.
+- `logit.output.records.dropped{signal, reason="rejected"}` (count): the records of a signal's
+  request the destination answered with a `Permanent` verdict that names the request (an HTTP
+  3xx or 4xx other than 401, 403, and 413, or gRPC `INVALID_ARGUMENT`, `UNIMPLEMENTED`, or an
+  unrecognized code). The send goes on to the other signals, and returns `Ok` if any was
+  accepted. A throttled `signal_rejected` diagnostic names the signal, the status, and the record
+  count, with a hint to place `has_signal` or `keep_signals` ahead of the sink. Counts per attempt,
+  whether or not the send ends `Ok`. See [ADR `delivery-semantics`](../adr/delivery-semantics.md)'s
+  "Amendment: per-request verdicts (2026-10-04)". Every per-signal counter has a record count to
+  read, `SignalPayload::records`: log records, spans, or encoded metric points, not counting a
+  metric the encoder skipped.
 - From the encoder, for metric kinds OTLP can't carry exactly:
   `logit.output.metrics.degraded{metric_kind="samples"|"distribution"}` (sent as a `Summary`), and
   `logit.output.metrics.skipped{metric_kind="set_members"|"set"|"gauge_delta"}`, each with a
@@ -1795,6 +1805,7 @@ One `send` is up to eight routes' requests, so every point carries `route`: `ser
 | `logit.output.records{route}` | count | entries in a request Datadog accepted: series points, samples records, and sketches by record; logs, events, checks, spans, and stats groups by event |
 | `logit.output.records.dropped{route, reason="stale"}` | count | a record outside Datadog's window at the batch's send time, read once per batch: a metric more than 1h old or 10 min ahead, a log or event more than 18h old, a check more than 10 min old; once per batch |
 | `logit.output.records.dropped{route, reason="oversize"}` | count | an event whose body alone is over the route's byte limit, once per batch; or every entry of a request Datadog answered `413`, on the attempt that got that answer |
+| `logit.output.records.dropped{route, reason="rejected"}` | count | every entry of a request Datadog answered with a 3xx or a 4xx other than 401, 403, and 413, on the attempt that got that answer. The send goes on to the next request. A `413` counts as `oversize` instead |
 | `logit.output.records.dropped{route="traces", reason="needs_agent_processing"\|"not_datadog_origin"}` | count | a span whose chunk's root has no `_top_level` mark: raw tracer output, or not a Datadog span at all; once per batch |
 
 A dropped record is never sent, so a `buffer.disk:` replay after a long outage shows up here as
@@ -1807,7 +1818,7 @@ class table above).
 
 `Diagnostics` keys, each throttled: `api_key_rejected` (a `403`: Datadog refused the key; the key
 itself is never logged), `request_rejected` (any other non-retryable `4xx` or `3xx`, quoting 256
-bytes of the body with the key redacted), and `oversize` (an event dropped for its size).
+bytes of the body with the key redacted, and the entries dropped), and `oversize` (an event dropped for its size).
 
 ##### `datadog_trace_out`
 
@@ -1821,6 +1832,7 @@ One `send` is up to two routes' requests, so every point carries `route`: `trace
 | `logit.output.request.bytes{route}` | count | the body as sent, after compression, for a request that got an answer or failed after it may have left (a timeout); a refused connection or a missing socket file counts none |
 | `logit.output.records{route}` | count | spans (`traces`) or stats groups (`stats`) in a request the Agent accepted |
 | `logit.output.records.dropped{route, reason="oversize"}` | count | a trace's spans, or a stats group, too large for the Agent's 25 MiB request limit alone, once per batch; or every record of a request the Agent answered `413`, on the attempt that got that answer |
+| `logit.output.records.dropped{route, reason="rejected"}` | count | every record of a request the Agent answered with a 3xx or a 4xx other than 413, on the attempt that got that answer. The send goes on to the next route. A `413` counts as `oversize` instead |
 
 The codec's own points are the `datadog` codec's, under [Codecs](#codecs), and this sink doesn't
 repeat them. They count once per batch, per route (the class table above). The one to watch here
