@@ -28,8 +28,7 @@ After this stream:
   a log event. Nothing behind it waits.
 - **A destination that isn't functional holds the queue.** Unreachable, timing out, answering
   `5xx`/`429`, refusing credentials, or rejecting every request for a reason that isn't the
-  batch: the sink retries the head immediately, then with exponential backoff to a cap, for as
-  long as it takes. The sink's `buffer:` (`max_batches`/`max_bytes`, `overflow`, `disk:`) is the
+  batch: the sink retries the head with exponential backoff to a cap, for as long as it takes. The sink's `buffer:` (`max_batches`/`max_bytes`, `overflow`, `disk:`) is the
   bound on what accumulates, as it is for every peer that retries indefinitely. There is no retry
   budget and no sustained-history state.
 - **Posture still governs an unknown outcome.** An `Ambiguous` fault under `at_most_once` is
@@ -113,8 +112,8 @@ Agreed with Ross on 2026-10-04; the ADR records the reasoning.
    (status, error code in the body, text), and W2's survey records the mapping per sink with its
    evidence. A response a sink can't attribute is settled below ("Settled in W0", item 1).
 3. **No retry budget, no streak, no probe state.** A retryable fault (`Clean`, `Refused`, and
-   `Ambiguous` under `at_least_once`) retries the head immediately, then with exponential backoff
-   from `base_delay` to `retry_max_delay`, indefinitely. The queue's `buffer:` bounds the cost.
+   `Ambiguous` under `at_least_once`) retries the head with exponential backoff from `base_delay`
+   to `retry_max_delay`, indefinitely. The queue's `buffer:` bounds the cost.
    `retry_budget`, `backoff_after`, and `backoff_interval` don't exist.
 4. **A drop is announced.** `batches.dropped{reason="rejected"}` and a throttled diagnostic
    carrying the destination's text; `internal` turns the diagnostic into a log event.

@@ -82,9 +82,8 @@ event, so a reader sees what the destination said. Nothing behind the batch wait
 ### A retryable fault retries until it succeeds
 
 A `Clean` or `Refused` fault under either posture, and an `Ambiguous` fault under
-`at_least_once`, retries the head at once, then with exponential backoff from the runtime's
-`base_delay` (200 ms) to the sink's `buffer.retry_max_delay`, with no end other than success or
-shutdown. The shutdown grace still cuts a retry (`Delivery::GraceExpired`; an in-flight send is
+`at_least_once`, retries the head with exponential backoff from the runtime's `base_delay`
+(200 ms) to the sink's `buffer.retry_max_delay`, with no end other than success or shutdown. The shutdown grace still cuts a retry (`Delivery::GraceExpired`; an in-flight send is
 `Ambiguous`, per `buffered-sink-delivery`'s "Amendment: a send cut off by the shutdown grace is
 `Ambiguous`").
 
