@@ -294,6 +294,16 @@ impl GraphiteInput {
         self
     }
 
+    /// Stamps each stream connection's events with its peer's address (`peer:`); see
+    /// [`crate::peer::PeerAttrs`]. A datagram listener is left untouched; graph rule 78 rejects
+    /// the field there.
+    pub fn with_peer(mut self, peer: bool) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_peer(peer));
+        }
+        self
+    }
+
     /// Terminates TLS on a TCP listener (`tls:`); [`TcpListener::with_tls`] resolves every path
     /// in `settings` against `base_dir`.
     ///

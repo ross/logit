@@ -274,6 +274,16 @@ impl SyslogInput {
         self
     }
 
+    /// Stamps each stream connection's events with its peer's address (`peer:`); see
+    /// [`crate::peer::PeerAttrs`]. A datagram listener is left untouched; graph rule 78 rejects
+    /// the field there.
+    pub fn with_peer(mut self, peer: bool) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_peer(peer));
+        }
+        self
+    }
+
     /// Caps the connections a stream listener serves at once, overriding
     /// [`crate::DEFAULT_MAX_CONNECTIONS`]; `max_connections:` in config. Graph rule 74 rejects `0`
     /// before it gets here. A datagram listener is left untouched: it has no connections, and

@@ -667,6 +667,52 @@ fn accumulator_absorb_into_a_warm_buffer_costs_nothing() {
     expect_allocs("accumulator: absorb into a warm buffer", stats, 0);
 }
 
+/// `PeerAttrs::stamp` (`peer: true`, ADR `listener-peer-address`) over 100 decoded statsd events
+/// costs nothing. The address is a `Bytes` formatted and shared once per peer, so each event takes
+/// a reference-count increment and an `I64`, and the two keys fit the map's inline capacity
+/// beside the line's one tag. The `PeerAttrs` itself is built outside the measured region: the
+/// stream driver builds it once per connection.
+#[test]
+fn peer_stamp_100_statsd_events() {
+    use logit_inputs::peer::PeerAttrs;
+
+    let peer = PeerAttrs::from_socket("192.0.2.7:5140".parse().unwrap());
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_datagram(100);
+    let mut warm = decoder.decode(datagram.clone()).expect("should decode").events;
+    peer.stamp(&mut warm); // warm: interns the two keys
+    let mut events = decoder.decode(datagram).expect("should decode").events;
+
+    let ((), stats) = measure(|| peer.stamp(&mut events));
+    assert_eq!(events.len(), 100);
+    expect_allocs("peer: stamp 100 statsd events", stats, 0);
+    assert_eq!(stats.reallocs, 0);
+}
+
+/// One allocation when the stamp pushes an inline map past its 8 entries: an event decoded with 7
+/// attributes spills on the second key. This is `AttrMap`'s ordinary growth, the same one
+/// `json_parse_one_event` pays, and nothing `PeerAttrs` adds per event.
+#[test]
+fn peer_stamp_one_7_attribute_event() {
+    use logit_core::Event;
+    use logit_inputs::peer::PeerAttrs;
+
+    let peer = PeerAttrs::from_socket("192.0.2.7:5140".parse().unwrap());
+    let seven = || {
+        let attrs: AttrMap = ["a", "b", "c", "d", "e", "f", "g"]
+            .into_iter()
+            .map(|key| (key, Value::I64(1)))
+            .collect();
+        vec![Event::empty(0, attrs)]
+    };
+    peer.stamp(&mut seven()); // warm: interns the two keys
+    let mut events = seven();
+
+    let ((), stats) = measure(|| peer.stamp(&mut events));
+    assert_eq!(events[0].attributes.len(), 9);
+    expect_allocs("peer: stamp 1 event of 7 attributes", stats, 1);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Transforms
 // ---------------------------------------------------------------------------------------------

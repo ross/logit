@@ -412,6 +412,16 @@ impl StatsdInput {
         self
     }
 
+    /// Stamps each stream connection's events with its peer's address (`peer:`); see
+    /// [`crate::peer::PeerAttrs`]. A datagram listener is left untouched; graph rule 78 rejects
+    /// the field there.
+    pub fn with_peer(mut self, peer: bool) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_peer(peer));
+        }
+        self
+    }
+
     /// Terminates TLS on a TCP listener (`tls:`); paths in `settings` resolve against `base_dir`.
     ///
     /// Fails on a UDP listener: DTLS is out of scope (`docs/adr/syslog-tcp-ingress-and-tls.md`'s
@@ -2126,6 +2136,31 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(metric_name(&events[0]), "1.hits");
         assert_eq!(counter_value(&events[0]), 7.0);
+
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    /// `peer: true` stamps the observed sender over a DogStatsD tag of the same name, and leaves
+    /// the line's other tags alone.
+    #[tokio::test]
+    async fn peer_replaces_a_tag_of_the_same_name() {
+        use crate::peer::{PEER_ADDRESS, PEER_PORT};
+
+        let mut running = start_tcp(|input| input.with_peer(true)).await;
+        let mut client = running.connect().await;
+        let port = client.local_addr().unwrap().port();
+        client
+            .write_all(b"hits:1|c|#network.peer.address:203.0.113.9,network.peer.port:1,env:prod\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let events = running.next_events("the tagged line").await;
+        let attrs = &events[0].attributes;
+        assert_eq!(attrs.get(PEER_ADDRESS).and_then(Value::as_str), Some("127.0.0.1"));
+        assert_eq!(attrs.get(PEER_PORT), Some(&Value::I64(i64::from(port))));
+        assert_eq!(attrs.get("env").and_then(Value::as_str), Some("prod"));
 
         running.shutdown.send(true).ok();
         running.handle.abort();

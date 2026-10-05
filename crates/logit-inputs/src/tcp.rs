@@ -73,6 +73,11 @@
 //! and the deadline would never fire. `the_first_byte_deadline_applies_under_every_framing_mode`
 //! pins it.
 //!
+//! **Peer address.** With [`TcpListener::with_peer`] on, the accept loop builds one [`PeerAttrs`]
+//! from the address `accept()` returned, and [`absorb_frame`] stamps it on the events each
+//! `decode_into` call appended, before they reach the accumulator. A Unix peer that bound no path
+//! gets nothing. Off, the accepted address is dropped unread.
+//!
 //! **Idle timeout.** [`TcpListener::with_idle_timeout`] (the operator's `idle_timeout:`) is off
 //! unless set, and when set bounds how long a connection may stay quiet before this listener
 //! closes it and hands its permit back (`docs/adr/idle-connection-timeout.md`). It shares one
@@ -96,6 +101,7 @@
 //! events are flushed [`FlushReason::Closed`] and a buffered *partial* frame is reported through
 //! [`report_buffered_tail`], as the shutdown and RST paths do.
 
+use crate::peer::PeerAttrs;
 use crate::Input;
 use bytes::{Bytes, BytesMut};
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
@@ -950,6 +956,8 @@ pub struct TcpListener<D: Decoder + Clone + Send + 'static> {
     handshake_timeout: Duration,
     /// `None` (the default) means no idle timeout. See this module's "Idle timeout" doc section.
     idle_timeout: Option<Duration>,
+    /// Whether to stamp each connection's events with its peer (`peer:`), per [`PeerAttrs`].
+    peer: bool,
 }
 
 /// Where a [`TcpListener`] binds: a TCP `host:port`, or a Unix stream socket path.
@@ -1001,6 +1009,7 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             idle_timeout: None,
+            peer: false,
         }
     }
 
@@ -1133,6 +1142,13 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
         self.idle_timeout = idle_timeout;
         self
     }
+
+    /// Stamps every event a connection decodes with that connection's peer (the `peer:` field of
+    /// `syslog_in`/`graphite_in`/`statsd_in`/`lines_in`), per [`PeerAttrs`]. Off by default.
+    pub fn with_peer(mut self, peer: bool) -> Self {
+        self.peer = peer;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -1200,11 +1216,11 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         loop {
             let accepted = match &listener {
                 BoundListener::Tcp(listener) => tokio::select! {
-                    accepted = accept_queue.accept(listener) => accepted.map(|(s, _)| Accepted::Tcp(s)),
+                    accepted = accept_queue.accept(listener) => accepted.map(|(s, a)| Accepted::Tcp(s, a)),
                     _ = shutdown.wait_for(|&due| due) => return Ok(()),
                 },
                 BoundListener::Unix(listener) => tokio::select! {
-                    accepted = listener.accept() => accepted.map(|(s, _)| Accepted::Unix(s)),
+                    accepted = listener.accept() => accepted.map(|(s, a)| Accepted::Unix(s, a)),
                     _ = shutdown.wait_for(|&due| due) => return Ok(()),
                 },
             };
@@ -1240,9 +1256,17 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                 continue;
             };
 
+            // Formatted once per connection, and only when asked for: with `peer: false` the
+            // accepted address is dropped unread.
             match accepted {
-                Accepted::Tcp(stream) => spawner.spawn(stream, permit),
-                Accepted::Unix(stream) => spawner.spawn(stream, permit),
+                Accepted::Tcp(stream, addr) => {
+                    let peer = self.peer.then(|| PeerAttrs::from_socket(addr));
+                    spawner.spawn(stream, permit, peer);
+                }
+                Accepted::Unix(stream, addr) => {
+                    let peer = if self.peer { PeerAttrs::from_unix(&addr) } else { None };
+                    spawner.spawn(stream, permit, peer);
+                }
             }
         }
     }
@@ -1250,8 +1274,8 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
 
 /// One accepted connection, per [`BoundListener`].
 enum Accepted {
-    Tcp(tokio::net::TcpStream),
-    Unix(tokio::net::UnixStream),
+    Tcp(tokio::net::TcpStream, std::net::SocketAddr),
+    Unix(tokio::net::UnixStream, tokio::net::unix::SocketAddr),
 }
 
 /// Everything a connection task needs from its listener, cloned per connection by
@@ -1272,8 +1296,9 @@ struct ConnectionSpawner<D> {
 }
 
 impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
-    /// Spawns the task serving `stream`, which holds `permit` for as long as it runs.
-    fn spawn<S>(&self, stream: S, permit: OwnedSemaphorePermit)
+    /// Spawns the task serving `stream`, which holds `permit` for as long as it runs. `peer`, when
+    /// present, is stamped on every event the connection decodes.
+    fn spawn<S>(&self, stream: S, permit: OwnedSemaphorePermit, peer: Option<PeerAttrs>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1310,6 +1335,7 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
                                 config,
                                 handshake_timeout,
                                 idle_timeout,
+                                peer,
                                 sink,
                                 telemetry.clone(),
                                 &mut diag,
@@ -1333,6 +1359,7 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
                         config,
                         handshake_timeout,
                         idle_timeout,
+                        peer,
                         sink,
                         telemetry.clone(),
                         &mut diag,
@@ -1412,6 +1439,7 @@ async fn serve_connection<S, D>(
     config: TcpListenerConfig,
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
+    peer: Option<PeerAttrs>,
     sink: Fanout,
     telemetry: Telemetry,
     diag: &mut Diagnostics,
@@ -1546,6 +1574,7 @@ where
                             frame,
                             now_nanos(),
                             &mut decoder,
+                            peer.as_ref(),
                             &mut scratch,
                             &mut accumulator,
                             &sink,
@@ -1586,6 +1615,7 @@ where
                         frame,
                         received_at,
                         &mut decoder,
+                        peer.as_ref(),
                         &mut scratch,
                         &mut accumulator,
                         &sink,
@@ -1624,11 +1654,12 @@ where
 /// One complete frame: counted, decoded, and accumulated. A decode error is diagnosed and the
 /// frame dropped; the connection stays open, as `crate::udp::decode_loop` does for one bad
 /// datagram.
-#[allow(clippy::too_many_arguments)] // eight threaded-through borrows; a params struct would only move them
+#[allow(clippy::too_many_arguments)] // threaded-through borrows; a params struct would only move them
 async fn absorb_frame<D: Decoder + Send>(
     frame: Bytes,
     received_at: i64,
     decoder: &mut D,
+    peer: Option<&PeerAttrs>,
     scratch: &mut Vec<Event>,
     accumulator: &mut BatchAccumulator,
     sink: &Fanout,
@@ -1640,6 +1671,10 @@ async fn absorb_frame<D: Decoder + Send>(
     scratch.clear();
     match decoder.decode_into(frame, received_at, scratch) {
         Ok((resource, scope)) => {
+            // After the decoder, so the observed peer replaces a same-named decoded attribute.
+            if let Some(peer) = peer {
+                peer.stamp(scratch);
+            }
             // `scope` is threaded through rather than hardcoded `None`, as `crate::udp` does.
             if let Some((batch, reason)) = accumulator.absorb(resource, scope, scratch) {
                 emit(sink, telemetry, batch, reason).await;
@@ -3569,6 +3604,7 @@ mod tests {
                         ..TcpListenerConfig::default()
                     },
                     Duration::from_secs(3600),
+                    None,
                     None,
                     Fanout::new(vec![tx]),
                     telemetry,

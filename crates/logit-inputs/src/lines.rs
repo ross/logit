@@ -43,8 +43,9 @@
 //! [`BodyFormat::Raw`] and no severity, trace, or event name. The message is a zero-copy
 //! `Bytes` slice of the frame or datagram: [`Value::Str`] when the line is valid UTF-8,
 //! [`Value::Bytes`] otherwise, as `crate::syslog` keeps a MSG. Every event shares one
-//! `Arc<Resource>`, empty, across every connection's decoder clone. Nothing about the peer (its
-//! address, a hostname) is attached; a `set` stage per listener stamps whatever the operator knows.
+//! `Arc<Resource>`, empty, across every connection's decoder clone. The decoder attaches nothing
+//! about the peer; under `peer:` the stream driver stamps its address after decode
+//! ([`crate::peer`]).
 //!
 //! ## Telemetry and diagnostics
 //!
@@ -222,6 +223,16 @@ impl LinesInput {
     pub fn with_idle_timeout(mut self, idle_timeout: Option<std::time::Duration>) -> Self {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_idle_timeout(idle_timeout));
+        }
+        self
+    }
+
+    /// Stamps each stream connection's events with its peer's address (`peer:`); see
+    /// [`crate::peer::PeerAttrs`]. A datagram listener is left untouched; graph rule 78 rejects
+    /// the field there.
+    pub fn with_peer(mut self, peer: bool) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_peer(peer));
         }
         self
     }
@@ -807,6 +818,112 @@ mod tests {
         client.write_all(b"first\nsecond\n").await.unwrap();
         client.flush().await.unwrap();
         assert_eq!(texts(&recv_events(&mut started.rx, 2).await), vec!["first", "second"]);
+        started.running.stop().await;
+    }
+
+    // ---- peer: ---------------------------------------------------------------------------------
+
+    use crate::peer::{PEER_ADDRESS, PEER_PORT};
+
+    fn peer_of(event: &Event) -> (Option<&str>, Option<&Value>) {
+        (
+            event.attributes.get(PEER_ADDRESS).and_then(Value::as_str),
+            event.attributes.get(PEER_PORT),
+        )
+    }
+
+    /// Sends one line from `client` and returns the event it became.
+    async fn one_event<S: tokio::io::AsyncWrite + Unpin>(
+        started: &mut Started,
+        client: &mut S,
+    ) -> Event {
+        client.write_all(b"hello\n").await.unwrap();
+        client.flush().await.unwrap();
+        recv_events(&mut started.rx, 1).await.pop().expect("one event")
+    }
+
+    #[tokio::test]
+    async fn peer_stamps_a_tcp_senders_address_and_port() {
+        let mut started = start(LinesInput::tcp("127.0.0.1:0").with_peer(true)).await;
+        let mut client = TcpStream::connect(started.addr.unwrap()).await.unwrap();
+        let port = client.local_addr().unwrap().port();
+        let event = one_event(&mut started, &mut client).await;
+        assert_eq!(peer_of(&event), (Some("127.0.0.1"), Some(&Value::I64(i64::from(port)))));
+        started.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn without_peer_a_tcp_event_carries_no_peer_attribute() {
+        let mut started = start(LinesInput::tcp("127.0.0.1:0")).await;
+        let mut client = TcpStream::connect(started.addr.unwrap()).await.unwrap();
+        let event = one_event(&mut started, &mut client).await;
+        assert_eq!(peer_of(&event), (None, None));
+        assert!(event.attributes.is_empty());
+        started.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn peer_stamps_an_ipv6_sender() {
+        let mut input = LinesInput::tcp("[::1]:0").with_peer(true);
+        if let Err(err) = input.bind().await {
+            println!("skipping: this environment has no usable IPv6 loopback ({err})");
+            return;
+        }
+        let mut started = start(input).await;
+        let mut client = TcpStream::connect(started.addr.unwrap()).await.unwrap();
+        let port = client.local_addr().unwrap().port();
+        let event = one_event(&mut started, &mut client).await;
+        assert_eq!(peer_of(&event), (Some("::1"), Some(&Value::I64(i64::from(port)))));
+        started.running.stop().await;
+    }
+
+    /// A dual-stack listener sees an IPv4 sender as `::ffff:127.0.0.1`, written as IPv4.
+    #[tokio::test]
+    async fn peer_writes_an_ipv4_sender_on_a_dual_stack_listener_as_ipv4() {
+        let mut input = LinesInput::tcp("[::]:0").with_peer(true);
+        if let Err(err) = input.bind().await {
+            println!("skipping: this environment has no IPv6 ({err})");
+            return;
+        }
+        let mut started = start(input).await;
+        let port = started.addr.unwrap().port();
+        let Ok(mut client) = TcpStream::connect(("127.0.0.1", port)).await else {
+            println!("skipping: this IPv6 socket is not dual-stack");
+            started.running.stop().await;
+            return;
+        };
+        let event = one_event(&mut started, &mut client).await;
+        assert_eq!(peer_of(&event).0, Some("127.0.0.1"));
+        started.running.stop().await;
+    }
+
+    /// The usual Unix client binds no path, so there is nothing to stamp.
+    #[tokio::test]
+    async fn peer_stamps_nothing_for_an_unbound_unix_stream_client() {
+        let path = scratch_dir("lines-peer-unbound").join("lines.sock");
+        let mut started = start(LinesInput::unix_stream(&path).with_peer(true)).await;
+        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let event = one_event(&mut started, &mut client).await;
+        assert_eq!(peer_of(&event), (None, None));
+        started.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn peer_stamps_a_bound_unix_stream_clients_path_and_no_port() {
+        let dir = scratch_dir("lines-peer-bound");
+        let path = dir.join("lines.sock");
+        let client_path = dir.join("client.sock");
+        let mut started = start(LinesInput::unix_stream(&path).with_peer(true)).await;
+        // Binding before connecting needs a raw socket; tokio's `UnixStream` has no such step.
+        let socket =
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        socket.bind(&socket2::SockAddr::unix(&client_path).unwrap()).unwrap();
+        socket.connect(&socket2::SockAddr::unix(&path).unwrap()).unwrap();
+        let std_stream: std::os::unix::net::UnixStream = socket.into();
+        std_stream.set_nonblocking(true).unwrap();
+        let mut client = tokio::net::UnixStream::from_std(std_stream).unwrap();
+        let event = one_event(&mut started, &mut client).await;
+        assert_eq!(peer_of(&event), (client_path.to_str(), None));
         started.running.stop().await;
     }
 }
