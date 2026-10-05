@@ -295,3 +295,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   the grace after it closes the connection. It ends when the send completes or the client goes
   away ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)'s 2026-09-25 amendments).
   Closing it would drop a batch that never reached the fanout.
+- **`proxy_protocol:` accepts a PROXY header from any peer.** A stream listener under
+  `proxy_protocol: true` has no allowlist of trusted proxy addresses, so a client that reaches the
+  port directly can write its own header and name any address as `client.address`
+  ([ADR `listener-peer-address`](../adr/listener-peer-address.md)).
+  - **Workaround:** make the port reachable only through the proxy, with network policy or a
+    firewall rule.
+  - **Revisit trigger:** a deployment where the proxy and direct clients share a network path to
+    the listener. The fix is a list of trusted source addresses, with a header from any other peer
+    refused.

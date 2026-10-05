@@ -777,8 +777,10 @@ budget of the configured length, so a TLS connection that says nothing costs up 
 **Under `proxy_protocol: true`, give the load balancer a PROXY-aware health check.** A plain TCP
 connect check sends no header, so each probe is closed and counted as
 `logit.input.connections.rejected{reason="proxy_header"}`, with a throttled `proxy_header`
-diagnostic. Use HAProxy's `check-send-proxy`, or any check that sends a v2 `LOCAL` header, which
-the listener accepts without stamping a client.
+diagnostic. HAProxy's `check` sends the header itself when the `server` line has `send-proxy` or
+`send-proxy-v2` and no `port` or `addr`; with either set, add `check-send-proxy`. Any other
+balancer's check should send a v2 `LOCAL` header, which the listener accepts without stamping a
+client.
 
 **`otlp_in` bounds one phase per connection, not two**, and not by choice. It hands each accepted
 connection straight to `hyper`, whose connection builder reads the first bytes itself to tell
@@ -956,6 +958,93 @@ connection. On `syslog_in`, `graphite_in`, `statsd_in`, or `lines_in` with `tran
 no connections, so any other value is rejected instead of silently ignored. On `prometheus_in` it belongs to the
 remote-write receiver, and rule 55 rejects a non-default value alongside `scrape_targets:`.
 
+### Recording the sender: `peer` and `proxy_protocol`
+
+No listener records who sent an event unless you ask. Two opt-in fields do, on the listeners
+built on the shared socket drivers ([ADR `listener-peer-address`](adr/listener-peer-address.md)):
+
+| Field | Listeners and transports | Stamps on each event |
+|---|---|---|
+| `peer: true` | `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` on every transport they offer, and `collectd_in` | `network.peer.address` and `network.peer.port`: the socket peer, the connection's for a stream and each datagram's own for UDP |
+| `proxy_protocol: true` | `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in`, under `transport: tcp` only (rule 78) | `client.address` and `client.port`: the original client a PROXY protocol header names |
+
+`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `logit_in` take neither field.
+
+**What `peer:` writes.** The address is a string in its standard text form, and the port is an
+integer. An IPv4-mapped IPv6 address is written as IPv4, so a sender reads the same on a
+dual-stack socket as on an IPv4 one. On a Unix socket, a client that bound a path reports that
+path as the address and no port; an unbound client, the usual case, gets neither attribute.
+There's no reverse DNS lookup: a lookup can stall intake and returns whatever the sender's
+resolver says. To get names, map addresses downstream, in a `lua` stage for example. Each
+attribute replaces a same-named one the decoder produced.
+
+**Keep the address away from anything that shouldn't have it.** An IP address is personal data in
+some jurisdictions, and it's one value per sender, so it reaches every sink that writes
+attributes, and it splits every series an `aggregate` keys by attributes into one per sender. Put
+a `remove` (or a `keep` that doesn't list it) ahead of each `aggregate` and each sink that
+shouldn't see it:
+
+```yaml
+components:
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:5140
+    transport: tcp
+    peer: true
+  archive:
+    type: file_out
+    sources: [syslog_in]            # keeps the sender
+    path: /var/log/logit/archive.log
+    rotate:
+      max_bytes: 1GiB
+  no_peer:
+    type: remove
+    sources: [syslog_in]
+    fields: [network.peer.address, network.peer.port]
+  syslog_out:
+    type: syslog_out
+    sources: [no_peer]
+    endpoint: siem.internal:6514
+    transport: tcp
+```
+
+**Behind a load balancer, `peer:` reports the load balancer.** To record the client, configure the
+proxy to send a PROXY protocol header and set `proxy_protocol: true`. Version 1 (text) and
+version 2 (binary) are both accepted and told apart by their signatures. With HAProxy, add
+`send-proxy-v2` (or `send-proxy` for version 1) to the `server` line:
+
+```text
+frontend syslog
+    mode tcp
+    bind :5140
+    default_backend logit
+backend logit
+    mode tcp
+    server logit1 logit.internal:5140 send-proxy-v2 check
+```
+
+With both fields on, each event carries both: `client.*` is the client the header names, and
+`network.peer.*` is HAProxy, which is what OpenTelemetry's semantic conventions mean by each.
+`client.*` is stamped whether or not `peer:` is on. A header that names no client, such as a
+version 2 `LOCAL` health check, keeps the connection and stamps no `client.*`.
+[`fixtures/lines-behind-haproxy.yaml`](../fixtures/lines-behind-haproxy.yaml) is a runnable
+config.
+
+**Make a `proxy_protocol: true` port reachable only through the proxy.** The listener can't tell a
+proxy's header from one a client wrote itself, so any client that connects directly can name any
+address as `client.address`. Enforce the boundary with network policy, as for every listener
+([Trust boundary](#trust-boundary)).
+
+**Every connection must open with a header.** It's never auto-detected, as the PROXY protocol
+specification requires. A connection without a valid header, or whose header doesn't arrive within
+`handshake_timeout`, is closed and counted
+`logit.input.connections.rejected{reason="proxy_header"}`, with a throttled `proxy_header`
+diagnostic. That includes a sender that connects to the port directly by mistake, and a load
+balancer's plain TCP health check; see
+[`handshake_timeout` on a TCP listener](#handshake_timeout-on-a-tcp-listener) for the health
+check to use and the phases the timeout bounds. The header is read before any TLS handshake, as
+a proxy sends it, so `tls:` and `proxy_protocol:` combine.
+
 ### `collectd_in`: multicast groups and `types_db`
 
 `collectd_in` ([ADR `collectd-binary-relay`](adr/collectd-binary-relay.md)) is an ordinary UDP
@@ -1091,7 +1180,9 @@ the runnable config, with every default present as a comment.
 - **A stream's unterminated last line is dropped.** When a connection closes mid-line, the partial
   line is counted `frames.dropped{reason="truncated"}`. A datagram's end also ends its last line,
   so a UDP or `unix` sender needs no trailing newline.
-- **Nothing about the sender is recorded.** Stamp what you know with a `set` stage per listener.
+- **The sender is recorded only on request.** `peer: true` stamps its address, and
+  `proxy_protocol: true` the client behind a proxy; see
+  [Recording the sender](#recording-the-sender-peer-and-proxy_protocol).
 
 To parse JSON lines, put a `json` transform after the listener; a line that isn't JSON passes
 through untouched:

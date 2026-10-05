@@ -122,17 +122,18 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit:** if a documented script runs `logit-outputs` tests under plain `cargo test`. The
     fix then is a test that doesn't depend on a thread-local subscriber, such as one reading
     `Diagnostics::occurrences`.
-- **No listener records the sending peer's address.** Every input that accepts a connection or a
-  datagram (`syslog_in`, `statsd_in`, `lines_in`, and the others) drops the peer's address after
-  accepting. The shared drivers don't pass it to the `Decoder`, so no event carries it. A
-  `lines_in` event in particular has no sender identity at all.
-  - **Consequence:** a pipeline can't tell which of several senders on one listener wrote an
-    event, or route on it.
+- **The HTTP listeners and `logit_in` don't record the sending peer's address.** `peer:` and
+  `proxy_protocol:` exist only on the listeners built on the shared socket drivers
+  ([ADR `listener-peer-address`](../adr/listener-peer-address.md)). `otlp_in`, `datadog_in`,
+  `datadog_trace_in`, `splunk_hec_in`, and `logit_in` accept their connections themselves and
+  stamp no `network.peer.*` or `client.*`.
+  - **Consequence:** a pipeline can't tell which of several senders on one of these listeners
+    wrote an event, or route on it, unless the sender puts its own identity in the payload, as an
+    OTLP resource's `host.name` does.
   - **Workaround:** run one listener per sender (or per group of senders) and stamp each with a
     `set` stage.
-  - **Revisit trigger:** a deployment that can't give each sender its own listener. The fix is a
-    hook in the shared TCP and UDP drivers that every input would carry
-    ([ADR `listener-peer-address`](../adr/listener-peer-address.md)).
+  - **Revisit trigger:** a deployment that can't give each sender its own listener and whose
+    senders don't identify themselves.
 
 ## Event model and interner
 
