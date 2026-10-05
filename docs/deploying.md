@@ -268,7 +268,8 @@ several requests (`datadog_out`, `datadog_trace_out`, `splunk_hec_out`) reports 
 failure as ambiguous once any of them was accepted, so `at_least_once` resends the accepted
 requests with the rest and `at_most_once` drops the rest (item 9). `otlp_out` instead remembers
 which signals of a batch were accepted and retries only the others: it reports the failed
-signal's own class, never resends an accepted signal, and under `at_most_once` counts the records
+signal's own class, never resends an accepted signal within a run (a `buffer.disk:` batch
+replayed after a restart sends every signal again), and under `at_most_once` counts the records
 of the signals it drops as `records.dropped{signal, reason="ambiguous_at_most_once"}`
 ([ADR `sink-fault-classes`](adr/sink-fault-classes.md), "Amendment: `otlp_out` retries per signal
 (2026-10-05)"). A request the

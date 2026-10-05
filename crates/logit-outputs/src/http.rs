@@ -238,10 +238,6 @@ pub(crate) fn after_delivery(err: anyhow::Error, sent_any: bool) -> anyhow::Erro
 /// | [`Fault::Rejected`] | calls `on_rejected` (the sink counts the request's records there), keeps the first such error; the send goes on |
 /// | [`Fault::Refused`] | stops the send through [`after_delivery`]: every later request would get the same answer |
 /// | [`Fault::Clean`] or [`Fault::Ambiguous`] | stops the send through [`after_delivery`] |
-///
-/// Built with [`Outcomes::resuming`], a stop keeps the request's own fault instead of passing
-/// through [`after_delivery`]: the sink resends none of the requests already accepted, so a retry
-/// risks no duplicate of them.
 /// | no `Fault` attached | stops the send with the error unchanged |
 ///
 /// An error with no `Fault` is not a destination's verdict on the request, so it isn't counted as
@@ -250,6 +246,10 @@ pub(crate) fn after_delivery(err: anyhow::Error, sent_any: bool) -> anyhow::Erro
 /// [`Outcomes::finish`] ends a send that wasn't stopped: `Ok` when any request was accepted, even
 /// with rejections beside it; the first rejection when none was, still explicitly `Rejected`, so
 /// `write_loop` drops the wholly rejected batch; `Ok` when there were no requests.
+///
+/// Built with [`Outcomes::resuming`], a stop keeps the request's own fault instead of passing
+/// through [`after_delivery`]: the sink resends none of the requests already accepted, so a retry
+/// risks no duplicate of them.
 #[derive(Debug, Default)]
 pub(crate) struct Outcomes {
     accepted: bool,

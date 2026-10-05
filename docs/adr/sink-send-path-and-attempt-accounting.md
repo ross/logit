@@ -94,6 +94,11 @@ nature. The encode-side counters are the only ones that measure the batch and no
      `Clean` and `Clean` retries under both; and any `Ambiguous` retry under `at_least_once`,
      which is `graphite_out`'s default.
 
+     [For `otlp_out`, a rejected signal's `records.dropped{reason="rejected"}` counts once per
+     batch: [ADR `sink-fault-classes`](sink-fault-classes.md)'s "Amendment: `otlp_out` retries per
+     signal (2026-10-05)" remembers the signal and a retry doesn't resend it. The Datadog and
+     Splunk sinks still count their server-verdict drops per attempt.]
+
    `docs/design/internal-telemetry.md` and `docs/deploying.md` state the third class's
    repetition, so an operator reading a drop counter on an unhealthy sink knows what it measures.
 2. **A gate in `Telemetry`, armed once per batch, makes encode-side counters count once per
