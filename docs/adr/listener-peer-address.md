@@ -140,3 +140,12 @@ fuzz targets ([ADR `out-of-ci-fuzzing`](out-of-ci-fuzzing.md)), whose workspace 
   - `network.connection.id`, to tell two connections from one address apart.
   - An allowlist of trusted proxy source addresses for `proxy_protocol:`, so a header from any
     other peer is refused.
+
+## Verification of the datagram read
+`script/unsafe-check`'s `udp-peer-eintr-retry` scenario, run on 2026-10-05 against
+`peer_stamps_each_udp_senders_own_address_and_port`, passes. The trace shows the injected `EINTR`
+on the first `recvmmsg`, then a retry returning all eight datagrams, each header decoded by
+`strace` as `msg_name={sa_family=AF_INET, sin_port=..., sin_addr=inet_addr("127.0.0.1")}` with
+`msg_namelen=128 => 16`. So the retry rebuilds every header with the full `sockaddr_storage` size,
+and the kernel shrinks it to the address it wrote. `script/unsafe-check miri` runs the `msg_name`
+construction, the `msg_namelen` harvest, and the address parser in `batch_reader_helpers`.
