@@ -26,6 +26,7 @@
 //! All-or-nothing: everything is parsed before anything is mutated, so a lift either applies
 //! completely or leaves the event as it arrived and counts one `.skipped{reason}`.
 
+use crate::{f64_seconds_to_nanos, present};
 use logit_core::trace::{
     parse_span_id, parse_span_id_datadog, parse_trace_id, parse_trace_id_datadog,
     parse_trace_id_high, trace_id_bytes, trace_id_halves,
@@ -198,21 +199,6 @@ struct Lifted {
     minted: bool,
 }
 
-/// An attribute is present only if it carries a value. `Null`, `""`, and `"-"` are how nginx
-/// (`escape=json` renders unset as `""`, plain formats as `-`) and haproxy (an unset `txn` var)
-/// spell "nothing here"; as present-but-invalid they would turn every edge request into an
-/// `invalid` skip.
-fn present<'a>(attrs: &'a AttrMap, key: &str) -> Option<&'a Value> {
-    match attrs.get(key)? {
-        Value::Null => None,
-        value @ Value::Str(_) => match value.as_str() {
-            Some("") | Some("-") => None,
-            _ => Some(value),
-        },
-        value => Some(value),
-    }
-}
-
 /// A standalone `flags` field as an integer 0-255, decimal only. Never hex: a `traceparent`'s
 /// hex flags octet pasted here would parse as a different value (`"10"` is 10, not `0x10`).
 /// `parse_traceparent` reads that octet as hex; the two paths never mix.
@@ -244,27 +230,11 @@ fn timing_nanos(value: &Value, unit: Unit, instant: bool) -> Option<i64> {
     match value {
         Value::I64(n) => n.checked_mul(scale),
         Value::U64(n) => i64::try_from(*n).ok()?.checked_mul(scale),
-        Value::Str(_) => parse_decimal_nanos(value.as_str()?, scale),
+        Value::Str(_) => parse_decimal_nanos(value.as_str()?, scale).ok(),
         Value::Timestamp(n) if instant && unit == Unit::Nanos => Some(*n),
         Value::F64(f) if unit == Unit::Seconds => f64_seconds_to_nanos(*f),
         _ => None,
     }
-}
-
-/// `f64` seconds to nanoseconds, scaling the integer part exactly (in `i128`, so a huge float is
-/// `None`, not a wrap) and rounding only the fraction. At epoch magnitude that's good to about a
-/// microsecond, finer than any producer that emits float seconds.
-fn f64_seconds_to_nanos(seconds: f64) -> Option<i64> {
-    if !seconds.is_finite() {
-        return None;
-    }
-    let whole = seconds.trunc();
-    let frac = seconds - whole;
-    // `as i128` saturates rather than wrapping; `checked_mul`/`try_from` then reject it.
-    let whole_nanos = (whole as i128).checked_mul(i128::from(NANOS_PER_SECOND))?;
-    let whole_nanos = i64::try_from(whole_nanos).ok()?;
-    let frac_nanos = (frac * NANOS_PER_SECOND as f64).round() as i64;
-    whole_nanos.checked_add(frac_nanos)
 }
 
 /// Looks up one quantity (start, end, or duration) across all its forms. Two forms at once

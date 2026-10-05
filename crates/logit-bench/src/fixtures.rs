@@ -655,6 +655,52 @@ pub fn trace_context() -> logit_transforms::TraceContext {
     logit_transforms::TraceContext::new("trace_id".to_string(), None, None, false)
 }
 
+/// A `timestamp` reading `syslog.timestamp` as RFC 3164 in `America/New_York` with a 24 hour skew
+/// bound and `keep_source: false`, for `tests/allocations.rs`'s `timestamp_rfc3164_*` measurement
+/// (`docs/adr/timestamp-transform.md`). The zone is built here, before any measurement.
+pub fn timestamp_rfc3164() -> logit_transforms::TimestampResolver {
+    logit_transforms::TimestampResolver::new(
+        "syslog.timestamp",
+        logit_transforms::TimestampFormat::Rfc3164,
+        logit_core::zoned::Zone::parse("America/New_York").expect("a tzdata zone"),
+        Duration::from_secs(24 * 3600),
+        false,
+    )
+}
+
+/// [`nginx_event`] with `syslog.timestamp = "Oct  4 12:00:00"` and a receipt instant of
+/// 2026-10-04T16:00:05Z, five seconds after that stamp in `America/New_York` (EDT), so year
+/// inference lands on 2026 and the instant is inside [`timestamp_rfc3164`]'s skew bound.
+pub fn timestamp_rfc3164_event() -> Event {
+    let mut event = nginx_event();
+    event.timestamp = 1_791_129_605_000_000_000;
+    event.attributes.insert("syslog.timestamp", Value::str("Oct  4 12:00:00"));
+    event
+}
+
+/// A `timestamp` reading `time_local` with the pattern `%d/%b/%Y:%H:%M:%S %z` (nginx's
+/// `$time_local`), UTC fallback zone, 24 hour skew bound, `keep_source: false`.
+pub fn timestamp_pattern() -> logit_transforms::TimestampResolver {
+    logit_transforms::TimestampResolver::new(
+        "time_local",
+        logit_transforms::TimestampFormat::Pattern(
+            logit_core::zoned::Pattern::compile("%d/%b/%Y:%H:%M:%S %z").expect("a valid pattern"),
+        ),
+        logit_core::zoned::Zone::utc(),
+        Duration::from_secs(24 * 3600),
+        false,
+    )
+}
+
+/// [`nginx_event`] with `time_local = "04/Oct/2026:12:00:00 +0000"` and a receipt instant of
+/// 2026-10-04T12:00:05Z.
+pub fn timestamp_pattern_event() -> Event {
+    let mut event = nginx_event();
+    event.timestamp = 1_791_115_205_000_000_000;
+    event.attributes.insert("time_local", Value::str("04/Oct/2026:12:00:00 +0000"));
+    event
+}
+
 /// A `trace_context` with the convention defaults and a `span:` block (`kind: server`, `name:
 /// http.request`, no minting), as `demo/logit.yaml`'s `haproxy_trace`/`nginx_trace` run it
 /// (`tests/allocations.rs`'s `trace_context_mints_a_span_from_the_convention`).

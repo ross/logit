@@ -15,7 +15,7 @@ pub fn parse_hec_time(text: &str) -> Option<i64> {
         Some(rest) => (true, rest),
         None => (false, text),
     };
-    if let Some(nanos) = logit_core::parse_decimal_nanos(magnitude, NANOS_PER_SECOND as i64) {
+    if let Ok(nanos) = logit_core::parse_decimal_nanos(magnitude, NANOS_PER_SECOND as i64) {
         return Some(if negative { -nanos } else { nanos });
     }
     let seconds: f64 = text.parse().ok()?;

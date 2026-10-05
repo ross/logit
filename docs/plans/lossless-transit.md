@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-25
+updated: 2026-10-04
 ---
 
 # Closing plan: lossless like-protocol transit
@@ -421,8 +421,8 @@ current term-by-term breakdown.
   (no year/timezone to construct an RFC 3339 stamp from); a `Value::Null` (a nil `-` TIMESTAMP,
   which `parse_5424` should now stamp explicitly rather than leaving the attribute simply absent)
   renders as `-`; an absent attribute falls through to `event.timestamp` exactly as today.
-  `event.timestamp` itself stays receipt time — the opt-in `syslog_timestamp` transform already
-  sketched in `docs/known-gaps/` remains the correct place to resolve it deliberately.
+  `event.timestamp` itself stays receipt time unless the `timestamp` transform runs. **Landed**
+  ([ADR `timestamp-transform`](../adr/timestamp-transform.md)).
 - `syslog.pid` becomes `Value::Str` when PROCID doesn't parse as a number, rather than being
   dropped; stays `Value::U64` when it does.
 - A non-UTF-8 syslog MSG decodes to a `Value::Bytes` message instead of rejecting the line; header
@@ -597,9 +597,10 @@ newly discovered here:
 - `statsd_out` still has no `unit` and no native metric rename/prefix, and only carries an egress
   timestamp on a `|T`-marked line — everything else is stamped with the receiver's own receipt time
   (`docs/known-gaps/`'s "`statsd_out` has no `unit` and no metric renaming/prefixing..." entry).
-- syslog's `event.timestamp` stays receipt time, not the sender's, even though `syslog_out`'s wire
-  TIMESTAMP now follows [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)'s
-  precedence table (`docs/known-gaps/`'s "`event.timestamp` is still receipt time..." entry).
+- syslog's `event.timestamp` stayed receipt time while `syslog_out`'s wire TIMESTAMP followed
+  [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)'s
+  precedence table. **Resolved** by the opt-in `timestamp` transform
+  ([ADR `timestamp-transform`](../adr/timestamp-transform.md)).
 - Cross-protocol egress (`P_in -> Q_out` for two different protocols) stays best-effort by design —
   a raw sample list has no OTLP wire type, a `DDSketch` has no statsd wire form — each such
   degradation is counted and documented per the ADR's own rule, in `docs/known-gaps/`'s

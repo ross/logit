@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-30
+updated: 2026-10-04
 ---
 
 # Syslog egress: format, transport, and header-field precedence
@@ -46,10 +46,9 @@ reimplementing RFC 3339 formatting.
 `syslog_in`'s own module doc explains why that attribute can't be resolved to an instant for RFC
 3164 without guessing a year and a timezone; re-emitting it here would reintroduce exactly that
 guess on the way out. Consequence: a `syslog_in -> syslog_out` relay re-stamps with `logit`'s
-receipt time rather than preserving the origin's own clock — recorded in
-`docs/known-gaps/syslog.md`. The opt-in `syslog_timestamp` transform that gap already proposes is
-the right place to resolve `syslog.timestamp` onto `event.timestamp` explicitly, for either
-direction.
+receipt time rather than preserving the origin's own clock, unless the operator places a
+`timestamp` component ahead of the sink, which resolves `syslog.timestamp` onto `event.timestamp`
+for either direction ([ADR `timestamp-transform`](timestamp-transform.md)).
 
 ### Transport: both UDP and TCP
 

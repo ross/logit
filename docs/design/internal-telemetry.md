@@ -1515,6 +1515,22 @@ Unlike the filters, both are **tallied in plain integers per event and emitted o
 exists for, where a `Telemetry::count` per event is the cost. No `Diagnostics`: nothing here can
 fail.
 
+##### `timestamp`
+
+`crates/logit-transforms/src/timestamp.rs`,
+[ADR `timestamp-transform`](../adr/timestamp-transform.md).
+
+- `logit.transform.timestamp.resolved` (count): events whose `event.timestamp` was rewritten.
+- `logit.transform.timestamp.skipped{reason="missing"|"invalid"|"skew_past"|"skew_future"|"span"|"start"}`
+  (count, non-zero cells only): events forwarded untouched, by why. `missing` is an absent, null,
+  empty, or `-` source; `invalid` a value that doesn't parse under `format`; `skew_past` and
+  `skew_future` a resolved instant further than `max_skew` before or after the event's current
+  timestamp; `span` an event carrying a span; `start` a metric whose non-zero
+  `start_timestamp` is later than the resolved instant.
+
+Both are **tallied in plain integers per event and emitted once per batch from `end_batch`**, as
+`sample` does. No `Diagnostics`: a skip is expected traffic during a backlog drain, not a fault.
+
 ##### `json`
 
 `crates/logit-transforms/src/json.rs`,

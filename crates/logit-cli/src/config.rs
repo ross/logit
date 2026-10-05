@@ -382,6 +382,48 @@ components:
         }
     }
 
+    /// `timestamp`'s unit-variant and `{pattern: ..}` `format:` forms read via YAML.
+    #[test]
+    fn timestamp_format_reads_through_the_real_yaml_path() {
+        let yaml = r#"
+components:
+  in:
+    type: statsd_in
+    bind: 127.0.0.1:8125
+  sys:
+    type: timestamp
+    sources: [in]
+    from: syslog.timestamp
+    format: rfc3164
+    timezone: Europe/Berlin
+  web:
+    type: timestamp
+    sources: [in]
+    from: time_local
+    format: {pattern: "%d/%b/%Y:%H:%M:%S %z"}
+    max_skew: 168h
+"#;
+        let config = parse(yaml, &env(&[])).expect("should parse");
+        match &config.components["sys"].kind {
+            logit_config::ComponentKind::Timestamp { format, timezone, max_skew, .. } => {
+                assert_eq!(format, &logit_config::TimestampFormat::Rfc3164);
+                assert_eq!(timezone.as_deref(), Some("Europe/Berlin"));
+                assert_eq!(*max_skew, logit_config::default_timestamp_max_skew());
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        }
+        match &config.components["web"].kind {
+            logit_config::ComponentKind::Timestamp { format, max_skew, .. } => {
+                assert_eq!(
+                    format,
+                    &logit_config::TimestampFormat::Pattern("%d/%b/%Y:%H:%M:%S %z".into())
+                );
+                assert_eq!(*max_skew, std::time::Duration::from_secs(168 * 3600));
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        }
+    }
+
     /// A quoted bare-number `max_bytes` reads via YAML (`human_bytes` rejects an unquoted one).
     #[test]
     fn buffer_config_quoted_bare_number_max_bytes_round_trips_through_the_real_yaml_path() {
