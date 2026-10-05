@@ -324,9 +324,10 @@ holds. See [`delivery-semantics.md`](delivery-semantics.md), item 3, and its W3 
 The rejected alternative "Reuse gRPC-over-hyper" gives the wrong reason. It cites the bake-off's
 framing overhead, but [ADR `native-wire-format-encoding`](native-wire-format-encoding.md) measured
 protobuf as the *payload encoding*, not HTTP/2 as the *transport*. A native hop frame carried as
-one message on a long-lived HTTP/2 stream costs a 9-byte `DATA` header and a 5-byte gRPC message
-prefix per batch, with HPACK headers once per stream. Against a multi-kilobyte batch behind a
-24-byte native header, that cost is noise. The rejection stands, on these grounds instead:
+one message on a long-lived HTTP/2 stream costs a 9-byte `DATA` header per 16 KiB (HTTP/2's
+default frame size) and a 5-byte gRPC message prefix per batch, with HPACK headers once per
+stream. Against a multi-kilobyte batch behind a 24-byte native header, that cost is noise. The
+rejection stands, on these grounds instead:
 
 - **The hard parts are the hop's own semantics, and HTTP/2 removes none of them.** Sender
   identity and sequence, the named cumulative `Ack`, the receiver's high-water marks and resend
@@ -352,12 +353,12 @@ has no native hop today; `otlp_out` to `otlp_in` is the fallback, at OTLP's fide
 cost. The industry splits on this: Vector's native hop is gRPC; Fluentd's forward protocol and
 Kafka's are bespoke framing over TCP.
 
-**The transport is a seam, not the decision.** The frame bytes are transport-agnostic (the same
-bytes go to a socket and to the `buffer.disk:` spool), and the session protocol above is defined
-over an ordered, reliable byte stream, so it carries unchanged over any transport that provides
-one. The remedy for the L7 limitation is a second transport for the same frames and the same
-control messages, selected per component, not a second protocol. Two candidates, neither
-designed here:
+**The transport is a seam, not the decision.** The frame format is transport-agnostic (the same
+`CODEC_HOP_BATCH` frame goes to a socket and inside a `buffer.disk:` spool record, each encoded
+under its own compression), and the session protocol above is defined over an ordered, reliable
+byte stream, so it carries unchanged over any transport that provides one. The remedy for the L7
+limitation is a second transport for the same frames and the same control messages, selected per
+component, not a second protocol. Two candidates, neither designed here:
 
 - **gRPC**, for L7 infrastructure: the hop frames as messages on one bidirectional stream, or one
   `POST` per frame with the `Ack` in the response. The second shape gives a proxy per-request
