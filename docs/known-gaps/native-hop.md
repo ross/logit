@@ -66,6 +66,20 @@ Entry format and the other areas: [the known-gaps index](README.md).
     and the frames behind it go on over the same connection
     ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md)).
   - **Workaround:** change the sender's batching.
+- **An oversize frame from an uncompressed sender is refused by name only within a sliver over
+  the cap.** `logit_out` defaults to `compression: none`, so a frame's `compressed_len` equals its
+  `uncompressed_len`. `logit_in` reads the body and answers `Ack{rejected(too_large)}` only for a
+  frame within `frame::compressed_bound(max_frame_bytes)` (`n + n/255 + 16`), through
+  `frame::read_frame_prefix`. Past that it answers `Reject{FRAME_TOO_LARGE}` with nothing of the
+  body read and closes the connection.
+  - **Consequence:** the sender drops the head as `rejected` on the `Reject` and reconnects, and
+    the frames behind it in the window are resent on the new connection, where `logit_in`'s marks
+    recognize any it already handled. A stock `logit_out` checks the cap before it writes, so only a
+    sender that doesn't reaches this path.
+  - **To close:** a streaming drain that reads the frame through a fixed scratch buffer with a
+    running CRC, up to a drain cap, so `logit_in` can refuse an uncompressed frame by name without
+    buffering it ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md),
+    "Consequences").
 
 - **No durable (disk-backed) buffering on the receive side.** A UDP listener's `ReceiveQueue`
   ([ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)) is in-memory only, so a

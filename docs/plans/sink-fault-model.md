@@ -268,8 +268,8 @@ signals a destination hasn't settled. What the stream leaves open:
   "`stdio_out` to a stdout or stderr pipe has no write bound").
 - **An uncompressed oversize frame still closes the connection.** Only a frame within the
   compressed bound is read and refused by name; a streaming drain would extend that to
-  uncompressed frames ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md),
-  "Consequences").
+  uncompressed frames (`docs/known-gaps/native-hop.md`, "An oversize frame from an uncompressed
+  sender is refused by name only within a sliver over the cap").
 - **The Datadog sinks retry a batch whole.** A retry resends the requests Datadog already
   accepted; per-request memory like `otlp_out`'s per-signal memory would end it
   (`docs/known-gaps/datadog.md`, "A `datadog_out` resend isn't idempotent").

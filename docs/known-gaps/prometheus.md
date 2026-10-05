@@ -145,3 +145,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `prometheus.type="untyped"`: a counter can't be told from a gauge, and a histogram's `_bucket`,
   `_sum`, and `_count` arrive as unrelated series (verified, leg 9). VictoriaMetrics stores no
   metric type, so there's nothing for `logit` to recover.
+- **Some rows of `prometheus_out`'s and `influxdb_out`'s response-class tables rest on
+  documentation and secondhand bodies, not a recorded response.** `prometheus_out`'s Grafana Cloud
+  `401` body (`authentication error: invalid authentication credentials`) comes from a forum
+  post, and only a test uses it. `influxdb_out`'s `413` and parse-error (`unable to parse ...`)
+  texts follow InfluxDB's documentation and are unverified; that sink classifies by status alone,
+  so the text matters only to the diagnostic. The tables are
+  `crates/logit-outputs/src/prometheus.rs`, "Faults, retries and duplicate safety (sender mode)",
+  and `crates/logit-outputs/src/influxdb.rs`, "Response classes".
+  - **Consequence:** none known for `influxdb_out`. For `prometheus_out`, only the decompression
+    `400` reads the body; a receiver whose decompression text differs from the matched prefixes
+    reads as `Rejected` and drops the batch where it would hold.
+  - **Revisit trigger:** a recorded response from a real Grafana Cloud or InfluxDB stack.

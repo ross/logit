@@ -205,6 +205,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
   would need the codec to defer its counts until the request is accepted.
   - **Consequence:** the degradation counters of a route that also drops oversize records read
     high by those records.
+- **Some rows of the Datadog sinks' response-class tables rest on documentation, not a recorded
+  response.** The status rows follow Datadog's documented intake statuses and the Agent's source.
+  The `{"errors":["Forbidden"]}` body a `403` carries appears only in a test
+  (`datadog::tests::a_403_forbidden_is_refused`); no recorded response from a real intake or
+  Agent backs any `4xx` row. The tables are `crates/logit-outputs/src/datadog.rs` and
+  `crates/logit-outputs/src/datadog_trace.rs`, "Faults, retries, and duplicate safety".
+  - **Consequence:** none known. Both sinks classify by status alone, so a body shape that
+    differs changes only the text the diagnostics quote.
+  - **Revisit trigger:** a recorded `4xx` response from a real Datadog intake or Agent.
 - **A sink sent to again without `observe_batch`, after a batch whose last attempt failed, keeps
   that batch's state.** `observe_batch` arms the attempt gate of every sink that has one, and on
   `datadog_out` it also fixes the batch's send time. Only an `Ok` disarms the gate and clears the

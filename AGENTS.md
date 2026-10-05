@@ -50,7 +50,9 @@ exists or a contract other `logit` processes depend on:
   by a test and the destination's documentation. On any change to how a sink reads a response, a
   reviewer checks that table first. A `Rejected` batch drops at once; a `Refused` destination
   holds the queue and retries with no budget and no exit, so reading a destination fault as
-  `Rejected` loses data and reading a bad batch as `Refused` wedges the sink.
+  `Rejected` loses data and reading a bad batch as `Refused` wedges the sink. A sink's own
+  transport timeout is the only bound on an attempt, so every write and acknowledgment wait a sink
+  makes must have one.
 
 The lossless-relay, Lua-VM, mergeable-sketch, and memory-pin rules are in
 [Design constraints that aren't optional](#design-constraints-that-arent-optional).
