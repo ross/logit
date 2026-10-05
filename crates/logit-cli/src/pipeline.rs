@@ -375,7 +375,15 @@ fn build_spec(
         // The transport picks the constructor and the `receive:` translation: a TCP listener has
         // no receive queue, so it takes `tcp_receive_config`, not `receive_config` (graph rule 17).
         // `tls:` is TCP-only: rules 43 and 65 reject it elsewhere, and `with_tls` refuses it again.
-        StatsdIn { bind, transport, tls, handshake_timeout, idle_timeout, max_connections } => {
+        StatsdIn {
+            bind,
+            transport,
+            tls,
+            handshake_timeout,
+            idle_timeout,
+            max_connections,
+            peer,
+        } => {
             let mut input = match transport {
                 logit_config::StatsdTransport::Udp => {
                     StatsdInput::new(bind.clone()).with_receive(receive_config(&component.receive))
@@ -392,10 +400,11 @@ fn build_spec(
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
-            // No-ops under UDP, where rules 45, 53, and 74 reject a value.
+            // No-ops under UDP, where rules 45, 53, 74, and 78 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
-            .with_max_connections(*max_connections);
+            .with_max_connections(*max_connections)
+            .with_peer(*peer);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -411,6 +420,7 @@ fn build_spec(
             idle_timeout,
             max_connections,
             max_line_bytes,
+            peer,
         } => {
             let mut input = match transport {
                 logit_config::LinesTransport::Tcp => LinesInput::tcp(bind.clone())
@@ -427,10 +437,11 @@ fn build_spec(
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
             .with_max_line_bytes(*max_line_bytes as usize)
-            // No-ops on a datagram transport, where rules 45, 53, and 74 reject a value.
+            // No-ops on a datagram transport, where rules 45, 53, 74, and 78 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
-            .with_max_connections(*max_connections);
+            .with_max_connections(*max_connections)
+            .with_peer(*peer);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -454,8 +465,8 @@ fn build_spec(
         }
         // `GraphiteInput` picks its own driver from `transport`, so `with_receive` is safe on
         // either: rule 17 rejects the queue fields under TCP, leaving only the batch-assembly half
-        // the stream driver reads. The two timeouts and the connection cap are no-ops under UDP
-        // (rules 45, 53, and 74 reject a value there); `tls:` is TCP-only (rule 43), and
+        // the stream driver reads. The two timeouts, the connection cap, and `peer` are no-ops under
+        // UDP (rules 45, 53, 74, and 78 reject a value there); `tls:` is TCP-only (rule 43), and
         // `with_tls` refuses it again.
         GraphiteIn {
             bind,
@@ -467,6 +478,7 @@ fn build_spec(
             max_line_bytes,
             max_frame_bytes,
             max_connections,
+            peer,
         } => {
             let mut input = GraphiteInput::new(
                 bind.clone(),
@@ -480,14 +492,23 @@ fn build_spec(
             .with_max_frame_bytes(*max_frame_bytes as usize)
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
-            .with_max_connections(*max_connections);
+            .with_max_connections(*max_connections)
+            .with_peer(*peer);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
         // The `StatsdIn` arm's shape (`docs/adr/syslog-tcp-ingress-and-tls.md`).
-        SyslogIn { bind, transport, tls, handshake_timeout, idle_timeout, max_connections } => {
+        SyslogIn {
+            bind,
+            transport,
+            tls,
+            handshake_timeout,
+            idle_timeout,
+            max_connections,
+            peer,
+        } => {
             let mut input = match transport {
                 logit_config::SyslogTransport::Udp => {
                     SyslogInput::new(bind.clone()).with_receive(receive_config(&component.receive))
@@ -497,10 +518,11 @@ fn build_spec(
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
-            // No-ops under UDP, where rules 45, 53, and 74 reject a value.
+            // No-ops under UDP, where rules 45, 53, 74, and 78 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
-            .with_max_connections(*max_connections);
+            .with_max_connections(*max_connections)
+            .with_peer(*peer);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -1931,6 +1953,7 @@ mod tests {
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
             },
         }
     }
@@ -2609,6 +2632,7 @@ mod tests {
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
                 max_line_bytes: 8192,
                 max_frame_bytes: 1 << 20,
             },
@@ -2967,6 +2991,7 @@ mod tests {
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
             },
         }
     }
@@ -3145,6 +3170,7 @@ mod tests {
                 handshake_timeout: Duration::from_millis(50),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -3329,6 +3355,7 @@ mod tests {
             handshake_timeout: logit_config::default_handshake_timeout(),
             idle_timeout: None,
             max_connections: 1,
+            peer: false,
         };
         let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
 
@@ -3456,6 +3483,7 @@ mod tests {
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -3479,6 +3507,7 @@ mod tests {
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
                 max_line_bytes: 8192,
                 max_frame_bytes: 1 << 20,
             },
@@ -3503,6 +3532,7 @@ mod tests {
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -4736,6 +4766,7 @@ mod tests {
             handshake_timeout: logit_config::default_handshake_timeout(),
             idle_timeout: None,
             max_connections: logit_config::default_max_connections(),
+            peer: false,
             max_line_bytes: logit_config::default_lines_max_line_bytes(),
         }
     }
@@ -4843,6 +4874,7 @@ mod tests {
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
             },
         }
     }

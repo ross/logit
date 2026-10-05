@@ -157,6 +157,11 @@
               "format": "uint",
               "minimum": 0.0
             },
+            "peer": {
+              "description": "Stamps each event with the address of the socket peer that sent it, as `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer reports the proxy's address. Either attribute replaces a same-named one decoded from the message. No reverse DNS lookup is made.\n\nEvery sender's address becomes an attribute on its events, so series keyed by attributes split by sender, and a sink that writes attributes receives the address. Drop it with a `remove` stage ahead of a sink that shouldn't see it.\n\nA Unix socket client that bound a path reports the path as `network.peer.address` and no port; one that didn't, the usual case, gets neither attribute.\n\n`transport: tcp` or `unix_stream` only: `true` under `transport: udp` or `unix` is rejected.",
+              "default": false,
+              "type": "boolean"
+            },
             "receive": true,
             "sources": true,
             "targets": true,
@@ -190,7 +195,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Plain newline-delimited text over TCP (the default), UDP, or a Unix socket. Each line becomes one log event whose message is the line's bytes, with nothing parsed. To give it structure, add a `json`, `logfmt`, `kv`, or `regex` stage downstream.\n\nThe event has no attributes, no severity, and a raw body, and is timestamped when it was received. A trailing `\\r` is stripped and an empty line is skipped. A line that isn't valid UTF-8 is kept as a byte string, not dropped. Nothing about the sender (its address, host, or a source name) is attached; stamp what you need with a `set` stage per listener.\n\n`bind` is a `host:port` under `tcp` and `udp`, and the socket file's absolute path, shorter than 108 bytes, under `unix` and `unix_stream`. The directory must exist; a stale socket file left by an earlier run is replaced, and anything else at the path is refused. The socket file is made mode `0722`, so a client running as any user can send; restrict access with the directory's permissions.\n\nUnder `tcp` and `unix_stream`, a line ends at its `\\n`. If the connection closes partway through a line, that unterminated line is dropped and counted as `logit.input.frames.dropped{reason=\"truncated\"}`, because the sender never finished it. Under `udp` and `unix`, a datagram holds one or more lines, and its end also ends its last line.\n\nA line can't carry a newline of its own, so a multi-line message (a stack trace, a pretty-printed JSON document) arrives as several events.\n\n`tls:` turns TLS on and makes it required, with no plaintext fallback. It's accepted under `transport: tcp` only.\n\nA TCP or `unix_stream` listener has no receive queue (the connection's own flow control is the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply per connection, so N live connections can hold up to N times `batch_max_events` in flight.",
+          "description": "Plain newline-delimited text over TCP (the default), UDP, or a Unix socket. Each line becomes one log event whose message is the line's bytes, with nothing parsed. To give it structure, add a `json`, `logfmt`, `kv`, or `regex` stage downstream.\n\nThe event has no attributes, no severity, and a raw body, and is timestamped when it was received. A trailing `\\r` is stripped and an empty line is skipped. A line that isn't valid UTF-8 is kept as a byte string, not dropped. Nothing about the sender is attached unless `peer:` is on, which records its address.\n\n`bind` is a `host:port` under `tcp` and `udp`, and the socket file's absolute path, shorter than 108 bytes, under `unix` and `unix_stream`. The directory must exist; a stale socket file left by an earlier run is replaced, and anything else at the path is refused. The socket file is made mode `0722`, so a client running as any user can send; restrict access with the directory's permissions.\n\nUnder `tcp` and `unix_stream`, a line ends at its `\\n`. If the connection closes partway through a line, that unterminated line is dropped and counted as `logit.input.frames.dropped{reason=\"truncated\"}`, because the sender never finished it. Under `udp` and `unix`, a datagram holds one or more lines, and its end also ends its last line.\n\nA line can't carry a newline of its own, so a multi-line message (a stack trace, a pretty-printed JSON document) arrives as several events.\n\n`tls:` turns TLS on and makes it required, with no plaintext fallback. It's accepted under `transport: tcp` only.\n\nA TCP or `unix_stream` listener has no receive queue (the connection's own flow control is the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply per connection, so N live connections can hold up to N times `batch_max_events` in flight.",
           "type": "object",
           "required": [
             "bind",
@@ -225,6 +230,11 @@
               "description": "The longest line this listener accepts, not counting its `\\n`, under every transport. A longer line is dropped and counted once as `logit.input.frames.dropped{reason=\"oversize\"}`, and the line after it still decodes; a stream connection skips to the next newline and stays open. A byte-count string (`\"65536\"`, `\"64KiB\"`). Defaults to `\"64KiB\"`; `0` is rejected.",
               "default": "65536",
               "type": "string"
+            },
+            "peer": {
+              "description": "Stamps each event with the address of the socket peer that sent it, as `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer reports the proxy's address. Either attribute replaces a same-named one decoded from the message. No reverse DNS lookup is made.\n\nEvery sender's address becomes an attribute on its events, so series keyed by attributes split by sender, and a sink that writes attributes receives the address. Drop it with a `remove` stage ahead of a sink that shouldn't see it.\n\nA Unix socket client that bound a path reports the path as `network.peer.address` and no port; one that didn't, the usual case, gets neither attribute.\n\n`transport: tcp` or `unix_stream` only: `true` under `transport: udp` or `unix` is rejected.",
+              "default": false,
+              "type": "boolean"
             },
             "receive": true,
             "sources": true,
@@ -331,6 +341,11 @@
               "default": "8192",
               "type": "string"
             },
+            "peer": {
+              "description": "Stamps each event with the address of the socket peer that sent it, as `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer reports the proxy's address. Either attribute replaces a same-named one decoded from the message. No reverse DNS lookup is made.\n\nEvery sender's address becomes an attribute on its events, so series keyed by attributes split by sender, and a sink that writes attributes receives the address. Drop it with a `remove` stage ahead of a sink that shouldn't see it.\n\n`transport: tcp` only: `true` under `transport: udp` is rejected.",
+              "default": false,
+              "type": "boolean"
+            },
             "protocol": {
               "default": "plaintext",
               "allOf": [
@@ -402,6 +417,11 @@
               "type": "integer",
               "format": "uint",
               "minimum": 0.0
+            },
+            "peer": {
+              "description": "Stamps each event with the address of the socket peer that sent it, as `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer reports the proxy's address. Either attribute replaces a same-named one decoded from the message. No reverse DNS lookup is made.\n\nEvery sender's address becomes an attribute on its events, so series keyed by attributes split by sender, and a sink that writes attributes receives the address. Drop it with a `remove` stage ahead of a sink that shouldn't see it.\n\n`transport: tcp` only: `true` under `transport: udp` is rejected.",
+              "default": false,
+              "type": "boolean"
             },
             "receive": true,
             "sources": true,

@@ -768,6 +768,23 @@ pub enum ComponentKind {
         /// connections, so a non-default value under `transport: udp` or `unix` is rejected.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Either attribute replaces a same-named one decoded from the
+        /// message. No reverse DNS lookup is made.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        ///
+        /// A Unix socket client that bound a path reports the path as `network.peer.address` and
+        /// no port; one that didn't, the usual case, gets neither attribute.
+        ///
+        /// `transport: tcp` or `unix_stream` only: `true` under `transport: udp` or `unix` is
+        /// rejected.
+        #[serde(default)]
+        peer: bool,
     },
     /// Plain newline-delimited text over TCP (the default), UDP, or a Unix socket. Each line
     /// becomes one log event whose message is the line's bytes, with nothing parsed. To give it
@@ -775,8 +792,8 @@ pub enum ComponentKind {
     ///
     /// The event has no attributes, no severity, and a raw body, and is timestamped when it was
     /// received. A trailing `\r` is stripped and an empty line is skipped. A line that isn't
-    /// valid UTF-8 is kept as a byte string, not dropped. Nothing about the sender (its address,
-    /// host, or a source name) is attached; stamp what you need with a `set` stage per listener.
+    /// valid UTF-8 is kept as a byte string, not dropped. Nothing about the sender is attached
+    /// unless `peer:` is on, which records its address.
     ///
     /// `bind` is a `host:port` under `tcp` and `udp`, and the socket file's absolute path, shorter
     /// than 108 bytes, under `unix` and `unix_stream`. The directory must exist; a stale socket file
@@ -855,6 +872,23 @@ pub enum ComponentKind {
         /// non-default value under `transport: udp` or `unix` is rejected.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Either attribute replaces a same-named one decoded from the
+        /// message. No reverse DNS lookup is made.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        ///
+        /// A Unix socket client that bound a path reports the path as `network.peer.address` and
+        /// no port; one that didn't, the usual case, gets neither attribute.
+        ///
+        /// `transport: tcp` or `unix_stream` only: `true` under `transport: udp` or `unix` is
+        /// rejected.
+        #[serde(default)]
+        peer: bool,
         /// The longest line this listener accepts, not counting its `\n`, under every transport.
         /// A longer line is dropped and counted once as
         /// `logit.input.frames.dropped{reason="oversize"}`, and the line after it still decodes; a
@@ -960,6 +994,19 @@ pub enum ComponentKind {
         /// non-default value under `transport: udp` is rejected.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Either attribute replaces a same-named one decoded from the
+        /// message. No reverse DNS lookup is made.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        ///
+        /// `transport: tcp` only: `true` under `transport: udp` is rejected.
+        #[serde(default)]
+        peer: bool,
         /// The longest plaintext line this listener assembles before dropping it and draining to
         /// the next newline (counted once as `logit.input.frames.dropped{reason="oversize"}`; the
         /// line after it still decodes). A byte-count string (`"8192"`, `"16KiB"`). Defaults to
@@ -1051,6 +1098,19 @@ pub enum ComponentKind {
         /// non-default value under `transport: udp` is rejected.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Either attribute replaces a same-named one decoded from the
+        /// message. No reverse DNS lookup is made.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        ///
+        /// `transport: tcp` only: `true` under `transport: udp` is rejected.
+        #[serde(default)]
+        peer: bool,
     },
     /// OpenTelemetry Protocol (logs, metrics, and/or traces) over OTLP/HTTP (protobuf or JSON
     /// body) or OTLP/gRPC.
@@ -5405,8 +5465,10 @@ mod tests {
                 max_line_bytes,
                 max_frame_bytes,
                 max_connections,
+                peer,
             } => {
                 assert_eq!(max_connections, default_max_connections());
+                assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert_eq!(bind, "0.0.0.0:2003");
                 assert_eq!(transport, GraphiteTransport::Tcp);
                 assert_eq!(protocol, GraphiteProtocol::Plaintext);
@@ -5600,7 +5662,9 @@ mod tests {
                 handshake_timeout,
                 idle_timeout,
                 max_connections,
+                peer,
             } => {
+                assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert_eq!(bind, "0.0.0.0:5514");
                 assert_eq!(transport, SyslogTransport::Udp);
                 assert_eq!(tls, None);
@@ -7384,7 +7448,9 @@ mod tests {
                 idle_timeout,
                 max_connections,
                 max_line_bytes,
+                peer,
             } => {
+                assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert_eq!(bind, "0.0.0.0:5170");
                 assert_eq!(transport, LinesTransport::Tcp, "tcp is the default");
                 assert_eq!(tls, None);
@@ -7400,7 +7466,7 @@ mod tests {
             r#"{"type": "lines_in", "bind": "0.0.0.0:5170", "transport": "tcp",
                 "tls": {"cert_file": "server.pem", "key_file": "server.key"},
                 "handshake_timeout": "2s", "idle_timeout": "5m", "max_connections": 7,
-                "max_line_bytes": "1MiB"}"#,
+                "max_line_bytes": "1MiB", "peer": true}"#,
         )
         .unwrap();
         match full.kind {
@@ -7410,8 +7476,10 @@ mod tests {
                 idle_timeout,
                 max_connections,
                 max_line_bytes,
+                peer,
                 ..
             } => {
+                assert!(peer);
                 assert_eq!(tls.cert_file, "server.pem");
                 assert_eq!(handshake_timeout, Duration::from_secs(2));
                 assert_eq!(idle_timeout, Some(Duration::from_secs(300)));
@@ -7435,6 +7503,27 @@ mod tests {
                 ComponentKind::LinesIn { transport, .. } => assert_eq!(transport, expected),
                 other => panic!("expected LinesIn, got {other:?}"),
             }
+        }
+    }
+
+    /// `peer: true` parses on every listener that has the field.
+    #[test]
+    fn peer_parses_on_every_stream_driver_listener() {
+        for json in [
+            r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp", "peer": true}"#,
+            r#"{"type": "syslog_in", "bind": "0.0.0.0:5514", "transport": "tcp", "peer": true}"#,
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2003", "peer": true}"#,
+            r#"{"type": "lines_in", "bind": "0.0.0.0:5170", "peer": true}"#,
+        ] {
+            let component: Component = serde_json::from_str(json).unwrap();
+            let peer = match component.kind {
+                ComponentKind::StatsdIn { peer, .. }
+                | ComponentKind::SyslogIn { peer, .. }
+                | ComponentKind::GraphiteIn { peer, .. }
+                | ComponentKind::LinesIn { peer, .. } => peer,
+                other => panic!("unexpected kind {other:?}"),
+            };
+            assert!(peer, "for {json}");
         }
     }
 
@@ -7463,8 +7552,10 @@ mod tests {
                 handshake_timeout,
                 idle_timeout,
                 max_connections,
+                peer,
             } => {
                 assert_eq!(max_connections, default_max_connections());
+                assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert_eq!(bind, "0.0.0.0:8125");
                 assert_eq!(transport, StatsdTransport::Udp, "classic statsd stays the default");
                 assert_eq!(tls, None);
