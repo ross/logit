@@ -23,6 +23,7 @@ pub mod generate;
 pub mod graphite;
 mod http;
 pub mod internal;
+pub mod lines;
 mod listener;
 pub mod logit;
 pub mod otlp;
@@ -41,9 +42,9 @@ mod zstd;
 pub use logit_pipeline::Input;
 
 /// The builder default for every stream listener's connection cap: the TCP driver's listeners
-/// (`syslog_in`, `graphite_in`, `statsd_in`), `logit_in`, and the HTTP listeners. A connection
-/// arriving past the cap is rejected, never queued. `logit_config::default_max_connections`
-/// mirrors this number by hand.
+/// (`syslog_in`, `graphite_in`, `statsd_in`, `lines_in`), `logit_in`, and the HTTP listeners. A
+/// connection arriving past the cap is rejected, never queued.
+/// `logit_config::default_max_connections` mirrors this number by hand.
 pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
 /// This process's soft `Max open files` limit, or `None` when it is unlimited or can't be read

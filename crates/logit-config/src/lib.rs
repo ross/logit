@@ -109,10 +109,11 @@ pub struct Component {
     #[serde(default)]
     pub buffer: BufferConfig,
     /// Per-listener receive queue and batch assembly. A datagram listener (`collectd_in`, and
-    /// `statsd_in`/`syslog_in`/`graphite_in` under `transport: udp`) accepts every field; the same
-    /// three under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly
-    /// fields and `shutdown_grace`; a non-default block on any other kind (`otlp_in`, `logit_in`,
-    /// `prometheus_in`, `internal`, and `generate_in` included) is rejected.
+    /// `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every
+    /// field; the same four under `transport: tcp`, `tail_in`, and `docker_in` accept only the
+    /// batch-assembly fields and `shutdown_grace`; a non-default block on any other kind
+    /// (`otlp_in`, `logit_in`, `prometheus_in`, `internal`, and `generate_in` included) is
+    /// rejected.
     #[serde(default)]
     pub receive: ReceiveConfig,
     #[serde(flatten)]
@@ -767,6 +768,102 @@ pub enum ComponentKind {
         /// connections, so a non-default value under `transport: udp` or `unix` is rejected.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
+    },
+    /// Plain newline-delimited text, over TCP (the default), UDP, or a Unix socket: one line in is
+    /// one log event out, its message the line's bytes with nothing parsed. Compose `json`,
+    /// `logfmt`, `kv`, or `regex` downstream to give it structure.
+    ///
+    /// Each line becomes a log event with no attributes, no severity, and a raw body, timestamped
+    /// when it was received. A trailing `\r` is stripped and an empty line is skipped. A line that
+    /// isn't valid UTF-8 is kept as a byte string rather than dropped. Nothing about the sender
+    /// (its address, host, or a source name) is attached; stamp what you need with a `set` stage
+    /// per listener.
+    ///
+    /// `bind` is a `host:port` under `tcp`/`udp`, and the socket file's absolute path, shorter
+    /// than 108 bytes, under `unix`/`unix_stream`. The directory must exist; a stale socket file
+    /// left by an earlier run is replaced, and anything else at the path is refused. The socket
+    /// file is made mode `0722`, so a client running as any user can send; restrict access with
+    /// the directory's permissions.
+    ///
+    /// Under `tcp` and `unix_stream` a line ends at its `\n`. An unterminated final line when the
+    /// connection closes is dropped and counted as
+    /// `logit.input.frames.dropped{reason="truncated"}`: a sender that died mid-write never
+    /// finished it. Under `udp` and `unix` a datagram holds one
+    /// or more lines, and its end also ends its last line.
+    ///
+    /// A line has no way to carry a newline of its own: a multi-line message (a stack trace, a
+    /// pretty-printed JSON document) arrives as several events.
+    ///
+    /// `tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS
+    /// listener. It applies to `transport: tcp` only and is rejected under any other transport.
+    ///
+    /// A TCP or `unix_stream` listener has no receive queue (the connection's own flow control is
+    /// the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
+    /// `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields
+    /// (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply
+    /// per connection: N live connections can hold up to N times `batch_max_events` in flight.
+    LinesIn {
+        bind: String,
+        #[serde(default)]
+        transport: LinesTransport,
+        /// Terminates TLS on this listener when present; plaintext when omitted. Requires
+        /// `transport: tcp`.
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// How long one connection has, per pre-message phase, before this listener closes it
+        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for
+        /// the connection's first byte. Each phase gets its own budget, so a silent TLS
+        /// connection costs up to twice this value. Defaults to `5s`; `0s` is rejected.
+        /// `transport: tcp` or `unix_stream` only: a non-default value under `transport: udp` or
+        /// `unix` is rejected.
+        ///
+        /// Not an idle timeout. Once a connection has sent its first byte, the gap before its
+        /// next line is bounded by `idle_timeout` if set, and unbounded otherwise.
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
+        /// How long one connection may stay quiet before this listener closes it and frees its
+        /// connection-cap slot. Off unless set: with no value, a connection that sent one line
+        /// and then went silent holds its slot indefinitely. `0s` is rejected; omit the field to
+        /// disable. `transport: tcp` or `unix_stream` only: any value under `transport: udp` or
+        /// `unix` is rejected.
+        ///
+        /// Recommended wherever steady traffic is expected: a connection quiet for longer than
+        /// this is an anomaly (a dead peer, a half-open socket, a slow-loris), and closing it
+        /// returns the slot. Set it well above the sender's longest normal gap. Leave it unset
+        /// for sparse or bursty senders, and think twice on plaintext transports, where the
+        /// sender cannot detect the close before its next write.
+        ///
+        /// The clock runs only while this listener is waiting on the peer's socket, and resets on
+        /// bytes read from the peer and on this listener handing an accumulated batch downstream.
+        /// Time blocked on a full downstream never counts, so a stalled pipeline cannot make a
+        /// busy connection look idle.
+        ///
+        /// An idle close is policy, not a fault: complete buffered lines are flushed downstream
+        /// first (`logit.component.receive.flushed{reason="closed"}`), a buffered partial line is
+        /// counted `logit.input.frames.dropped{reason="truncated"}`, and the close is counted
+        /// `logit.input.connections.closed{reason="idle"}`, never diagnosed as a
+        /// `connection_error`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
+        /// The most connections this listener serves at once. One arriving past it is closed at
+        /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
+        /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
+        /// keep the total across listeners under the process's `nofile` limit.
+        ///
+        /// Stream transports only (`tcp` and `unix_stream`); a datagram listener has no
+        /// connections, so a non-default value under `transport: udp` or `unix` is rejected.
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
+        /// The longest line this listener accepts, not counting its `\n`. A longer line is
+        /// dropped and counted once as `logit.input.frames.dropped{reason="oversize"}`, and the
+        /// line after it still decodes: a stream connection skips to the next newline and stays
+        /// open. A byte-count string (`"65536"`, `"64KiB"`). Defaults to `"64KiB"`; `0` is
+        /// rejected. Applies under every transport.
+        #[serde(default = "default_lines_max_line_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_line_bytes: u64,
     },
     /// collectd's binary `network` plugin protocol over UDP.
     ///
@@ -2982,6 +3079,11 @@ fn default_splunk_max_pending_acks() -> usize {
     1_000_000
 }
 
+/// Mirrors `logit_inputs::lines::DEFAULT_MAX_LINE_BYTES`, kept in sync by hand.
+pub fn default_lines_max_line_bytes() -> u64 {
+    64 * 1024
+}
+
 /// Mirrors `logit_proto::graphite::DEFAULT_MAX_LINE_BYTES`, kept in sync by hand.
 fn default_graphite_max_line_bytes() -> u64 {
     8192
@@ -3172,6 +3274,27 @@ pub enum StatsdTransport {
     /// A Unix stream socket, the Agent's `dogstatsd_stream_socket`. Each packet (one datagram's
     /// worth of newline-separated lines) is preceded by its length as a 4-byte little-endian
     /// integer, what `datadog-go`'s stream writer sends, reached with `unixstream://<path>`.
+    UnixStream,
+}
+
+/// `lines_in`'s transport. `tcp` (the default) is the reliable, framed transport, and what `tls:`
+/// needs underneath it; under it and `unix_stream` a line ends at its `\n`. Under `udp` and
+/// `unix` a datagram carries one or more newline-separated lines, and its end ends the last one.
+///
+/// Under `unix` and `unix_stream`, `bind` is the socket's absolute path, shorter than 108 bytes,
+/// not a `host:port`, and `tls:` is rejected.
+// Its own enum rather than a shared one: schemars publishes a type's name into the schema's
+// `$defs`, so sharing would document this transport by pointing at a statsd-named type.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LinesTransport {
+    #[default]
+    Tcp,
+    Udp,
+    /// A Unix datagram socket. One datagram carries one or more newline-separated lines, as over
+    /// UDP, and the whole `receive:` block applies.
+    Unix,
+    /// A Unix stream socket: newline-delimited lines, as over TCP.
     UnixStream,
 }
 
@@ -3528,14 +3651,14 @@ pub enum DeliveryPosture {
 }
 
 /// Per-listener receive queue and datagram-to-batch assembly. A datagram listener (`collectd_in`,
-/// and `statsd_in`/`syslog_in`/`graphite_in` under `transport: udp`) accepts every field; the
-/// same three under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly
-/// fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace`;
-/// a non-default block on any other kind is rejected. Every field defaults, so the block is never
-/// required. The defaults batch: `batch_max_events: 1000` and `batch_flush_interval: 100ms` mean
-/// a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to
-/// 100ms of added latency before a send). For one send per datagram with no added latency, set
-/// `batch_max_events: 1`.
+/// and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every
+/// field; the same four under `transport: tcp`, `tail_in`, and `docker_in` accept only the
+/// batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and
+/// `shutdown_grace`; a non-default block on any other kind is rejected. Every field defaults, so
+/// the block is never required. The defaults batch: `batch_max_events: 1000` and
+/// `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into
+/// batches (up to 1000 events, or up to 100ms of added latency before a send). For one send per
+/// datagram with no added latency, set `batch_max_events: 1`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ReceiveConfig {
@@ -5992,10 +6115,11 @@ mod tests {
         }
     }
 
-    /// The nine stream-listener kinds, each as a minimal JSON object, for the `max_connections`
+    /// The ten stream-listener kinds, each as a minimal JSON object, for the `max_connections`
     /// parse tests below.
-    const STREAM_LISTENERS: [&str; 9] = [
+    const STREAM_LISTENERS: [&str; 10] = [
         r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp""#,
+        r#"{"type": "lines_in", "bind": "0.0.0.0:5170""#,
         r#"{"type": "graphite_in", "bind": "0.0.0.0:2003""#,
         r#"{"type": "syslog_in", "bind": "0.0.0.0:6514", "transport": "tcp""#,
         r#"{"type": "otlp_in", "bind": "0.0.0.0:4318""#,
@@ -6009,6 +6133,7 @@ mod tests {
     fn max_connections_of(kind: &ComponentKind) -> usize {
         match kind {
             ComponentKind::StatsdIn { max_connections, .. }
+            | ComponentKind::LinesIn { max_connections, .. }
             | ComponentKind::GraphiteIn { max_connections, .. }
             | ComponentKind::SyslogIn { max_connections, .. }
             | ComponentKind::OtlpIn { max_connections, .. }
@@ -6022,7 +6147,7 @@ mod tests {
     }
 
     /// One `#[serde(default = ..)]` copy per kind: a typo on any one would silently change that
-    /// kind's cap, so all nine are checked.
+    /// kind's cap, so all ten are checked.
     #[test]
     fn max_connections_defaults_to_1024_on_every_stream_listener() {
         for head in STREAM_LISTENERS {
@@ -7244,6 +7369,84 @@ mod tests {
         )
         .unwrap();
         assert_eq!(component.targets, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// `lines_in`'s optional fields all default, and all round-trip when set.
+    #[test]
+    fn lines_in_defaults_and_round_trips_every_field() {
+        let bare: Component =
+            serde_json::from_str(r#"{"type": "lines_in", "bind": "0.0.0.0:5170"}"#).unwrap();
+        match bare.kind {
+            ComponentKind::LinesIn {
+                bind,
+                transport,
+                tls,
+                handshake_timeout,
+                idle_timeout,
+                max_connections,
+                max_line_bytes,
+            } => {
+                assert_eq!(bind, "0.0.0.0:5170");
+                assert_eq!(transport, LinesTransport::Tcp, "tcp is the default");
+                assert_eq!(tls, None);
+                assert_eq!(handshake_timeout, Duration::from_secs(5));
+                assert_eq!(idle_timeout, None, "opt-in -- no idle timeout unless asked for");
+                assert_eq!(max_connections, default_max_connections());
+                assert_eq!(max_line_bytes, 64 * 1024);
+            }
+            other => panic!("expected LinesIn, got {other:?}"),
+        }
+
+        let full: Component = serde_json::from_str(
+            r#"{"type": "lines_in", "bind": "0.0.0.0:5170", "transport": "tcp",
+                "tls": {"cert_file": "server.pem", "key_file": "server.key"},
+                "handshake_timeout": "2s", "idle_timeout": "5m", "max_connections": 7,
+                "max_line_bytes": "1MiB"}"#,
+        )
+        .unwrap();
+        match full.kind {
+            ComponentKind::LinesIn {
+                tls: Some(tls),
+                handshake_timeout,
+                idle_timeout,
+                max_connections,
+                max_line_bytes,
+                ..
+            } => {
+                assert_eq!(tls.cert_file, "server.pem");
+                assert_eq!(handshake_timeout, Duration::from_secs(2));
+                assert_eq!(idle_timeout, Some(Duration::from_secs(300)));
+                assert_eq!(max_connections, 7);
+                assert_eq!(max_line_bytes, 1024 * 1024);
+            }
+            other => panic!("expected LinesIn with tls set, got {other:?}"),
+        }
+
+        for (name, expected) in [
+            ("tcp", LinesTransport::Tcp),
+            ("udp", LinesTransport::Udp),
+            ("unix", LinesTransport::Unix),
+            ("unix_stream", LinesTransport::UnixStream),
+        ] {
+            let component: Component = serde_json::from_str(&format!(
+                r#"{{"type": "lines_in", "bind": "/run/x.sock", "transport": "{name}"}}"#
+            ))
+            .unwrap();
+            match component.kind {
+                ComponentKind::LinesIn { transport, .. } => assert_eq!(transport, expected),
+                other => panic!("expected LinesIn, got {other:?}"),
+            }
+        }
+    }
+
+    /// A typo'd key fails to parse rather than being dropped.
+    #[test]
+    fn lines_in_rejects_an_unknown_field() {
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "lines_in", "bind": "0.0.0.0:5170", "max_line_byte": "1KiB"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("max_line_byte"), "{err}");
     }
 
     /// `statsd_in`'s optional fields all default and all round-trip when set: the bare

@@ -24,6 +24,7 @@ use logit_inputs::docker::{ContainerFilter, DockerInput};
 use logit_inputs::generate::{GenerateInput, GenerateMetricKind};
 use logit_inputs::graphite::GraphiteInput;
 use logit_inputs::internal::InternalInput;
+use logit_inputs::lines::LinesInput;
 use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::prometheus::{PrometheusInput, PrometheusReceiver};
@@ -209,10 +210,13 @@ type PrepareResult =
     (graph::Graph, HashMap<String, NodeSpec>, HashMap<String, Telemetry>, Option<InternalInfo>);
 
 /// The summed `max_connections` of every listener in `graph` that has connections: what it can
-/// hold open at once, one file descriptor each. A datagram `syslog_in`/`graphite_in`/`statsd_in`
-/// and a scrape-mode `prometheus_in` hold none, so they contribute nothing.
+/// hold open at once, one file descriptor each. A datagram
+/// `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` and a scrape-mode `prometheus_in` hold none, so
+/// they contribute nothing.
 fn listener_connection_budget(graph: &graph::Graph) -> usize {
-    use logit_config::{ComponentKind::*, GraphiteTransport, StatsdTransport, SyslogTransport};
+    use logit_config::{
+        ComponentKind::*, GraphiteTransport, LinesTransport, StatsdTransport, SyslogTransport,
+    };
     graph
         .components
         .values()
@@ -221,6 +225,11 @@ fn listener_connection_budget(graph: &graph::Graph) -> usize {
             | GraphiteIn { transport: GraphiteTransport::Tcp, max_connections, .. }
             | StatsdIn {
                 transport: StatsdTransport::Tcp | StatsdTransport::UnixStream,
+                max_connections,
+                ..
+            }
+            | LinesIn {
+                transport: LinesTransport::Tcp | LinesTransport::UnixStream,
                 max_connections,
                 ..
             }
@@ -384,6 +393,41 @@ fn build_spec(
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
             // No-ops under UDP, where rules 45, 53, and 74 reject a value.
+            .with_handshake_timeout(*handshake_timeout)
+            .with_idle_timeout(*idle_timeout)
+            .with_max_connections(*max_connections);
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        // The `StatsdIn` arm's shape, plus `max_line_bytes`, which every transport takes: the
+        // stream framer's bound, or the decoder's for a datagram's lines.
+        LinesIn {
+            bind,
+            transport,
+            tls,
+            handshake_timeout,
+            idle_timeout,
+            max_connections,
+            max_line_bytes,
+        } => {
+            let mut input = match transport {
+                logit_config::LinesTransport::Tcp => LinesInput::tcp(bind.clone())
+                    .with_tcp_receive(tcp_receive_config(&component.receive)),
+                logit_config::LinesTransport::Udp => {
+                    LinesInput::udp(bind.clone()).with_receive(receive_config(&component.receive))
+                }
+                logit_config::LinesTransport::Unix => {
+                    LinesInput::unix(bind).with_receive(receive_config(&component.receive))
+                }
+                logit_config::LinesTransport::UnixStream => LinesInput::unix_stream(bind)
+                    .with_tcp_receive(tcp_receive_config(&component.receive)),
+            }
+            .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry.clone())
+            .with_max_line_bytes(*max_line_bytes as usize)
+            // No-ops on a datagram transport, where rules 45, 53, and 74 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
             .with_max_connections(*max_connections);
@@ -3199,8 +3243,15 @@ mod tests {
                 r#"{"type": "datadog_trace_in", "socket": "/tmp/apm.sock", "max_connections": 13}"#,
             ),
             ("receiver", r#"{"type": "prometheus_in", "bind": "127.0.0.1:0"}"#),
+            ("lines_udp", r#"{"type": "lines_in", "bind": "127.0.0.1:0", "transport": "udp"}"#),
+            ("lines_tcp", r#"{"type": "lines_in", "bind": "127.0.0.1:0", "max_connections": 17}"#),
+            (
+                "lines_stream",
+                r#"{"type": "lines_in", "bind": "/tmp/l.sock", "transport": "unix_stream",
+                    "max_connections": 19}"#,
+            ),
         ]);
-        assert_eq!(listener_connection_budget(&graph), 3 + 5 + 7 + 11 + 13 + 1024);
+        assert_eq!(listener_connection_budget(&graph), 3 + 5 + 7 + 11 + 13 + 1024 + 17 + 19);
     }
 
     #[test]
@@ -3279,6 +3330,21 @@ mod tests {
             idle_timeout: None,
             max_connections: 1,
         };
+        let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
+
+        let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut second, "a past-the-cap connection").await;
+        assert_one_limit_rejection(registry).await;
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn build_spec_wires_max_connections_into_a_tcp_lines_input() {
+        let addr = free_port().await;
+        let mut kind = lines_in_kind(addr.clone(), logit_config::LinesTransport::Tcp, None);
+        if let ComponentKind::LinesIn { max_connections, .. } = &mut kind {
+            *max_connections = 1;
+        }
         let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
 
         let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
@@ -3441,6 +3507,17 @@ mod tests {
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
         assert_closes_a_quiet_connection(spec, &addr, b"some.counter:1|c\n").await;
+    }
+
+    #[tokio::test]
+    async fn build_spec_wires_idle_timeout_into_a_tcp_lines_input() {
+        let addr = free_port().await;
+        let mut kind = lines_in_kind(addr.clone(), logit_config::LinesTransport::Tcp, None);
+        if let ComponentKind::LinesIn { idle_timeout, .. } = &mut kind {
+            *idle_timeout = Some(Duration::from_millis(50));
+        }
+        let spec = build_spec("in", &input_component(kind), Path::new(""), None).unwrap().0;
+        assert_closes_a_quiet_connection(spec, &addr, b"a line\n").await;
     }
 
     /// `logit_in` arms the idle clock after its handshake and closes with `Reject{GOING_AWAY}`,
@@ -4644,6 +4721,108 @@ mod tests {
             build_spec("drop_provenance", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
+    }
+
+    /// A `lines_in` with every optional field at its default.
+    fn lines_in_kind(
+        bind: String,
+        transport: logit_config::LinesTransport,
+        tls: Option<logit_config::TlsServerConfig>,
+    ) -> ComponentKind {
+        ComponentKind::LinesIn {
+            bind,
+            transport,
+            tls,
+            handshake_timeout: logit_config::default_handshake_timeout(),
+            idle_timeout: None,
+            max_connections: logit_config::default_max_connections(),
+            max_line_bytes: logit_config::default_lines_max_line_bytes(),
+        }
+    }
+
+    /// A listener component `in` of `kind`, consumed by `out`.
+    fn input_component(kind: ComponentKind) -> ResolvedComponent {
+        ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind,
+        }
+    }
+
+    /// Every transport builds; the TLS arm loads its cert, and a missing file fails the build.
+    #[test]
+    fn build_spec_builds_a_lines_input_for_every_transport() {
+        use logit_config::LinesTransport;
+        for (bind, transport) in [
+            ("127.0.0.1:0", LinesTransport::Tcp),
+            ("127.0.0.1:0", LinesTransport::Udp),
+            ("/tmp/lines.sock", LinesTransport::Unix),
+            ("/tmp/lines.sock", LinesTransport::UnixStream),
+        ] {
+            let component = input_component(lines_in_kind(bind.to_string(), transport, None));
+            assert!(
+                matches!(
+                    build_spec("in", &component, Path::new(""), None).unwrap().0,
+                    NodeSpec::Input(..)
+                ),
+                "{transport:?}"
+            );
+        }
+
+        let tls = |cert_file: &str| {
+            input_component(lines_in_kind(
+                "127.0.0.1:0".to_string(),
+                LinesTransport::Tcp,
+                Some(logit_config::TlsServerConfig {
+                    cert_file: cert_file.to_string(),
+                    key_file: "server.key".to_string(),
+                    client_ca_file: None,
+                }),
+            ))
+        };
+        assert!(matches!(
+            build_spec("in", &tls("server.pem"), &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+        let err = match build_spec("in", &tls("does-not-exist.pem"), &testdata_tls_dir(), None) {
+            Ok(_) => panic!("expected a missing tls.cert_file to fail build_spec"),
+            Err(err) => format!("{err:?}"),
+        };
+        assert!(err.contains("does-not-exist.pem"), "got: {err}");
+    }
+
+    /// `max_line_bytes` reaches the built listener: a line past it is skipped and counted, and the
+    /// next line on the connection is the first one delivered.
+    #[tokio::test]
+    async fn build_spec_wires_max_line_bytes_into_a_lines_input() {
+        let addr = free_port().await;
+        let mut kind = lines_in_kind(addr.clone(), logit_config::LinesTransport::Tcp, None);
+        if let ComponentKind::LinesIn { max_line_bytes, .. } = &mut kind {
+            *max_line_bytes = 4;
+        }
+        let registry = Registry::new();
+        let (spec, _) =
+            build_spec("in", &input_component(kind), Path::new(""), Some(&registry)).unwrap();
+        let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
+        input.bind().await.expect("bind should succeed");
+        let (sink, mut rx) = logit_pipeline::test_util::fanout_channel(16);
+        let handle = tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"too long\nok\n").await.unwrap();
+        let events = logit_pipeline::test_util::recv_events(&mut rx, 1).await;
+        assert_eq!(
+            events[0].log.as_ref().and_then(|log| log.message.as_str()),
+            Some("ok"),
+            "the oversize line is never delivered"
+        );
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::with_registry(registry);
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]), 1.0);
+        drop(client);
+        handle.abort();
     }
 
     /// A `statsd_in` at either transport, with or without TLS.

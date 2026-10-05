@@ -190,6 +190,75 @@
           "additionalProperties": false
         },
         {
+          "description": "Plain newline-delimited text, over TCP (the default), UDP, or a Unix socket: one line in is one log event out, its message the line's bytes with nothing parsed. Compose `json`, `logfmt`, `kv`, or `regex` downstream to give it structure.\n\nEach line becomes a log event with no attributes, no severity, and a raw body, timestamped when it was received. A trailing `\\r` is stripped and an empty line is skipped. A line that isn't valid UTF-8 is kept as a byte string rather than dropped. Nothing about the sender (its address, host, or a source name) is attached; stamp what you need with a `set` stage per listener.\n\n`bind` is a `host:port` under `tcp`/`udp`, and the socket file's absolute path, shorter than 108 bytes, under `unix`/`unix_stream`. The directory must exist; a stale socket file left by an earlier run is replaced, and anything else at the path is refused. The socket file is made mode `0722`, so a client running as any user can send; restrict access with the directory's permissions.\n\nUnder `tcp` and `unix_stream` a line ends at its `\\n`. An unterminated final line when the connection closes is dropped and counted as `logit.input.frames.dropped{reason=\"truncated\"}`: a sender that died mid-write never finished it. Under `udp` and `unix` a datagram holds one or more lines, and its end also ends its last line.\n\nA line has no way to carry a newline of its own: a multi-line message (a stack trace, a pretty-printed JSON document) arrives as several events.\n\n`tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS listener. It applies to `transport: tcp` only and is rejected under any other transport.\n\nA TCP or `unix_stream` listener has no receive queue (the connection's own flow control is the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply per connection: N live connections can hold up to N times `batch_max_events` in flight.",
+          "type": "object",
+          "required": [
+            "bind",
+            "type"
+          ],
+          "properties": {
+            "bind": {
+              "type": "string"
+            },
+            "buffer": true,
+            "handshake_timeout": {
+              "description": "How long one connection has, per pre-message phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for the connection's first byte. Each phase gets its own budget, so a silent TLS connection costs up to twice this value. Defaults to `5s`; `0s` is rejected. `transport: tcp` or `unix_stream` only: a non-default value under `transport: udp` or `unix` is rejected.\n\nNot an idle timeout. Once a connection has sent its first byte, the gap before its next line is bounded by `idle_timeout` if set, and unbounded otherwise.",
+              "default": "5s",
+              "type": "string"
+            },
+            "idle_timeout": {
+              "description": "How long one connection may stay quiet before this listener closes it and frees its connection-cap slot. Off unless set: with no value, a connection that sent one line and then went silent holds its slot indefinitely. `0s` is rejected; omit the field to disable. `transport: tcp` or `unix_stream` only: any value under `transport: udp` or `unix` is rejected.\n\nRecommended wherever steady traffic is expected: a connection quiet for longer than this is an anomaly (a dead peer, a half-open socket, a slow-loris), and closing it returns the slot. Set it well above the sender's longest normal gap. Leave it unset for sparse or bursty senders, and think twice on plaintext transports, where the sender cannot detect the close before its next write.\n\nThe clock runs only while this listener is waiting on the peer's socket, and resets on bytes read from the peer and on this listener handing an accumulated batch downstream. Time blocked on a full downstream never counts, so a stalled pipeline cannot make a busy connection look idle.\n\nAn idle close is policy, not a fault: complete buffered lines are flushed downstream first (`logit.component.receive.flushed{reason=\"closed\"}`), a buffered partial line is counted `logit.input.frames.dropped{reason=\"truncated\"}`, and the close is counted `logit.input.connections.closed{reason=\"idle\"}`, never diagnosed as a `connection_error`.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_connections": {
+              "description": "The most connections this listener serves at once. One arriving past it is closed at once and counted `logit.input.connections.rejected{reason=\"limit\"}`, never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so keep the total across listeners under the process's `nofile` limit.\n\nStream transports only (`tcp` and `unix_stream`); a datagram listener has no connections, so a non-default value under `transport: udp` or `unix` is rejected.",
+              "default": 1024,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "max_line_bytes": {
+              "description": "The longest line this listener accepts, not counting its `\\n`. A longer line is dropped and counted once as `logit.input.frames.dropped{reason=\"oversize\"}`, and the line after it still decodes: a stream connection skips to the next newline and stays open. A byte-count string (`\"65536\"`, `\"64KiB\"`). Defaults to `\"64KiB\"`; `0` is rejected. Applies under every transport.",
+              "default": "65536",
+              "type": "string"
+            },
+            "receive": true,
+            "sources": true,
+            "targets": true,
+            "tls": {
+              "description": "Terminates TLS on this listener when present; plaintext when omitted. Requires `transport: tcp`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsServerConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "transport": {
+              "default": "tcp",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/LinesTransport"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "lines_in"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "collectd's binary `network` plugin protocol over UDP.\n\n`bind` is an ordinary `host:port`; collectd's own default port is `25826`. When the address is a multicast group (collectd's defaults are `239.192.74.66` and `ff18::efc0:4a42`), the listener sets `SO_REUSEADDR`, binds the unspecified address on that port, and joins the group on the default interface. There is no `multicast:` field; the address says it. Such a listener also accepts unicast datagrams sent to that port from any source: joining a group is additive, not a filter.\n\n`types_db` names zero or more collectd `types.db` files (relative paths resolve against the config file's directory), read at startup and merged in order, later files overriding earlier ones. They supply data-source names only: a value list whose type resolves with a matching data-source count and kinds is named `<plugin>.<type>.<ds_name>` rather than `<plugin>.<type>.<i>` (a single-data-source list is `<plugin>.<type>` either way). A missing or unparseable file fails startup. Names never change what `collectd_out` puts back on the wire; it re-encodes from the `collectd.*` attributes. collectd's own `types.db` is GPL-licensed and not shipped with `logit`; point this at the installed copy.",
           "type": "object",
           "required": [
@@ -3185,7 +3254,7 @@
           ]
         },
         "receive": {
-          "description": "Per-listener receive queue and batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in` under `transport: udp`) accepts every field; the same three under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly fields and `shutdown_grace`; a non-default block on any other kind (`otlp_in`, `logit_in`, `prometheus_in`, `internal`, and `generate_in` included) is rejected.",
+          "description": "Per-listener receive queue and batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every field; the same four under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly fields and `shutdown_grace`; a non-default block on any other kind (`otlp_in`, `logit_in`, `prometheus_in`, `internal`, and `generate_in` included) is rejected.",
           "default": {
             "batch_flush_interval": "100ms",
             "batch_max_bytes": "1048576",
@@ -3665,6 +3734,32 @@
         "replace"
       ]
     },
+    "LinesTransport": {
+      "description": "`lines_in`'s transport. `tcp` (the default) is the reliable, framed transport, and what `tls:` needs underneath it; under it and `unix_stream` a line ends at its `\\n`. Under `udp` and `unix` a datagram carries one or more newline-separated lines, and its end ends the last one.\n\nUnder `unix` and `unix_stream`, `bind` is the socket's absolute path, shorter than 108 bytes, not a `host:port`, and `tls:` is rejected.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "tcp",
+            "udp"
+          ]
+        },
+        {
+          "description": "A Unix datagram socket. One datagram carries one or more newline-separated lines, as over UDP, and the whole `receive:` block applies.",
+          "type": "string",
+          "enum": [
+            "unix"
+          ]
+        },
+        {
+          "description": "A Unix stream socket: newline-delimited lines, as over TCP.",
+          "type": "string",
+          "enum": [
+            "unix_stream"
+          ]
+        }
+      ]
+    },
     "MatchMode": {
       "description": "`has_signal`'s matching rule. `any_of` forwards an event carrying at least one listed signal, untouched, even if it also carries an unlisted one. `only` also requires the event carry nothing outside `signals`: a mixed event with an unlisted signal is dropped, not trimmed (`keep_signals` trims; `has_signal` never mutates an event).",
       "type": "string",
@@ -3850,7 +3945,7 @@
       ]
     },
     "ReceiveConfig": {
-      "description": "Per-listener receive queue and datagram-to-batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in` under `transport: udp`) accepts every field; the same three under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace`; a non-default block on any other kind is rejected. Every field defaults, so the block is never required. The defaults batch: `batch_max_events: 1000` and `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to 100ms of added latency before a send). For one send per datagram with no added latency, set `batch_max_events: 1`.",
+      "description": "Per-listener receive queue and datagram-to-batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every field; the same four under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace`; a non-default block on any other kind is rejected. Every field defaults, so the block is never required. The defaults batch: `batch_max_events: 1000` and `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to 100ms of added latency before a send). For one send per datagram with no added latency, set `batch_max_events: 1`.",
       "type": "object",
       "properties": {
         "batch_flush_interval": {

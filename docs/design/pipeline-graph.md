@@ -213,7 +213,7 @@ literal argument string.
 
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
-| Listener (`statsd_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
+| Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
@@ -333,7 +333,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 41. A registry-mode `prometheus_out` `path` not starting with `/`, or `max_series: 0`.
 42. A `generate_in` count of `0`, an empty key or metric name, a non-finite metric value, or an
     unknown or unbounded template placeholder.
-43. A `tls:` on a UDP `syslog_in`, `graphite_in`, or `statsd_in`.
+43. A `tls:` on a UDP `syslog_in`, `graphite_in`, `statsd_in`, or `lines_in`.
 44. An inconsistent `syslog_out` `tls:`, or one under `transport: udp`.
 45. A `0s` `handshake_timeout`, or a non-default one on a UDP listener.
 46. A `graphite_in`/`graphite_out` pickle over UDP, a zero size or timeout bound, or an
@@ -364,7 +364,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     whitespace.
 64. A `datadog_trace_in` with neither `bind` nor `socket`, an empty `bind`, a relative `socket`
     path, or `tls` without `bind`.
-65. A `statsd_in` `bind` or `statsd_out` `endpoint` that isn't an absolute path under
+65. A `statsd_in`/`lines_in` `bind` or `statsd_out` `endpoint` that isn't an absolute path under
     `transport: unix`/`unix_stream` or is 108 bytes or longer, or `tls:` under either Unix
     transport.
 66. A `datadog_out` with an empty or whitespace-padded `api_key`, an empty `site` or one with a
@@ -393,6 +393,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `%z`, `%:z`, or `%s`); or a pattern that is empty, has no hour and minute, uses `%Z`, `%Q`, or
     `%:Q`, or fails to parse its own rendering of a reference instant
     (`docs/adr/timestamp-transform.md`).
+77. A `lines_in` `max_line_bytes` of `0`.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
