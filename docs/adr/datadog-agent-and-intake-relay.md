@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-10-04
+updated: 2026-10-05
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -331,3 +331,19 @@ The decisions:
   base URL, or the `version:`, the loss `Refused` exists to prevent. The resend costs a second copy
   of what the accepted routes carried: a series point overwrites, a log or trace is stored again
   (this record's "Delivery posture" text).
+
+## Amendment: the socket mode is configurable (2026-10-05)
+
+Decision 12's mode is now each listener's default rather than a fixed value. `statsd_in`,
+`lines_in`, and `datadog_trace_in` take an optional `socket_mode:`, a quoted octal string such as
+`"0660"`, and omitting it keeps `0722`, the Agent's own mode. An operator whose clients share a
+group, or who wants the socket closed to other users without a dedicated directory, sets it
+instead of changing the directory.
+
+- **The value is a quoted string of three octal digits, with an optional leading `0`.** A YAML
+  number is rejected with a hint to quote it, because YAML 1.1 reads `0660` as an octal number and
+  YAML 1.2 as a string, so only a string means the same mode to every tool that reads the file.
+- **Permission bits only.** Setuid, setgid, and the sticky bit mean nothing on a socket file, so a
+  value above `0777` is rejected when the config is parsed.
+- **Graph rule 78 rejects `socket_mode` where there's no socket file**: a `statsd_in` or `lines_in`
+  under `transport: tcp` or `udp`, and a `datadog_trace_in` without `socket`.

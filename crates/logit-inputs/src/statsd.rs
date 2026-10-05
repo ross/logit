@@ -18,9 +18,9 @@
 //!
 //! Under both Unix transports `bind:` is the socket's path. [`crate::unix`] prepares it (the
 //! directory must exist, a stale socket is replaced, anything else is refused) and the file is made
-//! mode [`SOCKET_MODE`], `0722`. The file isn't removed on shutdown. ADR
-//! `datadog-agent-and-intake-relay`, decision 12, has why the path lives in `bind:` and why the
-//! mode is `0722`.
+//! mode `socket_mode:` ([`StatsdInput::with_socket_mode`]), `0722` by default. The file isn't
+//! removed on shutdown. ADR `datadog-agent-and-intake-relay`, decision 12, has why the path lives
+//! in `bind:` and why the default mode is `0722`.
 //!
 //! A TCP listener has **no [`ReceiveQueue`](crate::udp::ReceiveQueue)**: TCP's flow control is
 //! the backpressure, and ADR `decoupled-listener-io` exists for UDP's silent drops, which a stream
@@ -248,10 +248,6 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::watch;
 
-/// The socket file's mode under `transport: unix`/`unix_stream`: the Datadog Agent's for its
-/// DogStatsD socket (this module's "Transports").
-pub const SOCKET_MODE: u32 = 0o722;
-
 /// Which driver a [`StatsdInput`] wraps, chosen once by `transport:`. An enum rather than a
 /// `Box<dyn Input>` so each arm's concrete builders ([`TcpListener::with_tls`],
 /// [`UdpListener::with_config`]) stay reachable; [`crate::syslog::SyslogInput`] does the same.
@@ -309,7 +305,7 @@ impl StatsdInput {
             inner: Inner::Udp(UdpListener::unix(
                 "statsd_in",
                 path,
-                SOCKET_MODE,
+                crate::unix::DEFAULT_SOCKET_MODE,
                 StatsdDecoder::new(Arc::new(Resource::default())),
                 UdpListenerConfig::default(),
             )),
@@ -325,7 +321,7 @@ impl StatsdInput {
                 TcpListener::unix(
                     "statsd_in",
                     path,
-                    SOCKET_MODE,
+                    crate::unix::DEFAULT_SOCKET_MODE,
                     StatsdDecoder::new(Arc::new(Resource::default())),
                     TcpListenerConfig::default(),
                 )
@@ -442,6 +438,17 @@ impl StatsdInput {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_max_connections(max_connections));
         }
+        self
+    }
+
+    /// Sets the socket file's mode under `transport: unix`/`unix_stream` (`socket_mode:`),
+    /// overriding the default `0722`. An IP listener is left untouched: it has no socket file, and
+    /// graph rule 78 rejects the field there.
+    pub fn with_socket_mode(mut self, socket_mode: u32) -> Self {
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(listener.with_socket_mode(socket_mode)),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_socket_mode(socket_mode)),
+        };
         self
     }
 
@@ -2168,7 +2175,16 @@ mod tests {
         let mut client = running.connect().await;
         client.write_all(b"split.across:12").await.unwrap();
         client.flush().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A half line must yield no event. With `batch_max_events: 1` and no flush timer, a
+        // wrongly emitted one would arrive within a loopback round trip (well under 1 ms), so
+        // 100 ms is a margin, not a multiple of a tick. The window also makes it likely, not
+        // certain, that the listener read the first write on its own.
+        logit_pipeline::test_util::assert_no_batch(
+            &mut running.rx,
+            Duration::from_millis(100),
+            "the half line",
+        )
+        .await;
         client.write_all(b"3|c\n").await.unwrap();
         client.flush().await.unwrap();
 
@@ -2253,25 +2269,36 @@ mod tests {
         // No trailing newline: the sender got this far and stopped.
         client.write_all(b"page.views:1|c").await.unwrap();
         client.flush().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
         drop(client); // a clean FIN, not an RST
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), running.rx.recv()).await.is_err(),
-            "half a line is not a metric -- nothing should be delivered"
-        );
-
-        let drained = running.registry.drain(0);
+        // The driver counts the truncated tail when it sees the close, so waiting on the count
+        // also waits for the close to be processed; no sleep orders the write before the FIN.
+        let mut probe =
+            logit_pipeline::test_util::TelemetryProbe::with_registry(running.registry.clone());
+        let totals = probe
+            .wait_for("the truncated tail to be counted", |t| {
+                t.sum("logit.input.frames.dropped", &[("reason", "truncated")]) >= 1.0
+            })
+            .await;
         assert_eq!(
-            metric_sum(&drained, "logit.input.frames.dropped", Some(("reason", "truncated"))),
+            totals.sum("logit.input.frames.dropped", &[("reason", "truncated")]),
             1.0,
-            "and the loss is counted, exactly as an abrupt close's is"
+            "the loss is counted once, as an abrupt close's is"
         );
         assert_eq!(
-            metric_sum(&drained, "logit.input.frames", None),
+            totals.sum("logit.input.frames", &[]),
             0.0,
             "the remainder never became a frame"
         );
+        // An event emitted for the tail would be sent with `batch_max_events: 1` and no flush
+        // timer, so it would already be queued or arrive within a loopback round trip. 100 ms is
+        // a margin for that, not a multiple of a tick.
+        logit_pipeline::test_util::assert_no_batch(
+            &mut running.rx,
+            Duration::from_millis(100),
+            "half a line is not a metric",
+        )
+        .await;
 
         running.shutdown.send(true).ok();
         running.handle.abort();
@@ -2696,7 +2723,7 @@ mod tests {
         let dir = TempDir::new("statsd-dgram");
         let path = dir.path().join("dsd.socket");
         let mut running = start_unix(StatsdInput::unix(&path)).await;
-        assert_eq!(mode_of(&path), SOCKET_MODE);
+        assert_eq!(mode_of(&path), crate::unix::DEFAULT_SOCKET_MODE);
 
         let client = tokio::net::UnixDatagram::unbound().unwrap();
         client.send_to(b"a:1|c\nb:2|g|e:ext|card:low\nc:3:4|ms", &path).await.unwrap();
@@ -2735,19 +2762,31 @@ mod tests {
         let dir = TempDir::new("statsd-stream");
         let path = dir.path().join("dsd-stream.socket");
         let mut running = start_unix(StatsdInput::unix_stream(&path)).await;
-        assert_eq!(mode_of(&path), SOCKET_MODE);
+        assert_eq!(mode_of(&path), crate::unix::DEFAULT_SOCKET_MODE);
 
         let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
         client.write_all(&packet(b"a:1|c\nb:2|c")).await.unwrap();
         let second = packet(b"1.c:3|c");
         client.write_all(&second[..3]).await.unwrap();
         client.flush().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The first packet's two lines are delivered; the half packet must add nothing.
+        let first = running.events(2, "the first packet's lines").await;
+        assert_eq!(names(&first), vec!["a", "b"]);
+        // With `batch_max_events: 1` and no flush timer, a wrongly emitted event would arrive
+        // within a loopback round trip (well under 1 ms), so 100 ms is a margin, not a multiple
+        // of a tick. The window also makes it likely, not certain, that the listener read the
+        // first part on its own.
+        logit_pipeline::test_util::assert_no_batch(
+            &mut running.rx,
+            Duration::from_millis(100),
+            "the half packet",
+        )
+        .await;
         client.write_all(&second[3..]).await.unwrap();
         client.flush().await.unwrap();
 
-        let events = running.events(3, "two packets' lines").await;
-        assert_eq!(names(&events), vec!["a", "b", "1.c"], "a leading digit is not an octet count");
+        let events = running.events(1, "the split packet's line").await;
+        assert_eq!(names(&events), vec!["1.c"], "a leading digit is not an octet count");
         running.stop();
     }
 
@@ -2767,16 +2806,32 @@ mod tests {
         let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf)).await;
         assert!(matches!(read, Ok(Ok(0))), "the listener closes the connection: {read:?}");
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), running.rx.recv()).await.is_err(),
-            "nothing is delivered"
-        );
+        // The close is already observed, and an oversize frame is dropped before decoding, so a
+        // delivery would have been sent first. 200 ms is a margin, not a multiple of a tick.
+        logit_pipeline::test_util::assert_no_batch(
+            &mut running.rx,
+            Duration::from_millis(200),
+            "an oversize packet delivers nothing",
+        )
+        .await;
         let drained = running.registry.drain(0);
         assert_eq!(
             metric_sum(&drained, "logit.input.frames.dropped", Some(("reason", "oversize"))),
             1.0
         );
         running.stop();
+    }
+
+    /// A configured `socket_mode:` replaces the default on both Unix transports.
+    #[tokio::test]
+    async fn with_socket_mode_sets_the_socket_files_mode_on_both_unix_transports() {
+        let dir = TempDir::new("statsd-mode");
+        let path = dir.path().join("dsd.socket");
+        for input in [StatsdInput::unix(&path), StatsdInput::unix_stream(&path)] {
+            let mut input = input.with_socket_mode(0o660);
+            input.bind().await.expect("bind");
+            assert_eq!(mode_of(&path), 0o660);
+        }
     }
 
     /// A Unix socket is always plaintext: `with_tls` fails on both transports.

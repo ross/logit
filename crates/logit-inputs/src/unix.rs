@@ -1,5 +1,5 @@
 //! Binding a listener on a Unix socket path, shared by `datadog_trace_in`'s `socket:` and
-//! `statsd_in`'s `transport: unix`/`unix_stream`.
+//! `statsd_in`'s and `lines_in`'s `transport: unix`/`unix_stream`.
 //!
 //! Every bind prepares the path the same way, which is what the Datadog Agent does at startup for
 //! its own sockets:
@@ -10,7 +10,7 @@
 //!   shutdown) would otherwise fail the bind with `EADDRINUSE`.
 //! - **Anything else at the path is refused**, so a typo can't delete a regular file.
 //! - **The mode is set after the bind**, since `bind(2)` creates the file with the process umask
-//!   applied.
+//!   applied. It's the component's `socket_mode:`, [`DEFAULT_SOCKET_MODE`] when omitted.
 //!
 //! The socket file isn't removed on shutdown; the next bind replaces it.
 
@@ -18,6 +18,12 @@ use anyhow::Context as _;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use tokio::net::{UnixDatagram, UnixListener};
+
+/// The socket file's mode when `socket_mode:` is omitted: the Datadog Agent's for its DogStatsD
+/// and APM sockets. A client needs only write permission on the file to connect or send, so the
+/// directory's permissions are the access control
+/// (`docs/adr/datadog-agent-and-intake-relay.md`, decision 12).
+pub(crate) const DEFAULT_SOCKET_MODE: u32 = 0o722;
 
 /// Binds a `SOCK_STREAM` Unix socket at `path` and sets its mode. `kind` names the component in
 /// the error text.

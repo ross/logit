@@ -424,6 +424,36 @@ components:
         }
     }
 
+    fn statsd_socket_mode(raw: &str) -> anyhow::Result<Option<u32>> {
+        let yaml = format!(
+            "components:\n  in:\n    type: statsd_in\n    bind: /run/dsd.socket\n    \
+             transport: unix\n    socket_mode: {raw}\n  out:\n    type: null_out\n    \
+             sources: [in]\n"
+        );
+        let config = parse(&yaml, &env(&[]))?;
+        match &config.components["in"].kind {
+            logit_config::ComponentKind::StatsdIn { socket_mode, .. } => {
+                Ok(socket_mode.map(logit_config::SocketMode::bits))
+            }
+            other => panic!("expected StatsdIn, got {other:?}"),
+        }
+    }
+
+    /// `socket_mode` through YAML: the string forms read as octal, and a YAML number is rejected
+    /// with a hint to quote it.
+    #[test]
+    fn socket_mode_reads_through_the_real_yaml_path() {
+        assert_eq!(statsd_socket_mode(r#""0660""#).unwrap(), Some(0o660));
+        assert_eq!(statsd_socket_mode("'660'").unwrap(), Some(0o660));
+        for raw in ["660", "0o660", "0x1b0"] {
+            let err = format!("{:#}", statsd_socket_mode(raw).unwrap_err());
+            assert!(err.contains("quote it"), "{raw}: {err}");
+        }
+        // YAML 1.2 reads a plain scalar with a leading `0` as a string, so it reaches the parser
+        // as written; YAML 1.1 would read the same octal value.
+        assert_eq!(statsd_socket_mode("0660").unwrap(), Some(0o660));
+    }
+
     /// A quoted bare-number `max_bytes` reads via YAML (`human_bytes` rejects an unquoted one).
     #[test]
     fn buffer_config_quoted_bare_number_max_bytes_round_trips_through_the_real_yaml_path() {
