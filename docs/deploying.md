@@ -2804,6 +2804,20 @@ per burst, up to 32 frames, because `logit_in` keeps finding the next frame alre
 holds the pending `Ack` through each forward. An `Ack` grants no credit; the window stays fixed at
 the handshake.
 
+**A batch `logit_in` can't take is dropped alone.** An `Ack` carries a status, accepted or
+rejected ([ADR `native-hop-ack-status`](adr/native-hop-ack-status.md)). `logit_in` answers a frame
+it reads but can't take with a rejected `Ack` naming that frame, and keeps reading the connection:
+a batch that decodes past its decode budget (four times `max_frame_bytes`; a sender learns the cap,
+not the budget, so a batch well under the cap can still exceed it), a body that doesn't decode, or
+a frame whose payload is past `max_frame_bytes` but whose compressed size is within the bound
+`logit_in` reads every frame under. `logit_out` drops that one batch as `rejected`
+(`logit.component.batches.dropped{reason="rejected"}` and a `send_failed` warning carrying
+`logit_in`'s reason), and the batches behind it in the window are acknowledged and delivered on the
+same connection, with no reconnect. A frame whose compressed size is past that bound is answered
+`Reject{FRAME_TOO_LARGE}` and the connection closes, since `logit_in` can't read past it. A stock
+`logit_out` checks the cap before sending and never sends either oversize frame, so in practice the
+decode budget is the case you meet: to stop it, send smaller batches.
+
 **Under `buffer.delivery: at_most_once`, set `window: 1`.** An ambiguous fault (a lost or late
 `Ack`, a reset) drops every batch in flight, not only the oldest, because each one may or may not
 have been forwarded. Under the default `at_least_once`, the same fault retries the window from the
@@ -2879,7 +2893,8 @@ connection, so the resend is forwarded when a consumer can take it. A frame at o
 sender's mark that `logit_in` reads whole gets an `Ack` even with no consumer open, because
 `logit_in` doesn't forward it; it is never refused for want of a consumer.
 
-**Sender identity and sequence.** Every frame `logit_out` sends carries a 16-byte sender identity and a sequence number in its trailer
+**Sender identity and sequence.** Every frame `logit_out` sends carries a 16-byte sender identity
+and a sequence number ahead of its batch
 ([ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md)). Each
 `logit_in` component keeps one high-water mark per identity: a frame at or below its identity's
 mark is acknowledged and not forwarded, and a frame above it is forwarded and, once a consumer
@@ -2895,18 +2910,24 @@ takes it, raises the mark. What follows from that:
   `Rejected` verdict, `at_most_once`, or a `drop_oldest` eviction whose cursor wasn't
   persisted) that a crash replay then sends is at or below the mark once a later batch of its
   identity was taken, and `logit_in` acknowledges it without forwarding it.
-- **A frame without a complete pair is never forwarded.** A frame whose trailer lacks a
-  complete, well-formed identity and sequence is a protocol error: `logit_in` ends the connection
-  and counts it in `logit.proto.errors`.
+- **A frame without a complete pair is never forwarded.** A frame whose payload doesn't open
+  with a complete, well-formed identity and sequence is a protocol error: `logit_in` ends the
+  connection and counts it in `logit.proto.errors`. A frame refused by name raises its identity's
+  mark, so a resend of it isn't forwarded either.
+- **A spool written before the pair moved ahead of the batch doesn't replay.** Each of its
+  records is skipped as corrupt and counted
+  `logit.component.batches.dropped{reason="disk_corrupt"}`. Let a `logit_out` with `buffer.disk:`
+  drain before upgrading it across that change.
 - **The table follows `max_connections`, with nothing further to configure.** It holds
   `max_connections + max_connections / 4` identities (1280 at the default cap of 1024) and evicts
   the least recently seen when full.
 - **Cloning a running process is unsupported.** A VM snapshot or a CRIU checkpoint restored
   beside its original shares the sink's identity and sequence, and `logit_in` reads the second
   copy's batches as resends and doesn't forward them.
-- **The sequence identifies a batch, and `Ack` names what is handled.** `Ack { id, seq }` says
-  every frame of that identity at or below `seq` on its connection is handled (see "What an `Ack`
-  means" above), and a reconnect's handshake reads the marks back to resume.
+- **The sequence identifies a batch, and `Ack` names what is handled.** An accepted
+  `Ack { id, seq }` says every frame of that identity at or below `seq` on its connection is
+  handled, and a rejected one names the one frame it refused (see "What an `Ack` means" above). A
+  reconnect's handshake reads the marks back to resume.
 
 **A `HelloAck` that doesn't answer the `Hello` is `refused`.** A peer that acks another protocol
 version, a codec or compression this sink didn't offer, a mark for an identity this sink didn't
@@ -2927,7 +2948,8 @@ reconnecting doesn't show as `connection_error` on the far end.
   was fully written with nothing in flight or a `GOING_AWAY` in place of an `Ack`, `ambiguous` a
   lost `Ack` (a timeout, an EOF, a reset, another message) or an `Ack` naming no run of the frames
   in flight, `rejected`
-  a size check or a frame-build error at the head, and `refused` a `HelloAck` that doesn't answer
+  a size check or a frame-build error at the head, a rejected `Ack`, or `Reject{FRAME_TOO_LARGE}`,
+  and `refused` a `HelloAck` that doesn't answer
   the `Hello` or a reject that names a protocol mismatch), `logit.output.reconnects` (should stay
   near zero in steady state; a climbing count means the peer or the network is unstable),
   `logit.output.batches.resumed` (batches a reconnect committed from `logit_in`'s marks instead
@@ -2950,7 +2972,9 @@ reconnecting doesn't show as `connection_error` on the far end.
   healthy link points at a version-mismatched or misbehaving peer, not routine loss, except
   `truncated_header` and `truncated`, which a `logit_out` whose write failed part-way through a
   frame also leaves, and `decode_budget`, a well-formed batch too large for the frame cap it
-  arrived under. `ack_write_stalled` is a peer that stopped reading its `Ack`s
+  arrived under. `decode_budget`, `too_large` within the compressed bound, and `malformed` after a
+  valid prefix are answered by a rejected `Ack` and the connection goes on; the rest end it.
+  `ack_write_stalled` is a peer that stopped reading its `Ack`s
   for `handshake_timeout`, and the connection was closed).
 - `logit_in` deduplication and refusal: `logit.input.batches.resends` (frames recognized as
   resends and not forwarded; nonzero means senders are retrying after lost or late `Ack`s, or a
@@ -2959,7 +2983,9 @@ reconnecting doesn't show as `connection_error` on the far end.
   `logit.input.senders.evicted` (nonzero means the table was full, and an evicted sender's next
   resend reaches consumers twice), and
   `logit.input.batches.dropped{reason="closed_consumer"}` (frames refused because every consumer
-  directly downstream had closed; expected during a shutdown, a fault anywhere else).
+  directly downstream had closed; expected during a shutdown, a fault anywhere else), and
+  `logit.input.batches.dropped{reason="rejected"}` (frames answered by a rejected `Ack`; each is
+  also counted under its `logit.proto.errors` reason, and dropped by the sender).
 - Both sides: `logit.proto.frames{direction,compression}` and `logit.proto.frame.bytes` for
   throughput.
 

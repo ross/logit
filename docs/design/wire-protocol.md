@@ -5,7 +5,7 @@ different hosts ([overview](../OVERVIEW.md),
 [ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md)). OTLP
 stays available as an interop codec at ingest and egress. The same frames also back `stdio_out`/
 `file_out`'s `format: native` and the `buffer.disk:` spool, whose records also carry the native
-hop's sender identity and sequence in their trailer.
+hop's sender identity and sequence ahead of their batch.
 
 ## Framing
 
@@ -67,7 +67,7 @@ Compression, when enabled, runs over the dictionary-encoded payload. Each writer
 `buffer.disk:`), defaulting to `none`; `logit_in` can negotiate a `logit_out`'s offer down to
 `none`.
 
-## `CODEC_HOP_BATCH`: the hop batch and its trailer
+## `CODEC_HOP_BATCH`: the hop batch, its prefix, and its trailer
 
 The native payload has two shapes, named by what they carry
 ([ADR `native-hop-no-compatibility`](../adr/native-hop-no-compatibility.md)):
@@ -75,34 +75,36 @@ The native payload has two shapes, named by what they carry
 - `CODEC_BATCH` (codec byte 1) is a bare batch: dictionary, resource, scope, events. It's the
   file format (`stdio_out`/`file_out`'s `format: native`, written by `NativeEncoder` and read by
   `NativeDecoder`) and the perf harness's telemetry dump. A file has no sender and no hop, so it
-  carries no trailer.
-- `CODEC_HOP_BATCH` (codec byte 2) is a bare batch followed by a mandatory, length-prefixed
-  trailer. It's what `logit_out` sends and what the `buffer.disk:` spool records.
+  carries neither a prefix nor a trailer.
+- `CODEC_HOP_BATCH` (codec byte 2) is the native hop's sender identity and sequence, a bare batch,
+  and a mandatory, length-prefixed trailer. It's what `logit_out` sends and what the
+  `buffer.disk:` spool records.
+
+```
+payload_hop   := id[16] | uvarint(seq)
+               | dict | resource attrs | uvarint(event_count) | events...
+               | uvarint(trailer_len) | trailer_bytes[trailer_len]
+trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*
+                 -- tag 1 = origin, tag 2 = previous
+```
+
+The prefix is the sender identity, 16 bytes, and the sequence, a uvarint from 1
+([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)). Every hop
+payload carries both. A payload shorter than the pair, or one whose sequence is 0, is malformed.
+The pair leads so a reader names a frame before it decodes the batch: `logit_in` reads it alone
+(`read_hop_prefix`) and answers a body it can't take with a rejected `Ack` naming that frame
+([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md); "Connection protocol" below). The
+longest prefix is 26 bytes (`HOP_PREFIX_MAX_LEN`).
 
 The trailer holds the batch's `Provenance`, the component that created the batch and the one that
 most recently handled it (`docs/design/pipeline-graph.md`'s "Provenance propagation",
-[ADR `batch-provenance-on-delivered`](../adr/batch-provenance-on-delivered.md)), and the native
-hop's sender identity and sequence:
+[ADR `batch-provenance-on-delivered`](../adr/batch-provenance-on-delivered.md)). A field of any
+tag that overruns the trailer or the 4096-byte field cap fails the decode. An empty provenance
+field writes no entry, and a tag this reader doesn't know is skipped by its length, which keeps a
+torn spool write from poisoning the walk.
 
-```
-payload_hop := dict | resource attrs | uvarint(event_count) | events...
-             | uvarint(trailer_len) | trailer_bytes[trailer_len]
-trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*
-                 -- tag 1 = origin, tag 2 = previous,
-                 -- tag 3 = sender identity ([u8; 16]), tag 4 = sequence (uvarint, from 1)
-```
-
-Tags 3 and 4 are the native hop's sender identity and sequence
-([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)), and every
-hop payload carries both. A payload without one well-formed tag 3 and one well-formed tag 4 is
-malformed: a missing or repeated tag, an identity that isn't 16 bytes, or a sequence of 0 or with
-bytes left over after its uvarint fails the decode. So does a field of any tag that overruns the
-trailer or the 4096-byte field cap. An empty provenance field writes no entry, and a tag this
-reader doesn't know is skipped by its length, which keeps a torn spool write from poisoning the
-walk.
-
-`encode_hop_batch`/`decode_hop_batch` call `encode_batch`/`decode_batch` and add the trailer
-around them. The bare encoding itself is not stable across releases: ADR `metrics-model-v2`
+`encode_hop_batch`/`decode_hop_batch` call `encode_batch`/`decode_batch` and add the prefix and
+the trailer around them. The bare encoding itself is not stable across releases: ADR `metrics-model-v2`
 reshaped every record to TLV and added the mandatory `Scope` section (see "Record layout" below),
 so a frame encoded before that ADR doesn't decode after it. `logit` is pre-release (ADR
 `lossless-transit`), so format changes are straight reshapes with no dual-read compatibility path.
@@ -119,9 +121,10 @@ The hop negotiates one codec. `logit_out` offers `Hello.codecs = [CODEC_HOP_BATC
 fallback to the bare shape. A data frame under any other codec byte is a protocol error. The
 `buffer.disk:` spool (`crates/logit-pipeline/src/disk_queue.rs`) parses `CODEC_HOP_BATCH` only:
 any other codec byte, or a record without a complete pair, is skipped and counted as corrupt, as a
-record with a bad CRC is. A record carries the sender identity and sequence it was written with,
-and `parse_record` returns them, so a replay after a crash goes out under the pair the batch first
-had.
+record with a bad CRC is. That includes a record written with the pair in its trailer, before the
+pair moved ahead of the batch. A record carries the sender identity and sequence it was written
+with, and `parse_record` returns them, so a replay after a crash goes out under the pair the batch
+first had.
 
 ## Decode amplification
 
@@ -130,7 +133,8 @@ encoding can become a much larger in-memory struct: one empty event is 1 wire by
 `Event`. So every payload decodes against a per-frame budget (`native::DecodeBudget`,
 `crates/logit-proto/src/native/budget.rs`), and a payload that would exceed it fails with
 `CodecError::BudgetExceeded` before the elements are built. `logit_in` counts that under
-`logit.proto.errors{reason="decode_budget"}` and diagnoses it under its own `decode_budget` key.
+`logit.proto.errors{reason="decode_budget"}`, diagnoses it under its own `decode_budget` key, and
+answers it with a rejected `Ack` naming the frame ("Connection protocol" below).
 The rule and the 4× multiplier are decided in
 [ADR `untrusted-input-bounds`](../adr/untrusted-input-bounds.md). The budget per reader:
 
@@ -353,7 +357,8 @@ scope_section := presence: u8 (0 | 1)  [+ uvarint(len) + scope TLV body]
 `scope_section` sits right after `resource_section`, never as an optional *trailing* section. A
 trailing one would let a payload truncated at that boundary decode as "no scope", breaking
 `robustness.rs`'s "no proper prefix of a valid encoding is itself valid" invariant, the same reason
-`CODEC_HOP_BATCH`'s trailer length is mandatory. A hop batch appends its trailer after this.
+`CODEC_HOP_BATCH`'s trailer length is mandatory. A hop batch puts its sender prefix ahead of this
+and its trailer after it.
 
 ## Connection protocol
 
@@ -371,10 +376,14 @@ decision record.
   compression is itself being negotiated. The payload is hand-rolled TLV over `native::varint`
   (`crates/logit-proto/src/native/control.rs`), with the same `tag(u8) + len(uvarint) + payload`
   shape as a native `Event`'s fields but none of their skip-unknown behavior. Every field in the
-  table is required and appears once; a missing, repeated, or unknown field, or an unknown message
-  type, is malformed ([ADR `native-hop-no-compatibility`](../adr/native-hop-no-compatibility.md),
-  decision 4). `window` is at least 1 in both `Hello` and `HelloAck`, and `Ack.seq` at least 1, as
-  a trailer's sequence is. `Hello.senders` is a run of 16-byte identities and `HelloAck.marks` a
+  table appears at most once and is required unless marked; a missing, repeated, or unknown field,
+  or an unknown message type, is malformed
+  ([ADR `native-hop-no-compatibility`](../adr/native-hop-no-compatibility.md), decision 4).
+  `window` is at least 1 in both `Hello` and `HelloAck`, and `Ack.seq` at least 1, as a hop
+  prefix's sequence is. `Ack.status` is one byte, `0` accepted or `1` rejected; a rejected `Ack`
+  requires `reason`, a `u16` code, and may carry `message`, at most 1024 bytes like
+  `Reject.message`, and an accepted one carrying either is malformed
+  ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md)). `Hello.senders` is a run of 16-byte identities and `HelloAck.marks` a
   run of 24-byte entries (the identity, then the mark as a big-endian `u64`); either one holding
   more than `MAX_HELLO_SENDERS` (16) entries, or not a whole number of them, is malformed. All of
   this is enforced on decode:
@@ -383,7 +392,7 @@ decision record.
   |---|---|---|
   | `Hello` | `version`, `codecs`, `compressions`, `max_frame_bytes`, `window`, `senders` | the connecting side, first |
   | `HelloAck` | `version`, `codec`, `compression`, `max_frame_bytes`, `window`, `marks` | the listener, once, in reply to a valid `Hello` |
-  | `Ack` | `id`, `seq` | the listener, after the data frames it names are handled: forwarded, or recognized as a resend and not forwarded |
+  | `Ack` | `id`, `seq`, `status`, `reason` (rejected only), `message` (optional, rejected only) | the listener: accepted, after the data frames it names are handled, forwarded or recognized as a resend and not forwarded; rejected, for the one frame it names, which it read the pair of and dropped |
   | `Reject` | `code`, `message` | either side, closing the connection |
 
 - **Handshake.** The connecting side sends `Hello`. The listener replies with `HelloAck` (codec
@@ -408,21 +417,25 @@ decision record.
   encodes and size-checks first, so an oversized batch still never connects. Identities past the
   16th are resent and recognized by the mark as before
   ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 4).
-- **Sender identity and sequence ride in the hop trailer.** The sink's store assigns each
-  batch a 16-byte sender identity and a sequence number, and `logit_out` writes them into the
-  trailer of every frame ([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)).
-  `Ack { id, seq }` names one identity and one sequence the connection carried, and means every
-  frame of that identity at or below `seq` on this connection is handled; it says nothing of any
-  other identity, and grants no credit ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 1). `seq` is a frame's own
+- **Sender identity and sequence lead the hop payload.** The sink's store assigns each
+  batch a 16-byte sender identity and a sequence number, and `logit_out` writes them ahead of the
+  batch in every frame ([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md),
+  [ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md)).
+  An accepted `Ack { id, seq }` names one identity and one sequence the connection carried, and
+  means every frame of that identity at or below `seq` on this connection is handled; it says
+  nothing of any other identity, and grants no credit
+  ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 1). A rejected `Ack`
+  covers the one frame it names. `seq` is a frame's own
   sequence, never the mark, so a resend below the mark is acknowledged by its own number.
   A store takes a fresh identity every time it opens, memory or disk, and numbers its batches
   from 1; a resend, on the same connection or a new one, reuses the batch's pair. Each `logit_in`
   component keeps one high-water mark per identity, in a table bounded at
   `max_connections + max_connections / 4` identities (1280 at the default `max_connections` of
   1024) that evicts the least recently seen when full. A frame at or below its identity's mark is
-  a resend; a frame above it is forwarded, and a consumer taking it raises the mark. A frame
-  without a complete pair is malformed (see "`CODEC_HOP_BATCH`: the hop batch and its trailer"
-  above): a protocol error, counted in `logit.proto.errors`, that ends the connection. The table
+  a resend; a frame above it is forwarded, and a consumer taking it raises the mark, as refusing
+  it by name does. A frame without a complete pair is malformed (see "`CODEC_HOP_BATCH`: the hop
+  batch, its prefix, and its trailer" above): a protocol error, counted in `logit.proto.errors`,
+  that ends the connection. The table
   reports `logit.input.batches.resends`, `logit.input.senders`, and
   `logit.input.senders.evicted`. No lock spans a forward, so a frame a connection still holds
   after a fault ends it can be forwarded beside the sender's resend of it on a new connection
@@ -435,30 +448,41 @@ decision record.
   forward. The pending `Ack` names the last frame handled and is written, one per run of frames,
   at the first of: the next read would wait (one non-blocking poll before every read), the
   next frame carries another identity, the run reaches 32 frames, or the connection is about to
-  write a `Reject` or close ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md),
-  decision 2). A frame already read whose forward waits holds the `Ack` for the frames before it,
+  write a rejected `Ack` or a `Reject` or close
+  ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 2). A frame already read whose forward waits holds the `Ack` for the frames before it,
   so a sender streaming faster than the receiver forwards gets one `Ack` per burst, up to 32
   frames. A stalled downstream delays the
   ack, which stalls the sender once its window is full. That is the protocol's backpressure, and
   it's why `logit_in` needs no receive-side queue the way a UDP listener does.
 - **Frame bounds.** `logit_in` checks a data frame's header before reading its body:
-  `uncompressed_len` against its `max_frame_bytes`, and `compressed_len` against
-  `frame::compressed_bound(max_frame_bytes)`. A frame over either is answered
-  `Reject{FRAME_TOO_LARGE}`, which `logit_out` treats as rejected and drops. So is a batch that decodes past
-  its decode budget, since it would on every resend. `logit_out` checks both its
-  payload and its compressed frame against the same two numbers before sending, so it never sends
-  a frame the listener refuses.
+  `compressed_len` against `frame::compressed_bound(max_frame_bytes)`, and `uncompressed_len`
+  against its `max_frame_bytes`. A frame past the compressed bound is answered
+  `Reject{FRAME_TOO_LARGE}` with nothing of its body read, and the connection closes; `logit_out`
+  treats it as rejected and drops the batch. A frame within the compressed bound whose
+  `uncompressed_len` is past `max_frame_bytes` is read and CRC-checked, only its prefix decoded,
+  and answered by a rejected `Ack` (`too_large`) with the connection kept. `logit_out` checks both
+  its payload and its compressed frame against the same two numbers before sending, so it never
+  sends a frame the listener refuses on its size.
+- **A frame `logit_in` can't take is refused by name.** A body that decodes past its decode budget
+  (`decode_budget`, which `logit_out` can't check: `HelloAck` carries the cap, not the budget) or
+  doesn't decode after a valid prefix (`malformed`) is answered by a rejected `Ack` naming it, as
+  is the oversize frame above (`too_large`). `logit_in` writes the pending accepted `Ack` first,
+  raises the frame's mark, counts it `logit.input.batches.dropped{reason="rejected"}`, and reads
+  the next frame. `logit_out` drops that batch as rejected and keeps the connection and every
+  frame behind it ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md)).
 - **The body is read once.** `logit_in` reads a frame's body into one buffer sized from the header,
   after a copy of the header, and verifies it in place. Peak memory for a frame is one
   `24 + compressed_len` buffer.
-- **`GOING_AWAY` means not forwarded.** `logit_in` writes a `Reject`, `GOING_AWAY` included, only
-  for a frame it hasn't forwarded; a forwarded frame is answered only by the `Ack` that covers it,
-  written before any `Reject`.
+- **`GOING_AWAY` means not forwarded.** `logit_in` writes a `Reject`, `GOING_AWAY` included, or a
+  rejected `Ack`, only for a frame it hasn't forwarded; a forwarded frame is answered only by the
+  accepted `Ack` that covers it, written before any `Reject`.
   `GOING_AWAY` has three causes: a shutdown or an idle close, either of which drops a frame still
   in the socket buffer unread, and a frame no consumer took (every direct consumer of `logit_in`
   has closed), after which the connection closes and the sender's mark stays where it was. A frame
   at or below its sender's mark that the listener reads whole gets an `Ack`; it is never answered
-  `GOING_AWAY` for want of a consumer, since it isn't forwarded. So `logit_out` treats
+  `GOING_AWAY` for want of a consumer, since it isn't forwarded. A frame no consumer took gets
+  `GOING_AWAY`, never a rejected `Ack`, since a consumer may take it on a resend. So `logit_out`
+  treats
   `GOING_AWAY` in place of
   an `Ack` as a clean fault, redials, and resends the batch at any delivery posture. An EOF,
   reset, or ack timeout after a frame left stays ambiguous: the batch may have been forwarded.
@@ -490,11 +514,14 @@ decision record.
     with one `Ack` per run of frames ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md),
     decision 2). Nothing acknowledges out of order.
   - **The sender commits by name.** `logit_out` keeps its frames in flight as a list in write
-    order. An `Ack` marks every entry from the front that carries its identity at or below its
-    sequence; the front entry must carry that identity and some entry that sequence, or the `Ack`
-    is a protocol error, ambiguous, and the connection is dropped. The marked entries are
+    order. An accepted `Ack` marks every entry from the front that carries its identity at or
+    below its sequence; the front entry must carry that identity and some entry that sequence, or
+    the `Ack` is a protocol error, ambiguous, and the connection is dropped. The marked entries are
     committed one at a time, in order, so one `Ack` commits every frame it covers
-    ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 3).
+    ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 3). A rejected `Ack`
+    must name the unmarked front entry, which is dropped alone with the rest of the window still
+    in flight; naming any other frame is a protocol error, ambiguous, and the connection is
+    dropped ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md)).
   - **The window is fixed at the handshake.** `Hello.window` is what the sender offers;
     `HelloAck.window` is `min(offered, RECEIVER_MAX_WINDOW)`, with `RECEIVER_MAX_WINDOW` at 1024.
     The sender uses `min(offered, answered)`. Both windows are at least 1 on the wire, so neither

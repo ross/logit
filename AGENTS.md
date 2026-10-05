@@ -414,9 +414,11 @@ Per pair:
   CRC-32C and optional lz4. A four-arm bake-off against `rkyv`, `postcard`, and OTLP itself
   decided it ([ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md)).
 - **Two payload shapes**: `CODEC_BATCH` is a bare batch, the file format; `CODEC_HOP_BATCH` is a
-  batch plus a trailer of provenance and a required sender identity and sequence, what the hop
-  sends and the spool records. A hop payload without a complete pair is malformed
-  ([ADR `native-hop-no-compatibility`](docs/adr/native-hop-no-compatibility.md)).
+  required sender identity and sequence, a batch, and a trailer of provenance, what the hop sends
+  and the spool records. A hop payload without a complete pair is malformed
+  ([ADR `native-hop-no-compatibility`](docs/adr/native-hop-no-compatibility.md)); the pair leads
+  so `logit_in` answers a frame it can't take with a rejected `Ack` naming it and keeps the
+  connection ([ADR `native-hop-ack-status`](docs/adr/native-hop-ack-status.md)).
 - **On disk**: `stdio_out`/`file_out` can write the bare shape as `format: native` alongside
   their default human-readable render
   ([ADR `file-output-native-format`](docs/adr/file-output-native-format.md)).
@@ -821,8 +823,8 @@ not a style preference:
   sink delivered it, and an input never acknowledges a batch no consumer directly downstream
   took, except `logit_in`'s acknowledgment of a frame at or below its sender's mark. The
   `logit_out` to `logit_in` hop is effectively-once: a sink's store mints a sender
-  identity every time it opens and numbers its batches, the pair rides in every hop frame's
-  trailer, outlives a reconnect, and rides a spool replay, and `logit_in` acknowledges a frame at
+  identity every time it opens and numbers its batches, the pair leads every hop frame's
+  payload, outlives a reconnect, and rides a spool replay, and `logit_in` acknowledges a frame at
   or below its sender's high-water mark without forwarding it. Each `Ack` names an identity and a
   sequence and covers that identity's frames up to it, and a reconnect resumes from `logit_in`'s
   marks instead of resending what it already handled
@@ -831,7 +833,7 @@ not a style preference:
   [ADR `delivery-semantics`](docs/adr/delivery-semantics.md) and
   [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md) before
   changing a sink's posture, a fault class, what an input acknowledges, or the native hop's
-  trailer.
+  payload layout.
 - **The threat model is accidental data, not a malicious peer.** A listener, decoder, or transform
   must survive a misconfigured sender, a wedged peer, or a corrupt file; a problem only crafted
   input can trigger is defended only when the defense is free (a branch, a counter, a timeout

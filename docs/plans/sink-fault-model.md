@@ -189,13 +189,15 @@ stream-and-datagram sinks (`syslog_out`, `statsd_out`, `graphite_out`, `collectd
 
 ### W3: native hop acknowledgment status (`fault/w3`)
 
-Its own wire ADR amending `native-hop-named-acks`: `Ack` gains a status
-(`accepted` | `rejected(reason)`), `logit_in` sends `rejected` for a frame it decodes but can't
-forward (an oversize payload past its cap, a payload it won't take) and keeps the cumulative mark
-moving, `logit_out` commits a rejected sequence as `dropped{reason="rejected"}`. Pre-release: no
-compatibility shim ([ADR `native-hop-no-compatibility`](../adr/native-hop-no-compatibility.md)).
-Decide whether a `Hello` refusal (version, codec) is `Refused` at the sender, which it is in
-substance.
+Its own wire ADR, [ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md), amending
+`native-hop-named-acks`: the sender identity and sequence move from the hop trailer to a prefix
+ahead of the batch, so `logit_in` names a frame before decoding its body; `Ack` gains a status
+(`accepted` | `rejected(reason)`, reasons `too_large`, `decode_budget`, `malformed`); `logit_in`
+answers a frame it can't take with a rejected `Ack`, raises its mark, and keeps the connection;
+`logit_out` drops that head alone as `dropped{reason="rejected"}` and keeps the window in flight.
+Pre-release: no compatibility shim ([ADR `native-hop-no-compatibility`](../adr/native-hop-no-compatibility.md)),
+so a spool written before the change is skipped as corrupt. A `Hello` refusal (version, codec) is
+`Refused` at the sender.
 
 ### W4: `otlp_out` per-signal outcomes (`fault/w4`)
 

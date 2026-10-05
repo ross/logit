@@ -775,7 +775,7 @@ current behavior.
 The native format is a hop between processes, not a stage in the reference pipeline, so it gets its
 own table. `NativeEncoder`/`NativeDecoder` write and read the bare batch, the file format.
 `logit_out`/`logit_in` (`docs/plans/native-transport.md`) carry the hop batch, the bare batch
-plus a provenance and sender-pair trailer: `logit_out` calls `encode_hop_batch` and
+behind a sender-pair prefix and ahead of a provenance trailer: `logit_out` calls `encode_hop_batch` and
 `write_frame_with_flags` directly, to frame with whatever compression the connection negotiated;
 `logit_in` calls `decode_hop_batch` directly, since `Fanout::send` takes the `EventBatch` it
 returns. (The disk buffer's encode cost is §2's `disk_queue` row.) One event

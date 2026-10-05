@@ -61,8 +61,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   [`design/wire-protocol.md`](../design/wire-protocol.md)'s "Decode amplification".
   - **Consequence:** a sender learns only `max_frame_bytes` from `HelloAck`, not the budget, so
     `logit_in` can refuse a stock `logit_out` batch between roughly 10% and 100% of the cap. The
-    refusal is deterministic: `logit_in` answers it with `REJECT_FRAME_TOO_LARGE`, so the sender
-    drops the batch as rejected and diagnoses it rather than retrying.
+    refusal is deterministic: `logit_in` answers it with `Ack{rejected(decode_budget)}` naming the
+    frame, so the sender drops that batch alone as rejected and diagnoses it rather than retrying,
+    and the frames behind it go on over the same connection
+    ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md)).
   - **Workaround:** change the sender's batching.
 
 - **No durable (disk-backed) buffering on the receive side.** A UDP listener's `ReceiveQueue`

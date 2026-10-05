@@ -1186,30 +1186,35 @@ the property the minimal-watch-set design is for.
 `crates/logit-inputs/src/logit.rs`,
 [ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md),
 [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md),
-[ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md).
+[ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md),
+[ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md).
 
 - `logit.proto.frames{direction="in",compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
 - `logit.input.acks` (count): `Ack`s written, one per run of handled frames
-  ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 2). Against
-  `logit.proto.frames{direction="in"}` it shows the coalescing ratio.
+  ([ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), decision 2), plus one per
+  frame refused by name. Against `logit.proto.frames{direction="in"}` it shows the coalescing
+  ratio.
 - `logit.proto.errors{reason="magic"|"version"|"malformed"|"crc"|"truncated_header"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"|"ack_write_stalled"|"reject_write_stalled"}`
   (count): every way a frame or a handshake can be rejected, each its own reason so a version
   mismatch doesn't hide behind a generic "bad frame" tag. `magic` is a frame header whose magic
   isn't `LGIT`, and `version` one whose frame version this reader doesn't understand.
   `malformed` is any other frame or hop batch that fails to parse: an unknown compression byte,
-  bad lengths, a body that doesn't decompress, a corrupt batch body, or a trailer without a
-  complete sender identity and sequence pair. `truncated_header` is a peer that closed,
+  bad lengths, a body that doesn't decompress, a payload that doesn't open with a complete sender
+  identity and sequence pair (the connection ends), or a corrupt batch body or trailer after a
+  valid pair (answered `Ack{rejected(malformed)}`, the connection kept). `truncated_header` is a peer that closed,
   or a read that failed, part-way through a frame header, and `truncated` the same part-way through
   a body. A close between frames is the ordinary end of a connection and isn't counted, including
   a TLS peer gone without `close_notify`. `too_large` is a header that declared a
-  payload over `max_frame_bytes`, or a `compressed_len` over `frame::compressed_bound` of it,
-  answered `Reject{FRAME_TOO_LARGE}`. `handshake` is any handshake that ends without a
+  payload over `max_frame_bytes`: with a `compressed_len` within `frame::compressed_bound` of it,
+  the frame is read and answered `Ack{rejected(too_large)}`, the connection kept; past that bound,
+  `Reject{FRAME_TOO_LARGE}` and a close. `handshake` is any handshake that ends without a
   `HelloAck`: no `Hello` within `handshake_timeout`, stray bytes, a header over the control-message
   cap, a `Hello` that fails to decode (a missing, repeated, or unknown field, or a `window` of 0),
   or a version or codec `Reject`. `decode_budget` is a well-formed batch that would decode
   past its per-frame budget (`native::DecodeBudget`), a batch too large for the frame cap it
-  arrived under rather than corrupt bytes, also answered `Reject{FRAME_TOO_LARGE}`. The two
+  arrived under rather than corrupt bytes, answered `Ack{rejected(decode_budget)}` with the
+  connection kept. The two
   `_write_stalled` reasons count a control write to a peer that stopped reading, abandoned after
   `handshake_timeout`: an `Ack` (the connection ends; for the `Ack` written before a `Reject`, the
   `Reject` is left out and the close ends as it would have) or a `Reject` (the connection was
@@ -1231,6 +1236,10 @@ the property the minimal-watch-set design is for.
   answered `Reject{GOING_AWAY, "no consumer took the batch"}` before the connection closes, and
   never acknowledged. Not disjoint from `logit.component.batches.sent`: the refused batch is also
   counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`.
+- `logit.input.batches.dropped{reason="rejected"}` (count): a frame refused by name with a
+  rejected `Ack` ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md)), also counted
+  under its `logit.proto.errors` reason (`decode_budget`, `malformed`, or `too_large`). Its
+  sender's mark is raised, and the sender drops the batch as `rejected`.
 - `logit.input.batches.resends` (count): frames at or below their sender identity's mark,
   acknowledged and not forwarded
   ([ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md)). These
@@ -1242,7 +1251,8 @@ the property the minimal-watch-set design is for.
   and then resending has its resend forwarded, a duplicate.
 
 `Diagnostics` keys: `bound`, `decode_budget` (a batch refused by its decode budget, naming the
-budget and `max_frame_bytes`), and `connection_error` (any other connection failing; never an
+budget and `max_frame_bytes`), `frame_rejected` (any other frame refused by name: too large, or a
+body that doesn't decode), and `connection_error` (any other connection failing; never an
 idle close, and never a close between frames).
 
 ##### `generate_in`
@@ -1963,7 +1973,9 @@ attempt.
   frame; `clean` a failure before a frame was completely written and flushed with nothing in flight,
   or a `Reject{GOING_AWAY}` read in place of an `Ack`; `ambiguous` a lost `Ack` (a timeout, an EOF,
   a reset, another message) or an `Ack` naming no run of the frames in flight; `rejected` a
-  size check or a frame-build error at the head, and `refused` a `HelloAck` that doesn't answer the `Hello`
+  size check or a frame-build error at the head, `Reject{FRAME_TOO_LARGE}`, or a rejected `Ack`
+  naming the head (that head alone: the connection and the frames behind it stay,
+  [ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md)), and `refused` a `HelloAck` that doesn't answer the `Hello`
   (another version, an unoffered codec or compression, a mark for an identity `Hello.senders`
   didn't list, or two marks for one identity), or a reject that names a protocol mismatch ([ADR
   `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
