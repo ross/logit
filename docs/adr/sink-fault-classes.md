@@ -202,8 +202,9 @@ once nothing poisonous is held.
 it decodes but can't take (an oversize payload past its cap, a payload it won't forward); the
 receiver has handled that sequence by dropping it, so the cumulative mark advances and `logit_out`
 commits the sequence as `batches.dropped{reason="rejected"}`. Transient trouble needs no message:
-not acknowledging is the backpressure, as today. The wire form is W3's own ADR amending
-[ADR `native-hop-named-acks`](native-hop-named-acks.md); there is no compatibility shim
+not acknowledging is the backpressure, as today. The wire form is [ADR
+`native-hop-ack-status`](native-hop-ack-status.md), amending [ADR
+`native-hop-named-acks`](native-hop-named-acks.md); there is no compatibility shim
 ([ADR `native-hop-no-compatibility`](native-hop-no-compatibility.md)).
 
 ## Alternatives considered

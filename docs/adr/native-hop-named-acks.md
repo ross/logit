@@ -1,6 +1,6 @@
 ---
 created: 2026-10-02
-updated: 2026-10-02
+updated: 2026-10-04
 ---
 
 # Native hop acks: a named cumulative `Ack`, coalesced at `logit_in`, and a resume mark in `HelloAck`
@@ -24,6 +24,12 @@ Accepted. Supersedes in part:
   from the last `Ack` written".
 - [ADR `idle-connection-timeout`](idle-connection-timeout.md): "`logit_in`: idle measured from
   the last `Ack` written". The clock runs from the last frame handled.
+
+Superseded in part on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): decision 1's two-field `Ack` and
+"Meaning", decision 2's flush point 4 for a batch past its decode budget, decision 3's "any other
+shape is a protocol error", and "What stays"'s mark rule. `Ack` gains a required status; a
+rejected `Ack` covers the one frame it names, goes out after the pending accepted run, raises
+that frame's mark unforwarded, and `logit_out` drops that head alone and keeps the connection.
 
 ## Context
 
@@ -82,7 +88,8 @@ reconnect commits what the receiver already holds without resending it.
 - **Wire.** `Ack` has two required fields: tag 1 `id`, the 16-byte sender identity, and tag 2
   `seq`, a uvarint; a `seq` of 0 is `Malformed`, as it is in a frame's trailer. Message byte
   `MSG_ACK` is unchanged. Both fields are required once, and an unknown tag is `Malformed`, as
-  for every control message.
+  for every control message. [Superseded in part on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): a required
+  tag 3 `status` follows, with a `reason` and an optional `message` when it's rejected.]
 - **Not a credit.** The ack names frames the receiver has handled. It grants no permission to
   send: the window is still fixed at the handshake, and nothing in an ack changes how many frames
   the sender may have in flight. The earlier records' "nothing acknowledges a sequence" was a
@@ -90,7 +97,8 @@ reconnect commits what the receiver already holds without resending it.
   guard while naming the frame.
 - **Meaning.** "Every data frame of identity `id` with a sequence at or below `seq` that this
   connection carried is handled: forwarded, or recognized as a resend and not forwarded." It
-  says nothing about any other identity.
+  says nothing about any other identity. [Superseded in part on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md):
+  this is an accepted `Ack`'s meaning; a rejected one covers the one frame it names.]
 - **Identity order.** `logit_in` never lets an `Ack` for one identity cover a frame of another:
   before it handles a frame whose identity differs from the pending ack's, it writes the pending
   ack (decision 2). So on the wire, acks for one identity's run arrive before any frame of the
@@ -115,6 +123,9 @@ reconnect commits what the receiver already holds without resending it.
      and frees store space before its window drains;
   4. before any `Reject` (`GOING_AWAY` on shutdown, idle, or no consumer; `FRAME_TOO_LARGE`)
      and before the lingering close on every other exit from `serve_frames`, best effort.
+     [Amended on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): and before every rejected `Ack`, which
+     answers a body past its decode budget in place of `FRAME_TOO_LARGE` and keeps the
+     connection.]
 - **The `GOING_AWAY` invariant holds.** With the pending ack flushed first, every frame still
   unanswered on a connection that read `Reject{GOING_AWAY}` was unforwarded, as [ADR
   `native-hop-send-window`](native-hop-send-window.md) decision 5 relies on.
@@ -140,7 +151,9 @@ reconnect commits what the receiver already holds without resending it.
   entry's identity is `id` and its sequence at or below `seq`, marking each `acked`. It requires
   that the front entry's identity is `id` and that an entry with sequence `seq` was marked; any
   other shape (an unknown identity at the front, a sequence not in flight) is a protocol error,
-  `Ambiguous`, and drops the connection.
+  `Ambiguous`, and drops the connection. [Amended on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): a rejected
+  `Ack` naming the unmarked front entry pops it and fails that head alone as `Rejected`, keeping
+  the connection.]
 - **`await_ack` answers one head per call.** The `Output` trait keeps its shape: `await_ack`
   returns `Ok` once per acknowledged frame, in order. If the front entry is `acked`, it pops it
   and returns without touching the wire; otherwise it reads one control message and applies it,
@@ -190,7 +203,8 @@ code accounts for it.
 
 - **Forwarding and the mark are unchanged.** A frame at or below its mark is still acknowledged
   without forwarding; a frame above it is still forwarded before the mark is raised; a frame no
-  consumer took still gets `Reject{GOING_AWAY}` and leaves the mark alone.
+  consumer took still gets `Reject{GOING_AWAY}` and leaves the mark alone. [Amended on 2026-10-04
+  by [ADR `native-hop-ack-status`](native-hop-ack-status.md): a frame refused by name raises the mark without a forward.]
 - **The window is still fixed at the handshake.** No credits, no window change on the wire.
 - **`logit_in` stays serial per connection.** Coalescing is about when the ack is written, not
   about handling frames concurrently.

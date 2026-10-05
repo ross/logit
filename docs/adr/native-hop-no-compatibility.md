@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-02
+updated: 2026-10-04
 ---
 
 # Native hop: two payload shapes named by shape, every hop frame sequenced, and strict control messages
@@ -27,6 +27,12 @@ Accepted. Supersedes in part:
 Superseded in part on 2026-10-02 by [ADR `native-hop-named-acks`](native-hop-named-acks.md):
 decision 4's "`Ack` is the message byte alone". `Ack` carries an identity and a sequence, both
 required, under the same strict rules.
+
+Superseded in part on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): decision 1's `CODEC_HOP_BATCH` layout and
+decision 2's trailer tags 3 and 4 and "a frame whose decode fails is a protocol error". The pair
+leads the hop payload, and a body that fails after a valid prefix is refused by a rejected `Ack`
+that keeps the connection. `Ack` gains a required status under the same strict rules, and a
+spool written before the change is skipped as corrupt, with no compatibility path.
 
 ## Context
 
@@ -73,7 +79,8 @@ nothing else; and the hop negotiates one codec.
   format and the perf dump, written by `NativeEncoder` and read by `NativeDecoder`.
 - `CODEC_HOP_BATCH` (codec byte 2) is a batch followed by the trailer: provenance (tags 1 and 2),
   the sender identity (tag 3), and the sequence (tag 4). It's what `logit_out` sends and what the
-  disk spool records.
+  disk spool records. [Superseded in part on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): the sender identity
+  and sequence lead the payload, ahead of the batch; the trailer carries provenance only.]
 - The byte values don't change. `encode_batch`/`decode_batch` keep their names;
   `encode_batch_v2`/`decode_batch_v2` become `encode_hop_batch`/`decode_hop_batch`.
 - The trailer's length prefix stays mandatory, so a hop payload truncated at any byte still fails
@@ -93,7 +100,9 @@ nothing else; and the hop negotiates one codec.
 - `logit_in`'s per-frame algorithm has two steps: at or below the mark, count and acknowledge
   without forwarding; above it, forward, raise the mark, and acknowledge. A frame whose decode
   fails is a protocol error, counted in `logit.proto.errors` and ending the connection, as any
-  malformed data frame is today.
+  malformed data frame is today. [Superseded in part on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): a frame
+  whose prefix decodes and whose body doesn't is answered by a rejected `Ack`, and the connection
+  goes on; one whose prefix doesn't decode still ends it.]
 - `parse_record` decodes `CODEC_HOP_BATCH` only. Any other codec byte, and a record without a
   complete pair, is a corrupt record: skipped and counted through `skip_corrupt`, as a record
   with a bad CRC is.
@@ -127,7 +136,8 @@ nothing else; and the hop negotiates one codec.
   `min(hello.window, RECEIVER_MAX_WINDOW)`; `logit_out` uses `min(offered, answered)`. Graph rule
   75 keeps the configured `window` at 1 or more, so nothing else clamps.
 - `MAX_CONTROL_MESSAGE_BYTES` stays where it is, as headroom for a longer `Reject.message` or
-  codec list, not for fields a later version adds.
+  codec list, not for fields a later version adds. [Amended on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): a
+  rejected `Ack` at the message cap, 1066 bytes, is now the longest message; the cap stays.]
 - An unknown message type stays `Malformed`, as today.
 
 ### 5. Breaking change, no path

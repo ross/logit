@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-10-01
+updated: 2026-10-04
 ---
 
 # Disk-backed durable buffering for a sink's delivery queue
@@ -498,6 +498,8 @@ producers refill it. A closed inbox can't refill, and the bound holds.
 
 [ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md) has the spool
 write a sender identity and a sequence into each record's v2 trailer, as tags 3 and 4.
+[Superseded in part on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): the pair leads the record's hop payload,
+ahead of the batch, and a record written with the pair in its trailer is skipped as corrupt.]
 
 - **Record evolution.** The 24-byte context prefix still never widens, and anything new still
   rides inside the frame. That now includes a new tag in the v2 trailer as well as a new codec

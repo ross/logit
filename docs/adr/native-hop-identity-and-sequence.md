@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-02
+updated: 2026-10-04
 ---
 
 # Native hop identity and sequence: a per-store sender identity and sequence in the batch trailer, an `Ack` with no fields, and a high-water mark at `logit_in`
@@ -24,6 +24,9 @@ decision 4, "`Ack` carries no fields" and the "nothing acknowledges a sequence" 
 sequence is a deduplication identity, never a credit", the Context's "nothing acknowledges a
 sequence", and the rejected alternative "`Ack` echoing the sequence". `Ack` names an identity and
 a sequence and covers every frame of that identity at or below it, and grants no credit.
+Superseded in part on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): decision 1's trailer tags 3 and 4 and
+decision 3's "in the record's v2 trailer". The pair leads the hop payload, ahead of the batch,
+so `logit_in` names a frame it refuses; decision 5's algorithm gains that refused case.
 
 ## Context
 
@@ -83,6 +86,8 @@ mark per sender identity, in a table bounded by its connection cap.
 
 - **Two new trailer tags.** Tag 3 is the sender identity, 16 bytes. Tag 4 is the sequence, a
   uvarint whose first value is 1. Both ride in every data frame's trailer, per frame.
+  [Superseded on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): the identity, then the sequence as a uvarint,
+  lead the hop payload ahead of the batch; the trailer keeps provenance only.]
 - **The handshake carries no identity.** `Hello` and `HelloAck` are unchanged.
 - **The unsequenced rule.** A frame or spool record without a complete, well-formed pair is
   unsequenced, and `logit_in` forwards it. That covers a v1 codec frame, a v2 frame written
@@ -118,7 +123,9 @@ mark per sender identity, in a table bounded by its connection cap.
 - **Every open mints one.** A memory store and a disk store alike take
   `random_id_bytes::<16>()` when they open, and their sequence starts at 1.
 - **A spool record keeps the pair it was written with.** The spool writes the pair in the
-  record's v2 trailer, and `parse_record` returns it. A record read back after a crash goes out
+  record's v2 trailer, and `parse_record` returns it. [Superseded in part on 2026-10-04 by
+  [ADR `native-hop-ack-status`](native-hop-ack-status.md): in the record's hop prefix; a record with the pair in its trailer is
+  corrupt.] A record read back after a crash goes out
   under its old identity and number, so a `logit_in` that saw it recognizes the replay. New
   batches start at 1 under the new identity. Replayed records precede new ones in the file, and
   each identity's numbers increase, so order within an identity holds.
@@ -183,6 +190,8 @@ mark per sender identity, in a table bounded by its connection cap.
      `delivery-semantics`](delivery-semantics.md), "Amendment: W3 decisions").
 
   An identity the table doesn't hold has a mark of 0. Gaps above the mark are ignored.
+  [Amended on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): before step 2, a frame whose body `logit_in` can't
+  take is answered by a rejected `Ack` naming it, its mark is raised, and it isn't forwarded.]
 - **The window is every number at or below the mark.** Per sender, `logit_in` holds one 64-bit
   mark and no list of numbers seen.
 - **A dropped batch that a spool replays stays dropped.** A batch the sender dropped (an
@@ -232,7 +241,9 @@ Names follow [`docs/design/internal-telemetry.md`](../design/internal-telemetry.
 corruption, not a torn tail"). A phantom that carries the current identity and a high number
 would raise the mark above the real records that follow, and `logit_in` would then drop them as
 resends. It needs the spool's own bytes logged back through the same sink, and this record
-accepts it.
+accepts it. [Amended on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): a frame `logit_in` refuses by name
+raises the mark too, but a phantom still has to decode whole at the spool to be sent, so the limit
+is unchanged.]
 
 ## Alternatives considered
 
