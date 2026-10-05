@@ -54,11 +54,12 @@
 //!
 //! **Pre-handshake timeout.** [`HANDSHAKE_TIMEOUT`] (overridden by the operator's
 //! `handshake_timeout:` through [`TcpListener::with_handshake_timeout`]) bounds each of a
-//! connection's two pre-message phases *independently*, as `logit_in` bounds its own two: the TLS
-//! accept (in the accept loop's `Some` arm, when TLS is configured), then the wait for the
-//! connection's first byte inside [`serve_connection`], which starts a fresh budget of the same
-//! length rather than inheriting a shared deadline. So on the TLS path the worst case is two of
-//! these back to back (10s at the default) before a silent connection gives up its permit.
+//! connection's pre-message phases *independently*, as `logit_in` bounds its own two: the PROXY
+//! header (when `proxy_protocol:` is on), the TLS accept (in the accept loop's `Some` arm, when TLS
+//! is configured), then the wait for the connection's first byte inside [`serve_connection`]. Each
+//! starts a fresh budget of the same length rather than inheriting a shared deadline. So with all
+//! three the worst case is three of these back to back (15s at the default) before a silent
+//! connection gives up its permit.
 //!
 //! **The first-byte bound applies on both arms, plaintext included.** No `tls:` block is the
 //! default shape, and without the bound a cap's worth of connections that complete the TCP
@@ -77,6 +78,18 @@
 //! from the address `accept()` returned, and [`absorb_frame`] stamps it on the events each
 //! `decode_into` call appended, before they reach the accumulator. A Unix peer that bound no path
 //! gets nothing. Off, the accepted address is dropped unread.
+//!
+//! **PROXY protocol.** With [`TcpListener::with_proxy_protocol`] on, every TCP connection must
+//! open with a PROXY protocol header (ADR `listener-peer-address`). The connection task reads it
+//! off the raw stream through [`read_proxy_header`], before any TLS accept, under its own
+//! `handshake_timeout` budget. That reader peeks and consumes only header bytes, so the payload
+//! behind the header reaches the TLS handshake or the [`Framer`] untouched, even when both arrive
+//! in one segment. A missing, malformed, or slow header, or a peer that closes before finishing
+//! one, closes the connection with a throttled `proxy_header` diagnostic and counts
+//! `logit.input.connections.rejected{reason="proxy_header"}`. An origin is stamped as `client.*`
+//! beside any `network.peer.*`, both held in one [`ConnectionAttrs`] built per connection; a
+//! header with no origin (`LOCAL`, `UNKNOWN`, `AF_UNSPEC`) stamps nothing. A Unix socket refuses
+//! the option at bind.
 //!
 //! **Idle timeout.** [`TcpListener::with_idle_timeout`] (the operator's `idle_timeout:`) is off
 //! unless set, and when set bounds how long a connection may stay quiet before this listener
@@ -101,13 +114,15 @@
 //! events are flushed [`FlushReason::Closed`] and a buffered *partial* frame is reported through
 //! [`report_buffered_tail`], as the shutdown and RST paths do.
 
-use crate::peer::PeerAttrs;
+use crate::peer::{ConnectionAttrs, PeerAttrs};
 use crate::Input;
 use bytes::{Bytes, BytesMut};
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
 use logit_pipeline::sockstat;
 use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
+use logit_proto::proxy::{self, Origin, Parse};
 use logit_proto::Decoder;
+use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -958,6 +973,9 @@ pub struct TcpListener<D: Decoder + Clone + Send + 'static> {
     idle_timeout: Option<Duration>,
     /// Whether to stamp each connection's events with its peer (`peer:`), per [`PeerAttrs`].
     peer: bool,
+    /// Whether every connection opens with a PROXY protocol header (`proxy_protocol:`). See this
+    /// module's "PROXY protocol" doc section.
+    proxy_protocol: bool,
 }
 
 /// Where a [`TcpListener`] binds: a TCP `host:port`, or a Unix stream socket path.
@@ -1010,6 +1028,7 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             idle_timeout: None,
             peer: false,
+            proxy_protocol: false,
         }
     }
 
@@ -1149,6 +1168,15 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
         self.peer = peer;
         self
     }
+
+    /// Requires a PROXY protocol header ahead of every connection's stream and stamps the origin
+    /// it names (the `proxy_protocol:` field of `syslog_in`/`graphite_in`/`statsd_in`/`lines_in`).
+    /// Off by default. See this module's "PROXY protocol" doc section. [`Input::bind`] refuses it
+    /// on a Unix socket; graph rule 78 is what an operator sees.
+    pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
+        self.proxy_protocol = proxy_protocol;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -1162,6 +1190,12 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                 let listener = TokioTcpListener::bind(bind).await?;
                 self.diag.info("bound", format_args!("listening on {bind}"));
                 BoundListener::Tcp(listener)
+            }
+            StreamTarget::Unix { kind, .. } if self.proxy_protocol => {
+                anyhow::bail!(
+                    "{kind}: 'proxy_protocol:' needs 'transport: tcp' -- the header comes from a \
+                     network proxy"
+                );
             }
             StreamTarget::Unix { path, mode, kind } => {
                 let listener = crate::unix::bind_listener(kind, path, *mode)?;
@@ -1261,7 +1295,11 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
             match accepted {
                 Accepted::Tcp(stream, addr) => {
                     let peer = self.peer.then(|| PeerAttrs::from_socket(addr));
-                    spawner.spawn(stream, permit, peer);
+                    if self.proxy_protocol {
+                        spawner.spawn_proxied(stream, permit, peer);
+                    } else {
+                        spawner.spawn(stream, permit, peer);
+                    }
                 }
                 Accepted::Unix(stream, addr) => {
                     let peer = if self.peer { PeerAttrs::from_unix(&addr) } else { None };
@@ -1302,6 +1340,39 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.spawn_after(permit, async move { Ok((stream, ConnectionAttrs::new(peer, None))) });
+    }
+
+    /// [`Self::spawn`] for a `proxy_protocol: true` listener: the task reads the PROXY header off
+    /// the raw stream first, under `handshake_timeout`, and stamps the origin it names beside
+    /// `peer`. A missing, malformed, or slow header closes the connection, counted as
+    /// `logit.input.connections.rejected{reason="proxy_header"}` (this module's "PROXY protocol"
+    /// doc section).
+    fn spawn_proxied(
+        &self,
+        mut stream: tokio::net::TcpStream,
+        permit: OwnedSemaphorePermit,
+        peer: Option<PeerAttrs>,
+    ) {
+        let handshake_timeout = self.handshake_timeout;
+        self.spawn_after(permit, async move {
+            let origin = tokio::time::timeout(handshake_timeout, read_proxy_header(&mut stream))
+                .await
+                .map_err(|_elapsed| {
+                    anyhow::anyhow!("no complete PROXY header within {handshake_timeout:?}")
+                })??;
+            let client = PeerAttrs::client(&origin);
+            Ok((stream, ConnectionAttrs::new(peer, client)))
+        });
+    }
+
+    /// Spawns the task that awaits `prelude` and then serves the stream it yields with the
+    /// attributes it built. A `prelude` error is a refused PROXY header, the only fallible one.
+    fn spawn_after<S, P>(&self, permit: OwnedSemaphorePermit, prelude: P)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        P: Future<Output = anyhow::Result<(S, Option<ConnectionAttrs>)>> + Send + 'static,
+    {
         // Every connection task holds a `Fanout` clone, so the shutdown cascade
         // (`docs/adr/service-lifecycle-and-output-retry.md`) completes only once every one has
         // dropped, which `serve_connection`'s shutdown race guarantees.
@@ -1318,11 +1389,25 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
         let framer = Framer::new(self.framing, self.max_frame_bytes);
 
         tokio::spawn(async move {
-            // Held for as long as this task runs: a TLS accept that fails or times out gives
-            // the permit back here.
+            // Held for as long as this task runs: a refused PROXY header or a TLS accept that
+            // fails or times out gives the permit back here.
             let _permit = permit;
             // Counted out on drop, so a panic in the connection brings the gauge back down too.
             let live = live_connections.enter();
+
+            let (stream, attrs) = match prelude.await {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    drop(live);
+                    telemetry.count(
+                        "logit.input.connections.rejected",
+                        1.0,
+                        &[("reason", "proxy_header")],
+                    );
+                    diag.warn_throttled("proxy_header", err);
+                    return;
+                }
+            };
 
             let result = match tls_acceptor {
                 Some(acceptor) => {
@@ -1335,7 +1420,7 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
                                 config,
                                 handshake_timeout,
                                 idle_timeout,
-                                peer,
+                                attrs,
                                 sink,
                                 telemetry.clone(),
                                 &mut diag,
@@ -1359,7 +1444,7 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
                         config,
                         handshake_timeout,
                         idle_timeout,
-                        peer,
+                        attrs,
                         sink,
                         telemetry.clone(),
                         &mut diag,
@@ -1378,6 +1463,47 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
                 diag.warn_throttled("connection_error", err);
             }
         });
+    }
+}
+
+/// Reads one PROXY protocol header off `stream` and nothing after it, and returns the origin it
+/// names. The caller bounds it with `handshake_timeout`.
+///
+/// A version 1 header's length is known only at its CRLF, so each step peeks at what the socket
+/// holds and consumes only the bytes [`proxy::parse`] places in the header: all of them while it
+/// answers [`Parse::Incomplete`], and the header's own length once it answers [`Parse::Complete`].
+/// The payload after the header stays in the socket for the TLS handshake or the framer. A
+/// version 2 header's length is known from its 16th byte, and the rest is read in one go.
+async fn read_proxy_header(stream: &mut tokio::net::TcpStream) -> anyhow::Result<Origin> {
+    let mut header = Vec::with_capacity(proxy::V1_MAX_LEN);
+    let mut chunk = [0u8; proxy::V1_MAX_LEN];
+    loop {
+        // Every byte peeked is consumed below unless the header completes, so the next peek waits
+        // for new bytes rather than returning the same ones again.
+        let peeked = stream.peek(&mut chunk).await?;
+        if peeked == 0 {
+            anyhow::bail!("the peer closed the connection before a complete PROXY header");
+        }
+        let held = header.len();
+        header.extend_from_slice(&chunk[..peeked]);
+        match proxy::parse(&header)? {
+            Parse::Complete { origin, len } => {
+                stream.read_exact(&mut chunk[..len - held]).await?;
+                return Ok(origin);
+            }
+            Parse::Incomplete { len: Some(len) } => {
+                stream.read_exact(&mut chunk[..peeked]).await?;
+                header.resize(len, 0);
+                stream.read_exact(&mut header[held + peeked..]).await?;
+                return match proxy::parse(&header)? {
+                    Parse::Complete { origin, .. } => Ok(origin),
+                    Parse::Incomplete { .. } => unreachable!("the header holds its whole length"),
+                };
+            }
+            Parse::Incomplete { len: None } => {
+                stream.read_exact(&mut chunk[..peeked]).await?;
+            }
+        }
     }
 }
 
@@ -1439,7 +1565,7 @@ async fn serve_connection<S, D>(
     config: TcpListenerConfig,
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
-    peer: Option<PeerAttrs>,
+    attrs: Option<ConnectionAttrs>,
     sink: Fanout,
     telemetry: Telemetry,
     diag: &mut Diagnostics,
@@ -1574,7 +1700,7 @@ where
                             frame,
                             now_nanos(),
                             &mut decoder,
-                            peer.as_ref(),
+                            attrs.as_ref(),
                             &mut scratch,
                             &mut accumulator,
                             &sink,
@@ -1615,7 +1741,7 @@ where
                         frame,
                         received_at,
                         &mut decoder,
-                        peer.as_ref(),
+                        attrs.as_ref(),
                         &mut scratch,
                         &mut accumulator,
                         &sink,
@@ -1659,7 +1785,7 @@ async fn absorb_frame<D: Decoder + Send>(
     frame: Bytes,
     received_at: i64,
     decoder: &mut D,
-    peer: Option<&PeerAttrs>,
+    attrs: Option<&ConnectionAttrs>,
     scratch: &mut Vec<Event>,
     accumulator: &mut BatchAccumulator,
     sink: &Fanout,
@@ -1671,9 +1797,9 @@ async fn absorb_frame<D: Decoder + Send>(
     scratch.clear();
     match decoder.decode_into(frame, received_at, scratch) {
         Ok((resource, scope)) => {
-            // After the decoder, so the observed peer replaces a same-named decoded attribute.
-            if let Some(peer) = peer {
-                peer.stamp(scratch);
+            // After the decoder, so the driver's values replace same-named decoded attributes.
+            if let Some(attrs) = attrs {
+                attrs.stamp(scratch);
             }
             // `scope` is threaded through rather than hardcoded `None`, as `crate::udp` does.
             if let Some((batch, reason)) = accumulator.absorb(resource, scope, scratch) {
@@ -3652,5 +3778,262 @@ mod tests {
             );
         }
         connection.abort();
+    }
+
+    // ---- driver: PROXY protocol ---------------------------------------------------------------
+
+    const PROXY_REJECTED: &str = "logit.input.connections.rejected";
+
+    /// A running `proxy_protocol: true` listener with `peer:` as given, and a probe on its
+    /// telemetry.
+    struct Proxied {
+        addr: String,
+        rx: mpsc::Receiver<logit_pipeline::Delivered>,
+        probe: TelemetryProbe,
+        handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    async fn proxied(
+        peer: bool,
+        configure: impl FnOnce(TcpListener<TestDecoder>) -> TcpListener<TestDecoder>,
+    ) -> Proxied {
+        let probe = TelemetryProbe::new();
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = configure(
+            listener
+                .with_telemetry(probe.telemetry("lines_in", "lines_in", "listener"))
+                .with_peer(peer)
+                .with_proxy_protocol(true),
+        );
+        let (sink, rx) = fanout_into_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            let _shutdown_tx = shutdown_tx;
+            listener.run_until_shutdown(sink, shutdown_rx).await
+        });
+        Proxied { addr, rx, probe, handle }
+    }
+
+    fn str_attr<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
+        event.attributes.get(key).and_then(Value::as_str)
+    }
+
+    /// A v2 header with command `ver_cmd`, family and transport `fam`, and `body` after the
+    /// fixed part.
+    fn v2_header(ver_cmd: u8, fam: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = proxy::V2_SIGNATURE.to_vec();
+        out.extend_from_slice(&[ver_cmd, fam]);
+        out.extend_from_slice(&u16::try_from(body.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A v2 `PROXY` over TCP/IPv4 from 203.0.113.5:41000, with an `AUTHORITY` TLV behind the
+    /// address block.
+    fn v2_ipv4_with_tlv() -> Vec<u8> {
+        let mut body = vec![203, 0, 113, 5, 192, 0, 2, 1];
+        body.extend_from_slice(&41000u16.to_be_bytes());
+        body.extend_from_slice(&5170u16.to_be_bytes());
+        body.extend_from_slice(&[0x02, 0x00, 0x0B]);
+        body.extend_from_slice(b"example.com");
+        v2_header(0x21, 0x11, &body)
+    }
+
+    /// Waits for `n` connections refused for their PROXY header.
+    async fn wait_for_proxy_rejections(probe: &mut TelemetryProbe, n: f64) {
+        wait_until("the proxy_header rejection count", || {
+            probe.sum(PROXY_REJECTED, &[("reason", "proxy_header")]) == n
+        })
+        .await;
+    }
+
+    /// A v1 header and the first frame in one write: the frame reaches the framer intact.
+    #[tokio::test]
+    async fn a_v1_tcp4_header_stamps_the_origin_and_leaves_the_payload_intact() {
+        let mut running = proxied(false, |l| l).await;
+        let mut client = connect(&running.addr).await;
+        client
+            .write_all(b"PROXY TCP4 198.51.100.7 192.0.2.1 40000 5170\r\n<13>first\n<13>second\n")
+            .await
+            .unwrap();
+
+        let first = recv_batch(&mut running.rx).await;
+        assert_eq!(payloads(&first), vec!["<13>first"]);
+        let event = &first.events[0];
+        assert_eq!(str_attr(event, "client.address"), Some("198.51.100.7"));
+        assert_eq!(event.attributes.get("client.port"), Some(&Value::I64(40000)));
+        assert_eq!(event.attributes.get("network.peer.address"), None, "peer: is off");
+        assert_eq!(payloads(&recv_batch(&mut running.rx).await), vec!["<13>second"]);
+        running.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_v1_tcp6_header_stamps_the_origin() {
+        let mut running = proxied(false, |l| l).await;
+        let mut client = connect(&running.addr).await;
+        client.write_all(b"PROXY TCP6 2001:db8::7 2001:db8::1 65535 5170\r\n").await.unwrap();
+        client.write_all(b"<13>hello\n").await.unwrap();
+
+        let batch = recv_batch(&mut running.rx).await;
+        assert_eq!(payloads(&batch), vec!["<13>hello"]);
+        assert_eq!(str_attr(&batch.events[0], "client.address"), Some("2001:db8::7"));
+        assert_eq!(batch.events[0].attributes.get("client.port"), Some(&Value::I64(65535)));
+        running.handle.abort();
+    }
+
+    /// A header split across writes is read in pieces, consuming only header bytes each time.
+    #[tokio::test]
+    async fn a_v1_header_split_across_writes_is_assembled() {
+        let mut running = proxied(false, |l| l).await;
+        let mut client = connect(&running.addr).await;
+        client.set_nodelay(true).unwrap();
+        for piece in
+            [&b"PROXY TCP4 198.5"[..], b"1.100.7 192.0.2.1 4", b"0000 5170\r", b"\n<13>a\n"]
+        {
+            client.write_all(piece).await.unwrap();
+        }
+        let batch = recv_batch(&mut running.rx).await;
+        assert_eq!(payloads(&batch), vec!["<13>a"]);
+        assert_eq!(str_attr(&batch.events[0], "client.address"), Some("198.51.100.7"));
+        running.handle.abort();
+    }
+
+    /// The TLV is skipped and the frame behind it, sent in the same write, decodes.
+    #[tokio::test]
+    async fn a_v2_ipv4_header_with_a_tlv_stamps_the_origin() {
+        let mut running = proxied(false, |l| l).await;
+        let mut client = connect(&running.addr).await;
+        let mut wire = v2_ipv4_with_tlv();
+        wire.extend_from_slice(b"<13>behind a tlv\n");
+        client.write_all(&wire).await.unwrap();
+
+        let batch = recv_batch(&mut running.rx).await;
+        assert_eq!(payloads(&batch), vec!["<13>behind a tlv"]);
+        assert_eq!(str_attr(&batch.events[0], "client.address"), Some("203.0.113.5"));
+        assert_eq!(batch.events[0].attributes.get("client.port"), Some(&Value::I64(41000)));
+        running.handle.abort();
+    }
+
+    /// A proxy's own health check: accepted, and nothing is stamped.
+    #[tokio::test]
+    async fn a_v2_local_header_is_accepted_with_no_client_attributes() {
+        let mut running = proxied(false, |l| l).await;
+        let mut client = connect(&running.addr).await;
+        let mut wire = v2_header(0x20, 0x00, &[]);
+        wire.extend_from_slice(b"<13>health\n");
+        client.write_all(&wire).await.unwrap();
+
+        let batch = recv_batch(&mut running.rx).await;
+        assert_eq!(payloads(&batch), vec!["<13>health"]);
+        assert_eq!(batch.events[0].attributes.get("client.address"), None);
+        assert_eq!(batch.events[0].attributes.get("client.port"), None);
+        assert_eq!(running.probe.sum(PROXY_REJECTED, &[("reason", "proxy_header")]), 0.0);
+        running.handle.abort();
+    }
+
+    /// `peer:` reports the proxy, the socket peer; the header names the client.
+    #[tokio::test]
+    async fn peer_reports_the_proxy_and_the_header_reports_the_client() {
+        let mut running = proxied(true, |l| l).await;
+        let mut client = connect(&running.addr).await;
+        let local_port = client.local_addr().unwrap().port();
+        let mut wire = v2_ipv4_with_tlv();
+        wire.extend_from_slice(b"<13>both\n");
+        client.write_all(&wire).await.unwrap();
+
+        let batch = recv_batch(&mut running.rx).await;
+        let event = &batch.events[0];
+        assert_eq!(str_attr(event, "network.peer.address"), Some("127.0.0.1"));
+        assert_eq!(
+            event.attributes.get("network.peer.port"),
+            Some(&Value::I64(i64::from(local_port)))
+        );
+        assert_eq!(str_attr(event, "client.address"), Some("203.0.113.5"));
+        assert_eq!(event.attributes.get("client.port"), Some(&Value::I64(41000)));
+        running.handle.abort();
+    }
+
+    /// No header: the connection is closed and counted, and its bytes are never decoded.
+    #[tokio::test]
+    async fn a_connection_without_a_header_is_rejected_and_counted() {
+        let mut running = proxied(false, |l| l).await;
+        let mut bare = connect(&running.addr).await;
+        bare.write_all(b"<13>no header\n").await.unwrap();
+        expect_closed(&mut bare, "a connection with no PROXY header").await;
+        wait_for_proxy_rejections(&mut running.probe, 1.0).await;
+
+        let mut good = connect(&running.addr).await;
+        good.write_all(b"PROXY UNKNOWN\r\n<13>after\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut running.rx).await), vec!["<13>after"]);
+        running.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_malformed_header_is_rejected_and_counted() {
+        let mut running = proxied(false, |l| l).await;
+        for wire in [
+            b"PROXY TCP4 198.51.100.7 192.0.2.1 99999 5170\r\n<13>x\n".to_vec(),
+            v2_header(0x22, 0x11, &[0; 12]),
+            v2_header(0x21, 0x11, &[0; 4]),
+        ] {
+            let mut client = connect(&running.addr).await;
+            client.write_all(&wire).await.unwrap();
+            expect_closed(&mut client, "a connection with a malformed PROXY header").await;
+        }
+        wait_for_proxy_rejections(&mut running.probe, 3.0).await;
+        running.handle.abort();
+    }
+
+    /// A header that stalls partway is cut by `handshake_timeout` and gives its permit back.
+    #[tokio::test]
+    async fn a_slow_header_is_cut_by_the_handshake_timeout() {
+        let mut running = proxied(false, |l| {
+            l.with_handshake_timeout(Duration::from_millis(50)).with_max_connections(1)
+        })
+        .await;
+        let mut slow = connect(&running.addr).await;
+        slow.write_all(b"PROXY TCP4 198.51").await.unwrap();
+        expect_closed(&mut slow, "a connection whose PROXY header stalled").await;
+        wait_for_proxy_rejections(&mut running.probe, 1.0).await;
+
+        let mut next = connect(&running.addr).await;
+        next.write_all(b"PROXY UNKNOWN\r\n<13>permit came back\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut running.rx).await), vec!["<13>permit came back"]);
+        drop(slow);
+        running.handle.abort();
+    }
+
+    /// The header is read off the raw stream, and the TLS handshake runs on what follows it.
+    #[tokio::test]
+    async fn tls_runs_behind_the_header() {
+        let mut running =
+            proxied(false, |l| l.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap())
+                .await;
+        let mut stream = connect(&running.addr).await;
+        stream.write_all(&v2_ipv4_with_tlv()).await.unwrap();
+        let connector = tls_connector("ca.pem", None).await;
+        let mut client =
+            tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name(), stream))
+                .await
+                .expect("the TLS handshake should complete within 5s")
+                .expect("the TLS handshake should succeed");
+        client.write_all(b"<13>over tls\n").await.unwrap();
+        client.flush().await.unwrap();
+
+        let batch = recv_batch(&mut running.rx).await;
+        assert_eq!(payloads(&batch), vec!["<13>over tls"]);
+        assert_eq!(str_attr(&batch.events[0], "client.address"), Some("203.0.113.5"));
+        running.handle.abort();
+    }
+
+    /// A Unix socket has no network proxy in front of it; bind refuses the option.
+    #[tokio::test]
+    async fn a_unix_listener_refuses_proxy_protocol_at_bind() {
+        let path = logit_pipeline::test_util::scratch_dir("tcp-proxy-unix").join("s.sock");
+        let mut listener =
+            TcpListener::unix("lines_in", path, 0o600, TestDecoder::new(), one_per_frame())
+                .with_proxy_protocol(true);
+        let err = listener.bind().await.expect_err("a Unix socket takes no PROXY header");
+        assert!(err.to_string().contains("'proxy_protocol:' needs 'transport: tcp'"), "{err}");
     }
 }

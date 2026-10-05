@@ -1,16 +1,20 @@
 //! The sender's address on listener events: the `network.peer.address` and `network.peer.port`
-//! attributes a shared driver stamps, after decode, on a listener configured `peer: true`.
+//! attributes a shared driver stamps, after decode, on a listener configured `peer: true`, and the
+//! `client.address` and `client.port` attributes the stream driver stamps from a PROXY protocol
+//! header under `proxy_protocol: true`.
 //!
 //! ADR `listener-peer-address` settles the names, the text form, why these are event attributes
 //! and not resource ones, and why the driver's value replaces a same-named attribute a decoder
 //! produced. A driver builds one [`PeerAttrs`] per peer and calls [`PeerAttrs::stamp`] on every
 //! event decoded from it. The stream driver builds one per connection. The datagram driver reads a
 //! [`Sender`] with every datagram and goes through a [`PeerCache`], which formats an address only
-//! when the sender differs from the previous datagram's.
+//! when the sender differs from the previous datagram's. A PROXY header's origin becomes a
+//! [`PeerAttrs`] through [`PeerAttrs::client`], and [`ConnectionAttrs`] holds a connection's two.
 
 use bytes::Bytes;
 use logit_core::interner::intern;
 use logit_core::{Event, Symbol, Value};
+use logit_proto::proxy::Origin;
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -21,15 +25,29 @@ pub const PEER_ADDRESS: &str = "network.peer.address";
 /// The attribute holding the immediate socket peer's port, in OpenTelemetry's name.
 pub const PEER_PORT: &str = "network.peer.port";
 
+/// The attribute holding the origin a PROXY protocol header names, in OpenTelemetry's name.
+pub const CLIENT_ADDRESS: &str = "client.address";
+/// The attribute holding the port of the origin a PROXY protocol header names.
+pub const CLIENT_PORT: &str = "client.port";
+
 /// [`PEER_ADDRESS`] and [`PEER_PORT`], interned once per process rather than per peer.
-fn keys() -> (Symbol, Symbol) {
+fn peer_keys() -> (Symbol, Symbol) {
     static KEYS: OnceLock<(Symbol, Symbol)> = OnceLock::new();
     *KEYS.get_or_init(|| (intern(PEER_ADDRESS), intern(PEER_PORT)))
 }
 
-/// One peer's attribute values, formatted once and cloned onto each event by [`Self::stamp`].
+/// [`CLIENT_ADDRESS`] and [`CLIENT_PORT`], interned once per process.
+fn client_keys() -> (Symbol, Symbol) {
+    static KEYS: OnceLock<(Symbol, Symbol)> = OnceLock::new();
+    *KEYS.get_or_init(|| (intern(CLIENT_ADDRESS), intern(CLIENT_PORT)))
+}
+
+/// One address's attribute values, formatted once and cloned onto each event by [`Self::stamp`]:
+/// the socket peer's under `network.peer.*`, or a PROXY header's origin under `client.*`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PeerAttrs {
+    /// The address and port attribute names.
+    keys: (Symbol, Symbol),
     address: Value,
     /// `None` for a Unix socket peer, which has a path and no port.
     port: Option<Value>,
@@ -40,7 +58,12 @@ impl PeerAttrs {
     /// socket reports for an IPv4 sender) is written as IPv4, so one sender reads the same on
     /// either kind of socket.
     pub fn from_socket(addr: SocketAddr) -> Self {
+        Self::ip(peer_keys(), addr)
+    }
+
+    fn ip(keys: (Symbol, Symbol), addr: SocketAddr) -> Self {
         Self {
+            keys,
             address: shared_str(addr.ip().to_canonical().to_string()),
             port: Some(Value::I64(i64::from(addr.port()))),
         }
@@ -55,17 +78,60 @@ impl PeerAttrs {
 
     /// A Unix socket peer that bound `path`. A path that isn't UTF-8 is written lossily.
     pub fn from_path(path: &Path) -> Self {
-        Self { address: shared_str(path.to_string_lossy().into_owned()), port: None }
+        Self {
+            keys: peer_keys(),
+            address: shared_str(path.to_string_lossy().into_owned()),
+            port: None,
+        }
     }
 
-    /// Writes this peer onto every event in `events`, replacing a same-named attribute.
+    /// A PROXY header's origin as `client.address` and `client.port`, the address written as
+    /// [`Self::from_socket`] writes one. A Unix origin's path is `client.address` alone, written
+    /// lossily when it isn't UTF-8. [`Origin::None`] has nothing to stamp.
+    pub fn client(origin: &Origin) -> Option<Self> {
+        match origin {
+            Origin::None => None,
+            Origin::Ip(addr) => Some(Self::ip(client_keys(), *addr)),
+            Origin::Unix(path) => Some(Self {
+                keys: client_keys(),
+                address: shared_str(String::from_utf8_lossy(path).into_owned()),
+                port: None,
+            }),
+        }
+    }
+
+    /// Writes this address onto every event in `events`, replacing a same-named attribute.
     pub fn stamp(&self, events: &mut [Event]) {
-        let (address_key, port_key) = keys();
+        let (address_key, port_key) = self.keys;
         for event in events {
             event.attributes.insert_sym(address_key, self.address.clone());
             if let Some(port) = &self.port {
                 event.attributes.insert_sym(port_key, port.clone());
             }
+        }
+    }
+}
+
+/// What the stream driver stamps on every event of one connection: the socket peer under
+/// `peer: true`, and a PROXY header's origin under `proxy_protocol: true`. Built once per
+/// connection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConnectionAttrs {
+    peer: Option<PeerAttrs>,
+    client: Option<PeerAttrs>,
+}
+
+impl ConnectionAttrs {
+    /// `None` when there's nothing to stamp, so a connection with neither costs one branch per
+    /// decoded frame.
+    pub fn new(peer: Option<PeerAttrs>, client: Option<PeerAttrs>) -> Option<Self> {
+        (peer.is_some() || client.is_some()).then_some(Self { peer, client })
+    }
+
+    /// Writes both onto every event in `events`, each replacing a same-named attribute.
+    pub fn stamp(&self, events: &mut [Event]) {
+        for attrs in [&self.peer, &self.client].into_iter().flatten() {
+            attrs.stamp(events);
         }
     }
 }
@@ -234,6 +300,49 @@ mod tests {
             (Value::Str(a), Value::Str(b)) => assert_eq!(a.as_ptr(), b.as_ptr()),
             other => panic!("expected two string addresses, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_proxy_origin_stamps_client_attributes_written_as_a_peer_is() {
+        let mapped: IpAddr = Ipv4Addr::new(198, 51, 100, 4).to_ipv6_mapped().into();
+        let client = PeerAttrs::client(&Origin::Ip(SocketAddr::new(mapped, 40000))).unwrap();
+        let mut events = vec![event()];
+        client.stamp(&mut events);
+        assert_eq!(str_attr(&events[0], CLIENT_ADDRESS), Some("198.51.100.4"));
+        assert_eq!(events[0].attributes.get(CLIENT_PORT), Some(&Value::I64(40000)));
+        assert_eq!(events[0].attributes.get(PEER_ADDRESS), None);
+    }
+
+    #[test]
+    fn a_unix_proxy_origin_stamps_its_path_lossily_and_no_port() {
+        let client = PeerAttrs::client(&Origin::Unix(b"/run/a\xFF.sock".to_vec())).unwrap();
+        let mut events = vec![event()];
+        client.stamp(&mut events);
+        assert_eq!(str_attr(&events[0], CLIENT_ADDRESS), Some("/run/a\u{FFFD}.sock"));
+        assert_eq!(events[0].attributes.get(CLIENT_PORT), None);
+    }
+
+    #[test]
+    fn no_proxy_origin_has_nothing_to_stamp() {
+        assert_eq!(PeerAttrs::client(&Origin::None), None);
+        assert_eq!(ConnectionAttrs::new(None, None), None);
+    }
+
+    /// The proxy is the peer and the origin is the client, both on one event, and each replaces
+    /// what a decoder wrote under its name.
+    #[test]
+    fn a_connection_stamps_its_peer_and_its_client_side_by_side() {
+        let peer = PeerAttrs::from_socket("192.0.2.1:5000".parse().unwrap());
+        let client = PeerAttrs::client(&Origin::Ip("203.0.113.9:6000".parse().unwrap()));
+        let attrs = ConnectionAttrs::new(Some(peer), client).unwrap();
+        let mut decoded = event();
+        decoded.attributes.insert(CLIENT_ADDRESS, Value::str("forged"));
+        let mut events = vec![decoded];
+        attrs.stamp(&mut events);
+        assert_eq!(str_attr(&events[0], PEER_ADDRESS), Some("192.0.2.1"));
+        assert_eq!(str_attr(&events[0], CLIENT_ADDRESS), Some("203.0.113.9"));
+        assert_eq!(events[0].attributes.get(CLIENT_PORT), Some(&Value::I64(6000)));
+        assert_eq!(events[0].attributes.len(), 4);
     }
 
     #[test]

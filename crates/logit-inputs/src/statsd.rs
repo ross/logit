@@ -422,6 +422,16 @@ impl StatsdInput {
         self
     }
 
+    /// Requires a PROXY protocol header on every TCP connection (`proxy_protocol:`); see
+    /// [`TcpListener::with_proxy_protocol`]. A datagram listener is left untouched, and graph rule
+    /// 78 rejects the option there and on a Unix stream socket.
+    pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_proxy_protocol(proxy_protocol));
+        }
+        self
+    }
+
     /// Terminates TLS on a TCP listener (`tls:`); paths in `settings` resolve against `base_dir`.
     ///
     /// Fails on a UDP listener: DTLS is out of scope (`docs/adr/syslog-tcp-ingress-and-tls.md`'s
@@ -2160,6 +2170,32 @@ mod tests {
         let attrs = &events[0].attributes;
         assert_eq!(attrs.get(PEER_ADDRESS).and_then(Value::as_str), Some("127.0.0.1"));
         assert_eq!(attrs.get(PEER_PORT), Some(&Value::I64(i64::from(port))));
+        assert_eq!(attrs.get("env").and_then(Value::as_str), Some("prod"));
+
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    /// `proxy_protocol: true` stamps the header's origin over a DogStatsD tag of the same name.
+    #[tokio::test]
+    async fn a_proxy_header_origin_replaces_a_tag_of_the_same_name() {
+        use crate::peer::{CLIENT_ADDRESS, CLIENT_PORT};
+
+        let mut running = start_tcp(|input| input.with_proxy_protocol(true)).await;
+        let mut client = running.connect().await;
+        client
+            .write_all(
+                b"PROXY TCP4 198.51.100.7 192.0.2.1 40000 8125\r\n\
+                  hits:1|c|#client.address:203.0.113.9,client.port:1,env:prod\n",
+            )
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let events = running.next_events("the tagged line").await;
+        let attrs = &events[0].attributes;
+        assert_eq!(attrs.get(CLIENT_ADDRESS).and_then(Value::as_str), Some("198.51.100.7"));
+        assert_eq!(attrs.get(CLIENT_PORT), Some(&Value::I64(40000)));
         assert_eq!(attrs.get("env").and_then(Value::as_str), Some("prod"));
 
         running.shutdown.send(true).ok();

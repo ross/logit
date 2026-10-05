@@ -304,6 +304,16 @@ impl GraphiteInput {
         self
     }
 
+    /// Requires a PROXY protocol header on every TCP connection (`proxy_protocol:`); see
+    /// [`TcpListener::with_proxy_protocol`]. A UDP listener is left untouched, and graph rule 78
+    /// rejects the option there.
+    pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_proxy_protocol(proxy_protocol));
+        }
+        self
+    }
+
     /// Terminates TLS on a TCP listener (`tls:`); [`TcpListener::with_tls`] resolves every path
     /// in `settings` against `base_dir`.
     ///

@@ -237,6 +237,16 @@ impl LinesInput {
         self
     }
 
+    /// Requires a PROXY protocol header on every TCP connection (`proxy_protocol:`); see
+    /// [`TcpListener::with_proxy_protocol`]. A datagram listener is left untouched, and graph rule
+    /// 78 rejects the option there and on a Unix stream socket.
+    pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_proxy_protocol(proxy_protocol));
+        }
+        self
+    }
+
     /// Terminates TLS on a TCP listener (`tls:`); paths in `settings` resolve against `base_dir`.
     /// Fails on a datagram listener and on a Unix socket. Graph rules 43 and 65 are what an
     /// operator sees; this backstops a caller that skipped validation.
@@ -849,6 +859,22 @@ mod tests {
         let port = client.local_addr().unwrap().port();
         let event = one_event(&mut started, &mut client).await;
         assert_eq!(peer_of(&event), (Some("127.0.0.1"), Some(&Value::I64(i64::from(port)))));
+        started.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_stamps_the_headers_origin_beside_the_peer() {
+        let input = LinesInput::tcp("127.0.0.1:0").with_peer(true).with_proxy_protocol(true);
+        let mut started = start(input).await;
+        let mut client = TcpStream::connect(started.addr.unwrap()).await.unwrap();
+        client.write_all(b"PROXY TCP6 2001:db8::7 2001:db8::1 5000 5170\r\n").await.unwrap();
+        let event = one_event(&mut started, &mut client).await;
+        assert_eq!(peer_of(&event).0, Some("127.0.0.1"));
+        assert_eq!(
+            event.attributes.get("client.address").and_then(Value::as_str),
+            Some("2001:db8::7")
+        );
+        assert_eq!(event.attributes.get("client.port"), Some(&Value::I64(5000)));
         started.running.stop().await;
     }
 

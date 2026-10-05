@@ -284,6 +284,16 @@ impl SyslogInput {
         self
     }
 
+    /// Requires a PROXY protocol header on every TCP connection (`proxy_protocol:`); see
+    /// [`TcpListener::with_proxy_protocol`]. A UDP listener is left untouched, and graph rule 78
+    /// rejects the option there.
+    pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_proxy_protocol(proxy_protocol));
+        }
+        self
+    }
+
     /// Caps the connections a stream listener serves at once, overriding
     /// [`crate::DEFAULT_MAX_CONNECTIONS`]; `max_connections:` in config. Graph rule 74 rejects `0`
     /// before it gets here. A datagram listener is left untouched: it has no connections, and

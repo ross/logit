@@ -734,6 +734,31 @@ fn peer_cache_repeated_sender_stamp_100_statsd_events() {
     assert_eq!(stats.reallocs, 0);
 }
 
+/// `ConnectionAttrs::stamp` with `peer: true` and a PROXY header's origin (`proxy_protocol: true`)
+/// over 100 decoded statsd events costs nothing: the client's address is a second shared `Bytes`
+/// built once per connection, and the four keys fit the map's inline capacity beside the line's
+/// three tags.
+#[test]
+fn peer_and_proxy_client_stamp_100_statsd_events() {
+    use logit_inputs::peer::{ConnectionAttrs, PeerAttrs};
+    use logit_proto::proxy::Origin;
+
+    let peer = PeerAttrs::from_socket("192.0.2.7:5140".parse().unwrap());
+    let client = PeerAttrs::client(&Origin::Ip("198.51.100.4:40000".parse().unwrap()));
+    let attrs = ConnectionAttrs::new(Some(peer), client).expect("both are set");
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_datagram(100);
+    let mut warm = decoder.decode(datagram.clone()).expect("should decode").events;
+    attrs.stamp(&mut warm); // warm: interns the four keys
+    let mut events = decoder.decode(datagram).expect("should decode").events;
+
+    let ((), stats) = measure(|| attrs.stamp(&mut events));
+    assert_eq!(events.len(), 100);
+    assert_eq!(events[0].attributes.len(), 7);
+    expect_allocs("peer + proxy client: stamp 100 statsd events", stats, 0);
+    assert_eq!(stats.reallocs, 0);
+}
+
 /// A change of sender formats the new one's address: the `String` it's written into (and one
 /// `realloc` while it's written) and the shared header `Bytes` adds on its first clone, so every
 /// event after it shares one buffer. The UDP driver pays this once per change of sender between
