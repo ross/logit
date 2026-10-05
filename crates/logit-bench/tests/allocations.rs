@@ -670,7 +670,7 @@ fn accumulator_absorb_into_a_warm_buffer_costs_nothing() {
 /// `PeerAttrs::stamp` (`peer: true`, ADR `listener-peer-address`) over 100 decoded statsd events
 /// costs nothing. The address is a `Bytes` formatted and shared once per peer, so each event takes
 /// a reference-count increment and an `I64`, and the two keys fit the map's inline capacity
-/// beside the line's one tag. The `PeerAttrs` itself is built outside the measured region: the
+/// beside the line's three tags. The `PeerAttrs` itself is built outside the measured region: the
 /// stream driver builds it once per connection.
 #[test]
 fn peer_stamp_100_statsd_events() {
