@@ -1076,8 +1076,9 @@ socket, a sender that targets a Datadog Agent's TCP `logs` port, or a Splunk for
 the runnable config, with every default present as a comment.
 
 - **`bind:` and `transport:`.** `tcp` is the default. `udp` takes one or more lines per datagram.
-  `unix` (datagram) and `unix_stream` take an absolute socket path as `bind:`. `tls:` requires
-  `tcp`. `max_connections:`, `handshake_timeout:`, and `idle_timeout:` work as they do on a TCP
+  `unix` (datagram) and `unix_stream` take an absolute socket path as `bind:`, and make the
+  socket file mode `socket_mode:` (a quoted octal string, `"0722"` by default, as on `statsd_in`'s
+  socket). `tls:` requires `tcp`. `max_connections:`, `handshake_timeout:`, and `idle_timeout:` work as they do on a TCP
   `statsd_in`, and `receive:` works as it does on a UDP `statsd_in`; the sections above cover
   each.
 - **`max_line_bytes:`** defaults to `64KiB`. A longer line is dropped and counted as
@@ -1193,9 +1194,11 @@ components:
   and mode are the access control. At startup a stale socket file from an earlier run is replaced;
   anything else at the path (a regular file, say) fails startup rather than being deleted. The
   socket file isn't removed on shutdown.
-- **The socket file is mode `0722`**, the Agent's own mode for this socket: a client needs only
-  write permission to send, so any user's process can send to it. Restrict senders with the
-  directory's permissions.
+- **The socket file is mode `0722` by default**, the Agent's own mode for this socket: a client
+  needs only write permission to send, so any user's process can send to it. Restrict senders with
+  the directory's permissions, or set `socket_mode:` to a quoted octal string (`socket_mode:
+  "0660"`) to give the file its own. Quote it: YAML versions disagree on whether an unquoted
+  `0660` is octal, so a YAML number is rejected.
 - **`transport: unix` behaves like UDP.** One datagram carries one or more newline-separated lines,
   and the whole `receive:` block applies. The kernel counters differ: a full Unix datagram queue
   makes the *client's* send block or fail with `EAGAIN` rather than dropping in the kernel, so
@@ -1976,9 +1979,10 @@ headers. For `/v0.7/traces`, the payload's own fields win over a header.
 **The Unix socket.** `socket:` binds a Unix stream socket, as the Agent's `receiver_socket` does.
 The directory must already exist. A stale socket file from an earlier run is replaced, but a path
 that exists and isn't a socket is refused, so a typo can't delete a file. The new socket is mode
-`0722`, the mode the Agent gives its own `apm.socket`: connecting needs only write permission, so
-a tracer running as any user can connect. Restrict access with the directory's permissions if
-that's too open. `tls:` applies to `bind` only.
+`0722` by default, the mode the Agent gives its own `apm.socket`: connecting needs only write
+permission, so a tracer running as any user can connect. If that's too open, restrict access with
+the directory's permissions, or set `socket_mode:` (a quoted octal string, such as `"0660"`).
+`tls:` applies to `bind` only.
 
 **A full pipeline loses spans.** When the pipeline doesn't accept a request's batch within 2
 seconds, `datadog_trace_in` answers `503` with `Retry-After: 1`, counted

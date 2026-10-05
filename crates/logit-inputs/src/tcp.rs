@@ -1048,6 +1048,15 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
         }
     }
 
+    /// Replaces a Unix stream listener's socket file mode before [`Input::bind`]; a TCP listener
+    /// is left untouched.
+    pub fn with_socket_mode(mut self, socket_mode: u32) -> Self {
+        if let StreamTarget::Unix { mode, .. } = &mut self.target {
+            *mode = socket_mode;
+        }
+        self
+    }
+
     /// The configured socket path of a Unix stream listener, bound or not; `None` for TCP.
     pub fn socket_path(&self) -> Option<&std::path::Path> {
         match &self.target {
@@ -1180,7 +1189,7 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
     /// Requires a PROXY protocol header ahead of every connection's stream and stamps the origin
     /// it names (the `proxy_protocol:` field of `syslog_in`/`graphite_in`/`statsd_in`/`lines_in`).
     /// Off by default. See this module's "PROXY protocol" doc section. [`Input::bind`] refuses it
-    /// on a Unix socket; graph rule 78 is what an operator sees.
+    /// on a Unix socket; graph rule 79 is what an operator sees.
     pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
         self.proxy_protocol = proxy_protocol;
         self

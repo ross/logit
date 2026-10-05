@@ -152,8 +152,9 @@
 //! `DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket`. [`Input::bind`] refuses a path whose
 //! directory doesn't exist, replaces a stale socket file left by an earlier run (what the Agent does
 //! at startup), and refuses a path that exists and isn't a socket, so a typo can't delete a
-//! regular file. The socket file is then made mode `0722`, the mode a recorded Agent 7.83 gives its
-//! own `apm.socket` (`testdata/interop/datadog/README.md`): connecting needs only write
+//! regular file. The socket file is then made mode `socket_mode:`
+//! ([`DatadogTraceInput::with_socket_mode`]), by default `0722`, the mode a recorded Agent 7.83
+//! gives its own `apm.socket` (`testdata/interop/datadog/README.md`): connecting needs only write
 //! permission, so a tracer running as any user can connect. Restrict access with the directory's
 //! permissions. The socket file isn't removed on shutdown;
 //! the next start replaces it.
@@ -232,10 +233,6 @@ const RATES_PAYLOAD_VERSION: &str = "logit-1";
 /// Every service's default rate, 1.0: keep everything (this module's "The trace reply").
 const RATE_BY_SERVICE: &[u8] = br#"{"rate_by_service":{"service:,env:":1.0}}"#;
 
-/// The Unix socket file's mode after binding (this module's "The Unix socket"): the Agent's own
-/// for its APM socket.
-const SOCKET_MODE: u32 = 0o722;
-
 /// `crate::tls::TlsServerSettings`, re-exported as `datadog_in`'s is.
 pub use crate::tls::TlsServerSettings;
 
@@ -243,6 +240,8 @@ pub use crate::tls::TlsServerSettings;
 pub struct DatadogTraceInput {
     bind: Option<String>,
     socket: Option<PathBuf>,
+    /// The `socket` file's mode after binding.
+    socket_mode: u32,
     diag: Diagnostics,
     telemetry: Telemetry,
     tls: Option<Arc<rustls::ServerConfig>>,
@@ -277,6 +276,7 @@ impl DatadogTraceInput {
         Self {
             bind: None,
             socket: None,
+            socket_mode: crate::unix::DEFAULT_SOCKET_MODE,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             tls: None,
@@ -298,6 +298,13 @@ impl DatadogTraceInput {
     /// Serves a Unix stream socket at `path` (this module's "The Unix socket").
     pub fn with_socket(mut self, path: impl Into<PathBuf>) -> Self {
         self.socket = Some(path.into());
+        self
+    }
+
+    /// Sets the `socket` file's mode (`socket_mode:`), overriding the default `0722`. Without a
+    /// socket it has no effect; graph rule 78 rejects the field there.
+    pub fn with_socket_mode(mut self, socket_mode: u32) -> Self {
+        self.socket_mode = socket_mode;
         self
     }
 
@@ -378,7 +385,8 @@ impl Input for DatadogTraceInput {
         }
         if let Some(path) = &self.socket {
             if self.unix_listener.is_none() {
-                let listener = bind_unix(path)?;
+                let listener =
+                    crate::unix::bind_listener("datadog_trace_in", path, self.socket_mode)?;
                 self.diag.info("bound", format_args!("listening on {}", path.display()));
                 self.unix_listener = Some(listener);
             }
@@ -429,12 +437,6 @@ impl Input for DatadogTraceInput {
             result = unix_loop => result,
         }
     }
-}
-
-/// Binds the Unix socket at `path` (this module's "The Unix socket"), through the path rules
-/// `crate::unix` shares with `statsd_in`.
-fn bind_unix(path: &Path) -> anyhow::Result<UnixListener> {
-    crate::unix::bind_listener("datadog_trace_in", path, SOCKET_MODE)
 }
 
 /// What both accept loops share, built once per [`Input::run`].
@@ -2024,6 +2026,17 @@ mod tests {
         drop(UnixStream::connect(&path).await.unwrap());
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(diag.occurrences("connection_error"), 0);
+    }
+
+    #[tokio::test]
+    async fn with_socket_mode_sets_the_socket_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("mode");
+        let path = dir.0.join("apm.socket");
+        let mut input = DatadogTraceInput::new().with_socket(&path).with_socket_mode(0o660);
+        input.bind().await.expect("bind");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660);
     }
 
     #[tokio::test]
