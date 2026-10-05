@@ -908,8 +908,10 @@ that name, and the rest of the datagram still decodes.
 
 **The connection metrics, and one codec counter.** `logit.input.connections`,
 `logit.input.connections.rejected{reason="limit"}` (the connection cap, `max_connections`, 1024
-by default, binding), and `logit.input.connections.closed{reason="idle"}`, the same three points
-`logit_in` and the shared TCP driver record, for the same reason: this accept loop rejects at the
+by default, binding), `logit.input.connections.rejected{reason="proxy_header"}` (under
+`proxy_protocol: true`, a PROXY header that was missing, malformed, cut short, or late, read
+before any TLS accept), and `logit.input.connections.closed{reason="idle"}`, the points `logit_in`
+and the shared TCP driver record, for the same reason: this accept loop rejects at the
 cap rather than queueing behind a permit, so there's a refusal to count, and the gauge counts
 permit holders only. A connection past the cap is dropped before any TLS accept (OTLP has no
 in-band "try later" to spend a handshake delivering), so a rejection is never also a handshake. An
@@ -931,10 +933,11 @@ The OTLP codec counts a metric with no data as
 `logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}`
 (`crates/logit-proto/src/otlp/metrics.rs`).
 
-`Diagnostics` keys: `bound`, and `connection_error` (one connection's I/O failing, a TLS accept
+`Diagnostics` keys: `bound`, `connection_error` (one connection's I/O failing, a TLS accept
 that failed or timed out, or a plaintext connection held open past `handshake_timeout` without a
-first byte, which then gave its permit back; never an idle close). A plaintext peer that *closes
-cleanly* before sending anything is deliberately not counted: that's what a TCP health check looks
+first byte, which then gave its permit back; never an idle close), and `proxy_header` (any
+`connections.rejected{reason="proxy_header"}` refusal). A plaintext peer that *closes
+cleanly or resets* before sending anything is not counted: that's what a TCP health check looks
 like, and counting it would add one point per probe interval to this key forever.
 
 ##### `prometheus_in`

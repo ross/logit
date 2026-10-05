@@ -772,7 +772,7 @@ budget of the configured length, so a TLS connection that says nothing costs up 
 | `statsd_in` (`transport: tcp`) | the same three phases, on the same shared driver |
 | `lines_in` (`transport: tcp`) | the same three phases, on the same shared driver |
 | `logit_in` | the TLS accept (under `tls:`), then the `Hello` read |
-| `otlp_in` | the TLS accept (under `tls:`), or — on the plaintext arm, which has no TLS accept — the wait for the connection's first byte |
+| `otlp_in` | the PROXY header (under `proxy_protocol:`), then the TLS accept (under `tls:`), or — on the plaintext arm, which has no TLS accept — the wait for the connection's first byte |
 
 **Under `proxy_protocol: true`, give the load balancer a PROXY-aware health check.** A plain TCP
 connect check sends no header, so each probe is closed and counted as
@@ -782,7 +782,8 @@ diagnostic. HAProxy's `check` sends the header itself when the `server` line has
 balancer's check should send a v2 `LOCAL` header, which the listener accepts without stamping a
 client.
 
-**`otlp_in` bounds one phase per connection, not two**, and not by choice. It hands each accepted
+**`otlp_in` bounds one phase per connection, not two**, plus the PROXY header under
+`proxy_protocol:`, and not by choice. It hands each accepted
 connection straight to `hyper`, whose connection builder reads the first bytes itself to tell
 HTTP/1.1 from an HTTP/2 preface, a read this listener never sees. On a plaintext listener it can
 wait for the first byte without consuming it (a `MSG_PEEK`), and that wait is what this knob
@@ -968,8 +969,8 @@ built on the shared socket drivers ([ADR `listener-peer-address`](adr/listener-p
 | `peer: true` | `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` on every transport they offer, and `collectd_in` | `network.peer.address` and `network.peer.port`: the socket peer, the connection's for a stream and each datagram's own for UDP |
 | `proxy_protocol: true` | `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in`, under `transport: tcp` only (rule 79) | `client.address` and `client.port`: the original client a PROXY protocol header names |
 
-`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `logit_in`, and `prometheus_in`'s remote-write
-receiver take neither field.
+`datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `logit_in`, and `prometheus_in`'s remote-write
+receiver take neither field. `otlp_in` takes both.
 
 **What `peer:` writes.** The address is a string in its standard text form, and the port is an
 integer. An IPv4-mapped IPv6 address is written as IPv4, so a sender reads the same on a

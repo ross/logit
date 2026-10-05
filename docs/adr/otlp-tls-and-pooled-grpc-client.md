@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-09-14
+updated: 2026-10-05
 ---
 
 # TLS for `otlp_out`/`otlp_in`, and a pooled gRPC client to carry it
@@ -205,3 +205,16 @@ That effort landed as of 2026-09-14: [ADR `idle-connection-timeout`](idle-connec
 gives `otlp_in` its own opt-in `idle_timeout:`, tracked at the service level (an in-flight counter,
 not an IO-level timer wrapped around this listener's `hyper` connection) rather than as the
 `header_read_timeout` shape rejected just above, closing the residual this section names.
+
+## Amendment: a reset before the first byte is quiet, and the PROXY header comes first (2026-10-05)
+
+The 2026-09-14 amendment above says only the deadline and a read error reach `connection_error`.
+A connection reset (`ECONNRESET`) before the first payload byte is also quiet, with or without
+`proxy_protocol:`: a load balancer's PROXY-aware health check sends a header and then an RST. This
+matches the shared stream driver's rule in `crates/logit-inputs/src/tcp.rs`'s module doc, "Reset
+before the first byte". On a TLS listener the reset reaches `connection_error` from the TLS accept,
+as on that driver.
+
+Under `proxy_protocol: true`, the PROXY header is read ahead of the TLS accept or the peek, under
+the same `handshake_timeout`. See [ADR `listener-peer-address`](listener-peer-address.md)'s
+2026-10-05 amendment.
