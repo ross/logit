@@ -34,7 +34,8 @@
 //! the series the stream framer uses, with a throttled `oversize_line` diagnostic, and the rest
 //! of the datagram still decodes.
 //!
-//! Under every transport a trailing `CR` is stripped and an empty line is skipped.
+//! Under every transport exactly one trailing `CR` is stripped, by the framer on a stream and by
+//! the decoder on a datagram, and an empty line is skipped.
 //!
 //! ## The event
 //!
@@ -92,7 +93,7 @@ impl LinesInput {
     pub fn tcp(bind: impl Into<String>) -> Self {
         Self {
             inner: Inner::Tcp(
-                TcpListener::new(bind, LinesDecoder::new(), TcpListenerConfig::default())
+                TcpListener::new(bind, LinesDecoder::stream(), TcpListenerConfig::default())
                     .with_framing(LINES, DEFAULT_MAX_LINE_BYTES),
             ),
         }
@@ -131,7 +132,7 @@ impl LinesInput {
                     "lines_in",
                     path,
                     SOCKET_MODE,
-                    LinesDecoder::new(),
+                    LinesDecoder::stream(),
                     TcpListenerConfig::default(),
                 )
                 .with_framing(LINES, DEFAULT_MAX_LINE_BYTES),
@@ -313,6 +314,9 @@ pub struct LinesDecoder {
     /// The longest line kept, not counting its `LF`. On a stream the framer already dropped
     /// anything longer, so only a datagram's lines can reach this bound.
     max_line_bytes: usize,
+    /// Set for a stream decoder, whose frames the framer already stripped one `CR` from. A second
+    /// strip would eat the first `CR` of a line ending in `CR CR`.
+    framed: bool,
 }
 
 impl Default for LinesDecoder {
@@ -328,7 +332,14 @@ impl LinesDecoder {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
+            framed: false,
         }
+    }
+
+    /// A decoder for frames the stream framer already split and stripped one `CR` from, so it
+    /// strips none itself.
+    pub fn stream() -> Self {
+        Self { framed: true, ..Self::new() }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -361,7 +372,8 @@ impl LinesDecoder {
         received_at: i64,
         out: &mut Vec<Event>,
     ) {
-        // Measured before the `CR` strip, as the stream framer measures it.
+        // Measured before the `CR` strip, as the stream framer measures it. On a stream the
+        // framer enforced the bound already, so only a datagram's lines can exceed it here.
         let len = end - start;
         if len > self.max_line_bytes {
             self.telemetry.count("logit.input.frames.dropped", 1.0, &[("reason", "oversize")]);
@@ -374,7 +386,8 @@ impl LinesDecoder {
             );
             return;
         }
-        let end = if end > start && bytes[end - 1] == b'\r' { end - 1 } else { end };
+        let end =
+            if !self.framed && end > start && bytes[end - 1] == b'\r' { end - 1 } else { end };
         if end == start {
             return;
         }
@@ -468,6 +481,16 @@ mod tests {
     fn one_trailing_cr_is_stripped_and_empty_lines_are_skipped() {
         let events = decode(b"a\r\n\r\n\nb\r\r\nc");
         assert_eq!(texts(&events), vec!["a", "b\r", "c"]);
+    }
+
+    #[test]
+    fn a_stream_frame_keeps_its_cr_because_the_framer_stripped_one() {
+        let mut out = Vec::new();
+        let mut decoder = LinesDecoder::stream();
+        for frame in [&b"b\r"[..], b"\r", b"c"] {
+            decoder.decode_into(Bytes::copy_from_slice(frame), 0, &mut out).unwrap();
+        }
+        assert_eq!(texts(&out), vec!["b\r", "\r", "c"]);
     }
 
     #[test]
@@ -623,13 +646,28 @@ mod tests {
         let mut client = TcpStream::connect(started.addr.unwrap()).await.unwrap();
         client.write_all(b"split ").await.unwrap();
         client.flush().await.unwrap();
-        // The first half must reach the listener alone; this window only orders the two reads.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Covers the 100 ms after the first write: a half line yields no event, so the second
+        // write completes a line the framer held rather than coalescing with it.
+        assert_no_batch(&mut started.rx, Duration::from_millis(100), "the half line").await;
         client.write_all(b"across writes\n").await.unwrap();
         client.flush().await.unwrap();
 
         let events = recv_events(&mut started.rx, 1).await;
         assert_eq!(texts(&events), vec!["split across writes"]);
+        started.running.stop().await;
+    }
+
+    /// The framer strips one `CR` per line, matching the datagram decoder's
+    /// `one_trailing_cr_is_stripped_and_empty_lines_are_skipped`.
+    #[tokio::test]
+    async fn a_tcp_line_loses_exactly_one_trailing_cr() {
+        let mut started = start(LinesInput::tcp("127.0.0.1:0")).await;
+        let mut client = TcpStream::connect(started.addr.unwrap()).await.unwrap();
+        client.write_all(b"b\r\r\n\r\r\nc\n").await.unwrap();
+        client.flush().await.unwrap();
+
+        let events = recv_events(&mut started.rx, 3).await;
+        assert_eq!(texts(&events), vec!["b\r", "\r", "c"]);
         started.running.stop().await;
     }
 
