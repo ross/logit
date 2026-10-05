@@ -223,7 +223,7 @@ process, not a component.
 | Event | Level | When |
 |---|---|---|
 | `starting` | info | Config loaded, before graph resolution — named even if the config goes on to fail. |
-| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
+| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`lines_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks and Lua nodes. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
@@ -547,7 +547,7 @@ shutdown, because the spool keeps it. Also watch:
 
 ## Listener intake
 
-Every UDP listener (`collectd_in`, and `statsd_in`, `syslog_in`, or `graphite_in` with
+Every UDP listener (`collectd_in`, and `statsd_in`, `syslog_in`, `graphite_in`, or `lines_in` with
 `transport: udp`) sits in front of its own in-memory receive queue that decouples reading the
 socket from decoding and batching what it read
 ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)). It is the listener-side sibling of
@@ -747,7 +747,7 @@ backpressure), but its accept queue has the same shape of problem:
 
 A stream listener has no receive queue (its connection's flow control is the backpressure), but a
 connection can open and then say nothing while holding one of the listener's
-`max_connections` permits. `syslog_in`, `graphite_in`, and `statsd_in` (each with `transport: tcp`),
+`max_connections` permits. `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` (each with `transport: tcp`),
 `logit_in`, and `otlp_in` bound that with `handshake_timeout:`, **5s by default**, a duration
 string (`5s`, `1m`, `1h30m`) like `connect_timeout`:
 
@@ -769,6 +769,7 @@ budget of the configured length, so a TLS connection that says nothing costs up 
 | `syslog_in` (`transport: tcp`) | the TLS accept (under `tls:`), then the wait for the connection's first byte — on the plaintext arm too |
 | `graphite_in` (`transport: tcp`) | the same two phases, on the same shared driver |
 | `statsd_in` (`transport: tcp`) | the same two phases, on the same shared driver |
+| `lines_in` (`transport: tcp`) | the same two phases, on the same shared driver |
 | `logit_in` | the TLS accept (under `tls:`), then the `Hello` read |
 | `otlp_in` | the TLS accept (under `tls:`), or — on the plaintext arm, which has no TLS accept — the wait for the connection's first byte |
 
@@ -790,7 +791,7 @@ with quiet connections; it only tightens how fast a connection that never said a
 up on. To bound the gap, use `idle_timeout`; see the next section.
 
 **Validation:** `handshake_timeout` must be greater than `0s` (rule 45), since `0` would close
-every connection before its handshake could start. On `syslog_in`, `graphite_in`, or `statsd_in`
+every connection before its handshake could start. On `syslog_in`, `graphite_in`, `statsd_in`, or `lines_in`
 with `transport: udp`, leave it at its default: a datagram listener has no connection to
 handshake, so a set value is rejected instead of silently ignored.
 
@@ -801,7 +802,7 @@ passes its handshake (or, on a plaintext listener, delivers at least one byte) a
 holds its connection-cap permit forever, and enough of them fill the listener's
 `max_connections` cap.
 `idle_timeout:` is the opt-in field that closes such a connection. It applies to the five kinds
-`handshake_timeout` covers (`syslog_in`, `graphite_in`, and `statsd_in` with `transport: tcp`;
+`handshake_timeout` covers (`syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` with `transport: tcp`;
 `logit_in`; and `otlp_in`) and to `prometheus_in` in remote-write receiver mode, which shares
 `otlp_in`'s HTTP idle machinery and has no `handshake_timeout`; see
 [Prometheus remote-write](#prometheus-remote-write-receiving-sending-and-picking-a-version). See
@@ -822,12 +823,12 @@ timeout is an anomaly (a dead peer, a half-open socket, or a slow-loris attempt)
 costs nothing and returns the permit. Size the value comfortably above the sender's longest normal
 gap (several flush intervals, for instance) so it never fires on legitimate traffic. Leave it unset
 for genuinely sparse or bursty senders, where long quiet periods are normal. **Think twice before
-enabling it on plaintext `syslog_in`/`graphite_in`/`statsd_in`**, because the sender has no way to
+enabling it on plaintext `syslog_in`/`graphite_in`/`statsd_in`/`lines_in`**, because the sender has no way to
 learn its connection was closed (see the client-side note below).
 
 **Off unless set.** With no value, a connection that finished its handshake and went silent is
 never closed for silence alone. `logit validate` rejects `0s` by name (rule 53: "omit the field to
-disable the idle timeout") and, on `syslog_in`/`graphite_in`/`statsd_in`, rejects any value under
+disable the idle timeout") and, on `syslog_in`/`graphite_in`/`statsd_in`/`lines_in`, rejects any value under
 `transport: udp`, where there is no connection to time out.
 
 **What it bounds, and what resets it.** The clock runs only while the listener waits on the peer's
@@ -842,7 +843,7 @@ the clock by itself.
 
 | Kind | What resets the clock | How the close happens |
 |---|---|---|
-| `syslog_in`, `graphite_in`, `statsd_in` (`transport: tcp`, the shared driver) | bytes read from the peer; an interval flush that actually emits a batch | the connection is closed directly; any complete buffered batch is flushed first |
+| `syslog_in`, `graphite_in`, `statsd_in`, `lines_in` (`transport: tcp`, the shared driver) | bytes read from the peer; an interval flush that actually emits a batch | the connection is closed directly; any complete buffered batch is flushed first |
 | `logit_in` | the handshake completing, and every frame this listener handles: forwarded, or recognized as a resend and not forwarded. An `Ack` can trail the frames it covers, so the clock runs from the last frame handled, not the last `Ack` written; a peer waiting on a delayed ack is by definition not idle. A frame header whose first byte has already arrived is progress too: the absolute idle deadline bounds only the wait for that first byte, and the rest of the header — like the body — is read under the per-`read` stall bound instead, so a frame that starts arriving right at the deadline is read and acked rather than rejected after the peer already wrote it | `Reject{GOING_AWAY, "idle for <dur>"}` is written first, the same signal an ordinary shutdown sends, then the connection closes |
 | `otlp_in` | a request *completing* — hyper owns the bytes, so this is the finest grain visible here; a request head that dribbles in slower than `idle_timeout` on an otherwise-quiet keep-alive connection is closed by this rule, a documented narrowing; a stalled request *body* gets its own bound, `idle_timeout` itself, per read frame | `graceful_shutdown()` is called and the connection is polled for up to `handshake_timeout` (reused as the grace period — no new knob); if that grace elapses with nothing in flight the connection is dropped regardless of what the poll returned, and if a request arrives inside the grace instead, see the note below the table; a stalled body instead answers `408` (`protocol: http`) or `grpc-status: 4` (`protocol: grpc`) and closes the connection once the handler returns — that close is counted the same `reason="idle"` as any other, one policy close reached one path earlier |
 
@@ -886,7 +887,7 @@ close it.
 Every stream listener serves at most `max_connections:` connections at once, **1024 by default**.
 A connection arriving past the cap is closed, never queued, and counted
 `logit.input.connections.rejected{reason="limit"}`. The field is on `syslog_in`, `graphite_in`,
-and `statsd_in` under a stream transport (`tcp`, and `unix_stream` on `statsd_in`), `logit_in`,
+`statsd_in`, and `lines_in` under a stream transport (`tcp`, and `unix_stream` on `statsd_in` and `lines_in`), `logit_in`,
 `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in` in remote-write
 receiver mode. The cap exists to protect the sinks: each open connection holds a file descriptor,
 and a fleet of senders leaking connections would otherwise run the process out of descriptors,
@@ -906,7 +907,7 @@ components:
 
 | Kind | Past the cap |
 |---|---|
-| `syslog_in`, `graphite_in`, `statsd_in` (stream transports, the shared driver) | closed as soon as it's accepted, before any TLS handshake or read; the plaintext wires have no way to say "try later" |
+| `syslog_in`, `graphite_in`, `statsd_in`, `lines_in` (stream transports, the shared driver) | closed as soon as it's accepted, before any TLS handshake or read; the plaintext wires have no way to say "try later" |
 | `otlp_in`, `datadog_in`, `splunk_hec_in`, `prometheus_in` (receiver) | closed as soon as it's accepted, before any TLS handshake or HTTP exchange; the client retries under its own policy |
 | `datadog_trace_in` | the same, with the TCP listener and the Unix socket counted against one cap; `/info` reports the cap as `connection_limit` |
 | `logit_in` | the TLS handshake completes (under `tls:`), then the peer is told `Reject{INTERNAL}`; a `logit_out` treats that as retryable and reconnects once there's room (see [Forwarding between `logit` nodes](#forwarding-between-logit-nodes)) |
@@ -943,8 +944,8 @@ cap. A nonzero `logit.input.connections.rejected{reason="limit"}` means a cap is
 if the senders are legitimate, or find the sender that's leaking connections.
 
 **Validation:** `max_connections` must be greater than `0` (rule 74), since `0` would reject every
-connection. On `syslog_in`, `graphite_in`, or `statsd_in` with `transport: udp`, or `statsd_in`
-with `transport: unix`, leave it at its default: a datagram listener has no connections, so any
+connection. On `syslog_in`, `graphite_in`, `statsd_in`, or `lines_in` with `transport: udp`, or `statsd_in`
+or `lines_in` with `transport: unix`, leave it at its default: a datagram listener has no connections, so any
 other value is rejected instead of silently ignored. On `prometheus_in` it belongs to the
 remote-write receiver, and rule 55 rejects a non-default value alongside `scrape_targets:`.
 
@@ -1057,6 +1058,50 @@ Two smaller behaviors to know before deploying one:
   A repeated tag key keeps its **last** value, counted
   `logit.input.tags.normalized{reason="duplicate_key"}`, which is also what carbon does (it builds
   a `dict`).
+
+### `lines_in`: plain newline-delimited lines
+
+`lines_in` ([ADR `plain-lines-listener`](adr/plain-lines-listener.md)) turns each line a sender
+writes into one raw log event and parses nothing. Use it for an application that writes lines to a
+socket, a Datadog-style TCP logs sender, or a Splunk forwarder's `[tcpout]` with
+`sendCookedData = false`. [`fixtures/lines-to-stdout.yaml`](../fixtures/lines-to-stdout.yaml) is
+the runnable config, with every default present as a comment.
+
+- **`bind:` and `transport:`.** `tcp` is the default. `udp` takes one or more lines per datagram.
+  `unix` (datagram) and `unix_stream` take an absolute socket path as `bind:`. `tls:` requires
+  `tcp`. Connection limits, `handshake_timeout:`, and `idle_timeout:` behave as on a TCP
+  `statsd_in`, and `receive:` as on a UDP one, as the sections above describe.
+- **`max_line_bytes:`** defaults to `64KiB`. A longer line is dropped and counted as
+  `logit.input.frames.dropped{reason="oversize"}`, and the lines around it still decode. `0` is
+  rejected (rule 77).
+- **What an event looks like.** A log event at the receive time, with the line as its body: a
+  string when the line is valid UTF-8, bytes otherwise. It has no attributes, no severity, and an
+  empty resource. A trailing `\r` is stripped and an empty line is skipped.
+- **A multi-line message arrives as several events.** The wire carries no way to join them, so
+  merge them downstream with a `regex` or `lua` stage.
+- **A stream's unterminated last line is dropped.** When a connection closes mid-line, the partial
+  line is counted `frames.dropped{reason="truncated"}`. A datagram's end also ends its last line,
+  so a UDP or `unix` sender needs no trailing newline.
+- **Nothing about the sender is recorded.** Stamp what you know with a `set` stage per listener.
+
+To parse JSON lines, put a `json` transform after the listener; a line that isn't JSON passes
+through untouched:
+
+```yaml
+components:
+  app_lines:
+    type: lines_in
+    bind: 0.0.0.0:5170
+  parse:
+    type: json
+    sources: [app_lines]
+  stamp:
+    type: set
+    sources: [parse]
+    resource:
+      service.name: checkout
+      host.name: web-1
+```
 
 ### `statsd_in`: `transport: tcp` and TLS
 
@@ -2762,7 +2807,7 @@ Which component takes which block:
 | `prometheus_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | scrape mode is a client, not a listener; a set block with no `https://` target is rule 40 |
 | `prometheus_in` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the remote-write receiver's own listener; bind mode only (rule 55) |
 | `otlp_in` | `TlsServerConfig` | the block's presence | both transports |
-| `syslog_in`, `graphite_in`, `statsd_in` | `TlsServerConfig` | the block's presence | `transport: tcp` only (rule 43) |
+| `syslog_in`, `graphite_in`, `statsd_in`, `lines_in` | `TlsServerConfig` | the block's presence | `transport: tcp` only (rule 43) |
 
 `TlsClientConfig` is `ca_file`/`cert_file`/`key_file`/`insecure_skip_verify`; `TlsServerConfig` is
 `cert_file`/`key_file`/`client_ca_file`. Every path resolves relative to the config file's own

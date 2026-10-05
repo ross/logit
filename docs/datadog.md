@@ -58,10 +58,15 @@ Which component carries each signal in each topology:
 | Events | `datadog_out` | `statsd_out` (`_e{}`) | `statsd_in` (`_e{}`) | `datadog_in` |
 | Service checks | `datadog_out` | `statsd_out` (`_sc`) | `statsd_in` (`_sc`) | `datadog_in` |
 
-Two log paths aren't covered. An application that writes JSON lines to an Agent's TCP `logs`
-listener has no plain-lines listener to switch to in `logit`. And an Agent's TCP `logs` listener
-takes syslog-formatted lines from `syslog_out`, but whether the Agent parses a JSON body in one
-into attributes is untested. Use `otlp_out` for logs through an Agent.
+An application that writes JSON lines to an Agent's TCP `logs` port can point at `lines_in` in
+`logit` instead: `lines_in` (`transport: tcp`) into `json`, then a `set` stage for the host and
+service the Agent would have stamped
+([`lines_in`](deploying.md#lines_in-plain-newline-delimited-lines)). A multi-line message arrives
+as several events.
+
+One log path is untested. An Agent's TCP `logs` listener takes syslog-formatted lines from
+`syslog_out`, but whether the Agent parses a JSON body in one into attributes is unverified. Use
+`otlp_out` for logs through an Agent.
 
 ## Which way to send
 

@@ -62,7 +62,7 @@ for a genuinely missing span. Don't mistake one failure for the other.
 the telemetry, not the source of the data, and `internal`'s telemetry genuinely is `logit`'s own.
 Inputs fall into three categories:
 
-- **No claim.** `syslog_in`/`statsd_in` always use `Resource::default()`. The data they ingest
+- **No claim.** `syslog_in`/`statsd_in`/`lines_in` always use `Resource::default()`. The data they ingest
   belongs to whatever service sent it (one statsd listener may serve several), so stamping `logit`
   would misattribute it. `otlp_in` makes no claim either: it preserves whatever resource the sender
   attached rather than manufacturing one.
@@ -876,6 +876,26 @@ close), `bad_frame` (a framed payload the decoder rejected outright, pickle only
 plaintext path isolates every failure per line), and `connection_error`. A `connection_error` is
 never fatal to the listener or its sibling connections.
 
+##### `lines_in`
+
+`crates/logit-inputs/src/lines.rs`, [ADR `plain-lines-listener`](../adr/plain-lines-listener.md).
+
+It has no layer-3 counters of its own. It runs on the shared drivers `statsd_in` does, so what it
+reports depends on its `transport:`:
+
+- **`udp` and `unix`:** the datagram set `statsd_in` records, from the shared `UdpListener`.
+- **`tcp` and `unix_stream`:** the stream set from the shared `TcpListener`: the connection
+  metrics, `logit.input.frames` / `.frame.bytes` (one frame is one LF-delimited line), and
+  `logit.input.frames.dropped{reason="oversize"|"truncated"}`.
+
+`max_line_bytes` is enforced by the stream framer on `tcp` and `unix_stream`, and by the decoder on
+`udp` and `unix`. Both count a dropped line as `logit.input.frames.dropped{reason="oversize"}`, so
+the series means the same on every transport. On a datagram transport it is the only series of
+that name, and the rest of the datagram still decodes.
+
+`Diagnostics` keys: `bound`, the driver's keys, and the datagram decoder's throttled
+`oversize_line`.
+
 ##### `otlp_in`
 
 `crates/logit-inputs/src/otlp.rs`,
@@ -1222,7 +1242,7 @@ the property the minimal-watch-set design is for.
 - `logit.input.connections` (gauge, sampled on every connect/disconnect) and
   `logit.input.connections.rejected{reason="limit"}` (count, the connection cap,
   `max_connections`, 1024 by default, binding). `otlp_in` and a TCP
-  `syslog_in`/`graphite_in`/`statsd_in` on the shared driver record the same pair; all five reject
+  `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` on the shared driver record the same pair; all five reject
   at the cap rather than queueing behind a permit. Here a connection this
   listener closed still counts, and holds its permit, while it lingers: after its last answer it
   reads and discards until the peer closes or for `handshake_timeout`.
