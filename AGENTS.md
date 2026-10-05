@@ -658,13 +658,32 @@ dir, `CARGO_TARGET_DIR=/work/perf/results/<slug>/target` (gitignored), through a
 `docker run` of the dev image with the worktree bound at `/work`; if that run passes, the shared
 cache was stale. CI builds from a clean cache and doesn't have the problem.
 
-**Before opening a PR, sweep for the two things review catches most often**: grep every comment
-line the branch added for the words the comment rule bans (`exactly`, `actually`, `genuinely`,
-`deliberately`, `simply`, `just`, `on purpose`, `load-bearing`), and ask whether the branch made
-a decision a maintainer would look for in an ADR (a wire form, a transport, a mode, a loss
-semantic) and recorded it only in a module doc. Both rules are in
-[Conventions to hold to](#conventions-to-hold-to); they are the two a reviewer flags on most
-PRs that skip this pass.
+**Before opening a PR, sweep for what review catches most often.** In order of how often a
+reviewer flags each:
+
+1. **Prose the diff contradicts.** For every behavior the branch changed, grep the docs, ADRs,
+   module docs, config field docs, and `docs/known-gaps/` for the statements that described the
+   old behavior, and update each one. The "one copy of a list" rule bounds how many copies there
+   are to find; this pass finds the ones that remain. Stale prose is the largest category of
+   review findings by a wide margin.
+2. **A list checked one row at a time.** When a change touches an enumerated list (a codec's
+   permitted normalizations, a sink's response-class table, a no-remedy table, a rule table, an
+   index), check every row against the code, not only the row the change touched. Fixing one
+   row per review round is how a PR takes seven rounds.
+3. **A test that can't fail.** For every new regression test, revert the fix, confirm the test
+   fails, restore the fix, and say so in the PR body. A test that passes on both sides of the
+   fix is the second-largest category of findings.
+4. **Banned words in comments.** Grep every comment line the branch added for the words the
+   comment rule bans (`exactly`, `actually`, `genuinely`, `deliberately`, `simply`, `just`,
+   `on purpose`, `load-bearing`).
+5. **A decision recorded only in a module doc.** Ask whether the branch made a decision a
+   maintainer would look for in an ADR (a wire form, a transport, a mode, a loss semantic) and
+   recorded it only in a module doc.
+
+Items 3 to 5 are rules in [Conventions to hold to](#conventions-to-hold-to). Open the PR before the
+fix rounds, not after them: a review posted on the PR, and a re-review of each fix as a delta
+against it, is what catches the list above. A review pass re-run by hand in the author's own
+session, approving its own fixes, is not a review.
 
 **To bring a branch with an open PR up to date with `main`, `git merge origin/main` — don't
 rebase.** A rebase rewrites the branch's commits, which means a force-push to update the PR; that's
@@ -745,7 +764,9 @@ Merged branches and PRs are never renamed to fit.
   `logit_pipeline::test_util` (`wait_until`, `TelemetryProbe`, `recv_batch`, `spawn_input`,
   `scratch_dir`, and the rest) rather than writing its own. A sleep only sizes a negative window.
   The eight rules, bind-before-spawn and the 5 s `RECV_TIMEOUT` among them, are in
-  [ADR `test-timing-and-observables`](docs/adr/test-timing-and-observables.md).
+  [ADR `test-timing-and-observables`](docs/adr/test-timing-and-observables.md). A regression
+  test is run once with its fix reverted to show it fails, and the PR body says so; a test that
+  passes on both sides of the fix pins nothing.
 - **A comment says what a maintainer would otherwise get wrong**: an invariant, a hidden
   constraint, a workaround, a wire fact. It explains why, and what only when the code can't.
   Concretely:
