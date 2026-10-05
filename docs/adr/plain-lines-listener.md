@@ -59,13 +59,14 @@ canonical copy of the framing and event rules.
   ([runtime gaps](../known-gaps/runtime.md)), and a `set` stage covers it for a listener with one
   known sender.
 - **TCP only.** The Datadog Agent's `logs` listener takes UDP too, and a local Unix socket is the
-  usual path for a same-host application. The shared drivers make the other transports free.
+  usual path for a same-host application. The shared drivers provide the other transports at no
+  extra cost.
 - **A parsing mode inside the listener** (`format: json`). It duplicates `json`, `logfmt`, `kv`, and
   `regex`, and every parsing option would have to be added to this one component as well.
 
 ## Consequences
-- A message with an embedded newline arrives as several events. The wire has no way to carry the
-  newline, so a `regex` or `lua` stage downstream has to merge them.
+- A message with an embedded newline arrives as several events. The wire can't carry the newline,
+  so a `regex` or `lua` stage downstream has to merge them.
 - A stream sender gets no acknowledgment beyond TCP flow control, and a partial last line at a
   close is lost, counted `truncated`.
 - A Splunk forwarder's `[tcpout]` output reaches `logit` without `host`, `source`, `sourcetype`, or

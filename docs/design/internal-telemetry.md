@@ -880,17 +880,17 @@ never fatal to the listener or its sibling connections.
 
 `crates/logit-inputs/src/lines.rs`, [ADR `plain-lines-listener`](../adr/plain-lines-listener.md).
 
-It has no layer-3 counters of its own. It runs on the shared drivers `statsd_in` does, so what it
-reports depends on its `transport:`:
+It has no layer-3 counters of its own. It runs on the same shared drivers as `statsd_in`, so what
+it reports depends on its `transport:`:
 
 - **`udp` and `unix`:** the datagram set `statsd_in` records, from the shared `UdpListener`.
 - **`tcp` and `unix_stream`:** the stream set from the shared `TcpListener`: the connection
   metrics, `logit.input.frames` / `.frame.bytes` (one frame is one LF-delimited line), and
   `logit.input.frames.dropped{reason="oversize"|"truncated"}`.
 
-`max_line_bytes` is enforced by the stream framer on `tcp` and `unix_stream`, and by the decoder on
-`udp` and `unix`. Both count a dropped line as `logit.input.frames.dropped{reason="oversize"}`, so
-the series means the same on every transport. On a datagram transport it is the only series of
+The stream framer enforces `max_line_bytes` on `tcp` and `unix_stream`, and the decoder enforces
+it on `udp` and `unix`. Both count a dropped line as `logit.input.frames.dropped{reason="oversize"}`,
+so the series means the same on every transport. On a datagram transport it's the only series of
 that name, and the rest of the datagram still decodes.
 
 `Diagnostics` keys: `bound`, the driver's keys, and the datagram decoder's throttled
@@ -1242,11 +1242,11 @@ the property the minimal-watch-set design is for.
 - `logit.input.connections` (gauge, sampled on every connect/disconnect) and
   `logit.input.connections.rejected{reason="limit"}` (count, the connection cap,
   `max_connections`, 1024 by default, binding). `otlp_in` and a TCP
-  `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` on the shared driver record the same pair; all five reject
-  at the cap rather than queueing behind a permit. Here a connection this
+  `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` on the shared driver record the same pair; all
+  six reject at the cap rather than queueing behind a permit. Here a connection this
   listener closed still counts, and holds its permit, while it lingers: after its last answer it
   reads and discards until the peer closes or for `handshake_timeout`.
-- `logit.input.connections.closed{reason="idle"}` (count), the third point all five share. Here the
+- `logit.input.connections.closed{reason="idle"}` (count), the third point all six share. Here the
   idle time is measured from the last frame handled rather than from bytes read, because a peer
   waiting on a delayed ack isn't idle. The close writes `Reject{GOING_AWAY, "idle for <dur>"}`, the
   same signal an ordinary shutdown sends, and returns `Ok(())`: it's never

@@ -29,7 +29,7 @@
 //!
 //! **`udp` and `unix`**: the driver hands [`LinesDecoder`] a whole datagram, which it splits on
 //! `LF` itself. A datagram's end also ends its last line, so an unterminated tail is emitted. The
-//! decoder enforces `max_line_bytes` here, since no framer did: an oversize line is dropped and
+//! decoder enforces `max_line_bytes` here, because no framer runs: an oversize line is dropped and
 //! counted as `logit.input.frames.dropped{reason="oversize"}` on the listener's own telemetry,
 //! the series the stream framer uses, with a throttled `oversize_line` diagnostic, and the rest
 //! of the datagram still decodes.

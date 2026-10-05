@@ -769,39 +769,38 @@ pub enum ComponentKind {
         #[serde(default = "default_max_connections")]
         max_connections: usize,
     },
-    /// Plain newline-delimited text, over TCP (the default), UDP, or a Unix socket: one line in is
-    /// one log event out, its message the line's bytes with nothing parsed. Compose `json`,
-    /// `logfmt`, `kv`, or `regex` downstream to give it structure.
+    /// Plain newline-delimited text over TCP (the default), UDP, or a Unix socket. Each line
+    /// becomes one log event whose message is the line's bytes, with nothing parsed. To give it
+    /// structure, add a `json`, `logfmt`, `kv`, or `regex` stage downstream.
     ///
-    /// Each line becomes a log event with no attributes, no severity, and a raw body, timestamped
-    /// when it was received. A trailing `\r` is stripped and an empty line is skipped. A line that
-    /// isn't valid UTF-8 is kept as a byte string rather than dropped. Nothing about the sender
-    /// (its address, host, or a source name) is attached; stamp what you need with a `set` stage
-    /// per listener.
+    /// The event has no attributes, no severity, and a raw body, and is timestamped when it was
+    /// received. A trailing `\r` is stripped and an empty line is skipped. A line that isn't
+    /// valid UTF-8 is kept as a byte string, not dropped. Nothing about the sender (its address,
+    /// host, or a source name) is attached; stamp what you need with a `set` stage per listener.
     ///
-    /// `bind` is a `host:port` under `tcp`/`udp`, and the socket file's absolute path, shorter
-    /// than 108 bytes, under `unix`/`unix_stream`. The directory must exist; a stale socket file
+    /// `bind` is a `host:port` under `tcp` and `udp`, and the socket file's absolute path, shorter
+    /// than 108 bytes, under `unix` and `unix_stream`. The directory must exist; a stale socket file
     /// left by an earlier run is replaced, and anything else at the path is refused. The socket
     /// file is made mode `0722`, so a client running as any user can send; restrict access with
     /// the directory's permissions.
     ///
-    /// Under `tcp` and `unix_stream` a line ends at its `\n`. An unterminated final line when the
-    /// connection closes is dropped and counted as
-    /// `logit.input.frames.dropped{reason="truncated"}`: a sender that died mid-write never
-    /// finished it. Under `udp` and `unix` a datagram holds one
-    /// or more lines, and its end also ends its last line.
+    /// Under `tcp` and `unix_stream`, a line ends at its `\n`. If the connection closes partway
+    /// through a line, that unterminated line is dropped and counted as
+    /// `logit.input.frames.dropped{reason="truncated"}`, because the sender never finished it.
+    /// Under `udp` and `unix`, a datagram holds one or more lines, and its end also ends its last
+    /// line.
     ///
-    /// A line has no way to carry a newline of its own: a multi-line message (a stack trace, a
+    /// A line can't carry a newline of its own, so a multi-line message (a stack trace, a
     /// pretty-printed JSON document) arrives as several events.
     ///
-    /// `tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS
-    /// listener. It applies to `transport: tcp` only and is rejected under any other transport.
+    /// `tls:` turns TLS on and makes it required, with no plaintext fallback. It's accepted under
+    /// `transport: tcp` only.
     ///
     /// A TCP or `unix_stream` listener has no receive queue (the connection's own flow control is
     /// the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
     /// `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields
     /// (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply
-    /// per connection: N live connections can hold up to N times `batch_max_events` in flight.
+    /// per connection, so N live connections can hold up to N times `batch_max_events` in flight.
     LinesIn {
         bind: String,
         #[serde(default)]
@@ -829,15 +828,15 @@ pub enum ComponentKind {
         /// `unix` is rejected.
         ///
         /// Recommended wherever steady traffic is expected: a connection quiet for longer than
-        /// this is an anomaly (a dead peer, a half-open socket, a slow-loris), and closing it
-        /// returns the slot. Set it well above the sender's longest normal gap. Leave it unset
+        /// this is an anomaly (a dead peer, a half-open socket, a slow-loris attack), and closing
+        /// it returns the slot. Set it well above the sender's longest normal gap. Leave it unset
         /// for sparse or bursty senders, and think twice on plaintext transports, where the
-        /// sender cannot detect the close before its next write.
+        /// sender can't detect the close before its next write.
         ///
         /// The clock runs only while this listener is waiting on the peer's socket, and resets on
         /// bytes read from the peer and on this listener handing an accumulated batch downstream.
-        /// Time blocked on a full downstream never counts, so a stalled pipeline cannot make a
-        /// busy connection look idle.
+        /// Time blocked on a full downstream never counts, so a stalled pipeline can't make a busy
+        /// connection look idle.
         ///
         /// An idle close is policy, not a fault: complete buffered lines are flushed downstream
         /// first (`logit.component.receive.flushed{reason="closed"}`), a buffered partial line is
@@ -847,20 +846,20 @@ pub enum ComponentKind {
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
-        /// The most connections this listener serves at once. One arriving past it is closed at
-        /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
-        /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
-        /// keep the total across listeners under the process's `nofile` limit.
+        /// The most connections this listener serves at once. A connection arriving past the cap
+        /// is closed immediately and counted `logit.input.connections.rejected{reason="limit"}`,
+        /// never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file
+        /// descriptor, so keep the total across listeners under the process's `nofile` limit.
         ///
-        /// Stream transports only (`tcp` and `unix_stream`); a datagram listener has no
-        /// connections, so a non-default value under `transport: udp` or `unix` is rejected.
+        /// `transport: tcp` or `unix_stream` only: a datagram listener has no connections, so a
+        /// non-default value under `transport: udp` or `unix` is rejected.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
-        /// The longest line this listener accepts, not counting its `\n`. A longer line is
-        /// dropped and counted once as `logit.input.frames.dropped{reason="oversize"}`, and the
-        /// line after it still decodes: a stream connection skips to the next newline and stays
-        /// open. A byte-count string (`"65536"`, `"64KiB"`). Defaults to `"64KiB"`; `0` is
-        /// rejected. Applies under every transport.
+        /// The longest line this listener accepts, not counting its `\n`, under every transport.
+        /// A longer line is dropped and counted once as
+        /// `logit.input.frames.dropped{reason="oversize"}`, and the line after it still decodes; a
+        /// stream connection skips to the next newline and stays open. A byte-count string
+        /// (`"65536"`, `"64KiB"`). Defaults to `"64KiB"`; `0` is rejected.
         #[serde(default = "default_lines_max_line_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_line_bytes: u64,
@@ -3277,12 +3276,12 @@ pub enum StatsdTransport {
     UnixStream,
 }
 
-/// `lines_in`'s transport. `tcp` (the default) is the reliable, framed transport, and what `tls:`
-/// needs underneath it; under it and `unix_stream` a line ends at its `\n`. Under `udp` and
-/// `unix` a datagram carries one or more newline-separated lines, and its end ends the last one.
+/// `lines_in`'s transport. `tcp` is the default and the only transport that takes `tls:`. Under
+/// `tcp` and `unix_stream` a line ends at its `\n`. Under `udp` and `unix` a datagram carries one
+/// or more newline-separated lines, and its end ends the last one.
 ///
 /// Under `unix` and `unix_stream`, `bind` is the socket's absolute path, shorter than 108 bytes,
-/// not a `host:port`, and `tls:` is rejected.
+/// not a `host:port`.
 // Its own enum rather than a shared one: schemars publishes a type's name into the schema's
 // `$defs`, so sharing would document this transport by pointing at a statsd-named type.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

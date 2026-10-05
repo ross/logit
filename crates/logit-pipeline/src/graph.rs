@@ -241,7 +241,7 @@
 //!     `%z`, `%:z`, or `%s`); or a pattern that is empty, has no hour and minute, uses `%Z`, `%Q`,
 //!     or `%:Q`, or fails to parse its own rendering of a reference instant
 //!     (`docs/adr/timestamp-transform.md`).
-//! 77. A `lines_in` `max_line_bytes` of `0`: every line would be dropped as oversize
+//! 77. A `lines_in` `max_line_bytes` of `0`: every non-empty line would be dropped as oversize
 //!     (`docs/adr/plain-lines-listener.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like

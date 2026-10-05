@@ -15,12 +15,12 @@ components:
   lines_in:
     type: lines_in
     bind: 0.0.0.0:5170
-    transport: tcp             # tcp (the default) | udp | unix | unix_stream -- tls: requires tcp
-    # Every field below is its default; omit it for the same effect.
+    transport: tcp             # tcp (the default) | udp | unix | unix_stream; tls: requires tcp
+    # Each field below shows its default, or an example value for one that's off unless set.
     # max_line_bytes: "64KiB"   # a longer line is dropped and counted; the next line still decodes
     # tls:                      # presence turns TLS on and makes it required; tcp only
-    #   cert_file: server.pem   # required -- this listener's own certificate chain
-    #   key_file: server.key    # required -- server.pem's private key
+    #   cert_file: server.pem   # required: this listener's own certificate chain
+    #   key_file: server.key    # required: server.pem's private key
     #   client_ca_file: null    # set for mutual TLS; omit for server-auth-only TLS
     # handshake_timeout: 5s     # tcp/unix_stream only; bounds the TLS accept and the wait for the
     #                             first byte separately. Not an idle timeout
