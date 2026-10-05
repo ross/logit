@@ -81,27 +81,22 @@ Entry format and the other areas: [the known-gaps index](README.md).
   writing the same series into one `prometheus_out` can send an older sample after a newer one. A
   single chain into one `prometheus_out` can't hit this.
   - **Consequence:** a receiver with no out-of-order window (stock Prometheus, Mimir without
-    `out_of_order_time_window`) answers `400`, which the sink classifies `Fault::Permanent` and
+    `out_of_order_time_window`) answers `400`, which the sink classifies `Fault::Rejected` and
     drops.
   - **Workaround:** use a topology that doesn't split one series across branches, or a receiver
     with an out-of-order window. The sink won't buffer its way out: a reorder window is
     `aggregate`-shaped state a sink doesn't hold.
-- **`influxdb_out` and `prometheus_in`'s scrape client still follow HTTP redirects.** Both build
-  their own `reqwest::Client` with no redirect policy (`crates/logit-outputs/src/influxdb.rs`'s
-  `build_client`, `crates/logit-inputs/src/prometheus.rs`'s scrape client), so they inherit
-  `reqwest`'s `limited(10)`.
-  - **Consequence:** a `301`/`302`/`303` is replayed as a body-less `GET`, so whatever answers it
-    becomes the verdict on a batch that was never written. A `307`/`308` replays the body and the
-    operator's `headers:` at the `Location` host, past a config-time `https://` check that has no
-    say at runtime. `reqwest` strips only `Authorization`/`Cookie`, and only on a host or port
-    change, so a tenant header always travels, as would `influxdb_out`'s token and a scrape URL's
-    basic-auth credential.
-  - **To close:** `otlp_out` and `prometheus_out`'s remote-write sender share
-    `crates/logit-outputs/src/http.rs`'s `build_client`, which turns redirects off; that helper's
-    doc comment has the reasoning. It isn't a one-line flip: `influxdb_out` keeps its own client
-    and its own `status_class`/`is_retryable_status`/`classify_transport_error` (the same table as
-    `http.rs`'s, as its module doc says), so closing this means moving it onto the shared client
-    and classifier.
+- **`prometheus_in`'s scrape client still follows HTTP redirects.** It builds its own
+  `reqwest::Client` with no redirect policy (`crates/logit-inputs/src/prometheus.rs`'s scrape
+  client), so it inherits `reqwest`'s `limited(10)`.
+  - **Consequence:** a `307`/`308` replays the request and the operator's `headers:` at the
+    `Location` host, past a config-time `https://` check that has no say at runtime. `reqwest`
+    strips only `Authorization`/`Cookie`, and only on a host or port change, so a tenant header
+    always travels, as would a scrape URL's basic-auth credential.
+  - **To close:** the HTTP sinks share `crates/logit-outputs/src/http.rs`'s `build_client`, which
+    turns redirects off; that helper's doc comment has the reasoning. `logit-inputs` doesn't
+    depend on `logit-outputs`, so the scrape client needs its own copy of the policy, or a shared
+    home for it.
 - **`logit.input.samples` means two different things depending on `prometheus_in`'s mode.**
   - Scrape mode counts the series a scrape decoded (`events.len()`, one event per series,
     `crates/logit-inputs/src/prometheus.rs`'s `tick`).
@@ -150,3 +145,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `prometheus.type="untyped"`: a counter can't be told from a gauge, and a histogram's `_bucket`,
   `_sum`, and `_count` arrive as unrelated series (verified, leg 9). VictoriaMetrics stores no
   metric type, so there's nothing for `logit` to recover.
+- **Some rows of `prometheus_out`'s and `influxdb_out`'s response-class tables rest on
+  documentation and secondhand bodies, not a recorded response.** `prometheus_out`'s Grafana Cloud
+  `401` body (`authentication error: invalid authentication credentials`) comes from a forum
+  post, and only a test uses it. `influxdb_out`'s `413` and parse-error (`unable to parse ...`)
+  texts follow InfluxDB's documentation and are unverified; that sink classifies by status alone,
+  so the text matters only to the diagnostic. The tables are
+  `crates/logit-outputs/src/prometheus.rs`, "Faults, retries and duplicate safety (sender mode)",
+  and `crates/logit-outputs/src/influxdb.rs`, "Response classes".
+  - **Consequence:** none known for `influxdb_out`. For `prometheus_out`, only the decompression
+    `400` reads the body; a receiver whose decompression text differs from the matched prefixes
+    reads as `Rejected` and drops the batch where it would hold.
+  - **Revisit trigger:** a recorded response from a real Grafana Cloud or InfluxDB stack.

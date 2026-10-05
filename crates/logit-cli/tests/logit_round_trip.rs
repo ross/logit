@@ -381,10 +381,20 @@ mod window {
     }
 
     /// `in -> out`, where `out` is `output` over a disk spool in `dir`. The `in` kind only names
-    /// a listener for graph resolution; its spec is a [`BurstInput`].
+    /// a listener for graph resolution; its spec is a [`BurstInput`] of [`BATCHES`] marked
+    /// batches.
     fn specs(
         output: LogitOutput,
         dir: std::path::PathBuf,
+    ) -> (graph::Graph, HashMap<String, NodeSpec>) {
+        specs_of(output, dir, (0..BATCHES).map(marked).collect())
+    }
+
+    /// [`specs`] with a [`BurstInput`] of `batches`.
+    fn specs_of(
+        output: LogitOutput,
+        dir: std::path::PathBuf,
+        batches: Vec<EventBatch>,
     ) -> (graph::Graph, HashMap<String, NodeSpec>) {
         let component = |sources: Vec<String>, kind| Component {
             buffer: BufferConfig::default(),
@@ -435,10 +445,7 @@ mod window {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(
-                Box::new(BurstInput((0..BATCHES).map(marked).collect())),
-                InputRuntimeConfig::default(),
-            ),
+            NodeSpec::Input(Box::new(BurstInput(batches)), InputRuntimeConfig::default()),
         );
         specs.insert(
             "out".to_string(),
@@ -447,7 +454,6 @@ mod window {
                 SinkStoreConfig::Disk(disk),
                 WriteLoopConfig {
                     retry: logit_pipeline::RetryConfig {
-                        total_budget: Duration::from_secs(60),
                         base_delay: Duration::from_millis(5),
                         max_delay: Duration::from_millis(50),
                     },
@@ -460,8 +466,18 @@ mod window {
 
     /// A running `logit_in` counting into `probe`, and every mark its consumer receives, in order.
     async fn spawn_listener(probe: &TelemetryProbe) -> (String, Arc<Mutex<Vec<i64>>>) {
+        spawn_listener_capped(probe, logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN).await
+    }
+
+    /// [`spawn_listener`] under `max_frame_bytes`.
+    async fn spawn_listener_capped(
+        probe: &TelemetryProbe,
+        max_frame_bytes: u32,
+    ) -> (String, Arc<Mutex<Vec<i64>>>) {
         let (addr, mut input) = bound_input(|input| {
-            input.with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"))
+            input
+                .with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"))
+                .with_max_frame_bytes(max_frame_bytes)
         })
         .await;
         let (tx, mut rx) = mpsc::channel(16);
@@ -524,6 +540,76 @@ mod window {
         let totals = probe.poll();
         assert_eq!(totals.gauge("logit.output.window", &[]), Some(1.0), "the flush dropped it");
         assert!(!totals.has("logit.input.batches.resends", &[]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One batch among [`BATCHES`] that `logit_in` refuses by name (past its decode budget) is
+    /// dropped alone through the runtime: counted `rejected` at both ends, its spooled record
+    /// committed, and every other batch delivered once, in order, on one connection
+    /// (`docs/adr/native-hop-ack-status.md`).
+    #[tokio::test]
+    async fn a_batch_logit_in_rejects_is_dropped_alone_and_the_window_goes_on() {
+        const REFUSED: usize = 57;
+        let mut probe = TelemetryProbe::new();
+        // A 1 KiB cap's decode budget is 4 KiB: five empty events exceed it in a few dozen bytes.
+        let (addr, marks) = spawn_listener_capped(&probe, 1024).await;
+        let output = LogitOutput::new(addr).with_window(32).with_telemetry(probe.telemetry(
+            "out",
+            "logit_out",
+            "sink",
+        ));
+        let batches = (0..BATCHES)
+            .map(|mark| match mark {
+                REFUSED => {
+                    let events =
+                        (0..5).map(|_| Event::empty(mark as i64, AttrMap::new())).collect();
+                    EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
+                }
+                _ => marked(mark),
+            })
+            .collect();
+        let dir = scratch_dir("logit-round-trip-window-rejected");
+        let (graph, specs) = specs_of(output, dir.clone(), batches);
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let run = tokio::spawn(logit_pipeline::run_with_telemetry(
+            graph,
+            specs,
+            HashMap::from([("out".to_string(), probe.telemetry("out", "logit_out", "sink"))]),
+            logit_pipeline::Readiness::disabled(),
+            async move {
+                let _ = shutdown_rx.wait_for(|&fired| fired).await;
+            },
+        ));
+        wait_until_within(
+            "every other batch to reach logit_in's consumer",
+            Duration::from_secs(30),
+            || marks.lock().unwrap().len() >= BATCHES - 1,
+        )
+        .await;
+        probe
+            .wait_for("the refused batch committed as dropped", |t| {
+                t.sum("logit.component.batches.dropped", &[("reason", "rejected")]) >= 1.0
+            })
+            .await;
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(RECV_TIMEOUT, run)
+            .await
+            .expect("run finishes once shutdown fires")
+            .unwrap()
+            .expect("run completes without error");
+
+        let expected: Vec<i64> =
+            (0..BATCHES as i64).filter(|&mark| mark != REFUSED as i64).collect();
+        assert_eq!(*marks.lock().unwrap(), expected, "each other batch once, in order");
+        let totals = probe.poll();
+        assert_eq!(totals.sum("logit.component.batches.dropped", &[("reason", "rejected")]), 1.0);
+        assert_eq!(totals.sum("logit.input.batches.dropped", &[("reason", "rejected")]), 1.0);
+        assert_eq!(totals.sum("logit.output.requests", &[("class", "rejected")]), 1.0);
+        assert_eq!(totals.sum("logit.output.requests", &[("class", "ok")]), (BATCHES - 1) as f64);
+        assert_eq!(totals.sum("logit.output.reconnects", &[]), 0.0, "one connection throughout");
+        assert!(!totals.has("logit.input.batches.resends", &[]));
+        assert_eq!(totals.sum("logit.component.buffer.disk.replayed", &[]), 0.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

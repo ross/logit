@@ -121,8 +121,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **A cancelled datagram send loses the counts of what it already sent.** A UDP sink, or
   `statsd_out` under `transport: unix`, counts `logit.output.messages` and
   `logit.output.datagrams` (and `graphite_out`'s `datapoints`) once `send_datagrams` returns, on
-  success and failure alike. A `send` dropped mid-batch, by the retry budget or the shutdown
-  grace, never returns, so the datagrams it already handed the kernel are never counted
+  success and failure alike. A `send` dropped mid-batch, by the shutdown grace, never returns, so
+  the datagrams it already handed the kernel are never counted
   (`crates/logit-outputs/src/datagram.rs`'s module doc). `logit.component.errors` records the
   cancelled attempt.
   - **To close:** count each datagram as it goes, at a telemetry call per datagram.

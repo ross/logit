@@ -79,8 +79,11 @@
 //! so a clock read per attempt could drop a point on one attempt and send it on the next. An `Ok`
 //! clears it, and the next `observe_batch` replaces it. A `send` with no `observe_batch` reads the
 //! clock itself only when no earlier batch left a time behind: after a batch whose last attempt
-//! failed, it reuses that batch's time (`docs/known-gaps/datadog.md`). A batch retried for
-//! `retry_budget` can send a point up to that long past its window.
+//! failed, it reuses that batch's time (`docs/known-gaps/datadog.md`).
+//!
+//! A retryable fault retries until the batch is delivered or shutdown cuts it, bounded by the
+//! sink's `buffer:`. Staleness is judged against the batch's one send time, so a batch held
+//! through a long outage can reach the intake with a point past its window.
 //!
 //! The series window is the documented one, and stricter than the intake, which stored older
 //! points in a trial-org run (`docs/plans/datadog-relay.md`, "Verification"). That plan's
@@ -144,24 +147,49 @@
 //! (2026-10-04)"). A request Datadog rejects is counted and the send goes on to the next request;
 //! a refused key, a `Clean` failure, or an `Ambiguous` one stops the send, and `write_loop` retries
 //! the whole batch, re-sending any request that had already succeeded. The send succeeds when any
-//! request was accepted, and fails with the first rejection when every request was rejected. The
-//! outcome is classified with [`crate::http`]'s helpers, with two additions for Datadog's
-//! documented retry set:
+//! request was accepted, and fails with the first rejection when every request was rejected.
 //!
-//! | Outcome | Result | The rest of the `send` |
-//! |---|---|---|
-//! | 2xx (logs answer `202`) | `Ok` | goes on |
-//! | 408, 429, any 5xx | [`Fault::Ambiguous`] | stops |
-//! | 403 | [`Fault::Permanent`], with a throttled `api_key_rejected` diagnostic saying Datadog refused the key | stops: every request would get the same answer |
-//! | 413 | [`Fault::Permanent`], and the request's entries counted `records.dropped{reason="oversize"}` | goes on |
-//! | any other 3xx or 4xx | [`Fault::Permanent`], the request's entries counted `records.dropped{reason="rejected"}`, with a throttled `request_rejected` diagnostic quoting the first 256 bytes of the body | goes on |
-//! | connect failure, before any request of this `send` was accepted | [`Fault::Clean`] | stops |
-//! | connect failure after one was | [`Fault::Ambiguous`] | stops |
-//! | any other transport error, timeout included | [`Fault::Ambiguous`] | stops |
+//! Datadog documents its intake statuses by HTTP code, the same on every route, with a free-text
+//! body; no documented body code changes a status's meaning, so the status decides. `Rejected`
+//! counts the request's entries `records.dropped{reason="rejected"}` (`oversize` for a `413`) with
+//! a throttled `request_rejected` diagnostic; a `403` warns `api_key_rejected`, and any other
+//! `Refused` warns `request_refused`. Each quotes the first 256 bytes of the body, scrubbed of the
+//! key.
 //!
-//! `Clean` means Datadog holds nothing of the batch, so once a request was accepted a connect
-//! failure on a later one is `Ambiguous` ([`crate::http::after_delivery`]). Redirects aren't
-//! followed ([`crate::http::build_client`] says why).
+//! | Response | Class | Why | Evidence |
+//! |---|---|---|---|
+//! | `2xx` (logs answer `202`) | `Ok` | accepted for processing | [send logs][logs-api] |
+//! | `400` | `Rejected` | "Bad request (likely an issue in the payload formatting)": this body; the Agent drops it too | [send logs][logs-api], [Agent retry guide][agent-retry] |
+//! | `401` | `Refused` | "Unauthorized (likely a missing API Key)": the key rides on every request | [send logs][logs-api] |
+//! | `403` | `Refused` | "Permission issue (likely using an invalid API Key)", or a key sent to another `site`: one org-wide key on every route, so every request gets it; the Agent retries it after refreshing the key | [send logs][logs-api], the Agent's [`transaction.go`][agent-tx] |
+//! | `404` | `Refused` | a route the configured base doesn't serve: a `site` or `endpoints:` override pointed at something that isn't the intake, the same for every batch that uses the route; the Agent's forwarder reschedules a `404` rather than drop it | the Agent's [`transaction.go`][agent-tx] |
+//! | `405`, `407` | `Refused` | the path to the intake, not the batch | [`crate::http::classify_status`] |
+//! | `408` | `Ambiguous` | "Request Timeout, request should be retried after some time" | [send logs][logs-api] |
+//! | `413` | `Rejected` | "Payload too large": this body; a smaller one would land, and the Agent drops it too | [send logs][logs-api], [Agent retry guide][agent-retry] |
+//! | `429` | `Ambiguous` | "Too Many Requests, request should be retried after some time", with `X-RateLimit-*` headers this sink doesn't read | [send logs][logs-api], [rate limits][rate-limits] |
+//! | any `5xx`, `501` included | `Ambiguous` | "request should be retried after some time"; may have been applied | [send logs][logs-api] |
+//! | any other `3xx` or `4xx` | `Rejected` | about this request; redirects are off ([`crate::http::build_client`]) | [Agent retry guide][agent-retry] |
+//! | connect failure, before any request of this `send` was accepted | `Clean` | nothing left the process | -- |
+//! | connect failure after one was | `Ambiguous` | Datadog holds part of the batch ([`crate::http::after_delivery`]) | -- |
+//! | any other transport error, timeout included | `Ambiguous` | the request may have been applied | -- |
+//!
+//! `Clean` and `Refused` mean Datadog holds nothing of the batch, so once a request was accepted a
+//! connect failure or a refusal on a later one is `Ambiguous` ([`crate::http::after_delivery`]):
+//! a route answered `Refused` after another route was accepted retries the whole batch under
+//! `at_least_once`, the accepted routes included, and drops it under `at_most_once`. That costs a
+//! resend of the accepted routes on every retry, and is kept because a refusal on one route holds
+//! for every batch: the routes share one org-wide key, so a `401` or `403` refuses them all, and a
+//! `404` names a route the configured base will refuse next time too. Reading such a route as
+//! `Rejected` instead would drop its records from every batch until the operator fixed the config,
+//! the loss `Refused` exists to prevent. Under `at_least_once` a resent series point overwrites
+//! and a resent log is stored again ("Delivery posture", below).
+//!
+//! [logs-api]: https://docs.datadoghq.com/api/latest/logs/#send-logs
+//! [rate-limits]: https://docs.datadoghq.com/api/latest/rate-limits/
+//! [agent-retry]: https://docs.datadoghq.com/agent/guide/agent-retry/
+//! [agent-tx]: https://github.com/DataDog/datadog-agent/blob/main/comp/forwarder/defaultforwarder/transaction/transaction.go
+//!
+//! Redirects aren't followed ([`crate::http::build_client`] says why).
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
 //! retries an `Ambiguous` attempt, and a batch spans several requests, so a retry re-sends the
@@ -196,9 +224,10 @@
 //! `rejected` count per attempt.
 
 use crate::accounting::BatchAccounting;
+use crate::http::classify_status;
 use crate::http::{
     build_client, classify_reqwest_error, error_read_bytes, read_body_prefix, redacted_snippet,
-    split_encode, status_class, Caps, Encoded, Outcomes, RefusesSink,
+    split_encode, status_class, Caps, Encoded, Outcomes,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -863,8 +892,8 @@ impl DatadogOutput {
     /// One request, one attempt (module doc's "Faults, retries, and duplicate safety").
     /// `request.bytes` counts a request that may have left: any answer, and any error but a
     /// [`Fault::Clean`] one, which never connected. A rejection counts the request's entries
-    /// dropped here, `oversize` for a `413` and `rejected` for any other 3xx or 4xx but a `403`,
-    /// whose error carries [`RefusesSink`].
+    /// dropped here, `oversize` for a `413` and `rejected` for any other 3xx or 4xx that
+    /// [`classify_status`] doesn't read as `Refused`.
     async fn post(&mut self, route: Route, encoded: Encoded, entries: usize) -> anyhow::Result<()> {
         let url = self.url(route);
         let tags = [("route", route.name())];
@@ -912,8 +941,8 @@ impl DatadogOutput {
         let key = self.api_key.to_str().unwrap_or_default();
         let body = read_body_prefix(response, error_read_bytes(key)).await;
         let snippet = redacted_snippet(&body, key);
-        let (fault, refuses_sink) = match status.as_u16() {
-            408 | 429 | 500..=599 => (Fault::Ambiguous, false),
+        let fault = match status.as_u16() {
+            408 | 429 | 500..=599 => Fault::Ambiguous,
             403 => {
                 self.diag.warn_throttled(
                     "api_key_rejected",
@@ -922,7 +951,7 @@ impl DatadogOutput {
                          that 'site' is the one the key belongs to"
                     ),
                 );
-                (Fault::Permanent, true)
+                Fault::Refused
             }
             413 => {
                 self.dropped(route, "oversize", entries);
@@ -933,27 +962,34 @@ impl DatadogOutput {
                          {snippet}"
                     ),
                 );
-                (Fault::Permanent, false)
+                Fault::Rejected
             }
-            _ => {
-                self.dropped(route, "rejected", entries);
-                self.diag.warn_throttled(
-                    "request_rejected",
-                    format_args!("{url} answered {status}, {entries} record(s) dropped: {snippet}"),
-                );
-                (Fault::Permanent, false)
-            }
+            _ => match classify_status(status) {
+                Fault::Refused => {
+                    self.diag.warn_throttled(
+                        "request_refused",
+                        format_args!("{url} answered {status}: {snippet}"),
+                    );
+                    Fault::Refused
+                }
+                other => {
+                    self.dropped(route, "rejected", entries);
+                    self.diag.warn_throttled(
+                        "request_rejected",
+                        format_args!(
+                            "{url} answered {status}, {entries} record(s) dropped: {snippet}"
+                        ),
+                    );
+                    other
+                }
+            },
         };
         let err = anyhow::anyhow!(
             "datadog_out: {} request to {url} failed ({status}): {snippet}",
             route.name()
         )
         .context(fault);
-        if refuses_sink {
-            Err(err.context(RefusesSink))
-        } else {
-            Err(err)
-        }
+        Err(err)
     }
 }
 
@@ -1423,8 +1459,94 @@ mod tests {
         for status in [408, 429, 500, 503] {
             assert_eq!(fault_for(status).await, Fault::Ambiguous, "{status}");
         }
-        for status in [301, 400, 403, 404, 413] {
-            assert_eq!(fault_for(status).await, Fault::Permanent, "{status}");
+        for status in [301, 400, 413] {
+            assert_eq!(fault_for(status).await, Fault::Rejected, "{status}");
+        }
+        for status in [401, 403, 404] {
+            assert_eq!(fault_for(status).await, Fault::Refused, "{status}");
+        }
+    }
+
+    async fn fault_with(status: u16, body: &'static str) -> Fault {
+        let (addr, _log) = intake(move |_| (status, body.into())).await;
+        let err = sink(addr).send_at(&batch(vec![gauge(NOW)]), NOW).await.unwrap_err();
+        logit_pipeline::classify(&err)
+    }
+
+    // One test per row of the module doc's "Faults, retries, and duplicate safety" table.
+
+    #[tokio::test]
+    async fn a_400_bad_request_is_rejected() {
+        let body = r#"{"errors":["Payload is not in the expected format"]}"#;
+        assert_eq!(fault_with(400, body).await, Fault::Rejected);
+    }
+
+    #[tokio::test]
+    async fn a_401_unauthorized_is_refused() {
+        assert_eq!(fault_with(401, r#"{"errors":["Unauthorized"]}"#).await, Fault::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_403_forbidden_is_refused() {
+        assert_eq!(fault_with(403, r#"{"errors":["Forbidden"]}"#).await, Fault::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_404_unserved_route_is_refused() {
+        assert_eq!(fault_with(404, "404 page not found").await, Fault::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_405_or_407_is_refused() {
+        for status in [405, 407] {
+            assert_eq!(fault_with(status, "").await, Fault::Refused, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_408_request_timeout_is_ambiguous() {
+        assert_eq!(fault_with(408, r#"{"errors":["Request Timeout"]}"#).await, Fault::Ambiguous);
+    }
+
+    #[tokio::test]
+    async fn a_413_payload_too_large_is_rejected() {
+        let body = r#"{"errors":["Request too large"]}"#;
+        assert_eq!(fault_with(413, body).await, Fault::Rejected);
+    }
+
+    #[tokio::test]
+    async fn a_429_too_many_requests_is_ambiguous() {
+        let body = r#"{"errors":["Too many requests"]}"#;
+        assert_eq!(fault_with(429, body).await, Fault::Ambiguous);
+    }
+
+    #[tokio::test]
+    async fn any_5xx_is_ambiguous() {
+        for status in [500, 501, 502, 503, 504] {
+            assert_eq!(fault_with(status, "").await, Fault::Ambiguous, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn any_other_3xx_or_4xx_is_rejected() {
+        for status in [302, 409, 415, 422] {
+            assert_eq!(fault_with(status, "").await, Fault::Rejected, "{status}");
+        }
+    }
+
+    /// A route refused after another was accepted retries the whole batch: `Ambiguous`, so
+    /// `at_least_once` resends and `at_most_once` drops, never a `Clean`-style resend under both.
+    #[tokio::test]
+    async fn a_refused_route_after_an_accepted_route_is_ambiguous() {
+        for status in [403, 404] {
+            let (addr, log) = intake(move |path| {
+                (if path == "/api/v2/series" { 202 } else { status }, String::new())
+            })
+            .await;
+            let b = batch(vec![gauge(NOW), log_event(NOW, "after")]);
+            let err = sink(addr).send_at(&b, NOW).await.unwrap_err();
+            assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{status}: {err:#}");
+            assert_eq!(paths(&log), ["/api/v2/series", "/api/v2/logs"], "{status}");
         }
     }
 
@@ -1461,14 +1583,14 @@ mod tests {
         assert_eq!(total(&points, RECORDS, &[("route", "series")]), 0.0);
     }
 
-    /// Every route rejected: each is counted, and the send fails explicitly `Permanent`.
+    /// Every route rejected: each is counted, and the send fails `Rejected`.
     #[tokio::test]
-    async fn every_route_rejected_fails_the_send_permanent() {
+    async fn every_route_rejected_fails_the_send_rejected() {
         let (addr, log) = intake(|_| (400, String::new())).await;
         let (registry, mut out) = metered(addr);
         let b = batch(vec![gauge(NOW), log_event(NOW, "after")]);
         let err = out.send_at(&b, NOW).await.unwrap_err();
-        assert!(logit_pipeline::is_explicitly_permanent(&err), "{err:#}");
+        assert_eq!(err.downcast_ref::<Fault>(), Some(&Fault::Rejected), "{err:#}");
         assert!(format!("{err:#}").contains("series"), "the first rejection: {err:#}");
         assert_eq!(paths(&log), ["/api/v2/series", "/api/v2/logs"]);
         let points = registry.drain(0);
@@ -1486,7 +1608,7 @@ mod tests {
         let (registry, mut out) = metered(addr);
         let b = batch(vec![gauge(NOW), log_event(NOW, "after")]);
         let err = out.send_at(&b, NOW).await.unwrap_err();
-        assert!(logit_pipeline::is_explicitly_permanent(&err), "{err:#}");
+        assert_eq!(err.downcast_ref::<Fault>(), Some(&Fault::Refused), "{err:#}");
         assert_eq!(paths(&log), ["/api/v2/series"]);
         assert_eq!(total(&registry.drain(0), RECORDS_DROPPED, &[]), 0.0);
     }
@@ -1705,9 +1827,9 @@ mod tests {
 
     use crate::test_support::{
         assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch,
-        at_least_once, bodies, fast_retry, http_recorder, per_path_recorder, recorded_paths,
-        refused_addr, sum_of, sums_through_write_loop, Recorded, Reply, SumSeries, Sums,
-        HUNG_REQUEST_BUDGET,
+        at_least_once, at_most_once, bodies, fast_retry, http_recorder, per_path_recorder,
+        recorded_paths, refused_addr, sum_of, sums_through_write_loop, Recorded, Reply, SumSeries,
+        Sums,
     };
     use logit_core::{Sum, Temporality};
     use logit_pipeline::test_util::TelemetryProbe;
@@ -2001,18 +2123,16 @@ mod tests {
         assert_eq!(reads.load(Ordering::SeqCst), 2, "one read per batch");
     }
 
-    /// The first batch's request never answers, and the retry budget drops it.
+    /// The first batch's request is answered `503`, an ambiguous failure `at_most_once` drops.
     #[tokio::test]
-    async fn a_batch_after_one_dropped_at_its_budget_reads_the_clock_again() {
-        let mut config = fast_retry();
-        config.retry.total_budget = HUNG_REQUEST_BUDGET;
-        assert_a_batch_after_a_dropped_one_reads_the_clock_again(|| Reply::Hang, config).await;
+    async fn a_batch_after_one_dropped_ambiguously_reads_the_clock_again() {
+        let unavailable = || Reply::Answer(503, Vec::new());
+        assert_a_batch_after_a_dropped_one_reads_the_clock_again(unavailable, at_most_once()).await;
     }
 
-    /// The first batch's request is answered `400`, a permanent failure that drops it at once,
-    /// with no real time involved.
+    /// The first batch's request is answered `400`, a rejection that drops it at once.
     #[tokio::test]
-    async fn a_batch_after_one_rejected_permanently_reads_the_clock_again() {
+    async fn a_batch_after_one_rejected_reads_the_clock_again() {
         let rejected = || Reply::Answer(400, b"bad request".to_vec());
         assert_a_batch_after_a_dropped_one_reads_the_clock_again(rejected, fast_retry()).await;
     }
@@ -2065,15 +2185,19 @@ mod tests {
         }
     }
 
-    /// A batch whose logs request never answers is cut off by the retry budget and dropped, and
-    /// the next batch counts its encode-side counters.
+    /// A batch whose logs request is answered `503` is dropped under `at_most_once`, and the next
+    /// batch counts its encode-side counters.
     #[tokio::test]
-    async fn a_datadog_batch_after_one_dropped_at_its_budget_counts_encode_side() {
-        let script = |p: &str, k| if p == LOGS && k == 0 { Reply::Hang } else { accepted(p) };
-        let mut config = fast_retry();
-        config.retry.total_budget = HUNG_REQUEST_BUDGET;
+    async fn a_datadog_batch_after_one_dropped_counts_encode_side() {
+        let script = |p: &str, k| {
+            if p == LOGS && k == 0 {
+                Reply::Answer(503, Vec::new())
+            } else {
+                accepted(p)
+            }
+        };
         let batches = vec![encode_side_batch(), encode_side_batch()];
-        let (sums, log) = run_dd(script, batches, config, instrumented).await;
+        let (sums, log) = run_dd(script, batches, at_most_once(), instrumented).await;
         assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
         assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
         assert_eq!(recorded_paths(&log), [SERIES, LOGS, SERIES, LOGS]);

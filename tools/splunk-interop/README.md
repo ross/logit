@@ -46,9 +46,8 @@ Every config passes `logit validate`: `script/validate` and the
 2. Brings the stack up with `docker compose up --wait`, which waits on Splunk's health check
    (`GET /services/collector/health`), on `splunk-init`, and on each `logit` service's `logit
    ready`, then starts `replay`.
-3. Lets traffic flow for `SPLUNK_INTEROP_WINDOW` seconds (default 60, at least 75 in cloud
-   mode, which outlasts the sink's 60 s retry budget for a connection it can't open), then
-   one telemetry interval more.
+3. Lets traffic flow for `SPLUNK_INTEROP_WINDOW` seconds (default 60), then one telemetry
+   interval more.
 4. Copies every service's log into the run directory and runs `check.py` in a
    `python:3.12-slim` container on the stack's network. `check.py` searches Splunk over REST
    (`/services/search/jobs/export`, `mstats`, `mcatalog`, `tstats`) for each leg, an event

@@ -186,14 +186,14 @@ async fn ack_true_is_acknowledged_by_the_listener() {
     assert_eq!(sum_tagged(&events, "logit.output.acks", "result", "timeout"), 0.0);
 }
 
-/// A token the listener doesn't list is refused permanently, and nothing is delivered.
+/// A token the listener doesn't list is refused, and nothing is delivered.
 #[tokio::test]
-async fn a_wrong_token_is_a_permanent_fault() {
+async fn a_wrong_token_is_a_refused_fault() {
     let (addr, mut rx) = listener().await;
     let mut out =
         SplunkHecOutput::new(format!("http://{addr}/services/collector"), "wrong").unwrap();
     let err = out.send(&logs()).await.unwrap_err();
-    assert_eq!(logit_pipeline::classify(&err), logit_pipeline::Fault::Permanent);
+    assert_eq!(logit_pipeline::classify(&err), logit_pipeline::Fault::Refused);
     assert_nothing_delivered(&mut rx).await;
 }
 

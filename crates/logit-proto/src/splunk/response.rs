@@ -57,8 +57,8 @@ impl HecStatus {
     // Codes 18 through 27: the codes and HTTP statuses are Splunk's documented ones; each `text`
     // is the best reading of Splunk's documentation. No run against a real Splunk has provoked
     // one, so the texts are unverified (ADR `splunk-hec-relay`, "Amendment: what W5's recorded
-    // traffic and the Splunk run settled"; `docs/plans/splunk-relay.md`, "Settled by W5"). Codes
-    // 21, 22, 24, and 25 aren't modeled.
+    // traffic and the Splunk run settled"; `docs/plans/splunk-relay.md`, "Settled by W5"), as are
+    // 21, 22, 24, and 25, from Splunk's "Troubleshoot HTTP Event Collector" table.
     pub const UNHEALTHY_QUEUES_FULL: HecStatus =
         HecStatus { code: 18, http: 503, text: "HEC is unhealthy, queues are full" };
     pub const UNHEALTHY_ACK_UNAVAILABLE: HecStatus =
@@ -68,8 +68,20 @@ impl HecStatus {
         http: 503,
         text: "HEC is unhealthy, queues are full, ack service unavailable",
     };
+    /// The `400` twin of code 4.
+    pub const INVALID_TOKEN_400: HecStatus =
+        HecStatus { code: 21, http: 400, text: "Invalid token" };
+    /// The `400` twin of code 1.
+    pub const TOKEN_DISABLED_400: HecStatus =
+        HecStatus { code: 22, http: 400, text: "Token disabled" };
     pub const SHUTTING_DOWN: HecStatus =
         HecStatus { code: 23, http: 503, text: "Server is shutting down" };
+    /// A `200`: the body was taken, with a warning.
+    pub const QUEUE_NEARING_CAPACITY: HecStatus =
+        HecStatus { code: 24, http: 200, text: "HEC queue is approaching its capacity limit" };
+    /// A `200`: the body was taken, with a warning.
+    pub const ACK_NEARING_CAPACITY: HecStatus =
+        HecStatus { code: 25, http: 200, text: "HEC ACK is approaching its capacity limit" };
     pub const QUEUE_AT_CAPACITY: HecStatus =
         HecStatus { code: 26, http: 429, text: "Queue at capacity" };
     pub const PERFORMANCE_LIMIT_REACHED: HecStatus =
@@ -85,7 +97,7 @@ impl HecStatus {
     };
 
     /// Every status above, in code order.
-    pub const ALL: [HecStatus; 25] = [
+    pub const ALL: [HecStatus; 29] = [
         Self::SUCCESS,
         Self::TOKEN_DISABLED,
         Self::TOKEN_REQUIRED,
@@ -107,7 +119,11 @@ impl HecStatus {
         Self::UNHEALTHY_QUEUES_FULL,
         Self::UNHEALTHY_ACK_UNAVAILABLE,
         Self::UNHEALTHY_QUEUES_FULL_ACK_UNAVAILABLE,
+        Self::INVALID_TOKEN_400,
+        Self::TOKEN_DISABLED_400,
         Self::SHUTTING_DOWN,
+        Self::QUEUE_NEARING_CAPACITY,
+        Self::ACK_NEARING_CAPACITY,
         Self::QUEUE_AT_CAPACITY,
         Self::PERFORMANCE_LIMIT_REACHED,
         Self::CHANNEL_MISSING_STICKY_LB,
@@ -288,7 +304,8 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(codes, sorted, "ALL is in code order, with no duplicate");
-        assert_eq!(HecStatus::from_code(21), None);
+        assert_eq!(codes, (0..=28).collect::<Vec<u16>>(), "every documented code, 0 to 28");
+        assert_eq!(HecStatus::from_code(29), None);
     }
 
     #[test]

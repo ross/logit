@@ -22,7 +22,7 @@ use bytes::{Bytes, BytesMut};
 use logit_core::{AttrMap, Event, EventBatch, LogRecord, Provenance, Resource, Severity, Value};
 use logit_proto::frame::{self, Compression};
 use logit_proto::graphite::{GraphiteDecoder, Protocol};
-use logit_proto::native::control::{self, Ack, Hello, HelloAck, Reject};
+use logit_proto::native::control::{self, Ack, AckStatus, Hello, HelloAck, Reject};
 use logit_proto::native::varint::{read_uvarint, write_uvarint};
 use logit_proto::native::{self, DecodeBudget, NativeDecoder};
 use logit_proto::otlp::generated::opentelemetry::proto::common::v1 as otlp_common;
@@ -303,7 +303,15 @@ fn sample_hello_ack() -> HelloAck {
 }
 
 fn sample_ack() -> Ack {
-    Ack { id: [3; 16], seq: 7 }
+    Ack::accepted([3; 16], 7)
+}
+
+fn sample_rejected_ack() -> Ack {
+    Ack {
+        id: [3; 16],
+        seq: 7,
+        status: AckStatus::rejected(control::ACK_REJECTED_DECODE_BUDGET, "over the decode budget"),
+    }
 }
 
 fn sample_reject() -> Reject {
@@ -436,6 +444,31 @@ fn decode_hop_batch_survives_seeded_bit_flips() {
     assert_bit_flips_never_panic(&payload, 5000, |bytes| {
         native::decode_hop_batch(bytes, &DecodeBudget::default()).is_ok()
     });
+}
+
+/// The prefix alone, as `logit_in` reads it from a frame it may refuse: every truncation short of
+/// the whole pair fails.
+#[test]
+fn read_hop_prefix_survives_every_single_byte_truncation() {
+    let payload = native::encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq());
+    let prefix_len = 16 + 3; // a 3-byte uvarint for 1_000_000
+    assert_every_truncation_fails_cleanly(&payload[..prefix_len], |bytes| {
+        native::read_hop_prefix(bytes).is_err()
+    });
+}
+
+#[test]
+fn read_frame_prefix_survives_truncation_and_bit_flips() {
+    let payload = native::encode_hop_batch(&sample_batch(), sample_provenance(), sample_seq());
+    for compression in [Compression::None, Compression::Lz4] {
+        let framed = frame::write_frame(native::CODEC_HOP_BATCH, compression, &payload).unwrap();
+        assert_every_truncation_fails_cleanly(&framed, |bytes| {
+            frame::read_frame_prefix(bytes, native::HOP_PREFIX_MAX_LEN).is_err()
+        });
+        assert_bit_flips_never_panic(&framed, 3000, |bytes| {
+            frame::read_frame_prefix(bytes, native::HOP_PREFIX_MAX_LEN).is_ok()
+        });
+    }
 }
 
 /// `decode_hop_batch` rejects a bare batch payload rather than decoding it as "no provenance".
@@ -693,14 +726,18 @@ fn hello_ack_survives_seeded_bit_flips() {
 
 #[test]
 fn ack_survives_every_single_byte_truncation() {
-    let encoded = sample_ack().encode();
-    assert_every_truncation_never_panics(&encoded, |bytes| Ack::decode(bytes).is_err());
+    for ack in [sample_ack(), sample_rejected_ack()] {
+        let encoded = ack.encode();
+        assert_every_truncation_never_panics(&encoded, |bytes| Ack::decode(bytes).is_err());
+    }
 }
 
 #[test]
 fn ack_survives_seeded_bit_flips() {
-    let encoded = sample_ack().encode();
-    assert_bit_flips_never_panic(&encoded, 3000, |bytes| Ack::decode(bytes).is_ok());
+    for ack in [sample_ack(), sample_rejected_ack()] {
+        let encoded = ack.encode();
+        assert_bit_flips_never_panic(&encoded, 3000, |bytes| Ack::decode(bytes).is_ok());
+    }
 }
 
 #[test]
@@ -734,6 +771,7 @@ fn control_message_dispatch_survives_every_single_byte_truncation_of_every_messa
         sample_hello().encode(),
         sample_hello_ack().encode(),
         sample_ack().encode(),
+        sample_rejected_ack().encode(),
         sample_reject().encode(),
     ] {
         assert_every_truncation_never_panics(&encoded, |bytes| {

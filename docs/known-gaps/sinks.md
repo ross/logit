@@ -42,6 +42,31 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
   A user-supplied `format:` *template* over the human render has room in the `Format` enum but
   isn't implemented.
+- **`stdio_out` to a stdout or stderr pipe has no write bound.** A pipe reader that stops
+  reading (a stalled log shipper, a paused `less`) fills the pipe, and the write never returns.
+  tokio writes stdout and stderr on a blocking thread: a timeout around the write would return,
+  but it can't cancel the write on that thread, and every later write queues behind it, so the
+  sink can't bound the attempt as `Output::send`'s contract asks.
+  - **Consequence:** the sink holds silently until shutdown. No attempt fails, so
+    `logit.component.retrying` never reads `1` and no `retrying` line is logged; the queue fills
+    behind it under its `buffer:` bounds.
+  - **Workaround:** write to a file with `file_out`, and have the reader follow the file.
+- **No runtime bound on a sink's attempt; each sink bounds its own.** The runtime wraps
+  `Output::send` in no timeout ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "A
+  retryable fault retries until it succeeds"). The HTTP and gRPC sinks bound each request with
+  `request_timeout`, the stream sinks bound each write's progress with `connect_timeout`, the Unix
+  datagram send has its `send_timeout`, and `logit_out` bounds each write and acknowledgment wait
+  with `request_timeout`. `stdio_out` to a pipe has no bound (the entry above).
+  - **Consequence:** a sink whose write or acknowledgment wait has no transport timeout holds its
+    queue silently when the destination stops answering: no attempt fails, so
+    `logit.component.retrying` stays `0` and no `retrying` line is logged. Only the shutdown grace
+    cuts it.
+  - **Rule for a sink author:** give every write and acknowledgment wait a sink makes its own
+    timeout, and classify a timeout that fires as `Ambiguous` (or `Clean` when nothing left the
+    process).
+  - **Alternative declined:** a runtime backstop timeout above every sink's own. Each sink's
+    timeout is configurable per component, so a backstop set above it needs a graph rule tying the
+    two, for a case the per-sink rule already covers.
 - **The human render shows everything on the event but the batch's provenance.** `stdio_out`'s
   block (ADR `human-render-block-format`) is exhaustive over `Event`, `Resource`, and `Scope`.
   A batch's `origin`/`previous` reach a sink only through `Output::observe_batch`, which
@@ -61,4 +86,5 @@ Entry format and the other areas: [the known-gaps index](README.md).
   [ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md).
   - **Related:** a write that succeeds followed by a flush that fails leaves
     `FileTarget::note_written` uncalled for bytes that may have reached the file, so a size
-    rotation can come late. The error carries no `Fault`, so the batch isn't retried.
+    rotation can come late. The error carries no `Fault`, so the batch drops as `Rejected`
+    instead of retrying.

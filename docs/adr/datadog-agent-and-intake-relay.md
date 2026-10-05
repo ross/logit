@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-09-30
+updated: 2026-10-04
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -303,3 +303,31 @@ trial-org run's; Consequences and decision 14 have what it settled.
 ## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
 
 `Output::duplicate_safe()` is gone, and `at_least_once` is every sink's default posture. `datadog_out` and `datadog_trace_out` now retry an `Ambiguous` fault for up to `buffer.retry_budget` by default, and a resend adds to the kinds Datadog aggregates (distribution points, sketches, APM stats) with no upstream remedy. The statements above that `duplicate_safe()` is `false` describe the earlier default; `buffer.delivery: at_most_once` restores it. See [`delivery-semantics.md`](delivery-semantics.md) item 5.
+
+## Amendment: response classes (2026-10-04)
+
+Under [ADR `sink-fault-classes`](sink-fault-classes.md), each sink records how it classifies a
+destination's answers. The Datadog sinks' tables are the "Faults, retries, and duplicate safety"
+sections of `crates/logit-outputs/src/datadog.rs` and `crates/logit-outputs/src/datadog_trace.rs`.
+The decisions:
+
+- **`datadog_out`.** A `401` or `403` is `Refused`: the routes share one org-wide key, so every
+  request would get it. A `404` is `Refused` too: it names a route the configured `site` or
+  `endpoints:` base doesn't serve, which every batch would hit, and the Agent's forwarder
+  reschedules a `404` rather than drop it. A `405` or `407` is `Refused` (the path to the intake).
+  A `400`, a `413`, and any other `4xx` are `Rejected`, as the Agent drops `400` and `413`; `408`,
+  `429`, and any `5xx`, `501` included, are `Ambiguous`.
+- **`datadog_trace_out`.** A `404` is `Refused`: the Agent doesn't serve the sink's `version:`
+  route, so every batch gets it (a tracer answers the same `404` by downgrading its API version).
+  A `415` is `Refused` for the same reason: the Agent doesn't take that version's body format. A
+  `401`, `403`, `405`, or `407` is `Refused`: the Agent has no credential, so a proxy or a wrong
+  path answered. An Agent's `429` is `Clean` before any request of the send was accepted, because
+  the receiver turns the payload away before reading it ("trace-agent is overwhelmed, a payload has
+  been rejected"), and `Ambiguous` after one was. A `400` and a `413` are `Rejected`.
+- **A route refused after another was accepted retries the batch whole.** The refusal reads as
+  `Ambiguous` (`crate::http::after_delivery`), so `at_least_once` resends every route, the accepted
+  ones included, and `at_most_once` drops the batch. Reading the refused route as `Rejected`
+  instead would drop that route's records from every batch until the operator fixed the key, the
+  base URL, or the `version:`, the loss `Refused` exists to prevent. The resend costs a second copy
+  of what the accepted routes carried: a series point overwrites, a log or trace is stored again
+  (this record's "Delivery posture" text).

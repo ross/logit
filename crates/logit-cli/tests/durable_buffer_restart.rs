@@ -156,7 +156,8 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
     const SUCCEED_FIRST_RUN: u64 = 10;
 
     // --- Run 1: push everything, let the first 10 succeed and commit, then jam retrying the
-    // 11th forever (a huge retry budget), and kill the whole runtime with no shutdown signal.
+    // 11th forever (a retryable fault retries until it succeeds), and kill the whole runtime with
+    // no shutdown signal.
     let run1_attempts = Arc::new(Mutex::new(Vec::new()));
     {
         let (graph, disk_config) = graph_and_topology(spool_dir.clone());
@@ -183,7 +184,6 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
                 SinkStoreConfig::Disk(disk_config),
                 WriteLoopConfig {
                     retry: logit_pipeline::RetryConfig {
-                        total_budget: Duration::from_secs(3600),
                         base_delay: Duration::from_millis(5),
                         max_delay: Duration::from_millis(5),
                     },

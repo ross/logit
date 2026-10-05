@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-01
+updated: 2026-10-05
 ---
 
 # Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed
@@ -93,6 +93,11 @@ nature. The encode-side counters are the only ones that measure the batch and no
      before any datagram of the attempt was sent, under either posture, since that failure is
      `Clean` and `Clean` retries under both; and any `Ambiguous` retry under `at_least_once`,
      which is `graphite_out`'s default.
+
+     [For `otlp_out`, a rejected signal's `records.dropped{reason="rejected"}` counts once per
+     batch: [ADR `sink-fault-classes`](sink-fault-classes.md)'s "Amendment: `otlp_out` retries per
+     signal (2026-10-05)" remembers the signal and a retry doesn't resend it. The Datadog and
+     Splunk sinks still count their server-verdict drops per attempt.]
 
    `docs/design/internal-telemetry.md` and `docs/deploying.md` state the third class's
    repetition, so an operator reading a drop counter on an unhealthy sink knows what it measures.
@@ -1086,3 +1091,17 @@ Unix socket for `datadog_trace_out`. Each applies it outside the code that count
 `logit.output.requests{class}` and `logit.output.request.bytes`, so a refused request still
 counts `network_error` and no bytes after an accepted one. The three `docs/known-gaps/` entries
 are closed.
+
+[`otlp_out` no longer applies it: [ADR `sink-fault-classes`](sink-fault-classes.md)'s
+"Amendment: `otlp_out` retries per signal (2026-10-05)" keeps the signals a batch's destination
+settled beside this record's per-batch gate, and a retry resends none of them.]
+
+## Amendment: a refused handshake holds, and nothing ends the pipeline (2026-10-04)
+
+Decision 11's last sentence is superseded by [ADR `sink-fault-classes`](sink-fault-classes.md):
+`PERMANENT_FAILURE_WINDOW` is gone, and no run of sink outcomes ends the pipeline. A `HelloAck`
+that doesn't answer the `Hello`, and a `REJECT_VERSION_MISMATCH` or `REJECT_NO_COMMON_CODEC`
+reject, are the peer refusing every frame, so each is `Refused`: the head holds and retries with
+backoff, bounded by the sink's `buffer:`. `logit_out`'s pre-connect too-large error is `Rejected`,
+dropped at once, where decision 3's `class=permanent` accounting read `Permanent`. The
+`class` label's `permanent` value is renamed with the variant in W1 of the `fault/` stream.

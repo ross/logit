@@ -243,6 +243,111 @@ pub fn read_frame_with_header(bytes: &mut Bytes) -> Result<(FrameHeader, Bytes),
     Ok((header, payload))
 }
 
+/// Reads one frame off the front of `bytes` as [`read_frame_with_header`] does, CRC included, but
+/// returns only the first `min(max, uncompressed_len)` bytes of its payload, and never sizes an
+/// allocation from `uncompressed_len`. For a frame whose payload is past the reader's bound: the
+/// compressed bytes are already in hand, and the reader needs only what leads the payload
+/// (`logit_in` reads a hop frame's sender pair to answer it by name). The sanity cap on
+/// `compressed_len` still applies; the one on `uncompressed_len` doesn't.
+///
+/// An lz4 payload is decoded only as far as its first `max` bytes ([`lz4_prefix`]), so the bytes
+/// past them are never checked: a corrupt tail goes unnoticed, which the CRC makes unlikely.
+pub fn read_frame_prefix(
+    bytes: &mut Bytes,
+    max: usize,
+) -> Result<(FrameHeader, Bytes), CodecError> {
+    let header = FrameHeader::read(bytes)?;
+    if header.compressed_len > MAX_SANE_COMPRESSED_LEN {
+        return Err(CodecError::Malformed(format!(
+            "frame declares {} compressed bytes, over the {MAX_SANE_COMPRESSED_LEN} sanity cap",
+            header.compressed_len
+        )));
+    }
+    if (bytes.len() as u64) < header.compressed_len as u64 {
+        return Err(CodecError::Truncated { needed: header.compressed_len as usize - bytes.len() });
+    }
+    let compressed = bytes.split_to(header.compressed_len as usize);
+    if crc32c::crc32c(&compressed) != header.crc32c {
+        return Err(CodecError::Malformed("crc32c mismatch -- frame is corrupt".to_string()));
+    }
+    let want = max.min(header.uncompressed_len as usize);
+    let prefix = match header.compression {
+        Compression::None => {
+            if compressed.len() < want {
+                return Err(CodecError::Malformed(format!(
+                    "frame carries {} payload bytes, fewer than the {want} its header implies",
+                    compressed.len()
+                )));
+            }
+            compressed.slice(..want)
+        }
+        Compression::Lz4 => Bytes::from(lz4_prefix(&compressed, want)?),
+        Compression::Zstd => {
+            return Err(CodecError::Unsupported(
+                "zstd frames are not decodable yet -- see Compression::Zstd's own doc comment"
+                    .to_string(),
+            ))
+        }
+    };
+    Ok((header, prefix))
+}
+
+/// Decodes the first `want` bytes of an lz4 block, by the block format's sequence grammar (a
+/// token, literals, a two-byte little-endian offset, a match), and stops there. Work and output
+/// are bounded by `want`, however long the block's literal and match runs declare themselves. A
+/// block that ends, or names an offset outside what it has produced, before `want` bytes is
+/// `Malformed`.
+fn lz4_prefix(block: &[u8], want: usize) -> Result<Vec<u8>, CodecError> {
+    fn malformed(what: &str) -> CodecError {
+        CodecError::Malformed(format!("lz4 block prefix: {what}"))
+    }
+    /// A run length: the token's 4-bit field, plus 255-continued extension bytes when it's 15.
+    /// Saturates rather than overflow; a run is never copied past `want` anyway.
+    fn run_len(block: &[u8], at: &mut usize, nibble: u8) -> Result<usize, CodecError> {
+        let mut len = usize::from(nibble);
+        if nibble == 15 {
+            loop {
+                let byte = *block.get(*at).ok_or_else(|| malformed("truncated run length"))?;
+                *at += 1;
+                len = len.saturating_add(usize::from(byte));
+                if byte != 255 {
+                    break;
+                }
+            }
+        }
+        Ok(len)
+    }
+
+    let mut out = Vec::with_capacity(want);
+    let mut at = 0;
+    while out.len() < want {
+        let token = *block.get(at).ok_or_else(|| malformed("block ends before the prefix"))?;
+        at += 1;
+        let literals = run_len(block, &mut at, token >> 4)?;
+        let take = literals.min(want - out.len());
+        let run = block.get(at..at + take).ok_or_else(|| malformed("truncated literals"))?;
+        out.extend_from_slice(run);
+        if out.len() == want {
+            break;
+        }
+        at += literals;
+        let offset = match block.get(at..at + 2) {
+            Some(&[lo, hi]) => usize::from(u16::from_le_bytes([lo, hi])),
+            _ => return Err(malformed("block ends before the prefix")),
+        };
+        at += 2;
+        if offset == 0 || offset > out.len() {
+            return Err(malformed("match offset outside the output"));
+        }
+        let matched = run_len(block, &mut at, token & 0x0f)?.saturating_add(4);
+        let start = out.len() - offset;
+        for i in 0..matched.min(want - out.len()) {
+            out.push(out[start + i]);
+        }
+    }
+    Ok(out)
+}
+
 /// How many bytes off the front of `bytes` [`read_frame_with_header`] reads: the header plus its
 /// declared `compressed_len`, clamped to `bytes.len()`. A `compressed_len` over the sanity cap
 /// counts as zero, because `read_frame_with_header` rejects it before looking at the body.
@@ -303,6 +408,69 @@ mod tests {
         assert_eq!(codec, 1);
         assert_eq!(&out[..], payload);
         assert!(bytes.is_empty(), "read_frame should consume exactly one frame");
+    }
+
+    /// Every prefix length of an lz4 frame, of a compressible payload (matches, overlapping ones
+    /// included) and an incompressible one, equals the same bytes of the whole decode.
+    #[test]
+    fn read_frame_prefix_matches_the_whole_decode_at_every_length() {
+        let mut incompressible = Vec::new();
+        let mut x: u32 = 0x9e37_79b9;
+        for _ in 0..600 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            incompressible.push(x as u8);
+        }
+        let compressible = [b"abcabcabcabc".repeat(40), b"z".repeat(300)].concat();
+        for payload in [compressible, incompressible] {
+            for compression in [Compression::None, Compression::Lz4] {
+                let framed = write_frame(2, compression, &payload).unwrap();
+                for max in [0, 1, 17, 26, 100, payload.len(), payload.len() + 5] {
+                    let (header, prefix) = read_frame_prefix(&mut framed.clone(), max).unwrap();
+                    assert_eq!(header.uncompressed_len as usize, payload.len());
+                    assert_eq!(&prefix[..], &payload[..max.min(payload.len())], "{max}");
+                }
+            }
+        }
+    }
+
+    /// A payload past the uncompressed sanity cap is never allocated: only its prefix is decoded.
+    #[test]
+    fn read_frame_prefix_ignores_the_uncompressed_cap() {
+        let payload = b"a hop prefix and a large body".repeat(10);
+        let framed = write_frame(2, Compression::Lz4, &payload).unwrap();
+        let mut raw = BytesMut::from(&framed[..]);
+        raw[12..16].copy_from_slice(&(MAX_SANE_UNCOMPRESSED_LEN + 1).to_le_bytes());
+        let (_, prefix) = read_frame_prefix(&mut raw.freeze(), 26).unwrap();
+        assert_eq!(&prefix[..], &payload[..26]);
+    }
+
+    #[test]
+    fn read_frame_prefix_checks_the_crc() {
+        let framed = write_frame(2, Compression::Lz4, &b"prefix".repeat(20)).unwrap();
+        let mut raw = BytesMut::from(&framed[..]);
+        let last = raw.len() - 1;
+        raw[last] ^= 0xff;
+        assert!(matches!(
+            read_frame_prefix(&mut raw.freeze(), 26),
+            Err(CodecError::Malformed(m)) if m.contains("crc32c")
+        ));
+    }
+
+    #[test]
+    fn lz4_prefix_refuses_a_block_too_short_or_an_offset_outside_the_output() {
+        // A token of 2 literals and a 4-byte match, then the literals, then offset 3: past the
+        // two bytes produced.
+        assert!(lz4_prefix(&[0x20, b'a', b'b', 3, 0], 10).is_err());
+        // Offset 0.
+        assert!(lz4_prefix(&[0x20, b'a', b'b', 0, 0], 10).is_err());
+        // Ends after the literals with more wanted.
+        assert!(lz4_prefix(&[0x20, b'a', b'b'], 10).is_err());
+        // Declares 15 + 255 + 4 literals and carries two.
+        assert!(lz4_prefix(&[0xf0, 255, 4, b'a', b'b'], 10).is_err());
+        // An overlapping match: offset 1 repeats the last byte.
+        assert_eq!(lz4_prefix(&[0x1f, b'a', 1, 0, 3], 8).unwrap(), b"aaaaaaaa");
     }
 
     #[test]

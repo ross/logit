@@ -52,5 +52,5 @@ components:
     #   cert_file: client.pem     # cert_file/key_file together, for mutual TLS
     #   key_file: client.key
     # buffer: (all defaults, docs/adr/buffered-sink-delivery.md). The sink itself never retries;
-    #         the buffer's retry budget covers a 429 or 5xx, and a replayed request is an
+    #         the buffer retries a 429 or 5xx until it succeeds, and a replayed request is an
     #         idempotent overwrite.

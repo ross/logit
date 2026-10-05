@@ -33,7 +33,7 @@ mod tls;
 pub use logit_pipeline::Output;
 
 /// Counts `logit.output.requests` for one returned attempt, tagged with its fault class
-/// (`ok|clean|ambiguous|permanent`; ADR `sink-send-path-and-attempt-accounting`, decision 4).
+/// (`ok|clean|ambiguous|rejected|refused`; ADR `sink-send-path-and-attempt-accounting`, decision 4).
 /// The pooled-stream driver, `logit_out`, and the datagram sinks all count through it, so every
 /// transport of every one of them has one vocabulary.
 pub(crate) fn count_request<T>(telemetry: &logit_core::Telemetry, result: &anyhow::Result<T>) {
@@ -42,7 +42,8 @@ pub(crate) fn count_request<T>(telemetry: &logit_core::Telemetry, result: &anyho
         Err(err) => match logit_pipeline::classify(err) {
             logit_pipeline::Fault::Clean => "clean",
             logit_pipeline::Fault::Ambiguous => "ambiguous",
-            logit_pipeline::Fault::Permanent => "permanent",
+            logit_pipeline::Fault::Rejected => "rejected",
+            logit_pipeline::Fault::Refused => "refused",
         },
     };
     telemetry.count("logit.output.requests", 1.0, &[("class", class)]);

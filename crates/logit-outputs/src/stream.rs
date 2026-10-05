@@ -3,16 +3,25 @@
 //! one frame written per `send` (ADR `sink-send-path-and-attempt-accounting`, decisions 4 to 6).
 //!
 //! A caller builds the frame with its own framing and counts its own encode-side and per-message
-//! results; [`PooledStream::send`] sees only the bytes. The driver owns the rest:
+//! results; [`PooledStream::send`] sees only the bytes. A stream has no application response, so
+//! the I/O outcome decides the class, for `syslog_out`, `statsd_out`, and `graphite_out` alike. An
+//! encode-side refusal (a message over the sink's cap) is the caller's: dropped and counted per
+//! message, never a `Fault`. The Evidence column names the test that pins each row.
 //!
-//! - **Dial** (TCP connect, TLS handshake, or Unix connect, each under `connect_timeout`):
-//!   `Fault::Clean`, not retried inside `send`.
-//! - **Probe of a reused connection** answers anything but open: no fault; the driver redials, and
-//!   the redial doesn't consume the retry.
-//! - **Plaintext first `write`** fails (`Err`, or `Ok(0)` read as `WriteZero`): retried once on
-//!   a fresh connection; a second failure is `Fault::Clean`.
-//! - **TLS first `write`** fails: `Fault::Ambiguous`, never retried.
-//! - **`write_all` of the remainder, or `flush`**, fails: `Fault::Ambiguous`, never retried.
+//! | Response | Class | Why | Evidence |
+//! |---|---|---|---|
+//! | dial failure: TCP connect refused, DNS failure, TLS handshake failure or stall, Unix connect, each under `connect_timeout` | `Clean`, not retried inside `send` | no byte of the frame left | `a_refused_dial_is_clean_leaves_the_pool_empty_and_counts_no_reconnect`, `a_stalled_tls_handshake_times_out_clean_within_twice_the_connect_timeout`, `unix_stream_dial_failures_are_clean` |
+//! | a reused connection's probe answers anything but open (EOF, unsolicited bytes, a reset) | no fault: the driver redials, and the redial doesn't consume the retry | the old connection was dead before this frame | `a_reused_connection_that_probes_eof_is_redialed_and_the_retry_survives`, `a_reused_connection_that_probes_unsolicited_bytes_is_redialed_and_the_retry_survives`, `unix_stream_redials_when_the_probe_finds_the_pooled_connection_closed` |
+//! | the plaintext first `write` fails (`Err`, or `Ok(0)` read as `WriteZero`) | retried once on a fresh connection; a second failure is `Clean` | a failed plaintext first write accepted nothing | `a_plaintext_first_write_error_is_retried_once_then_clean`, `a_plaintext_first_write_of_zero_bytes_is_write_zero_retried_once_then_clean`, `unix_stream_retries_a_first_write_the_peer_refused` |
+//! | the plaintext first `write` makes no progress for `connect_timeout` | `Clean`, the connection dropped | it accepted nothing | `a_stalled_plaintext_first_write_is_clean` |
+//! | the TLS first `write` fails | `Ambiguous`, never retried | rustls may have put whole records on the wire first (below) | `a_tls_write_error_is_ambiguous_and_never_retried` |
+//! | the remainder's `write_all`, or the `flush`, fails, a reset mid-frame included | `Ambiguous`, never retried | part of the frame left, and a line receiver keeps every complete line it got | `a_remainder_failure_after_a_short_first_write_is_ambiguous_and_never_resent`, `a_flush_failure_after_a_complete_write_is_ambiguous_and_drops_the_connection`, `a_real_reset_mid_frame_is_ambiguous` |
+//! | any other write, or the flush, makes no progress for `connect_timeout` | `Ambiguous`, the connection dropped | part of the frame may have left | `a_write_that_makes_no_progress_fails_ambiguous_and_the_next_send_dials_fresh` |
+//!
+//! `connect_timeout` bounds each write's progress as well as each dial phase
+//! ([`write_with_progress`]), so a peer that accepts the connection and stops reading fails the
+//! attempt instead of parking it until shutdown; a large frame on a slow link keeps making progress
+//! and never trips it (`a_slow_write_that_keeps_making_progress_is_never_cut`).
 //!
 //! A TLS write `Err` is `Ambiguous` because rustls may have put whole records on the wire first.
 //! rustls splits what each session write accepted into records of at most 16384 bytes of
@@ -192,6 +201,49 @@ where
         .context(Fault::Clean)
 }
 
+/// The write-chunk size under [`write_with_progress`]: each chunk's write must accept something
+/// within the bound.
+const WRITE_CHUNK: usize = 64 * 1024;
+
+/// A write that accepted nothing for the whole bound: the peer stopped reading.
+#[derive(Debug)]
+pub(crate) struct Stalled(pub(crate) Duration);
+
+impl std::fmt::Display for Stalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a write made no progress for {:?}", self.0)
+    }
+}
+
+impl std::error::Error for Stalled {}
+
+/// Writes and flushes `bytes`, bounding progress rather than the whole write: each `write` call,
+/// at most [`WRITE_CHUNK`] bytes, and the final flush must complete within `bound`. A large write
+/// on a slow link makes progress and never trips it; a peer that stops reading does, as a
+/// [`Stalled`] error. Errors carry no [`Fault`]: the caller knows what already left.
+pub(crate) async fn write_with_progress<W>(
+    stream: &mut W,
+    bytes: &[u8],
+    bound: Duration,
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let mut written = 0;
+    while written < bytes.len() {
+        let end = bytes.len().min(written + WRITE_CHUNK);
+        let n = tokio::time::timeout(bound, stream.write(&bytes[written..end]))
+            .await
+            .map_err(|_elapsed| Stalled(bound))??;
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero).into());
+        }
+        written += n;
+    }
+    tokio::time::timeout(bound, stream.flush()).await.map_err(|_elapsed| Stalled(bound))??;
+    Ok(())
+}
+
 /// A sink's pooled connection. `has_connected_once` lives here, not on the sink, because a sink
 /// holds one transport for its life, so no other arm dials under the same sink.
 #[derive(Default)]
@@ -238,25 +290,32 @@ impl PooledStream {
                 None => self.dial(dial, telemetry).await?,
             };
 
-            let first = match conn.write(frame).await {
-                Ok(0) if !frame.is_empty() => {
+            let bound = dial.connect_timeout;
+            let first = match tokio::time::timeout(bound, conn.write(frame)).await {
+                // The peer stopped reading. A plaintext `write` that stayed pending handed the
+                // kernel nothing, so it's `Clean`, as a failed one is below; a TLS session may
+                // hold part of the frame, so there it's `Ambiguous`. No retry inside `send`
+                // either way: the peer that stalled this write would stall the next.
+                Err(_elapsed) => {
+                    let fault = if dial.is_tls() { Fault::Ambiguous } else { Fault::Clean };
+                    return Err(anyhow::Error::new(Stalled(bound))
+                        .context(format!("{}: writing a frame", dial.sink))
+                        .context(fault));
+                }
+                Ok(Ok(0)) if !frame.is_empty() => {
                     Err(io::Error::new(io::ErrorKind::WriteZero, "wrote zero bytes"))
                 }
-                other => other,
+                Ok(other) => other,
             };
             match first {
                 Ok(n) => {
-                    let rest = match conn.write_all(&frame[n..]).await {
-                        Ok(()) => conn.flush().await,
-                        Err(err) => Err(err),
-                    };
-                    return match rest {
+                    return match write_with_progress(&mut *conn, &frame[n..], bound).await {
                         Ok(()) => {
                             self.stream = Some(conn);
                             Ok(())
                         }
                         // Part of the frame may be at the peer; the connection is dropped.
-                        Err(err) => Err(anyhow::Error::new(err)
+                        Err(err) => Err(err
                             .context(format!("{}: writing a frame", dial.sink))
                             .context(Fault::Ambiguous)),
                     };
@@ -331,7 +390,7 @@ mod tests {
     };
 
     const FRAME: &[u8] = b"a:1|c\nb:2|c\n";
-    const CLASSES: [&str; 4] = ["ok", "clean", "ambiguous", "permanent"];
+    const CLASSES: [&str; 5] = ["ok", "clean", "ambiguous", "rejected", "refused"];
 
     fn scripted(script: &ScriptedDial) -> Dial<'_> {
         Dial {
@@ -646,6 +705,114 @@ mod tests {
         assert_eq!(script.dials(), 2);
         // The dropped attempt counts no `requests`.
         assert_one_request(&mut probe, "ok");
+    }
+
+    /// A peer that stops reading: a 64-byte frame into a 16-byte pipe nobody reads. The write
+    /// makes no progress for `connect_timeout`, so the attempt fails `Ambiguous` instead of
+    /// parking, and the next send dials fresh.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_makes_no_progress_fails_ambiguous_and_the_next_send_dials_fresh() {
+        let (first, mut first_peer) = tokio::io::duplex(16);
+        let (second, mut second_peer) = tokio::io::duplex(1024);
+        let script = ScriptedDial::new(
+            false,
+            [DialStep::Connect(Box::new(first)), DialStep::Connect(Box::new(second))],
+        );
+        let (mut probe, telemetry) = sink_telemetry();
+        let mut pool = PooledStream::default();
+        let frame = [b'x'; 64];
+
+        let err = pool.send(&scripted(&script), &frame, &telemetry).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        assert!(err.chain().any(|e| e.is::<Stalled>()), "{err:#}");
+        assert!(pool.is_empty(), "the stalled connection isn't pooled");
+        assert_one_request(&mut probe, "ambiguous");
+        let mut buf = [0u8; 64];
+        assert!(matches!(read_once(&mut first_peer, &mut buf).await, Poll::Ready(Ok(16))));
+        assert!(
+            matches!(read_once(&mut first_peer, &mut buf).await, Poll::Ready(Ok(0))),
+            "the stalled connection was closed"
+        );
+
+        pool.send(&scripted(&script), &frame, &telemetry).await.expect("a fresh dial delivers");
+        let mut got = [0u8; 64];
+        second_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, frame);
+        assert_eq!(script.dials(), 2);
+    }
+
+    /// A writer whose `poll_write` stays pending forever.
+    struct NeverWrites;
+
+    impl AsyncRead for NeverWrites {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for NeverWrites {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// A plaintext first `write` that never accepts a byte stalls past `connect_timeout`: nothing
+    /// of the frame left, so the attempt is `Clean`, and nothing is pooled.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_plaintext_first_write_is_clean() {
+        let script = ScriptedDial::new(false, [DialStep::Connect(Box::new(NeverWrites))]);
+        let (mut probe, telemetry) = sink_telemetry();
+        let mut pool = PooledStream::default();
+        let err = pool.send(&scripted(&script), FRAME, &telemetry).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
+        assert!(err.chain().any(|e| e.is::<Stalled>()), "{err:#}");
+        assert!(pool.is_empty());
+        assert_eq!(script.dials(), 1, "no retry inside send");
+        assert_one_request(&mut probe, "clean");
+    }
+
+    /// A slow peer that keeps reading never trips the progress bound, however long the whole
+    /// write takes.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_write_that_keeps_making_progress_is_never_cut() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        let bound = Duration::from_secs(1);
+        let frame = vec![b'y'; 256];
+        let reading = tokio::spawn(async move {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 16];
+            while got.len() < 256 {
+                // Half the bound between reads: the whole write takes several bounds.
+                tokio::time::sleep(bound / 2).await;
+                let n = reader.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+            }
+            got
+        });
+        let start = tokio::time::Instant::now();
+        write_with_progress(&mut writer, &frame, bound).await.expect("progress never stalls");
+        assert!(start.elapsed() > bound * 4, "the write outlasted the bound several times");
+        assert_eq!(reading.await.unwrap(), frame);
     }
 
     #[tokio::test]

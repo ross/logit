@@ -185,17 +185,17 @@ services:
     image: logit-demo:latest
     command: ["run", "/config.yaml"]
     depends_on:
-      # prometheus_out/otlp_out both retry transient failures (ADR
-      # `service-lifecycle-and-output-retry`), but there's no reason to spend the demo's first
+      # prometheus_out/otlp_out both retry a destination that isn't up yet (ADR
+      # `sink-fault-classes`), but there's no reason to spend the demo's first
       # several seconds visibly doing that against a cold VictoriaMetrics/Loki.
       victoriametrics:
         condition: service_healthy
       loki:
         condition: service_healthy
       # `service_started`, not `service_healthy`, because `tempo` declares no healthcheck. That's
-      # enough: `tempo_out` retries through `write_loop` like any other sink (ADR
-      # `service-lifecycle-and-output-retry`'s bounded output retry), so a `logit` that starts
-      # before Tempo finishes booting retries its first few span exports rather than failing.
+      # enough: `tempo_out` retries through `write_loop` like any other sink, holding a batch
+      # until it's delivered (ADR `sink-fault-classes`), so a `logit` that starts before Tempo
+      # finishes booting retries its first few span exports rather than failing.
       tempo:
         condition: service_started
       # `service_started`, for the same reason: `postgres_in` (demo/logit.yaml) is a `tail_in` glob

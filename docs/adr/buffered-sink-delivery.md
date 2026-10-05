@@ -367,3 +367,20 @@ component.
 [ADR `delivery-semantics`](delivery-semantics.md)'s "Amendment: per-request verdicts (2026-10-04)"
 removes the guard's documented false positive, a signal-partial backend fed mixed signals: a send
 that had any request accepted returns `Ok`, and only a wholly refused batch reaches the guard.
+
+## Amendment: four fault classes and no process exit (2026-10-04)
+
+[ADR `sink-fault-classes`](sink-fault-classes.md) supersedes three parts of this record:
+
+- The `Fault` table under "Delivery posture is a per-sink policy": `Permanent` is removed, and
+  `Rejected` (the destination refused this batch: dropped at once, never retried) and `Refused`
+  (the destination refuses every batch for now: retried under both postures) take its place. An
+  unclassified error is `Rejected`.
+- "Retry moves behind the queue boundary and its budget widens": `buffer.retry_budget` doesn't
+  exist. A retryable fault retries until it succeeds or shutdown cuts it, and the sink's `buffer:`
+  bounds what accumulates.
+- "Failure handling: the process no longer exits on a sink failure by default", and the rejected
+  alternative "Never exit on a sink failure, under any circumstance": the 60 s
+  `PERMANENT_FAILURE_WINDOW` and the exit are gone, and the process never exits for a sink. The
+  misconfiguration the window existed to surface is announced by the `logit.component.retrying`
+  gauge and a paced error line instead.

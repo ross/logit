@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-04
+updated: 2026-10-05
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -8,7 +8,9 @@ updated: 2026-10-04
 ## Status
 Accepted. Superseded in part on 2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md):
 item 7's last line, "`window` stays 1". Amended on 2026-10-04: the W3 amendment's open per-edge
-`on_full` policy is closed as not planned.
+`on_full` policy is closed as not planned. Amended on 2026-10-05 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): item 3's native-hop
+exception gains a second case, a frame `logit_in` refuses by name, and the pair leads the hop
+payload rather than riding in the trailer.
 
 ## Context
 
@@ -95,7 +97,8 @@ ahead of the sink.
 ### 3. An input's acknowledgment means accepted into the pipeline
 
 [Narrowed for the native hop by "Amendment: W4 decisions (2026-10-01)": `logit_in` also
-acknowledges a frame at or below its sender's high-water mark, with no forward.]
+acknowledges a frame at or below its sender's high-water mark, with no forward. See also
+"Amendment: a rejected `Ack` (2026-10-05)".]
 
 An acknowledgment from a `logit` input means the batch is in every open downstream inbox of
 that process, and in at least one. It says nothing about a sink. This is `logit_in`'s `Ack`, an
@@ -276,6 +279,11 @@ request, and the loss of the requests that hadn't gone.
 request no longer stops the send, so the rule above applies to `Clean` and `Ambiguous` faults
 only.]
 
+[Narrowed again by [ADR `sink-fault-classes`](sink-fault-classes.md)'s "Amendment: `otlp_out`
+retries per signal (2026-10-05)": `otlp_out` resends no accepted signal on a retry, so the rule no
+longer applies to it, and a failed signal's own class is the batch's. `datadog_out` and
+`datadog_trace_out` keep it.]
+
 ### 10. A replaying input is at-least-once up to the in-memory queues
 
 `tail_in` and `docker_in` checkpoint an offset once its lines are acknowledged as item 3
@@ -415,7 +423,8 @@ wire layout, window, and spool record. It restates item 7's bullets as decided:
 
 - **Identity is per batch, from its store.** A sink's store, memory or disk, takes a fresh
   16-byte identity every time it opens and numbers the batches it holds from 1. The identity and
-  the number ride in the batch's v2 trailer, not in the handshake. A replayed spool record keeps
+  the number ride in the batch's v2 trailer, not in the handshake. [Amended on 2026-10-05 by
+  [ADR `native-hop-ack-status`](native-hop-ack-status.md): they lead the hop payload, ahead of the batch.] A replayed spool record keeps
   the identity and number it was written with, so nothing recovers a sequence after a restart.
 - **The window is a high-water mark.** Each `logit_in` component keeps one mark per sender
   identity. A frame at or below its identity's mark is acknowledged and not forwarded, and a
@@ -519,3 +528,32 @@ follow-up that has to account for the code 6 resend and the `Clean` rule for a b
 anything is accepted.
 
 There is no config knob.
+
+## Amendment: four fault classes (2026-10-04)
+
+[ADR `sink-fault-classes`](sink-fault-classes.md) replaces `Permanent` with `Rejected` and
+`Refused`, removes `buffer.retry_budget`, and removes the process exit. Two items here change:
+
+- Item 2's first permitted loss, "a batch whose `buffer.retry_budget` ran out, or whose fault is
+  `Permanent`", becomes "a batch whose fault is `Rejected`": the destination refused that batch for
+  its own content. A `Clean`, `Refused`, or (under `at_least_once`) `Ambiguous` fault retries until
+  it succeeds or shutdown cuts it, so no loss arises from a budget.
+- Item 5's closing paragraph, the `Fault` table: `Clean` and `Refused` retry under both postures,
+  `Ambiguous` under `at_least_once`, and `Rejected` under neither. An `Ambiguous` fault under
+  `at_least_once` retries indefinitely, `logit_out` included; `at_most_once` remains the opt-out
+  that drops it at once.
+
+The per-request verdicts amendment above reads with `Rejected` for "`Permanent` naming the
+request" and `Refused` for "`Permanent` refusing the sink"; its guard paragraph describes the
+process exit this record removes.
+
+## Amendment: a rejected `Ack` (2026-10-05)
+
+[ADR `native-hop-ack-status`](native-hop-ack-status.md) gives `Ack` a status. `logit_in` answers a frame it reads but won't take (a body
+past its decode budget, one that doesn't decode, an oversize frame within the compressed bound)
+with a rejected `Ack` naming it, raises its sender's mark with no forward, and keeps the
+connection. That is a second native-hop exception to item 3 beside the at-or-below-the-mark case,
+and it isn't an acknowledgment of delivery: it tells the sender the batch was dropped, and the
+sender drops it as `Rejected` (item 2's permitted loss). A frame no consumer took still gets
+`Reject{GOING_AWAY}` and leaves the mark alone. A rejected `Ack` lost before the sender reads it
+lets a mark resume commit the frame as delivered; `docs/known-gaps/native-hop.md` tracks that.

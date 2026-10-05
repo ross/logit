@@ -61,9 +61,25 @@ Entry format and the other areas: [the known-gaps index](README.md).
   [`design/wire-protocol.md`](../design/wire-protocol.md)'s "Decode amplification".
   - **Consequence:** a sender learns only `max_frame_bytes` from `HelloAck`, not the budget, so
     `logit_in` can refuse a stock `logit_out` batch between roughly 10% and 100% of the cap. The
-    refusal is deterministic: `logit_in` answers it with `REJECT_FRAME_TOO_LARGE`, so the sender
-    drops the batch as permanent and diagnoses it rather than retrying.
+    refusal is deterministic: `logit_in` answers it with `Ack{rejected(decode_budget)}` naming the
+    frame, so the sender drops that batch alone as rejected and diagnoses it rather than retrying,
+    and the frames behind it go on over the same connection
+    ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md)).
   - **Workaround:** change the sender's batching.
+- **An oversize frame from an uncompressed sender is refused by name only within a sliver over
+  the cap.** `logit_out` defaults to `compression: none`, so a frame's `compressed_len` equals its
+  `uncompressed_len`. `logit_in` reads the body and answers `Ack{rejected(too_large)}` only for a
+  frame within `frame::compressed_bound(max_frame_bytes)` (`n + n/255 + 16`), through
+  `frame::read_frame_prefix`. Past that it answers `Reject{FRAME_TOO_LARGE}` with nothing of the
+  body read and closes the connection.
+  - **Consequence:** the sender drops the head as `rejected` on the `Reject` and reconnects, and
+    the frames behind it in the window are resent on the new connection, where `logit_in`'s marks
+    recognize any it already handled. A stock `logit_out` checks the cap before it writes, so only a
+    sender that doesn't reaches this path.
+  - **To close:** a streaming drain that reads the frame through a fixed scratch buffer with a
+    running CRC, up to a drain cap, so `logit_in` can refuse an uncompressed frame by name without
+    buffering it ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md),
+    "Consequences").
 
 - **No durable (disk-backed) buffering on the receive side.** A UDP listener's `ReceiveQueue`
   ([ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)) is in-memory only, so a
@@ -143,18 +159,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     forwarding them again ([ADR `native-hop-send-window`](../adr/native-hop-send-window.md),
     decision 6).
 
-- **A round against a slowly draining `logit_in` can outlast the retry budget.** With a window,
-  the head's `buffer.retry_budget` bounds the head's own write, each backoff, and whether a failed
-  round is retried. It never cancels a write past the head or an ack wait, because cancelling
-  either would drop the connection and the `Ack`s `logit_in` already sent. A `logit_in` that
-  forwards a frame every few seconds makes progress, so no write trips `request_timeout`, and a
-  round of `window - 1` writes and the ack wait can last longer than the budget. The head is still
-  delivered once its `Ack` is read; only a shutdown grace cuts the round short.
-  - **Workaround:** `window: 1` restores the budget as a bound on each attempt
-    ([ADR `native-hop-send-window`](../adr/native-hop-send-window.md), decisions 4 and 6).
-  - **Revisit trigger:** an operator who needs `retry_budget` as a hard bound on one batch's time
-    in the sink at a window above 1.
-
 - **The native hop still forwards a duplicate after a `logit_in` restart, an evicted sender, or a
   load balancer.** `logit_in` deduplicates a resend or a `buffer.disk:` replay against a
   high-water mark per sender identity, held in memory and bounded at
@@ -166,7 +170,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 - **A resend can race the frames an ended connection still holds, and be forwarded twice.**
   `logit_in` holds no lock per sender identity across a forward, and it raises a sender's mark
-  only once a consumer takes the frame.
+  only once a consumer takes the frame or once it refuses the frame by name.
   - **The race:** a fault that ends a `logit_out` connection mid-window (a reset, a read error, a
     message other than `Ack`, an ack timeout) can leave that connection's task holding whole frames
     in its socket buffer. The task reads and forwards them while the sender resends the same window
@@ -185,12 +189,27 @@ Entry format and the other areas: [the known-gaps index](README.md).
     each of those forwards can race the resend of the same frame.
   - **Consequence:** nothing is lost. A duplicate copy can reach the consumers after later
     batches; a batch's only copy never does, because the mark reaches a sequence only after a copy
-    of it landed.
+    of it landed or `logit_in` refused it by name, and a refused frame is never forwarded by any
+    connection, since it fails the same way on each.
   - [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md), decision
     7, accepts the race: a per-sender lock held across the forward would close it at the cost of a
     lock per frame, to prevent a duplicate the at-least-once target tolerates.
     [ADR `native-hop-send-window`](../adr/native-hop-send-window.md), decision 6, keeps that with a
     window.
+
+- **A refused frame whose rejected `Ack` is lost is reported delivered by the sender.**
+  `logit_in` raises a refused frame's mark before the sender reads the rejected `Ack`
+  ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md), decision 4). If the connection
+  fails in between (a write failure, a stall, the sender's ack timeout), `logit_out` reads it as
+  `Ambiguous`, and the next `HelloAck.marks` covers the sequence, so the sink commits the frame
+  without resending it.
+  - **Consequence:** the batch was dropped, never forwarded, but the two ends disagree on why. To
+    reconcile, compare `logit_in`'s `logit.input.batches.dropped{reason="rejected"}` with the
+    sending sink's `logit.component.batches.dropped{reason="rejected"}`: the excess at the input is
+    batches the sink counted under `logit.output.batches.resumed` and
+    `logit.component.batches.delivered`. Nothing is lost beyond the drop itself.
+  - **Possible fix, out of scope:** a bounded per-identity set of refused sequences that
+    `HelloAck` names, so a resume commits them as dropped.
 
 - **A reconnect resumes at most 16 sender identities.** After a fault, `logit_out`'s next `Hello`
   lists the identities of the frames it will resend, so `logit_in` can answer their marks and the

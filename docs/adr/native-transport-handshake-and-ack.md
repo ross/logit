@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-10-02
+updated: 2026-10-05
 ---
 
 # Native transport: handshake, implicit sequencing, and per-batch acknowledgement
@@ -19,7 +19,9 @@ payload"'s skip-unknown forward compatibility. A control message's fields are ea
 an unknown tag is malformed. Superseded in part on 2026-10-02 by [ADR
 `native-hop-named-acks`](native-hop-named-acks.md): the `Ack` entry of "Control payload" and the
 `Hello`/`HelloAck` field lists. `Ack` is `{ id, seq }`, `Hello` gains `senders`, and `HelloAck`
-gains `marks`.
+gains `marks`. Superseded in part on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): the `Ack` entry of
+"Control payload" (`Ack` gains a required status) and the 2026-09-25 amendment's answer to a batch
+past its decode budget, which is now a rejected `Ack` naming the frame, with the connection kept.
 
 ## Context
 
@@ -54,7 +56,7 @@ fields.]
 **Sequence numbers are implicit.** [Superseded in part on 2026-10-01 by [ADR
 `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md): a sender identity and a
 sequence ride in every data frame's v2 trailer, assigned by the sink's store, and `Ack` carries no
-fields.] TCP is ordered, so the Nth data frame on a connection is always
+fields. Since 2026-10-05 ([ADR `native-hop-ack-status`](native-hop-ack-status.md)) the pair leads the hop payload instead.] TCP is ordered, so the Nth data frame on a connection is always
 seq N; `Ack.seq` is the cumulative count of data frames the receiver has forwarded. No seq field on
 the data frame itself, so the native-v1 payload is untouched, and a future credit window > 1 can
 use cumulative acks unchanged. [Superseded in part on 2026-10-01 by [ADR
@@ -128,8 +130,8 @@ idle keep-alive connection's `Fanout` clone open past shutdown — a real gap, t
   losing decisively on every axis against the native format for exactly this kind of hop.
 - **An explicit `seq` field on every data frame.** [Superseded in part on 2026-10-01 by [ADR
   `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md): the sequence now
-  rides in the v2 trailer, and `logit_out` re-encodes the payload on every attempt, so the
-  socket-and-file argument no longer binds.] Rejected: TCP's own ordering already makes it
+  rides in the v2 trailer (ahead of the batch since 2026-10-05, [ADR `native-hop-ack-status`](native-hop-ack-status.md)), and `logit_out`
+  re-encodes the payload on every attempt, so the socket-and-file argument no longer binds.] Rejected: TCP's own ordering already makes it
   redundant, and leaving it off keeps the native-v1 payload itself unmodified by the transport
   layer — the same frame bytes work identically written to a file (a durable buffer) or a socket.
 - **Building credit-based flow control (window > 1) now**, per `wire-protocol.md`'s original
@@ -247,7 +249,10 @@ saw an EOF, classified it `Fault::Ambiguous`, and dropped the batch at the defau
   sender sees a permanent refusal instead of an EOF. A batch that decodes past its per-frame decode
   budget ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)) gets the same answer: it
   would fail the same way on every resend, and at-least-once would otherwise retry it forever. It
-  is counted once, as `logit.proto.errors{reason="decode_budget"}`.
+  is counted once, as `logit.proto.errors{reason="decode_budget"}`. [Superseded in part on
+  2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): a batch past its decode budget, and a header past
+  `max_frame_bytes` within the compressed bound, are answered by a rejected `Ack` naming the frame,
+  and the connection goes on. A header past the compressed bound still gets `FRAME_TOO_LARGE`.]
 - `logit_out` checks its compressed frame against the same bound before sending, and drops a batch
   over it as `Fault::Permanent` with nothing written.
 

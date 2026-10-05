@@ -116,8 +116,9 @@ delta `Sum` reads in Splunk as a series of samples, not a running total: put `ag
 from the batch's resource attributes `com.splunk.index`, `com.splunk.source`,
 `com.splunk.sourcetype`, and `host.name`, so stamp them upstream with a `set` component, as
 `splunk-hec-send.yaml` does. An event without them takes the token's defaults in Splunk. An index
-the token isn't allowed to write fails the request with `400` code 7, and the objects from the
-bad one on aren't indexed; keep the `index` you stamp in the token's allowed list. Every other
+the token isn't allowed to write draws a `400` code 7 naming the object after it; `splunk_hec_out`
+drops the bad object and resends the ones after it (below); keep the `index` you stamp in the token's
+allowed list. Every other
 resource and event attribute goes out as an indexed field in `fields`, flattened to dotted keys.
 
 `splunk_hec_in` puts the same four values on the resource, so a relay keeps them.
@@ -155,7 +156,7 @@ one), and `splunk_hec_out` doesn't retry a `413`. A Splunk Cloud 10.5.2605.9 tri
 bodies up to 5,242,881 bytes and refused 6,000,000 and above with `400` code 6 naming object 0,
 not `413`. `splunk_hec_out` reads a code 6 naming the first object of a body over 5 MiB
 (5,242,880 bytes) as that answer: it splits the body in two and sends each half, and a half
-refused the same way fails the batch; a body of one object is dropped, counted
+refused the same way drops the batch as rejected; a body of one object is dropped, counted
 `logit.output.records.dropped{reason="oversize"}`. The 2 MiB default sits under the cap, and a
 `max_body_bytes` above 5 MiB logs a warning at startup, so against Splunk Cloud keep it at or
 under `5MiB`.
@@ -191,17 +192,24 @@ no body of the batch has been accepted the sink retries the batch under either p
 runtime's backoff. It ignores a `Retry-After` header. The same answer after an earlier body of the
 batch was accepted is treated like a `500`, since a retry would resend that body.
 
+A bad or disabled token, a channel something between the sink and Splunk stripped, or an
+endpoint that isn't a HEC collector answers every batch the same way, so `splunk_hec_out` holds
+the batch and retries it until the configuration is fixed, logging `token_rejected` for a token,
+`request_refused` for a channel or authorization code, or `request_rejected` for a `404`, `405`, or
+`407`; watch `logit.component.retrying` for it. The sink's module doc
+(`crates/logit-outputs/src/splunk.rs`, "Faults, retries, and duplicate safety") has the table of
+every HEC code it reads.
+
 ### One malformed event costs only itself
 
 A `400` code 6 names the first object Splunk couldn't parse in `invalid-event-number`, counting
 from 0. Splunk Enterprise 10.4.3 indexed every object before it and none from it on. So
 `splunk_hec_out` drops that one object, counted
 `logit.output.records.dropped{reason="invalid_event"}`, and resends the objects after it, once. A
-second code 6 on the resend is permanent. The other per-object rejections (7, 12, 13, and 15) are
-permanent: Splunk indexes the objects before the bad one and none from it on, and the rest of the
-batch is dropped with them. Code 7 names the object after the bad one. `splunk_hec_out` doesn't
-write the shapes behind codes 12, 13, and 15 (a missing or blank `event`, a nested `fields`
-value), which leaves code 7, an index the token can't write.
+second such answer on the resend is rejected. The other per-object codes, 7 (an index the token
+can't write), 12, 13, and 15, get the same treatment: Splunk indexes the objects before the bad
+one and none from it on. Code 7 names the object after the bad one, and the sink reads it so. `splunk_hec_out` doesn't write the shapes behind codes 12, 13, and 15 (a
+missing or blank `event`, a nested `fields` value), which leaves code 7.
 
 `splunk_hec_in` answers a `/event` body with a syntax error the same way: it delivers the objects
 before the bad one, answers `400` code 6 naming it, and delivers nothing from it on. So a client

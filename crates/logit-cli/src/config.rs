@@ -327,7 +327,6 @@ components:
       max_bytes: 64MiB
       overflow: drop_oldest
       delivery: at_least_once
-      retry_budget: 120s
       retry_max_delay: 20s
       shutdown_grace: 10s
 "#;
@@ -337,7 +336,6 @@ components:
         assert_eq!(out.buffer.max_bytes, 64 * 1024 * 1024, "64MiB should parse via serde_norway");
         assert_eq!(out.buffer.overflow, logit_config::OverflowPolicy::DropOldest);
         assert_eq!(out.buffer.delivery, Some(logit_config::DeliveryPosture::AtLeastOnce));
-        assert_eq!(out.buffer.retry_budget, std::time::Duration::from_secs(120));
         assert_eq!(out.buffer.retry_max_delay, std::time::Duration::from_secs(20));
         assert_eq!(out.buffer.shutdown_grace, std::time::Duration::from_secs(10));
     }

@@ -3,7 +3,8 @@
 # your OpenTelemetry SDKs or Collector at `otlp_in`, and change each `endpoint` to your product.
 #
 # One `otlp_out` posts every signal it carries to one host, and a product answers a signal it
-# doesn't ingest with a permanent `404` that drops the whole batch. So each product gets its own
+# doesn't ingest with a `404`, which `otlp_out` reads as that signal's rejection: it drops the
+# signal's records and spends the request again on every batch. So each product gets its own
 # `otlp_out` behind a `keep_signals` that passes only its signal.
 #
 # What to know per product (docs/deploying.md's "VictoriaMetrics, VictoriaLogs, and

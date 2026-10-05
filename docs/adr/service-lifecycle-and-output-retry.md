@@ -1,6 +1,6 @@
 ---
 created: 2026-08-30
-updated: 2026-09-14
+updated: 2026-10-04
 ---
 
 # Service lifecycle: signal-driven shutdown and bounded output retry
@@ -232,3 +232,11 @@ Consequences beyond `crates/logit-core/src/diag.rs`:
   So `component_id` becomes a `Cow<'static, str>` and the default's placeholder id is borrowed
   rather than copied onto the heap — a default `Diagnostics` allocates exactly once either way,
   and every allocation pin in that file holds unchanged.
+
+## Amendment: a retryable fault rides out the outage (2026-10-04)
+
+"What this does and does not buy" under "Retry: a tight wall-clock budget, not an attempt count"
+no longer describes the runtime. [ADR `sink-fault-classes`](sink-fault-classes.md) removes the
+budget: a `Clean`, `Refused`, or (under `at_least_once`) `Ambiguous` fault retries until it
+succeeds or shutdown cuts it, and `logit run` never exits for a sink. The sink's `buffer:` is what
+bounds an outage's cost. The shutdown-signal and diagnostics decisions here are unchanged.

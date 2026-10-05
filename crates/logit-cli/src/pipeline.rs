@@ -1260,12 +1260,12 @@ fn queue_config(buffer: &BufferConfig, base_dir: &Path) -> SinkStoreConfig {
 fn write_config(buffer: &BufferConfig) -> WriteLoopConfig {
     WriteLoopConfig {
         retry: RetryConfig {
-            total_budget: buffer.retry_budget,
             base_delay: RetryConfig::default().base_delay,
             max_delay: buffer.retry_max_delay,
         },
         shutdown_grace: buffer.shutdown_grace,
         delivery_override: buffer.delivery.map(delivery_posture),
+        ..WriteLoopConfig::default()
     }
 }
 
@@ -3608,7 +3608,6 @@ mod tests {
                 max_bytes: 128 * 1024 * 1024,
                 overflow: logit_config::OverflowPolicy::DropOldest,
                 delivery: Some(logit_config::DeliveryPosture::AtLeastOnce),
-                retry_budget: Duration::from_secs(120),
                 retry_max_delay: Duration::from_secs(20),
                 shutdown_grace: Duration::from_secs(10),
                 disk: None,
@@ -3635,7 +3634,6 @@ mod tests {
         assert_eq!(queue_config.max_batches, 4096);
         assert_eq!(queue_config.max_bytes, 128 * 1024 * 1024);
         assert_eq!(queue_config.overflow, logit_pipeline::OverflowPolicy::DropOldest);
-        assert_eq!(write_config.retry.total_budget, Duration::from_secs(120));
         assert_eq!(write_config.retry.max_delay, Duration::from_secs(20));
         assert_eq!(
             write_config.retry.base_delay,

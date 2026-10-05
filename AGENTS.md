@@ -44,6 +44,15 @@ exists or a contract other `logit` processes depend on:
   `lossless-transit`'s "summarization is opt-in and named" rule.
 - **`shape` and `aggregate` split the work**: `shape` emits raw `Samples`, never a sketch; an
   `aggregate` downstream summarizes, per `lossless-transit`.
+- **A sink's response-class table is the contract for its response handling.** Each sink's module
+  doc maps every response it distinguishes to `Clean`, `Ambiguous`, `Rejected`, or `Refused`
+  ([ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md)), one row per response, each backed
+  by a test and the destination's documentation. On any change to how a sink reads a response, a
+  reviewer checks that table first. A `Rejected` batch drops at once; a `Refused` destination
+  holds the queue and retries with no budget and no exit, so reading a destination fault as
+  `Rejected` loses data and reading a bad batch as `Refused` wedges the sink. A sink's own
+  transport timeout is the only bound on an attempt, so every write and acknowledgment wait a sink
+  makes must have one.
 
 The lossless-relay, Lua-VM, mergeable-sketch, and memory-pin rules are in
 [Design constraints that aren't optional](#design-constraints-that-arent-optional).
@@ -86,7 +95,7 @@ Sinks live in `crates/logit-outputs`.
 
 | Kind | Code | What it does | Decision record |
 |---|---|---|---|
-| `influxdb_out` | `crates/logit-outputs/src/influxdb.rs` | InfluxDB 2.x, with bounded output retry | [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md) |
+| `influxdb_out` | `crates/logit-outputs/src/influxdb.rs` | InfluxDB 2.x line protocol over the write API | [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md), [ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md) |
 | `stdio_out` | `crates/logit-outputs/src/stdio.rs`, render in `human.rs` | an exhaustive, sectioned text block per event (default, `message: escaped \| multiline`), `format: json` (one object per event per line, `ndjson.rs`, what every harness reader consumes), or `format: native`; its file target is `file_out` with an empty rotation policy | [ADR `human-render-block-format`](docs/adr/human-render-block-format.md), [ADR `stream-json-format`](docs/adr/stream-json-format.md), [ADR `file-output-native-format`](docs/adr/file-output-native-format.md) |
 | `file_out` | `crates/logit-outputs/src/file.rs` | rotating file sink sharing `stdio_out`'s implementation | [ADR `rotating-file-output`](docs/adr/rotating-file-output.md) |
 | `syslog_out` | `crates/logit-outputs/src/syslog.rs` | RFC 3164/5424 over UDP, TCP, or TLS (RFC 5425) | [ADR `syslog-output`](docs/adr/syslog-output.md) |
@@ -421,9 +430,11 @@ Per pair:
   CRC-32C and optional lz4. A four-arm bake-off against `rkyv`, `postcard`, and OTLP itself
   decided it ([ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md)).
 - **Two payload shapes**: `CODEC_BATCH` is a bare batch, the file format; `CODEC_HOP_BATCH` is a
-  batch plus a trailer of provenance and a required sender identity and sequence, what the hop
-  sends and the spool records. A hop payload without a complete pair is malformed
-  ([ADR `native-hop-no-compatibility`](docs/adr/native-hop-no-compatibility.md)).
+  required sender identity and sequence, a batch, and a trailer of provenance, what the hop sends
+  and the spool records. A hop payload without a complete pair is malformed
+  ([ADR `native-hop-no-compatibility`](docs/adr/native-hop-no-compatibility.md)); the pair leads
+  so `logit_in` answers a frame it can't take with a rejected `Ack` naming it and keeps the
+  connection ([ADR `native-hop-ack-status`](docs/adr/native-hop-ack-status.md)).
 - **On disk**: `stdio_out`/`file_out` can write the bare shape as `format: native` alongside
   their default human-readable render
   ([ADR `file-output-native-format`](docs/adr/file-output-native-format.md)).
@@ -434,7 +445,7 @@ Per pair:
   `crates/logit-outputs/src/logit.rs`) use one TCP (optionally TLS) connection, a `Hello`/`HelloAck`
   version/codec/compression handshake that offers and accepts the hop codec alone, and one native
   frame per batch, with up to a negotiated window of frames in flight, acknowledged in frame order
-  by a named, cumulative `Ack { id, seq }` that `logit_in` writes once per run of frames; a
+  by a named, cumulative `Ack { id, seq, status }` that `logit_in` writes once per run of frames; a
   reconnect lists its in-flight identities in `Hello` and commits every frame at or below the
   marks `HelloAck` returns without resending it
   ([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md),
@@ -455,9 +466,19 @@ Per pair:
   ([ADR `env-yaml-tag`](docs/adr/env-yaml-tag.md)), which is why `influxdb_out`'s `token` is a
   plain string, not an env-specific field.
 - **Lifecycle**: [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md)
-  covers signal-driven shutdown and `influxdb_out`'s bounded output retry.
-  `crates/logit-inputs/src/statsd.rs` and `crates/logit-outputs/src/influxdb.rs` are the
-  reference listener and sink.
+  covers signal-driven shutdown. `crates/logit-inputs/src/statsd.rs` and
+  `crates/logit-outputs/src/influxdb.rs` are the reference listener and sink.
+- **Sink faults**: a failed send is `Clean`, `Ambiguous`, `Rejected`, or `Refused`
+  ([ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md)). `write_loop` drops a `Rejected`
+  batch at once (`batches.dropped{reason="rejected"}`, with a throttled diagnostic carrying the
+  destination's text) and retries every other retryable fault with backoff until it succeeds or
+  shutdown cuts it; `buffer:` bounds what queues behind a held head, and
+  `logit.component.retrying` reads `1` while it holds. There's no retry budget, and no send
+  failure ends the process; a sink's `buffer.disk:` spool that can't open, or a sink task that
+  panics, still fails its node and exits `2`. `buffer.delivery: at_most_once` drops an `Ambiguous` fault instead of
+  retrying it ([ADR `delivery-semantics`](docs/adr/delivery-semantics.md)). The shared HTTP
+  driver (`crates/logit-outputs/src/http.rs`) supplies a status-only default that each HTTP
+  sink's table refines, and `otlp_out` retries only the signals a destination hasn't settled.
 - **Trace propagation**: every `Delivered` (one `Fanout` edge's channel payload) carries a real
   `TraceContext`, propagated as a child of its parent for the two node kinds with an unambiguous
   one to propagate: `Transform::process`/`ScriptWorker::process`'s non-flush path, and
@@ -495,7 +516,9 @@ the operator-facing account of all of this.
 - **Startup binding**: `Input::bind` opens every listener's socket in a pre-pass *before* any
   task is spawned, so a bind failure fails startup with nothing else running.
 - **Exit codes**: `1` for a startup failure, `2` for a runtime failure after the process reported
-  ready.
+  ready: a listener's loop dying, a Lua thread panicking, exceeding `max_memory`, or wedged
+  across shutdown, or a sink whose `buffer.disk:` spool can't open or whose task panics. A failed
+  send never ends the run.
 - **Release image**: `ghcr.io/ross/logit:latest`, pushed by hand via `workflow_dispatch` rather
   than on every merge
   ([ADR `publish-release-image-to-ghcr`](docs/adr/publish-release-image-to-ghcr.md)).
@@ -826,10 +849,12 @@ not a style preference:
   sender accepts). `statsd_out` is the one exception, because a statsd line has no timestamp.
   An input's acknowledgment means the batch is in every open downstream inbox, never that a
   sink delivered it, and an input never acknowledges a batch no consumer directly downstream
-  took, except `logit_in`'s acknowledgment of a frame at or below its sender's mark. The
+  took, except `logit_in`'s acknowledgment of a frame at or below its sender's mark, and its
+  rejected `Ack` for a frame it won't take, which raises the mark with no forward and reports a
+  drop, not a delivery ([ADR `native-hop-ack-status`](docs/adr/native-hop-ack-status.md)). The
   `logit_out` to `logit_in` hop is effectively-once: a sink's store mints a sender
-  identity every time it opens and numbers its batches, the pair rides in every hop frame's
-  trailer, outlives a reconnect, and rides a spool replay, and `logit_in` acknowledges a frame at
+  identity every time it opens and numbers its batches, the pair leads every hop frame's
+  payload, outlives a reconnect, and rides a spool replay, and `logit_in` acknowledges a frame at
   or below its sender's high-water mark without forwarding it. Each `Ack` names an identity and a
   sequence and covers that identity's frames up to it, and a reconnect resumes from `logit_in`'s
   marks instead of resending what it already handled
@@ -838,7 +863,7 @@ not a style preference:
   [ADR `delivery-semantics`](docs/adr/delivery-semantics.md) and
   [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md) before
   changing a sink's posture, a fault class, what an input acknowledges, or the native hop's
-  trailer.
+  payload layout.
 - **The threat model is accidental data, not a malicious peer.** A listener, decoder, or transform
   must survive a misconfigured sender, a wedged peer, or a corrupt file; a problem only crafted
   input can trigger is defended only when the defense is free (a branch, a counter, a timeout

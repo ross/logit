@@ -99,20 +99,45 @@
 //! next request; a `Clean` or `Ambiguous` failure stops the send, and `write_loop` retries the
 //! whole batch, re-sending any request that had already succeeded. The send succeeds when any
 //! request was accepted, and fails with the first rejection when every request was rejected. The
-//! Agent's API has no credential, so no answer refuses the sink as a whole.
+//! Agent's API has no credential, so only a status that says the endpoint or the body's format
+//! isn't served refuses the sink as a whole.
 //!
-//! | Outcome | Result | The rest of the `send` |
-//! |---|---|---|
-//! | 2xx | `Ok` | goes on |
-//! | 408, 429, any 5xx | [`Fault::Ambiguous`] | stops |
-//! | 413 | [`Fault::Permanent`], and the request's records counted `records.dropped{reason="oversize"}` | goes on |
-//! | any other 1xx, 3xx, or 4xx | [`Fault::Permanent`], the request's records counted `records.dropped{reason="rejected"}`, with a throttled `request_rejected` diagnostic quoting the first 256 bytes of the body | goes on |
-//! | connect failure (refused, no such socket file), before any request of this `send` was accepted | [`Fault::Clean`] | stops |
-//! | connect failure after one was | [`Fault::Ambiguous`] | stops |
-//! | any other transport error, timeout included | [`Fault::Ambiguous`] | stops |
+//! The Agent's receiver answers by status with its error's text as the body; the status decides.
+//! `Rejected` counts the request's records `records.dropped{reason="rejected"}` (`oversize` for a
+//! `413`) with a throttled `request_rejected` diagnostic, and `Refused` warns `request_refused`;
+//! each quotes the first 256 bytes of the body.
 //!
-//! `Clean` means the Agent holds nothing of the batch, so once a request was accepted a connect
-//! failure on a later one is `Ambiguous` ([`crate::http::after_delivery`]), on either transport.
+//! | Response | Class | Why | Evidence |
+//! |---|---|---|---|
+//! | `2xx` | `Ok` | accepted | -- |
+//! | `400` (the receiver's `decoding-error`) | `Rejected` | this body didn't decode | `httpDecodingError` in the Agent's [`responses.go`][agent-responses] |
+//! | `404` | `Refused` | the Agent doesn't serve this `version:`'s route (an Agent without `/v0.7/traces`), so every batch gets it; dd-trace answers the same `404` by downgrading its API version | the Agent's [`endpoints.go`][agent-endpoints], dd-trace-py's [`writer.py`][ddtrace-writer] |
+//! | `401`, `403`, `405`, `407` | `Refused` | the Agent has no credential, so a proxy or a wrong path answered: the same for every batch | [`crate::http::classify_status`] |
+//! | `408` (the receiver's `timeout`) | `Ambiguous` | the Agent timed out reading the body; it may have taken part of it | `httpDecodingError` in the Agent's [`responses.go`][agent-responses] |
+//! | `413` (the receiver's `payload-too-large`) | `Rejected` | over the Agent's request limit; a smaller body would land | `httpDecodingError` in the Agent's [`responses.go`][agent-responses] |
+//! | `415` | `Refused` | the Agent doesn't take this `version:`'s body format (`httpFormatError`): every batch gets it | the Agent's [`responses.go`][agent-responses] |
+//! | `429`, before any request of this `send` was accepted | `Clean` | "trace-agent is overwhelmed, a payload has been rejected": the receiver turns the payload away before reading it | the Agent's [`api.go`][agent-api] |
+//! | `429` after one was | `Ambiguous` | the Agent holds part of the batch ([`crate::http::after_delivery`]) | -- |
+//! | any `5xx`, `501` included | `Ambiguous` | may have been applied; the Agent's own trace writer retries a `5xx` | the Agent's [`sender.go`][agent-sender] |
+//! | any other `1xx`, `3xx`, or `4xx` | `Rejected` | about this request | [`crate::http::classify_status`] |
+//! | connect failure (refused, no such socket file), before any request of this `send` was accepted | `Clean` | nothing left the process | -- |
+//! | connect failure after one was | `Ambiguous` | the Agent holds part of the batch | -- |
+//! | any other transport error, timeout included | `Ambiguous` | the request may have been applied | -- |
+//!
+//! `Clean` and `Refused` mean the Agent holds nothing of the batch, so once a request was accepted
+//! a connect failure, a `429`, or a refusal on a later one is `Ambiguous`
+//! ([`crate::http::after_delivery`]), on either transport: a route answered `Refused` after another
+//! route was accepted retries the whole batch under `at_least_once`, the accepted routes included,
+//! and drops it under `at_most_once`. That resends the accepted traces on every retry, and is kept
+//! because a refused route is refused for every batch: a `404` or `415` answers the sink's
+//! `version:`, which reading it as `Rejected` would turn into a drop of that route's records from
+//! every batch until the operator fixed it.
+//!
+//! [agent-responses]: https://github.com/DataDog/datadog-agent/blob/main/pkg/trace/api/responses.go
+//! [agent-endpoints]: https://github.com/DataDog/datadog-agent/blob/main/pkg/trace/api/endpoints.go
+//! [agent-api]: https://github.com/DataDog/datadog-agent/blob/main/pkg/trace/api/api.go
+//! [agent-sender]: https://github.com/DataDog/datadog-agent/blob/main/pkg/trace/writer/sender.go
+//! [ddtrace-writer]: https://github.com/DataDog/dd-trace-py/blob/main/ddtrace/internal/writer/writer.py
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
 //! retries an `Ambiguous` attempt, and a batch can be two requests, so a retry after the second
@@ -863,7 +888,19 @@ impl DatadogTraceOutput {
         }
         let snippet = body_snippet(&reply.body, ERROR_BODY_SNIPPET_BYTES);
         let fault = match status.as_u16() {
-            408 | 429 | 500..=599 => Fault::Ambiguous,
+            // The Agent's receiver answers 429 when it turns a payload away before reading it.
+            429 => Fault::Clean,
+            408 | 500..=599 => Fault::Ambiguous,
+            415 => {
+                self.diag.warn_throttled(
+                    "request_refused",
+                    format_args!(
+                        "{target} answered 415: the Agent doesn't take this 'version:''s body: \
+                         {snippet}"
+                    ),
+                );
+                Fault::Refused
+            }
             413 => {
                 self.dropped(route, "oversize", records);
                 self.diag.warn_throttled(
@@ -873,18 +910,27 @@ impl DatadogTraceOutput {
                          {snippet}"
                     ),
                 );
-                Fault::Permanent
+                Fault::Rejected
             }
-            _ => {
-                self.dropped(route, "rejected", records);
-                self.diag.warn_throttled(
-                    "request_rejected",
-                    format_args!(
-                        "{target} answered {status}, {records} record(s) dropped: {snippet}"
-                    ),
-                );
-                Fault::Permanent
-            }
+            _ => match crate::http::classify_status(status) {
+                Fault::Refused => {
+                    self.diag.warn_throttled(
+                        "request_refused",
+                        format_args!("{target} answered {status}: {snippet}"),
+                    );
+                    Fault::Refused
+                }
+                _ => {
+                    self.dropped(route, "rejected", records);
+                    self.diag.warn_throttled(
+                        "request_rejected",
+                        format_args!(
+                            "{target} answered {status}, {records} record(s) dropped: {snippet}"
+                        ),
+                    );
+                    Fault::Rejected
+                }
+            },
         };
         Err(anyhow::anyhow!(
             "datadog_trace_out: {} request to {target} failed ({status}): {snippet}",
@@ -1339,12 +1385,102 @@ mod tests {
 
     #[tokio::test]
     async fn each_response_class_maps_to_its_fault() {
-        for status in [408, 429, 500, 503] {
+        for status in [408, 500, 501, 503] {
             assert_eq!(fault_for(status).await, Fault::Ambiguous, "{status}");
         }
-        for status in [301, 400, 404, 413] {
-            assert_eq!(fault_for(status).await, Fault::Permanent, "{status}");
+        for status in [301, 400, 413] {
+            assert_eq!(fault_for(status).await, Fault::Rejected, "{status}");
         }
+        for status in [401, 404, 415] {
+            assert_eq!(fault_for(status).await, Fault::Refused, "{status}");
+        }
+    }
+
+    async fn fault_with(status: u16, body: &'static str) -> Fault {
+        let (addr, _log) = agent(move |_| (status, body.into())).await;
+        let err = sink(addr).send(&two_traces()).await.unwrap_err();
+        logit_pipeline::classify(&err)
+    }
+
+    // One test per row of the module doc's "Faults, retries, and duplicate safety" table, each
+    // answering the text the Agent's receiver writes.
+
+    #[tokio::test]
+    async fn a_400_decoding_error_is_rejected() {
+        let body = "msgp: attempted to decode type \"int\" with method for \"map\"";
+        assert_eq!(fault_with(400, body).await, Fault::Rejected);
+    }
+
+    #[tokio::test]
+    async fn a_404_unserved_version_is_refused() {
+        assert_eq!(fault_with(404, "404 page not found\n").await, Fault::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_401_403_405_or_407_is_refused() {
+        for status in [401, 403, 405, 407] {
+            assert_eq!(fault_with(status, "").await, Fault::Refused, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_408_timeout_is_ambiguous() {
+        assert_eq!(fault_with(408, "i/o timeout").await, Fault::Ambiguous);
+    }
+
+    #[tokio::test]
+    async fn a_413_payload_too_large_is_rejected() {
+        assert_eq!(fault_with(413, "read limit reached").await, Fault::Rejected);
+    }
+
+    #[tokio::test]
+    async fn a_415_unsupported_format_is_refused() {
+        let body = "unsupported media type: \"application/json\"";
+        assert_eq!(fault_with(415, body).await, Fault::Refused);
+    }
+
+    /// The Agent turned the payload away unread: nothing was taken, so the retry is `Clean`.
+    #[tokio::test]
+    async fn a_429_overwhelmed_agent_is_clean() {
+        let body = "trace-agent is overwhelmed, a payload has been rejected";
+        assert_eq!(fault_with(429, body).await, Fault::Clean);
+    }
+
+    /// After the trace request was accepted, a `429` on the stats one is `Ambiguous`: a `Clean`
+    /// retry under `at_most_once` would resend the accepted traces.
+    #[tokio::test]
+    async fn a_429_after_an_accepted_request_is_ambiguous() {
+        let (addr, _log) =
+            agent(|path| (if path == "/v0.4/traces" { 200 } else { 429 }, String::new())).await;
+        let mut events = two_traces().events;
+        events.push(stats_event());
+        let err = sink(addr).send(&batch(events)).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn any_5xx_is_ambiguous() {
+        for status in [500, 501, 502, 503] {
+            assert_eq!(fault_with(status, "").await, Fault::Ambiguous, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn any_other_3xx_or_4xx_is_rejected() {
+        for status in [302, 409, 422] {
+            assert_eq!(fault_with(status, "").await, Fault::Rejected, "{status}");
+        }
+    }
+
+    /// A route refused after another was accepted retries the whole batch as `Ambiguous`.
+    #[tokio::test]
+    async fn a_refused_route_after_an_accepted_route_is_ambiguous() {
+        let (addr, _log) =
+            agent(|path| (if path == "/v0.4/traces" { 200 } else { 404 }, String::new())).await;
+        let mut events = two_traces().events;
+        events.push(stats_event());
+        let err = sink(addr).send(&batch(events)).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
     }
 
     /// An `Ambiguous` trace request aborts the stats request after it: the retry resends the
@@ -1379,15 +1515,15 @@ mod tests {
         assert_eq!(total(&points, RECORDS, &[("route", "stats")]), 1.0);
     }
 
-    /// Both requests rejected: each is counted, and the send fails explicitly `Permanent`.
+    /// Both requests rejected: each is counted, and the send fails `Rejected`.
     #[tokio::test]
-    async fn rejected_traces_and_stats_fail_the_send_permanent() {
+    async fn rejected_traces_and_stats_fail_the_send_rejected() {
         let (addr, log) = agent(|_| (400, String::new())).await;
         let (registry, mut out) = metered(sink(addr));
         let mut events = two_traces().events;
         events.push(stats_event());
         let err = out.send(&batch(events)).await.unwrap_err();
-        assert!(logit_pipeline::is_explicitly_permanent(&err), "{err:#}");
+        assert_eq!(err.downcast_ref::<Fault>(), Some(&Fault::Rejected), "{err:#}");
         assert!(format!("{err:#}").contains("traces"), "the first rejection: {err:#}");
         assert_eq!(captured(&log).len(), 2);
         let points = registry.drain(0);
@@ -1555,9 +1691,9 @@ mod tests {
 
     use crate::test_support::{
         assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch,
-        at_least_once, bodies, fast_retry, http_recorder, per_path_recorder, recorded_paths,
-        refused_addr, sum_of, sums_through_write_loop, Recorded, Reply as Answer, SumSeries, Sums,
-        HUNG_REQUEST_BUDGET,
+        at_least_once, at_most_once, bodies, fast_retry, http_recorder, per_path_recorder,
+        recorded_paths, refused_addr, sum_of, sums_through_write_loop, Recorded, Reply as Answer,
+        SumSeries, Sums,
     };
     use logit_pipeline::test_util::TelemetryProbe;
     use logit_pipeline::WriteLoopConfig;
@@ -1741,15 +1877,19 @@ mod tests {
         }
     }
 
-    /// A batch whose stats request never answers is cut off by the retry budget and dropped, and
-    /// the next batch counts its encode-side counters.
+    /// A batch whose stats request is answered `503` is dropped under `at_most_once`, and the next
+    /// batch counts its encode-side counters.
     #[tokio::test]
-    async fn a_trace_batch_after_one_dropped_at_its_budget_counts_encode_side() {
-        let script = |p: &str, k| if p == STATS && k == 0 { Answer::Hang } else { accepted() };
-        let mut config = fast_retry();
-        config.retry.total_budget = HUNG_REQUEST_BUDGET;
+    async fn a_trace_batch_after_one_dropped_counts_encode_side() {
+        let script = |p: &str, k| {
+            if p == STATS && k == 0 {
+                Answer::Answer(503, Vec::new())
+            } else {
+                accepted()
+            }
+        };
         let batches = vec![encode_side_batch(), encode_side_batch()];
-        let (sums, log) = run_agent(script, batches, config, instrumented).await;
+        let (sums, log) = run_agent(script, batches, at_most_once(), instrumented).await;
         let (one, _) =
             run_agent(|_, _| accepted(), vec![encode_side_batch()], fast_retry(), instrumented)
                 .await;

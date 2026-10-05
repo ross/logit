@@ -130,15 +130,46 @@
 //!
 //! **One `send` is one attempt.** Retry is `write_loop`'s job
 //! (`docs/adr/buffered-sink-delivery.md`); this sink classifies the outcome with
-//! `.context(fault)`, by the table `otlp_out`'s HTTP transport uses, shared in [`crate::http`]:
+//! `.context(fault)`. Both remote-write specifications define a `4xx` other than `429` as a write
+//! that "will never be able to succeed" and a `5xx` as one to retry; the rows below refine that
+//! where the receiver's answer is about the sink's config rather than the batch
+//! (`remote_write_fault`, falling through to [`crate::http::classify_status`]):
 //!
-//! | Outcome | Result |
-//! |---|---|
-//! | 2xx | `Ok` |
-//! | 429, any 5xx | [`Fault::Ambiguous`] -- the request reached the server and may have been partly applied. The status and the first 256 bytes of the response body are in the message and in a throttled `remote_write_rejected` diagnostic, as below, so a retried `503` reports once per attempt |
-//! | any 3xx, any other 4xx | [`Fault::Permanent`], with the status and the first 256 bytes of the response body in the message and in a throttled `remote_write_rejected` diagnostic: Prometheus's own `400` text names the offending series and is the only useful thing in the exchange. Under `compression: zstd`, a `415` or `400` also names `compression: snappy` as the likely remedy, since those are the statuses a receiver that doesn't take zstd answers |
-//! | connect failure | [`Fault::Clean`] -- the destination provably never saw it |
-//! | any other transport error, timeout included | [`Fault::Ambiguous`] |
+//! | Response | Class | Why | Evidence |
+//! |---|---|---|---|
+//! | `2xx` (Mimir's `202` for an HA replica it dedupes included) | `Ok` | written | [1.0 spec][rw1], [2.0 spec][rw2] |
+//! | `2xx` to a `version: 2` request from a 1.0-only receiver | `Ok` | can't be told apart: VictoriaMetrics answers it `2xx` and stores nothing (`docs/known-gaps/prometheus.md`, "VictoriaMetrics discards remote-write 2.0 silently") | `docs/plans/victoriametrics-interop.md`, "Findings" |
+//! | `400` for invalid samples: `out of order sample`, a duplicate timestamp, Mimir's `err-mimir-sample-out-of-order` and per-series limits | `Rejected` | "Receivers MUST return a HTTP 400 ... for write requests that contain any invalid samples", and senders "MUST NOT retry ... 4xx responses other than 429" | [1.0 spec][rw1], Prometheus's [`write_handler.go`][prom-handler], Mimir's [`distributor/errors.go`][mimir-errors] |
+//! | `400` whose body opens with a receiver's decompression error: VictoriaMetrics' `cannot decompress snappy-encoded request with length %d: %w` (or `zstd-encoded`), or `client_golang`'s Snappy error (`snappy: corrupt input`) | `Refused` | the receiver can't read this sink's `compression:`, so every batch gets the same answer | VictoriaMetrics' [`promremotewrite` stream parser][vm-parser], `client_golang`'s [`remote_api.go`][cg-remote] |
+//! | `401` (Mimir's `no org id` for a missing `X-Scope-OrgID`, Grafana Cloud's invalid credentials), `403`, `407` | `Refused` | a credential or tenant header the sink's `headers:` carries on every request | dskit's [`http_auth.go`][dskit-auth], [`crate::http::classify_status`] |
+//! | `404` (Prometheus without `--web.enable-remote-write-receiver`, a wrong path), `405`, `501` (Mimir's method not allowed) | `Refused` | the endpoint isn't a remote-write receiver as configured | Prometheus's [`api.go`][prom-api], [`crate::http::classify_status`] |
+//! | `409` (Thanos receive's conflict: an out-of-order or duplicate sample) | `Rejected` | about the samples, as a `400` is | Thanos's [`receive/handler.go`][thanos-handler] |
+//! | `413` (Thanos receive's request limits, `client_golang`'s size limit) | `Rejected` | "should not be retried without modifications"; a smaller batch would land | [Thanos receive][thanos-receive] |
+//! | `415` | `Refused` | "Receivers MUST return 415 ... if they don't support a given content type or encoding": the sink's `version:` or `compression:` is wrong for this receiver, the same for every batch | [2.0 spec][rw2], `client_golang`'s [`remote_api.go`][cg-remote] |
+//! | any other `3xx` or `4xx` | `Rejected` | "MUST NOT retry"; redirects are off ([`crate::http::build_client`]) | [1.0 spec][rw1] |
+//! | `429` (Mimir's `err-mimir-tenant-max-ingestion-rate`) | `Ambiguous` | "They MAY retry on HTTP 429 responses" | [1.0 spec][rw1], Mimir's [`distributor/errors.go`][mimir-errors] |
+//! | any `5xx` | `Ambiguous` | "MUST retry write requests on HTTP 5xx responses"; may have been partly applied | [1.0 spec][rw1] |
+//! | connect failure | `Clean` | the destination provably never saw it | -- |
+//! | any other transport error, timeout included | `Ambiguous` | the request may have been applied | -- |
+//!
+//! Every non-2xx answer's status and first 256 bytes of body are in the error and in a throttled
+//! `remote_write_rejected` diagnostic, so a retried `503` reports once per attempt; Prometheus's
+//! own `400` text names the offending series and is the only useful thing in the exchange. A 2.0
+//! receiver's `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` counts, when it
+//! sends them on a failure, are appended: on a `4xx` they say how much of a partial write landed.
+//! Under `compression: zstd`, a `415` or `400` also names `compression: snappy` as the likely
+//! remedy, since those are the statuses a receiver that doesn't take zstd answers.
+//!
+//! [rw1]: https://prometheus.io/docs/specs/prw/remote_write_spec/
+//! [rw2]: https://prometheus.io/docs/specs/prw/remote_write_spec_2_0/
+//! [prom-handler]: https://github.com/prometheus/prometheus/blob/main/storage/remote/write_handler.go
+//! [prom-api]: https://github.com/prometheus/prometheus/blob/main/web/api/v1/api.go
+//! [mimir-errors]: https://github.com/grafana/mimir/blob/main/pkg/distributor/errors.go
+//! [dskit-auth]: https://github.com/grafana/dskit/blob/main/middleware/http_auth.go
+//! [thanos-handler]: https://github.com/thanos-io/thanos/blob/main/pkg/receive/handler.go
+//! [thanos-receive]: https://thanos.io/tip/components/receive.md/
+//! [vm-parser]: https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/lib/protoparser/promremotewrite/stream/streamparser.go
+//! [cg-remote]: https://github.com/prometheus/client_golang/blob/main/exp/api/remote/remote_api.go
 //!
 //! **Redirects aren't followed** ([`crate::http::build_client`] turns off `reqwest`'s default
 //! `limited(10)`), which is why `3xx` is on that table. Remote-write defines no redirect, and
@@ -182,7 +213,7 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.requests{class="1xx"\|"2xx"\|"3xx"\|"4xx"\|"5xx"\|"other"\|"network_error"}` | one per request, in `otlp_out`'s vocabulary ([`crate::http::status_class`]). No `429` class: a 429 is a `4xx`, and splitting it out would contradict [`crate::http::is_retryable_http_status`], which picks the `Fault` from the same status. No `timeout` class: a timeout is a transport error, so `network_error`. No `signal` tag, unlike `otlp_out`: this sink has one signal |
+//! | `logit.output.requests{class="1xx"\|"2xx"\|"3xx"\|"4xx"\|"5xx"\|"other"\|"network_error"}` | one per request, in `otlp_out`'s vocabulary ([`crate::http::status_class`]). No `429` class: a 429 is a `4xx`, and splitting it out would contradict [`crate::http::classify_status`], which picks the `Fault` from the same status. No `timeout` class: a timeout is a transport error, so `network_error`. No `signal` tag, unlike `otlp_out`: this sink has one signal |
 //! | `logit.output.request.duration` | one timer per request issued, the spelling `graphite_out`, `collectd_out`, `syslog_out`, `statsd_out` and `influxdb_out` use |
 //! | `logit.output.samples` | samples in the request body, counted by the codec ([`remote_write::encode_counted`]) rather than guessed from family counts: one `Series` is one sample for a gauge and several for a histogram. Mirrors `prometheus_in`'s `logit.input.samples`, so the two ends of a relay compare |
 //!
@@ -225,7 +256,7 @@
 
 use crate::accounting::BatchAccounting;
 use crate::http::{
-    body_snippet, build_client, classify_reqwest_error, is_retryable_http_status, read_body_prefix,
+    body_snippet, build_client, classify_reqwest_error, classify_status, read_body_prefix,
     status_class, ERROR_BODY_SNIPPET_BYTES,
 };
 /// The sender's `endpoint_tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
@@ -586,6 +617,13 @@ impl Output for PrometheusOutput {
         match self {
             PrometheusOutput::Expose(output) => output.default_posture(),
             PrometheusOutput::Send(output) => output.default_posture(),
+        }
+    }
+
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        match self {
+            PrometheusOutput::Expose(output) => output.observe_posture(posture),
+            PrometheusOutput::Send(output) => output.observe_posture(posture),
         }
     }
 }
@@ -998,18 +1036,15 @@ impl RemoteWriteOutput {
             Ok(response) => {
                 let status = response.status();
                 self.telemetry.count(REQUESTS, 1.0, &[("class", status_class(status))]);
-                let fault = if is_retryable_http_status(status) {
-                    Fault::Ambiguous
-                } else {
-                    Fault::Permanent
-                };
+                let written = written_counts(response.headers());
                 // The body names the offending series in a Prometheus-style `400` (`out of order
                 // sample`, a bad label): the only actionable part. Read bounded.
                 let body = read_body_prefix(response, ERROR_BODY_SNIPPET_BYTES).await;
-                let snippet = body_snippet(&body, ERROR_BODY_SNIPPET_BYTES);
+                let fault = remote_write_fault(status, &body);
+                let snippet = format!("{}{written}", body_snippet(&body, ERROR_BODY_SNIPPET_BYTES));
                 // A receiver that doesn't take zstd answers `415` (Prometheus, Mimir) or `400`,
-                // the two statuses vmagent's own downgrade keys on. Still permanent: there is no
-                // fallback, so the operator gets the remedy instead.
+                // the two statuses vmagent's own downgrade keys on. There is no fallback, so the
+                // operator gets the remedy instead.
                 let hint = if self.encoding == Encoding::Zstd
                     && matches!(
                         status,
@@ -1035,6 +1070,52 @@ impl RemoteWriteOutput {
                 Err(anyhow::Error::new(err)).context(fault)
             }
         }
+    }
+}
+
+/// A remote-write receiver's non-2xx answer as a [`Fault`], per the module doc's "Faults, retries
+/// and duplicate safety" table: [`classify_status`], except a `415` and a `400` whose body says
+/// the receiver couldn't decompress the body, which are `Refused`. Both answer the sink's
+/// `version:` or `compression:`, not the batch, so every batch would get them.
+fn remote_write_fault(status: StatusCode, body: &str) -> Fault {
+    match status {
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => Fault::Refused,
+        StatusCode::BAD_REQUEST if names_decompression(body) => Fault::Refused,
+        _ => classify_status(status),
+    }
+}
+
+/// The receivers' own text for a body they couldn't decompress, matched at the start of a `400`
+/// body: VictoriaMetrics' `cannot decompress snappy-encoded request with length %d: %w` (and its
+/// `zstd-encoded` twin), and `client_golang`'s receiver, which answers the Snappy library's error,
+/// `snappy: corrupt input` and the other `snappy: ` texts. Anchored, never a word search: a
+/// per-batch `400` quotes the offending series after the receiver's own text, and a series named
+/// `envoy_http_decompressor_*` must not read as this sink's `compression:` being wrong.
+const DECOMPRESSION_PREFIXES: [&str; 2] = ["cannot decompress ", "snappy: "];
+
+/// Whether a `400` body opens with one of [`DECOMPRESSION_PREFIXES`].
+fn names_decompression(body: &str) -> bool {
+    let body = body.trim_start();
+    DECOMPRESSION_PREFIXES.iter().any(|prefix| body.starts_with(prefix))
+}
+
+/// A remote-write 2.0 receiver's `X-Prometheus-Remote-Write-*-Written` counts, as a suffix for the
+/// error message, or empty when it sent none. On a `4xx` they say how much of a partial write
+/// landed; the class doesn't change, since a sender "MUST NOT retry" a `4xx` other than `429`.
+fn written_counts(headers: &http::HeaderMap) -> String {
+    let count = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let parts: Vec<String> = [
+        ("samples", "x-prometheus-remote-write-samples-written"),
+        ("histograms", "x-prometheus-remote-write-histograms-written"),
+        ("exemplars", "x-prometheus-remote-write-exemplars-written"),
+    ]
+    .into_iter()
+    .filter_map(|(what, name)| count(name).map(|n| format!("{n} {what}")))
+    .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" (the receiver wrote {})", parts.join(", "))
     }
 }
 
@@ -1226,6 +1307,7 @@ mod tests {
         interner::intern, AttrMap, Event, Histogram, MetricKind, MetricRecord, Resource, Sum,
         Summary, Temporality, Value,
     };
+    use logit_pipeline::Fault;
     use logit_proto::prometheus::{ATTR_TIMESTAMP, ATTR_TYPE, LABEL_INSTANCE};
     // The vendored prompb types, so a sender test asserts against the *message* a receiver would
     // decode rather than against this codec's own view of it (`crates/logit-proto/proto/`).
@@ -2463,24 +2545,124 @@ mod tests {
         }
     }
 
-    /// A `400` is permanent and its body, which names the offending series, is reported.
+    /// A `400` is rejected and its body, which names the offending series, is reported.
     #[tokio::test]
-    async fn a_400_is_permanent_and_carries_the_response_body_in_its_message() {
+    async fn a_400_is_rejected_and_carries_the_response_body_in_its_message() {
         let (url, _seen) =
             canned_receiver(StatusCode::BAD_REQUEST, "out of order sample for series {x=\"1\"}")
                 .await;
         let mut sink = sender(&url);
         let err =
             sink.send(&counter_batch(1_000_000_000, 1.0)).await.expect_err("a 400 is an error");
-        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
-        assert!(logit_pipeline::is_explicitly_permanent(&err), "never retried under any posture");
+        assert_eq!(err.downcast_ref::<Fault>(), Some(&Fault::Rejected));
         let message = format!("{err:#}");
         assert!(message.contains("400"), "got: {message}");
         assert!(message.contains("out of order sample"), "got: {message}");
     }
 
-    /// Under zstd, a `415` or `400` names the remedy and stays permanent; a Snappy sender's
-    /// `415`, and a zstd sender's `403`, don't.
+    /// The class one canned remote-write answer reads as.
+    async fn remote_write_class(status: StatusCode, body: &'static str) -> Fault {
+        let (url, _seen) = canned_receiver(status, body).await;
+        let err = sender(&url).send(&counter_batch(1_000_000_000, 1.0)).await.expect_err("non-2xx");
+        logit_pipeline::classify(&err)
+    }
+
+    // One test per row of the module doc's "Faults, retries and duplicate safety" table, each
+    // answering the body the receiver it names sends.
+
+    #[tokio::test]
+    async fn a_400_duplicate_or_out_of_order_sample_is_rejected() {
+        for body in [
+            "out of order sample",
+            "the sample has been rejected because another sample with a more recent timestamp \
+             has already been ingested and out-of-order samples are not allowed \
+             (err-mimir-sample-out-of-order)",
+            "the sample has been rejected because another sample with the same timestamp, but a \
+             different value, has already been ingested (err-mimir-sample-duplicate-timestamp)",
+        ] {
+            let class = remote_write_class(StatusCode::BAD_REQUEST, body).await;
+            assert_eq!(class, Fault::Rejected, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_400_naming_a_failed_decompression_is_refused() {
+        let golang = "snappy: corrupt input\n";
+        assert_eq!(remote_write_class(StatusCode::BAD_REQUEST, golang).await, Fault::Refused);
+        let zstd = "cannot decompress zstd-encoded request with length 42: unexpected EOF";
+        assert_eq!(remote_write_class(StatusCode::BAD_REQUEST, zstd).await, Fault::Refused);
+        let body = "cannot decompress snappy-encoded request with length 42: snappy: corrupt input";
+        assert_eq!(remote_write_class(StatusCode::BAD_REQUEST, body).await, Fault::Refused);
+    }
+
+    /// A per-batch `400` that quotes a series named for decompression is about the batch: the
+    /// receiver's own text comes first, so the anchored match never sees the series name.
+    #[tokio::test]
+    async fn a_400_quoting_a_decompressed_series_stays_rejected() {
+        for body in [
+            "received a series whose number of labels exceeds the limit (actual: 31, limit: 30) \
+             series: 'envoy_http_decompressor_gzip_decompressed_bytes_total{cluster=\"a\"' \
+             (err-mimir-max-label-names-per-series). To adjust the related per-tenant limit, \
+             configure -validation.max-label-names-per-series, or contact your service \
+             administrator.",
+            "invalid labels for series, labels {__name__=\"cannot decompress \", job=\"x\"}",
+        ] {
+            let class = remote_write_class(StatusCode::BAD_REQUEST, body).await;
+            assert_eq!(class, Fault::Rejected, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_401_no_org_id_is_refused() {
+        assert_eq!(remote_write_class(StatusCode::UNAUTHORIZED, "no org id").await, Fault::Refused);
+        let grafana = r#"{"status":"error","error":"authentication error: invalid authentication credentials"}"#;
+        assert_eq!(remote_write_class(StatusCode::UNAUTHORIZED, grafana).await, Fault::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_404_from_a_disabled_receiver_is_refused() {
+        let body =
+            "remote write receiver needs to be enabled with --web.enable-remote-write-receiver";
+        assert_eq!(remote_write_class(StatusCode::NOT_FOUND, body).await, Fault::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_409_conflict_is_rejected() {
+        let body = "add 1 samples: out of order sample";
+        assert_eq!(remote_write_class(StatusCode::CONFLICT, body).await, Fault::Rejected);
+    }
+
+    #[tokio::test]
+    async fn a_413_is_rejected() {
+        let class = remote_write_class(StatusCode::PAYLOAD_TOO_LARGE, "request too large").await;
+        assert_eq!(class, Fault::Rejected);
+    }
+
+    #[tokio::test]
+    async fn a_415_unsupported_media_type_is_refused() {
+        let body =
+            "io.prometheus.write.v2.Request protobuf message is not accepted by this server; \
+                    only accepts prometheus.WriteRequest";
+        assert_eq!(
+            remote_write_class(StatusCode::UNSUPPORTED_MEDIA_TYPE, body).await,
+            Fault::Refused
+        );
+    }
+
+    /// A 2.0 receiver's written counts ride on the error; the class stays the status's.
+    #[test]
+    fn a_partial_write_quotes_the_written_counts() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-prometheus-remote-write-samples-written", HeaderValue::from_static("3"));
+        headers
+            .insert("x-prometheus-remote-write-exemplars-written", HeaderValue::from_static("0"));
+        assert_eq!(written_counts(&headers), " (the receiver wrote 3 samples, 0 exemplars)");
+        assert_eq!(written_counts(&HeaderMap::new()), "");
+        assert_eq!(remote_write_fault(StatusCode::BAD_REQUEST, "bad sample"), Fault::Rejected);
+    }
+
+    /// Under zstd, a `415` or `400` names the remedy; a Snappy sender's `415`, and a zstd
+    /// sender's `403`, don't.
     #[tokio::test]
     async fn a_415_or_400_under_zstd_names_compression_snappy_as_the_remedy() {
         for (status, encoding, hinted) in [
@@ -2492,7 +2674,9 @@ mod tests {
             let (url, _seen) = canned_receiver(status, "unsupported").await;
             let mut sink = sender(&url).with_compression(encoding);
             let err = sink.send(&counter_batch(1_000_000_000, 1.0)).await.expect_err("a 4xx");
-            assert_eq!(logit_pipeline::classify(&err), Fault::Permanent, "{status} {encoding:?}");
+            let want =
+                if status == StatusCode::BAD_REQUEST { Fault::Rejected } else { Fault::Refused };
+            assert_eq!(logit_pipeline::classify(&err), want, "{status} {encoding:?}");
             let message = format!("{err:#}");
             assert_eq!(
                 message.contains("set 'compression: snappy'"),
@@ -2534,7 +2718,7 @@ mod tests {
 
     /// A `3xx` is a failure, not a followed redirect; the receiver's request count is the proof.
     #[tokio::test]
-    async fn a_redirect_is_not_followed_and_is_a_permanent_fault() {
+    async fn a_redirect_is_not_followed_and_is_a_rejected_fault() {
         let (url, seen) = canned_redirect_receiver(StatusCode::FOUND, "/api/v1/write").await;
         let registry = logit_core::Registry::new();
         let mut sink =
@@ -2545,8 +2729,7 @@ mod tests {
             .expect_err("a 3xx is not a delivery");
 
         assert_eq!(seen.lock().unwrap().len(), 1, "the redirect must not be followed");
-        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
-        assert!(logit_pipeline::is_explicitly_permanent(&err), "never retried under any posture");
+        assert_eq!(err.downcast_ref::<Fault>(), Some(&Fault::Rejected));
         let message = format!("{err:#}");
         assert!(message.contains("302"), "got: {message}");
         assert!(
@@ -2825,32 +3008,28 @@ mod tests {
         }
     }
 
-    /// A batch whose one request never answers is cut off by the retry budget and dropped, and
-    /// the next batch counts its encode-side counters.
+    /// A batch whose one request is answered `503` is dropped under `at_most_once`, and the next
+    /// batch counts its encode-side counters.
     #[tokio::test]
-    async fn a_remote_write_batch_after_one_dropped_at_its_budget_counts_encode_side() {
-        let (addr, log) =
-            http_recorder(
-                |n, _, _| {
-                    if n == 0 {
-                        Reply::Hang
-                    } else {
-                        Reply::Answer(200, Vec::new())
-                    }
-                },
-            )
-            .await;
+    async fn a_remote_write_batch_after_one_dropped_counts_encode_side() {
+        let (addr, log) = http_recorder(|n, _, _| {
+            if n == 0 {
+                Reply::Answer(503, Vec::new())
+            } else {
+                Reply::Answer(200, Vec::new())
+            }
+        })
+        .await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented_sender(&format!("http://{addr}/api/v1/write"), &probe);
-        let mut config = fast_retry();
-        config.retry.total_budget = crate::test_support::HUNG_REQUEST_BUDGET;
+        let config = crate::test_support::at_most_once();
         let batches = vec![encode_side_batch(), encode_side_batch()];
         let sums =
             sums_through_write_loop(&mut output, &mut probe, "prometheus_out", batches, config)
                 .await;
         assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
         assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
-        assert_eq!(log.lock().unwrap().len(), 2, "the hung request, then the second batch's");
+        assert_eq!(log.lock().unwrap().len(), 2, "the failed request, then the second batch's");
         for (name, tags) in ENCODE_SIDE {
             assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
         }

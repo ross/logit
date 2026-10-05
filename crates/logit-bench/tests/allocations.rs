@@ -1973,9 +1973,9 @@ fn disk_queue_config(dir: std::path::PathBuf) -> logit_pipeline::DiskQueueConfig
     }
 }
 
-/// `DiskQueue::push`: `native::encode_hop_batch` (`encode_batch` plus its trailer of provenance and
-/// the store's sender identity and sequence, `docs/adr/batch-provenance-on-delivered.md` and
-/// `docs/adr/native-hop-identity-and-sequence.md`), `frame::write_frame`, and one `write_all` to
+/// `DiskQueue::push`: `native::encode_hop_batch` (`encode_batch` behind the store's sender
+/// identity and sequence and ahead of a provenance trailer, `docs/adr/batch-provenance-on-delivered.md`
+/// and `docs/adr/native-hop-identity-and-sequence.md`), `frame::write_frame`, and one `write_all` to
 /// the active segment. Taking the sequence number is an atomic add and allocates nothing. The disk buffer's ADR accepts that this encode breaks
 /// `buffered-sink-delivery`'s zero-clone `Arc<EventBatch>` property. The warm-up push+commit pays
 /// the one-time setup (the lock file, the first segment's open).
@@ -2001,7 +2001,7 @@ fn disk_queue_push_one_batch() {
         measure(|| rt.block_on(queue.push((Arc::clone(&batch), BatchContext::default()))));
 
     // Among the 33: `encode_hop_batch` builds the bare payload as its own `Bytes`, then copies it
-    // into a `BytesMut` sized to the whole payload, the trailer (provenance and the sender pair)
+    // into a `BytesMut` sized to the whole payload, the sender prefix and the provenance trailer
     // written straight into it: 2. Sizing it to fit is what spares `freeze` a shared header.
     // `write_field`'s temp buffers: 2 per `MetricRecord` (`write_record_list`'s per-entry length
     // prefix, which lets a reader skip a record with unknown fields, and the `MR_KIND` field) for
@@ -4001,7 +4001,7 @@ fn logit_out_encode_and_frame_one_batch() {
     });
     assert!(!framed.is_empty());
     // `native_encode_one_event`'s breakdown, plus the `BytesMut` `encode_hop_batch` copies the
-    // bare payload into beside the trailer.
+    // bare payload into between the prefix and the trailer.
     expect_allocs("logit_out: encode + frame 1 batch", stats, 31);
 }
 

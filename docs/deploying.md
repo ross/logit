@@ -85,16 +85,17 @@ design. What an operator needs:
   metrics.
 - **A second signal during a stuck drain exits immediately** with status 130, so a restart policy
   waiting on the process can still kill it with the same signal.
-- **A sink failure, transient or extended, doesn't end the process by default.** Every sink sits
-  behind a decoupled delivery buffer with its own retry budget
-  ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md), which revises ADR
-  `service-lifecycle-and-output-retry`'s retry-budget rationale without superseding its other
-  decisions). The one case that still exits is a sustained, purely configuration-error failure;
-  see [Sink delivery buffering](#sink-delivery-buffering).
+- **A failed send, transient or extended, never ends the process.** Every sink sits
+  behind a decoupled delivery buffer
+  ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)). A retryable failure holds the
+  queue head until it succeeds, and a batch the destination rejects is dropped and counted; no
+  sink failure exits the process ([ADR `sink-fault-classes`](adr/sink-fault-classes.md)). See
+  [Sink failure semantics](#sink-failure-semantics).
 - **An input never acknowledges a batch no consumer took.** An acknowledgment means the batch is
   in the inbox of at least one consumer directly downstream, never that a sink delivered it. The
-  one exception is `logit_in`'s acknowledgment of a frame at or below its sender's mark, which it
-  doesn't forward (see [Forwarding between `logit` nodes](#forwarding-between-logit-nodes)). Once
+  two exceptions are `logit_in`'s: its acknowledgment of a frame at or below its sender's mark,
+  which it doesn't forward, and its rejected `Ack` for a frame it can't take, which reports a drop
+  (see [Forwarding between `logit` nodes](#forwarding-between-logit-nodes)). Once
   every direct consumer has closed, as happens while a shutdown tears the graph down, an
   acknowledging input refuses instead: `logit_in` answers `Reject{GOING_AWAY}` and closes the
   connection, an HTTP listener answers its protocol's retryable failure (a `503`, or gRPC status
@@ -113,7 +114,7 @@ configured, answers readiness and liveness probes. See
 |---|---|
 | `0` | Clean shutdown — a signal arrived, every listener drained, every sink flushed. |
 | `1` | A startup failure — a bad config, a port already in use, a bad `lua_file`, a bad `--log-level`. Nothing was ever running. |
-| `2` | A runtime failure after the process reported ready — a sustained, purely-configuration-error sink failure (see [Sink delivery buffering](#sink-delivery-buffering) below), a listener's accept loop dying, a `lua`/`lua_file` component's thread panicking (a script's own `process()`/`flush()` errors are not this: they're logged and counted, never fatal), a `lua`/`lua_file` component's VM still over its `max_memory` after a full garbage collection (logged `memory_limit_exceeded`), or a script still wedged inside `process()`/`flush()` with no progress 2 s after shutdown began, which `logit` exits without (see [What to watch on `/readyz`](#what-to-watch-on-readyz)). |
+| `2` | A runtime failure after the process reported ready — a listener's accept loop dying, a `lua`/`lua_file` component's thread panicking (a script's own `process()`/`flush()` errors are not this: they're logged and counted, never fatal), a `lua`/`lua_file` component's VM still over its `max_memory` after a full garbage collection (logged `memory_limit_exceeded`), or a script still wedged inside `process()`/`flush()` with no progress 2 s after shutdown began, which `logit` exits without (see [What to watch on `/readyz`](#what-to-watch-on-readyz)), a sink's `buffer.disk:` spool that can't be opened (a bad path, permissions, another process holding the lock), or a sink's task panicking. A failed send never causes it: a sink that can't deliver holds or drops, per [Sink failure semantics](#sink-failure-semantics). |
 | `130` | A second SIGTERM/SIGINT arrived before a graceful drain finished. |
 
 To enable the probe endpoint, add a top-level `admin:` block:
@@ -171,8 +172,8 @@ configured).
 ### What to watch on `/readyz`
 
 - **`/readyz` stuck at `503 degraded`** means a node has failed, not that a sink is retrying. See
-  [Sink failure semantics](#sink-failure-semantics-degrade-to-dropping-dont-exit) for what does
-  and doesn't trip it.
+  [Sink failure semantics](#sink-failure-semantics) for how a sink handles a failing
+  destination without a node failing.
 - **`/readyz` at `503 stalled`** means a `lua`/`lua_file` script has been inside one
   `process()`/`flush()` call for 10 s with no progress: an infinite loop, or a pathological pattern
   match. The self-log carries a `script_stalled` warning naming the component. A script that is
@@ -226,8 +227,9 @@ process, not a component.
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks and Lua nodes. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
-| `degraded` | warn | A sink's first dropped batch (its retry budget exhausted) since it was last healthy. |
-| `recovered` | info | A sink's first successful delivery after `degraded`. |
+| `degraded` | warn | A sink's first dropped batch since it was last healthy. |
+| `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
+| `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
 Outside the lifecycle events, `logit run` can log one startup `warn` before `ready`: when the
@@ -257,17 +259,22 @@ in this section. To make the queue survive a restart, see [Durable buffering](#d
 ### Default delivery posture
 
 Every sink defaults to `at_least_once`: it retries a failure whose outcome is unknown (a timeout,
-a `5xx`, a `429`, or a failure after part of a batch was written) for up to `retry_budget`, and
-the destination may receive the batch twice. `statsd_out` is the one exception and defaults to
+a `5xx`, a `429`, or a failure after part of a batch was written) until it succeeds, and the
+destination may receive the batch twice. `statsd_out` is the one exception and defaults to
 `at_most_once`, because a statsd line has no timestamp: a resent counter has no identity at its
 destination, so the resend adds to it. Set `buffer.delivery: at_most_once` on any other sink to
 drop a batch on its first ambiguous failure instead of risking a duplicate
 ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 5). A sink that sends one batch as
-several requests (`otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`) reports a
-retryable failure as ambiguous once any of them was accepted, so `at_least_once` resends the
-accepted requests with the rest and `at_most_once` drops the rest (item 9). A request the
-destination rejects by name (a `4xx` other than an auth refusal) is counted and skipped, except
-at `splunk_hec_out`, and the send succeeds if any request was accepted.
+several requests (`datadog_out`, `datadog_trace_out`, `splunk_hec_out`) reports a retryable
+failure as ambiguous once any of them was accepted, so `at_least_once` resends the accepted
+requests with the rest and `at_most_once` drops the rest (item 9). `otlp_out` instead remembers
+which signals of a batch were accepted and retries only the others: it reports the failed
+signal's own class, never resends an accepted signal within a run (a `buffer.disk:` batch
+replayed after a restart sends every signal again), and under `at_most_once` counts the records
+of the signals it drops as `records.dropped{signal, reason="ambiguous_at_most_once"}`
+([ADR `sink-fault-classes`](adr/sink-fault-classes.md), "Amendment: `otlp_out` retries per signal
+(2026-10-05)"). A request whose answer is `Rejected` (a `400` or a `413`, for example) is counted
+and skipped, except at `splunk_hec_out`, and the send succeeds if any request was accepted.
 
 A resend is harmless where the destination overwrites on identity: a sample at its
 `(series, timestamp)`, or a cumulative sum. A log or a span arrives twice. A resend double-counts
@@ -282,30 +289,92 @@ where the destination aggregates the kind it carries:
   and accept the loss instead.
 
 **A destination that fails ambiguously on every attempt holds the queue head.** Under
-`at_least_once`, each batch is retried for up to `retry_budget` (60s by default) before it's
-dropped, where an `at_most_once` sink drops it at once. With the default `overflow: block`, a
-queue that fills behind that batch backs up into the inputs. Watch
-`logit.component.buffer.utilization`, and lower `retry_budget` or choose a `drop_*` policy if
-intake matters more than the batch.
+`at_least_once`, the sink retries the head until it succeeds, where an `at_most_once` sink drops it
+at once. Batches queue behind the head up to `max_batches`/`max_bytes`. With the default
+`overflow: block`, a full queue backs up into the inputs. Watch `logit.component.retrying` and
+`logit.component.buffer.utilization`, and choose a `drop_*` policy, or `at_most_once`, if intake
+matters more than the held batch.
 
-### Sink failure semantics: degrade to dropping, don't exit
+### Sink failure semantics
 
-A sink that can't reach its destination drops and counts batches; it doesn't end `logit run`:
+A sink classifies each failed send into one of four faults, and none of them ends `logit run`
+([ADR `sink-fault-classes`](adr/sink-fault-classes.md)):
 
-- **A retryable failure** (per the sink's fault classification and delivery posture) is retried
-  within `retry_budget` (60s by default), then the batch is dropped and counted. The backoff
-  between attempts starts at 200ms and doubles up to `retry_max_delay` (10s by default).
-  `logit validate` rejects `retry_budget: 0s` and `retry_max_delay: 0s`: the first times every
-  attempt out before it starts, and the second retries with no pause until the budget ends.
-- **A non-retryable failure**, including retry-budget exhaustion, drops the batch, counts it, and
-  logs a throttled warning. The writer moves on to the next batch; the rest of the pipeline and
+| Fault | Meaning | What the sink does |
+|---|---|---|
+| `Clean` | The destination never saw the batch (connect refused, DNS failure). | Retries under either posture. |
+| `Ambiguous` | The destination may have applied the batch before the response was lost (a timeout, a `5xx`, a `429`). | Retries under `at_least_once`. Drops the batch at once under `at_most_once`, counted `batches.dropped{reason="ambiguous_at_most_once"}`. |
+| `Rejected` | The destination refused this batch for its own content, so a resend gets the same answer. | Drops the batch at once and counts it `batches.dropped{reason="rejected"}` and `events.dropped{reason="rejected"}`. Never retries. |
+| `Refused` | The destination refuses every batch for now (bad credentials, an unknown tenant or bucket, a protocol mismatch). | Retries under either posture, because nothing was applied. |
+
+An error the sink attaches no fault to is treated as `Rejected`.
+
+- **A retryable fault holds the head until it succeeds.** The sink retries the head after a
+  200ms backoff that doubles up to `buffer.retry_max_delay` (10s by default), with no limit on
+  attempts or time, until the head is delivered or the shutdown grace cuts it. `logit validate`
+  rejects `retry_max_delay: 0s`, because a failing head would retry with no pause for as long as
+  it fails.
+- **The queue bounds a hold.** While the head waits, batches queue behind it up to
+  `buffer.max_batches`/`max_bytes`. After that, `overflow` decides: `block` backs up into the
+  inputs, `drop_oldest` and `drop_newest` evict, and `buffer.disk:` spools instead. See
+  [Sink buffer sizing](#sink-buffer-sizing-max_bytes--number-of-sinks).
+- **A rejected batch drops and the writer moves on.** The sink logs a throttled `send_failed`
+  warning carrying the fault class and the destination's error text. The rest of the pipeline and
   every other sink keep running.
-- **The one exception exits the process.** If a sink sees *only* configuration-error failures (a
-  bad token, a bad bucket: failures no retry can fix) for a sustained ~60-second window with no
-  success in between, `logit run` exits. This is deliberate: a misconfigured sink should fail
-  loudly enough for a restart-policy supervisor to notice, not drop every batch forever. A slow or
-  temporarily down destination never trips this; only a failure `logit` can identify as a
-  configuration problem does.
+- **No failed send ends the process.** A misconfigured sink, one whose token the destination
+  refuses, for example, holds its queue and shows through the signals below instead of exiting.
+  Only a `buffer.disk:` spool that can't open or a sink task that panics fails the node (exit
+  code `2`). A restart-policy
+  supervisor never sees it, so alert on those signals.
+- **An attempt has no runtime timeout.** The sink's own transport timeout bounds each one:
+  `request_timeout`, the HTTP client's timeouts, or, on `syslog_out`, `statsd_out`, and
+  `graphite_out` over a stream, `connect_timeout`, which also bounds each write's progress. The
+  shutdown grace cuts an attempt short. `stdio_out` writing to a stdout or stderr pipe has no
+  bound ([`docs/known-gaps/sinks.md`](known-gaps/sinks.md)): a reader that stops reading holds
+  the sink silently until shutdown.
+
+**To see a hold:**
+
+- `logit.component.retrying` (gauge, on the sink): `1` from the head's first retryable failure while a
+  retry is pending or in flight, `0` once that head is delivered or dropped and when the write loop
+  exits. `batches.dropped` stops moving during a hold, so alert on this gauge instead.
+- The `retrying` error-level line, logged on the held head's first failure and then at most once
+  a minute while it keeps failing, however long the hold lasts. It names the fault class, the
+  destination's error text, how long the head has been held, the failure count, and how many
+  batches are queued.
+- `degraded` (warn, on the first drop) and `recovered` (info, on the first success after a drop or
+  a retried failure) mark the edges.
+
+The status-only default for HTTP sinks is the `classify_status` table in
+[`crates/logit-outputs/src/http.rs`](../crates/logit-outputs/src/http.rs): `401`, `403`, `404`,
+`405`, `407`, and `501` are `Refused`; `429` and `5xx` are `Ambiguous`; other `4xx` and every
+`3xx` are `Rejected`; a connect or DNS failure is `Clean`; a request timeout is `Ambiguous`. Each
+sink refines it from what its destination documents, in a table in its module doc that cites the
+evidence for every row:
+
+- `influxdb_out`: InfluxDB's write API, in
+  [`influxdb.rs`](../crates/logit-outputs/src/influxdb.rs), "Response classes".
+- `otlp_out`: the OTLP specification's retry rules, in
+  [`otlp.rs`](../crates/logit-outputs/src/otlp.rs), "Response classes".
+- `prometheus_out`: the remote-write specifications and the common receivers' answers, in
+  [`prometheus.rs`](../crates/logit-outputs/src/prometheus.rs), "Faults, retries and duplicate
+  safety (sender mode)".
+- `datadog_out`: Datadog's intake statuses, in
+  [`datadog.rs`](../crates/logit-outputs/src/datadog.rs), "Faults, retries, and duplicate safety".
+- `datadog_trace_out`: the Agent's trace receiver, in
+  [`datadog_trace.rs`](../crates/logit-outputs/src/datadog_trace.rs), "Faults, retries, and
+  duplicate safety".
+- `splunk_hec_out`: Splunk's HEC codes, in [`splunk.rs`](../crates/logit-outputs/src/splunk.rs),
+  "Faults, retries, and duplicate safety".
+- `logit_out`: the native hop's handshake, `Reject` codes, and ack wait, in
+  [`logit.rs`](../crates/logit-outputs/src/logit.rs), "Response classes".
+- `syslog_out`, `statsd_out`, and `graphite_out` over a stream: the pooled-stream driver's I/O
+  table, in [`stream.rs`](../crates/logit-outputs/src/stream.rs).
+- `syslog_out`, `statsd_out`, `graphite_out`, and `collectd_out` over datagrams: the datagram
+  driver's table, in [`datagram.rs`](../crates/logit-outputs/src/datagram.rs).
+- `stdio_out` and `file_out`: the file and stream table, in
+  [`stdio.rs`](../crates/logit-outputs/src/stdio.rs), "Response classes".
+
 - **On SIGTERM/SIGINT**, each sink gets up to `shutdown_grace` (5s by default) to drain its queue.
   Anything still queued at that deadline, or still waiting to enter the queue, is dropped and
   counted (a disk-backed sink spools it instead). For a disk-backed sink, the posture decides a
@@ -343,10 +412,13 @@ buffering:
   `max_bytes` is closer to tripping. Sustained values near 1.0 mean the sink is falling behind its
   destination; under `block`, it is also back-pressuring intake.
 - `logit.component.batches.dropped` (count, tagged `reason`): `overflow_oldest`/`overflow_newest`
-  (a `drop_*` policy dropped something), `send_failed` (retry gave up on a batch), or `shutdown`
-  (the queue, or batches still waiting to enter it, held data when the sink stopped). Any sustained nonzero rate is data
+  (a `drop_*` policy dropped something), `rejected` (the destination refused the batch for its own
+  content), `ambiguous_at_most_once` (a send of unknown outcome under `at_most_once`), or
+  `shutdown` (the queue, or batches still waiting to enter it, held data when the sink stopped). Any sustained nonzero rate is data
   loss worth alerting on. The `reason` says whether the cause is an overflowing queue, a failing
   destination, or a slow drain racing shutdown.
+- `logit.component.retrying` (gauge): `1` while a sink holds a failing head. A hold drops nothing,
+  so it never shows in `batches.dropped`.
 - **A retried batch doesn't inflate a sink's encode-side drop counters, but a drop a peer or the
   kernel decided repeats.** While a sink retries, counts such as
   `logit.output.messages.dropped{reason="oversize_datagram"}`, a Splunk code 6, and an OTLP
@@ -434,16 +506,14 @@ it), and each segment when it rotates away and at shutdown, not per push. A proc
 (including `SIGKILL`) loses nothing already written; a power loss can lose the most recent,
 not-yet-synced tail of the active segment.
 
-**The spool survives a restart, not an outage longer than `retry_budget`.** A batch the sink
-gives up on is removed from the spool and counted `batches.dropped{reason="send_failed"}`,
-exactly as an in-memory queue drops it, and a restart doesn't bring it back. The sink gives up
-when a failure isn't retryable under its delivery posture (a configuration error, or a timeout or
-5xx under `at_most_once`; see the
-[retry table](adr/buffered-sink-delivery.md#delivery-posture-is-a-per-sink-policy-chosen-in-three-layers)),
-or when a retryable failure is still failing once `retry_budget` runs out. To ride out a longer
-destination outage, raise `retry_budget` as well as `disk.max_bytes`. That only helps for failures
-the posture retries: an `at_most_once` sink drops a batch on its first ambiguous failure, with no
-budget spent
+**The spool survives a restart, and a held head doesn't drop on a timer.** A sink retries a
+retryable failure until it succeeds, so an outage fills the spool instead of dropping batches. The
+spool bounds the outage: `disk.max_bytes` sets how much it holds before `overflow` applies. A
+batch the sink gives up on is removed from the spool and counted, as an in-memory queue
+drops it, and a restart doesn't bring it back. The sink gives up on a `Rejected` batch
+(`batches.dropped{reason="rejected"}`) and, under `at_most_once`, on an `Ambiguous` one
+(`batches.dropped{reason="ambiguous_at_most_once"}`); see
+[Sink failure semantics](#sink-failure-semantics)
 ([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md#amendment-a-dropped-batch-is-committed-off-the-spool-2026-09-24)).
 
 **`file_out` never fsyncs**, with or without a `buffer.disk:` block: a power loss can lose its most
@@ -1169,7 +1239,7 @@ one:
   `Int32StringReceiver.MAX_LENGTH`) bounds one pickle frame and applies regardless of transport,
   since pickle is TCP-only anyway. `connect_timeout:` (TCP only, default `5s`) matches
   `statsd_out`'s and `syslog_out`'s default.
-- **What to watch.** `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (one per
+- **What to watch.** `logit.output.requests{class="ok"|"clean"|"ambiguous"|"rejected"|"refused"}` (one per
   attempt) and, on TCP, `logit.output.reconnects`, which should stay near zero in steady state; a
   climbing count means the peer or the network is unstable. TCP sends through the same connection
   handling as `statsd_out` and `syslog_out`.
@@ -1220,7 +1290,7 @@ components:
   ([ADR `statsd-output`](adr/statsd-output.md)'s TLS amendment). That is deliberately conservative:
   `statsd_out` defaults to `at_most_once` because a redelivered `hits:5|c` *increments the
   destination counter a second time*. Watch `logit.component.batches.dropped` accordingly.
-- **What to watch.** `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (one per
+- **What to watch.** `logit.output.requests{class="ok"|"clean"|"ambiguous"|"rejected"|"refused"}` (one per
   attempt, tagged with its fault class) and, on TCP, `logit.output.reconnects`, which should stay near zero in steady state; a climbing count means the
   peer or the network is unstable, not this sink. It counts plaintext and TLS connections the same
   way, since both take the same connect path. `logit.output.datagrams` exists only under the
@@ -1678,6 +1748,22 @@ the graph down, a request is refused: HTTP `503` with `Retry-After: 1`, or gRPC 
 (`UNAVAILABLE`). Both are retryable, and OTLP exporters retry them. It's counted
 `logit.input.batches.dropped{reason="closed_consumer"}`.
 
+## `otlp_out`: a server failure is retried, not dropped
+
+The OTLP specification says a client must not retry an HTTP `5xx` other than `502`, `503`, and
+`504`, a gRPC `INTERNAL`, or a gRPC `RESOURCE_EXHAUSTED` without a `RetryInfo` detail, and the
+OpenTelemetry Collector drops all three. `otlp_out` departs from that and reads them as
+`ambiguous`: each says the server failed, not that the batch is bad. Under the default,
+`at_least_once`, the sink holds the batch and retries it with backoff, so a backend that answers
+`RESOURCE_EXHAUSTED` for a rate limit, or `500` for a transient failure, as New Relic's OTLP
+intake documents (`docs/plans/newrelic-relay.md`), gets the batch once it recovers, at the
+risk of a duplicate if the first attempt was applied. Under `buffer.delivery: at_most_once` the
+batch drops at once, counted `batches.dropped{reason="ambiguous_at_most_once"}`. See
+[ADR `sink-fault-classes`](adr/sink-fault-classes.md), "Amendment: `otlp_out` departs from the
+OTLP specification's non-retryable list (2026-10-04)", and the table in
+[`otlp.rs`](../crates/logit-outputs/src/otlp.rs)'s module doc for every answer `otlp_out`
+distinguishes.
+
 ## `datadog_in`: standing in for Datadog's intake
 
 To choose between this and the other Datadog topologies, and for the rules that lose data when
@@ -1901,8 +1987,8 @@ because Datadog's events route answers any compressed body `400 Invalid JSON str
 **Stale data is dropped before sending.** Datadog documents a window for each kind of data and
 discards data outside it, so `datadog_out` drops it and counts
 `logit.output.records.dropped{reason="stale"}`, measured from one send time per batch, read when
-the batch is first tried, so every retry of it drops the same points (and a batch retried for up
-to `retry_budget` can send a point that far past its window):
+the batch is first tried, so every retry of it drops the same points (and a batch held across
+retries can send a point that far past its window):
 
 | Data | Dropped when |
 |---|---|
@@ -1943,11 +2029,13 @@ event too large to send alone is dropped and counted `records.dropped{reason="ov
 
 **Delivery.** One batch goes out over up to eight routes, each as one or more requests (one per
 event, and a route over its size cap is split), sent one after another. A `408`, `429`, or `5xx`
-answer or a timeout stops the rest, and the whole batch is retried or dropped as one. A `403`
-(a rejected API key) also stops the rest. A `413` counts the request's entries `oversize`, and any
+answer or a timeout stops the rest, and the whole batch is retried or dropped as one. A `401` or
+`403` (a rejected API key), or a `404`, `405`, or `407` (the configured base, or a proxy in front
+of it, refusing every batch), also stops the rest, and the sink holds the batch and retries it (`refused`).
+A `413` counts the request's entries `oversize`, and any
 other `4xx` or `3xx` counts them `records.dropped{reason="rejected"}`; neither is retried, and the
 send goes on to the next request. The send is delivered if any request was accepted, and fails
-as a permanent fault only when none was. A retry re-sends the requests that succeeded, so the default posture, `at_least_once`,
+as `rejected`, and is dropped, only when none was. A retry re-sends the requests that succeeded, so the default posture, `at_least_once`,
 can deliver a resend. A trial org stored a resent series point once, the last write winning at
 its `(series, timestamp)`, and an identical log twice. Assume every other route (distribution
 points, sketches, events, checks, traces, stats) stores a resend again: none was measured.
@@ -2042,11 +2130,15 @@ Agent's `max_request_bytes`. A trace too large to send alone is dropped and coun
 `logit.output.records.dropped{reason="oversize"}`.
 
 **Delivery.** Traces go first, then stats. A request that fails with a retryable error stops the
-rest, and the batch is retried or dropped as one. A `413` counts `oversize`, and any other `4xx`
-counts `records.dropped{reason="rejected"}` and goes on to the next request; the send is
-delivered if either request was accepted. `408`, `429`, `5xx`, and timeouts are retryable; a refused
-connection or a missing socket file is retried under every posture before any request of the
-batch was accepted, and after one is retryable like a timeout; any other `4xx` isn't retried.
+rest, and the batch is retried or dropped as one. A `413` counts `oversize`, and a `400` or any
+other `4xx` the sink reads as `rejected` counts `records.dropped{reason="rejected"}` and goes on
+to the next request; the send is delivered if either request was accepted. `408`, `5xx`, and
+timeouts are retryable under `at_least_once`. A refused connection, a missing socket file, or an
+overwhelmed Agent's `429` is retried under every posture before any request of the batch was
+accepted, and after one is retryable like a timeout. A `401`, `403`, `404`, `405`, `407`, or
+`415` means the Agent doesn't serve this `version:` as configured, or something else answered in
+its place: the sink holds the batch and retries it (`refused`). The sink's module doc has the
+table.
 An Agent dedupes nothing, so under the default `at_least_once` posture a resend stores its spans
 twice and adds its stats; `buffer: {delivery: at_most_once}` drops the batch on a `5xx` instead. A
 `buffer:` here is also what keeps
@@ -2205,11 +2297,14 @@ order. An object larger than the cap alone is dropped, counted
 **Delivery.** A `429`, or a `503` code 9 ("Server is busy"), means Splunk didn't take the body:
 before any body of the batch was accepted, the batch is retried under every posture, with the
 runtime's backoff (a `Retry-After` header is ignored). `408`, other `5xx`, timeouts, and a busy
-answer after a body was accepted are retryable only under `at_least_once`; `401` and `403` are
-permanent, with a `token_rejected` warning; any other `4xx`, `413` included, is permanent and
-counted `logit.output.requests.rejected{code}`. A `400` code 6 is the exception: the sink drops the
-object Splunk names, counted `records.dropped{reason="invalid_event"}`, and resends the rest of
-that body once. A code 6 naming the first object of a body over 5 MiB is Splunk Cloud's oversize
+answer after a body was accepted are retryable only under `at_least_once`; a `401` or
+`403`, a token or channel code on a `400`, or a `404`, `405`, or `407`, is `refused`, with a
+`token_rejected` warning (a token), `request_refused` (a channel or authorization code), or
+`request_rejected` (`404`, `405`, `407`), and the sink holds the batch and retries it; any
+other `4xx`, `413` included, is `rejected`, dropped, and counted `logit.output.requests.rejected{code}`. A `400` that
+names one object (code 6, 7, 12, 13, or 15) is the exception: the sink drops that object, counted
+`records.dropped{reason="invalid_event"}`, and resends the rest of that body once. The sink's
+module doc has the table of every HEC code it reads. A code 6 naming the first object of a body over 5 MiB is Splunk Cloud's oversize
 answer instead: the sink splits the body in two and sends each half, or drops a lone object,
 counted `records.dropped{reason="oversize"}`. The first failing request stops the rest of the
 batch. Under the default `at_least_once` posture a `500` is retried, and Splunk indexes a resent
@@ -2339,8 +2434,9 @@ receiver speaks, as you pick an exposition dialect. The choice depends on the de
   symbol table (smaller bodies for the same series), carries `Metadata` inline on each series instead
   of in separate requests, carries the created timestamp per sample, and answers with
   `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` so a sender learns what was
-  stored. A receiver that doesn't speak 2.0 answers `415`, which this sink classifies as permanent:
-  the misconfiguration is reported immediately instead of retried.
+  stored. A receiver that doesn't speak 2.0 answers `415`, which this sink classifies as
+  `refused`: every batch would get the same answer, so the sink holds the batch and retries it
+  while the throttled `remote_write_rejected` diagnostic reports the misconfiguration.
 
 **Use `version: 1` for VictoriaMetrics: it discards 2.0 without an error.** VictoriaMetrics doesn't
 accept remote-write 2.0 and doesn't refuse it either. It answers a 2.0 request `204` with an empty
@@ -2361,7 +2457,10 @@ Native histograms are skipped and counted on both wires regardless of version
   `metadata_cache` metrics above. A nonzero `logit.input.connections.rejected{reason="limit"}`
   means the `max_connections` cap is binding.
 - Sender: `logit.output.requests{class}`, `logit.output.request.duration`, `logit.output.samples`.
-  A `4xx` is permanent and the batch is dropped; the throttled `remote_write_rejected` diagnostic
+  A `4xx` other than `401`, `403`, `404`, `405`, `407`, and `415`, or a `400` naming a failed
+  decompression (which hold the batch and retry it), and other than `429` (ambiguous, retried
+  under `at_least_once`), is `rejected` and the batch is dropped; the
+  throttled `remote_write_rejected` diagnostic
   quotes the receiver's message, which for Prometheus and Mimir names the offending series. A `3xx`
   means the endpoint is redirecting; this client deliberately doesn't follow redirects.
 - A sender feeding one series from two upstream branches can draw out-of-order `400`s from a
@@ -2399,11 +2498,10 @@ Runnable configs:
 [`fixtures/victoriametrics-vmagent-receive.yaml`](../fixtures/victoriametrics-vmagent-receive.yaml).
 
 **Run one `otlp_out` per product, each behind a `keep_signals`.** One `otlp_out` posts every signal
-it carries to one host, and a product answers a signal it doesn't ingest with a `404`, which is a
-permanent fault. `otlp_out` counts that signal's records `records.dropped{reason="rejected"}`,
-warns, and still sends the other signals, but the request is wasted on every batch. Split the flow
-with `keep_signals` (or `has_signal`) so each sink sees only its product's signal. A batch the
-product refuses whole still fails and is dropped.
+it carries to one host, and a product answers a signal it doesn't ingest with a `404`, which `otlp_out` reads as `rejected`
+for that signal. `otlp_out` counts that signal's records `records.dropped{reason="rejected"}`,
+warns, and still sends the other signals once, but the request is wasted on every batch. Split the
+flow with `keep_signals` (or `has_signal`) so each sink sees only its product's signal.
 
 **Put `aggregate` with `temporality: cumulative` ahead of metrics bound for VictoriaMetrics.**
 VictoriaMetrics keeps no temporality. A delta `Sum` sent over OTLP is stored as its raw
@@ -2434,9 +2532,11 @@ remote-write 1.0 request, compressed with zstd instead of Snappy. VictoriaMetric
 too, so the default is never wrong there. Choose `zstd` when you want the wire vmagent sends, for
 example for a `logit` hop that stands in for vmagent in front of VictoriaMetrics.
 
-- **There's no fallback.** Unlike vmagent, `prometheus_out` doesn't downgrade to Snappy. A `415` or
-  `400` under `zstd` is a permanent fault that drops the batch, and the `remote_write_rejected`
-  diagnostic names `compression: snappy` as the remedy.
+- **There's no fallback.** Unlike vmagent, `prometheus_out` doesn't downgrade to Snappy. A
+  receiver that can't read zstd answers `415`, or a `400` naming the failed decompression; both
+  are `refused`, so the sink holds the batch and retries it, and the `remote_write_rejected`
+  diagnostic names `compression: snappy` as the remedy. Any other `400` under `zstd` is
+  `rejected` and drops the batch, with the same remedy named.
 - **`zstd` needs `version: 1`.** Remote-write 2.0 mandates Snappy, so `version: 2` with
   `compression: zstd` is a config error.
 - **Expect about libzstd level 1's ratio.** `logit` compresses with `ruzstd`, a pure-Rust
@@ -2615,7 +2715,7 @@ listener"](#idle_timeout-on-a-tcp-listener) above.
 
 **What to watch.**
 
-- `syslog_out`: `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (one per
+- `syslog_out`: `logit.output.requests{class="ok"|"clean"|"ambiguous"|"rejected"|"refused"}` (one per
   attempt, tagged with its fault class) and
   `logit.output.reconnects`, which should stay near zero in steady state. A climbing count on a TLS
   connection means the peer or the network is unstable, not this sink. Plaintext and TLS
@@ -2744,6 +2844,20 @@ per burst, up to 32 frames, because `logit_in` keeps finding the next frame alre
 holds the pending `Ack` through each forward. An `Ack` grants no credit; the window stays fixed at
 the handshake.
 
+**A batch `logit_in` can't take is dropped alone.** An `Ack` carries a status, accepted or
+rejected ([ADR `native-hop-ack-status`](adr/native-hop-ack-status.md)). `logit_in` answers a frame
+it reads but can't take with a rejected `Ack` naming that frame, and keeps reading the connection:
+a batch that decodes past its decode budget (four times `max_frame_bytes`; a sender learns the cap,
+not the budget, so a batch well under the cap can still exceed it), a body that doesn't decode, or
+a frame whose payload is past `max_frame_bytes` but whose compressed size is within the bound
+`logit_in` reads every frame under. `logit_out` drops that one batch as `rejected`
+(`logit.component.batches.dropped{reason="rejected"}` and a `send_failed` warning carrying
+`logit_in`'s reason), and the batches behind it in the window are acknowledged and delivered on the
+same connection, with no reconnect. A frame whose compressed size is past that bound is answered
+`Reject{FRAME_TOO_LARGE}` and the connection closes, since `logit_in` can't read past it. A stock
+`logit_out` checks the cap before sending and never sends either oversize frame, so in practice the
+decode budget is the case you meet: to stop it, send smaller batches.
+
 **Under `buffer.delivery: at_most_once`, set `window: 1`.** An ambiguous fault (a lost or late
 `Ack`, a reset) drops every batch in flight, not only the oldest, because each one may or may not
 have been forwarded. Under the default `at_least_once`, the same fault retries the window from the
@@ -2759,20 +2873,16 @@ The handshake lists at most 16 identities, so a window spanning more store opens
 spool replay, say) resends the rest, and `logit_in` recognizes each by its mark without forwarding
 it. A `logit_in` that restarted holds no marks, and every batch is resent.
 
-**Sizing `request_timeout` against `buffer.retry_budget`.** Keep `request_timeout` comfortably under
-`retry_budget`. `logit_out.request_timeout` (default 10s) bounds each step of one attempt
-separately: the connect, the TLS handshake, the `HelloAck` wait, each ack wait, and at shutdown the
-close. With frames in flight it also bounds each chunk of a frame write and its flush: a write that
-accepts nothing for `request_timeout` means the receiver stopped reading. The connection then takes
-no more frames: the `Ack`s already owed are read, and the connection is dropped. The `Hello`, and a
-frame written with nothing in flight, aren't under it, since a large frame on a slow link can
-outlast it; `retry_budget` bounds them. `buffer.retry_budget` (default 60s; see [Sink delivery
-buffering](#sink-delivery-buffering)) bounds all retried attempts together. A `request_timeout`
-close to or above the retry budget leaves room for at most one attempt before the budget expires,
-which defeats retrying. With a window, the budget decides whether a failed round is retried, and it
-never cuts anything past the head's own write, so a receiver that forwards slowly can hold one round
-past it (`docs/known-gaps/native-hop.md`, "A round against a slowly draining `logit_in` can outlast
-the retry budget").
+**`request_timeout` bounds one attempt.** `logit_out.request_timeout` (default 10s) bounds each step of
+one attempt separately: the connect, the TLS handshake, the `HelloAck` wait, each ack wait, and at
+shutdown the close. With frames in flight it also bounds each chunk of a frame write and its
+flush: a write that accepts nothing for `request_timeout` means the receiver stopped reading. The
+connection then takes no more frames: the `Ack`s already owed are read, and the connection is
+dropped. The `Hello`, and a frame written with nothing in flight, aren't under it, since a large
+frame on a slow link can outlast it. No runtime timeout wraps an attempt, so only the shutdown
+grace cuts those. A retryable fault retries the head until it succeeds, so a `request_timeout`
+that is too short for a slow link turns each attempt into a timeout: size it for the slowest
+healthy round trip.
 
 `request_timeout` relates only loosely to the far end's handshake grace. A `logit_out` whose
 `request_timeout` is shorter than its peer's handshake patience gives up first; the connection
@@ -2790,12 +2900,12 @@ pooled connection, so an idle-timed-out `logit_in` costs `logit_out` a reconnect
 
 **A `logit_in` recognizes a resend, so the default delivery posture costs no duplicate on a
 healthy hop.** A peer that gets `Reject{code: REJECT_INTERNAL}`, the answer at the connection cap,
-never classifies it `permanent`:
+never classifies it `rejected` or `refused`:
 
 - At the handshake, with nothing of the batch written yet, it's `clean`, and the batch is retried
-  within `retry_budget`.
+  until it succeeds.
 - Once a frame has left on that connection, it's `ambiguous`, like a lost or late `Ack`. Under
-  `logit_out`'s default `at_least_once` posture it's retried within `retry_budget`, and the
+  `logit_out`'s default `at_least_once` posture it's retried, and the
   resend carries the sender identity and sequence the first attempt did. If `logit_in` forwarded
   the first copy, it acknowledges the resend without forwarding it again and counts it
   `logit.input.batches.resends`.
@@ -2823,7 +2933,8 @@ connection, so the resend is forwarded when a consumer can take it. A frame at o
 sender's mark that `logit_in` reads whole gets an `Ack` even with no consumer open, because
 `logit_in` doesn't forward it; it is never refused for want of a consumer.
 
-**Sender identity and sequence.** Every frame `logit_out` sends carries a 16-byte sender identity and a sequence number in its trailer
+**Sender identity and sequence.** Every frame `logit_out` sends carries a 16-byte sender identity
+and a sequence number ahead of its batch
 ([ADR `native-hop-identity-and-sequence`](adr/native-hop-identity-and-sequence.md)). Each
 `logit_in` component keeps one high-water mark per identity: a frame at or below its identity's
 mark is acknowledged and not forwarded, and a frame above it is forwarded and, once a consumer
@@ -2835,28 +2946,34 @@ takes it, raises the mark. What follows from that:
 - **A spool replay keeps its old identity.** A spool record keeps the identity and sequence it
   was written with, so a replay after a crash goes out under them, and a `logit_in` that saw the
   record recognizes it. New batches take the new identity.
-- **A dropped batch that a spool replays stays dropped.** A batch the sink gave up on (an
-  exhausted `retry_budget`, `at_most_once`, or a `drop_oldest` eviction whose cursor wasn't
+- **A dropped batch that a spool replays stays dropped.** A batch the sink gave up on (a
+  `Rejected` verdict, `at_most_once`, or a `drop_oldest` eviction whose cursor wasn't
   persisted) that a crash replay then sends is at or below the mark once a later batch of its
   identity was taken, and `logit_in` acknowledges it without forwarding it.
-- **A frame without a complete pair is never forwarded.** A frame whose trailer lacks a
-  complete, well-formed identity and sequence is a protocol error: `logit_in` ends the connection
-  and counts it in `logit.proto.errors`.
+- **A frame without a complete pair is never forwarded.** A frame whose payload doesn't open
+  with a complete, well-formed identity and sequence is a protocol error: `logit_in` ends the
+  connection and counts it in `logit.proto.errors`. A frame refused by name raises its identity's
+  mark, so a resend of it isn't forwarded either.
+- **A spool written before the pair moved ahead of the batch doesn't replay.** Each of its
+  records is skipped as corrupt and counted
+  `logit.component.batches.dropped{reason="disk_corrupt"}`. Let a `logit_out` with `buffer.disk:`
+  drain before upgrading it across that change.
 - **The table follows `max_connections`, with nothing further to configure.** It holds
   `max_connections + max_connections / 4` identities (1280 at the default cap of 1024) and evicts
   the least recently seen when full.
 - **Cloning a running process is unsupported.** A VM snapshot or a CRIU checkpoint restored
   beside its original shares the sink's identity and sequence, and `logit_in` reads the second
   copy's batches as resends and doesn't forward them.
-- **The sequence identifies a batch, and `Ack` names what is handled.** `Ack { id, seq }` says
-  every frame of that identity at or below `seq` on its connection is handled (see "What an `Ack`
-  means" above), and a reconnect's handshake reads the marks back to resume.
+- **The sequence identifies a batch, and `Ack` names what is handled.** An accepted
+  `Ack { id, seq }` says every frame of that identity at or below `seq` on its connection is
+  handled, and a rejected one names the one frame it refused (see "What an `Ack` means" above). A
+  reconnect's handshake reads the marks back to resume.
 
-**A `HelloAck` that doesn't answer the `Hello` is permanent.** A peer that acks another protocol
+**A `HelloAck` that doesn't answer the `Hello` is `refused`.** A peer that acks another protocol
 version, a codec or compression this sink didn't offer, a mark for an identity this sink didn't
-list, or two marks for one identity fails every attempt `permanent`, like a
-`Reject` for a version mismatch: the batch is dropped, and a minute of nothing else ends the
-pipeline. A stock `logit_in` never answers this way; it points at something else on the port.
+list, or two marks for one identity fails every attempt `refused`, like a `Reject` for a version
+mismatch. The sink holds the batch and retries until the peer changes. A stock `logit_in` never
+answers this way; it points at something else on the port.
 
 **Clean close.** `logit_out` shuts its connection down when it stops, which under TLS sends
 `close_notify`, and `logit_in` takes a close between frames as the end of a connection, not an
@@ -2865,14 +2982,15 @@ reconnecting doesn't show as `connection_error` on the far end.
 
 **What to watch.**
 
-- `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/`permanent`, one per `Ack`
+- `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/`rejected`/`refused`, one per `Ack`
   read or ack wait that fails, plus one per failed connect or handshake, too-large batch, or write
   that fails with nothing in flight; `ok` is an acknowledged frame, `clean` a failure before a frame
   was fully written with nothing in flight or a `GOING_AWAY` in place of an `Ack`, `ambiguous` a
   lost `Ack` (a timeout, an EOF, a reset, another message) or an `Ack` naming no run of the frames
-  in flight, and `permanent`
-  a size check or a frame-build error at the head, a `HelloAck` that doesn't answer the `Hello`,
-  or a permanent reject), `logit.output.reconnects` (should stay
+  in flight, `rejected`
+  a size check or a frame-build error at the head, a rejected `Ack`, or `Reject{FRAME_TOO_LARGE}`,
+  and `refused` a `HelloAck` that doesn't answer
+  the `Hello` or a reject that names a protocol mismatch), `logit.output.reconnects` (should stay
   near zero in steady state; a climbing count means the peer or the network is unstable),
   `logit.output.batches.resumed` (batches a reconnect committed from `logit_in`'s marks instead
   of resending), `logit.output.ack.duration` (one sample per read of the wire for an `Ack`, so a
@@ -2894,7 +3012,9 @@ reconnecting doesn't show as `connection_error` on the far end.
   healthy link points at a version-mismatched or misbehaving peer, not routine loss, except
   `truncated_header` and `truncated`, which a `logit_out` whose write failed part-way through a
   frame also leaves, and `decode_budget`, a well-formed batch too large for the frame cap it
-  arrived under. `ack_write_stalled` is a peer that stopped reading its `Ack`s
+  arrived under. `decode_budget`, `too_large` within the compressed bound, and `malformed` after a
+  valid prefix are answered by a rejected `Ack` and the connection goes on; the rest end it.
+  `ack_write_stalled` is a peer that stopped reading its `Ack`s
   for `handshake_timeout`, and the connection was closed).
 - `logit_in` deduplication and refusal: `logit.input.batches.resends` (frames recognized as
   resends and not forwarded; nonzero means senders are retrying after lost or late `Ack`s, or a
@@ -2903,7 +3023,9 @@ reconnecting doesn't show as `connection_error` on the far end.
   `logit.input.senders.evicted` (nonzero means the table was full, and an evicted sender's next
   resend reaches consumers twice), and
   `logit.input.batches.dropped{reason="closed_consumer"}` (frames refused because every consumer
-  directly downstream had closed; expected during a shutdown, a fault anywhere else).
+  directly downstream had closed; expected during a shutdown, a fault anywhere else), and
+  `logit.input.batches.dropped{reason="rejected"}` (frames answered by a rejected `Ack`; each is
+  also counted under its `logit.proto.errors` reason, and dropped by the sender).
 - Both sides: `logit.proto.frames{direction,compression}` and `logit.proto.frame.bytes` for
   throughput.
 

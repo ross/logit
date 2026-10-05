@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-10-01
+updated: 2026-10-04
 ---
 
 # Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment
@@ -550,3 +550,25 @@ by none (ADR `delivery-semantics`, item 3, and its W3 amendment). **Changed:**
   a client that drops on a `500` loses the body's later batches.
 - **Telemetry:** `logit.input.batches.dropped{reason="closed_consumer"}` counts every batch of
   the request no consumer took, the refused one included.
+
+## Amendment: response classes from the HEC code (2026-10-04)
+
+Under [ADR `sink-fault-classes`](sink-fault-classes.md), `splunk_hec_out` reads the HEC code in a
+non-2xx body, not the status alone, and three statements above change:
+
+- Codes 7, 12, 13, and 15 aren't permanent for the batch. Each names an object, as code 6 does, so
+  the sink drops that object and resends the rest once, the decision 18 rule. Code 7's
+  `invalid-event-number` is the object after the one with the disallowed index, and the sink reads
+  it so. A code 7 is the object's, not a configuration error held for the whole sink: the index
+  comes from the batch's `com.splunk.index`, which a relay carries from its sender.
+- A `400` with code 10 or 28 (no channel), 11 (an invalid channel), or 16 (query-string
+  authorization off) is `Refused`: every request carries the same channel and authorization, so
+  every batch would get the answer. The sink always sends a channel, so a code 10 or 28 means
+  something between it and Splunk stripped the header.
+- Codes 21 and 22, the `400` twins of an invalid and a disabled token, are modeled from Splunk's
+  "Troubleshoot HTTP Event Collector" table and are `Refused`, as a `401` or `403` is; codes 24 and
+  25 are a `200` with a capacity warning. Their texts, like 18 through 27, are unverified against
+  a real Splunk.
+
+The table, with its evidence, is the "Faults, retries, and duplicate safety" section of
+`crates/logit-outputs/src/splunk.rs`'s module doc.

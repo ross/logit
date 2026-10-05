@@ -361,7 +361,7 @@ than letting the sink silently override an operator's value at runtime.
 only contribution is classifying the outcome into a `Fault`, exactly as `otlp_out` does:
 
 - 2xx → `Ok`.
-- 429 and 5xx → **`Fault::Ambiguous`**, via `is_retryable_http_status`
+- 429 and 5xx → **`Fault::Ambiguous`**, via `classify_status`
   (`crates/logit-outputs/src/http.rs` — that whole table hoisted out of `otlp_out` into a shared
   module when this sender landed, rather than being copied). Ambiguous, not `Clean`: the request
   reached the server and may have been partially applied.
@@ -553,3 +553,16 @@ statements above change:
 ## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
 
 `Output::duplicate_safe()` and `DeliveryPosture::from_duplicate_safe` are gone. `at_least_once` is now every sink's default posture, so `prometheus_out` keeps the posture this section argues for through the runtime default rather than through a `true` from `duplicate_safe()`. The argument that a replayed request is an idempotent overwrite is unchanged. See [`delivery-semantics.md`](delivery-semantics.md) item 5.
+
+## Amendment: the sender's response classes (2026-10-04)
+
+"The sink does not retry" reads every answer through the status table `otlp_out` used. Under
+[ADR `sink-fault-classes`](sink-fault-classes.md) each sink keeps its own table, and the two now
+differ: `otlp_out` reads a server failure (an HTTP `5xx`, gRPC `INTERNAL` or
+`RESOURCE_EXHAUSTED`) as `Ambiguous` where the OTLP specification says not to retry it
+([ADR `sink-fault-classes`](sink-fault-classes.md), "Amendment: `otlp_out` departs from the OTLP
+specification's non-retryable list (2026-10-04)"), and this sender reads a `415`, and a `400`
+whose body opens with a receiver's decompression error, as `Refused`, since both answer the
+sink's `version:` or `compression:` rather than the batch. The table, with its evidence, is the
+"Faults, retries and duplicate safety (sender mode)" section of
+`crates/logit-outputs/src/prometheus.rs`'s module doc.

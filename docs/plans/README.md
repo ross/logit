@@ -10,20 +10,21 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: sink fault model — a bad batch drops, a non-functional destination holds, the process never exits](sink-fault-model.md) | 2026-10-04 | 2026-10-05 |
 | [Enabling plan: native hop named acks — a cumulative `Ack { id, seq }`, coalesced at `logit_in`, and a resume mark](native-hop-named-acks.md) | 2026-10-02 | 2026-10-02 |
 | [Enabling plan: a native hop send window — several frames in flight, acknowledged in frame order](native-send-window.md) | 2026-10-01 | 2026-10-02 |
 | [Enabling plan: delivery semantics — at-least-once per hop, and an effectively-once native hop](delivery-semantics.md) | 2026-09-29 | 2026-10-02 |
 | [Enabling plan: VictoriaMetrics — existing components verified, and zstd on remote-write](victoriametrics-interop.md) | 2026-09-24 | 2026-09-24 |
 | [Enabling plan: SigNoz — OTLP-native, verified, no new kind](signoz-relay.md) | 2026-09-24 | 2026-09-24 |
-| [Enabling plan: OpenSearch — SS4O documents over `_bulk`](opensearch-relay.md) | 2026-09-24 | 2026-09-24 |
+| [Enabling plan: OpenSearch — SS4O documents over `_bulk`](opensearch-relay.md) | 2026-09-24 | 2026-10-05 |
 | [Enabling plan: Dynatrace — OTLP and the ingest APIs, OneAgent-local stand-in, intake stand-in](dynatrace-relay.md) | 2026-09-24 | 2026-09-24 |
 | [Enabling plan: Splunk — HEC in both directions, and Observability Cloud over OTLP](splunk-relay.md) | 2026-09-24 | 2026-09-26 |
-| [Enabling plan: New Relic — direct APIs and OTLP, shipper-intake stand-in, APM collector stand-in](newrelic-relay.md) | 2026-09-24 | 2026-09-24 |
+| [Enabling plan: New Relic — direct APIs and OTLP, shipper-intake stand-in, APM collector stand-in](newrelic-relay.md) | 2026-09-24 | 2026-10-05 |
 | [Enabling plan: Datadog — direct API, Agent stand-in, intake stand-in](datadog-relay.md) | 2026-09-23 | 2026-09-24 |
 | [Enabling plan: `http_access` — access-log normalization from raw semconv fields](http-access-normalization.md) | 2026-09-22 | 2026-09-22 |
 | [Enabling plan: `flatten` — dotted-key expansion of nested attributes](flatten-transform.md) | 2026-09-21 | 2026-09-21 |
 | [Enabling plan: `Event` sizing and allocation strategy — a measured bake-off, then an ADR](event-sizing.md) | 2026-09-21 | 2026-09-21 |
-| [Verification plan: critical sections inventory](critical-sections-inventory.md) | 2026-09-20 | 2026-10-02 |
+| [Verification plan: critical sections inventory](critical-sections-inventory.md) | 2026-09-20 | 2026-10-05 |
 | [Enabling plan: a data-shape survey, and the `shape` component that measures it](data-shape-survey.md) | 2026-09-20 | 2026-09-20 |
 | [Enabling plan: UDP intake batching and socket visibility](udp-intake.md) | 2026-09-18 | 2026-10-02 |
 | [Enabling plan: Prometheus remote-write — receive on `prometheus_in`, send on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-09-18 |

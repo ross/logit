@@ -348,7 +348,7 @@ impl FileTarget {
     /// - Cascading or promoting a retained file: `retention_failure`, continue.
     ///
     /// A re-open failure is `Fault::Clean`: the batch provably reached no file, so a retry is safe
-    /// under either delivery posture (`crate::stdio`'s module doc, "Delivery posture"), and a
+    /// under either delivery posture (`crate::stdio`'s module doc, "Response classes"), and a
     /// likely-transient ENOSPC/EMFILE-class failure isn't a configuration error
     /// (`docs/adr/rotating-file-output.md`, "Retention").
     pub async fn rotate(&mut self, diag: &mut Diagnostics) -> anyhow::Result<RotateOutcome> {
@@ -903,12 +903,35 @@ mod tests {
             .expect_err("a failed re-open should propagate as an error");
 
         assert_eq!(logit_pipeline::classify(&err), logit_pipeline::Fault::Clean);
-        assert!(
-            !logit_pipeline::is_explicitly_permanent(&err),
-            "a transient re-open failure must never trip write_loop's sustained-permanent-\
-             failure exit window"
-        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failed write or flush of the active file (a full disk, a permission lost, an I/O error)
+    /// carries no `Fault`, so it reads as `Rejected` and the batch drops: `crate::stdio`'s module
+    /// doc, "Response classes", says why.
+    #[tokio::test]
+    async fn a_failed_write_or_flush_of_the_active_file_is_rejected() {
+        for (point, errno) in [
+            (ACTIVE_WRITE, errno::ENOSPC),
+            (ACTIVE_WRITE, errno::EACCES),
+            (ACTIVE_WRITE, errno::EIO),
+            (ACTIVE_FLUSH, errno::ENOSPC),
+        ] {
+            let dir = scratch_dir("failed-write-rejected");
+            let path = dir.join("events.log");
+            let mut target = FileTarget::open(&path, RotatePolicy::never()).expect("open");
+            let scope = fault::scope(&dir);
+            scope.fail(point, errno);
+            let err = send(&mut target, b"line\n").await.expect_err("the injected failure");
+            assert_eq!(
+                logit_pipeline::classify(&err),
+                logit_pipeline::Fault::Rejected,
+                "{point:?} errno {errno}: {err:#}"
+            );
+            assert!(err.downcast_ref::<logit_pipeline::Fault>().is_none(), "no Fault attached");
+            drop(scope);
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[tokio::test]

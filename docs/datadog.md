@@ -148,16 +148,21 @@ an hour, the metrics are dropped as stale, not delivered late. The 1-hour window
 one and stricter than what the intake stored in testing
 ([the plan's "Timestamp windows"](plans/datadog-relay.md#11-timestamp-windows-w5)). The windows are
 measured from one send time per batch, read when the batch is first tried, so every retry of it
-drops the same points and each counts once. A batch retried for up to `retry_budget` can therefore
+drops the same points and each counts once. A batch held across retries can therefore
 send a point that far past the end of its window.
 
 ### `at_least_once` duplicates everything but series
 
 The default posture is `at_least_once`, so a `5xx` or a timeout is retried. One batch goes out
 over up to eight routes, each as one or more requests (one per event, and a route over its size
-cap is split), and a retry re-sends the ones that succeeded. A route Datadog rejects with a `4xx`
-(not a `403` or `413`) is counted `records.dropped{reason="rejected"}` and the send goes on to the
-next route, so one refused route doesn't fail the batch or stop the others. A failure after any request of the
+cap is split), and a retry re-sends the ones that succeeded. A route Datadog rejects for its
+content (a `400`, or a `413`, counted `oversize`) is counted `records.dropped{reason="rejected"}`
+and the send goes on to the next route, so one rejected route doesn't fail the batch or stop the
+others. A `403` (an invalid API key, or one sent to another `site`) logs `api_key_rejected`; a
+`401` (a missing key) or a `404` (a route the configured `site` doesn't serve) logs
+`request_refused`. Each would answer every batch the same way, so the sink holds the batch and
+retries it until the key or the site is fixed; watch
+`logit.component.retrying` for it. A failure after any request of the
 batch was accepted counts as ambiguous ([ADR `delivery-semantics`](adr/delivery-semantics.md),
 item 9), so `at_least_once` retries it and `at_most_once` drops the batch. Datadog stores a
 resent series point once, the last write winning at its `(series, timestamp)`, but stores a

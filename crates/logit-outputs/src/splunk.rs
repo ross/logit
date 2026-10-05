@@ -58,31 +58,43 @@
 //! batch's requests, and `write_loop` retries the whole batch, re-sending any request that had
 //! already succeeded.
 //!
-//! | Outcome | Result |
-//! |---|---|
-//! | 2xx | `Ok` (then acknowledgment, below, under `ack: true`) |
-//! | `400` code 6 naming an object of the body (`invalid-event-number` in range), except the row below | that object dropped, counted `records.dropped{reason="invalid_event"}` with a throttled `invalid_event` diagnostic, and the rest resent once ([`after_invalid_event`]); a second code 6 is [`Fault::Permanent`] |
-//! | `400` code 6 naming object 0 of a body over [`SPLUNK_CLOUD_BODY_CAP`] before compression | Splunk Cloud's answer to an oversize body: a body of several objects is split in two and each half sent, with a throttled `oversize` diagnostic; a half answered so again is [`Fault::Permanent`]. A body of one object is dropped, counted `records.dropped{reason="oversize"}` |
-//! | 429, or 503 with code 9 or no HEC body, before any `/event` request of this `send` was accepted | [`Fault::Clean`] |
-//! | the same after one was | [`Fault::Ambiguous`] |
-//! | 408, any other 5xx | [`Fault::Ambiguous`] |
-//! | 401, 403 | [`Fault::Permanent`], with a throttled `token_rejected` diagnostic |
-//! | any other 3xx or 4xx (a code 6 with no or an out-of-range number included) | [`Fault::Permanent`], with a throttled `request_rejected` diagnostic quoting the first 256 bytes of the body |
-//! | connect failure, before any `/event` request of this `send` was accepted | [`Fault::Clean`] |
-//! | connect failure after one was (a 2xx, or a code 6 whose objects ahead count as delivered) | [`Fault::Ambiguous`] |
-//! | any other transport error, timeout included | [`Fault::Ambiguous`] |
+//! Splunk answers with an HTTP status and a JSON `{"text","code"}` body whose HEC code says more
+//! than the status: a `400` can refuse the token or the channel, the same for every request, or
+//! name one object. The code decides where Splunk's table gives one; the status decides
+//! otherwise ([`crate::http::classify_status`]). HEC is [the code table][hec-codes] in Splunk's
+//! "Troubleshoot HTTP Event Collector"; what Splunk does around a code that the table doesn't say
+//! is from the runs in `docs/plans/splunk-relay.md`.
+//!
+//! | Response | Class | Why | Evidence |
+//! |---|---|---|---|
+//! | `2xx` code 0 (or 24, 25: taken, with a capacity warning) | `Ok` (then acknowledgment, below, under `ack: true`) | taken | [HEC codes][hec-codes] |
+//! | `401` or `403` (codes 1 to 4), or any status with code 21 or 22 (the `400` twins of 4 and 1) | `Refused`, with a throttled `token_rejected` diagnostic | a disabled, missing, or invalid token: every request carries it | [HEC codes][hec-codes] |
+//! | `400` code 10 or 28 (no channel), 11 (invalid channel), or 16 (query-string authorization off) | `Refused`, with a throttled `request_refused` diagnostic | every request carries the same channel header and authorization, so every request gets the same answer: a code 10 or 28 means something between the sink and Splunk stripped the channel, since the sink always sends one | [HEC codes][hec-codes], `docs/plans/splunk-relay.md`, "Settled by the Cloud run (2026-09-26)" |
+//! | `400` code 6, 7 (incorrect index), 12, 13 (event field required, or blank), or 15 (indexed fields) naming an object of the body (`invalid-event-number` in range), except the row below | `Rejected` for that object: dropped, counted `records.dropped{reason="invalid_event"}` with a throttled `invalid_event` diagnostic, and the rest resent once ([`after_invalid_event`]); a second such answer is `Rejected` for the batch | Splunk indexes the objects before the bad one and none from it on; a code 7 names the object after the one with the bad index. A code 7 is read as the object's, not the sink's config: the index comes from the batch's `com.splunk.index`, which a relay carries from its sender, so holding on it would wedge the sink on one stray index | [HEC codes][hec-codes], `docs/plans/splunk-relay.md`, "Settled by W5 (2026-09-25)", `tools/splunk-interop/README.md` |
+//! | `400` code 6 naming object 0 of a body over [`SPLUNK_CLOUD_BODY_CAP`] before compression | `Rejected` for its size: a body of several objects is split in two and each half sent, with a throttled `oversize` diagnostic; a half answered so again is `Rejected`. A body of one object is dropped, counted `records.dropped{reason="oversize"}` | Splunk Cloud's answer to an oversize body | `docs/plans/splunk-relay.md`, "Settled by the Cloud run (2026-09-26)" |
+//! | `429` (codes 26, 27), or `503` code 9 or with no HEC body, before any `/event` request of this `send` was accepted | `Clean` | Splunk didn't take the body: its queue or ack channel is full, or it's busy ([`is_busy`]) | [HEC codes][hec-codes] |
+//! | the same after one was | `Ambiguous` | Splunk holds part of the batch ([`after_delivery`]) | -- |
+//! | `500` code 8, `503` codes 18 to 20 and 23, `408`, any other `5xx`, `501` included | `Ambiguous` | may have indexed: code 8 says nothing either way, and 18 to 20 and 23 are `/health` and shutdown answers Splunk doesn't document on `/event` | [HEC codes][hec-codes] |
+//! | `400` code 5 (no data), 14 (ACK disabled, an `/ack` answer), a per-object code with no or an out-of-range object number, or no HEC code | `Rejected`, with a throttled `request_rejected` diagnostic | about this request: the sink never sends an empty body or polls `/ack` from `/event`, and the status alone can't say more | [`crate::http::classify_status`] |
+//! | `404`, `405`, `407` | `Refused`, with a throttled `request_rejected` diagnostic | the endpoint isn't a HEC collector as configured | [`crate::http::classify_status`] |
+//! | any other `3xx` or `4xx` | `Rejected`, with a throttled `request_rejected` diagnostic | about this request; redirects are off | [`crate::http::classify_status`] |
+//! | connect failure, before any `/event` request of this `send` was accepted | `Clean` | nothing left the process | -- |
+//! | connect failure after one was (a 2xx, or a per-object answer whose objects ahead count as delivered) | `Ambiguous` | Splunk holds part of the batch | -- |
+//! | any other transport error, timeout included | `Ambiguous` | the request may have been indexed | -- |
+//!
+//! [hec-codes]: https://help.splunk.com/en/splunk-enterprise/get-data-in/collect-http-event-data/troubleshoot-http-event-collector
 //!
 //! `Clean` means Splunk didn't take the body. A connect failure, a `429` (codes 26 and 27), and a
 //! `503` code 9 ("Server is busy") each say so ([`is_busy`]); a `500` code 8 may have indexed, and
 //! a `408`, a timeout, or another `5xx` says nothing either way. `Clean` holds only while nothing
 //! of the batch has reached Splunk: `write_loop` retries `Clean` under every posture, and a retry
-//! re-sends the bodies already indexed, so once one was accepted each of these is `Ambiguous`
-//! instead ([`after_delivery`]). A `Retry-After` header is ignored; `write_loop`'s backoff applies.
+//! re-sends the bodies already indexed, so once one was accepted each of these, and a `Refused`
+//! answer, is `Ambiguous` instead ([`after_delivery`]). A `Retry-After` header is ignored; `write_loop`'s backoff applies.
 //!
-//! A drop leaves `sent_any` unset when nothing ahead of the dropped object was indexed (a code 6
-//! at object 0, or a lone object over Splunk Cloud's cap), so a busy answer later in the same
-//! `send` is still `Clean` and the whole batch is retried: a busy retry re-sends and re-counts a
-//! dropped object in `records.dropped`; the record is never delivered twice. Marking the drop
+//! A drop leaves `sent_any` unset when nothing ahead of the dropped object was indexed (a
+//! per-object answer at object 0, or a lone object over Splunk Cloud's cap), so a busy answer
+//! later in the same `send` is still `Clean` and the whole batch is retried: a busy retry re-sends
+//! and re-counts a dropped object in `records.dropped`; the record is never delivered twice. Marking the drop
 //! as a delivery instead would make that busy answer `Ambiguous`, which `at_most_once` answers by
 //! dropping the rest of the batch.
 //!
@@ -207,9 +219,24 @@ type Object<'a> = (&'a [u8], usize);
 enum EventReply {
     /// A 2xx, with the `ackId` it carried when `ack` is on.
     Accepted { ack_id: Option<u64> },
-    /// `400` code 6 naming object `n` of the body.
-    InvalidEvent { n: u64 },
+    /// `400` with a per-object code ([`OBJECT_CODES`]) naming object `n` of the body.
+    InvalidEvent { n: u64, code: u16 },
 }
+
+/// The HEC codes that name one object of a body in `invalid-event-number`: 6 (invalid data
+/// format), 7 (incorrect index), 12 and 13 (event field required, or blank), and 15 (indexed
+/// fields). Splunk indexes the objects before the named one and none from it on
+/// ([`after_invalid_event`]).
+const OBJECT_CODES: [u16; 5] = [6, 7, 12, 13, 15];
+
+/// The HEC codes that refuse the token on any status: 1 and 22 (disabled), 2 (required), 3
+/// (invalid authorization), and 4 and 21 (invalid). Every request carries the same token.
+const TOKEN_CODES: [u16; 6] = [1, 2, 3, 4, 21, 22];
+
+/// The HEC codes that refuse how this sink's requests are built, the same on every request: 10
+/// and 28 (no channel), 11 (an invalid channel), and 16 (query-string authorization, which this
+/// sink never uses).
+const REQUEST_CODES: [u16; 4] = [10, 11, 16, 28];
 
 /// What one `/ack` poll said.
 enum AckPoll {
@@ -224,7 +251,7 @@ enum AckPoll {
 /// What one body's send settled, when it didn't fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BodyOutcome {
-    /// Accepted, or the objects left after a code-6 drop were.
+    /// Accepted, or the objects left after a per-object drop were.
     Done,
     /// Splunk Cloud answered it as over its cap, and it holds more than one object.
     OverCloudCap,
@@ -249,12 +276,15 @@ fn split_point(objects: &[Object<'_>]) -> usize {
     objects.len() - 1
 }
 
-/// Which objects of a body to resend after Splunk answered `400` code 6 with
-/// `invalid-event-number` `n`: the object to drop, and the range of objects to send again, or
-/// `None` when `n` names no object of the body. Splunk indexes every object before `n` and none
-/// from it on, which it doesn't document (`docs/plans/splunk-relay.md`, "Settled by W5" item 8),
-/// and `splunk_hec_in` delivers the same prefix. This function is the one place that rule lives.
-fn after_invalid_event(objects: usize, n: u64) -> Option<(usize, Range<usize>)> {
+/// Which objects of a body to resend after Splunk answered `400` with per-object `code`
+/// ([`OBJECT_CODES`]) and `invalid-event-number` `n`: the object to drop, and the range of objects
+/// to send again, or `None` when `n` names no object of the body. The bad object is `n`, except
+/// under code 7, whose `n` is the object after the one with the bad index. Splunk indexes every
+/// object before the bad one and none from it on, which it doesn't document
+/// (`docs/plans/splunk-relay.md`, "Settled by W5" item 8), and `splunk_hec_in` delivers the same
+/// prefix. This function is the one place that rule lives.
+fn after_invalid_event(objects: usize, code: u16, n: u64) -> Option<(usize, Range<usize>)> {
+    let n = if code == 7 { n.checked_sub(1)? } else { n };
     let n = usize::try_from(n).ok().filter(|&n| n < objects)?;
     Some((n, n + 1..objects))
 }
@@ -533,8 +563,8 @@ impl SplunkHecOutput {
         }
     }
 
-    /// One `/event` request for `objects` (module doc's "Faults" table). A code 6 naming an
-    /// object is returned for the caller to act on; every other non-2xx is an error.
+    /// One `/event` request for `objects` (module doc's "Faults" table). A per-object code
+    /// ([`OBJECT_CODES`]) naming an object is returned for the caller to act on; every other non-2xx is an error.
     async fn post_event(&mut self, objects: &[Object<'_>]) -> anyhow::Result<EventReply> {
         let raw: Vec<u8> = objects.iter().flat_map(|(bytes, _)| bytes.iter().copied()).collect();
         let gzipped = self.compression == SplunkCompression::Gzip;
@@ -562,12 +592,15 @@ impl SplunkHecOutput {
             408 | 500..=599 => Fault::Ambiguous,
             code => {
                 self.telemetry.count(REQUESTS_REJECTED, 1.0, &[("code", code_tag(reply.as_ref()))]);
-                if let (400, Some(HecReply { code: 6, invalid_event_number: Some(n), .. })) =
+                let hec = reply.as_ref().map(|reply| reply.code);
+                if let (400, Some(HecReply { code, invalid_event_number: Some(n), .. })) =
                     (code, &reply)
                 {
-                    return Ok(EventReply::InvalidEvent { n: *n });
+                    if OBJECT_CODES.contains(code) {
+                        return Ok(EventReply::InvalidEvent { n: *n, code: *code });
+                    }
                 }
-                if matches!(code, 401 | 403) {
+                if matches!(code, 401 | 403) || hec.is_some_and(|c| TOKEN_CODES.contains(&c)) {
                     self.diag.warn_throttled(
                         "token_rejected",
                         format_args!(
@@ -575,13 +608,23 @@ impl SplunkHecOutput {
                              check 'token', and that it is enabled"
                         ),
                     );
+                    Fault::Refused
+                } else if hec.is_some_and(|c| REQUEST_CODES.contains(&c)) {
+                    self.diag.warn_throttled(
+                        "request_refused",
+                        format_args!(
+                            "Splunk refused every request of this sink: {url} answered {status}: \
+                             {snippet} -- a proxy may strip X-Splunk-Request-Channel"
+                        ),
+                    );
+                    Fault::Refused
                 } else {
                     self.diag.warn_throttled(
                         "request_rejected",
                         format_args!("{url} answered {status}: {snippet}"),
                     );
+                    crate::http::classify_status(status)
                 }
-                Fault::Permanent
             }
         };
         Err(anyhow::anyhow!("splunk_hec_out: request to {url} failed ({status}): {snippet}"))
@@ -612,7 +655,7 @@ impl SplunkHecOutput {
     }
 
     /// One body, split in two when Splunk Cloud answers it as over its cap, and each half's
-    /// code-6 resend (module doc's "Faults" table). `sent_any` says whether an earlier request of
+    /// per-object resend (module doc's "Faults" table). `sent_any` says whether an earlier request of
     /// this `send` was accepted, and is set once one of these is.
     async fn send_body(
         &mut self,
@@ -639,10 +682,11 @@ impl SplunkHecOutput {
         Ok(())
     }
 
-    /// One body and its code-6 resend. A code 6 naming object 0 of a body over
+    /// One body and its resend after a per-object code ([`OBJECT_CODES`]). A code 6 naming
+    /// object 0 of a body over
     /// [`SPLUNK_CLOUD_BODY_CAP`] is Splunk Cloud's oversize answer, not a bad object: a lone
     /// object is dropped as `oversize`; several are [`BodyOutcome::OverCloudCap`] for the caller
-    /// to split when `may_split`, and [`Fault::Permanent`] otherwise.
+    /// to split when `may_split`, and [`Fault::Rejected`] otherwise.
     async fn send_once(
         &mut self,
         objects: &[Object<'_>],
@@ -651,26 +695,26 @@ impl SplunkHecOutput {
         may_split: bool,
     ) -> anyhow::Result<BodyOutcome> {
         let reply = self.post_event(objects).await.map_err(|err| after_delivery(err, *sent_any))?;
-        let n = match reply {
+        let (n, code) = match reply {
             EventReply::Accepted { ack_id } => {
                 *sent_any = true;
                 self.keep_ack_id(ack_id, ack_ids);
                 return Ok(BodyOutcome::Done);
             }
-            EventReply::InvalidEvent { n } => n,
+            EventReply::InvalidEvent { n, code } => (n, code),
         };
-        if n == 0 && body_len(objects) > SPLUNK_CLOUD_BODY_CAP {
+        if code == 6 && n == 0 && body_len(objects) > SPLUNK_CLOUD_BODY_CAP {
             return self.over_cloud_cap(objects, may_split);
         }
-        let Some((bad, rest)) = after_invalid_event(objects.len(), n) else {
+        let Some((bad, rest)) = after_invalid_event(objects.len(), code, n) else {
             let message = format!(
-                "Splunk rejected a request of {} objects as invalid (code 6) at object {n}, \
-                 which isn't one of them",
+                "Splunk rejected a request of {} objects as invalid (code {code}) at object \
+                 {n}, which isn't one of them",
                 objects.len()
             );
             self.diag.warn_throttled("request_rejected", &message);
             return Err(anyhow::anyhow!("splunk_hec_out: {message}"))
-                .map_err(|err| err.context(Fault::Permanent));
+                .map_err(|err| err.context(Fault::Rejected));
         };
         // The objects ahead of `bad` count as indexed (`after_invalid_event`'s rule).
         *sent_any |= bad > 0;
@@ -681,8 +725,8 @@ impl SplunkHecOutput {
         self.diag.warn_throttled(
             "invalid_event",
             format_args!(
-                "Splunk rejected object {bad} of a request as invalid (code 6); dropped it and \
-                 resent the {} objects after it",
+                "Splunk rejected object {bad} of a request as invalid (code {code}); dropped it \
+                 and resent the {} objects after it",
                 rest.len()
             ),
         );
@@ -697,11 +741,11 @@ impl SplunkHecOutput {
                 self.keep_ack_id(ack_id, ack_ids);
                 Ok(BodyOutcome::Done)
             }
-            EventReply::InvalidEvent { n } => Err(anyhow::anyhow!(
+            EventReply::InvalidEvent { n, code } => Err(anyhow::anyhow!(
                 "splunk_hec_out: Splunk rejected the resend after a dropped invalid object as \
-                 invalid too (code 6, object {n})"
+                 invalid too (code {code}, object {n})"
             ))
-            .map_err(|err| err.context(Fault::Permanent)),
+            .map_err(|err| err.context(Fault::Rejected)),
         }
     }
 
@@ -736,7 +780,7 @@ impl SplunkHecOutput {
         );
         self.diag.warn_throttled("oversize", &message);
         Err(anyhow::anyhow!("splunk_hec_out: {message}"))
-            .map_err(|err| err.context(Fault::Permanent))
+            .map_err(|err| err.context(Fault::Rejected))
     }
 
     /// One `/ack` poll for `pending`.
@@ -1212,17 +1256,21 @@ mod tests {
             (502, String::new()),
             (503, body(18)),
             (504, String::new()),
+            (501, String::new()),
         ] {
             assert_eq!(fault_for(status, &body).await, Fault::Ambiguous, "{status} {body}");
         }
-        for status in [301, 400, 401, 403, 404, 413] {
-            assert_eq!(fault_for(status, "").await, Fault::Permanent, "{status}");
+        for status in [301, 400, 413] {
+            assert_eq!(fault_for(status, "").await, Fault::Rejected, "{status}");
         }
-        // A code 6 with no object number, or none in range, is permanent too.
+        for status in [401, 403, 404, 405, 407] {
+            assert_eq!(fault_for(status, "").await, Fault::Refused, "{status}");
+        }
+        // A code 6 with no object number, or none in range, is rejected too.
         let code6 = String::from_utf8(encode_status_body(6, None)).unwrap();
-        assert_eq!(fault_for(400, &code6).await, Fault::Permanent);
+        assert_eq!(fault_for(400, &code6).await, Fault::Rejected);
         let out_of_range = String::from_utf8(encode_status_body(6, Some(1))).unwrap();
-        assert_eq!(fault_for(400, &out_of_range).await, Fault::Permanent);
+        assert_eq!(fault_for(400, &out_of_range).await, Fault::Rejected);
     }
 
     fn encode_status_body(code: u16, n: Option<u64>) -> Vec<u8> {
@@ -1236,13 +1284,108 @@ mod tests {
     /// Splunk Cloud 10.5.2605.9's answer to a `useACK` token's request without a channel.
     const CLOUD_CHANNEL_MISSING: &str = r#"{"text":"Data channel is missing. If you have multiple indexers, sticky session load balancers must be provisioned and client requests must be routed accordingly.","code":28}"#;
 
-    /// A missing channel is permanent, whether Splunk Enterprise (code 10) or Splunk Cloud (code
-    /// 28) says so.
+    // One test per row of the module doc's "Faults, retries, and duplicate safety" table that
+    // the tests around it don't cover, each answering the body Splunk's code table gives.
+
+    /// A missing channel refuses every request the same way, whether Splunk Enterprise (code 10)
+    /// or Splunk Cloud (code 28) says so, and so do an invalid channel and query-string auth.
     #[tokio::test]
-    async fn a_missing_channel_is_permanent_on_either_code() {
+    async fn a_channel_or_query_string_auth_code_is_refused() {
         let enterprise = r#"{"text":"Data channel is missing","code":10}"#;
-        assert_eq!(fault_for(400, enterprise).await, Fault::Permanent);
-        assert_eq!(fault_for(400, CLOUD_CHANNEL_MISSING).await, Fault::Permanent);
+        assert_eq!(fault_for(400, enterprise).await, Fault::Refused);
+        assert_eq!(fault_for(400, CLOUD_CHANNEL_MISSING).await, Fault::Refused);
+        for code in [11, 16] {
+            let body = String::from_utf8(encode_status_body(code, None)).unwrap();
+            assert_eq!(fault_for(400, &body).await, Fault::Refused, "{body}");
+        }
+    }
+
+    /// A token code refuses the sink on `401`/`403` and on the `400` twins, codes 21 and 22.
+    #[tokio::test]
+    async fn a_token_code_is_refused_on_any_status() {
+        for code in [1, 2, 3, 4, 21, 22] {
+            let status = HecStatus::from_code(code).unwrap();
+            let body = String::from_utf8(encode_status_body(code, None)).unwrap();
+            assert_eq!(fault_for(status.http, &body).await, Fault::Refused, "{body}");
+        }
+    }
+
+    /// Codes 5 and 14, and a body with no HEC code, are about this request.
+    #[tokio::test]
+    async fn a_400_with_no_code_that_names_the_sink_is_rejected() {
+        for code in [5, 14] {
+            let body = String::from_utf8(encode_status_body(code, None)).unwrap();
+            assert_eq!(fault_for(400, &body).await, Fault::Rejected, "{body}");
+        }
+        assert_eq!(fault_for(400, "Bad Request").await, Fault::Rejected);
+    }
+
+    /// A `200` with a capacity warning (codes 24 and 25) is taken.
+    #[tokio::test]
+    async fn a_200_with_a_capacity_warning_is_ok() {
+        for code in [24, 25] {
+            let body = String::from_utf8(encode_status_body(code, None)).unwrap();
+            let (addr, _log) = collector(move |_, _| (200, body.clone())).await;
+            sink(addr).send(&logs(1)).await.expect("a 200 is taken");
+        }
+    }
+
+    /// `/health` and shutdown codes on a `503` say nothing about the body: `Ambiguous`.
+    #[tokio::test]
+    async fn a_503_health_or_shutdown_code_is_ambiguous() {
+        for code in [18, 19, 20, 23] {
+            let body = String::from_utf8(encode_status_body(code, None)).unwrap();
+            assert_eq!(fault_for(503, &body).await, Fault::Ambiguous, "{body}");
+        }
+    }
+
+    /// A disallowed index in object 1 of 3: Splunk 10.4.3 answers code 7 naming object 2, the one
+    /// after it (`tools/splunk-interop/README.md`). Object 1 is dropped and object 2 resent.
+    #[tokio::test]
+    async fn a_code_7_incorrect_index_drops_the_object_before_the_one_it_names() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (addr, log) = collector(move |_, _| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                (400, r#"{"text":"Incorrect index","code":7,"invalid-event-number":2}"#.into())
+            } else {
+                success()
+            }
+        })
+        .await;
+        let (registry, mut out) = metered(addr);
+        out.send(&logs(3)).await.expect("the resend is accepted");
+        let captured = log.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(messages(&captured[1].decode()), ["line 2"]);
+        let points = registry.drain(0);
+        assert_eq!(total(&points, RECORDS_DROPPED, &[("reason", "invalid_event")]), 1.0);
+        assert_eq!(total(&points, RECORDS, &[]), 2.0, "object 0 ahead, and object 2 resent");
+    }
+
+    /// Codes 12, 13, and 15 name an object as code 6 does: it's dropped and the rest resent.
+    #[tokio::test]
+    async fn a_per_object_code_drops_that_object_and_resends_the_rest_once() {
+        for code in [12, 13, 15] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            let (addr, log) = collector(move |_, _| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (400, String::from_utf8(encode_status_body(code, Some(1))).unwrap())
+                } else {
+                    success()
+                }
+            })
+            .await;
+            let (registry, mut out) = metered(addr);
+            out.send(&logs(3)).await.expect("the resend is accepted");
+            let captured = log.lock().unwrap().clone();
+            assert_eq!(captured.len(), 2, "code {code}");
+            assert_eq!(messages(&captured[1].decode()), ["line 2"], "code {code}");
+            let points = registry.drain(0);
+            let dropped = total(&points, RECORDS_DROPPED, &[("reason", "invalid_event")]);
+            assert_eq!(dropped, 1.0, "code {code}");
+        }
     }
 
     /// A rejection is counted by its HEC code, bounded: an unknown code tags `other`.
@@ -1305,14 +1448,14 @@ mod tests {
         assert_eq!(log.lock().unwrap().len(), 1);
     }
 
-    /// A second code 6, on the resend, is permanent.
+    /// A second code 6, on the resend, is rejected.
     #[tokio::test]
-    async fn a_second_code_6_is_permanent() {
+    async fn a_second_code_6_is_rejected() {
         let (addr, log) =
             collector(|_, _| (400, String::from_utf8(encode_status_body(6, Some(0))).unwrap()))
                 .await;
         let err = sink(addr).send(&logs(3)).await.unwrap_err();
-        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+        assert_eq!(logit_pipeline::classify(&err), Fault::Rejected);
         let captured = log.lock().unwrap().clone();
         assert_eq!(captured.len(), 2, "one resend, not a third request");
         assert_eq!(messages(&captured[1].decode()), ["line 1", "line 2"]);
@@ -1320,10 +1463,15 @@ mod tests {
 
     #[test]
     fn after_invalid_event_names_the_object_and_what_follows_it() {
-        assert_eq!(after_invalid_event(4, 1), Some((1, 2..4)));
-        assert_eq!(after_invalid_event(4, 3), Some((3, 4..4)));
-        assert_eq!(after_invalid_event(4, 4), None);
-        assert_eq!(after_invalid_event(4, u64::MAX), None);
+        assert_eq!(after_invalid_event(4, 6, 1), Some((1, 2..4)));
+        assert_eq!(after_invalid_event(4, 6, 3), Some((3, 4..4)));
+        assert_eq!(after_invalid_event(4, 6, 4), None);
+        assert_eq!(after_invalid_event(4, 6, u64::MAX), None);
+        // Code 7 names the object after the bad one.
+        assert_eq!(after_invalid_event(4, 7, 2), Some((1, 2..4)));
+        assert_eq!(after_invalid_event(4, 7, 4), Some((3, 4..4)));
+        assert_eq!(after_invalid_event(4, 7, 0), None);
+        assert_eq!(after_invalid_event(4, 7, 5), None);
     }
 
     /// A busy answer after an earlier body of the `send` was accepted is ambiguous: a `Clean`
@@ -1418,13 +1566,13 @@ mod tests {
         assert_eq!(total(&points, RECORDS, &[]), 0.0);
     }
 
-    /// A half still over the cap after the one split is permanent.
+    /// A half still over the cap after the one split is rejected.
     #[tokio::test]
-    async fn a_half_still_over_the_cloud_cap_is_permanent() {
+    async fn a_half_still_over_the_cloud_cap_is_rejected() {
         let (addr, log) = cloud_capped().await;
         let (_registry, mut out) = over_cap_sink(addr);
         let err = out.send(&large_logs(&[3_000_000, 3_000_000, 3_000_000])).await.unwrap_err();
-        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent, "{err:#}");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Rejected, "{err:#}");
         assert_eq!(log.lock().unwrap().len(), 2, "the whole body, then the first half only");
     }
 
@@ -1568,7 +1716,7 @@ mod tests {
         assert!(total(&points, REQUESTS, &refused) >= 1.0, "every poll was refused");
     }
 
-    /// A code 6 naming no object of the body is permanent, with a `request_rejected` diagnostic.
+    /// A code 6 naming no object of the body is rejected, with a `request_rejected` diagnostic.
     #[tokio::test]
     async fn a_code_6_out_of_range_is_diagnosed() {
         use tracing_subscriber::util::SubscriberInitExt as _;
@@ -1584,7 +1732,7 @@ mod tests {
         let mut out = sink(addr).with_diagnostics(Diagnostics::new("splunk"));
         let err = out.send(&logs(2)).await.unwrap_err();
         drop(guard);
-        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+        assert_eq!(logit_pipeline::classify(&err), Fault::Rejected);
         let logged = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
         assert!(logged.contains("at object 5, which isn't one of them"), "{logged}");
         assert_eq!(out.diag.occurrences("request_rejected"), 1);
@@ -1803,7 +1951,8 @@ mod tests {
         Busy,
         /// `400` code 6 naming object `n`.
         Invalid(u64),
-        Hang,
+        /// `500`: `Fault::Ambiguous`.
+        Unavailable,
     }
 
     /// A collector answering the `n`th request by `script[n]`, the last to every later one.
@@ -1812,7 +1961,7 @@ mod tests {
             Hec::Accept => Reply::Answer(200, encode_success(None)),
             Hec::Busy => Reply::Answer(503, encode_status_body(9, None)),
             Hec::Invalid(n) => Reply::Answer(400, encode_status_body(6, Some(n))),
-            Hec::Hang => Reply::Hang,
+            Hec::Unavailable => Reply::Answer(500, Vec::new()),
         })
         .await
     }
@@ -1905,22 +2054,21 @@ mod tests {
         }
     }
 
-    /// A batch whose one request never answers is cut off by the retry budget and dropped, and
-    /// the next batch counts its encode-side counters.
+    /// A batch whose one request is answered `500` is dropped under `at_most_once`, and the next
+    /// batch counts its encode-side counters.
     #[tokio::test]
-    async fn a_hec_batch_after_one_dropped_at_its_budget_counts_encode_side() {
-        let (addr, log) = scripted_hec(&[Hec::Hang, Hec::Accept]).await;
+    async fn a_hec_batch_after_one_dropped_counts_encode_side() {
+        let (addr, log) = scripted_hec(&[Hec::Unavailable, Hec::Accept]).await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented_hec(addr, &probe);
-        let mut config = fast_retry();
-        config.retry.total_budget = crate::test_support::HUNG_REQUEST_BUDGET;
+        let config = crate::test_support::at_most_once();
         let batches = vec![encode_side_batch(), encode_side_batch()];
         let sums =
             sums_through_write_loop(&mut output, &mut probe, "splunk_hec_out", batches, config)
                 .await;
         assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
         assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
-        assert_eq!(log.lock().unwrap().len(), 2, "the hung request, then the second batch's");
+        assert_eq!(log.lock().unwrap().len(), 2, "the failed request, then the second batch's");
         for (name, tags) in ENCODE_SIDE {
             assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
         }

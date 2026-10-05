@@ -14,10 +14,26 @@
 //! (`format: native`, `docs/adr/file-output-native-format.md`); `Target`/`FileTarget` never see
 //! which.
 //!
-//! **Delivery posture**, for `stdio_out` and `file_out` alike. A write error carries no `Fault`,
-//! so it classifies `Permanent` and is never retried; a failed re-open after rotation is `Clean`
-//! and is retried under both postures (`FileTarget::rotate`). The one case the posture decides is
-//! a write the shutdown grace cuts off, which is `Ambiguous`: under the default, `at_least_once`
+//! **Response classes**, for `stdio_out` and `file_out` alike. A file or stream has no
+//! application response, so the I/O error decides. The Evidence column names the test that pins
+//! each row.
+//!
+//! | Response | Class | Why | Evidence |
+//! |---|---|---|---|
+//! | an encode error | `Rejected` (no `Fault` attached) | about this batch: it would encode the same way again | -- |
+//! | a failed re-open of the active file after a rotation's rename | `Clean` | the batch provably reached no file, so a retry is safe under either posture; the failure is likely transient (`ENOSPC`, `EMFILE`) | `a_failed_reopen_is_classified_clean_so_the_batch_is_retried_rather_than_dropped` |
+//! | a failed write or flush of the active file (a full disk, a permission lost, an I/O error), or of stdout or stderr | `Rejected` (no `Fault` attached) | part of the batch may already be in the file, and a resend would repeat it; the write is local, so nothing tells this batch's failure from the next one's | `a_failed_write_or_flush_of_the_active_file_is_rejected` |
+//! | a failed rotation rename or `max_files: 1` truncate | no fault: the batch is written to the current file, `rotate_failure` warns, and the next batch retries the rotation | nothing on disk changed | `a_failed_truncate_under_max_files_one_is_not_rotated_and_keeps_writing_to_the_existing_file` |
+//!
+//! A full disk drops batch after batch while it lasts, counted
+//! `batches.dropped{reason="rejected"}`, where holding them as `Refused` would keep them until
+//! space came back. That trade is the current one, unchanged by
+//! [ADR `sink-fault-classes`](../../../docs/adr/sink-fault-classes.md): reading a write error as
+//! `Refused` needs the write to be all-or-nothing, which a partial `write_all` isn't, or a
+//! truncate back to the batch's start on failure, which this sink doesn't do.
+//!
+//! **Delivery posture.** The one case the posture decides is a write the shutdown grace cuts off,
+//! which is `Ambiguous`: under the default, `at_least_once`
 //! (`docs/adr/delivery-semantics.md`, item 5), the batch stays queued, so a `buffer.disk:` spool
 //! replays it after a restart and the file can repeat its block; under `at_most_once` it's
 //! dropped and counted `reason="shutdown"`.
@@ -171,8 +187,7 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
 
         // One `write_all` and one `flush` per batch, so nothing sits in tokio's buffer between
         // batches. `flush` is not `fsync`: the OS page cache still holds the bytes. A write error
-        // carries no `Fault`, so the runtime doesn't retry the batch, and it doesn't count toward
-        // the permanent-failure exit either (`logit_pipeline::output::is_explicitly_permanent`).
+        // carries no `Fault`, so the runtime classifies it `Rejected` and doesn't retry the batch.
         // A failed re-open after rotation is the exception: `Fault::Clean` (`FileTarget::rotate`).
         match &mut self.target {
             Target::Stdout(w) => {
@@ -505,7 +520,7 @@ mod tests {
         // "Pipeline runtime and graph", the `fault` seam entry).
         scope.fail_nth(open, 1, errno::EMFILE).fail_nth(open, 1, errno::EMFILE);
         let config = crate::test_support::fast_retry();
-        drive_write_loop(&mut output, vec![small], config, telemetry).await.unwrap();
+        drive_write_loop(&mut output, vec![small], config, telemetry).await;
         drop(scope);
 
         let totals = probe.poll();

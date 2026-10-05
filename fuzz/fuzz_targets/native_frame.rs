@@ -1,10 +1,12 @@
 //! Native frames (`logit_proto::frame`) off a byte stream, as `DiskQueue` walks a segment file:
-//! read a frame, and on a rejected one scan to the next magic with `resync`.
+//! read a frame, and on a rejected one scan to the next magic with `resync`. Each position is also
+//! read for its payload's prefix alone, as `logit_in` reads a frame past its cap.
 #![no_main]
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use logit_proto::frame::{read_frame_with_header, resync};
+use logit_proto::frame::{read_frame_prefix, read_frame_with_header, resync};
+use logit_proto::native::HOP_PREFIX_MAX_LEN;
 use logit_proto::CodecError;
 
 fuzz_target!(|data: &[u8]| {
@@ -12,6 +14,7 @@ fuzz_target!(|data: &[u8]| {
     let mut pos = 0;
     while pos < all.len() {
         let mut rest = all.slice(pos..);
+        let _ = read_frame_prefix(&mut rest.clone(), HOP_PREFIX_MAX_LEN);
         match read_frame_with_header(&mut rest) {
             Ok(_) => pos = all.len() - rest.len(),
             Err(CodecError::Truncated { .. }) => break,

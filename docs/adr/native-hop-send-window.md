@@ -1,6 +1,6 @@
 ---
 created: 2026-10-01
-updated: 2026-10-02
+updated: 2026-10-04
 ---
 
 # Native hop send window: several frames in flight, acknowledged in frame order
@@ -36,7 +36,10 @@ sequence in `Ack`", decision 1's "Acks arrive
 in frame order" (the k-th `Ack` answers the k-th unanswered frame), decision 4's "`in_flight` is
 the loop's count" drift check, decision 5's `await_ack` ("`Ack` decrements `in_flight`"), and the
 rejected alternative "`Ack` carrying the sequence". An `Ack` names an identity and a sequence,
-one ack covers a run of frames, and the sender commits by name.
+one ack covers a run of frames, and the sender commits by name. Superseded in part on 2026-10-04
+by [ADR `native-hop-ack-status`](native-hop-ack-status.md): decision 4's "Every `Err` from `await_ack` ... means the sink dropped its
+connection" and decision 5's "Every `Err` drops the connection". A rejected `Ack` fails the head
+alone, marked `HeadOnly`, and the connection and the frames behind it stay.
 
 ## Context
 
@@ -195,7 +198,9 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   fault doesn't reset it, so a resubmitted batch isn't observed again.
 - **The sink drops its connection on every failure of `await_ack`.** Every `Err` from
   `await_ack`, and every cancelled `submit` or `await_ack`, means the sink dropped its connection,
-  and `write_loop` resets `outstanding` to 0 on either.
+  and `write_loop` resets `outstanding` to 0 on either. [Superseded in part on 2026-10-04 by
+  [ADR `native-hop-ack-status`](native-hop-ack-status.md): an `Err` marked `HeadOnly`, always `Rejected`, settles the head alone; the
+  sink kept its connection, and `write_loop` commits the head and leaves the rest outstanding.]
 - **`in_flight` is the loop's count.** `submit` receives `outstanding`. A sink whose own count
   differs fails the submit `Ambiguous`, so a drifted count can't let the first `Ack` commit a
   head that was never sent.
@@ -285,7 +290,9 @@ async fn await_ack(&mut self) -> anyhow::Result<()> { Ok(()) }
   - A permanent reject code is `Permanent`.
   - Any other message, an EOF, a reset, or a timeout is `Ambiguous`.
   - Every `Err` drops the connection. The connection is taken into a local for the read, so a
-    cancelled `await_ack` drops it.
+    cancelled `await_ack` drops it. [Superseded in part on 2026-10-04 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): a
+    rejected `Ack` naming the head pops it, returns `Rejected` marked `HeadOnly`, and keeps the
+    connection.]
 - **`send` is `submit` then `await_ack`.** `send` calls `submit` with the pending context and
   sequence and `in_flight` 0, then `await_ack`, and clears the pending sequence on `Ok`. Direct
   callers and fake peers that answer `window: 1` see today's behavior.

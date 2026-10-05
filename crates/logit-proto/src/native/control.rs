@@ -2,8 +2,10 @@
 //! compression handshake), `Ack` (frames are handled), and `Reject` (a clean refusal).
 //! ADR `native-transport-handshake-and-ack` has the protocol.
 //!
-//! `Ack` names a sender identity and a sequence, and covers every frame of that identity at or
-//! below it (`docs/adr/native-hop-named-acks.md`, decision 1). `Hello.senders` lists the
+//! `Ack` names a sender identity and a sequence (`docs/adr/native-hop-named-acks.md`, decision 1)
+//! and carries a status (`docs/adr/native-hop-ack-status.md`): an accepted `Ack` covers every
+//! frame of that identity at or below the sequence, and a rejected one the one frame it names,
+//! with a reason code and an optional message. `Hello.senders` lists the
 //! identities of the frames a connection will resend, and `HelloAck.marks` answers each with the
 //! receiver's high-water mark (the same ADR, decision 4).
 //!
@@ -53,11 +55,11 @@ const SENDER_ID_BYTES: usize = 16;
 const MARK_ENTRY_BYTES: usize = SENDER_ID_BYTES + 8;
 
 /// The longest control message payload a reader accepts, checked against a frame header before
-/// the body is allocated. The longest message this version writes is a `Reject` whose message is
-/// at [`MAX_REJECT_MESSAGE_BYTES`], 1033 bytes. The largest valid `Hello` (16 senders) is 315
-/// bytes and the largest valid `HelloAck` (16 marks) is 413; the rest is headroom for a longer
-/// `Reject.message` or list. No valid control message reaches it, so it bounds a malformed
-/// length.
+/// the body is allocated. The longest message this version writes is a rejected `Ack` whose
+/// message is at [`MAX_REJECT_MESSAGE_BYTES`], 1066 bytes; a `Reject` at the same message length is
+/// 1033. The largest valid `Hello` (16 senders) is 315 bytes and the largest valid `HelloAck`
+/// (16 marks) is 413; the rest is headroom for a longer message or list. No valid control message
+/// reaches it, so it bounds a malformed length.
 pub const MAX_CONTROL_MESSAGE_BYTES: u32 = 4096;
 
 const MSG_HELLO: u8 = 1;
@@ -129,6 +131,31 @@ fn required<T>(slot: Option<T>, msg: &str, field: &str) -> Result<T, CodecError>
 
 fn unknown_tag(msg: &str, tag: u8) -> CodecError {
     CodecError::Malformed(format!("{msg} has an unknown field tag {tag}"))
+}
+
+/// Reads a `Reject.message` or `Ack.message` field: over [`MAX_REJECT_MESSAGE_BYTES`] on the wire
+/// is `Malformed`, and invalid UTF-8 is replaced, then cut back to the cap.
+fn read_message_field(field: &[u8], msg: &str) -> Result<String, CodecError> {
+    if field.len() > MAX_REJECT_MESSAGE_BYTES {
+        return Err(CodecError::Malformed(format!(
+            "{msg}.message is {} bytes, over the {MAX_REJECT_MESSAGE_BYTES} sanity cap",
+            field.len()
+        )));
+    }
+    let mut text = String::from_utf8_lossy(field).into_owned();
+    truncate_to_cap(&mut text);
+    Ok(text)
+}
+
+/// Cuts `text` to [`MAX_REJECT_MESSAGE_BYTES`] on a char boundary. A lossy decode turns each
+/// invalid byte into a 3-byte U+FFFD, so its string can exceed the cap; cut back, a decoded
+/// message always re-encodes within it.
+fn truncate_to_cap(text: &mut String) {
+    let mut cut = text.len().min(MAX_REJECT_MESSAGE_BYTES);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
 }
 
 fn read_window_field(field: Bytes, msg: &str) -> Result<u32, CodecError> {
@@ -385,34 +412,102 @@ impl HelloAck {
 
 // -- Ack -------------------------------------------------------------------------------------
 
-/// Every data frame of sender identity `id` with a sequence at or below `seq` that this
-/// connection carried is handled: forwarded, or recognized as a resend and not forwarded. `seq`
-/// is a frame the connection carried, never the receiver's mark. Grants no credit
-/// (`docs/adr/native-hop-named-acks.md`, decision 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Frames of sender identity `id` up to `seq` that this connection carried are handled, as
+/// `status` says (`docs/adr/native-hop-ack-status.md`). `seq` is a frame the connection carried,
+/// never the receiver's mark. Grants no credit (`docs/adr/native-hop-named-acks.md`, decision 1).
+///
+/// - [`AckStatus::Accepted`] covers every frame of `id` at or below `seq`: forwarded, or
+///   recognized as a resend and not forwarded.
+/// - [`AckStatus::Rejected`] covers the one frame `seq` names, dropped by the receiver; every
+///   earlier frame of the connection was answered by an earlier `Ack`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ack {
     pub id: [u8; 16],
-    /// At least 1; a decoded 0 is [`CodecError::Malformed`], as in a frame's trailer.
+    /// At least 1; a decoded 0 is [`CodecError::Malformed`], as in a hop payload's prefix.
     pub seq: u64,
+    pub status: AckStatus,
 }
+
+/// What the receiver did with the frames an [`Ack`] names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AckStatus {
+    Accepted,
+    /// The receiver read the frame's sender pair and dropped the frame, as it would on every
+    /// resend. `reason` is one of the `ACK_REJECTED_*` codes, or one a newer receiver adds;
+    /// `message` is at most 1024 bytes, like `Reject.message`.
+    Rejected {
+        reason: u16,
+        message: Option<String>,
+    },
+}
+
+/// [`AckStatus::Rejected`] reasons. Codes, not an enum, as `Reject.code` is: a reader that
+/// doesn't know a code still reads the frame as rejected.
+///
+/// The frame's header declared a payload over the receiver's `max_frame_bytes`.
+pub const ACK_REJECTED_TOO_LARGE: u16 = 1;
+/// The frame's batch would decode past the receiver's per-frame decode budget.
+pub const ACK_REJECTED_DECODE_BUDGET: u16 = 2;
+/// The frame's payload after its sender pair doesn't decode.
+pub const ACK_REJECTED_MALFORMED: u16 = 3;
 
 const ACK_FIELD_ID: u8 = 1;
 const ACK_FIELD_SEQ: u8 = 2;
+const ACK_FIELD_STATUS: u8 = 3;
+const ACK_FIELD_REASON: u8 = 4;
+const ACK_FIELD_MESSAGE: u8 = 5;
+
+/// [`ACK_FIELD_STATUS`]'s one byte.
+const ACK_STATUS_ACCEPTED: u8 = 0;
+const ACK_STATUS_REJECTED: u8 = 1;
+
+impl AckStatus {
+    /// [`AckStatus::Rejected`] with `message` cut to the message cap on a char boundary, so it
+    /// always encodes within it.
+    pub fn rejected(reason: u16, message: impl Into<String>) -> Self {
+        let mut message = message.into();
+        truncate_to_cap(&mut message);
+        AckStatus::Rejected { reason, message: Some(message) }
+    }
+}
 
 impl Ack {
+    /// An [`AckStatus::Accepted`] `Ack`.
+    pub fn accepted(id: [u8; 16], seq: u64) -> Self {
+        Ack { id, seq, status: AckStatus::Accepted }
+    }
+
     pub fn encode(&self) -> Bytes {
         debug_assert!(self.seq >= 1, "Ack.seq must be at least 1");
         let mut out = BytesMut::new();
         out.extend_from_slice(&[MSG_ACK]);
         write_bytes_field(&mut out, ACK_FIELD_ID, &self.id);
         write_field(&mut out, ACK_FIELD_SEQ, |buf| write_uvarint(buf, self.seq));
+        match &self.status {
+            AckStatus::Accepted => {
+                write_bytes_field(&mut out, ACK_FIELD_STATUS, &[ACK_STATUS_ACCEPTED]);
+            }
+            AckStatus::Rejected { reason, message } => {
+                write_bytes_field(&mut out, ACK_FIELD_STATUS, &[ACK_STATUS_REJECTED]);
+                write_u16(&mut out, ACK_FIELD_REASON, *reason);
+                if let Some(message) = message {
+                    debug_assert!(message.len() <= MAX_REJECT_MESSAGE_BYTES);
+                    write_bytes_field(&mut out, ACK_FIELD_MESSAGE, message.as_bytes());
+                }
+            }
+        }
         out.freeze()
     }
 
+    /// `status` is required. `reason` is required with a rejected status and `Malformed` with an
+    /// accepted one, as `message` is; `message` is optional with a rejected status.
     fn decode_fields(mut body: Bytes) -> Result<Self, CodecError> {
         const MSG: &str = "Ack";
         let mut id = None;
         let mut seq = None;
+        let mut status = None;
+        let mut reason = None;
+        let mut message = None;
         while let Some((tag, mut field)) = read_field(&mut body)? {
             match tag {
                 ACK_FIELD_ID => {
@@ -431,10 +526,39 @@ impl Ack {
                     }
                     set_once(&mut seq, value, MSG, "seq")?
                 }
+                ACK_FIELD_STATUS => {
+                    let value = match field[..] {
+                        [byte @ (ACK_STATUS_ACCEPTED | ACK_STATUS_REJECTED)] => byte,
+                        _ => {
+                            return Err(CodecError::Malformed(format!(
+                                "Ack.status is {:?}, not one byte of 0 or 1",
+                                &field[..]
+                            )))
+                        }
+                    };
+                    set_once(&mut status, value, MSG, "status")?
+                }
+                ACK_FIELD_REASON => set_once(&mut reason, read_u16_field(field)?, MSG, "reason")?,
+                ACK_FIELD_MESSAGE => {
+                    set_once(&mut message, read_message_field(&field, MSG)?, MSG, "message")?
+                }
                 tag => return Err(unknown_tag(MSG, tag)),
             }
         }
-        Ok(Ack { id: required(id, MSG, "id")?, seq: required(seq, MSG, "seq")? })
+        let id = required(id, MSG, "id")?;
+        let seq = required(seq, MSG, "seq")?;
+        let status = match required(status, MSG, "status")? {
+            ACK_STATUS_ACCEPTED => {
+                if reason.is_some() || message.is_some() {
+                    return Err(CodecError::Malformed(
+                        "an accepted Ack carries a reason or a message".to_string(),
+                    ));
+                }
+                AckStatus::Accepted
+            }
+            _ => AckStatus::Rejected { reason: required(reason, MSG, "reason")?, message },
+        };
+        Ok(Ack { id, seq, status })
     }
 
     pub fn decode(bytes: &mut Bytes) -> Result<Self, CodecError> {
@@ -468,30 +592,12 @@ impl Reject {
     fn decode_fields(mut body: Bytes) -> Result<Self, CodecError> {
         const MSG: &str = "Reject";
         let mut code = None;
-        let mut message: Option<String> = None;
+        let mut message = None;
         while let Some((tag, field)) = read_field(&mut body)? {
             match tag {
                 REJECT_FIELD_CODE => set_once(&mut code, read_u16_field(field)?, MSG, "code")?,
                 REJECT_FIELD_MESSAGE => {
-                    if message.is_some() {
-                        return Err(CodecError::Malformed(format!("{MSG} repeats message")));
-                    }
-                    if field.len() > MAX_REJECT_MESSAGE_BYTES {
-                        return Err(CodecError::Malformed(format!(
-                            "Reject.message is {} bytes, over the {MAX_REJECT_MESSAGE_BYTES} \
-                             sanity cap",
-                            field.len()
-                        )));
-                    }
-                    let mut text = String::from_utf8_lossy(&field).into_owned();
-                    // Each invalid byte becomes a 3-byte U+FFFD, so the lossy string can exceed
-                    // the cap; cut it back so a decoded message always re-encodes within it.
-                    let mut cut = text.len().min(MAX_REJECT_MESSAGE_BYTES);
-                    while !text.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    text.truncate(cut);
-                    message = Some(text);
+                    set_once(&mut message, read_message_field(&field, MSG)?, MSG, "message")?
                 }
                 tag => return Err(unknown_tag(MSG, tag)),
             }
@@ -634,11 +740,135 @@ mod tests {
     #[test]
     fn an_ack_round_trips_its_identity_and_sequence() {
         for seq in [1, 300, u64::MAX] {
-            let ack = Ack { id: ID, seq };
+            let ack = Ack::accepted(ID, seq);
             let mut encoded = ack.encode();
             assert_eq!(Ack::decode(&mut encoded).unwrap(), ack);
             let mut encoded = ack.encode();
             assert_eq!(ControlMessage::decode(&mut encoded).unwrap(), ControlMessage::Ack(ack));
+        }
+    }
+
+    fn rejected(reason: u16, message: Option<&str>) -> Ack {
+        let message = message.map(str::to_string);
+        Ack { id: ID, seq: 9, status: AckStatus::Rejected { reason, message } }
+    }
+
+    #[test]
+    fn a_rejected_ack_round_trips_its_reason_and_message() {
+        for ack in [
+            rejected(ACK_REJECTED_TOO_LARGE, None),
+            rejected(ACK_REJECTED_DECODE_BUDGET, Some("over the budget")),
+            rejected(ACK_REJECTED_MALFORMED, Some("")),
+            rejected(u16::MAX, Some(&"x".repeat(MAX_REJECT_MESSAGE_BYTES))),
+        ] {
+            assert_eq!(Ack::decode(&mut ack.encode()).unwrap(), ack);
+            assert_eq!(
+                ControlMessage::decode(&mut ack.encode()).unwrap(),
+                ControlMessage::Ack(ack)
+            );
+        }
+    }
+
+    #[test]
+    fn ack_status_rejected_cuts_its_message_to_the_cap_on_a_char_boundary() {
+        let AckStatus::Rejected { message: Some(message), .. } =
+            AckStatus::rejected(ACK_REJECTED_MALFORMED, "é".repeat(MAX_REJECT_MESSAGE_BYTES))
+        else {
+            panic!("a rejected status");
+        };
+        assert_eq!(message.len(), MAX_REJECT_MESSAGE_BYTES);
+    }
+
+    /// An `Ack`'s `id` and `seq` fields, then a `reason` field, as `tag + len + payload` bytes.
+    fn accepted_fields() -> (Bytes, Bytes) {
+        let mut id_and_seq = BytesMut::new();
+        write_bytes_field(&mut id_and_seq, ACK_FIELD_ID, &ID);
+        write_field(&mut id_and_seq, ACK_FIELD_SEQ, |buf| write_uvarint(buf, 9));
+        let mut reason = BytesMut::new();
+        write_u16(&mut reason, ACK_FIELD_REASON, ACK_REJECTED_MALFORMED);
+        (id_and_seq.freeze(), reason.freeze())
+    }
+
+    fn ack_from(parts: &[&[u8]]) -> Result<Ack, CodecError> {
+        let mut out = BytesMut::from(&[MSG_ACK][..]);
+        for part in parts {
+            out.extend_from_slice(part);
+        }
+        Ack::decode(&mut out.freeze())
+    }
+
+    #[test]
+    fn an_ack_status_must_be_one_byte_of_zero_or_one() {
+        let (id_and_seq, _) = accepted_fields();
+        for status in [&[][..], &[2], &[0, 0], &[0xff]] {
+            let mut field = BytesMut::new();
+            write_bytes_field(&mut field, ACK_FIELD_STATUS, status);
+            let result = ack_from(&[&id_and_seq, &field]);
+            assert!(
+                matches!(&result, Err(CodecError::Malformed(m)) if m.starts_with("Ack.status is")),
+                "{status:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ack_without_a_status_is_malformed() {
+        let (id_and_seq, _) = accepted_fields();
+        let result = ack_from(&[&id_and_seq]);
+        assert!(
+            matches!(&result, Err(CodecError::Malformed(m)) if m == "Ack is missing status"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_ack_without_a_reason_is_malformed() {
+        let (id_and_seq, _) = accepted_fields();
+        let mut status = BytesMut::new();
+        write_bytes_field(&mut status, ACK_FIELD_STATUS, &[ACK_STATUS_REJECTED]);
+        let result = ack_from(&[&id_and_seq, &status]);
+        assert!(
+            matches!(&result, Err(CodecError::Malformed(m)) if m == "Ack is missing reason"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn an_accepted_ack_carrying_a_reason_or_a_message_is_malformed() {
+        let (id_and_seq, reason) = accepted_fields();
+        let mut status = BytesMut::new();
+        write_bytes_field(&mut status, ACK_FIELD_STATUS, &[ACK_STATUS_ACCEPTED]);
+        let mut message = BytesMut::new();
+        write_bytes_field(&mut message, ACK_FIELD_MESSAGE, b"why");
+        for extra in [&reason[..], &message[..]] {
+            let result = ack_from(&[&id_and_seq, &status, extra]);
+            assert!(
+                matches!(&result, Err(CodecError::Malformed(m)) if m == "an accepted Ack carries a reason or a message"),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_ack_repeating_its_reason_or_message_or_over_the_message_cap_is_malformed() {
+        let (id_and_seq, reason) = accepted_fields();
+        let mut status = BytesMut::new();
+        write_bytes_field(&mut status, ACK_FIELD_STATUS, &[ACK_STATUS_REJECTED]);
+        let mut message = BytesMut::new();
+        write_bytes_field(&mut message, ACK_FIELD_MESSAGE, b"why");
+        let mut long = BytesMut::new();
+        write_bytes_field(&mut long, ACK_FIELD_MESSAGE, &[b'x'; MAX_REJECT_MESSAGE_BYTES + 1]);
+        for (parts, want) in [
+            (vec![&id_and_seq[..], &status, &reason, &reason], "Ack repeats reason"),
+            (vec![&id_and_seq[..], &status, &reason, &message, &message], "Ack repeats message"),
+            (vec![&id_and_seq[..], &status, &reason, &status], "Ack repeats status"),
+            (vec![&id_and_seq[..], &status, &reason, &long], "Ack.message is 1025 bytes"),
+        ] {
+            let result = ack_from(&parts);
+            assert!(
+                matches!(&result, Err(CodecError::Malformed(m)) if m.starts_with(want)),
+                "{want}: {result:?}"
+            );
         }
     }
 
@@ -789,7 +1019,7 @@ mod tests {
     }
 
     /// Every message this version writes, at its largest, fits [`MAX_CONTROL_MESSAGE_BYTES`], and
-    /// the largest is the 1033-byte `Reject` its doc names.
+    /// the largest is the 1066-byte rejected `Ack` its doc names.
     #[test]
     fn the_largest_message_of_each_type_fits_the_control_message_cap() {
         let largest = [
@@ -811,11 +1041,17 @@ mod tests {
                 marks: vec![([u8::MAX; 16], u64::MAX); MAX_HELLO_SENDERS],
             }
             .encode(),
-            Ack { id: [u8::MAX; 16], seq: u64::MAX }.encode(),
+            Ack::accepted([u8::MAX; 16], u64::MAX).encode(),
+            Ack {
+                id: [u8::MAX; 16],
+                seq: u64::MAX,
+                status: AckStatus::rejected(u16::MAX, "x".repeat(MAX_REJECT_MESSAGE_BYTES)),
+            }
+            .encode(),
             Reject { code: u16::MAX, message: "x".repeat(MAX_REJECT_MESSAGE_BYTES) }.encode(),
         ];
         let lens: Vec<usize> = largest.iter().map(Bytes::len).collect();
-        assert_eq!(lens, [315, 413, 31, 1033]);
+        assert_eq!(lens, [315, 413, 34, 1066, 1033]);
         assert!(lens.iter().all(|&len| len <= MAX_CONTROL_MESSAGE_BYTES as usize), "{lens:?}");
     }
 
@@ -848,7 +1084,7 @@ mod tests {
         vec![
             fields(hello_with(vec![ID, [8; 16]]).encode()),
             fields(hello_ack_with(vec![(ID, 3)]).encode()),
-            fields(Ack { id: ID, seq: 9 }.encode()),
+            fields(Ack::accepted(ID, 9).encode()),
             fields(Reject { code: REJECT_INTERNAL, message: "no".to_string() }.encode()),
         ]
     }
@@ -939,7 +1175,7 @@ mod tests {
 
     #[test]
     fn decoding_the_wrong_message_type_is_a_clear_error() {
-        let mut encoded = Ack { id: ID, seq: 1 }.encode();
+        let mut encoded = Ack::accepted(ID, 1).encode();
         assert!(matches!(HelloAck::decode(&mut encoded), Err(CodecError::Malformed(_))));
     }
 
@@ -962,7 +1198,7 @@ mod tests {
                 window: 1,
                 marks: vec![],
             }),
-            ControlMessage::Ack(Ack { id: ID, seq: 42 }),
+            ControlMessage::Ack(Ack::accepted(ID, 42)),
             ControlMessage::Reject(Reject { code: REJECT_GOING_AWAY, message: "bye".to_string() }),
         ] {
             let mut encoded = msg.encode();
