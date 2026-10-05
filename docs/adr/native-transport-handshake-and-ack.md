@@ -318,3 +318,55 @@ close, and no consumer taking the frame. The frame wasn't forwarded, so `logit_o
 `Clean`, redials, and resends, and the sender and receiver sequences stay aligned. The invariant
 in the 2026-09-25 amendment, that `GOING_AWAY` is written only for a frame that wasn't forwarded,
 holds. See [`delivery-semantics.md`](delivery-semantics.md), item 3, and its W3 amendment.
+
+## Amendment: the transport is a seam, and the gRPC rejection rests on a different reason (2026-10-05)
+
+The rejected alternative "Reuse gRPC-over-hyper" gives the wrong reason. It cites the bake-off's
+framing overhead, but [ADR `native-wire-format-encoding`](native-wire-format-encoding.md) measured
+protobuf as the *payload encoding*, not HTTP/2 as the *transport*. A native hop frame carried as
+one message on a long-lived HTTP/2 stream costs a 9-byte `DATA` header and a 5-byte gRPC message
+prefix per batch, with HPACK headers once per stream. Against a multi-kilobyte batch behind a
+24-byte native header, that cost is noise. The rejection stands, on these grounds instead:
+
+- **The hard parts are the hop's own semantics, and HTTP/2 removes none of them.** Sender
+  identity and sequence, the named cumulative `Ack`, the receiver's high-water marks and resend
+  dedup, the reconnect resume from `HelloAck.marks`, and a spool replay are application state
+  either way. HTTP/2's flow control is per-stream bytes, not application frames awaiting an
+  acknowledgment, so the send window stays too. What a gRPC stream would replace is the framing,
+  the version negotiation (ALPN and headers), keepalive, graceful close (`GOAWAY` for
+  `Reject{GOING_AWAY}`), the frame-size settings, and the TLS plumbing: a minority of this ADR's
+  surface, though several of its amendments live there.
+- **A long-lived stream gets little from L7 infrastructure.** A stream pins to one backend, so a
+  load balancer can't balance it, and a second `logit_in` behind one holds no mark for the sender
+  either way (`docs/known-gaps/native-hop.md`). Cloud load balancers close an idle stream on their
+  own timer, often 60 s, which this ADR's idle-close design would have to track.
+- **The gRPC in tree is unary only** ([ADR `hand-rolled-grpc-over-hyper`](hand-rolled-grpc-over-hyper.md)).
+  A bidirectional stream is new transport code, not a reuse.
+
+What the decision costs, stated so it isn't rediscovered: the hop crosses L4 infrastructure
+(TCP proxies, network load balancers, and stateful firewalls; `logit_in` takes no
+`proxy_protocol:`, so a TCP proxy's origin is lost) and not L7 (an HTTP ingress, a service mesh
+in HTTP mode, an application load balancer, an HTTP `CONNECT` egress proxy, or TLS termination
+that routes on HTTP). A deployment that can only open an HTTP path between two `logit` processes
+has no native hop today; `otlp_out` to `otlp_in` is the fallback, at OTLP's fidelity and encode
+cost. The industry splits on this: Vector's native hop is gRPC; Fluentd's forward protocol and
+Kafka's are bespoke framing over TCP.
+
+**The transport is a seam, not the decision.** The frame bytes are transport-agnostic (the same
+bytes go to a socket and to the `buffer.disk:` spool), and the session protocol above is defined
+over an ordered, reliable byte stream, so it carries unchanged over any transport that provides
+one. The remedy for the L7 limitation is a second transport for the same frames and the same
+control messages, selected per component, not a second protocol. Two candidates, neither
+designed here:
+
+- **gRPC**, for L7 infrastructure: the hop frames as messages on one bidirectional stream, or one
+  `POST` per frame with the `Ack` in the response. The second shape gives a proxy per-request
+  visibility but reorders a window of concurrent requests, which the cumulative `Ack` assumes it
+  won't see. Choosing between them is the first question of that work.
+- **QUIC**, for a lossy or migrating WAN hop: the frames on one `quinn` stream, no HTTP/3 needed.
+  The hop is one ordered sequence with cumulative acks, so QUIC's independent streams buy
+  nothing here. Its wins are 0-RTT reconnect, connection migration, and loss recovery. A raw QUIC
+  stream is as opaque to L7 infrastructure as TCP is.
+
+`docs/known-gaps/native-hop.md`'s transport entry tracks both. Neither is built speculatively;
+the trigger is a deployment that needs one.

@@ -607,7 +607,8 @@ the operator-facing account of all of this.
 
 ### Not yet built
 
-- QUIC for the native transport (`docs/known-gaps/native-hop.md`).
+- A second transport for the native hop, gRPC for L7 infrastructure or QUIC for a WAN hop
+  (`docs/known-gaps/native-hop.md`).
 - Prometheus native histograms, skipped and counted in both directions.
 - An Agent-equivalent Datadog trace processor (normalization, `_top_level` marking, sampling, a
   stats concentrator), so tracer spans could reach Datadog with no real Agent in the path
