@@ -25,7 +25,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   only on a `|T`-marked line.**
   - **Timestamp:** `statsd_out` stamps any event without a `statsd.timestamp` `U64` carrier
     (everything but a relayed `|T`-carrying line) with the receiver's receipt time, like
-    `syslog_out` (see "`event.timestamp` is still receipt time" under [syslog](syslog.md)).
+    `syslog_out`.
     DogStatsD's `|T<unix-seconds>` segment (`format: dogstatsd` only) round-trips: `statsd_in`
     sets `Event::timestamp` from it and stamps a `statsd.timestamp: Value::U64(secs)` carrier with
     the raw wire value. `statsd_out` re-emits `|T<secs>` from that carrier, never from

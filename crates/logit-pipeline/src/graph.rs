@@ -235,6 +235,11 @@
 //!     `docs/adr/native-hop-identity-and-sequence.md`).
 //! 75. A `logit_out` `window` of 0, which could send nothing, or past 1024, the largest window a
 //!     `logit_in` answers (`docs/adr/native-hop-send-window.md`).
+//! 76. A `timestamp` with an empty `from`; a `max_skew` of `0s`; a `timezone` that doesn't resolve;
+//!     a `timezone` set under a format that never reads it (`unix_*`, `rfc3339`, or a pattern with
+//!     `%z`, `%:z`, or `%s`); or a pattern that is empty, has no hour and minute, uses `%Z`, `%Q`,
+//!     or `%:Q`, or fails to parse its own rendering of a reference instant
+//!     (`docs/adr/timestamp-transform.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -247,7 +252,7 @@ use logit_config::{
     default_prometheus_scrape_timeout, default_prometheus_write_path, BufferConfig, Component,
     ComponentKind, Compression, Config, GraphiteProtocol, GraphiteTransport, MessageMode,
     MetadataCacheConfig, ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport,
-    TraceIdFormat, MAX_READ_BATCH,
+    TimestampFormat, TraceIdFormat, MAX_READ_BATCH,
 };
 use logit_core::redact;
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
@@ -326,6 +331,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Set { .. }
         | TraceContext { .. }
         | Scale { .. }
+        | Timestamp { .. }
         | HasSignal { .. }
         | KeepSignals { .. }
         | DropSignals { .. }
@@ -392,6 +398,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Set { .. } => "set",
         TraceContext { .. } => "trace_context",
         Scale { .. } => "scale",
+        Timestamp { .. } => "timestamp",
         HasSignal { .. } => "has_signal",
         KeepSignals { .. } => "keep_signals",
         DropSignals { .. } => "drop_signals",
@@ -492,6 +499,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Set { .. }
             | ComponentKind::TraceContext { .. }
             | ComponentKind::Scale { .. }
+            | ComponentKind::Timestamp { .. }
             | ComponentKind::HasSignal { .. }
             | ComponentKind::KeepSignals { .. }
             | ComponentKind::DropSignals { .. }
@@ -3507,6 +3515,52 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 76: `timestamp` (`docs/adr/timestamp-transform.md`). `logit_core::zoned` decides what a
+    // valid zone and pattern are, so this and the transform can't disagree. A zone is resolved here
+    // once, never per event.
+    for (id, component) in &components {
+        if let ComponentKind::Timestamp { from, format, timezone, max_skew, .. } = &component.kind {
+            if from.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': timestamp 'from' must not be empty -- name the attribute \
+                     holding the sender's timestamp"
+                );
+            }
+            if max_skew.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': timestamp 'max_skew' must be greater than 0s -- a zero \
+                     window would leave every event unresolved"
+                );
+            }
+            let reads_zone = match format {
+                TimestampFormat::Rfc3164 => true,
+                TimestampFormat::Rfc3339
+                | TimestampFormat::UnixSeconds
+                | TimestampFormat::UnixMillis
+                | TimestampFormat::UnixMicros
+                | TimestampFormat::UnixNanos => false,
+                TimestampFormat::Pattern(text) => match logit_core::zoned::Pattern::compile(text) {
+                    Ok(pattern) => pattern.reads_zone(),
+                    Err(e) => anyhow::bail!(
+                        "component '{id}': timestamp 'format.pattern' is invalid: {e}"
+                    ),
+                },
+            };
+            if let Some(name) = timezone {
+                if let Err(e) = logit_core::zoned::Zone::parse(name) {
+                    anyhow::bail!("component '{id}': timestamp 'timezone' is invalid: {e}");
+                }
+                if !reads_zone {
+                    anyhow::bail!(
+                        "component '{id}': timestamp 'timezone' is set but this 'format' never \
+                         reads it -- remove 'timezone' (it applies to 'rfc3164' and to a pattern \
+                         with no '%z', '%:z', or '%s')"
+                    );
+                }
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is fixed here, once (see [`targets_of`]).
@@ -5685,6 +5739,139 @@ mod tests {
             ("out", vec!["tap"], sink()),
         ]));
         assert!(err.contains("max_tracked_keysets"), "{err}");
+    }
+
+    // ---- Rule 76: `timestamp` -------------------------------------------------------------------
+
+    fn timestamp_with(
+        from: &str,
+        format: logit_config::TimestampFormat,
+        timezone: Option<&str>,
+        max_skew: Duration,
+    ) -> ComponentKind {
+        ComponentKind::Timestamp {
+            from: from.to_string(),
+            format,
+            timezone: timezone.map(str::to_string),
+            max_skew,
+            keep_source: false,
+        }
+    }
+
+    fn timestamp_at(
+        format: logit_config::TimestampFormat,
+        timezone: Option<&str>,
+    ) -> ComponentKind {
+        timestamp_with("syslog.timestamp", format, timezone, Duration::from_secs(24 * 3600))
+    }
+
+    fn resolve_timestamp(kind: ComponentKind) -> anyhow::Result<Graph> {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("stamped", vec!["in"], kind),
+            ("out", vec!["stamped"], sink()),
+        ]))
+    }
+
+    fn timestamp_err(kind: ComponentKind) -> String {
+        expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("stamped", vec!["in"], kind),
+            ("out", vec!["stamped"], sink()),
+        ]))
+    }
+
+    #[test]
+    fn a_default_timestamp_resolves_as_a_transform() {
+        let graph = resolve_timestamp(timestamp_at(logit_config::TimestampFormat::Rfc3339, None))
+            .expect("should resolve");
+        assert_eq!(graph.components["stamped"].role(), Role::Transform);
+        assert_eq!(graph.components["stamped"].kind_name(), "timestamp");
+    }
+
+    #[test]
+    fn a_timestamp_accepts_a_zone_where_the_format_reads_one() {
+        resolve_timestamp(timestamp_at(
+            logit_config::TimestampFormat::Rfc3164,
+            Some("America/New_York"),
+        ))
+        .expect("rfc3164 reads the zone");
+        resolve_timestamp(timestamp_at(
+            logit_config::TimestampFormat::Pattern("%Y-%m-%d %H:%M:%S".to_string()),
+            Some("+02:00"),
+        ))
+        .expect("a pattern with no offset reads the zone");
+    }
+
+    #[test]
+    fn a_timestamp_pattern_with_an_offset_needs_no_zone() {
+        let pattern = "%d/%b/%Y:%H:%M:%S %z".to_string();
+        resolve_timestamp(timestamp_at(
+            logit_config::TimestampFormat::Pattern(pattern.clone()),
+            None,
+        ))
+        .expect("an offset pattern resolves without a zone");
+        let err = timestamp_err(timestamp_at(
+            logit_config::TimestampFormat::Pattern(pattern),
+            Some("UTC"),
+        ));
+        assert!(err.contains("never reads it"), "got: {err}");
+    }
+
+    #[test]
+    fn a_timestamp_with_an_empty_from_is_rejected() {
+        let err = timestamp_err(timestamp_with(
+            "",
+            logit_config::TimestampFormat::Rfc3339,
+            None,
+            Duration::from_secs(60),
+        ));
+        assert!(err.contains("'from' must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_timestamp_with_a_zero_max_skew_is_rejected() {
+        let err = timestamp_err(timestamp_with(
+            "ts",
+            logit_config::TimestampFormat::Rfc3339,
+            None,
+            Duration::ZERO,
+        ));
+        assert!(err.contains("'max_skew'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_timestamp_with_an_unknown_zone_is_rejected() {
+        let err = timestamp_err(timestamp_at(
+            logit_config::TimestampFormat::Rfc3164,
+            Some("Mars/Olympus_Mons"),
+        ));
+        assert!(err.contains("'timezone'") && err.contains("Mars/Olympus_Mons"), "got: {err}");
+    }
+
+    #[test]
+    fn a_timestamp_zone_under_a_format_that_never_reads_it_is_rejected() {
+        for format in [
+            logit_config::TimestampFormat::Rfc3339,
+            logit_config::TimestampFormat::UnixSeconds,
+            logit_config::TimestampFormat::UnixMillis,
+            logit_config::TimestampFormat::UnixMicros,
+            logit_config::TimestampFormat::UnixNanos,
+        ] {
+            let err = timestamp_err(timestamp_at(format.clone(), Some("UTC")));
+            assert!(err.contains("never reads it"), "{format:?}, got: {err}");
+        }
+    }
+
+    #[test]
+    fn a_timestamp_with_an_invalid_pattern_is_rejected() {
+        for pattern in ["", "%H:%M %Z", "%Y-%m-%d", "%d %b"] {
+            let err = timestamp_err(timestamp_at(
+                logit_config::TimestampFormat::Pattern(pattern.to_string()),
+                None,
+            ));
+            assert!(err.contains("'format.pattern'"), "{pattern:?}, got: {err}");
+        }
     }
 
     /// A bare `sample` at `rate` -- no key, no `missing`, no override.

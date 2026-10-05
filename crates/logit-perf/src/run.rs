@@ -1505,45 +1505,19 @@ fn now_unix_seconds() -> i64 {
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ`, second precision: results need only order and legibility.
-/// Hand-rolled with Hinnant's civil-from-days, as `crates/logit-core/src/time.rs` does, rather
-/// than a date/time crate dependency.
+/// `logit_core::time`'s nanosecond render with its fraction cut; a time past 2262 saturates.
 fn format_rfc3339_utc_seconds(unix_seconds: i64) -> String {
-    let days = unix_seconds.div_euclid(86_400);
-    let secs_of_day = unix_seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    let mut out = logit_core::time::format_rfc3339_utc(unix_seconds.saturating_mul(1_000_000_000));
+    // `YYYY-MM-DDTHH:MM:SS` is 19 bytes; the render's `.fffffffffZ` follows.
+    out.truncate(19);
+    out.push('Z');
+    out
 }
 
 /// Same instant as [`format_rfc3339_utc_seconds`], filesystem-safe: no `:` (illegal on some
 /// filesystems, awkward to shell-quote on all of them).
 fn compact_utc_now(unix_seconds: i64) -> String {
-    let days = unix_seconds.div_euclid(86_400);
-    let secs_of_day = unix_seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
-}
-
-/// Howard Hinnant's `civil_from_days`
-/// (<http://howardhinnant.github.io/date_algorithms.html#civil_from_days>), exact over the full
-/// `i64` day range; `crates/logit-core/src/time.rs` has the derivation.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = if month <= 2 { y + 1 } else { y };
-    (year, month, day)
+    format_rfc3339_utc_seconds(unix_seconds).replace(['-', ':'], "")
 }
 
 fn print_table(report: &RunReport) {
@@ -1760,23 +1734,13 @@ mod tests {
     }
 
     #[test]
-    fn civil_from_days_recovers_the_unix_epoch() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-    }
-
-    #[test]
     fn format_rfc3339_utc_seconds_renders_a_known_instant() {
-        // 2026-09-12T00:00:00Z, computed independently: days since epoch for 2026-09-12.
-        let days = civil_days_since_epoch_for_test(2026, 9, 12);
-        let unix_seconds = days * 86_400 + 12 * 3600 + 34 * 60 + 56;
+        // `date -u -d 2026-09-12T12:34:56Z +%s`.
+        let unix_seconds = 1_789_216_496;
         assert_eq!(format_rfc3339_utc_seconds(unix_seconds), "2026-09-12T12:34:56Z");
         assert_eq!(compact_utc_now(unix_seconds), "20260912T123456Z");
-    }
-
-    /// Round-trips [`civil_from_days`] by linear search from a nearby known point, purely to
-    /// build the test fixture above without hand-computing a day count.
-    fn civil_days_since_epoch_for_test(year: i64, month: u32, day: u32) -> i64 {
-        (0..40_000).find(|&d| civil_from_days(d) == (year, month, day)).expect("date in range")
+        assert_eq!(format_rfc3339_utc_seconds(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_rfc3339_utc_seconds(-1), "1969-12-31T23:59:59Z");
     }
 
     #[test]
