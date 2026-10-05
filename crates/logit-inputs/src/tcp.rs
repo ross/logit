@@ -91,6 +91,12 @@
 //! header with no origin (`LOCAL`, `UNKNOWN`, `AF_UNSPEC`) stamps nothing. A Unix socket refuses
 //! the option at bind.
 //!
+//! **Reset before the first byte.** A connection reset (`ECONNRESET`) before its first payload
+//! byte ends quietly: no `connection_error`, and nothing counted, since no data was lost. A load
+//! balancer ends a health check this way: HAProxy's PROXY-aware check sends a `LOCAL` header and
+//! then an RST, which reaches [`serve_connection`] while it waits for the first payload byte. A
+//! reset after the first byte is a broken connection, diagnosed as `connection_error`.
+//!
 //! **Idle timeout.** [`TcpListener::with_idle_timeout`] (the operator's `idle_timeout:`) is off
 //! unless set, and when set bounds how long a connection may stay quiet before this listener
 //! closes it and hands its permit back (`docs/adr/idle-connection-timeout.md`). It shares one
@@ -1718,6 +1724,13 @@ where
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Closed).await;
                 }
+                return Ok(());
+            }
+            // A reset before the first byte lost nothing: it's how a load balancer ends a health
+            // check (this module's "Reset before the first byte" doc section).
+            ReadStep::Failed(err)
+                if awaiting_first_byte && err.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
                 return Ok(());
             }
             ReadStep::Failed(err) => {
@@ -3779,6 +3792,117 @@ mod tests {
             );
         }
         connection.abort();
+    }
+
+    // ---- driver: a reset before the first byte -------------------------------------------------
+
+    /// A one-permit listener, with or without `proxy_protocol:`, and its diagnostics and probe.
+    struct OnePermit {
+        addr: String,
+        rx: mpsc::Receiver<logit_pipeline::Delivered>,
+        diag: Diagnostics,
+        probe: TelemetryProbe,
+        handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    async fn one_permit(proxy_protocol: bool) -> OnePermit {
+        let probe = TelemetryProbe::new();
+        let diag = Diagnostics::new("lines_in");
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener
+            .with_telemetry(probe.telemetry("lines_in", "lines_in", "listener"))
+            .with_diagnostics(diag.clone())
+            .with_max_connections(1)
+            .with_proxy_protocol(proxy_protocol);
+        let (sink, rx) = fanout_into_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            let _shutdown_tx = shutdown_tx;
+            listener.run_until_shutdown(sink, shutdown_rx).await
+        });
+        OnePermit { addr, rx, diag, probe, handle }
+    }
+
+    /// Connects, writes `prefix`, and closes with an RST (`SO_LINGER` of zero), as HAProxy ends a
+    /// health check.
+    async fn connect_and_reset(addr: &str, prefix: &[u8]) {
+        let mut client = connect(addr).await;
+        client.write_all(prefix).await.unwrap();
+        socket2::SockRef::from(&client).set_linger(Some(Duration::ZERO)).unwrap();
+        drop(client);
+    }
+
+    /// Sends `wire` on new connections until one gets its frame through. With one permit, that
+    /// proves every earlier connection's task has finished, diagnostics included: a connection
+    /// refused at the cap is closed, and the loop tries again.
+    async fn next_connection_delivers(running: &mut OnePermit, wire: &[u8]) -> EventBatch {
+        let deadline = tokio::time::Instant::now() + logit_pipeline::test_util::RECV_TIMEOUT;
+        loop {
+            assert!(tokio::time::Instant::now() < deadline, "no connection got a permit back");
+            let mut client = connect(&running.addr).await;
+            client.write_all(wire).await.unwrap();
+            let mut byte = [0u8; 1];
+            tokio::select! {
+                delivered = running.rx.recv() => {
+                    return logit_pipeline::unwrap_batch(delivered.expect("the listener is running"));
+                }
+                _ = client.read(&mut byte) => {}
+            }
+        }
+    }
+
+    /// A health check that connects and resets before sending a byte is no fault.
+    #[tokio::test]
+    async fn a_reset_before_the_first_byte_is_not_a_connection_error() {
+        let mut running = one_permit(false).await;
+        connect_and_reset(&running.addr, b"").await;
+        let batch = next_connection_delivers(&mut running, b"<13>after\n").await;
+        assert_eq!(payloads(&batch), vec!["<13>after"]);
+        assert_eq!(running.diag.occurrences("connection_error"), 0);
+        running.handle.abort();
+    }
+
+    /// HAProxy's PROXY-aware health check: an accepted header, then an RST before any payload.
+    /// It ends as a reset before the first byte does without the header: no diagnostic, and no
+    /// rejection.
+    #[tokio::test]
+    async fn a_reset_after_an_accepted_header_and_before_the_first_byte_is_not_an_error() {
+        for header in
+            [v2_header(0x20, 0x00, &[]), b"PROXY TCP4 198.51.100.7 192.0.2.1 1 2\r\n".to_vec()]
+        {
+            let mut running = one_permit(true).await;
+            connect_and_reset(&running.addr, &header).await;
+            let batch =
+                next_connection_delivers(&mut running, b"PROXY UNKNOWN\r\n<13>after\n").await;
+            assert_eq!(payloads(&batch), vec!["<13>after"]);
+            assert_eq!(running.diag.occurrences("connection_error"), 0, "after {header:?}");
+            assert_eq!(running.diag.occurrences("proxy_header"), 0, "after {header:?}");
+            assert_eq!(
+                running.probe.sum(PROXY_REJECTED, &[("reason", "proxy_header")]),
+                0.0,
+                "after {header:?}"
+            );
+            running.handle.abort();
+        }
+    }
+
+    /// A reset after payload bytes is a broken connection, diagnosed as before.
+    #[tokio::test]
+    async fn a_reset_after_payload_bytes_is_still_a_connection_error() {
+        for proxy_protocol in [false, true] {
+            let mut running = one_permit(proxy_protocol).await;
+            let header: &[u8] = if proxy_protocol { b"PROXY UNKNOWN\r\n" } else { b"" };
+            // A partial frame, so the reset lands while the connection is mid-message.
+            connect_and_reset(&running.addr, &[header, b"<13>partial"].concat()).await;
+            let wire = [header, b"<13>after\n"].concat();
+            next_connection_delivers(&mut running, &wire).await;
+            assert_eq!(
+                running.diag.occurrences("connection_error"),
+                1,
+                "proxy_protocol: {proxy_protocol}"
+            );
+            running.handle.abort();
+        }
     }
 
     // ---- driver: PROXY protocol ---------------------------------------------------------------
