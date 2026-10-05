@@ -6233,6 +6233,8 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
         }
     }
 
