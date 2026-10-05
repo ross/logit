@@ -136,8 +136,8 @@ fuzz targets ([ADR `out-of-ci-fuzzing`](out-of-ci-fuzzing.md)), whose workspace 
   the port directly can send its own header and name any origin, so a `proxy_protocol: true` port
   must be reachable only through the proxy.
 - Deferred, each its own follow-up:
-  - The HTTP listeners (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`) and
-    `logit_in`, which don't use the shared drivers.
+  - The HTTP listeners (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`), `prometheus_in`'s
+    remote-write receiver, and `logit_in`, which don't use the shared drivers.
   - A mutual-TLS client's identity (`tls.client.subject`) and the server name it asked for.
   - `SO_PEERCRED` on `unix_stream`, which would name a local sender's process and user.
   - `network.connection.id`, to tell two connections from one address apart.

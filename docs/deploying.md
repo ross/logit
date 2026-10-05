@@ -968,7 +968,8 @@ built on the shared socket drivers ([ADR `listener-peer-address`](adr/listener-p
 | `peer: true` | `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` on every transport they offer, and `collectd_in` | `network.peer.address` and `network.peer.port`: the socket peer, the connection's for a stream and each datagram's own for UDP |
 | `proxy_protocol: true` | `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in`, under `transport: tcp` only (rule 78) | `client.address` and `client.port`: the original client a PROXY protocol header names |
 
-`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `logit_in` take neither field.
+`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `logit_in`, and `prometheus_in`'s remote-write
+receiver take neither field.
 
 **What `peer:` writes.** The address is a string in its standard text form, and the port is an
 integer. An IPv4-mapped IPv6 address is written as IPv4, so a sender reads the same on a
@@ -1004,7 +1005,7 @@ components:
   syslog_out:
     type: syslog_out
     sources: [no_peer]
-    endpoint: siem.internal:6514
+    endpoint: siem.internal:601
     transport: tcp
 ```
 
