@@ -474,6 +474,34 @@ pub enum ProvenanceField {
     Previous,
 }
 
+/// How `timestamp` reads its source attribute. Written `format: rfc3164`, or `format: {pattern:
+/// "%d/%b/%Y:%H:%M:%S %z"}` for a custom layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampFormat {
+    /// RFC 3339, leniently: a space may replace the `T`, a lowercase `z` is accepted, an RFC 9557
+    /// `[zone]` suffix is allowed, and a `:60` leap second reads as `:59`. An offset is required.
+    Rfc3339,
+    /// The 15-byte syslog RFC 3164 stamp, `Mmm dd hh:mm:ss`, which carries no year or zone. The
+    /// year is whichever of last, this, or next year puts the stamp closest to the event's
+    /// current timestamp, and the civil time is read in `timezone`.
+    Rfc3164,
+    /// Integer or fractional seconds since the Unix epoch, as a number or a numeric string.
+    UnixSeconds,
+    /// Milliseconds since the Unix epoch, as a number or a numeric string.
+    UnixMillis,
+    /// Microseconds since the Unix epoch, as a number or a numeric string.
+    UnixMicros,
+    /// Nanoseconds since the Unix epoch, as a number or a numeric string.
+    UnixNanos,
+    /// A strftime-style layout that must match the whole value, such as `%d/%b/%Y:%H:%M:%S %z`
+    /// for nginx's `$time_local`. `%z`, `%:z`, or `%s` makes the result an instant, and
+    /// `timezone` is not read; otherwise the result is civil time in `timezone`. A layout with no
+    /// year infers it as `rfc3164` does. A layout with an offset needs a year, needs an hour and
+    /// minute, and may not use `%Z`, `%Q`, or `%:Q`.
+    Pattern(String),
+}
+
 /// What `sample` hashes to reach its keep/drop verdict. Written `key: trace_id`, `key:
 /// {attribute: request_id}`, or `key: {resource: service.name}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -623,6 +651,11 @@ pub enum DatadogTraceCompression {
 /// `datadog_out`'s default `site:`, Datadog's US1 site.
 pub fn default_datadog_site() -> String {
     "datadoghq.com".to_string()
+}
+
+/// `timestamp`'s default `max_skew`: long enough for an overnight backlog drain.
+pub fn default_timestamp_max_skew() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
 }
 
 /// `datadog_out`'s default per-request `timeout:`.
@@ -1504,6 +1537,40 @@ pub enum ComponentKind {
         /// Attribute name to multiplication factor. At least one entry is required; an empty name
         /// or a non-finite factor is rejected.
         fields: std::collections::BTreeMap<String, f64>,
+    },
+    /// Resolves `event.timestamp` from an attribute holding the sender's own stamp, so a replayed
+    /// backlog reaches every sink with its record time instead of its receipt time. `from` names
+    /// the attribute and `format` says how to read it. An event the component can't resolve (the
+    /// attribute is absent, null, empty, or `-`; it doesn't parse; or it falls further than
+    /// `max_skew` from the event's current timestamp) is forwarded untouched and counted by
+    /// reason, never dropped. A native `Timestamp` attribute value is used as it is under every
+    /// format. An event carrying a span is left alone, since its timestamp is the span's start.
+    /// When it applies to a log with no `observed_timestamp`, the previous timestamp becomes the
+    /// `observed_timestamp`.
+    Timestamp {
+        /// The attribute to read, named literally (never a path). An empty name is rejected.
+        from: String,
+        /// How to read the attribute's value.
+        format: TimestampFormat,
+        /// The zone for civil times: an IANA name (`Europe/Berlin`), `UTC`, or a fixed offset
+        /// such as `+02:00`. Defaults to `UTC`, never the host's zone. Read only by `rfc3164` and
+        /// by a pattern with no `%z`, `%:z`, or `%s`; setting it under any other format is
+        /// rejected. A named zone needs the system time zone database (the `tzdata` package, or
+        /// the directory in `TZDIR`) and is rejected at startup when it can't be loaded.
+        #[serde(default)]
+        timezone: Option<String>,
+        /// The furthest a resolved instant may sit from the event's current timestamp, in either
+        /// direction, before the event is forwarded unchanged. Defaults to `24h`; `0s` is
+        /// rejected. A week is `168h`.
+        #[serde(default = "default_timestamp_max_skew", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        max_skew: Duration,
+        /// Keep the source attribute after resolving it. Defaults to `false`, which removes it.
+        /// Set it to `true` ahead of `syslog_out` when `timezone` is not UTC: a kept
+        /// `syslog.timestamp` is written verbatim on an RFC 3164 output, while a removed one is
+        /// re-rendered from `event.timestamp` in UTC.
+        #[serde(default)]
+        keep_source: bool,
     },
     /// Forwards an event carrying a wanted signal and drops the rest: `signals: [traces]` ahead
     /// of a traces-only sink, say, fed from a source whose events also carry metrics. Never
@@ -3773,15 +3840,27 @@ mod human_bytes {
     }
 }
 
-/// Minimal `humantime`-flavored `(de)serialize` for `Duration` fields (`10s`, `1m`, ...), so
-/// config keeps human-readable durations without an external crate for one helper.
-/// TODO: replace with the `humantime-serde` crate once the crate list is finalized.
+/// `(de)serialize` for `Duration` fields over jiff's friendly duration format
+/// (`docs/adr/jiff-for-calendar-time.md`).
+///
+/// - **Accepted**: one or more `<number><unit>` designators, optionally space-separated (`10s`,
+///   `1h30m`, `1h 30m`, `90 seconds`). Units are `ns`, `us`, `ms`, `s`, `m`/`min`, `h`, and `d`
+///   (24 hours), plus jiff's long labels for each. The smallest unit may carry a 1-9 digit
+///   fraction (`1.5s`, `0.5h`) when it is hours or smaller. Surrounding whitespace is trimmed.
+/// - **Rejected**: weeks, months, and years (their length is a calendar question), a negative
+///   value (`-5s`, `5s ago`), and a bare number. Zero is the field's rule to reject, not the codec's.
+/// - **Serialized** in compact designator form with no spaces: `10s`, `100ms`, `1h30m`, `48h`.
 mod humantime_serde_duration {
     use super::*;
+    use jiff::fmt::friendly::{Spacing, SpanParser, SpanPrinter};
+    use jiff::{SignedDuration, SpanRelativeTo};
     use serde::{de::Error as _, Deserializer, Serializer};
 
+    static PARSER: SpanParser = SpanParser::new();
+    static PRINTER: SpanPrinter = SpanPrinter::new().spacing(Spacing::None);
+
     pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("{}s", d.as_secs_f64()))
+        s.serialize_str(&PRINTER.unsigned_duration_to_string(d))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
@@ -3789,21 +3868,23 @@ mod humantime_serde_duration {
         parse(&raw).map_err(D::Error::custom)
     }
 
-    fn parse(raw: &str) -> Result<Duration, String> {
-        let (num, unit) = raw.trim().split_at(
-            raw.trim()
-                .find(|c: char| !c.is_ascii_digit() && c != '.')
-                .ok_or_else(|| "expected a number followed by a unit, e.g. 10s".to_string())?,
-        );
-        let n: f64 = num.parse().map_err(|e| format!("{e}"))?;
-        let secs = match unit {
-            "ms" => n / 1000.0,
-            "s" => n,
-            "m" => n * 60.0,
-            "h" => n * 3600.0,
-            other => return Err(format!("unknown duration unit '{other}'")),
-        };
-        Ok(Duration::from_secs_f64(secs))
+    pub(super) fn parse(raw: &str) -> Result<Duration, String> {
+        let span = PARSER
+            .parse_span(raw.trim())
+            .map_err(|e| format!("invalid duration '{raw}', expected e.g. 10s or 1h30m: {e}"))?;
+        if span.get_years() != 0 || span.get_months() != 0 || span.get_weeks() != 0 {
+            return Err(format!(
+                "invalid duration '{raw}': weeks, months, and years aren't fixed lengths; use d, h, \
+                 m, s, or ms"
+            ));
+        }
+        if span.is_negative() {
+            return Err(format!("invalid duration '{raw}': must not be negative"));
+        }
+        let signed: SignedDuration = span
+            .to_duration(SpanRelativeTo::days_are_24_hours())
+            .map_err(|e| format!("invalid duration '{raw}': {e}"))?;
+        Duration::try_from(signed).map_err(|e| format!("invalid duration '{raw}': {e}"))
     }
 
     /// The same codec for `Option<Duration>` fields. A nested module because `#[serde(with =
@@ -3822,6 +3903,93 @@ mod humantime_serde_duration {
         pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
             let raw: Option<String> = Option::deserialize(d)?;
             raw.map(|raw| parse(&raw).map_err(D::Error::custom)).transpose()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn ms(n: u64) -> Duration {
+            Duration::from_millis(n)
+        }
+
+        #[test]
+        fn every_four_unit_form_parses_to_its_duration() {
+            for (raw, want) in [
+                ("10s", ms(10_000)),
+                ("0s", Duration::ZERO),
+                ("100ms", ms(100)),
+                ("1m", ms(60_000)),
+                ("2h", ms(7_200_000)),
+                ("1.5s", ms(1_500)),
+                ("0.5m", ms(30_000)),
+                ("1.5h", ms(5_400_000)),
+                ("0.25ms", Duration::from_micros(250)),
+                ("2.000s", ms(2_000)),
+                ("007s", ms(7_000)),
+                (" 10s ", ms(10_000)),
+            ] {
+                assert_eq!(parse(raw), Ok(want), "{raw:?}");
+            }
+        }
+
+        #[test]
+        fn days_compound_forms_and_finer_units_parse() {
+            for (raw, want) in [
+                ("2d", ms(2 * 86_400_000)),
+                ("1d12h", ms(36 * 3_600_000)),
+                ("1h30m", ms(5_400_000)),
+                ("1h 30m", ms(5_400_000)),
+                ("90 seconds", ms(90_000)),
+                ("5min", ms(300_000)),
+                ("250us", Duration::from_micros(250)),
+                ("10ns", Duration::from_nanos(10)),
+                ("1s500ms", ms(1_500)),
+            ] {
+                assert_eq!(parse(raw), Ok(want), "{raw:?}");
+            }
+        }
+
+        #[test]
+        fn calendar_units_negatives_and_bare_numbers_are_rejected() {
+            for raw in [
+                "1w",
+                "1mo",
+                "1y",
+                "-5s",
+                "5s ago",
+                "10",
+                "",
+                "s",
+                "1e3s",
+                "1.5d",
+                "1.5.5s",
+                "10S",
+                "1.0000000001s",
+                ".5s",
+                "5.s",
+            ] {
+                assert!(parse(raw).is_err(), "{raw:?} should be rejected");
+            }
+        }
+
+        #[test]
+        fn serializes_in_compact_designator_form_that_parses_back() {
+            #[derive(serde::Serialize)]
+            struct W(#[serde(with = "super")] Duration);
+            for (d, want) in [
+                (ms(10_000), "10s"),
+                (Duration::ZERO, "0s"),
+                (ms(100), "100ms"),
+                (ms(1_500), "1s500ms"),
+                (ms(5_400_000), "1h30m"),
+                (ms(2 * 86_400_000), "48h"),
+            ] {
+                let json = serde_json::to_string(&W(d)).unwrap();
+                assert_eq!(json, format!("\"{want}\""));
+                assert_eq!(parse(want), Ok(d), "{want} parses back");
+            }
         }
     }
 }
@@ -4730,6 +4898,68 @@ mod tests {
                 assert_eq!(arrays, FlattenArrays::Skip);
             }
             other => panic!("expected Flatten, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timestamp_component_deserializes_full_form() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "timestamp", "sources": ["in"], "from": "syslog.timestamp",
+                "format": "rfc3164", "timezone": "Europe/Berlin", "max_skew": "168h",
+                "keep_source": true}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Timestamp { from, format, timezone, max_skew, keep_source } => {
+                assert_eq!(from, "syslog.timestamp");
+                assert_eq!(format, TimestampFormat::Rfc3164);
+                assert_eq!(timezone.as_deref(), Some("Europe/Berlin"));
+                assert_eq!(max_skew, Duration::from_secs(168 * 3600));
+                assert!(keep_source);
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timestamp_defaults_apply() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "timestamp", "sources": ["in"], "from": "ts", "format": "unix_millis"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Timestamp { format, timezone, max_skew, keep_source, .. } => {
+                assert_eq!(format, TimestampFormat::UnixMillis);
+                assert_eq!(timezone, None);
+                assert_eq!(max_skew, Duration::from_secs(24 * 3600));
+                assert_eq!(max_skew, default_timestamp_max_skew());
+                assert!(!keep_source);
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timestamp_format_reads_each_shape() {
+        let format: TimestampFormat = serde_json::from_str(r#""rfc3164""#).unwrap();
+        assert_eq!(format, TimestampFormat::Rfc3164);
+        let format: TimestampFormat =
+            serde_json::from_str(r#"{"pattern": "%d/%b/%Y:%H:%M:%S %z"}"#).unwrap();
+        assert_eq!(format, TimestampFormat::Pattern("%d/%b/%Y:%H:%M:%S %z".to_string()));
+        // A pattern needs its text; the bare word is not a format.
+        assert!(serde_json::from_str::<TimestampFormat>(r#""pattern""#).is_err());
+        assert!(serde_json::from_str::<TimestampFormat>(r#""unix_minutes""#).is_err());
+    }
+
+    #[test]
+    fn timestamp_rejects_an_unknown_key_and_missing_required_fields() {
+        for text in [
+            r#"{"type": "timestamp", "sources": ["in"], "from": "t", "format": "rfc3339",
+                "tz": "UTC"}"#,
+            r#"{"type": "timestamp", "sources": ["in"], "format": "rfc3339"}"#,
+            r#"{"type": "timestamp", "sources": ["in"], "from": "t"}"#,
+        ] {
+            assert!(serde_json::from_str::<Component>(text).is_err(), "{text}");
         }
     }
 

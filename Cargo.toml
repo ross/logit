@@ -52,6 +52,11 @@ crc32c = "0.6"
 # hash a key identically, so a release that changed XXH64's output would be a wire-breaking change
 # -- the pinned vectors in `crates/logit-core/src/sampling.rs` are what would catch one.
 twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
+# Calendar math, IANA time zones, and strptime-style parsing for the `timestamp` transform, through
+# `logit_core::zoned` (`docs/adr/timestamp-transform.md`). Pure Rust, `Unlicense OR MIT`. Default
+# features: named zones read the system tzdb (`/usr/share/zoneinfo` or `TZDIR`) at runtime; the
+# database is not bundled into the binary.
+jiff = "0.2"
 smallvec = { version = "1", features = ["union"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

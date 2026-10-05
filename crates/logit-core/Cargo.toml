@@ -25,6 +25,11 @@ tracing-subscriber.workspace = true
 # XXH64, seed 0 -- the frozen cross-process hash `sampling` keys `sample`'s verdicts on
 # (`docs/adr/consistent-sampling-component.md`).
 twox-hash.workspace = true
+# Calendar math, IANA zones, and strptime behind `zoned` and `time`, shared by graph validation, the
+# `timestamp` transform, and the codecs (`docs/adr/jiff-for-calendar-time.md`).
+jiff.workspace = true
+# `zoned`'s error types.
+thiserror.workspace = true
 
 [dev-dependencies]
 # `sketch.rs`'s property tests: every quantile within the mapping's bound of the true quantile

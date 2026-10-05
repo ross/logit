@@ -1159,7 +1159,7 @@ component emits goes to its own consumers.
 
 **Native transforms handle the common parsing cases without per-event VM overhead:** `json`,
 `logfmt`, `kv`, `regex`, `csv`, `keep`/`remove`/`set`, `has_attributes`/`drop_attributes`,
-`sample`, `aggregate`, and the rest of the transform kinds `docs/design/pipeline-graph.md` lists.
+`sample`, `timestamp`, `aggregate`, and the rest of the transform kinds `docs/design/pipeline-graph.md` lists.
 (`filter`, `rename`, `throttle`, and `dedup` were retired rather than built, per ADR
 `routing-by-condition-is-lua`; `sample` came back as a native kind for the keyed, cross-process
 consistency Lua can't express, per ADR `consistent-sampling-component`.) Each is a transform-kind

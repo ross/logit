@@ -26,9 +26,10 @@ mod scale;
 mod set;
 mod shape;
 mod signals;
+mod timestamp;
 mod trace_context;
 
-use logit_core::Value;
+use logit_core::{AttrMap, Value};
 
 pub use aggregate::{AggregateTemporality, Aggregator, Distributions, Sets};
 pub use attributes::{DropAttributes, HasAttributes};
@@ -48,6 +49,7 @@ pub use scale::Scale;
 pub use set::Set;
 pub use shape::{Shape, DEFAULT_MAX_TRACKED_KEYS, DEFAULT_MAX_TRACKED_KEYSETS};
 pub use signals::{DropSignals, HasSignal, KeepSignals, MatchMode, SignalSet};
+pub use timestamp::{TimestampFormat, TimestampResolver};
 pub use trace_context::{IdFormat, SpanLift, TraceContext};
 
 /// Coerces a `Value` to a finite `f64`.
@@ -66,6 +68,44 @@ pub(crate) fn numeric(value: &Value) -> Option<f64> {
         _ => return None,
     };
     v.is_finite().then_some(v)
+}
+
+/// An attribute is present only if it carries a value. `Null`, `""`, and `"-"` are how nginx
+/// (`escape=json` renders unset as `""`, plain formats as `-`) and haproxy (an unset `txn` var)
+/// spell "nothing here"; as present-but-invalid they would turn every edge request into an
+/// `invalid` skip. Shared by `trace_context` and `timestamp`.
+pub(crate) fn present<'a>(attrs: &'a AttrMap, key: &str) -> Option<&'a Value> {
+    present_value(attrs.get(key))
+}
+
+/// [`present`] for a value already looked up (by `Symbol`, say).
+pub(crate) fn present_value(value: Option<&Value>) -> Option<&Value> {
+    match value? {
+        Value::Null => None,
+        value @ Value::Str(_) => match value.as_str() {
+            Some("") | Some("-") => None,
+            _ => Some(value),
+        },
+        value => Some(value),
+    }
+}
+
+/// `f64` seconds to nanoseconds, scaling the integer part without rounding (in `i128`, so a huge
+/// float is `None`, not a wrap) and rounding only the fraction. At epoch magnitude that's good to
+/// about a microsecond, finer than any producer that emits float seconds. Shared by
+/// `trace_context` and `timestamp`.
+pub(crate) fn f64_seconds_to_nanos(seconds: f64) -> Option<i64> {
+    const NANOS_PER_SECOND: i64 = 1_000_000_000;
+    if !seconds.is_finite() {
+        return None;
+    }
+    let whole = seconds.trunc();
+    let frac = seconds - whole;
+    // `as i128` saturates rather than wrapping; `checked_mul`/`try_from` then reject it.
+    let whole_nanos = (whole as i128).checked_mul(i128::from(NANOS_PER_SECOND))?;
+    let whole_nanos = i64::try_from(whole_nanos).ok()?;
+    let frac_nanos = (frac * NANOS_PER_SECOND as f64).round() as i64;
+    whole_nanos.checked_add(frac_nanos)
 }
 
 /// Whether an event's (or resource's) `Value` matches an operator-configured one.
