@@ -243,7 +243,11 @@
 //!     (`docs/adr/timestamp-transform.md`).
 //! 77. A `lines_in` `max_line_bytes` of `0`: every non-empty line would be dropped as oversize
 //!     (`docs/adr/plain-lines-listener.md`).
-//! 78. `proxy_protocol: true` on a `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` whose
+//! 78. A `socket_mode` on a `statsd_in`/`lines_in` under `transport: tcp`/`udp`, or on a
+//!     `datadog_trace_in` without `socket`: there's no socket file for it to apply to. A malformed
+//!     value is a parse error, not a graph rule
+//!     (`docs/adr/datadog-agent-and-intake-relay.md`).
+//! 79. `proxy_protocol: true` on a `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` whose
 //!     transport isn't `tcp`: a PROXY header leads a TCP stream from a network proxy
 //!     (`docs/adr/listener-peer-address.md`).
 //!
@@ -3598,7 +3602,32 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 78: `proxy_protocol: true` off TCP. A PROXY header is written by a network proxy ahead
+    // Rule 78: a `socket_mode` with no socket file to apply it to. The value's own shape is
+    // checked when the config is parsed, so only where it's set is checked here.
+    for (id, component) in &components {
+        let (kind_name, needs) = match &component.kind {
+            ComponentKind::StatsdIn {
+                socket_mode: Some(_),
+                transport: StatsdTransport::Tcp | StatsdTransport::Udp,
+                ..
+            } => ("statsd_in", "'transport: unix' or 'transport: unix_stream'"),
+            ComponentKind::LinesIn {
+                socket_mode: Some(_),
+                transport: LinesTransport::Tcp | LinesTransport::Udp,
+                ..
+            } => ("lines_in", "'transport: unix' or 'transport: unix_stream'"),
+            ComponentKind::DatadogTraceIn { socket_mode: Some(_), socket: None, .. } => {
+                ("datadog_trace_in", "'socket'")
+            }
+            _ => continue,
+        };
+        anyhow::bail!(
+            "component '{id}': {kind_name} 'socket_mode' needs {needs} -- without a Unix socket \
+             there's no socket file to set the mode on"
+        );
+    }
+
+    // Rule 79: `proxy_protocol: true` off TCP. A PROXY header is written by a network proxy ahead
     // of a TCP stream; a datagram has no stream to lead, and a Unix socket's peer is local.
     for (id, component) in &components {
         let (kind_name, transport) = match &component.kind {
@@ -4024,6 +4053,7 @@ mod tests {
             max_connections: default_max_connections(),
             peer: false,
             proxy_protocol: false,
+            socket_mode: None,
         }
     }
 
@@ -6765,6 +6795,7 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            socket_mode: None,
         }
     }
 
@@ -11678,6 +11709,7 @@ mod tests {
             max_connections: default_max_connections(),
             peer: false,
             proxy_protocol: false,
+            socket_mode: None,
         }
     }
 
@@ -11695,6 +11727,7 @@ mod tests {
             max_connections: default_max_connections(),
             peer: false,
             proxy_protocol: false,
+            socket_mode: None,
         }
     }
 
@@ -11815,6 +11848,7 @@ mod tests {
             max_connections: default_max_connections(),
             peer: false,
             proxy_protocol: false,
+            socket_mode: None,
         }
     }
 
@@ -12010,6 +12044,7 @@ mod tests {
             peer: false,
             proxy_protocol: false,
             max_line_bytes: 64 * 1024,
+            socket_mode: None,
         }
     }
 
@@ -12184,6 +12219,71 @@ mod tests {
         assert!(err.contains("'idle_timeout' must be greater than 0s"), "got: {err}");
     }
 
+    // ---- Rule 78: `socket_mode` without a socket file ------------------------------------------
+
+    fn with_socket_mode(mut kind: ComponentKind) -> ComponentKind {
+        match &mut kind {
+            ComponentKind::StatsdIn { socket_mode, .. }
+            | ComponentKind::LinesIn { socket_mode, .. }
+            | ComponentKind::DatadogTraceIn { socket_mode, .. } => {
+                *socket_mode = logit_config::SocketMode::new(0o660);
+            }
+            other => panic!("no socket_mode on {}", kind_name(other)),
+        }
+        kind
+    }
+
+    /// Rule 78: a `socket_mode` off a Unix socket has no file to apply to.
+    #[test]
+    fn a_socket_mode_without_a_unix_socket_is_rejected() {
+        for (kind, expected) in [
+            (
+                statsd_in_on("127.0.0.1:8125", StatsdTransport::Udp),
+                "statsd_in 'socket_mode' needs 'transport: unix' or 'transport: unix_stream'",
+            ),
+            (
+                statsd_in_on("127.0.0.1:8125", StatsdTransport::Tcp),
+                "statsd_in 'socket_mode' needs 'transport: unix' or 'transport: unix_stream'",
+            ),
+            (
+                lines_in_on("127.0.0.1:5170", LinesTransport::Tcp),
+                "lines_in 'socket_mode' needs 'transport: unix' or 'transport: unix_stream'",
+            ),
+            (
+                lines_in_on("127.0.0.1:5170", LinesTransport::Udp),
+                "lines_in 'socket_mode' needs 'transport: unix' or 'transport: unix_stream'",
+            ),
+            (
+                datadog_trace_in(Some("127.0.0.1:8126"), None),
+                "datadog_trace_in 'socket_mode' needs 'socket'",
+            ),
+        ] {
+            let kind = with_socket_mode(kind);
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains("'in'"), "got: {err}");
+            assert!(err.contains(expected), "got: {err}");
+        }
+    }
+
+    /// Rule 78's other side: every Unix socket takes a `socket_mode`.
+    #[test]
+    fn a_socket_mode_on_a_unix_socket_resolves() {
+        for kind in [
+            statsd_in_on(DSD_SOCKET, StatsdTransport::Unix),
+            statsd_in_on(DSD_SOCKET, StatsdTransport::UnixStream),
+            lines_in_on(LINES_SOCKET, LinesTransport::Unix),
+            lines_in_on(LINES_SOCKET, LinesTransport::UnixStream),
+            datadog_trace_in(None, Some("/var/run/datadog/apm.socket")),
+            datadog_trace_in(Some("127.0.0.1:8126"), Some("/var/run/datadog/apm.socket")),
+        ] {
+            let kind = with_socket_mode(kind);
+            if let Err(err) = resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+            {
+                panic!("expected to resolve: {err}");
+            }
+        }
+    }
+
     /// Rule 77: `max_line_bytes: 0` would drop every line, under any transport.
     #[test]
     fn a_lines_in_max_line_bytes_of_zero_is_rejected() {
@@ -12233,11 +12333,11 @@ mod tests {
         }
     }
 
-    // ---- rule 78: `proxy_protocol` ------------------------------------------------------------
+    // ---- rule 79: `proxy_protocol` ------------------------------------------------------------
 
-    /// Rule 78: every stream listener takes `proxy_protocol: true` under `transport: tcp`.
+    /// Rule 79: every stream listener takes `proxy_protocol: true` under `transport: tcp`.
     #[test]
-    fn rule_78_proxy_protocol_resolves_on_tcp() {
+    fn rule_79_proxy_protocol_resolves_on_tcp() {
         for json in [
             r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "transport": "tcp",
                 "proxy_protocol": true}"#,
@@ -12253,9 +12353,9 @@ mod tests {
         }
     }
 
-    /// Rule 78: a datagram or Unix transport has no network proxy in front of a TCP stream.
+    /// Rule 79: a datagram or Unix transport has no network proxy in front of a TCP stream.
     #[test]
-    fn rule_78_rejects_proxy_protocol_off_tcp() {
+    fn rule_79_rejects_proxy_protocol_off_tcp() {
         for (json, transport) in [
             (r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "proxy_protocol": true}"#, "udp"),
             (
@@ -12297,9 +12397,9 @@ mod tests {
         }
     }
 
-    /// Rule 78: `proxy_protocol: false` stays legal on every transport.
+    /// Rule 79: `proxy_protocol: false` stays legal on every transport.
     #[test]
-    fn rule_78_allows_proxy_protocol_false_off_tcp() {
+    fn rule_79_allows_proxy_protocol_false_off_tcp() {
         let kind = listener_from_json(
             r#"{"type": "lines_in", "bind": "127.0.0.1:0", "transport": "udp",
                 "proxy_protocol": false}"#,

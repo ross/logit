@@ -306,7 +306,7 @@ impl GraphiteInput {
     }
 
     /// Requires a PROXY protocol header on every TCP connection (`proxy_protocol:`); see
-    /// [`TcpListener::with_proxy_protocol`]. A UDP listener is left untouched, and graph rule 78
+    /// [`TcpListener::with_proxy_protocol`]. A UDP listener is left untouched, and graph rule 79
     /// rejects the option there.
     pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
         if let Inner::Tcp(listener) = self.inner {

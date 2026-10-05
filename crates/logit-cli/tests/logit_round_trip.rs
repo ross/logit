@@ -417,6 +417,7 @@ mod window {
                         max_connections: logit_config::default_max_connections(),
                         peer: false,
                         proxy_protocol: false,
+                        socket_mode: None,
                     },
                 ),
             ),

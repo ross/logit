@@ -29,6 +29,7 @@ components:
     # max_connections: 1024     # tcp/unix_stream only; a connection past the cap is closed at once
     # peer: false               # stamps the sender as network.peer.address and network.peer.port
     # proxy_protocol: false     # tcp only; requires a PROXY header, stamps client.address/port
+    # socket_mode: "0722"       # unix/unix_stream only; the socket file's mode, as a quoted string
 
   parse:
     type: json
