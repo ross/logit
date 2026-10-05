@@ -122,9 +122,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit:** if a documented script runs `logit-outputs` tests under plain `cargo test`. The
     fix then is a test that doesn't depend on a thread-local subscriber, such as one reading
     `Diagnostics::occurrences`.
-- **The HTTP listeners and `logit_in` don't record the sending peer's address.** `peer:` and
-  `proxy_protocol:` exist only on the listeners built on the shared socket drivers
-  ([ADR `listener-peer-address`](../adr/listener-peer-address.md)). `otlp_in`, `datadog_in`,
+- **Most HTTP listeners and `logit_in` don't record the sending peer's address.** `peer:` and
+  `proxy_protocol:` exist only on the listeners built on the shared socket drivers and on
+  `otlp_in` ([ADR `listener-peer-address`](../adr/listener-peer-address.md)). `datadog_in`,
   `datadog_trace_in`, `splunk_hec_in`, `logit_in`, and `prometheus_in`'s remote-write receiver
   accept their connections themselves and stamp no `network.peer.*` or `client.*`.
   - **Consequence:** a pipeline can't tell which of several senders on one of these listeners

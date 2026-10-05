@@ -550,7 +550,16 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        OtlpIn { bind, protocol, tls, handshake_timeout, idle_timeout, max_connections } => {
+        OtlpIn {
+            bind,
+            protocol,
+            tls,
+            handshake_timeout,
+            idle_timeout,
+            max_connections,
+            peer,
+            proxy_protocol,
+        } => {
             let mut input = OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
@@ -558,7 +567,9 @@ fn build_spec(
                 // the grace an idle close gives `hyper` (`docs/adr/idle-connection-timeout.md`).
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
-                .with_max_connections(*max_connections);
+                .with_max_connections(*max_connections)
+                .with_peer(*peer)
+                .with_proxy_protocol(*proxy_protocol);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -2488,6 +2499,8 @@ mod tests {
                     handshake_timeout: Duration::from_secs(5),
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
+                    peer: false,
+                    proxy_protocol: false,
                 },
             };
             assert!(
@@ -3005,6 +3018,8 @@ mod tests {
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
             },
         };
         assert!(matches!(
@@ -3262,6 +3277,8 @@ mod tests {
                 handshake_timeout: Duration::from_millis(50),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
             },
         };
         let spec = build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0;
@@ -3472,6 +3489,8 @@ mod tests {
             handshake_timeout: logit_config::default_handshake_timeout(),
             idle_timeout: None,
             max_connections: 1,
+            peer: false,
+            proxy_protocol: false,
         };
         let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
 
@@ -3700,6 +3719,8 @@ mod tests {
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;

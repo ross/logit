@@ -8903,6 +8903,8 @@ mod tests {
             handshake_timeout,
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
         }
     }
 
@@ -8916,6 +8918,8 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
         }
     }
 
@@ -9140,6 +9144,8 @@ mod tests {
             handshake_timeout: Duration::from_secs(30),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
         };
         resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
             .expect("a TLS otlp_in with a real handshake_timeout should resolve");
