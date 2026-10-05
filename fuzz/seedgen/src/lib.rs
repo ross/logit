@@ -99,19 +99,18 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         add("native_hop_batch", name.clone(), hop.to_vec());
     }
 
-    // Prefixes whose sender pair is malformed, which `decode_hop_batch` rejects (ADR
-    // `native-hop-no-compatibility`, decision 2): inputs one byte away from a valid pair.
+    // Sender pairs that `read_hop_prefix` rejects (ADR `native-hop-no-compatibility`, decision
+    // 2): a sequence of 0 ahead of a valid batch, and payloads that end inside the pair.
     if let Some((name, batch)) = batches.first() {
         let bare = encode_batch(batch);
         let id: &[u8] = b"seed-sender-id16";
-        let malformed: [(&str, &[u8]); 3] = [
-            ("bad-prefix-seq0", &[id, &[0]].concat()),
-            ("bad-prefix-id15", &id[..15]),
-            ("bad-prefix-seq-truncated", &[id, &[0x81]].concat()),
-        ];
-        for (label, prefix) in malformed {
-            add("native_hop_batch", format!("{name}-{label}"), with_prefix(prefix, &bare));
-        }
+        add(
+            "native_hop_batch",
+            format!("{name}-bad-prefix-seq0"),
+            with_prefix(&[id, &[0]].concat(), &bare),
+        );
+        add("native_hop_batch", format!("{name}-bad-prefix-id15"), id[..15].to_vec());
+        add("native_hop_batch", format!("{name}-bad-prefix-seq-truncated"), [id, &[0x81]].concat());
     }
 
     let controls = [
