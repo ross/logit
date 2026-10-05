@@ -386,8 +386,9 @@ impl StatsdInput {
         self
     }
 
-    /// Sets a **TCP** listener's per-phase pre-message budget (`handshake_timeout:`): the TLS
-    /// accept and the wait for the first byte (`crate::tcp`'s "Pre-handshake timeout").
+    /// Sets a **TCP** listener's per-phase pre-message budget (`handshake_timeout:`): the PROXY
+    /// header under `proxy_protocol:`, the TLS accept when `tls:` is set, then the wait for the
+    /// first byte (`crate::tcp`'s "Pre-handshake timeout").
     ///
     /// A UDP listener is left untouched rather than failing, since it has no connection to bound;
     /// graph rule 45 rejects a non-default value there. `tls:` differs ([`Self::with_tls`] fails):

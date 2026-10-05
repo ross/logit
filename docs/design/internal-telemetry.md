@@ -721,7 +721,7 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 The driver's `Diagnostics` keys: `framing_error` (any `frames.dropped` reason), `bad_frame` (a
 decoder that rejects a whole frame), `connection_error` (I/O, a TLS handshake that failed or
 timed out, or a connection that sent no first byte inside `handshake_timeout` and so gave its
-permit back; never an idle close), `proxy_header` (any `connections.rejected{reason="proxy_header"}`
+permit back; never an idle close, nor a reset before the connection's first payload byte), `proxy_header` (any `connections.rejected{reason="proxy_header"}`
 refusal), and `accept_error` (any `accept.errors` reason). These keys
 and the decoder's own `bad_line` throttle listener-wide rather than per connection, because a `Diagnostics` clone shares its original's
 counts ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md)'s
