@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-10-02
+updated: 2026-10-05
 ---
 
 # Verification plan: critical sections inventory
@@ -2872,6 +2872,10 @@ surveyor's.
   (`a_batch_parked_in_a_blocked_push_when_the_drain_is_abandoned_is_spooled_by_the_sweep`; the
   memory twin now counts 3, not 2). This overlaps cluster 3 (RT-03, lead 11); its fix lives here.
   `finish` stays unbounded after the grace, documented in the disk ADR's amendment.
+- **Superseded 2026-10-05 (`fault/` stream):** the `Dropped ⇒ commit` concern above no longer
+  applies to an outage. There is no retry budget, so an outage holds a spooled head instead of
+  discarding it; only a `Rejected` batch, or an `Ambiguous` one under `at_most_once`, commits on
+  failure ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md)).
 
 ---
 
@@ -3447,6 +3451,11 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   argued at the `ShutdownExpired` arm. A deadline already past never starts a send: `deliver_with_retry`
   checks it before every attempt (`a_batch_queued_behind_a_send_that_completes_at_the_grace_deadline_is_not_started_and_stays_uncommitted`,
   `a_backoff_ending_at_the_grace_deadline_does_not_start_another_attempt`).
+- **Superseded 2026-10-05 (`fault/` stream, [ADR `sink-fault-classes`](../adr/sink-fault-classes.md)):**
+  `Fault::Permanent`, `is_explicitly_permanent`, `PERMANENT_FAILURE_WINDOW`, and the retry budget
+  are gone, and `write_loop` no longer ends the run. A failed send is `Clean`, `Ambiguous`,
+  `Rejected` (committed and counted `reason="rejected"`), or `Refused`, and every retryable fault
+  holds the head until it succeeds or the grace cuts it.
 
 ---
 
@@ -3500,6 +3509,10 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   - An attempt the budget cuts off is `Ambiguous` and ends when the budget does
     (`an_attempt_cut_off_by_the_budget_is_ambiguous`, paused clock; `Clean` fails it).
   - `attempt` uses `saturating_add`, so it can't wrap even past `u32::MAX` attempts.
+- **Superseded 2026-10-05 (`fault/` stream):** the budget half of this entry no longer exists.
+  `deliver_with_retry` retries until success or the shutdown grace, `buffer.retry_budget` and its
+  rule 15 clause are gone, and the backoff schedule is unchanged
+  ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md)).
 
 ---
 

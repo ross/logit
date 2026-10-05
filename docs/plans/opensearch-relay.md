@@ -1,9 +1,14 @@
 ---
 created: 2026-09-24
-updated: 2026-09-24
+updated: 2026-10-05
 ---
 
 # Enabling plan: OpenSearch — SS4O documents over `_bulk`
+
+**Note (2026-10-05):** `Fault::Permanent` no longer exists. [ADR
+`sink-fault-classes`](../adr/sink-fault-classes.md) splits it into `Rejected` (this batch: drop it)
+and `Refused` (every batch: hold and retry), so each `Permanent` row below needs re-mapping by that
+ADR before a workstream builds it.
 
 ## Context
 

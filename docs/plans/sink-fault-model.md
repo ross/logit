@@ -1,9 +1,17 @@
 ---
 created: 2026-10-04
-updated: 2026-10-04
+updated: 2026-10-05
 ---
 
 # Enabling plan: sink fault model — a bad batch drops, a non-functional destination holds, the process never exits
+
+## Status
+
+Complete (2026-10-05). Every workstream landed as a PR: W0 #523 (this plan and [ADR
+`sink-fault-classes`](../adr/sink-fault-classes.md)), W1 #525 (the runtime), W2 #530 (per-sink
+response-class tables), W3 #531 (the native hop's `Ack` status, [ADR
+`native-hop-ack-status`](../adr/native-hop-ack-status.md)), W4 #532 (`otlp_out` per-signal retry),
+and W5, the operator docs sweep. The residuals are in "Closing assessment" at the end.
 
 ## Goal
 
@@ -242,3 +250,29 @@ Agreed with Ross on 2026-10-04 and recorded in [ADR `sink-fault-classes`](../adr
 6. **W1 maps mechanically, W2 refines with evidence.** Twelve files construct `Fault::Permanent`,
    so W1 can't remove it without a first mapping; it uses the driver default above and makes every
    other `Permanent` a `Rejected`, and W2 writes the tables.
+
+## Closing assessment
+
+Recorded 2026-10-05, at W5. The goal holds: no sink ends `logit run`, a `Rejected` batch drops at
+once with the destination's text, a `Refused` or `Clean` destination holds the queue under its
+`buffer:` with no budget, each sink's module doc tables its responses with a test per row,
+`logit_in` refuses a frame by name and keeps the connection, and `otlp_out` resends only the
+signals a destination hasn't settled. What the stream leaves open:
+
+- **A lost rejected `Ack` reads as a delivery.** If the connection drops after `logit_in` refuses
+  a frame and before the `Ack` arrives, the reconnect's mark covers the frame and `logit_out`
+  commits it as resumed, not dropped (`docs/known-gaps/native-hop.md`, "A refused frame whose
+  rejected `Ack` is lost is reported delivered by the sender").
+- **`stdio_out` to a pipe has no write bound.** A reader that stops reading holds the sink with no
+  failed attempt, so `logit.component.retrying` never rises (`docs/known-gaps/sinks.md`,
+  "`stdio_out` to a stdout or stderr pipe has no write bound").
+- **An uncompressed oversize frame still closes the connection.** Only a frame within the
+  compressed bound is read and refused by name; a streaming drain would extend that to
+  uncompressed frames ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md),
+  "Consequences").
+- **The Datadog sinks retry a batch whole.** A retry resends the requests Datadog already
+  accepted; per-request memory like `otlp_out`'s per-signal memory would end it
+  (`docs/known-gaps/datadog.md`, "A `datadog_out` resend isn't idempotent").
+- **A dead-letter path and an oversize split are follow-ups** with their own records, as the
+  non-goals above say. Until a dead-letter path exists, a `Rejected` batch shows in
+  `batches.dropped{reason="rejected"}` and a log event and nowhere else.
