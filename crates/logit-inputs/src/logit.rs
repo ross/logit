@@ -429,24 +429,10 @@ impl Input for LogitInput {
                 // One connection's error (a mid-frame disconnect, a malformed preamble, a failed
                 // or timed-out TLS accept, a cap reject that failed to write) is never fatal to
                 // the listener; only `accept` failing above is.
+                // A batch past its decode budget never ends a connection: the frame loop
+                // refuses it by name and diagnoses it under `decode_budget` there.
                 if let Err(err) = result {
-                    match err.downcast_ref::<CodecError>() {
-                        Some(CodecError::BudgetExceeded { limit }) => {
-                            diag.warn_throttled(
-                                "decode_budget",
-                                format_args!(
-                                    "closing a connection whose batch decodes past its \
-                                     {limit}-byte budget ({}x max_frame_bytes of \
-                                     {max_frame_bytes}); the sender's batches are too large \
-                                     for this listener: {err:#}",
-                                    native::budget::DECODE_BUDGET_PER_FRAME_BYTE
-                                ),
-                            );
-                        }
-                        _ => {
-                            diag.warn_throttled("connection_error", err);
-                        }
-                    }
+                    diag.warn_throttled("connection_error", err);
                 }
             });
         }

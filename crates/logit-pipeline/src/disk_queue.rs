@@ -22,8 +22,9 @@
 //! `CODEC_HOP_BATCH`: the native-hop sender identity and sequence the store numbered it with
 //! (`docs/adr/native-hop-identity-and-sequence.md`, decision 3), the batch, then a trailer with
 //! its [`logit_core::Provenance`]. A replayed record goes out under the pair it was written with,
-//! never the reopened store's. A record written with the pair in the trailer, the layout before
-//! `docs/adr/native-hop-ack-status.md`, doesn't parse and is skipped as corrupt.
+//! never the reopened store's. A record whose payload doesn't open with a complete pair, a batch
+//! first with the pair as trailer tags 3 and 4 among them, doesn't parse and is skipped as
+//! corrupt (`docs/adr/native-hop-ack-status.md`).
 //! `frame::resync` can recover past a corrupt record because `MAGIC` always immediately follows a
 //! record's 24 context bytes.
 //!
@@ -2080,9 +2081,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A record `push` never writes: a hop payload with no sender prefix, one in the layout
-    /// before the pair moved ahead of the batch (the pair in the trailer, as tags 3 and 4), and a
-    /// bare `CODEC_BATCH` frame. Each is skipped and counted as corrupt, as a bad CRC is
+    /// A record `push` never writes: a hop payload with no sender prefix, one that opens with the
+    /// batch and carries the pair as trailer tags 3 and 4, and a bare `CODEC_BATCH` frame. Each is skipped and counted as corrupt, as a bad CRC is
     /// (`docs/adr/native-hop-no-compatibility.md`, decision 2; `docs/adr/native-hop-ack-status.md`).
     #[tokio::test]
     async fn a_record_without_a_complete_pair_is_skipped_as_corrupt() {
