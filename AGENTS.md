@@ -44,6 +44,13 @@ exists or a contract other `logit` processes depend on:
   `lossless-transit`'s "summarization is opt-in and named" rule.
 - **`shape` and `aggregate` split the work**: `shape` emits raw `Samples`, never a sketch; an
   `aggregate` downstream summarizes, per `lossless-transit`.
+- **A sink's response-class table is the contract for its response handling.** Each sink's module
+  doc maps every response it distinguishes to `Clean`, `Ambiguous`, `Rejected`, or `Refused`
+  ([ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md)), one row per response, each backed
+  by a test and the destination's documentation. On any change to how a sink reads a response, a
+  reviewer checks that table first. A `Rejected` batch drops at once; a `Refused` destination
+  holds the queue and retries with no budget and no exit, so reading a destination fault as
+  `Rejected` loses data and reading a bad batch as `Refused` wedges the sink.
 
 The lossless-relay, Lua-VM, mergeable-sketch, and memory-pin rules are in
 [Design constraints that aren't optional](#design-constraints-that-arent-optional).
@@ -86,7 +93,7 @@ Sinks live in `crates/logit-outputs`.
 
 | Kind | Code | What it does | Decision record |
 |---|---|---|---|
-| `influxdb_out` | `crates/logit-outputs/src/influxdb.rs` | InfluxDB 2.x, with bounded output retry | [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md) |
+| `influxdb_out` | `crates/logit-outputs/src/influxdb.rs` | InfluxDB 2.x line protocol over the write API | [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md), [ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md) |
 | `stdio_out` | `crates/logit-outputs/src/stdio.rs`, render in `human.rs` | an exhaustive, sectioned text block per event (default, `message: escaped \| multiline`), `format: json` (one object per event per line, `ndjson.rs`, what every harness reader consumes), or `format: native`; its file target is `file_out` with an empty rotation policy | [ADR `human-render-block-format`](docs/adr/human-render-block-format.md), [ADR `stream-json-format`](docs/adr/stream-json-format.md), [ADR `file-output-native-format`](docs/adr/file-output-native-format.md) |
 | `file_out` | `crates/logit-outputs/src/file.rs` | rotating file sink sharing `stdio_out`'s implementation | [ADR `rotating-file-output`](docs/adr/rotating-file-output.md) |
 | `syslog_out` | `crates/logit-outputs/src/syslog.rs` | RFC 3164/5424 over UDP, TCP, or TLS (RFC 5425) | [ADR `syslog-output`](docs/adr/syslog-output.md) |
@@ -429,7 +436,7 @@ Per pair:
   `crates/logit-outputs/src/logit.rs`) use one TCP (optionally TLS) connection, a `Hello`/`HelloAck`
   version/codec/compression handshake that offers and accepts the hop codec alone, and one native
   frame per batch, with up to a negotiated window of frames in flight, acknowledged in frame order
-  by a named, cumulative `Ack { id, seq }` that `logit_in` writes once per run of frames; a
+  by a named, cumulative `Ack { id, seq, status }` that `logit_in` writes once per run of frames; a
   reconnect lists its in-flight identities in `Hello` and commits every frame at or below the
   marks `HelloAck` returns without resending it
   ([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md),
@@ -450,9 +457,18 @@ Per pair:
   ([ADR `env-yaml-tag`](docs/adr/env-yaml-tag.md)), which is why `influxdb_out`'s `token` is a
   plain string, not an env-specific field.
 - **Lifecycle**: [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md)
-  covers signal-driven shutdown and `influxdb_out`'s bounded output retry.
-  `crates/logit-inputs/src/statsd.rs` and `crates/logit-outputs/src/influxdb.rs` are the
-  reference listener and sink.
+  covers signal-driven shutdown. `crates/logit-inputs/src/statsd.rs` and
+  `crates/logit-outputs/src/influxdb.rs` are the reference listener and sink.
+- **Sink faults**: a failed send is `Clean`, `Ambiguous`, `Rejected`, or `Refused`
+  ([ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md)). `write_loop` drops a `Rejected`
+  batch at once (`batches.dropped{reason="rejected"}`, with a throttled diagnostic carrying the
+  destination's text) and retries every other retryable fault with backoff until it succeeds or
+  shutdown cuts it; `buffer:` bounds what queues behind a held head, and
+  `logit.component.retrying` reads `1` while it holds. There's no retry budget, and the process
+  never exits for a sink. `buffer.delivery: at_most_once` drops an `Ambiguous` fault instead of
+  retrying it ([ADR `delivery-semantics`](docs/adr/delivery-semantics.md)). The shared HTTP
+  driver (`crates/logit-outputs/src/http.rs`) supplies a status-only default that each HTTP
+  sink's table refines, and `otlp_out` retries only the signals a destination hasn't settled.
 - **Trace propagation**: every `Delivered` (one `Fanout` edge's channel payload) carries a real
   `TraceContext`, propagated as a child of its parent for the two node kinds with an unambiguous
   one to propagate: `Transform::process`/`ScriptWorker::process`'s non-flush path, and
@@ -490,7 +506,8 @@ the operator-facing account of all of this.
 - **Startup binding**: `Input::bind` opens every listener's socket in a pre-pass *before* any
   task is spawned, so a bind failure fails startup with nothing else running.
 - **Exit codes**: `1` for a startup failure, `2` for a runtime failure after the process reported
-  ready.
+  ready: a listener's loop dying, or a Lua thread panicking, exceeding `max_memory`, or wedged
+  across shutdown. A sink never ends the run.
 - **Release image**: `ghcr.io/ross/logit:latest`, pushed by hand via `workflow_dispatch` rather
   than on every merge
   ([ADR `publish-release-image-to-ghcr`](docs/adr/publish-release-image-to-ghcr.md)).
