@@ -59,8 +59,8 @@ The driver stamps the events that `decode_into` appended to its output for that 
 datagram. The `Decoder` trait doesn't change, and no decoder learns about peers.
 
 The values are `Value::Str(Bytes)`, so stamping an event is a reference-count increment. The TCP
-driver builds the values once per connection. The UDP driver formats once per datagram and reuses
-the previous datagram's values when the sender repeats. With `peer: false` the code path is the
+driver builds the values once per connection. The UDP driver formats them only when a datagram's
+sender differs from the previous datagram's. With `peer: false` the code path is the
 one that exists today, so the existing allocation pins don't move; the `peer: true` path gets pins
 of its own ([`docs/design/memory.md`](../design/memory.md)).
 
