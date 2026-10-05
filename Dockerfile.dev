@@ -8,6 +8,8 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 
 # Build deps for the vendored LuaJIT build (mlua "vendored" feature) and general native-dep builds.
+# tzdata: named time zones in a `timestamp` component read /usr/share/zoneinfo
+# (docs/adr/timestamp-transform.md).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         clang \
         cmake \
@@ -15,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev \
         git \
         ca-certificates \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add rustfmt clippy

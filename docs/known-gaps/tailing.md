@@ -26,7 +26,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   history) as "now" would misstate when those lines happened. See the "docker_in timestamps"
   section of [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md).
   - `tail_in` keeps the general rule (read time, matching `syslog_in`), because a plain text line
-    carries no timestamp to trust.
+    carries no timestamp to trust. A `timestamp` component after `json`, `regex`, or `logfmt`
+    resolves it from the parsed field
+    ([ADR `timestamp-transform`](../adr/timestamp-transform.md)).
   - Receipt time isn't a repo-wide invariant either: `otlp_in` prefers a record's own
     `time_unix_nano` when set, falls back to `observed_time_unix_nano` only for the zero "unknown"
     sentinel, and preserves `observed_time_unix_nano` both ways (`otlp/logs.rs`'s module doc,

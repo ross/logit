@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-09-11
+updated: 2026-10-04
 ---
 
 # RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission
@@ -126,9 +126,9 @@ Per event, per `syslog.timestamp`'s shape, independent of the *input* dialect th
 | absent, or any other `Value` | falls through to `event.timestamp` | falls through to `event.timestamp` |
 
 `event.timestamp` itself is always receipt time (`docs/adr/decoupled-listener-io.md`) and this sink
-never resolves `syslog.timestamp` onto it — the opt-in `syslog_timestamp` transform
-`docs/known-gaps/syslog.md` sketches remains the place that would do that explicitly, for either
-direction, before an event reaches `syslog_out`.
+never resolves `syslog.timestamp` onto it. The `timestamp` transform
+([ADR `timestamp-transform`](timestamp-transform.md)) does that explicitly, for either direction,
+before an event reaches `syslog_out`.
 
 ### `syslog.pid`
 
@@ -222,10 +222,10 @@ at all.
     rather than rejecting. `syslog_out` then re-emits that literal backslash the canonical way
     (`\` → `\\`), so `p="a\xb"` relays as `p="a\\xb"` — the same PARAM-VALUE, per the RFC's own
     equivalence, just spelled the canonical way.
-- **The `syslog_timestamp` transform sketch (`docs/known-gaps/syslog.md`) remains the way to resolve
+- **The `timestamp` transform ([ADR `timestamp-transform`](timestamp-transform.md)) resolves
   `event.timestamp` from `syslog.timestamp` explicitly**, for either direction — this ADR changes
   what `syslog_out` does with `syslog.timestamp` when present, not what sets `event.timestamp`
-  itself, which stays receipt time throughout the pipeline.
+  itself, which is receipt time unless that component runs.
 - `crates/logit-config/src/lib.rs` gains `SyslogStructuredData` and `SyslogOut::structured_data`;
   `crates/logit-cli/src/pipeline.rs`'s `SyslogOut` arm is the sole place a config `sd_id` crosses
   into `SyslogEncoder::with_structured_data` and its `anyhow::Result` becomes a config-time error;

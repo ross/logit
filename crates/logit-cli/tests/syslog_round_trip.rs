@@ -67,12 +67,14 @@
 //! (`docs/adr/syslog-tcp-ingress-and-tls.md`).
 
 use bytes::Bytes;
+use logit_core::zoned::Zone;
 use logit_core::{Event, EventBatch, Value};
 use logit_inputs::syslog::{SyslogDecoder, SyslogInput};
 use logit_outputs::syslog::{Format, SyslogEncoder, SyslogOutput};
 use logit_pipeline::test_util::{recv_batch, RECV_TIMEOUT};
-use logit_pipeline::{Delivered, Fanout, Input, Output};
+use logit_pipeline::{Delivered, Fanout, Input, Output, Transform};
 use logit_proto::Decoder;
+use logit_transforms::{TimestampFormat, TimestampResolver};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -422,6 +424,59 @@ async fn a_3164_to_5424_relay_falls_the_timestamp_to_receipt_time() {
     );
     assert_eq!(decoded.events[0].attributes.get("syslog.tag").and_then(Value::as_str), Some("app"));
     assert_eq!(decoded.events[0].attributes.get("syslog.pid").and_then(Value::as_str), Some("abc"));
+}
+
+/// The decoded 3164 event with its receipt time pinned to 2026-01-01T00:05:00Z, five minutes
+/// after its `Jan  1 00:00:00` stamp read as UTC, then run through a `timestamp` transform.
+fn resolved_3164_batch(keep_source: bool) -> (Vec<u8>, EventBatch) {
+    let raw = read_fixture("rfc3164-nonnumeric-pid", "in");
+    let mut event = decode_one(&raw);
+    event.timestamp = 1_767_225_900_000_000_000;
+    let mut resolver = TimestampResolver::new(
+        "syslog.timestamp",
+        TimestampFormat::Rfc3164,
+        Zone::utc(),
+        Duration::from_secs(24 * 3600),
+        keep_source,
+    );
+    let resource = std::sync::Arc::new(logit_core::Resource::default());
+    assert!(resolver.process(&resource, &mut event), "timestamp forwards, never absorbs");
+    resolver.end_batch();
+    let batch = EventBatch { resource, scope: None, events: vec![event] };
+    (raw, batch)
+}
+
+/// The inverse of [`a_3164_to_5424_relay_falls_the_timestamp_to_receipt_time`]: with a
+/// `timestamp` transform ahead of the sink, the 5424 TIMESTAMP is the sender's stamp, not receipt
+/// time.
+#[tokio::test]
+async fn a_3164_to_5424_relay_carries_the_sender_stamp_through_a_timestamp_transform() {
+    let (_, batch) = resolved_3164_batch(false);
+    assert_eq!(batch.events[0].timestamp, 1_767_225_600_000_000_000, "2026-01-01T00:00:00Z");
+    assert!(batch.events[0].attributes.get("syslog.timestamp").is_none(), "the source is removed");
+
+    let mut harness = Harness::new().await;
+    let (captured, _) =
+        harness.round_trip(&batch, || SyslogEncoder::new(Format::Rfc5424, 16)).await;
+    let text = String::from_utf8(captured).unwrap();
+    let ts_field = text["<13>1 ".len()..].split(' ').next().unwrap();
+    assert!(
+        ts_field.starts_with("2026-01-01T00:00:00") && ts_field.ends_with('Z'),
+        "expected the sender's stamp, not receipt time (00:05:00): {text}"
+    );
+}
+
+/// With `keep_source: true` the stamp stays on the event, so a 3164 sink writes the original
+/// bytes back.
+#[tokio::test]
+async fn a_3164_relay_through_timestamp_with_keep_source_is_byte_identical() {
+    let (raw, batch) = resolved_3164_batch(true);
+    assert_eq!(batch.events[0].timestamp, 1_767_225_600_000_000_000);
+
+    let mut harness = Harness::new().await;
+    let (captured, _) =
+        harness.round_trip(&batch, || SyslogEncoder::new(Format::Rfc3164, 16)).await;
+    assert_eq!(captured, raw);
 }
 
 // ---- opt-in `structured_data` ------------------------------------------------------------------

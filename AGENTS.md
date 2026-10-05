@@ -119,6 +119,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `set` | stamps constant values onto event attributes and/or the batch resource | [ADR `operator-declared-resource-attributes`](docs/adr/operator-declared-resource-attributes.md) |
 | `scale` | multiplies named numeric attributes by a constant factor (unit conversion) | [ADR `scale-transform`](docs/adr/scale-transform.md) |
 | `keep_values` | clamps attribute values to a per-field allow-list | [ADR `value-allowlist-cardinality-clamp`](docs/adr/value-allowlist-cardinality-clamp.md) |
+| `timestamp` | resolves `event.timestamp` from an attribute (RFC 3164/3339, unix epochs, or a strftime pattern, in a named zone), so a replayed backlog or a tailed file carries the record's own time | [ADR `timestamp-transform`](docs/adr/timestamp-transform.md) |
 | `trace_context` | gives a `LogRecord` a native application trace/span reference, from W3C hex ids or, under `format: datadog`, a dd-trace tracer's decimal and 128-bit `dd.trace_id`/`dd.span_id`; an opt-in `span:` block turns an access log line into a real `SpanRecord` on the same event | [ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md), [ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md) |
 | `http_access` | normalizes web-server access logs onto OTel semconv | [ADR `http-access-normalization`](docs/adr/http-access-normalization.md) |
 | `flatten` | rewrites a nested attribute into flat, dot-joined keys | [ADR `flatten-transform`](docs/adr/flatten-transform.md) |
@@ -130,6 +131,13 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `route`, `target` | native equality-only router, and the named destinations it fills | [ADR `target-components`](docs/adr/target-components.md) |
 
 Details an agent needs beyond the table:
+
+- **`timestamp`** skips a span-carrying event (a span's timestamp is its start, which
+  `trace_context` owns) and forwards anything it can't resolve untouched. It removes the source
+  attribute unless `keep_source: true`, so set that ahead of `syslog_out` when `timezone:` isn't
+  UTC. A named `timezone:` reads the system tz database (`tzdata`), while UTC and fixed offsets
+  need none. `aggregate`'s windows are wall-clock and don't move with a resolved timestamp. See
+  [docs/deploying.md](docs/deploying.md)'s "Named time zones".
 
 - **`aggregate`**: `temporality: cumulative` keeps a delta `Sum`/`Histogram` accumulator across
   flushes, summing instead of resetting. That's what lets `statsd_in -> aggregate ->
@@ -235,11 +243,10 @@ Datadog pairs, and [docs/plans/splunk-relay.md](docs/plans/splunk-relay.md) for 
   exporter's span object decoded back to a `SpanRecord`.
 
 Residual debt lives in `docs/known-gaps/statsd.md` and `docs/known-gaps/syslog.md`: post-sketch
-metric kinds at `statsd_out`; `statsd_out` carrying no `unit` and no native rename/prefix and
-stamping an egress timestamp only on a `|T`-marked line; and syslog's `event.timestamp` staying
-receipt time while the wire TIMESTAMP follows the precedence table. The Datadog pairs' and the
-Splunk pair's residual debt is in `docs/known-gaps/datadog.md` and `docs/known-gaps/splunk.md`,
-each listed by its plan's closing assessment.
+metric kinds at `statsd_out`, and `statsd_out` carrying no `unit` and no native rename/prefix and
+stamping an egress timestamp only on a `|T`-marked line. The Datadog pairs' and the Splunk pair's
+residual debt is in `docs/known-gaps/datadog.md` and `docs/known-gaps/splunk.md`, each listed by
+its plan's closing assessment.
 
 Per pair:
 
@@ -694,7 +701,7 @@ Merged branches and PRs are never renamed to fit.
 - **Every config type derives `Serialize + Deserialize + JsonSchema` together**
   ([ADR `config-yaml-jsonschema`](docs/adr/config-yaml-jsonschema.md)) — the published schema is generated from
   the Rust types specifically so it can't drift. If `schemars` needs a hint `serde` doesn't give it
-  (as with the hand-rolled `Duration` codec in `logit-config`), add `#[schemars(with = "...")]`
+  (as with the jiff-backed `Duration` codec in `logit-config`), add `#[schemars(with = "...")]`
   alongside `#[serde(with = "...")]` rather than dropping the derive. A config struct with a
   fixed set of keys also carries `#[serde(deny_unknown_fields)]`, so a typo fails `logit validate`
   instead of being dropped; a map whose keys are the operator's data stays open. A new
@@ -854,7 +861,7 @@ crates/
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, graphite, collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), splunk (splunk_hec_out), logit (logit_out), null_out (load-test discard sink)
                     shared drivers: `stream` (the pooled TCP, TLS, and Unix-stream send of statsd, syslog, and graphite), `datagram` (the packer and UDP/Unix-datagram send of statsd, syslog, graphite, and collectd), `accounting` (`BatchAccounting`, the once-per-batch encode-side counting gate; ADR `sink-send-path-and-attempt-accounting`)
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, has_attributes, drop_attributes, has_provenance, drop_provenance, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), sample (consistent, keyed sampling on a frozen XXH64 hash), route (implements logit-pipeline::Router)
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, timestamp (event.timestamp from an attribute), scale, has_signal, keep_signals, drop_signals, has_attributes, drop_attributes, has_provenance, drop_provenance, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), sample (consistent, keyed sampling on a frozen XXH64 hash), route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
   logit-perf        dev-only, publish = false: the load-test harness binary (`logit-perf`, `script/perf`) -- spawns the real logit-cli binary against perf/scenarios/*.yaml (docs/adr/load-test-harness.md, docs/design/performance.md)
