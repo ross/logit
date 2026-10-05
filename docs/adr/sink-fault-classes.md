@@ -106,6 +106,10 @@ a Lua thread panicking or exceeding `max_memory`, and a script wedged across shu
 ([docs/deploying.md](../deploying.md), "Probes and exit codes"). A misconfigured sink is visible
 through the announcements below, not through an exit code.
 
+[2026-10-05: the rule covers a failed send. `run_output` opens the sink's store inside the sink's
+task, so a `buffer.disk:` spool that can't open, or a sink task that panics, still fails the node
+and exits `2` through the join loop.]
+
 ### A hold is announced
 
 While a sink's head has failed at least once and a retry is pending or in flight, the gauge

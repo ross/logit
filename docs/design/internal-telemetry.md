@@ -1866,7 +1866,7 @@ One `send` is up to eight routes' requests, so every point carries `route`: `ser
 | `logit.output.records{route}` | count | entries in a request Datadog accepted: series points, samples records, and sketches by record; logs, events, checks, spans, and stats groups by event |
 | `logit.output.records.dropped{route, reason="stale"}` | count | a record outside Datadog's window at the batch's send time, read once per batch: a metric more than 1h old or 10 min ahead, a log or event more than 18h old, a check more than 10 min old; once per batch |
 | `logit.output.records.dropped{route, reason="oversize"}` | count | an event whose body alone is over the route's byte limit, once per batch; or every entry of a request Datadog answered `413`, on the attempt that got that answer |
-| `logit.output.records.dropped{route, reason="rejected"}` | count | every entry of a request Datadog answered with a 3xx or a 4xx other than 403 and 413, on the attempt that got that answer. The send goes on to the next request. A `413` counts as `oversize` instead |
+| `logit.output.records.dropped{route, reason="rejected"}` | count | every entry of a request Datadog answered with a 3xx or a `Rejected` 4xx (a `400`, say), on the attempt that got that answer. The send goes on to the next request. A `413` counts as `oversize` instead; a `401`, `403`, `404`, `405`, or `407` is `Refused` and a `408` or `429` `Ambiguous`, and none of them counts here |
 | `logit.output.records.dropped{route="traces", reason="needs_agent_processing"\|"not_datadog_origin"}` | count | a span whose chunk's root has no `_top_level` mark: raw tracer output, or not a Datadog span at all; once per batch |
 
 A dropped record is never sent, so a `buffer.disk:` replay after a long outage shows up here as
@@ -1894,7 +1894,7 @@ One `send` is up to two routes' requests, so every point carries `route`: `trace
 | `logit.output.request.bytes{route}` | count | the body as sent, after compression, for a request that got an answer or failed after it may have left (a timeout); a refused connection or a missing socket file counts none |
 | `logit.output.records{route}` | count | spans (`traces`) or stats groups (`stats`) in a request the Agent accepted |
 | `logit.output.records.dropped{route, reason="oversize"}` | count | a trace's spans, or a stats group, too large for the Agent's 25 MiB request limit alone, once per batch; or every record of a request the Agent answered `413`, on the attempt that got that answer |
-| `logit.output.records.dropped{route, reason="rejected"}` | count | every record of a request the Agent answered with a 3xx or a 4xx other than 413, on the attempt that got that answer. The send goes on to the next route. A `413` counts as `oversize` instead |
+| `logit.output.records.dropped{route, reason="rejected"}` | count | every record of a request the Agent answered with a 3xx or a `Rejected` 4xx (a `400`, say), on the attempt that got that answer. The send goes on to the next route. A `413` counts as `oversize` instead; a `401`, `403`, `404`, `405`, `407`, or `415` is `Refused`, a `408` `Ambiguous`, and a `429` `Clean` or `Ambiguous`, and none of them counts here |
 
 The codec's own points are the `datadog` codec's, under [Codecs](#codecs), and this sink doesn't
 repeat them. They count once per batch, per route (the class table above). The one to watch here

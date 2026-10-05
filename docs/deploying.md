@@ -85,7 +85,7 @@ design. What an operator needs:
   metrics.
 - **A second signal during a stuck drain exits immediately** with status 130, so a restart policy
   waiting on the process can still kill it with the same signal.
-- **A sink failure, transient or extended, never ends the process.** Every sink sits
+- **A failed send, transient or extended, never ends the process.** Every sink sits
   behind a decoupled delivery buffer
   ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)). A retryable failure holds the
   queue head until it succeeds, and a batch the destination rejects is dropped and counted; no
@@ -114,7 +114,7 @@ configured, answers readiness and liveness probes. See
 |---|---|
 | `0` | Clean shutdown — a signal arrived, every listener drained, every sink flushed. |
 | `1` | A startup failure — a bad config, a port already in use, a bad `lua_file`, a bad `--log-level`. Nothing was ever running. |
-| `2` | A runtime failure after the process reported ready — a listener's accept loop dying, a `lua`/`lua_file` component's thread panicking (a script's own `process()`/`flush()` errors are not this: they're logged and counted, never fatal), a `lua`/`lua_file` component's VM still over its `max_memory` after a full garbage collection (logged `memory_limit_exceeded`), or a script still wedged inside `process()`/`flush()` with no progress 2 s after shutdown began, which `logit` exits without (see [What to watch on `/readyz`](#what-to-watch-on-readyz)). A sink never causes it: a failing sink holds or drops, per [Sink failure semantics](#sink-failure-semantics). |
+| `2` | A runtime failure after the process reported ready — a listener's accept loop dying, a `lua`/`lua_file` component's thread panicking (a script's own `process()`/`flush()` errors are not this: they're logged and counted, never fatal), a `lua`/`lua_file` component's VM still over its `max_memory` after a full garbage collection (logged `memory_limit_exceeded`), or a script still wedged inside `process()`/`flush()` with no progress 2 s after shutdown began, which `logit` exits without (see [What to watch on `/readyz`](#what-to-watch-on-readyz)), a sink's `buffer.disk:` spool that can't be opened (a bad path, permissions, another process holding the lock), or a sink's task panicking. A failed send never causes it: a sink that can't deliver holds or drops, per [Sink failure semantics](#sink-failure-semantics). |
 | `130` | A second SIGTERM/SIGINT arrived before a graceful drain finished. |
 
 To enable the probe endpoint, add a top-level `admin:` block:
@@ -321,8 +321,10 @@ An error the sink attaches no fault to is treated as `Rejected`.
 - **A rejected batch drops and the writer moves on.** The sink logs a throttled `send_failed`
   warning carrying the fault class and the destination's error text. The rest of the pipeline and
   every other sink keep running.
-- **Nothing ends the process.** A misconfigured sink, one whose token the destination refuses, for
-  example, holds its queue and shows through the signals below instead of exiting. A restart-policy
+- **No failed send ends the process.** A misconfigured sink, one whose token the destination
+  refuses, for example, holds its queue and shows through the signals below instead of exiting.
+  Only a `buffer.disk:` spool that can't open or a sink task that panics fails the node (exit
+  code `2`). A restart-policy
   supervisor never sees it, so alert on those signals.
 - **An attempt has no runtime timeout.** The sink's own transport timeout bounds each one:
   `request_timeout`, the HTTP client's timeouts, or, on `syslog_out`, `statsd_out`, and
@@ -2276,7 +2278,8 @@ before any body of the batch was accepted, the batch is retried under every post
 runtime's backoff (a `Retry-After` header is ignored). `408`, other `5xx`, timeouts, and a busy
 answer after a body was accepted are retryable only under `at_least_once`; a `401` or
 `403`, a token or channel code on a `400`, or a `404`, `405`, or `407`, is `refused`, with a
-`token_rejected` or `request_refused` warning, and the sink holds the batch and retries it; any
+`token_rejected` warning (a token), `request_refused` (a channel or authorization code), or
+`request_rejected` (`404`, `405`, `407`), and the sink holds the batch and retries it; any
 other `4xx`, `413` included, is `rejected`, dropped, and counted `logit.output.requests.rejected{code}`. A `400` that
 names one object (code 6, 7, 12, 13, or 15) is the exception: the sink drops that object, counted
 `records.dropped{reason="invalid_event"}`, and resends the rest of that body once. The sink's
@@ -2434,7 +2437,8 @@ Native histograms are skipped and counted on both wires regardless of version
   means the `max_connections` cap is binding.
 - Sender: `logit.output.requests{class}`, `logit.output.request.duration`, `logit.output.samples`.
   A `4xx` other than `401`, `403`, `404`, `405`, `407`, and `415`, or a `400` naming a failed
-  decompression (which hold the batch and retry it), is `rejected` and the batch is dropped; the
+  decompression (which hold the batch and retry it), and other than `429` (ambiguous, retried
+  under `at_least_once`), is `rejected` and the batch is dropped; the
   throttled `remote_write_rejected` diagnostic
   quotes the receiver's message, which for Prometheus and Mimir names the offending series. A `3xx`
   means the endpoint is redirecting; this client deliberately doesn't follow redirects.

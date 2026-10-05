@@ -56,7 +56,7 @@ pub enum NodeSpec {
     /// by drop. See `docs/adr/decoupled-listener-io.md`.
     Input(Box<dyn Input + Send>, InputRuntimeConfig),
     /// The sink, its queue (in memory or disk-backed; see `SinkStoreConfig`), and its retry
-    /// budget and shutdown grace (`WriteLoopConfig`). Production builds these from the
+    /// backoff cap and shutdown grace (`WriteLoopConfig`). Production builds these from the
     /// component's `buffer:` block, falling back to the defaults when it's omitted.
     Output(Box<dyn Output + Send>, SinkStoreConfig, WriteLoopConfig),
     Transform(Box<dyn Transform + Send>),

@@ -464,8 +464,9 @@ Per pair:
   batch at once (`batches.dropped{reason="rejected"}`, with a throttled diagnostic carrying the
   destination's text) and retries every other retryable fault with backoff until it succeeds or
   shutdown cuts it; `buffer:` bounds what queues behind a held head, and
-  `logit.component.retrying` reads `1` while it holds. There's no retry budget, and the process
-  never exits for a sink. `buffer.delivery: at_most_once` drops an `Ambiguous` fault instead of
+  `logit.component.retrying` reads `1` while it holds. There's no retry budget, and no send
+  failure ends the process; a sink's `buffer.disk:` spool that can't open, or a sink task that
+  panics, still fails its node and exits `2`. `buffer.delivery: at_most_once` drops an `Ambiguous` fault instead of
   retrying it ([ADR `delivery-semantics`](docs/adr/delivery-semantics.md)). The shared HTTP
   driver (`crates/logit-outputs/src/http.rs`) supplies a status-only default that each HTTP
   sink's table refines, and `otlp_out` retries only the signals a destination hasn't settled.
@@ -506,8 +507,9 @@ the operator-facing account of all of this.
 - **Startup binding**: `Input::bind` opens every listener's socket in a pre-pass *before* any
   task is spawned, so a bind failure fails startup with nothing else running.
 - **Exit codes**: `1` for a startup failure, `2` for a runtime failure after the process reported
-  ready: a listener's loop dying, or a Lua thread panicking, exceeding `max_memory`, or wedged
-  across shutdown. A sink never ends the run.
+  ready: a listener's loop dying, a Lua thread panicking, exceeding `max_memory`, or wedged
+  across shutdown, or a sink whose `buffer.disk:` spool can't open or whose task panics. A failed
+  send never ends the run.
 - **Release image**: `ghcr.io/ross/logit:latest`, pushed by hand via `workflow_dispatch` rather
   than on every merge
   ([ADR `publish-release-image-to-ghcr`](docs/adr/publish-release-image-to-ghcr.md)).

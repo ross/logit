@@ -194,8 +194,9 @@ batch was accepted is treated like a `500`, since a retry would resend that body
 
 A bad or disabled token, a channel something between the sink and Splunk stripped, or an
 endpoint that isn't a HEC collector answers every batch the same way, so `splunk_hec_out` holds
-the batch and retries it until the configuration is fixed, logging `token_rejected` or
-`request_refused`; watch `logit.component.retrying` for it. The sink's module doc
+the batch and retries it until the configuration is fixed, logging `token_rejected` for a token,
+`request_refused` for a channel or authorization code, or `request_rejected` for a `404`, `405`, or
+`407`; watch `logit.component.retrying` for it. The sink's module doc
 (`crates/logit-outputs/src/splunk.rs`, "Faults, retries, and duplicate safety") has the table of
 every HEC code it reads.
 
