@@ -74,8 +74,9 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # length shows up. Each sits above the largest allocation a valid input may make: `native_frame`'s
 # 65 admits a 64 MiB lz4 frame, which allocates its `uncompressed_len`, and the `native_batch_*`
 # targets' 64 admits `decode_batch_body`'s events `Vec` regrowing by doubling past its initial
-# 4,096: a batch of one-byte empty events at `max_len` regrows to about 56 MiB. `extra args` go to
-# `fuzz` only, never to `fuzz-tmin`.
+# 4,096: a batch of one-byte empty events at `max_len` regrows to about 56 MiB. `proxy_header`'s
+# `max_len` admits the largest PROXY v2 header, 16 plus 65,535 bytes, and one payload byte behind
+# it. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
 #
 # `native_batch` and `native_hop_batch` run in fork mode: the process-wide interner never evicts, so a
 # long-lived fuzz process accumulates every dictionary string it decodes until the arena outgrows
@@ -94,6 +95,7 @@ FUZZ_TARGETS=(
     "otlp_grpc|65536|16|"
     "prom_decompress|65536|16|"
     "prom_remote_write|65536|64|"
+    "proxy_header|65552|16|"
 )
 
 # The sanitizer builds' RUSTFLAGS differ from miri's and careful's, so they get their own volume
