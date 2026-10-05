@@ -412,13 +412,13 @@ impl StatsdInput {
         self
     }
 
-    /// Stamps each stream connection's events with its peer's address (`peer:`); see
-    /// [`crate::peer::PeerAttrs`]. A datagram listener is left untouched; graph rule 78 rejects
-    /// the field there.
+    /// Stamps each event with the address of the peer that sent it (`peer:`); see
+    /// [`crate::peer::PeerAttrs`].
     pub fn with_peer(mut self, peer: bool) -> Self {
-        if let Inner::Tcp(listener) = self.inner {
-            self.inner = Inner::Tcp(listener.with_peer(peer));
-        }
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(listener.with_peer(peer)),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_peer(peer)),
+        };
         self
     }
 
@@ -2164,6 +2164,35 @@ mod tests {
 
         running.shutdown.send(true).ok();
         running.handle.abort();
+    }
+
+    /// The same over UDP: the datagram driver's stamp replaces the decoded tag too.
+    #[tokio::test]
+    async fn peer_replaces_a_tag_of_the_same_name_over_udp() {
+        use crate::peer::{PEER_ADDRESS, PEER_PORT};
+        use logit_pipeline::test_util::{fanout_channel, recv_events, spawn_input};
+
+        let mut input = StatsdInput::new("127.0.0.1:0").with_peer(true);
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("a bound UDP listener has an address");
+        let (fanout, mut rx) = fanout_channel(8);
+        let running = spawn_input(input, fanout).await;
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = client.local_addr().unwrap().port();
+        client
+            .send_to(
+                b"hits:1|c|#network.peer.address:203.0.113.9,network.peer.port:1,env:prod",
+                addr,
+            )
+            .await
+            .unwrap();
+
+        let events = recv_events(&mut rx, 1).await;
+        let attrs = &events[0].attributes;
+        assert_eq!(attrs.get(PEER_ADDRESS).and_then(Value::as_str), Some("127.0.0.1"));
+        assert_eq!(attrs.get(PEER_PORT), Some(&Value::I64(i64::from(port))));
+        assert_eq!(attrs.get("env").and_then(Value::as_str), Some("prod"));
+        running.stop().await;
     }
 
     /// Two concurrent clients both deliver (`crate::tcp`'s "Batching is per connection"): the

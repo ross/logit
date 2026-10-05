@@ -4,12 +4,16 @@
 //! ADR `listener-peer-address` settles the names, the text form, why these are event attributes
 //! and not resource ones, and why the driver's value replaces a same-named attribute a decoder
 //! produced. A driver builds one [`PeerAttrs`] per peer and calls [`PeerAttrs::stamp`] on every
-//! event decoded from it.
+//! event decoded from it. The stream driver builds one per connection. The datagram driver reads a
+//! [`Sender`] with every datagram and goes through a [`PeerCache`], which formats an address only
+//! when the sender differs from the previous datagram's.
 
 use bytes::Bytes;
 use logit_core::interner::intern;
 use logit_core::{Event, Symbol, Value};
 use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::OnceLock;
 
 /// The attribute holding the immediate socket peer's address, in OpenTelemetry's name.
@@ -46,8 +50,12 @@ impl PeerAttrs {
     /// usual case, which gets no attribute. A path that isn't UTF-8 is written lossily, since a
     /// `Value::Str` must be UTF-8.
     pub fn from_unix(addr: &tokio::net::unix::SocketAddr) -> Option<Self> {
-        let path = addr.as_pathname()?;
-        Some(Self { address: shared_str(path.to_string_lossy().into_owned()), port: None })
+        addr.as_pathname().map(Self::from_path)
+    }
+
+    /// A Unix socket peer that bound `path`. A path that isn't UTF-8 is written lossily.
+    pub fn from_path(path: &Path) -> Self {
+        Self { address: shared_str(path.to_string_lossy().into_owned()), port: None }
     }
 
     /// Writes this peer onto every event in `events`, replacing a same-named attribute.
@@ -59,6 +67,44 @@ impl PeerAttrs {
                 event.attributes.insert_sym(port_key, port.clone());
             }
         }
+    }
+}
+
+/// A datagram's sender as the datagram driver reads it off the socket, before any formatting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sender {
+    Ip(SocketAddr),
+    /// A Unix datagram sender's bound path, as raw bytes. A sender that bound none has no
+    /// `Sender`.
+    Unix(Bytes),
+}
+
+impl Sender {
+    fn attrs(&self) -> PeerAttrs {
+        match self {
+            Self::Ip(addr) => PeerAttrs::from_socket(*addr),
+            Self::Unix(path) => PeerAttrs::from_path(Path::new(std::ffi::OsStr::from_bytes(path))),
+        }
+    }
+}
+
+/// The last [`Sender`] seen and its [`PeerAttrs`]. Consecutive datagrams from one sender, the
+/// common case for a listener with few senders, share one formatted address; a change of sender
+/// formats the new one.
+#[derive(Debug, Default)]
+pub struct PeerCache {
+    last: Option<(Sender, PeerAttrs)>,
+}
+
+impl PeerCache {
+    /// The attributes for `sender`, formatted only when it differs from the previous call's.
+    pub fn attrs_for(&mut self, sender: &Sender) -> &PeerAttrs {
+        let cached = matches!(&self.last, Some((last, _)) if last == sender);
+        if !cached {
+            self.last = Some((sender.clone(), sender.attrs()));
+        }
+        let (_, attrs) = self.last.as_ref().expect("filled above");
+        attrs
     }
 }
 
@@ -142,6 +188,52 @@ mod tests {
             other => panic!("expected a string address, got {other:?}"),
         };
         assert_eq!(ptr(&events[0]), ptr(&events[1]));
+    }
+
+    /// Two senders interleaved each get their own address: the cache never hands one sender's
+    /// attributes to another.
+    #[test]
+    fn the_cache_follows_every_change_of_sender() {
+        let a = Sender::Ip("192.0.2.1:1000".parse().unwrap());
+        let b = Sender::Ip("192.0.2.2:2000".parse().unwrap());
+        let unix = Sender::Unix(Bytes::from_static(b"/run/client.sock"));
+        let mut cache = PeerCache::default();
+        for (sender, address, port) in [
+            (&a, "192.0.2.1", Some(1000)),
+            (&a, "192.0.2.1", Some(1000)),
+            (&b, "192.0.2.2", Some(2000)),
+            (&a, "192.0.2.1", Some(1000)),
+            (&unix, "/run/client.sock", None),
+            (&b, "192.0.2.2", Some(2000)),
+        ] {
+            let mut events = vec![event()];
+            cache.attrs_for(sender).stamp(&mut events);
+            assert_eq!(str_attr(&events[0], PEER_ADDRESS), Some(address));
+            assert_eq!(events[0].attributes.get(PEER_PORT), port.map(Value::I64).as_ref());
+        }
+    }
+
+    /// Only the same address and port are the same sender: one host's two sockets are two.
+    #[test]
+    fn the_same_host_on_another_port_is_another_sender() {
+        let mut cache = PeerCache::default();
+        let mut events = vec![event()];
+        cache.attrs_for(&Sender::Ip("192.0.2.1:1000".parse().unwrap())).stamp(&mut events);
+        cache.attrs_for(&Sender::Ip("192.0.2.1:1001".parse().unwrap())).stamp(&mut events);
+        assert_eq!(events[0].attributes.get(PEER_PORT), Some(&Value::I64(1001)));
+    }
+
+    /// A repeated sender reuses the buffer its address was first formatted into.
+    #[test]
+    fn a_repeated_sender_reuses_its_formatted_address() {
+        let sender = Sender::Ip("192.0.2.1:1000".parse().unwrap());
+        let mut cache = PeerCache::default();
+        let first = cache.attrs_for(&sender).clone();
+        let again = cache.attrs_for(&sender);
+        match (&first.address, &again.address) {
+            (Value::Str(a), Value::Str(b)) => assert_eq!(a.as_ptr(), b.as_ptr()),
+            other => panic!("expected two string addresses, got {other:?}"),
+        }
     }
 
     #[test]

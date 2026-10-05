@@ -600,7 +600,7 @@ fn receive_queue_push_then_pop_costs_nothing() {
     // Built once, outside the measured region: cloning the `Bytes` per push is a refcount bump,
     // where calling the fixture would allocate its `String` each time.
     let payload = fixtures::statsd_datagram(1);
-    let warm = || Datagram { bytes: payload.clone(), received_at: 0 };
+    let warm = || Datagram { bytes: payload.clone(), received_at: 0, peer: None };
     rt.block_on(queue.push(warm()));
     rt.block_on(queue.pop()); // warm: past InMemoryBuffer's initial with_capacity sizing
 
@@ -630,7 +630,7 @@ fn receive_queue_push_many_then_pop_many_costs_nothing() {
         Telemetry::default(),
     );
     let payload = fixtures::statsd_datagram(1);
-    let datagram = || Datagram { bytes: payload.clone(), received_at: 0 };
+    let datagram = || Datagram { bytes: payload.clone(), received_at: 0, peer: None };
     // One round outside the measured region grows both `Vec`s and the `VecDeque`, as
     // `decode_loop`'s reuse does, so the measured round is steady state.
     let mut inbound: Vec<Datagram> = Vec::new();
@@ -711,6 +711,47 @@ fn peer_stamp_one_7_attribute_event() {
     let ((), stats) = measure(|| peer.stamp(&mut events));
     assert_eq!(events[0].attributes.len(), 9);
     expect_allocs("peer: stamp 1 event of 7 attributes", stats, 1);
+}
+
+/// The datagram driver's `peer: true` path on a run of datagrams from one sender: `PeerCache`
+/// finds the sender unchanged and hands back the attributes it already formatted, so stamping a
+/// datagram's 100 decoded events costs nothing more than `peer_stamp_100_statsd_events`.
+#[test]
+fn peer_cache_repeated_sender_stamp_100_statsd_events() {
+    use logit_inputs::peer::{PeerCache, Sender};
+
+    let sender = Sender::Ip("192.0.2.7:5140".parse().unwrap());
+    let mut cache = PeerCache::default();
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_datagram(100);
+    let mut warm = decoder.decode(datagram.clone()).expect("should decode").events;
+    cache.attrs_for(&sender).stamp(&mut warm); // warm: formats the sender, interns the keys
+    let mut events = decoder.decode(datagram).expect("should decode").events;
+
+    let ((), stats) = measure(|| cache.attrs_for(&sender).stamp(&mut events));
+    assert_eq!(events.len(), 100);
+    expect_allocs("peer: cached sender, stamp 100 statsd events", stats, 0);
+    assert_eq!(stats.reallocs, 0);
+}
+
+/// A change of sender formats the new one's address: the `String` it's written into (and one
+/// `realloc` while it's written) and the shared header `Bytes` adds on its first clone, so every
+/// event after it shares one buffer. The UDP driver pays this once per change of sender between
+/// consecutive datagrams, never per event.
+#[test]
+fn peer_cache_new_sender() {
+    use logit_inputs::peer::{PeerCache, Sender};
+
+    let first = Sender::Ip("192.0.2.7:5140".parse().unwrap());
+    let second = Sender::Ip("192.0.2.8:5140".parse().unwrap());
+    let mut cache = PeerCache::default();
+    cache.attrs_for(&first);
+
+    let (_, stats) = measure(|| {
+        cache.attrs_for(&second);
+    });
+    expect_allocs("peer: change of sender", stats, 2);
+    assert_eq!(stats.reallocs, 1);
 }
 
 // ---------------------------------------------------------------------------------------------

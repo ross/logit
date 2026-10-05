@@ -22,9 +22,17 @@
 //! rather than dropping in the kernel, so `logit.input.kernel.drops` stays at zero there and the
 //! loss, if any, is the client's to count (`net/unix/af_unix.c`, `unix_dgram_sendmsg`).
 //!
+//! **Peer address.** With [`UdpListener::with_peer`] on, the read half records each datagram's
+//! source address (`msg_name` on Linux, `recv_from` elsewhere) in [`Datagram::peer`], and
+//! [`decode_loop`] stamps it on the events that datagram decoded into, through a [`PeerCache`] that
+//! formats an address only when the sender differs from the previous datagram's. A Unix datagram
+//! sender that bound no path, the usual case, reports none. Off, every header keeps a NULL
+//! `msg_name` and the kernel reports nothing.
+//!
 //! **Not used by [`crate::internal::InternalInput`].** `internal` has no socket, no datagram, and
 //! no `receive:` block; don't generalize this module toward it.
 
+use crate::peer::{PeerCache, Sender};
 use bytes::Bytes;
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
 use logit_pipeline::sockstat;
@@ -44,6 +52,9 @@ use tokio::sync::watch;
 pub struct Datagram {
     pub bytes: Bytes,
     pub received_at: i64,
+    /// Who sent it, read only under `peer:` ([`UdpListener::with_peer`]). `None` with `peer` off,
+    /// and for a Unix datagram sender that bound no path.
+    pub peer: Option<Sender>,
 }
 
 impl Queued for Datagram {
@@ -190,9 +201,12 @@ pub(crate) trait DatagramSocket: std::os::fd::AsRawFd + Send + Sync {
         f: impl FnMut() -> std::io::Result<R> + Send,
     ) -> impl Future<Output = std::io::Result<R>> + Send;
 
-    /// One datagram into `buf`, for the non-Linux reader.
+    /// One datagram into `buf` and its sender, for the non-Linux reader.
     #[cfg(not(target_os = "linux"))]
-    fn recv(&self, buf: &mut [u8]) -> impl Future<Output = std::io::Result<usize>> + Send;
+    fn recv_sender(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = std::io::Result<(usize, Option<Sender>)>> + Send;
 
     /// The bound address or path, for [`describe_read_failure`].
     fn describe_local(&self) -> String;
@@ -208,8 +222,14 @@ impl DatagramSocket for tokio::net::UdpSocket {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn recv(&self, buf: &mut [u8]) -> impl Future<Output = std::io::Result<usize>> + Send {
-        async move { self.recv_from(buf).await.map(|(n, _peer)| n) }
+    fn recv_sender(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = std::io::Result<(usize, Option<Sender>)>> + Send {
+        async move {
+            let (n, peer) = tokio::net::UdpSocket::recv_from(self, buf).await?;
+            Ok((n, Some(Sender::Ip(peer))))
+        }
     }
 
     fn describe_local(&self) -> String {
@@ -230,8 +250,16 @@ impl DatagramSocket for tokio::net::UnixDatagram {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn recv(&self, buf: &mut [u8]) -> impl Future<Output = std::io::Result<usize>> + Send {
-        tokio::net::UnixDatagram::recv(self, buf)
+    fn recv_sender(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = std::io::Result<(usize, Option<Sender>)>> + Send {
+        use std::os::unix::ffi::OsStrExt;
+        async move {
+            let (n, peer) = tokio::net::UnixDatagram::recv_from(self, buf).await?;
+            let path = peer.as_pathname().map(|path| path.as_os_str().as_bytes());
+            Ok((n, path.map(|path| Sender::Unix(Bytes::copy_from_slice(path)))))
+        }
     }
 
     fn describe_local(&self) -> String {
@@ -270,6 +298,8 @@ pub struct UdpListener<D: Decoder + Send> {
     /// Set by [`Input::bind`], taken by [`Input::run_until_shutdown`]. `None` after a run, so a
     /// second run rebinds.
     socket: Option<BoundSocket>,
+    /// Whether to stamp each datagram's events with its sender (`peer:`); see this module's doc.
+    peer: bool,
 }
 
 impl<D: Decoder + Send> UdpListener<D> {
@@ -297,6 +327,7 @@ impl<D: Decoder + Send> UdpListener<D> {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             socket: None,
+            peer: false,
         }
     }
 
@@ -350,6 +381,13 @@ impl<D: Decoder + Send> UdpListener<D> {
     /// The configured knobs, for `logit-cli::pipeline`'s `build_spec` wiring tests.
     pub fn config(&self) -> UdpListenerConfig {
         self.config
+    }
+
+    /// Stamps every event with the address of the datagram it decoded from (the `peer:` field of
+    /// `statsd_in`/`syslog_in`/`graphite_in`/`lines_in`/`collectd_in`). Off by default.
+    pub fn with_peer(mut self, peer: bool) -> Self {
+        self.peer = peer;
+        self
     }
 
     /// This listener's own diagnostics. With [`Self::decoder`], lets a wrapper's test prove its
@@ -452,6 +490,7 @@ impl<D: Decoder + Send> UdpListener<D> {
             self.diag.clone(),
             shutdown,
             self.config.read_batch(),
+            self.peer,
         ));
         let mut decode = Box::pin(decode_loop(
             &mut self.decoder,
@@ -744,8 +783,9 @@ async fn read_loop<S: DatagramSocket>(
     diag: Diagnostics,
     mut shutdown: watch::Receiver<bool>,
     read_batch: usize,
+    peer: bool,
 ) -> anyhow::Result<()> {
-    let mut reader = BatchReader::new(read_batch);
+    let mut reader = BatchReader::new(read_batch, peer);
     // `batch` is reused and cleared each iteration: `push_many` drains it, so its capacity
     // survives and the steady state allocates only the one right-sized copy per datagram.
     let mut half = ReadHalf {
@@ -887,6 +927,12 @@ const HDR_WORDS: usize = std::mem::size_of::<libc::mmsghdr>().div_ceil(8);
 #[cfg(target_os = "linux")]
 const IOV_WORDS: usize = std::mem::size_of::<libc::iovec>().div_ceil(8);
 
+/// [`HDR_WORDS`]'s twin for the `sockaddr_storage` each header's `msg_name` points at under
+/// `peer:`. One `sockaddr_storage` holds every family this socket can report: `sockaddr_in`,
+/// `sockaddr_in6`, and the 110-byte `sockaddr_un`.
+#[cfg(target_os = "linux")]
+const NAME_WORDS: usize = std::mem::size_of::<libc::sockaddr_storage>().div_ceil(8);
+
 /// Every layout fact [`build_headers`], [`recvmmsg_into`] and [`harvest_headers`] rest on, checked
 /// against what `libc` says these two structs look like on the target being built.
 ///
@@ -924,6 +970,23 @@ const _: () = {
     assert!(
         std::mem::offset_of!(libc::mmsghdr, msg_len)
             != std::mem::offset_of!(libc::mmsghdr, msg_hdr.msg_flags)
+    );
+    assert!(
+        std::mem::offset_of!(libc::mmsghdr, msg_hdr.msg_namelen)
+            + std::mem::size_of::<libc::socklen_t>()
+            <= std::mem::size_of::<libc::mmsghdr>()
+    );
+    // **Names.** The same three facts for the `sockaddr_storage` slots `peer:` adds, and the room
+    // in one for the largest address [`parse_sockaddr`] reads.
+    assert!(std::mem::align_of::<libc::sockaddr_storage>() <= std::mem::align_of::<u64>());
+    assert!(NAME_WORDS * 8 >= std::mem::size_of::<libc::sockaddr_storage>());
+    assert!(std::mem::size_of::<libc::sockaddr_storage>()
+        .is_multiple_of(std::mem::align_of::<libc::sockaddr_storage>()));
+    assert!(
+        std::mem::size_of::<libc::sockaddr_un>() <= std::mem::size_of::<libc::sockaddr_storage>()
+    );
+    assert!(
+        std::mem::size_of::<libc::sockaddr_in6>() <= std::mem::size_of::<libc::sockaddr_storage>()
     );
 };
 
@@ -972,12 +1035,19 @@ struct BatchReader {
     /// How many datagrams the last `read_batch` call truncated. Reset per call: [`read_loop`]
     /// reports it once per batch.
     truncated: u64,
+    /// Under `peer:`, backing words for one `sockaddr_storage` per header, which the kernel fills
+    /// with that message's source address. `None` with `peer` off: every `msg_name` stays NULL.
+    names: Option<Vec<u64>>,
+    /// Each returned message's `msg_namelen`, copied out with `lens`. Empty with `peer` off.
+    name_lens: Vec<u32>,
+    /// The last Unix sender path read, so a bound sender's run of datagrams shares one buffer.
+    last_unix: Option<Bytes>,
     vlen: usize,
 }
 
 #[cfg(target_os = "linux")]
 impl BatchReader {
-    fn new(read_batch: usize) -> Self {
+    fn new(read_batch: usize, peer: bool) -> Self {
         let vlen = read_batch.clamp(1, MAX_READ_BATCH);
         Self {
             slots: vec![0u8; vlen * MAX_DATAGRAM_BYTES],
@@ -986,6 +1056,9 @@ impl BatchReader {
             lens: vec![0u32; vlen],
             flags: vec![0i32; vlen],
             truncated: 0,
+            names: peer.then(|| vec![0u64; vlen * NAME_WORDS]),
+            name_lens: if peer { vec![0u32; vlen] } else { Vec::new() },
+            last_unix: None,
             vlen,
         }
     }
@@ -1039,26 +1112,38 @@ impl BatchReader {
         let iov_words = &mut self.iov_words;
         let lens = &mut self.lens;
         let flags = &mut self.flags;
+        let names = &mut self.names;
+        let name_lens = &mut self.name_lens;
 
         // `READABLE | ERROR`, as tokio's own `UdpSocket::recv_from` waits on: a socket with only a
         // pending error isn't "readable" to the poller, and an arm that never wakes stalls the
         // listener.
         let received = socket
             .async_io(tokio::io::Interest::READABLE | tokio::io::Interest::ERROR, || {
-                // Rebuilt on every call of this `FnMut` (`async_io` may call it more than once), so
-                // every pointer the kernel gets is derived from a live allocation within this call,
-                // and no raw pointer outlives the closure.
-                build_headers(slots, MAX_DATAGRAM_BYTES, iov_words, hdr_words, vlen);
                 loop {
+                    // Rebuilt before every syscall, the `EINTR` retry included, so every pointer
+                    // the kernel gets is derived from a live allocation within this call, no raw
+                    // pointer outlives the closure, and each `msg_namelen` is reset to the full
+                    // `sockaddr_storage` the kernel shrinks it from.
+                    build_headers(
+                        slots,
+                        MAX_DATAGRAM_BYTES,
+                        iov_words,
+                        hdr_words,
+                        names.as_deref_mut(),
+                        vlen,
+                    );
                     // SAFETY: `build_headers` immediately above wrote `vlen` fully-initialized
                     // `mmsghdr`s into `hdr_words`, each with a one-entry `iov` describing one
-                    // distinct, wholly-owned `MAX_DATAGRAM_BYTES` slot of `slots` -- which is
-                    // borrowed exclusively by this closure and not reborrowed anywhere between
-                    // that call and this one, so those `iov_base` pointers are still live. That
-                    // is exactly `recvmmsg_into`'s stated precondition.
+                    // distinct, wholly-owned `MAX_DATAGRAM_BYTES` slot of `slots`, and a
+                    // `msg_name` that is NULL or one distinct `sockaddr_storage` of `names`. Both
+                    // buffers are borrowed exclusively by this closure and not reborrowed between
+                    // that call and this one, so those pointers are still live. That is
+                    // `recvmmsg_into`'s stated precondition.
                     let n = unsafe { recvmmsg_into(fd, hdr_words, vlen) };
                     if n >= 0 {
-                        harvest_headers(hdr_words, n as usize, lens, flags);
+                        let name_lens = names.is_some().then_some(name_lens.as_mut_slice());
+                        harvest_headers(hdr_words, n as usize, lens, flags, name_lens);
                         return Ok(n as usize);
                     }
                     let err = std::io::Error::last_os_error();
@@ -1118,11 +1203,16 @@ impl BatchReader {
                 self.truncated += 1;
             }
             let start = i * MAX_DATAGRAM_BYTES;
+            let peer = self.names.as_deref().and_then(|names| {
+                let name = &names[i * NAME_WORDS..(i + 1) * NAME_WORDS];
+                sender_of(name, self.name_lens[i], &mut self.last_unix)
+            });
             out.push(Datagram {
                 bytes: Bytes::copy_from_slice(&self.slots[start..start + len]),
                 // Saturating only so the arithmetic is total: `now_nanos()` is ~1.8e18 and `i` is
                 // at most 1023, nowhere near `i64::MAX`.
                 received_at: base.saturating_add(i as i64),
+                peer,
             });
         }
         Ok(received)
@@ -1143,6 +1233,10 @@ impl BatchReader {
 /// one-entry `iov`. Every header is fully re-initialized, overwriting a previous call's kernel
 /// writeback.
 ///
+/// With `names` (`peer:` on), header `i`'s `msg_name` points at the `i`th `sockaddr_storage` in
+/// it and `msg_namelen` is that struct's size, so the kernel reports each message's source
+/// address there. Without, both stay NULL/0 and the kernel reports none.
+///
 /// **Why this is its own function.** It's the pure half of [`BatchReader::read_batch`]'s closure:
 /// no syscall, no fd, only pointer arithmetic over three caller-owned buffers. That makes it
 /// reachable under `miri`, which has no shim for `recvmmsg`
@@ -1153,13 +1247,12 @@ impl BatchReader {
 /// **Why `mem::zeroed()` + two field assignments, not a struct literal.** rust-`libc`'s musl
 /// `msghdr` has private `__pad1`/`__pad2` fields a struct literal can't set (rust-lang/libc#2344),
 /// and an unzeroed pad is libuv#3419's spurious `EMSGSIZE`. Zeroing also leaves
-/// `msg_name`/`msg_namelen`/`msg_control`/`msg_controllen` NULL/0, which tells the kernel to report
-/// neither a source address nor ancillary data, and makes the `msg_flags`/`msg_controllen` the
-/// kernel writes back per call (`____sys_recvmsg`, `net/socket.c`) inert: they're overwritten here
-/// before anything reads them.
+/// `msg_control`/`msg_controllen` NULL/0, which tells the kernel to report no ancillary data, and
+/// makes the `msg_flags`/`msg_namelen`/`msg_controllen` the kernel writes back per call
+/// (`____sys_recvmsg`, `net/socket.c`) inert: they're overwritten here before anything reads them.
 ///
-/// Panics rather than trusting its caller: the three length preconditions would otherwise be
-/// undefined behaviour, and checking them costs three comparisons per batch.
+/// Panics rather than trusting its caller: the length preconditions would otherwise be undefined
+/// behaviour, and checking them costs a comparison each per batch.
 #[cfg(target_os = "linux")]
 #[inline]
 fn build_headers(
@@ -1167,6 +1260,7 @@ fn build_headers(
     slot_bytes: usize,
     iov_words: &mut [u64],
     hdr_words: &mut [u64],
+    names: Option<&mut [u64]>,
     vlen: usize,
 ) {
     assert!(
@@ -1184,9 +1278,17 @@ fn build_headers(
         "hdr_words must hold vlen ({vlen}) mmsghdrs of {HDR_WORDS} words, got {}",
         hdr_words.len()
     );
+    if let Some(names) = &names {
+        assert!(
+            vlen.checked_mul(NAME_WORDS).is_some_and(|need| names.len() >= need),
+            "names must hold vlen ({vlen}) sockaddr_storages of {NAME_WORDS} words, got {}",
+            names.len()
+        );
+    }
 
     let iovs = iov_words.as_mut_ptr().cast::<libc::iovec>();
     let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
+    let names = names.map(|names| names.as_mut_ptr().cast::<libc::sockaddr_storage>());
     let base = slots.as_mut_ptr();
     for i in 0..vlen {
         // SAFETY: the asserts above establish that `iov_words`/`hdr_words` are live allocations of
@@ -1198,7 +1300,9 @@ fn build_headers(
         // and `base.add(i * slot_bytes)` is in bounds with `slot_bytes` bytes behind it. The three
         // buffers are borrowed exclusively here, so nothing aliases them for the duration. Writing
         // an `mmsghdr` whose only non-zero fields are a valid `msg_iov` and `msg_iovlen = 1`
-        // leaves a fully valid value in every field.
+        // leaves a fully valid value in every field. With `names`, its assert above makes
+        // `names.add(i)` in bounds and its `sockaddr_storage` wholly inside `names`, aligned by the
+        // module's `const _` block, and `msg_namelen` is no larger than that struct.
         unsafe {
             iovs.add(i).write(libc::iovec {
                 iov_base: base.add(i * slot_bytes).cast::<libc::c_void>(),
@@ -1207,6 +1311,11 @@ fn build_headers(
             let mut hdr: libc::mmsghdr = std::mem::zeroed();
             hdr.msg_hdr.msg_iov = iovs.add(i);
             hdr.msg_hdr.msg_iovlen = 1;
+            if let Some(names) = names {
+                hdr.msg_hdr.msg_name = names.add(i).cast::<libc::c_void>();
+                hdr.msg_hdr.msg_namelen =
+                    std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            }
             hdrs.add(i).write(hdr);
         }
     }
@@ -1225,10 +1334,11 @@ fn build_headers(
 ///
 /// `hdr_words` must hold at least `vlen` initialized `mmsghdr`s as [`build_headers`]
 /// writes them: each with a valid one-entry `msg_iov` pointing at a live, writable, exclusively
-/// owned buffer of at least `iov_len` bytes, and NULL `msg_name`/`msg_control`. The kernel writes
-/// through those pointers and into each header's `msg_len`/`msg_flags`, so every one of them must
-/// still be live when this is called. `fd` need not be valid -- a bad descriptor is `EBADF`, not
-/// undefined behaviour -- but the buffers must be.
+/// owned buffer of at least `iov_len` bytes, NULL `msg_control`, and a `msg_name` that is NULL or
+/// points at a live, writable, exclusively owned buffer of at least `msg_namelen` bytes. The kernel
+/// writes through those pointers and into each header's `msg_len`/`msg_flags`/`msg_namelen`, so
+/// every one of them must still be live when this is called. `fd` need not be valid -- a bad
+/// descriptor is `EBADF`, not undefined behaviour -- but the buffers must be.
 #[cfg(target_os = "linux")]
 #[inline]
 unsafe fn recvmmsg_into(fd: std::os::fd::RawFd, hdr_words: &mut [u64], vlen: usize) -> libc::c_int {
@@ -1242,7 +1352,8 @@ unsafe fn recvmmsg_into(fd: std::os::fd::RawFd, hdr_words: &mut [u64], vlen: usi
 }
 
 /// Copies the `msg_len` and `msg_hdr.msg_flags` the kernel wrote into the first `n` headers of
-/// `hdr_words` out into `lens`/`flags`, touching nothing beyond `n`.
+/// `hdr_words` out into `lens`/`flags`, and `msg_hdr.msg_namelen` into `name_lens` when given,
+/// touching nothing beyond `n`.
 ///
 /// The headers hold raw pointers, which the `Vec<u64>` storage exists to keep out of a `Send`
 /// future, so they mean nothing outside [`BatchReader::read_batch`]'s closure. The two numbers
@@ -1251,12 +1362,18 @@ unsafe fn recvmmsg_into(fd: std::os::fd::RawFd, hdr_words: &mut [u64], vlen: usi
 /// Pure, like [`build_headers`]: under `miri` a test plays the kernel's part by writing into the
 /// same headers through the same pointer type.
 ///
-/// Panics if `n` exceeds any of the three buffers. The kernel can't return more than the `vlen` it
+/// Panics if `n` exceeds any of the buffers. The kernel can't return more than the `vlen` it
 /// was given, so this is unreachable; an assert rather than a quiet `take(n)` because a count that
 /// large would mean the ABI assumption underneath had broken.
 #[cfg(target_os = "linux")]
 #[inline]
-fn harvest_headers(hdr_words: &mut [u64], n: usize, lens: &mut [u32], flags: &mut [i32]) {
+fn harvest_headers(
+    hdr_words: &mut [u64],
+    n: usize,
+    lens: &mut [u32],
+    flags: &mut [i32],
+    mut name_lens: Option<&mut [u32]>,
+) {
     assert!(
         n.checked_mul(HDR_WORDS).is_some_and(|need| hdr_words.len() >= need),
         "hdr_words must hold n ({n}) mmsghdrs of {HDR_WORDS} words, got {}",
@@ -1268,18 +1385,98 @@ fn harvest_headers(hdr_words: &mut [u64], n: usize, lens: &mut [u32], flags: &mu
         lens.len(),
         flags.len()
     );
+    if let Some(name_lens) = &name_lens {
+        assert!(name_lens.len() >= n, "name_lens ({}) must hold n ({n}) entries", name_lens.len());
+    }
 
     let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
     for (i, (len, flag)) in lens.iter_mut().zip(flags.iter_mut()).take(n).enumerate() {
         // SAFETY: `i < n`, and the assert above establishes `hdr_words` holds at least `n`
         // `mmsghdr`-sized slots, so `hdrs.add(i)` is in bounds and aligned (this module's `const _`
         // block asserts the alignment and the stride). The caller's contract is that the first `n`
-        // headers were initialized by `build_headers` and then written by the kernel; both fields
-        // read here lie wholly inside one header (also asserted in that block) and are plain
-        // integers, so every byte of each is initialized either way.
+        // headers were initialized by `build_headers` and then written by the kernel; every field
+        // read here lies wholly inside one header (also asserted in that block) and is a plain
+        // integer, so every byte of each is initialized either way.
         unsafe {
             *len = (*hdrs.add(i)).msg_len;
             *flag = (*hdrs.add(i)).msg_hdr.msg_flags;
+            if let Some(name_lens) = name_lens.as_deref_mut() {
+                name_lens[i] = (*hdrs.add(i)).msg_hdr.msg_namelen;
+            }
+        }
+    }
+}
+
+/// A source address as [`parse_sockaddr`] finds it, borrowing a Unix path from the raw bytes.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq)]
+enum RawSender<'a> {
+    Ip(std::net::SocketAddr),
+    Unix(&'a [u8]),
+}
+
+/// Reads the source address out of one `msg_name` slot, `name` being its `sockaddr_storage`'s
+/// bytes and `len` the `msg_namelen` the kernel wrote back.
+///
+/// Byte offsets come from `libc`'s struct layouts, so this is safe code, testable on a hand-built
+/// buffer with no socket. Ports and IPv4/IPv6 addresses are in network byte order on the wire;
+/// the family is in host order. Returns `None` for anything without a usable sender:
+/// - a `len` shorter than the family's struct, including the `0` the kernel reports for an
+///   unbound Unix datagram sender (`unix_copy_addr`, `net/unix/af_unix.c`, writes no address);
+/// - an unnamed or abstract-namespace Unix address, which [`crate::peer::PeerAttrs::from_unix`]
+///   also skips;
+/// - any other family.
+///
+/// A Unix path ends at its first NUL, whether or not `len` counts a terminator.
+#[cfg(target_os = "linux")]
+fn parse_sockaddr(name: &[u8], len: usize) -> Option<RawSender<'_>> {
+    use std::mem::{offset_of, size_of};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let name = &name[..len.min(name.len())];
+    let family_bytes = name.get(..size_of::<libc::sa_family_t>())?;
+    let family = libc::sa_family_t::from_ne_bytes(family_bytes.try_into().ok()?);
+    let port_at = |offset: usize| -> Option<u16> {
+        Some(u16::from_be_bytes(name.get(offset..offset + 2)?.try_into().ok()?))
+    };
+    match i32::from(family) {
+        libc::AF_INET if name.len() >= size_of::<libc::sockaddr_in>() => {
+            let port = port_at(offset_of!(libc::sockaddr_in, sin_port))?;
+            let at = offset_of!(libc::sockaddr_in, sin_addr);
+            let octets: [u8; 4] = name.get(at..at + 4)?.try_into().ok()?;
+            Some(RawSender::Ip(SocketAddr::new(Ipv4Addr::from(octets).into(), port)))
+        }
+        libc::AF_INET6 if name.len() >= size_of::<libc::sockaddr_in6>() => {
+            let port = port_at(offset_of!(libc::sockaddr_in6, sin6_port))?;
+            let at = offset_of!(libc::sockaddr_in6, sin6_addr);
+            let octets: [u8; 16] = name.get(at..at + 16)?.try_into().ok()?;
+            Some(RawSender::Ip(SocketAddr::new(Ipv6Addr::from(octets).into(), port)))
+        }
+        libc::AF_UNIX => {
+            let path = name.get(offset_of!(libc::sockaddr_un, sun_path)..)?;
+            let path = &path[..path.iter().position(|&b| b == 0).unwrap_or(path.len())];
+            (!path.is_empty()).then_some(RawSender::Unix(path))
+        }
+        _ => None,
+    }
+}
+
+/// The [`Sender`] in one `msg_name` slot's words, reusing `last_unix`'s buffer when a Unix sender's
+/// path repeats so a bound sender's run of datagrams allocates once.
+#[cfg(target_os = "linux")]
+fn sender_of(name: &[u64], len: u32, last_unix: &mut Option<Bytes>) -> Option<Sender> {
+    let mut raw = [0u8; NAME_WORDS * 8];
+    for (bytes, word) in raw.as_chunks_mut::<8>().0.iter_mut().zip(name) {
+        *bytes = word.to_ne_bytes();
+    }
+    match parse_sockaddr(&raw, len as usize)? {
+        RawSender::Ip(addr) => Some(Sender::Ip(addr)),
+        RawSender::Unix(path) => {
+            let shared = match last_unix {
+                Some(last) if last[..] == *path => last.clone(),
+                _ => last_unix.insert(Bytes::copy_from_slice(path)).clone(),
+            };
+            Some(Sender::Unix(shared))
         }
     }
 }
@@ -1312,12 +1509,14 @@ fn assert_batch_read_future_is_send(
 #[cfg(not(target_os = "linux"))]
 struct BatchReader {
     buf: Vec<u8>,
+    /// Whether to keep each datagram's sender (`peer:`).
+    peer: bool,
 }
 
 #[cfg(not(target_os = "linux"))]
 impl BatchReader {
-    fn new(_read_batch: usize) -> Self {
-        Self { buf: vec![0u8; MAX_DATAGRAM_BYTES] }
+    fn new(_read_batch: usize, peer: bool) -> Self {
+        Self { buf: vec![0u8; MAX_DATAGRAM_BYTES], peer }
     }
 
     /// Always `0`: `recv_from` reports only how many bytes it copied, never whether it discarded
@@ -1333,10 +1532,11 @@ impl BatchReader {
         socket: &S,
         out: &mut Vec<Datagram>,
     ) -> std::io::Result<usize> {
-        let n = socket.recv(&mut self.buf).await?;
+        let (n, sender) = socket.recv_sender(&mut self.buf).await?;
         out.push(Datagram {
             bytes: Bytes::copy_from_slice(&self.buf[..n]),
             received_at: now_nanos(),
+            peer: if self.peer { sender } else { None },
         });
         Ok(1)
     }
@@ -1390,9 +1590,10 @@ async fn read_loop_sampled<S: DatagramSocket>(
     diag: Diagnostics,
     shutdown: watch::Receiver<bool>,
     read_batch: usize,
+    peer: bool,
 ) -> anyhow::Result<()> {
     let sampler = ReceiveBufferSampler::new(socket, telemetry.clone(), diag.clone());
-    let read = read_loop(socket, queue, telemetry, diag, shutdown, read_batch);
+    let read = read_loop(socket, queue, telemetry, diag, shutdown, read_batch, peer);
     sample_while(sampler, read, KERNEL_SAMPLE_INTERVAL).await
 }
 
@@ -1609,6 +1810,8 @@ async fn decode_loop<D: Decoder + Send>(
     let mut popped: Vec<Datagram> = Vec::new();
     // A clone for `Undecoded` to borrow, since `diag` itself is borrowed mutably below.
     let remainder_diag = diag.clone();
+    // Untouched with `peer` off: no datagram carries a sender.
+    let mut peers = PeerCache::default();
     let has_interval = !batching.flush_interval.is_zero();
     let mut next_flush =
         has_interval.then(|| tokio::time::Instant::now() + batching.flush_interval);
@@ -1670,8 +1873,8 @@ async fn decode_loop<D: Decoder + Send>(
             left: count,
             diag: &remainder_diag,
         };
-        for datagram in undecoded {
-            let latency_nanos = (now_nanos() - datagram.received_at).max(0) as u64;
+        for Datagram { bytes, received_at, peer } in undecoded {
+            let latency_nanos = (now_nanos() - received_at).max(0) as u64;
             telemetry.timing(
                 "logit.component.receive.latency",
                 Duration::from_nanos(latency_nanos),
@@ -1679,8 +1882,13 @@ async fn decode_loop<D: Decoder + Send>(
             );
 
             scratch.clear();
-            match decoder.decode_into(datagram.bytes, datagram.received_at, &mut scratch) {
+            match decoder.decode_into(bytes, received_at, &mut scratch) {
                 Ok((resource, scope)) => {
+                    // After the decoder, so the observed sender replaces a same-named decoded
+                    // attribute.
+                    if let Some(sender) = &peer {
+                        peers.attrs_for(sender).stamp(&mut scratch);
+                    }
                     // `scope` is `None` from every datagram decoder today, but threaded through
                     // rather than hardcoded so a decoder that carries one isn't dropped.
                     if let Some((batch, reason)) = accumulator.absorb(resource, scope, &mut scratch)
@@ -1852,6 +2060,7 @@ mod tests {
                 Diagnostics::default(),
                 shutdown_rx.clone(),
                 TEST_POP_BATCH,
+                false,
             );
             let decode_fut = decode_loop(
                 &mut decoder,
@@ -2007,7 +2216,11 @@ mod tests {
         // first poll, so signalling before either loop runs is equivalent to mid-run.
         for i in 0..3u32 {
             queue
-                .push(Datagram { bytes: Bytes::from(format!("msg-{i}")), received_at: i as i64 })
+                .push(Datagram {
+                    bytes: Bytes::from(format!("msg-{i}")),
+                    received_at: i as i64,
+                    peer: None,
+                })
                 .await;
         }
         shutdown_tx.send(true).expect("receiver should still be alive");
@@ -2020,7 +2233,8 @@ mod tests {
                 telemetry.clone(),
                 Diagnostics::default(),
                 shutdown_rx,
-                TEST_POP_BATCH
+                TEST_POP_BATCH,
+                false
             ),
             decode_loop(
                 &mut decoder,
@@ -2062,7 +2276,11 @@ mod tests {
 
         for i in 0..BACKLOG {
             queue
-                .push(Datagram { bytes: Bytes::from(format!("msg-{i}")), received_at: i as i64 })
+                .push(Datagram {
+                    bytes: Bytes::from(format!("msg-{i}")),
+                    received_at: i as i64,
+                    peer: None,
+                })
                 .await;
         }
         shutdown_tx.send(true).expect("receiver should still be alive");
@@ -2074,7 +2292,8 @@ mod tests {
                 telemetry.clone(),
                 Diagnostics::default(),
                 shutdown_rx,
-                TEST_POP_BATCH
+                TEST_POP_BATCH,
+                false
             ),
             decode_loop(
                 &mut decoder,
@@ -2131,7 +2350,8 @@ mod tests {
                 telemetry.clone(),
                 Diagnostics::default(),
                 shutdown_rx,
-                TEST_POP_BATCH
+                TEST_POP_BATCH,
+                false
             ),
             decode_loop(
                 &mut decoder,
@@ -2581,6 +2801,7 @@ mod tests {
             Diagnostics::default(),
             shutdown_rx,
             TEST_POP_BATCH,
+            false,
         );
         tokio::pin!(sampled);
 
@@ -2655,6 +2876,7 @@ mod tests {
                 Diagnostics::default(),
                 shutdown_rx,
                 TEST_POP_BATCH,
+                false,
             ),
             KERNEL_SAMPLE_INTERVAL,
         )
@@ -2741,8 +2963,14 @@ mod tests {
     /// relies on under Stacked/Tree Borrows.
     #[cfg(target_os = "linux")]
     mod batch_reader_helpers {
-        use super::super::{build_headers, harvest_headers, HDR_WORDS, IOV_WORDS};
+        use super::super::{
+            build_headers, harvest_headers, parse_sockaddr, sender_of, RawSender, HDR_WORDS,
+            IOV_WORDS, NAME_WORDS,
+        };
         use super::MAX_DATAGRAM_BYTES;
+        use crate::peer::Sender;
+        use bytes::Bytes;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
         /// Every `vlen` worth checking: both ends of [`BatchReader::new`]'s clamp (`1` and
         /// [`MAX_READ_BATCH`]), the default 64 and 63 (so an off-by-one in the loop bound shows as
@@ -2887,7 +3115,7 @@ mod tests {
                 let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, SMALL_SLOT);
                 let slab = (slots.as_ptr() as usize, slots.len());
 
-                build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, vlen);
+                build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, None, vlen);
 
                 let views = view(&mut hdr_words, vlen);
                 assert_eq!(views.len(), vlen);
@@ -2910,7 +3138,14 @@ mod tests {
                 let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, MAX_DATAGRAM_BYTES);
                 let slab = (slots.as_ptr() as usize, slots.len());
 
-                build_headers(&mut slots, MAX_DATAGRAM_BYTES, &mut iov_words, &mut hdr_words, vlen);
+                build_headers(
+                    &mut slots,
+                    MAX_DATAGRAM_BYTES,
+                    &mut iov_words,
+                    &mut hdr_words,
+                    None,
+                    vlen,
+                );
 
                 let views = view(&mut hdr_words, vlen);
                 assert_freshly_built(&views, slab, MAX_DATAGRAM_BYTES);
@@ -2925,13 +3160,13 @@ mod tests {
                 let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, SMALL_SLOT);
                 let slab = (slots.as_ptr() as usize, slots.len());
 
-                build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, vlen);
+                build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, None, vlen);
                 let lens: Vec<u32> = (0..vlen).map(|i| (i as u32) + 7).collect();
                 let flags: Vec<i32> = (0..vlen).map(|_| libc::MSG_TRUNC).collect();
                 play_kernel(&mut hdr_words, vlen, &lens, &flags);
 
                 // As the closure's next `FnMut` call does: same buffers, no clearing in between.
-                build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, vlen);
+                build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, None, vlen);
 
                 let views = view(&mut hdr_words, vlen);
                 assert_freshly_built(&views, slab, SMALL_SLOT);
@@ -2948,7 +3183,14 @@ mod tests {
                 // None, one, one short of the batch, and the whole batch.
                 for n in [0, 1, vlen.saturating_sub(1), vlen] {
                     let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, SMALL_SLOT);
-                    build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, vlen);
+                    build_headers(
+                        &mut slots,
+                        SMALL_SLOT,
+                        &mut iov_words,
+                        &mut hdr_words,
+                        None,
+                        vlen,
+                    );
 
                     let written_lens: Vec<u32> =
                         (0..vlen).map(|i| ((i * 13) % SMALL_SLOT) as u32).collect();
@@ -2959,7 +3201,7 @@ mod tests {
 
                     let mut lens = vec![UNTOUCHED_LEN; vlen];
                     let mut flags = vec![UNTOUCHED_FLAG; vlen];
-                    harvest_headers(&mut hdr_words, n, &mut lens, &mut flags);
+                    harvest_headers(&mut hdr_words, n, &mut lens, &mut flags, None);
 
                     for i in 0..n {
                         assert_eq!(
@@ -2997,7 +3239,7 @@ mod tests {
         fn writing_through_each_headers_own_iov_lands_in_that_headers_own_slot() {
             for vlen in VLENS {
                 let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, SMALL_SLOT);
-                build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, vlen);
+                build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, None, vlen);
 
                 let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
                 for i in 0..vlen {
@@ -3019,7 +3261,13 @@ mod tests {
 
                 let mut harvested_lens = vec![0u32; vlen];
                 let mut harvested_flags = vec![0i32; vlen];
-                harvest_headers(&mut hdr_words, vlen, &mut harvested_lens, &mut harvested_flags);
+                harvest_headers(
+                    &mut hdr_words,
+                    vlen,
+                    &mut harvested_lens,
+                    &mut harvested_flags,
+                    None,
+                );
                 assert!(harvested_lens.iter().all(|&len| len == 1));
 
                 for i in 0..vlen {
@@ -3049,30 +3297,244 @@ mod tests {
             must_panic("slots", || {
                 let (mut s, mut i, mut h) = buffers(4, SMALL_SLOT);
                 s.truncate(4 * SMALL_SLOT - 1);
-                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, 4);
+                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, None, 4);
             });
             must_panic("iov_words", || {
                 let (mut s, mut i, mut h) = buffers(4, SMALL_SLOT);
                 i.truncate(4 * IOV_WORDS - 1);
-                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, 4);
+                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, None, 4);
             });
             must_panic("hdr_words", || {
                 let (mut s, mut i, mut h) = buffers(4, SMALL_SLOT);
                 h.truncate(4 * HDR_WORDS - 1);
-                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, 4);
+                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, None, 4);
             });
             must_panic("harvest past the headers", || {
                 let (mut s, mut i, mut h) = buffers(4, SMALL_SLOT);
-                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, 4);
+                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, None, 4);
                 let (mut lens, mut flags) = (vec![0u32; 8], vec![0i32; 8]);
-                harvest_headers(&mut h, 5, &mut lens, &mut flags);
+                harvest_headers(&mut h, 5, &mut lens, &mut flags, None);
             });
             must_panic("harvest past the outputs", || {
                 let (mut s, mut i, mut h) = buffers(8, SMALL_SLOT);
-                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, 8);
+                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, None, 8);
                 let (mut lens, mut flags) = (vec![0u32; 4], vec![0i32; 4]);
-                harvest_headers(&mut h, 8, &mut lens, &mut flags);
+                harvest_headers(&mut h, 8, &mut lens, &mut flags, None);
             });
+        }
+
+        // -- `peer:`: the `msg_name` slots and the address parser ---------------------------------
+
+        const STORAGE_BYTES: u32 = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+
+        /// With `names`, header `i` points at the `i`th `sockaddr_storage` and offers its whole
+        /// size; nothing else about the header changes.
+        #[test]
+        fn with_names_every_header_points_at_its_own_name_slot() {
+            for vlen in VLENS {
+                let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, SMALL_SLOT);
+                let mut names = vec![0u64; vlen * NAME_WORDS];
+                let names_start = names.as_ptr() as usize;
+
+                build_headers(
+                    &mut slots,
+                    SMALL_SLOT,
+                    &mut iov_words,
+                    &mut hdr_words,
+                    Some(&mut names),
+                    vlen,
+                );
+
+                for (i, v) in view(&mut hdr_words, vlen).iter().enumerate() {
+                    assert_eq!(v.msg_name, names_start + i * NAME_WORDS * 8, "header {i}");
+                    assert_eq!(v.msg_namelen, STORAGE_BYTES, "header {i}");
+                    assert_eq!(v.msg_iovlen, 1, "header {i}");
+                    assert_eq!(v.msg_control, 0, "header {i}");
+                }
+            }
+        }
+
+        /// The kernel shrinks `msg_namelen` to the address it wrote; the next build restores the
+        /// full size, so a long address after a short one isn't truncated.
+        #[test]
+        fn a_rebuild_resets_every_name_length_the_kernel_shrank() {
+            let vlen = 4;
+            let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, SMALL_SLOT);
+            let mut names = vec![0u64; vlen * NAME_WORDS];
+            let mut build = |hdr_words: &mut [u64]| {
+                build_headers(
+                    &mut slots,
+                    SMALL_SLOT,
+                    &mut iov_words,
+                    hdr_words,
+                    Some(&mut names),
+                    vlen,
+                )
+            };
+            build(&mut hdr_words);
+            play_kernel(&mut hdr_words, vlen, &[1; 4], &[0; 4]);
+            build(&mut hdr_words);
+            for v in view(&mut hdr_words, vlen) {
+                assert_eq!(v.msg_namelen, STORAGE_BYTES);
+            }
+        }
+
+        /// Harvest copies the first `n` name lengths when asked for them, and nothing past `n`.
+        #[test]
+        fn harvest_copies_the_first_n_name_lengths() {
+            let vlen = 8;
+            for n in [0, 1, 7, 8] {
+                let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, SMALL_SLOT);
+                let mut names = vec![0u64; vlen * NAME_WORDS];
+                build_headers(
+                    &mut slots,
+                    SMALL_SLOT,
+                    &mut iov_words,
+                    &mut hdr_words,
+                    Some(&mut names),
+                    vlen,
+                );
+                play_kernel(&mut hdr_words, n, &[1; 8], &[0; 8]);
+                let (mut lens, mut flags, mut name_lens) = (vec![0; 8], vec![0; 8], vec![7u32; 8]);
+                harvest_headers(&mut hdr_words, n, &mut lens, &mut flags, Some(&mut name_lens));
+                assert!(name_lens[..n].iter().all(|&len| len == 0xDEAD), "n {n}");
+                assert!(name_lens[n..].iter().all(|&len| len == 7), "n {n}: past the batch");
+            }
+        }
+
+        /// Both helpers panic on an undersized name buffer rather than overrunning it.
+        #[test]
+        fn an_undersized_name_buffer_panics_rather_than_overrunning() {
+            let caught = std::panic::catch_unwind(|| {
+                let (mut s, mut i, mut h) = buffers(4, SMALL_SLOT);
+                let mut names = vec![0u64; 4 * NAME_WORDS - 1];
+                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, Some(&mut names), 4);
+            });
+            assert!(caught.is_err(), "build_headers: an undersized names buffer must panic");
+            let caught = std::panic::catch_unwind(|| {
+                let (mut s, mut i, mut h) = buffers(4, SMALL_SLOT);
+                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, None, 4);
+                let (mut lens, mut flags, mut name_lens) = (vec![0; 4], vec![0; 4], vec![0u32; 3]);
+                harvest_headers(&mut h, 4, &mut lens, &mut flags, Some(&mut name_lens));
+            });
+            assert!(caught.is_err(), "harvest_headers: an undersized name_lens must panic");
+        }
+
+        /// `addr` as the kernel writes it into a `msg_name` slot: `socket2`'s encoding, an
+        /// implementation independent of [`parse_sockaddr`], padded to a whole
+        /// `sockaddr_storage`.
+        fn raw(addr: &socket2::SockAddr) -> (Vec<u8>, usize) {
+            let len = addr.len() as usize;
+            // SAFETY: `SockAddr::as_ptr` points at its `sockaddr_storage`, of which the first
+            // `len()` bytes are the initialized address.
+            let bytes = unsafe { std::slice::from_raw_parts(addr.as_ptr().cast::<u8>(), len) };
+            let mut buf = vec![0u8; STORAGE_BYTES as usize];
+            buf[..len].copy_from_slice(bytes);
+            (buf, len)
+        }
+
+        fn parsed(addr: SocketAddr) -> Option<RawSender<'static>> {
+            let (buf, len) = raw(&addr.into());
+            match parse_sockaddr(&buf, len)? {
+                RawSender::Ip(addr) => Some(RawSender::Ip(addr)),
+                RawSender::Unix(_) => panic!("an IP address parsed as a Unix path"),
+            }
+        }
+
+        #[test]
+        fn parse_sockaddr_reads_an_ipv4_address_and_port() {
+            let addr = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 7).into(), 5140);
+            assert_eq!(parsed(addr), Some(RawSender::Ip(addr)));
+        }
+
+        #[test]
+        fn parse_sockaddr_reads_an_ipv6_address_and_port() {
+            let ip: Ipv6Addr = "2001:db8::1:2".parse().unwrap();
+            let addr = SocketAddr::new(ip.into(), 65535);
+            assert_eq!(parsed(addr), Some(RawSender::Ip(addr)));
+        }
+
+        /// A dual-stack socket's IPv4 sender parses as the mapped IPv6 address, which
+        /// `PeerAttrs::from_socket` then writes as IPv4.
+        #[test]
+        fn parse_sockaddr_keeps_an_ipv4_mapped_address_for_peer_attrs_to_unmap() {
+            let mapped: IpAddr = Ipv4Addr::new(192, 0, 2, 7).to_ipv6_mapped().into();
+            let addr = SocketAddr::new(mapped, 1);
+            assert_eq!(parsed(addr), Some(RawSender::Ip(addr)));
+            let mut events = vec![logit_core::Event::empty(0, logit_core::AttrMap::new())];
+            crate::peer::PeerAttrs::from_socket(addr).stamp(&mut events);
+            assert_eq!(
+                events[0].attributes.get(crate::peer::PEER_ADDRESS).and_then(|v| v.as_str()),
+                Some("192.0.2.7")
+            );
+        }
+
+        #[test]
+        fn parse_sockaddr_reads_a_unix_path_with_or_without_its_terminator() {
+            let (buf, len) = raw(&socket2::SockAddr::unix("/run/client.sock").unwrap());
+            assert_eq!(parse_sockaddr(&buf, len), Some(RawSender::Unix(b"/run/client.sock")));
+            // One byte shorter drops the NUL the encoding counts, if it counts one.
+            let exact = len - usize::from(buf[len - 1] == 0);
+            assert_eq!(parse_sockaddr(&buf, exact), Some(RawSender::Unix(b"/run/client.sock")));
+        }
+
+        /// No usable sender: an unbound Unix sender's `0`, an unnamed or abstract Unix address,
+        /// a length shorter than its family's struct, and a family this socket never reports.
+        #[test]
+        fn parse_sockaddr_finds_no_sender_where_there_is_none() {
+            let unix_family = (libc::AF_UNIX as libc::sa_family_t).to_ne_bytes();
+            let mut unnamed = vec![0u8; STORAGE_BYTES as usize];
+            unnamed[..2].copy_from_slice(&unix_family);
+            assert_eq!(parse_sockaddr(&unnamed, 0), None, "an unbound sender's length");
+            assert_eq!(parse_sockaddr(&unnamed, 2), None, "an unnamed address");
+            let mut abstract_name = unnamed.clone();
+            abstract_name[3..6].copy_from_slice(b"dsd");
+            assert_eq!(parse_sockaddr(&abstract_name, 6), None, "an abstract address");
+
+            let (v4, v4_len) = raw(&SocketAddr::from(([192, 0, 2, 7], 1)).into());
+            assert_eq!(parse_sockaddr(&v4, v4_len - 1), None, "a short IPv4 address");
+            assert_eq!(parse_sockaddr(&v4, 1), None, "shorter than a family");
+            let (v6, v6_len) = raw(&SocketAddr::from((Ipv6Addr::LOCALHOST, 1)).into());
+            assert_eq!(parse_sockaddr(&v6, v6_len - 1), None, "a short IPv6 address");
+
+            let mut other = v4.clone();
+            other[..2].copy_from_slice(&(libc::AF_PACKET as libc::sa_family_t).to_ne_bytes());
+            assert_eq!(parse_sockaddr(&other, v4_len), None, "another family");
+        }
+
+        /// A `len` past the buffer is clamped to it, never read past.
+        #[test]
+        fn parse_sockaddr_clamps_a_length_past_the_buffer() {
+            let (buf, _) = raw(&socket2::SockAddr::unix("/a").unwrap());
+            assert_eq!(parse_sockaddr(&buf, 10_000), Some(RawSender::Unix(b"/a")));
+        }
+
+        fn words(addr: &socket2::SockAddr) -> (Vec<u64>, u32) {
+            let (buf, len) = raw(addr);
+            let words = buf.as_chunks::<8>().0.iter().map(|b| u64::from_ne_bytes(*b)).collect();
+            (words, len as u32)
+        }
+
+        /// The words-to-[`Sender`] step, and its reuse of a repeated Unix path's buffer.
+        #[test]
+        fn sender_of_reuses_a_repeated_unix_path_and_replaces_a_new_one() {
+            let mut last = None;
+            let (a, a_len) = words(&socket2::SockAddr::unix("/run/a.sock").unwrap());
+            let (b, b_len) = words(&socket2::SockAddr::unix("/run/b.sock").unwrap());
+            let path = |sender: Option<Sender>| match sender {
+                Some(Sender::Unix(path)) => path,
+                other => panic!("expected a Unix sender, got {other:?}"),
+            };
+            let first = path(sender_of(&a, a_len, &mut last));
+            let again = path(sender_of(&a, a_len, &mut last));
+            assert_eq!(first, Bytes::from_static(b"/run/a.sock"));
+            assert_eq!(first.as_ptr(), again.as_ptr(), "a repeated path shares one buffer");
+            assert_eq!(path(sender_of(&b, b_len, &mut last)), Bytes::from_static(b"/run/b.sock"));
+
+            let addr = SocketAddr::from(([192, 0, 2, 7], 9));
+            let (ip, ip_len) = words(&addr.into());
+            assert_eq!(sender_of(&ip, ip_len, &mut last), Some(Sender::Ip(addr)));
+            assert_eq!(sender_of(&ip, 0, &mut last), None);
         }
     }
 
@@ -3152,7 +3614,8 @@ mod tests {
                 telemetry.clone(),
                 Diagnostics::default(),
                 shutdown_rx,
-                read_batch
+                read_batch,
+                false
             ),
             decode_loop(
                 &mut decoder,
@@ -3287,6 +3750,7 @@ mod tests {
             Diagnostics::default(),
             shutdown_rx,
             64,
+            false,
         );
         tokio::pin!(read);
         let mut stamps: Vec<i64> = Vec::with_capacity(BURST);
@@ -3359,6 +3823,7 @@ mod tests {
             Diagnostics::default(),
             shutdown_rx,
             64,
+            false,
         );
         tokio::pin!(read);
         let datagram = tokio::select! {
@@ -3438,6 +3903,7 @@ mod tests {
                 Diagnostics::default(),
                 shutdown_rx,
                 64,
+                false,
             ),
         )
         .await
@@ -3520,7 +3986,13 @@ mod tests {
         let addr = socket.local_addr().expect("a bound socket has an address");
         let queue = test_queue(OverflowPolicy::Block, 4, &telemetry);
         for i in 0..3u32 {
-            queue.push(Datagram { bytes: Bytes::from(format!("pre-{i}")), received_at: 0 }).await;
+            queue
+                .push(Datagram {
+                    bytes: Bytes::from(format!("pre-{i}")),
+                    received_at: 0,
+                    peer: None,
+                })
+                .await;
         }
 
         // More than a batch, so the read half holds a remainder it can't place.
@@ -3537,6 +4009,7 @@ mod tests {
             Diagnostics::default(),
             shutdown_rx,
             64,
+            false,
         );
         tokio::pin!(read);
 
@@ -3800,6 +4273,7 @@ mod tests {
                     Diagnostics::default(),
                     shutdown_rx,
                     64,
+                    false,
                 ),
             )
             .await
@@ -3859,6 +4333,7 @@ mod tests {
             Diagnostics::default(),
             shutdown_rx,
             64,
+            false,
         ));
 
         let mut events = Vec::new();
@@ -3913,6 +4388,7 @@ mod tests {
             Diagnostics::default(),
             shutdown_rx,
             64,
+            false,
         ));
         let pending =
             std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx).is_pending())).await;
@@ -3935,7 +4411,11 @@ mod tests {
         let queue = test_queue(OverflowPolicy::Block, 5, &telemetry);
         for payload in ["a", "bb", "ccc", "dddd", "eeeee"] {
             queue
-                .push(Datagram { bytes: Bytes::from_static(payload.as_bytes()), received_at: 0 })
+                .push(Datagram {
+                    bytes: Bytes::from_static(payload.as_bytes()),
+                    received_at: 0,
+                    peer: None,
+                })
                 .await;
         }
         let (fanout, mut rx) = recording_fanout(1);
@@ -4115,7 +4595,11 @@ mod tests {
             }
         });
         let push = |i: usize| {
-            queue.push(Datagram { bytes: Bytes::from(format!("msg-{i}")), received_at: 0 })
+            queue.push(Datagram {
+                bytes: Bytes::from(format!("msg-{i}")),
+                received_at: 0,
+                peer: None,
+            })
         };
 
         let start = tokio::time::Instant::now();
@@ -4168,7 +4652,9 @@ mod tests {
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         let queue = test_queue(OverflowPolicy::DropOldest, 4, &telemetry);
-        queue.push(Datagram { bytes: Bytes::from_static(b"only"), received_at: 0 }).await;
+        queue
+            .push(Datagram { bytes: Bytes::from_static(b"only"), received_at: 0, peer: None })
+            .await;
 
         let (first_tx, mut first_rx) = mpsc::channel(8);
         let (second_tx, mut second_rx) = mpsc::channel(1);
@@ -4208,5 +4694,165 @@ mod tests {
         assert_eq!(counter(&events, "logit.component.receive.flushed"), 1.0);
         assert_eq!(counter(&events, "logit.component.events.dropped"), 0.0);
         assert_eq!(shutdown_drops(&events), (0.0, 0.0), "the datagram was decoded, not dropped");
+    }
+
+    // -- `peer:` (`UdpListener::with_peer`) -------------------------------------------------------
+
+    use crate::peer::{PEER_ADDRESS, PEER_PORT};
+    use logit_pipeline::test_util::{fanout_channel, recv_events, scratch_dir, spawn_input};
+
+    /// One event per send, so each event's attributes are its own datagram's.
+    fn one_event_per_datagram() -> UdpListenerConfig {
+        UdpListenerConfig {
+            batch_max_events: 1,
+            batch_flush_interval: Duration::ZERO,
+            ..UdpListenerConfig::default()
+        }
+    }
+
+    fn peer_of(event: &Event) -> (Option<&str>, Option<&logit_core::Value>) {
+        (
+            event.attributes.get(PEER_ADDRESS).and_then(logit_core::Value::as_str),
+            event.attributes.get(PEER_PORT),
+        )
+    }
+
+    /// Binds `listener` and runs it, returning its address and the delivery channel.
+    async fn start_udp(
+        mut listener: UdpListener<TestDecoder>,
+    ) -> (
+        std::net::SocketAddr,
+        logit_pipeline::test_util::Running,
+        mpsc::Receiver<logit_pipeline::Delivered>,
+    ) {
+        listener.bind().await.expect("bind should succeed");
+        let addr = listener.local_addr().expect("a bound UDP listener has an address");
+        let (fanout, rx) = fanout_channel(64);
+        (addr, spawn_input(listener, fanout).await, rx)
+    }
+
+    /// Two senders interleaved each get their own address and port on every event, through the
+    /// read half's `msg_name` slots and the decode loop's cache, which changes sender at every
+    /// datagram here.
+    #[tokio::test]
+    async fn peer_stamps_each_udp_senders_own_address_and_port() {
+        let listener =
+            UdpListener::new("127.0.0.1:0", TestDecoder::new(), one_event_per_datagram())
+                .with_peer(true);
+        let (addr, running, mut rx) = start_udp(listener).await;
+        let a = bind_ephemeral().await;
+        let b = bind_ephemeral().await;
+        let ports = [
+            ("a", i64::from(a.local_addr().unwrap().port())),
+            ("b", i64::from(b.local_addr().unwrap().port())),
+        ];
+        for i in 0..4 {
+            a.send_to(format!("a-{i}").as_bytes(), addr).await.unwrap();
+            b.send_to(format!("b-{i}").as_bytes(), addr).await.unwrap();
+        }
+
+        let events = recv_events(&mut rx, 8).await;
+        assert_eq!(events.len(), 8);
+        for event in &events {
+            let payload = payload(event);
+            let (_, port) = ports.iter().find(|(name, _)| payload.starts_with(name)).unwrap();
+            assert_eq!(
+                peer_of(event),
+                (Some("127.0.0.1"), Some(&logit_core::Value::I64(*port))),
+                "datagram {payload} must carry its own sender's port"
+            );
+        }
+        running.stop().await;
+    }
+
+    /// With `peer` off, the default, a datagram's event carries only what the decoder wrote.
+    #[tokio::test]
+    async fn without_peer_a_udp_event_carries_no_peer_attribute() {
+        let listener =
+            UdpListener::new("127.0.0.1:0", TestDecoder::new(), one_event_per_datagram());
+        let (addr, running, mut rx) = start_udp(listener).await;
+        bind_ephemeral().await.send_to(b"plain", addr).await.unwrap();
+
+        let events = recv_events(&mut rx, 1).await;
+        assert_eq!(peer_of(&events[0]), (None, None));
+        assert_eq!(events[0].attributes.len(), 1, "the decoder's payload attribute only");
+        running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn peer_stamps_an_ipv6_udp_sender() {
+        let mut listener =
+            UdpListener::new("[::1]:0", TestDecoder::new(), one_event_per_datagram())
+                .with_peer(true);
+        if let Err(err) = listener.bind().await {
+            println!("skipping: this environment has no usable IPv6 loopback ({err})");
+            return;
+        }
+        let (addr, running, mut rx) = start_udp(listener).await;
+        let sender = UdpSocket::bind("[::1]:0").await.unwrap();
+        let port = i64::from(sender.local_addr().unwrap().port());
+        sender.send_to(b"six", addr).await.unwrap();
+
+        let events = recv_events(&mut rx, 1).await;
+        assert_eq!(peer_of(&events[0]), (Some("::1"), Some(&logit_core::Value::I64(port))));
+        running.stop().await;
+    }
+
+    /// Binds a Unix datagram listener at `path` with `peer: true` and runs it.
+    async fn start_unix_datagram(
+        path: &Path,
+    ) -> (logit_pipeline::test_util::Running, mpsc::Receiver<logit_pipeline::Delivered>) {
+        let listener = UdpListener::unix(
+            "statsd_in",
+            path,
+            0o660,
+            TestDecoder::new(),
+            one_event_per_datagram(),
+        )
+        .with_peer(true);
+        let (fanout, rx) = fanout_channel(64);
+        (spawn_input(listener, fanout).await, rx)
+    }
+
+    /// A Unix datagram sender that bound a path reports it, with no port. Two bound senders
+    /// interleaved keep their own paths.
+    #[tokio::test]
+    async fn peer_stamps_a_bound_unix_datagram_senders_path_and_no_port() {
+        let dir = scratch_dir("udp-peer-unix-bound");
+        let path = dir.join("listen.sock");
+        let (running, mut rx) = start_unix_datagram(&path).await;
+        let a_path = dir.join("a.sock");
+        let b_path = dir.join("b.sock");
+        let a = tokio::net::UnixDatagram::bind(&a_path).unwrap();
+        let b = tokio::net::UnixDatagram::bind(&b_path).unwrap();
+        for i in 0..3 {
+            a.send_to(format!("a-{i}").as_bytes(), &path).await.unwrap();
+            b.send_to(format!("b-{i}").as_bytes(), &path).await.unwrap();
+        }
+
+        let events = recv_events(&mut rx, 6).await;
+        for event in &events {
+            let payload = payload(event);
+            let expected = if payload.starts_with('a') { &a_path } else { &b_path };
+            assert_eq!(
+                peer_of(event),
+                (expected.to_str(), None),
+                "datagram {payload} must carry its own sender's path"
+            );
+        }
+        running.stop().await;
+    }
+
+    /// The usual Unix datagram client binds no path, so there is nothing to stamp.
+    #[tokio::test]
+    async fn peer_stamps_nothing_for_an_unbound_unix_datagram_sender() {
+        let path = scratch_dir("udp-peer-unix-unbound").join("listen.sock");
+        let (running, mut rx) = start_unix_datagram(&path).await;
+        let client = tokio::net::UnixDatagram::unbound().unwrap();
+        client.send_to(b"anonymous", &path).await.unwrap();
+
+        let events = recv_events(&mut rx, 1).await;
+        assert_eq!(peer_of(&events[0]), (None, None));
+        running.stop().await;
     }
 }
