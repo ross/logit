@@ -116,6 +116,13 @@ impl CollectdInput {
         self
     }
 
+    /// Stamps each event with the address of the datagram's sender (`peer:`); see
+    /// [`crate::peer::PeerAttrs`].
+    pub fn with_peer(mut self, peer: bool) -> Self {
+        self.inner = self.inner.with_peer(peer);
+        self
+    }
+
     /// The configured `receive:` knobs, for `logit-cli::pipeline`'s wiring tests.
     pub fn receive_config(&self) -> UdpListenerConfig {
         self.inner.config()
@@ -269,6 +276,30 @@ mod tests {
         assert_eq!(names, vec!["load.load.shortterm", "load.load.midterm", "load.load.longterm"]);
 
         handle.abort();
+    }
+
+    /// `with_peer` reaches the datagram driver: the sender's address lands beside the decoded
+    /// `collectd.*` attributes.
+    #[tokio::test]
+    async fn with_peer_stamps_the_senders_address() {
+        use crate::peer::{PEER_ADDRESS, PEER_PORT};
+        use logit_pipeline::test_util::{fanout_channel, recv_events, spawn_input};
+
+        let mut input = CollectdInput::new("127.0.0.1:0").with_peer(true);
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("bind() should leave a real address behind");
+        let (fanout, mut rx) = fanout_channel(8);
+        let running = spawn_input(input, fanout).await;
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("sender should bind");
+        let port = sender.local_addr().unwrap().port();
+        sender.send_to(&single_gauge_packet(), addr).await.expect("send_to should succeed");
+
+        let events = recv_events(&mut rx, 1).await;
+        let attrs = &events[0].attributes;
+        assert_eq!(attrs.get(PEER_ADDRESS), Some(&Value::from("127.0.0.1")));
+        assert_eq!(attrs.get(PEER_PORT), Some(&Value::I64(i64::from(port))));
+        assert_eq!(attrs.get("collectd.host"), Some(&Value::from("web-1")));
+        running.stop().await;
     }
 
     /// `with_diagnostics` reaches the decoder too; dropping `.map_decoder(..)` still compiles.

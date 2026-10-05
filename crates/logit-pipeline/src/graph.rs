@@ -247,6 +247,9 @@
 //!     `datadog_trace_in` without `socket`: there's no socket file for it to apply to. A malformed
 //!     value is a parse error, not a graph rule
 //!     (`docs/adr/datadog-agent-and-intake-relay.md`).
+//! 79. `proxy_protocol: true` on a `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` whose
+//!     transport isn't `tcp`: a PROXY header leads a TCP stream from a network proxy
+//!     (`docs/adr/listener-peer-address.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3624,6 +3627,44 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         );
     }
 
+    // Rule 79: `proxy_protocol: true` off TCP. A PROXY header is written by a network proxy ahead
+    // of a TCP stream; a datagram has no stream to lead, and a Unix socket's peer is local.
+    for (id, component) in &components {
+        let (kind_name, transport) = match &component.kind {
+            ComponentKind::SyslogIn { proxy_protocol: true, transport, .. } => {
+                ("syslog_in", (*transport != SyslogTransport::Tcp).then_some("udp"))
+            }
+            ComponentKind::GraphiteIn { proxy_protocol: true, transport, .. } => {
+                ("graphite_in", (*transport != GraphiteTransport::Tcp).then_some("udp"))
+            }
+            ComponentKind::StatsdIn { proxy_protocol: true, transport, .. } => (
+                "statsd_in",
+                match transport {
+                    StatsdTransport::Tcp => None,
+                    StatsdTransport::Udp => Some("udp"),
+                    StatsdTransport::Unix => Some("unix"),
+                    StatsdTransport::UnixStream => Some("unix_stream"),
+                },
+            ),
+            ComponentKind::LinesIn { proxy_protocol: true, transport, .. } => (
+                "lines_in",
+                match transport {
+                    LinesTransport::Tcp => None,
+                    LinesTransport::Udp => Some("udp"),
+                    LinesTransport::Unix => Some("unix"),
+                    LinesTransport::UnixStream => Some("unix_stream"),
+                },
+            ),
+            _ => continue,
+        };
+        if let Some(transport) = transport {
+            anyhow::bail!(
+                "component '{id}': {kind_name} 'proxy_protocol' needs 'transport: tcp', not \
+                 '{transport}' -- a PROXY header comes from a network proxy ahead of a TCP stream"
+            );
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is fixed here, once (see [`targets_of`]).
@@ -4010,6 +4051,8 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
             socket_mode: None,
         }
     }
@@ -8243,6 +8286,8 @@ mod tests {
             handshake_timeout,
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
         }
     }
 
@@ -8258,6 +8303,8 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
         }
     }
 
@@ -10520,6 +10567,7 @@ mod tests {
         ComponentKind::CollectdIn {
             bind: "0.0.0.0:25826".to_string(),
             types_db: types_db.into_iter().map(std::path::PathBuf::from).collect(),
+            peer: false,
         }
     }
 
@@ -10613,6 +10661,8 @@ mod tests {
             handshake_timeout,
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
             max_line_bytes,
             max_frame_bytes,
         }
@@ -10631,6 +10681,8 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
             max_line_bytes: 8192,
             max_frame_bytes: 1 << 20,
         }
@@ -11655,6 +11707,8 @@ mod tests {
             handshake_timeout,
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
             socket_mode: None,
         }
     }
@@ -11671,6 +11725,8 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
             socket_mode: None,
         }
     }
@@ -11790,6 +11846,8 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
             socket_mode: None,
         }
     }
@@ -11983,6 +12041,8 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
             max_line_bytes: 64 * 1024,
             socket_mode: None,
         }
@@ -12241,6 +12301,110 @@ mod tests {
             assert!(err.contains("'in'"), "got: {err}");
             assert!(err.contains("'max_line_bytes' must be greater than 0"), "got: {err}");
         }
+    }
+
+    // ---- `peer` -------------------------------------------------------------------------------
+
+    /// Every shared-driver listener takes `peer: true` on every transport it offers.
+    #[test]
+    fn peer_resolves_on_every_transport() {
+        for json in [
+            r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "peer": true}"#,
+            r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "transport": "tcp", "peer": true}"#,
+            r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix",
+                "peer": true}"#,
+            r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix_stream",
+                "peer": true}"#,
+            r#"{"type": "syslog_in", "bind": "127.0.0.1:0", "peer": true}"#,
+            r#"{"type": "syslog_in", "bind": "127.0.0.1:0", "transport": "tcp", "peer": true}"#,
+            r#"{"type": "graphite_in", "bind": "127.0.0.1:0", "peer": true}"#,
+            r#"{"type": "graphite_in", "bind": "127.0.0.1:0", "transport": "udp", "peer": true}"#,
+            r#"{"type": "lines_in", "bind": "127.0.0.1:0", "peer": true}"#,
+            r#"{"type": "lines_in", "bind": "127.0.0.1:0", "transport": "udp", "peer": true}"#,
+            r#"{"type": "lines_in", "bind": "/tmp/lines.socket", "transport": "unix",
+                "peer": true}"#,
+            r#"{"type": "lines_in", "bind": "/tmp/lines.socket", "transport": "unix_stream",
+                "peer": true}"#,
+            r#"{"type": "collectd_in", "bind": "127.0.0.1:0", "peer": true}"#,
+        ] {
+            let kind = listener_from_json(json);
+            resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+                .unwrap_or_else(|err| panic!("{json} should resolve: {err}"));
+        }
+    }
+
+    // ---- rule 79: `proxy_protocol` ------------------------------------------------------------
+
+    /// Rule 79: every stream listener takes `proxy_protocol: true` under `transport: tcp`.
+    #[test]
+    fn rule_79_proxy_protocol_resolves_on_tcp() {
+        for json in [
+            r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "transport": "tcp",
+                "proxy_protocol": true}"#,
+            r#"{"type": "syslog_in", "bind": "127.0.0.1:0", "transport": "tcp",
+                "proxy_protocol": true, "peer": true}"#,
+            r#"{"type": "graphite_in", "bind": "127.0.0.1:0", "proxy_protocol": true}"#,
+            r#"{"type": "lines_in", "bind": "127.0.0.1:0", "proxy_protocol": true,
+                "tls": {"cert_file": "server.pem", "key_file": "server.key"}}"#,
+        ] {
+            let kind = listener_from_json(json);
+            resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+                .unwrap_or_else(|err| panic!("{json} should resolve: {err}"));
+        }
+    }
+
+    /// Rule 79: a datagram or Unix transport has no network proxy in front of a TCP stream.
+    #[test]
+    fn rule_79_rejects_proxy_protocol_off_tcp() {
+        for (json, transport) in [
+            (r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "proxy_protocol": true}"#, "udp"),
+            (
+                r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix",
+                    "proxy_protocol": true}"#,
+                "unix",
+            ),
+            (
+                r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix_stream",
+                    "proxy_protocol": true}"#,
+                "unix_stream",
+            ),
+            (r#"{"type": "syslog_in", "bind": "127.0.0.1:0", "proxy_protocol": true}"#, "udp"),
+            (
+                r#"{"type": "graphite_in", "bind": "127.0.0.1:0", "transport": "udp",
+                    "proxy_protocol": true}"#,
+                "udp",
+            ),
+            (
+                r#"{"type": "lines_in", "bind": "127.0.0.1:0", "transport": "udp",
+                    "proxy_protocol": true}"#,
+                "udp",
+            ),
+            (
+                r#"{"type": "lines_in", "bind": "/tmp/lines.socket", "transport": "unix",
+                    "proxy_protocol": true}"#,
+                "unix",
+            ),
+            (
+                r#"{"type": "lines_in", "bind": "/tmp/lines.socket", "transport": "unix_stream",
+                    "proxy_protocol": true}"#,
+                "unix_stream",
+            ),
+        ] {
+            let kind = listener_from_json(json);
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains("'proxy_protocol' needs 'transport: tcp'"), "{json}: {err}");
+            assert!(err.contains(&format!("not '{transport}'")), "{json}: {err}");
+        }
+    }
+
+    /// Rule 79: `proxy_protocol: false` stays legal on every transport.
+    #[test]
+    fn rule_79_allows_proxy_protocol_false_off_tcp() {
+        let kind = listener_from_json(
+            r#"{"type": "lines_in", "bind": "127.0.0.1:0", "transport": "udp",
+                "proxy_protocol": false}"#,
+        );
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())])).unwrap();
     }
 
     // ---- rule 71: lua / lua_file max_memory ------------------------------------------------

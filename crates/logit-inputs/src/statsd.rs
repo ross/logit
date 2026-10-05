@@ -382,8 +382,9 @@ impl StatsdInput {
         self
     }
 
-    /// Sets a **TCP** listener's per-phase pre-message budget (`handshake_timeout:`): the TLS
-    /// accept and the wait for the first byte (`crate::tcp`'s "Pre-handshake timeout").
+    /// Sets a **TCP** listener's per-phase pre-message budget (`handshake_timeout:`): the PROXY
+    /// header under `proxy_protocol:`, the TLS accept when `tls:` is set, then the wait for the
+    /// first byte (`crate::tcp`'s "Pre-handshake timeout").
     ///
     /// A UDP listener is left untouched rather than failing, since it has no connection to bound;
     /// graph rule 45 rejects a non-default value there. `tls:` differs ([`Self::with_tls`] fails):
@@ -404,6 +405,26 @@ impl StatsdInput {
     pub fn with_idle_timeout(mut self, idle_timeout: Option<std::time::Duration>) -> Self {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_idle_timeout(idle_timeout));
+        }
+        self
+    }
+
+    /// Stamps each event with the address of the peer that sent it (`peer:`); see
+    /// [`crate::peer::PeerAttrs`].
+    pub fn with_peer(mut self, peer: bool) -> Self {
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(listener.with_peer(peer)),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_peer(peer)),
+        };
+        self
+    }
+
+    /// Requires a PROXY protocol header on every TCP connection (`proxy_protocol:`); see
+    /// [`TcpListener::with_proxy_protocol`]. A datagram listener is left untouched, and graph rule
+    /// 79 rejects the option there and on a Unix stream socket.
+    pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_proxy_protocol(proxy_protocol));
         }
         self
     }
@@ -2136,6 +2157,86 @@ mod tests {
 
         running.shutdown.send(true).ok();
         running.handle.abort();
+    }
+
+    /// `peer: true` stamps the observed sender over a DogStatsD tag of the same name, and leaves
+    /// the line's other tags alone.
+    #[tokio::test]
+    async fn peer_replaces_a_tag_of_the_same_name() {
+        use crate::peer::{PEER_ADDRESS, PEER_PORT};
+
+        let mut running = start_tcp(|input| input.with_peer(true)).await;
+        let mut client = running.connect().await;
+        let port = client.local_addr().unwrap().port();
+        client
+            .write_all(b"hits:1|c|#network.peer.address:203.0.113.9,network.peer.port:1,env:prod\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let events = running.next_events("the tagged line").await;
+        let attrs = &events[0].attributes;
+        assert_eq!(attrs.get(PEER_ADDRESS).and_then(Value::as_str), Some("127.0.0.1"));
+        assert_eq!(attrs.get(PEER_PORT), Some(&Value::I64(i64::from(port))));
+        assert_eq!(attrs.get("env").and_then(Value::as_str), Some("prod"));
+
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    /// `proxy_protocol: true` stamps the header's origin over a DogStatsD tag of the same name.
+    #[tokio::test]
+    async fn a_proxy_header_origin_replaces_a_tag_of_the_same_name() {
+        use crate::peer::{CLIENT_ADDRESS, CLIENT_PORT};
+
+        let mut running = start_tcp(|input| input.with_proxy_protocol(true)).await;
+        let mut client = running.connect().await;
+        client
+            .write_all(
+                b"PROXY TCP4 198.51.100.7 192.0.2.1 40000 8125\r\n\
+                  hits:1|c|#client.address:203.0.113.9,client.port:1,env:prod\n",
+            )
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let events = running.next_events("the tagged line").await;
+        let attrs = &events[0].attributes;
+        assert_eq!(attrs.get(CLIENT_ADDRESS).and_then(Value::as_str), Some("198.51.100.7"));
+        assert_eq!(attrs.get(CLIENT_PORT), Some(&Value::I64(40000)));
+        assert_eq!(attrs.get("env").and_then(Value::as_str), Some("prod"));
+
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    /// The same over UDP: the datagram driver's stamp replaces the decoded tag too.
+    #[tokio::test]
+    async fn peer_replaces_a_tag_of_the_same_name_over_udp() {
+        use crate::peer::{PEER_ADDRESS, PEER_PORT};
+        use logit_pipeline::test_util::{fanout_channel, recv_events, spawn_input};
+
+        let mut input = StatsdInput::new("127.0.0.1:0").with_peer(true);
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("a bound UDP listener has an address");
+        let (fanout, mut rx) = fanout_channel(8);
+        let running = spawn_input(input, fanout).await;
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = client.local_addr().unwrap().port();
+        client
+            .send_to(
+                b"hits:1|c|#network.peer.address:203.0.113.9,network.peer.port:1,env:prod",
+                addr,
+            )
+            .await
+            .unwrap();
+
+        let events = recv_events(&mut rx, 1).await;
+        let attrs = &events[0].attributes;
+        assert_eq!(attrs.get(PEER_ADDRESS).and_then(Value::as_str), Some("127.0.0.1"));
+        assert_eq!(attrs.get(PEER_PORT), Some(&Value::I64(i64::from(port))));
+        assert_eq!(attrs.get("env").and_then(Value::as_str), Some("prod"));
+        running.stop().await;
     }
 
     /// Two concurrent clients both deliver (`crate::tcp`'s "Batching is per connection"): the

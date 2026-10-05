@@ -1,0 +1,42 @@
+# Plain lines from behind HAProxy, with both the original client and the proxy recorded on each
+# event. HAProxy opens every connection with a PROXY protocol header naming the client;
+# `proxy_protocol: true` reads it into `client.address` and `client.port`, and `peer: true` stamps
+# the socket peer, HAProxy itself, as `network.peer.address` and `network.peer.port`.
+#
+#   app --> HAProxy (send-proxy-v2) --> lines_in --> stdio_out (format: json)
+#
+# A matching HAProxy config, with `logit` reachable as `logit`:
+#
+#   frontend lines
+#       mode tcp
+#       bind :5170
+#       default_backend logit
+#   backend logit
+#       mode tcp
+#       server logit logit:5170 send-proxy-v2 check
+#
+# `send-proxy` (version 1, text) works the same. HAProxy's health check sends the header too while
+# the `server` line sets no `port` or `addr`; a check that sends none is refused and counted as
+# `logit.input.connections.rejected{reason="proxy_header"}`.
+#
+# Try it against `logit run fixtures/lines-behind-haproxy.yaml`, through the proxy:
+#
+#   printf 'hello\n' | nc -q1 HAPROXY_HOST 5170
+#
+# Connecting to port 5170 on `logit` directly sends no header, so the connection is closed and
+# counted the same way. Any client that can reach the port can also write its own header and name
+# any address, so in a real deployment only the proxy may reach it.
+components:
+  lines_in:
+    type: lines_in
+    bind: 0.0.0.0:5170
+    transport: tcp             # proxy_protocol: requires tcp
+    peer: true                 # network.peer.address/port: the proxy
+    proxy_protocol: true       # client.address/port: the client the header names
+    # handshake_timeout: 5s     # bounds the PROXY header, the TLS accept, and the first byte, each
+    #                             separately
+
+  stdout:
+    type: stdio_out
+    sources: [lines_in]
+    format: json

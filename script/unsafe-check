@@ -47,7 +47,8 @@ IMAGE=logit-unsafe-check:local
 # limits"). Add an entry when a new one lands.
 #
 #   parse_events            the `inotify_event` parser in tail/watch.rs
-#   batch_reader_helpers    udp.rs's `mmsghdr`/`iovec` construction and post-call harvest
+#   batch_reader_helpers    udp.rs's `mmsghdr`/`iovec`/`msg_name` construction, post-call harvest,
+#                           and the source-address parser `peer:` reads `msg_name` with
 #   reply_parsing           sockstat.rs's two `getsockopt` reply parsers, which take an
 #                           already-filled buffer, including a `mem::zeroed::<libc::tcp_info>()`
 #   hyperloglog, hll_       metric.rs's `HyperLogLog` codec; Stacked Borrows off, permissive provenance
@@ -73,8 +74,9 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # length shows up. Each sits above the largest allocation a valid input may make: `native_frame`'s
 # 65 admits a 64 MiB lz4 frame, which allocates its `uncompressed_len`, and the `native_batch_*`
 # targets' 64 admits `decode_batch_body`'s events `Vec` regrowing by doubling past its initial
-# 4,096: a batch of one-byte empty events at `max_len` regrows to about 56 MiB. `extra args` go to
-# `fuzz` only, never to `fuzz-tmin`.
+# 4,096: a batch of one-byte empty events at `max_len` regrows to about 56 MiB. `proxy_header`'s
+# `max_len` admits the largest PROXY v2 header, 16 plus 65,535 bytes, and one payload byte behind
+# it. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
 #
 # `native_batch` and `native_hop_batch` run in fork mode: the process-wide interner never evicts, so a
 # long-lived fuzz process accumulates every dictionary string it decodes until the arena outgrows
@@ -93,6 +95,7 @@ FUZZ_TARGETS=(
     "otlp_grpc|65536|16|"
     "prom_decompress|65536|16|"
     "prom_remote_write|65536|64|"
+    "proxy_header|65552|16|"
 )
 
 # The sanitizer builds' RUSTFLAGS differ from miri's and careful's, so they get their own volume
@@ -109,6 +112,10 @@ INJECT_SCENARIOS=(
     # The EINTR retry arm in `BatchReader::read_batch`, which a signal can't reach on a
     # non-blocking socket. EXPECT: the test passes, every datagram delivered.
     "udp-eintr-retry|recvmmsg:error=EINTR:when=2+3|-p logit-inputs --lib a_two_hundred_datagram_burst_is_delivered_complete_and_in_order"
+    # The same retry with `peer:` on, failing the first call so the retry is the one that reads
+    # addresses. EXPECT: the test passes, and the strace shows the injected `recvmmsg`, then one
+    # returning every datagram with `msg_namelen=128 => 16` on each.
+    "udp-peer-eintr-retry|recvmmsg:error=EINTR:when=1|-p logit-inputs --lib peer_stamps_each_udp_senders_own_address_and_port"
     # A fatal errno after two batches. EXPECT: the test fails, and the strace shows one injected
     # `recvmmsg` and then the process exiting: no retry, spin, or hang. The test panics on its
     # closed fanout, so the error message isn't checked here;

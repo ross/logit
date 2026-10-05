@@ -18,6 +18,7 @@ use logit_proto::native::{encode_batch, encode_hop_batch, SeqId, CODEC_BATCH, CO
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{decompress_bounded, Encoding};
 use logit_proto::prometheus::remote_write::Version;
+use logit_proto::proxy::V2_SIGNATURE;
 use logit_proto::{Signal, SignalEncoder, SignalPayload};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -225,6 +226,10 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         add("prom_remote_write", stem, prefixed(version_selector, &decompressed));
     }
 
+    for (name, bytes) in proxy_headers() {
+        add("proxy_header", name.to_string(), bytes);
+    }
+
     let mut skipped = Vec::new();
     for (target, files) in seeds.iter_mut() {
         files.retain(|name, bytes| {
@@ -244,6 +249,51 @@ fn with_prefix(prefix: &[u8], bare: &[u8]) -> Vec<u8> {
     out.extend_from_slice(bare);
     write_uvarint(&mut out, 0);
     out.to_vec()
+}
+
+/// PROXY protocol headers from HAProxy's `proxy-protocol.txt`, each followed by a payload line as
+/// a listener receives it: v1 for every family at its longest, and v2 for every command, family,
+/// and transport, one with TLVs after its address block.
+fn proxy_headers() -> Vec<(&'static str, Vec<u8>)> {
+    let payload = b"<13>hello\n";
+    let full = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
+    let v1 = |line: String| [line.as_bytes(), payload].concat();
+    let v2 = |ver_cmd: u8, fam: u8, body: &[u8]| {
+        let mut out = V2_SIGNATURE.to_vec();
+        out.extend_from_slice(&[ver_cmd, fam]);
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(payload);
+        out
+    };
+    let mut inet = vec![192, 168, 0, 1, 192, 168, 0, 11];
+    inet.extend_from_slice(&56324u16.to_be_bytes());
+    inet.extend_from_slice(&443u16.to_be_bytes());
+    let mut inet6 = [0x20, 0x01, 0x0d, 0xb8].repeat(8);
+    inet6.extend_from_slice(&[0xc0, 0x04, 0x01, 0xbb]);
+    let mut unix = vec![0u8; 216];
+    unix[..13].copy_from_slice(b"/run/app.sock");
+    let mut with_tlvs = inet.clone();
+    with_tlvs.extend_from_slice(&[0x02, 0x00, 0x0B]);
+    with_tlvs.extend_from_slice(b"example.com");
+    with_tlvs.extend_from_slice(&[0x05, 0x00, 0x04, 1, 2, 3, 4]);
+    vec![
+        ("v1-tcp4", v1("PROXY TCP4 192.168.0.1 192.168.0.11 56324 443\r\n".into())),
+        (
+            "v1-tcp4-longest",
+            v1("PROXY TCP4 255.255.255.255 255.255.255.255 65535 65535\r\n".into()),
+        ),
+        ("v1-tcp6", v1(format!("PROXY TCP6 {full} {full} 65535 65535\r\n"))),
+        ("v1-unknown", v1("PROXY UNKNOWN\r\n".into())),
+        ("v1-unknown-longest", v1(format!("PROXY UNKNOWN {full} {full} 65535 65535\r\n"))),
+        ("v2-local", v2(0x20, 0x00, &[])),
+        ("v2-unspec", v2(0x21, 0x00, &[])),
+        ("v2-tcp4", v2(0x21, 0x11, &inet)),
+        ("v2-udp4", v2(0x21, 0x12, &inet)),
+        ("v2-tcp6", v2(0x21, 0x21, &inet6)),
+        ("v2-unix-stream", v2(0x21, 0x31, &unix)),
+        ("v2-tcp4-tlvs", v2(0x21, 0x11, &with_tlvs)),
+    ]
 }
 
 fn prefixed(selector: u8, body: &[u8]) -> Vec<u8> {
@@ -314,6 +364,7 @@ mod tests {
                 "otlp_proto",
                 "prom_decompress",
                 "prom_remote_write",
+                "proxy_header",
                 "sketch_bytes",
                 "sketch_merge",
             ]

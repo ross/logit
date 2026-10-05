@@ -10,7 +10,8 @@
 #
 # A line ends at its `\n` (a trailing `\r` is stripped), so a multi-line message arrives as several
 # events. An unterminated last line when the sender closes is dropped and counted, never emitted.
-# Nothing about the sender is attached; stamp what you know with a `set` stage.
+# Nothing about the sender is attached unless `peer: true` is set; for a sender behind HAProxy,
+# see `fixtures/lines-behind-haproxy.yaml`.
 components:
   lines_in:
     type: lines_in
@@ -22,10 +23,12 @@ components:
     #   cert_file: server.pem   # required: this listener's own certificate chain
     #   key_file: server.key    # required: server.pem's private key
     #   client_ca_file: null    # set for mutual TLS; omit for server-auth-only TLS
-    # handshake_timeout: 5s     # tcp/unix_stream only; bounds the TLS accept and the wait for the
-    #                             first byte separately. Not an idle timeout
+    # handshake_timeout: 5s     # tcp/unix_stream only; bounds the PROXY header, the TLS accept,
+    #                             and the wait for the first byte separately. Not an idle timeout
     # idle_timeout: 5m          # off by default; closes a connection quiet for longer than this
     # max_connections: 1024     # tcp/unix_stream only; a connection past the cap is closed at once
+    # peer: false               # stamps the sender as network.peer.address and network.peer.port
+    # proxy_protocol: false     # tcp only; requires a PROXY header, stamps client.address/port
     # socket_mode: "0722"       # unix/unix_stream only; the socket file's mode, as a quoted string
 
   parse:

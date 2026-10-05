@@ -314,6 +314,11 @@ line.
 | `disk_queue`: peek_at over a cached window (no re-decode) | **0** | three records already read ahead: each `peek_at` clones a cached record's `Arc`, so re-peeking a window after a fault decodes nothing again |
 | `sink_queue`: peek_at over a window | **0** | a memory store's `peek_at(0..3)` through `SinkStore`: one lock and one `Arc` clone per batch |
 | accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR `decoupled-listener-io` -- see below |
+| `peer: true` stamp 100 statsd events | **0** | `logit_inputs::peer::PeerAttrs::stamp`, ADR `listener-peer-address`: the stream driver formats the address once per connection into a shared `Bytes`, so each event takes a reference-count increment and an `I64`, and the two keys fit inline beside the line's three tags. `peer: false` runs none of it, so no other listener row moves |
+| `peer: true` + `proxy_protocol: true` stamp 100 statsd events | **0** | `logit_inputs::peer::ConnectionAttrs::stamp`: a PROXY header's origin is a second shared `Bytes` built once per connection beside the peer's, so `client.*` costs what `network.peer.*` does, and the four keys still fit inline beside the line's three tags. Without either option the stream driver holds no `ConnectionAttrs` and runs none of it |
+| `peer: true` stamp 1 event of 7 attributes | **1** | the same stamp pushing an inline map past 8 entries: `AttrMap`'s ordinary spill, not a per-peer cost |
+| `peer: true` cached sender, stamp 100 statsd events | **0** | the datagram driver's path: `PeerCache::attrs_for` finds the sender unchanged since the previous datagram and returns its formatted attributes, so a run of datagrams from one sender costs what the stream driver's per-connection stamp does |
+| `peer: true` change of sender | **2** | `PeerCache::attrs_for` on a sender that differs from the previous datagram's: the address's `String` (plus one `realloc`) and the shared header its first `Bytes` clone adds. Paid once per change of sender, not per event. The read half adds nothing per datagram: each `recvmmsg` slot's `sockaddr_storage` is allocated with the slab, and a bound Unix sender's path is copied only when it differs from the last one read |
 | `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
 | `statsd_out` encode_into 100 events | **0** | measured through the same `FramedEncoder::encode_into` call as the syslog row (ADR `framed-encoder`), over 100 single-counter DogStatsD events: every per-metric buffer was a reused struct field from the start, and a statsd line has no timestamp to format, so a warm `MessageBuf` never touches the allocator |
 | `prometheus_out` encode 100 series (1 gauge family) | **414** | `events_to_families` + `text::write`, no `Encoder` trait (same ADR as the decode row above) -- ~4.1/series: one `String` label key/value pair, one `MetricFamily`/`Series` entry, and the rendered text line's own buffer growth per series; not yet optimized, tracked as follow-up work alongside the decode row above |
@@ -1114,7 +1119,9 @@ window of decoded `EventBatch`es outside both bounds.
 **Listeners bound undecoded bytes too.** [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)
 generalizes `SinkQueue` into `BoundedQueue<T: Queued>` and weighs a UDP listener's receive queue
 (`logit-inputs::udp::ReceiveQueue`) by `Datagram::weight()`: `bytes.len()` plus the struct's inline
-footprint. `receive.max_bytes` (default 32 MiB) bounds it. `receive.batch_max_bytes` (default 1 MiB)
+footprint, 80 bytes on x86-64, half of it the `Option<Sender>` that `peer:` fills (ADR
+`listener-peer-address`) and that every datagram carries either way. `receive.max_bytes` (default 32
+MiB) bounds it. `receive.batch_max_bytes` (default 1 MiB)
 is the independent bound one layer downstream, on `BatchAccumulator`'s not-yet-sent events.
 
 ### The batched read's slab: a fixed per-listener cost, mostly virtual
@@ -1139,6 +1146,10 @@ address space and a few tens of KiB of allocator bookkeeping, not its nominal si
 then tracks what traffic writes: one 4 KiB page per slot for any datagram up to 4 KiB, which covers
 every statsd or syslog datagram in practice. So the default's realistic steady state is the
 ~256-308 KiB column, not the 4 MiB one.
+
+`peer: true` adds one 128-byte `sockaddr_storage` per slot for the kernel to write each sender's
+address into (`BatchReader::names`): 8 KiB at the default `read_batch`, 128 KiB at the ceiling,
+allocated with the slab and never resized. `peer: false` allocates none.
 
 The table comes from a direct probe under the release profile, and the whole process agrees: across
 the `read_batch` sweep

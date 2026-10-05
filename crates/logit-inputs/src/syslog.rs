@@ -248,8 +248,9 @@ impl SyslogInput {
         self
     }
 
-    /// Sets a **TCP** listener's per-phase pre-message budget (`handshake_timeout:`): the TLS
-    /// accept and the wait for the first byte (`crate::tcp`'s "Pre-handshake timeout").
+    /// Sets a **TCP** listener's per-phase pre-message budget (`handshake_timeout:`): the PROXY
+    /// header under `proxy_protocol:`, the TLS accept when `tls:` is set, then the wait for the
+    /// first byte (`crate::tcp`'s "Pre-handshake timeout").
     ///
     /// A UDP listener is left untouched rather than failing, since it has no connection to bound;
     /// graph rule 45 rejects a non-default value there. `tls:` differs ([`Self::with_tls`] fails):
@@ -270,6 +271,26 @@ impl SyslogInput {
     pub fn with_idle_timeout(mut self, idle_timeout: Option<std::time::Duration>) -> Self {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_idle_timeout(idle_timeout));
+        }
+        self
+    }
+
+    /// Stamps each event with the address of the peer that sent it (`peer:`); see
+    /// [`crate::peer::PeerAttrs`].
+    pub fn with_peer(mut self, peer: bool) -> Self {
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(listener.with_peer(peer)),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_peer(peer)),
+        };
+        self
+    }
+
+    /// Requires a PROXY protocol header on every TCP connection (`proxy_protocol:`); see
+    /// [`TcpListener::with_proxy_protocol`]. A UDP listener is left untouched, and graph rule 79
+    /// rejects the option there.
+    pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_proxy_protocol(proxy_protocol));
         }
         self
     }
@@ -1085,6 +1106,28 @@ mod tests {
     fn decode_bytes(datagram: Vec<u8>) -> Vec<Event> {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
         decoder.decode(Bytes::from(datagram)).expect("decode should succeed").events
+    }
+
+    /// `with_peer` reaches the UDP driver: the sender's address lands on the decoded event.
+    #[tokio::test]
+    async fn with_peer_stamps_a_udp_senders_address() {
+        use crate::peer::{PEER_ADDRESS, PEER_PORT};
+        use logit_pipeline::test_util::{fanout_channel, recv_events, spawn_input};
+
+        let mut input = SyslogInput::new("127.0.0.1:0").with_peer(true);
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("a bound UDP listener has an address");
+        let (fanout, mut rx) = fanout_channel(8);
+        let running = spawn_input(input, fanout).await;
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = client.local_addr().unwrap().port();
+        client.send_to(b"<134>1 - host app - - - hello", addr).await.unwrap();
+
+        let events = recv_events(&mut rx, 1).await;
+        let attrs = &events[0].attributes;
+        assert_eq!(attrs.get(PEER_ADDRESS).and_then(Value::as_str), Some("127.0.0.1"));
+        assert_eq!(attrs.get(PEER_PORT), Some(&Value::I64(i64::from(port))));
+        running.stop().await;
     }
 
     /// `with_diagnostics` reaches the UDP decoder as well as the driver, so `bad_line` reports

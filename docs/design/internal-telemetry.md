@@ -712,6 +712,7 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 |---|---|---|
 | `logit.input.connections` | gauge | connections holding a permit, sampled on every connect and disconnect. Published by a drop guard (`crates/logit-inputs/src/listener.rs`), so a connection task that panics still counts itself out |
 | `logit.input.connections.rejected{reason="limit"}` | count | a connection closed at the connection cap, before any TLS handshake |
+| `logit.input.connections.rejected{reason="proxy_header"}` | count | a connection under `proxy_protocol: true` whose PROXY header was missing, malformed, cut short by the peer closing, or not complete within `handshake_timeout`; read before any TLS handshake |
 | `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
 | `logit.input.connections.closed{reason="idle"}` | count | an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
@@ -720,7 +721,8 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 The driver's `Diagnostics` keys: `framing_error` (any `frames.dropped` reason), `bad_frame` (a
 decoder that rejects a whole frame), `connection_error` (I/O, a TLS handshake that failed or
 timed out, or a connection that sent no first byte inside `handshake_timeout` and so gave its
-permit back; never an idle close), and `accept_error` (any `accept.errors` reason). These keys
+permit back; never an idle close, nor a reset before the connection's first payload byte), `proxy_header` (any `connections.rejected{reason="proxy_header"}`
+refusal), and `accept_error` (any `accept.errors` reason). These keys
 and the decoder's own `bad_line` throttle listener-wide rather than per connection, because a `Diagnostics` clone shares its original's
 counts ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md)'s
 2026-09-14 amendment). A peer looping connect / bad frame / close is throttled like any other
@@ -846,7 +848,9 @@ misconfiguration.
   (`docs/adr/graphite-carbon-relay.md`'s 2026-09-14 amendment) and reports exactly what a TCP
   `syslog_in` reports. `logit.input.connections.rejected{reason="limit"}` is the connection cap
   (`max_connections`, 1024 by default) binding; the listener rejects rather than queues because
-  carbon's wire has no way to say "try later". `logit.input.frames` / `.frame.bytes` count under
+  carbon's wire has no way to say "try later". Under `proxy_protocol: true`,
+  `logit.input.connections.rejected{reason="proxy_header"}` counts a connection refused for its
+  PROXY header. `logit.input.frames` / `.frame.bytes` count under
   **both** protocols, where one frame is one plaintext line or one pickle payload, counted at the
   size the decoder was handed (a pickle frame's 4-byte length prefix is stripped first, so the
   count is the payload, not the wire framing).
@@ -873,7 +877,8 @@ per-connection accumulator flushes as `receive.flushed{reason="closed"}` when a 
 `bad_line`/`bad_tag`/`bad_timestamp`/`non_finite_value`/`duplicate_tag_key`/`bad_pickle`; and the
 driver's `framing_error` (either oversize case above, or a partial frame discarded by an abrupt
 close), `bad_frame` (a framed payload the decoder rejected outright, pickle only, because the
-plaintext path isolates every failure per line), and `connection_error`. A `connection_error` is
+plaintext path isolates every failure per line), `connection_error`, and `proxy_header` under
+`proxy_protocol: true`. A `connection_error` is
 never fatal to the listener or its sibling connections.
 
 ##### `lines_in`

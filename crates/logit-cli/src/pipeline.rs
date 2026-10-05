@@ -382,6 +382,8 @@ fn build_spec(
             handshake_timeout,
             idle_timeout,
             max_connections,
+            peer,
+            proxy_protocol,
             socket_mode,
         } => {
             let mut input = match transport {
@@ -403,7 +405,10 @@ fn build_spec(
             // No-ops under UDP, where rules 45, 53, and 74 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
-            .with_max_connections(*max_connections);
+            .with_max_connections(*max_connections)
+            .with_peer(*peer)
+            // Rule 79 rejects it off `transport: tcp`.
+            .with_proxy_protocol(*proxy_protocol);
             // Off a Unix transport, rule 78 rejects a value.
             if let Some(mode) = socket_mode {
                 input = input.with_socket_mode(mode.bits());
@@ -423,6 +428,8 @@ fn build_spec(
             idle_timeout,
             max_connections,
             max_line_bytes,
+            peer,
+            proxy_protocol,
             socket_mode,
         } => {
             let mut input = match transport {
@@ -443,7 +450,10 @@ fn build_spec(
             // No-ops on a datagram transport, where rules 45, 53, and 74 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
-            .with_max_connections(*max_connections);
+            .with_max_connections(*max_connections)
+            .with_peer(*peer)
+            // Rule 79 rejects it off `transport: tcp`.
+            .with_proxy_protocol(*proxy_protocol);
             if let Some(mode) = socket_mode {
                 input = input.with_socket_mode(mode.bits());
             }
@@ -455,11 +465,12 @@ fn build_spec(
         // `types_db` paths resolve against the config file's directory, like every path here, and
         // are read at startup: a bad file stops the process before it reports ready rather than
         // leaving a listener with no data-source names.
-        CollectdIn { bind, types_db } => {
+        CollectdIn { bind, types_db, peer } => {
             let mut input = CollectdInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
-                .with_receive(receive_config(&component.receive));
+                .with_receive(receive_config(&component.receive))
+                .with_peer(*peer);
             if !types_db.is_empty() {
                 let paths: Vec<PathBuf> = types_db.iter().map(|p| base_dir.join(p)).collect();
                 let loaded = TypesDb::load(&paths)
@@ -483,6 +494,8 @@ fn build_spec(
             max_line_bytes,
             max_frame_bytes,
             max_connections,
+            peer,
+            proxy_protocol,
         } => {
             let mut input = GraphiteInput::new(
                 bind.clone(),
@@ -496,14 +509,26 @@ fn build_spec(
             .with_max_frame_bytes(*max_frame_bytes as usize)
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
-            .with_max_connections(*max_connections);
+            .with_max_connections(*max_connections)
+            .with_peer(*peer)
+            // Rule 79 rejects it off `transport: tcp`.
+            .with_proxy_protocol(*proxy_protocol);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
         // The `StatsdIn` arm's shape (`docs/adr/syslog-tcp-ingress-and-tls.md`).
-        SyslogIn { bind, transport, tls, handshake_timeout, idle_timeout, max_connections } => {
+        SyslogIn {
+            bind,
+            transport,
+            tls,
+            handshake_timeout,
+            idle_timeout,
+            max_connections,
+            peer,
+            proxy_protocol,
+        } => {
             let mut input = match transport {
                 logit_config::SyslogTransport::Udp => {
                     SyslogInput::new(bind.clone()).with_receive(receive_config(&component.receive))
@@ -516,7 +541,10 @@ fn build_spec(
             // No-ops under UDP, where rules 45, 53, and 74 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
-            .with_max_connections(*max_connections);
+            .with_max_connections(*max_connections)
+            .with_peer(*peer)
+            // Rule 79 rejects it off `transport: tcp`.
+            .with_proxy_protocol(*proxy_protocol);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -1958,6 +1986,8 @@ mod tests {
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
                 socket_mode: None,
             },
         }
@@ -2574,7 +2604,11 @@ mod tests {
             sources: vec![],
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
-            kind: ComponentKind::CollectdIn { bind: "127.0.0.1:0".to_string(), types_db },
+            kind: ComponentKind::CollectdIn {
+                bind: "127.0.0.1:0".to_string(),
+                types_db,
+                peer: false,
+            },
         }
     }
 
@@ -2637,6 +2671,8 @@ mod tests {
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
                 max_line_bytes: 8192,
                 max_frame_bytes: 1 << 20,
             },
@@ -2995,6 +3031,8 @@ mod tests {
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
             },
         }
     }
@@ -3173,6 +3211,8 @@ mod tests {
                 handshake_timeout: Duration::from_millis(50),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -3357,6 +3397,8 @@ mod tests {
             handshake_timeout: logit_config::default_handshake_timeout(),
             idle_timeout: None,
             max_connections: 1,
+            peer: false,
+            proxy_protocol: false,
         };
         let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
 
@@ -3484,6 +3526,8 @@ mod tests {
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -3507,6 +3551,8 @@ mod tests {
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
                 max_line_bytes: 8192,
                 max_frame_bytes: 1 << 20,
             },
@@ -3531,6 +3577,8 @@ mod tests {
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
                 socket_mode: None,
             },
         };
@@ -4796,6 +4844,8 @@ mod tests {
             handshake_timeout: logit_config::default_handshake_timeout(),
             idle_timeout: None,
             max_connections: logit_config::default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
             max_line_bytes: logit_config::default_lines_max_line_bytes(),
             socket_mode: None,
         }
@@ -4904,6 +4954,8 @@ mod tests {
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
                 socket_mode: None,
             },
         }

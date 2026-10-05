@@ -17,6 +17,7 @@ pub mod msgpack;
 pub mod native;
 pub mod otlp;
 pub mod prometheus;
+pub mod proxy;
 pub mod splunk;
 
 pub use msgbuf::MessageBuf;
