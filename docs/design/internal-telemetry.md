@@ -910,8 +910,9 @@ that name, and the rest of the datagram still decodes.
 `logit.input.connections.rejected{reason="limit"}` (the connection cap, `max_connections`, 1024
 by default, binding), `logit.input.connections.rejected{reason="proxy_header"}` (under
 `proxy_protocol: true`, a PROXY header that was missing, malformed, cut short, or late, read
-before any TLS accept), and `logit.input.connections.closed{reason="idle"}`, the points `logit_in`
-and the shared TCP driver record, for the same reason: this accept loop rejects at the
+before any TLS accept), and `logit.input.connections.closed{reason="idle"}`. The first three are
+the points `logit_in` and the shared TCP driver record, and the shared TCP driver alone records
+the `proxy_header` reason, for the same reason: this accept loop rejects at the
 cap rather than queueing behind a permit, so there's a refusal to count, and the gauge counts
 permit holders only. A connection past the cap is dropped before any TLS accept (OTLP has no
 in-band "try later" to spend a handshake delivering), so a rejection is never also a handshake. An
@@ -937,8 +938,9 @@ The OTLP codec counts a metric with no data as
 that failed or timed out, or a plaintext connection held open past `handshake_timeout` without a
 first byte, which then gave its permit back; never an idle close), and `proxy_header` (any
 `connections.rejected{reason="proxy_header"}` refusal). A plaintext peer that *closes
-cleanly or resets* before sending anything is not counted: that's what a TCP health check looks
-like, and counting it would add one point per probe interval to this key forever.
+cleanly or resets* before sending a request byte, after a complete PROXY header under
+`proxy_protocol: true`, is not counted: that's what a TCP health check looks like, and counting it
+would add one point per probe interval to this key forever.
 
 ##### `prometheus_in`
 

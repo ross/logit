@@ -209,11 +209,12 @@ not an IO-level timer wrapped around this listener's `hyper` connection) rather 
 ## Amendment: a reset before the first byte is quiet, and the PROXY header comes first (2026-10-05)
 
 The 2026-09-14 amendment above says only the deadline and a read error reach `connection_error`.
-A connection reset (`ECONNRESET`) before the first payload byte is also quiet, with or without
-`proxy_protocol:`: a load balancer's PROXY-aware health check sends a header and then an RST. This
-matches the shared stream driver's rule in `crates/logit-inputs/src/tcp.rs`'s module doc, "Reset
-before the first byte". On a TLS listener the reset reaches `connection_error` from the TLS accept,
-as on that driver.
+A connection reset (`ECONNRESET`) before the first payload byte is also quiet, after a complete
+PROXY header or with `proxy_protocol:` off: a load balancer's PROXY-aware health check sends a
+header and then an RST. A reset or close during the header read is a `proxy_header` refusal, not
+a quiet end. This matches the shared stream driver's rule in `crates/logit-inputs/src/tcp.rs`'s
+module doc, "Reset before the first byte". On a TLS listener the reset reaches `connection_error`
+from the TLS accept, as on that driver.
 
 Under `proxy_protocol: true`, the PROXY header is read ahead of the TLS accept or the peek, under
 the same `handshake_timeout`. See [ADR `listener-peer-address`](listener-peer-address.md)'s
