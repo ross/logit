@@ -383,6 +383,7 @@ fn build_spec(
             idle_timeout,
             max_connections,
             peer,
+            proxy_protocol,
         } => {
             let mut input = match transport {
                 logit_config::StatsdTransport::Udp => {
@@ -404,7 +405,9 @@ fn build_spec(
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
             .with_max_connections(*max_connections)
-            .with_peer(*peer);
+            .with_peer(*peer)
+            // Rule 78 rejects it off `transport: tcp`.
+            .with_proxy_protocol(*proxy_protocol);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -421,6 +424,7 @@ fn build_spec(
             max_connections,
             max_line_bytes,
             peer,
+            proxy_protocol,
         } => {
             let mut input = match transport {
                 logit_config::LinesTransport::Tcp => LinesInput::tcp(bind.clone())
@@ -441,7 +445,9 @@ fn build_spec(
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
             .with_max_connections(*max_connections)
-            .with_peer(*peer);
+            .with_peer(*peer)
+            // Rule 78 rejects it off `transport: tcp`.
+            .with_proxy_protocol(*proxy_protocol);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -480,6 +486,7 @@ fn build_spec(
             max_frame_bytes,
             max_connections,
             peer,
+            proxy_protocol,
         } => {
             let mut input = GraphiteInput::new(
                 bind.clone(),
@@ -494,7 +501,9 @@ fn build_spec(
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
             .with_max_connections(*max_connections)
-            .with_peer(*peer);
+            .with_peer(*peer)
+            // Rule 78 rejects it off `transport: tcp`.
+            .with_proxy_protocol(*proxy_protocol);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -509,6 +518,7 @@ fn build_spec(
             idle_timeout,
             max_connections,
             peer,
+            proxy_protocol,
         } => {
             let mut input = match transport {
                 logit_config::SyslogTransport::Udp => {
@@ -523,7 +533,9 @@ fn build_spec(
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
             .with_max_connections(*max_connections)
-            .with_peer(*peer);
+            .with_peer(*peer)
+            // Rule 78 rejects it off `transport: tcp`.
+            .with_proxy_protocol(*proxy_protocol);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -1955,6 +1967,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                proxy_protocol: false,
             },
         }
     }
@@ -2638,6 +2651,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                proxy_protocol: false,
                 max_line_bytes: 8192,
                 max_frame_bytes: 1 << 20,
             },
@@ -2997,6 +3011,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                proxy_protocol: false,
             },
         }
     }
@@ -3176,6 +3191,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                proxy_protocol: false,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -3361,6 +3377,7 @@ mod tests {
             idle_timeout: None,
             max_connections: 1,
             peer: false,
+            proxy_protocol: false,
         };
         let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
 
@@ -3489,6 +3506,7 @@ mod tests {
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                proxy_protocol: false,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -3513,6 +3531,7 @@ mod tests {
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                proxy_protocol: false,
                 max_line_bytes: 8192,
                 max_frame_bytes: 1 << 20,
             },
@@ -3538,6 +3557,7 @@ mod tests {
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                proxy_protocol: false,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -4772,6 +4792,7 @@ mod tests {
             idle_timeout: None,
             max_connections: logit_config::default_max_connections(),
             peer: false,
+            proxy_protocol: false,
             max_line_bytes: logit_config::default_lines_max_line_bytes(),
         }
     }
@@ -4880,6 +4901,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                proxy_protocol: false,
             },
         }
     }

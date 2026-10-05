@@ -782,6 +782,20 @@ pub enum ComponentKind {
         /// no port; one that didn't, the usual case, gets neither attribute.
         #[serde(default)]
         peer: bool,
+        /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
+        /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
+        /// the original client it names on each event as `client.address` and `client.port`.
+        /// Off by default, and only under `transport: tcp`. The header is read before any TLS
+        /// handshake, within `handshake_timeout`. A connection without a valid header is closed
+        /// and counted as `logit.input.connections.rejected{reason="proxy_header"}`. A header
+        /// that names no client, such as a proxy's own health check, keeps the connection and
+        /// stamps nothing. Either attribute replaces a same-named one decoded from the message;
+        /// `peer:` still reports the proxy.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
     },
     /// Plain newline-delimited text over TCP (the default), UDP, or a Unix socket. Each line
     /// becomes one log event whose message is the line's bytes, with nothing parsed. To give it
@@ -883,6 +897,20 @@ pub enum ComponentKind {
         /// no port; one that didn't, the usual case, gets neither attribute.
         #[serde(default)]
         peer: bool,
+        /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
+        /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
+        /// the original client it names on each event as `client.address` and `client.port`.
+        /// Off by default, and only under `transport: tcp`. The header is read before any TLS
+        /// handshake, within `handshake_timeout`. A connection without a valid header is closed
+        /// and counted as `logit.input.connections.rejected{reason="proxy_header"}`. A header
+        /// that names no client, such as a proxy's own health check, keeps the connection and
+        /// stamps nothing. Either attribute replaces a same-named one decoded from the message;
+        /// `peer:` still reports the proxy.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
         /// The longest line this listener accepts, not counting its `\n`, under every transport.
         /// A longer line is dropped and counted once as
         /// `logit.input.frames.dropped{reason="oversize"}`, and the line after it still decodes; a
@@ -1010,6 +1038,20 @@ pub enum ComponentKind {
         /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
         #[serde(default)]
         peer: bool,
+        /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
+        /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
+        /// the original client it names on each event as `client.address` and `client.port`.
+        /// Off by default, and only under `transport: tcp`. The header is read before any TLS
+        /// handshake, within `handshake_timeout`. A connection without a valid header is closed
+        /// and counted as `logit.input.connections.rejected{reason="proxy_header"}`. A header
+        /// that names no client, such as a proxy's own health check, keeps the connection and
+        /// stamps nothing. Either attribute replaces a same-named one decoded from the message;
+        /// `peer:` still reports the proxy.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
         /// The longest plaintext line this listener assembles before dropping it and draining to
         /// the next newline (counted once as `logit.input.frames.dropped{reason="oversize"}`; the
         /// line after it still decodes). A byte-count string (`"8192"`, `"16KiB"`). Defaults to
@@ -1112,6 +1154,20 @@ pub enum ComponentKind {
         /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
         #[serde(default)]
         peer: bool,
+        /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
+        /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
+        /// the original client it names on each event as `client.address` and `client.port`.
+        /// Off by default, and only under `transport: tcp`. The header is read before any TLS
+        /// handshake, within `handshake_timeout`. A connection without a valid header is closed
+        /// and counted as `logit.input.connections.rejected{reason="proxy_header"}`. A header
+        /// that names no client, such as a proxy's own health check, keeps the connection and
+        /// stamps nothing. Either attribute replaces a same-named one decoded from the message;
+        /// `peer:` still reports the proxy.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
     },
     /// OpenTelemetry Protocol (logs, metrics, and/or traces) over OTLP/HTTP (protobuf or JSON
     /// body) or OTLP/gRPC.
@@ -5469,9 +5525,11 @@ mod tests {
                 max_frame_bytes,
                 max_connections,
                 peer,
+                proxy_protocol,
             } => {
                 assert_eq!(max_connections, default_max_connections());
                 assert!(!peer, "opt-in -- no peer address unless asked for");
+                assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
                 assert_eq!(bind, "0.0.0.0:2003");
                 assert_eq!(transport, GraphiteTransport::Tcp);
                 assert_eq!(protocol, GraphiteProtocol::Plaintext);
@@ -5666,8 +5724,10 @@ mod tests {
                 idle_timeout,
                 max_connections,
                 peer,
+                proxy_protocol,
             } => {
                 assert!(!peer, "opt-in -- no peer address unless asked for");
+                assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
                 assert_eq!(bind, "0.0.0.0:5514");
                 assert_eq!(transport, SyslogTransport::Udp);
                 assert_eq!(tls, None);
@@ -7452,8 +7512,10 @@ mod tests {
                 max_connections,
                 max_line_bytes,
                 peer,
+                proxy_protocol,
             } => {
                 assert!(!peer, "opt-in -- no peer address unless asked for");
+                assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
                 assert_eq!(bind, "0.0.0.0:5170");
                 assert_eq!(transport, LinesTransport::Tcp, "tcp is the default");
                 assert_eq!(tls, None);
@@ -7535,6 +7597,29 @@ mod tests {
         }
     }
 
+    /// `proxy_protocol: true` parses on every stream-driver listener.
+    #[test]
+    fn proxy_protocol_parses_on_every_stream_driver_listener() {
+        for json in [
+            r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp",
+                "proxy_protocol": true}"#,
+            r#"{"type": "syslog_in", "bind": "0.0.0.0:5514", "transport": "tcp",
+                "proxy_protocol": true}"#,
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2003", "proxy_protocol": true}"#,
+            r#"{"type": "lines_in", "bind": "0.0.0.0:5170", "proxy_protocol": true}"#,
+        ] {
+            let component: Component = serde_json::from_str(json).unwrap();
+            let proxy_protocol = match component.kind {
+                ComponentKind::StatsdIn { proxy_protocol, .. }
+                | ComponentKind::SyslogIn { proxy_protocol, .. }
+                | ComponentKind::GraphiteIn { proxy_protocol, .. }
+                | ComponentKind::LinesIn { proxy_protocol, .. } => proxy_protocol,
+                other => panic!("unexpected kind {other:?}"),
+            };
+            assert!(proxy_protocol, "for {json}");
+        }
+    }
+
     /// A typo'd key fails to parse rather than being dropped.
     #[test]
     fn lines_in_rejects_an_unknown_field() {
@@ -7561,9 +7646,11 @@ mod tests {
                 idle_timeout,
                 max_connections,
                 peer,
+                proxy_protocol,
             } => {
                 assert_eq!(max_connections, default_max_connections());
                 assert!(!peer, "opt-in -- no peer address unless asked for");
+                assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
                 assert_eq!(bind, "0.0.0.0:8125");
                 assert_eq!(transport, StatsdTransport::Udp, "classic statsd stays the default");
                 assert_eq!(tls, None);

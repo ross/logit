@@ -401,6 +401,7 @@ mod tests {
             idle_timeout: None,
             max_connections: logit_config::default_max_connections(),
             peer: false,
+            proxy_protocol: false,
         };
         let mut components = HashMap::new();
         components.insert(
