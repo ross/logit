@@ -10,15 +10,25 @@
 //! [`Sender`] with every datagram and goes through a [`PeerCache`], which formats an address only
 //! when the sender differs from the previous datagram's. A PROXY header's origin becomes a
 //! [`PeerAttrs`] through [`PeerAttrs::client`], and [`ConnectionAttrs`] holds a connection's two.
+//!
+//! The PROXY header is read here too, by [`read_proxy_origin`], because reading it and stamping its
+//! origin are the two halves of `proxy_protocol:`, and the stream driver and the HTTP listeners'
+//! accept loops both call it on a raw [`TcpStream`]. An HTTP listener builds a [`ConnectionPeer`]
+//! per connection: the sender its diagnostics name, and the attributes
+//! [`ConnectionAttrs::stamp_batches`] writes on every batch a request decodes into.
 
 use bytes::Bytes;
 use logit_core::interner::intern;
-use logit_core::{Event, Symbol, Value};
-use logit_proto::proxy::Origin;
+use logit_core::{Event, EventBatch, Symbol, Value};
+use logit_proto::proxy::{self, Origin, Parse};
+use std::fmt;
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
 
 /// The attribute holding the immediate socket peer's address, in OpenTelemetry's name.
 pub const PEER_ADDRESS: &str = "network.peer.address";
@@ -112,7 +122,7 @@ impl PeerAttrs {
     }
 }
 
-/// What the stream driver stamps on every event of one connection: the socket peer under
+/// What a stream or HTTP listener stamps on every event of one connection: the socket peer under
 /// `peer: true`, and a PROXY header's origin under `proxy_protocol: true`. Built once per
 /// connection.
 #[derive(Debug, Clone, PartialEq)]
@@ -128,10 +138,137 @@ impl ConnectionAttrs {
         (peer.is_some() || client.is_some()).then_some(Self { peer, client })
     }
 
+    /// What a TCP connection stamps: `peer` as `network.peer.*` when `record_peer` is on, and a
+    /// PROXY header's `origin` as `client.*`. `peer` is `None` for a listener whose socket has no
+    /// `SocketAddr`. `None` when there's nothing to stamp, as for [`Self::new`].
+    pub fn for_connection(
+        peer: Option<SocketAddr>,
+        record_peer: bool,
+        origin: Option<&Origin>,
+    ) -> Option<Self> {
+        let peer = peer.filter(|_| record_peer).map(PeerAttrs::from_socket);
+        Self::new(peer, origin.and_then(PeerAttrs::client))
+    }
+
     /// Writes both onto every event in `events`, each replacing a same-named attribute.
     pub fn stamp(&self, events: &mut [Event]) {
         for attrs in [&self.peer, &self.client].into_iter().flatten() {
             attrs.stamp(events);
+        }
+    }
+
+    /// [`Self::stamp`] on every event of every batch, for a request that decodes into several.
+    pub fn stamp_batches(&self, batches: &mut [EventBatch]) {
+        for batch in batches {
+            self.stamp(&mut batch.events);
+        }
+    }
+}
+
+/// One HTTP connection's sender, built once per connection: the socket peer its diagnostics name,
+/// stamped or not, and the [`ConnectionAttrs`] its requests' events carry.
+#[derive(Debug, Clone)]
+pub struct ConnectionPeer {
+    socket: SocketPeer,
+    attrs: Option<ConnectionAttrs>,
+}
+
+/// The socket a connection came from, as diagnostic text names it.
+#[derive(Debug, Clone)]
+enum SocketPeer {
+    Tcp(SocketAddr),
+    /// The listener's own path: an unbound Unix client, the usual case, has no address to name.
+    Unix(Arc<Path>),
+}
+
+impl ConnectionPeer {
+    /// A TCP connection from `peer`, stamped as [`ConnectionAttrs::for_connection`] describes.
+    pub fn tcp(peer: SocketAddr, record_peer: bool, origin: Option<&Origin>) -> Self {
+        Self {
+            socket: SocketPeer::Tcp(peer),
+            attrs: ConnectionAttrs::for_connection(Some(peer), record_peer, origin),
+        }
+    }
+
+    /// A connection accepted on the Unix socket at `listener`, stamped with `peer` when it's set.
+    /// Diagnostics name the listener's path, written `unix:<path>`.
+    pub fn unix(listener: Arc<Path>, peer: Option<PeerAttrs>) -> Self {
+        Self { socket: SocketPeer::Unix(listener), attrs: ConnectionAttrs::new(peer, None) }
+    }
+
+    /// The attributes this connection's events carry, or `None` when it stamps nothing.
+    pub fn attrs(&self) -> Option<&ConnectionAttrs> {
+        self.attrs.as_ref()
+    }
+
+    /// [`ConnectionAttrs::stamp_batches`] when there's anything to stamp, one branch when not.
+    pub fn stamp_batches(&self, batches: &mut [EventBatch]) {
+        if let Some(attrs) = &self.attrs {
+            attrs.stamp_batches(batches);
+        }
+    }
+}
+
+/// The socket peer as `SocketAddr` writes it (`192.0.2.1:5000`, `[2001:db8::1]:443`), or
+/// `unix:<listener path>`, whether or not `peer:` stamps it.
+impl fmt::Display for ConnectionPeer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.socket {
+            SocketPeer::Tcp(addr) => write!(f, "{addr}"),
+            SocketPeer::Unix(path) => write!(f, "unix:{}", path.display()),
+        }
+    }
+}
+
+/// Reads one PROXY protocol header off `stream` under `handshake_timeout` and returns the origin
+/// it names, leaving every byte after the header in the socket, as [`read_proxy_header`] does.
+pub(crate) async fn read_proxy_origin(
+    stream: &mut TcpStream,
+    handshake_timeout: Duration,
+) -> anyhow::Result<Origin> {
+    tokio::time::timeout(handshake_timeout, read_proxy_header(stream)).await.map_err(
+        |_elapsed| anyhow::anyhow!("no complete PROXY header within {handshake_timeout:?}"),
+    )?
+}
+
+/// Reads one PROXY protocol header off `stream` and nothing after it, and returns the origin it
+/// names. [`read_proxy_origin`] bounds it with the listener's `handshake_timeout`.
+///
+/// A version 1 header's length is known only at its CRLF, so each step peeks at what the socket
+/// holds and consumes only the bytes [`proxy::parse`] places in the header: all of them while it
+/// answers [`Parse::Incomplete`], and the header's own length once it answers [`Parse::Complete`].
+/// The payload after the header stays in the socket for whatever reads the connection next: a
+/// TLS handshake, the stream driver's framer, or hyper. A version 2 header's length is known from
+/// its 16th byte, and the rest is read in one go.
+pub(crate) async fn read_proxy_header(stream: &mut TcpStream) -> anyhow::Result<Origin> {
+    let mut header = Vec::with_capacity(proxy::V1_MAX_LEN);
+    let mut chunk = [0u8; proxy::V1_MAX_LEN];
+    loop {
+        // Every byte peeked is consumed below unless the header completes, so the next peek waits
+        // for new bytes rather than returning the same ones again.
+        let peeked = stream.peek(&mut chunk).await?;
+        if peeked == 0 {
+            anyhow::bail!("the peer closed the connection before a complete PROXY header");
+        }
+        let held = header.len();
+        header.extend_from_slice(&chunk[..peeked]);
+        match proxy::parse(&header)? {
+            Parse::Complete { origin, len } => {
+                stream.read_exact(&mut chunk[..len - held]).await?;
+                return Ok(origin);
+            }
+            Parse::Incomplete { len: Some(len) } => {
+                stream.read_exact(&mut chunk[..peeked]).await?;
+                header.resize(len, 0);
+                stream.read_exact(&mut header[held + peeked..]).await?;
+                return match proxy::parse(&header)? {
+                    Parse::Complete { origin, .. } => Ok(origin),
+                    Parse::Incomplete { .. } => unreachable!("the header holds its whole length"),
+                };
+            }
+            Parse::Incomplete { len: None } => {
+                stream.read_exact(&mut chunk[..peeked]).await?;
+            }
         }
     }
 }
@@ -343,6 +480,101 @@ mod tests {
         assert_eq!(str_attr(&events[0], CLIENT_ADDRESS), Some("203.0.113.9"));
         assert_eq!(events[0].attributes.get(CLIENT_PORT), Some(&Value::I64(6000)));
         assert_eq!(events[0].attributes.len(), 4);
+    }
+
+    fn batch(events: usize) -> EventBatch {
+        EventBatch {
+            resource: Arc::new(logit_core::Resource::default()),
+            scope: None,
+            events: (0..events).map(|_| event()).collect(),
+        }
+    }
+
+    /// A request that decodes into several batches carries its sender on every event of each,
+    /// and an empty batch among them is no obstacle.
+    #[test]
+    fn stamp_batches_stamps_every_event_of_every_batch() {
+        let attrs = ConnectionAttrs::for_connection(
+            Some("192.0.2.1:5000".parse().unwrap()),
+            true,
+            Some(&Origin::Ip("203.0.113.9:6000".parse().unwrap())),
+        )
+        .unwrap();
+        let mut batches = vec![batch(2), batch(0), batch(1)];
+        attrs.stamp_batches(&mut batches);
+        assert_eq!(batches.iter().map(|b| b.events.len()).collect::<Vec<_>>(), [2, 0, 1]);
+        for event in batches.iter().flat_map(|b| &b.events) {
+            assert_eq!(str_attr(event, PEER_ADDRESS), Some("192.0.2.1"));
+            assert_eq!(event.attributes.get(PEER_PORT), Some(&Value::I64(5000)));
+            assert_eq!(str_attr(event, CLIENT_ADDRESS), Some("203.0.113.9"));
+            assert_eq!(event.attributes.get(CLIENT_PORT), Some(&Value::I64(6000)));
+        }
+    }
+
+    /// Every combination of `peer:` and a PROXY origin: the socket peer only under
+    /// `record_peer`, the origin's `client.*` whenever it names one, and `None` with neither.
+    #[test]
+    fn for_connection_builds_what_each_option_asks_for() {
+        type Client = (Option<&'static str>, Option<i64>);
+        type Case<'a> =
+            (Option<SocketAddr>, bool, Option<&'a Origin>, Option<(Option<&'a str>, Client)>);
+        let socket: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        let ip = Origin::Ip("203.0.113.9:6000".parse().unwrap());
+        let unix = Origin::Unix(b"/run/origin.sock".to_vec());
+        let peer = Some("192.0.2.1");
+        let ip_client = (Some("203.0.113.9"), Some(6000));
+        let unix_client = (Some("/run/origin.sock"), None);
+        let no_client = (None, None);
+        let cases: [Case<'_>; 10] = [
+            (Some(socket), false, None, None),
+            (Some(socket), false, Some(&Origin::None), None),
+            (Some(socket), false, Some(&ip), Some((None, ip_client))),
+            (Some(socket), false, Some(&unix), Some((None, unix_client))),
+            (Some(socket), true, None, Some((peer, no_client))),
+            (Some(socket), true, Some(&Origin::None), Some((peer, no_client))),
+            (Some(socket), true, Some(&ip), Some((peer, ip_client))),
+            (Some(socket), true, Some(&unix), Some((peer, unix_client))),
+            (None, true, None, None),
+            (None, true, Some(&ip), Some((None, ip_client))),
+        ];
+        for (socket, record_peer, origin, expect) in cases {
+            let case = format!("socket {socket:?}, record_peer {record_peer}, origin {origin:?}");
+            let attrs = ConnectionAttrs::for_connection(socket, record_peer, origin);
+            let Some((peer_address, (client_address, client_port))) = expect else {
+                assert_eq!(attrs, None, "{case}");
+                continue;
+            };
+            let mut events = vec![event()];
+            attrs.expect(&case).stamp(&mut events);
+            let stamped = &events[0];
+            assert_eq!(str_attr(stamped, PEER_ADDRESS), peer_address, "{case}");
+            let peer_port = peer_address.map(|_| Value::I64(5000));
+            assert_eq!(stamped.attributes.get(PEER_PORT), peer_port.as_ref(), "{case}");
+            assert_eq!(str_attr(stamped, CLIENT_ADDRESS), client_address, "{case}");
+            let client_port = client_port.map(Value::I64);
+            assert_eq!(stamped.attributes.get(CLIENT_PORT), client_port.as_ref(), "{case}");
+        }
+    }
+
+    /// Diagnostics name the socket peer whether or not `peer:` stamps it.
+    #[test]
+    fn a_connection_peer_names_its_socket_with_or_without_a_stamp() {
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let quiet = ConnectionPeer::tcp(v6, false, None);
+        assert_eq!(quiet.to_string(), "[2001:db8::1]:443");
+        assert_eq!(quiet.attrs(), None);
+        let mut batches = vec![batch(1)];
+        quiet.stamp_batches(&mut batches);
+        assert_eq!(batches[0].events[0].attributes.len(), 0);
+
+        let stamped = ConnectionPeer::tcp("192.0.2.1:5000".parse().unwrap(), true, None);
+        assert_eq!(stamped.to_string(), "192.0.2.1:5000");
+        stamped.stamp_batches(&mut batches);
+        assert_eq!(str_attr(&batches[0].events[0], PEER_ADDRESS), Some("192.0.2.1"));
+
+        let unix = ConnectionPeer::unix(Arc::from(Path::new("/run/trace.sock")), None);
+        assert_eq!(unix.to_string(), "unix:/run/trace.sock");
+        assert_eq!(unix.attrs(), None);
     }
 
     #[test]

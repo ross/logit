@@ -81,15 +81,14 @@
 //!
 //! **PROXY protocol.** With [`TcpListener::with_proxy_protocol`] on, every TCP connection must
 //! open with a PROXY protocol header (ADR `listener-peer-address`). The connection task reads it
-//! off the raw stream through [`read_proxy_header`], before any TLS accept, under its own
-//! `handshake_timeout` budget. That reader peeks and consumes only header bytes, so the payload
-//! behind the header reaches the TLS handshake or the [`Framer`] untouched, even when both arrive
-//! in one segment. A missing, malformed, or slow header, or a peer that closes before finishing
-//! one, closes the connection with a throttled `proxy_header` diagnostic and counts
-//! `logit.input.connections.rejected{reason="proxy_header"}`. An origin is stamped as `client.*`
-//! beside any `network.peer.*`, both held in one [`ConnectionAttrs`] built per connection; a
-//! header with no origin (`LOCAL`, `UNKNOWN`, `AF_UNSPEC`) stamps nothing. A Unix socket refuses
-//! the option at bind.
+//! off the raw stream through [`read_proxy_origin`], before any TLS accept, under its own
+//! `handshake_timeout` budget; that function's doc says how the payload behind the header stays
+//! in the socket for the TLS handshake or the [`Framer`]. A missing, malformed, or slow header, or
+//! a peer that closes before finishing one, closes the connection with a throttled `proxy_header`
+//! diagnostic and counts `logit.input.connections.rejected{reason="proxy_header"}`. An origin is
+//! stamped as `client.*` beside any `network.peer.*`, both held in one [`ConnectionAttrs`] built
+//! per connection; a header with no origin (`LOCAL`, `UNKNOWN`, `AF_UNSPEC`) stamps nothing. A
+//! Unix socket refuses the option at bind.
 //!
 //! **Reset before the first byte.** A connection reset (`ECONNRESET`) before its first payload
 //! byte ends quietly: no `connection_error`, and nothing counted, since no data was lost. A load
@@ -120,13 +119,12 @@
 //! events are flushed [`FlushReason::Closed`] and a buffered *partial* frame is reported through
 //! [`report_buffered_tail`], as the shutdown and RST paths do.
 
-use crate::peer::{ConnectionAttrs, PeerAttrs};
+use crate::peer::{read_proxy_origin, ConnectionAttrs, PeerAttrs};
 use crate::Input;
 use bytes::{Bytes, BytesMut};
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
 use logit_pipeline::sockstat;
 use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
-use logit_proto::proxy::{self, Origin, Parse};
 use logit_proto::Decoder;
 use std::future::Future;
 use std::path::Path;
@@ -1373,11 +1371,7 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
     ) {
         let handshake_timeout = self.handshake_timeout;
         self.spawn_after(permit, async move {
-            let origin = tokio::time::timeout(handshake_timeout, read_proxy_header(&mut stream))
-                .await
-                .map_err(|_elapsed| {
-                    anyhow::anyhow!("no complete PROXY header within {handshake_timeout:?}")
-                })??;
+            let origin = read_proxy_origin(&mut stream, handshake_timeout).await?;
             let client = PeerAttrs::client(&origin);
             Ok((stream, ConnectionAttrs::new(peer, client)))
         });
@@ -1480,47 +1474,6 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
                 diag.warn_throttled("connection_error", err);
             }
         });
-    }
-}
-
-/// Reads one PROXY protocol header off `stream` and nothing after it, and returns the origin it
-/// names. The caller bounds it with `handshake_timeout`.
-///
-/// A version 1 header's length is known only at its CRLF, so each step peeks at what the socket
-/// holds and consumes only the bytes [`proxy::parse`] places in the header: all of them while it
-/// answers [`Parse::Incomplete`], and the header's own length once it answers [`Parse::Complete`].
-/// The payload after the header stays in the socket for the TLS handshake or the framer. A
-/// version 2 header's length is known from its 16th byte, and the rest is read in one go.
-async fn read_proxy_header(stream: &mut tokio::net::TcpStream) -> anyhow::Result<Origin> {
-    let mut header = Vec::with_capacity(proxy::V1_MAX_LEN);
-    let mut chunk = [0u8; proxy::V1_MAX_LEN];
-    loop {
-        // Every byte peeked is consumed below unless the header completes, so the next peek waits
-        // for new bytes rather than returning the same ones again.
-        let peeked = stream.peek(&mut chunk).await?;
-        if peeked == 0 {
-            anyhow::bail!("the peer closed the connection before a complete PROXY header");
-        }
-        let held = header.len();
-        header.extend_from_slice(&chunk[..peeked]);
-        match proxy::parse(&header)? {
-            Parse::Complete { origin, len } => {
-                stream.read_exact(&mut chunk[..len - held]).await?;
-                return Ok(origin);
-            }
-            Parse::Incomplete { len: Some(len) } => {
-                stream.read_exact(&mut chunk[..peeked]).await?;
-                header.resize(len, 0);
-                stream.read_exact(&mut header[held + peeked..]).await?;
-                return match proxy::parse(&header)? {
-                    Parse::Complete { origin, .. } => Ok(origin),
-                    Parse::Incomplete { .. } => unreachable!("the header holds its whole length"),
-                };
-            }
-            Parse::Incomplete { len: None } => {
-                stream.read_exact(&mut chunk[..peeked]).await?;
-            }
-        }
     }
 }
 
@@ -1899,6 +1852,7 @@ mod tests {
     use logit_pipeline::test_util::{
         expect_closed, expect_still_open, recv_batch, wait_until, TelemetryProbe, Totals,
     };
+    use logit_proto::proxy;
     use logit_proto::CodecError;
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
