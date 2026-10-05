@@ -646,8 +646,10 @@ mod tests {
         let mut client = TcpStream::connect(started.addr.unwrap()).await.unwrap();
         client.write_all(b"split ").await.unwrap();
         client.flush().await.unwrap();
-        // Covers the 100 ms after the first write: a half line yields no event, so the second
-        // write completes a line the framer held rather than coalescing with it.
+        // A half line must yield no event. With `batch_max_events: 1` and no flush timer, a
+        // wrongly emitted one would arrive within a loopback round trip (well under 1 ms), so
+        // 100 ms is a margin, not a multiple of a tick. The window also makes it likely, not
+        // certain, that the listener read the first write on its own.
         assert_no_batch(&mut started.rx, Duration::from_millis(100), "the half line").await;
         client.write_all(b"across writes\n").await.unwrap();
         client.flush().await.unwrap();
