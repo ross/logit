@@ -41,7 +41,7 @@ and `lines_in` on every transport they offer, and `collectd_in` on UDP.
 - **Names.** OpenTelemetry semantic conventions: `network.peer.address` is the immediate socket
   peer, `network.peer.port` its port. The address is a `Value::Str` in the standard text form,
   with an IPv4-mapped IPv6 address written as IPv4, so one sender reads the same on a dual-stack
-  socket and a v4 one. The port is a `Value::Int`.
+  socket and a v4 one. The port is a `Value::I64`.
 - **Event attributes, never the resource.** A UDP batch mixes senders, and `BatchAccumulator`
   compares resources with `Arc::ptr_eq`, so a per-sender resource would flush a batch at every
   sender change. One location on every transport keeps a downstream config the same whichever
