@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-04
+updated: 2026-10-05
 ---
 
 # Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink
@@ -292,3 +292,71 @@ backoff until the backend recovers, where the Collector would drop it; a resend 
 twice if the first attempt was applied. Under `at_most_once` the batch drops at once, counted
 `batches.dropped{reason="ambiguous_at_most_once"}`. Every other row of `otlp_out`'s table follows the
 specification; the table is `crates/logit-outputs/src/otlp.rs`'s module doc, "Response classes".
+
+## Amendment: `otlp_out` retries per signal (2026-10-05)
+
+`otlp_out` sends a batch as one request per signal. Until this amendment, a `Rejected` signal was
+already counted and skipped, but any other failure after an accepted signal made the batch
+`Ambiguous` ([ADR `delivery-semantics`](delivery-semantics.md), item 9), and a retry resent the
+whole batch. Under `at_least_once` every retry duplicated the accepted signals; under
+`at_most_once` the batch dropped with its remaining signals, though nothing about them was
+ambiguous.
+
+**Decision.** `otlp_out` remembers, per batch, which signals the destination settled, accepted
+or rejected, and a retry sends only the rest, in the fixed order (logs, traces, metrics). The
+batch's class is the failed signal's own:
+
+| What the signals got | Effect on the batch |
+|---|---|
+| a `Refused` or `Clean` failure | holds under both postures; each retry sends the signals not yet settled |
+| an `Ambiguous` failure, under `at_least_once` | retries the signals not yet settled; the failed one may arrive twice |
+| an `Ambiguous` failure, under `at_most_once` | drops the batch; the failed signal's records and those of every signal not yet sent count `logit.output.records.dropped{signal, reason="ambiguous_at_most_once"}` |
+| every signal sent `Rejected`, none accepted on any attempt | drops the batch `rejected`, unchanged |
+| any signal accepted on any attempt, the rest `Rejected` | `Ok`, the rejected signals counted, unchanged |
+
+- **The memory sits beside the attempt gate.** `BatchAccounting`
+  (`crates/logit-outputs/src/accounting.rs`) already arms once per batch: the runtime calls
+  `observe_batch` before a batch's first attempt and never between its retries ([ADR
+  `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md), decisions 2
+  and 3). Two bitsets of settled requests live there, cleared by `observe_batch` and ignored when
+  unarmed, so a caller that never observes gets every signal sent on every `send`.
+- **`after_delivery` no longer applies to `otlp_out`.** Item 9 of `delivery-semantics` turns a
+  `Clean` after an accepted request into `Ambiguous` so that a retry under `at_most_once` doesn't
+  resend it. With accepted signals never resent there's nothing to protect, so a `Clean` or
+  `Refused` answer holds. `crate::http::Outcomes::resuming` is the fold without the conversion;
+  the Datadog sinks keep `Outcomes::new`.
+- **The sink learns its posture.** `Output::observe_posture` hands a sink the posture `write_loop`
+  resolved, once, before the first batch. `otlp_out` reads it to count the per-signal records an
+  `at_most_once` drop loses; the runtime counts the batch as before.
+- **The per-signal reading of credential answers stays.** HTTP `401`, `403`, `404`, `501` and gRPC
+  `UNAUTHENTICATED`, `PERMISSION_DENIED`, `UNIMPLEMENTED`, `NOT_FOUND` are still `Rejected` for that
+  signal's request. With per-signal retry, that reading is what lets a credential scoped per
+  signal deliver its signals once with no duplicate.
+
+**Alternatives considered.**
+
+- **Remember accepted signals only, and resend a rejected one.** Rejected: the resend would be
+  rejected again and count its records dropped a second time.
+- **Pass the posture through `otlp_out`'s config builder.** Rejected: `write_loop` resolves the
+  posture from `buffer.delivery` and the sink's default, and a second copy of that rule could
+  drift.
+- **Return `Ok` under `at_most_once` once a signal was accepted**, counting the rest per signal as
+  a `Rejected` signal is. Rejected: the loss would then show in no batch counter, and the batch's
+  class would no longer be the failed signal's.
+
+**Consequences.**
+
+- A mixed batch to a backend that takes only some signals delivers each accepted signal once,
+  however often another signal is retried. `docs/known-gaps/otlp.md`'s per-batch-verdict entry is
+  closed, and `demo/logit.yaml`'s `trace_only` gate is a noise filter rather than a correctness
+  requirement.
+- Every attempt still encodes every signal, the settled ones included: the encoder returns all
+  signals at once, and its counters are already gated per batch.
+- Under `at_most_once`, `logit.component.events.dropped{reason="ambiguous_at_most_once"}` counts
+  every event of a dropped batch, including events whose signals were delivered; the per-signal
+  `records.dropped` is the precise count.
+- A disk-buffered batch replayed after a restart is a new batch: the memory is in-process, so the
+  replay sends every signal again.
+- `datadog_out` and `datadog_trace_out` still retry a batch whole, resending the requests already
+  accepted. Per-request memory has the same shape, keyed on each request `split_encode` cuts; it's
+  a follow-up, tracked in `docs/known-gaps/datadog.md`'s resend entry.

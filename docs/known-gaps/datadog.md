@@ -68,8 +68,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** Datadog documents these routes' limits, or the extra requests show up in
     a sink's request rate.
 - **A `datadog_out` resend isn't idempotent: Datadog stores a resent log twice.** A batch is
-  several requests, and a retry resends the ones that succeeded. A trial org received two
-  resends:
+  several requests, and a retry resends the ones that succeeded; `datadog_trace_out` does the
+  same across its routes. Neither remembers which requests of a batch were accepted, as
+  `otlp_out` does per signal. A trial org received two resends:
   - A series point resent at the same `(series, timestamp)` was stored once, the last write
     winning: a count sent twice read 5, not 10, and a gauge sent as 7 then 9 read 9.
   - An identical log posted twice was stored as two logs.
@@ -80,8 +81,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
     duplicates on every route but series: duplicate logs, and assumed inflated distribution,
     sketch, event, check, trace, and stats counts. `buffer: {delivery: at_most_once}` drops the
     batch instead.
-  - **Revisit trigger:** a measurement showing another route dedupes a resend, or a design that
-    sends one batch as one request.
+  - **To close:** remember the accepted requests per batch and resend only the rest, as
+    `otlp_out` does per signal ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md),
+    "Amendment: `otlp_out` retries per signal (2026-10-05)"). A request is a chunk of a route
+    that `split_encode` (`crates/logit-outputs/src/http.rs`) cuts, so the memory keys on the
+    chunk, not the route.
+  - **Revisit trigger:** a measurement showing another route dedupes a resend.
 - **`datadog_out` drops metric points older than 1 hour, which Datadog would store.** The sink
   uses the documented series window, which is stricter than the intake;
   [the plan's "Timestamp windows" section](../plans/datadog-relay.md#11-timestamp-windows-w5) has

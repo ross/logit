@@ -264,9 +264,14 @@ destination may receive the batch twice. `statsd_out` is the one exception and d
 destination, so the resend adds to it. Set `buffer.delivery: at_most_once` on any other sink to
 drop a batch on its first ambiguous failure instead of risking a duplicate
 ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 5). A sink that sends one batch as
-several requests (`otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`) reports a
-retryable failure as ambiguous once any of them was accepted, so `at_least_once` resends the
-accepted requests with the rest and `at_most_once` drops the rest (item 9). A request the
+several requests (`datadog_out`, `datadog_trace_out`, `splunk_hec_out`) reports a retryable
+failure as ambiguous once any of them was accepted, so `at_least_once` resends the accepted
+requests with the rest and `at_most_once` drops the rest (item 9). `otlp_out` instead remembers
+which signals of a batch were accepted and retries only the others: it reports the failed
+signal's own class, never resends an accepted signal, and under `at_most_once` counts the records
+of the signals it drops as `records.dropped{signal, reason="ambiguous_at_most_once"}`
+([ADR `sink-fault-classes`](adr/sink-fault-classes.md), "Amendment: `otlp_out` retries per signal
+(2026-10-05)"). A request the
 destination rejects by name (a `4xx` other than an auth refusal) is counted and skipped, except
 at `splunk_hec_out`, and the send succeeds if any request was accepted.
 
@@ -2462,8 +2467,8 @@ Runnable configs:
 **Run one `otlp_out` per product, each behind a `keep_signals`.** One `otlp_out` posts every signal
 it carries to one host, and a product answers a signal it doesn't ingest with a `404`, which `otlp_out` reads as `rejected`
 for that signal. `otlp_out` counts that signal's records `records.dropped{reason="rejected"}`,
-warns, and still sends the other signals, but the request is wasted on every batch. Split the flow
-with `keep_signals` (or `has_signal`) so each sink sees only its product's signal.
+warns, and still sends the other signals once, but the request is wasted on every batch. Split the
+flow with `keep_signals` (or `has_signal`) so each sink sees only its product's signal.
 
 **Put `aggregate` with `temporality: cumulative` ahead of metrics bound for VictoriaMetrics.**
 VictoriaMetrics keeps no temporality. A delta `Sum` sent over OTLP is stored as its raw

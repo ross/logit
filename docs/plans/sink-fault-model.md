@@ -201,13 +201,18 @@ so a spool written before the change is skipped as corrupt. A `Hello` refusal (v
 
 ### W4: `otlp_out` per-signal outcomes (`fault/w4`)
 
-`OtlpOutput::attempt` sends every non-empty signal and reports per request: a `Rejected` signal
-is dropped and counted for that signal alone, the others are delivered. That covers a credential
-scoped per signal too: `otlp_out` reads HTTP `401`/`403` and gRPC
-`UNAUTHENTICATED`/`PERMISSION_DENIED` as `Rejected` for that signal's request, since an OTLP
-credential can grant one signal and not another. Closes
-`docs/known-gaps/otlp.md`'s mixed-signal entry; `demo/logit.yaml`'s `trace_only` gate becomes a
-noise filter rather than a correctness requirement, and its comment says so.
+[ADR `sink-fault-classes`](../adr/sink-fault-classes.md)'s "Amendment: `otlp_out` retries per
+signal (2026-10-05)": `otlp_out` remembers, beside its per-batch attempt gate, which signals the
+destination accepted or rejected, and a retry sends only the rest. The batch's class is the failed
+signal's own: a `Refused` or `Clean` signal after an accepted one holds instead of becoming
+`Ambiguous`, and an `Ambiguous` one under `at_most_once` drops the batch with the unsent signals'
+records counted `records.dropped{signal, reason="ambiguous_at_most_once"}`. `Output::observe_posture`
+hands the sink its resolved posture. HTTP `401`/`403` and gRPC
+`UNAUTHENTICATED`/`PERMISSION_DENIED` stay `Rejected` for that signal's request, so a credential
+scoped per signal delivers its signals once. Closes `docs/known-gaps/otlp.md`'s mixed-signal
+entry; `demo/logit.yaml`'s `trace_only` gate is a noise filter rather than a correctness
+requirement, and its comment says so. The Datadog sinks keep their whole-batch retry
+(`docs/known-gaps/datadog.md`).
 
 ### W5: operator docs sweep (`fault/w5`)
 

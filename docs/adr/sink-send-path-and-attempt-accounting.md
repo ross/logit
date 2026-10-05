@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-04
+updated: 2026-10-05
 ---
 
 # Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed
@@ -1086,6 +1086,10 @@ Unix socket for `datadog_trace_out`. Each applies it outside the code that count
 `logit.output.requests{class}` and `logit.output.request.bytes`, so a refused request still
 counts `network_error` and no bytes after an accepted one. The three `docs/known-gaps/` entries
 are closed.
+
+[`otlp_out` no longer applies it: [ADR `sink-fault-classes`](sink-fault-classes.md)'s
+"Amendment: `otlp_out` retries per signal (2026-10-05)" keeps the signals a batch's destination
+settled beside this record's per-batch gate, and a retry resends none of them.]
 
 ## Amendment: a refused handshake holds, and nothing ends the pipeline (2026-10-04)
 

@@ -279,6 +279,11 @@ request, and the loss of the requests that hadn't gone.
 request no longer stops the send, so the rule above applies to `Clean` and `Ambiguous` faults
 only.]
 
+[Narrowed again by [ADR `sink-fault-classes`](sink-fault-classes.md)'s "Amendment: `otlp_out`
+retries per signal (2026-10-05)": `otlp_out` resends no accepted signal on a retry, so the rule no
+longer applies to it, and a failed signal's own class is the batch's. `datadog_out` and
+`datadog_trace_out` keep it.]
+
 ### 10. A replaying input is at-least-once up to the in-memory queues
 
 `tail_in` and `docker_in` checkpoint an offset once its lines are acknowledged as item 3

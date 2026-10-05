@@ -1583,7 +1583,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 |---|---|---|
 | Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.dropped`, `labels.normalized`, `spans.degraded`, `stats.skipped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"needs_agent_processing"\|"not_datadog_origin"}`; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `file.rotations`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
 | Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
-| Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `otlp_out`'s `records.rejected`; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"}` and the Datadog sinks' `records.dropped{route, reason="rejected"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `ack_unsupported`, `ack_timeout`, and `oversize` for Splunk Cloud's answer) |
+| Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `otlp_out`'s `records.rejected`; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"\|"ambiguous_at_most_once"}` and the Datadog sinks' `records.dropped{route, reason="rejected"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `ack_unsupported`, `ack_timeout`, and `oversize` for Splunk Cloud's answer) |
 
 The sinks with encoders count the first class through a gate `Output::observe_batch` arms
 (`crates/logit-outputs/src/accounting.rs`); `stdio_out` and `file_out` count after the write that
@@ -1830,9 +1830,16 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   405, 407, and 429; or any gRPC status but the transient ones). An auth answer is counted here
   too, since a credential can be scoped per signal. The send goes on to the other signals, and
   returns `Ok` if any was accepted. A throttled `signal_rejected` diagnostic names the signal, the status, and the record
-  count, with a hint to place `has_signal` or `keep_signals` ahead of the sink. Counts per attempt,
-  whether or not the send ends `Ok`. See [ADR `delivery-semantics`](../adr/delivery-semantics.md)'s
-  "Amendment: per-request verdicts (2026-10-04)". Every per-signal counter has a record count to
+  count, with a hint to place `has_signal` or `keep_signals` ahead of the sink. Counts on the
+  attempt that got the verdict, whether or not the send ends `Ok`. See [ADR `delivery-semantics`](../adr/delivery-semantics.md)'s
+  "Amendment: per-request verdicts (2026-10-04)". A rejected signal is remembered for the batch
+  and not resent on a retry, so its records count once per batch.
+- `logit.output.records.dropped{signal, reason="ambiguous_at_most_once"}` (count): under
+  `delivery: at_most_once`, the records of a signal answered with an `Ambiguous` verdict, and of
+  every signal of the batch not yet sent, when that answer drops the batch. Signals accepted
+  earlier in the batch aren't counted, though the runtime's `events.dropped` counts their events
+  with the batch. See [ADR `sink-fault-classes`](../adr/sink-fault-classes.md)'s "Amendment:
+  `otlp_out` retries per signal (2026-10-05)". Every per-signal counter has a record count to
   read, `SignalPayload::records`: log records, spans, or encoded metric points, not counting a
   metric the encoder skipped.
 - From the encoder, for metric kinds OTLP can't carry exactly:

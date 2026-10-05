@@ -650,15 +650,15 @@ components:
   # reaches `tempo_out` arrives exactly as `self` produced it. See
   # `docs/adr/signal-filtering-components.md`.
   #
-  # The gate keeps the sink's input to the one signal Tempo takes. Tempo is a traces-only gRPC
-  # server (it registers no `MetricsService`). `otlp_out` issues one request per signal, so an
-  # `internal` metric point reaching `tempo_out` would draw a `grpc-status: 12` (UNIMPLEMENTED)
-  # answer, which `otlp_out` reads as `Rejected` for that signal: it counts those points
-  # `records.dropped{reason="rejected"}`, warns, and still delivers the batch's spans, and a batch
-  # of only metric points is dropped `rejected`. Nothing holds and the process never exits, but the
-  # refused request repeats on every batch (`docs/known-gaps/otlp.md`, "`otlp_out` gives the
-  # runtime one verdict per batch, not one per signal").
-  # `access_spans` needs the same gate for the same reason, because `haproxy_trace`/`nginx_trace`
+  # The gate is a noise filter, not a correctness requirement: it keeps the sink's input to the
+  # one signal Tempo takes. Tempo is a traces-only gRPC server (it registers no `MetricsService`).
+  # `otlp_out` issues one request per signal, so an `internal` metric point reaching `tempo_out`
+  # would draw a `grpc-status: 12` (UNIMPLEMENTED) answer, which `otlp_out` reads as `Rejected`
+  # for that signal: it counts those points `records.dropped{reason="rejected"}`, warns, and still
+  # delivers the batch's spans once, retrying only an unsettled signal; a batch of only metric
+  # points is dropped `rejected`. Without the gate nothing is lost or duplicated, but every batch
+  # spends a refused request and a `signal_rejected` warning.
+  # `access_spans` gets the same gate for the same reason, because `haproxy_trace`/`nginx_trace`
   # produce metric-and-span-carrying batches, and so does `browser_spans`, even though `browser_in`
   # only ever emits traces (see `browser_spans`'s comment above).
   trace_only:
