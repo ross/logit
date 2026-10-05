@@ -1364,6 +1364,58 @@
           "additionalProperties": false
         },
         {
+          "description": "Resolves `event.timestamp` from an attribute holding the sender's own stamp, so a replayed backlog reaches every sink with its record time instead of its receipt time. `from` names the attribute and `format` says how to read it. An event the component can't resolve (the attribute is absent, null, empty, or `-`; it doesn't parse; or it falls further than `max_skew` from the event's current timestamp) is forwarded untouched and counted by reason, never dropped. A native `Timestamp` attribute value is used as it is under every format. An event carrying a span is left alone, since its timestamp is the span's start. When it applies to a log with no `observed_timestamp`, the previous timestamp becomes the `observed_timestamp`.",
+          "type": "object",
+          "required": [
+            "format",
+            "from",
+            "type"
+          ],
+          "properties": {
+            "buffer": true,
+            "format": {
+              "description": "How to read the attribute's value.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TimestampFormat"
+                }
+              ]
+            },
+            "from": {
+              "description": "The attribute to read, named literally (never a path). An empty name is rejected.",
+              "type": "string"
+            },
+            "keep_source": {
+              "description": "Keep the source attribute after resolving it. Defaults to `false`, which removes it. Set it to `true` ahead of `syslog_out` when `timezone` is not UTC: a kept `syslog.timestamp` is written verbatim on an RFC 3164 output, while a removed one is re-rendered from `event.timestamp` in UTC.",
+              "default": false,
+              "type": "boolean"
+            },
+            "max_skew": {
+              "description": "The furthest a resolved instant may sit from the event's current timestamp, in either direction, before the event is forwarded unchanged. Defaults to `24h`; `0s` is rejected. A week is `168h`.",
+              "default": "24h",
+              "type": "string"
+            },
+            "receive": true,
+            "sources": true,
+            "targets": true,
+            "timezone": {
+              "description": "The zone for civil times: an IANA name (`Europe/Berlin`), `UTC`, or a fixed offset such as `+02:00`. Defaults to `UTC`, never the host's zone. Read only by `rfc3164` and by a pattern with no `%z`, `%:z`, or `%s`; setting it under any other format is rejected. A named zone needs the system time zone database (the `tzdata` package, or the directory in `TZDIR`) and is rejected at startup when it can't be loaded.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "timestamp"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "Forwards an event carrying a wanted signal and drops the rest: `signals: [traces]` ahead of a traces-only sink, say, fed from a source whose events also carry metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event carrying a listed signal is forwarded as it arrived, unlisted signals included. `mode: only` also requires the event carry nothing outside `signals`. Place `keep_signals`/`drop_signals` ahead of this instead if unwanted payloads must be stripped rather than tolerated. `signals` may not be empty.",
           "type": "object",
           "required": [
@@ -2857,7 +2909,7 @@
               "description": "What the receiver remembers about metric types between requests, so a Prometheus 1.0 sender's series decode as typed families. Receiver mode only.",
               "default": {
                 "max_families": 10000,
-                "ttl": "600s"
+                "ttl": "10m"
               },
               "allOf": [
                 {
@@ -3026,7 +3078,7 @@
             },
             "expire_after": {
               "description": "A series not updated within this window is dropped from the registry and stops being exposed. Defaults to `5m`, Prometheus's own staleness horizon. `0s` disables expiry, leaving `max_series` as the only bound. Registry mode only.",
-              "default": "300s",
+              "default": "5m",
               "type": "string"
             },
             "headers": {
@@ -3135,7 +3187,7 @@
         "receive": {
           "description": "Per-listener receive queue and batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in` under `transport: udp`) accepts every field; the same three under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly fields and `shutdown_grace`; a non-default block on any other kind (`otlp_in`, `logit_in`, `prometheus_in`, `internal`, and `generate_in` included) is rejected.",
           "default": {
-            "batch_flush_interval": "0.1s",
+            "batch_flush_interval": "100ms",
             "batch_max_bytes": "1048576",
             "batch_max_events": 1000,
             "max_bytes": "33554432",
@@ -3642,7 +3694,7 @@
         },
         "ttl": {
           "description": "How long a family is remembered after the last request that declared it. Defaults to `10m`, ten times Prometheus's own default metadata cadence, so a sender has to miss ten refreshes running before its types lapse. An expired entry is dropped, counted `logit.input.metadata_cache.evicted{reason=\"expired\"}`, and the families it typed decode as `unknown` again until the sender's next metadata request. `0s` is rejected; `max_families: 0` is how the cache is turned off.",
-          "default": "600s",
+          "default": "10m",
           "type": "string"
         }
       },
@@ -3803,7 +3855,7 @@
       "properties": {
         "batch_flush_interval": {
           "description": "Longest an accumulated batch waits before being sent regardless of size. Defaults to `100ms`. `0s` disables the timer (`batch_max_events` and `batch_max_bytes` are then the only triggers) and is not rejected.",
-          "default": "0.1s",
+          "default": "100ms",
           "type": "string"
         },
         "batch_max_bytes": {
@@ -4155,7 +4207,7 @@
         },
         "max_skew": {
           "description": "A resolved start or end further than this from the event's receipt time is rejected (`skipped{reason=\"skew\"}`) rather than written, so one sender with a badly wrong clock can't write spans years away and poison a trace store. Defaults to `1h`; `0s` is rejected.",
-          "default": "3600s",
+          "default": "1h",
           "type": "string"
         },
         "mint_id": {
@@ -4301,6 +4353,66 @@
       "enum": [
         "udp",
         "tcp"
+      ]
+    },
+    "TimestampFormat": {
+      "description": "How `timestamp` reads its source attribute. Written `format: rfc3164`, or `format: {pattern: \"%d/%b/%Y:%H:%M:%S %z\"}` for a custom layout.",
+      "oneOf": [
+        {
+          "description": "RFC 3339, leniently: a space may replace the `T`, a lowercase `z` is accepted, an RFC 9557 `[zone]` suffix is allowed, and a `:60` leap second reads as `:59`. An offset is required.",
+          "type": "string",
+          "enum": [
+            "rfc3339"
+          ]
+        },
+        {
+          "description": "The 15-byte syslog RFC 3164 stamp, `Mmm dd hh:mm:ss`, which carries no year or zone. The year is whichever of last, this, or next year puts the stamp closest to the event's current timestamp, and the civil time is read in `timezone`.",
+          "type": "string",
+          "enum": [
+            "rfc3164"
+          ]
+        },
+        {
+          "description": "Integer or fractional seconds since the Unix epoch, as a number or a numeric string.",
+          "type": "string",
+          "enum": [
+            "unix_seconds"
+          ]
+        },
+        {
+          "description": "Milliseconds since the Unix epoch, as a number or a numeric string.",
+          "type": "string",
+          "enum": [
+            "unix_millis"
+          ]
+        },
+        {
+          "description": "Microseconds since the Unix epoch, as a number or a numeric string.",
+          "type": "string",
+          "enum": [
+            "unix_micros"
+          ]
+        },
+        {
+          "description": "Nanoseconds since the Unix epoch, as a number or a numeric string.",
+          "type": "string",
+          "enum": [
+            "unix_nanos"
+          ]
+        },
+        {
+          "description": "A strftime-style layout that must match the whole value, such as `%d/%b/%Y:%H:%M:%S %z` for nginx's `$time_local`. `%z`, `%:z`, or `%s` makes the result an instant, and `timezone` is not read; otherwise the result is civil time in `timezone`. A layout with no year infers it as `rfc3164` does. A layout with an offset needs a year, needs an hour and minute, and may not use `%Z`, `%Q`, or `%:Q`.",
+          "type": "object",
+          "required": [
+            "pattern"
+          ],
+          "properties": {
+            "pattern": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
       ]
     },
     "TlsClientConfig": {

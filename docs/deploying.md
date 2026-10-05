@@ -740,8 +740,8 @@ backpressure), but its accept queue has the same shape of problem:
 A stream listener has no receive queue (its connection's flow control is the backpressure), but a
 connection can open and then say nothing while holding one of the listener's
 `max_connections` permits. `syslog_in`, `graphite_in`, and `statsd_in` (each with `transport: tcp`),
-`logit_in`, and `otlp_in` bound that with `handshake_timeout:`, **5s by default**, a humantime
-string like `connect_timeout`:
+`logit_in`, and `otlp_in` bound that with `handshake_timeout:`, **5s by default**, a duration
+string (`5s`, `1m`, `1h30m`) like `connect_timeout`:
 
 ```yaml
 components:
@@ -1502,6 +1502,27 @@ HUP within one `poll_interval` of the rename: the renamed file is read until it 
 least one `poll_interval` after `logit` saw the rotation, and what the writer appends to it after
 that is lost. `copytruncate` under an exact
 pattern loses what was written after the last read and before the truncate.
+
+## Named time zones
+
+`timestamp` resolves `event.timestamp` from an attribute
+([ADR `timestamp-transform`](adr/timestamp-transform.md); the module doc of
+`crates/logit-transforms/src/timestamp.rs` has the value and format table). A named `timezone:`
+such as `America/New_York` reads the system time zone database, `/usr/share/zoneinfo` or the
+directory `TZDIR` names, which `logit` doesn't bundle. The release image installs `tzdata`; a
+scratch or distroless image must add it. An image without a database fails `logit validate` and
+startup on a config that names a zone, never per event. `UTC` and fixed offsets (`+05:30`) need no
+database.
+
+Two patterns that come up in a tailed file (`{pattern: ...}` must match the whole value):
+
+```yaml
+# Postgres jsonlog, with log_timezone = UTC set in postgresql.conf. The UTC is a literal.
+format: {pattern: "%Y-%m-%d %H:%M:%S.%f UTC"}
+
+# nginx and Apache $time_local. The offset in the value makes it an instant; timezone is not read.
+format: {pattern: "%d/%b/%Y:%H:%M:%S %z"}
+```
 
 ## Series retention
 

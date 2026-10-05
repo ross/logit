@@ -20,8 +20,11 @@ RUN cargo build --release -p logit-cli
 
 FROM debian:bookworm-slim
 
+# tzdata: named time zones in a `timestamp` component read /usr/share/zoneinfo
+# (docs/adr/timestamp-transform.md).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --shell /usr/sbin/nologin logit
 

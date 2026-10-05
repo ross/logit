@@ -99,7 +99,9 @@ dotted, `service.name`-style attribute. `syslog_in` stamps
 `syslog.facility`/`.severity`/`.timestamp`/`.hostname`/`.tag`/`.pid`/`.msgid`/`.sd`, and the OTLP
 codec stamps `otel.severity_number`/`otel.severity_text`. `syslog.pid` may be `Value::Str` as well
 as `Value::U64`, because RFC 5424's PROCID is free-form PRINTUSASCII. `syslog.timestamp` may be
-`Value::Null` (a nil `-` RFC 5424 TIMESTAMP) as well as `Value::Timestamp`/`Value::Str`. See
+`Value::Null` (a nil `-` RFC 5424 TIMESTAMP) as well as `Value::Timestamp`/`Value::Str`. The
+`timestamp` component resolves it onto `event.timestamp`
+([ADR `timestamp-transform`](../adr/timestamp-transform.md)). See
 [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md).
 
 **The raw, protocol-native value rides alongside the normalized field and wins on the way back

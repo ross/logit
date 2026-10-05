@@ -2,40 +2,6 @@
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
-- **`event.timestamp` is still receipt time, not the sender's.** `syslog_in` stamps every event
-  with the instant its datagram came off the socket (`received_at`, captured by the read half and
-  passed to `Decoder::decode_into`; [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)).
-  It keeps the sender's own timestamp separately as the `syslog.timestamp` attribute: a
-  `Value::Timestamp` for RFC 5424's RFC 3339 form, a raw `Value::Str` for RFC 3164's, or
-  `Value::Null` for a nil 5424 TIMESTAMP. The two always diverge by network and queueing delay, and
-  diverge arbitrarily when the sender's clock is skewed or messages are replayed or relayed.
-  `syslog_out`'s emitted TIMESTAMP follows the precedence rule in
-  [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md), so a
-  `syslog_in -> syslog_out` relay's wire timestamp can reflect the origin even though
-  `event.timestamp` doesn't. Tracked as debt against
-  [ADR `lossless-transit`](../adr/lossless-transit.md); the residual-debt list is in
-  [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md).
-  - **Consequence:** everything keyed on time (`aggregate`'s tumbling window, the point timestamp
-    `influxdb_out` writes) uses `event.timestamp`, so a delayed or replayed message lands in the
-    window it arrived in, not the one it happened in.
-  - **Why not derive it from the sender:** RFC 3164's timestamp has no year and no timezone, so
-    resolving it to an instant means guessing both. Resolving only RFC 5424 would give two senders
-    on one listener different timestamp semantics with nothing in the config saying so.
-  - **Worth exploring: an optional `syslog_timestamp` transform**, added to a flow explicitly,
-    that replaces `event.timestamp` with a resolved `syslog.timestamp` and makes the guesswork
-    configurable. A separate, opt-in component rather than a `syslog_in` flag keeps the listener's
-    contract simple and makes "we trust our senders' clocks" a visible line in the config graph.
-    It would need:
-    - RFC 5424: parse the RFC 3339 timestamp directly, with no inference.
-    - RFC 3164: fill in year and timezone. The default year is the one that puts the message
-      closest to receipt time (handling a New Year's Eve rollover both ways). An explicit
-      `timezone:` field defaults to UTC, never the host's local zone, which would make behavior
-      depend on an environment variable.
-    - A bounded sanity window (`max_skew:`, say): a resolved timestamp further from receipt time
-      than the window is rejected, keeping receipt time, with a throttled diagnostic. Without it,
-      one sender with a badly wrong clock can write points years away and poison a dashboard.
-    - The skip rule every other transform follows: an event with no `syslog.timestamp`, or one
-      that doesn't resolve, passes through with `event.timestamp` untouched, never dropped.
 - **`syslog_out` re-stamps a relayed timestamp with receipt time when the origin's can't be
   rendered on the output format.** Under the precedence rule in
   [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)
@@ -43,13 +9,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `Value::Timestamp` `syslog.timestamp` renders on either format. A `Value::Str` renders verbatim
   only on a 3164 output, and only in the 15-byte `Mmm dd hh:mm:ss` shape
   (`is_rfc3164_timestamp_shape`). These cases fall through to `event.timestamp` (receipt time):
-  - a 3164-origin `Value::Str` relayed onto a 5424 output (no year or timezone to build an RFC 3339
-    stamp from);
   - a nil `Value::Null` relayed onto a 3164 output (3164 has no NILVALUE);
   - an absent attribute.
 
-  The `syslog_timestamp` transform sketched in "`event.timestamp` is still receipt time" (this
-  file) would resolve `event.timestamp` itself, in either direction.
+  A `timestamp` component with `from: syslog.timestamp` and `format: rfc3164` ahead of
+  `syslog_out` makes the fall-through render the sender's instant
+  ([ADR `timestamp-transform`](../adr/timestamp-transform.md)).
 - **`syslog_out`'s control-character escaping is ambiguous with a message that already contained
   the escape sequence literally.** The encoder (`sanitize_msg`) escapes an embedded newline as the
   two characters `\`/`n` (likewise `\r`, NUL, and every other C0 control and DEL) so it can't
