@@ -1148,8 +1148,9 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
         self
     }
 
-    /// Overrides [`HANDSHAKE_TIMEOUT`] for both pre-message budgets (the TLS accept and the
-    /// first-byte wait): the `handshake_timeout:` field of `syslog_in`/`graphite_in`/`statsd_in`,
+    /// Overrides [`HANDSHAKE_TIMEOUT`] for every pre-message budget (the PROXY header under
+    /// `proxy_protocol:`, the TLS accept when `tls:` is set, then the wait for the first byte):
+    /// the `handshake_timeout:` field of `syslog_in`/`graphite_in`/`statsd_in`/`lines_in`,
     /// through each wrapper's `with_handshake_timeout`. Graph rule 45 rejects `0s` before it can
     /// reach here.
     pub fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
