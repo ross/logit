@@ -1097,6 +1097,28 @@ mod tests {
         decoder.decode(Bytes::from(datagram)).expect("decode should succeed").events
     }
 
+    /// `with_peer` reaches the UDP driver: the sender's address lands on the decoded event.
+    #[tokio::test]
+    async fn with_peer_stamps_a_udp_senders_address() {
+        use crate::peer::{PEER_ADDRESS, PEER_PORT};
+        use logit_pipeline::test_util::{fanout_channel, recv_events, spawn_input};
+
+        let mut input = SyslogInput::new("127.0.0.1:0").with_peer(true);
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("a bound UDP listener has an address");
+        let (fanout, mut rx) = fanout_channel(8);
+        let running = spawn_input(input, fanout).await;
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = client.local_addr().unwrap().port();
+        client.send_to(b"<134>1 - host app - - - hello", addr).await.unwrap();
+
+        let events = recv_events(&mut rx, 1).await;
+        let attrs = &events[0].attributes;
+        assert_eq!(attrs.get(PEER_ADDRESS).and_then(Value::as_str), Some("127.0.0.1"));
+        assert_eq!(attrs.get(PEER_PORT), Some(&Value::I64(i64::from(port))));
+        running.stop().await;
+    }
+
     /// `with_diagnostics` reaches the UDP decoder as well as the driver, so `bad_line` reports
     /// under the component id.
     #[test]

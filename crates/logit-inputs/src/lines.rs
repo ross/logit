@@ -926,4 +926,28 @@ mod tests {
         assert_eq!(peer_of(&event), (client_path.to_str(), None));
         started.running.stop().await;
     }
+
+    #[tokio::test]
+    async fn peer_stamps_a_udp_senders_address_and_port() {
+        let mut started = start(LinesInput::udp("127.0.0.1:0").with_peer(true)).await;
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = client.local_addr().unwrap().port();
+        client.send_to(b"hello", started.addr.unwrap()).await.unwrap();
+        let event = recv_events(&mut started.rx, 1).await.pop().expect("one event");
+        assert_eq!(peer_of(&event), (Some("127.0.0.1"), Some(&Value::I64(i64::from(port)))));
+        started.running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn peer_stamps_a_bound_unix_datagram_senders_path_and_no_port() {
+        let dir = scratch_dir("lines-peer-unix-dgram");
+        let path = dir.join("lines.sock");
+        let client_path = dir.join("client.sock");
+        let mut started = start(LinesInput::unix(&path).with_peer(true)).await;
+        let client = tokio::net::UnixDatagram::bind(&client_path).unwrap();
+        client.send_to(b"hello", &path).await.unwrap();
+        let event = recv_events(&mut started.rx, 1).await.pop().expect("one event");
+        assert_eq!(peer_of(&event), (client_path.to_str(), None));
+        started.running.stop().await;
+    }
 }
