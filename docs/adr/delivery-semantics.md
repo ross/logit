@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-04
+updated: 2026-10-05
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -8,7 +8,9 @@ updated: 2026-10-04
 ## Status
 Accepted. Superseded in part on 2026-10-01 by [ADR `native-hop-send-window`](native-hop-send-window.md):
 item 7's last line, "`window` stays 1". Amended on 2026-10-04: the W3 amendment's open per-edge
-`on_full` policy is closed as not planned.
+`on_full` policy is closed as not planned. Amended on 2026-10-05 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): item 3's native-hop
+exception gains a second case, a frame `logit_in` refuses by name, and the pair leads the hop
+payload rather than riding in the trailer.
 
 ## Context
 
@@ -95,7 +97,8 @@ ahead of the sink.
 ### 3. An input's acknowledgment means accepted into the pipeline
 
 [Narrowed for the native hop by "Amendment: W4 decisions (2026-10-01)": `logit_in` also
-acknowledges a frame at or below its sender's high-water mark, with no forward.]
+acknowledges a frame at or below its sender's high-water mark, with no forward. See also
+"Amendment: a rejected `Ack` (2026-10-05)".]
 
 An acknowledgment from a `logit` input means the batch is in every open downstream inbox of
 that process, and in at least one. It says nothing about a sink. This is `logit_in`'s `Ack`, an
@@ -415,7 +418,8 @@ wire layout, window, and spool record. It restates item 7's bullets as decided:
 
 - **Identity is per batch, from its store.** A sink's store, memory or disk, takes a fresh
   16-byte identity every time it opens and numbers the batches it holds from 1. The identity and
-  the number ride in the batch's v2 trailer, not in the handshake. A replayed spool record keeps
+  the number ride in the batch's v2 trailer, not in the handshake. [Amended on 2026-10-05 by
+  [ADR `native-hop-ack-status`](native-hop-ack-status.md): they lead the hop payload, ahead of the batch.] A replayed spool record keeps
   the identity and number it was written with, so nothing recovers a sequence after a restart.
 - **The window is a high-water mark.** Each `logit_in` component keeps one mark per sender
   identity. A frame at or below its identity's mark is acknowledged and not forwarded, and a
@@ -537,3 +541,14 @@ There is no config knob.
 The per-request verdicts amendment above reads with `Rejected` for "`Permanent` naming the
 request" and `Refused` for "`Permanent` refusing the sink"; its guard paragraph describes the
 process exit this record removes.
+
+## Amendment: a rejected `Ack` (2026-10-05)
+
+[ADR `native-hop-ack-status`](native-hop-ack-status.md) gives `Ack` a status. `logit_in` answers a frame it reads but won't take (a body
+past its decode budget, one that doesn't decode, an oversize frame within the compressed bound)
+with a rejected `Ack` naming it, raises its sender's mark with no forward, and keeps the
+connection. That is a second native-hop exception to item 3 beside the at-or-below-the-mark case,
+and it isn't an acknowledgment of delivery: it tells the sender the batch was dropped, and the
+sender drops it as `Rejected` (item 2's permitted loss). A frame no consumer took still gets
+`Reject{GOING_AWAY}` and leaves the mark alone. A rejected `Ack` lost before the sender reads it
+lets a mark resume commit the frame as delivered; `docs/known-gaps/native-hop.md` tracks that.

@@ -156,7 +156,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 - **A resend can race the frames an ended connection still holds, and be forwarded twice.**
   `logit_in` holds no lock per sender identity across a forward, and it raises a sender's mark
-  only once a consumer takes the frame.
+  only once a consumer takes the frame or once it refuses the frame by name.
   - **The race:** a fault that ends a `logit_out` connection mid-window (a reset, a read error, a
     message other than `Ack`, an ack timeout) can leave that connection's task holding whole frames
     in its socket buffer. The task reads and forwards them while the sender resends the same window
@@ -175,12 +175,27 @@ Entry format and the other areas: [the known-gaps index](README.md).
     each of those forwards can race the resend of the same frame.
   - **Consequence:** nothing is lost. A duplicate copy can reach the consumers after later
     batches; a batch's only copy never does, because the mark reaches a sequence only after a copy
-    of it landed.
+    of it landed or `logit_in` refused it by name, and a refused frame is never forwarded by any
+    connection, since it fails the same way on each.
   - [ADR `native-hop-identity-and-sequence`](../adr/native-hop-identity-and-sequence.md), decision
     7, accepts the race: a per-sender lock held across the forward would close it at the cost of a
     lock per frame, to prevent a duplicate the at-least-once target tolerates.
     [ADR `native-hop-send-window`](../adr/native-hop-send-window.md), decision 6, keeps that with a
     window.
+
+- **A refused frame whose rejected `Ack` is lost is reported delivered by the sender.**
+  `logit_in` raises a refused frame's mark before the sender reads the rejected `Ack`
+  ([ADR `native-hop-ack-status`](../adr/native-hop-ack-status.md), decision 4). If the connection
+  fails in between (a write failure, a stall, the sender's ack timeout), `logit_out` reads it as
+  `Ambiguous`, and the next `HelloAck.marks` covers the sequence, so the sink commits the frame
+  without resending it.
+  - **Consequence:** the batch was dropped, never forwarded, but the two ends disagree on why. To
+    reconcile, compare `logit_in`'s `logit.input.batches.dropped{reason="rejected"}` with the
+    sending sink's `logit.component.batches.dropped{reason="rejected"}`: the excess at the input is
+    batches the sink counted under `logit.output.batches.resumed` and
+    `logit.component.batches.delivered`. Nothing is lost beyond the drop itself.
+  - **Possible fix, out of scope:** a bounded per-identity set of refused sequences that
+    `HelloAck` names, so a resume commits them as dropped.
 
 - **A reconnect resumes at most 16 sender identities.** After a fault, `logit_out`'s next `Hello`
   lists the identities of the frames it will resend, so `logit_in` can answer their marks and the

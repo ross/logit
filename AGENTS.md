@@ -821,7 +821,9 @@ not a style preference:
   sender accepts). `statsd_out` is the one exception, because a statsd line has no timestamp.
   An input's acknowledgment means the batch is in every open downstream inbox, never that a
   sink delivered it, and an input never acknowledges a batch no consumer directly downstream
-  took, except `logit_in`'s acknowledgment of a frame at or below its sender's mark. The
+  took, except `logit_in`'s acknowledgment of a frame at or below its sender's mark, and its
+  rejected `Ack` for a frame it won't take, which raises the mark with no forward and reports a
+  drop, not a delivery ([ADR `native-hop-ack-status`](docs/adr/native-hop-ack-status.md)). The
   `logit_out` to `logit_in` hop is effectively-once: a sink's store mints a sender
   identity every time it opens and numbers its batches, the pair leads every hop frame's
   payload, outlives a reconnect, and rides a spool replay, and `logit_in` acknowledges a frame at

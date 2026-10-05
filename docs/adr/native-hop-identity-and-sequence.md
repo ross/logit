@@ -1,9 +1,9 @@
 ---
 created: 2026-10-01
-updated: 2026-10-04
+updated: 2026-10-05
 ---
 
-# Native hop identity and sequence: a per-store sender identity and sequence in the batch trailer, an `Ack` with no fields, and a high-water mark at `logit_in`
+# Native hop identity and sequence: a per-store sender identity and sequence on every hop frame, and a high-water mark at `logit_in`
 
 ## Status
 Accepted. Supersedes, in part, [ADR

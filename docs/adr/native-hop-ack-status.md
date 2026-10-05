@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-04
+updated: 2026-10-05
 ---
 
 # Native hop ack status: the sender pair leads the hop payload, and a rejected `Ack` settles one frame by name
@@ -22,6 +22,9 @@ Accepted. Supersedes in part:
 - [ADR `native-hop-send-window`](native-hop-send-window.md): decision 4's "every `Err` from
   `await_ack` means the sink dropped its connection" and decision 5's "Every `Err` drops the
   connection": a rejected `Ack` keeps it.
+- [ADR `delivery-semantics`](delivery-semantics.md): item 3's exception for the native hop. A
+  rejected `Ack` is a second case where `logit_in` answers a frame no consumer took and raises
+  its mark with no forward; it reports a drop, not an acknowledgment of delivery.
 - [ADR `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md): the
   2026-09-25 amendment's "A batch that decodes past its per-frame decode budget gets the same
   answer", `Reject{FRAME_TOO_LARGE}`, and the `Ack` entry of "Control payload".
@@ -117,6 +120,10 @@ trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*     -- tag 1 origin,
   rejected `Ack` on its own. "An `Ack` never covers another identity" holds.
 - **The mark rises.** A refused frame raises its sender's mark, as a forward does, so a resend of
   that sequence on a later connection, or a resume through `HelloAck.marks`, isn't forwarded.
+- **A rejected `Ack` reports a drop, not a delivery.** [ADR `delivery-semantics`](delivery-semantics.md)'s
+  item 3 has `logit_in` acknowledge only a batch a consumer took, or one at or below its mark. A
+  rejected `Ack` is neither: it tells the sender the batch was dropped. The raised mark is what
+  keeps a resend from being forwarded, not a claim that anything landed.
 - **The decode precedes the resend check**, as it did. A resend whose body still fails is refused
   by name again rather than acknowledged on the mark, so the sender learns the frame was
   dropped.
@@ -148,6 +155,15 @@ trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*     -- tag 1 origin,
   commits the head, so it never replays. The marker is legal only beside `Fault::Rejected`: a
   retried head would have to be resubmitted behind frames already in flight.
 - **Counted** as `logit.output.requests{class="rejected"}`, once.
+- **The sender learns of a rejection only from the rejected `Ack` it reads.** A mark carries no
+  status. If the connection fails after `logit_in` raised the mark and before `logit_out` read the
+  rejected `Ack` (a write failure, a stall, the sender's ack timeout), `logit_out` reads the loss
+  as `Ambiguous`, and the next handshake's `HelloAck.marks` covers that sequence. The sink then
+  commits the frame as resumed and delivered (`logit.output.batches.resumed`,
+  `logit.component.batches.delivered`), while `logit_in` counted it
+  `logit.input.batches.dropped{reason="rejected"}`. Raising the mark later wouldn't close this: a
+  later forwarded frame raises it past the refused one anyway, and a mark resume never resends the
+  bytes that would be refused again. `docs/known-gaps/native-hop.md` tracks it.
 
 ### 5. A `Hello` refusal is `Refused`
 
@@ -205,6 +221,11 @@ Drain a spool before upgrading a `logit_out` that has one.
   budget, so a stock batch can still be refused; it's now dropped alone, by name.
 - **The spool doesn't survive the upgrade.** Records written before this change are skipped as
   corrupt (decision 6).
+- **Follow-up, not built.** A streaming drain, reading a frame through a fixed scratch buffer with
+  a running CRC up to a drain cap, would extend the by-name `too_large` path to uncompressed
+  frames without buffering them.
+- **A lost rejected `Ack` reads as a delivery at the sender** (decision 4). Closing it would take a
+  bounded per-identity set of rejected sequences that `HelloAck` could name; out of scope.
 - **Operator docs.** `docs/design/wire-protocol.md`'s hop payload and connection protocol,
   `docs/design/internal-telemetry.md`'s `logit_in` and `logit_out` rows, `docs/deploying.md`'s
   native-hop section, and `docs/known-gaps/native-hop.md`'s decode-budget entry describe the

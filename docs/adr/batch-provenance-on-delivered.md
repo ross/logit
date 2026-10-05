@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-01
+updated: 2026-10-05
 ---
 
 # Batch provenance (`origin`/`previous`) carried on `Delivered`, stamped by `Fanout`
@@ -172,7 +172,8 @@ widens, as a constraint on a versionless record rather than a promise about reco
 [Amendment (2026-10-01): a new field can also ride as a new v2 trailer tag, with no new codec
 byte, because `decode_batch_v2` skips a tag it doesn't know; [ADR
 `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md) adds tags 3 and 4 this
-way.]
+way. Since 2026-10-05 ([ADR `native-hop-ack-status`](native-hop-ack-status.md)) the sender pair leads the hop payload, and the trailer
+carries provenance only.]
 
 **Two new hooks, not widened existing ones, for reading it.** `Transform::observe_provenance`
 (default no-op) sits alongside `observe_batch_context`, not folded into it: `Aggregator` exposes
