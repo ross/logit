@@ -1013,6 +1013,15 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
         }
     }
 
+    /// Replaces a Unix stream listener's socket file mode before [`Input::bind`]; a TCP listener
+    /// is left untouched.
+    pub fn with_socket_mode(mut self, socket_mode: u32) -> Self {
+        if let StreamTarget::Unix { mode, .. } = &mut self.target {
+            *mode = socket_mode;
+        }
+        self
+    }
+
     /// The configured socket path of a Unix stream listener, bound or not; `None` for TCP.
     pub fn socket_path(&self) -> Option<&std::path::Path> {
         match &self.target {

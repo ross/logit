@@ -309,6 +309,15 @@ impl<D: Decoder + Send> UdpListener<D> {
         }
     }
 
+    /// Replaces a Unix datagram listener's socket file mode before [`Input::bind`]; a UDP
+    /// listener is left untouched.
+    pub fn with_socket_mode(mut self, socket_mode: u32) -> Self {
+        if let BindTarget::Unix { mode, .. } = &mut self.target {
+            *mode = socket_mode;
+        }
+        self
+    }
+
     /// The configured socket path of a Unix datagram listener, bound or not; `None` for UDP.
     pub fn socket_path(&self) -> Option<&Path> {
         match &self.target {

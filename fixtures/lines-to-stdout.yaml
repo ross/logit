@@ -26,6 +26,7 @@ components:
     #                             first byte separately. Not an idle timeout
     # idle_timeout: 5m          # off by default; closes a connection quiet for longer than this
     # max_connections: 1024     # tcp/unix_stream only; a connection past the cap is closed at once
+    # socket_mode: "0722"       # unix/unix_stream only; the socket file's mode, as a quoted string
 
   parse:
     type: json
