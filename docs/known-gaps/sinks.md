@@ -70,4 +70,5 @@ Entry format and the other areas: [the known-gaps index](README.md).
   [ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md).
   - **Related:** a write that succeeds followed by a flush that fails leaves
     `FileTarget::note_written` uncalled for bytes that may have reached the file, so a size
-    rotation can come late. The error carries no `Fault`, so the batch isn't retried.
+    rotation can come late. The error carries no `Fault`, so the batch drops as `Rejected`
+    instead of retrying.
