@@ -35,7 +35,8 @@ default `false`. When it's on, the driver stamps each event with the immediate s
 `client.address` and `client.port`.
 
 The listeners in scope are those on the shared drivers: `statsd_in`, `syslog_in`, `graphite_in`,
-and `lines_in` on every transport they offer, and `collectd_in` on UDP.
+and `lines_in` on every transport they offer, and `collectd_in` on UDP. The HTTP listeners take the
+same two options under the amendment below.
 
 ### Peer attributes
 - **Names.** OpenTelemetry semantic conventions: `network.peer.address` is the immediate socket
@@ -136,13 +137,38 @@ fuzz targets ([ADR `out-of-ci-fuzzing`](out-of-ci-fuzzing.md)), whose workspace 
   the port directly can send its own header and name any origin, so a `proxy_protocol: true` port
   must be reachable only through the proxy.
 - Deferred, each its own follow-up:
-  - The HTTP listeners (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`), `prometheus_in`'s
-    remote-write receiver, and `logit_in`, which don't use the shared drivers.
+  - `logit_in`, which doesn't use the shared drivers. The HTTP listeners are in scope under the
+    amendment below.
   - A mutual-TLS client's identity (`tls.client.subject`) and the server name it asked for.
   - `SO_PEERCRED` on `unix_stream`, which would name a local sender's process and user.
   - `network.connection.id`, to tell two connections from one address apart.
   - An allowlist of trusted proxy source addresses for `proxy_protocol:`, so a header from any
     other peer is refused.
+
+## Amendment (2026-10-05): the HTTP listeners
+
+`peer:` and `proxy_protocol:` extend to the listeners that accept their own connections:
+`otlp_in` (HTTP and gRPC), `datadog_in`, `datadog_trace_in` (TCP and its Unix socket),
+`splunk_hec_in`, and `prometheus_in`'s remote-write receiver. The attribute names, their text form,
+the cost, the collision rule, and the PROXY rules are the ones in the Decision above. Only where
+the stamp happens differs:
+
+- **Once per request.** Each listener stamps after it decodes a request and before it delivers
+  anything from it, on every batch the request produced. A request that decodes into several
+  batches (one per OTLP resource, one per HEC envelope) carries the same values on each.
+- **Built once per connection.** The values come from the socket peer and the PROXY header,
+  both fixed for the connection's life.
+- **The PROXY header comes first.** On a TCP listener under `proxy_protocol: true`, the header is
+  read after the connection permit and before the TLS accept or the plaintext first-byte peek,
+  under the listener's `handshake_timeout`.
+- **`datadog_trace_in`'s Unix socket** follows the `unix_stream` rule under "Peer attributes": a
+  bound client's path is the address, with no port, and an unbound client gets neither attribute.
+  `proxy_protocol:` applies only to its TCP `bind:` listener.
+
+An L7 proxy puts the client in a forwarding header rather than a PROXY header. [ADR
+`forwarded-header-parsing`](forwarded-header-parsing.md) decides how these listeners read one, and
+how its `client.*` relates to a PROXY origin. [The `hpeer` plan](../plans/http-listener-peer-address.md)
+has the per-listener stamp points.
 
 ## Verification of the datagram read
 `script/unsafe-check`'s `udp-peer-eintr-retry` scenario, run on 2026-10-05 against
