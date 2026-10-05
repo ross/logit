@@ -112,7 +112,7 @@ inside `flush()` — rather than inheriting the last batch's.
   dropped.
 - `logit validate`/`logit run` reject a zero flush interval on either an `aggregate` stage or a Lua
   stage's `interval` (`require_implemented_transform`,
-  `crates/logit-cli/src/pipeline.rs`) — the hand-rolled humantime codec in `logit-config` accepts
+  `crates/logit-cli/src/pipeline.rs`) — the `Duration` codec in `logit-config` accepts
   `0s` structurally, but a zero interval would make the worker's flush schedule perpetually due.
 - The published schema (ADR `config-yaml-jsonschema`) gets `interval` as an additive, optional field on the Lua
   variants; `BuiltinTransformConfig::Aggregate`'s `interval` was already required.

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-09-28
+updated: 2026-10-04
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -272,7 +272,9 @@ directory that now carries the old name.
 same-host clock) and uses that as the event timestamp, falling back to read time (plus a `bad_time`
 diagnostic) only on a parse failure. Replaying a backlog (`read_from: beginning`, or a fresh
 container's already-written history) as "now" would misrepresent when those lines actually
-happened; the daemon's local clock is a source `logit` can trust for a same-host log. This is the
+happened; the daemon's local clock is a source `logit` can trust for a same-host log. A `timestamp` component
+after `json`, `regex`, or `logfmt` resolves a `tail_in` event's time from the parsed field
+([ADR `timestamp-transform`](timestamp-transform.md)). This is the
 one place a tailing decoder's timestamp policy differs between the two kinds — documented here so a
 future kind added to this driver has to make the same choice deliberately, not by copying whichever
 of the two happened to be closer.
