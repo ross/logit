@@ -137,9 +137,10 @@ use tokio_rustls::TlsAcceptor;
 pub use crate::tls::TlsServerSettings;
 
 /// How long a connection has, per pre-message phase, before this listener releases its
-/// connection-limit permit: the TLS accept when TLS is configured, and on both arms the wait for
-/// the first byte. Each phase gets its own budget, so a silent TLS connection costs two. See this
-/// module's "Pre-handshake timeout" doc section.
+/// connection-limit permit: the PROXY header under `proxy_protocol:`, the TLS accept when TLS is
+/// configured, and on both arms the wait for the first byte. Each phase gets its own budget, so a
+/// silent connection with both options on costs three. See this module's "Pre-handshake timeout"
+/// doc section.
 ///
 /// The default only: the `handshake_timeout:` field on `syslog_in`/`graphite_in`/`statsd_in`
 /// overrides it through [`TcpListener::with_handshake_timeout`]. `logit_config`'s

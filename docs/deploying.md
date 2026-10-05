@@ -762,16 +762,23 @@ components:
 
 **It is a per-phase budget, not one deadline per connection.** Each pre-message phase gets its own
 budget of the configured length, so a TLS connection that says nothing costs up to two of them
-(10s at the default) before it is closed and its permit released. The phases:
+(10s at the default) before it is closed and its permit released, and up to three (15s) under
+`proxy_protocol: true`. The phases:
 
 | Kind | Phases bounded |
 |---|---|
-| `syslog_in` (`transport: tcp`) | the TLS accept (under `tls:`), then the wait for the connection's first byte — on the plaintext arm too |
-| `graphite_in` (`transport: tcp`) | the same two phases, on the same shared driver |
-| `statsd_in` (`transport: tcp`) | the same two phases, on the same shared driver |
-| `lines_in` (`transport: tcp`) | the same two phases, on the same shared driver |
+| `syslog_in` (`transport: tcp`) | the PROXY header (under `proxy_protocol:`), the TLS accept (under `tls:`), then the wait for the connection's first byte — on the plaintext arm too |
+| `graphite_in` (`transport: tcp`) | the same three phases, on the same shared driver |
+| `statsd_in` (`transport: tcp`) | the same three phases, on the same shared driver |
+| `lines_in` (`transport: tcp`) | the same three phases, on the same shared driver |
 | `logit_in` | the TLS accept (under `tls:`), then the `Hello` read |
 | `otlp_in` | the TLS accept (under `tls:`), or — on the plaintext arm, which has no TLS accept — the wait for the connection's first byte |
+
+**Under `proxy_protocol: true`, give the load balancer a PROXY-aware health check.** A plain TCP
+connect check sends no header, so each probe is closed and counted as
+`logit.input.connections.rejected{reason="proxy_header"}`, with a throttled `proxy_header`
+diagnostic. Use HAProxy's `check-send-proxy`, or any check that sends a v2 `LOCAL` header, which
+the listener accepts without stamping a client.
 
 **`otlp_in` bounds one phase per connection, not two**, and not by choice. It hands each accepted
 connection straight to `hyper`, whose connection builder reads the first bytes itself to tell
@@ -1011,9 +1018,10 @@ cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out
   A `tls:` block's presence turns TLS on and makes it required; a TLS listener has no plaintext
   fallback. `logit validate` rejects `tls:` under `transport: udp` (carbon has no DTLS receiver).
   Plain carbon senders have no TLS, so this is for a `logit`-to-`logit` or stunnel-shaped relay hop.
-  `handshake_timeout:` (default `5s`) bounds each pre-message phase independently: the TLS accept
-  when `tls:` is set, then the wait for the connection's first byte, so a silent TLS connection
-  costs up to two budgets before its permit comes back. It is **not** an idle timeout: once a
+  `handshake_timeout:` (default `5s`) bounds each pre-message phase independently: the PROXY
+  header under `proxy_protocol:`, the TLS accept when `tls:` is set, then the wait for the
+  connection's first byte, so a silent connection costs up to one budget per phase before its
+  permit comes back. It is **not** an idle timeout: once a
   connection has sent a byte, the gap before the next datapoint is bounded only by the opt-in
   `idle_timeout:`, if set; see
   ["`idle_timeout` on a TCP listener"](#idle_timeout-on-a-tcp-listener) above.

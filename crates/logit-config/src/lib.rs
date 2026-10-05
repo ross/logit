@@ -721,9 +721,10 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: Option<TlsServerConfig>,
         /// How long one connection has, per pre-message phase, before this listener closes it
-        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for
-        /// the connection's first byte. Each phase gets its own budget, so a silent TLS
-        /// connection costs up to twice this value. Defaults to `5s`; `0s` is rejected.
+        /// and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, the
+        /// TLS accept when `tls:` is set, then the wait for the connection's first byte. Each
+        /// phase gets its own budget, so a silent connection costs up to three times this value
+        /// with both options on. Defaults to `5s`; `0s` is rejected.
         /// `transport: tcp` or `unix_stream` only: a non-default value under `transport: udp` or
         /// `unix` is rejected.
         ///
@@ -838,9 +839,10 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: Option<TlsServerConfig>,
         /// How long one connection has, per pre-message phase, before this listener closes it
-        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for
-        /// the connection's first byte. Each phase gets its own budget, so a silent TLS
-        /// connection costs up to twice this value. Defaults to `5s`; `0s` is rejected.
+        /// and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, the
+        /// TLS accept when `tls:` is set, then the wait for the connection's first byte. Each
+        /// phase gets its own budget, so a silent connection costs up to three times this value
+        /// with both options on. Defaults to `5s`; `0s` is rejected.
         /// `transport: tcp` or `unix_stream` only: a non-default value under `transport: udp` or
         /// `unix` is rejected.
         ///
@@ -982,9 +984,10 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: Option<TlsServerConfig>,
         /// How long one connection has, per pre-message phase, before this listener closes it
-        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for
-        /// the connection's first byte. Each phase gets its own budget, so a silent TLS
-        /// connection costs up to twice this value. Defaults to `5s`; `0s` is rejected.
+        /// and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, the
+        /// TLS accept when `tls:` is set, then the wait for the connection's first byte. Each
+        /// phase gets its own budget, so a silent connection costs up to three times this value
+        /// with both options on. Defaults to `5s`; `0s` is rejected.
         /// `transport: tcp` only: a non-default value under `transport: udp` is rejected.
         ///
         /// Not an idle timeout. Once a connection has sent its first byte, the gap before its
@@ -1099,9 +1102,10 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: Option<TlsServerConfig>,
         /// How long one connection has, per pre-message phase, before this listener closes it
-        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for
-        /// the connection's first byte. Each phase gets its own budget, so a silent TLS
-        /// connection costs up to twice this value. Defaults to `5s`; `0s` is rejected.
+        /// and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, the
+        /// TLS accept when `tls:` is set, then the wait for the connection's first byte. Each
+        /// phase gets its own budget, so a silent connection costs up to three times this value
+        /// with both options on. Defaults to `5s`; `0s` is rejected.
         /// `transport: tcp` only: a non-default value under `transport: udp` is rejected.
         ///
         /// Not an idle timeout. Once a connection has sent its first byte, the gap before its

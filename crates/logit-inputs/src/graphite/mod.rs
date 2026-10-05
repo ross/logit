@@ -84,10 +84,11 @@
 //! The driver's: `max_connections:` at a time (1024 by default), the permit taken non-blockingly
 //! after `accept`, and a past-the-cap connection closed immediately and counted
 //! `logit.input.connections.rejected{reason="limit"}` (carbon's wire has no way to say "try
-//! later"). `handshake_timeout:` bounds each pre-message phase independently (the TLS accept when
-//! `tls:` is set, then the wait for the first byte) and is **not** an idle timeout. The gaps after
-//! the first byte are bounded by the opt-in `idle_timeout:` (`docs/adr/idle-connection-timeout.md`,
-//! and the driver module's "Idle timeout" section).
+//! later"). `handshake_timeout:` bounds each pre-message phase independently (the PROXY header
+//! under `proxy_protocol:`, the TLS accept when `tls:` is set, then the wait for the first byte)
+//! and is **not** an idle timeout. The gaps after the first byte are bounded by the opt-in
+//! `idle_timeout:` (`docs/adr/idle-connection-timeout.md`, and the driver module's "Idle timeout"
+//! section).
 //!
 //! ## Diagnostics
 //!
@@ -267,9 +268,9 @@ impl GraphiteInput {
         self
     }
 
-    /// Sets a TCP listener's per-phase pre-message budget (`handshake_timeout:`): the TLS accept
-    /// when `tls:` is set, then the wait for the first byte. See
-    /// [`TcpListener::with_handshake_timeout`].
+    /// Sets a TCP listener's per-phase pre-message budget (`handshake_timeout:`): the PROXY header
+    /// under `proxy_protocol:`, the TLS accept when `tls:` is set, then the wait for the first
+    /// byte. See [`TcpListener::with_handshake_timeout`].
     ///
     /// A no-op under UDP, which has no connection to bound; graph rule 45 rejects a non-default
     /// value there. [`Self::with_tls`] fails instead, because `tls:` has no default and its
