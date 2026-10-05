@@ -112,6 +112,7 @@ fn graph_and_topology(disk_dir: std::path::PathBuf) -> (graph::Graph, DiskQueueC
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                socket_mode: None,
             },
         },
     );

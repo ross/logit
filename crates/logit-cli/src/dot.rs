@@ -97,6 +97,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    socket_mode: None,
                 },
             },
         );
