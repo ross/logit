@@ -70,26 +70,36 @@ load balancer pass the original client's address ahead of the stream.
 
 - **TCP transports only.** A graph rule rejects `proxy_protocol: true` on UDP and Unix-socket
   transports.
-- **Required when on.** Every connection must open with a header. It's never auto-detected: the
-  spec's security note says a receiver must not guess, because a client that can reach the
-  listener directly could then forge its own origin.
+- **Required when on.** Every connection must open with a header, and it's never auto-detected,
+  as the spec requires. Requiring it only rejects a client that connects without one by mistake.
+  It doesn't stop a client that reaches the listener directly from sending a header of its own
+  and naming any origin. `client.*` is as trustworthy as the network path to the listener, so the
+  operator makes the port reachable only through the proxy, the same operator boundary
+  [ADR `deployment-threat-model`](deployment-threat-model.md) draws for every listener.
 - **Both versions.** v1 (text) and v2 (binary) are told apart by their signatures.
 - **Before TLS.** The header is read off the raw stream before the TLS handshake, as a proxy sends
   it, under the listener's `handshake_timeout`.
 - **Failure closes the connection.** A missing, malformed, or slow header closes it with a
   throttled diagnostic, counted as `logit.input.connections.rejected{reason="proxy_header"}`.
-- **`LOCAL` keeps the socket peer.** A v2 `LOCAL` command (a proxy's own health check) and a v1
-  `UNKNOWN` carry no origin, so no `client.*` attribute is stamped.
-- **TLVs are ignored.** v2's type-length-value extensions are skipped by their length.
+- **No origin keeps the socket peer.** A v2 `LOCAL` command (a proxy's own health check), a v2
+  `PROXY` with family `AF_UNSPEC`, and a v1 `UNKNOWN` carry no usable origin, so the connection
+  is accepted and no `client.*` attribute is stamped.
+- **TLVs are ignored.** v2's type-length-value extensions follow the address block inside the
+  header's length and are skipped.
 - **Attributes.** The header's source address and port become `client.address` and `client.port`
-  whether or not `peer:` is on. `network.peer.*`, when on, stays the proxy, which is what semconv
-  means by it.
+  whether or not `peer:` is on. A v2 `PROXY` with family `AF_UNIX` stamps the source path as
+  `client.address` and no `client.port`. `network.peer.*`, when on, stays the proxy, which is what
+  semconv means by it. `client.*` follows the same collision rule as `network.peer.*`: the
+  driver's value replaces a same-named attribute a decoder produced.
 
 The parser is hand-rolled, not the `ppp` crate (Apache-2.0, version 2.3.0 at writing). The format
-is small: a v1 header is one CRLF-terminated text line of at most 107 bytes, and a v2 header is a
-16-byte fixed part followed by a length-prefixed address block of 12, 36, or 216 bytes. `logit`
+is small. A v1 header is one CRLF-terminated text line of at most 107 bytes. A v2 header is a
+16-byte fixed part whose last 2 bytes give the length of what follows, 0 to 65,535 bytes: the
+address block (0 bytes for `AF_UNSPEC`, 12 for IPv4, 36 for IPv6, 216 for `AF_UNIX`) and then any
+TLVs. The parser reads the whole length, takes the address block, and skips the rest. `logit`
 needs only the command, the family, and the source address and port. The work a crate wouldn't
-save is the stream side: how many bytes to read before parsing, the 107-byte cap, and the timeout.
+save is the stream side: how many bytes to read before parsing, the 107-byte v1 cap and the
+16-plus-length v2 bound, and the timeout.
 A dependency would add a single-maintainer crate to `deny.toml`'s and `script/audit`'s scope for
 what the pickle reader, the gRPC framing, and the native codec show this codebase writes itself.
 The parser lives in `logit-proto`, beside the other codecs that read peer bytes, so it joins the
@@ -107,8 +117,10 @@ fuzz targets ([ADR `out-of-ci-fuzzing`](out-of-ci-fuzzing.md)), whose workspace 
 - **A peer parameter on `Decoder::decode_into`.** It changes every decoder for a value none of them
   reads. Stamping after decode needs no decoder change.
 - **A hostname from reverse DNS.** Rejected under "No reverse DNS" above.
-- **Auto-detecting the PROXY header.** The spec forbids it for the forgery reason above, and a v1
-  header is plain text that a `lines_in` or carbon plaintext sender could send by accident.
+- **Auto-detecting the PROXY header.** The spec forbids it: a listener that guesses accepts a
+  header from every client, including the direct ones it also serves, so any of them can name its
+  own origin. A v1 header is also plain text that a `lines_in` or carbon plaintext sender could
+  send by accident.
 
 ## Consequences
 - An operator turns on `peer:` per listener. With it on, a sender's address reaches every sink
@@ -117,9 +129,14 @@ fuzz targets ([ADR `out-of-ci-fuzzing`](out-of-ci-fuzzing.md)), whose workspace 
   origin needs `proxy_protocol: true` and a proxy configured to send the header.
 - With `proxy_protocol: true`, a client that connects without the header is refused. A health
   check has to go through the proxy or use v2 `LOCAL`.
+- `client.*` is only as trustworthy as the network path to the listener. A client that can reach
+  the port directly can send its own header and name any origin, so a `proxy_protocol: true` port
+  must be reachable only through the proxy.
 - Deferred, each its own follow-up:
   - The HTTP listeners (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`) and
     `logit_in`, which don't use the shared drivers.
   - A mutual-TLS client's identity (`tls.client.subject`) and the server name it asked for.
   - `SO_PEERCRED` on `unix_stream`, which would name a local sender's process and user.
   - `network.connection.id`, to tell two connections from one address apart.
+  - An allowlist of trusted proxy source addresses for `proxy_protocol:`, so a header from any
+    other peer is refused.
