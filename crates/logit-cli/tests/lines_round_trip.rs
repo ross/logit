@@ -86,8 +86,6 @@ async fn lines_over_tcp_and_udp_reach_stdout_as_log_events() {
         }
     });
 
-    // Every listener binds before any runs, so an accepted TCP connection means the UDP socket
-    // is bound too.
     let mut client = None;
     wait_until_within("the TCP lines_in to accept", PROCESS_DEADLINE, || {
         client = std::net::TcpStream::connect(&tcp_addr).ok();
@@ -97,18 +95,25 @@ async fn lines_over_tcp_and_udp_reach_stdout_as_log_events() {
     let mut client = client.unwrap();
     client.write_all(b"{\"user\":\"ada\",\"n\":3}\r\nplain text over tcp\n").unwrap();
     client.flush().unwrap();
-    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    udp.send_to(b"one datagram\nits unterminated tail", &udp_addr).unwrap();
 
     let mut events = Vec::new();
-    while events.len() < 4 {
-        let line = line_rx
-            .recv_timeout(PROCESS_DEADLINE)
-            .unwrap_or_else(|_| panic!("timed out with {} of 4 events: {events:?}", events.len()));
-        let event: serde_json::Value =
-            serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON ({e}): {line}"));
-        events.push(event);
-    }
+    let mut read_events = |want: usize| {
+        while events.len() < want {
+            let line = line_rx.recv_timeout(PROCESS_DEADLINE).unwrap_or_else(|_| {
+                panic!("timed out with {} of {want} events: {events:?}", events.len())
+            });
+            let event: serde_json::Value =
+                serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON ({e}): {line}"));
+            events.push(event);
+        }
+    };
+    // A TCP connect succeeds once the listener calls listen(2), before the startup bind pass
+    // reaches the UDP listener, so a datagram sent then can hit an unbound port. An event on
+    // stdout means every node is running, and so every listener is bound.
+    read_events(2);
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.send_to(b"one datagram\nits unterminated tail", &udp_addr).unwrap();
+    read_events(4);
 
     let message = |event: &serde_json::Value| event["log"]["message"].as_str().map(str::to_string);
     let mut messages: Vec<String> = events.iter().filter_map(message).collect();
