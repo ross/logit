@@ -82,10 +82,13 @@ load balancer pass the original client's address ahead of the stream.
 - **Failure closes the connection.** A missing, malformed, or slow header closes it with a
   throttled diagnostic, counted as `logit.input.connections.rejected{reason="proxy_header"}`.
 - **No origin keeps the socket peer.** A v2 `LOCAL` command (a proxy's own health check), a v2
-  `PROXY` with family `AF_UNSPEC`, and a v1 `UNKNOWN` carry no usable origin, so the connection
-  is accepted and no `client.*` attribute is stamped.
+  `PROXY` with family `AF_UNSPEC` or transport `UNSPEC`, a v2 `AF_UNIX` source with an empty path
+  (an unnamed or abstract socket), and a v1 `UNKNOWN` carry no usable origin, so the connection
+  is accepted and no `client.*` attribute is stamped. A `DGRAM` transport's source is an origin
+  like a `STREAM` one's.
 - **TLVs are ignored.** v2's type-length-value extensions follow the address block inside the
-  header's length and are skipped.
+  header's length and are skipped unread, so a `PP2_TYPE_CRC32C` checksum isn't verified, which
+  the spec permits a receiver that doesn't implement it.
 - **Attributes.** The header's source address and port become `client.address` and `client.port`
   whether or not `peer:` is on. A v2 `PROXY` with family `AF_UNIX` stamps the source path as
   `client.address` and no `client.port`. `network.peer.*`, when on, stays the proxy, which is what
