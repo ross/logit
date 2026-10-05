@@ -18,9 +18,9 @@
 //!
 //! Under both Unix transports `bind:` is the socket's path. [`crate::unix`] prepares it (the
 //! directory must exist, a stale socket is replaced, anything else is refused) and the file is made
-//! mode [`SOCKET_MODE`], `0722`. The file isn't removed on shutdown. ADR
-//! `datadog-agent-and-intake-relay`, decision 12, has why the path lives in `bind:` and why the
-//! mode is `0722`.
+//! mode `socket_mode:` ([`StatsdInput::with_socket_mode`]), `0722` by default. The file isn't
+//! removed on shutdown. ADR `datadog-agent-and-intake-relay`, decision 12, has why the path lives
+//! in `bind:` and why the default mode is `0722`.
 //!
 //! A TCP listener has **no [`ReceiveQueue`](crate::udp::ReceiveQueue)**: TCP's flow control is
 //! the backpressure, and ADR `decoupled-listener-io` exists for UDP's silent drops, which a stream
@@ -248,10 +248,6 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::watch;
 
-/// The socket file's mode under `transport: unix`/`unix_stream`: the Datadog Agent's for its
-/// DogStatsD socket (this module's "Transports").
-pub const SOCKET_MODE: u32 = 0o722;
-
 /// Which driver a [`StatsdInput`] wraps, chosen once by `transport:`. An enum rather than a
 /// `Box<dyn Input>` so each arm's concrete builders ([`TcpListener::with_tls`],
 /// [`UdpListener::with_config`]) stay reachable; [`crate::syslog::SyslogInput`] does the same.
@@ -309,7 +305,7 @@ impl StatsdInput {
             inner: Inner::Udp(UdpListener::unix(
                 "statsd_in",
                 path,
-                SOCKET_MODE,
+                crate::unix::DEFAULT_SOCKET_MODE,
                 StatsdDecoder::new(Arc::new(Resource::default())),
                 UdpListenerConfig::default(),
             )),
@@ -325,7 +321,7 @@ impl StatsdInput {
                 TcpListener::unix(
                     "statsd_in",
                     path,
-                    SOCKET_MODE,
+                    crate::unix::DEFAULT_SOCKET_MODE,
                     StatsdDecoder::new(Arc::new(Resource::default())),
                     TcpListenerConfig::default(),
                 )
@@ -442,6 +438,17 @@ impl StatsdInput {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_max_connections(max_connections));
         }
+        self
+    }
+
+    /// Sets the socket file's mode under `transport: unix`/`unix_stream` (`socket_mode:`),
+    /// overriding the default `0722`. An IP listener is left untouched: it has no socket file, and
+    /// graph rule 78 rejects the field there.
+    pub fn with_socket_mode(mut self, socket_mode: u32) -> Self {
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(listener.with_socket_mode(socket_mode)),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_socket_mode(socket_mode)),
+        };
         self
     }
 
@@ -2696,7 +2703,7 @@ mod tests {
         let dir = TempDir::new("statsd-dgram");
         let path = dir.path().join("dsd.socket");
         let mut running = start_unix(StatsdInput::unix(&path)).await;
-        assert_eq!(mode_of(&path), SOCKET_MODE);
+        assert_eq!(mode_of(&path), crate::unix::DEFAULT_SOCKET_MODE);
 
         let client = tokio::net::UnixDatagram::unbound().unwrap();
         client.send_to(b"a:1|c\nb:2|g|e:ext|card:low\nc:3:4|ms", &path).await.unwrap();
@@ -2735,7 +2742,7 @@ mod tests {
         let dir = TempDir::new("statsd-stream");
         let path = dir.path().join("dsd-stream.socket");
         let mut running = start_unix(StatsdInput::unix_stream(&path)).await;
-        assert_eq!(mode_of(&path), SOCKET_MODE);
+        assert_eq!(mode_of(&path), crate::unix::DEFAULT_SOCKET_MODE);
 
         let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
         client.write_all(&packet(b"a:1|c\nb:2|c")).await.unwrap();
@@ -2777,6 +2784,18 @@ mod tests {
             1.0
         );
         running.stop();
+    }
+
+    /// A configured `socket_mode:` replaces the default on both Unix transports.
+    #[tokio::test]
+    async fn with_socket_mode_sets_the_socket_files_mode_on_both_unix_transports() {
+        let dir = TempDir::new("statsd-mode");
+        let path = dir.path().join("dsd.socket");
+        for input in [StatsdInput::unix(&path), StatsdInput::unix_stream(&path)] {
+            let mut input = input.with_socket_mode(0o660);
+            input.bind().await.expect("bind");
+            assert_eq!(mode_of(&path), 0o660);
+        }
     }
 
     /// A Unix socket is always plaintext: `with_tls` fails on both transports.

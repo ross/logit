@@ -29,7 +29,10 @@ The shared stream and datagram drivers already provide what such a listener need
 Add the kind `lines_in`. One line is one raw log event, and the listener parses nothing.
 
 - **Transports.** `transport:` is `tcp` (the default, with an optional `tls:` block), `udp`, `unix`,
-  or `unix_stream`, each on the shared driver `statsd_in` uses for it.
+  or `unix_stream`, each on the shared driver `statsd_in` uses for it. A Unix socket file is made
+  mode `socket_mode:`, `0722` by default, as `statsd_in`'s is
+  ([ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s socket-mode
+  amendment).
 - **No parsing.** The event is a log with `BodyFormat::Raw`, no attributes, and no severity. An
   operator composes `json`, `logfmt`, `kv`, or `regex` after it, as the pipeline model already
   expects.

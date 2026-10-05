@@ -213,9 +213,9 @@ enough to absorb a stall, so the channel it sends into keeps draining. A `buffer
 
 `statsd_in` (`transport: unix` or `unix_stream`) and `datadog_trace_in` (`socket:`) bind the
 Agent's socket paths. `logit` never creates the socket's directory, because its owner and mode are
-the access control. It makes the socket file mode `0722`, the Agent's own mode: a client needs
-only write permission to send, so any user's process can. Restrict senders with the directory's
-permissions. The path must be absolute, and neither Unix transport takes `tls:`. On the sending
+the access control. It makes the socket file mode `0722` by default, the Agent's own mode: a
+client needs only write permission to send, so any user's process can. Restrict senders with the
+directory's permissions, or set `socket_mode:` to a quoted octal string such as `"0660"`. The path must be absolute, and neither Unix transport takes `tls:`. On the sending
 side, raise `statsd_out`'s `max_packet_bytes:` to `8192` for a Unix socket.
 
 ### Log correlation: `trace_context` with `format: datadog`

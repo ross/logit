@@ -394,6 +394,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `%:Q`, or fails to parse its own rendering of a reference instant
     (`docs/adr/timestamp-transform.md`).
 77. A `lines_in` `max_line_bytes` of `0`.
+78. A `socket_mode` on a `statsd_in`/`lines_in` under `transport: tcp`/`udp`, or on a
+    `datadog_trace_in` without `socket`.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
