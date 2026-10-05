@@ -17,17 +17,17 @@ Entry format and the other areas: [the known-gaps index](README.md).
   Splunk Cloud opens that port only by support ticket.
   - **Consequence:** data already indexed in Splunk can't be pulled out through `logit`.
   - **Revisit trigger:** a migration that needs historical data moved, not only new data teed.
-- **No listener for a forwarder's `[tcpout] sendCookedData = false` output.** Splunk Enterprise
-  10.4.3 writes each event's `_raw` followed by one LF, with no header, length, or metadata
-  (`tools/splunk-interop/README.md`, "What the run showed"). `logit` has no plain-lines TCP
-  listener; `syslog_in` would parse each line as a syslog message. The "No plain-lines
-  listener" entry in [the Datadog gaps](datadog.md) is the same gap.
-  - **Consequence:** this output can't feed `logit`. Even a line listener would split an event
-    with an embedded newline in two, and would receive no `host`, `source`, `sourcetype`, or
-    `index`.
-  - **Workaround:** the heavy forwarder's `[syslog]` output, as above.
-  - **Revisit trigger:** a `lines_in` on the `TcpListener` driver, which would serve this and the
-    Datadog case ([plan §9](../plans/splunk-relay.md#9-not-in-this-stack)).
+- **A forwarder's `[tcpout] sendCookedData = false` output reaches `lines_in` without its
+  metadata, and an embedded newline splits an event.** Splunk Enterprise 10.4.3 writes each
+  event's `_raw` followed by one LF, with no header, length, or metadata
+  (`tools/splunk-interop/README.md`, "What the run showed"). `lines_in` reads that framing, but no
+  run has sent a forwarder's `[tcpout]` into it.
+  - **Consequence:** no `host`, `source`, `sourcetype`, or `index` arrives, and an event with an
+    embedded newline becomes two events.
+  - **Workaround:** stamp the envelope with a `set` stage, or use the heavy forwarder's `[syslog]`
+    output, as above.
+  - **Revisit trigger:** a user whose forwarders need the envelope, or a `[tcpout]` run against
+    `lines_in`.
 - **An Edge Processor's HEC destination pointed at `splunk_hec_in` is UNVERIFIED.** Splunk's docs
   describe the HEC destination only for Splunk targets, with acknowledgment off on the destination
   token. Edge Processor runs in Splunk Cloud and in a Splunk Enterprise 10.x edition that the

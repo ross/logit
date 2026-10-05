@@ -1106,8 +1106,8 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
     }
 
     /// Overrides [`crate::DEFAULT_MAX_CONNECTIONS`]: the `max_connections:` field of
-    /// `syslog_in`/`graphite_in`/`statsd_in`, through each wrapper's `with_max_connections`. Graph
-    /// rule 74 rejects `0` before it gets here.
+    /// `syslog_in`/`graphite_in`/`statsd_in`/`lines_in`, through each wrapper's
+    /// `with_max_connections`. Graph rule 74 rejects `0` before it gets here.
     pub(crate) fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
         self

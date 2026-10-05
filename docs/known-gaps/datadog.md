@@ -135,16 +135,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
     instead. An OTLP explicit-bucket histogram reaches Datadog only through `otlp_out`.
   - **Revisit trigger:** an operator who needs the Agent's five series, or a `Histogram` as
     Datadog's `.bucket` counters ([plan §2](../plans/datadog-relay.md#2-kinds-and-config-w3w6)).
-- **No plain-lines listener for an application that writes JSON lines to an Agent's TCP `logs`
-  port.** An Agent's `logs` integration can listen on TCP or UDP for raw, JSON, or syslog lines,
-  one per `\n`. `logit` has no listener that takes such a line as a plain line: `syslog_in`
-  parses each one as a syslog message. The reverse direction is unverified: an Agent's TCP `logs`
-  listener takes `syslog_out`'s syslog-formatted lines, but whether it parses a JSON body into
-  attributes is untested.
-  - **Consequence:** such an application can't point at `logit` in place of the Agent, and logs
-    into an Agent go through `otlp_out` with the Agent's OTLP logs turned on.
-  - **Revisit trigger:** a user with such an application. The plan sketches a `lines_in` on the
-    `TcpListener` driver ([plan §7](../plans/datadog-relay.md#7-documented-recipes-not-code-w8b)).
+- **Whether an Agent's TCP `logs` listener parses a JSON body from `syslog_out` is untested.** An
+  Agent's TCP `logs` listener takes `syslog_out`'s syslog-formatted lines, but no run has checked
+  that it parses a JSON body into attributes.
+  - **Consequence:** logs into an Agent go through `otlp_out` with the Agent's OTLP logs turned on.
+  - **Revisit trigger:** a user who needs to send logs to an Agent's TCP `logs` listener.
 - **Some Datadog behavior wasn't exercised by the recorded corpus or the trial-org run.** Each of
   these is implemented from the Agent's source or Datadog's docs and covered by the codec's own
   tests, but no real sender or Datadog org has checked it:

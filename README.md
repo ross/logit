@@ -96,7 +96,7 @@ DOT format. [examples/](examples) has complete starting configs, each with a ren
 
 | Role | Types |
 |---|---|
-| Inputs | `statsd_in` (statsd and DogStatsD), `syslog_in`, `otlp_in`, `prometheus_in` (scrape or remote-write), `datadog_in` (Datadog's intake API), `datadog_trace_in` (a Datadog Agent's APM API), `splunk_hec_in` (Splunk's HTTP Event Collector), `collectd_in`, `graphite_in`, `tail_in`, `docker_in`, `logit_in`, `internal` (`logit`'s own telemetry), `generate_in` |
+| Inputs | `statsd_in` (statsd and DogStatsD), `syslog_in`, `otlp_in`, `prometheus_in` (scrape or remote-write), `datadog_in` (Datadog's intake API), `datadog_trace_in` (a Datadog Agent's APM API), `splunk_hec_in` (Splunk's HTTP Event Collector), `collectd_in`, `graphite_in`, `lines_in` (plain newline-delimited lines), `tail_in`, `docker_in`, `logit_in`, `internal` (`logit`'s own telemetry), `generate_in` |
 | Parsers | `json`, `csv`, `logfmt`, `kv`, `regex`, `http_access` |
 | Reshaping | `set`, `remove`, `keep`, `keep_values`, `flatten`, `scale`, `kv_metrics`, `trace_context`, `timestamp` |
 | Filtering and sampling | `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `sample` |

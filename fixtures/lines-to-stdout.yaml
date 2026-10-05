@@ -1,0 +1,37 @@
+# Plain newline-delimited lines in, parsed JSON out: an application writing one JSON object per
+# line to a TCP socket, with no agent library in between. Each line becomes one raw log event;
+# `json` turns a JSON line into attributes and passes any other line through untouched.
+#
+#   app (TCP lines) --> lines_in --> json --> stdio_out (format: json)
+#
+# Try it against `logit run fixtures/lines-to-stdout.yaml`:
+#
+#   printf '{"level":"info","msg":"hello"}\nnot json\n' | nc -q1 127.0.0.1 5170
+#
+# A line ends at its `\n` (a trailing `\r` is stripped), so a multi-line message arrives as several
+# events. An unterminated last line when the sender closes is dropped and counted, never emitted.
+# Nothing about the sender is attached; stamp what you know with a `set` stage.
+components:
+  lines_in:
+    type: lines_in
+    bind: 0.0.0.0:5170
+    transport: tcp             # tcp (the default) | udp | unix | unix_stream; tls: requires tcp
+    # Each field below shows its default, or an example value for one that's off unless set.
+    # max_line_bytes: "64KiB"   # a longer line is dropped and counted; the next line still decodes
+    # tls:                      # presence turns TLS on and makes it required; tcp only
+    #   cert_file: server.pem   # required: this listener's own certificate chain
+    #   key_file: server.key    # required: server.pem's private key
+    #   client_ca_file: null    # set for mutual TLS; omit for server-auth-only TLS
+    # handshake_timeout: 5s     # tcp/unix_stream only; bounds the TLS accept and the wait for the
+    #                             first byte separately. Not an idle timeout
+    # idle_timeout: 5m          # off by default; closes a connection quiet for longer than this
+    # max_connections: 1024     # tcp/unix_stream only; a connection past the cap is closed at once
+
+  parse:
+    type: json
+    sources: [lines_in]
+
+  stdout:
+    type: stdio_out
+    sources: [parse]
+    format: json

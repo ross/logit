@@ -234,10 +234,15 @@ listener. Two outputs a heavy forwarder has reach `logit` instead:
 
 - `outputs.conf [syslog]` into `syslog_in`, RFC 3164 over UDP or TCP;
 - `[tcpout]` with `sendCookedData = false`, which writes each event's raw text followed by one LF
-  and nothing else. `logit` has no plain-lines listener to receive it, and an event with an
-  embedded newline arrives as two lines.
+  and nothing else. Point the forwarder at a `lines_in` listener with `transport: tcp`
+  ([`lines_in`](deploying.md#lines_in-plain-newline-delimited-lines)). The interop run observed
+  that framing and `lines_in` reads it, but no run has sent a forwarder's `[tcpout]` into
+  `lines_in`, so treat the path as unverified. An event with an embedded newline arrives as two
+  events, and no `host`, `source`, `sourcetype`, or `index` arrives, so stamp them with a `set`
+  stage.
 
-`docs/known-gaps/splunk.md` tracks both, and Edge Processor's HEC destination.
+`docs/known-gaps/splunk.md` tracks the S2S gap, the `[tcpout]` limits, and Edge Processor's HEC
+destination.
 
 ## Credentials
 

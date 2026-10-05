@@ -77,6 +77,7 @@ Listeners live in `crates/logit-inputs`, codecs in `crates/logit-proto`.
 | `statsd_in` | `crates/logit-inputs/src/statsd.rs` | statsd/DogStatsD over UDP (default), `transport: tcp`, or a Unix socket (`unix`, `unix_stream`) | [ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) |
 | `syslog_in` | `crates/logit-inputs/src/syslog.rs` | syslog over UDP (default) or `transport: tcp`, optional TLS (RFC 5425) | [ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md) |
 | `graphite_in` | `crates/logit-inputs/src/graphite/` | carbon plaintext and pickle, UDP or TCP | [ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md) |
+| `lines_in` | `crates/logit-inputs/src/lines.rs` | newline-delimited plain text over TCP (optionally TLS), UDP, or a Unix socket (`unix`, `unix_stream`); one raw log event per line, nothing parsed (compose `json`, `logfmt`, `kv`, `regex`) | [ADR `plain-lines-listener`](docs/adr/plain-lines-listener.md) |
 | `collectd_in` | `crates/logit-inputs/src/collectd.rs` | collectd's binary `network` protocol, unicast or multicast | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
 | `otlp_in` | `crates/logit-inputs/src/otlp.rs` | OTLP logs, metrics, and traces over OTLP/HTTP (protobuf and OTLP/JSON) and OTLP/gRPC | [ADR `otlp-json-decoding`](docs/adr/otlp-json-decoding.md) |
 | `datadog_in` | `crates/logit-inputs/src/datadog.rs` | Datadog's intake API over HTTP (series, sketches, checks, events, logs, APM traces and stats), gzip/deflate/zstd, `503` when busy | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
@@ -406,12 +407,12 @@ Per pair:
   more after the read loop stops. So `logit.input.kernel.drops` and the
   `receive_buffer.*`/`accept_queue.*` gauges attribute to a component a loss no other layer could
   see ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)).
-- **TCP**: `syslog_in`, `graphite_in`, and `statsd_in` can each run `transport: tcp` on a
+- **TCP**: `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` can each run `transport: tcp` on a
   generic stream driver, `logit-inputs::tcp::TcpListener` (`crates/logit-inputs/src/tcp.rs`),
   which provides:
   - an accept loop and a connection cap (`max_connections:`, 1024 by default);
   - per-listener framing: RFC 6587's auto-detecting pair for `syslog_in`, LF-delimited lines for
-    `statsd_in` and carbon plaintext, and carbon's 4-byte length prefix for pickle;
+    `statsd_in`, `lines_in`, and carbon plaintext, and carbon's 4-byte length prefix for pickle;
   - `handshake_timeout:`, bounding each pre-message phase;
   - an opt-in `idle_timeout:`, bounding the quiet gaps after them (off by default;
     [ADR `idle-connection-timeout`](docs/adr/idle-connection-timeout.md));
@@ -879,7 +880,7 @@ crates/
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
-  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, graphite, collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
+  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, graphite, lines (lines_in), collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), splunk (splunk_hec_out), logit (logit_out), null_out (load-test discard sink)
                     shared drivers: `stream` (the pooled TCP, TLS, and Unix-stream send of statsd, syslog, and graphite), `datagram` (the packer and UDP/Unix-datagram send of statsd, syslog, graphite, and collectd), `accounting` (`BatchAccounting`, the once-per-batch encode-side counting gate; ADR `sink-send-path-and-attempt-accounting`)
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, timestamp (event.timestamp from an attribute), scale, has_signal, keep_signals, drop_signals, has_attributes, drop_attributes, has_provenance, drop_provenance, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), sample (consistent, keyed sampling on a frozen XXH64 hash), route (implements logit-pipeline::Router)
