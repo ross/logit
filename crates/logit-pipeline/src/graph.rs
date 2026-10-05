@@ -243,9 +243,6 @@
 //!     (`docs/adr/timestamp-transform.md`).
 //! 77. A `lines_in` `max_line_bytes` of `0`: every non-empty line would be dropped as oversize
 //!     (`docs/adr/plain-lines-listener.md`).
-//! 78. `peer: true` on a UDP `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` or a
-//!     `transport: unix` `statsd_in`/`lines_in`: the datagram driver doesn't record a sender
-//!     (`docs/adr/listener-peer-address.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3594,28 +3591,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             anyhow::bail!(
                 "component '{id}': lines_in 'max_line_bytes' must be greater than 0 -- 0 would \
                  drop every line"
-            );
-        }
-    }
-
-    // Rule 78: `peer:`. Only the stream driver stamps a peer, so `true` on a datagram listener
-    // ([`datagram_transport_of`]) would be silently ignored.
-    for (id, component) in &components {
-        let peer = match &component.kind {
-            ComponentKind::SyslogIn { peer, .. }
-            | ComponentKind::GraphiteIn { peer, .. }
-            | ComponentKind::StatsdIn { peer, .. }
-            | ComponentKind::LinesIn { peer, .. } => *peer,
-            _ => continue,
-        };
-        if !peer {
-            continue;
-        }
-        if let Some((kind_name, transport)) = datagram_transport_of(&component.kind) {
-            anyhow::bail!(
-                "component '{id}': 'peer' needs {} -- a {transport} {kind_name} doesn't record \
-                 its senders' addresses",
-                stream_transports_for(kind_name)
             );
         }
     }
@@ -10517,6 +10492,7 @@ mod tests {
         ComponentKind::CollectdIn {
             bind: "0.0.0.0:25826".to_string(),
             types_db: types_db.into_iter().map(std::path::PathBuf::from).collect(),
+            peer: false,
         }
     }
 
@@ -12177,68 +12153,29 @@ mod tests {
         }
     }
 
-    // ---- Rule 78: `peer` on a datagram listener ------------------------------------------------
+    // ---- `peer` -------------------------------------------------------------------------------
 
-    /// Rule 78: the datagram driver records no sender, so `peer: true` there would do nothing.
+    /// Every shared-driver listener takes `peer: true` on every transport it offers.
     #[test]
-    fn peer_on_a_datagram_transport_is_rejected() {
-        for (json, needs, listener) in [
-            (
-                r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "peer": true}"#,
-                "'transport: tcp' or 'transport: unix_stream'",
-                "a UDP statsd_in",
-            ),
-            (
-                r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix",
-                    "peer": true}"#,
-                "'transport: tcp' or 'transport: unix_stream'",
-                "a 'transport: unix' statsd_in",
-            ),
-            (
-                r#"{"type": "syslog_in", "bind": "127.0.0.1:0", "peer": true}"#,
-                "'transport: tcp'",
-                "a UDP syslog_in",
-            ),
-            (
-                r#"{"type": "graphite_in", "bind": "127.0.0.1:0", "transport": "udp",
-                    "peer": true}"#,
-                "'transport: tcp'",
-                "a UDP graphite_in",
-            ),
-            (
-                r#"{"type": "lines_in", "bind": "127.0.0.1:0", "transport": "udp", "peer": true}"#,
-                "'transport: tcp' or 'transport: unix_stream'",
-                "a UDP lines_in",
-            ),
-            (
-                r#"{"type": "lines_in", "bind": "/tmp/lines.socket", "transport": "unix",
-                    "peer": true}"#,
-                "'transport: tcp' or 'transport: unix_stream'",
-                "a 'transport: unix' lines_in",
-            ),
-        ] {
-            let kind = listener_from_json(json);
-            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
-            assert!(
-                err.contains(&format!("'peer' needs {needs}")) && err.contains(listener),
-                "for {json}, got: {err}"
-            );
-        }
-    }
-
-    /// Rule 78: every stream transport takes `peer: true`, and a datagram one takes the default.
-    #[test]
-    fn peer_on_a_stream_transport_resolves_fine() {
+    fn peer_resolves_on_every_transport() {
         for json in [
+            r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "peer": true}"#,
             r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "transport": "tcp", "peer": true}"#,
+            r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix",
+                "peer": true}"#,
             r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix_stream",
                 "peer": true}"#,
+            r#"{"type": "syslog_in", "bind": "127.0.0.1:0", "peer": true}"#,
             r#"{"type": "syslog_in", "bind": "127.0.0.1:0", "transport": "tcp", "peer": true}"#,
             r#"{"type": "graphite_in", "bind": "127.0.0.1:0", "peer": true}"#,
+            r#"{"type": "graphite_in", "bind": "127.0.0.1:0", "transport": "udp", "peer": true}"#,
             r#"{"type": "lines_in", "bind": "127.0.0.1:0", "peer": true}"#,
+            r#"{"type": "lines_in", "bind": "127.0.0.1:0", "transport": "udp", "peer": true}"#,
+            r#"{"type": "lines_in", "bind": "/tmp/lines.socket", "transport": "unix",
+                "peer": true}"#,
             r#"{"type": "lines_in", "bind": "/tmp/lines.socket", "transport": "unix_stream",
                 "peer": true}"#,
-            r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "peer": false}"#,
+            r#"{"type": "collectd_in", "bind": "127.0.0.1:0", "peer": true}"#,
         ] {
             let kind = listener_from_json(json);
             resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))

@@ -400,7 +400,7 @@ fn build_spec(
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
-            // No-ops under UDP, where rules 45, 53, 74, and 78 reject a value.
+            // No-ops under UDP, where rules 45, 53, and 74 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
             .with_max_connections(*max_connections)
@@ -437,7 +437,7 @@ fn build_spec(
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
             .with_max_line_bytes(*max_line_bytes as usize)
-            // No-ops on a datagram transport, where rules 45, 53, 74, and 78 reject a value.
+            // No-ops on a datagram transport, where rules 45, 53, and 74 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
             .with_max_connections(*max_connections)
@@ -450,11 +450,12 @@ fn build_spec(
         // `types_db` paths resolve against the config file's directory, like every path here, and
         // are read at startup: a bad file stops the process before it reports ready rather than
         // leaving a listener with no data-source names.
-        CollectdIn { bind, types_db } => {
+        CollectdIn { bind, types_db, peer } => {
             let mut input = CollectdInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
-                .with_receive(receive_config(&component.receive));
+                .with_receive(receive_config(&component.receive))
+                .with_peer(*peer);
             if !types_db.is_empty() {
                 let paths: Vec<PathBuf> = types_db.iter().map(|p| base_dir.join(p)).collect();
                 let loaded = TypesDb::load(&paths)
@@ -465,8 +466,8 @@ fn build_spec(
         }
         // `GraphiteInput` picks its own driver from `transport`, so `with_receive` is safe on
         // either: rule 17 rejects the queue fields under TCP, leaving only the batch-assembly half
-        // the stream driver reads. The two timeouts, the connection cap, and `peer` are no-ops under
-        // UDP (rules 45, 53, 74, and 78 reject a value there); `tls:` is TCP-only (rule 43), and
+        // the stream driver reads. The two timeouts and the connection cap are no-ops under UDP
+        // (rules 45, 53, and 74 reject a value there); `tls:` is TCP-only (rule 43), and
         // `with_tls` refuses it again.
         GraphiteIn {
             bind,
@@ -518,7 +519,7 @@ fn build_spec(
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
-            // No-ops under UDP, where rules 45, 53, 74, and 78 reject a value.
+            // No-ops under UDP, where rules 45, 53, and 74 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
             .with_max_connections(*max_connections)
@@ -2569,7 +2570,11 @@ mod tests {
             sources: vec![],
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
-            kind: ComponentKind::CollectdIn { bind: "127.0.0.1:0".to_string(), types_db },
+            kind: ComponentKind::CollectdIn {
+                bind: "127.0.0.1:0".to_string(),
+                types_db,
+                peer: false,
+            },
         }
     }
 

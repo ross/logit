@@ -780,9 +780,6 @@ pub enum ComponentKind {
         ///
         /// A Unix socket client that bound a path reports the path as `network.peer.address` and
         /// no port; one that didn't, the usual case, gets neither attribute.
-        ///
-        /// `transport: tcp` or `unix_stream` only: `true` under `transport: udp` or `unix` is
-        /// rejected.
         #[serde(default)]
         peer: bool,
     },
@@ -884,9 +881,6 @@ pub enum ComponentKind {
         ///
         /// A Unix socket client that bound a path reports the path as `network.peer.address` and
         /// no port; one that didn't, the usual case, gets neither attribute.
-        ///
-        /// `transport: tcp` or `unix_stream` only: `true` under `transport: udp` or `unix` is
-        /// rejected.
         #[serde(default)]
         peer: bool,
         /// The longest line this listener accepts, not counting its `\n`, under every transport.
@@ -919,6 +913,17 @@ pub enum ComponentKind {
         bind: String,
         #[serde(default)]
         types_db: Vec<PathBuf>,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Either attribute replaces a same-named one decoded from the
+        /// message. No reverse DNS lookup is made.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        #[serde(default)]
+        peer: bool,
     },
     /// Graphite/Carbon metric ingress: carbon's plaintext line protocol or its pickle batch
     /// protocol, over TCP or UDP.
@@ -1003,8 +1008,6 @@ pub enum ComponentKind {
         /// Every sender's address becomes an attribute on its events, so series keyed by
         /// attributes split by sender, and a sink that writes attributes receives the address.
         /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
-        ///
-        /// `transport: tcp` only: `true` under `transport: udp` is rejected.
         #[serde(default)]
         peer: bool,
         /// The longest plaintext line this listener assembles before dropping it and draining to
@@ -1107,8 +1110,6 @@ pub enum ComponentKind {
         /// Every sender's address becomes an attribute on its events, so series keyed by
         /// attributes split by sender, and a sink that writes attributes receives the address.
         /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
-        ///
-        /// `transport: tcp` only: `true` under `transport: udp` is rejected.
         #[serde(default)]
         peer: bool,
     },
@@ -5416,9 +5417,10 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "collectd_in", "bind": "0.0.0.0:25826"}"#).unwrap();
         match component.kind {
-            ComponentKind::CollectdIn { bind, types_db } => {
+            ComponentKind::CollectdIn { bind, types_db, peer } => {
                 assert_eq!(bind, "0.0.0.0:25826");
                 assert!(types_db.is_empty(), "types_db defaults to no files at all");
+                assert!(!peer, "peer is opt-in");
             }
             other => panic!("expected CollectdIn, got {other:?}"),
         }
@@ -5428,11 +5430,12 @@ mod tests {
     fn collectd_in_component_parses_a_types_db_list_in_order() {
         let component: Component = serde_json::from_str(
             r#"{"type": "collectd_in", "bind": "239.192.74.66:25826",
-                "types_db": ["/usr/share/collectd/types.db", "local-types.db"]}"#,
+                "types_db": ["/usr/share/collectd/types.db", "local-types.db"], "peer": true}"#,
         )
         .unwrap();
         match component.kind {
-            ComponentKind::CollectdIn { bind, types_db } => {
+            ComponentKind::CollectdIn { bind, types_db, peer } => {
+                assert!(peer);
                 assert_eq!(bind, "239.192.74.66:25826", "a multicast group is an ordinary bind");
                 assert_eq!(
                     types_db,
@@ -7508,19 +7511,24 @@ mod tests {
 
     /// `peer: true` parses on every listener that has the field.
     #[test]
-    fn peer_parses_on_every_stream_driver_listener() {
+    fn peer_parses_on_every_shared_driver_listener() {
         for json in [
             r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp", "peer": true}"#,
+            r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "peer": true}"#,
             r#"{"type": "syslog_in", "bind": "0.0.0.0:5514", "transport": "tcp", "peer": true}"#,
+            r#"{"type": "syslog_in", "bind": "0.0.0.0:5514", "peer": true}"#,
             r#"{"type": "graphite_in", "bind": "0.0.0.0:2003", "peer": true}"#,
             r#"{"type": "lines_in", "bind": "0.0.0.0:5170", "peer": true}"#,
+            r#"{"type": "lines_in", "bind": "0.0.0.0:5170", "transport": "udp", "peer": true}"#,
+            r#"{"type": "collectd_in", "bind": "0.0.0.0:25826", "peer": true}"#,
         ] {
             let component: Component = serde_json::from_str(json).unwrap();
             let peer = match component.kind {
                 ComponentKind::StatsdIn { peer, .. }
                 | ComponentKind::SyslogIn { peer, .. }
                 | ComponentKind::GraphiteIn { peer, .. }
-                | ComponentKind::LinesIn { peer, .. } => peer,
+                | ComponentKind::LinesIn { peer, .. }
+                | ComponentKind::CollectdIn { peer, .. } => peer,
                 other => panic!("unexpected kind {other:?}"),
             };
             assert!(peer, "for {json}");
