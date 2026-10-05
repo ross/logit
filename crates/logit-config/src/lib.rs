@@ -1293,9 +1293,11 @@ pub enum ComponentKind {
         #[serde(default)]
         api_keys: Vec<String>,
         /// How long one connection has, per pre-request phase, before this listener closes it
-        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a
-        /// plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected.
-        /// Also the grace an idle close gives the HTTP server, as on `otlp_in`.
+        /// and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then
+        /// the TLS accept when `tls:` is set, or on a plaintext listener the wait for its first
+        /// byte. Each phase gets its own budget, so a silent connection costs up to twice this
+        /// value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected. Also the grace an
+        /// idle close gives the HTTP server, as on `otlp_in`.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
@@ -1313,6 +1315,32 @@ pub enum ComponentKind {
         /// keep the total across listeners under the process's `nofile` limit.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Every event of a request carries the same values, and
+        /// either attribute replaces a same-named one decoded from the request. No reverse DNS
+        /// lookup is made.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        #[serde(default)]
+        peer: bool,
+        /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
+        /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
+        /// the original client it names on each event as `client.address` and `client.port`.
+        /// Off by default. The header is read before any TLS handshake, within
+        /// `handshake_timeout`. A connection without a valid header is closed and counted as
+        /// `logit.input.connections.rejected{reason="proxy_header"}`. A header that names no
+        /// client, such as a proxy's own health check, keeps the connection and stamps nothing.
+        /// Either attribute replaces a same-named one decoded from the request; `peer:` still
+        /// reports the proxy.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
     },
     /// A stand-in for the Datadog Agent's APM receiver: what a dd-trace tracer sends its traces
     /// and client-computed stats to. Serves `/v0.3`, `/v0.4`, `/v0.5`, and `/v0.7/traces`
@@ -1350,9 +1378,11 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: Option<TlsServerConfig>,
         /// How long one connection has, per pre-request phase, before this listener closes it
-        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and otherwise
-        /// the wait for its first byte. Defaults to `5s`; `0s` is rejected. Also the grace an
-        /// idle close gives the HTTP server, as on `otlp_in`.
+        /// and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then
+        /// the TLS accept when `tls:` is set, or otherwise the wait for its first byte. Each phase
+        /// gets its own budget, so a silent connection costs up to twice this value with
+        /// `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected. Also the grace an idle close
+        /// gives the HTTP server, as on `otlp_in`.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
@@ -1373,6 +1403,36 @@ pub enum ComponentKind {
         /// `connection_limit`.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Every event of a request carries the same values, and
+        /// either attribute replaces a same-named one decoded from the request. No reverse DNS
+        /// lookup is made.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        ///
+        /// A `socket` client that bound a path reports the path as `network.peer.address` and no
+        /// port; one that didn't, the usual tracer, gets neither attribute.
+        #[serde(default)]
+        peer: bool,
+        /// Requires every connection to the `bind` listener to open with a PROXY protocol header,
+        /// version 1 or 2, as a load balancer such as HAProxy sends with `send-proxy` or
+        /// `send-proxy-v2`, and stamps the original client it names on each event as
+        /// `client.address` and `client.port`. Off by default, and requires `bind`: a `socket`
+        /// connection is never read for a header. The header is read before any TLS handshake,
+        /// within `handshake_timeout`. A connection without a valid header is closed and counted
+        /// as `logit.input.connections.rejected{reason="proxy_header"}`. A header that names no
+        /// client, such as a proxy's own health check, keeps the connection and stamps nothing.
+        /// Either attribute replaces a same-named one decoded from the request; `peer:` still
+        /// reports the proxy.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
     },
     /// A stand-in for Splunk's HTTP Event Collector (HEC): what a HEC client's URL points at,
     /// such as Docker's `splunk` log driver, Splunk's logging libraries, the OpenTelemetry
@@ -6135,8 +6195,12 @@ mod tests {
                 idle_timeout,
                 max_connections,
                 socket_mode,
+                peer,
+                proxy_protocol,
             } => {
                 assert_eq!(socket_mode, None);
+                assert!(!peer, "opt-in -- no peer address unless asked for");
+                assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
                 assert_eq!(bind.as_deref(), Some("127.0.0.1:8126"));
                 assert_eq!(socket.as_deref(), Some("/var/run/datadog/apm.socket"));
                 assert_eq!(tls, None);
