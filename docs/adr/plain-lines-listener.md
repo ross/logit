@@ -35,8 +35,9 @@ Add the kind `lines_in`. One line is one raw log event, and the listener parses 
   expects.
 - **Body type.** The message is `Value::Str` when the line is valid UTF-8 and `Value::Bytes`
   otherwise, as `syslog_in` keeps a MSG. No byte is rewritten.
-- **Identity.** The resource is empty and nothing about the peer, such as its address, is
-  attached. A `set` stage per listener stamps what the operator knows.
+- **Identity.** The resource is empty, and the listener attaches nothing about the peer. A `set`
+  stage per listener stamps what the operator knows. Amended: `peer: true` stamps the peer's
+  address ([ADR `listener-peer-address`](listener-peer-address.md)); see the amendment below.
 - **Line bound.** `max_line_bytes` defaults to 64 KiB. A longer line is dropped and counted as
   `logit.input.frames.dropped{reason="oversize"}` on every transport, and the lines around it
   still decode.
@@ -54,10 +55,12 @@ canonical copy of the framing and event rules.
 - **Lossy UTF-8, as `tail_in` does.** Rewriting invalid bytes loses data a relay should carry
   ([ADR `lossless-transit`](lossless-transit.md)). The `Str`-or-`Bytes` split costs a downstream
   stage one type check.
-- **A peer-address attribute.** It needs a hook in the shared driver and in `Decoder` that every
+- ~~**A peer-address attribute.** It needs a hook in the shared driver and in `Decoder` that every
   TCP input would then carry. The need is tracked as a known gap
   ([runtime gaps](../known-gaps/runtime.md)), and a `set` stage covers it for a listener with one
-  known sender.
+  known sender.~~ Superseded 2026-10-05 by
+  [ADR `listener-peer-address`](listener-peer-address.md), which builds that hook in the shared
+  drivers for every listener on them.
 - **TCP only.** The Datadog Agent's `logs` listener takes UDP too, and a local Unix socket is the
   usual path for a same-host application. The shared drivers provide the other transports at no
   extra cost.
@@ -72,3 +75,11 @@ canonical copy of the framing and event rules.
 - A Splunk forwarder's `[tcpout]` output reaches `logit` without `host`, `source`, `sourcetype`, or
   `index`, because the cooked-off wire carries none. The operator stamps them with `set`.
 - A change to the shared drivers' line framing changes this listener too.
+
+## Amendment (2026-10-05): the peer's address is opt-in
+
+[ADR `listener-peer-address`](listener-peer-address.md) adds `peer: bool` to every listener on the
+shared drivers, `lines_in` included. With it on, each event carries the sender's
+`network.peer.address` and `network.peer.port` as event attributes. On TCP, `proxy_protocol: true`
+also stamps the origin a load balancer names as `client.address` and `client.port`. With both off,
+a `lines_in` event is as this ADR's Decision describes: no attributes, and an empty resource.

@@ -130,8 +130,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
     event, or route on it.
   - **Workaround:** run one listener per sender (or per group of senders) and stamp each with a
     `set` stage.
-  - **Revisit trigger:** a deployment that can't give each sender its own listener. The fix is a
-    hook in the shared TCP and UDP drivers that every input would carry.
+  - **Planned:** [ADR `listener-peer-address`](../adr/listener-peer-address.md) closes this for
+    the listeners on the shared TCP, UDP, and Unix-socket drivers with an opt-in `peer:` field and
+    PROXY protocol on TCP. Until that lands, use the workaround. The HTTP listeners and `logit_in`
+    stay open after it, as that ADR's follow-ups.
 
 ## Event model and interner
 
