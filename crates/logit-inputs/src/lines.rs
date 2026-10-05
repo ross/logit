@@ -34,8 +34,8 @@
 //! the series the stream framer uses, with a throttled `oversize_line` diagnostic, and the rest
 //! of the datagram still decodes.
 //!
-//! Under every transport exactly one trailing `CR` is stripped, by the framer on a stream and by
-//! the decoder on a datagram, and an empty line is skipped.
+//! Under every transport one trailing `CR` is stripped, never two: the framer strips it on a
+//! stream and the decoder on a datagram. An empty line is skipped.
 //!
 //! ## The event
 //!
@@ -660,7 +660,7 @@ mod tests {
     /// The framer strips one `CR` per line, matching the datagram decoder's
     /// `one_trailing_cr_is_stripped_and_empty_lines_are_skipped`.
     #[tokio::test]
-    async fn a_tcp_line_loses_exactly_one_trailing_cr() {
+    async fn a_tcp_line_loses_one_trailing_cr() {
         let mut started = start(LinesInput::tcp("127.0.0.1:0")).await;
         let mut client = TcpStream::connect(started.addr.unwrap()).await.unwrap();
         client.write_all(b"b\r\r\n\r\r\nc\n").await.unwrap();
