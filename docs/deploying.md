@@ -85,7 +85,7 @@ design. What an operator needs:
   metrics.
 - **A second signal during a stuck drain exits immediately** with status 130, so a restart policy
   waiting on the process can still kill it with the same signal.
-- **A sink failure, transient or extended, doesn't end the process by default.** Every sink sits
+- **A sink failure, transient or extended, never ends the process.** Every sink sits
   behind a decoupled delivery buffer
   ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)). A retryable failure holds the
   queue head until it succeeds, and a batch the destination rejects is dropped and counted; no
@@ -93,8 +93,9 @@ design. What an operator needs:
   [Sink failure semantics](#sink-failure-semantics).
 - **An input never acknowledges a batch no consumer took.** An acknowledgment means the batch is
   in the inbox of at least one consumer directly downstream, never that a sink delivered it. The
-  one exception is `logit_in`'s acknowledgment of a frame at or below its sender's mark, which it
-  doesn't forward (see [Forwarding between `logit` nodes](#forwarding-between-logit-nodes)). Once
+  two exceptions are `logit_in`'s: its acknowledgment of a frame at or below its sender's mark,
+  which it doesn't forward, and its rejected `Ack` for a frame it can't take, which reports a drop
+  (see [Forwarding between `logit` nodes](#forwarding-between-logit-nodes)). Once
   every direct consumer has closed, as happens while a shutdown tears the graph down, an
   acknowledging input refuses instead: `logit_in` answers `Reject{GOING_AWAY}` and closes the
   connection, an HTTP listener answers its protocol's retryable failure (a `503`, or gRPC status
@@ -113,7 +114,7 @@ configured, answers readiness and liveness probes. See
 |---|---|
 | `0` | Clean shutdown — a signal arrived, every listener drained, every sink flushed. |
 | `1` | A startup failure — a bad config, a port already in use, a bad `lua_file`, a bad `--log-level`. Nothing was ever running. |
-| `2` | A runtime failure after the process reported ready — a listener's accept loop dying, a `lua`/`lua_file` component's thread panicking (a script's own `process()`/`flush()` errors are not this: they're logged and counted, never fatal), a `lua`/`lua_file` component's VM still over its `max_memory` after a full garbage collection (logged `memory_limit_exceeded`), or a script still wedged inside `process()`/`flush()` with no progress 2 s after shutdown began, which `logit` exits without (see [What to watch on `/readyz`](#what-to-watch-on-readyz)). |
+| `2` | A runtime failure after the process reported ready — a listener's accept loop dying, a `lua`/`lua_file` component's thread panicking (a script's own `process()`/`flush()` errors are not this: they're logged and counted, never fatal), a `lua`/`lua_file` component's VM still over its `max_memory` after a full garbage collection (logged `memory_limit_exceeded`), or a script still wedged inside `process()`/`flush()` with no progress 2 s after shutdown began, which `logit` exits without (see [What to watch on `/readyz`](#what-to-watch-on-readyz)). A sink never causes it: a failing sink holds or drops, per [Sink failure semantics](#sink-failure-semantics). |
 | `130` | A second SIGTERM/SIGINT arrived before a graceful drain finished. |
 
 To enable the probe endpoint, add a top-level `admin:` block:
@@ -272,9 +273,8 @@ signal's own class, never resends an accepted signal within a run (a `buffer.dis
 replayed after a restart sends every signal again), and under `at_most_once` counts the records
 of the signals it drops as `records.dropped{signal, reason="ambiguous_at_most_once"}`
 ([ADR `sink-fault-classes`](adr/sink-fault-classes.md), "Amendment: `otlp_out` retries per signal
-(2026-10-05)"). A request the
-destination rejects by name (a `4xx` other than an auth refusal) is counted and skipped, except
-at `splunk_hec_out`, and the send succeeds if any request was accepted.
+(2026-10-05)"). A request whose answer is `Rejected` (a `400` or a `413`, for example) is counted
+and skipped, except at `splunk_hec_out`, and the send succeeds if any request was accepted.
 
 A resend is harmless where the destination overwrites on identity: a sample at its
 `(series, timestamp)`, or a cumulative sum. A log or a span arrives twice. A resend double-counts
@@ -309,11 +309,11 @@ A sink classifies each failed send into one of four faults, and none of them end
 
 An error the sink attaches no fault to is treated as `Rejected`.
 
-- **A retryable fault holds the head until it succeeds.** There's no retry budget. The sink retries
-  the head after a 200ms backoff that doubles up to `buffer.retry_max_delay` (10s by default),
-  until the head is delivered or the shutdown grace cuts it. `logit validate` rejects
-  `retry_max_delay: 0s`, because a failing head would retry with no pause for as long as it fails.
-  `buffer.retry_budget` isn't a field; a config that sets it fails validation as an unknown field.
+- **A retryable fault holds the head until it succeeds.** The sink retries the head after a
+  200ms backoff that doubles up to `buffer.retry_max_delay` (10s by default), with no limit on
+  attempts or time, until the head is delivered or the shutdown grace cuts it. `logit validate`
+  rejects `retry_max_delay: 0s`, because a failing head would retry with no pause for as long as
+  it fails.
 - **The queue bounds a hold.** While the head waits, batches queue behind it up to
   `buffer.max_batches`/`max_bytes`. After that, `overflow` decides: `block` backs up into the
   inputs, `drop_oldest` and `drop_newest` evict, and `buffer.disk:` spools instead. See
@@ -2006,8 +2006,9 @@ event too large to send alone is dropped and counted `records.dropped{reason="ov
 
 **Delivery.** One batch goes out over up to eight routes, each as one or more requests (one per
 event, and a route over its size cap is split), sent one after another. A `408`, `429`, or `5xx`
-answer or a timeout stops the rest, and the whole batch is retried or dropped as one. A `403`
-(a rejected API key) also stops the rest, and the sink holds the batch and retries it (`refused`).
+answer or a timeout stops the rest, and the whole batch is retried or dropped as one. A `401` or
+`403` (a rejected API key), or a `404`, `405`, or `407` (the configured base, or a proxy in front
+of it, refusing every batch), also stops the rest, and the sink holds the batch and retries it (`refused`).
 A `413` counts the request's entries `oversize`, and any
 other `4xx` or `3xx` counts them `records.dropped{reason="rejected"}`; neither is retried, and the
 send goes on to the next request. The send is delivered if any request was accepted, and fails
@@ -2106,11 +2107,15 @@ Agent's `max_request_bytes`. A trace too large to send alone is dropped and coun
 `logit.output.records.dropped{reason="oversize"}`.
 
 **Delivery.** Traces go first, then stats. A request that fails with a retryable error stops the
-rest, and the batch is retried or dropped as one. A `413` counts `oversize`, and any other `4xx`
-counts `records.dropped{reason="rejected"}` and goes on to the next request; the send is
-delivered if either request was accepted. `408`, `429`, `5xx`, and timeouts are retryable; a refused
-connection or a missing socket file is retried under every posture before any request of the
-batch was accepted, and after one is retryable like a timeout; any other `4xx` isn't retried.
+rest, and the batch is retried or dropped as one. A `413` counts `oversize`, and a `400` or any
+other `4xx` the sink reads as `rejected` counts `records.dropped{reason="rejected"}` and goes on
+to the next request; the send is delivered if either request was accepted. `408`, `5xx`, and
+timeouts are retryable under `at_least_once`. A refused connection, a missing socket file, or an
+overwhelmed Agent's `429` is retried under every posture before any request of the batch was
+accepted, and after one is retryable like a timeout. A `401`, `403`, `404`, `405`, `407`, or
+`415` means the Agent doesn't serve this `version:` as configured, or something else answered in
+its place: the sink holds the batch and retries it (`refused`). The sink's module doc has the
+table.
 An Agent dedupes nothing, so under the default `at_least_once` posture a resend stores its spans
 twice and adds its stats; `buffer: {delivery: at_most_once}` drops the batch on a `5xx` instead. A
 `buffer:` here is also what keeps
@@ -2270,9 +2275,9 @@ order. An object larger than the cap alone is dropped, counted
 before any body of the batch was accepted, the batch is retried under every posture, with the
 runtime's backoff (a `Retry-After` header is ignored). `408`, other `5xx`, timeouts, and a busy
 answer after a body was accepted are retryable only under `at_least_once`; a `401` or
-`403`, or a token or channel code on a `400`, is `refused`, with a `token_rejected` or
-`request_refused` warning, and the sink holds the batch and retries it; any other `4xx`, `413`
-included, is `rejected`, dropped, and counted `logit.output.requests.rejected{code}`. A `400` that
+`403`, a token or channel code on a `400`, or a `404`, `405`, or `407`, is `refused`, with a
+`token_rejected` or `request_refused` warning, and the sink holds the batch and retries it; any
+other `4xx`, `413` included, is `rejected`, dropped, and counted `logit.output.requests.rejected{code}`. A `400` that
 names one object (code 6, 7, 12, 13, or 15) is the exception: the sink drops that object, counted
 `records.dropped{reason="invalid_event"}`, and resends the rest of that body once. The sink's
 module doc has the table of every HEC code it reads. A code 6 naming the first object of a body over 5 MiB is Splunk Cloud's oversize
@@ -2405,8 +2410,9 @@ receiver speaks, as you pick an exposition dialect. The choice depends on the de
   symbol table (smaller bodies for the same series), carries `Metadata` inline on each series instead
   of in separate requests, carries the created timestamp per sample, and answers with
   `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` so a sender learns what was
-  stored. A receiver that doesn't speak 2.0 answers `415`, which this sink classifies as `rejected`:
-  the batch is dropped and the misconfiguration reported immediately instead of retried.
+  stored. A receiver that doesn't speak 2.0 answers `415`, which this sink classifies as
+  `refused`: every batch would get the same answer, so the sink holds the batch and retries it
+  while the throttled `remote_write_rejected` diagnostic reports the misconfiguration.
 
 **Use `version: 1` for VictoriaMetrics: it discards 2.0 without an error.** VictoriaMetrics doesn't
 accept remote-write 2.0 and doesn't refuse it either. It answers a 2.0 request `204` with an empty
@@ -2427,8 +2433,9 @@ Native histograms are skipped and counted on both wires regardless of version
   `metadata_cache` metrics above. A nonzero `logit.input.connections.rejected{reason="limit"}`
   means the `max_connections` cap is binding.
 - Sender: `logit.output.requests{class}`, `logit.output.request.duration`, `logit.output.samples`.
-  A `4xx` other than `401`, `403`, `404`, `405`, and `407` (which hold the batch and retry it) is
-  `rejected` and the batch is dropped; the throttled `remote_write_rejected` diagnostic
+  A `4xx` other than `401`, `403`, `404`, `405`, `407`, and `415`, or a `400` naming a failed
+  decompression (which hold the batch and retry it), is `rejected` and the batch is dropped; the
+  throttled `remote_write_rejected` diagnostic
   quotes the receiver's message, which for Prometheus and Mimir names the offending series. A `3xx`
   means the endpoint is redirecting; this client deliberately doesn't follow redirects.
 - A sender feeding one series from two upstream branches can draw out-of-order `400`s from a
@@ -2500,9 +2507,11 @@ remote-write 1.0 request, compressed with zstd instead of Snappy. VictoriaMetric
 too, so the default is never wrong there. Choose `zstd` when you want the wire vmagent sends, for
 example for a `logit` hop that stands in for vmagent in front of VictoriaMetrics.
 
-- **There's no fallback.** Unlike vmagent, `prometheus_out` doesn't downgrade to Snappy. A `415` or
-  `400` under `zstd` is a `rejected` fault that drops the batch, and the `remote_write_rejected`
-  diagnostic names `compression: snappy` as the remedy.
+- **There's no fallback.** Unlike vmagent, `prometheus_out` doesn't downgrade to Snappy. A
+  receiver that can't read zstd answers `415`, or a `400` naming the failed decompression; both
+  are `refused`, so the sink holds the batch and retries it, and the `remote_write_rejected`
+  diagnostic names `compression: snappy` as the remedy. Any other `400` under `zstd` is
+  `rejected` and drops the batch, with the same remedy named.
 - **`zstd` needs `version: 1`.** Remote-write 2.0 mandates Snappy, so `version: 2` with
   `compression: zstd` is a config error.
 - **Expect about libzstd level 1's ratio.** `logit` compresses with `ruzstd`, a pure-Rust

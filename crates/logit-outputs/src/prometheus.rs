@@ -1043,8 +1043,8 @@ impl RemoteWriteOutput {
                 let fault = remote_write_fault(status, &body);
                 let snippet = format!("{}{written}", body_snippet(&body, ERROR_BODY_SNIPPET_BYTES));
                 // A receiver that doesn't take zstd answers `415` (Prometheus, Mimir) or `400`,
-                // the two statuses vmagent's own downgrade keys on. Still rejected: there is no
-                // fallback, so the operator gets the remedy instead.
+                // the two statuses vmagent's own downgrade keys on. There is no fallback, so the
+                // operator gets the remedy instead.
                 let hint = if self.encoding == Encoding::Zstd
                     && matches!(
                         status,

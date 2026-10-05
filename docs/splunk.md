@@ -156,7 +156,7 @@ one), and `splunk_hec_out` doesn't retry a `413`. A Splunk Cloud 10.5.2605.9 tri
 bodies up to 5,242,881 bytes and refused 6,000,000 and above with `400` code 6 naming object 0,
 not `413`. `splunk_hec_out` reads a code 6 naming the first object of a body over 5 MiB
 (5,242,880 bytes) as that answer: it splits the body in two and sends each half, and a half
-refused the same way fails the batch; a body of one object is dropped, counted
+refused the same way drops the batch as rejected; a body of one object is dropped, counted
 `logit.output.records.dropped{reason="oversize"}`. The 2 MiB default sits under the cap, and a
 `max_body_bytes` above 5 MiB logs a warning at startup, so against Splunk Cloud keep it at or
 under `5MiB`.
@@ -191,6 +191,13 @@ Splunk is the exception: a `429`, or a `503` code 9, says Splunk didn't take the
 no body of the batch has been accepted the sink retries the batch under either posture, on the
 runtime's backoff. It ignores a `Retry-After` header. The same answer after an earlier body of the
 batch was accepted is treated like a `500`, since a retry would resend that body.
+
+A bad or disabled token, a channel something between the sink and Splunk stripped, or an
+endpoint that isn't a HEC collector answers every batch the same way, so `splunk_hec_out` holds
+the batch and retries it until the configuration is fixed, logging `token_rejected` or
+`request_refused`; watch `logit.component.retrying` for it. The sink's module doc
+(`crates/logit-outputs/src/splunk.rs`, "Faults, retries, and duplicate safety") has the table of
+every HEC code it reads.
 
 ### One malformed event costs only itself
 
