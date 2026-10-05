@@ -249,8 +249,8 @@ def rejections(service):
 def delivery(leg):
     """The sink's own account of a leg from /out/<leg>-telemetry.log, as (problems, summary).
 
-    A connect, DNS, or TLS failure is retried without a log line until the retry budget runs out,
-    and a code 6 or oversize drop still returns success, so only the telemetry shows either.
+    A connect, DNS, or TLS failure holds the batch and retries it until it succeeds, and a code 6
+    or oversize drop still returns success, so the telemetry is where either shows.
     """
     events = read_events(OUT / f"{leg}-telemetry.log")
     requests = telemetry_sum(events, "logit.output.requests", route="event")
@@ -260,11 +260,11 @@ def delivery(leg):
     dropped = {reason: telemetry_sum(events, "logit.output.records.dropped", reason=reason)
                for reason in ("oversize", "invalid_event")}
     dropped_total = telemetry_sum(events, "logit.output.records.dropped")
-    failed = telemetry_sum(events, "logit.component.batches.dropped", reason="send_failed")
+    failed = telemetry_sum(events, "logit.component.batches.dropped", reason="rejected")
     retries = telemetry_sum(events, "logit.component.retries")
     summary = (f"telemetry: {requests} /event requests, {ok} 2xx, {network} network_error, "
                f"{requests - ok - network} other; {records} records delivered; records dropped "
-               f"{dropped_total} {dropped}; {failed} batches dropped send_failed; {retries} retries")
+               f"{dropped_total} {dropped}; {failed} batches dropped rejected; {retries} retries")
     problems = []
     if not events:
         problems.append(f"no {leg}-telemetry.log")
