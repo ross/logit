@@ -14,7 +14,8 @@
 //! | `unix_stream` | [`TcpListener::unix`](crate::tcp::TcpListener::unix) | everything `tcp` brings but TLS and the accept-queue gauges, on a `SOCK_STREAM` Unix socket |
 //!
 //! Under both Unix transports `bind:` is the socket's path, prepared by [`crate::unix`], and the
-//! file is made mode [`SOCKET_MODE`]. The file isn't removed on shutdown.
+//! file is made mode `socket_mode:` ([`LinesInput::with_socket_mode`]), `0722` by default. The
+//! file isn't removed on shutdown.
 //!
 //! ## Framing
 //!
@@ -65,10 +66,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-/// The socket file's mode under `transport: unix`/`unix_stream`: any local user may send, and
-/// the directory's permissions restrict access, as for `statsd_in`.
-pub const SOCKET_MODE: u32 = 0o722;
-
 /// `max_line_bytes`' default, the stream driver's own frame bound.
 /// `logit_config::default_lines_max_line_bytes` mirrors it by hand.
 pub const DEFAULT_MAX_LINE_BYTES: usize = crate::tcp::MAX_FRAME_BYTES;
@@ -117,7 +114,7 @@ impl LinesInput {
             inner: Inner::Udp(UdpListener::unix(
                 "lines_in",
                 path,
-                SOCKET_MODE,
+                crate::unix::DEFAULT_SOCKET_MODE,
                 LinesDecoder::new(),
                 UdpListenerConfig::default(),
             )),
@@ -132,7 +129,7 @@ impl LinesInput {
                 TcpListener::unix(
                     "lines_in",
                     path,
-                    SOCKET_MODE,
+                    crate::unix::DEFAULT_SOCKET_MODE,
                     LinesDecoder::stream(),
                     TcpListenerConfig::default(),
                 )
@@ -228,7 +225,7 @@ impl LinesInput {
     }
 
     /// Stamps each stream connection's events with its peer's address (`peer:`); see
-    /// [`crate::peer::PeerAttrs`]. A datagram listener is left untouched; graph rule 78 rejects
+    /// [`crate::peer::PeerAttrs`]. A datagram listener is left untouched; graph rule 79 rejects
     /// the field there.
     pub fn with_peer(mut self, peer: bool) -> Self {
         if let Inner::Tcp(listener) = self.inner {
@@ -262,6 +259,17 @@ impl LinesInput {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_max_connections(max_connections));
         }
+        self
+    }
+
+    /// Sets the socket file's mode under `transport: unix`/`unix_stream` (`socket_mode:`),
+    /// overriding the default `0722`. An IP listener is left untouched; graph rule 78 rejects the
+    /// field there.
+    pub fn with_socket_mode(mut self, socket_mode: u32) -> Self {
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(listener.with_socket_mode(socket_mode)),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_socket_mode(socket_mode)),
+        };
         self
     }
 
@@ -797,7 +805,7 @@ mod tests {
         let path = scratch_dir("lines-dgram").join("lines.sock");
         let mut started = start(LinesInput::unix(&path)).await;
         assert_eq!(started.addr, None);
-        assert_eq!(mode_of(&path), SOCKET_MODE);
+        assert_eq!(mode_of(&path), crate::unix::DEFAULT_SOCKET_MODE);
 
         let client = tokio::net::UnixDatagram::unbound().unwrap();
         client.send_to(b"a\nb", &path).await.unwrap();
@@ -812,13 +820,24 @@ mod tests {
         let input = LinesInput::unix_stream(&path);
         assert_eq!(input.socket_path(), Some(path.as_path()));
         let mut started = start(input).await;
-        assert_eq!(mode_of(&path), SOCKET_MODE);
+        assert_eq!(mode_of(&path), crate::unix::DEFAULT_SOCKET_MODE);
 
         let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
         client.write_all(b"first\nsecond\n").await.unwrap();
         client.flush().await.unwrap();
         assert_eq!(texts(&recv_events(&mut started.rx, 2).await), vec!["first", "second"]);
         started.running.stop().await;
+    }
+
+    /// A configured `socket_mode:` replaces the default on both Unix transports.
+    #[tokio::test]
+    async fn with_socket_mode_sets_the_socket_files_mode_on_both_unix_transports() {
+        let path = scratch_dir("lines-mode").join("lines.sock");
+        for input in [LinesInput::unix(&path), LinesInput::unix_stream(&path)] {
+            let started = start(input.with_socket_mode(0o660)).await;
+            assert_eq!(mode_of(&path), 0o660);
+            started.running.stop().await;
+        }
     }
 
     // ---- peer: ---------------------------------------------------------------------------------

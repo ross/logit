@@ -295,7 +295,7 @@ impl GraphiteInput {
     }
 
     /// Stamps each stream connection's events with its peer's address (`peer:`); see
-    /// [`crate::peer::PeerAttrs`]. A datagram listener is left untouched; graph rule 78 rejects
+    /// [`crate::peer::PeerAttrs`]. A datagram listener is left untouched; graph rule 79 rejects
     /// the field there.
     pub fn with_peer(mut self, peer: bool) -> Self {
         if let Inner::Tcp(listener) = self.inner {

@@ -383,6 +383,7 @@ fn build_spec(
             idle_timeout,
             max_connections,
             peer,
+            socket_mode,
         } => {
             let mut input = match transport {
                 logit_config::StatsdTransport::Udp => {
@@ -400,11 +401,15 @@ fn build_spec(
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
-            // No-ops under UDP, where rules 45, 53, 74, and 78 reject a value.
+            // No-ops under UDP, where rules 45, 53, 74, and 79 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
             .with_max_connections(*max_connections)
             .with_peer(*peer);
+            // Off a Unix transport, rule 78 rejects a value.
+            if let Some(mode) = socket_mode {
+                input = input.with_socket_mode(mode.bits());
+            }
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -421,6 +426,7 @@ fn build_spec(
             max_connections,
             max_line_bytes,
             peer,
+            socket_mode,
         } => {
             let mut input = match transport {
                 logit_config::LinesTransport::Tcp => LinesInput::tcp(bind.clone())
@@ -437,11 +443,14 @@ fn build_spec(
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
             .with_max_line_bytes(*max_line_bytes as usize)
-            // No-ops on a datagram transport, where rules 45, 53, 74, and 78 reject a value.
+            // No-ops on a datagram transport, where rules 45, 53, 74, and 79 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
             .with_max_connections(*max_connections)
             .with_peer(*peer);
+            if let Some(mode) = socket_mode {
+                input = input.with_socket_mode(mode.bits());
+            }
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -466,7 +475,7 @@ fn build_spec(
         // `GraphiteInput` picks its own driver from `transport`, so `with_receive` is safe on
         // either: rule 17 rejects the queue fields under TCP, leaving only the batch-assembly half
         // the stream driver reads. The two timeouts, the connection cap, and `peer` are no-ops under
-        // UDP (rules 45, 53, 74, and 78 reject a value there); `tls:` is TCP-only (rule 43), and
+        // UDP (rules 45, 53, 74, and 79 reject a value there); `tls:` is TCP-only (rule 43), and
         // `with_tls` refuses it again.
         GraphiteIn {
             bind,
@@ -518,7 +527,7 @@ fn build_spec(
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
-            // No-ops under UDP, where rules 45, 53, 74, and 78 reject a value.
+            // No-ops under UDP, where rules 45, 53, 74, and 79 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout)
             .with_max_connections(*max_connections)
@@ -585,7 +594,15 @@ fn build_spec(
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
         // Graph rule 64 guarantees at least one of `bind`/`socket`, and `tls` only with `bind`.
-        DatadogTraceIn { bind, socket, tls, handshake_timeout, idle_timeout, max_connections } => {
+        DatadogTraceIn {
+            bind,
+            socket,
+            socket_mode,
+            tls,
+            handshake_timeout,
+            idle_timeout,
+            max_connections,
+        } => {
             let mut input = DatadogTraceInput::new()
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
@@ -598,6 +615,9 @@ fn build_spec(
             }
             if let Some(socket) = socket {
                 input = input.with_socket(socket);
+            }
+            if let Some(mode) = socket_mode {
+                input = input.with_socket_mode(mode.bits());
             }
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
@@ -1954,6 +1974,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                socket_mode: None,
             },
         }
     }
@@ -3533,6 +3554,7 @@ mod tests {
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                socket_mode: None,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -4753,6 +4775,37 @@ mod tests {
         ));
     }
 
+    /// `socket_mode` reaches every Unix-socket listener: the bound socket file carries it.
+    #[tokio::test]
+    async fn build_spec_wires_socket_mode_into_every_unix_socket_listener() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = logit_pipeline::test_util::scratch_dir("socket-mode");
+        for (name, json) in [
+            ("statsd.sock", r#"{"type": "statsd_in", "transport": "unix", "socket_mode": "0640""#),
+            (
+                "statsd-stream.sock",
+                r#"{"type": "statsd_in", "transport": "unix_stream", "socket_mode": "0640""#,
+            ),
+            ("lines.sock", r#"{"type": "lines_in", "transport": "unix", "socket_mode": "0640""#),
+            (
+                "lines-stream.sock",
+                r#"{"type": "lines_in", "transport": "unix_stream", "socket_mode": "0640""#,
+            ),
+            ("apm.sock", r#"{"type": "datadog_trace_in", "socket_mode": "0640""#),
+        ] {
+            let path = dir.join(name);
+            let field = if json.contains("datadog_trace_in") { "socket" } else { "bind" };
+            let json = format!(r#"{json}, "{field}": "{}"}}"#, path.display());
+            let component: logit_config::Component = serde_json::from_str(&json).unwrap();
+            let (spec, _) =
+                build_spec("in", &input_component(component.kind), Path::new(""), None).unwrap();
+            let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
+            input.bind().await.expect("bind should succeed");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o640, "{name}");
+        }
+    }
+
     /// A `lines_in` with every optional field at its default.
     fn lines_in_kind(
         bind: String,
@@ -4768,6 +4821,7 @@ mod tests {
             max_connections: logit_config::default_max_connections(),
             peer: false,
             max_line_bytes: logit_config::default_lines_max_line_bytes(),
+            socket_mode: None,
         }
     }
 
@@ -4875,6 +4929,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                socket_mode: None,
             },
         }
     }

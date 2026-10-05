@@ -126,7 +126,7 @@
       "type": "object",
       "oneOf": [
         {
-          "description": "statsd / DogStatsD-style tagged metrics, over UDP (the default), TCP, or a Unix socket.\n\n`bind` is a `host:port` under `udp`/`tcp`, and the socket file's absolute path, shorter than 108 bytes, under `unix`/`unix_stream` (the Datadog Agent's is `/var/run/datadog/dsd.socket`). The directory must exist; a stale socket file left by an earlier run is replaced, and anything else at the path is refused. The socket file is made mode `0722`, as the Agent's is, so a client running as any user can send; restrict access with the directory's permissions. To listen on UDP and a socket at once, configure two `statsd_in` components.\n\n`transport: unix` behaves as UDP does: the whole `receive:` block applies. Under `transport: unix_stream`, each 4-byte little-endian length prefix frames one packet of newline-separated lines, `handshake_timeout`/`idle_timeout` apply as under TCP, and `receive:`'s queue fields are rejected. A packet declaring more than 64 KiB closes its connection, counted as `logit.input.frames.dropped{reason=\"oversize\"}`: a length-framed stream has no point to resynchronize at.\n\nUnder `transport: tcp` a message is one LF-delimited line; there is no `framing:` field and no octet-counted alternative, because a statsd line may begin with a digit. A line longer than 64 KiB is dropped and counted (`logit.input.frames.dropped{reason=\"oversize\"}`); the connection stays open and the next line still decodes.\n\n`tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS listener. It applies to `transport: tcp` only and is rejected under any other transport. Plain statsd clients have no TLS of their own, so this is for a `logit`-to-`logit` or stunnel-shaped relay hop.\n\nA TCP or `unix_stream` listener has no receive queue (the connection's own flow control is the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply per connection: N live connections can hold up to N times `batch_max_events` in flight.",
+          "description": "statsd / DogStatsD-style tagged metrics, over UDP (the default), TCP, or a Unix socket.\n\n`bind` is a `host:port` under `udp`/`tcp`, and the socket file's absolute path, shorter than 108 bytes, under `unix`/`unix_stream` (the Datadog Agent's is `/var/run/datadog/dsd.socket`). The directory must exist; a stale socket file left by an earlier run is replaced, and anything else at the path is refused. The socket file is made mode `socket_mode`, by default `0722` as the Agent's is, so a client running as any user can send; restrict access with the directory's permissions. To listen on UDP and a socket at once, configure two `statsd_in` components.\n\n`transport: unix` behaves as UDP does: the whole `receive:` block applies. Under `transport: unix_stream`, each 4-byte little-endian length prefix frames one packet of newline-separated lines, `handshake_timeout`/`idle_timeout` apply as under TCP, and `receive:`'s queue fields are rejected. A packet declaring more than 64 KiB closes its connection, counted as `logit.input.frames.dropped{reason=\"oversize\"}`: a length-framed stream has no point to resynchronize at.\n\nUnder `transport: tcp` a message is one LF-delimited line; there is no `framing:` field and no octet-counted alternative, because a statsd line may begin with a digit. A line longer than 64 KiB is dropped and counted (`logit.input.frames.dropped{reason=\"oversize\"}`); the connection stays open and the next line still decodes.\n\n`tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS listener. It applies to `transport: tcp` only and is rejected under any other transport. Plain statsd clients have no TLS of their own, so this is for a `logit`-to-`logit` or stunnel-shaped relay hop.\n\nA TCP or `unix_stream` listener has no receive queue (the connection's own flow control is the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply per connection: N live connections can hold up to N times `batch_max_events` in flight.",
           "type": "object",
           "required": [
             "bind",
@@ -163,6 +163,18 @@
               "type": "boolean"
             },
             "receive": true,
+            "socket_mode": {
+              "description": "The socket file's permission bits under `transport: unix` or `unix_stream`, as a quoted octal string: `\"0660\"`. Three octal digits, optionally after a leading `0`; setuid, setgid, and sticky bits are rejected. Defaults to `\"0722\"`: a client needs only write permission to send, so the directory's permissions are the access control. Quote the value: YAML versions disagree on whether an unquoted `0660` is octal, so a YAML number (`660`, `0o660`) is rejected. Rejected under `transport: tcp` or `udp`, which have no socket file.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SocketMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "sources": true,
             "targets": true,
             "tls": {
@@ -195,7 +207,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Plain newline-delimited text over TCP (the default), UDP, or a Unix socket. Each line becomes one log event whose message is the line's bytes, with nothing parsed. To give it structure, add a `json`, `logfmt`, `kv`, or `regex` stage downstream.\n\nThe event has no attributes, no severity, and a raw body, and is timestamped when it was received. A trailing `\\r` is stripped and an empty line is skipped. A line that isn't valid UTF-8 is kept as a byte string, not dropped. Nothing about the sender is attached unless `peer:` is on, which records its address.\n\n`bind` is a `host:port` under `tcp` and `udp`, and the socket file's absolute path, shorter than 108 bytes, under `unix` and `unix_stream`. The directory must exist; a stale socket file left by an earlier run is replaced, and anything else at the path is refused. The socket file is made mode `0722`, so a client running as any user can send; restrict access with the directory's permissions.\n\nUnder `tcp` and `unix_stream`, a line ends at its `\\n`. If the connection closes partway through a line, that unterminated line is dropped and counted as `logit.input.frames.dropped{reason=\"truncated\"}`, because the sender never finished it. Under `udp` and `unix`, a datagram holds one or more lines, and its end also ends its last line.\n\nA line can't carry a newline of its own, so a multi-line message (a stack trace, a pretty-printed JSON document) arrives as several events.\n\n`tls:` turns TLS on and makes it required, with no plaintext fallback. It's accepted under `transport: tcp` only.\n\nA TCP or `unix_stream` listener has no receive queue (the connection's own flow control is the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply per connection, so N live connections can hold up to N times `batch_max_events` in flight.",
+          "description": "Plain newline-delimited text over TCP (the default), UDP, or a Unix socket. Each line becomes one log event whose message is the line's bytes, with nothing parsed. To give it structure, add a `json`, `logfmt`, `kv`, or `regex` stage downstream.\n\nThe event has no attributes, no severity, and a raw body, and is timestamped when it was received. A trailing `\\r` is stripped and an empty line is skipped. A line that isn't valid UTF-8 is kept as a byte string, not dropped. Nothing about the sender is attached unless `peer:` is on, which records its address.\n\n`bind` is a `host:port` under `tcp` and `udp`, and the socket file's absolute path, shorter than 108 bytes, under `unix` and `unix_stream`. The directory must exist; a stale socket file left by an earlier run is replaced, and anything else at the path is refused. The socket file is made mode `socket_mode`, by default `0722`, so a client running as any user can send; restrict access with the directory's permissions.\n\nUnder `tcp` and `unix_stream`, a line ends at its `\\n`. If the connection closes partway through a line, that unterminated line is dropped and counted as `logit.input.frames.dropped{reason=\"truncated\"}`, because the sender never finished it. Under `udp` and `unix`, a datagram holds one or more lines, and its end also ends its last line.\n\nA line can't carry a newline of its own, so a multi-line message (a stack trace, a pretty-printed JSON document) arrives as several events.\n\n`tls:` turns TLS on and makes it required, with no plaintext fallback. It's accepted under `transport: tcp` only.\n\nA TCP or `unix_stream` listener has no receive queue (the connection's own flow control is the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply per connection, so N live connections can hold up to N times `batch_max_events` in flight.",
           "type": "object",
           "required": [
             "bind",
@@ -237,6 +249,18 @@
               "type": "boolean"
             },
             "receive": true,
+            "socket_mode": {
+              "description": "The socket file's permission bits under `transport: unix` or `unix_stream`, as a quoted octal string: `\"0660\"`. Three octal digits, optionally after a leading `0`; setuid, setgid, and sticky bits are rejected. Defaults to `\"0722\"`: a client needs only write permission to send, so the directory's permissions are the access control. Quote the value: YAML versions disagree on whether an unquoted `0660` is octal, so a YAML number (`660`, `0o660`) is rejected. Rejected under `transport: tcp` or `udp`, which have no socket file.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SocketMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "sources": true,
             "targets": true,
             "tls": {
@@ -621,11 +645,23 @@
             },
             "receive": true,
             "socket": {
-              "description": "An absolute path for a Unix stream socket, the Agent's `receiver_socket` (`/var/run/datadog/apm.socket` by default). A tracer finds it through `DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket`. The directory must exist; a stale socket file at the path is replaced, and the new one is made writable by every user (mode `0722`, the Agent's own) so unprivileged tracers can connect.",
+              "description": "An absolute path for a Unix stream socket, the Agent's `receiver_socket` (`/var/run/datadog/apm.socket` by default). A tracer finds it through `DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket`. The directory must exist; a stale socket file at the path is replaced, and the new one is made mode `socket_mode`, by default `0722` (the Agent's own), so unprivileged tracers can connect.",
               "default": null,
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "socket_mode": {
+              "description": "The `socket` file's permission bits, as a quoted octal string: `\"0660\"`. Three octal digits, optionally after a leading `0`; setuid, setgid, and sticky bits are rejected. Defaults to `\"0722\"`, the Agent's own: a tracer needs only write permission to connect, so the directory's permissions are the access control. Quote the value: YAML versions disagree on whether an unquoted `0660` is octal, so a YAML number (`660`, `0o660`) is rejected. Requires `socket`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SocketMode"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "sources": true,
@@ -4295,6 +4331,10 @@
         "metrics",
         "traces"
       ]
+    },
+    "SocketMode": {
+      "type": "string",
+      "pattern": "^0?[0-7]{3}$"
     },
     "SpanKindConfig": {
       "description": "OTLP's span kinds, as config vocabulary.",

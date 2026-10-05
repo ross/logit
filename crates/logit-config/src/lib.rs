@@ -686,9 +686,9 @@ pub enum ComponentKind {
     /// 108 bytes, under `unix`/`unix_stream` (the Datadog Agent's is
     /// `/var/run/datadog/dsd.socket`). The directory
     /// must exist; a stale socket file left by an earlier run is replaced, and anything else at the
-    /// path is refused. The socket file is made mode `0722`, as the Agent's is, so a client running
-    /// as any user can send; restrict access with the directory's permissions. To listen on UDP and
-    /// a socket at once, configure two `statsd_in` components.
+    /// path is refused. The socket file is made mode `socket_mode`, by default `0722` as the
+    /// Agent's is, so a client running as any user can send; restrict access with the directory's
+    /// permissions. To listen on UDP and a socket at once, configure two `statsd_in` components.
     ///
     /// `transport: unix` behaves as UDP does: the whole `receive:` block applies. Under
     /// `transport: unix_stream`, each 4-byte little-endian length prefix frames one packet of
@@ -785,6 +785,15 @@ pub enum ComponentKind {
         /// rejected.
         #[serde(default)]
         peer: bool,
+        /// The socket file's permission bits under `transport: unix` or `unix_stream`, as a quoted
+        /// octal string: `"0660"`. Three octal digits, optionally after a leading `0`; setuid,
+        /// setgid, and sticky bits are rejected. Defaults to `"0722"`: a client needs only write
+        /// permission to send, so the directory's permissions are the access control. Quote the
+        /// value: YAML versions disagree on whether an unquoted `0660` is octal, so a YAML number
+        /// (`660`, `0o660`) is rejected. Rejected under `transport: tcp` or `udp`, which have no
+        /// socket file.
+        #[serde(default)]
+        socket_mode: Option<SocketMode>,
     },
     /// Plain newline-delimited text over TCP (the default), UDP, or a Unix socket. Each line
     /// becomes one log event whose message is the line's bytes, with nothing parsed. To give it
@@ -798,8 +807,8 @@ pub enum ComponentKind {
     /// `bind` is a `host:port` under `tcp` and `udp`, and the socket file's absolute path, shorter
     /// than 108 bytes, under `unix` and `unix_stream`. The directory must exist; a stale socket file
     /// left by an earlier run is replaced, and anything else at the path is refused. The socket
-    /// file is made mode `0722`, so a client running as any user can send; restrict access with
-    /// the directory's permissions.
+    /// file is made mode `socket_mode`, by default `0722`, so a client running as any user can
+    /// send; restrict access with the directory's permissions.
     ///
     /// Under `tcp` and `unix_stream`, a line ends at its `\n`. If the connection closes partway
     /// through a line, that unterminated line is dropped and counted as
@@ -897,6 +906,15 @@ pub enum ComponentKind {
         #[serde(default = "default_lines_max_line_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_line_bytes: u64,
+        /// The socket file's permission bits under `transport: unix` or `unix_stream`, as a quoted
+        /// octal string: `"0660"`. Three octal digits, optionally after a leading `0`; setuid,
+        /// setgid, and sticky bits are rejected. Defaults to `"0722"`: a client needs only write
+        /// permission to send, so the directory's permissions are the access control. Quote the
+        /// value: YAML versions disagree on whether an unquoted `0660` is octal, so a YAML number
+        /// (`660`, `0o660`) is rejected. Rejected under `transport: tcp` or `udp`, which have no
+        /// socket file.
+        #[serde(default)]
+        socket_mode: Option<SocketMode>,
     },
     /// collectd's binary `network` plugin protocol over UDP.
     ///
@@ -1226,10 +1244,18 @@ pub enum ComponentKind {
         /// An absolute path for a Unix stream socket, the Agent's `receiver_socket`
         /// (`/var/run/datadog/apm.socket` by default). A tracer finds it through
         /// `DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket`. The directory must exist; a
-        /// stale socket file at the path is replaced, and the new one is made writable by every
-        /// user (mode `0722`, the Agent's own) so unprivileged tracers can connect.
+        /// stale socket file at the path is replaced, and the new one is made mode `socket_mode`,
+        /// by default `0722` (the Agent's own), so unprivileged tracers can connect.
         #[serde(default)]
         socket: Option<String>,
+        /// The `socket` file's permission bits, as a quoted octal string: `"0660"`. Three octal
+        /// digits, optionally after a leading `0`; setuid, setgid, and sticky bits are rejected.
+        /// Defaults to `"0722"`, the Agent's own: a tracer needs only write permission to
+        /// connect, so the directory's permissions are the access control. Quote the value: YAML
+        /// versions disagree on whether an unquoted `0660` is octal, so a YAML number (`660`,
+        /// `0o660`) is rejected. Requires `socket`.
+        #[serde(default)]
+        socket_mode: Option<SocketMode>,
         /// Terminates TLS on the `bind` listener when present; plaintext when omitted. Requires
         /// `bind`: the Unix socket is always plaintext.
         #[serde(default)]
@@ -3500,6 +3526,108 @@ impl JsonSchema for StdioTarget {
     }
 }
 
+/// A Unix socket file's permission bits, written as a quoted octal string: `"0660"` or `"660"`.
+/// Three octal digits, optionally after a leading `0`, so the value is at most `0777`: no setuid,
+/// setgid, or sticky bit. A YAML number (`660`, `0o660`) is rejected: YAML 1.1 reads `0660` as
+/// an octal number and YAML 1.2 as a string, so only a string means the same thing to every tool.
+/// An unquoted `0660` reaches this type as the string YAML 1.2 makes it.
+// `Serialize`/`Deserialize`/`JsonSchema` are hand-rolled: a derived string newtype can't tell a
+// bare YAML integer apart to give it the "quote it" message, and the schema needs a pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketMode(u32);
+
+impl SocketMode {
+    /// The schema's `pattern`, which [`SocketMode::parse`] enforces by hand.
+    const PATTERN: &'static str = "^0?[0-7]{3}$";
+
+    /// A mode of `bits`, or `None` past `0o777`.
+    pub fn new(bits: u32) -> Option<Self> {
+        (bits <= 0o777).then_some(SocketMode(bits))
+    }
+
+    /// The permission bits, for `chmod`.
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    fn parse(raw: &str) -> Result<Self, String> {
+        let digits = raw.strip_prefix('0').filter(|rest| rest.len() == 3).unwrap_or(raw);
+        if digits.len() == 3 && digits.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+            return u32::from_str_radix(digits, 8).map(SocketMode).map_err(|e| e.to_string());
+        }
+        if raw.len() == 4 && raw.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+            return Err(format!(
+                "socket_mode \"{raw}\" sets a setuid, setgid, or sticky bit -- give permission \
+                 bits only, at most \"0777\""
+            ));
+        }
+        Err(format!(
+            "socket_mode \"{raw}\" isn't an octal file mode -- give 3 or 4 octal digits, such as \
+             \"0660\" or \"0722\""
+        ))
+    }
+}
+
+impl Serialize for SocketMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("{:04o}", self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for SocketMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = SocketMode;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a quoted octal file mode, such as \"0660\"")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<SocketMode, E> {
+                SocketMode::parse(v).map_err(E::custom)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<SocketMode, E> {
+                Err(E::custom(UNQUOTED))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<SocketMode, E> {
+                Err(E::custom(UNQUOTED))
+            }
+        }
+
+        // The number isn't echoed: YAML has already read `0o660` as 432, which would mislead.
+        const UNQUOTED: &str = "socket_mode must be a quoted octal string such as \"0660\", not \
+                                a number -- quote it, because YAML versions disagree on whether \
+                                an unquoted 0660 is octal";
+
+        // `deserialize_any`, so a YAML number reaches `visit_u64`/`visit_i64` and gets the quote
+        // hint. `deserialize_str` would reject it with serde's generic message, or, on a
+        // deserializer reading text directly, accept `660` as a string.
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl JsonSchema for SocketMode {
+    fn schema_name() -> String {
+        "SocketMode".to_string()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        use schemars::schema::{InstanceType, SchemaObject, StringValidation};
+        SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                pattern: Some(Self::PATTERN.to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .into()
+    }
+}
+
 /// The largest `rotate.max_files` graph validation accepts. It counts the active file, so 1000
 /// keeps 999 rotated files: about 2.7 years of daily files, or 41 days of hourly ones. Every
 /// rotation stats and renames each retained file, so a larger value makes each rotation slower
@@ -4227,6 +4355,72 @@ mod tests {
     // Deserialized via `serde_json` rather than YAML (`logit-cli` owns YAML parsing, and this
     // crate has no YAML dependency): both are self-describing, so this exercises the same
     // tagged-enum disambiguation the real deserializer does.
+
+    fn socket_mode_of(json_value: &str) -> Result<Option<SocketMode>, String> {
+        let component: Component = serde_json::from_str(&format!(
+            r#"{{"type": "statsd_in", "bind": "/run/dsd.socket", "transport": "unix",
+                "socket_mode": {json_value}}}"#
+        ))
+        .map_err(|e| e.to_string())?;
+        match component.kind {
+            ComponentKind::StatsdIn { socket_mode, .. } => Ok(socket_mode),
+            other => panic!("expected StatsdIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn socket_mode_reads_three_or_four_octal_digits() {
+        assert_eq!(socket_mode_of(r#""660""#).unwrap().map(SocketMode::bits), Some(0o660));
+        assert_eq!(socket_mode_of(r#""0660""#).unwrap().map(SocketMode::bits), Some(0o660));
+        assert_eq!(socket_mode_of(r#""0777""#).unwrap().map(SocketMode::bits), Some(0o777));
+        assert_eq!(socket_mode_of(r#""000""#).unwrap().map(SocketMode::bits), Some(0));
+    }
+
+    #[test]
+    fn socket_mode_is_none_when_omitted() {
+        for kind in [
+            r#"{"type": "statsd_in", "bind": "/run/dsd.socket", "transport": "unix"}"#,
+            r#"{"type": "lines_in", "bind": "/run/l.socket", "transport": "unix_stream"}"#,
+            r#"{"type": "datadog_trace_in", "socket": "/run/apm.socket"}"#,
+        ] {
+            let component: Component = serde_json::from_str(kind).unwrap();
+            let socket_mode = match component.kind {
+                ComponentKind::StatsdIn { socket_mode, .. }
+                | ComponentKind::LinesIn { socket_mode, .. }
+                | ComponentKind::DatadogTraceIn { socket_mode, .. } => socket_mode,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(socket_mode, None, "{kind}");
+        }
+    }
+
+    #[test]
+    fn socket_mode_rejects_a_bare_number_with_a_hint_to_quote_it() {
+        let err = socket_mode_of("660").unwrap_err();
+        assert!(err.contains("quoted octal string") && err.contains("quote it"), "{err}");
+    }
+
+    #[test]
+    fn socket_mode_rejects_setuid_setgid_and_sticky_bits() {
+        for raw in ["1777", "2755", "4755", "7777"] {
+            let err = socket_mode_of(&format!("\"{raw}\"")).unwrap_err();
+            assert!(err.contains("setuid, setgid, or sticky"), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn socket_mode_rejects_a_value_that_is_not_an_octal_mode() {
+        for raw in ["", "66", "0o660", "0698", "rw-r-----", "00660", " 660", "+660"] {
+            let err = socket_mode_of(&format!("\"{raw}\"")).unwrap_err();
+            assert!(err.contains("isn't an octal file mode"), "{raw:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn socket_mode_serializes_as_a_four_digit_octal_string() {
+        let mode = socket_mode_of(r#""660""#).unwrap().unwrap();
+        assert_eq!(serde_json::to_string(&mode).unwrap(), r#""0660""#);
+    }
 
     #[test]
     fn lua_component_without_interval_deserializes() {
@@ -5841,7 +6035,9 @@ mod tests {
                 handshake_timeout,
                 idle_timeout,
                 max_connections,
+                socket_mode,
             } => {
+                assert_eq!(socket_mode, None);
                 assert_eq!(bind.as_deref(), Some("127.0.0.1:8126"));
                 assert_eq!(socket.as_deref(), Some("/var/run/datadog/apm.socket"));
                 assert_eq!(tls, None);
@@ -7449,8 +7645,10 @@ mod tests {
                 max_connections,
                 max_line_bytes,
                 peer,
+                socket_mode,
             } => {
                 assert!(!peer, "opt-in -- no peer address unless asked for");
+                assert_eq!(socket_mode, None);
                 assert_eq!(bind, "0.0.0.0:5170");
                 assert_eq!(transport, LinesTransport::Tcp, "tcp is the default");
                 assert_eq!(tls, None);
@@ -7553,7 +7751,9 @@ mod tests {
                 idle_timeout,
                 max_connections,
                 peer,
+                socket_mode,
             } => {
+                assert_eq!(socket_mode, None);
                 assert_eq!(max_connections, default_max_connections());
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert_eq!(bind, "0.0.0.0:8125");
