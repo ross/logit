@@ -1,6 +1,6 @@
 ---
 created: 2026-09-22
-updated: 2026-09-22
+updated: 2026-10-05
 ---
 
 # `http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields
@@ -99,9 +99,11 @@ alone when no route matched, `HTTP` in place of `_OTHER`); and `span.duration_s`
 `http.request.duration_s` unless the event already states a span duration, or both a start and
 an end — the two shapes `trace_context` resolves on its own. A lone end (nginx's `$msec`) and a
 lone start (HAProxy's `request_date(us)`) both get the mirror, which is what turns each into a
-resolvable pair instead of a span with receipt time borrowed for its missing bound. Under an
+resolvable pair instead of a span with receipt time borrowed for its missing bound. ~~Under an
 explicit `forwarded: {trust: true}`, `client.address` is overwritten from the first hop of
-`http.request.header.x-forwarded-for`; off by default because the header is client-supplied.
+`http.request.header.x-forwarded-for`; off by default because the header is client-supplied.~~
+Superseded 2026-10-05 by [ADR `forwarded-header-parsing`](forwarded-header-parsing.md); see the
+amendment below.
 
 A field that is absent produces nothing — no default `url.scheme`, no `user_agent.class: none`
 for a producer that doesn't log the header at all (an *empty* header is `none`; an *absent* one is
@@ -131,10 +133,12 @@ input? It must not. Normalizing a value the producer did send — coercing its s
 integer, capping its user agent, redacting its query — is not overriding; that hardening applies
 regardless, which is what makes the drop-in and the server-side shapes meet in the middle.
 
-The one deliberate overwrite is `client.address` under `forwarded: {trust: true}`: nginx and
+~~The one deliberate overwrite is `client.address` under `forwarded: {trust: true}`: nginx and
 HAProxy always log the peer address, so a fill-only rule would make the option a no-op. It is
 gated behind an explicit operator statement about their own topology, and it replaces exactly one
-field with exactly one thing.
+field with exactly one thing.~~ Superseded 2026-10-05 by
+[ADR `forwarded-header-parsing`](forwarded-header-parsing.md): the overwrite stays, gated the same
+way, and now replaces the `client.address` and `client.port` pair; see the amendment below.
 
 **Best-effort per field, never all-or-nothing, and never a dropped event.** `trace_context` is
 all-or-nothing per event because it writes *identity* — a half-lifted trace id is a corrupt trace.
@@ -245,7 +249,8 @@ everywhere.
   meaningful, so unlike `keep_values`/`flatten` there is no "nothing configured is a no-op" rule.
   Graph rule 60 compiles every pattern at validate time (rule 31's reasoning) and rejects the
   usual empties, a duplicate built-in, a `max_length` key that names nothing this component caps,
-  and `forwarded: {trust: false}` (omit the block instead). `CAPPED_FIELDS` and its defaults live
+  ~~and `forwarded: {trust: false}` (omit the block instead)~~ (superseded 2026-10-05; see the
+  amendment below). `CAPPED_FIELDS` and its defaults live
   in `logit-config` so the rule and the transform cannot disagree. `ComponentKind::Json` gains
   `invalid_utf8: reject | replace`. Schema regenerated.
 - **Allocation contract**, enforced by `crates/logit-bench/tests/allocations.rs` and recorded in
@@ -288,3 +293,26 @@ everywhere.
   `docs/deploying.md`'s nginx recipe points at it; `docs/design/data-model.md`'s well-known
   table gains a pointer and the alias note; `docs/design/pipeline-graph.md` and
   `docs/design/internal-telemetry.md` gain the rule and the counters.
+
+## Amendment (2026-10-05): the forwarding header moves to a shared parser
+
+[ADR `forwarded-header-parsing`](forwarded-header-parsing.md) replaces `forwarded: {trust: true}`
+and is the canonical account of what follows:
+
+- **Config.** `forwarded: x_forwarded_for | forwarded | x_real_ip`, the shape the HTTP listeners
+  take, names the one header `http_access` reads, as `http.request.header.<name>`. Omitting it
+  leaves `client.address` as logged.
+- **Three headers.** `X-Forwarded-For`'s leftmost entry, RFC 7239 `Forwarded`'s first `for=`, or
+  `X-Real-IP`'s whole value.
+- **The address is stripped.** IPv6 brackets and a port come off, so `client.address` holds an IP
+  address alone.
+- **`client.port` is written.** A parsed header replaces `client.address` and `client.port` as a
+  pair. With no port in the header, a logged `client.port` is removed, because once a forwarding
+  header is in play it's the proxy's ephemeral port.
+- **One parser.** `http_access` and the HTTP listeners share one parser in `logit-proto`, a fuzz
+  target, in place of `http_access`'s own `first_hop`.
+- **Graph rule 60 no longer checks `forwarded:`.** With an enum, there's no `{trust: false}` to
+  reject.
+
+The overwrite stays the one exception to fill-only, for the reason the Decision gives: a web
+server always logs the peer address.

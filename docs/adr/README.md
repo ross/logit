@@ -42,7 +42,7 @@ the same date, write the record, then add a row here.
 | [Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`](datadog-agent-and-intake-relay.md) | 2026-09-23 | 2026-10-05 |
 | [`sample`: consistent, keyed event sampling with an operator override](consistent-sampling-component.md) | 2026-09-22 | 2026-09-22 |
 | [Publish the release image to GHCR, `latest` only, on manual dispatch](publish-release-image-to-ghcr.md) | 2026-09-22 | 2026-09-22 |
-| [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-09-22 |
+| [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-10-05 |
 | [Out-of-CI verification of raw-`libc` `unsafe`: a throwaway nightly image, not a Dockerfile.dev change](out-of-ci-unsafe-verification.md) | 2026-09-21 | 2026-09-25 |
 | [`flatten`: dotted-key expansion as an opt-in, operator-placed transform](flatten-transform.md) | 2026-09-21 | 2026-09-21 |
 | [Event sizing: `AttrMap`'s inline capacity stays 8, and attribute maps are not pre-sized](event-sizing-and-allocation-strategy.md) | 2026-09-21 | 2026-09-21 |

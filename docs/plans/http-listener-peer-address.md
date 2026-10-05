@@ -7,8 +7,9 @@ updated: 2026-10-05
 
 ## Status
 
-Planned. `hpeer/w0` is this plan, an amendment to [ADR
-`listener-peer-address`](../adr/listener-peer-address.md), and [ADR
+Planned. `hpeer/w0` is this plan, amendments to [ADR
+`listener-peer-address`](../adr/listener-peer-address.md) and [ADR
+`http-access-normalization`](../adr/http-access-normalization.md), and [ADR
 `forwarded-header-parsing`](../adr/forwarded-header-parsing.md), and changes no code.
 
 ## Goal
@@ -30,12 +31,14 @@ The listeners in scope are `otlp_in` (HTTP and gRPC), `datadog_in`, `datadog_tra
 - **Unifying the five HTTP accept loops.** They're separate by design:
   `crates/logit-inputs/src/http.rs`'s module doc keeps `serve_connection` per listener. This stream
   adds shared helpers and calls them from each loop.
-- **A trusted-proxy allowlist or a hop count.** [ADR
+- **A trusted-proxy list or a hop count for forwarding headers.** [ADR
   `deployment-threat-model`](../adr/deployment-threat-model.md) puts the trust boundary with the
-  operator and rejects a per-listener untrusted mode. A client that spoofs a forwarding header, or
-  reaches a `proxy_protocol:` port directly, is the crafted-input case. It's recorded as a
-  known-gaps non-goal citing that ADR, beside the existing `proxy_protocol:` entry in
-  [intake gaps](../known-gaps/intake.md).
+  operator and rejects a per-listener untrusted mode. A client that spoofs a forwarding header is
+  the crafted-input case. The `forwarded` entry in [transform gaps](../known-gaps/transforms.md)
+  becomes the one non-goal entry for it, covering the listeners and `http_access` alike, and
+  [intake gaps](../known-gaps/intake.md)' `proxy_protocol:` entry points at it. An allowlist of
+  trusted PROXY sources is separate: it stays deferred work in ADR `listener-peer-address`'s
+  "Consequences", and the intake entry keeps its revisit trigger.
 - **A mutual-TLS client's identity, `SO_PEERCRED`, and `network.connection.id`.** These stay
   deferred, as in ADR `listener-peer-address`'s "Consequences".
 - **Reverse DNS.** Rejected for the reasons in ADR `listener-peer-address`'s "Peer attributes".
@@ -57,8 +60,10 @@ Agreed on 2026-10-05. The two ADRs record the reasoning.
    the listeners' shape: `forwarded: x_forwarded_for | forwarded | x_real_ip`, reading
    `http.request.header.<name>`, in place of `forwarded: {trust: true}`. Its `first_hop` stamps
    `203.0.113.7:5678` or `[2001:db8::1]:443` into `client.address` as written. The shared parser
-   strips the port and brackets, and when the port parses, `http_access` writes it as
-   `client.port`, as the listeners do. Both are changes to `http_access` output, which the
+   strips the port and brackets. A parsed header replaces `client.address` and `client.port` as a
+   pair, as on the listeners: the header's port when it carries one, and otherwise no
+   `client.port`, removing the one the web server logged, which is the proxy's ephemeral port
+   once a forwarding header is in play. Both are changes to `http_access` output, which the
    pre-release no-compatibility rule allows.
 
 ## Design
@@ -74,8 +79,7 @@ Agreed on 2026-10-05. The two ADRs record the reasoning.
   5. Hand the stream to hyper.
 - `otlp_in` discards the peer address. `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and the
   remote-write receiver keep it for diagnostic text only, never a tag.
-- Every HTTP listener has one point per request where all its batches exist, before delivery,
-  with the request headers still readable:
+- Every HTTP listener has one point per request where all its batches exist, before delivery:
 
   | Listener | Stamp point | Batches per request |
   |---|---|---|
@@ -86,9 +90,14 @@ Agreed on 2026-10-05. The two ADRs record the reasoning.
   | `splunk_hec_in` | `respond`, before the split into a deadline-bound first batch and detached rest | One per envelope |
   | Remote-write receiver | `write_response`, before building the batch | One |
 
-  Two of these constrain the order of work. The remote-write receiver consumes the request into
-  its body partway through `write_response`, so it reads the forwarding header first.
-  `splunk_hec_in` stamps before its split, because a code 6 can follow a delivered prefix.
+  Two things constrain the order of work:
+  - Every handler but `datadog_trace_in`'s `respond` consumes the request with `req.into_body()`
+    before it decodes: `handle_http`, `handle_grpc`, `datadog_in`'s `respond`, `splunk_hec_in`'s
+    `respond`, and `write_response`. Each of those five reads the forwarding header, or splits the
+    request with `into_parts`, before it collects the body, and the stamp itself stays after
+    decode. `datadog_trace_in` already splits the request with `req.into_parts()` for
+    `apply_tracer_headers`.
+  - `splunk_hec_in` stamps before its split, because a code 6 can follow a delivered prefix.
 - `datadog_trace_in` also accepts on a Unix socket, which has no `SocketAddr`.
 
 ### Shared pieces
@@ -115,8 +124,7 @@ All in `logit-inputs`, beside the `peer` stack's code, except the parser:
   client's path is the address, with no port. An unbound client, the usual tracer, gets nothing.
 - Each listener's permitted-normalization list names the attributes as an opt-in addition, in the
   codec module doc that's canonical for it (`crates/logit-proto/src/{otlp,datadog,splunk,prometheus}`)
-  and in [ADR `lossless-transit`](../adr/lossless-transit.md). The remote-write receiver's "never a
-  tag" sentence becomes "never a tag unless `peer:` is on".
+  and in [ADR `lossless-transit`](../adr/lossless-transit.md).
 
 ### Part 2: `proxy_protocol:`
 
@@ -141,8 +149,10 @@ the trust stance. In brief:
   default. gRPC metadata is HTTP/2 headers, so `otlp_in` gRPC needs nothing extra.
 - Each request reads the first instance of the configured header, and no other header (decision
   3).
-- A parsed header replaces a PROXY-derived `client.*` for that request (decision 2).
-  `network.peer.*` always stays the socket peer.
+- A parsed header replaces a PROXY-derived `client.*` for that request (decision 2), as a pair:
+  `client.address`, and `client.port` when the header carries a port. A header with no port
+  leaves no `client.port`, as a PROXY `AF_UNIX` origin does. `network.peer.*` always stays the
+  socket peer.
 - The field's doc states the trust assertion in the same words `proxy_protocol:` uses for
   reachability: the operator asserts their proxy sets the header.
 
@@ -152,15 +162,15 @@ Stacked, as the stacking rules below the table describe.
 
 | Branch | Content |
 |---|---|
-| `hpeer/w0` | This plan, an amendment to ADR `listener-peer-address` extending it to these listeners (its deferred list narrows to `logit_in`), and ADR `forwarded-header-parsing` for part 3. |
+| `hpeer/w0` | This plan, an amendment to ADR `listener-peer-address` extending it to these listeners (its deferred list narrows to `logit_in`), ADR `forwarded-header-parsing` for part 3, and an amendment to ADR `http-access-normalization` superseding its `forwarded: {trust: true}`. |
 | `hpeer/w1` | The shared pieces: `read_proxy_header` moved, the per-connection origin, and the batch stamp helper. No behavior change. |
 | `hpeer/w2` | `otlp_in` (HTTP and gRPC): `peer:` and `proxy_protocol:`, with the header-then-RST test. Sets the pattern. |
 | `hpeer/w3a` | `datadog_in` and `datadog_trace_in`, including the Unix socket. |
 | `hpeer/w3b` | `splunk_hec_in`. |
 | `hpeer/w3c` | The remote-write receiver. |
-| `hpeer/w4a` | The forwarding-header parser in `logit-proto` with a fuzz target and seeds, and `http_access` moved onto it with the listeners' config shape (decision 4). It updates the docs it contradicts: [`docs/http-access-logs.md`](../http-access-logs.md), [ADR `http-access-normalization`](../adr/http-access-normalization.md), [the `http_access` plan](http-access-normalization.md), and the all-or-nothing `forwarded` entry in [transform gaps](../known-gaps/transforms.md), which becomes the shared spoofed-header non-goal. |
+| `hpeer/w4a` | The forwarding-header parser in `logit-proto` with a fuzz target and seeds, and `http_access` moved onto it with the listeners' config shape (decision 4), including dashed aliases for `forwarded` and `x-real-ip`. It updates the docs it contradicts: [`docs/http-access-logs.md`](../http-access-logs.md), [the `http_access` plan](http-access-normalization.md), and the all-or-nothing `forwarded` entry in transform gaps, rewritten as the shared spoofed-header non-goal for the listeners and `http_access`. |
 | `hpeer/w4b` | `forwarded:` on the five HTTP listeners, over `w4a`'s parser. |
-| `hpeer/w5` | Operator docs ([`docs/deploying.md`](../deploying.md)'s "Recording the sender" section grows to cover these listeners), the runtime-gaps peer entry narrowed to `logit_in`, the spoofed-header non-goal, and an end-to-end run. |
+| `hpeer/w5` | Operator docs ([`docs/deploying.md`](../deploying.md)'s "Recording the sender" section grows to cover these listeners), the runtime-gaps peer entry narrowed to `logit_in`, a pointer from intake gaps' `proxy_protocol:` entry to the spoofed-header non-goal, and an end-to-end run. |
 
 - `w1` stacks on `w0`, and `w2` on `w1`.
 - `w3a`, `w3b`, and `w3c` are siblings off `w2` and can be built in parallel.
@@ -177,8 +187,10 @@ Stacked, as the stacking rules below the table describe.
   `crates/logit-bench/tests/allocations.rs`. A multi-batch stamp gets a pin of its own if its cost
   differs from the shared drivers' stamp.
 - **`w4a`:** the forwarding-header parser fuzzed for at least 600 s; unit vectors from RFC 7239's
-  examples, including a quoted IPv6 address with a port and `unknown`; and `http_access`'s existing
-  `X-Forwarded-For` tests rewritten for the stripped form and `client.port`.
+  examples, including a quoted IPv6 address with a port, a bracketed IPv6 address with no port
+  (`for="[2001:db8::cafe]"`), and `unknown`; an unbracketed IPv6 address (`2001:db8::1`), which
+  keeps its last group; and `http_access`'s existing `X-Forwarded-For` tests rewritten for the
+  stripped form and the `client.port` pair.
 - **`w5` end to end:**
   - HAProxy with `send-proxy-v2` in front of `otlp_in` (HTTP and gRPC).
   - nginx setting `X-Forwarded-For` in front of `otlp_in` HTTP and `splunk_hec_in`.

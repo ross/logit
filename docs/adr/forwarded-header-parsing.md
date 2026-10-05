@@ -41,36 +41,41 @@ header the component reads. One parser in `logit-proto` serves all six.
   side reads it as its HTTP side does.
 - **`http_access` reads an attribute.** It reads `http.request.header.<name>`, the name being the
   lowercase header name (`x-forwarded-for`, `forwarded`, `x-real-ip`), or its dashed alias
-  (`http-request-header-x-forwarded-for`), which the fixed alias table carries for each of the
-  three. This replaces `forwarded: {trust: true}`.
+  (`http-request-header-x-forwarded-for`). The fixed alias table carries the `x-forwarded-for`
+  alias today and gains the other two. This replaces `forwarded: {trust: true}`.
 
 ### Parsing
 - **`X-Forwarded-For`:** the leftmost comma-separated entry, trimmed of whitespace.
 - **`Forwarded`:** the `for=` parameter of the first comma-separated element, as a token or a
   quoted string (`for="[2001:db8::1]:443"`).
 - **`X-Real-IP`:** the whole value, trimmed of whitespace.
-- **The address.** For all three, IPv6 brackets are stripped, and so is a trailing `:port`. The
-  remaining text must parse as an IP address, and it's stamped as `client.address` in the text form
-  ADR `listener-peer-address` uses. A port that parses is stamped as `client.port`.
+- **The address.** A value that parses whole as an IP address is the address, with no port, so an
+  unbracketed IPv6 address keeps its last group. Otherwise only `[v6]`, `[v6]:port`, and
+  `v4:port` are split, and the remaining text must parse as an IP address. It's stamped as
+  `client.address` in the text form ADR `listener-peer-address` uses. A port that parses is
+  stamped as `client.port`.
 - **Nothing usable stamps nothing.** `unknown`, an obfuscated identifier (`_hidden`), an empty
   value, or anything else that isn't an IP address stamps no `client.*` and counts a throttled
   `forwarded` diagnostic. The request and its events go through unchanged.
 
 ### Precedence
-- A parsed header replaces a PROXY-derived `client.*` for that request. Behind an L4 proxy in front
-  of an L7 one (an NLB in front of nginx), the PROXY header names nginx and the forwarding header
-  names the client.
+- A parsed header replaces `client.address` and `client.port` as a pair. When the header carries
+  no port, any existing `client.port` is removed, so an address never sits beside another
+  source's port. This matches a PROXY `AF_UNIX` origin, which stamps an address and no port.
+- On a listener, the header's pair replaces a PROXY-derived `client.*` for that request. Behind an
+  L4 proxy in front of an L7 one (an NLB in front of nginx), the PROXY header names nginx and its
+  ephemeral port, and the forwarding header names the client.
 - An absent or unparseable header leaves the PROXY origin standing.
 - `network.peer.*` always stays the socket peer.
-- In `http_access`, a parsed header replaces the `client.address` the web server logged, as
-  `{trust: true}` does today, and writes `client.port` when the header carries one.
+- In `http_access`, the header's pair replaces the `client.address` and `client.port` the web
+  server logged, which name the proxy once a forwarding header is in play.
 
 ### Trust
 The operator asserts that the named header is set by their proxy. `logit` keeps no allowlist of
 trusted proxy addresses and no hop count. A client that reaches the listener directly, or through a
 proxy that appends to a header the client sent, can name any address. Under ADR
 `deployment-threat-model`, that's crafted input whose defense isn't free (it needs the operator's
-proxy topology as config), so it's a documented non-goal in `docs/known-gaps/`. Each
+proxy topology as config), so it's a documented non-goal in `docs/known-gaps/transforms.md`. Each
 component's `forwarded:` field doc states the assertion, in the same words `proxy_protocol:`'s doc
 uses for reachability.
 
@@ -98,11 +103,16 @@ goes away.
   its own origin by sending the one the proxy doesn't set.
 
 ## Consequences
-- `http_access`'s output changes: `client.address` loses a port and IPv6 brackets, a parsed port
-  appears as `client.port`, and the config changes from `forwarded: {trust: true}` to
-  `forwarded: x_forwarded_for`. The pre-release no-compatibility rule allows both.
+- `http_access`'s output changes: `client.address` loses a port and IPv6 brackets, the header's
+  port, or none, replaces a logged `client.port`, and the config changes from
+  `forwarded: {trust: true}` to `forwarded: x_forwarded_for`. The pre-release no-compatibility
+  rule allows both.
 - Changing the proxy in front of a listener, or the header it sets, is a config change.
-- The all-or-nothing `forwarded` entry in `docs/known-gaps/transforms.md` becomes the shared
-  spoofed-header non-goal for the listeners and `http_access`.
+- The all-or-nothing `forwarded` entry in `docs/known-gaps/transforms.md` becomes the one
+  spoofed-header non-goal for the listeners and `http_access`, and `docs/known-gaps/intake.md`'s
+  `proxy_protocol:` entry points at it. An allowlist of trusted PROXY sources isn't part of this
+  non-goal: it stays deferred work in ADR `listener-peer-address`.
+- [ADR `http-access-normalization`](http-access-normalization.md)'s `forwarded: {trust: true}` is
+  superseded, recorded in its 2026-10-05 amendment.
 - A request through an L7 proxy with `forwarded:` off carries the proxy's address as
   `client.address` when a PROXY header names it, and no `client.*` otherwise.
