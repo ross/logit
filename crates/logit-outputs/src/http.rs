@@ -11,9 +11,13 @@
 //! `hyper`, not `reqwest`). Each request's verdict stands on its own: a `Fault::Rejected` that
 //! names one request is counted by the sink and the send goes on to the next request; a
 //! `Fault::Refused` (the destination refuses every request), a `Fault::Clean`, or a
-//! `Fault::Ambiguous` stops the send, the last two through [`after_delivery`]. The send succeeds when any request was accepted, and
-//! fails with the first rejection when none was. See `docs/adr/delivery-semantics.md`'s
-//! "Amendment: per-request verdicts (2026-10-04)".
+//! `Fault::Ambiguous` stops the send. A sink that resends the whole batch on a retry
+//! ([`Outcomes::new`]) stops it through [`after_delivery`]; one that remembers the requests the
+//! destination settled and resends only the rest ([`Outcomes::resuming`], `otlp_out`) stops it with
+//! the failed request's own fault. The send succeeds when any request was accepted, and fails with
+//! the first rejection when none was. See `docs/adr/delivery-semantics.md`'s "Amendment:
+//! per-request verdicts (2026-10-04)" and `docs/adr/sink-fault-classes.md`'s "Amendment:
+//! `otlp_out` retries per signal (2026-10-05)".
 //!
 //! **How a sink overrides the status table.** [`classify_status`] reads the status alone, and is
 //! the class of every response a sink's own table doesn't name. A sink whose destination says
@@ -234,6 +238,10 @@ pub(crate) fn after_delivery(err: anyhow::Error, sent_any: bool) -> anyhow::Erro
 /// | [`Fault::Rejected`] | calls `on_rejected` (the sink counts the request's records there), keeps the first such error; the send goes on |
 /// | [`Fault::Refused`] | stops the send through [`after_delivery`]: every later request would get the same answer |
 /// | [`Fault::Clean`] or [`Fault::Ambiguous`] | stops the send through [`after_delivery`] |
+///
+/// Built with [`Outcomes::resuming`], a stop keeps the request's own fault instead of passing
+/// through [`after_delivery`]: the sink resends none of the requests already accepted, so a retry
+/// risks no duplicate of them.
 /// | no `Fault` attached | stops the send with the error unchanged |
 ///
 /// An error with no `Fault` is not a destination's verdict on the request, so it isn't counted as
@@ -246,11 +254,22 @@ pub(crate) fn after_delivery(err: anyhow::Error, sent_any: bool) -> anyhow::Erro
 pub(crate) struct Outcomes {
     accepted: bool,
     first_rejected: Option<anyhow::Error>,
+    /// Set by [`Outcomes::resuming`]: a stop keeps the request's own fault.
+    resuming: bool,
 }
 
 impl Outcomes {
+    /// For a sink whose retry resends every request of the batch.
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// For a sink whose retry resends only the requests the destination hasn't settled.
+    /// `accepted_before` says whether an earlier attempt at the same batch had a request
+    /// accepted, which makes the send `Ok` however this attempt's requests are answered short of
+    /// a stop.
+    pub(crate) fn resuming(accepted_before: bool) -> Self {
+        Self { accepted: accepted_before, first_rejected: None, resuming: true }
     }
 
     /// Folds one request's `result` in. `Ok(())` means the send goes on; `Err` is the send's
@@ -276,6 +295,7 @@ impl Outcomes {
                 Ok(())
             }
             None => Err(err),
+            Some(Fault::Clean | Fault::Ambiguous | Fault::Refused) if self.resuming => Err(err),
             Some(Fault::Clean | Fault::Ambiguous | Fault::Refused) => {
                 Err(after_delivery(err, self.accepted))
             }
@@ -531,6 +551,24 @@ mod tests {
                 "accepted_first: {accepted_first}, fault: {fault}"
             );
         }
+    }
+
+    /// Resuming, a stop keeps the request's own fault even after an accepted request, and an
+    /// earlier attempt's acceptance makes a send of rejections alone `Ok`.
+    #[test]
+    fn resuming_stops_with_the_requests_own_fault_and_carries_an_earlier_acceptance() {
+        for fault in [Fault::Clean, Fault::Refused, Fault::Ambiguous] {
+            let mut outcomes = Outcomes::resuming(false);
+            assert!(note(&mut outcomes, Ok(())).0.is_ok());
+            let err = note(&mut outcomes, failed(fault)).0.unwrap_err();
+            assert_eq!(logit_pipeline::classify(&err), fault);
+        }
+        let mut outcomes = Outcomes::resuming(true);
+        assert!(note(&mut outcomes, failed(Fault::Rejected)).0.is_ok());
+        assert!(outcomes.finish().is_ok(), "an earlier attempt's acceptance makes the send Ok");
+        let mut outcomes = Outcomes::resuming(false);
+        assert!(note(&mut outcomes, failed(Fault::Rejected)).0.is_ok());
+        assert_eq!(logit_pipeline::classify(&outcomes.finish().unwrap_err()), Fault::Rejected);
     }
 
     /// An error with no `Fault` is no destination verdict: it stops the send unchanged.

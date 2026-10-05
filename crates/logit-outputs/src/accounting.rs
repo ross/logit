@@ -11,6 +11,12 @@
 //!
 //! A sink skips the encode-side counts it emits itself when `encode` reports a repeat, and keeps
 //! ungated handles for its transport counters and for drops a kernel or peer verdict decides.
+//!
+//! A sink that sends one batch as several requests can also remember, per armed batch, which
+//! requests the destination settled ([`BatchAccounting::settle`]), so a retry resends only the
+//! rest. The memory has the gate's lifetime: `observe` clears it, an `Ok` send disarms it, and
+//! unarmed nothing is settled, so a caller that never calls `observe_batch` resends every
+//! request. `otlp_out` keys it by signal (`crate::otlp`, "One `send`, several requests").
 
 use logit_core::CountGate;
 
@@ -24,6 +30,12 @@ pub(crate) struct BatchAccounting {
     armed: bool,
     /// Units already encoded for the armed batch.
     counted: u32,
+    /// Requests of the armed batch the destination accepted, as bits; a request's bit index is
+    /// the sink's own numbering, separate from the encode units.
+    accepted: u32,
+    /// Requests of the armed batch the destination rejected, as bits; their records are counted
+    /// dropped, and a resend would be rejected again.
+    rejected: u32,
 }
 
 impl BatchAccounting {
@@ -36,6 +48,29 @@ impl BatchAccounting {
     pub(crate) fn observe(&mut self) {
         self.armed = true;
         self.counted = 0;
+        self.accepted = 0;
+        self.rejected = 0;
+    }
+
+    /// Records the destination's verdict on `request` of the armed batch: accepted, or rejected.
+    /// Unarmed, it records nothing.
+    pub(crate) fn settle(&mut self, request: u32, accepted: bool) {
+        debug_assert!(request < u32::BITS, "request {request} is past the bitset");
+        if self.armed {
+            let bits = if accepted { &mut self.accepted } else { &mut self.rejected };
+            *bits |= 1 << request;
+        }
+    }
+
+    /// Whether the destination already settled `request` of the armed batch, so a retry skips
+    /// it.
+    pub(crate) fn settled(&self, request: u32) -> bool {
+        self.armed && (self.accepted | self.rejected) & (1 << request) != 0
+    }
+
+    /// Whether the destination accepted any request of the armed batch on an earlier attempt.
+    pub(crate) fn any_accepted(&self) -> bool {
+        self.armed && self.accepted != 0
     }
 
     /// Runs one encode of `unit` with the gate muted when it repeats, and returns whether it was
@@ -128,6 +163,30 @@ mod tests {
         accounting.delivered();
         assert_eq!(encode(&mut accounting, 0), (true, false));
         assert_eq!(encode(&mut accounting, 0), (true, false), "unarmed, nothing is remembered");
+    }
+
+    #[test]
+    fn settled_requests_are_remembered_until_the_next_batch() {
+        let mut accounting = BatchAccounting::default();
+        accounting.observe();
+        accounting.settle(0, true);
+        accounting.settle(2, false);
+        assert!(accounting.settled(0) && accounting.settled(2) && !accounting.settled(1));
+        assert!(accounting.any_accepted());
+        accounting.observe();
+        assert!(!accounting.settled(0) && !accounting.settled(2), "observe clears the verdicts");
+        assert!(!accounting.any_accepted());
+    }
+
+    #[test]
+    fn unarmed_or_after_delivery_nothing_is_settled() {
+        let mut accounting = BatchAccounting::default();
+        accounting.settle(0, true);
+        assert!(!accounting.settled(0) && !accounting.any_accepted(), "unarmed records nothing");
+        accounting.observe();
+        accounting.settle(1, true);
+        accounting.delivered();
+        assert!(!accounting.settled(1) && !accounting.any_accepted(), "an Ok send disarms");
     }
 
     #[test]

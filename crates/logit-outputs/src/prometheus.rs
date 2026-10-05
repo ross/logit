@@ -619,6 +619,13 @@ impl Output for PrometheusOutput {
             PrometheusOutput::Send(output) => output.default_posture(),
         }
     }
+
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        match self {
+            PrometheusOutput::Expose(output) => output.observe_posture(posture),
+            PrometheusOutput::Send(output) => output.observe_posture(posture),
+        }
+    }
 }
 
 /// The `bind:` mode: `logit_pipeline::Output` for the exposition endpoint.

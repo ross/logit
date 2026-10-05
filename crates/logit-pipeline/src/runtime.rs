@@ -1290,6 +1290,7 @@ pub(crate) async fn write_loop(
     shutdown_dropped: &AtomicU64,
 ) {
     let posture = write_config.delivery_override.unwrap_or_else(|| output.default_posture());
+    output.observe_posture(posture);
     let mut diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
     let mut retrying =
         Retrying::new(telemetry.clone(), diag.clone(), write_config.retrying_log_interval);
@@ -5259,6 +5260,39 @@ mod tests {
         .await;
         let dropped = probe.poll().sum("logit.component.batches.dropped", &[]);
         (handles.attempts.load(std::sync::atomic::Ordering::SeqCst), dropped)
+    }
+
+    /// A sink declaring `AtMostOnce` that records each posture `write_loop` hands it.
+    struct RecordsPosture(DeclaresAtMostOnce, Vec<DeliveryPosture>);
+
+    #[async_trait::async_trait]
+    impl Output for RecordsPosture {
+        async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+            self.0.send(batch).await
+        }
+
+        fn default_posture(&self) -> DeliveryPosture {
+            self.0.default_posture()
+        }
+
+        fn observe_posture(&mut self, posture: DeliveryPosture) {
+            self.1.push(posture);
+        }
+    }
+
+    /// `write_loop` hands the sink the posture it resolved, once: the override when set, else
+    /// the sink's own default.
+    #[tokio::test(start_paused = true)]
+    async fn write_loop_hands_the_sink_its_resolved_posture_once() {
+        for (delivery_override, want) in [
+            (None, DeliveryPosture::AtMostOnce),
+            (Some(DeliveryPosture::AtLeastOnce), DeliveryPosture::AtLeastOnce),
+        ] {
+            let (output, handles) = faulty_output(Fault::Clean, 0);
+            let mut output = RecordsPosture(DeclaresAtMostOnce(output), Vec::new());
+            attempts_and_drops(&mut output, &handles, delivery_override).await;
+            assert_eq!(output.1, [want], "override: {delivery_override:?}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

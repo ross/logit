@@ -13,18 +13,35 @@
 //! `host:port` means plaintext. `tls:` ([`TlsClientSettings`]) tunes a TLS connection and never
 //! turns TLS on by itself.
 //!
-//! **One `send`, several requests.** An [`EventBatch`] mixes logs, metrics, and spans (ADR
-//! `multi-payload-events`), but OTLP is three services, so `send` issues one request per
-//! non-empty signal [`logit_proto::SignalEncoder::encode_signals`] returns, sequentially. Each
-//! request's verdict stands on its own ([`crate::http::Outcomes`]): a `Rejected` answer to one
-//! signal counts that signal's records as `logit.output.records.dropped{signal, reason="rejected"}`,
-//! warns (throttled, `signal_rejected`), and the send goes on to the next signal. A backend that
-//! takes only some signals (Tempo takes traces) fed a mixed batch delivers what it takes when it
-//! answers the others with a rejection, and the send succeeds. A send fails `Rejected` only when
-//! every signal was rejected. A `Refused` answer (HTTP `405` or `407`) stops the send: the runtime
-//! holds the batch and retries it. Once an earlier signal was accepted it stops the send as
-//! `Ambiguous` instead ([`crate::http::after_delivery`]), so an at-most-once sink drops the batch
-//! rather than resend what was applied.
+//! **One `send`, several requests, retried per signal.** An [`EventBatch`] mixes logs, metrics,
+//! and spans (ADR `multi-payload-events`), but OTLP is three services, so `send` issues one request
+//! per non-empty signal [`logit_proto::SignalEncoder::encode_signals`] returns, sequentially, in
+//! the order logs, traces, metrics. Each request's verdict stands on its own
+//! ([`crate::http::Outcomes::resuming`]):
+//! - An accepted signal is remembered for the batch, and a retry of the batch doesn't resend it.
+//! - A `Rejected` signal counts its records as
+//!   `logit.output.records.dropped{signal, reason="rejected"}`, warns (throttled,
+//!   `signal_rejected`), is remembered too, and the send goes on to the next signal.
+//! - A `Clean`, `Refused`, or `Ambiguous` answer stops the send with that signal's own class, and
+//!   the runtime retries or drops the batch on it: a retry sends only the signals not yet
+//!   remembered.
+//!
+//! A send succeeds when any signal of the batch was accepted, on this attempt or an earlier one,
+//! and fails `Rejected` only when every signal sent was rejected. The memory lives beside the
+//! batch accounting ([`crate::accounting::BatchAccounting::settle`]): `observe_batch` clears it
+//! for each new batch, so it covers the retries of one batch and nothing else. A caller that never
+//! calls `observe_batch` gets no memory, and each `send` sends every signal. A disk-buffered batch
+//! replayed after a restart is a new batch and sends every signal again.
+//!
+//! The posture decides what a stop costs, and the accepted signals are never resent under either:
+//! - `Refused` and `Clean` hold the batch under both postures, and each retry sends the
+//!   remaining signals.
+//! - `Ambiguous` under `at_least_once` retries the remaining signals; the failed one may arrive
+//!   twice.
+//! - `Ambiguous` under `at_most_once` drops the batch. The sink counts the records of the failed
+//!   signal and of every signal not yet sent as
+//!   `logit.output.records.dropped{signal, reason="ambiguous_at_most_once"}`, from the posture the
+//!   runtime hands it ([`Output::observe_posture`]); the runtime counts the batch.
 //!
 //! **An answer that names one signal is `Rejected`, not `Refused`.** The shared driver reads HTTP
 //! `401`, `403`, `404`, and `501` as `Refused` ([`crate::http::classify_status`]); here they, and
@@ -36,24 +53,22 @@
 //!   `traces:write` without `metrics:write`), so a credential answer refuses that signal's
 //!   endpoint only.
 //!
-//! Read as `Refused`, they would hold a mixed batch forever, or, after an accepted signal, retry it
-//! as `Ambiguous` and resend the accepted signal on every retry. As `Rejected` they count that
-//! signal's records and the send goes on, so a mixed batch delivers what the backend takes. A
-//! batch whose every signal is answered this way is dropped whole, counted
-//! `batches.dropped{reason="rejected"}`: until `attempt` reports per signal
-//! (`docs/plans/sink-fault-model.md`, "W4: `otlp_out` per-signal outcomes"), a whole-batch verdict
-//! is the only one the runtime sees. `has_signal` or `keep_signals` ahead of the sink keeps the
-//! other signals off it.
-//! A `Clean` or `Ambiguous` failure stops the send, and a retry resends the whole batch, the signals
-//! whose requests succeeded included. See `docs/adr/delivery-semantics.md`'s "Amendment:
-//! per-request verdicts (2026-10-04)".
+//! Read as `Refused`, they would hold a mixed batch forever on the signal the backend never takes.
+//! Read as `Rejected` per request, with the per-signal retry above, a mixed batch delivers what
+//! the backend or the credential takes, once, and counts the rest. A batch whose every signal is
+//! answered this way is dropped whole, counted `batches.dropped{reason="rejected"}`.
+//! `has_signal` or `keep_signals` ahead of the sink keeps the other signals off it and saves the
+//! refused request per batch. See `docs/adr/delivery-semantics.md`'s "Amendment: per-request
+//! verdicts (2026-10-04)" and `docs/adr/sink-fault-classes.md`'s "Amendment: `otlp_out` retries
+//! per signal (2026-10-05)".
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
-//! retries an `Ambiguous` attempt, and OTLP has no identity that makes a resend overwrite. A
-//! resent delta `Sum` or `Histogram` adds at the receiver; the remedy is an upstream `aggregate`
-//! with `temporality: cumulative`, whose running total a resend repeats rather than adds. A delta
-//! `ExponentialHistogram` passes `aggregate` unchanged and has no remedy. A resent log or span
-//! arrives as a second record. `buffer.delivery: at_most_once` drops the batch instead.
+//! resends the signal an `Ambiguous` answer named, and OTLP has no identity that makes a resend
+//! overwrite. A resent delta `Sum` or `Histogram` adds at the receiver; the remedy is an upstream
+//! `aggregate` with `temporality: cumulative`, whose running total a resend repeats rather than
+//! adds. A delta `ExponentialHistogram` passes `aggregate` unchanged and has no remedy. A resent
+//! log or span arrives as a second record. `buffer.delivery: at_most_once` drops the batch
+//! instead.
 //!
 //! **Response classes.** Each request's class, from the OTLP specification's failure rules
 //! ([OTLP/gRPC failures][grpc-failures], [OTLP/HTTP failures][http-failures]): a retryable answer
@@ -63,7 +78,7 @@
 //! rows below say why). The HTTP half is
 //! `http_status_fault`, overriding [`crate::http::classify_status`]; the gRPC half is
 //! `grpc_fault`. A `Rejected` request is counted and the send goes on to the next signal; every
-//! other class stops the send.
+//! other class stops the send, and is the batch's class.
 //!
 //! | Response | Class | Why | Evidence |
 //! |---|---|---|---|
@@ -82,11 +97,11 @@
 //! | connect refused, DNS failure, TLS handshake failure | `Clean` | no request left the process | [all other responses][other] |
 //! | timeout, a reset after the request left, a gRPC response with no `grpc-status` | `Ambiguous` | "If the server disconnects without returning a response, the client SHOULD retry" | [all other responses][other] |
 //!
-//! Once a signal's request was accepted, a later `Clean` or `Refused` answer becomes `Ambiguous`
-//! ([`crate::http::after_delivery`], on both transports), since the collector then holds part of
-//! the batch. A send whose every request was rejected returns the first rejection; one with any
-//! request accepted returns `Ok`. A `Retry-After` header or a `RetryInfo` delay is not honored:
-//! `write_loop`'s backoff applies.
+//! The batch's class is the failed signal's own, whatever was accepted before it: a retry resends
+//! no accepted signal, so a `Clean` or `Refused` answer after an accepted one doesn't become
+//! `Ambiguous`. A send whose every request was rejected returns the first rejection; one with any
+//! request accepted, on this attempt or an earlier one, returns `Ok`. A `Retry-After` header or a
+//! `RetryInfo` delay is not honored: `write_loop`'s backoff applies.
 //!
 //! [grpc-failures]: https://github.com/open-telemetry/opentelemetry-proto/blob/main/docs/specification.md#failures
 //! [http-failures]: https://github.com/open-telemetry/opentelemetry-proto/blob/main/docs/specification.md#failures-1
@@ -115,7 +130,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as GrpcClient;
 use hyper_util::rt::TokioExecutor;
 use logit_core::{redact, CountGate, Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::{BatchContext, Fault, SeqId};
+use logit_pipeline::{BatchContext, DeliveryPosture, Fault, SeqId};
 use logit_proto::otlp::OtlpEncoder;
 use logit_proto::{Signal, SignalEncoder};
 // For the test module's TLS server (`test_server_tls_config`); client TLS lives in `crate::tls`.
@@ -185,6 +200,9 @@ pub struct OtlpOutput {
     telemetry: Telemetry,
     diag: Diagnostics,
     accounting: BatchAccounting,
+    /// The posture `write_loop` resolved ([`Output::observe_posture`]); under `AtMostOnce`, an
+    /// `Ambiguous` stop counts the records of every signal the destination hasn't settled.
+    posture: DeliveryPosture,
     /// Extra headers on every export request, both transports. Applied per request, never as
     /// `reqwest` `default_headers`: `with_timeout` rebuilds `client`, which would drop them if
     /// called afterward. `client` stays a function of timeout and TLS settings only.
@@ -210,6 +228,7 @@ impl OtlpOutput {
             telemetry,
             diag,
             accounting,
+            posture: DeliveryPosture::AtLeastOnce,
             headers: HeaderMap::new(),
             paths: SignalPaths::default(),
             compression: OtlpCompression::default(),
@@ -468,27 +487,35 @@ impl OtlpOutput {
         }
     }
 
-    /// One request per signal, no retry in the sink (`docs/adr/buffered-sink-delivery.md`), each
-    /// verdict folded by [`Outcomes`]. A signal the destination rejects is counted
-    /// `logit.output.records.dropped{signal, reason="rejected"}` by its record count on this
-    /// attempt and the next signal is sent. A `Clean` or `Ambiguous` failure stops the attempt;
-    /// `write_loop` then retries the whole batch, the requests that succeeded included (the module
-    /// doc's "Delivery posture"). Every signal is encoded before the first request, as unit 0 of
-    /// the batch accounting.
+    /// One request per signal the destination hasn't settled for this batch, no retry in the
+    /// sink (`docs/adr/buffered-sink-delivery.md`), each verdict folded by
+    /// [`Outcomes::resuming`]. An accepted signal is remembered and skipped on a retry of the same
+    /// batch; a rejected one is counted `logit.output.records.dropped{signal, reason="rejected"}`
+    /// by its record count, remembered, and the next signal is sent. A `Clean`, `Refused`, or
+    /// `Ambiguous` failure stops the attempt with its own fault, and `write_loop` retries only the
+    /// signals not yet settled. Under `at_most_once`, an `Ambiguous` stop drops the batch, so the
+    /// records of the failed signal and every signal not yet settled are counted
+    /// `records.dropped{signal, reason="ambiguous_at_most_once"}`. Every signal is encoded before
+    /// the first request, as unit 0 of the batch accounting, the settled ones included.
     ///
     /// A 2xx or `OK` whose `partial_success` rejected every record counts as accepted: a resend of
     /// rejected records is only rejected again.
     async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let (_, payloads) = self.accounting.encode(0, || self.encoder.encode_signals(batch));
-        let mut outcomes = Outcomes::new();
-        for payload in payloads? {
+        let mut outcomes = Outcomes::resuming(self.accounting.any_accepted());
+        let mut payloads = payloads?.into_iter();
+        while let Some(payload) = payloads.next() {
             let (signal, records) = (payload.signal, payload.records);
+            if self.accounting.settled(signal_bit(signal)) {
+                continue;
+            }
             let result = match self.transport {
                 OtlpTransport::Http => self.send_http(signal, payload.bytes).await,
                 OtlpTransport::Grpc => self.send_grpc(signal, payload.bytes).await,
             };
+            let accepted = result.is_ok();
             let (telemetry, diag) = (&self.telemetry, &mut self.diag);
-            outcomes.note(result, |err| {
+            let next = outcomes.note(result, |err| {
                 telemetry.count(
                     "logit.output.records.dropped",
                     records as f64,
@@ -504,9 +531,43 @@ impl OtlpOutput {
                         err.root_cause(),
                     ),
                 );
-            })?;
+            });
+            match next {
+                Ok(()) => self.accounting.settle(signal_bit(signal), accepted),
+                Err(err) => {
+                    if self.posture == DeliveryPosture::AtMostOnce
+                        && logit_pipeline::classify(&err) == Fault::Ambiguous
+                    {
+                        self.count_dropped_at_most_once(signal, records);
+                        for rest in payloads {
+                            if !self.accounting.settled(signal_bit(rest.signal)) {
+                                self.count_dropped_at_most_once(rest.signal, rest.records);
+                            }
+                        }
+                    }
+                    return Err(err);
+                }
+            }
         }
         outcomes.finish()
+    }
+
+    /// Counts `records` of `signal` lost to an at-most-once drop of an `Ambiguous` attempt.
+    fn count_dropped_at_most_once(&self, signal: Signal, records: usize) {
+        self.telemetry.count(
+            "logit.output.records.dropped",
+            records as f64,
+            &[("signal", signal.as_str()), ("reason", "ambiguous_at_most_once")],
+        );
+    }
+}
+
+/// `signal`'s bit in the batch accounting's settled requests.
+fn signal_bit(signal: Signal) -> u32 {
+    match signal {
+        Signal::Logs => 0,
+        Signal::Metrics => 1,
+        Signal::Traces => 2,
     }
 }
 
@@ -519,9 +580,14 @@ fn new_encoder(telemetry: &Telemetry, diag: &Diagnostics, gate: &CountGate) -> O
 
 #[async_trait::async_trait]
 impl Output for OtlpOutput {
-    /// Arms this sink's batch accounting (`crate::accounting`).
+    /// Arms this sink's batch accounting (`crate::accounting`), which clears the signals the
+    /// destination settled for the last batch.
     fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
         self.accounting.observe();
+    }
+
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        self.posture = posture;
     }
 
     /// One attempt ([`OtlpOutput::attempt`]). An `Ok` disarms the batch accounting on every path,
@@ -1071,13 +1137,13 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
     }
 
-    /// Once a signal's request was accepted, a connect failure on the next is ambiguous: a
-    /// `Clean` retry would resend the accepted signal.
+    /// A connect failure after an accepted request stays `Clean`: a retry resends only the
+    /// signals not yet accepted.
     #[tokio::test]
-    async fn a_connect_failure_after_an_accepted_request_is_ambiguous() {
+    async fn a_connect_failure_after_an_accepted_request_is_clean() {
         let (addr, log) = crate::test_support::answers_once(200, Vec::new()).await;
         let err = http_output(addr).send(&all_three_signals_batch()).await.unwrap_err();
-        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
         assert_eq!(log.lock().unwrap().len(), 1, "one request accepted, then refused");
     }
 
@@ -1508,12 +1574,12 @@ mod tests {
         (addr, log)
     }
 
-    /// The gRPC twin of `a_connect_failure_after_an_accepted_request_is_ambiguous`.
+    /// The gRPC twin of `a_connect_failure_after_an_accepted_request_is_clean`.
     #[tokio::test]
-    async fn a_grpc_connect_failure_after_an_accepted_call_is_ambiguous() {
+    async fn a_grpc_connect_failure_after_an_accepted_call_is_clean() {
         let (addr, log) = grpc_answers_once().await;
         let err = grpc_output(addr).send(&all_three_signals_batch()).await.unwrap_err();
-        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
         assert_eq!(log.lock().unwrap().len(), 1, "one call accepted, then refused");
     }
 
@@ -2443,5 +2509,206 @@ mod tests {
         let metrics = [("signal", "metrics"), ("reason", "rejected")];
         assert_eq!(sum_of(&sums, DROPPED, &metrics), 3.0, "{sums:?}");
         assert_eq!(sum_of(&sums, "logit.component.retries", &[]), 0.0, "nothing holds: {sums:?}");
+    }
+
+    // ---- per-signal retry (`docs/adr/sink-fault-classes.md`, "Amendment: `otlp_out` retries per
+    // signal (2026-10-05)") ----
+
+    /// An HTTP receiver answering `/v1/logs` and `/v1/traces` `200`, and the `k`th request to
+    /// `/v1/metrics` with `metrics(k)`.
+    async fn http_failing_metrics(
+        metrics: impl Fn(usize) -> u16 + Send + Sync + 'static,
+    ) -> (std::net::SocketAddr, RecordLog) {
+        crate::test_support::per_path_recorder(move |path, k| {
+            let status = if path == "/v1/metrics" { metrics(k) } else { 200 };
+            Reply::Answer(status, Vec::new())
+        })
+        .await
+    }
+
+    fn paths_of(log: &RecordLog) -> Vec<String> {
+        crate::test_support::recorded_paths(&log.lock().unwrap())
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn batch_seq() -> SeqId {
+        SeqId { id: [0; 16], seq: 1 }
+    }
+
+    /// A `503` on metrics after accepted traces, under at-least-once: the retry resends metrics
+    /// alone, so traces are requested once, and every request is counted under its own class.
+    #[tokio::test]
+    async fn an_http_retry_after_accepted_traces_resends_only_the_failed_signal() {
+        let (addr, log) = http_failing_metrics(|k| if k == 0 { 503 } else { 200 }).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_http(addr, &probe);
+        let batches = vec![traces_and_metrics_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, retrying()).await;
+        assert_eq!(paths_of(&log), ["/v1/traces", "/v1/metrics", "/v1/metrics"]);
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0, "{sums:?}");
+        assert_eq!(sum_of(&sums, "logit.component.retries", &[]), 1.0, "{sums:?}");
+        let traces_2xx = [("signal", "traces"), ("class", "2xx")];
+        assert_eq!(sum_of(&sums, "logit.output.requests", &traces_2xx), 1.0, "{sums:?}");
+        assert_eq!(sum_of(&sums, "logit.output.requests", &METRICS_5XX), 1.0, "{sums:?}");
+        assert_eq!(sum_of(&sums, "logit.output.requests", &METRICS_2XX), 1.0, "{sums:?}");
+        assert_eq!(sum_of(&sums, DROPPED, &[]), 0.0, "nothing is dropped: {sums:?}");
+    }
+
+    /// The gRPC twin: `UNAVAILABLE` on metrics after accepted traces retries metrics alone.
+    #[tokio::test]
+    async fn a_grpc_retry_after_accepted_traces_resends_only_the_failed_signal() {
+        let metrics_calls = AtomicUsize::new(0);
+        let (addr, log) = grpc_server_answering(move |_, path| {
+            if path.contains("MetricsService") && metrics_calls.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                14
+            } else {
+                0
+            }
+        })
+        .await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(grpc_output(addr), &probe);
+        let batches = vec![traces_and_metrics_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, retrying()).await;
+        assert_eq!(log.lock().unwrap().len(), 3, "traces once, metrics twice");
+        let traces_ok = [("signal", "traces"), ("class", "ok")];
+        assert_eq!(sum_of(&sums, "logit.output.requests", &traces_ok), 1.0, "{sums:?}");
+        let metrics_ok = [("signal", "metrics"), ("class", "ok")];
+        assert_eq!(sum_of(&sums, "logit.output.requests", &metrics_ok), 1.0, "{sums:?}");
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0, "{sums:?}");
+    }
+
+    /// A `405` on metrics after accepted logs and traces holds the batch as `Refused`, not
+    /// `Ambiguous`, and the next attempt at the same batch resends metrics alone.
+    #[tokio::test]
+    async fn a_refusal_after_accepted_signals_holds_and_the_retry_resends_only_that_signal() {
+        let (addr, log) = http_failing_metrics(|k| if k == 0 { 405 } else { 200 }).await;
+        let mut output = http_output(addr);
+        let batch = all_three_signals_batch();
+        output.observe_batch(BatchContext::default(), batch_seq());
+        let err = output.send(&batch).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
+        output.send(&batch).await.expect("the retry delivers metrics");
+        assert_eq!(paths_of(&log), ["/v1/logs", "/v1/traces", "/v1/metrics", "/v1/metrics"]);
+    }
+
+    /// Under at-most-once, a `503` on traces after accepted logs drops the batch: the records of
+    /// traces and of metrics, never sent, are counted `ambiguous_at_most_once`, and logs' aren't.
+    #[tokio::test]
+    async fn an_at_most_once_drop_counts_only_the_signals_not_accepted() {
+        let (addr, log) = http_by_signal(200, 503, 200).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_http(addr, &probe);
+        let config = crate::test_support::at_most_once();
+        let batches = vec![all_three_signals_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, config).await;
+        assert_eq!(paths_of(&log), ["/v1/logs", "/v1/traces"]);
+        let dropped = [("reason", "ambiguous_at_most_once")];
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &dropped), 1.0, "{sums:?}");
+        for signal in ["traces", "metrics"] {
+            let tags = [("signal", signal), ("reason", "ambiguous_at_most_once")];
+            assert_eq!(sum_of(&sums, DROPPED, &tags), 1.0, "{signal}: {sums:?}");
+        }
+        assert_eq!(sum_of(&sums, DROPPED, &[("signal", "logs")]), 0.0, "{sums:?}");
+        assert_eq!(sum_of(&sums, DROPPED, &dropped), 2.0, "{sums:?}");
+    }
+
+    /// Under at-least-once, an `Ambiguous` stop counts no record dropped: the batch is retried.
+    #[tokio::test]
+    async fn an_at_least_once_ambiguous_stop_counts_nothing_dropped() {
+        let (addr, _log) = http_failing_metrics(|k| if k == 0 { 503 } else { 200 }).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_http(addr, &probe);
+        output.observe_posture(DeliveryPosture::AtLeastOnce);
+        output.observe_batch(BatchContext::default(), batch_seq());
+        let err = output.send(&traces_and_metrics_batch()).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        let sums = drained(&mut probe);
+        assert_eq!(sum_of(&sums, DROPPED, &[]), 0.0, "{sums:?}");
+    }
+
+    /// `observe_batch` starts a new batch with nothing settled: after a batch whose traces were
+    /// accepted and whose metrics dropped at most once, the next batch sends traces again.
+    #[tokio::test]
+    async fn a_new_batch_resends_every_signal() {
+        let (addr, log) = http_failing_metrics(|k| if k == 0 { 503 } else { 200 }).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_http(addr, &probe);
+        let config = crate::test_support::at_most_once();
+        let batches = vec![traces_and_metrics_batch(), traces_and_metrics_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, config).await;
+        assert_eq!(paths_of(&log), ["/v1/traces", "/v1/metrics", "/v1/traces", "/v1/metrics"]);
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0, "{sums:?}");
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0, "{sums:?}");
+    }
+
+    /// Without `observe_batch`, nothing is remembered: each direct send is a new batch and sends
+    /// every signal.
+    #[tokio::test]
+    async fn direct_sends_with_no_observe_batch_resend_every_signal() {
+        let (addr, log) = http_failing_metrics(|k| if k == 0 { 503 } else { 200 }).await;
+        let mut output = http_output(addr);
+        let batch = traces_and_metrics_batch();
+        output.send(&batch).await.unwrap_err();
+        output.send(&batch).await.expect("the second send is accepted");
+        assert_eq!(paths_of(&log), ["/v1/traces", "/v1/metrics", "/v1/traces", "/v1/metrics"]);
+    }
+
+    /// A rejected signal is settled too: a retry after a later signal's `503` doesn't resend it,
+    /// so its records are counted dropped once, and the batch is delivered.
+    #[tokio::test]
+    async fn a_retry_does_not_resend_a_rejected_signal() {
+        let (addr, log) = crate::test_support::per_path_recorder(|path, k| {
+            let status = match path {
+                "/v1/logs" => 400,
+                "/v1/traces" if k == 0 => 503,
+                _ => 200,
+            };
+            Reply::Answer(status, Vec::new())
+        })
+        .await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_http(addr, &probe);
+        let batches = vec![all_three_signals_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, retrying()).await;
+        assert_eq!(paths_of(&log), ["/v1/logs", "/v1/traces", "/v1/traces", "/v1/metrics"]);
+        let logs = [("signal", "logs"), ("reason", "rejected")];
+        assert_eq!(sum_of(&sums, DROPPED, &logs), 1.0, "{sums:?}");
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0, "{sums:?}");
+    }
+
+    /// Every signal rejected across two attempts still drops the batch `rejected`: the retry's
+    /// only request is rejected, and no attempt had a request accepted.
+    #[tokio::test]
+    async fn signals_rejected_across_attempts_drop_the_batch_rejected() {
+        let (addr, log) = crate::test_support::per_path_recorder(|path, k| {
+            let status = match path {
+                "/v1/traces" if k == 0 => 503,
+                _ => 400,
+            };
+            Reply::Answer(status, Vec::new())
+        })
+        .await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_http(addr, &probe);
+        let batches = vec![all_three_signals_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, retrying()).await;
+        assert_eq!(
+            paths_of(&log),
+            ["/v1/logs", "/v1/traces", "/v1/traces", "/v1/metrics"],
+            "logs is rejected once and not resent"
+        );
+        let rejected = [("reason", "rejected")];
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &rejected), 1.0, "{sums:?}");
+        assert_eq!(sum_of(&sums, DROPPED, &rejected), 3.0, "{sums:?}");
     }
 }

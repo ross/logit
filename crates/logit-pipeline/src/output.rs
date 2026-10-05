@@ -164,6 +164,16 @@ pub trait Output {
     fn default_posture(&self) -> DeliveryPosture {
         DeliveryPosture::AtLeastOnce
     }
+
+    /// Called once by `write_loop` before its first batch, with the posture it resolved
+    /// (`buffer.delivery`, else [`Output::default_posture`]). Default no-op. A sink that sends a
+    /// batch as several requests and remembers the ones its destination accepted reads it to
+    /// count the records an at-most-once drop of the rest loses (`otlp_out`). A caller outside the
+    /// runtime that never calls it leaves the sink on its default. A type that implements
+    /// `Output` by delegating to another must forward this too.
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        let _ = posture;
+    }
 }
 
 /// What a `send` failure says about the batch and the destination. Only the sink can tell, so it
