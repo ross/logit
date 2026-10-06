@@ -996,7 +996,9 @@ reports itself:
 
 The connection metrics are `otlp_in`'s spelling verbatim, because bind mode runs the same accept
 loop and the same shared idle tracker (`crates/logit-inputs/src/http.rs`):
-`logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}` and
+`logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}`,
+`logit.input.connections.rejected{reason="proxy_header"}` (under `proxy_protocol: true`, a PROXY
+header that was missing, malformed, cut short, or late, read before any TLS accept), and
 `logit.input.connections.closed{reason="idle"}` (count). Scrape mode has none of them: it's a
 client, with no socket of its own.
 
@@ -1029,8 +1031,11 @@ client, with no socket of its own.
 `Diagnostics` keys: `bound` (bind mode's listener), `scrape_failed` (scrape mode; the failing
 target's redacted URL appears in the message text only, never a tag), `write_rejected` (bind mode,
 every `400`/`408`/`413`/`415`; the peer address appears in the message text only, for the same
-tag-cardinality reason), `closed_consumer` (bind mode, a `503` for a write no consumer took), and
-`connection_error` (never an idle close).
+tag-cardinality reason), `closed_consumer` (bind mode, a `503` for a write no consumer took),
+`connection_error` (never an idle close, nor a plaintext peer that closes cleanly or resets
+before sending a request byte, after a complete PROXY header under `proxy_protocol: true`; on a
+TLS listener that close fails the TLS accept and is counted), and `proxy_header` (bind mode, any
+`connections.rejected{reason="proxy_header"}` refusal).
 
 ##### `datadog_in`
 

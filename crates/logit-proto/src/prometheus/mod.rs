@@ -135,6 +135,9 @@
 //!   holds `sum: f64`/`count: u64`, not `Option`s, so "absent" and "zero" are the same model value.
 //!   (This applies to a wire `summary` only: a `Distribution` or `Samples` builds its [`Point`]
 //!   directly, with the sketch's own sum and count.)
+//! - under the remote-write receiver's `peer:` or `proxy_protocol:`, `network.peer.*` or
+//!   `client.*` added to every event after decode, an opt-in addition the sender never sent, and
+//!   one of ADR `lossless-transit`'s "Permitted normalizations".
 //!
 //! Everything else is an error or a counted skip, never a silent reinterpretation.
 

@@ -663,6 +663,8 @@ fn build_spec(
             idle_timeout,
             max_connections,
             metadata_cache,
+            peer,
+            proxy_protocol,
         } => {
             let input: Box<dyn Input + Send> = match bind {
                 Some(bind) => {
@@ -671,6 +673,8 @@ fn build_spec(
                         .with_telemetry(telemetry.clone())
                         .with_idle_timeout(*idle_timeout)
                         .with_max_connections(*max_connections)
+                        .with_peer(*peer)
+                        .with_proxy_protocol(*proxy_protocol)
                         // Unconditional: the receiver reads `max_families: 0` as off, and rule 55
                         // rejects a zero `ttl`.
                         .with_metadata_cache(metadata_cache.max_families, metadata_cache.ttl);
@@ -2570,6 +2574,8 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 metadata_cache: logit_config::MetadataCacheConfig::default(),
+                peer: false,
+                proxy_protocol: false,
             },
         };
         assert!(matches!(
@@ -2599,6 +2605,8 @@ mod tests {
                 idle_timeout: Some(Duration::from_secs(60)),
                 max_connections: logit_config::default_max_connections(),
                 metadata_cache: logit_config::MetadataCacheConfig::default(),
+                peer: false,
+                proxy_protocol: false,
             },
         };
         assert!(matches!(
