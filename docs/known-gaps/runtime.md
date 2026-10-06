@@ -277,9 +277,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   the way `serde_norway::from_str` on the raw file does. Two things partly offset it: `!env`'s own
   errors name a config path (`components.influx_out.token`), and a note is appended when a
   substitution's resolved type likely caused the failure.
-- **No config hot reload on SIGHUP.** A config change means a restart. A SIGHUP never ends the
-  process and logs that the config wasn't reloaded; reopening file outputs on it arrives with the
-  file targets ([ADR `signal-handling`](../adr/signal-handling.md)). Hot reload is out of scope
+- **No config hot reload on SIGHUP.** A config change means a restart. A SIGHUP reopens
+  `stdio_out`'s and `file_out`'s file targets and logs that the config wasn't reloaded
+  ([ADR `signal-handling`](../adr/signal-handling.md)); TLS material, `types_db:`, and `lua_file`
+  scripts are read once at startup too. Hot reload is out of scope
   for `docs/plans/operator-surface.md`, because it needs its own design (diffing the old and new
   resolved `Graph`, deciding which components to reuse versus tear down and rebuild), not a small
   addition to the readiness/exit-code work.

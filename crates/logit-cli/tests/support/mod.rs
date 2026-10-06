@@ -104,12 +104,13 @@ impl Lines {
     /// [`PROCESS_DEADLINE`] or once the output closes.
     pub fn wait_for(&self, needle: &str) -> String {
         let deadline = std::time::Instant::now() + PROCESS_DEADLINE;
+        let mut skipped = Vec::new();
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match self.0.recv_timeout(left) {
                 Ok(line) if line.contains(needle) => return line,
-                Ok(_) => {}
-                Err(err) => panic!("no line containing {needle:?}: {err}"),
+                Ok(line) => skipped.push(line),
+                Err(err) => panic!("no line containing {needle:?} ({err}); read: {skipped:#?}"),
             }
         }
     }

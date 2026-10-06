@@ -86,9 +86,12 @@ error.
 - **A second signal during a stuck drain exits immediately** with status 130, so a restart policy
   waiting on the process can still kill it with the same signal. Only SIGTERM and SIGINT count; a
   SIGHUP never does.
-- **SIGHUP never ends the process and doesn't reload the config.** It logs
-  `reopen signal received` with `config_reloaded=false` and nothing else changes: a config change
-  still means a restart. A SIGHUP can arrive in any state, a drain included.
+- **SIGHUP reopens file outputs and never ends the process.** It logs `reopen signal received`
+  with `config_reloaded=false`, and each `stdio_out`/`file_out` file target reopens its path
+  before its next write; see
+  [Rotating a file output externally](#rotating-a-file-output-externally).
+  It doesn't reload the config: a config change still means a restart. A SIGHUP can arrive in any
+  state, a drain included.
 - **Handlers are installed before the config is read.** A SIGTERM or SIGINT during startup is held,
   and the drain starts as soon as the pipeline has started; a startup that fails still exits `1`.
   A second SIGTERM or SIGINT during startup exits 130 at once, so a wedged startup stays killable.
@@ -98,8 +101,10 @@ error.
   any other process, so an unhandled SIGHUP would be ignored under the release image, where
   `logit` is PID 1, and fatal under `docker run --init`, tini, or a Kubernetes pod with
   `shareProcessNamespace`. `logit` installs a handler for every signal it reacts to, so it
-  behaves the same in all of them. A config-reloader sidecar's SIGHUP doesn't apply a new config;
-  in Kubernetes, roll the pod.
+  behaves the same in all of them, and `docker kill -s HUP` reopens. A config-reloader sidecar's
+  SIGHUP doesn't apply a new config; in Kubernetes, roll the pod. In a container, write to stdout
+  or a network sink; a reopen matters only when `file_out` writes to a volume that a rotator able
+  to signal `logit` manages.
 - **A failed send, transient or extended, never ends the process.** Every sink sits
   behind a decoupled delivery buffer
   ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)). A retryable failure holds the
@@ -118,6 +123,43 @@ error.
   open transform doesn't count: the transform took the batch. Each refused batch is counted
   `logit.input.batches.dropped{reason="closed_consumer"}`
   ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 3, and its W3 amendment).
+
+### Rotating a file output externally
+
+To have logrotate rotate a `stdio_out` or `file_out` file, use rename mode, the default, and send
+`logit` a SIGHUP after the rename. Under systemd, give the unit a reload command:
+
+```ini
+[Service]
+ExecReload=/bin/kill -HUP $MAINPID
+```
+
+Then call it from `postrotate`:
+
+```text
+/var/log/logit/events.log {
+    daily
+    rotate 7
+    dateext
+    compress
+    delaycompress
+    missingok
+    notifempty
+    postrotate
+        systemctl reload logit.service
+    endscript
+}
+```
+
+- **Don't use `copytruncate`.** It still works, but loses the lines written between its copy and
+  its truncate.
+- **Keep `delaycompress`.** A batch mid-write when the signal arrives finishes into the renamed
+  file, so compressing that file in the same run can cut off the batch's tail.
+- **Use `dateext` with `file_out`.** `file_out` always has a `rotate:` policy of its own and names
+  its rotated files `.1`, `.2`, and so on, as logrotate does by default, so without `dateext` the
+  two rotators shift each other's files. A `stdio_out` file target never rotates itself.
+- **An idle sink reopens late.** The reopen happens before the target's next write, so the renamed
+  file stays open, and its disk space allocated, until the sink's next batch.
 
 ## Probes and exit codes
 

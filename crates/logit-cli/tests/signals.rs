@@ -1,7 +1,7 @@
 //! `logit run`'s signal contract against the real binary (`docs/adr/signal-handling.md`): SIGHUP
-//! never ends the process and never counts toward the second-signal exit, and a SIGTERM during
-//! startup drains once the pipeline starts. Each test reads the child's self-log on stderr to know
-//! a signal was handled, rather than sleeping.
+//! never ends the process, never counts toward the second-signal exit, and reopens a `file_out`
+//! target, and a SIGTERM during startup drains once the pipeline starts. Each test reads the
+//! child's self-log on stderr to know a signal was handled, rather than sleeping.
 
 #![cfg(unix)]
 
@@ -9,9 +9,10 @@ mod support;
 
 use std::process::{Command, Stdio};
 
+use logit_pipeline::test_util::wait_until_within;
 use support::{
     ephemeral_addr, logit_ready, send_signal, wait_for_exit, wait_until_ready, KillOnDrop, Lines,
-    TempConfig,
+    TempConfig, PROCESS_DEADLINE,
 };
 
 fn spawn_run(config: &TempConfig) -> (KillOnDrop, Lines) {
@@ -132,4 +133,54 @@ async fn a_failed_startup_exits_1_with_a_sigterm_held() {
     let status = wait_for_exit(&mut child.0).await;
     assert_eq!(status.code(), Some(1), "{status:?}");
     drop(taken);
+}
+
+/// What an external rotator in rename mode does to a `file_out` target: rename the file, then
+/// SIGHUP. Lines sent after the signal land in a new file at `path`, and the renamed file keeps
+/// only the lines sent before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sighup_after_an_external_rename_reopens_a_file_out_target() {
+    let dir =
+        std::env::temp_dir().join(format!("logit-cli-test-hup-reopen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("events.log");
+    let renamed = dir.join("events.log.1");
+    let udp_addr = {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.local_addr().unwrap().to_string()
+    };
+    let config = TempConfig::write(
+        "hup-reopen",
+        format!(
+            "components:\n  in:\n    type: lines_in\n    transport: udp\n    bind: \
+             \"{udp_addr}\"\n  out:\n    type: file_out\n    sources: [in]\n    format: json\n    \
+             path: \"{}\"\n    rotate:\n      max_bytes: 1MiB\n",
+            path.display()
+        ),
+    );
+    let (child, stderr) = spawn_run(&config);
+    // `ready` means every listener is bound, so the first datagram can't hit an unbound port.
+    stderr.wait_for("ready");
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+
+    sender.send_to(b"before the rotation\n", &udp_addr).unwrap();
+    wait_until_within("the first line in the file", PROCESS_DEADLINE, || {
+        read(&path).contains("before the rotation")
+    })
+    .await;
+
+    std::fs::rename(&path, &renamed).unwrap();
+    send_signal(&child.0, libc::SIGHUP);
+    stderr.wait_for("reopen signal received");
+    sender.send_to(b"after the rotation\n", &udp_addr).unwrap();
+    wait_until_within("the second line in a new file at the path", PROCESS_DEADLINE, || {
+        read(&path).contains("after the rotation")
+    })
+    .await;
+
+    assert!(!read(&path).contains("before the rotation"), "{}", read(&path));
+    assert!(!read(&renamed).contains("after the rotation"), "{}", read(&renamed));
+    std::fs::remove_dir_all(&dir).ok();
 }

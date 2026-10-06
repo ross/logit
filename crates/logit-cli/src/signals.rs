@@ -1,5 +1,6 @@
 //! `logit run`'s process signals (`docs/adr/signal-handling.md`): SIGTERM/SIGINT start a graceful
-//! drain and a second one exits 130; SIGHUP bumps a reopen generation and never exits.
+//! drain and a second one exits 130; SIGHUP bumps the reopen generation file targets watch, and
+//! never exits.
 //!
 //! [`Signals::install`] runs first in `run_pipelines`, before the config loads, and creates every
 //! tokio `Signal` stream before it returns. Once a stream exists, the signal's default disposition
@@ -17,7 +18,7 @@ pub struct Signals {
     tasks: [JoinHandle<()>; 2],
     /// The reopen generation's first receiver, created with its sender so a hangup that lands
     /// before any sink clones it still reads as changed to every clone.
-    _reopen: watch::Receiver<u64>,
+    reopen: watch::Receiver<u64>,
 }
 
 impl Signals {
@@ -42,7 +43,7 @@ impl Signals {
             drop(reopen_tx);
             [tokio::spawn(count_ctrl_c(shutdown.clone())), tokio::spawn(async {})]
         };
-        Self { shutdown, tasks, _reopen: reopen }
+        Self { shutdown, tasks, reopen }
     }
 
     /// Resolves once the first SIGTERM or SIGINT has arrived, including one that arrived before
@@ -50,6 +51,14 @@ impl Signals {
     pub fn shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
         let shutdown = self.shutdown.clone();
         async move { shutdown.notified().await }
+    }
+}
+
+impl Signals {
+    /// A clone of the reopen generation's first receiver, for a file target to watch. A bump
+    /// made before the clone still reads as changed to it.
+    pub fn reopen_generation(&self) -> watch::Receiver<u64> {
+        self.reopen.clone()
     }
 }
 
