@@ -611,6 +611,8 @@ fn build_spec(
             handshake_timeout,
             idle_timeout,
             max_connections,
+            peer,
+            proxy_protocol,
         } => {
             let mut input = SplunkHecInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -619,6 +621,8 @@ fn build_spec(
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
                 .with_max_connections(*max_connections)
+                .with_peer(*peer)
+                .with_proxy_protocol(*proxy_protocol)
                 .with_tokens(tokens.clone())
                 // Saturates on a 32-bit target: a cap past the address space is no cap.
                 .with_max_request_bytes(usize::try_from(*max_request_bytes).unwrap_or(usize::MAX))

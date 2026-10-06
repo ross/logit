@@ -10,6 +10,11 @@
 //! Splunk. HTTP concerns (routes, auth, `Content-Encoding`, channels, acknowledgment) belong to the
 //! listener and sink, never here.
 //!
+//! **The listener adds sender attributes after decode.** Under `splunk_hec_in`'s `peer:` or
+//! `proxy_protocol:`, `network.peer.*` or `client.*` is added to every event, an opt-in addition
+//! the sender never sent, and one of ADR `lossless-transit`'s "Permitted normalizations". It
+//! applies to `/event` and `/raw` alike.
+//!
 //! # API
 //!
 //! [`SplunkDecoder::decode_events`] takes one decompressed `/services/collector/event` body

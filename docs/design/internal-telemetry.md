@@ -1138,7 +1138,9 @@ left out of the resource).
 **The connection metrics are `datadog_in`'s verbatim**, from the same accept loop and shared idle
 tracker: `logit.input.connections` (gauge, published by the same drop guard),
 `logit.input.connections.rejected{reason="limit"}`, `logit.input.connections.closed{reason="idle"}`,
-and the accept-queue gauges.
+and the accept-queue gauges. Under `proxy_protocol: true`,
+`logit.input.connections.rejected{reason="proxy_header"}` counts a connection refused for its
+PROXY header, as on the shared TCP stream driver.
 
 | Name | Kind | Meaning |
 |---|---|---|
@@ -1168,9 +1170,13 @@ key, a bad `time` or `fields`, a span that fell back to a log) are in the tables
 `crates/logit-proto/src/splunk/mod.rs`'s module doc and its `logs`, `metrics`, and `spans`
 submodules, under this component's id.
 
-`Diagnostics` keys: `bound`, `connection_error` (never an idle close), `request_rejected` (every
-rejection except `404` and `405`; the peer address appears in the message text only, never a tag,
-and a token never appears at all), `busy` (a `503`), and `closed_consumer` (a `503` code 9 or `500` code 8).
+`Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a plaintext peer that
+closes cleanly or resets before sending a request byte, after a complete PROXY header under
+`proxy_protocol: true`; on a TLS listener that close fails the TLS accept and is counted),
+`proxy_header` (any `connections.rejected{reason="proxy_header"}` refusal),
+`request_rejected` (every rejection except `404` and `405`; the peer address appears in the
+message text only, never a tag, and a token never appears at all), `busy` (a `503`), and
+`closed_consumer` (a `503` code 9 or `500` code 8).
 
 ##### `tail_in` and `docker_in`
 
