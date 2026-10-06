@@ -23,6 +23,7 @@
 //! | an encode error | `Rejected` (no `Fault` attached) | about this batch: it would encode the same way again | -- |
 //! | a failed re-open of the active file after a rotation's rename | `Clean` | the batch provably reached no file, so a retry is safe under either posture; the failure is likely transient (`ENOSPC`, `EMFILE`) | `a_failed_reopen_is_classified_clean_so_the_batch_is_retried_rather_than_dropped` |
 //! | a failed write or flush of the active file (a full disk, a permission lost, an I/O error), or of stdout or stderr | `Rejected` (no `Fault` attached) | part of the batch may already be in the file, and a resend would repeat it; the write is local, so nothing tells this batch's failure from the next one's | `a_failed_write_or_flush_of_the_active_file_is_rejected` |
+//! | a failed flush or re-open of the active file on a reopen signal | `Clean` | as for the re-open after a rotation: the batch reached no file | `a_failed_reopen_is_clean_and_the_retry_writes_to_the_new_file` |
 //! | a failed rotation rename or `max_files: 1` truncate | no fault: the batch is written to the current file, `rotate_failure` warns, and the next batch retries the rotation | nothing on disk changed | `a_failed_truncate_under_max_files_one_is_not_rotated_and_keeps_writing_to_the_existing_file` |
 //!
 //! A full disk drops batch after batch while it lasts, counted
@@ -31,6 +32,14 @@
 //! [ADR `sink-fault-classes`](../../../docs/adr/sink-fault-classes.md): reading a write error as
 //! `Refused` needs the write to be all-or-nothing, which a partial `write_all` isn't, or a
 //! truncate back to the batch's start on failure, which this sink doesn't do.
+//!
+//! **Reopen on SIGHUP** (`docs/adr/signal-handling.md`). A file target given a reopen generation
+//! ([`StreamOutput::with_reopen`]) checks it at the top of each `send`, before the rotation
+//! check, and on a change reopens its path ([`FileTarget::reopen`]). The order matters: a size or
+//! time trigger computed from the renamed file would otherwise rotate the fresh file a rotator
+//! created at `path` and shift the rotator's own `path.N` files. A reopen is lazy, so a sink that
+//! receives no batch keeps the old inode open until its next one. A `stdout` or `stderr` target
+//! ignores the generation.
 //!
 //! **Delivery posture.** The one case the posture decides is a write the shutdown grace cuts off,
 //! which is `Ambiguous`: under the default, `at_least_once`
@@ -49,6 +58,7 @@ use logit_proto::native::NativeEncoder;
 use logit_proto::{CodecError, Encoder};
 use std::path::Path;
 use tokio::io::{self, AsyncWriteExt};
+use tokio::sync::watch;
 
 /// Which encoder [`StreamOutput`] writes through: [`EventDump`]'s block or NDJSON render, or
 /// `logit_proto::native::NativeEncoder` (`docs/adr/file-output-native-format.md`).
@@ -109,9 +119,11 @@ pub struct StreamOutput<E> {
     target: Target,
     encoder: E,
     telemetry: Telemetry,
-    /// Only for a rotating file target's two non-fatal failures, `FileTarget::rotate`'s
-    /// `rotate_failure`/`retention_failure`; every other failure returns `Err` from `send`.
+    /// For a file target's `rotate_failure`/`retention_failure`, `FileTarget::rotate`'s two
+    /// non-fatal failures, and `reopen_failure`, which `send` also returns as `Err`.
     diagnostics: Diagnostics,
+    /// The process's reopen generation, bumped on each SIGHUP. `None` reopens nothing.
+    reopen: Option<watch::Receiver<u64>>,
 }
 
 impl StreamOutput<StreamEncoder> {
@@ -121,6 +133,7 @@ impl StreamOutput<StreamEncoder> {
             encoder: StreamEncoder::human(),
             telemetry: Telemetry::default(),
             diagnostics: Diagnostics::default(),
+            reopen: None,
         }
     }
 
@@ -130,6 +143,7 @@ impl StreamOutput<StreamEncoder> {
             encoder: StreamEncoder::human(),
             telemetry: Telemetry::default(),
             diagnostics: Diagnostics::default(),
+            reopen: None,
         }
     }
 
@@ -150,6 +164,7 @@ impl StreamOutput<StreamEncoder> {
             encoder: StreamEncoder::human(),
             telemetry: Telemetry::default(),
             diagnostics: Diagnostics::default(),
+            reopen: None,
         })
     }
 
@@ -168,9 +183,18 @@ impl<E> StreamOutput<E> {
         self
     }
 
-    /// Attaches a diagnostics handle for the two rotation keys the `diagnostics` field names.
+    /// Attaches a diagnostics handle for the keys the `diagnostics` field names.
     pub fn with_diagnostics(mut self, diagnostics: Diagnostics) -> Self {
         self.diagnostics = diagnostics;
+        self
+    }
+
+    /// Reopens a file target before its next write whenever `reopen` changes. Pass a clone of
+    /// the receiver created with the sender, not a fresh `subscribe()`: a clone keeps the
+    /// original's last-seen version, so a bump that landed before this output was built still
+    /// reads as changed on its first `send`.
+    pub fn with_reopen(mut self, reopen: watch::Receiver<u64>) -> Self {
+        self.reopen = Some(reopen);
         self
     }
 }
@@ -188,7 +212,8 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
         // One `write_all` and one `flush` per batch, so nothing sits in tokio's buffer between
         // batches. `flush` is not `fsync`: the OS page cache still holds the bytes. A write error
         // carries no `Fault`, so the runtime classifies it `Rejected` and doesn't retry the batch.
-        // A failed re-open after rotation is the exception: `Fault::Clean` (`FileTarget::rotate`).
+        // A failed re-open, after a rotation or on a reopen signal, is the exception:
+        // `Fault::Clean` (`FileTarget::rotate`, `FileTarget::reopen`).
         match &mut self.target {
             Target::Stdout(w) => {
                 w.write_all(&bytes).await?;
@@ -199,6 +224,23 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
                 w.flush().await?;
             }
             Target::File(file) => {
+                // A closed sender (the process is exiting) reads as no change.
+                if let Some(reopen) =
+                    self.reopen.as_mut().filter(|r| r.has_changed().unwrap_or(false))
+                {
+                    reopen.mark_unchanged();
+                    match file.reopen().await {
+                        Ok(()) => self.telemetry.count("logit.output.file.reopens", 1.0, &[]),
+                        Err(err) => {
+                            self.diagnostics
+                                .warn_throttled("reopen_failure", format_args!("{err:#}"));
+                            return Err(err);
+                        }
+                    }
+                }
+                // A target a failed re-open left with no handle opens before the rotation check,
+                // which must read the state of the file at `path`, not of the one renamed away.
+                file.ensure_open()?;
                 // Rotation is decided before the write, so a batch is never split across files
                 // (`FileTarget::should_rotate` on a batch bigger than `max_bytes`).
                 let now = crate::file::now_unix();
@@ -536,6 +578,141 @@ mod tests {
             "one batch of `len` bytes is in the new file, so a second one still fits"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Reopen on SIGHUP ---
+
+    fn named(name: &str) -> EventBatch {
+        batch_with(vec![metric_event(0, name, MetricKind::counter(1.0))])
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_reopen_generation_bump_reopens_the_file_target_before_the_next_write_and_counts_it()
+    {
+        use logit_pipeline::test_util::{scratch_dir, TelemetryProbe};
+        let dir = scratch_dir("stream-output-reopen");
+        let path = dir.join("events.log");
+        let renamed = dir.join("events.log.1");
+        let (tx, rx) = watch::channel(0u64);
+        let mut probe = TelemetryProbe::new();
+        let mut output = StreamOutput::open_path(&path)
+            .unwrap()
+            .with_telemetry(probe.telemetry("out", "stdio_out", "sink"))
+            .with_reopen(rx.clone());
+        output.send(&named("before")).await.unwrap();
+
+        std::fs::rename(&path, &renamed).unwrap();
+        tx.send_modify(|g| *g += 1);
+        output.send(&named("after")).await.unwrap();
+        output.send(&named("later")).await.unwrap();
+
+        assert!(read(&renamed).contains("before") && !read(&renamed).contains("after"));
+        assert!(read(&path).contains("after") && read(&path).contains("later"));
+        assert_eq!(probe.sum("logit.output.file.reopens", &[]), 1.0, "one bump, one reopen");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A SIGHUP during startup can land after the target opened its file and before the output
+    /// gets its receiver. A clone of the receiver created with the sender still reads the bump as
+    /// changed, so the first `send` reopens.
+    #[tokio::test]
+    async fn a_bump_between_opening_the_file_and_the_first_send_reopens_on_that_send() {
+        use logit_pipeline::test_util::scratch_dir;
+        let dir = scratch_dir("stream-output-reopen-at-startup");
+        let path = dir.join("events.log");
+        let renamed = dir.join("events.log.1");
+        let (tx, rx) = watch::channel(0u64);
+        let output = StreamOutput::open_path(&path).unwrap();
+
+        std::fs::rename(&path, &renamed).unwrap();
+        tx.send_modify(|g| *g += 1);
+        let mut output = output.with_reopen(rx.clone());
+        output.send(&named("first")).await.unwrap();
+
+        assert!(read(&path).contains("first"), "the first send reopened {}", path.display());
+        assert_eq!(read(&renamed), "");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reopen runs before the rotation check. Checked the other way round, the renamed file's
+    /// size would rotate the fresh `events.log` the rotator created, and shift the rotator's own
+    /// `events.log.1` to `.2`.
+    #[tokio::test]
+    async fn a_reopen_runs_before_the_rotation_check_so_a_rotators_files_are_left_alone() {
+        use logit_pipeline::test_util::scratch_dir;
+        let dir = scratch_dir("stream-output-reopen-before-rotate");
+        let path = dir.join("events.log");
+        let rotators = dir.join("events.log.1");
+        let len = StreamEncoder::human().encode(&named("a")).unwrap().len() as u64;
+        let (tx, rx) = watch::channel(0u64);
+        let policy = RotatePolicy { max_bytes: Some(len + 1), interval: None, max_files: 3 };
+        let mut output = StreamOutput::rotating(&path, policy).unwrap().with_reopen(rx.clone());
+        output.send(&named("a")).await.unwrap();
+
+        std::fs::rename(&path, &rotators).unwrap();
+        std::fs::File::create(&path).unwrap();
+        tx.send_modify(|g| *g += 1);
+        output.send(&named("b")).await.unwrap();
+
+        assert!(read(&rotators).contains("name: a") && !read(&rotators).contains("name: b"));
+        assert!(read(&path).contains("name: b"));
+        assert!(!dir.join("events.log.2").exists(), "nothing rotated");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reopen's open fails: the batch is `Clean`, `reopen_failure` warns, and nothing counts
+    /// as a reopen. The retry opens the new file, re-seeds the rotation state from it before the
+    /// rotation check, and writes there without rotating it.
+    #[tokio::test]
+    async fn a_failed_reopen_is_clean_and_the_retry_writes_to_the_new_file() {
+        use logit_pipeline::fault::{self, errno, sites, Op, Point};
+        use logit_pipeline::test_util::{scratch_dir, TelemetryProbe};
+        let dir = scratch_dir("stream-output-failed-reopen");
+        let path = dir.join("events.log");
+        let renamed = dir.join("events.log.1");
+        let len = StreamEncoder::human().encode(&named("a")).unwrap().len() as u64;
+        let (tx, rx) = watch::channel(0u64);
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "file_out", "sink");
+        let policy = RotatePolicy { max_bytes: Some(len + 1), interval: None, max_files: 3 };
+        let mut output = StreamOutput::rotating(&path, policy)
+            .unwrap()
+            .with_telemetry(telemetry.clone())
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry))
+            .with_reopen(rx.clone());
+        output.send(&named("a")).await.unwrap();
+        std::fs::rename(&path, &renamed).unwrap();
+        std::fs::File::create(&path).unwrap();
+        tx.send_modify(|g| *g += 1);
+
+        let scope = fault::scope(&dir);
+        scope.fail_nth(Point::new(sites::FILE_OUT_ACTIVE, Op::Open), 1, errno::EMFILE);
+        let err = output.send(&named("b")).await.expect_err("the injected failure");
+        drop(scope);
+        assert_eq!(logit_pipeline::classify(&err), logit_pipeline::Fault::Clean);
+
+        output.send(&named("b")).await.expect("the retry opens the new file");
+        assert!(read(&path).contains("name: b"));
+        assert!(!read(&renamed).contains("name: b"));
+        assert!(!dir.join("events.log.2").exists(), "the retry didn't rotate the new file");
+        let totals = probe.poll();
+        assert_eq!(totals.sum("logit.component.diagnostics", &[("key", "reopen_failure")]), 1.0);
+        assert_eq!(totals.sum("logit.output.file.reopens", &[]), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_reopen_generation_bump_leaves_a_stdout_target_alone() {
+        let (tx, rx) = watch::channel(0u64);
+        let mut output = StreamOutput::stdout().with_reopen(rx);
+        tx.send_modify(|g| *g += 1);
+        output.send(&named("x")).await.unwrap();
+        let reopen = output.reopen.as_ref().unwrap();
+        assert!(reopen.has_changed().unwrap(), "a stdout target never consumes the bump");
     }
 
     // --- StreamEncoder ---

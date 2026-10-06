@@ -76,15 +76,37 @@ error.
 
 ## Signal and restart behavior
 
-[ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md) has the full
-design. What an operator needs:
+[ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md) and
+[ADR `signal-handling`](adr/signal-handling.md) have the full design. What an operator needs:
 
 - **SIGTERM or SIGINT starts a graceful drain**, not an immediate kill. Every listener's inbox
   closes as if the listener had finished on its own, which flushes any in-flight `aggregate` window
   before exit. An orchestrator sending SIGTERM ahead of SIGKILL doesn't silently drop a window of
   metrics.
 - **A second signal during a stuck drain exits immediately** with status 130, so a restart policy
-  waiting on the process can still kill it with the same signal.
+  waiting on the process can still kill it with the same signal. Only SIGTERM and SIGINT count; a
+  SIGHUP never does.
+- **SIGHUP reopens file outputs and never ends the process.** It logs `reopen signal received`
+  with `config_reloaded=false`, and each `stdio_out`/`file_out` file target reopens its path
+  before its next write; see
+  [Rotating a file output externally](#rotating-a-file-output-externally).
+  It doesn't reload the config: a config change still means a restart. A SIGHUP can arrive in any
+  state, a drain included. A foreground `logit run` survives its terminal hanging up too: it keeps
+  its ports, and its writes to stdout fail as `Rejected`, so run it under systemd or a container
+  runtime.
+- **Handlers are installed before the config is read.** A SIGTERM or SIGINT during startup is held,
+  and the drain starts as soon as the pipeline has started; a startup that fails still exits `1`.
+  A second SIGTERM or SIGINT during startup exits 130 at once, so a wedged startup stays killable.
+- **Signals behave the same in a container and on a host.** Docker, containerd, and the kubelet
+  stop a container with SIGTERM and never send SIGHUP. The kernel drops a signal sent to a PID
+  namespace's init process when no handler is installed (pid_namespaces(7)), but delivers it to
+  any other process, so an unhandled SIGHUP would be ignored under the release image, where
+  `logit` is PID 1, and fatal under `docker run --init`, tini, or a Kubernetes pod with
+  `shareProcessNamespace`. `logit` installs a handler for every signal it reacts to, so it
+  behaves the same in all of them, and `docker kill -s HUP` reopens. A config-reloader sidecar's
+  SIGHUP doesn't apply a new config; in Kubernetes, roll the pod. In a container, write to stdout
+  or a network sink; a reopen matters only when a `stdio_out` file target writes to a volume that
+  a rotator able to signal `logit` manages.
 - **A failed send, transient or extended, never ends the process.** Every sink sits
   behind a decoupled delivery buffer
   ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)). A retryable failure holds the
@@ -104,6 +126,57 @@ design. What an operator needs:
   `logit.input.batches.dropped{reason="closed_consumer"}`
   ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 3, and its W3 amendment).
 
+### Rotating a file output externally
+
+To have logrotate manage a file `logit` writes, point it at a `stdio_out` file target, which never
+rotates itself, and send `logit` a SIGHUP after the rename:
+
+```yaml
+components:
+  out:
+    type: stdio_out
+    sources: [in]
+    target: /var/log/logit/events.log
+```
+
+Under systemd, give the unit a reload command:
+
+```ini
+[Service]
+ExecReload=/bin/kill -HUP $MAINPID
+```
+
+Then call it from `postrotate`, in rename mode, the default:
+
+```text
+/var/log/logit/events.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    postrotate
+        systemctl reload logit.service || true
+    endscript
+}
+```
+
+- **Don't use `copytruncate`.** It still works, but loses the lines written between its copy and
+  its truncate.
+- **Keep `delaycompress`.** A batch mid-write when the signal arrives finishes into the renamed
+  file, so compressing that file in the same run can cut off the batch's tail.
+- **`|| true` keeps a stopped service from failing the rotation.** `systemctl reload` exits
+  non-zero while the unit isn't running, and logrotate would report the script as failed even
+  though the rename succeeded.
+- **An idle sink reopens late.** The reopen happens before the target's next write, so the renamed
+  file stays open, and its disk space allocated, until the sink's next batch.
+- **Don't give logrotate a `file_out` path.** Every `file_out` has a `rotate:` policy of its own,
+  so both rotators rename the same path on their own triggers: one stream splits across
+  `events.log.N` and logrotate's names under two retention limits. If you do it anyway, add
+  `dateext` so the two sets of names don't collide, and set `max_bytes` well above one logrotate
+  period's output so `file_out`'s rotation is only a backstop.
+
 ## Probes and exit codes
 
 `logit` exits with a code that separates startup failures from runtime ones, and, when `admin:` is
@@ -115,7 +188,7 @@ configured, answers readiness and liveness probes. See
 | `0` | Clean shutdown — a signal arrived, every listener drained, every sink flushed. |
 | `1` | A startup failure — a bad config, a port already in use, a bad `lua_file`, a bad `--log-level`. Nothing was ever running. |
 | `2` | A runtime failure after the process reported ready — a listener's accept loop dying, a `lua`/`lua_file` component's thread panicking (a script's own `process()`/`flush()` errors are not this: they're logged and counted, never fatal), a `lua`/`lua_file` component's VM still over its `max_memory` after a full garbage collection (logged `memory_limit_exceeded`), or a script still wedged inside `process()`/`flush()` with no progress 2 s after shutdown began, which `logit` exits without (see [What to watch on `/readyz`](#what-to-watch-on-readyz)), a sink's `buffer.disk:` spool that can't be opened (a bad path, permissions, another process holding the lock), or a sink's task panicking. A failed send never causes it: a sink that can't deliver holds or drops, per [Sink failure semantics](#sink-failure-semantics). |
-| `130` | A second SIGTERM/SIGINT arrived before a graceful drain finished. |
+| `130` | A second SIGTERM/SIGINT arrived during startup or before a graceful drain finished. |
 
 To enable the probe endpoint, add a top-level `admin:` block:
 
@@ -215,8 +288,8 @@ so a log collector can parse it instead of scraping text.
 Every component-scoped diagnostic carries a `component` field naming the component that reported
 it. A throttled diagnostic, or a component-owned lifecycle message like `bound`/`recovered`, also
 carries a `key` naming *why*. The process-level lifecycle events (`starting`, `ready`,
-`shutdown signal received`, `drain complete`, `exiting`) carry neither, because they describe the
-process, not a component.
+`shutdown signal received`, `reopen signal received`, `drain complete`, `exiting`) carry
+neither, because they describe the process, not a component.
 
 **Lifecycle event names are stable `&'static str` values, so you can alert on them directly:**
 
@@ -226,6 +299,7 @@ process, not a component.
 | `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`lines_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
+| `reopen signal received` | info | A SIGHUP arrived. Carries `generation` (SIGHUPs so far) and `config_reloaded=false`: the config isn't reloaded. Logged during a drain too. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks and Lua nodes. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
