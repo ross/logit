@@ -12,7 +12,8 @@ Accepted
 `logit run` installs handlers for SIGTERM and SIGINT only
 ([ADR `service-lifecycle-and-output-retry`](service-lifecycle-and-output-retry.md)'s "Shutdown"
 section; `shutdown_signal` and `run_pipelines` in `crates/logit-cli/src/pipeline.rs`). Every other
-signal gets the kernel's default disposition. Two gaps follow:
+signal gets the kernel's default disposition, except SIGPIPE, which Rust's runtime ignores. Two
+gaps follow:
 
 - **SIGHUP kills the process undrained.** The default action for SIGHUP is to terminate: no
   drain, any open `aggregate` window lost, and no `exiting` lifecycle line. Operators send SIGHUP
@@ -50,7 +51,8 @@ read, and SIGHUP reopens file targets instead of ending the process.
 1. **SIGTERM and SIGINT drain, and a second one exits.** Unchanged from
    [ADR `service-lifecycle-and-output-retry`](service-lifecycle-and-output-retry.md): the first
    SIGTERM or SIGINT starts a graceful drain, and a second one before the drain finishes exits
-   with code `130`.
+   with code `130`. The count starts when the handlers are installed (decision 3), so a second
+   SIGTERM or SIGINT during startup exits `130` at once, and a wedged startup stays killable.
 2. **SIGHUP never ends the process.** It reopens the file targets of `stdio_out` and `file_out`,
    rsyslog's semantic, so an external rotator in rename mode with a `postrotate` `kill -HUP` works.
    Each SIGHUP logs a stable lifecycle line, `reopen signal received`, at `info` on the `logit`
@@ -59,12 +61,15 @@ read, and SIGHUP reopens file targets instead of ending the process.
    SIGTERM starts a drain.
 3. **Handlers are installed before `config::load`.** A signal that arrives during startup is held
    and acted on once the pipeline runs. A SIGTERM or SIGINT during startup starts the drain as
-   soon as the pipeline has started; a SIGHUP during startup is a reopen with nothing to reopen
-   yet. A startup that fails still exits `1`, whatever signal arrived first.
+   soon as the pipeline has started. A SIGHUP during startup still increments the reopen
+   generation (decision 4), so a file target that opened its file during startup reopens it
+   before its first write. A startup that fails still exits `1`, whatever signal arrived first.
 4. **A reopen is lazy, per target, and ordered against writes.** A process-wide generation counter
-   (a `tokio::sync::watch`) increments on each SIGHUP. Each file target compares it with the
-   generation it last opened under before its next write, and on a change reopens its path. The
-   reopen:
+   (a `tokio::sync::watch`) increments on each SIGHUP. The counter is created before
+   `config::load`, and each file target takes its snapshot of the generation before it opens its
+   file, so a SIGHUP between the two is never marked as seen. The check runs first in the
+   file-target arm of `StreamOutput::send`, before the rotation decision, and on a change the
+   target reopens its path, so the re-seeded state decides that batch's rotation. The reopen:
    - opens in append mode and never truncates, so a file a rotator copied but didn't move keeps
      its contents;
    - re-seeds `file_out`'s rotation state (bytes written, current period) from the newly opened
@@ -115,15 +120,21 @@ restart. Certificate rotation stays the gap `docs/known-gaps/intake.md` records.
 ## Consequences
 - `crates/logit-cli/src/pipeline.rs` installs the SIGTERM, SIGINT, and SIGHUP handlers before
   `config::load` and owns the generation counter. The second-signal exit counts only SIGTERM and
-  SIGINT.
+  SIGINT, starting from the handlers' installation, so a second one during startup exits `130`.
 - `crates/logit-outputs/src/file.rs`'s `FileTarget` and `crates/logit-outputs/src/stdio.rs`'s sink
-  take a receiver for the generation, check it before each write, and count
+  take a receiver for the generation, check it first in the file-target arm of `send`, before
+  `should_rotate` and `rotate`, and count
   `logit.output.file.reopens`. `docs/design/internal-telemetry.md` gains the counter.
 - An operator running logrotate against a `logit` file uses rename mode with `postrotate`
   `kill -HUP` and `delaycompress`. `copytruncate` keeps working, and still loses the lines written
-  between its copy and its truncate.
+  between its copy and its truncate. `file_out`'s own `rotate:` policy and an external rotator
+  shouldn't manage the same path: each renames files the other counts on.
 - `docs/known-gaps/runtime.md`'s config hot reload entry stays open, with SIGHUP now defined as a
-  reopen. `docs/known-gaps/sinks.md`'s two missing-reopen entries and `docs/deploying.md` change when the
-  behavior lands.
+  reopen. `docs/known-gaps/sinks.md`'s two missing-reopen entries and `docs/deploying.md` change
+  when the behavior lands.
 - A sink that receives no traffic holds the old inode until its next batch, so disk space for a
   rotated file isn't freed until then.
+- A foreground `logit run` whose terminal hangs up keeps running. It holds its ports, and a
+  `stdio_out` writing to `stdout` fails each write with `EIO`, counted as a `Rejected` drop. nginx,
+  rsyslog, and other daemons that handle SIGHUP behave the same way. Run `logit` under systemd or
+  a container runtime, not a bare terminal session.
