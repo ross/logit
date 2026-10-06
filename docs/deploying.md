@@ -846,7 +846,8 @@ budget of the configured length, so a TLS connection that says nothing costs up 
 | `statsd_in` (`transport: tcp`) | the same three phases, on the same shared driver |
 | `lines_in` (`transport: tcp`) | the same three phases, on the same shared driver |
 | `logit_in` | the TLS accept (under `tls:`), then the `Hello` read |
-| `otlp_in` | the TLS accept (under `tls:`), or — on the plaintext arm, which has no TLS accept — the wait for the connection's first byte |
+| `otlp_in` | the PROXY header (under `proxy_protocol:`), then the TLS accept (under `tls:`), or — on the plaintext arm, which has no TLS accept — the wait for the connection's first byte |
+| `prometheus_in` (remote-write receiver) | the same phases as `otlp_in`, under `bind_tls:`, each bounded by a fixed 5 seconds; this kind has no `handshake_timeout:` field |
 
 **Under `proxy_protocol: true`, give the load balancer a PROXY-aware health check.** A plain TCP
 connect check sends no header, so each probe is closed and counted as
@@ -856,7 +857,8 @@ diagnostic. HAProxy's `check` sends the header itself when the `server` line has
 balancer's check should send a v2 `LOCAL` header, which the listener accepts without stamping a
 client.
 
-**`otlp_in` bounds one phase per connection, not two**, and not by choice. It hands each accepted
+**`otlp_in` bounds one phase per connection, not two**, plus the PROXY header under
+`proxy_protocol:`, and not by choice. It hands each accepted
 connection straight to `hyper`, whose connection builder reads the first bytes itself to tell
 HTTP/1.1 from an HTTP/2 preface, a read this listener never sees. On a plaintext listener it can
 wait for the first byte without consuming it (a `MSG_PEEK`), and that wait is what this knob
@@ -1042,8 +1044,10 @@ built on the shared socket drivers ([ADR `listener-peer-address`](adr/listener-p
 | `peer: true` | `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` on every transport they offer, and `collectd_in` | `network.peer.address` and `network.peer.port`: the socket peer, the connection's for a stream and each datagram's own for UDP |
 | `proxy_protocol: true` | `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in`, under `transport: tcp` only (rule 79) | `client.address` and `client.port`: the original client a PROXY protocol header names |
 
-`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `logit_in`, and `prometheus_in`'s remote-write
-receiver take neither field.
+`logit_in` takes neither field. `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and
+`prometheus_in`'s remote-write receiver take both; `datadog_trace_in`'s `proxy_protocol:` applies to
+its `bind:` listener only, and on `prometheus_in` both are receiver-mode fields, rejected beside
+`scrape_targets:`.
 
 **What `peer:` writes.** The address is a string in its standard text form, and the port is an
 integer. An IPv4-mapped IPv6 address is written as IPv4, so a sender reads the same on a
@@ -1112,13 +1116,15 @@ address as `client.address`. Enforce the boundary with network policy, as for ev
 
 **Every connection must open with a header.** It's never auto-detected, as the PROXY protocol
 specification requires. A connection without a valid header, or whose header doesn't arrive within
-`handshake_timeout`, is closed and counted
+`handshake_timeout` (a fixed 5 seconds on `prometheus_in`'s remote-write receiver, which has no
+such field), is closed and counted
 `logit.input.connections.rejected{reason="proxy_header"}`, with a throttled `proxy_header`
 diagnostic. That includes a sender that connects to the port directly by mistake, and a load
 balancer's plain TCP health check; see
 [`handshake_timeout` on a TCP listener](#handshake_timeout-on-a-tcp-listener) for the health
 check to use and the phases the timeout bounds. The header is read before any TLS handshake, as
-a proxy sends it, so `tls:` and `proxy_protocol:` combine.
+a proxy sends it, so `tls:` (`bind_tls:` on the remote-write receiver) and `proxy_protocol:`
+combine.
 
 ### `collectd_in`: multicast groups and `types_db`
 
