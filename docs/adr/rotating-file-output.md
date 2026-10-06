@@ -262,7 +262,9 @@ in this pass (see Alternatives). Retention is `max_files` alone -- no `max_age`,
   already documents.
   Amended 2026-10-05: [ADR `signal-handling`](signal-handling.md) decides that a SIGHUP reopens
   both sinks' file targets before their next write, so an external rotator in rename mode with a
-  `postrotate` `kill -HUP` works.
+  `postrotate` `kill -HUP` works against a `stdio_out` file target. A `file_out` path still
+  belongs to its own `rotate:` policy: an external rotator managing it too renames files the
+  other counts on.
 
 ## Consequences
 

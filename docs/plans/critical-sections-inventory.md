@@ -3937,8 +3937,8 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   `shutdown_grace` mapping silently changes drop behaviour). Everything else in this 4k-line file is thin
   `ComponentKind` → constructor plumbing and is **not** sensitive.
 - **Invariants to verify:**
-  - Every signal stream exists before `config::load`, so no signal reaches its default disposition after
-    `Signals::install` returns.
+  - On Unix, every signal stream exists before `config::load`, so no signal reaches its default disposition
+    after `Signals::install` returns.
   - The kill switch's `process::exit(130)` can only fire on a genuine *second* signal, never on a duplicate
     wakeup of the first.
   - The signal tasks (`Signals`' drop) and `admin_server.abort()` stop after `run_with_telemetry` returns, on
@@ -3955,6 +3955,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     restart than the first. Documented in `run_pipelines`'s doc comment as deliberate; noting it as context.
   - **No `unsafe` here** (contrary to the survey brief). Confirmed by grep over the whole crate's `src/`.
 - **Existing coverage:** `crates/logit-cli/tests/admin_ready.rs` (real SIGTERM + drain probe),
+  `crates/logit-cli/tests/signals.rs` (SIGHUP, a SIGTERM held through `config::load`, the 130 count),
   `exit_codes.rs`, `durable_buffer_restart.rs`, `logging_flags.rs`, `route_round_trip.rs`, and the per-protocol
   round-trip suites; `pipeline.rs`'s own `#[cfg(test)]` module (`mod tests`, including `run_config_reports_a_missing_lua_file_clearly`, which drives `run_config`).
   Governed by `docs/adr/service-lifecycle-and-output-retry.md`, `docs/adr/admin-readiness-endpoint.md`,
