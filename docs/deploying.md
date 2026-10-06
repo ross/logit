@@ -814,10 +814,11 @@ handshake, so a set value is rejected instead of silently ignored.
 passes its handshake (or, on a plaintext listener, delivers at least one byte) and then goes quiet
 holds its connection-cap permit forever, and enough of them fill the listener's
 `max_connections` cap.
-`idle_timeout:` is the opt-in field that closes such a connection. It applies to the six kinds
+`idle_timeout:` is the opt-in field that closes such a connection. It applies to the kinds
 `handshake_timeout` covers (`syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` with
-`transport: tcp`; `logit_in`; and `otlp_in`) and to `prometheus_in` in remote-write receiver mode, which shares
-`otlp_in`'s HTTP idle machinery and has no `handshake_timeout`; see
+`transport: tcp`; `logit_in`; `otlp_in`, `datadog_in`, `datadog_trace_in`, and `splunk_hec_in`)
+and to `prometheus_in` in remote-write receiver mode, which shares `otlp_in`'s HTTP idle machinery
+and has no `handshake_timeout`; see
 [Prometheus remote-write](#prometheus-remote-write-receiving-sending-and-picking-a-version). See
 [ADR `idle-connection-timeout`](adr/idle-connection-timeout.md) for the full design.
 
@@ -1098,8 +1099,10 @@ accepts a PROXY header from any peer" and [transform gaps](known-gaps/transforms
 **Health checks.** A load balancer's check reaches the listener as an ordinary connection, and
 whether it's diagnosed or counted depends on the port:
 
-- **Plaintext, `proxy_protocol:` off:** a check that connects and then closes or resets without
-  sending a byte ends quietly, with no `connection_error` diagnostic and nothing counted.
+- **Plaintext, `proxy_protocol:` off:** on every listener above but `logit_in`, a check that
+  connects and then closes or resets without sending a byte ends quietly, with no
+  `connection_error` diagnostic and nothing counted. `logit_in` diagnoses a connection that closes
+  before its `Hello` as `connection_error`.
 - **Plaintext, `proxy_protocol: true`:** the check must send a header. A complete header followed
   by a close or a reset ends quietly. A plain TCP connect check is closed and counted as
   `rejected{reason="proxy_header"}` on every probe. HAProxy's `check` sends the header itself

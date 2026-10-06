@@ -235,7 +235,9 @@ HAProxy at `.20`, nginx at `.30`, `logit` at `.40`, and Envoy at `.50`. Images:
 `fullstorydev/grpcurl:latest`, and `curlimages/curl:8.11.1`. Events went to a `stdio_out` with
 `format: json`, and an `internal` input on a 2 s interval went to a second one. OTLP/HTTP requests
 were a JSON `POST /v1/logs` from curl, and gRPC requests a `LogsService/Export` from grpcurl with
-the repo's OTLP protos. Every leg passed.
+the repo's OTLP protos. Every leg passed. No leg ran `tls:`; the TLS health-check rule in
+"Recording the sender" (a check that doesn't complete the handshake reaches `connection_error`)
+comes from the code and its tests, not this run.
 
 1. **HAProxy `mode tcp` with `send-proxy-v2` in front of `otlp_in` HTTP and gRPC**, both
    listeners `peer: true` and `proxy_protocol: true`, and HAProxy's `server` lines
