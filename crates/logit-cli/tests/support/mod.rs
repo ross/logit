@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Duration;
 
+use logit_pipeline::test_util::wait_until_within;
+
 /// How long a poll against a `logit run` child waits for the state it expects: ready, exited, or
 /// an event on its output. A process spawn is slower than an in-process bind, and a poll that
 /// spawns `logit ready` once per attempt slower still, so this is wider than
@@ -19,13 +21,49 @@ pub const PROCESS_DEADLINE: Duration = Duration::from_secs(10);
 pub struct TempConfig(pub PathBuf);
 
 impl TempConfig {
+    fn path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("logit-cli-test-{name}-{}.yaml", std::process::id()))
+    }
+
     pub fn write(name: &str, contents: impl AsRef<[u8]>) -> Self {
-        let path =
-            std::env::temp_dir().join(format!("logit-cli-test-{name}-{}.yaml", std::process::id()));
+        let path = Self::path(name);
         std::fs::File::create(&path)
             .and_then(|mut f| f.write_all(contents.as_ref()))
             .expect("writing the temp config");
         Self(path)
+    }
+
+    /// A FIFO in place of the file, so a test can hold `logit run` inside `config::load`: the
+    /// child's read blocks until [`TempConfig::wait_for_reader`]'s write end is written and closed.
+    #[cfg(unix)]
+    pub fn fifo(name: &str) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Self::path(name);
+        let _ = std::fs::remove_file(&path);
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+        let result = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "mkfifo failed: {:?}", std::io::Error::last_os_error());
+        Self(path)
+    }
+
+    /// Waits until a reader has opened this FIFO, returning its write end. A non-blocking
+    /// write-only open fails with `ENXIO` until a reader exists, so its success is the observable
+    /// that `logit run` is inside `config::load`.
+    #[cfg(unix)]
+    pub async fn wait_for_reader(&self) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut writer = None;
+        wait_until_within("logit run to open its config", PROCESS_DEADLINE, || {
+            writer = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.0)
+                .ok();
+            writer.is_some()
+        })
+        .await;
+        writer.unwrap()
     }
 }
 
@@ -118,17 +156,13 @@ impl Lines {
 
 /// Waits up to [`PROCESS_DEADLINE`] for `child` to exit, returning its status.
 pub async fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
-    let deadline = std::time::Instant::now() + PROCESS_DEADLINE;
-    loop {
-        if let Some(status) = child.try_wait().expect("polling the child") {
-            return status;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the child didn't exit within {PROCESS_DEADLINE:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let mut status = None;
+    wait_until_within("the child to exit", PROCESS_DEADLINE, || {
+        status = child.try_wait().expect("polling the child");
+        status.is_some()
+    })
+    .await;
+    status.unwrap()
 }
 
 /// Sends `signal` to `child`, a real signal rather than `Child::kill`'s SIGKILL.

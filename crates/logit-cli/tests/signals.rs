@@ -7,6 +7,7 @@
 
 mod support;
 
+use std::io::Write;
 use std::process::{Command, Stdio};
 
 use logit_pipeline::test_util::wait_until_within;
@@ -89,46 +90,47 @@ async fn a_sighup_during_the_drain_doesnt_exit_130() {
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
-/// A SIGTERM sent while the config is still being resolved is held, not defaulted: the process
-/// drains and exits 0 rather than dying to the signal. `starting` is logged after the config
-/// loads and before the graph is built, so the signal lands during startup or, on a fast run,
-/// after it; both must exit 0.
+/// A SIGTERM sent while `config::load` is still reading the config is held, not defaulted: the
+/// process starts, drains, and exits 0. The config path is a FIFO, so the signal lands while the
+/// load is blocked on it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_sigterm_during_startup_drains_and_exits_0() {
+async fn a_sigterm_during_config_load_drains_and_exits_0() {
     let statsd_addr = ephemeral_addr().await;
-    let config = TempConfig::write(
-        "term-at-startup",
-        format!(
-            "components:\n  in:\n    type: statsd_in\n    bind: \"{statsd_addr}\"\n  out:\n    \
-             type: stdio_out\n    sources: [in]\n"
-        ),
-    );
+    let config = TempConfig::fifo("term-during-load");
     let (mut child, stderr) = spawn_run(&config);
-    stderr.wait_for("starting");
+    let mut writer = config.wait_for_reader().await;
     send_signal(&child.0, libc::SIGTERM);
+    write!(
+        writer,
+        "components:\n  in:\n    type: statsd_in\n    bind: \"{statsd_addr}\"\n  out:\n    type: \
+         stdio_out\n    sources: [in]\n"
+    )
+    .unwrap();
+    drop(writer);
 
     let status = wait_for_exit(&mut child.0).await;
     assert_eq!(status.code(), Some(0), "{status:?}");
     stderr.wait_for("exiting");
 }
 
-/// A startup that fails exits 1 even with a SIGTERM already held: the held signal never turns a
-/// startup failure into a clean exit.
+/// A startup that fails exits 1 even with a SIGTERM held from `config::load`: the held signal
+/// never turns a startup failure into a clean exit.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_startup_exits_1_with_a_sigterm_held() {
     // A port already in use fails the startup bind pass.
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let taken_addr = taken.local_addr().unwrap();
-    let config = TempConfig::write(
-        "term-then-failed-startup",
-        format!(
-            "components:\n  in:\n    type: statsd_in\n    transport: tcp\n    bind: \
-             \"{taken_addr}\"\n  out:\n    type: stdio_out\n    sources: [in]\n"
-        ),
-    );
-    let (mut child, stderr) = spawn_run(&config);
-    stderr.wait_for("starting");
+    let config = TempConfig::fifo("term-then-failed-startup");
+    let (mut child, _stderr) = spawn_run(&config);
+    let mut writer = config.wait_for_reader().await;
     send_signal(&child.0, libc::SIGTERM);
+    write!(
+        writer,
+        "components:\n  in:\n    type: statsd_in\n    transport: tcp\n    bind: \
+         \"{taken_addr}\"\n  out:\n    type: stdio_out\n    sources: [in]\n"
+    )
+    .unwrap();
+    drop(writer);
 
     let status = wait_for_exit(&mut child.0).await;
     assert_eq!(status.code(), Some(1), "{status:?}");

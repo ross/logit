@@ -91,7 +91,9 @@ error.
   before its next write; see
   [Rotating a file output externally](#rotating-a-file-output-externally).
   It doesn't reload the config: a config change still means a restart. A SIGHUP can arrive in any
-  state, a drain included.
+  state, a drain included. A foreground `logit run` survives its terminal hanging up too: it keeps
+  its ports, and its writes to stdout fail as `Rejected`, so run it under systemd or a container
+  runtime.
 - **Handlers are installed before the config is read.** A SIGTERM or SIGINT during startup is held,
   and the drain starts as soon as the pipeline has started; a startup that fails still exits `1`.
   A second SIGTERM or SIGINT during startup exits 130 at once, so a wedged startup stays killable.
