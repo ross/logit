@@ -517,7 +517,7 @@
             },
             "buffer": true,
             "handshake_timeout": {
-              "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected.\n\nNot an idle timeout. Once a connection has produced one byte, the quiet gaps between requests are bounded by `idle_timeout` if set, and by nothing otherwise.\n\nAlso the grace period an idle close gives the HTTP server to shut the connection down before it is dropped.",
+              "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then the TLS accept when `tls:` is set, or on a plaintext listener the wait for its first byte. Each phase gets its own budget, so a silent connection costs up to twice this value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected.\n\nNot an idle timeout. Once a connection has produced one byte, the quiet gaps between requests are bounded by `idle_timeout` if set, and by nothing otherwise.\n\nAlso the grace period an idle close gives the HTTP server to shut the connection down before it is dropped.",
               "default": "5s",
               "type": "string"
             },
@@ -536,6 +536,11 @@
               "format": "uint",
               "minimum": 0.0
             },
+            "peer": {
+              "description": "Stamps each event with the address of the socket peer that sent it, as `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer reports the proxy's address. Every event of a request carries the same values, and either attribute replaces a same-named one decoded from the request. No reverse DNS lookup is made.\n\nEvery sender's address becomes an attribute on its events, so series keyed by attributes split by sender, and a sink that writes attributes receives the address. Drop it with a `remove` stage ahead of a sink that shouldn't see it.",
+              "default": false,
+              "type": "boolean"
+            },
             "protocol": {
               "default": "http",
               "allOf": [
@@ -543,6 +548,11 @@
                   "$ref": "#/definitions/OtlpProtocol"
                 }
               ]
+            },
+            "proxy_protocol": {
+              "description": "Requires every connection to open with a PROXY protocol header, version 1 or 2, as a load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps the original client it names on each event as `client.address` and `client.port`. Off by default. The header is read before any TLS handshake, within `handshake_timeout`. A connection without a valid header is closed and counted as `logit.input.connections.rejected{reason=\"proxy_header\"}`. A header that names no client, such as a proxy's own health check, keeps the connection and stamps nothing. Either attribute replaces a same-named one decoded from the request; `peer:` still reports the proxy.\n\nMake the port reachable only through the proxy: any client that can connect to it directly can send its own header and name any address as `client.address`.",
+              "default": false,
+              "type": "boolean"
             },
             "receive": true,
             "sources": true,
@@ -589,7 +599,7 @@
             },
             "buffer": true,
             "handshake_timeout": {
-              "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
+              "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then the TLS accept when `tls:` is set, or on a plaintext listener the wait for its first byte. Each phase gets its own budget, so a silent connection costs up to twice this value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
               "default": "5s",
               "type": "string"
             },
@@ -607,6 +617,16 @@
               "type": "integer",
               "format": "uint",
               "minimum": 0.0
+            },
+            "peer": {
+              "description": "Stamps each event with the address of the socket peer that sent it, as `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer reports the proxy's address. Every event of a request carries the same values, and either attribute replaces a same-named one decoded from the request. No reverse DNS lookup is made.\n\nEvery sender's address becomes an attribute on its events, so series keyed by attributes split by sender, and a sink that writes attributes receives the address. Drop it with a `remove` stage ahead of a sink that shouldn't see it.",
+              "default": false,
+              "type": "boolean"
+            },
+            "proxy_protocol": {
+              "description": "Requires every connection to open with a PROXY protocol header, version 1 or 2, as a load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps the original client it names on each event as `client.address` and `client.port`. Off by default. The header is read before any TLS handshake, within `handshake_timeout`. A connection without a valid header is closed and counted as `logit.input.connections.rejected{reason=\"proxy_header\"}`. A header that names no client, such as a proxy's own health check, keeps the connection and stamps nothing. Either attribute replaces a same-named one decoded from the request; `peer:` still reports the proxy.\n\nMake the port reachable only through the proxy: any client that can connect to it directly can send its own header and name any address as `client.address`.",
+              "default": false,
+              "type": "boolean"
             },
             "receive": true,
             "sources": true,
@@ -649,7 +669,7 @@
             },
             "buffer": true,
             "handshake_timeout": {
-              "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, and otherwise the wait for its first byte. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
+              "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then the TLS accept when `tls:` is set, or otherwise the wait for its first byte. Each phase gets its own budget, so a silent connection costs up to twice this value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
               "default": "5s",
               "type": "string"
             },
@@ -667,6 +687,16 @@
               "type": "integer",
               "format": "uint",
               "minimum": 0.0
+            },
+            "peer": {
+              "description": "Stamps each event with the address of the socket peer that sent it, as `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer reports the proxy's address. Every event of a request carries the same values, and either attribute replaces a same-named one decoded from the request. No reverse DNS lookup is made.\n\nEvery sender's address becomes an attribute on its events, so series keyed by attributes split by sender, and a sink that writes attributes receives the address. Drop it with a `remove` stage ahead of a sink that shouldn't see it.\n\nA `socket` client that bound a path reports the path as `network.peer.address` and no port; one that didn't, the usual tracer, gets neither attribute.",
+              "default": false,
+              "type": "boolean"
+            },
+            "proxy_protocol": {
+              "description": "Requires every connection to the `bind` listener to open with a PROXY protocol header, version 1 or 2, as a load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps the original client it names on each event as `client.address` and `client.port`. Off by default, and requires `bind`: a `socket` connection is never read for a header. The header is read before any TLS handshake, within `handshake_timeout`. A connection without a valid header is closed and counted as `logit.input.connections.rejected{reason=\"proxy_header\"}`. A header that names no client, such as a proxy's own health check, keeps the connection and stamps nothing. Either attribute replaces a same-named one decoded from the request; `peer:` still reports the proxy.\n\nMake the port reachable only through the proxy: any client that can connect to it directly can send its own header and name any address as `client.address`.",
+              "default": false,
+              "type": "boolean"
             },
             "receive": true,
             "socket": {

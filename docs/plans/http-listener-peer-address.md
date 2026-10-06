@@ -135,8 +135,10 @@ All in `logit-inputs`, beside the `peer` stack's code, except the parser:
   one-byte `peek`, under the same `handshake_timeout`. The plaintext `peek` comes after the header,
   because otherwise it reads the header's first byte as the request's.
 - Health checks: the HTTP loops treat a `peek` of `Ok(0)` as a health check. A PROXY-aware check
-  sends a header and then an RST, as HAProxy 3.2 does. Each loop ends that connection quietly,
-  matching the shared stream driver in `tcp.rs`, and each listener gets a header-then-RST test.
+  sends a header and then an RST, as HAProxy 3.2 does. On a plaintext listener, a complete
+  header followed by an RST or a FIN ends the connection quietly at the first-byte `peek`. On a TLS
+  listener the check reaches `connection_error` from the TLS accept, as on the shared stream driver
+  in `tcp.rs`. Each listener gets a header-then-RST test.
 - A rejected header counts as `logit.input.connections.rejected{reason="proxy_header"}` with the
   `proxy_header` diagnostic, as on the shared stream driver.
 

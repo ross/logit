@@ -427,8 +427,9 @@ Per pair:
   after decode, as `network.peer.address`/`network.peer.port`, under an opt-in `peer:` on every
   listener built on them. Under `transport: tcp`, opt-in `proxy_protocol:` requires a PROXY v1/v2
   header (`logit_proto::proxy`, a fuzz target) ahead of any TLS and stamps the origin it names as
-  `client.address`/`client.port`. No `Decoder` sees a peer, and the HTTP listeners and `logit_in`
-  record none ([ADR `listener-peer-address`](docs/adr/listener-peer-address.md)).
+  `client.address`/`client.port`. No `Decoder` sees a peer. `otlp_in`, `datadog_in`, and
+  `datadog_trace_in` take both fields too; `logit_in`, `splunk_hec_in`, and the remote-write
+  receiver record none ([ADR `listener-peer-address`](docs/adr/listener-peer-address.md)).
 
 ### Native wire format and transport
 
