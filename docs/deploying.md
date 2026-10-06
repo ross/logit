@@ -1044,9 +1044,10 @@ built on the shared socket drivers ([ADR `listener-peer-address`](adr/listener-p
 | `peer: true` | `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` on every transport they offer, and `collectd_in` | `network.peer.address` and `network.peer.port`: the socket peer, the connection's for a stream and each datagram's own for UDP |
 | `proxy_protocol: true` | `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in`, under `transport: tcp` only (rule 79) | `client.address` and `client.port`: the original client a PROXY protocol header names |
 
-`datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `logit_in` take neither field. `otlp_in`
-and `prometheus_in`'s remote-write receiver take both; a scrape-mode `prometheus_in` takes
-neither (rule 55).
+`logit_in` takes neither field. `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and
+`prometheus_in`'s remote-write receiver take both; `datadog_trace_in`'s `proxy_protocol:` applies to
+its `bind:` listener only, and on `prometheus_in` both are receiver-mode fields, rejected beside
+`scrape_targets:`.
 
 **What `peer:` writes.** The address is a string in its standard text form, and the port is an
 integer. An IPv4-mapped IPv6 address is written as IPv4, so a sender reads the same on a

@@ -159,8 +159,20 @@
 //! permissions. The socket file isn't removed on shutdown;
 //! the next start replaces it.
 //!
-//! Both listeners share one connection cap and one handler. A Unix connection has no TLS and no
-//! peer address; its diagnostics name the socket path.
+//! Both listeners share one connection cap and one handler. A Unix connection has no TLS, and its
+//! diagnostics name the socket path.
+//!
+//! # Sender address
+//!
+//! Under `peer:` and `proxy_protocol:` ([`DatadogTraceInput::with_peer`],
+//! [`DatadogTraceInput::with_proxy_protocol`]), each connection task builds one
+//! [`ConnectionPeer`], and `respond` stamps it on the request's batch beside the tracer headers,
+//! before delivery. On the TCP listener the PROXY header is read right after the permit, before
+//! the TLS accept or the first-byte peek, with `otlp_in`'s rejection, counting, and health-check
+//! rules (`crate::otlp`'s "Sender address"). The Unix socket never reads a header, and graph rule
+//! 79 rejects `proxy_protocol:` without `bind`. Under `peer:` a Unix client that bound a path is
+//! stamped with that path and no port, as on the shared drivers' `unix_stream`; an unbound
+//! client, the usual tracer, is stamped with nothing.
 //!
 //! # Telemetry
 //!
@@ -183,6 +195,7 @@ use crate::http::{
     media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding, MediaType,
     Undelivered,
 };
+use crate::peer::{ConnectionPeer, PeerAttrs};
 use crate::Input;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -201,7 +214,6 @@ use logit_proto::datadog::{
 };
 use logit_proto::msgpack::{Reader, Type};
 use logit_proto::CodecError;
-use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -261,6 +273,10 @@ pub struct DatadogTraceInput {
     /// has the formula).
     max_connections: usize,
     busy_after: Duration,
+    /// `peer:` in config. See [`Self::with_peer`].
+    peer: bool,
+    /// `proxy_protocol:` in config. See [`Self::with_proxy_protocol`].
+    proxy_protocol: bool,
 }
 
 impl Default for DatadogTraceInput {
@@ -286,6 +302,8 @@ impl DatadogTraceInput {
             idle_timeout: None,
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             busy_after: BUSY_AFTER,
+            peer: false,
+            proxy_protocol: false,
         }
     }
 
@@ -341,8 +359,8 @@ impl DatadogTraceInput {
         Ok(self)
     }
 
-    /// Overrides [`HANDSHAKE_TIMEOUT`] for the TLS accept and the first-byte wait
-    /// (`handshake_timeout:` in config). Graph rule 45 rejects `0s`.
+    /// Overrides [`HANDSHAKE_TIMEOUT`] for the PROXY header, the TLS accept, and the first-byte
+    /// wait, each on its own budget (`handshake_timeout:` in config). Graph rule 45 rejects `0s`.
     pub fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
         self.handshake_timeout = handshake_timeout;
         self
@@ -365,6 +383,21 @@ impl DatadogTraceInput {
     /// Overrides [`BUSY_AFTER`]. A test/tuning hook, not a config field, as on `datadog_in`.
     pub fn with_busy_after(mut self, d: Duration) -> Self {
         self.busy_after = d;
+        self
+    }
+
+    /// Stamps every event a request decodes with its connection's socket peer (`peer:` in
+    /// config), per [`crate::peer`], on both listeners. Off by default.
+    pub fn with_peer(mut self, peer: bool) -> Self {
+        self.peer = peer;
+        self
+    }
+
+    /// Requires a PROXY protocol header ahead of every connection to the TCP listener and stamps
+    /// the origin it names (`proxy_protocol:` in config). Off by default; the Unix socket never
+    /// reads one. See this module's "Sender address".
+    pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
+        self.proxy_protocol = proxy_protocol;
         self
     }
 }
@@ -413,6 +446,8 @@ impl Input for DatadogTraceInput {
             idle_timeout: self.idle_timeout,
             busy_after: self.busy_after,
             info: Bytes::from(info_document(receiver_port, &receiver_socket, self.max_connections)),
+            record_peer: self.peer,
+            proxy_protocol: self.proxy_protocol,
         });
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
         let socket_path: Option<Arc<Path>> = self.socket.as_deref().map(Arc::from);
@@ -452,6 +487,10 @@ struct AcceptContext {
     busy_after: Duration,
     /// The `/info` body, rendered once.
     info: Bytes,
+    /// `peer:` in config.
+    record_peer: bool,
+    /// `proxy_protocol:` in config, read on the TCP listener only.
+    proxy_protocol: bool,
 }
 
 impl AcceptContext {
@@ -465,7 +504,7 @@ impl AcceptContext {
         permit
     }
 
-    fn shared(&self, peer: Peer) -> Arc<Shared> {
+    fn shared(&self, peer: ConnectionPeer) -> Arc<Shared> {
         Arc::new(Shared {
             sink: self.sink.clone(),
             telemetry: self.telemetry.clone(),
@@ -496,9 +535,9 @@ impl AcceptContext {
     }
 }
 
-/// The TCP accept loop: `datadog_in`'s, including the accept-queue gauges, the TLS handshake or
-/// plaintext first-byte peek bounded inside the spawned task, and a clean close before the first
-/// byte treated as a health check.
+/// The TCP accept loop: `datadog_in`'s, including the accept-queue gauges, the PROXY header under
+/// `proxy_protocol:` and then the TLS handshake or plaintext first-byte peek, each bounded inside
+/// the spawned task, and a clean close or a reset before the first byte treated as a health check.
 async fn accept_tcp(
     listener: TcpListener,
     accept: Arc<AcceptContext>,
@@ -508,7 +547,7 @@ async fn accept_tcp(
         crate::tcp::AcceptQueueSampler::new(accept.telemetry.clone(), accept.diag.clone());
     let mut accept_diag = accept.diag.clone();
     loop {
-        let (stream, peer) = match accept_queue.accept(&listener).await {
+        let (mut stream, peer) = match accept_queue.accept(&listener).await {
             Ok(accepted) => accepted,
             Err(err) => {
                 crate::listener::absorb_accept_error(err, &accept.telemetry, &mut accept_diag)
@@ -520,11 +559,31 @@ async fn accept_tcp(
             drop(stream);
             continue;
         };
-        let shared = accept.shared(Peer::Tcp(peer));
         let tls_acceptor = tls_acceptor.clone();
         let handshake_timeout = accept.handshake_timeout;
         let idle_timeout = accept.idle_timeout;
+        let context = Arc::clone(&accept);
         accept.spawn(permit, async move {
+            // Ahead of the TLS accept and the first-byte peek, both of which would otherwise read
+            // the header's bytes as the request's (this module's "Sender address").
+            let origin = if context.proxy_protocol {
+                match crate::peer::read_proxy_origin(&mut stream, handshake_timeout).await {
+                    Ok(origin) => Some(origin),
+                    Err(err) => {
+                        context.telemetry.count(
+                            "logit.input.connections.rejected",
+                            1.0,
+                            &[("reason", "proxy_header")],
+                        );
+                        context.diag.clone().warn_throttled("proxy_header", err);
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
+            let shared =
+                context.shared(ConnectionPeer::tcp(peer, context.record_peer, origin.as_ref()));
             match tls_acceptor {
                 Some(acceptor) => {
                     match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
@@ -547,7 +606,10 @@ async fn accept_tcp(
                     let first_byte =
                         tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1])).await;
                     match first_byte {
-                        Ok(Ok(0)) => Ok(()), // a health-check probe, not a fault
+                        // A clean close or a reset before the first byte is a health-check probe,
+                        // not a fault (`crate::otlp`'s "not a fault").
+                        Ok(Ok(0)) => Ok(()),
+                        Ok(Err(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => Ok(()),
                         Ok(Ok(_)) => {
                             serve_connection(
                                 TokioIo::new(stream),
@@ -577,7 +639,7 @@ async fn accept_unix(
 ) -> anyhow::Result<()> {
     let mut accept_diag = accept.diag.clone();
     loop {
-        let (stream, _addr) = match listener.accept().await {
+        let (stream, addr) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
                 crate::listener::absorb_accept_error(err, &accept.telemetry, &mut accept_diag)
@@ -589,7 +651,8 @@ async fn accept_unix(
             drop(stream);
             continue;
         };
-        let shared = accept.shared(Peer::Unix(Arc::clone(&path)));
+        let stamped = if accept.record_peer { PeerAttrs::from_unix(&addr) } else { None };
+        let shared = accept.shared(ConnectionPeer::unix(Arc::clone(&path), stamped));
         let handshake_timeout = accept.handshake_timeout;
         let idle_timeout = accept.idle_timeout;
         accept.spawn(permit, async move {
@@ -625,22 +688,6 @@ async fn has_first_byte(stream: &UnixStream) -> std::io::Result<bool> {
     }
 }
 
-/// Who sent a request, for diagnostic text only, never a tag.
-enum Peer {
-    Tcp(SocketAddr),
-    /// A Unix peer has no address worth naming; the socket's path says which listener it was.
-    Unix(Arc<Path>),
-}
-
-impl fmt::Display for Peer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Tcp(addr) => write!(f, "{addr}"),
-            Self::Unix(path) => write!(f, "unix:{}", path.display()),
-        }
-    }
-}
-
 /// What every request on one connection needs, built once per connection.
 struct Shared {
     sink: Fanout,
@@ -648,7 +695,9 @@ struct Shared {
     diag: Diagnostics,
     busy_after: Duration,
     info: Bytes,
-    peer: Peer,
+    /// Names the sender in diagnostic text, and stamps the batch under `peer:` or
+    /// `proxy_protocol:`.
+    peer: ConnectionPeer,
 }
 
 /// Serves one accepted (and, with TLS on, handshaken) connection to completion: `datadog_in`'s,
@@ -926,6 +975,7 @@ async fn respond(
     } else {
         apply_stats_headers(&mut batch, &parts.headers);
     }
+    shared.peer.stamp_batches(std::slice::from_mut(&mut batch));
     let success = success(route, &parts.headers);
     if batch.events.is_empty() {
         return (name, OK, success);
@@ -2063,5 +2113,314 @@ mod tests {
         let missing = dir.0.join("no-such-dir").join("apm.socket");
         let err = DatadogTraceInput::new().with_socket(&missing).bind().await.unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    // ---- sender address: `peer:` and `proxy_protocol:` ----------------------------------------
+
+    const CONNECTIONS_REJECTED: &str = "logit.input.connections.rejected";
+
+    /// A running listener with `peer:` and `proxy_protocol:` as given, one connection permit, its
+    /// diagnostics, and a probe on its telemetry.
+    struct Stamping {
+        addr: String,
+        rx: mpsc::Receiver<logit_pipeline::Delivered>,
+        diag: Diagnostics,
+        probe: logit_pipeline::test_util::TelemetryProbe,
+    }
+
+    async fn sender_input(
+        peer: bool,
+        proxy_protocol: bool,
+        configure: impl FnOnce(DatadogTraceInput) -> DatadogTraceInput,
+    ) -> Stamping {
+        let probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = probe.telemetry("apm", "datadog_trace_in", "listener");
+        let diag = Diagnostics::new("apm").with_telemetry(telemetry.clone());
+        let input = configure(
+            tcp()
+                .with_telemetry(telemetry)
+                .with_diagnostics(diag.clone())
+                .with_max_connections(1)
+                .with_peer(peer)
+                .with_proxy_protocol(proxy_protocol),
+        );
+        let (addr, rx) = start(input, 16).await;
+        Stamping { addr, rx, diag, probe }
+    }
+
+    /// A v2 `PROXY` over TCP/IPv4 from 203.0.113.5:41000.
+    fn v2_ipv4_header() -> Vec<u8> {
+        let mut header = logit_proto::proxy::V2_SIGNATURE.to_vec();
+        header.extend_from_slice(&[0x21, 0x11, 0x00, 0x0C]);
+        header.extend_from_slice(&[203, 0, 113, 5, 127, 0, 0, 1]);
+        header.extend_from_slice(&41000u16.to_be_bytes());
+        header.extend_from_slice(&8126u16.to_be_bytes());
+        header
+    }
+
+    /// A v2 `LOCAL` header, a proxy's own health check, which names no origin.
+    fn v2_local_header() -> Vec<u8> {
+        let mut header = logit_proto::proxy::V2_SIGNATURE.to_vec();
+        header.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]);
+        header
+    }
+
+    const V1_HEADER: &[u8] = b"PROXY TCP4 198.51.100.7 127.0.0.1 40000 8126\r\n";
+
+    /// The HTTP/1.1 request carrying a two-trace v0.4 body, `Connection: close`.
+    fn traces_request(host: &str) -> Vec<u8> {
+        let body = v04(2);
+        let mut wire = format!(
+            "PUT /v0.4/traces HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n{MSGPACK}\
+             Connection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        wire.extend_from_slice(&body);
+        wire
+    }
+
+    /// Connects, writes `prefix`, then the two-trace request. Returns the response and the
+    /// client's local port.
+    async fn put_traces_after(addr: &str, prefix: &[u8]) -> (String, u16) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let port = stream.local_addr().unwrap().port();
+        let mut wire = prefix.to_vec();
+        wire.extend_from_slice(&traces_request(addr));
+        // Unchecked: a connection refused at the cap may already be closed, and then the
+        // response is empty.
+        let _ = stream.write_all(&wire).await;
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(
+            logit_pipeline::test_util::RECV_TIMEOUT,
+            stream.read_to_end(&mut buf),
+        )
+        .await;
+        (String::from_utf8_lossy(&buf).into_owned(), port)
+    }
+
+    fn str_attr<'a>(event: &'a logit_core::Event, key: &str) -> Option<&'a str> {
+        event.attributes.get(key).and_then(|v| v.as_str())
+    }
+
+    /// The one batch the two-trace body decodes into, with every event checked against the
+    /// expected `network.peer.*` and `client.*` values.
+    async fn expect_stamped_batch(
+        rx: &mut mpsc::Receiver<logit_pipeline::Delivered>,
+        peer: Option<(&str, Option<u16>)>,
+        client: Option<(&str, i64)>,
+    ) {
+        let batch = recv_batch(rx).await;
+        assert_eq!(batch.events.len(), 2, "one event per span");
+        for event in &batch.events {
+            assert_eq!(str_attr(event, "network.peer.address"), peer.map(|(address, _)| address));
+            assert_eq!(
+                event.attributes.get("network.peer.port"),
+                peer.and_then(|(_, port)| port)
+                    .map(|port| logit_core::Value::I64(i64::from(port)))
+                    .as_ref()
+            );
+            assert_eq!(str_attr(event, "client.address"), client.map(|(address, _)| address));
+            assert_eq!(
+                event.attributes.get("client.port"),
+                client.map(|(_, port)| logit_core::Value::I64(port)).as_ref()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_stamps_every_event_of_a_request_with_the_socket_peer() {
+        for peer in [true, false] {
+            let mut running = sender_input(peer, false, |i| i).await;
+            let (response, port) = put_traces_after(&running.addr, b"").await;
+            assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+            let expected = peer.then_some(("127.0.0.1", Some(port)));
+            expect_stamped_batch(&mut running.rx, expected, None).await;
+        }
+    }
+
+    /// The proxy is the socket peer, and the v2 header names the client.
+    #[tokio::test]
+    async fn a_v2_header_stamps_the_client_beside_the_peer() {
+        let mut running = sender_input(true, true, |i| i).await;
+        let (response, port) = put_traces_after(&running.addr, &v2_ipv4_header()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        let client = Some(("203.0.113.5", 41000));
+        expect_stamped_batch(&mut running.rx, Some(("127.0.0.1", Some(port))), client).await;
+    }
+
+    #[tokio::test]
+    async fn a_v1_header_stamps_the_client() {
+        let mut running = sender_input(false, true, |i| i).await;
+        let (response, _port) = put_traces_after(&running.addr, V1_HEADER).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        expect_stamped_batch(&mut running.rx, None, Some(("198.51.100.7", 40000))).await;
+    }
+
+    fn testdata_tls_dir() -> PathBuf {
+        // The repo root's `testdata/tls` (`testdata/tls/README.md`).
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    /// A client trusting `testdata/tls/ca.pem`, presenting no certificate.
+    fn tls_connector() -> tokio_rustls::TlsConnector {
+        use rustls_pki_types::pem::PemObject;
+        let mut roots = rustls::RootCertStore::empty();
+        let ca: Vec<rustls_pki_types::CertificateDer<'static>> =
+            rustls_pki_types::CertificateDer::pem_file_iter(testdata_tls_dir().join("ca.pem"))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        roots.add_parsable_certificates(ca);
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
+    }
+
+    /// The header goes ahead of the ClientHello, in the clear, as a proxy sends it.
+    #[tokio::test]
+    async fn a_proxy_header_ahead_of_the_tls_handshake_is_read_first() {
+        let tls = |input: DatadogTraceInput| {
+            let settings = TlsServerSettings {
+                cert_file: "server.pem".to_string(),
+                key_file: "server.key".to_string(),
+                client_ca_file: None,
+            };
+            input.with_tls(&settings, &testdata_tls_dir()).unwrap()
+        };
+        let mut running = sender_input(false, true, tls).await;
+        let mut stream = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
+        stream.write_all(&v2_ipv4_header()).await.unwrap();
+        let server_name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls_stream = tls_connector().connect(server_name, stream).await.unwrap();
+        tls_stream.write_all(&traces_request("localhost")).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(
+            logit_pipeline::test_util::RECV_TIMEOUT,
+            tls_stream.read_to_end(&mut buf),
+        )
+        .await;
+        let response = String::from_utf8_lossy(&buf);
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        expect_stamped_batch(&mut running.rx, None, Some(("203.0.113.5", 41000))).await;
+    }
+
+    /// A direct request on a `proxy_protocol: true` port is closed, counted, and never decoded.
+    #[tokio::test]
+    async fn a_request_without_a_proxy_header_is_rejected_and_counted() {
+        let mut running = sender_input(false, true, |i| i).await;
+        let mut bare = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
+        bare.write_all(b"PUT /v0.4/traces HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        logit_pipeline::test_util::expect_closed(&mut bare, "a request with no PROXY header").await;
+        running
+            .probe
+            .wait_for("the proxy_header rejection", |totals| {
+                totals.sum(CONNECTIONS_REJECTED, &[("reason", "proxy_header")]) == 1.0
+            })
+            .await;
+        assert_eq!(running.diag.occurrences("proxy_header"), 1);
+        assert_eq!(running.diag.occurrences("connection_error"), 0);
+        assert!(running.rx.try_recv().is_err(), "nothing is delivered");
+    }
+
+    /// Sends a request with a `LOCAL` header on new connections until one is answered `200`.
+    /// With one permit, that proves every earlier connection's task has finished, diagnostics
+    /// included: a connection refused at the cap is closed, and the loop tries again.
+    async fn next_connection_is_served(running: &mut Stamping) {
+        let deadline = tokio::time::Instant::now() + logit_pipeline::test_util::RECV_TIMEOUT;
+        loop {
+            assert!(tokio::time::Instant::now() < deadline, "no connection got a permit back");
+            let (response, _port) = put_traces_after(&running.addr, &v2_local_header()).await;
+            if response.starts_with("HTTP/1.1 200") {
+                return;
+            }
+        }
+    }
+
+    /// HAProxy's PROXY-aware health check: a complete header, then an RST before any request
+    /// byte. It ends quietly, as a probe with no header does on a plain port.
+    #[tokio::test]
+    async fn a_reset_after_a_complete_proxy_header_is_not_an_error() {
+        for header in [v2_local_header(), V1_HEADER.to_vec()] {
+            let mut running = sender_input(false, true, |i| i).await;
+            let mut client = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
+            client.write_all(&header).await.unwrap();
+            // `SO_LINGER` of zero makes the close an RST, not a FIN.
+            socket2::SockRef::from(&client).set_linger(Some(Duration::ZERO)).unwrap();
+            drop(client);
+            next_connection_is_served(&mut running).await;
+            assert_eq!(running.diag.occurrences("connection_error"), 0, "after {header:?}");
+            assert_eq!(running.diag.occurrences("proxy_header"), 0, "after {header:?}");
+            assert_eq!(
+                running.probe.sum(CONNECTIONS_REJECTED, &[("reason", "proxy_header")]),
+                0.0,
+                "after {header:?}"
+            );
+        }
+    }
+
+    /// The same check ended with a FIN: the first-byte peek reads `Ok(0)` after the header.
+    #[tokio::test]
+    async fn a_close_after_a_complete_proxy_header_is_not_an_error() {
+        let mut running = sender_input(false, true, |i| i).await;
+        let mut client = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
+        client.write_all(&v2_local_header()).await.unwrap();
+        drop(client);
+        next_connection_is_served(&mut running).await;
+        assert_eq!(running.diag.occurrences("connection_error"), 0);
+        assert_eq!(running.diag.occurrences("proxy_header"), 0);
+        assert_eq!(running.probe.sum(CONNECTIONS_REJECTED, &[("reason", "proxy_header")]), 0.0);
+    }
+
+    /// Writes the two-trace request on `stream` and returns the response.
+    async fn put_traces_on(mut stream: UnixStream) -> String {
+        stream.write_all(&traces_request("localhost")).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(
+            logit_pipeline::test_util::RECV_TIMEOUT,
+            stream.read_to_end(&mut buf),
+        )
+        .await;
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// A tracer's usual Unix client binds no path, so `peer:` has nothing to stamp, and a socket
+    /// connection is never read for a PROXY header even with `proxy_protocol:` on for `bind`.
+    #[tokio::test]
+    async fn an_unbound_unix_client_is_stamped_with_nothing() {
+        let dir = TempDir::new("peer-unbound");
+        let path = dir.0.join("apm.socket");
+        let mut running = sender_input(true, true, |input| input.with_socket(path.clone())).await;
+        let response = put_traces_on(UnixStream::connect(&path).await.unwrap()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        expect_stamped_batch(&mut running.rx, None, None).await;
+        assert_eq!(running.diag.occurrences("proxy_header"), 0);
+    }
+
+    /// A Unix client that bound a path is stamped with it, and no port.
+    #[tokio::test]
+    async fn a_bound_unix_client_is_stamped_with_its_path_and_no_port() {
+        let dir = TempDir::new("peer-bound");
+        let path = dir.0.join("apm.socket");
+        let client_path = dir.0.join("client.socket");
+        let mut running = sender_input(true, false, |input| input.with_socket(path.clone())).await;
+        // Binding before connecting needs a raw socket; tokio's `UnixStream` has no such step.
+        let socket =
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        socket.bind(&socket2::SockAddr::unix(&client_path).unwrap()).unwrap();
+        socket.connect(&socket2::SockAddr::unix(&path).unwrap()).unwrap();
+        let std_stream: std::os::unix::net::UnixStream = socket.into();
+        std_stream.set_nonblocking(true).unwrap();
+        let response = put_traces_on(UnixStream::from_std(std_stream).unwrap()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        let client_path = client_path.to_str().unwrap();
+        expect_stamped_batch(&mut running.rx, Some((client_path, None)), None).await;
     }
 }

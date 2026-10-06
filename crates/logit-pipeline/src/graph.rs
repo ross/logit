@@ -249,8 +249,8 @@
 //!     value is a parse error, not a graph rule
 //!     (`docs/adr/datadog-agent-and-intake-relay.md`).
 //! 79. `proxy_protocol: true` on a `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` whose
-//!     transport isn't `tcp`: a PROXY header leads a TCP stream from a network proxy
-//!     (`docs/adr/listener-peer-address.md`).
+//!     transport isn't `tcp`, or on a `datadog_trace_in` without `bind`: a PROXY header leads a
+//!     TCP stream from a network proxy (`docs/adr/listener-peer-address.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3662,6 +3662,15 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     LinesTransport::UnixStream => Some("unix_stream"),
                 },
             ),
+            // Its TCP listener and its Unix socket are separate fields, so the rule names the
+            // field the header needs rather than a transport.
+            ComponentKind::DatadogTraceIn { proxy_protocol: true, bind: None, .. } => {
+                anyhow::bail!(
+                    "component '{id}': datadog_trace_in 'proxy_protocol' needs 'bind' -- a PROXY \
+                     header comes from a network proxy ahead of a TCP stream, and a 'socket' \
+                     connection is never read for one"
+                );
+            }
             _ => continue,
         };
         if let Some(transport) = transport {
@@ -6171,6 +6180,8 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
         }
     }
 
@@ -6244,6 +6255,8 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
         }
     }
 
@@ -6807,6 +6820,8 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             socket_mode: None,
+            peer: false,
+            proxy_protocol: false,
         }
     }
 
@@ -12456,6 +12471,27 @@ mod tests {
             assert!(err.contains("'proxy_protocol' needs 'transport: tcp'"), "{json}: {err}");
             assert!(err.contains(&format!("not '{transport}'")), "{json}: {err}");
         }
+    }
+
+    /// Rule 79: `datadog_trace_in` reads a PROXY header on its `bind` listener only, so
+    /// `proxy_protocol: true` needs one; a `socket` beside it is fine.
+    #[test]
+    fn rule_79_datadog_trace_in_proxy_protocol_needs_bind() {
+        for json in [
+            r#"{"type": "datadog_trace_in", "bind": "127.0.0.1:0", "proxy_protocol": true}"#,
+            r#"{"type": "datadog_trace_in", "bind": "127.0.0.1:0", "socket": "/tmp/apm.socket",
+                "proxy_protocol": true, "peer": true}"#,
+            r#"{"type": "datadog_trace_in", "socket": "/tmp/apm.socket", "proxy_protocol": false}"#,
+        ] {
+            let kind = listener_from_json(json);
+            resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+                .unwrap_or_else(|err| panic!("{json} should resolve: {err}"));
+        }
+        let kind = listener_from_json(
+            r#"{"type": "datadog_trace_in", "socket": "/tmp/apm.socket", "proxy_protocol": true}"#,
+        );
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("datadog_trace_in 'proxy_protocol' needs 'bind'"), "got: {err}");
     }
 
     /// Rule 79: `proxy_protocol: false` stays legal on every transport.

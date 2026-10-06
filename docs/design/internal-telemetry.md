@@ -1045,7 +1045,9 @@ TLS listener that close fails the TLS accept and is counted), and `proxy_header`
 **The connection metrics are `otlp_in`'s verbatim**, because this listener runs the same accept loop
 and the same shared idle tracker (`crates/logit-inputs/src/http.rs`): `logit.input.connections`
 (gauge), `logit.input.connections.rejected{reason="limit"}`,
-`logit.input.connections.closed{reason="idle"}`, and the accept-queue gauges.
+`logit.input.connections.closed{reason="idle"}`, and the accept-queue gauges. Under
+`proxy_protocol: true`, `logit.input.connections.rejected{reason="proxy_header"}` counts a
+connection refused for its PROXY header, as on the shared TCP stream driver.
 
 **Unlike `otlp_in`, it counts requests.** A Datadog Agent posts to about a dozen routes, some of
 which this listener only acknowledges, so the `Fanout`'s batch count can't say which routes are
@@ -1083,9 +1085,13 @@ The codec's own counters (a series, sketch, log, event, check, span, or stats gr
 the rest of a request decodes) are in the [`datadog` codec section](#datadog), under this
 component's id.
 
-`Diagnostics` keys: `bound`, `connection_error` (never an idle close), `request_rejected` (every
-rejection except `404` and `405`; the peer address appears in the message text only, never a tag,
-and an API key never appears at all), `busy` (a `503`), and `closed_consumer` (a `503`).
+`Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a plaintext peer that
+closes cleanly or resets before sending a request byte, after a complete PROXY header under
+`proxy_protocol: true`; on a TLS listener that close fails the TLS accept and is counted),
+`proxy_header` (any `connections.rejected{reason="proxy_header"}` refusal),
+`request_rejected` (every rejection except `404` and `405`; the peer address appears in the
+message text only, never a tag, and an API key never appears at all), `busy` (a `503`), and
+`closed_consumer` (a `503`).
 
 ##### `datadog_trace_in`
 
@@ -1096,7 +1102,9 @@ and an API key never appears at all), `busy` (a `503`), and `closed_consumer` (a
 listener only.** `logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}`,
 and `logit.input.connections.closed{reason="idle"}` count the TCP listener and the Unix socket
 together, under one cap. The accept-queue gauges read the kernel's `TCP_INFO`, which a Unix socket
-has no counterpart for, so a `socket:`-only listener has none.
+has no counterpart for, so a `socket:`-only listener has none. Under `proxy_protocol: true`,
+`logit.input.connections.rejected{reason="proxy_header"}` counts a TCP connection refused for its
+PROXY header; the Unix socket never reads one.
 
 | Name | Kind | Meaning |
 |---|---|---|
@@ -1118,7 +1126,10 @@ a shorter stall and lost ones during a longer one, and the counter can't tell th
 The codec's own counters are in the [`datadog` codec section](#datadog), under this component's id.
 
 `Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a connect-and-close
-probe), `request_rejected` (every rejection except `404` and `405`; the peer address or socket path
+probe on the Unix socket, nor a plaintext TCP peer that closes cleanly or resets before sending
+a request byte, after a complete PROXY header under `proxy_protocol: true`), `proxy_header` (any
+`connections.rejected{reason="proxy_header"}` refusal),
+`request_rejected` (every rejection except `404` and `405`; the peer address or socket path
 appears in the message text only), `busy` (a `503`), `closed_consumer` (a `503`), `trace_count_mismatch` (an
 `X-Datadog-Trace-Count` header that disagrees with the traces on the wire; the request is still
 served), and `bad_header` (a `Datadog-Client-Dropped-P0-*` header that isn't an unsigned integer,
@@ -1132,7 +1143,9 @@ left out of the resource).
 **The connection metrics are `datadog_in`'s verbatim**, from the same accept loop and shared idle
 tracker: `logit.input.connections` (gauge, published by the same drop guard),
 `logit.input.connections.rejected{reason="limit"}`, `logit.input.connections.closed{reason="idle"}`,
-and the accept-queue gauges.
+and the accept-queue gauges. Under `proxy_protocol: true`,
+`logit.input.connections.rejected{reason="proxy_header"}` counts a connection refused for its
+PROXY header, as on the shared TCP stream driver.
 
 | Name | Kind | Meaning |
 |---|---|---|
@@ -1162,9 +1175,13 @@ key, a bad `time` or `fields`, a span that fell back to a log) are in the tables
 `crates/logit-proto/src/splunk/mod.rs`'s module doc and its `logs`, `metrics`, and `spans`
 submodules, under this component's id.
 
-`Diagnostics` keys: `bound`, `connection_error` (never an idle close), `request_rejected` (every
-rejection except `404` and `405`; the peer address appears in the message text only, never a tag,
-and a token never appears at all), `busy` (a `503`), and `closed_consumer` (a `503` code 9 or `500` code 8).
+`Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a plaintext peer that
+closes cleanly or resets before sending a request byte, after a complete PROXY header under
+`proxy_protocol: true`; on a TLS listener that close fails the TLS accept and is counted),
+`proxy_header` (any `connections.rejected{reason="proxy_header"}` refusal),
+`request_rejected` (every rejection except `404` and `405`; the peer address appears in the
+message text only, never a tag, and a token never appears at all), `busy` (a `503`), and
+`closed_consumer` (a `503` code 9 or `500` code 8).
 
 ##### `tail_in` and `docker_in`
 
