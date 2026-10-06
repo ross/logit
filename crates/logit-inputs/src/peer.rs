@@ -1,7 +1,7 @@
 //! The sender's address on listener events: the `network.peer.address` and `network.peer.port`
 //! attributes a shared driver stamps, after decode, on a listener configured `peer: true`, and the
-//! `client.address` and `client.port` attributes the stream driver stamps from a PROXY protocol
-//! header under `proxy_protocol: true`.
+//! `client.address` and `client.port` attributes stamped from a PROXY header's origin under
+//! `proxy_protocol: true` or a forwarding header's client under `forwarded:`.
 //!
 //! ADR `listener-peer-address` settles the names, the text form, why these are event attributes
 //! and not resource ones, and why the driver's value replaces a same-named attribute a decoder
@@ -42,9 +42,10 @@ pub const PEER_ADDRESS: &str = "network.peer.address";
 /// The attribute holding the immediate socket peer's port, in OpenTelemetry's name.
 pub const PEER_PORT: &str = "network.peer.port";
 
-/// The attribute holding the origin a PROXY protocol header names, in OpenTelemetry's name.
+/// The attribute holding a PROXY header's origin or a forwarding header's client, in
+/// OpenTelemetry's name.
 pub const CLIENT_ADDRESS: &str = "client.address";
-/// The attribute holding the port of the origin a PROXY protocol header names.
+/// The attribute holding the port of a PROXY header's origin or a forwarding header's client.
 pub const CLIENT_PORT: &str = "client.port";
 
 /// [`PEER_ADDRESS`] and [`PEER_PORT`], interned once per process rather than per peer.
@@ -60,7 +61,8 @@ fn client_keys() -> (Symbol, Symbol) {
 }
 
 /// One address's attribute values, formatted once and cloned onto each event by [`Self::stamp`]:
-/// the socket peer's under `network.peer.*`, or a PROXY header's origin under `client.*`.
+/// the socket peer's under `network.peer.*`, or a PROXY header's origin or a forwarding header's
+/// client under `client.*`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PeerAttrs {
     /// The address and port attribute names.
