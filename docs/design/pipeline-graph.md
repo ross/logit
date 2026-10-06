@@ -692,7 +692,7 @@ A bare file name is under `crates/logit-pipeline/src/` or `crates/logit-inputs/s
 | `outputs/logit.rs`, `Output::flush` (`logit_out`) | `timeout(request_timeout, stream.shutdown())` on the pooled connection, once when the sink stops | The timeout firing drops a shutdown, possibly with `close_notify` part-written | The connection drops either way, and `logit_in` reads a close between frames, with or without `close_notify`, as the end of the connection. A grace cut can leave frames in flight on a pooled connection under a window above 1; `logit_in` reads and forwards them before the close (`docs/known-gaps/native-hop.md`, "A shutdown with a `logit_out` window in flight can count as dropped batches that `logit_in` then forwards") |
 | `outputs/datagram.rs`, `UnixDest::send_once` (`statsd_out`'s `transport: unix`) | `timeout(send_timeout, socket.send(datagram))` | The timeout firing drops a `send` that wrote nothing: a datagram send is all or nothing | The socket is reset, so the next send reconnects, and the send error reaches `send_datagrams`, which classifies it like any other send failure: `Fault::Clean` when nothing of the batch was sent, else `Fault::Ambiguous` |
 
-The table leaves out `logit-cli`'s signal wait (`shutdown_signal`) and admin server, which run
+The table leaves out `logit-cli`'s signal tasks (`crates/logit-cli/src/signals.rs`) and admin server, which run
 outside any node, and test code.
 
 ## Backpressure: diamonds are the normal shape now

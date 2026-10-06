@@ -369,7 +369,8 @@ decision record.
 
 - **Transport:** TCP, optionally TLS through `rustls`. `rustls` has no system OpenSSL to link,
   which keeps [ADR `containerized-development`](../adr/containerized-development.md)'s "no host
-  toolchain needed" property. QUIC isn't implemented.
+  toolchain needed" property. There's no other transport: no gRPC for L7 infrastructure, no
+  QUIC (`docs/known-gaps/native-hop.md`'s transport entry).
 - **Control frames.** A handshake or ack is an ordinary frame with
   [`FLAG_CONTROL`](../../crates/logit-proto/src/frame.rs) set in the header's `flags`. Its `codec`
   byte is meaningless, and its `compression` is always `none`: the messages are tiny, and
