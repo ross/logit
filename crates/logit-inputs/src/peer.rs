@@ -16,10 +16,17 @@
 //! accept loops both call it on a raw [`TcpStream`]. An HTTP listener builds a [`ConnectionPeer`]
 //! per connection: the sender its diagnostics name, and the attributes
 //! [`ConnectionAttrs::stamp_batches`] writes on every batch a request decodes into.
+//!
+//! Under `forwarded:`, [`ConnectionPeer::request`] reads one request's forwarding header, with
+//! `logit_proto::forwarded`, into a [`RequestPeer`] whose `client.*` replaces the connection's
+//! PROXY-derived pair for that request. It reads the request's headers, so a handler calls it
+//! before `into_body()` consumes the request. ADR `forwarded-header-parsing`'s "Precedence"
+//! section has the rules.
 
 use bytes::Bytes;
 use logit_core::interner::intern;
-use logit_core::{Event, EventBatch, Symbol, Value};
+use logit_core::{Diagnostics, Event, EventBatch, Symbol, Value};
+use logit_proto::forwarded::{self, ForwardedHeader};
 use logit_proto::proxy::{self, Origin, Parse};
 use std::fmt;
 use std::net::SocketAddr;
@@ -110,6 +117,16 @@ impl PeerAttrs {
         }
     }
 
+    /// A forwarding header's client as `client.address` and `client.port`, the address written
+    /// as [`Self::from_socket`] writes one. A header that names no port has no `client.port`.
+    fn forwarded_client(client: forwarded::Client) -> Self {
+        Self {
+            keys: client_keys(),
+            address: shared_str(client.address.to_canonical().to_string()),
+            port: client.port.map(|port| Value::I64(i64::from(port))),
+        }
+    }
+
     /// Writes this address onto every event in `events`, replacing a same-named attribute.
     pub fn stamp(&self, events: &mut [Event]) {
         let (address_key, port_key) = self.keys;
@@ -166,11 +183,22 @@ impl ConnectionAttrs {
 }
 
 /// One HTTP connection's sender, built once per connection: the socket peer its diagnostics name,
-/// stamped or not, and the [`ConnectionAttrs`] its requests' events carry.
+/// stamped or not, the [`ConnectionAttrs`] its requests' events carry, and the forwarding header
+/// each request is read for under `forwarded:`.
 #[derive(Debug, Clone)]
 pub struct ConnectionPeer {
     socket: SocketPeer,
     attrs: Option<ConnectionAttrs>,
+    /// Behind an `Arc` because some listeners clone the peer per request, and the off path
+    /// clones a `None`.
+    forwarded: Option<Arc<Forwarding>>,
+}
+
+/// `forwarded:`'s header, and the diagnostics an unusable one is counted on.
+#[derive(Debug)]
+struct Forwarding {
+    header: ForwardedHeader,
+    diag: Diagnostics,
 }
 
 /// The socket a connection came from, as diagnostic text names it.
@@ -187,13 +215,58 @@ impl ConnectionPeer {
         Self {
             socket: SocketPeer::Tcp(peer),
             attrs: ConnectionAttrs::for_connection(Some(peer), record_peer, origin),
+            forwarded: None,
         }
     }
 
     /// A connection accepted on the Unix socket at `listener`, stamped with `peer` when it's set.
     /// Diagnostics name the listener's path, written `unix:<path>`.
     pub fn unix(listener: Arc<Path>, peer: Option<PeerAttrs>) -> Self {
-        Self { socket: SocketPeer::Unix(listener), attrs: ConnectionAttrs::new(peer, None) }
+        Self {
+            socket: SocketPeer::Unix(listener),
+            attrs: ConnectionAttrs::new(peer, None),
+            forwarded: None,
+        }
+    }
+
+    /// Reads `header` on each of this connection's requests (`forwarded:` in config), counting
+    /// an unusable one as the throttled `forwarded` diagnostic on `diag`. `None` reads nothing.
+    pub fn with_forwarded(mut self, header: Option<ForwardedHeader>, diag: &Diagnostics) -> Self {
+        self.forwarded = header.map(|header| Arc::new(Forwarding { header, diag: diag.clone() }));
+        self
+    }
+
+    /// What one request's events carry. Without `forwarded:`, this connection's attributes.
+    /// With it, the first instance of the named header in `headers` is parsed: a client it
+    /// names replaces the connection's `client.*` for this request, and an unusable value
+    /// leaves them standing and counts the `forwarded` diagnostic. An absent header leaves them
+    /// standing and counts nothing.
+    pub fn request(&self, headers: &http::HeaderMap) -> RequestPeer<'_> {
+        let connection = self.attrs.as_ref();
+        let Some(forwarding) = &self.forwarded else {
+            return RequestPeer { connection, client: None };
+        };
+        // `get` returns the first instance of a repeated header.
+        let Some(value) = headers.get(forwarding.header.name()) else {
+            return RequestPeer { connection, client: None };
+        };
+        match forwarded::parse(forwarding.header, value.as_bytes()) {
+            Ok(client) => {
+                RequestPeer { connection, client: Some(PeerAttrs::forwarded_client(client)) }
+            }
+            Err(reason) => {
+                // The value itself is never written: it's whatever the sender put there.
+                forwarding.diag.clone().warn_throttled(
+                    "forwarded",
+                    format_args!(
+                        "the {} header from {self} names no client: {reason}; the request keeps \
+                         its connection's client.address and client.port",
+                        forwarding.header.name()
+                    ),
+                );
+                RequestPeer { connection, client: None }
+            }
+        }
     }
 
     /// The attributes this connection's events carry, or `None` when it stamps nothing.
@@ -205,6 +278,42 @@ impl ConnectionPeer {
     pub fn stamp_batches(&self, batches: &mut [EventBatch]) {
         if let Some(attrs) = &self.attrs {
             attrs.stamp_batches(batches);
+        }
+    }
+}
+
+/// What one request's events carry, from [`ConnectionPeer::request`].
+#[derive(Debug)]
+pub struct RequestPeer<'a> {
+    connection: Option<&'a ConnectionAttrs>,
+    /// A forwarding header's client, which replaces `connection`'s `client.*` as a pair.
+    client: Option<PeerAttrs>,
+}
+
+impl RequestPeer<'_> {
+    /// Stamps every event of every batch, each attribute replacing a same-named one. A forwarded
+    /// client takes the place of the connection's PROXY-derived `client.*`, which isn't stamped,
+    /// and one with no port removes a decoded `client.port`, so the address never sits beside
+    /// another source's port.
+    pub fn stamp_batches(&self, batches: &mut [EventBatch]) {
+        let Some(client) = &self.client else {
+            if let Some(attrs) = self.connection {
+                attrs.stamp_batches(batches);
+            }
+            return;
+        };
+        let peer = self.connection.and_then(|attrs| attrs.peer.as_ref());
+        let (_, port_key) = client.keys;
+        for batch in batches {
+            if let Some(peer) = peer {
+                peer.stamp(&mut batch.events);
+            }
+            client.stamp(&mut batch.events);
+            if client.port.is_none() {
+                for event in &mut batch.events {
+                    event.attributes.remove_sym(port_key);
+                }
+            }
         }
     }
 }
@@ -575,6 +684,136 @@ mod tests {
         let unix = ConnectionPeer::unix(Arc::from(Path::new("/run/trace.sock")), None);
         assert_eq!(unix.to_string(), "unix:/run/trace.sock");
         assert_eq!(unix.attrs(), None);
+    }
+
+    // ---- `forwarded:` --------------------------------------------------------------------------
+
+    /// A connection behind a PROXY header naming `198.51.100.7:40000`, with `peer:` on, reading
+    /// `header` on its requests, and the diagnostics it counts on.
+    fn forwarding_peer(header: Option<ForwardedHeader>) -> (ConnectionPeer, Diagnostics) {
+        let diag = Diagnostics::new("http");
+        let origin = Origin::Ip("198.51.100.7:40000".parse().unwrap());
+        let peer = ConnectionPeer::tcp("192.0.2.1:5000".parse().unwrap(), true, Some(&origin))
+            .with_forwarded(header, &diag);
+        (peer, diag)
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(*name, http::HeaderValue::from_static(value));
+        }
+        map
+    }
+
+    /// Stamps one request's two batches and returns their events' `client.*` and
+    /// `network.peer.address`, asserting every event agrees.
+    fn stamped(request: &RequestPeer<'_>) -> (Option<String>, Option<Value>, Option<String>) {
+        let mut decoded = event();
+        decoded.attributes.insert(CLIENT_PORT, Value::I64(1));
+        let mut batches = vec![batch(1), batch(0), batch(1)];
+        batches[0].events[0] = decoded;
+        request.stamp_batches(&mut batches);
+        let mut seen = batches.iter().flat_map(|b| &b.events).map(|event| {
+            (
+                str_attr(event, CLIENT_ADDRESS).map(str::to_owned),
+                event.attributes.get(CLIENT_PORT).cloned(),
+                str_attr(event, PEER_ADDRESS).map(str::to_owned),
+            )
+        });
+        let first = seen.next().expect("two stamped events");
+        assert_eq!(seen.next().as_ref(), Some(&first), "every event carries the same values");
+        first
+    }
+
+    #[test]
+    fn a_forwarded_header_with_a_port_replaces_both_client_attributes() {
+        let (peer, diag) = forwarding_peer(Some(ForwardedHeader::Forwarded));
+        let request = peer.request(&headers(&[("forwarded", r#"for="[2001:db8::1]:443""#)]));
+        let (address, port, socket) = stamped(&request);
+        assert_eq!(address.as_deref(), Some("2001:db8::1"));
+        assert_eq!(port, Some(Value::I64(443)));
+        assert_eq!(socket.as_deref(), Some("192.0.2.1"), "network.peer.* stays the socket peer");
+        assert_eq!(diag.occurrences("forwarded"), 0);
+    }
+
+    /// The pair rule: an address with no port never sits beside the PROXY origin's port, or one
+    /// the decoder wrote.
+    #[test]
+    fn a_header_without_a_port_removes_the_proxy_origins_port() {
+        let (peer, _diag) = forwarding_peer(Some(ForwardedHeader::XForwardedFor));
+        let request = peer.request(&headers(&[("x-forwarded-for", "203.0.113.9, 10.0.0.1")]));
+        let (address, port, socket) = stamped(&request);
+        assert_eq!(address.as_deref(), Some("203.0.113.9"));
+        assert_eq!(port, None);
+        assert_eq!(socket.as_deref(), Some("192.0.2.1"));
+    }
+
+    #[test]
+    fn an_unusable_header_leaves_the_proxy_origin_and_is_diagnosed() {
+        let (peer, diag) = forwarding_peer(Some(ForwardedHeader::XRealIp));
+        let request = peer.request(&headers(&[("x-real-ip", "unknown")]));
+        let (address, port, _) = stamped(&request);
+        assert_eq!(address.as_deref(), Some("198.51.100.7"));
+        assert_eq!(port, Some(Value::I64(40000)));
+        assert_eq!(diag.occurrences("forwarded"), 1);
+    }
+
+    #[test]
+    fn an_absent_header_leaves_the_proxy_origin_and_is_not_diagnosed() {
+        let (peer, diag) = forwarding_peer(Some(ForwardedHeader::XForwardedFor));
+        let request = peer.request(&headers(&[("x-real-ip", "203.0.113.9")]));
+        let (address, port, _) = stamped(&request);
+        assert_eq!(address.as_deref(), Some("198.51.100.7"));
+        assert_eq!(port, Some(Value::I64(40000)));
+        assert_eq!(diag.occurrences("forwarded"), 0);
+    }
+
+    /// With `forwarded:` unset, no header is read, whatever the request carries.
+    #[test]
+    fn no_configured_header_reads_nothing() {
+        let (peer, diag) = forwarding_peer(None);
+        let request = peer.request(&headers(&[
+            ("x-forwarded-for", "203.0.113.9"),
+            ("forwarded", "for=203.0.113.9"),
+            ("x-real-ip", "unknown"),
+        ]));
+        let (address, port, _) = stamped(&request);
+        assert_eq!(address.as_deref(), Some("198.51.100.7"));
+        assert_eq!(port, Some(Value::I64(40000)));
+        assert_eq!(diag.occurrences("forwarded"), 0);
+    }
+
+    #[test]
+    fn a_repeated_header_is_read_from_its_first_instance() {
+        let (peer, diag) = forwarding_peer(Some(ForwardedHeader::XForwardedFor));
+        let request = peer.request(&headers(&[
+            ("x-forwarded-for", "203.0.113.9"),
+            ("x-forwarded-for", "198.51.100.200"),
+        ]));
+        assert_eq!(stamped(&request).0.as_deref(), Some("203.0.113.9"));
+
+        let request = peer.request(&headers(&[
+            ("x-forwarded-for", "unknown"),
+            ("x-forwarded-for", "198.51.100.200"),
+        ]));
+        assert_eq!(stamped(&request).0.as_deref(), Some("198.51.100.7"), "the second is ignored");
+        assert_eq!(diag.occurrences("forwarded"), 1);
+    }
+
+    /// A connection with nothing of its own to stamp still stamps a forwarded client, and an
+    /// IPv4-mapped address is written as IPv4, as a socket peer is.
+    #[test]
+    fn a_forwarded_client_is_stamped_without_peer_or_proxy_protocol() {
+        let diag = Diagnostics::new("http");
+        let peer = ConnectionPeer::tcp("192.0.2.1:5000".parse().unwrap(), false, None)
+            .with_forwarded(Some(ForwardedHeader::XRealIp), &diag);
+        assert_eq!(peer.attrs(), None);
+        let request = peer.request(&headers(&[("x-real-ip", "::ffff:203.0.113.9")]));
+        let (address, port, socket) = stamped(&request);
+        assert_eq!(address.as_deref(), Some("203.0.113.9"));
+        assert_eq!(port, None);
+        assert_eq!(socket, None);
     }
 
     #[test]

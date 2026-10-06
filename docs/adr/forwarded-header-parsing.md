@@ -38,7 +38,8 @@ header the component reads. One parser in `logit-proto` serves all six.
 - **The first instance.** When a request carries the named header more than once, the first is
   read and the rest are ignored.
 - **The listeners read the request header.** gRPC metadata is HTTP/2 headers, so `otlp_in`'s gRPC
-  side reads it as its HTTP side does.
+  side reads it as its HTTP side does, and a request header arrives on every transport a listener
+  serves, so `datadog_trace_in` reads it on its Unix socket as well as its TCP port.
 - **`http_access` reads an attribute.** It reads `http.request.header.<name>`, the name being the
   lowercase header name (`x-forwarded-for`, `forwarded`, `x-real-ip`), or its dashed alias
   (`http-request-header-x-forwarded-for`). The fixed alias table carries the `x-forwarded-for`

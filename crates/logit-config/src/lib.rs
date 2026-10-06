@@ -1268,6 +1268,25 @@ pub enum ComponentKind {
         /// directly can send its own header and name any address as `client.address`.
         #[serde(default)]
         proxy_protocol: bool,
+        /// The forwarding header that names each request's client: `x_forwarded_for`
+        /// (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first
+        /// element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header
+        /// is read, even when another is present, and only its first instance. A gRPC request's
+        /// metadata is its headers, so `protocol: grpc` reads it the same way. A usable
+        /// address replaces `client.address` and `client.port` for that request as a pair, ahead of
+        /// the client a PROXY header names: the header's port, when it has one, becomes
+        /// `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY
+        /// header's client, if any, standing, and so does a value with no usable address
+        /// (`unknown`, an obfuscated name, anything that isn't an IP address), which is also
+        /// counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port`
+        /// always report the socket peer.
+        ///
+        /// Make the port reachable only through the proxy, and have the proxy overwrite the header
+        /// rather than append to one the client sent: any client that can connect to it directly,
+        /// or whose header the proxy keeps, can send its own header and name any address as
+        /// `client.address`.
+        #[serde(default)]
+        forwarded: Option<ForwardedHeader>,
     },
     /// A stand-in for Datadog's intake API: what a Datadog Agent's `dd_url`,
     /// `logs_config.logs_dd_url`, `apm_config.apm_dd_url`, or `additional_endpoints` point at.
@@ -1338,6 +1357,24 @@ pub enum ComponentKind {
         /// directly can send its own header and name any address as `client.address`.
         #[serde(default)]
         proxy_protocol: bool,
+        /// The forwarding header that names each request's client: `x_forwarded_for`
+        /// (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first
+        /// element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header
+        /// is read, even when another is present, and only its first instance. A usable
+        /// address replaces `client.address` and `client.port` for that request as a pair, ahead of
+        /// the client a PROXY header names: the header's port, when it has one, becomes
+        /// `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY
+        /// header's client, if any, standing, and so does a value with no usable address
+        /// (`unknown`, an obfuscated name, anything that isn't an IP address), which is also
+        /// counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port`
+        /// always report the socket peer.
+        ///
+        /// Make the port reachable only through the proxy, and have the proxy overwrite the header
+        /// rather than append to one the client sent: any client that can connect to it directly,
+        /// or whose header the proxy keeps, can send its own header and name any address as
+        /// `client.address`.
+        #[serde(default)]
+        forwarded: Option<ForwardedHeader>,
     },
     /// A stand-in for the Datadog Agent's APM receiver: what a dd-trace tracer sends its traces
     /// and client-computed stats to. Serves `/v0.3`, `/v0.4`, `/v0.5`, and `/v0.7/traces`
@@ -1430,6 +1467,25 @@ pub enum ComponentKind {
         /// directly can send its own header and name any address as `client.address`.
         #[serde(default)]
         proxy_protocol: bool,
+        /// The forwarding header that names each request's client: `x_forwarded_for`
+        /// (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first
+        /// element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header
+        /// is read, even when another is present, and only its first instance. It's read on `bind` and
+        /// `socket` connections alike. A usable
+        /// address replaces `client.address` and `client.port` for that request as a pair, ahead of
+        /// the client a PROXY header names: the header's port, when it has one, becomes
+        /// `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY
+        /// header's client, if any, standing, and so does a value with no usable address
+        /// (`unknown`, an obfuscated name, anything that isn't an IP address), which is also
+        /// counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port`
+        /// always report the socket peer.
+        ///
+        /// Make the port reachable only through the proxy, and have the proxy overwrite the header
+        /// rather than append to one the client sent: any client that can connect to it directly,
+        /// or whose header the proxy keeps, can send its own header and name any address as
+        /// `client.address`.
+        #[serde(default)]
+        forwarded: Option<ForwardedHeader>,
     },
     /// A stand-in for Splunk's HTTP Event Collector (HEC): what a HEC client's URL points at,
     /// such as Docker's `splunk` log driver, Splunk's logging libraries, the OpenTelemetry
@@ -1529,6 +1585,24 @@ pub enum ComponentKind {
         /// directly can send its own header and name any address as `client.address`.
         #[serde(default)]
         proxy_protocol: bool,
+        /// The forwarding header that names each request's client: `x_forwarded_for`
+        /// (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first
+        /// element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header
+        /// is read, even when another is present, and only its first instance. A usable
+        /// address replaces `client.address` and `client.port` for that request as a pair, ahead of
+        /// the client a PROXY header names: the header's port, when it has one, becomes
+        /// `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY
+        /// header's client, if any, standing, and so does a value with no usable address
+        /// (`unknown`, an obfuscated name, anything that isn't an IP address), which is also
+        /// counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port`
+        /// always report the socket peer.
+        ///
+        /// Make the port reachable only through the proxy, and have the proxy overwrite the header
+        /// rather than append to one the client sent: any client that can connect to it directly,
+        /// or whose header the proxy keeps, can send its own header and name any address as
+        /// `client.address`.
+        #[serde(default)]
+        forwarded: Option<ForwardedHeader>,
     },
     /// Tails one or more files as a log source, one line per event; rotation-, truncation-, and
     /// checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final
@@ -2772,6 +2846,25 @@ pub enum ComponentKind {
         /// directly can send its own header and name any address as `client.address`.
         #[serde(default)]
         proxy_protocol: bool,
+        /// The forwarding header that names each request's client: `x_forwarded_for`
+        /// (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first
+        /// element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header
+        /// is read, even when another is present, and only its first instance. A usable
+        /// address replaces `client.address` and `client.port` for that request as a pair, ahead of
+        /// the client a PROXY header names: the header's port, when it has one, becomes
+        /// `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY
+        /// header's client, if any, standing, and so does a value with no usable address
+        /// (`unknown`, an obfuscated name, anything that isn't an IP address), which is also
+        /// counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port`
+        /// always report the socket peer. Receiver mode only; a value alongside
+        /// `scrape_targets` is rejected.
+        ///
+        /// Make the port reachable only through the proxy, and have the proxy overwrite the header
+        /// rather than append to one the client sent: any client that can connect to it directly,
+        /// or whose header the proxy keeps, can send its own header and name any address as
+        /// `client.address`.
+        #[serde(default)]
+        forwarded: Option<ForwardedHeader>,
     },
     /// A synthetic event source for load testing. No socket and no decoder: it renders a
     /// declarative `event:` template as fast as `count`/`rate` allow, so a scenario measures the
@@ -6160,6 +6253,7 @@ mod tests {
                 max_connections,
                 peer,
                 proxy_protocol,
+                forwarded,
             } => {
                 assert_eq!(bind, "0.0.0.0:4317");
                 assert_eq!(protocol, OtlpProtocol::Grpc);
@@ -6169,6 +6263,7 @@ mod tests {
                 assert_eq!(max_connections, default_max_connections());
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
+                assert_eq!(forwarded, None, "opt-in -- no forwarding header unless asked for");
             }
             other => panic!("expected OtlpIn, got {other:?}"),
         }
@@ -6282,10 +6377,12 @@ mod tests {
                 socket_mode,
                 peer,
                 proxy_protocol,
+                forwarded,
             } => {
                 assert_eq!(socket_mode, None);
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
+                assert_eq!(forwarded, None, "opt-in -- no forwarding header unless asked for");
                 assert_eq!(bind.as_deref(), Some("127.0.0.1:8126"));
                 assert_eq!(socket.as_deref(), Some("/var/run/datadog/apm.socket"));
                 assert_eq!(tls, None);
@@ -6321,6 +6418,7 @@ mod tests {
                 max_connections,
                 peer,
                 proxy_protocol,
+                forwarded,
             } => {
                 assert_eq!(bind, "0.0.0.0:8088");
                 assert_eq!(tls, None);
@@ -6333,6 +6431,7 @@ mod tests {
                 assert_eq!(max_connections, default_max_connections());
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
+                assert_eq!(forwarded, None, "opt-in -- no forwarding header unless asked for");
             }
             other => panic!("expected SplunkHecIn, got {other:?}"),
         }
@@ -7604,10 +7703,12 @@ mod tests {
                 metadata_cache,
                 peer,
                 proxy_protocol,
+                forwarded,
             } => {
                 assert_eq!(max_connections, default_max_connections());
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
+                assert_eq!(forwarded, None, "opt-in -- no forwarding header unless asked for");
                 assert_eq!(scrape_targets, vec!["http://node-exporter:9100/metrics".to_string()]);
                 assert_eq!(interval, Duration::from_secs(15));
                 assert_eq!(timeout, Duration::from_secs(10));

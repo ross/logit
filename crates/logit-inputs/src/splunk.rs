@@ -18,7 +18,9 @@
 //! and `respond` stamps it on every batch a request decodes into before any is delivered, since a
 //! code 6 can follow a delivered prefix. The PROXY header is read right after the permit, before
 //! the TLS accept or the first-byte peek, with `otlp_in`'s rejection, counting, and health-check
-//! rules (`crate::otlp`'s "Sender address").
+//! rules (`crate::otlp`'s "Sender address"). Under `forwarded:` ([`SplunkHecInput::with_forwarded`]),
+//! each request's forwarding header replaces the PROXY origin's `client.*` for that request, per
+//! ADR `forwarded-header-parsing`.
 //!
 //! # Routes
 //!
@@ -156,6 +158,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::Fanout;
+use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::splunk::response::{
     encode_ack_reply, encode_http_error, encode_status, encode_success, parse_ack_request,
 };
@@ -232,6 +235,8 @@ pub struct SplunkHecInput {
     peer: bool,
     /// `proxy_protocol:` in config. See [`Self::with_proxy_protocol`].
     proxy_protocol: bool,
+    /// `forwarded:` in config. See [`Self::with_forwarded`].
+    forwarded: Option<ForwardedHeader>,
 }
 
 impl SplunkHecInput {
@@ -253,6 +258,7 @@ impl SplunkHecInput {
             max_pending_acks: DEFAULT_MAX_PENDING_ACKS,
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -362,6 +368,13 @@ impl SplunkHecInput {
         self.proxy_protocol = proxy_protocol;
         self
     }
+
+    /// Reads the client from `header` on every request (`forwarded:` in config), per
+    /// [`ConnectionPeer::request`]. Off by default.
+    pub fn with_forwarded(mut self, header: Option<ForwardedHeader>) -> Self {
+        self.forwarded = header;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -421,6 +434,7 @@ impl Input for SplunkHecInput {
             let tls_acceptor = tls_acceptor.clone();
             let live_connections = live_connections.clone();
             let (record_peer, proxy_protocol) = (self.peer, self.proxy_protocol);
+            let forwarded = self.forwarded;
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
 
@@ -455,7 +469,8 @@ impl Input for SplunkHecInput {
                     busy_after,
                     acks,
                     health,
-                    peer: ConnectionPeer::tcp(peer, record_peer, origin.as_ref()),
+                    peer: ConnectionPeer::tcp(peer, record_peer, origin.as_ref())
+                        .with_forwarded(forwarded, &diag),
                 });
 
                 let result = match tls_acceptor {
@@ -916,6 +931,7 @@ async fn respond(
         return (name, REJECTED, reject(shared, "no_channel", Some(message), response));
     }
 
+    let request_peer = shared.peer.request(req.headers());
     let body = match collect_with_stall_bound(Limited::new(req.into_body(), cap), stall).await {
         Ok(body) => body,
         // `otlp_in`'s `408`: the client's clock, not its size, and the connection closes once
@@ -1013,7 +1029,7 @@ async fn respond(
 
     // Every batch, before the first is delivered: the split below delivers a prefix that a code 6
     // or a closed consumer can follow.
-    shared.peer.stamp_batches(&mut batches);
+    request_peer.stamp_batches(&mut batches);
     if !batches.is_empty() {
         // Only the first batch waits under the deadline: once one is delivered, a `503` would
         // tell the client nothing was taken, and its retry would deliver that batch twice.
@@ -2321,9 +2337,16 @@ mod tests {
 
     /// The HTTP/1.1 `/event` request carrying `body`, `Connection: close`.
     fn event_request(host: &str, body: &[u8]) -> Vec<u8> {
+        event_request_with(host, body, &[])
+    }
+
+    /// [`event_request`], with `headers` added.
+    fn event_request_with(host: &str, body: &[u8], headers: &[(&str, &str)]) -> Vec<u8> {
+        let extra: String =
+            headers.iter().map(|(name, value)| format!("{name}: {value}\r\n")).collect();
         let mut wire = format!(
             "POST /services/collector/event HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\
-             Connection: close\r\n\r\n",
+             Connection: close\r\n{extra}\r\n",
             body.len()
         )
         .into_bytes();
@@ -2334,10 +2357,20 @@ mod tests {
     /// Connects, writes `prefix`, then `body` to `/event`. Returns the response and the client's
     /// local port.
     async fn post_events_after(addr: &str, prefix: &[u8], body: &[u8]) -> (String, u16) {
+        post_events_with(addr, prefix, body, &[]).await
+    }
+
+    /// [`post_events_after`], with `headers` added to the request.
+    async fn post_events_with(
+        addr: &str,
+        prefix: &[u8],
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> (String, u16) {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let port = stream.local_addr().unwrap().port();
         let mut wire = prefix.to_vec();
-        wire.extend_from_slice(&event_request(addr, body));
+        wire.extend_from_slice(&event_request_with(addr, body, headers));
         // Unchecked: a connection refused at the cap may already be closed, and then the
         // response is empty.
         let _ = stream.write_all(&wire).await;
@@ -2348,6 +2381,15 @@ mod tests {
         )
         .await;
         (String::from_utf8_lossy(&buf).into_owned(), port)
+    }
+
+    /// [`post_events_with`] with [`TWO_ENVELOPES`].
+    async fn post_two_envelopes_with(
+        addr: &str,
+        prefix: &[u8],
+        headers: &[(&str, &str)],
+    ) -> (String, u16) {
+        post_events_with(addr, prefix, TWO_ENVELOPES, headers).await
     }
 
     fn str_attr<'a>(event: &'a logit_core::Event, key: &str) -> Option<&'a str> {
@@ -2548,5 +2590,112 @@ mod tests {
         assert_eq!(running.diag.occurrences("connection_error"), 0);
         assert_eq!(running.diag.occurrences("proxy_header"), 0);
         assert_eq!(running.probe.sum(CONNECTIONS_REJECTED, &[("reason", "proxy_header")]), 0.0);
+    }
+
+    // ---- sender address: `forwarded:` ---------------------------------------------------------
+
+    /// The two batches the request decodes into, each event carrying `client.address`
+    /// `address` and `client.port` `port`, absent where `None`.
+    async fn expect_forwarded_client(
+        rx: &mut mpsc::Receiver<logit_pipeline::Delivered>,
+        address: Option<&str>,
+        port: Option<i64>,
+        case: &str,
+    ) {
+        for _ in 0..2 {
+            let batch = logit_pipeline::test_util::recv_batch(rx).await;
+            assert!(!batch.events.is_empty());
+            for event in &batch.events {
+                assert_eq!(str_attr(event, "client.address"), address, "{case}");
+                let expected = port.map(logit_core::Value::I64);
+                assert_eq!(event.attributes.get("client.port"), expected.as_ref(), "{case}");
+            }
+        }
+    }
+
+    /// One request per case, on a fresh listener with `forwarded:` and `proxy_protocol:` as
+    /// given: what `client.*` reads, and how many `forwarded` diagnostics it counted. The PROXY
+    /// header, when on, names 203.0.113.5:41000.
+    #[tokio::test]
+    async fn forwarded_reads_the_named_header() {
+        use ForwardedHeader::{Forwarded, XForwardedFor, XRealIp};
+        type Case = (
+            Option<ForwardedHeader>,
+            bool,
+            &'static [(&'static str, &'static str)],
+            Option<&'static str>,
+            Option<i64>,
+            u64,
+        );
+        let cases: [Case; 7] = [
+            (
+                Some(XForwardedFor),
+                false,
+                &[("X-Forwarded-For", "203.0.113.9, 10.0.0.1")],
+                Some("203.0.113.9"),
+                None,
+                0,
+            ),
+            (
+                Some(Forwarded),
+                false,
+                &[("Forwarded", r#"for="[2001:db8::1]:443""#)],
+                Some("2001:db8::1"),
+                Some(443),
+                0,
+            ),
+            (Some(XRealIp), false, &[("X-Real-IP", "203.0.113.9")], Some("203.0.113.9"), None, 0),
+            // Absent: the PROXY origin stands, quietly.
+            (Some(XForwardedFor), true, &[], Some("203.0.113.5"), Some(41000), 0),
+            // Unusable: the PROXY origin stands, diagnosed.
+            (
+                Some(XForwardedFor),
+                true,
+                &[("X-Forwarded-For", "unknown")],
+                Some("203.0.113.5"),
+                Some(41000),
+                1,
+            ),
+            // Only the named header is read.
+            (Some(XRealIp), false, &[("X-Forwarded-For", "203.0.113.9")], None, None, 0),
+            // Off: nothing is read.
+            (None, false, &[("X-Forwarded-For", "203.0.113.9")], None, None, 0),
+        ];
+        for (forwarded, proxy, headers, address, port, diagnosed) in cases {
+            let case = format!("{forwarded:?} proxy {proxy} {headers:?}");
+            let mut running = sender_input(false, proxy, |i| i.with_forwarded(forwarded)).await;
+            let prefix = if proxy { v2_ipv4_header() } else { Vec::new() };
+            let (response, _) = post_two_envelopes_with(&running.addr, &prefix, headers).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{case}: {response}");
+            expect_forwarded_client(&mut running.rx, address, port, &case).await;
+            assert_eq!(running.diag.occurrences("forwarded"), diagnosed, "{case}");
+        }
+    }
+
+    /// An L4 proxy in front of an L7 one: the PROXY header names the L7 proxy and its ephemeral
+    /// port, `X-Forwarded-For` names the client, and the client's address goes out with no port
+    /// at all. `network.peer.*` stays the socket.
+    #[tokio::test]
+    async fn a_forwarding_header_replaces_the_proxy_origin_as_a_pair() {
+        let mut running =
+            sender_input(true, true, |i| i.with_forwarded(Some(ForwardedHeader::XForwardedFor)))
+                .await;
+        let headers = [("X-Forwarded-For", "203.0.113.9")];
+        let (response, port) =
+            post_two_envelopes_with(&running.addr, &v2_ipv4_header(), &headers).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        for _ in 0..2 {
+            let batch = logit_pipeline::test_util::recv_batch(&mut running.rx).await;
+            assert!(!batch.events.is_empty());
+            for event in &batch.events {
+                assert_eq!(str_attr(event, "client.address"), Some("203.0.113.9"));
+                assert_eq!(event.attributes.get("client.port"), None);
+                assert_eq!(str_attr(event, "network.peer.address"), Some("127.0.0.1"));
+                assert_eq!(
+                    event.attributes.get("network.peer.port"),
+                    Some(&logit_core::Value::I64(i64::from(port)))
+                );
+            }
+        }
     }
 }

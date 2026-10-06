@@ -973,7 +973,10 @@ built on the shared socket drivers ([ADR `listener-peer-address`](adr/listener-p
 `logit_in` takes neither field. `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and
 `prometheus_in`'s remote-write receiver take both; `datadog_trace_in`'s `proxy_protocol:` applies to
 its `bind:` listener only, and on `prometheus_in` both are receiver-mode fields, rejected beside
-`scrape_targets:`.
+`scrape_targets:`. Those five HTTP listeners also take `forwarded: x_forwarded_for | forwarded |
+x_real_ip`, which reads each request's client from the forwarding header an L7 proxy sets, ahead
+of a PROXY header's client; [ADR `forwarded-header-parsing`](adr/forwarded-header-parsing.md) has
+the rules.
 
 **What `peer:` writes.** The address is a string in its standard text form, and the port is an
 integer. An IPv4-mapped IPv6 address is written as IPv4, so a sender reads the same on a

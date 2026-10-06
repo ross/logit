@@ -429,7 +429,9 @@ Per pair:
   header (`logit_proto::proxy`, a fuzz target) ahead of any TLS and stamps the origin it names as
   `client.address`/`client.port`. No `Decoder` sees a peer. The five HTTP listeners (`otlp_in`,
   `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver)
-  take both fields too; `logit_in` records none
+  take both fields too, plus `forwarded:`, which stamps a request's `client.*` pair from one named
+  forwarding header ahead of the PROXY origin
+  ([ADR `forwarded-header-parsing`](docs/adr/forwarded-header-parsing.md)); `logit_in` records none
   ([ADR `listener-peer-address`](docs/adr/listener-peer-address.md)).
 
 ### Native wire format and transport

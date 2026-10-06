@@ -560,6 +560,7 @@ fn build_spec(
             max_connections,
             peer,
             proxy_protocol,
+            forwarded,
         } => {
             let mut input = OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -570,7 +571,8 @@ fn build_spec(
                 .with_idle_timeout(*idle_timeout)
                 .with_max_connections(*max_connections)
                 .with_peer(*peer)
-                .with_proxy_protocol(*proxy_protocol);
+                .with_proxy_protocol(*proxy_protocol)
+                .with_forwarded(forwarded.map(to_forwarded_header));
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -585,6 +587,7 @@ fn build_spec(
             max_connections,
             peer,
             proxy_protocol,
+            forwarded,
         } => {
             let mut input = DatadogInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -595,6 +598,7 @@ fn build_spec(
                 .with_max_connections(*max_connections)
                 .with_peer(*peer)
                 .with_proxy_protocol(*proxy_protocol)
+                .with_forwarded(forwarded.map(to_forwarded_header))
                 .with_api_keys(api_keys.clone());
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
@@ -613,6 +617,7 @@ fn build_spec(
             max_connections,
             peer,
             proxy_protocol,
+            forwarded,
         } => {
             let mut input = SplunkHecInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -623,6 +628,7 @@ fn build_spec(
                 .with_max_connections(*max_connections)
                 .with_peer(*peer)
                 .with_proxy_protocol(*proxy_protocol)
+                .with_forwarded(forwarded.map(to_forwarded_header))
                 .with_tokens(tokens.clone())
                 // Saturates on a 32-bit target: a cap past the address space is no cap.
                 .with_max_request_bytes(usize::try_from(*max_request_bytes).unwrap_or(usize::MAX))
@@ -644,6 +650,7 @@ fn build_spec(
             max_connections,
             peer,
             proxy_protocol,
+            forwarded,
         } => {
             let mut input = DatadogTraceInput::new()
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -653,7 +660,8 @@ fn build_spec(
                 .with_idle_timeout(*idle_timeout)
                 .with_max_connections(*max_connections)
                 .with_peer(*peer)
-                .with_proxy_protocol(*proxy_protocol);
+                .with_proxy_protocol(*proxy_protocol)
+                .with_forwarded(forwarded.map(to_forwarded_header));
             if let Some(bind) = bind {
                 input = input.with_bind(bind.clone());
             }
@@ -685,6 +693,7 @@ fn build_spec(
             metadata_cache,
             peer,
             proxy_protocol,
+            forwarded,
         } => {
             let input: Box<dyn Input + Send> = match bind {
                 Some(bind) => {
@@ -695,6 +704,7 @@ fn build_spec(
                         .with_max_connections(*max_connections)
                         .with_peer(*peer)
                         .with_proxy_protocol(*proxy_protocol)
+                        .with_forwarded(forwarded.map(to_forwarded_header))
                         // Unconditional: the receiver reads `max_families: 0` as off, and rule 55
                         // rejects a zero `ttl`.
                         .with_metadata_cache(metadata_cache.max_families, metadata_cache.ttl);
@@ -2534,6 +2544,7 @@ mod tests {
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
                     proxy_protocol: false,
+                    forwarded: None,
                 },
             };
             assert!(
@@ -2605,6 +2616,7 @@ mod tests {
                 metadata_cache: logit_config::MetadataCacheConfig::default(),
                 peer: false,
                 proxy_protocol: false,
+                forwarded: None,
             },
         };
         assert!(matches!(
@@ -2636,6 +2648,7 @@ mod tests {
                 metadata_cache: logit_config::MetadataCacheConfig::default(),
                 peer: false,
                 proxy_protocol: false,
+                forwarded: None,
             },
         };
         assert!(matches!(
@@ -3057,6 +3070,7 @@ mod tests {
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
                 proxy_protocol: false,
+                forwarded: None,
             },
         };
         assert!(matches!(
@@ -3316,6 +3330,7 @@ mod tests {
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
                 proxy_protocol: false,
+                forwarded: None,
             },
         };
         let spec = build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0;
@@ -3528,6 +3543,7 @@ mod tests {
             max_connections: 1,
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         };
         let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
 
@@ -3758,6 +3774,7 @@ mod tests {
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
                 proxy_protocol: false,
+                forwarded: None,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;

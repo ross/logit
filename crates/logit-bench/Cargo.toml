@@ -50,6 +50,8 @@ divan = "0.1"
 tikv-jemallocator = "0.6"
 tokio.workspace = true
 async-trait.workspace = true
+# The request headers `forwarded:` reads, for its allocation pin.
+http.workspace = true
 anyhow.workspace = true
 
 [[bench]]

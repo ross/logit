@@ -172,7 +172,9 @@
 //! rules (`crate::otlp`'s "Sender address"). The Unix socket never reads a header, and graph rule
 //! 79 rejects `proxy_protocol:` without `bind`. Under `peer:` a Unix client that bound a path is
 //! stamped with that path and no port, as on the shared drivers' `unix_stream`; an unbound
-//! client, the usual tracer, is stamped with nothing.
+//! client, the usual tracer, is stamped with nothing. Under `forwarded:`
+//! ([`DatadogTraceInput::with_forwarded`]), each request's forwarding header, on either listener,
+//! replaces the PROXY origin's `client.*` for that request, per ADR `forwarded-header-parsing`.
 //!
 //! # Telemetry
 //!
@@ -212,6 +214,7 @@ use logit_proto::datadog::{
     RESOURCE_ATTR_TRACER_CONTAINER_ID, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
     RESOURCE_ATTR_TRACER_VERSION, TRACER_STR_HEADERS, TRACER_U64_HEADERS,
 };
+use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::msgpack::{Reader, Type};
 use logit_proto::CodecError;
 use std::future::Future;
@@ -277,6 +280,8 @@ pub struct DatadogTraceInput {
     peer: bool,
     /// `proxy_protocol:` in config. See [`Self::with_proxy_protocol`].
     proxy_protocol: bool,
+    /// `forwarded:` in config. See [`Self::with_forwarded`].
+    forwarded: Option<ForwardedHeader>,
 }
 
 impl Default for DatadogTraceInput {
@@ -304,6 +309,7 @@ impl DatadogTraceInput {
             busy_after: BUSY_AFTER,
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -400,6 +406,13 @@ impl DatadogTraceInput {
         self.proxy_protocol = proxy_protocol;
         self
     }
+
+    /// Reads the client from `header` on every request, on both listeners (`forwarded:` in
+    /// config), per [`ConnectionPeer::request`]. Off by default.
+    pub fn with_forwarded(mut self, header: Option<ForwardedHeader>) -> Self {
+        self.forwarded = header;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -448,6 +461,7 @@ impl Input for DatadogTraceInput {
             info: Bytes::from(info_document(receiver_port, &receiver_socket, self.max_connections)),
             record_peer: self.peer,
             proxy_protocol: self.proxy_protocol,
+            forwarded: self.forwarded,
         });
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
         let socket_path: Option<Arc<Path>> = self.socket.as_deref().map(Arc::from);
@@ -491,6 +505,8 @@ struct AcceptContext {
     record_peer: bool,
     /// `proxy_protocol:` in config, read on the TCP listener only.
     proxy_protocol: bool,
+    /// `forwarded:` in config, read on both listeners.
+    forwarded: Option<ForwardedHeader>,
 }
 
 impl AcceptContext {
@@ -511,7 +527,7 @@ impl AcceptContext {
             diag: self.diag.clone(),
             busy_after: self.busy_after,
             info: self.info.clone(),
-            peer,
+            peer: peer.with_forwarded(self.forwarded, &self.diag),
         })
     }
 
@@ -975,7 +991,7 @@ async fn respond(
     } else {
         apply_stats_headers(&mut batch, &parts.headers);
     }
-    shared.peer.stamp_batches(std::slice::from_mut(&mut batch));
+    shared.peer.request(&parts.headers).stamp_batches(std::slice::from_mut(&mut batch));
     let success = success(route, &parts.headers);
     if batch.events.is_empty() {
         return (name, OK, success);
@@ -2169,10 +2185,17 @@ mod tests {
 
     /// The HTTP/1.1 request carrying a two-trace v0.4 body, `Connection: close`.
     fn traces_request(host: &str) -> Vec<u8> {
+        traces_request_with(host, &[])
+    }
+
+    /// [`traces_request`], with `headers` added.
+    fn traces_request_with(host: &str, headers: &[(&str, &str)]) -> Vec<u8> {
         let body = v04(2);
+        let extra: String =
+            headers.iter().map(|(name, value)| format!("{name}: {value}\r\n")).collect();
         let mut wire = format!(
             "PUT /v0.4/traces HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n{MSGPACK}\
-             Connection: close\r\n\r\n",
+             Connection: close\r\n{extra}\r\n",
             body.len()
         )
         .into_bytes();
@@ -2183,10 +2206,15 @@ mod tests {
     /// Connects, writes `prefix`, then the two-trace request. Returns the response and the
     /// client's local port.
     async fn put_traces_after(addr: &str, prefix: &[u8]) -> (String, u16) {
+        put_traces_with(addr, prefix, &[]).await
+    }
+
+    /// [`put_traces_after`], with `headers` added to the request.
+    async fn put_traces_with(addr: &str, prefix: &[u8], headers: &[(&str, &str)]) -> (String, u16) {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let port = stream.local_addr().unwrap().port();
         let mut wire = prefix.to_vec();
-        wire.extend_from_slice(&traces_request(addr));
+        wire.extend_from_slice(&traces_request_with(addr, headers));
         // Unchecked: a connection refused at the cap may already be closed, and then the
         // response is empty.
         let _ = stream.write_all(&wire).await;
@@ -2422,5 +2450,111 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
         let client_path = client_path.to_str().unwrap();
         expect_stamped_batch(&mut running.rx, Some((client_path, None)), None).await;
+    }
+
+    // ---- sender address: `forwarded:` ---------------------------------------------------------
+
+    /// The one batch the request decodes into, each event carrying `client.address`
+    /// `address` and `client.port` `port`, absent where `None`.
+    async fn expect_forwarded_client(
+        rx: &mut mpsc::Receiver<logit_pipeline::Delivered>,
+        address: Option<&str>,
+        port: Option<i64>,
+        case: &str,
+    ) {
+        for _ in 0..1 {
+            let batch = logit_pipeline::test_util::recv_batch(rx).await;
+            assert!(!batch.events.is_empty());
+            for event in &batch.events {
+                assert_eq!(str_attr(event, "client.address"), address, "{case}");
+                let expected = port.map(logit_core::Value::I64);
+                assert_eq!(event.attributes.get("client.port"), expected.as_ref(), "{case}");
+            }
+        }
+    }
+
+    /// One request per case, on a fresh listener with `forwarded:` and `proxy_protocol:` as
+    /// given: what `client.*` reads, and how many `forwarded` diagnostics it counted. The PROXY
+    /// header, when on, names 203.0.113.5:41000.
+    #[tokio::test]
+    async fn forwarded_reads_the_named_header() {
+        use ForwardedHeader::{Forwarded, XForwardedFor, XRealIp};
+        type Case = (
+            Option<ForwardedHeader>,
+            bool,
+            &'static [(&'static str, &'static str)],
+            Option<&'static str>,
+            Option<i64>,
+            u64,
+        );
+        let cases: [Case; 7] = [
+            (
+                Some(XForwardedFor),
+                false,
+                &[("X-Forwarded-For", "203.0.113.9, 10.0.0.1")],
+                Some("203.0.113.9"),
+                None,
+                0,
+            ),
+            (
+                Some(Forwarded),
+                false,
+                &[("Forwarded", r#"for="[2001:db8::1]:443""#)],
+                Some("2001:db8::1"),
+                Some(443),
+                0,
+            ),
+            (Some(XRealIp), false, &[("X-Real-IP", "203.0.113.9")], Some("203.0.113.9"), None, 0),
+            // Absent: the PROXY origin stands, quietly.
+            (Some(XForwardedFor), true, &[], Some("203.0.113.5"), Some(41000), 0),
+            // Unusable: the PROXY origin stands, diagnosed.
+            (
+                Some(XForwardedFor),
+                true,
+                &[("X-Forwarded-For", "unknown")],
+                Some("203.0.113.5"),
+                Some(41000),
+                1,
+            ),
+            // Only the named header is read.
+            (Some(XRealIp), false, &[("X-Forwarded-For", "203.0.113.9")], None, None, 0),
+            // Off: nothing is read.
+            (None, false, &[("X-Forwarded-For", "203.0.113.9")], None, None, 0),
+        ];
+        for (forwarded, proxy, headers, address, port, diagnosed) in cases {
+            let case = format!("{forwarded:?} proxy {proxy} {headers:?}");
+            let mut running = sender_input(false, proxy, |i| i.with_forwarded(forwarded)).await;
+            let prefix = if proxy { v2_ipv4_header() } else { Vec::new() };
+            let (response, _) = put_traces_with(&running.addr, &prefix, headers).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{case}: {response}");
+            expect_forwarded_client(&mut running.rx, address, port, &case).await;
+            assert_eq!(running.diag.occurrences("forwarded"), diagnosed, "{case}");
+        }
+    }
+
+    /// An L4 proxy in front of an L7 one: the PROXY header names the L7 proxy and its ephemeral
+    /// port, `X-Forwarded-For` names the client, and the client's address goes out with no port
+    /// at all. `network.peer.*` stays the socket.
+    #[tokio::test]
+    async fn a_forwarding_header_replaces_the_proxy_origin_as_a_pair() {
+        let mut running =
+            sender_input(true, true, |i| i.with_forwarded(Some(ForwardedHeader::XForwardedFor)))
+                .await;
+        let headers = [("X-Forwarded-For", "203.0.113.9")];
+        let (response, port) = put_traces_with(&running.addr, &v2_ipv4_header(), &headers).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        for _ in 0..1 {
+            let batch = logit_pipeline::test_util::recv_batch(&mut running.rx).await;
+            assert!(!batch.events.is_empty());
+            for event in &batch.events {
+                assert_eq!(str_attr(event, "client.address"), Some("203.0.113.9"));
+                assert_eq!(event.attributes.get("client.port"), None);
+                assert_eq!(str_attr(event, "network.peer.address"), Some("127.0.0.1"));
+                assert_eq!(
+                    event.attributes.get("network.peer.port"),
+                    Some(&logit_core::Value::I64(i64::from(port)))
+                );
+            }
+        }
     }
 }

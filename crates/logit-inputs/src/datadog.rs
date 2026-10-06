@@ -18,7 +18,9 @@
 //! [`DatadogInput::with_proxy_protocol`]), each connection task builds one [`ConnectionPeer`], and
 //! `respond` stamps it on every batch a request decodes into, before delivery. The PROXY header is
 //! read right after the permit, before the TLS accept or the first-byte peek, with `otlp_in`'s
-//! rejection, counting, and health-check rules (`crate::otlp`'s "Sender address").
+//! rejection, counting, and health-check rules (`crate::otlp`'s "Sender address"). Under
+//! `forwarded:` ([`DatadogInput::with_forwarded`]), each request's forwarding header replaces the
+//! PROXY origin's `client.*` for that request, per ADR `forwarded-header-parsing`.
 //!
 //! # Routes
 //!
@@ -147,6 +149,7 @@ use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::Fanout;
 use logit_proto::datadog::DatadogDecoder;
+use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::CodecError;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -206,6 +209,8 @@ pub struct DatadogInput {
     peer: bool,
     /// `proxy_protocol:` in config. See [`Self::with_proxy_protocol`].
     proxy_protocol: bool,
+    /// `forwarded:` in config. See [`Self::with_forwarded`].
+    forwarded: Option<ForwardedHeader>,
 }
 
 impl DatadogInput {
@@ -223,6 +228,7 @@ impl DatadogInput {
             busy_after: BUSY_AFTER,
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -307,6 +313,13 @@ impl DatadogInput {
         self.proxy_protocol = proxy_protocol;
         self
     }
+
+    /// Reads the client from `header` on every request (`forwarded:` in config), per
+    /// [`ConnectionPeer::request`]. Off by default.
+    pub fn with_forwarded(mut self, header: Option<ForwardedHeader>) -> Self {
+        self.forwarded = header;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -363,6 +376,7 @@ impl Input for DatadogInput {
             let tls_acceptor = tls_acceptor.clone();
             let live_connections = live_connections.clone();
             let (record_peer, proxy_protocol) = (self.peer, self.proxy_protocol);
+            let forwarded = self.forwarded;
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
 
@@ -394,7 +408,8 @@ impl Input for DatadogInput {
                     diag: diag.clone(),
                     api_keys,
                     busy_after,
-                    peer: ConnectionPeer::tcp(peer, record_peer, origin.as_ref()),
+                    peer: ConnectionPeer::tcp(peer, record_peer, origin.as_ref())
+                        .with_forwarded(forwarded, &diag),
                 });
 
                 let result = match tls_acceptor {
@@ -688,6 +703,7 @@ async fn respond(
         }
     };
     let protobuf = route == Route::SeriesV2 && media_type(req.headers()) == MediaType::Protobuf;
+    let request_peer = shared.peer.request(req.headers());
 
     let body =
         match collect_with_stall_bound(Limited::new(req.into_body(), MAX_REQUEST_BYTES), stall)
@@ -778,7 +794,7 @@ async fn respond(
         }
         return (name, OK, route.success());
     }
-    shared.peer.stamp_batches(&mut batches);
+    request_peer.stamp_batches(&mut batches);
 
     match deliver_with_deadline(&shared.sink, batches, shared.busy_after).await {
         Ok(()) => (name, OK, route.success()),
@@ -1513,10 +1529,17 @@ mod tests {
 
     /// The HTTP/1.1 request carrying [`two_client_stats_payload`], `Connection: close`.
     fn stats_request(host: &str) -> Vec<u8> {
+        stats_request_with(host, &[])
+    }
+
+    /// [`stats_request`], with `headers` added.
+    fn stats_request_with(host: &str, headers: &[(&str, &str)]) -> Vec<u8> {
         let body = two_client_stats_payload();
+        let extra: String =
+            headers.iter().map(|(name, value)| format!("{name}: {value}\r\n")).collect();
         let mut wire = format!(
             "POST /api/v0.2/stats HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\
-             Content-Type: application/msgpack\r\nConnection: close\r\n\r\n",
+             Content-Type: application/msgpack\r\nConnection: close\r\n{extra}\r\n",
             body.len()
         )
         .into_bytes();
@@ -1527,10 +1550,15 @@ mod tests {
     /// Connects, writes `prefix`, then the two-payload stats request. Returns the response and
     /// the client's local port.
     async fn post_stats_after(addr: &str, prefix: &[u8]) -> (String, u16) {
+        post_stats_with(addr, prefix, &[]).await
+    }
+
+    /// [`post_stats_after`], with `headers` added to the request.
+    async fn post_stats_with(addr: &str, prefix: &[u8], headers: &[(&str, &str)]) -> (String, u16) {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let port = stream.local_addr().unwrap().port();
         let mut wire = prefix.to_vec();
-        wire.extend_from_slice(&stats_request(addr));
+        wire.extend_from_slice(&stats_request_with(addr, headers));
         // Unchecked: a connection refused at the cap may already be closed, and then the
         // response is empty.
         let _ = stream.write_all(&wire).await;
@@ -1725,5 +1753,111 @@ mod tests {
         assert_eq!(running.diag.occurrences("connection_error"), 0);
         assert_eq!(running.diag.occurrences("proxy_header"), 0);
         assert_eq!(running.probe.sum(CONNECTIONS_REJECTED, &[("reason", "proxy_header")]), 0.0);
+    }
+
+    // ---- sender address: `forwarded:` ---------------------------------------------------------
+
+    /// The two batches the request decodes into, each event carrying `client.address`
+    /// `address` and `client.port` `port`, absent where `None`.
+    async fn expect_forwarded_client(
+        rx: &mut mpsc::Receiver<logit_pipeline::Delivered>,
+        address: Option<&str>,
+        port: Option<i64>,
+        case: &str,
+    ) {
+        for _ in 0..2 {
+            let batch = logit_pipeline::test_util::recv_batch(rx).await;
+            assert!(!batch.events.is_empty());
+            for event in &batch.events {
+                assert_eq!(str_attr(event, "client.address"), address, "{case}");
+                let expected = port.map(logit_core::Value::I64);
+                assert_eq!(event.attributes.get("client.port"), expected.as_ref(), "{case}");
+            }
+        }
+    }
+
+    /// One request per case, on a fresh listener with `forwarded:` and `proxy_protocol:` as
+    /// given: what `client.*` reads, and how many `forwarded` diagnostics it counted. The PROXY
+    /// header, when on, names 203.0.113.5:41000.
+    #[tokio::test]
+    async fn forwarded_reads_the_named_header() {
+        use ForwardedHeader::{Forwarded, XForwardedFor, XRealIp};
+        type Case = (
+            Option<ForwardedHeader>,
+            bool,
+            &'static [(&'static str, &'static str)],
+            Option<&'static str>,
+            Option<i64>,
+            u64,
+        );
+        let cases: [Case; 7] = [
+            (
+                Some(XForwardedFor),
+                false,
+                &[("X-Forwarded-For", "203.0.113.9, 10.0.0.1")],
+                Some("203.0.113.9"),
+                None,
+                0,
+            ),
+            (
+                Some(Forwarded),
+                false,
+                &[("Forwarded", r#"for="[2001:db8::1]:443""#)],
+                Some("2001:db8::1"),
+                Some(443),
+                0,
+            ),
+            (Some(XRealIp), false, &[("X-Real-IP", "203.0.113.9")], Some("203.0.113.9"), None, 0),
+            // Absent: the PROXY origin stands, quietly.
+            (Some(XForwardedFor), true, &[], Some("203.0.113.5"), Some(41000), 0),
+            // Unusable: the PROXY origin stands, diagnosed.
+            (
+                Some(XForwardedFor),
+                true,
+                &[("X-Forwarded-For", "unknown")],
+                Some("203.0.113.5"),
+                Some(41000),
+                1,
+            ),
+            // Only the named header is read.
+            (Some(XRealIp), false, &[("X-Forwarded-For", "203.0.113.9")], None, None, 0),
+            // Off: nothing is read.
+            (None, false, &[("X-Forwarded-For", "203.0.113.9")], None, None, 0),
+        ];
+        for (forwarded, proxy, headers, address, port, diagnosed) in cases {
+            let case = format!("{forwarded:?} proxy {proxy} {headers:?}");
+            let mut running = sender_input(false, proxy, |i| i.with_forwarded(forwarded)).await;
+            let prefix = if proxy { v2_ipv4_header() } else { Vec::new() };
+            let (response, _) = post_stats_with(&running.addr, &prefix, headers).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{case}: {response}");
+            expect_forwarded_client(&mut running.rx, address, port, &case).await;
+            assert_eq!(running.diag.occurrences("forwarded"), diagnosed, "{case}");
+        }
+    }
+
+    /// An L4 proxy in front of an L7 one: the PROXY header names the L7 proxy and its ephemeral
+    /// port, `X-Forwarded-For` names the client, and the client's address goes out with no port
+    /// at all. `network.peer.*` stays the socket.
+    #[tokio::test]
+    async fn a_forwarding_header_replaces_the_proxy_origin_as_a_pair() {
+        let mut running =
+            sender_input(true, true, |i| i.with_forwarded(Some(ForwardedHeader::XForwardedFor)))
+                .await;
+        let headers = [("X-Forwarded-For", "203.0.113.9")];
+        let (response, port) = post_stats_with(&running.addr, &v2_ipv4_header(), &headers).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        for _ in 0..2 {
+            let batch = logit_pipeline::test_util::recv_batch(&mut running.rx).await;
+            assert!(!batch.events.is_empty());
+            for event in &batch.events {
+                assert_eq!(str_attr(event, "client.address"), Some("203.0.113.9"));
+                assert_eq!(event.attributes.get("client.port"), None);
+                assert_eq!(str_attr(event, "network.peer.address"), Some("127.0.0.1"));
+                assert_eq!(
+                    event.attributes.get("network.peer.port"),
+                    Some(&logit_core::Value::I64(i64::from(port)))
+                );
+            }
+        }
     }
 }

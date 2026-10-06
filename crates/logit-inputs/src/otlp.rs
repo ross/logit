@@ -84,7 +84,10 @@
 //! counts `logit.input.connections.rejected{reason="proxy_header"}`, as on `crate::tcp`'s driver.
 //! A complete header followed by a close or a reset, HAProxy's PROXY-aware health check, then
 //! ends at the plaintext peek like any other probe. On a TLS listener that check ends in the TLS
-//! accept and reaches `connection_error`, as on `crate::tcp`'s driver.
+//! accept and reaches `connection_error`, as on `crate::tcp`'s driver. Under `forwarded:`
+//! ([`OtlpInput::with_forwarded`]), each request's forwarding header, read from gRPC metadata as
+//! from an HTTP request's headers, replaces the PROXY origin's `client.*` for that request, per
+//! ADR `forwarded-header-parsing`.
 //!
 //! **Idle timeout.** [`OtlpInput::with_idle_timeout`] (`idle_timeout:`, off unless set) bounds how
 //! long a connection may sit with no request in flight before this listener closes it and
@@ -179,6 +182,7 @@ use crate::Input;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Full, Limited};
+use logit_proto::forwarded::ForwardedHeader;
 // Only this module's tests collect a body directly; the lib path uses `collect_with_stall_bound`.
 #[cfg(test)]
 use http_body_util::BodyExt;
@@ -257,6 +261,8 @@ pub struct OtlpInput {
     peer: bool,
     /// `proxy_protocol:` in config. See [`Self::with_proxy_protocol`].
     proxy_protocol: bool,
+    /// `forwarded:` in config. See [`Self::with_forwarded`].
+    forwarded: Option<ForwardedHeader>,
 }
 
 impl OtlpInput {
@@ -273,6 +279,7 @@ impl OtlpInput {
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -345,6 +352,13 @@ impl OtlpInput {
         self.proxy_protocol = proxy_protocol;
         self
     }
+
+    /// Reads the client from `header` on every request, HTTP and gRPC alike (`forwarded:` in
+    /// config), per [`ConnectionPeer::request`]. Off by default.
+    pub fn with_forwarded(mut self, header: Option<ForwardedHeader>) -> Self {
+        self.forwarded = header;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -402,6 +416,7 @@ impl Input for OtlpInput {
             let tls_acceptor = tls_acceptor.clone();
             let live_connections = live_connections.clone();
             let (record_peer, proxy_protocol) = (self.peer, self.proxy_protocol);
+            let forwarded = self.forwarded;
             tokio::spawn(async move {
                 // Held for the connection's lifetime; released on drop.
                 let _permit = permit;
@@ -427,7 +442,8 @@ impl Input for OtlpInput {
                 } else {
                     None
                 };
-                let connection_peer = ConnectionPeer::tcp(peer, record_peer, origin.as_ref());
+                let connection_peer = ConnectionPeer::tcp(peer, record_peer, origin.as_ref())
+                    .with_forwarded(forwarded, &diag);
 
                 // The handshake runs here, after the permit, so it stalls only this connection.
                 let result = match tls_acceptor {
@@ -618,6 +634,7 @@ async fn handle_http(
         }
     };
 
+    let request_peer = peer.request(req.headers());
     let limited = Limited::new(req.into_body(), MAX_REQUEST_BYTES);
     let bytes = match collect_with_stall_bound(limited, stall).await {
         Ok(bytes) => bytes,
@@ -661,7 +678,7 @@ async fn handle_http(
     };
     match result {
         Ok(mut batches) => {
-            peer.stamp_batches(&mut batches);
+            request_peer.stamp_batches(&mut batches);
             if let Err(undelivered) = crate::http::deliver_detached(&sink, batches).await {
                 count_undelivered(&telemetry, undelivered);
                 let mut response =
@@ -752,6 +769,8 @@ async fn handle_grpc(
         }
     }
 
+    // gRPC metadata is HTTP/2 headers, so the forwarding header reads as on the HTTP side.
+    let request_peer = peer.request(req.headers());
     let limited = Limited::new(req.into_body(), MAX_REQUEST_BYTES);
     let framed = match collect_with_stall_bound(limited, stall).await {
         Ok(bytes) => bytes,
@@ -802,7 +821,7 @@ async fn handle_grpc(
     let mut decoder = OtlpDecoder::new().with_telemetry(telemetry.clone());
     match decoder.decode_signal(signal, payload) {
         Ok(mut batches) => {
-            peer.stamp_batches(&mut batches);
+            request_peer.stamp_batches(&mut batches);
             match crate::http::deliver_detached(&sink, batches).await {
                 Ok(()) => Ok(grpc_response(0, "", Some(export_response(0, "")))),
                 Err(undelivered) => {
@@ -2833,6 +2852,15 @@ mod tests {
     /// Connects, writes `prefix`, then POSTs the two-resource metrics body over HTTP/1.1. Returns
     /// the response and the client's local port.
     async fn post_metrics_after(addr: &str, prefix: &[u8]) -> (String, u16) {
+        post_metrics_with(addr, prefix, &[]).await
+    }
+
+    /// [`post_metrics_after`], with `headers` added to the request.
+    async fn post_metrics_with(
+        addr: &str,
+        prefix: &[u8],
+        headers: &[(&str, &str)],
+    ) -> (String, u16) {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let port = stream.local_addr().unwrap().port();
         let body = two_resource_metrics_payload();
@@ -2840,8 +2868,12 @@ mod tests {
         wire.extend_from_slice(
             format!(
                 "POST /v1/metrics HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\
-                 Content-Type: application/x-protobuf\r\nConnection: close\r\n\r\n",
-                body.len()
+                 Content-Type: application/x-protobuf\r\nConnection: close\r\n{}\r\n",
+                body.len(),
+                headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}\r\n"))
+                    .collect::<String>()
             )
             .as_bytes(),
         );
@@ -2861,6 +2893,15 @@ mod tests {
     /// Connects, writes `prefix`, then sends the two-resource metrics body as one gRPC `Export`
     /// over h2c. Returns the `grpc-status` trailer and the client's local port.
     async fn grpc_metrics_after(addr: &str, prefix: &[u8]) -> (String, u16) {
+        grpc_metrics_with(addr, prefix, &[]).await
+    }
+
+    /// [`grpc_metrics_after`], with `metadata` added to the call.
+    async fn grpc_metrics_with(
+        addr: &str,
+        prefix: &[u8],
+        metadata: &[(&'static str, &'static str)],
+    ) -> (String, u16) {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let port = stream.local_addr().unwrap().port();
         stream.write_all(prefix).await.unwrap();
@@ -2869,11 +2910,15 @@ mod tests {
             .await
             .unwrap();
         tokio::spawn(conn);
-        let req = http::Request::builder()
+        let mut req = http::Request::builder()
             .method(Method::POST)
             .uri(Signal::Metrics.grpc_method())
             .header("content-type", "application/grpc+proto")
-            .header("te", "trailers")
+            .header("te", "trailers");
+        for (name, value) in metadata {
+            req = req.header(*name, *value);
+        }
+        let req = req
             .body(Full::new(Bytes::from(grpc_message(false, &two_resource_metrics_payload()))))
             .unwrap();
         let res = sender.send_request(req).await.unwrap();
@@ -3052,5 +3097,137 @@ mod tests {
         assert_eq!(running.diag.occurrences("connection_error"), 0);
         assert_eq!(running.diag.occurrences("proxy_header"), 0);
         assert_eq!(running.probe.sum(REJECTED, &[("reason", "proxy_header")]), 0.0);
+    }
+
+    // ---- sender address: `forwarded:` ---------------------------------------------------------
+
+    /// The two batches the two-resource body decodes into, each event carrying `client.address`
+    /// `address` and `client.port` `port`, absent where `None`.
+    async fn expect_forwarded_client(
+        rx: &mut mpsc::Receiver<logit_pipeline::Delivered>,
+        address: Option<&str>,
+        port: Option<i64>,
+        case: &str,
+    ) {
+        for _ in 0..2 {
+            let batch = logit_pipeline::test_util::recv_batch(rx).await;
+            assert!(!batch.events.is_empty());
+            for event in &batch.events {
+                assert_eq!(str_attr(event, "client.address"), address, "{case}");
+                let expected = port.map(logit_core::Value::I64);
+                assert_eq!(event.attributes.get("client.port"), expected.as_ref(), "{case}");
+            }
+        }
+    }
+
+    /// One request per case over each transport, on a fresh listener with `forwarded:` and
+    /// `proxy_protocol:` as given: what `client.*` reads, and how many `forwarded` diagnostics
+    /// it counted. The PROXY header, when on, names 203.0.113.5:41000.
+    #[tokio::test]
+    async fn forwarded_reads_the_named_header_on_http_and_grpc() {
+        use ForwardedHeader::{Forwarded, XForwardedFor, XRealIp};
+        type Case = (
+            Option<ForwardedHeader>,
+            bool,
+            &'static [(&'static str, &'static str)],
+            Option<&'static str>,
+            Option<i64>,
+            u64,
+        );
+        let cases: [Case; 7] = [
+            (
+                Some(XForwardedFor),
+                false,
+                &[("x-forwarded-for", "203.0.113.9, 10.0.0.1")],
+                Some("203.0.113.9"),
+                None,
+                0,
+            ),
+            (
+                Some(Forwarded),
+                false,
+                &[("forwarded", r#"for="[2001:db8::1]:443""#)],
+                Some("2001:db8::1"),
+                Some(443),
+                0,
+            ),
+            (Some(XRealIp), false, &[("x-real-ip", "203.0.113.9")], Some("203.0.113.9"), None, 0),
+            // Absent: the PROXY origin stands, quietly.
+            (Some(XForwardedFor), true, &[], Some("203.0.113.5"), Some(41000), 0),
+            // Unusable: the PROXY origin stands, diagnosed.
+            (
+                Some(XForwardedFor),
+                true,
+                &[("x-forwarded-for", "unknown")],
+                Some("203.0.113.5"),
+                Some(41000),
+                1,
+            ),
+            // Only the named header is read.
+            (Some(XRealIp), false, &[("x-forwarded-for", "203.0.113.9")], None, None, 0),
+            // Off: nothing is read.
+            (None, false, &[("x-forwarded-for", "203.0.113.9")], None, None, 0),
+        ];
+        for transport in [OtlpTransport::Http, OtlpTransport::Grpc] {
+            for (forwarded, proxy, headers, address, port, diagnosed) in cases {
+                let case = format!("{transport:?} {forwarded:?} proxy {proxy} {headers:?}");
+                let mut running =
+                    sender_input(transport, false, proxy, |i| i.with_forwarded(forwarded)).await;
+                let prefix = if proxy { v2_ipv4_header() } else { Vec::new() };
+                match transport {
+                    OtlpTransport::Http => {
+                        let (response, _) =
+                            post_metrics_with(&running.addr, &prefix, headers).await;
+                        assert!(response.starts_with("HTTP/1.1 200"), "{case}: {response}");
+                    }
+                    OtlpTransport::Grpc => {
+                        let (status, _) = grpc_metrics_with(&running.addr, &prefix, headers).await;
+                        assert_eq!(status, "0", "{case}");
+                    }
+                }
+                expect_forwarded_client(&mut running.rx, address, port, &case).await;
+                assert_eq!(running.diag.occurrences("forwarded"), diagnosed, "{case}");
+            }
+        }
+    }
+
+    /// An L4 proxy in front of an L7 one: the PROXY header names the L7 proxy and its ephemeral
+    /// port, `X-Forwarded-For` names the client, and the client's address goes out with no port
+    /// at all. `network.peer.*` stays the socket.
+    #[tokio::test]
+    async fn a_forwarding_header_replaces_the_proxy_origin_as_a_pair() {
+        for transport in [OtlpTransport::Http, OtlpTransport::Grpc] {
+            let mut running = sender_input(transport, true, true, |i| {
+                i.with_forwarded(Some(ForwardedHeader::XForwardedFor))
+            })
+            .await;
+            let headers = [("x-forwarded-for", "203.0.113.9")];
+            let port = match transport {
+                OtlpTransport::Http => {
+                    let (response, port) =
+                        post_metrics_with(&running.addr, &v2_ipv4_header(), &headers).await;
+                    assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+                    port
+                }
+                OtlpTransport::Grpc => {
+                    let (status, port) =
+                        grpc_metrics_with(&running.addr, &v2_ipv4_header(), &headers).await;
+                    assert_eq!(status, "0");
+                    port
+                }
+            };
+            for _ in 0..2 {
+                let batch = logit_pipeline::test_util::recv_batch(&mut running.rx).await;
+                for event in &batch.events {
+                    assert_eq!(str_attr(event, "client.address"), Some("203.0.113.9"));
+                    assert_eq!(event.attributes.get("client.port"), None, "{transport:?}");
+                    assert_eq!(str_attr(event, "network.peer.address"), Some("127.0.0.1"));
+                    assert_eq!(
+                        event.attributes.get("network.peer.port"),
+                        Some(&logit_core::Value::I64(i64::from(port)))
+                    );
+                }
+            }
+        }
     }
 }

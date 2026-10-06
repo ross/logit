@@ -160,7 +160,8 @@
 //!     `set`/`remove`), a non-finite literal, a non-lowercase `Str` under `normalize: [lower]`, or
 //!     a repeated `normalize` step (`docs/adr/value-allowlist-cardinality-clamp.md`).
 //! 55. A `prometheus_in` with both or neither of `scrape_targets`/`bind`, a non-default field of
-//!     the other mode (`peer`/`proxy_protocol` among the receiver's), a bind-mode `path` not
+//!     the other mode (`peer`/`proxy_protocol`/`forwarded` among the receiver's), a bind-mode
+//!     `path` not
 //!     starting with `/`, or `metadata_cache.ttl: 0s` with `max_families > 0`
 //!     (`docs/adr/prometheus-remote-write.md`, `docs/adr/listener-peer-address.md`).
 //! 56. A `prometheus_out` with both or neither of `bind`/`endpoint`, a non-default field of the
@@ -2319,6 +2320,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             metadata_cache,
             peer,
             proxy_protocol,
+            forwarded,
         } = &component.kind
         else {
             continue;
@@ -2387,6 +2389,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 Some("peer")
             } else if *proxy_protocol {
                 Some("proxy_protocol")
+            } else if forwarded.is_some() {
+                Some("forwarded")
             } else {
                 None
             };
@@ -4198,6 +4202,7 @@ mod tests {
             metadata_cache: MetadataCacheConfig::default(),
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -4216,6 +4221,7 @@ mod tests {
             metadata_cache: MetadataCacheConfig::default(),
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -6175,6 +6181,7 @@ mod tests {
             max_connections: default_max_connections(),
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -6250,6 +6257,7 @@ mod tests {
             max_connections: default_max_connections(),
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -6815,6 +6823,7 @@ mod tests {
             socket_mode: None,
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -8937,6 +8946,7 @@ mod tests {
             max_connections: default_max_connections(),
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -8952,6 +8962,7 @@ mod tests {
             max_connections: default_max_connections(),
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -9178,6 +9189,7 @@ mod tests {
             max_connections: default_max_connections(),
             peer: false,
             proxy_protocol: false,
+            forwarded: None,
         };
         resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
             .expect("a TLS otlp_in with a real handshake_timeout should resolve");
@@ -10573,17 +10585,26 @@ mod tests {
                     }
                 }),
             ),
+            (
+                "forwarded",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { forwarded, .. } = kind {
+                        *forwarded = Some(logit_config::ForwardedHeader::XForwardedFor);
+                    }
+                }),
+            ),
         ]
     }
 
-    /// Rule 55: `peer` and `proxy_protocol` are the receiver's fields, so a receiver takes them
-    /// and a scrape client is rejected for either.
+    /// Rule 55: `peer`, `proxy_protocol`, and `forwarded` are the receiver's fields, so a
+    /// receiver takes them and a scrape client is rejected for any of them.
     #[test]
     fn peer_and_proxy_protocol_on_a_bind_mode_prometheus_in_resolve_fine() {
         let mut kind = prometheus_in_bind("0.0.0.0:9090");
-        if let ComponentKind::PrometheusIn { peer, proxy_protocol, .. } = &mut kind {
+        if let ComponentKind::PrometheusIn { peer, proxy_protocol, forwarded, .. } = &mut kind {
             *peer = true;
             *proxy_protocol = true;
+            *forwarded = Some(logit_config::ForwardedHeader::Forwarded);
         }
         resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
             .expect("a remote-write receiver may record its senders");
@@ -10591,11 +10612,13 @@ mod tests {
 
     #[test]
     fn peer_or_proxy_protocol_alongside_scrape_targets_is_rejected() {
-        for field in ["peer", "proxy_protocol"] {
+        for field in ["peer", "proxy_protocol", "forwarded"] {
             let mut kind = prometheus_in(vec!["http://node-exporter:9100/metrics"]);
-            if let ComponentKind::PrometheusIn { peer, proxy_protocol, .. } = &mut kind {
+            if let ComponentKind::PrometheusIn { peer, proxy_protocol, forwarded, .. } = &mut kind {
                 *peer = field == "peer";
                 *proxy_protocol = field == "proxy_protocol";
+                *forwarded =
+                    (field == "forwarded").then_some(logit_config::ForwardedHeader::XRealIp);
             }
             let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
             assert!(err.contains("'in'"), "for {field}, got: {err}");

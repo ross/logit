@@ -759,6 +759,38 @@ fn peer_and_proxy_client_stamp_100_statsd_events() {
     assert_eq!(stats.reallocs, 0);
 }
 
+/// `forwarded:` on an HTTP listener, behind `peer: true` and a PROXY origin: one request's
+/// `X-Forwarded-For` parsed and its 100 decoded statsd events stamped. The header's client is
+/// formatted once per request into a shared `Bytes`, the per-request cost, and each event then
+/// takes what `peer_and_proxy_client_stamp_100_statsd_events` pays. The two allocations are the
+/// address's `String` (plus one `realloc`) and the shared header its first `Bytes` clone adds. Without `forwarded:`, `ConnectionPeer::request` reads no header and stamps the
+/// connection's attributes, the pin above.
+#[test]
+fn forwarded_request_stamp_100_statsd_events() {
+    use logit_inputs::peer::ConnectionPeer;
+    use logit_proto::forwarded::ForwardedHeader;
+    use logit_proto::proxy::Origin;
+
+    let origin = Origin::Ip("198.51.100.4:40000".parse().unwrap());
+    let peer = ConnectionPeer::tcp("192.0.2.7:5140".parse().unwrap(), true, Some(&origin))
+        .with_forwarded(Some(ForwardedHeader::XForwardedFor), &Default::default());
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-forwarded-for", http::HeaderValue::from_static("203.0.113.9, 10.0.0.1"));
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_datagram(100);
+    let batch =
+        |events| EventBatch { resource: Arc::new(Resource::default()), scope: None, events };
+    let mut warm = vec![batch(decoder.decode(datagram.clone()).expect("should decode").events)];
+    peer.request(&headers).stamp_batches(&mut warm); // warm: interns the keys
+    let mut batches = vec![batch(decoder.decode(datagram).expect("should decode").events)];
+
+    let ((), stats) = measure(|| peer.request(&headers).stamp_batches(&mut batches));
+    assert_eq!(batches[0].events.len(), 100);
+    assert_eq!(batches[0].events[0].attributes.len(), 6, "three tags, peer pair, client address");
+    expect_allocs("forwarded: one request's header, stamp 100 statsd events", stats, 2);
+    assert_eq!(stats.reallocs, 1);
+}
+
 /// A change of sender formats the new one's address: the `String` it's written into (and one
 /// `realloc` while it's written) and the shared header `Bytes` adds on its first clone, so every
 /// event after it shares one buffer. The UDP driver pays this once per change of sender between

@@ -516,6 +516,18 @@
               "type": "string"
             },
             "buffer": true,
+            "forwarded": {
+              "description": "The forwarding header that names each request's client: `x_forwarded_for` (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header is read, even when another is present, and only its first instance. A gRPC request's metadata is its headers, so `protocol: grpc` reads it the same way. A usable address replaces `client.address` and `client.port` for that request as a pair, ahead of the client a PROXY header names: the header's port, when it has one, becomes `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY header's client, if any, standing, and so does a value with no usable address (`unknown`, an obfuscated name, anything that isn't an IP address), which is also counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port` always report the socket peer.\n\nMake the port reachable only through the proxy, and have the proxy overwrite the header rather than append to one the client sent: any client that can connect to it directly, or whose header the proxy keeps, can send its own header and name any address as `client.address`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ForwardedHeader"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "handshake_timeout": {
               "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then the TLS accept when `tls:` is set, or on a plaintext listener the wait for its first byte. Each phase gets its own budget, so a silent connection costs up to twice this value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected.\n\nNot an idle timeout. Once a connection has produced one byte, the quiet gaps between requests are bounded by `idle_timeout` if set, and by nothing otherwise.\n\nAlso the grace period an idle close gives the HTTP server to shut the connection down before it is dropped.",
               "default": "5s",
@@ -598,6 +610,18 @@
               "type": "string"
             },
             "buffer": true,
+            "forwarded": {
+              "description": "The forwarding header that names each request's client: `x_forwarded_for` (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header is read, even when another is present, and only its first instance. A usable address replaces `client.address` and `client.port` for that request as a pair, ahead of the client a PROXY header names: the header's port, when it has one, becomes `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY header's client, if any, standing, and so does a value with no usable address (`unknown`, an obfuscated name, anything that isn't an IP address), which is also counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port` always report the socket peer.\n\nMake the port reachable only through the proxy, and have the proxy overwrite the header rather than append to one the client sent: any client that can connect to it directly, or whose header the proxy keeps, can send its own header and name any address as `client.address`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ForwardedHeader"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "handshake_timeout": {
               "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then the TLS accept when `tls:` is set, or on a plaintext listener the wait for its first byte. Each phase gets its own budget, so a silent connection costs up to twice this value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
               "default": "5s",
@@ -668,6 +692,18 @@
               ]
             },
             "buffer": true,
+            "forwarded": {
+              "description": "The forwarding header that names each request's client: `x_forwarded_for` (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header is read, even when another is present, and only its first instance. It's read on `bind` and `socket` connections alike. A usable address replaces `client.address` and `client.port` for that request as a pair, ahead of the client a PROXY header names: the header's port, when it has one, becomes `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY header's client, if any, standing, and so does a value with no usable address (`unknown`, an obfuscated name, anything that isn't an IP address), which is also counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port` always report the socket peer.\n\nMake the port reachable only through the proxy, and have the proxy overwrite the header rather than append to one the client sent: any client that can connect to it directly, or whose header the proxy keeps, can send its own header and name any address as `client.address`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ForwardedHeader"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "handshake_timeout": {
               "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then the TLS accept when `tls:` is set, or otherwise the wait for its first byte. Each phase gets its own budget, so a silent connection costs up to twice this value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
               "default": "5s",
@@ -755,6 +791,18 @@
               "type": "string"
             },
             "buffer": true,
+            "forwarded": {
+              "description": "The forwarding header that names each request's client: `x_forwarded_for` (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header is read, even when another is present, and only its first instance. A usable address replaces `client.address` and `client.port` for that request as a pair, ahead of the client a PROXY header names: the header's port, when it has one, becomes `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY header's client, if any, standing, and so does a value with no usable address (`unknown`, an obfuscated name, anything that isn't an IP address), which is also counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port` always report the socket peer.\n\nMake the port reachable only through the proxy, and have the proxy overwrite the header rather than append to one the client sent: any client that can connect to it directly, or whose header the proxy keeps, can send its own header and name any address as `client.address`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ForwardedHeader"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "handshake_timeout": {
               "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then the TLS accept when `tls:` is set, or on a plaintext listener the wait for its first byte. Each phase gets its own budget, so a silent connection costs up to twice this value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
               "default": "5s",
@@ -3067,6 +3115,18 @@
               ]
             },
             "buffer": true,
+            "forwarded": {
+              "description": "The forwarding header that names each request's client: `x_forwarded_for` (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header is read, even when another is present, and only its first instance. A usable address replaces `client.address` and `client.port` for that request as a pair, ahead of the client a PROXY header names: the header's port, when it has one, becomes `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY header's client, if any, standing, and so does a value with no usable address (`unknown`, an obfuscated name, anything that isn't an IP address), which is also counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port` always report the socket peer. Receiver mode only; a value alongside `scrape_targets` is rejected.\n\nMake the port reachable only through the proxy, and have the proxy overwrite the header rather than append to one the client sent: any client that can connect to it directly, or whose header the proxy keeps, can send its own header and name any address as `client.address`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ForwardedHeader"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "headers": {
               "description": "Extra headers sent on every scrape request. A name this input reserves (`accept`, `user-agent`, `content-type`, `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting with `:`) is rejected, as are two keys naming the same header once case is ignored. Scrape mode only.",
               "default": {},
