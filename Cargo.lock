@@ -1229,6 +1229,7 @@ dependencies = [
  "logit-config",
  "logit-core",
  "logit-pipeline",
+ "logit-proto",
  "proptest",
  "regex",
  "serde",

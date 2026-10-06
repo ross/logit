@@ -126,7 +126,7 @@ pub enum ComponentKind {
     // placed between `json` and `trace_context` (docs/adr/http-access-normalization.md).
     HttpAccess { routes: Vec<HttpRouteRule>, route_other: Option<String>,
                  user_agent_rules: Vec<UserAgentRule>, max_length: BTreeMap<String, usize>,
-                 redact_query: Vec<String>, forwarded: Option<ForwardedConfig> },
+                 redact_query: Vec<String>, forwarded: Option<ForwardedHeader> },
     // Splits each row of a delimited line into positional attributes named by a configured
     // `columns` list (docs/adr/csv-positional-columns.md).
     Csv { columns: Vec<String>, delimiter: char },
@@ -355,7 +355,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 58. A `shape` `max_tracked_keys` or `max_tracked_keysets` of `0`.
 59. A `flatten` that selects nothing, or has an empty list or an empty or repeated name.
 60. An `http_access` with an empty or invalid pattern, an empty label, a malformed or repeated
-    route rule, a bad `max_length`, or `forwarded: {trust: false}`.
+    route rule, or a bad `max_length`.
 61. A `sample` rate outside `[0, 1)` (`0` needs `always_keep`), an empty field name, a malformed
     `always_keep`, or `missing:` without `key:`.
 62. Two `tail_in`/`docker_in` components sharing a `checkpoint_path`, or one whose

@@ -1377,6 +1377,25 @@ fn http_access_cleans_a_control_byte() {
     expect_allocs("http_access: cleans a control byte", stats, 2);
 }
 
+/// [`fixtures::http_access_xff_event`] through a `forwarded: x_forwarded_for` component warmed on
+/// the same line: one. The parser slices the header and returns an `IpAddr`, and the address's
+/// text form goes through the warm `scratch` into one exact-size `Bytes::copy_from_slice`, the new
+/// `client.address`. The header has no port and the line no `client.port`, so the pair rule
+/// removes nothing. The off path is the warm conforming-line row above: zero.
+#[test]
+fn http_access_rewrites_client_address_from_xff() {
+    let mut ha = fixtures::http_access_forwarded();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::http_access_xff_event();
+    ha.process(&resource, &mut warm);
+
+    let mut event = fixtures::http_access_xff_event();
+    let (forwarded, stats) = measure(|| ha.process(&resource, &mut event));
+    assert!(forwarded, "http_access always forwards");
+    assert_eq!(event.attributes.get("client.address"), Some(&Value::str("198.51.100.2")));
+    expect_allocs("http_access: rewrites client.address from X-Forwarded-For", stats, 1);
+}
+
 /// `shape` is the one transform here that doesn't aim for zero
 /// ([ADR `shape-observer-component`](../../../docs/adr/shape-observer-component.md)): a
 /// measurement event carries a dozen-odd metric records, so it always spills `MetricList`'s single

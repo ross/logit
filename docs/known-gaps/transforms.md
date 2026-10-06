@@ -182,14 +182,23 @@ Entry format and the other areas: [the known-gaps index](README.md).
     rename component (`set` only stamps constants).
   - **Revisit trigger:** either server turns out to matter; then build a native rename, or a
     preset.
-- **`http_access`'s `forwarded: {trust: true}` is all-or-nothing.** It overwrites
-  `client.address` with the *first* hop of `http.request.header.x-forwarded-for`, with no
-  trusted-proxy list and no hop count. That's right behind one proxy you control that sets the
-  header.
-  - **Consequence:** behind several proxies, or behind one that appends to a client-supplied
-    header, the first hop is whatever the client wrote. Picking the right hop needs to know which
-    proxies are yours (the `set_real_ip_from`/`real_ip_recursive` shape of nginx's realip module),
-    config this component doesn't carry.
+- **`forwarded:` trusts the header it names.** The five HTTP listeners (`otlp_in`, `datadog_in`,
+  `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver) and
+  `http_access` each read the client from the leftmost entry of the one forwarding header
+  `forwarded:` names, with no trusted-proxy list and no hop count
+  ([ADR `forwarded-header-parsing`](../adr/forwarded-header-parsing.md)). That's right behind one
+  proxy you control that overwrites the header.
+  - **Consequence:** a client that reaches the listener or web server directly, or through a proxy
+    that appends to a header the client sent, can name any address as `client.address`. Picking
+    the right hop needs to know which proxies are yours (the `set_real_ip_from`/`real_ip_recursive`
+    shape of nginx's realip module), config none of these components carry. That's crafted input
+    whose defense isn't free, so it's a non-goal under
+    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md).
+  - **Workaround:** make the port reachable only through the proxy, and have the proxy overwrite
+    the header rather than append to it.
+  - **Revisit trigger:** a deployment where clients can reach the component past the proxy, or a
+    proxy chain whose first hop isn't the operator's. The fix is a list of trusted proxy
+    addresses, with the rightmost untrusted entry taken as the client.
 - **`http_access`'s route rules are regex-only, and matched O(rules) per event with no
   prefilter.** Each `routes:` entry is a regex (or a built-in set, itself one regex) tried in list
   order until one matches: no path-template syntax (`/users/:id`), no prefix trie, no `RegexSet`

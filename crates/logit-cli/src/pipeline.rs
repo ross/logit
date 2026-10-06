@@ -63,6 +63,7 @@ use logit_pipeline::{
     SinkQueueConfig, SinkStoreConfig, WriteLoopConfig,
 };
 use logit_proto::collectd::{CollectdEncoder, TypesDb};
+use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::frame::Compression as NativeCompression;
 use logit_proto::graphite::{
     GraphiteEncoder, MultiValue as GraphiteWireMultiValue, Protocol as GraphiteWireProtocol,
@@ -1846,7 +1847,7 @@ fn to_http_access_config(
     user_agent_rules: &[logit_config::UserAgentRule],
     max_length: &std::collections::BTreeMap<String, usize>,
     redact_query: &[String],
-    forwarded: Option<logit_config::ForwardedConfig>,
+    forwarded: Option<logit_config::ForwardedHeader>,
 ) -> HttpAccessConfig {
     let routes = routes
         .iter()
@@ -1882,7 +1883,16 @@ fn to_http_access_config(
         user_agent_rules,
         max_length,
         redact_query: redact_query.to_vec(),
-        trust_forwarded: forwarded.is_some_and(|f| f.trust),
+        forwarded: forwarded.map(to_forwarded_header),
+    }
+}
+
+/// A `forwarded:` header into the parser's own enum.
+fn to_forwarded_header(header: logit_config::ForwardedHeader) -> ForwardedHeader {
+    match header {
+        logit_config::ForwardedHeader::XForwardedFor => ForwardedHeader::XForwardedFor,
+        logit_config::ForwardedHeader::Forwarded => ForwardedHeader::Forwarded,
+        logit_config::ForwardedHeader::XRealIp => ForwardedHeader::XRealIp,
     }
 }
 
@@ -4688,7 +4698,7 @@ mod tests {
                 user_agent_rules: vec![],
                 max_length: std::collections::BTreeMap::from([("user.name".to_string(), 3)]),
                 redact_query: vec![],
-                forwarded: Some(logit_config::ForwardedConfig { trust: true }),
+                forwarded: Some(logit_config::ForwardedHeader::XForwardedFor),
             },
         };
         let NodeSpec::Transform(mut transform) =
@@ -4729,7 +4739,7 @@ mod tests {
             Some(256),
             "the CAPPED_FIELDS default for every field not overridden"
         );
-        assert_eq!(get("client.address"), Some(logit_core::Value::str("192.0.2.1")), "trusted");
+        assert_eq!(get("client.address"), Some(logit_core::Value::str("192.0.2.1")), "forwarded");
     }
 
     /// The component id becomes `shape`'s `tap` tag.

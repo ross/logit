@@ -177,8 +177,7 @@
 //!     `none` or `all`), or an empty or repeated field name (`docs/adr/flatten-transform.md`).
 //! 60. An `http_access` `match` that is empty or invalid, an empty `route`/`class`/`route_other`/
 //!     `redact_query`, a `routes` entry not `builtin` xor `match` + `route`, a repeated `builtin`,
-//!     a bad `max_length`, or `forwarded: {trust: false}`
-//!     (`docs/adr/http-access-normalization.md`).
+//!     or a bad `max_length` (`docs/adr/http-access-normalization.md`).
 //! 61. A `sample` `rate` non-finite, outside `[0, 1]`, `1`, or `0` without `always_keep`; an empty
 //!     field name; an `always_keep` naming both or neither side, or with a non-finite value; or
 //!     `missing:` without `key:` (`docs/adr/consistent-sampling-component.md`).
@@ -2671,7 +2670,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             user_agent_rules,
             max_length,
             redact_query,
-            forwarded,
+            forwarded: _,
         } = &component.kind
         {
             let compile = |what: &str, pattern: &str| -> anyhow::Result<()> {
@@ -2773,12 +2772,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': an http_access 'redact_query' entry must not be empty -- \
                      it could never name a real query key"
-                );
-            }
-            if forwarded.is_some_and(|f| !f.trust) {
-                anyhow::bail!(
-                    "component '{id}': http_access 'forwarded: {{trust: false}}' is the default \
-                     -- omit the block instead"
                 );
             }
         }
@@ -7024,7 +7017,7 @@ mod tests {
 
     #[test]
     fn a_fully_configured_http_access_validates() {
-        use logit_config::{ForwardedConfig, HttpRouteSet, UserAgentRule};
+        use logit_config::{ForwardedHeader, HttpRouteSet, UserAgentRule};
         let kind = ComponentKind::HttpAccess {
             routes: vec![
                 route_rule(Some(HttpRouteSet::Probes), None, None),
@@ -7038,7 +7031,7 @@ mod tests {
             }],
             max_length: std::collections::BTreeMap::from([("url.path".to_string(), 512)]),
             redact_query: vec!["token".to_string()],
-            forwarded: Some(ForwardedConfig { trust: true }),
+            forwarded: Some(ForwardedHeader::XForwardedFor),
         };
         resolve(cfg(vec![
             ("in", vec![], listener()),
@@ -7195,15 +7188,28 @@ mod tests {
         assert!(err.contains("'url.path' is 0"), "{err}");
     }
 
-    /// Rule 60: `forwarded: {trust: false}`, the default spelled out.
+    /// Rule 60 has nothing to check on `forwarded`: every header it can name validates.
     #[test]
-    fn an_http_access_forwarded_trust_false_is_rejected() {
-        let err = http_access_err(|kind| {
-            if let ComponentKind::HttpAccess { forwarded, .. } = kind {
-                *forwarded = Some(logit_config::ForwardedConfig { trust: false });
-            }
-        });
-        assert!(err.contains("omit the block instead"), "{err}");
+    fn every_http_access_forwarded_header_validates() {
+        use logit_config::ForwardedHeader;
+        for header in
+            [ForwardedHeader::XForwardedFor, ForwardedHeader::Forwarded, ForwardedHeader::XRealIp]
+        {
+            let kind = ComponentKind::HttpAccess {
+                routes: vec![],
+                route_other: None,
+                user_agent_rules: vec![],
+                max_length: std::collections::BTreeMap::new(),
+                redact_query: vec![],
+                forwarded: Some(header),
+            };
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("http", vec!["in"], kind),
+                ("out", vec!["http"], sink()),
+            ]))
+            .unwrap_or_else(|err| panic!("{header:?}: {err}"));
+        }
     }
 
     #[test]

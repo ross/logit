@@ -1510,15 +1510,17 @@ Seven counters. Every tag comes from a closed, `&'static` table, never an observ
 | Name | Meaning |
 |---|---|
 | `logit.transform.http_access.normalized{field}` | a field rewritten into its conformant form: a dashed alias renamed, a composite decomposed, a numeric coerced, a duration converted, a method or version normalized, a leading `?` stripped |
-| `.derived{field}` | a field written from config or a built-in table: `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`, `span.status`, `span.duration_s`, `http.request.method_original`, `client.address` under `forwarded`. Every derived attribute is fill-only, so one the producer already sent is honoured and not counted |
+| `.derived{field}` | a field written from config or a built-in table: `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`, `span.status`, `span.duration_s`, `http.request.method_original`, and `client.address` and `client.port` under `forwarded`. Every derived attribute but those two is fill-only, so one the producer already sent is honoured and not counted |
 | `.truncated{field}` | a value cut to its `max_length` |
 | `.cleaned{field}` | a control byte replaced by `_` |
-| `.invalid{field}` | present but unparseable, left as it arrived |
+| `.invalid{field}` | present but unparseable, left as it arrived; under `forwarded`, the header's attribute when it names no usable client |
 | `.redacted` | untagged; one per sensitive `url.query` value replaced |
 | `.routed{outcome="rule"\|"builtin"\|"other"\|"none"\|"kept"}` | once per event with a `url.path`, or with a producer-sent `http.route`, which is `kept` (honoured, never re-matched). The tag is the outcome, never the route value, which is operator-declared and unbounded in number |
 
-Three throttled `Diagnostics` keys, for genuine producer malformation only: `bad_request_line`
-(`http.request.line` isn't `METHOD TARGET PROTOCOL`), `bad_status`, and `bad_duration`. An absent
+Four throttled `Diagnostics` keys, for genuine producer malformation only: `bad_request_line`
+(`http.request.line` isn't `METHOD TARGET PROTOCOL`), `bad_status`, `bad_duration`, and
+`forwarded` (the header `forwarded:` names gives no usable client address, so `client.address`
+and `client.port` stay as logged). An absent
 field, an unknown method, an unclassifiable user agent, and an unrouted path are normal traffic and
 get counters only.
 

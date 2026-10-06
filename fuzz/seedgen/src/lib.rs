@@ -230,6 +230,10 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         add("proxy_header", name.to_string(), bytes);
     }
 
+    for (name, bytes) in forwarding_headers() {
+        add("forwarded", name.to_string(), bytes);
+    }
+
     let mut skipped = Vec::new();
     for (target, files) in seeds.iter_mut() {
         files.retain(|name, bytes| {
@@ -296,6 +300,32 @@ fn proxy_headers() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
+/// Forwarding header values from `logit_proto::forwarded`'s unit vectors, RFC 7239's examples
+/// among them, each behind the selector byte the `forwarded` target reads: `0` `X-Forwarded-For`,
+/// `1` `Forwarded`, `2` `X-Real-IP`.
+fn forwarding_headers() -> Vec<(&'static str, Vec<u8>)> {
+    let xff = |value: &str| prefixed(0, value.as_bytes());
+    let fwd = |value: &str| prefixed(1, value.as_bytes());
+    let real = |value: &str| prefixed(2, value.as_bytes());
+    vec![
+        ("xff-chain", xff("  203.0.113.7 , 10.0.0.9, 10.0.0.1")),
+        ("xff-v4-port", xff("203.0.113.7:5678")),
+        ("xff-v6-port", xff("[2001:db8::1]:443")),
+        ("xff-v6-bare", xff("2001:db8::5:1")),
+        ("xff-v4-mapped", xff("::ffff:192.0.2.1")),
+        ("xff-unknown", xff("unknown")),
+        ("fwd-obfuscated", fwd(r#"for="_gazonk""#)),
+        ("fwd-v6-port", fwd(r#"For="[2001:db8:cafe::17]:4711""#)),
+        ("fwd-pairs", fwd("for=192.0.2.60;proto=http;by=203.0.113.43")),
+        ("fwd-elements", fwd("for=192.0.2.43, for=198.51.100.17")),
+        ("fwd-v6-bracketed", fwd(r#"for="[2001:db8::cafe]""#)),
+        ("fwd-escaped", fwd(r#"host="a,b;c";for="192.0.2.\1:80""#)),
+        ("fwd-unquoted-v6", fwd("for=[2001:db8::1]:443")),
+        ("real-ip", real(" 198.51.100.2 ")),
+        ("real-ip-v6", real("2001:db8::1")),
+    ]
+}
+
 fn prefixed(selector: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + body.len());
     out.push(selector);
@@ -354,6 +384,7 @@ mod tests {
         assert_eq!(
             targets,
             [
+                "forwarded",
                 "hll_bytes",
                 "native_batch",
                 "native_control",

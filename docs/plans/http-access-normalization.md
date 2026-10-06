@@ -1,6 +1,6 @@
 ---
 created: 2026-09-22
-updated: 2026-09-22
+updated: 2026-10-05
 ---
 
 # Enabling plan: `http_access` — access-log normalization from raw semconv fields
@@ -15,6 +15,12 @@ operator otherwise writes by hand. This plan is the build-out: what lands in whi
 which files, and how each piece is verified. Read the ADR first; this document repeats its
 consequences, not its reasoning.
 
+**`forwarded:` is superseded.** [ADR `forwarded-header-parsing`](../adr/forwarded-header-parsing.md)
+replaced `forwarded: {trust: true}` with `forwarded: x_forwarded_for | forwarded | x_real_ip`, a
+parser shared with the HTTP listeners (`logit_proto::forwarded`), and a `client.address` and
+`client.port` pair. Every `forwarded`, `ForwardedConfig`, `trust_forwarded`, and first-hop
+statement below records what this plan built, not what the code does now.
+
 Stream key **`hacc`**: branches `hacc/w0`…`hacc/w7`, a strictly linear stack, each PR based on
 and targeting its parent's branch, brought up to date with `git merge origin/main` (never rebase).
 
@@ -26,8 +32,8 @@ and targeting its parent's branch, brought up to date with `git merge origin/mai
 | Dashed aliases | Every canonical name is also accepted with each `.` replaced by `-`; fixed pre-interned table, dotted wins, dashed key removed on rename; includes the trace/timing names since `http_access` runs before `trace_context` |
 | Placement | `json -> http_access -> trace_context`; the component only *emits* `span.name`/`span.status`/`span.duration_s`, `trace_context` lifts; never mints a trace id |
 | Failure model | Best-effort per field; `process` always returns `true`; a value that doesn't parse is left in place and counted `invalid{field}` (plus a throttled diagnostic for status/duration only) |
-| Derived set (v1) | `user_agent.class` (+ `user_agent.synthetic.type: bot`), `http.route`, `error.type`, `span.name`, `span.status` (never `ok`), `span.duration_s` mirror, `http.request.method_original`, and `client.address` from XFF under `forwarded: {trust: true}` |
-| Fill-only derivation | Every derived attribute (`http.route`, `span.name`, `span.status`, `error.type`, `user_agent.class`, `user_agent.synthetic.type`, the `span.duration_s` mirror) is written only when absent — a producer-sent value is honoured, never overridden, and there is no `overwrite:` option. The one exception is `forwarded: {trust: true}`, an explicit opt-in to *replace* `client.address`. Normalizing a value the producer did send (coercion, units, method/version, caps, cleaning, redaction) still applies |
+| Derived set (v1) | `user_agent.class` (+ `user_agent.synthetic.type: bot`), `http.route`, `error.type`, `span.name`, `span.status` (never `ok`), `span.duration_s` mirror, `http.request.method_original`, and `client.address` from XFF under `forwarded: {trust: true}` (superseded; see the note above) |
+| Fill-only derivation | Every derived attribute (`http.route`, `span.name`, `span.status`, `error.type`, `user_agent.class`, `user_agent.synthetic.type`, the `span.duration_s` mirror) is written only when absent — a producer-sent value is honoured, never overridden, and there is no `overwrite:` option. The one exception is `forwarded: {trust: true}` (superseded; see the note above), an explicit opt-in to *replace* `client.address`. Normalizing a value the producer did send (coercion, units, method/version, caps, cleaning, redaction) still applies |
 | Bounded outputs | Every `http.route`/`user_agent.class` value *this component writes* comes from config or the built-in table — never a capture; a producer's own values are the producer's, bounded by `keep_values` if needed |
 | Metrics | Not emitted; the doc ships the `kv_metrics` + `keep` block |
 | Caps | Per-field character limits from `CAPPED_FIELDS` (in `logit-config`), overridable via `max_length:`; control bytes in the capped prefix become `_` |

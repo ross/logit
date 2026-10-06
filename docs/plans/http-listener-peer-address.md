@@ -168,14 +168,14 @@ Stacked, as the stacking rules below the table describe.
 | `hpeer/w3a` | `datadog_in` and `datadog_trace_in`, including the Unix socket. |
 | `hpeer/w3b` | `splunk_hec_in`. |
 | `hpeer/w3c` | The remote-write receiver. |
-| `hpeer/w4a` | The forwarding-header parser in `logit-proto` with a fuzz target and seeds, and `http_access` moved onto it with the listeners' config shape (decision 4), including dashed aliases for `forwarded` and `x-real-ip`. It updates the docs it contradicts: [`docs/http-access-logs.md`](../http-access-logs.md), [the `http_access` plan](http-access-normalization.md), and the all-or-nothing `forwarded` entry in transform gaps, rewritten as the shared spoofed-header non-goal for the listeners and `http_access`. |
+| `hpeer/w4a` | The forwarding-header parser in `logit-proto` with a fuzz target and seeds, and `http_access` moved onto it with the listeners' config shape (decision 4), including dashed aliases for `forwarded` and `x-real-ip`. It updates the docs it contradicts: [`docs/http-access-logs.md`](../http-access-logs.md), [the `http_access` plan](http-access-normalization.md), the all-or-nothing `forwarded` entry in transform gaps, rewritten as the shared spoofed-header non-goal for the listeners and `http_access`, and the telemetry, graph-rule, and allocation tables `http_access`'s `forwarded` path appears in. |
 | `hpeer/w4b` | `forwarded:` on the five HTTP listeners, over `w4a`'s parser. |
 | `hpeer/w5` | Operator docs ([`docs/deploying.md`](../deploying.md)'s "Recording the sender" section grows to cover these listeners), the runtime-gaps peer entry narrowed to `logit_in`, a pointer from intake gaps' `proxy_protocol:` entry to the spoofed-header non-goal, and an end-to-end run. |
 
 - `w1` stacks on `w0`, and `w2` on `w1`.
 - `w3a`, `w3b`, and `w3c` are siblings off `w2` and can be built in parallel.
-- `w4a` branches from `main` and stacks on nothing, so the parser is reviewed once before five call
-  sites depend on it.
+- `w4a` stacks on `w0` alone, whose ADR its docs link, and not on `w1`–`w3c`, so the parser is
+  reviewed once before five call sites depend on it.
 - `w4b` stacks on `w4a` and on whichever of `w3a`–`w3c` lands last.
 - `w5` stacks on `w4b`.
 

@@ -56,7 +56,17 @@ header the component reads. One parser in `logit-proto` serves all six.
   stamped as `client.port`.
 - **Nothing usable stamps nothing.** `unknown`, an obfuscated identifier (`_hidden`), an empty
   value, or anything else that isn't an IP address stamps no `client.*` and counts a throttled
-  `forwarded` diagnostic. The request and its events go through unchanged.
+  `forwarded` diagnostic. The request and its events go through unchanged. In `http_access`, it
+  also counts `invalid{field}` for the header's attribute, as any value it can't parse does.
+- **An empty leading element is read as it stands.** `X-Forwarded-For: , 203.0.113.7` or
+  `Forwarded: , for=203.0.113.7` stamps nothing. A proxy that writes one is misconfigured, and
+  skipping it would read an element the client may have written.
+- **`Forwarded` edge cases.** An unquoted bracketed value (`for=[2001:db8::1]:443`) is read, though
+  RFC 7239 requires the quotes, and the address rule still decides it. `unknown:4711` is
+  `unknown`. When an element names `for` twice, the first wins.
+- **`http_access` caps the new attributes.** `http.request.header.forwarded` (256 characters) and
+  `http.request.header.x-real-ip` (128) join its capped fields, as
+  `http.request.header.x-forwarded-for` (128) is.
 
 ### Precedence
 - A parsed header replaces `client.address` and `client.port` as a pair. When the header carries

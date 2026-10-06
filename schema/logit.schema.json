@@ -2055,11 +2055,11 @@
           "properties": {
             "buffer": true,
             "forwarded": {
-              "description": "Present only to opt in to overwriting `client.address` from the first hop of `http.request.header.x-forwarded-for`. Off by default, since the header is client-supplied.",
+              "description": "The forwarding header that names the client, read from the attribute `http.request.header.x-forwarded-for`, `http.request.header.forwarded`, or `http.request.header.x-real-ip` (or its spelling with each `.` as `-`). Off by default. Only the named header is read, even when another is logged. `x_forwarded_for` reads the leftmost entry, `forwarded` the first element's `for=`, and `x_real_ip` the whole value. A usable address replaces `client.address` and `client.port` as a pair: the header's port, when it has one, replaces `client.port`, and otherwise `client.port` is removed. A value with no usable address (`unknown`, an obfuscated name, anything that isn't an IP address) leaves both as logged and is counted as a `forwarded` diagnostic.\n\nMake the web server reachable only through the proxy, and have the proxy overwrite the header rather than append to one the client sent: any client that can connect to it directly, or whose header the proxy keeps, can send its own header and name any address as `client.address`.",
               "default": null,
               "anyOf": [
                 {
-                  "$ref": "#/definitions/ForwardedConfig"
+                  "$ref": "#/definitions/ForwardedHeader"
                 },
                 {
                   "type": "null"
@@ -3594,16 +3594,14 @@
         }
       ]
     },
-    "ForwardedConfig": {
-      "description": "`http_access`'s `forwarded` block. When present, `client.address` is overwritten with the first hop of `http.request.header.x-forwarded-for`. All-or-nothing: there is no trusted-proxy list or hop count. `trust: false` is rejected; omit the block instead.",
-      "type": "object",
-      "properties": {
-        "trust": {
-          "default": true,
-          "type": "boolean"
-        }
-      },
-      "additionalProperties": false
+    "ForwardedHeader": {
+      "description": "The forwarding header a component reads the client's address from: `x_forwarded_for` (`X-Forwarded-For`), `forwarded` (RFC 7239's `Forwarded`), or `x_real_ip` (`X-Real-IP`).",
+      "type": "string",
+      "enum": [
+        "x_forwarded_for",
+        "forwarded",
+        "x_real_ip"
+      ]
     },
     "GenerateEvent": {
       "description": "The event template `generate_in` renders per generated event. Every field defaults, so an omitted `event:` block generates the cheapest event there is: a timestamp, the configured resource, and nothing else, which is what a \"runtime floor\" scenario measures.\n\n`log`, every value in `attributes`, and `metric.name` are templates: `{seq}` renders the generator's 0-based event counter and `{seq%N}` renders it modulo `N`, the knob that gives a scenario a chosen attribute or series cardinality. `{{`/`}}` write a literal brace, which a JSON log body needs. An unknown placeholder is rejected. A field with no placeholder is rendered once and shared by every event, so use placeholders for cardinality, not decoration: each one costs a rendering and a copy per event.",

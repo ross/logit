@@ -263,19 +263,14 @@ pub struct UserAgentRule {
     pub class: String,
 }
 
-/// `http_access`'s `forwarded` block. When present, `client.address` is overwritten with the
-/// first hop of `http.request.header.x-forwarded-for`. All-or-nothing: there is no trusted-proxy
-/// list or hop count. `trust: false` is rejected; omit the block instead.
+/// The forwarding header a component reads the client's address from: `x_forwarded_for`
+/// (`X-Forwarded-For`), `forwarded` (RFC 7239's `Forwarded`), or `x_real_ip` (`X-Real-IP`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ForwardedConfig {
-    #[serde(default = "default_true")]
-    pub trust: bool,
-}
-
-/// `ForwardedConfig::trust`'s default.
-fn default_true() -> bool {
-    true
+#[serde(rename_all = "snake_case")]
+pub enum ForwardedHeader {
+    XForwardedFor,
+    Forwarded,
+    XRealIp,
 }
 
 /// Every field `http_access` caps, with its default character limit. A `max_length` key must name
@@ -286,10 +281,12 @@ pub const CAPPED_FIELDS: &[(&str, usize)] = &[
     ("url.query", 256),
     ("user_agent.original", 256),
     ("http.request.header.referer", 256),
+    ("http.request.header.forwarded", 256),
     ("server.address", 253),
     ("client.address", 128),
     ("network.peer.address", 128),
     ("http.request.header.x-forwarded-for", 128),
+    ("http.request.header.x-real-ip", 128),
     ("upstream.address", 128),
     ("user.name", 128),
     ("http.request.method_original", 32),
@@ -2066,11 +2063,23 @@ pub enum ComponentKind {
         /// entry is rejected.
         #[serde(default)]
         redact_query: Vec<String>,
-        /// Present only to opt in to overwriting `client.address` from the first hop of
-        /// `http.request.header.x-forwarded-for`. Off by default, since the header is
-        /// client-supplied.
+        /// The forwarding header that names the client, read from the attribute
+        /// `http.request.header.x-forwarded-for`, `http.request.header.forwarded`, or
+        /// `http.request.header.x-real-ip` (or its spelling with each `.` as `-`). Off by
+        /// default. Only the named header is read, even when another is logged. `x_forwarded_for`
+        /// reads the leftmost entry, `forwarded` the first element's `for=`, and `x_real_ip` the
+        /// whole value. A usable address replaces `client.address` and `client.port` as a pair:
+        /// the header's port, when it has one, replaces `client.port`, and otherwise
+        /// `client.port` is removed. A value with no usable address (`unknown`, an obfuscated
+        /// name, anything that isn't an IP address) leaves both as logged and is counted as a
+        /// `forwarded` diagnostic.
+        ///
+        /// Make the web server reachable only through the proxy, and have the proxy overwrite
+        /// the header rather than append to one the client sent: any client that can connect to
+        /// it directly, or whose header the proxy keeps, can send its own header and name any
+        /// address as `client.address`.
         #[serde(default)]
-        forwarded: Option<ForwardedConfig>,
+        forwarded: Option<ForwardedHeader>,
     },
     /// Keeps a fraction of events, consistently. With `key:` set, the key's value is hashed
     /// (XXH64, seed 0, over a fixed canonical byte form; a frozen cross-version contract) and
@@ -5515,7 +5524,7 @@ mod tests {
                 "user_agent_rules": [{"match": "MyMonitor/", "class": "tool"}],
                 "max_length": {"url.path": 512},
                 "redact_query": ["token"],
-                "forwarded": {}
+                "forwarded": "x_forwarded_for"
             }"#,
         )
         .unwrap();
@@ -5556,11 +5565,7 @@ mod tests {
                 );
                 assert_eq!(max_length.get("url.path"), Some(&512));
                 assert_eq!(redact_query, vec!["token".to_string()]);
-                assert_eq!(
-                    forwarded,
-                    Some(ForwardedConfig { trust: true }),
-                    "an empty forwarded block defaults trust to true"
-                );
+                assert_eq!(forwarded, Some(ForwardedHeader::XForwardedFor));
             }
             other => panic!("expected HttpAccess, got {other:?}"),
         }
@@ -5611,11 +5616,36 @@ mod tests {
             user_agent_rules: vec![],
             max_length: std::collections::BTreeMap::from([("user.name".to_string(), 16)]),
             redact_query: vec![],
-            forwarded: Some(ForwardedConfig { trust: true }),
+            forwarded: Some(ForwardedHeader::Forwarded),
         };
         let json = serde_json::to_string(&kind).unwrap();
         let back: ComponentKind = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn forwarded_header_names_each_header_in_snake_case() {
+        for (text, header) in [
+            ("x_forwarded_for", ForwardedHeader::XForwardedFor),
+            ("forwarded", ForwardedHeader::Forwarded),
+            ("x_real_ip", ForwardedHeader::XRealIp),
+        ] {
+            let json = format!("\"{text}\"");
+            assert_eq!(serde_json::from_str::<ForwardedHeader>(&json).unwrap(), header);
+            assert_eq!(serde_json::to_string(&header).unwrap(), json);
+        }
+        assert!(serde_json::from_str::<ForwardedHeader>(r#""XForwardedFor""#).is_err());
+    }
+
+    /// The block form `forwarded: {trust: true}` is gone; it fails to parse rather than being
+    /// read as some header.
+    #[test]
+    fn http_access_rejects_the_forwarded_trust_block() {
+        for block in [r#"{"trust": true}"#, "{}"] {
+            let json =
+                format!(r#"{{"type": "http_access", "sources": ["in"], "forwarded": {block}}}"#);
+            assert!(serde_json::from_str::<Component>(&json).is_err(), "{block}");
+        }
     }
 
     #[test]
