@@ -26,6 +26,8 @@
 //! metadata_cache:       # what 1.0 metric types are remembered between requests
 //!   max_families: 10000 #   0 turns the cache off
 //!   ttl: 10m
+//! peer: false           # stamp network.peer.* on every event
+//! proxy_protocol: false # require a PROXY v1/v2 header; stamp client.*
 //! ```
 //!
 //! `scrape_targets`, not `targets`: `Component.targets` (`docs/adr/target-components.md`) claims
@@ -254,10 +256,10 @@
 //! (`logit.input.connections.rejected{reason="limit"}`). An HTTP/2 connection carries up to
 //! [`crate::http::MAX_CONCURRENT_STREAMS`] requests at once; [`PrometheusReceiver`]'s
 //! `max_connections` field states the listener's worst case. [`HANDSHAKE_TIMEOUT`] bounds each
-//! connection's pre-request phase: its TLS accept on a TLS listener, its first byte on a plaintext
-//! one. Neither [`MAX_REQUEST_BYTES`] nor [`HANDSHAKE_TIMEOUT`] is a config field: the first is a
-//! denial-of-service bound rather than a tuning knob, and graph rule 45's `handshake_timeout:`
-//! does not cover this kind.
+//! connection's pre-request phase: its PROXY header under `proxy_protocol:`, then its TLS accept
+//! on a TLS listener or its first byte on a plaintext one. Neither [`MAX_REQUEST_BYTES`] nor
+//! [`HANDSHAKE_TIMEOUT`] is a config field: the first is a denial-of-service bound rather than a
+//! tuning knob, and graph rule 45's `handshake_timeout:` does not cover this kind.
 //!
 //! `idle_timeout:` closes a connection that sits with no request in flight, via the shared
 //! tracker in [`crate::http`]; `otlp_in`'s module doc holds the reasoning (why the clock is at
@@ -280,6 +282,16 @@
 //! the socket can write series into the pipeline. `admin:` and `prometheus_out`'s exposition
 //! `bind:` carry the same gap, tracked in `docs/known-gaps/prometheus.md`: front it with something
 //! that authenticates, or keep it on a trusted network.
+//!
+//! ## Sender address
+//!
+//! Under `peer:` and `proxy_protocol:` ([`PrometheusReceiver::with_peer`],
+//! [`PrometheusReceiver::with_proxy_protocol`]), each connection task builds one
+//! [`ConnectionPeer`], and `write_response` stamps it on the request's batch before delivery. The
+//! PROXY header is read right after the permit, before the TLS accept or the first-byte peek,
+//! with `otlp_in`'s rejection, counting, and health-check rules (`crate::otlp`'s "Sender
+//! address"). Both are receiver fields: graph rule 55 rejects either alongside `scrape_targets:`,
+//! since a scrape client accepts no connection.
 //!
 //! ## Counters
 //!
@@ -315,6 +327,7 @@
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, drive_with_idle, Activity, BodyReadError,
 };
+use crate::peer::ConnectionPeer;
 use crate::tls::apply_client_tls;
 use crate::Input;
 use bytes::Bytes;
@@ -775,8 +788,9 @@ impl Input for PrometheusInput {
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 /// How long a connection has, per pre-request phase, before this listener releases its
-/// connection-cap permit: its TLS accept on a TLS listener, its first byte on a
-/// plaintext one. The same 5s every other TCP listener here defaults to.
+/// connection-cap permit: its PROXY header under `proxy_protocol:`, then its TLS accept on a TLS
+/// listener or its first byte on a plaintext one, each on its own budget. The same 5s every other
+/// TCP listener here defaults to.
 ///
 /// **Not an operator-facing field**, unlike `otlp_in`'s `handshake_timeout:`: `prometheus_in` has
 /// no such field for graph rule 45 to check. A field can be added if a deployment needs one.
@@ -1089,6 +1103,10 @@ pub struct PrometheusReceiver {
     /// The empty `Resource` every batch this receiver builds carries, allocated once (this
     /// module's "Labels stay labels").
     resource: Arc<Resource>,
+    /// `peer:` in config. See [`Self::with_peer`].
+    peer: bool,
+    /// `proxy_protocol:` in config. See [`Self::with_proxy_protocol`].
+    proxy_protocol: bool,
     diag: Diagnostics,
     telemetry: Telemetry,
 }
@@ -1107,6 +1125,8 @@ impl PrometheusReceiver {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             resource: Arc::new(Resource::default()),
+            peer: false,
+            proxy_protocol: false,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
         }
@@ -1164,6 +1184,20 @@ impl PrometheusReceiver {
         self
     }
 
+    /// Stamps every event a request decodes with its connection's socket peer (`peer:` in
+    /// config), per [`crate::peer`]. Off by default.
+    pub fn with_peer(mut self, peer: bool) -> Self {
+        self.peer = peer;
+        self
+    }
+
+    /// Requires a PROXY protocol header ahead of every connection and stamps the origin it names
+    /// (`proxy_protocol:` in config). Off by default. See this module's "Sender address".
+    pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
+        self.proxy_protocol = proxy_protocol;
+        self
+    }
+
     /// Test-only override of [`HANDSHAKE_TIMEOUT`], so a test can watch a silent connection close
     /// without a multi-second sleep.
     #[cfg(test)]
@@ -1185,8 +1219,9 @@ impl Input for PrometheusReceiver {
         Ok(())
     }
 
-    /// `otlp_in`'s accept loop: a permit per connection acquired before any TLS accept, the
-    /// handshake (or plaintext first-byte peek) bounded inside the spawned task, and `hyper_util`'s
+    /// `otlp_in`'s accept loop: a permit per connection acquired before any TLS accept, under
+    /// `proxy_protocol:` the PROXY header, then the handshake (or plaintext first-byte peek), each
+    /// bounded inside the spawned task, and `hyper_util`'s
     /// auto builder serving HTTP/1.1 and h2c off one socket. Copied rather than shared because the
     /// telemetry, handler and dispatch are each listener's own; the idle machinery it hands off to
     /// is shared ([`crate::http`]).
@@ -1207,7 +1242,7 @@ impl Input for PrometheusReceiver {
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
         let mut accept_diag = self.diag.clone();
         loop {
-            let (stream, peer) = match accept_queue.accept(&listener).await {
+            let (mut stream, peer) = match accept_queue.accept(&listener).await {
                 Ok(accepted) => accepted,
                 Err(err) => {
                     crate::listener::absorb_accept_error(err, &self.telemetry, &mut accept_diag)
@@ -1238,11 +1273,33 @@ impl Input for PrometheusReceiver {
             let live_connections = live_connections.clone();
             let resource = Arc::clone(&self.resource);
             let metadata_cache = metadata_cache.clone();
+            let (record_peer, proxy_protocol) = (self.peer, self.proxy_protocol);
             tokio::spawn(async move {
                 // Held for the connection's lifetime; released on drop.
                 let _permit = permit;
                 // Counted out on drop, so a panicking handler brings the gauge back down too.
-                let _live = live_connections.enter();
+                let live = live_connections.enter();
+
+                // Ahead of the TLS accept and the first-byte peek, both of which would otherwise
+                // read the header's bytes as the request's (`crate::otlp`'s "Sender address").
+                let origin = if proxy_protocol {
+                    match crate::peer::read_proxy_origin(&mut stream, handshake_timeout).await {
+                        Ok(origin) => Some(origin),
+                        Err(err) => {
+                            drop(live);
+                            telemetry.count(
+                                "logit.input.connections.rejected",
+                                1.0,
+                                &[("reason", "proxy_header")],
+                            );
+                            diag.warn_throttled("proxy_header", err);
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let peer = ConnectionPeer::tcp(peer, record_peer, origin.as_ref());
 
                 let result = match tls_acceptor {
                     // No first-byte peek on this arm: `acceptor.accept` already waits on this
@@ -1273,7 +1330,7 @@ impl Input for PrometheusReceiver {
                     }
                     // The plaintext arm's budget. `peek` is `recv(..., MSG_PEEK)`: it consumes
                     // nothing, so the auto builder's `ReadVersion` sniff still sees a pristine
-                    // stream. A clean close before the first byte (`Ok(0)`) is a TCP health
+                    // stream. A clean close or a reset before the first byte is a TCP health
                     // check, not a fault, as in `otlp_in` and `crate::tcp`.
                     None => {
                         let first_byte =
@@ -1281,6 +1338,9 @@ impl Input for PrometheusReceiver {
                                 .await;
                         match first_byte {
                             Ok(Ok(0)) => Ok(()),
+                            Ok(Err(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                                Ok(())
+                            }
                             Ok(Ok(_)) => {
                                 serve_write_connection(
                                     TokioIo::new(stream),
@@ -1320,7 +1380,7 @@ impl Input for PrometheusReceiver {
 #[allow(clippy::too_many_arguments)]
 async fn serve_write_connection<IO>(
     io: IO,
-    peer: SocketAddr,
+    peer: ConnectionPeer,
     path: Arc<str>,
     resource: Arc<Resource>,
     metadata_cache: Option<Arc<MetadataCache>>,
@@ -1348,6 +1408,7 @@ where
             let (sink, telemetry, diag) = (sink.clone(), telemetry.clone(), diag.clone());
             let (path, resource) = (Arc::clone(&path), Arc::clone(&resource));
             let metadata_cache = metadata_cache.clone();
+            let peer = peer.clone();
             let activity = Arc::clone(&activity);
             async move {
                 let _in_flight = in_flight;
@@ -1356,7 +1417,7 @@ where
                     &path,
                     resource,
                     metadata_cache.as_deref(),
-                    peer,
+                    &peer,
                     sink,
                     telemetry,
                     diag,
@@ -1391,7 +1452,7 @@ async fn handle_write(
     path: &str,
     resource: Arc<Resource>,
     metadata_cache: Option<&MetadataCache>,
-    peer: SocketAddr,
+    peer: &ConnectionPeer,
     sink: Fanout,
     telemetry: Telemetry,
     diag: Diagnostics,
@@ -1432,7 +1493,7 @@ async fn write_response(
     path: &str,
     resource: Arc<Resource>,
     metadata_cache: Option<&MetadataCache>,
-    peer: SocketAddr,
+    peer: &ConnectionPeer,
     sink: &Fanout,
     telemetry: &Telemetry,
     mut diag: Diagnostics,
@@ -1619,7 +1680,8 @@ async fn write_response(
         // `204` and the sender's queue throttles, remote-write's own flow-control model.
         // On its own task, so a sender that disconnects mid-wait cancels only the wait, never
         // part of the fan-out (`crate::http::deliver_detached`).
-        let batch = vec![EventBatch { resource, scope: None, events }];
+        let mut batch = vec![EventBatch { resource, scope: None, events }];
+        peer.stamp_batches(&mut batch);
         if let Err(undelivered) = crate::http::deliver_detached(sink, batch).await {
             telemetry.count(
                 "logit.input.batches.dropped",
@@ -4061,5 +4123,269 @@ mod tests {
         assert!(seed.is_empty());
         let _ = cache.seed(start + Duration::from_secs(3_600), &telemetry);
         assert_eq!(cache.sweeps.load(Ordering::Relaxed), 1, "an empty table has nothing to sweep");
+    }
+
+    // ---- bind mode: sender address, `peer:` and `proxy_protocol:` ------------------------------
+
+    const REJECTED: &str = "logit.input.connections.rejected";
+
+    /// A running receiver with `peer:` and `proxy_protocol:` as given, one connection permit, its
+    /// diagnostics, and a probe on its telemetry.
+    struct Stamping {
+        addr: String,
+        rx: mpsc::Receiver<Delivered>,
+        diag: Diagnostics,
+        probe: TelemetryProbe,
+    }
+
+    async fn sender_receiver(
+        peer: bool,
+        proxy_protocol: bool,
+        configure: impl FnOnce(PrometheusReceiver) -> PrometheusReceiver,
+    ) -> Stamping {
+        let probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("receive", "prometheus_in", "listener");
+        let diag = Diagnostics::new("prometheus_in").with_telemetry(telemetry.clone());
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let receiver = configure(
+            receiver
+                .with_telemetry(telemetry)
+                .with_diagnostics(diag.clone())
+                .with_max_connections(1)
+                .with_peer(peer)
+                .with_proxy_protocol(proxy_protocol),
+        );
+        let rx = spawn_receiver(receiver, 4);
+        Stamping { addr, rx, diag, probe }
+    }
+
+    /// A v2 `PROXY` over TCP/IPv4 from 203.0.113.5:41000.
+    fn v2_ipv4_header() -> Vec<u8> {
+        let mut header = logit_proto::proxy::V2_SIGNATURE.to_vec();
+        header.extend_from_slice(&[0x21, 0x11, 0x00, 0x0C]);
+        header.extend_from_slice(&[203, 0, 113, 5, 127, 0, 0, 1]);
+        header.extend_from_slice(&41000u16.to_be_bytes());
+        header.extend_from_slice(&9090u16.to_be_bytes());
+        header
+    }
+
+    /// A v2 `LOCAL` header, a proxy's own health check, which names no origin.
+    fn v2_local_header() -> Vec<u8> {
+        let mut header = logit_proto::proxy::V2_SIGNATURE.to_vec();
+        header.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]);
+        header
+    }
+
+    const V1_HEADER: &[u8] = b"PROXY TCP4 198.51.100.7 127.0.0.1 40000 9090\r\n";
+
+    /// A 1.0 write of two series at two timestamps, so its one batch holds several events.
+    fn two_timestamp_body() -> Vec<u8> {
+        request_body(
+            &[
+                vec![
+                    gauge_family("queue_depth", ("job", "api"), 1.0, millis(1)),
+                    gauge_family("queue_age", ("job", "api"), 2.0, millis(1)),
+                ],
+                vec![gauge_family("queue_depth", ("job", "api"), 3.0, millis(2))],
+            ],
+            remote_write::Version::V1,
+        )
+    }
+
+    /// Connects, writes `prefix`, then POSTs [`two_timestamp_body`] over HTTP/1.1. Returns the
+    /// response and the client's local port.
+    async fn post_write_after(addr: &str, prefix: &[u8]) -> (String, u16) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let port = stream.local_addr().unwrap().port();
+        let body = two_timestamp_body();
+        let mut wire = prefix.to_vec();
+        wire.extend_from_slice(
+            format!(
+                "POST /api/v1/write HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{}\r\n",
+                body.len(),
+                write_headers(remote_write::Version::V1)
+            )
+            .as_bytes(),
+        );
+        wire.extend_from_slice(&body);
+        // Unchecked: a connection refused at the cap may already be closed, and then the
+        // response is empty.
+        let _ = stream.write_all(&wire).await;
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(test_util::RECV_TIMEOUT, stream.read_to_end(&mut buf)).await;
+        (String::from_utf8_lossy(&buf).into_owned(), port)
+    }
+
+    fn str_attr<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
+        event.attributes.get(key).and_then(|v| v.as_str())
+    }
+
+    /// The one batch [`two_timestamp_body`] decodes into, with every event checked against the
+    /// expected `network.peer.*` and `client.*` values.
+    async fn expect_stamped_batch(
+        rx: &mut mpsc::Receiver<Delivered>,
+        peer_port: Option<u16>,
+        client: Option<(&str, i64)>,
+    ) {
+        let batch = test_util::recv_batch(rx).await;
+        assert_eq!(batch.events.len(), 3, "one event per series per timestamp");
+        for event in &batch.events {
+            let port = event.attributes.get("network.peer.port");
+            match peer_port {
+                Some(expected) => {
+                    assert_eq!(str_attr(event, "network.peer.address"), Some("127.0.0.1"));
+                    assert_eq!(port, Some(&Value::I64(i64::from(expected))));
+                }
+                None => {
+                    assert_eq!(event.attributes.get("network.peer.address"), None);
+                    assert_eq!(port, None);
+                }
+            }
+            assert_eq!(str_attr(event, "client.address"), client.map(|(address, _)| address));
+            assert_eq!(
+                event.attributes.get("client.port"),
+                client.map(|(_, port)| Value::I64(port)).as_ref()
+            );
+            // The write's own label is untouched beside them.
+            assert_eq!(str_attr(event, "job"), Some("api"));
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_stamps_every_event_of_a_write_with_the_socket_peer() {
+        for peer in [true, false] {
+            let mut running = sender_receiver(peer, false, |r| r).await;
+            let (response, port) = post_write_after(&running.addr, b"").await;
+            assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+            expect_stamped_batch(&mut running.rx, peer.then_some(port), None).await;
+        }
+    }
+
+    /// The proxy is the socket peer, and the v2 header names the client.
+    #[tokio::test]
+    async fn a_v2_header_stamps_the_client_beside_the_peer() {
+        let mut running = sender_receiver(true, true, |r| r).await;
+        let (response, port) = post_write_after(&running.addr, &v2_ipv4_header()).await;
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+        expect_stamped_batch(&mut running.rx, Some(port), Some(("203.0.113.5", 41000))).await;
+    }
+
+    #[tokio::test]
+    async fn a_v1_header_stamps_the_client() {
+        let mut running = sender_receiver(false, true, |r| r).await;
+        let (response, _port) = post_write_after(&running.addr, V1_HEADER).await;
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+        expect_stamped_batch(&mut running.rx, None, Some(("198.51.100.7", 40000))).await;
+    }
+
+    /// The header goes ahead of the ClientHello, in the clear, as a proxy sends it.
+    #[tokio::test]
+    async fn a_proxy_header_ahead_of_the_tls_handshake_is_read_first() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tls = |receiver: PrometheusReceiver| {
+            receiver
+                .with_bind_tls(
+                    &TlsServerSettings {
+                        cert_file: "server.pem".to_string(),
+                        key_file: "server.key".to_string(),
+                        client_ca_file: None,
+                    },
+                    &testdata_dir(),
+                )
+                .unwrap()
+        };
+        let mut running = sender_receiver(false, true, tls).await;
+        let mut stream = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
+        stream.write_all(&v2_ipv4_header()).await.unwrap();
+        let server_name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls_stream = test_tls_connector().connect(server_name, stream).await.unwrap();
+        let body = two_timestamp_body();
+        let head = format!(
+            "POST /api/v1/write HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n{}\r\n",
+            body.len(),
+            write_headers(remote_write::Version::V1)
+        );
+        tls_stream.write_all(head.as_bytes()).await.unwrap();
+        tls_stream.write_all(&body).await.unwrap();
+        let mut buf = Vec::new();
+        let _ =
+            tokio::time::timeout(test_util::RECV_TIMEOUT, tls_stream.read_to_end(&mut buf)).await;
+        let response = String::from_utf8_lossy(&buf);
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+        expect_stamped_batch(&mut running.rx, None, Some(("203.0.113.5", 41000))).await;
+    }
+
+    /// A direct write on a `proxy_protocol: true` port is closed, counted, and never decoded.
+    #[tokio::test]
+    async fn a_write_without_a_proxy_header_is_rejected_and_counted() {
+        use tokio::io::AsyncWriteExt;
+        let mut running = sender_receiver(false, true, |r| r).await;
+        let mut bare = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
+        bare.write_all(b"POST /api/v1/write HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        expect_closed(&mut bare, "a write with no PROXY header").await;
+        running
+            .probe
+            .wait_for("the proxy_header rejection", |totals| {
+                totals.sum(REJECTED, &[("reason", "proxy_header")]) == 1.0
+            })
+            .await;
+        assert_eq!(running.diag.occurrences("proxy_header"), 1);
+        assert_eq!(running.diag.occurrences("connection_error"), 0);
+        assert!(running.rx.try_recv().is_err(), "nothing is delivered");
+    }
+
+    /// Sends a write with a `LOCAL` header on new connections until one is answered `204`. With
+    /// one permit, that proves every earlier connection's task has finished, diagnostics
+    /// included: a connection refused at the cap is closed, and the loop tries again.
+    async fn next_connection_is_served(running: &mut Stamping) {
+        let deadline = tokio::time::Instant::now() + test_util::RECV_TIMEOUT;
+        loop {
+            assert!(tokio::time::Instant::now() < deadline, "no connection got a permit back");
+            let (response, _port) = post_write_after(&running.addr, &v2_local_header()).await;
+            if response.starts_with("HTTP/1.1 204") {
+                test_util::recv_batch(&mut running.rx).await;
+                return;
+            }
+        }
+    }
+
+    /// HAProxy's PROXY-aware health check: a complete header, then an RST before any request
+    /// byte. It ends quietly, as a probe with no header does on a plain port.
+    #[tokio::test]
+    async fn a_reset_after_a_complete_proxy_header_is_not_an_error() {
+        use tokio::io::AsyncWriteExt;
+        for header in [v2_local_header(), V1_HEADER.to_vec()] {
+            let mut running = sender_receiver(false, true, |r| r).await;
+            let mut client = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
+            client.write_all(&header).await.unwrap();
+            // `SO_LINGER` of zero makes the close an RST, not a FIN.
+            socket2::SockRef::from(&client).set_linger(Some(Duration::ZERO)).unwrap();
+            drop(client);
+            next_connection_is_served(&mut running).await;
+            assert_eq!(running.diag.occurrences("connection_error"), 0, "after {header:?}");
+            assert_eq!(running.diag.occurrences("proxy_header"), 0, "after {header:?}");
+            assert_eq!(
+                running.probe.sum(REJECTED, &[("reason", "proxy_header")]),
+                0.0,
+                "after {header:?}"
+            );
+        }
+    }
+
+    /// The same check ended with a FIN: the first-byte peek reads `Ok(0)` after the header.
+    #[tokio::test]
+    async fn a_close_after_a_complete_proxy_header_is_not_an_error() {
+        use tokio::io::AsyncWriteExt;
+        let mut running = sender_receiver(false, true, |r| r).await;
+        let mut client = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
+        client.write_all(&v2_local_header()).await.unwrap();
+        drop(client);
+        next_connection_is_served(&mut running).await;
+        assert_eq!(running.diag.occurrences("connection_error"), 0);
+        assert_eq!(running.diag.occurrences("proxy_header"), 0);
+        assert_eq!(running.probe.sum(REJECTED, &[("reason", "proxy_header")]), 0.0);
     }
 }

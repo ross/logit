@@ -160,8 +160,9 @@
 //!     `set`/`remove`), a non-finite literal, a non-lowercase `Str` under `normalize: [lower]`, or
 //!     a repeated `normalize` step (`docs/adr/value-allowlist-cardinality-clamp.md`).
 //! 55. A `prometheus_in` with both or neither of `scrape_targets`/`bind`, a non-default field of
-//!     the other mode, a bind-mode `path` not starting with `/`, or `metadata_cache.ttl: 0s` with
-//!     `max_families > 0` (`docs/adr/prometheus-remote-write.md`).
+//!     the other mode (`peer`/`proxy_protocol` among the receiver's), a bind-mode `path` not
+//!     starting with `/`, or `metadata_cache.ttl: 0s` with `max_families > 0`
+//!     (`docs/adr/prometheus-remote-write.md`, `docs/adr/listener-peer-address.md`).
 //! 56. A `prometheus_out` with both or neither of `bind`/`endpoint`, a non-default field of the
 //!     other mode, `version: 2` with `compression: zstd` (2.0 mandates Snappy), or a sender fault
 //!     in 40's shape: a non-absolute `endpoint`, `timeout: 0s`, a reserved or colliding header, or
@@ -2316,6 +2317,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             idle_timeout,
             max_connections,
             metadata_cache,
+            peer,
+            proxy_protocol,
         } = &component.kind
         else {
             continue;
@@ -2380,6 +2383,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 Some("max_connections")
             } else if *metadata_cache != MetadataCacheConfig::default() {
                 Some("metadata_cache")
+            } else if *peer {
+                Some("peer")
+            } else if *proxy_protocol {
+                Some("proxy_protocol")
             } else {
                 None
             };
@@ -4189,6 +4196,8 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             metadata_cache: MetadataCacheConfig::default(),
+            peer: false,
+            proxy_protocol: false,
         }
     }
 
@@ -4205,6 +4214,8 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             metadata_cache: MetadataCacheConfig::default(),
+            peer: false,
+            proxy_protocol: false,
         }
     }
 
@@ -10546,7 +10557,51 @@ mod tests {
                     }
                 }),
             ),
+            (
+                "peer",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { peer, .. } = kind {
+                        *peer = true;
+                    }
+                }),
+            ),
+            (
+                "proxy_protocol",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { proxy_protocol, .. } = kind {
+                        *proxy_protocol = true;
+                    }
+                }),
+            ),
         ]
+    }
+
+    /// Rule 55: `peer` and `proxy_protocol` are the receiver's fields, so a receiver takes them
+    /// and a scrape client is rejected for either.
+    #[test]
+    fn peer_and_proxy_protocol_on_a_bind_mode_prometheus_in_resolve_fine() {
+        let mut kind = prometheus_in_bind("0.0.0.0:9090");
+        if let ComponentKind::PrometheusIn { peer, proxy_protocol, .. } = &mut kind {
+            *peer = true;
+            *proxy_protocol = true;
+        }
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+            .expect("a remote-write receiver may record its senders");
+    }
+
+    #[test]
+    fn peer_or_proxy_protocol_alongside_scrape_targets_is_rejected() {
+        for field in ["peer", "proxy_protocol"] {
+            let mut kind = prometheus_in(vec!["http://node-exporter:9100/metrics"]);
+            if let ComponentKind::PrometheusIn { peer, proxy_protocol, .. } = &mut kind {
+                *peer = field == "peer";
+                *proxy_protocol = field == "proxy_protocol";
+            }
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains("'in'"), "for {field}, got: {err}");
+            let expected = format!("'{field}' configures the remote-write receiver");
+            assert!(err.contains(&expected), "for {field}, got: {err}");
+        }
     }
 
     /// Rule 55: a non-default `metadata_cache` in scrape mode is rejected (a scrape client reads `#

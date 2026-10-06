@@ -2745,6 +2745,33 @@ pub enum ComponentKind {
         /// sender's series decode as typed families. Receiver mode only.
         #[serde(default)]
         metadata_cache: MetadataCacheConfig,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Every event of a request carries the same values, and
+        /// either attribute replaces a same-named label decoded from the request. No reverse DNS
+        /// lookup is made. Receiver mode only; `true` alongside `scrape_targets` is rejected.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        #[serde(default)]
+        peer: bool,
+        /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
+        /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
+        /// the original client it names on each event as `client.address` and `client.port`.
+        /// Off by default. The header is read before any TLS handshake, and must arrive within 5
+        /// seconds of the connection opening. A connection without a valid header is closed and
+        /// counted as `logit.input.connections.rejected{reason="proxy_header"}`. A header that
+        /// names no client, such as a proxy's own health check, keeps the connection and stamps
+        /// nothing. Either attribute replaces a same-named label decoded from the request;
+        /// `peer:` still reports the proxy. Receiver mode only; `true` alongside
+        /// `scrape_targets` is rejected.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
     },
     /// A synthetic event source for load testing. No socket and no decoder: it renders a
     /// declarative `event:` template as fast as `count`/`rate` allow, so a scenario measures the
@@ -7575,8 +7602,12 @@ mod tests {
                 idle_timeout,
                 max_connections,
                 metadata_cache,
+                peer,
+                proxy_protocol,
             } => {
                 assert_eq!(max_connections, default_max_connections());
+                assert!(!peer, "opt-in -- no peer address unless asked for");
+                assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
                 assert_eq!(scrape_targets, vec!["http://node-exporter:9100/metrics".to_string()]);
                 assert_eq!(interval, Duration::from_secs(15));
                 assert_eq!(timeout, Duration::from_secs(10));
