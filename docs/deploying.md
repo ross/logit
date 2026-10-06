@@ -88,7 +88,9 @@ error.
   SIGHUP never does.
 - **SIGHUP never ends the process and doesn't reload the config.** It logs
   `reopen signal received` with `config_reloaded=false` and nothing else changes: a config change
-  still means a restart. A SIGHUP can arrive in any state, a drain included.
+  still means a restart. A SIGHUP can arrive in any state, a drain included. A foreground
+  `logit run` survives its terminal hanging up too: it keeps its ports, and its writes to stdout
+  fail as `Rejected`, so run it under systemd or a container runtime.
 - **Handlers are installed before the config is read.** A SIGTERM or SIGINT during startup is held,
   and the drain starts as soon as the pipeline has started; a startup that fails still exits `1`.
   A second SIGTERM or SIGINT during startup exits 130 at once, so a wedged startup stays killable.

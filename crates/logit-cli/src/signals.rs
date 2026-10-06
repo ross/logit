@@ -1,10 +1,12 @@
 //! `logit run`'s process signals (`docs/adr/signal-handling.md`): SIGTERM/SIGINT start a graceful
 //! drain and a second one exits 130; SIGHUP bumps a reopen generation and never exits.
 //!
-//! [`Signals::install`] runs first in `run_pipelines`, before the config loads, and creates every
-//! tokio `Signal` stream before it returns. Once a stream exists, the signal's default disposition
-//! is gone for the life of the process and a delivery waits for the stream's next poll, so a
-//! signal that arrives during startup is handled rather than killing the process.
+//! [`Signals::install`] runs first in `run_pipelines`, before the config loads. On Unix it creates
+//! every tokio `Signal` stream before it returns. Once a stream exists, the signal's default
+//! disposition is gone for the life of the process and a delivery waits for the stream's next
+//! poll, so a signal that arrives during startup is handled rather than killing the process. Off
+//! Unix, `ctrl_c()` registers when its task first polls it, so a Ctrl-C before then still gets the
+//! default.
 
 use std::future::Future;
 use std::sync::Arc;

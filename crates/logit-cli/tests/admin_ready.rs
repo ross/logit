@@ -9,8 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use support::{
-    ephemeral_addr, logit_ready, send_signal, wait_until_ready, KillOnDrop, TempConfig,
-    PROCESS_DEADLINE,
+    ephemeral_addr, logit_ready, wait_until_ready, KillOnDrop, TempConfig, PROCESS_DEADLINE,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -109,7 +108,7 @@ async fn readyz_answers_draining_for_the_whole_drain_after_a_sigterm() {
 
     // A real SIGTERM, not `Child::kill` (SIGKILL) -- only SIGTERM starts the graceful drain this
     // test exists to probe.
-    send_signal(&child.0, libc::SIGTERM);
+    support::send_signal(&child.0, libc::SIGTERM);
 
     let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
     let mut saw_draining = false;

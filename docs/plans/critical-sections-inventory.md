@@ -3919,16 +3919,19 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 ---
 
 ### RT-15 — `logit-cli::pipeline`: process lifecycle, the double-signal kill switch, and config→runtime knob mapping
-- **Location:** `crates/logit-cli/src/pipeline.rs` (`run_pipelines` and its admin bind),
-  `crates/logit-cli/src/signals.rs` (`Signals`), `prepare`, `queue_config`, `write_config`, `input_runtime_config`, `overflow_policy`,
-  `delivery_posture`, `build_spec`'s `internal` arm, its `lua_file` read, and its `target`/`route` arms.
-- **What it does:** Loads and resolves the config, activates the `TelemetryLayer` once the `internal` component's
-  `logs` threshold is known, spawns a detached kill-switch task that `std::process::exit(130)`s on a **second**
-  signal, binds the admin listener synchronously (a bind failure is `Startup`), and runs the graph.
-  `Signals::install` creates one stream per signal kind before the config loads; one task counts
-  SIGTERM/SIGINT for both the drain and the kill switch, and another bumps the SIGHUP reopen generation. `queue_config`/`write_config`/`input_runtime_config` are the only places config values
-  become runtime behaviour (`SinkStoreConfig`, `RetryConfig`, `WriteLoopConfig`, `InputRuntimeConfig`).
-- **Why sensitive:** concurrency (signal tasks spawned before startup, a detached task calling `process::exit`);
+- **Location:** `crates/logit-cli/src/pipeline.rs` (`run_pipelines` and its admin bind, `prepare`,
+  `queue_config`, `write_config`, `input_runtime_config`, `overflow_policy`, `delivery_posture`,
+  `build_spec`'s `internal` arm, its `lua_file` read, and its `target`/`route` arms), then
+  `crates/logit-cli/src/signals.rs` (`Signals`).
+- **What it does:** Installs the signal handlers (`Signals::install`) and their tasks, then loads and resolves
+  the config, activates the `TelemetryLayer` once the `internal` component's `logs` threshold is known, binds
+  the admin listener synchronously (a bind failure is `Startup`), and runs the graph. `signals.rs`'s counting
+  task fires the drain on the first SIGTERM/SIGINT and `std::process::exit(130)`s on the second; a second task
+  bumps the SIGHUP reopen generation. `queue_config`/`write_config`/`input_runtime_config` are the only places
+  config values become runtime behaviour (`SinkStoreConfig`, `RetryConfig`, `WriteLoopConfig`,
+  `InputRuntimeConfig`).
+- **Why sensitive:** concurrency (signal tasks spawned before the config loads, `signals.rs`'s counting task
+  calling `process::exit`);
   shutdown ordering (the admin server is deliberately *not* given a shutdown listener, so `/readyz` can answer
   `503 draining` throughout the drain); data-loss via misconfiguration (a wrong `overflow`/`delivery`/
   `shutdown_grace` mapping silently changes drop behaviour). Everything else in this 4k-line file is thin
