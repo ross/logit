@@ -3,53 +3,14 @@
 //! attributes. `crates/logit-inputs/src/lines.rs`'s own tests cover the decoder and each
 //! transport; this pins the config-to-runtime wiring the binary does.
 
+mod support;
+
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
 
 use logit_pipeline::test_util::wait_until_within;
-
-/// How long the `logit run` child gets to bind its listeners, and each stdout line to arrive. A
-/// process spawn is slower than an in-process bind, so this is wider than `RECV_TIMEOUT`.
-const PROCESS_DEADLINE: Duration = Duration::from_secs(10);
-
-struct TempConfig(PathBuf);
-
-impl TempConfig {
-    fn write(name: &str, contents: &str) -> Self {
-        let path = std::env::temp_dir()
-            .join(format!("logit-lines-round-trip-{name}-{}.yaml", std::process::id()));
-        std::fs::File::create(&path)
-            .and_then(|mut f| f.write_all(contents.as_bytes()))
-            .expect("writing the temp config");
-        Self(path)
-    }
-}
-
-impl Drop for TempConfig {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// Kills the child on drop, so a failing assertion never leaves a `logit run` holding its ports.
-struct KillOnDrop(Child);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// A free loopback port, bound and released: the child-process exception to
-/// `docs/adr/test-timing-and-observables.md`'s bind-before-spawn rule, since the child binds it.
-async fn ephemeral_addr() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().to_string()
-}
+use support::{ephemeral_addr, KillOnDrop, TempConfig, PROCESS_DEADLINE};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn lines_over_tcp_and_udp_reach_stdout_as_log_events() {
@@ -59,8 +20,8 @@ async fn lines_over_tcp_and_udp_reach_stdout_as_log_events() {
         socket.local_addr().unwrap().to_string()
     };
     let config = TempConfig::write(
-        "tcp-udp",
-        &format!(
+        "lines-tcp-udp",
+        format!(
             "components:\n  tcp_in:\n    type: lines_in\n    bind: \"{tcp_addr}\"\n  udp_in:\n    \
              type: lines_in\n    bind: \"{udp_addr}\"\n    transport: udp\n  parse:\n    type: \
              json\n    sources: [tcp_in, udp_in]\n  out:\n    type: stdio_out\n    sources: \
@@ -86,8 +47,6 @@ async fn lines_over_tcp_and_udp_reach_stdout_as_log_events() {
         }
     });
 
-    // Every listener binds before any runs, so an accepted TCP connection means the UDP socket
-    // is bound too.
     let mut client = None;
     wait_until_within("the TCP lines_in to accept", PROCESS_DEADLINE, || {
         client = std::net::TcpStream::connect(&tcp_addr).ok();
@@ -97,18 +56,25 @@ async fn lines_over_tcp_and_udp_reach_stdout_as_log_events() {
     let mut client = client.unwrap();
     client.write_all(b"{\"user\":\"ada\",\"n\":3}\r\nplain text over tcp\n").unwrap();
     client.flush().unwrap();
-    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    udp.send_to(b"one datagram\nits unterminated tail", &udp_addr).unwrap();
 
     let mut events = Vec::new();
-    while events.len() < 4 {
-        let line = line_rx
-            .recv_timeout(PROCESS_DEADLINE)
-            .unwrap_or_else(|_| panic!("timed out with {} of 4 events: {events:?}", events.len()));
-        let event: serde_json::Value =
-            serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON ({e}): {line}"));
-        events.push(event);
-    }
+    let mut read_events = |want: usize| {
+        while events.len() < want {
+            let line = line_rx.recv_timeout(PROCESS_DEADLINE).unwrap_or_else(|_| {
+                panic!("timed out with {} of {want} events: {events:?}", events.len())
+            });
+            let event: serde_json::Value =
+                serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON ({e}): {line}"));
+            events.push(event);
+        }
+    };
+    // A TCP connect succeeds once the listener calls listen(2), before the startup bind pass
+    // reaches the UDP listener, so a datagram sent then can hit an unbound port. An event on
+    // stdout means every node is running, and so every listener is bound.
+    read_events(2);
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.send_to(b"one datagram\nits unterminated tail", &udp_addr).unwrap();
+    read_events(4);
 
     let message = |event: &serde_json::Value| event["log"]["message"].as_str().map(str::to_string);
     let mut messages: Vec<String> = events.iter().filter_map(message).collect();
