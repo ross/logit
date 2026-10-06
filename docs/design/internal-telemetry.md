@@ -1159,8 +1159,10 @@ key, a bad `time` or `fields`, a span that fell back to a log) are in the tables
 `crates/logit-proto/src/splunk/mod.rs`'s module doc and its `logs`, `metrics`, and `spans`
 submodules, under this component's id.
 
-`Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a close or reset before
-the first byte), `proxy_header` (any `connections.rejected{reason="proxy_header"}` refusal),
+`Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a plaintext peer that
+closes cleanly or resets before sending a request byte, after a complete PROXY header under
+`proxy_protocol: true`; on a TLS listener that close fails the TLS accept and is counted),
+`proxy_header` (any `connections.rejected{reason="proxy_header"}` refusal),
 `request_rejected` (every rejection except `404` and `405`; the peer address appears in the
 message text only, never a tag, and a token never appears at all), `busy` (a `503`), and
 `closed_consumer` (a `503` code 9 or `500` code 8).

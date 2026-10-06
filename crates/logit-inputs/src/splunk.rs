@@ -8,9 +8,9 @@
 //! live in that codec's module doc; this module owns HTTP: routing, authentication, compression,
 //! size caps, channels and acknowledgment, and backpressure.
 //!
-//! The accept loop, connection cap, handshake timeout, and idle timeout are `datadog_in`'s
-//! ([`crate::datadog`]), which are `otlp_in`'s; `crate::otlp`'s module doc has the reasoning for
-//! each. The request helpers (`Content-Encoding`, bounded decompression, the constant-time token
+//! The accept loop, connection cap, handshake timeout, idle timeout, and sender-address handling
+//! are `otlp_in`'s ([`crate::otlp`]), as `datadog_in` runs them too; `crate::otlp`'s module doc
+//! has the reasoning for each. The request helpers (`Content-Encoding`, bounded decompression, the constant-time token
 //! check, deadline-bounded delivery) are shared through [`crate::http`].
 //!
 //! **Sender address.** Under `peer:` and `proxy_protocol:` ([`SplunkHecInput::with_peer`],
@@ -376,7 +376,7 @@ impl Input for SplunkHecInput {
         Ok(())
     }
 
-    /// `datadog_in`'s accept loop: a permit per connection, taken before any TLS accept and
+    /// `otlp_in`'s accept loop: a permit per connection, taken before any TLS accept and
     /// rejected rather than queued at the cap; under `proxy_protocol:` the PROXY header, then the
     /// handshake or a plaintext first-byte peek, each bounded inside the spawned task; a clean
     /// close or a reset before the first byte treated as a health check.
