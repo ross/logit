@@ -198,6 +198,11 @@
 //!     because exposition has a competing cumulative meaning, carbon's wire has no opinion on
 //!     either, so the number is carried faithfully and only the model's extra facts are lost.
 //!
+//! One more sits outside the numbering the ADR and plan share, because the listener adds it after
+//! decode rather than the codec: under `graphite_in`'s `peer:` or `proxy_protocol:`,
+//! `network.peer.*` or `client.*` is added to every event, an opt-in addition the sender never
+//! sent, and one of ADR `lossless-transit`'s "Permitted normalizations".
+//!
 //! Everything else is an error or a counted drop, never a silent reinterpretation.
 
 pub mod decode;

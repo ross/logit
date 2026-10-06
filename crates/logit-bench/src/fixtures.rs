@@ -32,6 +32,7 @@ use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
 use logit_proto::collectd::types_db::TEST_TYPES_DB;
 use logit_proto::collectd::{CollectdDecoder, TypesDb};
+use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::graphite::{GraphiteDecoder, Protocol as GraphiteProtocol};
 use logit_proto::prometheus::{PrometheusDecoder, PrometheusEncoder};
 use logit_proto::Decoder;
@@ -2158,6 +2159,17 @@ pub fn http_access_event() -> Event {
     event
 }
 
+/// [`http_access_event`] with an `X-Forwarded-For` header naming a client with no port, as nginx
+/// logs `$http_x_forwarded_for` behind a proxy, for `forwarded:`'s rewrite of `client.address`
+/// (`http_access_rewrites_client_address_from_xff`).
+pub fn http_access_xff_event() -> Event {
+    let mut event = http_access_event();
+    event
+        .attributes
+        .insert("http.request.header.x-forwarded-for", Value::str("198.51.100.2, 10.0.0.1"));
+    event
+}
+
 /// [`http_access_event`] parsed from [`HTTP_ACCESS_DASHED_LINE`], for `http_access`'s de-alias
 /// step (`http_access_normalizes_a_dashed_line_warm`).
 pub fn http_access_dashed_event() -> Event {
@@ -2203,8 +2215,17 @@ pub fn http_access_event_with_control_byte() -> Event {
 /// `http_access` at the demo's configuration: the two builtin route sets, two operator patterns
 /// (`/work`, `/`), a catch-all `route_other`, and the full `logit_config::CAPPED_FIELDS` cap list,
 /// resolved as `logit-cli`'s `to_http_access_config` does rather than copied. No user-agent rules,
-/// no extra `redact_query`, `trust_forwarded: false`.
+/// no extra `redact_query`, no `forwarded`.
 pub fn http_access() -> HttpAccess {
+    http_access_with(None)
+}
+
+/// [`http_access`] with `forwarded: x_forwarded_for`.
+pub fn http_access_forwarded() -> HttpAccess {
+    http_access_with(Some(ForwardedHeader::XForwardedFor))
+}
+
+fn http_access_with(forwarded: Option<ForwardedHeader>) -> HttpAccess {
     let config = HttpAccessConfig {
         routes: vec![
             RouteRule::Builtin(RouteSet::Probes),
@@ -2219,7 +2240,7 @@ pub fn http_access() -> HttpAccess {
             .map(|(field, cap)| (field.to_string(), *cap))
             .collect(),
         redact_query: vec![],
-        trust_forwarded: false,
+        forwarded,
     };
     HttpAccess::new(config).expect("fixture patterns should compile")
 }

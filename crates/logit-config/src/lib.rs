@@ -263,19 +263,14 @@ pub struct UserAgentRule {
     pub class: String,
 }
 
-/// `http_access`'s `forwarded` block. When present, `client.address` is overwritten with the
-/// first hop of `http.request.header.x-forwarded-for`. All-or-nothing: there is no trusted-proxy
-/// list or hop count. `trust: false` is rejected; omit the block instead.
+/// The forwarding header a component reads the client's address from: `x_forwarded_for`
+/// (`X-Forwarded-For`), `forwarded` (RFC 7239's `Forwarded`), or `x_real_ip` (`X-Real-IP`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ForwardedConfig {
-    #[serde(default = "default_true")]
-    pub trust: bool,
-}
-
-/// `ForwardedConfig::trust`'s default.
-fn default_true() -> bool {
-    true
+#[serde(rename_all = "snake_case")]
+pub enum ForwardedHeader {
+    XForwardedFor,
+    Forwarded,
+    XRealIp,
 }
 
 /// Every field `http_access` caps, with its default character limit. A `max_length` key must name
@@ -286,10 +281,12 @@ pub const CAPPED_FIELDS: &[(&str, usize)] = &[
     ("url.query", 256),
     ("user_agent.original", 256),
     ("http.request.header.referer", 256),
+    ("http.request.header.forwarded", 256),
     ("server.address", 253),
     ("client.address", 128),
     ("network.peer.address", 128),
     ("http.request.header.x-forwarded-for", 128),
+    ("http.request.header.x-real-ip", 128),
     ("upstream.address", 128),
     ("user.name", 128),
     ("http.request.method_original", 32),
@@ -1202,8 +1199,10 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: Option<TlsServerConfig>,
         /// How long one connection has, per pre-request phase, before this listener closes it
-        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a
-        /// plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected.
+        /// and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then
+        /// the TLS accept when `tls:` is set, or on a plaintext listener the wait for its first
+        /// byte. Each phase gets its own budget, so a silent connection costs up to twice this
+        /// value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected.
         ///
         /// Not an idle timeout. Once a connection has produced one byte, the quiet gaps between
         /// requests are bounded by `idle_timeout` if set, and by nothing otherwise.
@@ -1243,6 +1242,51 @@ pub enum ComponentKind {
         /// keep the total across listeners under the process's `nofile` limit.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Every event of a request carries the same values, and
+        /// either attribute replaces a same-named one decoded from the request. No reverse DNS
+        /// lookup is made.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        #[serde(default)]
+        peer: bool,
+        /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
+        /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
+        /// the original client it names on each event as `client.address` and `client.port`.
+        /// Off by default. The header is read before any TLS handshake, within
+        /// `handshake_timeout`. A connection without a valid header is closed and counted as
+        /// `logit.input.connections.rejected{reason="proxy_header"}`. A header that names no
+        /// client, such as a proxy's own health check, keeps the connection and stamps nothing.
+        /// Either attribute replaces a same-named one decoded from the request; `peer:` still
+        /// reports the proxy.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
+        /// The forwarding header that names each request's client: `x_forwarded_for`
+        /// (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first
+        /// element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header
+        /// is read, even when another is present, and only its first instance. A gRPC request's
+        /// metadata is its headers, so `protocol: grpc` reads it the same way. A usable
+        /// address replaces `client.address` and `client.port` for that request as a pair, ahead of
+        /// the client a PROXY header names: the header's port, when it has one, becomes
+        /// `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY
+        /// header's client, if any, standing, and so does a value with no usable address
+        /// (`unknown`, an obfuscated name, anything that isn't an IP address), which is also
+        /// counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port`
+        /// always report the socket peer.
+        ///
+        /// Make the port reachable only through the proxy, and have the proxy overwrite the header
+        /// rather than append to one the client sent: any client that can connect to it directly,
+        /// or whose header the proxy keeps, can send its own header and name any address as
+        /// `client.address`.
+        #[serde(default)]
+        forwarded: Option<ForwardedHeader>,
     },
     /// A stand-in for Datadog's intake API: what a Datadog Agent's `dd_url`,
     /// `logs_config.logs_dd_url`, `apm_config.apm_dd_url`, or `additional_endpoints` point at.
@@ -1265,9 +1309,11 @@ pub enum ComponentKind {
         #[serde(default)]
         api_keys: Vec<String>,
         /// How long one connection has, per pre-request phase, before this listener closes it
-        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a
-        /// plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected.
-        /// Also the grace an idle close gives the HTTP server, as on `otlp_in`.
+        /// and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then
+        /// the TLS accept when `tls:` is set, or on a plaintext listener the wait for its first
+        /// byte. Each phase gets its own budget, so a silent connection costs up to twice this
+        /// value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected. Also the grace an
+        /// idle close gives the HTTP server, as on `otlp_in`.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
@@ -1285,6 +1331,50 @@ pub enum ComponentKind {
         /// keep the total across listeners under the process's `nofile` limit.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Every event of a request carries the same values, and
+        /// either attribute replaces a same-named one decoded from the request. No reverse DNS
+        /// lookup is made.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        #[serde(default)]
+        peer: bool,
+        /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
+        /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
+        /// the original client it names on each event as `client.address` and `client.port`.
+        /// Off by default. The header is read before any TLS handshake, within
+        /// `handshake_timeout`. A connection without a valid header is closed and counted as
+        /// `logit.input.connections.rejected{reason="proxy_header"}`. A header that names no
+        /// client, such as a proxy's own health check, keeps the connection and stamps nothing.
+        /// Either attribute replaces a same-named one decoded from the request; `peer:` still
+        /// reports the proxy.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
+        /// The forwarding header that names each request's client: `x_forwarded_for`
+        /// (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first
+        /// element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header
+        /// is read, even when another is present, and only its first instance. A usable
+        /// address replaces `client.address` and `client.port` for that request as a pair, ahead of
+        /// the client a PROXY header names: the header's port, when it has one, becomes
+        /// `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY
+        /// header's client, if any, standing, and so does a value with no usable address
+        /// (`unknown`, an obfuscated name, anything that isn't an IP address), which is also
+        /// counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port`
+        /// always report the socket peer.
+        ///
+        /// Make the port reachable only through the proxy, and have the proxy overwrite the header
+        /// rather than append to one the client sent: any client that can connect to it directly,
+        /// or whose header the proxy keeps, can send its own header and name any address as
+        /// `client.address`.
+        #[serde(default)]
+        forwarded: Option<ForwardedHeader>,
     },
     /// A stand-in for the Datadog Agent's APM receiver: what a dd-trace tracer sends its traces
     /// and client-computed stats to. Serves `/v0.3`, `/v0.4`, `/v0.5`, and `/v0.7/traces`
@@ -1322,9 +1412,11 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: Option<TlsServerConfig>,
         /// How long one connection has, per pre-request phase, before this listener closes it
-        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and otherwise
-        /// the wait for its first byte. Defaults to `5s`; `0s` is rejected. Also the grace an
-        /// idle close gives the HTTP server, as on `otlp_in`.
+        /// and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then
+        /// the TLS accept when `tls:` is set, or otherwise the wait for its first byte. Each phase
+        /// gets its own budget, so a silent connection costs up to twice this value with
+        /// `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected. Also the grace an idle close
+        /// gives the HTTP server, as on `otlp_in`.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
@@ -1345,6 +1437,55 @@ pub enum ComponentKind {
         /// `connection_limit`.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Every event of a request carries the same values, and
+        /// either attribute replaces a same-named one decoded from the request. No reverse DNS
+        /// lookup is made.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        ///
+        /// A `socket` client that bound a path reports the path as `network.peer.address` and no
+        /// port; one that didn't, the usual tracer, gets neither attribute.
+        #[serde(default)]
+        peer: bool,
+        /// Requires every connection to the `bind` listener to open with a PROXY protocol header,
+        /// version 1 or 2, as a load balancer such as HAProxy sends with `send-proxy` or
+        /// `send-proxy-v2`, and stamps the original client it names on each event as
+        /// `client.address` and `client.port`. Off by default, and requires `bind`: a `socket`
+        /// connection is never read for a header. The header is read before any TLS handshake,
+        /// within `handshake_timeout`. A connection without a valid header is closed and counted
+        /// as `logit.input.connections.rejected{reason="proxy_header"}`. A header that names no
+        /// client, such as a proxy's own health check, keeps the connection and stamps nothing.
+        /// Either attribute replaces a same-named one decoded from the request; `peer:` still
+        /// reports the proxy.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
+        /// The forwarding header that names each request's client: `x_forwarded_for`
+        /// (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first
+        /// element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header
+        /// is read, even when another is present, and only its first instance. It's read on `bind` and
+        /// `socket` connections alike. A usable
+        /// address replaces `client.address` and `client.port` for that request as a pair, ahead of
+        /// the client a PROXY header names: the header's port, when it has one, becomes
+        /// `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY
+        /// header's client, if any, standing, and so does a value with no usable address
+        /// (`unknown`, an obfuscated name, anything that isn't an IP address), which is also
+        /// counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port`
+        /// always report the socket peer.
+        ///
+        /// Make the port reachable only through the proxy, and have the proxy overwrite the header
+        /// rather than append to one the client sent: any client that can connect to it directly,
+        /// or whose header the proxy keeps, can send its own header and name any address as
+        /// `client.address`.
+        #[serde(default)]
+        forwarded: Option<ForwardedHeader>,
     },
     /// A stand-in for Splunk's HTTP Event Collector (HEC): what a HEC client's URL points at,
     /// such as Docker's `splunk` log driver, Splunk's logging libraries, the OpenTelemetry
@@ -1396,9 +1537,11 @@ pub enum ComponentKind {
         #[serde(default = "default_splunk_max_pending_acks")]
         max_pending_acks: usize,
         /// How long one connection has, per pre-request phase, before this listener closes it
-        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a
-        /// plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected.
-        /// Also the grace an idle close gives the HTTP server, as on `otlp_in`.
+        /// and frees its connection-cap slot: the PROXY header when `proxy_protocol:` is on, then
+        /// the TLS accept when `tls:` is set, or on a plaintext listener the wait for its first
+        /// byte. Each phase gets its own budget, so a silent connection costs up to twice this
+        /// value with `proxy_protocol:` on. Defaults to `5s`; `0s` is rejected. Also the grace an
+        /// idle close gives the HTTP server, as on `otlp_in`.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
@@ -1416,6 +1559,50 @@ pub enum ComponentKind {
         /// keep the total across listeners under the process's `nofile` limit.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Every event of a request carries the same values, and
+        /// either attribute replaces a same-named one decoded from the request. No reverse DNS
+        /// lookup is made.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        #[serde(default)]
+        peer: bool,
+        /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
+        /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
+        /// the original client it names on each event as `client.address` and `client.port`.
+        /// Off by default. The header is read before any TLS handshake, within
+        /// `handshake_timeout`. A connection without a valid header is closed and counted as
+        /// `logit.input.connections.rejected{reason="proxy_header"}`. A header that names no
+        /// client, such as a proxy's own health check, keeps the connection and stamps nothing.
+        /// Either attribute replaces a same-named one decoded from the request; `peer:` still
+        /// reports the proxy.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
+        /// The forwarding header that names each request's client: `x_forwarded_for`
+        /// (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first
+        /// element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header
+        /// is read, even when another is present, and only its first instance. A usable
+        /// address replaces `client.address` and `client.port` for that request as a pair, ahead of
+        /// the client a PROXY header names: the header's port, when it has one, becomes
+        /// `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY
+        /// header's client, if any, standing, and so does a value with no usable address
+        /// (`unknown`, an obfuscated name, anything that isn't an IP address), which is also
+        /// counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port`
+        /// always report the socket peer.
+        ///
+        /// Make the port reachable only through the proxy, and have the proxy overwrite the header
+        /// rather than append to one the client sent: any client that can connect to it directly,
+        /// or whose header the proxy keeps, can send its own header and name any address as
+        /// `client.address`.
+        #[serde(default)]
+        forwarded: Option<ForwardedHeader>,
     },
     /// Tails one or more files as a log source, one line per event; rotation-, truncation-, and
     /// checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final
@@ -2066,11 +2253,23 @@ pub enum ComponentKind {
         /// entry is rejected.
         #[serde(default)]
         redact_query: Vec<String>,
-        /// Present only to opt in to overwriting `client.address` from the first hop of
-        /// `http.request.header.x-forwarded-for`. Off by default, since the header is
-        /// client-supplied.
+        /// The forwarding header that names the client, read from the attribute
+        /// `http.request.header.x-forwarded-for`, `http.request.header.forwarded`, or
+        /// `http.request.header.x-real-ip` (or its spelling with each `.` as `-`). Off by
+        /// default. Only the named header is read, even when another is logged. `x_forwarded_for`
+        /// reads the leftmost entry, `forwarded` the first element's `for=`, and `x_real_ip` the
+        /// whole value. A usable address replaces `client.address` and `client.port` as a pair:
+        /// the header's port, when it has one, replaces `client.port`, and otherwise
+        /// `client.port` is removed. A value with no usable address (`unknown`, an obfuscated
+        /// name, anything that isn't an IP address) leaves both as logged and is counted as a
+        /// `forwarded` diagnostic.
+        ///
+        /// Make the web server reachable only through the proxy, and have the proxy overwrite
+        /// the header rather than append to one the client sent: any client that can connect to
+        /// it directly, or whose header the proxy keeps, can send its own header and name any
+        /// address as `client.address`.
         #[serde(default)]
-        forwarded: Option<ForwardedConfig>,
+        forwarded: Option<ForwardedHeader>,
     },
     /// Keeps a fraction of events, consistently. With `key:` set, the key's value is hashed
     /// (XXH64, seed 0, over a fixed canonical byte form; a frozen cross-version contract) and
@@ -2625,6 +2824,52 @@ pub enum ComponentKind {
         /// sender's series decode as typed families. Receiver mode only.
         #[serde(default)]
         metadata_cache: MetadataCacheConfig,
+        /// Stamps each event with the address of the socket peer that sent it, as
+        /// `network.peer.address` (an IP address, with an IPv4-mapped IPv6 address written as
+        /// IPv4) and `network.peer.port`. Off by default. A sender behind a proxy or load balancer
+        /// reports the proxy's address. Every event of a request carries the same values, and
+        /// either attribute replaces a same-named label decoded from the request. No reverse DNS
+        /// lookup is made. Receiver mode only; `true` alongside `scrape_targets` is rejected.
+        ///
+        /// Every sender's address becomes an attribute on its events, so series keyed by
+        /// attributes split by sender, and a sink that writes attributes receives the address.
+        /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
+        #[serde(default)]
+        peer: bool,
+        /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
+        /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
+        /// the original client it names on each event as `client.address` and `client.port`.
+        /// Off by default. The header is read before any TLS handshake, and must arrive within 5
+        /// seconds of the connection opening. A connection without a valid header is closed and
+        /// counted as `logit.input.connections.rejected{reason="proxy_header"}`. A header that
+        /// names no client, such as a proxy's own health check, keeps the connection and stamps
+        /// nothing. Either attribute replaces a same-named label decoded from the request;
+        /// `peer:` still reports the proxy. Receiver mode only; `true` alongside
+        /// `scrape_targets` is rejected.
+        ///
+        /// Make the port reachable only through the proxy: any client that can connect to it
+        /// directly can send its own header and name any address as `client.address`.
+        #[serde(default)]
+        proxy_protocol: bool,
+        /// The forwarding header that names each request's client: `x_forwarded_for`
+        /// (`X-Forwarded-For`, its leftmost entry), `forwarded` (RFC 7239's `Forwarded`, its first
+        /// element's `for=`), or `x_real_ip` (`X-Real-IP`). Off by default. Only the named header
+        /// is read, even when another is present, and only its first instance. A usable
+        /// address replaces `client.address` and `client.port` for that request as a pair, ahead of
+        /// the client a PROXY header names: the header's port, when it has one, becomes
+        /// `client.port`, and otherwise `client.port` is removed. An absent header leaves the PROXY
+        /// header's client, if any, standing, and so does a value with no usable address
+        /// (`unknown`, an obfuscated name, anything that isn't an IP address), which is also
+        /// counted as a `forwarded` diagnostic. `network.peer.address` and `network.peer.port`
+        /// always report the socket peer. Receiver mode only; a value alongside
+        /// `scrape_targets` is rejected.
+        ///
+        /// Make the port reachable only through the proxy, and have the proxy overwrite the header
+        /// rather than append to one the client sent: any client that can connect to it directly,
+        /// or whose header the proxy keeps, can send its own header and name any address as
+        /// `client.address`.
+        #[serde(default)]
+        forwarded: Option<ForwardedHeader>,
     },
     /// A synthetic event source for load testing. No socket and no decoder: it renders a
     /// declarative `event:` template as fast as `count`/`rate` allow, so a scenario measures the
@@ -5520,7 +5765,7 @@ mod tests {
                 "user_agent_rules": [{"match": "MyMonitor/", "class": "tool"}],
                 "max_length": {"url.path": 512},
                 "redact_query": ["token"],
-                "forwarded": {}
+                "forwarded": "x_forwarded_for"
             }"#,
         )
         .unwrap();
@@ -5561,11 +5806,7 @@ mod tests {
                 );
                 assert_eq!(max_length.get("url.path"), Some(&512));
                 assert_eq!(redact_query, vec!["token".to_string()]);
-                assert_eq!(
-                    forwarded,
-                    Some(ForwardedConfig { trust: true }),
-                    "an empty forwarded block defaults trust to true"
-                );
+                assert_eq!(forwarded, Some(ForwardedHeader::XForwardedFor));
             }
             other => panic!("expected HttpAccess, got {other:?}"),
         }
@@ -5616,11 +5857,36 @@ mod tests {
             user_agent_rules: vec![],
             max_length: std::collections::BTreeMap::from([("user.name".to_string(), 16)]),
             redact_query: vec![],
-            forwarded: Some(ForwardedConfig { trust: true }),
+            forwarded: Some(ForwardedHeader::Forwarded),
         };
         let json = serde_json::to_string(&kind).unwrap();
         let back: ComponentKind = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn forwarded_header_names_each_header_in_snake_case() {
+        for (text, header) in [
+            ("x_forwarded_for", ForwardedHeader::XForwardedFor),
+            ("forwarded", ForwardedHeader::Forwarded),
+            ("x_real_ip", ForwardedHeader::XRealIp),
+        ] {
+            let json = format!("\"{text}\"");
+            assert_eq!(serde_json::from_str::<ForwardedHeader>(&json).unwrap(), header);
+            assert_eq!(serde_json::to_string(&header).unwrap(), json);
+        }
+        assert!(serde_json::from_str::<ForwardedHeader>(r#""XForwardedFor""#).is_err());
+    }
+
+    /// The block form `forwarded: {trust: true}` is gone; it fails to parse rather than being
+    /// read as some header.
+    #[test]
+    fn http_access_rejects_the_forwarded_trust_block() {
+        for block in [r#"{"trust": true}"#, "{}"] {
+            let json =
+                format!(r#"{{"type": "http_access", "sources": ["in"], "forwarded": {block}}}"#);
+            assert!(serde_json::from_str::<Component>(&json).is_err(), "{block}");
+        }
     }
 
     #[test]
@@ -5990,6 +6256,9 @@ mod tests {
                 handshake_timeout,
                 idle_timeout,
                 max_connections,
+                peer,
+                proxy_protocol,
+                forwarded,
             } => {
                 assert_eq!(bind, "0.0.0.0:4317");
                 assert_eq!(protocol, OtlpProtocol::Grpc);
@@ -5997,6 +6266,9 @@ mod tests {
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
                 assert_eq!(idle_timeout, None, "opt-in -- no idle timeout unless asked for");
                 assert_eq!(max_connections, default_max_connections());
+                assert!(!peer, "opt-in -- no peer address unless asked for");
+                assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
+                assert_eq!(forwarded, None, "opt-in -- no forwarding header unless asked for");
             }
             other => panic!("expected OtlpIn, got {other:?}"),
         }
@@ -6108,8 +6380,14 @@ mod tests {
                 idle_timeout,
                 max_connections,
                 socket_mode,
+                peer,
+                proxy_protocol,
+                forwarded,
             } => {
                 assert_eq!(socket_mode, None);
+                assert!(!peer, "opt-in -- no peer address unless asked for");
+                assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
+                assert_eq!(forwarded, None, "opt-in -- no forwarding header unless asked for");
                 assert_eq!(bind.as_deref(), Some("127.0.0.1:8126"));
                 assert_eq!(socket.as_deref(), Some("/var/run/datadog/apm.socket"));
                 assert_eq!(tls, None);
@@ -6143,6 +6421,9 @@ mod tests {
                 handshake_timeout,
                 idle_timeout,
                 max_connections,
+                peer,
+                proxy_protocol,
+                forwarded,
             } => {
                 assert_eq!(bind, "0.0.0.0:8088");
                 assert_eq!(tls, None);
@@ -6153,6 +6434,9 @@ mod tests {
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
                 assert_eq!(idle_timeout, None);
                 assert_eq!(max_connections, default_max_connections());
+                assert!(!peer, "opt-in -- no peer address unless asked for");
+                assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
+                assert_eq!(forwarded, None, "opt-in -- no forwarding header unless asked for");
             }
             other => panic!("expected SplunkHecIn, got {other:?}"),
         }
@@ -7422,8 +7706,14 @@ mod tests {
                 idle_timeout,
                 max_connections,
                 metadata_cache,
+                peer,
+                proxy_protocol,
+                forwarded,
             } => {
                 assert_eq!(max_connections, default_max_connections());
+                assert!(!peer, "opt-in -- no peer address unless asked for");
+                assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
+                assert_eq!(forwarded, None, "opt-in -- no forwarding header unless asked for");
                 assert_eq!(scrape_targets, vec!["http://node-exporter:9100/metrics".to_string()]);
                 assert_eq!(interval, Duration::from_secs(15));
                 assert_eq!(timeout, Duration::from_secs(10));

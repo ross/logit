@@ -54,8 +54,8 @@
 //! **Handshake timeout.** [`OtlpInput::handshake_timeout`] (default [`HANDSHAKE_TIMEOUT`], set
 //! from `handshake_timeout:` by [`OtlpInput::with_handshake_timeout`]) bounds each pre-request
 //! phase, as `crate::tcp`'s driver does (`crates/logit-inputs/src/tcp.rs`'s "Pre-handshake
-//! timeout" section): the TLS accept on a TLS listener, the wait for the first byte on a
-//! plaintext one. Without it, a client that completes the TCP connect and never speaks pins a
+//! timeout" section): the PROXY header under `proxy_protocol:`, then the TLS accept on a TLS
+//! listener or the wait for the first byte on a plaintext one. Without it, a client that completes the TCP connect and never speaks pins a
 //! permit forever.
 //!
 //! **The plaintext first-byte bound is a `peek`, not a read.** `tokio::net::TcpStream::peek` is
@@ -67,10 +67,27 @@
 //!
 //! **A peer that closes before sending anything is not a fault.** That is every TCP health
 //! check: `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` against `demo/logit.yaml`'s
-//! plaintext `browser_in`, a Kubernetes `tcpSocket` probe, `nc -z`. A `peek` of `Ok(0)` returns
-//! `Ok(())`; only the deadline (a connection held open saying nothing) and a read error reach
-//! `connection_error`, which a probe would otherwise hit once per interval, forever. `crate::tcp`
-//! makes the same call for an EOF before its first frame.
+//! plaintext `browser_in`, a Kubernetes `tcpSocket` probe, `nc -z`. A `peek` of `Ok(0)` or of a
+//! reset (`ECONNRESET`) returns `Ok(())`; only the deadline (a connection held open saying
+//! nothing) and any other read error reach `connection_error`, which a probe would otherwise hit
+//! once per interval, forever. `crate::tcp` makes the same call for an EOF or a reset before its
+//! first payload byte (`crates/logit-inputs/src/tcp.rs`'s "Reset before the first byte" section).
+//!
+//! **Sender address.** Under `peer:` and `proxy_protocol:` ([`OtlpInput::with_peer`],
+//! [`OtlpInput::with_proxy_protocol`]), each connection task builds one [`ConnectionPeer`], and
+//! `handle_http` and `handle_grpc` stamp it on every batch a request decodes into, before
+//! delivery. [`crate::peer`] has the attributes and the PROXY read, and ADR
+//! `listener-peer-address`'s 2026-10-05 amendment has the rules. The PROXY header is read right
+//! after the permit, before the TLS accept or the first-byte peek, so the peek sees the request's
+//! first byte and not the header's. A missing, malformed, slow, or cut-off header, a reset
+//! partway through it included, closes the connection with a `proxy_header` diagnostic and
+//! counts `logit.input.connections.rejected{reason="proxy_header"}`, as on `crate::tcp`'s driver.
+//! A complete header followed by a close or a reset, HAProxy's PROXY-aware health check, then
+//! ends at the plaintext peek like any other probe. On a TLS listener that check ends in the TLS
+//! accept and reaches `connection_error`, as on `crate::tcp`'s driver. Under `forwarded:`
+//! ([`OtlpInput::with_forwarded`]), each request's forwarding header, read from gRPC metadata as
+//! from an HTTP request's headers, replaces the PROXY origin's `client.*` for that request, per
+//! ADR `forwarded-header-parsing`.
 //!
 //! **Idle timeout.** [`OtlpInput::with_idle_timeout`] (`idle_timeout:`, off unless set) bounds how
 //! long a connection may sit with no request in flight before this listener closes it and
@@ -160,10 +177,12 @@
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, drive_with_idle, Activity, BodyReadError,
 };
+use crate::peer::ConnectionPeer;
 use crate::Input;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Full, Limited};
+use logit_proto::forwarded::ForwardedHeader;
 // Only this module's tests collect a body directly; the lib path uses `collect_with_stall_bound`.
 #[cfg(test)]
 use http_body_util::BodyExt;
@@ -238,6 +257,12 @@ pub struct OtlpInput {
     /// body is capped at `MAX_REQUEST_BYTES` before parsing), so the all-JSON worst case is a
     /// finite multiple of it; `docs/known-gaps/otlp.md`'s OTLP section has the measured multiple.
     max_connections: usize,
+    /// `peer:` in config. See [`Self::with_peer`].
+    peer: bool,
+    /// `proxy_protocol:` in config. See [`Self::with_proxy_protocol`].
+    proxy_protocol: bool,
+    /// `forwarded:` in config. See [`Self::with_forwarded`].
+    forwarded: Option<ForwardedHeader>,
 }
 
 impl OtlpInput {
@@ -252,6 +277,9 @@ impl OtlpInput {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             idle_timeout: None,
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
+            peer: false,
+            proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -310,6 +338,27 @@ impl OtlpInput {
         self.max_connections = max_connections;
         self
     }
+
+    /// Stamps every event a request decodes with its connection's socket peer (`peer:` in
+    /// config), per [`crate::peer`]. Off by default.
+    pub fn with_peer(mut self, peer: bool) -> Self {
+        self.peer = peer;
+        self
+    }
+
+    /// Requires a PROXY protocol header ahead of every connection and stamps the origin it names
+    /// (`proxy_protocol:` in config). Off by default. See this module's "Sender address" section.
+    pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
+        self.proxy_protocol = proxy_protocol;
+        self
+    }
+
+    /// Reads the client from `header` on every request, HTTP and gRPC alike (`forwarded:` in
+    /// config), per [`ConnectionPeer::request`]. Off by default.
+    pub fn with_forwarded(mut self, header: Option<ForwardedHeader>) -> Self {
+        self.forwarded = header;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -340,7 +389,7 @@ impl Input for OtlpInput {
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
         let mut accept_diag = self.diag.clone();
         loop {
-            let (stream, _peer) = match accept_queue.accept(&listener).await {
+            let (mut stream, peer) = match accept_queue.accept(&listener).await {
                 Ok(accepted) => accepted,
                 Err(err) => {
                     crate::listener::absorb_accept_error(err, &self.telemetry, &mut accept_diag)
@@ -366,11 +415,35 @@ impl Input for OtlpInput {
             let telemetry = self.telemetry.clone();
             let tls_acceptor = tls_acceptor.clone();
             let live_connections = live_connections.clone();
+            let (record_peer, proxy_protocol) = (self.peer, self.proxy_protocol);
+            let forwarded = self.forwarded;
             tokio::spawn(async move {
                 // Held for the connection's lifetime; released on drop.
                 let _permit = permit;
                 // Counted out on drop, so a panicking handler brings the gauge back down too.
-                let _live = live_connections.enter();
+                let live = live_connections.enter();
+
+                // Ahead of the TLS accept and the first-byte peek, both of which would otherwise
+                // read the header's bytes as the request's (this module's "Sender address").
+                let origin = if proxy_protocol {
+                    match crate::peer::read_proxy_origin(&mut stream, handshake_timeout).await {
+                        Ok(origin) => Some(origin),
+                        Err(err) => {
+                            drop(live);
+                            telemetry.count(
+                                "logit.input.connections.rejected",
+                                1.0,
+                                &[("reason", "proxy_header")],
+                            );
+                            diag.warn_throttled("proxy_header", err);
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let connection_peer = ConnectionPeer::tcp(peer, record_peer, origin.as_ref())
+                    .with_forwarded(forwarded, &diag);
 
                 // The handshake runs here, after the permit, so it stalls only this connection.
                 let result = match tls_acceptor {
@@ -387,6 +460,7 @@ impl Input for OtlpInput {
                                     transport,
                                     sink,
                                     telemetry.clone(),
+                                    connection_peer,
                                     idle_timeout,
                                     handshake_timeout,
                                 )
@@ -400,9 +474,8 @@ impl Input for OtlpInput {
                     }
                     // The plaintext arm's budget: a `peek` that consumes nothing (this module's
                     // "peek, not a read"). A read error and the deadline reach `connection_error`
-                    // like the TLS arm's; a clean close before the first byte (`Ok(0)`) is a TCP
-                    // health check (this module's "not a fault"), as `crate::tcp`'s
-                    // `ReadStep::Eof` before any frame is.
+                    // like the TLS arm's; a clean close or a reset before the first byte is a TCP
+                    // health check (this module's "not a fault"), as in `crate::tcp`.
                     None => {
                         // Bound to a local, not matched directly: the scrutinee's temporaries
                         // (`peek`'s borrow of `stream`) would outlive the arms, and the success
@@ -412,12 +485,16 @@ impl Input for OtlpInput {
                                 .await;
                         match first_byte {
                             Ok(Ok(0)) => Ok(()), // a health-check probe, not a fault
+                            Ok(Err(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                                Ok(())
+                            }
                             Ok(Ok(_)) => {
                                 serve_connection(
                                     TokioIo::new(stream),
                                     transport,
                                     sink,
                                     telemetry.clone(),
+                                    connection_peer,
                                     idle_timeout,
                                     handshake_timeout,
                                 )
@@ -446,11 +523,13 @@ impl Input for OtlpInput {
 ///
 /// `grace` is the budget [`drive_with_idle`] gives hyper to shut down in once `idle_timeout`
 /// fires (`handshake_timeout`, reused). With `idle_timeout: None` the connection is awaited.
+/// `peer` is stamped on every batch each request decodes into.
 async fn serve_connection<IO>(
     io: IO,
     transport: OtlpTransport,
     sink: Fanout,
     telemetry: Telemetry,
+    peer: ConnectionPeer,
     idle_timeout: Option<std::time::Duration>,
     grace: std::time::Duration,
 ) -> Result<(), String>
@@ -470,11 +549,11 @@ where
                     // `enter` here, not inside the returned future: hyper calls the service as
                     // soon as a request head is parsed, so the in-flight count rises then.
                     let in_flight = activity.enter();
-                    let (sink, telemetry) = (sink.clone(), telemetry.clone());
+                    let (sink, telemetry, peer) = (sink.clone(), telemetry.clone(), peer.clone());
                     let activity = Arc::clone(&activity);
                     async move {
                         let _in_flight = in_flight;
-                        handle_http(req, sink, telemetry, &activity, idle_timeout).await
+                        handle_http(req, sink, telemetry, &peer, &activity, idle_timeout).await
                     }
                 }
             });
@@ -498,11 +577,11 @@ where
                 let (sink, telemetry) = (sink.clone(), telemetry.clone());
                 move |req| {
                     let in_flight = activity.enter();
-                    let (sink, telemetry) = (sink.clone(), telemetry.clone());
+                    let (sink, telemetry, peer) = (sink.clone(), telemetry.clone(), peer.clone());
                     let activity = Arc::clone(&activity);
                     async move {
                         let _in_flight = in_flight;
-                        handle_grpc(req, sink, telemetry, &activity, idle_timeout).await
+                        handle_grpc(req, sink, telemetry, &peer, &activity, idle_timeout).await
                     }
                 }
             });
@@ -524,6 +603,7 @@ async fn handle_http(
     req: http::Request<Incoming>,
     sink: Fanout,
     telemetry: Telemetry,
+    peer: &ConnectionPeer,
     activity: &Activity,
     stall: Option<std::time::Duration>,
 ) -> Result<http::Response<Full<Bytes>>, std::convert::Infallible> {
@@ -554,6 +634,7 @@ async fn handle_http(
         }
     };
 
+    let request_peer = peer.request(req.headers());
     let limited = Limited::new(req.into_body(), MAX_REQUEST_BYTES);
     let bytes = match collect_with_stall_bound(limited, stall).await {
         Ok(bytes) => bytes,
@@ -596,7 +677,8 @@ async fn handle_http(
         RequestEncoding::Json => decoder.decode_signal_json(signal, bytes),
     };
     match result {
-        Ok(batches) => {
+        Ok(mut batches) => {
+            request_peer.stamp_batches(&mut batches);
             if let Err(undelivered) = crate::http::deliver_detached(&sink, batches).await {
                 count_undelivered(&telemetry, undelivered);
                 let mut response =
@@ -658,6 +740,7 @@ async fn handle_grpc(
     req: http::Request<Incoming>,
     sink: Fanout,
     telemetry: Telemetry,
+    peer: &ConnectionPeer,
     activity: &Activity,
     stall: Option<std::time::Duration>,
 ) -> Result<http::Response<GrpcBody>, std::convert::Infallible> {
@@ -686,6 +769,8 @@ async fn handle_grpc(
         }
     }
 
+    // gRPC metadata is HTTP/2 headers, so the forwarding header reads as on the HTTP side.
+    let request_peer = peer.request(req.headers());
     let limited = Limited::new(req.into_body(), MAX_REQUEST_BYTES);
     let framed = match collect_with_stall_bound(limited, stall).await {
         Ok(bytes) => bytes,
@@ -735,13 +820,16 @@ async fn handle_grpc(
 
     let mut decoder = OtlpDecoder::new().with_telemetry(telemetry.clone());
     match decoder.decode_signal(signal, payload) {
-        Ok(batches) => match crate::http::deliver_detached(&sink, batches).await {
-            Ok(()) => Ok(grpc_response(0, "", Some(export_response(0, "")))),
-            Err(undelivered) => {
-                count_undelivered(&telemetry, undelivered);
-                Ok(grpc_response(14, NO_CONSUMER_TOOK_THE_BATCH, None))
+        Ok(mut batches) => {
+            request_peer.stamp_batches(&mut batches);
+            match crate::http::deliver_detached(&sink, batches).await {
+                Ok(()) => Ok(grpc_response(0, "", Some(export_response(0, "")))),
+                Err(undelivered) => {
+                    count_undelivered(&telemetry, undelivered);
+                    Ok(grpc_response(14, NO_CONSUMER_TOOK_THE_BATCH, None))
+                }
             }
-        },
+        }
         Err(err) => Ok(grpc_response(3, &err.to_string(), None)),
     }
 }
@@ -2704,5 +2792,442 @@ mod tests {
             "a keep-alive connection with no idle_timeout",
         )
         .await;
+    }
+
+    // ---- sender address: `peer:` and `proxy_protocol:` ----------------------------------------
+
+    const REJECTED: &str = "logit.input.connections.rejected";
+
+    /// A running listener with `peer:` and `proxy_protocol:` as given, one connection permit, its
+    /// diagnostics, and a probe on its telemetry.
+    struct Stamping {
+        addr: String,
+        rx: mpsc::Receiver<logit_pipeline::Delivered>,
+        diag: logit_core::Diagnostics,
+        probe: logit_pipeline::test_util::TelemetryProbe,
+    }
+
+    async fn sender_input(
+        transport: OtlpTransport,
+        peer: bool,
+        proxy_protocol: bool,
+        configure: impl FnOnce(OtlpInput) -> OtlpInput,
+    ) -> Stamping {
+        let probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
+        let diag = logit_core::Diagnostics::new("otlp_in").with_telemetry(telemetry.clone());
+        let (addr, input) = bound_input(transport).await;
+        let mut input = configure(
+            input
+                .with_telemetry(telemetry)
+                .with_diagnostics(diag.clone())
+                .with_max_connections(1)
+                .with_peer(peer)
+                .with_proxy_protocol(proxy_protocol),
+        );
+        let (sink, rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        Stamping { addr, rx, diag, probe }
+    }
+
+    /// A v2 `PROXY` over TCP/IPv4 from 203.0.113.5:41000.
+    fn v2_ipv4_header() -> Vec<u8> {
+        let mut header = logit_proto::proxy::V2_SIGNATURE.to_vec();
+        header.extend_from_slice(&[0x21, 0x11, 0x00, 0x0C]);
+        header.extend_from_slice(&[203, 0, 113, 5, 127, 0, 0, 1]);
+        header.extend_from_slice(&41000u16.to_be_bytes());
+        header.extend_from_slice(&4318u16.to_be_bytes());
+        header
+    }
+
+    /// A v2 `LOCAL` header, a proxy's own health check, which names no origin.
+    fn v2_local_header() -> Vec<u8> {
+        let mut header = logit_proto::proxy::V2_SIGNATURE.to_vec();
+        header.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]);
+        header
+    }
+
+    const V1_HEADER: &[u8] = b"PROXY TCP4 198.51.100.7 127.0.0.1 40000 4317\r\n";
+
+    /// Connects, writes `prefix`, then POSTs the two-resource metrics body over HTTP/1.1. Returns
+    /// the response and the client's local port.
+    async fn post_metrics_after(addr: &str, prefix: &[u8]) -> (String, u16) {
+        post_metrics_with(addr, prefix, &[]).await
+    }
+
+    /// [`post_metrics_after`], with `headers` added to the request.
+    async fn post_metrics_with(
+        addr: &str,
+        prefix: &[u8],
+        headers: &[(&str, &str)],
+    ) -> (String, u16) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let port = stream.local_addr().unwrap().port();
+        let body = two_resource_metrics_payload();
+        let mut wire = prefix.to_vec();
+        wire.extend_from_slice(
+            format!(
+                "POST /v1/metrics HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\
+                 Content-Type: application/x-protobuf\r\nConnection: close\r\n{}\r\n",
+                body.len(),
+                headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}\r\n"))
+                    .collect::<String>()
+            )
+            .as_bytes(),
+        );
+        wire.extend_from_slice(&body);
+        // Unchecked: a connection refused at the cap may already be closed, and then the
+        // response is empty.
+        let _ = stream.write_all(&wire).await;
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(
+            logit_pipeline::test_util::RECV_TIMEOUT,
+            stream.read_to_end(&mut buf),
+        )
+        .await;
+        (String::from_utf8_lossy(&buf).into_owned(), port)
+    }
+
+    /// Connects, writes `prefix`, then sends the two-resource metrics body as one gRPC `Export`
+    /// over h2c. Returns the `grpc-status` trailer and the client's local port.
+    async fn grpc_metrics_after(addr: &str, prefix: &[u8]) -> (String, u16) {
+        grpc_metrics_with(addr, prefix, &[]).await
+    }
+
+    /// [`grpc_metrics_after`], with `metadata` added to the call.
+    async fn grpc_metrics_with(
+        addr: &str,
+        prefix: &[u8],
+        metadata: &[(&'static str, &'static str)],
+    ) -> (String, u16) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let port = stream.local_addr().unwrap().port();
+        stream.write_all(prefix).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let mut req = http::Request::builder()
+            .method(Method::POST)
+            .uri(Signal::Metrics.grpc_method())
+            .header("content-type", "application/grpc+proto")
+            .header("te", "trailers");
+        for (name, value) in metadata {
+            req = req.header(*name, *value);
+        }
+        let req = req
+            .body(Full::new(Bytes::from(grpc_message(false, &two_resource_metrics_payload()))))
+            .unwrap();
+        let res = sender.send_request(req).await.unwrap();
+        let collected = res.into_body().collect().await.unwrap();
+        let trailers = collected.trailers().expect("should carry trailers");
+        (trailers.get("grpc-status").unwrap().to_str().unwrap().to_string(), port)
+    }
+
+    fn str_attr<'a>(event: &'a logit_core::Event, key: &str) -> Option<&'a str> {
+        event.attributes.get(key).and_then(|v| v.as_str())
+    }
+
+    /// The two batches the two-resource body decodes into, with every event checked against the
+    /// expected `network.peer.*` and `client.*` values.
+    async fn expect_two_stamped_batches(
+        rx: &mut mpsc::Receiver<logit_pipeline::Delivered>,
+        peer_port: Option<u16>,
+        client: Option<(&str, i64)>,
+    ) {
+        for _ in 0..2 {
+            let batch = logit_pipeline::test_util::recv_batch(rx).await;
+            assert!(!batch.events.is_empty());
+            for event in &batch.events {
+                let port = event.attributes.get("network.peer.port");
+                match peer_port {
+                    Some(expected) => {
+                        assert_eq!(str_attr(event, "network.peer.address"), Some("127.0.0.1"));
+                        assert_eq!(port, Some(&logit_core::Value::I64(i64::from(expected))));
+                    }
+                    None => {
+                        assert_eq!(event.attributes.get("network.peer.address"), None);
+                        assert_eq!(port, None);
+                    }
+                }
+                assert_eq!(str_attr(event, "client.address"), client.map(|(address, _)| address));
+                assert_eq!(
+                    event.attributes.get("client.port"),
+                    client.map(|(_, port)| logit_core::Value::I64(port)).as_ref()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_stamps_every_batch_of_an_http_request_with_the_socket_peer() {
+        for peer in [true, false] {
+            let mut running = sender_input(OtlpTransport::Http, peer, false, |i| i).await;
+            let (response, port) = post_metrics_after(&running.addr, b"").await;
+            assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+            expect_two_stamped_batches(&mut running.rx, peer.then_some(port), None).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_stamps_every_batch_of_a_grpc_request_with_the_socket_peer() {
+        for peer in [true, false] {
+            let mut running = sender_input(OtlpTransport::Grpc, peer, false, |i| i).await;
+            let (status, port) = grpc_metrics_after(&running.addr, b"").await;
+            assert_eq!(status, "0");
+            expect_two_stamped_batches(&mut running.rx, peer.then_some(port), None).await;
+        }
+    }
+
+    /// The proxy is the socket peer, and the v2 header names the client.
+    #[tokio::test]
+    async fn a_v2_header_on_http_stamps_the_client_beside_the_peer() {
+        let mut running = sender_input(OtlpTransport::Http, true, true, |i| i).await;
+        let (response, port) = post_metrics_after(&running.addr, &v2_ipv4_header()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        expect_two_stamped_batches(&mut running.rx, Some(port), Some(("203.0.113.5", 41000))).await;
+    }
+
+    /// The header is read before hyper's h2 preface sniff, which then sees the preface intact.
+    #[tokio::test]
+    async fn a_v1_header_on_grpc_stamps_the_client() {
+        let mut running = sender_input(OtlpTransport::Grpc, false, true, |i| i).await;
+        let (status, _port) = grpc_metrics_after(&running.addr, V1_HEADER).await;
+        assert_eq!(status, "0");
+        expect_two_stamped_batches(&mut running.rx, None, Some(("198.51.100.7", 40000))).await;
+    }
+
+    /// The header goes ahead of the ClientHello, in the clear, as a proxy sends it.
+    #[tokio::test]
+    async fn a_proxy_header_ahead_of_the_tls_handshake_is_read_first() {
+        let tls =
+            |input: OtlpInput| input.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap();
+        let mut running = sender_input(OtlpTransport::Http, false, true, tls).await;
+        let mut stream = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
+        stream.write_all(&v2_ipv4_header()).await.unwrap();
+        let connector = tls_connector(None).await;
+        let server_name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls_stream = connector.connect(server_name, stream).await.unwrap();
+        let body = two_resource_metrics_payload();
+        let head = format!(
+            "POST /v1/metrics HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\
+             Content-Type: application/x-protobuf\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        tls_stream.write_all(head.as_bytes()).await.unwrap();
+        tls_stream.write_all(&body).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(
+            logit_pipeline::test_util::RECV_TIMEOUT,
+            tls_stream.read_to_end(&mut buf),
+        )
+        .await;
+        let response = String::from_utf8_lossy(&buf);
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        expect_two_stamped_batches(&mut running.rx, None, Some(("203.0.113.5", 41000))).await;
+    }
+
+    /// A direct request on a `proxy_protocol: true` port is closed, counted, and never decoded.
+    #[tokio::test]
+    async fn a_request_without_a_proxy_header_is_rejected_and_counted() {
+        let mut running = sender_input(OtlpTransport::Http, false, true, |i| i).await;
+        let mut bare = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
+        bare.write_all(b"POST /v1/metrics HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        logit_pipeline::test_util::expect_closed(&mut bare, "a request with no PROXY header").await;
+        running
+            .probe
+            .wait_for("the proxy_header rejection", |totals| {
+                totals.sum(REJECTED, &[("reason", "proxy_header")]) == 1.0
+            })
+            .await;
+        assert_eq!(running.diag.occurrences("proxy_header"), 1);
+        assert_eq!(running.diag.occurrences("connection_error"), 0);
+        assert!(running.rx.try_recv().is_err(), "nothing is delivered");
+    }
+
+    /// Sends a request with a `LOCAL` header on new connections until one is answered `200`.
+    /// With one permit, that proves every earlier connection's task has finished, diagnostics
+    /// included: a connection refused at the cap is closed, and the loop tries again.
+    async fn next_connection_is_served(running: &mut Stamping) {
+        let deadline = tokio::time::Instant::now() + logit_pipeline::test_util::RECV_TIMEOUT;
+        loop {
+            assert!(tokio::time::Instant::now() < deadline, "no connection got a permit back");
+            let (response, _port) = post_metrics_after(&running.addr, &v2_local_header()).await;
+            if response.starts_with("HTTP/1.1 200") {
+                return;
+            }
+        }
+    }
+
+    /// HAProxy's PROXY-aware health check: a complete header, then an RST before any request
+    /// byte. It ends quietly, as a probe with no header does on a plain port.
+    #[tokio::test]
+    async fn a_reset_after_a_complete_proxy_header_is_not_an_error() {
+        for header in [v2_local_header(), V1_HEADER.to_vec()] {
+            let mut running = sender_input(OtlpTransport::Http, false, true, |i| i).await;
+            let mut client = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
+            client.write_all(&header).await.unwrap();
+            // `SO_LINGER` of zero makes the close an RST, not a FIN.
+            socket2::SockRef::from(&client).set_linger(Some(Duration::ZERO)).unwrap();
+            drop(client);
+            next_connection_is_served(&mut running).await;
+            assert_eq!(running.diag.occurrences("connection_error"), 0, "after {header:?}");
+            assert_eq!(running.diag.occurrences("proxy_header"), 0, "after {header:?}");
+            assert_eq!(
+                running.probe.sum(REJECTED, &[("reason", "proxy_header")]),
+                0.0,
+                "after {header:?}"
+            );
+        }
+    }
+
+    /// The same check ended with a FIN: the first-byte peek reads `Ok(0)` after the header.
+    #[tokio::test]
+    async fn a_close_after_a_complete_proxy_header_is_not_an_error() {
+        let mut running = sender_input(OtlpTransport::Http, false, true, |i| i).await;
+        let mut client = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
+        client.write_all(&v2_local_header()).await.unwrap();
+        drop(client);
+        next_connection_is_served(&mut running).await;
+        assert_eq!(running.diag.occurrences("connection_error"), 0);
+        assert_eq!(running.diag.occurrences("proxy_header"), 0);
+        assert_eq!(running.probe.sum(REJECTED, &[("reason", "proxy_header")]), 0.0);
+    }
+
+    // ---- sender address: `forwarded:` ---------------------------------------------------------
+
+    /// The two batches the two-resource body decodes into, each event carrying `client.address`
+    /// `address` and `client.port` `port`, absent where `None`.
+    async fn expect_forwarded_client(
+        rx: &mut mpsc::Receiver<logit_pipeline::Delivered>,
+        address: Option<&str>,
+        port: Option<i64>,
+        case: &str,
+    ) {
+        for _ in 0..2 {
+            let batch = logit_pipeline::test_util::recv_batch(rx).await;
+            assert!(!batch.events.is_empty());
+            for event in &batch.events {
+                assert_eq!(str_attr(event, "client.address"), address, "{case}");
+                let expected = port.map(logit_core::Value::I64);
+                assert_eq!(event.attributes.get("client.port"), expected.as_ref(), "{case}");
+            }
+        }
+    }
+
+    /// One request per case over each transport, on a fresh listener with `forwarded:` and
+    /// `proxy_protocol:` as given: what `client.*` reads, and how many `forwarded` diagnostics
+    /// it counted. The PROXY header, when on, names 203.0.113.5:41000.
+    #[tokio::test]
+    async fn forwarded_reads_the_named_header_on_http_and_grpc() {
+        use ForwardedHeader::{Forwarded, XForwardedFor, XRealIp};
+        type Case = (
+            Option<ForwardedHeader>,
+            bool,
+            &'static [(&'static str, &'static str)],
+            Option<&'static str>,
+            Option<i64>,
+            u64,
+        );
+        let cases: [Case; 7] = [
+            (
+                Some(XForwardedFor),
+                false,
+                &[("x-forwarded-for", "203.0.113.9, 10.0.0.1")],
+                Some("203.0.113.9"),
+                None,
+                0,
+            ),
+            (
+                Some(Forwarded),
+                false,
+                &[("forwarded", r#"for="[2001:db8::1]:443""#)],
+                Some("2001:db8::1"),
+                Some(443),
+                0,
+            ),
+            (Some(XRealIp), false, &[("x-real-ip", "203.0.113.9")], Some("203.0.113.9"), None, 0),
+            // Absent: the PROXY origin stands, quietly.
+            (Some(XForwardedFor), true, &[], Some("203.0.113.5"), Some(41000), 0),
+            // Unusable: the PROXY origin stands, diagnosed.
+            (
+                Some(XForwardedFor),
+                true,
+                &[("x-forwarded-for", "unknown")],
+                Some("203.0.113.5"),
+                Some(41000),
+                1,
+            ),
+            // Only the named header is read.
+            (Some(XRealIp), false, &[("x-forwarded-for", "203.0.113.9")], None, None, 0),
+            // Off: nothing is read.
+            (None, false, &[("x-forwarded-for", "203.0.113.9")], None, None, 0),
+        ];
+        for transport in [OtlpTransport::Http, OtlpTransport::Grpc] {
+            for (forwarded, proxy, headers, address, port, diagnosed) in cases {
+                let case = format!("{transport:?} {forwarded:?} proxy {proxy} {headers:?}");
+                let mut running =
+                    sender_input(transport, false, proxy, |i| i.with_forwarded(forwarded)).await;
+                let prefix = if proxy { v2_ipv4_header() } else { Vec::new() };
+                match transport {
+                    OtlpTransport::Http => {
+                        let (response, _) =
+                            post_metrics_with(&running.addr, &prefix, headers).await;
+                        assert!(response.starts_with("HTTP/1.1 200"), "{case}: {response}");
+                    }
+                    OtlpTransport::Grpc => {
+                        let (status, _) = grpc_metrics_with(&running.addr, &prefix, headers).await;
+                        assert_eq!(status, "0", "{case}");
+                    }
+                }
+                expect_forwarded_client(&mut running.rx, address, port, &case).await;
+                assert_eq!(running.diag.occurrences("forwarded"), diagnosed, "{case}");
+            }
+        }
+    }
+
+    /// An L4 proxy in front of an L7 one: the PROXY header names the L7 proxy and its ephemeral
+    /// port, `X-Forwarded-For` names the client, and the client's address goes out with no port
+    /// at all. `network.peer.*` stays the socket.
+    #[tokio::test]
+    async fn a_forwarding_header_replaces_the_proxy_origin_as_a_pair() {
+        for transport in [OtlpTransport::Http, OtlpTransport::Grpc] {
+            let mut running = sender_input(transport, true, true, |i| {
+                i.with_forwarded(Some(ForwardedHeader::XForwardedFor))
+            })
+            .await;
+            let headers = [("x-forwarded-for", "203.0.113.9")];
+            let port = match transport {
+                OtlpTransport::Http => {
+                    let (response, port) =
+                        post_metrics_with(&running.addr, &v2_ipv4_header(), &headers).await;
+                    assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+                    port
+                }
+                OtlpTransport::Grpc => {
+                    let (status, port) =
+                        grpc_metrics_with(&running.addr, &v2_ipv4_header(), &headers).await;
+                    assert_eq!(status, "0");
+                    port
+                }
+            };
+            for _ in 0..2 {
+                let batch = logit_pipeline::test_util::recv_batch(&mut running.rx).await;
+                for event in &batch.events {
+                    assert_eq!(str_attr(event, "client.address"), Some("203.0.113.9"));
+                    assert_eq!(event.attributes.get("client.port"), None, "{transport:?}");
+                    assert_eq!(str_attr(event, "network.peer.address"), Some("127.0.0.1"));
+                    assert_eq!(
+                        event.attributes.get("network.peer.port"),
+                        Some(&logit_core::Value::I64(i64::from(port)))
+                    );
+                }
+            }
+        }
     }
 }

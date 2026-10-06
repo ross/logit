@@ -2,6 +2,11 @@
 //! statsd_out` lossless-relay pair (`docs/adr/lossless-transit.md`; the mirror is
 //! `docs/adr/statsd-output.md`).
 //!
+//! **The driver adds sender attributes after decode.** Under `peer:` or `proxy_protocol:`,
+//! `network.peer.*` or `client.*` is added to every event, an opt-in addition the sender never
+//! sent, and one of ADR `lossless-transit`'s "Permitted normalizations". [`StatsdDecoder`] never
+//! sees a peer.
+//!
 //! ## Transports
 //!
 //! One component, two shared drivers, chosen by `transport:`; each serves an IP socket or a Unix

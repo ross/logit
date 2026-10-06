@@ -160,8 +160,10 @@
 //!     `set`/`remove`), a non-finite literal, a non-lowercase `Str` under `normalize: [lower]`, or
 //!     a repeated `normalize` step (`docs/adr/value-allowlist-cardinality-clamp.md`).
 //! 55. A `prometheus_in` with both or neither of `scrape_targets`/`bind`, a non-default field of
-//!     the other mode, a bind-mode `path` not starting with `/`, or `metadata_cache.ttl: 0s` with
-//!     `max_families > 0` (`docs/adr/prometheus-remote-write.md`).
+//!     the other mode (`peer`/`proxy_protocol`/`forwarded` among the receiver's), a bind-mode
+//!     `path` not
+//!     starting with `/`, or `metadata_cache.ttl: 0s` with `max_families > 0`
+//!     (`docs/adr/prometheus-remote-write.md`, `docs/adr/listener-peer-address.md`).
 //! 56. A `prometheus_out` with both or neither of `bind`/`endpoint`, a non-default field of the
 //!     other mode, `version: 2` with `compression: zstd` (2.0 mandates Snappy), or a sender fault
 //!     in 40's shape: a non-absolute `endpoint`, `timeout: 0s`, a reserved or colliding header, or
@@ -177,8 +179,7 @@
 //!     `none` or `all`), or an empty or repeated field name (`docs/adr/flatten-transform.md`).
 //! 60. An `http_access` `match` that is empty or invalid, an empty `route`/`class`/`route_other`/
 //!     `redact_query`, a `routes` entry not `builtin` xor `match` + `route`, a repeated `builtin`,
-//!     a bad `max_length`, or `forwarded: {trust: false}`
-//!     (`docs/adr/http-access-normalization.md`).
+//!     or a bad `max_length` (`docs/adr/http-access-normalization.md`).
 //! 61. A `sample` `rate` non-finite, outside `[0, 1]`, `1`, or `0` without `always_keep`; an empty
 //!     field name; an `always_keep` naming both or neither side, or with a non-finite value; or
 //!     `missing:` without `key:` (`docs/adr/consistent-sampling-component.md`).
@@ -248,8 +249,8 @@
 //!     value is a parse error, not a graph rule
 //!     (`docs/adr/datadog-agent-and-intake-relay.md`).
 //! 79. `proxy_protocol: true` on a `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` whose
-//!     transport isn't `tcp`: a PROXY header leads a TCP stream from a network proxy
-//!     (`docs/adr/listener-peer-address.md`).
+//!     transport isn't `tcp`, or on a `datadog_trace_in` without `bind`: a PROXY header leads a
+//!     TCP stream from a network proxy (`docs/adr/listener-peer-address.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -2317,6 +2318,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             idle_timeout,
             max_connections,
             metadata_cache,
+            peer,
+            proxy_protocol,
+            forwarded,
         } = &component.kind
         else {
             continue;
@@ -2381,6 +2385,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 Some("max_connections")
             } else if *metadata_cache != MetadataCacheConfig::default() {
                 Some("metadata_cache")
+            } else if *peer {
+                Some("peer")
+            } else if *proxy_protocol {
+                Some("proxy_protocol")
+            } else if forwarded.is_some() {
+                Some("forwarded")
             } else {
                 None
             };
@@ -2671,7 +2681,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             user_agent_rules,
             max_length,
             redact_query,
-            forwarded,
+            forwarded: _,
         } = &component.kind
         {
             let compile = |what: &str, pattern: &str| -> anyhow::Result<()> {
@@ -2773,12 +2783,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': an http_access 'redact_query' entry must not be empty -- \
                      it could never name a real query key"
-                );
-            }
-            if forwarded.is_some_and(|f| !f.trust) {
-                anyhow::bail!(
-                    "component '{id}': http_access 'forwarded: {{trust: false}}' is the default \
-                     -- omit the block instead"
                 );
             }
         }
@@ -3655,6 +3659,15 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     LinesTransport::UnixStream => Some("unix_stream"),
                 },
             ),
+            // Its TCP listener and its Unix socket are separate fields, so the rule names the
+            // field the header needs rather than a transport.
+            ComponentKind::DatadogTraceIn { proxy_protocol: true, bind: None, .. } => {
+                anyhow::bail!(
+                    "component '{id}': datadog_trace_in 'proxy_protocol' needs 'bind' -- a PROXY \
+                     header comes from a network proxy ahead of a TCP stream, and a 'socket' \
+                     connection is never read for one"
+                );
+            }
             _ => continue,
         };
         if let Some(transport) = transport {
@@ -4187,6 +4200,9 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             metadata_cache: MetadataCacheConfig::default(),
+            peer: false,
+            proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -4203,6 +4219,9 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             metadata_cache: MetadataCacheConfig::default(),
+            peer: false,
+            proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -6160,6 +6179,9 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -6233,6 +6255,9 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -6796,6 +6821,9 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             socket_mode: None,
+            peer: false,
+            proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -7024,7 +7052,7 @@ mod tests {
 
     #[test]
     fn a_fully_configured_http_access_validates() {
-        use logit_config::{ForwardedConfig, HttpRouteSet, UserAgentRule};
+        use logit_config::{ForwardedHeader, HttpRouteSet, UserAgentRule};
         let kind = ComponentKind::HttpAccess {
             routes: vec![
                 route_rule(Some(HttpRouteSet::Probes), None, None),
@@ -7038,7 +7066,7 @@ mod tests {
             }],
             max_length: std::collections::BTreeMap::from([("url.path".to_string(), 512)]),
             redact_query: vec!["token".to_string()],
-            forwarded: Some(ForwardedConfig { trust: true }),
+            forwarded: Some(ForwardedHeader::XForwardedFor),
         };
         resolve(cfg(vec![
             ("in", vec![], listener()),
@@ -7195,15 +7223,28 @@ mod tests {
         assert!(err.contains("'url.path' is 0"), "{err}");
     }
 
-    /// Rule 60: `forwarded: {trust: false}`, the default spelled out.
+    /// Rule 60 has nothing to check on `forwarded`: every header it can name validates.
     #[test]
-    fn an_http_access_forwarded_trust_false_is_rejected() {
-        let err = http_access_err(|kind| {
-            if let ComponentKind::HttpAccess { forwarded, .. } = kind {
-                *forwarded = Some(logit_config::ForwardedConfig { trust: false });
-            }
-        });
-        assert!(err.contains("omit the block instead"), "{err}");
+    fn every_http_access_forwarded_header_validates() {
+        use logit_config::ForwardedHeader;
+        for header in
+            [ForwardedHeader::XForwardedFor, ForwardedHeader::Forwarded, ForwardedHeader::XRealIp]
+        {
+            let kind = ComponentKind::HttpAccess {
+                routes: vec![],
+                route_other: None,
+                user_agent_rules: vec![],
+                max_length: std::collections::BTreeMap::new(),
+                redact_query: vec![],
+                forwarded: Some(header),
+            };
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("http", vec!["in"], kind),
+                ("out", vec!["http"], sink()),
+            ]))
+            .unwrap_or_else(|err| panic!("{header:?}: {err}"));
+        }
     }
 
     #[test]
@@ -8903,6 +8944,9 @@ mod tests {
             handshake_timeout,
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -8916,6 +8960,9 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
+            forwarded: None,
         }
     }
 
@@ -9140,6 +9187,9 @@ mod tests {
             handshake_timeout: Duration::from_secs(30),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            peer: false,
+            proxy_protocol: false,
+            forwarded: None,
         };
         resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
             .expect("a TLS otlp_in with a real handshake_timeout should resolve");
@@ -10519,7 +10569,62 @@ mod tests {
                     }
                 }),
             ),
+            (
+                "peer",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { peer, .. } = kind {
+                        *peer = true;
+                    }
+                }),
+            ),
+            (
+                "proxy_protocol",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { proxy_protocol, .. } = kind {
+                        *proxy_protocol = true;
+                    }
+                }),
+            ),
+            (
+                "forwarded",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { forwarded, .. } = kind {
+                        *forwarded = Some(logit_config::ForwardedHeader::XForwardedFor);
+                    }
+                }),
+            ),
         ]
+    }
+
+    /// Rule 55: `peer`, `proxy_protocol`, and `forwarded` are the receiver's fields, so a
+    /// receiver takes them and a scrape client is rejected for any of them.
+    #[test]
+    fn peer_and_proxy_protocol_on_a_bind_mode_prometheus_in_resolve_fine() {
+        let mut kind = prometheus_in_bind("0.0.0.0:9090");
+        if let ComponentKind::PrometheusIn { peer, proxy_protocol, forwarded, .. } = &mut kind {
+            *peer = true;
+            *proxy_protocol = true;
+            *forwarded = Some(logit_config::ForwardedHeader::Forwarded);
+        }
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+            .expect("a remote-write receiver may record its senders");
+    }
+
+    #[test]
+    fn peer_or_proxy_protocol_alongside_scrape_targets_is_rejected() {
+        for field in ["peer", "proxy_protocol", "forwarded"] {
+            let mut kind = prometheus_in(vec!["http://node-exporter:9100/metrics"]);
+            if let ComponentKind::PrometheusIn { peer, proxy_protocol, forwarded, .. } = &mut kind {
+                *peer = field == "peer";
+                *proxy_protocol = field == "proxy_protocol";
+                *forwarded =
+                    (field == "forwarded").then_some(logit_config::ForwardedHeader::XRealIp);
+            }
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains("'in'"), "for {field}, got: {err}");
+            let expected = format!("'{field}' configures the remote-write receiver");
+            assert!(err.contains(&expected), "for {field}, got: {err}");
+        }
     }
 
     /// Rule 55: a non-default `metadata_cache` in scrape mode is rejected (a scrape client reads `#
@@ -12395,6 +12500,27 @@ mod tests {
             assert!(err.contains("'proxy_protocol' needs 'transport: tcp'"), "{json}: {err}");
             assert!(err.contains(&format!("not '{transport}'")), "{json}: {err}");
         }
+    }
+
+    /// Rule 79: `datadog_trace_in` reads a PROXY header on its `bind` listener only, so
+    /// `proxy_protocol: true` needs one; a `socket` beside it is fine.
+    #[test]
+    fn rule_79_datadog_trace_in_proxy_protocol_needs_bind() {
+        for json in [
+            r#"{"type": "datadog_trace_in", "bind": "127.0.0.1:0", "proxy_protocol": true}"#,
+            r#"{"type": "datadog_trace_in", "bind": "127.0.0.1:0", "socket": "/tmp/apm.socket",
+                "proxy_protocol": true, "peer": true}"#,
+            r#"{"type": "datadog_trace_in", "socket": "/tmp/apm.socket", "proxy_protocol": false}"#,
+        ] {
+            let kind = listener_from_json(json);
+            resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+                .unwrap_or_else(|err| panic!("{json} should resolve: {err}"));
+        }
+        let kind = listener_from_json(
+            r#"{"type": "datadog_trace_in", "socket": "/tmp/apm.socket", "proxy_protocol": true}"#,
+        );
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("datadog_trace_in 'proxy_protocol' needs 'bind'"), "got: {err}");
     }
 
     /// Rule 79: `proxy_protocol: false` stays legal on every transport.

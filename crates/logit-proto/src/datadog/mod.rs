@@ -22,6 +22,11 @@
 //! are the same Datadog concepts DogStatsD carries. Tags fold into attributes by [`tags`]'s rule;
 //! timestamps convert by [`time`]'s.
 //!
+//! **The listener adds sender attributes after decode.** Under `datadog_in`'s or
+//! `datadog_trace_in`'s `peer:`, `proxy_protocol:`, or `forwarded:`, `network.peer.*` or
+//! `client.*` is added to every event, an opt-in addition the sender never sent, and one of ADR
+//! `lossless-transit`'s "Permitted normalizations". It applies to every payload family below.
+//!
 //! # Metrics (`series`, `sketches`)
 //!
 //! Five routes, each a [`DatadogDecoder`] method taking one decompressed body and `received_at`

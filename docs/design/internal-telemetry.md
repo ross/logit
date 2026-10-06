@@ -908,8 +908,11 @@ that name, and the rest of the datagram still decodes.
 
 **The connection metrics, and one codec counter.** `logit.input.connections`,
 `logit.input.connections.rejected{reason="limit"}` (the connection cap, `max_connections`, 1024
-by default, binding), and `logit.input.connections.closed{reason="idle"}`, the same three points
-`logit_in` and the shared TCP driver record, for the same reason: this accept loop rejects at the
+by default, binding), `logit.input.connections.rejected{reason="proxy_header"}` (under
+`proxy_protocol: true`, a PROXY header that was missing, malformed, cut short, or late, read
+before any TLS accept), and `logit.input.connections.closed{reason="idle"}`. The first three are
+the points `logit_in` and the shared TCP driver record, and the shared TCP driver alone records
+the `proxy_header` reason, for the same reason: this accept loop rejects at the
 cap rather than queueing behind a permit, so there's a refusal to count, and the gauge counts
 permit holders only. A connection past the cap is dropped before any TLS accept (OTLP has no
 in-band "try later" to spend a handshake delivering), so a rejection is never also a handshake. An
@@ -931,11 +934,13 @@ The OTLP codec counts a metric with no data as
 `logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}`
 (`crates/logit-proto/src/otlp/metrics.rs`).
 
-`Diagnostics` keys: `bound`, and `connection_error` (one connection's I/O failing, a TLS accept
+`Diagnostics` keys: `bound`, `connection_error` (one connection's I/O failing, a TLS accept
 that failed or timed out, or a plaintext connection held open past `handshake_timeout` without a
-first byte, which then gave its permit back; never an idle close). A plaintext peer that *closes
-cleanly* before sending anything is deliberately not counted: that's what a TCP health check looks
-like, and counting it would add one point per probe interval to this key forever.
+first byte, which then gave its permit back; never an idle close), `proxy_header` (any
+`connections.rejected{reason="proxy_header"}` refusal), and `forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted). A plaintext peer that *closes
+cleanly or resets* before sending a request byte, after a complete PROXY header under
+`proxy_protocol: true`, is not counted: that's what a TCP health check looks like, and counting it
+would add one point per probe interval to this key forever.
 
 ##### `prometheus_in`
 
@@ -991,7 +996,9 @@ reports itself:
 
 The connection metrics are `otlp_in`'s spelling verbatim, because bind mode runs the same accept
 loop and the same shared idle tracker (`crates/logit-inputs/src/http.rs`):
-`logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}` and
+`logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}`,
+`logit.input.connections.rejected{reason="proxy_header"}` (under `proxy_protocol: true`, a PROXY
+header that was missing, malformed, cut short, or late, read before any TLS accept), and
 `logit.input.connections.closed{reason="idle"}` (count). Scrape mode has none of them: it's a
 client, with no socket of its own.
 
@@ -1024,8 +1031,11 @@ client, with no socket of its own.
 `Diagnostics` keys: `bound` (bind mode's listener), `scrape_failed` (scrape mode; the failing
 target's redacted URL appears in the message text only, never a tag), `write_rejected` (bind mode,
 every `400`/`408`/`413`/`415`; the peer address appears in the message text only, for the same
-tag-cardinality reason), `closed_consumer` (bind mode, a `503` for a write no consumer took), and
-`connection_error` (never an idle close).
+tag-cardinality reason), `closed_consumer` (bind mode, a `503` for a write no consumer took),
+`connection_error` (never an idle close, nor a plaintext peer that closes cleanly or resets
+before sending a request byte, after a complete PROXY header under `proxy_protocol: true`; on a
+TLS listener that close fails the TLS accept and is counted), `proxy_header` (bind mode, any
+`connections.rejected{reason="proxy_header"}` refusal), and `forwarded` (bind mode, under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted).
 
 ##### `datadog_in`
 
@@ -1035,7 +1045,9 @@ tag-cardinality reason), `closed_consumer` (bind mode, a `503` for a write no co
 **The connection metrics are `otlp_in`'s verbatim**, because this listener runs the same accept loop
 and the same shared idle tracker (`crates/logit-inputs/src/http.rs`): `logit.input.connections`
 (gauge), `logit.input.connections.rejected{reason="limit"}`,
-`logit.input.connections.closed{reason="idle"}`, and the accept-queue gauges.
+`logit.input.connections.closed{reason="idle"}`, and the accept-queue gauges. Under
+`proxy_protocol: true`, `logit.input.connections.rejected{reason="proxy_header"}` counts a
+connection refused for its PROXY header, as on the shared TCP stream driver.
 
 **Unlike `otlp_in`, it counts requests.** A Datadog Agent posts to about a dozen routes, some of
 which this listener only acknowledges, so the `Fanout`'s batch count can't say which routes are
@@ -1073,9 +1085,14 @@ The codec's own counters (a series, sketch, log, event, check, span, or stats gr
 the rest of a request decodes) are in the [`datadog` codec section](#datadog), under this
 component's id.
 
-`Diagnostics` keys: `bound`, `connection_error` (never an idle close), `request_rejected` (every
-rejection except `404` and `405`; the peer address appears in the message text only, never a tag,
-and an API key never appears at all), `busy` (a `503`), and `closed_consumer` (a `503`).
+`Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a plaintext peer that
+closes cleanly or resets before sending a request byte, after a complete PROXY header under
+`proxy_protocol: true`; on a TLS listener that close fails the TLS accept and is counted),
+`proxy_header` (any `connections.rejected{reason="proxy_header"}` refusal),
+`forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted),
+`request_rejected` (every rejection except `404` and `405`; the peer address appears in the
+message text only, never a tag, and an API key never appears at all), `busy` (a `503`), and
+`closed_consumer` (a `503`).
 
 ##### `datadog_trace_in`
 
@@ -1086,7 +1103,9 @@ and an API key never appears at all), `busy` (a `503`), and `closed_consumer` (a
 listener only.** `logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}`,
 and `logit.input.connections.closed{reason="idle"}` count the TCP listener and the Unix socket
 together, under one cap. The accept-queue gauges read the kernel's `TCP_INFO`, which a Unix socket
-has no counterpart for, so a `socket:`-only listener has none.
+has no counterpart for, so a `socket:`-only listener has none. Under `proxy_protocol: true`,
+`logit.input.connections.rejected{reason="proxy_header"}` counts a TCP connection refused for its
+PROXY header; the Unix socket never reads one.
 
 | Name | Kind | Meaning |
 |---|---|---|
@@ -1108,7 +1127,11 @@ a shorter stall and lost ones during a longer one, and the counter can't tell th
 The codec's own counters are in the [`datadog` codec section](#datadog), under this component's id.
 
 `Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a connect-and-close
-probe), `request_rejected` (every rejection except `404` and `405`; the peer address or socket path
+probe on the Unix socket, nor a plaintext TCP peer that closes cleanly or resets before sending
+a request byte, after a complete PROXY header under `proxy_protocol: true`), `proxy_header` (any
+`connections.rejected{reason="proxy_header"}` refusal),
+`forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted),
+`request_rejected` (every rejection except `404` and `405`; the peer address or socket path
 appears in the message text only), `busy` (a `503`), `closed_consumer` (a `503`), `trace_count_mismatch` (an
 `X-Datadog-Trace-Count` header that disagrees with the traces on the wire; the request is still
 served), and `bad_header` (a `Datadog-Client-Dropped-P0-*` header that isn't an unsigned integer,
@@ -1122,7 +1145,9 @@ left out of the resource).
 **The connection metrics are `datadog_in`'s verbatim**, from the same accept loop and shared idle
 tracker: `logit.input.connections` (gauge, published by the same drop guard),
 `logit.input.connections.rejected{reason="limit"}`, `logit.input.connections.closed{reason="idle"}`,
-and the accept-queue gauges.
+and the accept-queue gauges. Under `proxy_protocol: true`,
+`logit.input.connections.rejected{reason="proxy_header"}` counts a connection refused for its
+PROXY header, as on the shared TCP stream driver.
 
 | Name | Kind | Meaning |
 |---|---|---|
@@ -1152,9 +1177,14 @@ key, a bad `time` or `fields`, a span that fell back to a log) are in the tables
 `crates/logit-proto/src/splunk/mod.rs`'s module doc and its `logs`, `metrics`, and `spans`
 submodules, under this component's id.
 
-`Diagnostics` keys: `bound`, `connection_error` (never an idle close), `request_rejected` (every
-rejection except `404` and `405`; the peer address appears in the message text only, never a tag,
-and a token never appears at all), `busy` (a `503`), and `closed_consumer` (a `503` code 9 or `500` code 8).
+`Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a plaintext peer that
+closes cleanly or resets before sending a request byte, after a complete PROXY header under
+`proxy_protocol: true`; on a TLS listener that close fails the TLS accept and is counted),
+`proxy_header` (any `connections.rejected{reason="proxy_header"}` refusal),
+`forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted),
+`request_rejected` (every rejection except `404` and `405`; the peer address appears in the
+message text only, never a tag, and a token never appears at all), `busy` (a `503`), and
+`closed_consumer` (a `503` code 9 or `500` code 8).
 
 ##### `tail_in` and `docker_in`
 
@@ -1510,15 +1540,17 @@ Seven counters. Every tag comes from a closed, `&'static` table, never an observ
 | Name | Meaning |
 |---|---|
 | `logit.transform.http_access.normalized{field}` | a field rewritten into its conformant form: a dashed alias renamed, a composite decomposed, a numeric coerced, a duration converted, a method or version normalized, a leading `?` stripped |
-| `.derived{field}` | a field written from config or a built-in table: `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`, `span.status`, `span.duration_s`, `http.request.method_original`, `client.address` under `forwarded`. Every derived attribute is fill-only, so one the producer already sent is honoured and not counted |
+| `.derived{field}` | a field written from config or a built-in table: `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`, `span.status`, `span.duration_s`, `http.request.method_original`, and `client.address` and `client.port` under `forwarded`. Every derived attribute but those two is fill-only, so one the producer already sent is honoured and not counted |
 | `.truncated{field}` | a value cut to its `max_length` |
 | `.cleaned{field}` | a control byte replaced by `_` |
-| `.invalid{field}` | present but unparseable, left as it arrived |
+| `.invalid{field}` | present but unparseable, left as it arrived; under `forwarded`, the header's attribute when it names no usable client |
 | `.redacted` | untagged; one per sensitive `url.query` value replaced |
 | `.routed{outcome="rule"\|"builtin"\|"other"\|"none"\|"kept"}` | once per event with a `url.path`, or with a producer-sent `http.route`, which is `kept` (honoured, never re-matched). The tag is the outcome, never the route value, which is operator-declared and unbounded in number |
 
-Three throttled `Diagnostics` keys, for genuine producer malformation only: `bad_request_line`
-(`http.request.line` isn't `METHOD TARGET PROTOCOL`), `bad_status`, and `bad_duration`. An absent
+Four throttled `Diagnostics` keys, for genuine producer malformation only: `bad_request_line`
+(`http.request.line` isn't `METHOD TARGET PROTOCOL`), `bad_status`, `bad_duration`, and
+`forwarded` (the header `forwarded:` names gives no usable client address, so `client.address`
+and `client.port` stay as logged). An absent
 field, an unknown method, an unclassifiable user agent, and an unrouted path are normal traffic and
 get counters only.
 

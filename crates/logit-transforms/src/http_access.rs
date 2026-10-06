@@ -11,8 +11,8 @@
 //! of `trace_context`'s contract: that component writes identity (a half-lifted trace id is a
 //! corrupt trace), this one writes descriptions, where a half-normalized line beats an untouched
 //! one. A value that doesn't parse is left as it arrived and counted `invalid{field}`; a bad
-//! status, duration, or request line also gets one throttled diagnostic, since those are producer
-//! malformation. An absent field produces nothing: no default `url.scheme`, no `user_agent.class`
+//! status, duration, request line, or forwarding header also gets one throttled diagnostic, since
+//! those are producer malformation. An absent field produces nothing: no default `url.scheme`, no `user_agent.class`
 //! for a producer that doesn't log the header, no fabricated route (ADR
 //! `operator-declared-resource-attributes`' rule).
 //!
@@ -20,10 +20,11 @@
 //! `user_agent.class`, `user_agent.synthetic.type`, and the `span.duration_s` mirror are written
 //! only when absent (by [`present`]'s rule), so a value computed server-side (a real router's
 //! `http.route`, an application's `span.status`) wins. There is no `overwrite:` option. The one
-//! exception is `forwarded: {trust: true}`, an opt-in to *replace* `client.address` with the first
-//! `X-Forwarded-For` hop (a server always logs a peer address, so fill-only would make the option
-//! a no-op). Normalizing a value the producer did send (coercion, unit conversion, method/version
-//! normalization, capping, cleaning, redaction) still applies.
+//! exception is `forwarded:`, an opt-in to *replace* `client.address` and `client.port` as a pair
+//! with the client the named forwarding header names, parsed by `logit_proto::forwarded` (a
+//! server always logs a peer address, so fill-only would make the option a no-op). ADR
+//! `forwarded-header-parsing` has the rules. Normalizing a value the producer did send (coercion,
+//! unit conversion, method/version normalization, capping, cleaning, redaction) still applies.
 //!
 //! Fill-only also makes a second pass stable: the user agent is classified on its uncapped,
 //! uncleaned value, which only the first pass sees, and the class it wrote is present on the
@@ -40,7 +41,8 @@
 //! `Bytes::from_static`, every substring a `Bytes::slice` of its source, and every config-derived
 //! output a `Value` built once in [`HttpAccess::new`] and cloned by refcount. The user-agent and
 //! route tables are scanned with `is_match`, which allocates nothing. What allocates: a
-//! control-byte clean or a redaction (one exact-size copy, via the reused `scratch` buffer), the
+//! control-byte clean, a redaction, or a `forwarded:` rewrite of `client.address` (one exact-size
+//! copy each, via the reused `scratch` buffer), the
 //! first use of each lazily-built `span.name`/`error.type` cell, and the `span.name` of an event
 //! whose producer sent its own `http.route` but no `span.name`, formatted per event since an
 //! arbitrary route has no pre-built cell.
@@ -53,6 +55,8 @@ use bytes::Bytes;
 use logit_core::interner::{intern, resolve};
 use logit_core::{AttrMap, Diagnostics, Event, Resource, Symbol, Telemetry, Value};
 use logit_pipeline::Transform;
+use logit_proto::forwarded::{self, ForwardedHeader, Unusable};
+use std::io::Write as _;
 use std::sync::Arc;
 
 // -- Names ------------------------------------------------------------------------------------
@@ -83,8 +87,12 @@ const ERROR_TYPE: &str = "error.type";
 const SPAN_NAME: &str = "span.name";
 const SPAN_STATUS: &str = "span.status";
 const SPAN_DURATION_S: &str = "span.duration_s";
+/// The forwarding headers `forwarded:` can name, as attributes.
 const XFF: &str = "http.request.header.x-forwarded-for";
+const FORWARDED: &str = "http.request.header.forwarded";
+const X_REAL_IP: &str = "http.request.header.x-real-ip";
 const CLIENT_ADDRESS: &str = "client.address";
+const CLIENT_PORT: &str = "client.port";
 
 /// Coerced to `I64` from an integer, an integral float, or a quoted numeric string.
 const INTEGER_FIELDS: [&str; 9] = [
@@ -314,7 +322,7 @@ pub struct HttpAccessConfig {
     pub user_agent_rules: Vec<UaRule>,
     pub max_length: Vec<(String, usize)>,
     pub redact_query: Vec<String>,
-    pub trust_forwarded: bool,
+    pub forwarded: Option<ForwardedHeader>,
 }
 
 // -- Pre-built state --------------------------------------------------------------------------
@@ -358,8 +366,8 @@ struct Keys {
     span_name: Key,
     span_status: Key,
     span_duration_s: Key,
-    xff: Key,
     client_address: Key,
+    client_port: Key,
     integers: [Key; INTEGER_FIELDS.len()],
     /// `[_s, _ms, _us, ns]` per quantity, each with its divisor to seconds.
     durations: [[(Key, f64); 4]; DURATIONS.len()],
@@ -387,8 +395,8 @@ impl Keys {
             span_name: Key::new(SPAN_NAME),
             span_status: Key::new(SPAN_STATUS),
             span_duration_s: Key::new(SPAN_DURATION_S),
-            xff: Key::new(XFF),
             client_address: Key::new(CLIENT_ADDRESS),
+            client_port: Key::new(CLIENT_PORT),
             integers: INTEGER_FIELDS.map(Key::new),
             durations: DURATIONS.map(|forms| forms.map(|(name, div)| (Key::new(name), div))),
             span_timing: SPAN_TIMING.map(Key::new),
@@ -419,6 +427,8 @@ fn canonical_names() -> impl Iterator<Item = &'static str> {
         SPAN_STATUS,
         SPAN_DURATION_S,
         XFF,
+        FORWARDED,
+        X_REAL_IP,
         CLIENT_ADDRESS,
     ]
     .into_iter()
@@ -635,9 +645,11 @@ pub struct HttpAccess {
     other_method: Value,
     /// Semconv's seven plus the config's `redact_query`, matched ASCII-case-insensitively.
     redact: Vec<String>,
-    trust_forwarded: bool,
-    /// Reused across events for a control-byte clean or a redaction rewrite, so neither pays for
-    /// a growing buffer, only for the one exact-size copy that becomes the new `Bytes`.
+    /// The `forwarded:` header and the attribute it's read from.
+    forwarded: Option<(ForwardedHeader, Key)>,
+    /// Reused across events for a control-byte clean, a redaction, or a `client.address` written
+    /// from a forwarding header, so none pays for a growing buffer, only for the one exact-size
+    /// copy that becomes the new `Bytes`.
     scratch: Vec<u8>,
     telemetry: Telemetry,
     diag: Diagnostics,
@@ -670,7 +682,9 @@ impl HttpAccess {
             span_unset: static_str("unset"),
             other_method: static_str(OTHER_METHOD),
             redact,
-            trust_forwarded: config.trust_forwarded,
+            forwarded: config
+                .forwarded
+                .map(|header| (header, Key::new(forwarded_attribute(header)))),
             scratch: Vec::new(),
             telemetry: Telemetry::default(),
             diag: Diagnostics::default(),
@@ -682,12 +696,21 @@ impl HttpAccess {
         self
     }
 
-    /// Attaches the throttled-diagnostic sink for the three producer malformations:
-    /// `bad_request_line`, `bad_status`, `bad_duration`. An absent field, an unknown method, an
+    /// Attaches the throttled-diagnostic sink for the four producer malformations:
+    /// `bad_request_line`, `bad_status`, `bad_duration`, and `forwarded`. An absent field, an unknown method, an
     /// unclassifiable UA, or an unrouted path is normal traffic and gets counters only.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self
+    }
+}
+
+/// The attribute a web server logs `header` under.
+fn forwarded_attribute(header: ForwardedHeader) -> &'static str {
+    match header {
+        ForwardedHeader::XForwardedFor => XFF,
+        ForwardedHeader::Forwarded => FORWARDED,
+        ForwardedHeader::XRealIp => X_REAL_IP,
     }
 }
 
@@ -1200,23 +1223,61 @@ fn classify_route(
 
 // -- Step 9: derive -----------------------------------------------------------------------------
 
-/// The first comma-separated hop of an `X-Forwarded-For` value, ASCII-trimmed, as a slice.
-fn first_hop(xff: &Bytes) -> Bytes {
-    let end = xff.iter().position(|&b| b == b',').unwrap_or(xff.len());
-    let start = xff[..end].iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(end);
-    let end = xff[..end].iter().rposition(|b| !b.is_ascii_whitespace()).map_or(start, |i| i + 1);
-    xff.slice(start..end)
-}
-
 impl HttpAccess {
+    /// Step 9's `forwarded:` half, run ahead of step 7 so the header is parsed from its uncapped,
+    /// uncleaned value: a cap can cut a `Forwarded` element inside its `for=` node, and the clean
+    /// turns a tab the parser reads as whitespace into `_`. The address written is at most 45
+    /// bytes, inside `client.address`'s cap. Only under `forwarded:`, since the header is
+    /// client-supplied: `client.address` and `client.port` are *replaced* from the named header.
+    fn rewrite_forwarded(&mut self, attrs: &mut AttrMap) {
+        let keys = &self.keys;
+        let telemetry = &self.telemetry;
+        let Some((header, key)) = self.forwarded else { return };
+        let parsed = match present(attrs, key.sym) {
+            None => return,
+            Some(Value::Str(value)) => forwarded::parse(header, value),
+            Some(_) => Err(Unusable::NotAnAddress),
+        };
+        match parsed {
+            Ok(client) => {
+                // The text form the listeners stamp: an IPv4-mapped IPv6 address as IPv4.
+                self.scratch.clear();
+                write!(self.scratch, "{}", client.address.to_canonical())
+                    .expect("writing to a Vec never fails");
+                let address = Value::Str(Bytes::copy_from_slice(&self.scratch));
+                attrs.insert_sym(keys.client_address.sym, address);
+                count(telemetry, DERIVED, keys.client_address.name);
+                match client.port {
+                    Some(port) => {
+                        attrs.insert_sym(keys.client_port.sym, Value::I64(i64::from(port)));
+                        count(telemetry, DERIVED, keys.client_port.name);
+                    }
+                    None => {
+                        attrs.remove_sym(keys.client_port.sym);
+                    }
+                }
+            }
+            Err(reason) => {
+                count(telemetry, INVALID, key.name);
+                self.diag.warn_throttled(
+                    "forwarded",
+                    format_args!(
+                        "http_access: {}: {reason}; client.address and client.port left as \
+                         logged",
+                        key.name
+                    ),
+                );
+            }
+        }
+    }
+
     /// Step 9, each attribute written only when the producer didn't send it (by [`present`]'s
     /// rule): `error.type` (the status, 5xx only), `span.status` (`error` for 5xx or `0`, else
     /// `unset`; never `ok`, which semconv reserves for an explicit override, though a producer's
     /// own `ok` is honoured even on a 5xx), `span.name` (`{method} {route}`, or the method
-    /// alone), and the `span.duration_s` mirror. Then, only under `forwarded: {trust: true}`
-    /// since the header is client-supplied, `client.address` is *replaced* by the first XFF hop.
-    /// Every value is a pre-built cell, a constant, or a slice, except a `span.name` around a
-    /// producer-sent `http.route`, which is formatted per event.
+    /// alone), and the `span.duration_s` mirror. Its `forwarded:` half is
+    /// [`Self::rewrite_forwarded`]. Every value is a pre-built cell, a constant, or a slice, except
+    /// a `span.name` around a producer-sent `http.route`, which is formatted per event.
     fn derive(&mut self, attrs: &mut AttrMap, method: Option<usize>, route: Routed) {
         let keys = &self.keys;
         let telemetry = &self.telemetry;
@@ -1264,15 +1325,6 @@ impl HttpAccess {
                 count(telemetry, DERIVED, keys.span_duration_s.name);
             }
         }
-        if self.trust_forwarded {
-            if let Some(Value::Str(xff)) = present(attrs, keys.xff.sym) {
-                let hop = first_hop(xff);
-                if !hop.is_empty() {
-                    attrs.insert_sym(keys.client_address.sym, Value::Str(hop));
-                    count(telemetry, DERIVED, keys.client_address.name);
-                }
-            }
-        }
     }
 }
 
@@ -1293,9 +1345,10 @@ impl Transform for HttpAccess {
         let method = normalize_method(attrs, &self.keys, &self.other_method, &self.telemetry);
         normalize_version(attrs, &self.keys, &self.telemetry);
         normalize_query(attrs, &self.keys, &self.redact, &mut self.scratch, &self.telemetry);
-        // Step 8's user-agent half runs ahead of step 7 because it classifies the uncapped
-        // value; the route half below classifies the capped path.
+        // Step 8's user-agent half and step 9's `forwarded:` half run ahead of step 7 because
+        // each reads its field's uncapped value; the route half below classifies the capped path.
         classify_user_agent(attrs, &self.keys, &self.ua, &self.telemetry);
+        self.rewrite_forwarded(attrs);
         cap_and_clean(attrs, &self.caps, &mut self.scratch, &self.telemetry);
         let route = classify_route(attrs, &self.keys, &self.router, &self.telemetry);
         self.derive(attrs, method, route);
@@ -1321,6 +1374,8 @@ mod tests {
             ("http.request.header.referer", 256),
             ("client.address", 128),
             ("http.request.header.x-forwarded-for", 128),
+            ("http.request.header.forwarded", 256),
+            ("http.request.header.x-real-ip", 128),
             ("user.name", 128),
             ("http.request.method_original", 32),
             ("network.protocol.version", 8),
@@ -2233,18 +2288,135 @@ mod tests {
         assert_eq!(get(&event, "span.duration_s"), None, "a start and an end: not mirrored");
     }
 
-    #[test]
-    fn xff_is_ignored_by_default_and_its_first_hop_wins_when_trusted() {
-        let pairs =
-            [("client.address", s("10.0.0.1")), (XFF, s("  203.0.113.7 , 10.0.0.9, 10.0.0.1"))];
-        let event = run(&mut bare(), &pairs);
-        assert_eq!(get(&event, "client.address"), Some(&s("10.0.0.1")));
+    fn forwarding(header: ForwardedHeader) -> HttpAccess {
+        http(HttpAccessConfig { forwarded: Some(header), ..config() })
+    }
 
-        let mut trusted = http(HttpAccessConfig { trust_forwarded: true, ..config() });
-        let event = run(&mut trusted, &pairs);
+    /// The proxy's address and port, as a web server behind it logs them.
+    fn proxy_peer() -> [(&'static str, Value); 2] {
+        [("client.address", s("10.0.0.1")), ("client.port", s("51234"))]
+    }
+
+    fn with_proxy_peer(extra: (&'static str, Value)) -> Vec<(&'static str, Value)> {
+        let mut pairs = proxy_peer().to_vec();
+        pairs.push(extra);
+        pairs
+    }
+
+    #[test]
+    fn every_forwarding_header_is_ignored_by_default() {
+        for name in [XFF, FORWARDED, X_REAL_IP] {
+            let event = run(&mut bare(), &with_proxy_peer((name, s("for=203.0.113.7"))));
+            assert_eq!(get(&event, "client.address"), Some(&s("10.0.0.1")), "{name}");
+            assert_eq!(get(&event, "client.port"), Some(&Value::I64(51234)), "{name}");
+        }
+    }
+
+    #[test]
+    fn xff_with_a_port_replaces_the_address_and_the_port() {
+        let pairs = with_proxy_peer((XFF, s("  203.0.113.7:5678 , 10.0.0.9, 10.0.0.1")));
+        let event = run(&mut forwarding(ForwardedHeader::XForwardedFor), &pairs);
         assert_eq!(get(&event, "client.address"), Some(&s("203.0.113.7")));
-        let event = run(&mut trusted, &[("client.address", s("10.0.0.1")), (XFF, s("-"))]);
-        assert_eq!(get(&event, "client.address"), Some(&s("10.0.0.1")), "a blank XFF is absent");
+        assert_eq!(get(&event, "client.port"), Some(&Value::I64(5678)));
+    }
+
+    #[test]
+    fn xff_without_a_port_removes_the_logged_port() {
+        let pairs = with_proxy_peer((XFF, s("203.0.113.7, 10.0.0.1")));
+        let event = run(&mut forwarding(ForwardedHeader::XForwardedFor), &pairs);
+        assert_eq!(get(&event, "client.address"), Some(&s("203.0.113.7")));
+        assert_eq!(
+            get(&event, "client.port"),
+            None,
+            "an address never sits beside the proxy's port"
+        );
+    }
+
+    #[test]
+    fn forwarded_quoted_ipv6_with_a_port_is_stripped_of_brackets() {
+        let pairs = with_proxy_peer((
+            FORWARDED,
+            s(r#"for="[2001:db8:cafe::17]:4711";proto=https, for=10.0.0.9"#),
+        ));
+        let event = run(&mut forwarding(ForwardedHeader::Forwarded), &pairs);
+        assert_eq!(get(&event, "client.address"), Some(&s("2001:db8:cafe::17")));
+        assert_eq!(get(&event, "client.port"), Some(&Value::I64(4711)));
+    }
+
+    #[test]
+    fn x_real_ip_replaces_the_address_and_an_ipv4_mapped_one_is_written_as_ipv4() {
+        let mut t = forwarding(ForwardedHeader::XRealIp);
+        let event = run(&mut t, &with_proxy_peer((X_REAL_IP, s(" 198.51.100.2 "))));
+        assert_eq!(get(&event, "client.address"), Some(&s("198.51.100.2")));
+        assert_eq!(get(&event, "client.port"), None);
+        let event = run(&mut t, &with_proxy_peer((X_REAL_IP, s("::ffff:192.0.2.1"))));
+        assert_eq!(get(&event, "client.address"), Some(&s("192.0.2.1")));
+    }
+
+    #[test]
+    fn only_the_named_header_is_read() {
+        let mut pairs = with_proxy_peer((XFF, s("203.0.113.7")));
+        pairs.push((X_REAL_IP, s("198.51.100.2")));
+        let event = run(&mut forwarding(ForwardedHeader::Forwarded), &pairs);
+        assert_eq!(get(&event, "client.address"), Some(&s("10.0.0.1")), "no Forwarded logged");
+        assert_eq!(get(&event, "client.port"), Some(&Value::I64(51234)));
+        let event = run(&mut forwarding(ForwardedHeader::XRealIp), &pairs);
+        assert_eq!(get(&event, "client.address"), Some(&s("198.51.100.2")));
+    }
+
+    #[test]
+    fn an_unusable_header_leaves_client_as_logged_and_is_counted_and_diagnosed() {
+        let (mut t, registry, diag) = instrumented(HttpAccessConfig {
+            forwarded: Some(ForwardedHeader::Forwarded),
+            ..config()
+        });
+        for value in [s(r#"for="_gazonk""#), s("for=unknown"), s("by=10.0.0.1"), Value::I64(7)] {
+            let event = run(&mut t, &with_proxy_peer((FORWARDED, value.clone())));
+            assert_eq!(get(&event, "client.address"), Some(&s("10.0.0.1")), "{value:?}");
+            assert_eq!(get(&event, "client.port"), Some(&Value::I64(51234)), "{value:?}");
+            assert_eq!(get(&event, FORWARDED), Some(&value), "the header is left in place");
+        }
+        assert_eq!(diag.occurrences("forwarded"), 4);
+        let events = registry.drain(0);
+        assert_eq!(counter(&events, INVALID, Some(("field", FORWARDED))), 4.0);
+        assert_eq!(counter(&events, DERIVED, Some(("field", "client.address"))), 0.0);
+    }
+
+    /// The header is parsed before step 7 caps it at 256 characters: here the cap would cut the
+    /// node to `192.0.2.4`, a valid address with no port.
+    #[test]
+    fn a_long_parameter_ahead_of_for_still_yields_the_whole_node() {
+        let value = format!(r#"host="{}";for=192.0.2.43:4711"#, "a".repeat(235));
+        assert!(value.len() > 256, "the value must be over the cap");
+        let event = run(
+            &mut forwarding(ForwardedHeader::Forwarded),
+            &with_proxy_peer((FORWARDED, s(&value))),
+        );
+        assert_eq!(get(&event, "client.address"), Some(&s("192.0.2.43")));
+        assert_eq!(get(&event, "client.port"), Some(&Value::I64(4711)));
+    }
+
+    /// The header is parsed before step 7's clean, which would turn the tab into `_`.
+    #[test]
+    fn a_tab_beside_the_for_pair_is_whitespace() {
+        let pairs = with_proxy_peer((FORWARDED, s("proto=http;\tfor=192.0.2.1:80\t")));
+        let event = run(&mut forwarding(ForwardedHeader::Forwarded), &pairs);
+        assert_eq!(get(&event, "client.address"), Some(&s("192.0.2.1")));
+        assert_eq!(get(&event, "client.port"), Some(&Value::I64(80)));
+    }
+
+    #[test]
+    fn a_blank_header_is_absent_and_not_diagnosed() {
+        let (mut t, _registry, diag) = instrumented(HttpAccessConfig {
+            forwarded: Some(ForwardedHeader::XForwardedFor),
+            ..config()
+        });
+        for value in [s("-"), s(""), Value::Null] {
+            let event = run(&mut t, &with_proxy_peer((XFF, value)));
+            assert_eq!(get(&event, "client.address"), Some(&s("10.0.0.1")));
+            assert_eq!(get(&event, "client.port"), Some(&Value::I64(51234)));
+        }
+        assert_eq!(diag.occurrences("forwarded"), 0);
     }
 
     // -- Step 0: aliases --------------------------------------------------------------------------
@@ -2290,11 +2462,18 @@ mod tests {
 
     #[test]
     fn a_dashed_header_key_keeps_its_own_dashes_after_the_prefix() {
-        let mut trusted = http(HttpAccessConfig { trust_forwarded: true, ..config() });
-        let event =
-            run(&mut trusted, &[("http-request-header-x-forwarded-for", s("198.51.100.2"))]);
-        assert_eq!(get(&event, XFF), Some(&s("198.51.100.2")));
-        assert_eq!(get(&event, "client.address"), Some(&s("198.51.100.2")));
+        for (header, dotted, value) in [
+            (ForwardedHeader::XForwardedFor, XFF, "198.51.100.2:80"),
+            (ForwardedHeader::Forwarded, FORWARDED, "for=198.51.100.2:80"),
+            (ForwardedHeader::XRealIp, X_REAL_IP, "198.51.100.2:80"),
+        ] {
+            let dashed = dotted.replace('.', "-");
+            assert!(dashed.starts_with("http-request-header-"), "{dashed}");
+            let event = run(&mut forwarding(header), &[(dashed.as_str(), s(value))]);
+            assert_eq!(get(&event, dotted), Some(&s(value)), "{dashed}");
+            assert_eq!(get(&event, "client.address"), Some(&s("198.51.100.2")), "{dashed}");
+            assert_eq!(get(&event, "client.port"), Some(&Value::I64(80)), "{dashed}");
+        }
     }
 
     #[test]
@@ -2322,7 +2501,7 @@ mod tests {
         HttpAccessConfig {
             routes: vec![RouteRule::Builtin(RouteSet::Assets)],
             route_other: Some("/{other}".to_string()),
-            trust_forwarded: true,
+            forwarded: Some(ForwardedHeader::XForwardedFor),
             ..config()
         }
     }

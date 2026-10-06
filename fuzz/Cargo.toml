@@ -112,3 +112,10 @@ path = "fuzz_targets/proxy_header.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "forwarded"
+path = "fuzz_targets/forwarded.rs"
+test = false
+doc = false
+bench = false

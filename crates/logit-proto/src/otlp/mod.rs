@@ -24,6 +24,11 @@
 //!
 //! **An empty batch encodes to no payloads**, never an empty request
 //! ([`SignalEncoder::encode_signals`]).
+//!
+//! **The listener adds sender attributes after decode.** Under `otlp_in`'s `peer:`,
+//! `proxy_protocol:`, or `forwarded:`, `network.peer.*` or `client.*` is added to every event, an
+//! opt-in addition the sender never sent, and one of ADR `lossless-transit`'s "Permitted
+//! normalizations".
 
 pub mod common;
 pub mod grpc;

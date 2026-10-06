@@ -203,8 +203,8 @@ per-attempt list (`0.004, 0.012` after a retry) is left verbatim and never count
 |---|---|---|
 | `server.address` | string | Capped (253 chars). |
 | `server.port` | integer or numeric string | Coerced to an integer. |
-| `client.address` | string | Capped (128 chars). Overwritten from the first hop of `http.request.header.x-forwarded-for` only under `forwarded: {trust: true}`. |
-| `client.port` | integer or numeric string | Coerced to an integer. |
+| `client.address` | string | Capped (128 chars). Under [`forwarded:`](#forwarded), replaced by the address the named forwarding header gives. |
+| `client.port` | integer or numeric string | Coerced to an integer. Under [`forwarded:`](#forwarded), replaced by the forwarding header's port, or removed when the header has none. |
 | `network.peer.address` | string | Capped (128 chars). |
 | `network.peer.port` | integer or numeric string | Coerced to an integer. |
 
@@ -214,7 +214,9 @@ per-attempt list (`0.004, 0.012` after a retry) is left verbatim and never count
 |---|---|---|
 | `user_agent.original` | string, raw header value | Classified into `user_agent.class` on the **uncapped** value (a spoofed user agent's identifying token is often at its tail), then capped (256 chars). Absent: no class. Present but `""`/`"-"`: class `none`. |
 | `http.request.header.referer` | string, raw | Capped (256 chars). |
-| `http.request.header.x-forwarded-for` | string, raw | Capped (128 chars). Its first comma-separated hop feeds `client.address` under `forwarded: {trust: true}` (off by default — the header is client-supplied). |
+| `http.request.header.x-forwarded-for` | string, raw | Capped (128 chars). Read under `forwarded: x_forwarded_for`. |
+| `http.request.header.forwarded` | string, raw | Capped (256 chars). RFC 7239's `Forwarded`, read under `forwarded: forwarded`. |
+| `http.request.header.x-real-ip` | string, raw | Capped (128 chars). Read under `forwarded: x_real_ip`. |
 | `user.name` | string | Capped (128 chars). The authenticated principal, when the server exposes one. |
 
 ### Proxy fields
@@ -267,8 +269,8 @@ put `keep_values` after this component if that matters. See "Doing some of it se
 Every row above is fill-only. An existing value is never recomputed, whether the producer logged
 it or an upstream `set`/`lua` stage wrote it, and a present `user_agent.class` also suppresses the
 `user_agent.synthetic.type` derivation. No option makes `http_access` overwrite them. The one
-field it does replace is `client.address`, and only under `forwarded: {trust: true}` (see
-[`forwarded:`](#forwarded)). Normalization of a value you *did* send (status to an integer, the
+fields it does replace are `client.address` and `client.port`, and only under
+[`forwarded:`](#forwarded). Normalization of a value you *did* send (status to an integer, the
 cap, the clean, the redaction) applies regardless: that's hardening, not overriding.
 
 ### Server variables at a glance
@@ -381,7 +383,8 @@ wrapped in `"..."`. Getting it wrong either breaks the line's JSON or loses prec
 
 - `http-request-method`, `url-path`, `http-response-status_code`, `user_agent-original`,
   `span-start_us`, and `http-request-duration_ms`.
-- `http-request-header-x-forwarded-for`: the header key keeps its own dashes.
+- `http-request-header-x-forwarded-for`, `http-request-header-forwarded`, and
+  `http-request-header-x-real-ip`: the header key keeps its own dashes.
 
 This exists for HAProxy's own JSON encoder (`%{+json}o`, HAProxy 3.0+), which names each item with
 `%(name)`. That name grammar accepts only `[A-Za-z0-9_-]` and rejects a literal `.` (verified
@@ -920,10 +923,12 @@ Per-field character caps, overriding these defaults (`logit-config`'s `CAPPED_FI
 | `url.query` | 256 |
 | `user_agent.original` | 256 |
 | `http.request.header.referer` | 256 |
+| `http.request.header.forwarded` | 256 |
 | `server.address` | 253 |
 | `client.address` | 128 |
 | `network.peer.address` | 128 |
 | `http.request.header.x-forwarded-for` | 128 |
+| `http.request.header.x-real-ip` | 128 |
 | `upstream.address` | 128 |
 | `user.name` | 128 |
 | `http.request.method_original` | 32 |
@@ -956,15 +961,38 @@ redact_query: [session_token, api_key]
 ### `forwarded:`
 
 ```yaml
-forwarded: {trust: true}
+forwarded: x_forwarded_for   # or forwarded, or x_real_ip
 ```
 
-Off by default. When present, `client.address` is overwritten with the first comma-separated hop
-of `http.request.header.x-forwarded-for`. That header is client-supplied, so only turn this on
-when every request reaches this server through a proxy you control that sets it. There is no
-trusted-proxy list or hop count (see [What it does not do](#what-it-does-not-do)).
+Off by default. Names the one forwarding header your proxy sets, and `http_access` reads the
+client's address from it. Log the header under its attribute:
 
-`{trust: false}` is rejected. To turn trust off, omit the block, so there's one spelling of "off".
+| `forwarded:` | Attribute | Client read from |
+|---|---|---|
+| `x_forwarded_for` | `http.request.header.x-forwarded-for` | the leftmost comma-separated entry |
+| `forwarded` | `http.request.header.forwarded` | the first element's `for=` parameter |
+| `x_real_ip` | `http.request.header.x-real-ip` | the whole value |
+
+Only the named header is read, even when the line logs another. `http_access` reads the one
+string the server logged, so when a request repeats the header, the server decides which instance
+that is.
+
+The value must be an IP address, optionally with a port: `203.0.113.7`, `203.0.113.7:5678`,
+`2001:db8::1`, `[2001:db8::1]`, or `[2001:db8::1]:443`. An unbracketed IPv6 address is always read
+whole, so its last group is never taken as a port. `client.address` and `client.port` are replaced
+as a pair: the address is written without brackets, an IPv4-mapped IPv6 address as IPv4, and the
+header's port replaces `client.port`. When the header has no port, `client.port` is removed, so
+the client's address never sits beside the proxy's port.
+
+A header with no usable address (`unknown`, an obfuscated name such as `_hidden`, or anything
+that isn't an IP address) leaves `client.address` and `client.port` as logged, counts
+`invalid{field}` for the header's attribute, and raises a throttled `forwarded` diagnostic. An
+absent, `""`, or `"-"` header does nothing.
+
+Make the web server reachable only through your proxy, and have the proxy overwrite the header
+rather than append to one the client sent. Any client that reaches the server directly, or whose
+header the proxy keeps, can name any address as `client.address`. There's no trusted-proxy list
+or hop count (see [What it does not do](#what-it-does-not-do)).
 
 ## Bounding cardinality
 
@@ -1061,8 +1089,8 @@ Once traffic is flowing, watch these:
   unclassifiable paths.
 - **`logit.transform.http_access.invalid{field}`**: a field that arrived but didn't parse. Beyond
   an occasional blip, a steady count on one `field` means that key is misnamed or mistyped in the
-  log format. The throttled diagnostics `bad_request_line`, `bad_status`, and `bad_duration`
-  (`logit.component.diagnostics{key}`) point at the same problems.
+  log format. The throttled diagnostics `bad_request_line`, `bad_status`, `bad_duration`, and,
+  under `forwarded:`, `forwarded` (`logit.component.diagnostics{key}`) point at the same problems.
 - **`logit.component.diagnostics{key="invalid_utf8"}` on the `json` component**: how often
   `invalid_utf8: replace` actually rescued a line. `key="parse_failure"` is a line lost anyway.
 
@@ -1136,9 +1164,9 @@ tracks each of these:
 - **No per-server presets.** `http_access` never learns a server's native variable names; you
   write the mapping in the server's own log-format language, or, for Caddy and Traefik, in a Lua
   rename stage.
-- **`forwarded: {trust: true}` is all-or-nothing.** No trusted-proxy list and no hop count: it
-  trusts the first hop of the whole `X-Forwarded-For` chain, including any a client injected before
-  reaching your first proxy.
+- **`forwarded:` trusts the header you name.** No trusted-proxy list and no hop count: it reads
+  the client the header names first, including one a client wrote before reaching your proxy if
+  the proxy appends rather than overwrites.
 - **Route rules are regex-only**, matched in order, one at a time — O(rules) per event, no
   prefilter, no path-template syntax (`/users/:id`), no prefix trie. Fine for the handful of rules
   a real deployment needs.

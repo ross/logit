@@ -64,6 +64,7 @@ use logit_pipeline::{
     SinkQueueConfig, SinkStoreConfig, WriteLoopConfig,
 };
 use logit_proto::collectd::{CollectdEncoder, TypesDb};
+use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::frame::Compression as NativeCompression;
 use logit_proto::graphite::{
     GraphiteEncoder, MultiValue as GraphiteWireMultiValue, Protocol as GraphiteWireProtocol,
@@ -553,7 +554,17 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        OtlpIn { bind, protocol, tls, handshake_timeout, idle_timeout, max_connections } => {
+        OtlpIn {
+            bind,
+            protocol,
+            tls,
+            handshake_timeout,
+            idle_timeout,
+            max_connections,
+            peer,
+            proxy_protocol,
+            forwarded,
+        } => {
             let mut input = OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
@@ -561,13 +572,26 @@ fn build_spec(
                 // the grace an idle close gives `hyper` (`docs/adr/idle-connection-timeout.md`).
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
-                .with_max_connections(*max_connections);
+                .with_max_connections(*max_connections)
+                .with_peer(*peer)
+                .with_proxy_protocol(*proxy_protocol)
+                .with_forwarded(forwarded.map(to_forwarded_header));
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        DatadogIn { bind, tls, api_keys, handshake_timeout, idle_timeout, max_connections } => {
+        DatadogIn {
+            bind,
+            tls,
+            api_keys,
+            handshake_timeout,
+            idle_timeout,
+            max_connections,
+            peer,
+            proxy_protocol,
+            forwarded,
+        } => {
             let mut input = DatadogInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
@@ -575,6 +599,9 @@ fn build_spec(
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
                 .with_max_connections(*max_connections)
+                .with_peer(*peer)
+                .with_proxy_protocol(*proxy_protocol)
+                .with_forwarded(forwarded.map(to_forwarded_header))
                 .with_api_keys(api_keys.clone());
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
@@ -591,6 +618,9 @@ fn build_spec(
             handshake_timeout,
             idle_timeout,
             max_connections,
+            peer,
+            proxy_protocol,
+            forwarded,
         } => {
             let mut input = SplunkHecInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -599,6 +629,9 @@ fn build_spec(
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
                 .with_max_connections(*max_connections)
+                .with_peer(*peer)
+                .with_proxy_protocol(*proxy_protocol)
+                .with_forwarded(forwarded.map(to_forwarded_header))
                 .with_tokens(tokens.clone())
                 // Saturates on a 32-bit target: a cap past the address space is no cap.
                 .with_max_request_bytes(usize::try_from(*max_request_bytes).unwrap_or(usize::MAX))
@@ -618,6 +651,9 @@ fn build_spec(
             handshake_timeout,
             idle_timeout,
             max_connections,
+            peer,
+            proxy_protocol,
+            forwarded,
         } => {
             let mut input = DatadogTraceInput::new()
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -625,7 +661,10 @@ fn build_spec(
                 // Read twice, as on `otlp_in`: the pre-request budget and an idle close's grace.
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
-                .with_max_connections(*max_connections);
+                .with_max_connections(*max_connections)
+                .with_peer(*peer)
+                .with_proxy_protocol(*proxy_protocol)
+                .with_forwarded(forwarded.map(to_forwarded_header));
             if let Some(bind) = bind {
                 input = input.with_bind(bind.clone());
             }
@@ -655,6 +694,9 @@ fn build_spec(
             idle_timeout,
             max_connections,
             metadata_cache,
+            peer,
+            proxy_protocol,
+            forwarded,
         } => {
             let input: Box<dyn Input + Send> = match bind {
                 Some(bind) => {
@@ -663,6 +705,9 @@ fn build_spec(
                         .with_telemetry(telemetry.clone())
                         .with_idle_timeout(*idle_timeout)
                         .with_max_connections(*max_connections)
+                        .with_peer(*peer)
+                        .with_proxy_protocol(*proxy_protocol)
+                        .with_forwarded(forwarded.map(to_forwarded_header))
                         // Unconditional: the receiver reads `max_families: 0` as off, and rule 55
                         // rejects a zero `ttl`.
                         .with_metadata_cache(metadata_cache.max_families, metadata_cache.ttl);
@@ -1854,7 +1899,7 @@ fn to_http_access_config(
     user_agent_rules: &[logit_config::UserAgentRule],
     max_length: &std::collections::BTreeMap<String, usize>,
     redact_query: &[String],
-    forwarded: Option<logit_config::ForwardedConfig>,
+    forwarded: Option<logit_config::ForwardedHeader>,
 ) -> HttpAccessConfig {
     let routes = routes
         .iter()
@@ -1890,7 +1935,16 @@ fn to_http_access_config(
         user_agent_rules,
         max_length,
         redact_query: redact_query.to_vec(),
-        trust_forwarded: forwarded.is_some_and(|f| f.trust),
+        forwarded: forwarded.map(to_forwarded_header),
+    }
+}
+
+/// A `forwarded:` header into the parser's own enum.
+fn to_forwarded_header(header: logit_config::ForwardedHeader) -> ForwardedHeader {
+    match header {
+        logit_config::ForwardedHeader::XForwardedFor => ForwardedHeader::XForwardedFor,
+        logit_config::ForwardedHeader::Forwarded => ForwardedHeader::Forwarded,
+        logit_config::ForwardedHeader::XRealIp => ForwardedHeader::XRealIp,
     }
 }
 
@@ -2506,6 +2560,9 @@ mod tests {
                     handshake_timeout: Duration::from_secs(5),
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
+                    peer: false,
+                    proxy_protocol: false,
+                    forwarded: None,
                 },
             };
             assert!(
@@ -2575,6 +2632,9 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 metadata_cache: logit_config::MetadataCacheConfig::default(),
+                peer: false,
+                proxy_protocol: false,
+                forwarded: None,
             },
         };
         assert!(matches!(
@@ -2604,6 +2664,9 @@ mod tests {
                 idle_timeout: Some(Duration::from_secs(60)),
                 max_connections: logit_config::default_max_connections(),
                 metadata_cache: logit_config::MetadataCacheConfig::default(),
+                peer: false,
+                proxy_protocol: false,
+                forwarded: None,
             },
         };
         assert!(matches!(
@@ -3023,6 +3086,9 @@ mod tests {
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
+                forwarded: None,
             },
         };
         assert!(matches!(
@@ -3280,6 +3346,9 @@ mod tests {
                 handshake_timeout: Duration::from_millis(50),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
+                forwarded: None,
             },
         };
         let spec = build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0;
@@ -3490,6 +3559,9 @@ mod tests {
             handshake_timeout: logit_config::default_handshake_timeout(),
             idle_timeout: None,
             max_connections: 1,
+            peer: false,
+            proxy_protocol: false,
+            forwarded: None,
         };
         let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
 
@@ -3718,6 +3790,9 @@ mod tests {
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
+                peer: false,
+                proxy_protocol: false,
+                forwarded: None,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -4706,7 +4781,7 @@ mod tests {
                 user_agent_rules: vec![],
                 max_length: std::collections::BTreeMap::from([("user.name".to_string(), 3)]),
                 redact_query: vec![],
-                forwarded: Some(logit_config::ForwardedConfig { trust: true }),
+                forwarded: Some(logit_config::ForwardedHeader::XForwardedFor),
             },
         };
         let NodeSpec::Transform(mut transform) =
@@ -4747,7 +4822,7 @@ mod tests {
             Some(256),
             "the CAPPED_FIELDS default for every field not overridden"
         );
-        assert_eq!(get("client.address"), Some(logit_core::Value::str("192.0.2.1")), "trusted");
+        assert_eq!(get("client.address"), Some(logit_core::Value::str("192.0.2.1")), "forwarded");
     }
 
     /// The component id becomes `shape`'s `tap` tag.
