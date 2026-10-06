@@ -137,9 +137,9 @@ async fn a_failed_startup_exits_1_with_a_sigterm_held() {
     drop(taken);
 }
 
-/// What an external rotator in rename mode does to a `file_out` target: rename the file, then
-/// SIGHUP. Lines sent after the signal land in a new file at `path`, and the renamed file keeps
-/// only the lines sent before it.
+/// A rename then a SIGHUP reopens a `file_out` target, the sink with the more involved reopen
+/// (its rotation state is re-seeded): lines sent after the signal land in a new file at `path`,
+/// and the renamed file keeps only the lines sent before it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sighup_after_an_external_rename_reopens_a_file_out_target() {
     let dir = scratch_dir("hup-reopen");

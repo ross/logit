@@ -2352,8 +2352,8 @@ pub enum ComponentKind {
     /// `logit`'s native wire format under `format: native`.
     FileOut {
         /// The active file. A relative path resolves against the config file's directory. The
-        /// file is reopened on SIGHUP before the next write, so an external log rotator can
-        /// rename it.
+        /// file is reopened on SIGHUP before the next write; let `rotate:` manage it, or use
+        /// `stdio_out` for a file logrotate manages.
         path: String,
         #[serde(default)]
         rotate: RotateConfig,

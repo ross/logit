@@ -105,8 +105,8 @@ error.
   `shareProcessNamespace`. `logit` installs a handler for every signal it reacts to, so it
   behaves the same in all of them, and `docker kill -s HUP` reopens. A config-reloader sidecar's
   SIGHUP doesn't apply a new config; in Kubernetes, roll the pod. In a container, write to stdout
-  or a network sink; a reopen matters only when `file_out` writes to a volume that a rotator able
-  to signal `logit` manages.
+  or a network sink; a reopen matters only when a `stdio_out` file target writes to a volume that
+  a rotator able to signal `logit` manages.
 - **A failed send, transient or extended, never ends the process.** Every sink sits
   behind a decoupled delivery buffer
   ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)). A retryable failure holds the
