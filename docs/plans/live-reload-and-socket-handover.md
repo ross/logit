@@ -30,9 +30,9 @@ preserves.
 - **Certificates load once at construction.** Every TLS listener holds one
   `Arc<rustls::ServerConfig>` built by `logit_inputs::tls::build_server_config` and wraps it in a
   `TlsAcceptor` once. Every TLS sink builds a `rustls::ClientConfig` through
-  `logit_outputs::tls::build_client_config`, except the two `reqwest` clients (`http.rs`'s sinks and
-  `prometheus_in`'s scrape client), which take PEM through `reqwest`'s own builders.
-  `docs/known-gaps/intake.md` has the entry.
+  `logit_outputs::tls::build_client_config`; the HTTP sinks hand theirs to `reqwest` with
+  `use_preconfigured_tls`. Only `prometheus_in`'s scrape client takes PEM through `reqwest`'s own
+  builders (`apply_client_tls`). `docs/known-gaps/intake.md` has the entry.
 - **Listener sockets bind from config, never from an inherited fd.** `udp.rs`'s `bind_one` goes
   through `socket2` and sets `SO_REUSEADDR` only for a multicast bind. `tcp.rs` binds through
   `tokio::net::TcpListener::bind` directly. `unix.rs` unlinks a stale socket path and binds fresh.
@@ -107,10 +107,10 @@ Points specific to `logit` that the HAProxy model doesn't cover on its own:
   [ADR `out-of-ci-unsafe-verification`](../adr/out-of-ci-unsafe-verification.md) covers, and
   systemd socket activation then works unchanged.
 - **Overlap doubles memory.** Two Lua VM sets, two `aggregate` states, two sets of sink queues.
-  `max_memory` is per process and doesn't see the sum.
+  `max_memory` caps each Lua VM separately, and nothing caps the process total across both graphs.
 - **The main PID changes.** Under systemd that's `Type=notify` with a `MAINPID=` update, the
-  standard pattern for a service that re-execs. In a container the parent is PID 1 and its exit ends the container, which is
-  where this shape stops working as described. See [The two worlds](#the-two-worlds).
+  standard pattern for a service that re-execs. In a container the parent is PID 1 and its exit
+  ends the container, which is where this shape stops working as described. See [The two worlds](#the-two-worlds).
 
 Why fd passing rather than `SO_REUSEPORT` for the handover: with reuseport, a closing TCP listener
 resets whatever is in its accept queue, and a closing UDP socket drops whatever is in its receive
@@ -140,8 +140,8 @@ systemd as the parent, and one `LISTEN_FDS` reader serves both.
 - **Config reload inside one container forces a supervisor.** Either the old process drains and
   then execs itself into a supervisor that only reaps and forwards signals, or `logit` runs
   HAProxy's master-worker shape from the start. Both add the process-management surface that
-  makes shape 3 expensive. Most Kubernetes deployments avoid the question by rolling the pods on a config
-  checksum.
+  makes shape 3 expensive. Most Kubernetes deployments avoid the question by rolling the pods on
+  a config checksum.
 - **The upgrade case needs overlap on the port.** For a node-local statsd or syslog agent as a
   DaemonSet with `hostNetwork: true`, old and new pods share the node's network namespace. With
   `maxSurge: 1` the new pod starts before the old stops, and it can bind the same UDP port only
@@ -171,9 +171,10 @@ Smaller than either reload shape and independent of both.
   the `TlsAcceptor` stay as built: open connections keep their session, new handshakes get the new
   certificate, and rotation is one atomic store. The client-CA verifier (`WebPkiClientVerifier`) is
   baked into the config and needs the same wrapper treatment to rotate.
-- **Client side has a seam, except `reqwest`.** The pooled `hyper-rustls` and `tokio-rustls` connectors share
-  one `Arc<ClientConfig>`, which has `client_auth_cert_resolver` and a replaceable server-cert
-  verifier. The two `reqwest` clients don't expose rustls, so there a rotation rebuilds the client
+- **Client side has a seam, except the scrape client.** The pooled `hyper-rustls` and
+  `tokio-rustls` connectors, and the HTTP sinks' preconfigured `reqwest` clients, each hold an
+  `Arc<ClientConfig>` with `client_auth_cert_resolver` and a replaceable server-cert verifier.
+  Only `prometheus_in`'s scrape client, which loads PEM through `reqwest`, needs the client rebuilt
   behind a swap. A renewed client certificate affects new handshakes only.
 - **Trigger on a file poll, not only a signal.** cert-manager and a mounted Secret signal no one.
   A poll on the cert and key files' identity (mtime, size, inode) with SIGHUP as an extra trigger
@@ -192,8 +193,8 @@ Smaller than either reload shape and independent of both.
   separately.
 - Config reload stays a known gap. If it's built, the shapes worth building are 2 or 3, not the
   diff. Shape 3 is the robust one for hosts and systemd and doesn't translate to containers
-  without a supervisor process. A shared "acquire listeners from a fresh bind, an inherited set, or a
-  handover socket" seam in the bind pre-pass would let the host and container mechanisms share
+  without a supervisor process. A shared "acquire listeners from a fresh bind, an inherited set,
+  or a handover socket" seam in the bind pre-pass would let the host and container mechanisms share
   code without committing to the supervisor.
 
 ## Related
