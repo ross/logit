@@ -10,6 +10,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Research note: live reload, socket handover, and what each deployment world needs](live-reload-and-socket-handover.md) | 2026-10-05 | 2026-10-05 |
 | [Enabling plan: sink fault model — a bad batch drops, a non-functional destination holds, the process never exits](sink-fault-model.md) | 2026-10-04 | 2026-10-05 |
 | [Enabling plan: native hop named acks — a cumulative `Ack { id, seq }`, coalesced at `logit_in`, and a resume mark](native-hop-named-acks.md) | 2026-10-02 | 2026-10-02 |
 | [Enabling plan: a native hop send window — several frames in flight, acknowledged in frame order](native-send-window.md) | 2026-10-01 | 2026-10-02 |
