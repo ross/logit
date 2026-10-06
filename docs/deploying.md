@@ -128,27 +128,36 @@ error.
 
 ### Rotating a file output externally
 
-To have logrotate rotate a `stdio_out` or `file_out` file, use rename mode, the default, and send
-`logit` a SIGHUP after the rename. Under systemd, give the unit a reload command:
+To have logrotate manage a file `logit` writes, point it at a `stdio_out` file target, which never
+rotates itself, and send `logit` a SIGHUP after the rename:
+
+```yaml
+components:
+  out:
+    type: stdio_out
+    sources: [in]
+    target: /var/log/logit/events.log
+```
+
+Under systemd, give the unit a reload command:
 
 ```ini
 [Service]
 ExecReload=/bin/kill -HUP $MAINPID
 ```
 
-Then call it from `postrotate`:
+Then call it from `postrotate`, in rename mode, the default:
 
 ```text
 /var/log/logit/events.log {
     daily
     rotate 7
-    dateext
     compress
     delaycompress
     missingok
     notifempty
     postrotate
-        systemctl reload logit.service
+        systemctl reload logit.service || true
     endscript
 }
 ```
@@ -157,11 +166,16 @@ Then call it from `postrotate`:
   its truncate.
 - **Keep `delaycompress`.** A batch mid-write when the signal arrives finishes into the renamed
   file, so compressing that file in the same run can cut off the batch's tail.
-- **Use `dateext` with `file_out`.** `file_out` always has a `rotate:` policy of its own and names
-  its rotated files `.1`, `.2`, and so on, as logrotate does by default, so without `dateext` the
-  two rotators shift each other's files. A `stdio_out` file target never rotates itself.
+- **`|| true` keeps a stopped service from failing the rotation.** `systemctl reload` exits
+  non-zero while the unit isn't running, and logrotate would report the script as failed even
+  though the rename succeeded.
 - **An idle sink reopens late.** The reopen happens before the target's next write, so the renamed
   file stays open, and its disk space allocated, until the sink's next batch.
+- **Don't give logrotate a `file_out` path.** Every `file_out` has a `rotate:` policy of its own,
+  so both rotators rename the same path on their own triggers: one stream splits across
+  `events.log.N` and logrotate's names under two retention limits. If you do it anyway, add
+  `dateext` so the two sets of names don't collide, and set `max_bytes` well above one logrotate
+  period's output so `file_out`'s rotation is only a backstop.
 
 ## Probes and exit codes
 

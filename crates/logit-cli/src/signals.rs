@@ -117,3 +117,27 @@ async fn bump_on_hangup(mut hangup: tokio::signal::unix::Signal, reopen: watch::
         tracing::info!(target: "logit", generation, config_reloaded = false, "reopen signal received");
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A SIGHUP that lands before a file target takes its receiver still reads as changed to it:
+    /// `reopen_generation` hands out a clone of the first receiver, not a fresh subscription that
+    /// starts out having seen the bump.
+    #[tokio::test]
+    async fn a_receiver_taken_after_a_sighup_still_sees_it_as_changed() {
+        let signals = Signals::install();
+        let mut first = signals.reopen_generation();
+        // SAFETY: `raise` sends SIGHUP to this process, whose handler `install` registered above,
+        // so the signal is caught rather than ending the test binary.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        tokio::time::timeout(logit_pipeline::test_util::RECV_TIMEOUT, first.changed())
+            .await
+            .expect("the hangup task never bumped the generation")
+            .expect("the sender is alive");
+
+        let second = signals.reopen_generation();
+        assert!(second.has_changed().unwrap(), "a receiver taken after the bump missed it");
+    }
+}

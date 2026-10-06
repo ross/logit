@@ -10,7 +10,7 @@ mod support;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use logit_pipeline::test_util::wait_until_within;
+use logit_pipeline::test_util::{scratch_dir, wait_until_within};
 use support::{
     ephemeral_addr, logit_ready, send_signal, wait_for_exit, wait_until_ready, KillOnDrop, Lines,
     TempConfig, PROCESS_DEADLINE,
@@ -142,10 +142,7 @@ async fn a_failed_startup_exits_1_with_a_sigterm_held() {
 /// only the lines sent before it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sighup_after_an_external_rename_reopens_a_file_out_target() {
-    let dir =
-        std::env::temp_dir().join(format!("logit-cli-test-hup-reopen-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("hup-reopen");
     let path = dir.join("events.log");
     let renamed = dir.join("events.log.1");
     let udp_addr = {
