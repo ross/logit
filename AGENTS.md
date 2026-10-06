@@ -607,7 +607,8 @@ the operator-facing account of all of this.
 
 ### Not yet built
 
-- QUIC for the native transport (`docs/known-gaps/native-hop.md`).
+- A second transport for the native hop, gRPC for L7 infrastructure or QUIC for a WAN hop
+  (`docs/known-gaps/native-hop.md`).
 - Prometheus native histograms, skipped and counted in both directions.
 - An Agent-equivalent Datadog trace processor (normalization, `_top_level` marking, sampling, a
   stats concentrator), so tracer spans could reach Datadog with no real Agent in the path
@@ -838,8 +839,9 @@ not a style preference:
   file-backed implementation. The `logit_out`/`logit_in` connection/handshake state machine is
   built ([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md)),
   with a send window of frames in flight
-  ([ADR `native-hop-send-window`](docs/adr/native-hop-send-window.md)); still open: QUIC -- don't
-  design it in passing; it's real future work, not yet started.
+  ([ADR `native-hop-send-window`](docs/adr/native-hop-send-window.md)); still open: a second
+  transport (gRPC for L7 infrastructure or QUIC for a WAN hop; `docs/known-gaps/native-hop.md`) --
+  don't design it in passing; it's real future work, not yet started.
 - **Memory behavior is measured, not assumed** — `docs/design/memory.md` records what every
   pipeline stage allocates and what `Event` costs to move, and both are enforced by tests:
   `crates/logit-core/tests/type_sizes.rs` asserts exact `size_of`s, and

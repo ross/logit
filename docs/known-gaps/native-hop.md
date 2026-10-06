@@ -2,9 +2,20 @@
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
-- **No QUIC transport for the native hop.** `logit_in`/`logit_out` speak TCP (optionally TLS)
-  only ([ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)).
-  QUIC is a plausible later transport upgrade, not attempted.
+- **The native hop has one transport, TCP (optionally TLS).** `logit_in`/`logit_out` cross L4
+  infrastructure (a TCP proxy, a network load balancer, a stateful firewall) and not L7 (an HTTP
+  ingress, a service mesh in HTTP mode, an application load balancer, an HTTP `CONNECT` egress
+  proxy, or TLS termination that routes on HTTP).
+  - **Consequence:** a deployment that can only open an HTTP path between two `logit` processes
+    has no native hop. The fallback is `otlp_out` to `otlp_in`, at OTLP's fidelity and encode
+    cost. A lossy or migrating WAN hop gets TCP's reconnect and loss recovery, with no 0-RTT
+    resume and no connection migration.
+  - **Revisit trigger:** a deployment that needs one of them. The frames and the session protocol
+    carry unchanged over any ordered, reliable byte stream, so the remedy is a second transport
+    selected per component (gRPC for L7 infrastructure, QUIC for the WAN case), not a second
+    protocol. The 2026-10-05 amendment of
+    [ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)
+    names the candidates and the first design question of each. Neither is started.
 - **No OTLP passthrough codec.** Whether the native protocol should carry OTLP-encoded payloads
   unmodified, so a relay forwards OTLP without re-encoding it into native, is undecided and
   undesigned; see [`design/wire-protocol.md`](../design/wire-protocol.md)'s "Open question".
