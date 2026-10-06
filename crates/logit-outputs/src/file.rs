@@ -7,6 +7,8 @@
 //! (newest) through `path.{max_files - 1}`, and the oldest is removed once it would fall off the
 //! end. `max_files: 1` truncates in place. There is no `fsync`; each batch is flushed to the OS.
 //! [`FileTarget::rotate`] has the crash-safety order and the per-failure handling.
+//! [`FileTarget::reopen`], SIGHUP's reopen for an external rotator, is not a rotation: it renames
+//! nothing.
 //!
 //! [`RotatePolicy`]/[`RotateInterval`] mirror `logit_config`'s types because `logit-outputs` must
 //! not depend on `logit-config` (`docs/design/pipeline-graph.md`'s "Crate layout");
@@ -167,17 +169,34 @@ const STAGING_RENAME: Point = Point::new(sites::FILE_OUT_STAGING, Op::Rename);
 const RETAINED_RENAME: Point = Point::new(sites::FILE_OUT_RETAINED, Op::Rename);
 const RETAINED_UNLINK: Point = Point::new(sites::FILE_OUT_RETAINED, Op::Unlink);
 
-/// Opens the active file at `path`, creating it if needed. `truncate: true` is `max_files: 1`'s
-/// in-place rotation; otherwise it appends.
+/// Opens the active file at `path` for append, creating it if needed. `truncate: true` is
+/// `max_files: 1`'s in-place rotation, which also empties it.
+///
+/// Always `O_APPEND`, truncating included: after an external `copytruncate`, a handle without it
+/// writes at its old offset and leaves a run of NUL bytes ahead of the new data. `OpenOptions`
+/// refuses `append` with `truncate`, so the truncate is a `set_len(0)` on the opened handle.
 fn open_active(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true);
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     if truncate {
-        opts.write(true).truncate(true);
-    } else {
-        opts.append(true);
+        file.set_len(0)?;
     }
-    opts.open(path)
+    Ok(file)
+}
+
+/// How [`FileTarget`] opens its active file: [`open_active`], or a test's injected failure. A
+/// `fn` pointer, not `impl Fn`, so the futures that take one stay `Send`.
+type Opener = fn(&Path, bool) -> std::io::Result<std::fs::File>;
+
+/// A [`RotationState`] for `file`, seeded from its length and mtime: the state a fresh
+/// [`FileTarget::open`] starts from.
+fn seeded_state(file: &std::fs::File, policy: RotatePolicy) -> RotationState {
+    let metadata = file.metadata().ok();
+    let written = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mut state = RotationState::new(written, policy);
+    if let Some(mtime_unix) = metadata.and_then(|m| m.modified().ok()).and_then(unix_seconds) {
+        state.seed_period(mtime_unix);
+    }
+    state
 }
 
 /// The open file `Target::File` writes to, plus its rotation state. Opened eagerly at
@@ -185,8 +204,9 @@ fn open_active(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
 #[derive(Debug)]
 pub struct FileTarget {
     path: PathBuf,
-    /// The handle to `path`. `None` only between a committed rotation rename and a successful
-    /// re-open; never a handle to a rotated-away file. [`FileTarget::write_all`] re-opens it.
+    /// The handle to `path`. `None` only after a committed rotation rename or a
+    /// [`FileTarget::reopen`] whose open failed, until a successful re-open; never a handle to a
+    /// rotated-away file. [`FileTarget::write_all`] re-opens it.
     file: Option<tokio::fs::File>,
     state: RotationState,
 }
@@ -196,15 +216,7 @@ impl FileTarget {
         let path = path.as_ref();
         let std_file = fault_io!(ACTIVE_OPEN, path, 0, open_active(path, false))
             .with_context(|| format!("opening file target {}", path.display()))?;
-        let metadata = std_file.metadata().ok();
-        let written = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-        let mtime_unix = metadata.and_then(|m| m.modified().ok()).and_then(unix_seconds);
-
-        let mut state = RotationState::new(written, policy);
-        if let Some(mtime_unix) = mtime_unix {
-            state.seed_period(mtime_unix);
-        }
-
+        let state = seeded_state(&std_file, policy);
         Ok(Self {
             path: path.to_path_buf(),
             file: Some(tokio::fs::File::from_std(std_file)),
@@ -212,17 +224,47 @@ impl FileTarget {
         })
     }
 
-    /// Re-opens the active file if `self.file` is `None`, so a write after a failed post-rotation
-    /// re-open heals itself. A failure is `Fault::Clean` for the reason [`FileTarget::rotate`]
-    /// gives.
-    fn ensure_open(&mut self) -> anyhow::Result<()> {
+    /// Re-opens the active file if `self.file` is `None`, so a write after a failed re-open heals
+    /// itself. A failure is `Fault::Clean` for the reason [`FileTarget::rotate`] gives.
+    pub fn ensure_open(&mut self) -> anyhow::Result<()> {
+        self.ensure_open_with(open_active)
+    }
+
+    /// [`FileTarget::ensure_open`] with an injectable opener. Re-seeds the rotation state from
+    /// the file it opens, as [`FileTarget::open`] does: after a [`FileTarget::reopen`], `path`
+    /// can be a file a rotator created, not the one the state counted.
+    fn ensure_open_with(&mut self, open: Opener) -> anyhow::Result<()> {
         if self.file.is_none() {
-            let std_file = fault_io!(ACTIVE_OPEN, &self.path, 0, open_active(&self.path, false))
+            let std_file = fault_io!(ACTIVE_OPEN, &self.path, 0, open(&self.path, false))
                 .with_context(|| format!("re-opening {} for write", self.path.display()))
                 .context(Fault::Clean)?;
+            self.state = seeded_state(&std_file, self.state.policy);
             self.file = Some(tokio::fs::File::from_std(std_file));
         }
         Ok(())
+    }
+
+    /// Drops the handle and opens `path` again, for an external rotator that renamed the file
+    /// away and signaled SIGHUP. Appends and never truncates, under any policy, so a file a
+    /// rotator copied but didn't move keeps its contents. Re-seeds the rotation state from the
+    /// newly opened file. Not a rotation: nothing is renamed or deleted.
+    ///
+    /// On a failed open the target is left with no handle, so the next write retries the open,
+    /// re-seed included, and the error is `Fault::Clean`, as for [`FileTarget::rotate`]'s failed
+    /// re-open.
+    pub async fn reopen(&mut self) -> anyhow::Result<()> {
+        self.reopen_with(open_active).await
+    }
+
+    async fn reopen_with(&mut self, open: Opener) -> anyhow::Result<()> {
+        // `Clean` on a failed flush too: it's the batch before this one that may be cut short,
+        // and this batch has reached no file.
+        if let Some(mut file) = self.file.take() {
+            fault_io!(ACTIVE_FLUSH, &self.path, 0, file.flush().await)
+                .with_context(|| format!("flushing {} before reopen", self.path.display()))
+                .context(Fault::Clean)?;
+        }
+        self.ensure_open_with(open)
     }
 
     /// Writes `bytes` to the active file, re-opening it first if a rotation's re-open failed.
@@ -356,12 +398,11 @@ impl FileTarget {
     }
 
     /// [`FileTarget::rotate`] with an injectable opener: once `path` is renamed away, no test can
-    /// make a `create` there fail, so injection is the only way to exercise that path. A `fn`
-    /// pointer, not `impl Fn`, so the future stays `Send`.
+    /// make a `create` there fail, so injection is the only way to exercise that path.
     async fn rotate_inner(
         &mut self,
         diag: &mut Diagnostics,
-        open: fn(&Path, bool) -> std::io::Result<std::fs::File>,
+        open: Opener,
     ) -> anyhow::Result<RotateOutcome> {
         if let Some(file) = self.file.as_mut() {
             fault_io!(ACTIVE_FLUSH, &self.path, 0, file.flush().await)
@@ -430,7 +471,7 @@ impl FileTarget {
     async fn rotate_with(
         &mut self,
         diag: &mut Diagnostics,
-        open: fn(&Path, bool) -> std::io::Result<std::fs::File>,
+        open: Opener,
     ) -> anyhow::Result<RotateOutcome> {
         self.rotate_inner(diag, open).await
     }
@@ -985,6 +1026,131 @@ mod tests {
         send(&mut target, b"b3\n").await.expect("rotate and write");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "b3\n");
         assert!(!dir.join("events.log.1").exists(), "max_files: 1 must never create a .1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- reopen: an external rotator's rename then SIGHUP ---
+
+    #[tokio::test]
+    async fn a_reopen_after_an_external_rename_writes_to_a_fresh_file_at_path() {
+        let dir = scratch_dir("reopen-after-rename");
+        let path = dir.join("events.log");
+        let renamed = dir.join("events.log.1");
+        let mut target = FileTarget::open(&path, RotatePolicy::never()).expect("open");
+        send(&mut target, b"before\n").await.unwrap();
+
+        std::fs::rename(&path, &renamed).unwrap();
+        target.reopen().await.expect("reopen");
+        send(&mut target, b"after\n").await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "before\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A reopen with nothing renamed appends to the same file, under `max_files: 1` too, whose
+    /// rotation truncates.
+    #[tokio::test]
+    async fn a_reopen_never_truncates_even_under_max_files_one() {
+        let dir = scratch_dir("reopen-never-truncates");
+        let path = dir.join("events.log");
+        let policy = RotatePolicy { max_bytes: Some(100), interval: None, max_files: 1 };
+        let mut target = FileTarget::open(&path, policy).expect("open");
+        send(&mut target, b"one\n").await.unwrap();
+
+        target.reopen().await.expect("reopen");
+        send(&mut target, b"two\n").await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_reopen_leaves_no_handle_is_clean_and_the_next_write_recovers() {
+        let dir = scratch_dir("failed-reopen-recovers");
+        let path = dir.join("events.log");
+        let renamed = dir.join("events.log.1");
+        let mut target = FileTarget::open(&path, RotatePolicy::never()).expect("open");
+        send(&mut target, b"before\n").await.unwrap();
+        std::fs::rename(&path, &renamed).unwrap();
+
+        let err = target.reopen_with(failing_open).await.expect_err("the injected failure");
+        assert_eq!(logit_pipeline::classify(&err), logit_pipeline::Fault::Clean);
+        assert!(target.awaiting_reopen(), "no handle to the renamed file is kept");
+
+        send(&mut target, b"after\n").await.expect("the next write re-opens");
+        assert!(!target.awaiting_reopen());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "before\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The size rotation counts the file at `path` after a reopen, not the renamed one: 8 bytes
+    /// were written before the rename, so a 5-byte write under `max_bytes: 10` would rotate the
+    /// new, empty file if the count carried over.
+    #[tokio::test]
+    async fn a_reopen_reseeds_the_size_rotation_state_from_the_new_file() {
+        let dir = scratch_dir("reopen-reseeds-size");
+        let path = dir.join("events.log");
+        let policy = RotatePolicy { max_bytes: Some(10), interval: None, max_files: 3 };
+        let mut target = FileTarget::open(&path, policy).expect("open");
+        send(&mut target, b"0123456\n").await.unwrap();
+        assert!(target.should_rotate(0, 5), "8 + 5 crosses 10 before the reopen");
+
+        std::fs::rename(&path, dir.join("moved.log")).unwrap();
+        target.reopen().await.expect("reopen");
+
+        assert_eq!(target.state.written, 0);
+        assert!(!target.should_rotate(0, 5), "the new file is empty");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A reopen whose open fails, then a write whose open succeeds: the retry re-seeds the
+    /// rotation state from the file it opened, size and period both, not from the renamed file.
+    /// The new file holds 3 bytes and was last written in an earlier day than the renamed one.
+    #[tokio::test]
+    async fn a_failed_reopen_reseeds_the_rotation_state_when_the_retry_opens() {
+        let dir = scratch_dir("failed-reopen-reseeds");
+        let path = dir.join("events.log");
+        let policy = RotatePolicy {
+            max_bytes: Some(100),
+            interval: Some(RotateInterval::Daily),
+            max_files: 3,
+        };
+        let mut target = FileTarget::open(&path, policy).expect("open");
+        let now = now_unix();
+        target.write_all(b"0123456789").await.unwrap();
+        target.note_written(now, 10);
+
+        std::fs::rename(&path, dir.join("moved.log")).unwrap();
+        std::fs::write(&path, b"xyz").unwrap();
+        let earlier_day = now - 2 * 86_400;
+        backdate_mtime(&path, earlier_day);
+        target.reopen_with(failing_open).await.expect_err("the injected failure");
+
+        target.ensure_open().expect("the retry opens");
+        assert_eq!(target.state.written, 3, "seeded from the new file's length");
+        assert_eq!(target.state.period, Some(earlier_day.div_euclid(86_400)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// After a `max_files: 1` rotation truncates in place, an external `copytruncate` empties the
+    /// file under the handle. The next write lands at the start of the file, not at the handle's
+    /// old offset after a run of NUL bytes.
+    #[tokio::test]
+    async fn a_write_after_an_external_truncate_of_a_max_files_one_target_leaves_no_nul_bytes() {
+        let dir = scratch_dir("max-files-one-copytruncate");
+        let path = dir.join("events.log");
+        let policy = RotatePolicy { max_bytes: Some(4), interval: None, max_files: 1 };
+        let mut target = FileTarget::open(&path, policy).expect("open");
+        send(&mut target, b"aaaa").await.unwrap();
+        send(&mut target, b"bb").await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"bb", "the second write rotated in place");
+
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        send(&mut target, b"c").await.unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"c");
         std::fs::remove_dir_all(&dir).ok();
     }
 

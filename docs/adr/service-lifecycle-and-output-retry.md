@@ -1,6 +1,6 @@
 ---
 created: 2026-08-30
-updated: 2026-10-04
+updated: 2026-10-05
 ---
 
 # Service lifecycle: signal-driven shutdown and bounded output retry
@@ -240,3 +240,11 @@ no longer describes the runtime. [ADR `sink-fault-classes`](sink-fault-classes.m
 budget: a `Clean`, `Refused`, or (under `at_least_once`) `Ambiguous` fault retries until it
 succeeds or shutdown cuts it, and `logit run` never exits for a sink. The sink's `buffer:` is what
 bounds an outage's cost. The shutdown-signal and diagnostics decisions here are unchanged.
+
+## Amendment: SIGHUP and the startup window (2026-10-05)
+
+[ADR `signal-handling`](signal-handling.md) records `logit run`'s whole signal contract. The
+SIGTERM/SIGINT drain and the second-signal exit `130` above are unchanged. That record adds two
+things: every handler is installed before `config::load`, so a signal during startup is acted on
+once the pipeline runs, and SIGHUP reopens `stdio_out`'s and `file_out`'s file targets instead of
+ending the process. A SIGHUP doesn't count toward the second-signal exit.
