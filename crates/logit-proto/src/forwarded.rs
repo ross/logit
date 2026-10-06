@@ -7,10 +7,10 @@
 //!
 //! - [`parse`] reads one header value. A request that carries the header more than once is the
 //!   caller's concern: the caller passes the first instance.
-//! - Each header yields one candidate: `X-Forwarded-For`'s leftmost comma-separated entry,
-//!   `Forwarded`'s first element's `for=` value, or `X-Real-IP`'s whole value, each trimmed of
-//!   whitespace. The address rule in the ADR then decides it, and an IPv4-mapped IPv6 address is
-//!   returned as given; the caller canonicalizes it when it writes the text form.
+//! - Each header yields one candidate: `X-Forwarded-For`'s leftmost comma-separated entry or
+//!   `X-Real-IP`'s whole value, each trimmed of whitespace, or `Forwarded`'s first element's
+//!   `for=` value as it stands. The address rule in the ADR then decides it, and an IPv4-mapped
+//!   IPv6 address is returned as given; the caller canonicalizes it when it writes the text form.
 //! - `Forwarded` is read with RFC 7239 §4's grammar, a `;`-separated list of pairs per
 //!   comma-separated element, with case-insensitive parameter names:
 //!

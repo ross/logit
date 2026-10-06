@@ -1224,14 +1224,60 @@ fn classify_route(
 // -- Step 9: derive -----------------------------------------------------------------------------
 
 impl HttpAccess {
+    /// Step 9's `forwarded:` half, run ahead of step 7 so the header is parsed from its uncapped,
+    /// uncleaned value: a cap can cut a `Forwarded` element inside its `for=` node, and the clean
+    /// turns a tab the parser reads as whitespace into `_`. The address written is at most 45
+    /// bytes, inside `client.address`'s cap. Only under `forwarded:`, since the header is
+    /// client-supplied: `client.address` and `client.port` are *replaced* from the named header.
+    fn rewrite_forwarded(&mut self, attrs: &mut AttrMap) {
+        let keys = &self.keys;
+        let telemetry = &self.telemetry;
+        let Some((header, key)) = self.forwarded else { return };
+        let parsed = match present(attrs, key.sym) {
+            None => return,
+            Some(Value::Str(value)) => forwarded::parse(header, value),
+            Some(_) => Err(Unusable::NotAnAddress),
+        };
+        match parsed {
+            Ok(client) => {
+                // The text form the listeners stamp: an IPv4-mapped IPv6 address as IPv4.
+                self.scratch.clear();
+                write!(self.scratch, "{}", client.address.to_canonical())
+                    .expect("writing to a Vec never fails");
+                let address = Value::Str(Bytes::copy_from_slice(&self.scratch));
+                attrs.insert_sym(keys.client_address.sym, address);
+                count(telemetry, DERIVED, keys.client_address.name);
+                match client.port {
+                    Some(port) => {
+                        attrs.insert_sym(keys.client_port.sym, Value::I64(i64::from(port)));
+                        count(telemetry, DERIVED, keys.client_port.name);
+                    }
+                    None => {
+                        attrs.remove_sym(keys.client_port.sym);
+                    }
+                }
+            }
+            Err(reason) => {
+                count(telemetry, INVALID, key.name);
+                self.diag.warn_throttled(
+                    "forwarded",
+                    format_args!(
+                        "http_access: {}: {reason}; client.address and client.port left as \
+                         logged",
+                        key.name
+                    ),
+                );
+            }
+        }
+    }
+
     /// Step 9, each attribute written only when the producer didn't send it (by [`present`]'s
     /// rule): `error.type` (the status, 5xx only), `span.status` (`error` for 5xx or `0`, else
     /// `unset`; never `ok`, which semconv reserves for an explicit override, though a producer's
     /// own `ok` is honoured even on a 5xx), `span.name` (`{method} {route}`, or the method
-    /// alone), and the `span.duration_s` mirror. Then, only under `forwarded:` since the header is
-    /// client-supplied, `client.address` and `client.port` are *replaced* from the named header.
-    /// Every value is a pre-built cell, a constant, or a slice, except a `span.name` around a
-    /// producer-sent `http.route`, which is formatted per event, and a forwarded `client.address`.
+    /// alone), and the `span.duration_s` mirror. Its `forwarded:` half is
+    /// [`Self::rewrite_forwarded`]. Every value is a pre-built cell, a constant, or a slice, except
+    /// a `span.name` around a producer-sent `http.route`, which is formatted per event.
     fn derive(&mut self, attrs: &mut AttrMap, method: Option<usize>, route: Routed) {
         let keys = &self.keys;
         let telemetry = &self.telemetry;
@@ -1279,44 +1325,6 @@ impl HttpAccess {
                 count(telemetry, DERIVED, keys.span_duration_s.name);
             }
         }
-        if let Some((header, key)) = self.forwarded {
-            let parsed = match present(attrs, key.sym) {
-                None => return,
-                Some(Value::Str(value)) => forwarded::parse(header, value),
-                Some(_) => Err(Unusable::NotAnAddress),
-            };
-            match parsed {
-                Ok(client) => {
-                    // The text form the listeners stamp: an IPv4-mapped IPv6 address as IPv4.
-                    self.scratch.clear();
-                    write!(self.scratch, "{}", client.address.to_canonical())
-                        .expect("writing to a Vec never fails");
-                    let address = Value::Str(Bytes::copy_from_slice(&self.scratch));
-                    attrs.insert_sym(keys.client_address.sym, address);
-                    count(telemetry, DERIVED, keys.client_address.name);
-                    match client.port {
-                        Some(port) => {
-                            attrs.insert_sym(keys.client_port.sym, Value::I64(i64::from(port)));
-                            count(telemetry, DERIVED, keys.client_port.name);
-                        }
-                        None => {
-                            attrs.remove_sym(keys.client_port.sym);
-                        }
-                    }
-                }
-                Err(reason) => {
-                    count(telemetry, INVALID, key.name);
-                    self.diag.warn_throttled(
-                        "forwarded",
-                        format_args!(
-                            "http_access: {}: {reason}; client.address and client.port left as \
-                             logged",
-                            key.name
-                        ),
-                    );
-                }
-            }
-        }
     }
 }
 
@@ -1337,9 +1345,10 @@ impl Transform for HttpAccess {
         let method = normalize_method(attrs, &self.keys, &self.other_method, &self.telemetry);
         normalize_version(attrs, &self.keys, &self.telemetry);
         normalize_query(attrs, &self.keys, &self.redact, &mut self.scratch, &self.telemetry);
-        // Step 8's user-agent half runs ahead of step 7 because it classifies the uncapped
-        // value; the route half below classifies the capped path.
+        // Step 8's user-agent half and step 9's `forwarded:` half run ahead of step 7 because
+        // each reads its field's uncapped value; the route half below classifies the capped path.
         classify_user_agent(attrs, &self.keys, &self.ua, &self.telemetry);
+        self.rewrite_forwarded(attrs);
         cap_and_clean(attrs, &self.caps, &mut self.scratch, &self.telemetry);
         let route = classify_route(attrs, &self.keys, &self.router, &self.telemetry);
         self.derive(attrs, method, route);
@@ -1365,6 +1374,8 @@ mod tests {
             ("http.request.header.referer", 256),
             ("client.address", 128),
             ("http.request.header.x-forwarded-for", 128),
+            ("http.request.header.forwarded", 256),
+            ("http.request.header.x-real-ip", 128),
             ("user.name", 128),
             ("http.request.method_original", 32),
             ("network.protocol.version", 8),
@@ -2369,6 +2380,29 @@ mod tests {
         let events = registry.drain(0);
         assert_eq!(counter(&events, INVALID, Some(("field", FORWARDED))), 4.0);
         assert_eq!(counter(&events, DERIVED, Some(("field", "client.address"))), 0.0);
+    }
+
+    /// The header is parsed before step 7 caps it at 256 characters: here the cap would cut the
+    /// node to `192.0.2.4`, a valid address with no port.
+    #[test]
+    fn a_long_parameter_ahead_of_for_still_yields_the_whole_node() {
+        let value = format!(r#"host="{}";for=192.0.2.43:4711"#, "a".repeat(235));
+        assert!(value.len() > 256, "the value must be over the cap");
+        let event = run(
+            &mut forwarding(ForwardedHeader::Forwarded),
+            &with_proxy_peer((FORWARDED, s(&value))),
+        );
+        assert_eq!(get(&event, "client.address"), Some(&s("192.0.2.43")));
+        assert_eq!(get(&event, "client.port"), Some(&Value::I64(4711)));
+    }
+
+    /// The header is parsed before step 7's clean, which would turn the tab into `_`.
+    #[test]
+    fn a_tab_beside_the_for_pair_is_whitespace() {
+        let pairs = with_proxy_peer((FORWARDED, s("proto=http;\tfor=192.0.2.1:80\t")));
+        let event = run(&mut forwarding(ForwardedHeader::Forwarded), &pairs);
+        assert_eq!(get(&event, "client.address"), Some(&s("192.0.2.1")));
+        assert_eq!(get(&event, "client.port"), Some(&Value::I64(80)));
     }
 
     #[test]
