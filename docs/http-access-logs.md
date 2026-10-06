@@ -1089,8 +1089,8 @@ Once traffic is flowing, watch these:
   unclassifiable paths.
 - **`logit.transform.http_access.invalid{field}`**: a field that arrived but didn't parse. Beyond
   an occasional blip, a steady count on one `field` means that key is misnamed or mistyped in the
-  log format. The throttled diagnostics `bad_request_line`, `bad_status`, and `bad_duration`
-  (`logit.component.diagnostics{key}`) point at the same problems.
+  log format. The throttled diagnostics `bad_request_line`, `bad_status`, `bad_duration`, and,
+  under `forwarded:`, `forwarded` (`logit.component.diagnostics{key}`) point at the same problems.
 - **`logit.component.diagnostics{key="invalid_utf8"}` on the `json` component**: how often
   `invalid_utf8: replace` actually rescued a line. `key="parse_failure"` is a line lost anyway.
 
