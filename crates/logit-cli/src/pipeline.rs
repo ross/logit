@@ -14,6 +14,7 @@
 //! graph rule runs (a syslog `sd_id`), so those fail only at `run`.
 
 use crate::config;
+use crate::signals::Signals;
 use anyhow::Context;
 use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
@@ -110,10 +111,13 @@ fn severity_for_logs(logs: logit_config::InternalLogs) -> Option<logit_core::Sev
 /// Loads `path`, resolves its component graph, and runs it until the first component fails or a
 /// shutdown signal is received.
 ///
-/// SIGTERM/SIGINT (Ctrl-C on non-Unix) starts a graceful drain: every listener stops, closing its
-/// downstream inboxes and triggering each node's close-time flush, so an in-flight `aggregate`
-/// window is emitted rather than lost. A second signal before the drain finishes exits at once
-/// with code 130, so a wedged drain stays killable by the signal that started it.
+/// The signal handlers ([`Signals::install`]) go in before the config loads, so a signal during
+/// startup is handled, not defaulted. SIGTERM/SIGINT (Ctrl-C on non-Unix) starts a graceful drain:
+/// every listener stops, closing its downstream inboxes and triggering each node's close-time
+/// flush, so an in-flight `aggregate` window is emitted rather than lost. A second SIGTERM/SIGINT
+/// before the drain finishes exits at once with code 130, so a wedged drain stays killable by the
+/// signal that started it. SIGHUP never exits and never reloads the config: it logs
+/// `reopen signal received` and bumps the reopen generation.
 ///
 /// Every failure before the pipeline reports ready is `RunError::Startup` (exit 1); after, it's a
 /// runtime failure (exit 2). See `docs/deploying.md`'s "Probes and exit codes".
@@ -124,6 +128,7 @@ pub async fn run_pipelines(
     path: PathBuf,
     telemetry_layer: logit_core::TelemetryLayer,
 ) -> Result<(), RunError> {
+    let signals = Signals::install();
     let config = config::load(&path).map_err(RunError::Startup)?;
 
     // `starting`/`exiting` are stable lifecycle event names for log-based alerting
@@ -155,14 +160,6 @@ pub async fn run_pipelines(
         tracing::warn!(target: "logit", "{warning}");
     }
 
-    // Every concurrent listener on a signal kind is notified, so this doesn't consume the one
-    // `run_with_telemetry` races on. Aborted once that returns.
-    let kill_switch = tokio::spawn(async {
-        shutdown_signal().await;
-        shutdown_signal().await;
-        std::process::exit(130);
-    });
-
     // The admin listener binds here, before `run_with_telemetry` spawns anything, so a bind
     // failure is `RunError::Startup`: the guarantee `Input::bind`'s pre-pass gives every listener.
     let (readiness, admin_server) = match admin_bind {
@@ -181,9 +178,9 @@ pub async fn run_pipelines(
     };
 
     let result =
-        logit_pipeline::run_with_telemetry(graph, specs, telemetry, readiness, shutdown_signal())
+        logit_pipeline::run_with_telemetry(graph, specs, telemetry, readiness, signals.shutdown())
             .await;
-    kill_switch.abort();
+    drop(signals);
     if let Some(admin_server) = admin_server {
         admin_server.abort();
     }
@@ -303,25 +300,6 @@ fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<PrepareResult> {
     };
 
     Ok((graph, specs, telemetry, internal))
-}
-
-/// Waits for one SIGTERM or SIGINT (Ctrl-C on non-Unix). Each call installs its own listener, and
-/// `run_pipelines` relies on its three calls each being notified.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut terminate = signal(SignalKind::terminate()).expect("installing a SIGTERM handler");
-        let mut interrupt = signal(SignalKind::interrupt()).expect("installing a SIGINT handler");
-        tokio::select! {
-            _ = terminate.recv() => {}
-            _ = interrupt.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }
 
 /// [`run_pipelines`] for an in-memory `Config`, with no signal handler to race a test.

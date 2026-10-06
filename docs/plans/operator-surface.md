@@ -208,6 +208,7 @@ sent.
 ## Explicitly out of scope (file in `known-gaps/`)
 
 TLS/auth on the admin endpoint; a `/metrics` scrape path (still rejected); config hot reload on
-SIGHUP (separate design: needs graph diffing); `logit stats` CLI reading the `Registry`
+SIGHUP (separate design: needs graph diffing; SIGHUP is a non-fatal reopen instead, per
+[ADR `signal-handling`](../adr/signal-handling.md)); `logit stats` CLI reading the `Registry`
 out-of-process; per-sink readiness; log sampling/rate limiting beyond the existing occurrence
 throttle; `tracing` spans for pipeline stages.

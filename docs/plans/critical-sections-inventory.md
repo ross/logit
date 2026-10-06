@@ -333,7 +333,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-14](#disk-14--config--spool-wiring-path-resolution-graph-rule-35-and-the-exclusive-lock) | P2 | Config → spool wiring: path resolution, graph rule 35, and the exclusive lock | `crates/logit-cli/src/pipeline.rs` (`queue_config`) | unreviewed |
 | [RT-09](#rt-09--process_batch-in-place-retain_mut-per-event-loop-and-absorbed-accounting) | P2 | `process_batch`: in-place `retain_mut` per-event loop and absorbed accounting | `runtime.rs` (`process_batch`) | unreviewed |
 | [RT-13](#rt-13--readiness-monotonic-phase-transitions-under-concurrent-writers) | P2 | `Readiness`: monotonic phase transitions under concurrent writers | `crates/logit-pipeline/src/readiness.rs` (`Readiness`) | unreviewed |
-| [RT-15](#rt-15--logit-clipipeline-process-lifecycle-the-double-signal-kill-switch-and-configruntime-knob-mapping) | P2 | `logit-cli::pipeline`: process lifecycle, the double-signal kill switch, and config→runtime knob mapping | `crates/logit-cli/src/pipeline.rs` (`run_pipelines`, `shutdown_signal`, `write_config`) | unreviewed |
+| [RT-15](#rt-15--logit-clipipeline-process-lifecycle-the-double-signal-kill-switch-and-configruntime-knob-mapping) | P2 | `logit-cli::pipeline`: process lifecycle, the double-signal kill switch, and config→runtime knob mapping | `crates/logit-cli/src/pipeline.rs` (`run_pipelines`, `write_config`), `crates/logit-cli/src/signals.rs` | unreviewed |
 | [WIRE-20](#wire-20--prometheus_out-remote-write-sender-timestamp-partition-one-post-per-batch-duplicate-safety) | P2 | `prometheus_out` remote-write sender: timestamp partition, one POST per batch, duplicate safety | `crates/logit-outputs/src/prometheus.rs` (`RemoteWriteOutput`) | unreviewed |
 | [CODEC-04](#codec-04--carbon-plaintextpickle-encoder-tag-sanitization-multi-value-expansion-frame-packing) | P2 | Carbon plaintext/pickle encoder: tag sanitization, multi-value expansion, frame packing | `crates/logit-proto/src/graphite/encode.rs` (`encode_record`, `Sink::emit`, `sanitize_into`) | unreviewed |
 | [CODEC-06](#codec-06--statsddogstatsd-encoder--service-check-status-coercion-and-multi-value-rendering) | P2 | statsd/DogStatsD encoder — service-check status coercion and multi-value rendering | `crates/logit-outputs/src/statsd.rs` (`render_service_check`) | unreviewed |
@@ -3919,26 +3919,26 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 ---
 
 ### RT-15 — `logit-cli::pipeline`: process lifecycle, the double-signal kill switch, and config→runtime knob mapping
-- **Location:** `crates/logit-cli/src/pipeline.rs` (`run_pipelines`; its `kill_switch` task and admin bind),
-  `prepare`, `shutdown_signal`, `queue_config`, `write_config`, `input_runtime_config`, `overflow_policy`,
+- **Location:** `crates/logit-cli/src/pipeline.rs` (`run_pipelines` and its admin bind),
+  `crates/logit-cli/src/signals.rs` (`Signals`), `prepare`, `queue_config`, `write_config`, `input_runtime_config`, `overflow_policy`,
   `delivery_posture`, `build_spec`'s `internal` arm, its `lua_file` read, and its `target`/`route` arms.
 - **What it does:** Loads and resolves the config, activates the `TelemetryLayer` once the `internal` component's
   `logs` threshold is known, spawns a detached kill-switch task that `std::process::exit(130)`s on a **second**
   signal, binds the admin listener synchronously (a bind failure is `Startup`), and runs the graph.
-  `shutdown_signal()` installs an *independent* listener per call and is called three times, relying on all
-  three being notified. `queue_config`/`write_config`/`input_runtime_config` are the only places config values
+  `Signals::install` creates one stream per signal kind before the config loads; one task counts
+  SIGTERM/SIGINT for both the drain and the kill switch, and another bumps the SIGHUP reopen generation. `queue_config`/`write_config`/`input_runtime_config` are the only places config values
   become runtime behaviour (`SinkStoreConfig`, `RetryConfig`, `WriteLoopConfig`, `InputRuntimeConfig`).
-- **Why sensitive:** concurrency (three independent signal listeners, a detached task calling `process::exit`);
+- **Why sensitive:** concurrency (signal tasks spawned before startup, a detached task calling `process::exit`);
   shutdown ordering (the admin server is deliberately *not* given a shutdown listener, so `/readyz` can answer
   `503 draining` throughout the drain); data-loss via misconfiguration (a wrong `overflow`/`delivery`/
   `shutdown_grace` mapping silently changes drop behaviour). Everything else in this 4k-line file is thin
   `ComponentKind` → constructor plumbing and is **not** sensitive.
 - **Invariants to verify:**
-  - Multiple `tokio::signal::unix::signal(SignalKind::terminate())` listeners really are all notified — the whole
-    kill switch depends on it (`shutdown_signal`'s doc comment asserts this in prose).
+  - Every signal stream exists before `config::load`, so no signal reaches its default disposition after
+    `Signals::install` returns.
   - The kill switch's `process::exit(130)` can only fire on a genuine *second* signal, never on a duplicate
     wakeup of the first.
-  - `kill_switch.abort()` and `admin_server.abort()` happen after `run_with_telemetry` returns, on
+  - The signal tasks (`Signals`' drop) and `admin_server.abort()` stop after `run_with_telemetry` returns, on
     both the `Ok` and `Err` paths.
   - `queue_config` resolves `disk.path` against `base_dir`, not the process CWD (`dir: base_dir.join(&disk.path)`).
   - `write_config` maps `retry_budget`/`retry_max_delay`/`shutdown_grace`/`delivery` faithfully, and leaving
@@ -3947,7 +3947,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     deterministic.
   - The `internal` arm's `expect` (in `build_spec`) is genuinely guaranteed by graph rule 13.
 - **Observed concerns (unverified):**
-  - `std::process::exit(130)` from the detached `kill_switch` task skips every destructor — including any disk-queue
+  - `std::process::exit(130)` from the detached signal task skips every destructor — including any disk-queue
     cursor `fsync`. That is the intent of a kill switch, but it means the second signal can cost more replay on
     restart than the first. Documented in `run_pipelines`'s doc comment as deliberate; noting it as context.
   - **No `unsafe` here** (contrary to the survey brief). Confirmed by grep over the whole crate's `src/`.

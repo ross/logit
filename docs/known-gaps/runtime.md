@@ -277,10 +277,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   the way `serde_norway::from_str` on the raw file does. Two things partly offset it: `!env`'s own
   errors name a config path (`components.influx_out.token`), and a note is appended when a
   substitution's resolved type likely caused the failure.
-- **No config hot reload on SIGHUP.** A config change means a restart; SIGHUP gets no special
-  handling. It's out of scope for `docs/plans/operator-surface.md`, because it needs its own
-  design (diffing the old and new resolved `Graph`, deciding which components to reuse versus
-  tear down and rebuild), not a small addition to the readiness/exit-code work.
+- **No config hot reload on SIGHUP.** A config change means a restart. A SIGHUP never ends the
+  process and logs that the config wasn't reloaded; reopening file outputs on it arrives with the
+  file targets ([ADR `signal-handling`](../adr/signal-handling.md)). Hot reload is out of scope
+  for `docs/plans/operator-surface.md`, because it needs its own design (diffing the old and new
+  resolved `Graph`, deciding which components to reuse versus tear down and rebuild), not a small
+  addition to the readiness/exit-code work.
 - **No `logit stats` command reading a live `Registry` out-of-process.** You can see `internal`'s
   telemetry only *through* the pipeline, with a sink attached downstream. There's no out-of-band
   read path like `/readyz`/`/healthz` for lifecycle state. It's set aside alongside the admin
