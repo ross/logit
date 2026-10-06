@@ -208,6 +208,11 @@
 //! 12. NUL in a notification message becomes `_` (uncounted); a message longer than 255 bytes is
 //!     truncated (counted).
 //!
+//! One more sits outside the numbering the ADR shares, because the listener adds it after decode
+//! rather than the codec: under `collectd_in`'s `peer:`, `network.peer.*` is added to every event,
+//! an opt-in addition the sender never sent, and one of ADR `lossless-transit`'s "Permitted
+//! normalizations".
+//!
 //! Everything else is an error or a counted drop, never a silent reinterpretation.
 
 pub mod decode;

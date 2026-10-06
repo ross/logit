@@ -7,10 +7,11 @@ updated: 2026-10-05
 
 ## Status
 
-Planned. `hpeer/w0` is this plan, amendments to [ADR
+Complete. Every PR in the table under "PRs" landed, and "Closing assessment" records what each
+one did, the residual debt, and the end-to-end run. The decisions are in amendments to [ADR
 `listener-peer-address`](../adr/listener-peer-address.md) and [ADR
-`http-access-normalization`](../adr/http-access-normalization.md), and [ADR
-`forwarded-header-parsing`](../adr/forwarded-header-parsing.md), and changes no code.
+`http-access-normalization`](../adr/http-access-normalization.md), and in [ADR
+`forwarded-header-parsing`](../adr/forwarded-header-parsing.md).
 
 ## Goal
 
@@ -200,3 +201,105 @@ Stacked, as the stacking rules below the table describe.
   - An L4-then-L7 chain (HAProxy in TCP mode into nginx), to confirm decision 2's precedence.
   - For each: the expected `client.*` and `network.peer.*` on the JSON event, health checks quiet,
     and a direct connection to a `proxy_protocol:` port rejected and counted.
+
+## Closing assessment
+
+### What landed
+
+| PR | Branch | What it did |
+|---|---|---|
+| #546 | `hpeer/w0` | This plan, ADR `forwarded-header-parsing`, and the amendments to ADR `listener-peer-address` and ADR `http-access-normalization`. |
+| #547 | `hpeer/w1` | The shared pieces in `crates/logit-inputs/src/peer.rs`: `read_proxy_header` moved out of `tcp.rs`, `ConnectionPeer` built once per connection, and the multi-batch stamp. No behavior change. |
+| #548 | `hpeer/w2` | `peer:` and `proxy_protocol:` on `otlp_in` over HTTP and gRPC, with the header-then-RST health-check test. |
+| #550 | `hpeer/w3a` | The same on `datadog_in` and `datadog_trace_in`, including the Unix socket's bound-path rule and a `socket:`-only `proxy_protocol:` rejected. |
+| #551 | `hpeer/w3b` | The same on `splunk_hec_in`, stamped before the split a code 6 can follow. |
+| #552 | `hpeer/w3c` | The same on `prometheus_in`'s remote-write receiver, receiver mode only. |
+| #555 | `hpeer/w4a` | `logit_proto::forwarded`, its fuzz target and seeds, and `http_access` moved onto it with `forwarded: x_forwarded_for \| forwarded \| x_real_ip`. |
+| #558 | `hpeer/w4b` | `forwarded:` on the five HTTP listeners, replacing a PROXY origin's `client.*` per request. |
+| This PR | `hpeer/w5` | [`docs/deploying.md`](../deploying.md)'s "Recording the sender" rewritten to cover every listener; the runtime-gaps peer entry narrowed to `logit_in`; a pointer from intake gaps' `proxy_protocol:` entry to the spoofed-header non-goal; the sender-attribute pointer in the `statsd`, `syslog`, `graphite`, and `collectd` codec docs; and the end-to-end run below. |
+
+### Residual debt
+
+- **`logit_in`** records no sender ([runtime gaps](../known-gaps/runtime.md)), per decision 1.
+- **An allowlist of trusted PROXY sources** stays deferred ([intake gaps](../known-gaps/intake.md)).
+- **A mutual-TLS client's identity, `SO_PEERCRED`, and `network.connection.id`** stay deferred, as
+  ADR `listener-peer-address`'s "Consequences" lists them.
+- **A spoofed forwarding header** is a non-goal, not debt ([transform gaps](../known-gaps/transforms.md)).
+
+### End-to-end run
+
+Run on 2026-10-05 against a release build of `hpeer/w4b`'s head (`b2f43cce`), each leg in a
+throwaway compose project on its own `172.31.<leg>.0/24` network: clients at `.10` to `.14`,
+HAProxy at `.20`, nginx at `.30`, `logit` at `.40`, and Envoy at `.50`. Images:
+`haproxy:3.2-alpine`, `nginx:1.27-alpine` (nginx 1.27.5), `envoyproxy/envoy:v1.33-latest`,
+`fullstorydev/grpcurl:latest`, and `curlimages/curl:8.11.1`. Events went to a `stdio_out` with
+`format: json`, and an `internal` input on a 2 s interval went to a second one. OTLP/HTTP requests
+were a JSON `POST /v1/logs` from curl, and gRPC requests a `LogsService/Export` from grpcurl with
+the repo's OTLP protos. Every leg passed.
+
+1. **HAProxy `mode tcp` with `send-proxy-v2` in front of `otlp_in` HTTP and gRPC**, both
+   listeners `peer: true` and `proxy_protocol: true`, and HAProxy's `server` lines
+   `send-proxy-v2 check inter 500ms` (`check-send-proxy` added on the gRPC one):
+
+   ```json
+   {"network.peer.address":"172.31.1.20","network.peer.port":50374,"client.address":"172.31.1.10","client.port":49970}
+   {"network.peer.address":"172.31.1.20","network.peer.port":45286,"client.address":"172.31.1.11","client.port":33270}
+   ```
+
+   HAProxy's log named the same client and port. Each health check, with or without
+   `check-send-proxy`, was a 16-byte version 2 `LOCAL` header and then an RST (captured with
+   tcpdump). Over about 100 seconds of checks every 500 ms on both backends, both servers stayed
+   `UP` with `chkfail=0`, and `logit` counted no `connections.rejected` and logged no diagnostic.
+2. **nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for`** in front of
+   `otlp_in` HTTP and `splunk_hec_in` (`/services/collector/event`), both `peer: true` and
+   `forwarded: x_forwarded_for`:
+
+   ```json
+   {"network.peer.address":"172.31.2.30","network.peer.port":52030,"client.address":"172.31.2.10"}
+   {"network.peer.address":"172.31.2.30","network.peer.port":46994,"client.address":"172.31.2.11"}
+   ```
+
+   No `client.port`. A client sending `X-Forwarded-For: unknown` got no `client.*` and one
+   `forwarded` diagnostic that names the socket peer and not the value. A client sending
+   `X-Forwarded-For: 192.0.2.1` got `client.address` `192.0.2.1`, because `$proxy_add_x_forwarded_for`
+   appends: the spoofed-header non-goal, now called out in "Recording the sender".
+3. **Envoy with `use_remote_address: true`**, HTTP/2 upstream, in front of `otlp_in` gRPC with
+   `peer: true` and `forwarded: x_forwarded_for`:
+
+   ```json
+   {"network.peer.address":"172.31.3.50","network.peer.port":41248,"client.address":"172.31.3.10"}
+   ```
+
+   Envoy also appends to a client's own `X-Forwarded-For`, with the same result as leg 2.
+4. **Decision 2's precedence**: client, then nginx setting `X-Forwarded-For`, then HAProxy
+   `mode tcp` with `send-proxy-v2`, then `otlp_in` HTTP with `peer: true`, `proxy_protocol: true`,
+   and `forwarded: x_forwarded_for`. The PROXY header names nginx, and the forwarding header names
+   the client. HAProxy in TCP mode into nginx, the arrangement this plan's "Verification" names,
+   sends `logit` no PROXY header, so it can't test precedence; leg 6 runs it instead.
+
+   | Route | `client.*` | `network.peer.*` |
+   |---|---|---|
+   | nginx sets the header | `172.31.4.10`, no port (the PROXY origin was `172.31.4.30:57170`) | HAProxy |
+   | nginx clears the header | `172.31.4.30:45182`, the PROXY origin | HAProxy |
+   | The client sends `unknown` | `172.31.4.30:45196`, the PROXY origin, and one `forwarded` diagnostic | HAProxy |
+
+5. **A direct connection to a `proxy_protocol: true` port**: curl to leg 1's `otlp_in` HTTP port
+   got `Recv failure: Connection reset by peer`, and `logit` counted
+   `logit.input.connections.rejected{reason="proxy_header"}` once, with one `proxy_header`
+   diagnostic. A plain `nc -z` to the gRPC port, a TCP health check with no header, counted the
+   same.
+6. **The "Recording the sender" recipe**: client, then HAProxy `mode tcp` with
+   `send-proxy-v2 check`, then nginx on `listen 8080 proxy_protocol` with
+   `proxy_set_header X-Forwarded-For $proxy_protocol_addr`, then `otlp_in` HTTP with `peer: true`
+   and `forwarded: x_forwarded_for`:
+
+   ```json
+   {"network.peer.address":"172.31.6.30","network.peer.port":38818,"client.address":"172.31.6.10"}
+   ```
+
+   A client sending `X-Forwarded-For: 192.0.2.1` got its own address, `172.31.6.11`, because nginx
+   overwrites the header. HAProxy's check against nginx stayed `UP`.
+
+The run found one wording fault: the `forwarded` diagnostic said the request kept "its
+connection's `client.address` and `client.port`" on a listener with no `proxy_protocol:`, where
+there are none. This PR rewords it.

@@ -122,18 +122,19 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit:** if a documented script runs `logit-outputs` tests under plain `cargo test`. The
     fix then is a test that doesn't depend on a thread-local subscriber, such as one reading
     `Diagnostics::occurrences`.
-- **`logit_in` doesn't record the sending peer's address.** `peer:` and
-  `proxy_protocol:` exist on the listeners built on the shared socket drivers and on every HTTP
-  listener: `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s
-  remote-write receiver ([ADR `listener-peer-address`](../adr/listener-peer-address.md)).
-  `logit_in` accepts its connections itself and stamps no `network.peer.*` or `client.*`.
-  - **Consequence:** a pipeline can't tell which of several senders on one of these listeners
-    wrote an event, or route on it, unless the sender puts its own identity in the payload, as an
-    OTLP resource's `host.name` does.
-  - **Workaround:** run one listener per sender (or per group of senders) and stamp each with a
-    `set` stage.
-  - **Revisit trigger:** a deployment that can't give each sender its own listener and whose
-    senders don't identify themselves.
+- **`logit_in` doesn't record the sending peer's address.** Every other network listener takes
+  `peer:` and, on TCP, `proxy_protocol:`: those on the shared socket drivers and the five HTTP
+  listeners (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s
+  remote-write receiver), which also take `forwarded:`
+  ([ADR `listener-peer-address`](../adr/listener-peer-address.md)). `logit_in` accepts its
+  connections itself, takes none of the three, and stamps no `network.peer.*` or `client.*`.
+  - **Consequence:** a pipeline can't tell which of several `logit_out` senders on one `logit_in`
+    wrote an event, or route on it, unless the sender's events carry its identity.
+  - **Workaround:** stamp each sender's identity upstream of its `logit_out`, with a `set` stage
+    writing a resource attribute, or run one `logit_in` per sender (or per group of senders) and
+    stamp each with a `set` stage.
+  - **Revisit trigger:** work on the native protocol, or a deployment that can't do either
+    workaround.
 
 ## Event model and interner
 

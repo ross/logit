@@ -423,16 +423,21 @@ Per pair:
   A TCP listener has no receive queue at all: TCP's own flow control is the backpressure, unlike
   the UDP-only `decoupled-listener-io` queue every datagram listener shares. So a TCP
   `graphite_in` takes the same `tls:` block a TCP `syslog_in` does.
-- **Sender address**: the shared TCP, UDP, and Unix drivers stamp the socket peer on each event
-  after decode, as `network.peer.address`/`network.peer.port`, under an opt-in `peer:` on every
-  listener built on them. Under `transport: tcp`, opt-in `proxy_protocol:` requires a PROXY v1/v2
+- **Sender address**: every network listener but `logit_in` can record who sent each event,
+  opt-in, stamped after decode; no `Decoder` sees a peer. `peer:` stamps the socket peer as
+  `network.peer.address`/`network.peer.port`. On TCP, `proxy_protocol:` requires a PROXY v1/v2
   header (`logit_proto::proxy`, a fuzz target) ahead of any TLS and stamps the origin it names as
-  `client.address`/`client.port`. No `Decoder` sees a peer. The five HTTP listeners (`otlp_in`,
-  `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver)
-  take both fields too, plus `forwarded:`, which stamps a request's `client.*` pair from one named
-  forwarding header ahead of the PROXY origin
-  ([ADR `forwarded-header-parsing`](docs/adr/forwarded-header-parsing.md)); `logit_in` records none
-  ([ADR `listener-peer-address`](docs/adr/listener-peer-address.md)).
+  `client.address`/`client.port`. The shared TCP, UDP, and Unix drivers stamp per connection or
+  datagram. The five HTTP listeners (`otlp_in`, `datadog_in`, `datadog_trace_in`,
+  `splunk_hec_in`, and `prometheus_in`'s remote-write receiver) build the values once per
+  connection (`crates/logit-inputs/src/peer.rs`) and stamp every batch a request decodes into.
+  They also take `forwarded: x_forwarded_for | forwarded | x_real_ip`, which reads the one named
+  header on each request (`logit_proto::forwarded`, shared with `http_access`, a fuzz target) and
+  replaces a PROXY origin's `client.*` as a pair, while `network.peer.*` stays the socket peer
+  ([ADR `listener-peer-address`](docs/adr/listener-peer-address.md) and its amendment,
+  [ADR `forwarded-header-parsing`](docs/adr/forwarded-header-parsing.md)). `logit_in` records
+  none (`docs/known-gaps/runtime.md`); [docs/deploying.md](docs/deploying.md)'s "Recording the
+  sender" is the operator-facing account.
 
 ### Native wire format and transport
 

@@ -2,6 +2,11 @@
 //! lossless-relay pair (`docs/adr/lossless-transit.md`). nginx's `access_log syslog:` writer
 //! speaks it over UDP.
 //!
+//! **The driver adds sender attributes after decode.** Under `peer:` or `proxy_protocol:`,
+//! `network.peer.*` or `client.*` is added to every event, an opt-in addition the sender never
+//! sent, and one of ADR `lossless-transit`'s "Permitted normalizations". [`SyslogDecoder`] never
+//! sees a peer.
+//!
 //! ## Transports and framing
 //!
 //! **Both transports, one decoder.** UDP is the default. `transport: tcp`

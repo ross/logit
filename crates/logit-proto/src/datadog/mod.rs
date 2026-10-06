@@ -23,9 +23,9 @@
 //! timestamps convert by [`time`]'s.
 //!
 //! **The listener adds sender attributes after decode.** Under `datadog_in`'s or
-//! `datadog_trace_in`'s `peer:` or `proxy_protocol:`, `network.peer.*` or `client.*` is added to
-//! every event, an opt-in addition the sender never sent, and one of ADR `lossless-transit`'s
-//! "Permitted normalizations". It applies to every payload family below.
+//! `datadog_trace_in`'s `peer:`, `proxy_protocol:`, or `forwarded:`, `network.peer.*` or
+//! `client.*` is added to every event, an opt-in addition the sender never sent, and one of ADR
+//! `lossless-transit`'s "Permitted normalizations". It applies to every payload family below.
 //!
 //! # Metrics (`series`, `sketches`)
 //!

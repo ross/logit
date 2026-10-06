@@ -748,8 +748,9 @@ backpressure), but its accept queue has the same shape of problem:
 A stream listener has no receive queue (its connection's flow control is the backpressure), but a
 connection can open and then say nothing while holding one of the listener's
 `max_connections` permits. `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` (each with
-`transport: tcp`), `logit_in`, and `otlp_in` bound that with `handshake_timeout:`, **5s by default**, a duration
-string (`5s`, `1m`, `1h30m`) like `connect_timeout`:
+`transport: tcp`), `logit_in`, `otlp_in`, `datadog_in`, `datadog_trace_in`, and `splunk_hec_in`
+bound that with `handshake_timeout:`, **5s by default**, a duration string (`5s`, `1m`, `1h30m`)
+like `connect_timeout`:
 
 ```yaml
 components:
@@ -773,15 +774,16 @@ budget of the configured length, so a TLS connection that says nothing costs up 
 | `lines_in` (`transport: tcp`) | the same three phases, on the same shared driver |
 | `logit_in` | the TLS accept (under `tls:`), then the `Hello` read |
 | `otlp_in` | the PROXY header (under `proxy_protocol:`), then the TLS accept (under `tls:`), or — on the plaintext arm, which has no TLS accept — the wait for the connection's first byte |
+| `datadog_in` | the same phases as `otlp_in` |
+| `datadog_trace_in` | on `bind:`, the same phases as `otlp_in`; on `socket:`, the wait for the connection's first byte |
+| `splunk_hec_in` | the same phases as `otlp_in` |
 | `prometheus_in` (remote-write receiver) | the same phases as `otlp_in`, under `bind_tls:`, each bounded by a fixed 5 seconds; this kind has no `handshake_timeout:` field |
 
 **Under `proxy_protocol: true`, give the load balancer a PROXY-aware health check.** A plain TCP
 connect check sends no header, so each probe is closed and counted as
-`logit.input.connections.rejected{reason="proxy_header"}`, with a throttled `proxy_header`
-diagnostic. HAProxy's `check` sends the header itself when the `server` line has `send-proxy` or
-`send-proxy-v2` and no `port` or `addr`; with either set, add `check-send-proxy`. Any other
-balancer's check should send a v2 `LOCAL` header, which the listener accepts without stamping a
-client.
+`logit.input.connections.rejected{reason="proxy_header"}`. "Health checks" under
+[Recording the sender](#recording-the-sender-peer-proxy_protocol-and-forwarded) has the check to
+use on each kind of port.
 
 **`otlp_in` bounds one phase per connection, not two**, plus the PROXY header under
 `proxy_protocol:`, and not by choice. It hands each accepted
@@ -960,23 +962,35 @@ connection. On `syslog_in`, `graphite_in`, `statsd_in`, or `lines_in` with `tran
 no connections, so any other value is rejected instead of silently ignored. On `prometheus_in` it belongs to the
 remote-write receiver, and rule 55 rejects a non-default value alongside `scrape_targets:`.
 
-### Recording the sender: `peer` and `proxy_protocol`
+### Recording the sender: `peer`, `proxy_protocol`, and `forwarded`
 
-No listener records who sent an event unless you ask. Two opt-in fields do, on the listeners
-built on the shared socket drivers ([ADR `listener-peer-address`](adr/listener-peer-address.md)):
+No listener records who sent an event unless you ask. Three opt-in fields do
+([ADR `listener-peer-address`](adr/listener-peer-address.md),
+[ADR `forwarded-header-parsing`](adr/forwarded-header-parsing.md)):
 
-| Field | Listeners and transports | Stamps on each event |
-|---|---|---|
-| `peer: true` | `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in` on every transport they offer, and `collectd_in` | `network.peer.address` and `network.peer.port`: the socket peer, the connection's for a stream and each datagram's own for UDP |
-| `proxy_protocol: true` | `syslog_in`, `graphite_in`, `statsd_in`, and `lines_in`, under `transport: tcp` only (rule 79) | `client.address` and `client.port`: the original client a PROXY protocol header names |
+| Field | Stamps on each event |
+|---|---|
+| `peer: true` | `network.peer.address` and `network.peer.port`: the socket peer, the connection's for a stream and each datagram's own for UDP |
+| `proxy_protocol: true` | `client.address` and `client.port`: the original client a PROXY protocol header names, read once per connection |
+| `forwarded: x_forwarded_for \| forwarded \| x_real_ip` | `client.address`, and `client.port` when the header carries a port: the client the named forwarding header names, read once per request |
 
-`logit_in` takes neither field. `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and
-`prometheus_in`'s remote-write receiver take both; `datadog_trace_in`'s `proxy_protocol:` applies to
-its `bind:` listener only, and on `prometheus_in` both are receiver-mode fields, rejected beside
-`scrape_targets:`. Those five HTTP listeners also take `forwarded: x_forwarded_for | forwarded |
-x_real_ip`, which reads each request's client from the forwarding header an L7 proxy sets, ahead
-of a PROXY header's client; [ADR `forwarded-header-parsing`](adr/forwarded-header-parsing.md) has
-the rules.
+Which listener takes which field:
+
+| Kind | Transports | `peer:` | `proxy_protocol:` | `forwarded:` | Notes |
+|---|---|---|---|---|---|
+| `statsd_in` | UDP, TCP, `unix`, `unix_stream` | Yes | TCP only | No | |
+| `syslog_in` | UDP, TCP | Yes | TCP only | No | |
+| `graphite_in` | UDP, TCP | Yes | TCP only | No | |
+| `lines_in` | TCP, UDP, `unix`, `unix_stream` | Yes | TCP only | No | |
+| `collectd_in` | UDP, unicast or multicast | Yes | No | No | |
+| `otlp_in` | HTTP and gRPC over TCP | Yes | Yes | Yes | gRPC metadata is read as HTTP headers |
+| `datadog_in` | HTTP over TCP | Yes | Yes | Yes | |
+| `datadog_trace_in` | HTTP over TCP (`bind:`) and a Unix socket (`socket:`) | Yes, both | `bind:` only | Yes, both | `proxy_protocol: true` with `socket:` and no `bind:` is rejected |
+| `splunk_hec_in` | HTTP over TCP | Yes | Yes | Yes | |
+| `prometheus_in` | The remote-write receiver (`bind:`) | Yes | Yes | Yes | Receiver mode only: each is rejected beside `scrape_targets:` |
+| `logit_in` | TCP | No | No | No | See [runtime gaps](known-gaps/runtime.md) |
+
+`logit validate` rejects `proxy_protocol: true` on any transport but TCP (rule 79).
 
 **What `peer:` writes.** The address is a string in its standard text form, and the port is an
 integer. An IPv4-mapped IPv6 address is written as IPv4, so a sender reads the same on a
@@ -984,13 +998,14 @@ dual-stack socket as on an IPv4 one. On a Unix socket, a client that bound a pat
 path as the address and no port; an unbound client, the usual case, gets neither attribute.
 There's no reverse DNS lookup: a lookup can stall intake and returns whatever the sender's
 resolver says. To get names, map addresses downstream, in a `lua` stage for example. Each
-attribute replaces a same-named one the decoder produced.
+attribute replaces a same-named one the decoder produced. On an HTTP listener, every event a
+request decodes into carries the same values.
 
 **Keep the address away from anything that shouldn't have it.** An IP address is personal data in
 some jurisdictions, and it's one value per sender, so it reaches every sink that writes
 attributes, and it splits every series an `aggregate` keys by attributes into one per sender. Put
 a `remove` (or a `keep` that doesn't list it) ahead of each `aggregate` and each sink that
-shouldn't see it:
+shouldn't see it. The same holds for `client.address` and `client.port`:
 
 ```yaml
 components:
@@ -1016,10 +1031,10 @@ components:
     transport: tcp
 ```
 
-**Behind a load balancer, `peer:` reports the load balancer.** To record the client, configure the
-proxy to send a PROXY protocol header and set `proxy_protocol: true`. Version 1 (text) and
-version 2 (binary) are both accepted and told apart by their signatures. With HAProxy, add
-`send-proxy-v2` (or `send-proxy` for version 1) to the `server` line:
+**Behind a TCP proxy, use `proxy_protocol:`.** `peer:` reports the proxy, not the client. To record
+the client, configure the proxy to send a PROXY protocol header and set `proxy_protocol: true`.
+Version 1 (text) and version 2 (binary) are both accepted and told apart by their signatures.
+With HAProxy, add `send-proxy-v2` (or `send-proxy` for version 1) to the `server` line:
 
 ```text
 frontend syslog
@@ -1038,22 +1053,110 @@ version 2 `LOCAL` health check, keeps the connection and stamps no `client.*`.
 [`fixtures/lines-behind-haproxy.yaml`](../fixtures/lines-behind-haproxy.yaml) is a runnable
 config.
 
-**Make a `proxy_protocol: true` port reachable only through the proxy.** The listener can't tell a
-proxy's header from one a client wrote itself, so any client that connects directly can name any
-address as `client.address`. Enforce the boundary with network policy, as for every listener
-([Trust boundary](#trust-boundary)).
-
-**Every connection must open with a header.** It's never auto-detected, as the PROXY protocol
-specification requires. A connection without a valid header, or whose header doesn't arrive within
-`handshake_timeout` (a fixed 5 seconds on `prometheus_in`'s remote-write receiver, which has no
-such field), is closed and counted
+**Every connection to a `proxy_protocol: true` port must open with a header.** It's never
+auto-detected, as the PROXY protocol specification requires. A connection without a valid header,
+or whose header doesn't arrive within `handshake_timeout` (a fixed 5 seconds on `prometheus_in`'s
+remote-write receiver, which has no such field), is closed and counted
 `logit.input.connections.rejected{reason="proxy_header"}`, with a throttled `proxy_header`
 diagnostic. That includes a sender that connects to the port directly by mistake, and a load
-balancer's plain TCP health check; see
-[`handshake_timeout` on a TCP listener](#handshake_timeout-on-a-tcp-listener) for the health
-check to use and the phases the timeout bounds. The header is read before any TLS handshake, as
-a proxy sends it, so `tls:` (`bind_tls:` on the remote-write receiver) and `proxy_protocol:`
-combine.
+balancer's plain TCP health check (see "Health checks" below). The header is read before any TLS
+handshake, as a proxy sends it, so `tls:` (`bind_tls:` on the remote-write receiver) and
+`proxy_protocol:` combine.
+
+**Behind an HTTP proxy, use `forwarded:`.** nginx, Envoy, HAProxy in `mode http`, and cloud HTTP
+load balancers put the client in a forwarding header, not a PROXY header. Name the one your proxy
+sets: `x_forwarded_for` reads the leftmost entry of `X-Forwarded-For`, `forwarded` reads the
+first element's `for=` in RFC 7239's `Forwarded`, and `x_real_ip` reads `X-Real-IP`. Only the
+named header is read, and only its first instance, even when the request carries another
+forwarding header. The address is written in the text form `peer:` uses, without IPv6 brackets,
+and a port in the value becomes `client.port`. Proxies rarely put a port in `X-Forwarded-For` or
+`X-Real-IP`, so `client.port` is usually present only when a `Forwarded` element names one. A value with no usable
+address, such as `unknown` or an obfuscated name, stamps nothing and counts a throttled
+`forwarded` diagnostic; the request goes through.
+
+**Where `client.*` comes from when both are on.** `network.peer.*` is always the socket peer. A
+parsed forwarding header replaces the PROXY header's `client.address` and `client.port` for that
+request, as a pair: when the forwarding header carries no port, the PROXY header's `client.port`
+is removed rather than left beside another source's address. When the forwarding header is
+absent or has no usable address, the PROXY header's client stands. That's the order an HTTP
+proxy in front of a TCP proxy needs: the TCP proxy's PROXY header names the HTTP proxy, and the
+HTTP proxy's forwarding header names the client.
+
+**Make the port reachable only through the proxy, and have the proxy overwrite the header.** No
+listener can tell a proxy's PROXY header or forwarding header from one a client wrote itself, so
+any client that connects directly, or whose own forwarding header the proxy keeps and appends to,
+can name any address as `client.address`. There's no allowlist of trusted proxy addresses and no
+hop count. Common configurations append rather than overwrite: nginx's
+`$proxy_add_x_forwarded_for` and Envoy's `use_remote_address: true` both keep a client's own
+`X-Forwarded-For` as the leftmost entry, so that client's claim is what `logit` reads. Set the
+header from the address the proxy saw, as the nginx example below does with
+`$proxy_protocol_addr` (`$remote_addr` without a PROXY header in front). Enforce the boundary with network policy, as for every listener
+([Trust boundary](#trust-boundary)). [Intake gaps](known-gaps/intake.md)' "`proxy_protocol:`
+accepts a PROXY header from any peer" and [transform gaps](known-gaps/transforms.md)'
+"`forwarded:` trusts the header it names" record what that leaves open.
+
+**Health checks.** A load balancer's check reaches the listener as an ordinary connection, and
+whether it's diagnosed or counted depends on the port:
+
+- **Plaintext, `proxy_protocol:` off:** a check that connects and then closes or resets without
+  sending a byte ends quietly, with no `connection_error` diagnostic and nothing counted.
+- **Plaintext, `proxy_protocol: true`:** the check must send a header. A complete header followed
+  by a close or a reset ends quietly. A plain TCP connect check is closed and counted as
+  `rejected{reason="proxy_header"}` on every probe. HAProxy's `check` sends the header itself
+  when the `server` line has `send-proxy` or `send-proxy-v2` and no `port` or `addr`; with either
+  set, add `check-send-proxy`. Any other balancer's check should send a version 2 `LOCAL` header,
+  which the listener accepts without stamping a client.
+- **TLS (`tls:`, or `bind_tls:` on the remote-write receiver):** a check that doesn't finish a
+  TLS handshake fails the TLS accept and is diagnosed as `connection_error` on every probe, with or
+  without `proxy_protocol:`. Use a check that completes the handshake, such as HAProxy's
+  `check-ssl`, or expect the throttled diagnostic.
+
+[`handshake_timeout` on a TCP listener](#handshake_timeout-on-a-tcp-listener) has the phases a
+connection passes through before its first message.
+
+**An HTTP proxy behind a TCP proxy.** With HAProxy in TCP mode in front of nginx, HAProxy sends a
+PROXY header to nginx, and nginx turns it into the forwarding header `logit` reads. Set the
+header from `$proxy_protocol_addr`, so nginx overwrites any `X-Forwarded-For` the client sent
+rather than appending to it:
+
+```text
+# HAProxy
+frontend otlp
+    mode tcp
+    bind :4318
+    default_backend nginx
+backend nginx
+    mode tcp
+    server nginx1 nginx.internal:8080 send-proxy-v2 check
+```
+
+```nginx
+# nginx
+server {
+    listen 8080 proxy_protocol;
+    location / {
+        proxy_pass http://logit.internal:4318;
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $proxy_protocol_addr;
+    }
+}
+```
+
+```yaml
+# logit
+components:
+  otlp_in:
+    type: otlp_in
+    bind: 0.0.0.0:4318
+    peer: true                       # nginx
+    forwarded: x_forwarded_for       # the client HAProxy accepted
+```
+
+Each event carries the client's address as `client.address`, with no `client.port`, and nginx as
+`network.peer.*`. `logit` takes no `proxy_protocol:` here, because nginx's HTTP proxy doesn't
+send a PROXY header. When a TCP proxy sits between nginx and `logit` instead, set both
+`proxy_protocol: true` and `forwarded:`: the PROXY header names nginx, and the forwarding header
+wins.
 
 ### `collectd_in`: multicast groups and `types_db`
 
@@ -1193,7 +1296,7 @@ the runnable config, with every default present as a comment.
   so a UDP or `unix` sender needs no trailing newline.
 - **The sender is recorded only on request.** `peer: true` stamps its address, and
   `proxy_protocol: true` the client behind a proxy; see
-  [Recording the sender](#recording-the-sender-peer-and-proxy_protocol).
+  [Recording the sender](#recording-the-sender-peer-proxy_protocol-and-forwarded).
 
 To parse JSON lines, put a `json` transform after the listener; a line that isn't JSON passes
 through untouched:

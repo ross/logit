@@ -259,8 +259,8 @@ impl ConnectionPeer {
                 forwarding.diag.clone().warn_throttled(
                     "forwarded",
                     format_args!(
-                        "the {} header from {self} names no client: {reason}; the request keeps \
-                         its connection's client.address and client.port",
+                        "the {} header from {self} names no client: {reason}; the request \
+                         keeps any client.address and client.port its PROXY header named",
                         forwarding.header.name()
                     ),
                 );

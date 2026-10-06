@@ -304,3 +304,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** a deployment where the proxy and direct clients share a network path to
     the listener. The fix is a list of trusted source addresses, with a header from any other peer
     refused.
+  - **Forwarding headers:** an HTTP listener's `forwarded:` has the same exposure for a client
+    that writes its own forwarding header, recorded as a non-goal in
+    [transform gaps](transforms.md)' "`forwarded:` trusts the header it names" entry; the
+    trusted-source allowlist above stays deferred work, not part of that non-goal.
