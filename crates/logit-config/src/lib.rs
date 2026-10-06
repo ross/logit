@@ -2413,6 +2413,9 @@ pub enum ComponentKind {
     /// default), stderr, or a file. The dev loop for seeing a whole pipeline's output without a
     /// real backend.
     StdioOut {
+        /// `stdout` (the default), `stderr`, or a file path, which resolves against the config
+        /// file's directory when relative. A file is reopened on SIGHUP before the next write, so
+        /// an external log rotator can rename it.
         #[serde(default)]
         target: StdioTarget,
         /// Which encoder writes through this sink: `human` (the default) is the readable text;
@@ -2436,7 +2439,9 @@ pub enum ComponentKind {
     /// `stdio_out` does by default, one JSON object per event per line under `format: json`, or
     /// `logit`'s native wire format under `format: native`.
     FileOut {
-        /// The active file. A relative path resolves against the config file's directory.
+        /// The active file. A relative path resolves against the config file's directory. The
+        /// file is reopened on SIGHUP before the next write; let `rotate:` manage it, or use
+        /// `stdio_out` for a file logrotate manages.
         path: String,
         #[serde(default)]
         rotate: RotateConfig,
