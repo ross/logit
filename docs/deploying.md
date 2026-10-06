@@ -1102,7 +1102,7 @@ whether it's diagnosed or counted depends on the port:
 - **Plaintext, `proxy_protocol:` off:** on every listener above but `logit_in`, a check that
   connects and then closes or resets without sending a byte ends quietly, with no
   `connection_error` diagnostic and nothing counted. `logit_in` diagnoses a connection that closes
-  before its `Hello` as `connection_error`.
+  or resets before its `Hello` as `connection_error`.
 - **Plaintext, `proxy_protocol: true`:** the check must send a header. A complete header followed
   by a close or a reset ends quietly. A plain TCP connect check is closed and counted as
   `rejected{reason="proxy_header"}` on every probe. HAProxy's `check` sends the header itself
