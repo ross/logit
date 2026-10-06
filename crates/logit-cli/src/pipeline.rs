@@ -14,6 +14,7 @@
 //! graph rule runs (a syslog `sd_id`), so those fail only at `run`.
 
 use crate::config;
+use crate::signals::Signals;
 use anyhow::Context;
 use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
@@ -87,6 +88,7 @@ use logit_transforms::{
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::watch;
 
 /// A config's `internal` component: what [`run_pipelines`] needs to
 /// [`logit_core::TelemetryLayer::activate`] the layer. Absent when there's no `internal`, in which
@@ -110,10 +112,14 @@ fn severity_for_logs(logs: logit_config::InternalLogs) -> Option<logit_core::Sev
 /// Loads `path`, resolves its component graph, and runs it until the first component fails or a
 /// shutdown signal is received.
 ///
-/// SIGTERM/SIGINT (Ctrl-C on non-Unix) starts a graceful drain: every listener stops, closing its
-/// downstream inboxes and triggering each node's close-time flush, so an in-flight `aggregate`
-/// window is emitted rather than lost. A second signal before the drain finishes exits at once
-/// with code 130, so a wedged drain stays killable by the signal that started it.
+/// On Unix the signal handlers ([`Signals::install`]) go in before the config loads, so a signal
+/// during startup is handled, not defaulted. SIGTERM/SIGINT (Ctrl-C on non-Unix) starts a
+/// graceful drain: every listener stops, closing its downstream inboxes and triggering each node's
+/// close-time flush, so an in-flight `aggregate` window is emitted rather than lost. A second
+/// SIGTERM/SIGINT before the drain finishes exits at once with code 130, so a wedged drain stays
+/// killable by the signal that started it. SIGHUP never exits and never reloads the config: it
+/// logs `reopen signal received` and bumps the reopen generation, and each `stdio_out`/`file_out`
+/// file target reopens its path before its next write.
 ///
 /// Every failure before the pipeline reports ready is `RunError::Startup` (exit 1); after, it's a
 /// runtime failure (exit 2). See `docs/deploying.md`'s "Probes and exit codes".
@@ -124,6 +130,7 @@ pub async fn run_pipelines(
     path: PathBuf,
     telemetry_layer: logit_core::TelemetryLayer,
 ) -> Result<(), RunError> {
+    let signals = Signals::install();
     let config = config::load(&path).map_err(RunError::Startup)?;
 
     // `starting`/`exiting` are stable lifecycle event names for log-based alerting
@@ -140,7 +147,7 @@ pub async fn run_pipelines(
     let admin_bind = config.admin.bind.clone();
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let (graph, specs, telemetry, internal) =
-        prepare(config, base_dir).map_err(RunError::Startup)?;
+        prepare(config, base_dir, Some(signals.reopen_generation())).map_err(RunError::Startup)?;
 
     if let Some(info) = &internal {
         if let Some(threshold) = severity_for_logs(info.logs) {
@@ -154,14 +161,6 @@ pub async fn run_pipelines(
     {
         tracing::warn!(target: "logit", "{warning}");
     }
-
-    // Every concurrent listener on a signal kind is notified, so this doesn't consume the one
-    // `run_with_telemetry` races on. Aborted once that returns.
-    let kill_switch = tokio::spawn(async {
-        shutdown_signal().await;
-        shutdown_signal().await;
-        std::process::exit(130);
-    });
 
     // The admin listener binds here, before `run_with_telemetry` spawns anything, so a bind
     // failure is `RunError::Startup`: the guarantee `Input::bind`'s pre-pass gives every listener.
@@ -181,9 +180,9 @@ pub async fn run_pipelines(
     };
 
     let result =
-        logit_pipeline::run_with_telemetry(graph, specs, telemetry, readiness, shutdown_signal())
+        logit_pipeline::run_with_telemetry(graph, specs, telemetry, readiness, signals.shutdown())
             .await;
-    kill_switch.abort();
+    drop(signals);
     if let Some(admin_server) = admin_server {
         admin_server.abort();
     }
@@ -269,7 +268,14 @@ fn fd_limit_warning(budget: usize, soft_limit: Option<u64>) -> Option<String> {
 /// Then one process-wide [`Registry`] is built, and each component's handle serves both its own
 /// instrumentation (`build_spec`, layer 3) and the node runtime's (layer 2), so both drain from
 /// one buffer. See `docs/design/internal-telemetry.md`.
-fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<PrepareResult> {
+///
+/// `reopen` is the SIGHUP reopen generation every `stdio_out`/`file_out` file target watches;
+/// `None` gives them none.
+fn prepare(
+    config: Config,
+    base_dir: PathBuf,
+    reopen: Option<watch::Receiver<u64>>,
+) -> anyhow::Result<PrepareResult> {
     let graph = graph::resolve(config)?;
 
     // Graph rule 13 allows at most one `internal`; its `span_sample_rate` configures the registry.
@@ -291,8 +297,9 @@ fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<PrepareResult> {
     let mut telemetry: HashMap<String, Telemetry> = HashMap::with_capacity(graph.components.len());
     for id in ids {
         let component = &graph.components[id];
-        let (spec, component_telemetry) = build_spec(id, component, &base_dir, registry.as_ref())
-            .with_context(|| format!("component '{id}'"))?;
+        let (spec, component_telemetry) =
+            build_spec(id, component, &base_dir, registry.as_ref(), reopen.as_ref())
+                .with_context(|| format!("component '{id}'"))?;
         specs.insert(id.clone(), spec);
         telemetry.insert(id.clone(), component_telemetry);
     }
@@ -305,29 +312,10 @@ fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<PrepareResult> {
     Ok((graph, specs, telemetry, internal))
 }
 
-/// Waits for one SIGTERM or SIGINT (Ctrl-C on non-Unix). Each call installs its own listener, and
-/// `run_pipelines` relies on its three calls each being notified.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut terminate = signal(SignalKind::terminate()).expect("installing a SIGTERM handler");
-        let mut interrupt = signal(SignalKind::interrupt()).expect("installing a SIGINT handler");
-        tokio::select! {
-            _ = terminate.recv() => {}
-            _ = interrupt.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
 /// [`run_pipelines`] for an in-memory `Config`, with no signal handler to race a test.
 #[cfg(test)]
 async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
-    let (graph, specs, telemetry, _internal) = prepare(config, base_dir)?;
+    let (graph, specs, telemetry, _internal) = prepare(config, base_dir, None)?;
     logit_pipeline::run_with_telemetry(
         graph,
         specs,
@@ -337,6 +325,17 @@ async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
     )
     .await
     .map_err(RunError::into_inner)
+}
+
+/// Gives a file target `reopen`'s generation to watch, when there is one.
+fn with_reopen<E>(
+    output: StreamOutput<E>,
+    reopen: Option<&watch::Receiver<u64>>,
+) -> StreamOutput<E> {
+    match reopen {
+        Some(reopen) => output.with_reopen(reopen.clone()),
+        None => output,
+    }
 }
 
 /// The graph checks `logit run` makes before building anything, shared with `logit validate`.
@@ -359,11 +358,15 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
 /// [`Telemetry`] handle is the no-op default. The handle goes on a component's `Diagnostics`, so
 /// every `warn_throttled` call is also a metric, and on the component itself where it records
 /// points of its own. See `docs/design/internal-telemetry.md`.
+///
+/// `reopen`, when `Some`, is cloned into every `stdio_out`/`file_out` file target. A clone, not
+/// a `subscribe()`, so a SIGHUP that landed during startup still reads as changed.
 fn build_spec(
     id: &str,
     component: &ResolvedComponent,
     base_dir: &Path,
     registry: Option<&Arc<Registry>>,
+    reopen: Option<&watch::Receiver<u64>>,
 ) -> anyhow::Result<(NodeSpec, Telemetry)> {
     use logit_config::ComponentKind::*;
     // Every arm clones this rather than moving it: it's returned too, so the node runtime's layer 2
@@ -1107,7 +1110,11 @@ fn build_spec(
                 StdioTarget::Stderr => StreamOutput::stderr(),
                 // Relative to the config file's directory, not the working directory, as
                 // `StdioTarget` documents; `Path::join` leaves an absolute path untouched.
-                StdioTarget::Path(path) => StreamOutput::open_path(base_dir.join(path))?,
+                StdioTarget::Path(path) => with_reopen(
+                    StreamOutput::open_path(base_dir.join(path))?
+                        .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
+                    reopen,
+                ),
             };
             let output = output.with_format(to_stream_encoder(*format, *compression, *message));
             NodeSpec::Output(
@@ -1122,6 +1129,7 @@ fn build_spec(
                 .with_format(to_stream_encoder(*format, *compression, *message))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
+            let output = with_reopen(output, reopen);
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer, base_dir),
@@ -1953,6 +1961,16 @@ fn to_sample_override(o: &logit_config::SampleOverride) -> logit_transforms::Sam
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`super::build_spec`] with no reopen generation, shadowing it for every test below.
+    fn build_spec(
+        id: &str,
+        component: &ResolvedComponent,
+        base_dir: &Path,
+        registry: Option<&Arc<Registry>>,
+    ) -> anyhow::Result<(NodeSpec, Telemetry)> {
+        super::build_spec(id, component, base_dir, registry, None)
+    }
     use logit_config::{Component, ComponentKind, InternalLogs};
     use std::collections::HashMap as Map;
     use std::time::Duration;
@@ -2111,7 +2129,7 @@ mod tests {
     #[test]
     fn prepare_builds_no_registry_and_only_disabled_handles_without_an_internal_component() {
         let cfg = config(vec![("in", statsd_in()), ("out", influxdb_out(vec!["in"]))]);
-        let (_, _, telemetry, _) = prepare(cfg, PathBuf::new()).unwrap();
+        let (_, _, telemetry, _) = prepare(cfg, PathBuf::new(), None).unwrap();
         assert_eq!(telemetry.len(), 2);
         assert!(
             telemetry.values().all(|t| !t.is_enabled()),
@@ -2138,7 +2156,7 @@ mod tests {
             ),
             ("out", influxdb_out(vec!["self"])),
         ]);
-        let (_, _, telemetry, _) = prepare(cfg, PathBuf::new()).unwrap();
+        let (_, _, telemetry, _) = prepare(cfg, PathBuf::new(), None).unwrap();
         assert!(
             telemetry.values().all(|t| t.is_enabled()),
             "an 'internal' component should give every component a live telemetry handle"
@@ -5100,7 +5118,7 @@ mod tests {
                 },
             ),
         ]);
-        let err = match prepare(cfg, testdata_tls_dir()) {
+        let err = match prepare(cfg, testdata_tls_dir(), None) {
             Ok(_) => panic!("expected a bad TLS endpoint to fail startup"),
             Err(err) => format!("{err:#}"),
         };
@@ -5134,7 +5152,7 @@ mod tests {
                 },
             ),
         ]);
-        let err = match prepare(cfg, testdata_tls_dir()) {
+        let err = match prepare(cfg, testdata_tls_dir(), None) {
             Ok(_) => panic!("expected a bad TLS endpoint to fail startup"),
             Err(err) => format!("{err:#}"),
         };
