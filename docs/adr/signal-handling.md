@@ -95,8 +95,8 @@ handler installed, `logit` behaves the same as PID 1, under `--init`, and on a h
 - `docker kill -s HUP` reopens.
 - A config-reloader sidecar's SIGHUP reopens and logs that the config wasn't reloaded. A config
   change in Kubernetes means rolling the pod.
-- A reopen matters in a container only when `file_out` writes to a volume that a rotator able to
-  signal `logit` manages. `stdout`, or a network sink, stays the recommended container output.
+- A reopen matters in a container only when a `stdio_out` file target writes to a volume that a
+  rotator able to signal `logit` manages. `stdout`, or a network sink, stays the recommended container output.
 
 ### Not covered
 A SIGHUP doesn't reload the config, TLS certificates and keys, `collectd_in`'s `types_db:`, or a
