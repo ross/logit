@@ -257,9 +257,9 @@
 //! [`crate::http::MAX_CONCURRENT_STREAMS`] requests at once; [`PrometheusReceiver`]'s
 //! `max_connections` field states the listener's worst case. [`HANDSHAKE_TIMEOUT`] bounds each
 //! connection's pre-request phase: its PROXY header under `proxy_protocol:`, then its TLS accept
-//! on a TLS listener or its first byte on a plaintext one. Neither [`MAX_REQUEST_BYTES`] nor [`HANDSHAKE_TIMEOUT`] is a config field: the first is a
-//! denial-of-service bound rather than a tuning knob, and graph rule 45's `handshake_timeout:`
-//! does not cover this kind.
+//! on a TLS listener or its first byte on a plaintext one. Neither [`MAX_REQUEST_BYTES`] nor
+//! [`HANDSHAKE_TIMEOUT`] is a config field: the first is a denial-of-service bound rather than a
+//! tuning knob, and graph rule 45's `handshake_timeout:` does not cover this kind.
 //!
 //! `idle_timeout:` closes a connection that sits with no request in flight, via the shared
 //! tracker in [`crate::http`]; `otlp_in`'s module doc holds the reasoning (why the clock is at

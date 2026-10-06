@@ -773,6 +773,7 @@ budget of the configured length, so a TLS connection that says nothing costs up 
 | `lines_in` (`transport: tcp`) | the same three phases, on the same shared driver |
 | `logit_in` | the TLS accept (under `tls:`), then the `Hello` read |
 | `otlp_in` | the PROXY header (under `proxy_protocol:`), then the TLS accept (under `tls:`), or — on the plaintext arm, which has no TLS accept — the wait for the connection's first byte |
+| `prometheus_in` (remote-write receiver) | the same phases as `otlp_in`, under `bind_tls:`, each bounded by a fixed 5 seconds; this kind has no `handshake_timeout:` field |
 
 **Under `proxy_protocol: true`, give the load balancer a PROXY-aware health check.** A plain TCP
 connect check sends no header, so each probe is closed and counted as
@@ -1040,13 +1041,15 @@ address as `client.address`. Enforce the boundary with network policy, as for ev
 
 **Every connection must open with a header.** It's never auto-detected, as the PROXY protocol
 specification requires. A connection without a valid header, or whose header doesn't arrive within
-`handshake_timeout`, is closed and counted
+`handshake_timeout` (a fixed 5 seconds on `prometheus_in`'s remote-write receiver, which has no
+such field), is closed and counted
 `logit.input.connections.rejected{reason="proxy_header"}`, with a throttled `proxy_header`
 diagnostic. That includes a sender that connects to the port directly by mistake, and a load
 balancer's plain TCP health check; see
 [`handshake_timeout` on a TCP listener](#handshake_timeout-on-a-tcp-listener) for the health
 check to use and the phases the timeout bounds. The header is read before any TLS handshake, as
-a proxy sends it, so `tls:` and `proxy_protocol:` combine.
+a proxy sends it, so `tls:` (`bind_tls:` on the remote-write receiver) and `proxy_protocol:`
+combine.
 
 ### `collectd_in`: multicast groups and `types_db`
 
