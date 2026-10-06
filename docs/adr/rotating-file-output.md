@@ -1,6 +1,6 @@
 ---
 created: 2026-09-08
-updated: 2026-09-24
+updated: 2026-10-05
 ---
 
 # `file_out`: a rotating file sink, sharing `stdio_out`'s implementation
@@ -260,6 +260,9 @@ in this pass (see Alternatives). Retention is `max_files` alone -- no `max_age`,
   for the process's lifetime between its own rotations, same as `stdio_out` always has. An external
   tool rotating a `file_out`-managed file out from under it remains the same known gap `stdio_out`
   already documents.
+  Amended 2026-10-05: [ADR `signal-handling`](signal-handling.md) decides that a SIGHUP reopens
+  both sinks' file targets before their next write, so an external rotator in rename mode with a
+  `postrotate` `kill -HUP` works.
 
 ## Consequences
 
