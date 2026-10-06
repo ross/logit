@@ -9,9 +9,9 @@
 //! size caps, channels and acknowledgment, and backpressure.
 //!
 //! The accept loop, connection cap, handshake timeout, idle timeout, and sender-address handling
-//! are `otlp_in`'s ([`crate::otlp`]), as `datadog_in` runs them too; `crate::otlp`'s module doc
-//! has the reasoning for each. The request helpers (`Content-Encoding`, bounded decompression, the constant-time token
-//! check, deadline-bounded delivery) are shared through [`crate::http`].
+//! are `otlp_in`'s ([`crate::otlp`]); `crate::otlp`'s module doc has the reasoning for each. The
+//! request helpers (`Content-Encoding`, bounded decompression, the constant-time token check,
+//! deadline-bounded delivery) are shared through [`crate::http`].
 //!
 //! **Sender address.** Under `peer:` and `proxy_protocol:` ([`SplunkHecInput::with_peer`],
 //! [`SplunkHecInput::with_proxy_protocol`]), each connection task builds one [`ConnectionPeer`],
