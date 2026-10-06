@@ -59,9 +59,10 @@ read, and SIGHUP reopens file targets instead of ending the process.
    target, with a field saying the config isn't reloaded. A SIGHUP doesn't count toward the
    second-signal exit in decision 1: SIGTERM then SIGHUP doesn't exit `130`, and SIGHUP then
    SIGTERM starts a drain.
-3. **Handlers are installed before `config::load`.** A signal that arrives during startup is held
-   and acted on once the pipeline runs. A SIGTERM or SIGINT during startup starts the drain as
-   soon as the pipeline has started. A SIGHUP during startup still increments the reopen
+3. **Handlers are installed before `config::load`.** The first SIGTERM or SIGINT, and any SIGHUP,
+   that arrives during startup is held and acted on once the pipeline runs; a second SIGTERM or
+   SIGINT exits `130` at once (decision 1). A held SIGTERM or SIGINT starts the drain as soon as
+   the pipeline has started. A SIGHUP during startup still increments the reopen
    generation (decision 4), so a file target that opened its file during startup reopens it
    before its first write. A startup that fails still exits `1`, whatever signal arrived first.
 4. **A reopen is lazy, per target, and ordered against writes.** A process-wide generation counter
