@@ -1622,7 +1622,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 
 | Class | Counts | Counters |
 |---|---|---|
-| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.dropped`, `labels.normalized`, `spans.degraded`, `stats.skipped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"needs_agent_processing"\|"not_datadog_origin"}`; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `file.rotations`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
+| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.dropped`, `labels.normalized`, `spans.degraded`, `stats.skipped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"needs_agent_processing"\|"not_datadog_origin"}`; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
 | Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
 | Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `otlp_out`'s `records.rejected`; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"\|"ambiguous_at_most_once"}` and the Datadog sinks' `records.dropped{route, reason="rejected"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `ack_unsupported`, `ack_timeout`, and `oversize` for Splunk Cloud's answer). `otlp_out` meets each of its verdicts at most once per batch, because a retry never resends a signal the destination settled |
 
@@ -1715,6 +1715,12 @@ sinks tag one count per request with its status class or `network_error`
   `.1`, failed and was skipped. Neither can fire for
   a `stdio_out` target or an unrotated `file_out` (`RotatePolicy::never()`), because
   `should_rotate` never returns `true` under that policy.
+- Any file target, `stdio_out`'s or `file_out`'s: `logit.output.file.reopens` (count, one per
+  successful reopen of the target's path after a SIGHUP, ADR `signal-handling`) and, through
+  `Diagnostics::warn_throttled`, `logit.component.diagnostics{key="reopen_failure"}` when that
+  reopen's open fails (`crates/logit-outputs/src/file.rs::FileTarget::reopen`). A failed reopen
+  also fails the batch as `Clean`, and the retry's write opens the file again. A `stdout` or
+  `stderr` target never counts either.
 
 ##### `syslog_out`
 
