@@ -123,10 +123,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
     fix then is a test that doesn't depend on a thread-local subscriber, such as one reading
     `Diagnostics::occurrences`.
 - **Some HTTP listeners and `logit_in` don't record the sending peer's address.** `peer:` and
-  `proxy_protocol:` exist only on the listeners built on the shared socket drivers, `otlp_in`, and
-  `splunk_hec_in` ([ADR `listener-peer-address`](../adr/listener-peer-address.md)). `datadog_in`,
-  `datadog_trace_in`, `logit_in`, and `prometheus_in`'s remote-write receiver accept their
-  connections themselves and stamp no `network.peer.*` or `client.*`.
+  `proxy_protocol:` exist only on the listeners built on the shared socket drivers, `otlp_in`,
+  `datadog_in`, `datadog_trace_in`, and `splunk_hec_in` ([ADR
+  `listener-peer-address`](../adr/listener-peer-address.md)). `logit_in` and `prometheus_in`'s
+  remote-write receiver accept their connections themselves and stamp no `network.peer.*` or
+  `client.*`.
   - **Consequence:** a pipeline can't tell which of several senders on one of these listeners
     wrote an event, or route on it, unless the sender puts its own identity in the payload, as an
     OTLP resource's `host.name` does.

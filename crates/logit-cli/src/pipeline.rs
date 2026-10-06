@@ -578,7 +578,16 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        DatadogIn { bind, tls, api_keys, handshake_timeout, idle_timeout, max_connections } => {
+        DatadogIn {
+            bind,
+            tls,
+            api_keys,
+            handshake_timeout,
+            idle_timeout,
+            max_connections,
+            peer,
+            proxy_protocol,
+        } => {
             let mut input = DatadogInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
@@ -586,6 +595,8 @@ fn build_spec(
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
                 .with_max_connections(*max_connections)
+                .with_peer(*peer)
+                .with_proxy_protocol(*proxy_protocol)
                 .with_api_keys(api_keys.clone());
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
@@ -633,6 +644,8 @@ fn build_spec(
             handshake_timeout,
             idle_timeout,
             max_connections,
+            peer,
+            proxy_protocol,
         } => {
             let mut input = DatadogTraceInput::new()
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -640,7 +653,9 @@ fn build_spec(
                 // Read twice, as on `otlp_in`: the pre-request budget and an idle close's grace.
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
-                .with_max_connections(*max_connections);
+                .with_max_connections(*max_connections)
+                .with_peer(*peer)
+                .with_proxy_protocol(*proxy_protocol);
             if let Some(bind) = bind {
                 input = input.with_bind(bind.clone());
             }
