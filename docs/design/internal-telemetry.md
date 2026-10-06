@@ -937,7 +937,7 @@ The OTLP codec counts a metric with no data as
 `Diagnostics` keys: `bound`, `connection_error` (one connection's I/O failing, a TLS accept
 that failed or timed out, or a plaintext connection held open past `handshake_timeout` without a
 first byte, which then gave its permit back; never an idle close), `proxy_header` (any
-`connections.rejected{reason="proxy_header"}` refusal), and `forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value). A plaintext peer that *closes
+`connections.rejected{reason="proxy_header"}` refusal), and `forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted). A plaintext peer that *closes
 cleanly or resets* before sending a request byte, after a complete PROXY header under
 `proxy_protocol: true`, is not counted: that's what a TCP health check looks like, and counting it
 would add one point per probe interval to this key forever.
@@ -1035,7 +1035,7 @@ tag-cardinality reason), `closed_consumer` (bind mode, a `503` for a write no co
 `connection_error` (never an idle close, nor a plaintext peer that closes cleanly or resets
 before sending a request byte, after a complete PROXY header under `proxy_protocol: true`; on a
 TLS listener that close fails the TLS accept and is counted), `proxy_header` (bind mode, any
-`connections.rejected{reason="proxy_header"}` refusal), and `forwarded` (bind mode, under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value).
+`connections.rejected{reason="proxy_header"}` refusal), and `forwarded` (bind mode, under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted).
 
 ##### `datadog_in`
 
@@ -1089,7 +1089,7 @@ component's id.
 closes cleanly or resets before sending a request byte, after a complete PROXY header under
 `proxy_protocol: true`; on a TLS listener that close fails the TLS accept and is counted),
 `proxy_header` (any `connections.rejected{reason="proxy_header"}` refusal),
-`forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value),
+`forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted),
 `request_rejected` (every rejection except `404` and `405`; the peer address appears in the
 message text only, never a tag, and an API key never appears at all), `busy` (a `503`), and
 `closed_consumer` (a `503`).
@@ -1130,7 +1130,7 @@ The codec's own counters are in the [`datadog` codec section](#datadog), under t
 probe on the Unix socket, nor a plaintext TCP peer that closes cleanly or resets before sending
 a request byte, after a complete PROXY header under `proxy_protocol: true`), `proxy_header` (any
 `connections.rejected{reason="proxy_header"}` refusal),
-`forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value),
+`forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted),
 `request_rejected` (every rejection except `404` and `405`; the peer address or socket path
 appears in the message text only), `busy` (a `503`), `closed_consumer` (a `503`), `trace_count_mismatch` (an
 `X-Datadog-Trace-Count` header that disagrees with the traces on the wire; the request is still
@@ -1181,7 +1181,7 @@ submodules, under this component's id.
 closes cleanly or resets before sending a request byte, after a complete PROXY header under
 `proxy_protocol: true`; on a TLS listener that close fails the TLS accept and is counted),
 `proxy_header` (any `connections.rejected{reason="proxy_header"}` refusal),
-`forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value),
+`forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted),
 `request_rejected` (every rejection except `404` and `405`; the peer address appears in the
 message text only, never a tag, and a token never appears at all), `busy` (a `503`), and
 `closed_consumer` (a `503` code 9 or `500` code 8).
