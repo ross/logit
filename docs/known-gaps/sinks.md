@@ -2,12 +2,13 @@
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
-- **`file_out` rotates and retains by count, but has no SIGHUP/external-rotator reopen, no
-  compression, no `max_age`, no timestamped rotated-file naming, and its time-based rotation is
-  write-triggered rather than boundary-triggered** (ADR `rotating-file-output`).
-  - **Reopen:** `file_out` rotates only a file it opened itself and never re-checks whether its
-    path still names the same inode, so an external rotator leaves it writing to the unlinked
-    inode, the same gap `stdio_out` has.
+- **`file_out` rotates and retains by count, but has no compression, no `max_age`, no
+  timestamped rotated-file naming, and its time-based rotation is write-triggered rather than
+  boundary-triggered** (ADR `rotating-file-output`).
+  - **Reopen:** a SIGHUP reopens a `file_out` or `stdio_out` file target before its next write
+    ([ADR `signal-handling`](../adr/signal-handling.md)), not at the signal. A sink that receives
+    no batch keeps the renamed inode open, and its disk space allocated, until its next one, and a
+    batch mid-write when the signal arrives finishes into the old inode.
   - **Naming and timing:** rotated files always get a numbered suffix (`.1`, `.2`, and so on),
     never a timestamp. An idle sink under a calendar `interval` rolls on its *next* write after
     the boundary, not at the boundary. The rolled file still holds the previous period's contents;
@@ -33,15 +34,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   "`file_out` makes no durability promise" amendment to
   [ADR `rotating-file-output`](../adr/rotating-file-output.md#amendment-file_out-makes-no-durability-promise-2026-09-24).
   There's no revisit trigger short of a deployment that needs a power-loss-safe log file.
-- **`stdio_out` has no reopen** — it opens a file target once, in append mode, and holds it for
-  the process's lifetime. An external log rotator that moves the file leaves `logit` writing to
-  the unlinked inode until restart; there's no SIGHUP reopen. That's acceptable for a debugging
-  and dev-loop sink.
-  - **Workaround:** when a file target needs bounding, use `file_out` (ADR
-    `rotating-file-output`), which shares `stdio_out`'s implementation and adds a rotation policy.
-
-  A user-supplied `format:` *template* over the human render has room in the `Format` enum but
-  isn't implemented.
 - **`stdio_out` to a stdout or stderr pipe has no write bound.** A pipe reader that stops
   reading (a stalled log shipper, a paused `less`) fills the pipe, and the write never returns.
   tokio writes stdout and stderr on a blocking thread: a timeout around the write would return,

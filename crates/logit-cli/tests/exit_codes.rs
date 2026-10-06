@@ -5,29 +5,11 @@
 //! `a_listener_failing_after_ready_flips_failed_and_returns_runtime` and the unit test on
 //! `RunError::exit_code` cover it instead. A sink failure never ends the run.
 
-use std::io::Write;
-use std::path::PathBuf;
+mod support;
+
 use std::process::Command;
 
-/// Removed on drop; no `tempfile` dependency for one throwaway file.
-struct TempConfig(PathBuf);
-
-impl TempConfig {
-    fn write(name: &str, contents: &[u8]) -> Self {
-        let path = std::env::temp_dir()
-            .join(format!("logit-exit-codes-test-{name}-{}.yaml", std::process::id()));
-        std::fs::File::create(&path)
-            .and_then(|mut f| f.write_all(contents))
-            .expect("writing the temp config");
-        Self(path)
-    }
-}
-
-impl Drop for TempConfig {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+use support::TempConfig;
 
 #[test]
 fn an_empty_config_exits_1() {
