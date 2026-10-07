@@ -1674,10 +1674,14 @@ impl StatsdOutput {
     ///
     /// Paths in `settings` resolve against `base_dir` (the config file's directory) and load here,
     /// since `graph::resolve` never touches the filesystem.
+    ///
+    /// Registers the files with `reloader` under this sink's diagnostics and telemetry as they are
+    /// when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         match self.conn {
             Conn::Tcp { .. } => {}
@@ -1695,7 +1699,13 @@ impl StatsdOutput {
                  output will accept any certificate the peer presents, self-signed or otherwise",
             );
         }
-        let config = crate::tls::build_client_config(settings, base_dir)?;
+        let config = logit_pipeline::tls::build_client_config(
+            settings,
+            base_dir,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?;
         self.tls = Some(TlsTarget::new("statsd_out", &self.endpoint, config)?);
         Ok(self)
     }
@@ -3742,12 +3752,12 @@ mod tests {
     async fn with_tls_on_a_unix_statsd_out_is_an_error() {
         let settings = TlsClientSettings::default();
         let err = StatsdOutput::unix_stream("/tmp/x.socket", Duration::from_secs(1))
-            .with_tls(&settings, Path::new("."))
+            .with_tls(&settings, Path::new("."), &logit_pipeline::tls::TlsReloader::new())
             .err()
             .expect("a Unix socket is always plaintext");
         assert!(err.to_string().contains("plaintext"), "{err}");
         let err = StatsdOutput::unix_datagram("/tmp/x.socket", Duration::from_secs(1))
-            .with_tls(&settings, Path::new("."))
+            .with_tls(&settings, Path::new("."), &logit_pipeline::tls::TlsReloader::new())
             .err()
             .expect("a Unix socket is always plaintext");
         assert!(err.to_string().contains("plaintext"), "{err}");
@@ -4034,7 +4044,11 @@ mod tests {
             format!("localhost:{}", collector.addr().port()),
             Duration::from_secs(2),
         )
-        .with_tls(&tls_settings(|t| t.ca_file = Some("ca.pem".to_string())), &testdata_dir())
+        .with_tls(
+            &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
+            &testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
         .expect("a tls: block on the TCP transport is legal");
         let batch = batch_with(vec![
             metric_event("a", MetricKind::counter(1.0), &[]),
@@ -4060,7 +4074,11 @@ mod tests {
             format!("localhost:{}", collector.addr().port()),
             Duration::from_secs(2),
         )
-        .with_tls(&tls_settings(|t| t.ca_file = Some("other-ca.pem".to_string())), &testdata_dir())
+        .with_tls(
+            &tls_settings(|t| t.ca_file = Some("other-ca.pem".to_string())),
+            &testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
         .expect("a tls: block on the TCP transport is legal");
         let batch = batch_with(vec![metric_event("untrusted", MetricKind::counter(1.0), &[])]);
         let err = output.send(&batch).await.expect_err("an untrusted CA must fail the handshake");
@@ -4110,7 +4128,11 @@ mod tests {
             Duration::from_secs(2),
         )
         .with_diagnostics(Diagnostics::new("statsd_out"))
-        .with_tls(&tls_settings(|t| t.insecure_skip_verify = true), &testdata_dir())
+        .with_tls(
+            &tls_settings(|t| t.insecure_skip_verify = true),
+            &testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
         .expect("insecure_skip_verify is legal, if loud");
         let batch = batch_with(vec![metric_event("insecure", MetricKind::counter(1.0), &[])]);
         output.send(&batch).await.expect("insecure_skip_verify should bypass CA trust");
@@ -4142,6 +4164,7 @@ mod tests {
                 t.key_file = Some("client.key".to_string());
             }),
             &testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
         )
         .expect("a client certificate is legal on the TCP transport");
         let batch = batch_with(vec![metric_event("mutual", MetricKind::counter(1.0), &[])]);
@@ -4158,7 +4181,11 @@ mod tests {
         let output = StatsdOutput::udp("127.0.0.1:8125").unwrap();
         // `.err()` rather than `expect_err`, which would need `StatsdOutput: Debug`.
         let err = output
-            .with_tls(&TlsClientSettings::default(), &testdata_dir())
+            .with_tls(
+                &TlsClientSettings::default(),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
             .err()
             .expect("DTLS is out of scope");
         assert!(err.to_string().contains("transport: tcp"), "got: {err}");
@@ -4233,7 +4260,11 @@ mod tests {
         let mut output = StatsdOutput::tcp(endpoint, Duration::from_millis(500));
         if tls {
             output = output
-                .with_tls(&TlsClientSettings::default(), &testdata_dir())
+                .with_tls(
+                    &TlsClientSettings::default(),
+                    &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
+                )
                 .expect("the default settings and an IP endpoint always build");
         }
         output.conn = Conn::Tcp {
@@ -4430,14 +4461,22 @@ mod tests {
     fn with_tls_rejects_an_endpoint_with_no_valid_server_name() {
         for endpoint in ["[fe80::1%eth0]:8125", ":8125"] {
             let err = StatsdOutput::tcp(endpoint, Duration::from_secs(1))
-                .with_tls(&TlsClientSettings::default(), &testdata_dir())
+                .with_tls(
+                    &TlsClientSettings::default(),
+                    &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
+                )
                 .err()
                 .expect(endpoint);
             assert!(err.to_string().contains(endpoint), "{err}");
         }
         for endpoint in ["127.0.0.1:8125", "[::1]:8125", "statsd.example.com:8125"] {
             StatsdOutput::tcp(endpoint, Duration::from_secs(1))
-                .with_tls(&TlsClientSettings::default(), &testdata_dir())
+                .with_tls(
+                    &TlsClientSettings::default(),
+                    &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
+                )
                 .unwrap_or_else(|err| panic!("{endpoint}: {err}"));
         }
     }

@@ -252,10 +252,14 @@ impl OtlpOutput {
     /// Graph rule 24 rejects a non-empty `tls:` on a non-`https://` endpoint and requires
     /// `cert_file`/`key_file` together; this still loads and validates every file, since
     /// `graph::resolve` never touches the filesystem.
+    ///
+    /// Registers the files with `reloader` under this sink's diagnostics and telemetry as they are
+    /// when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         if settings.is_empty() {
             return Ok(self);
@@ -266,7 +270,13 @@ impl OtlpOutput {
                  output will accept any certificate the peer presents, self-signed or otherwise",
             );
         }
-        let cfg = crate::tls::build_client_config(settings, base_dir)?;
+        let cfg = logit_pipeline::tls::build_client_config(
+            settings,
+            base_dir,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?;
         self.client = build_client(self.request_timeout, Some(&cfg));
         self.grpc_client = build_grpc_client(&cfg);
         self.tls = Some(cfg);
@@ -615,7 +625,7 @@ fn default_client_tls_config() -> rustls::ClientConfig {
 /// Builds the gRPC transport's pooled client. `enable_http2` means prior-knowledge h2c for
 /// `http://` and ALPN `h2` for `https://`; `https_or_http` lets one connector serve both, since
 /// the scheme decides TLS. `tls.alpn_protocols` must be empty (`with_tls_config` panics
-/// otherwise); neither `default_client_tls_config` nor `crate::tls::build_client_config` sets it.
+/// otherwise); neither `default_client_tls_config` nor `logit_pipeline::tls::build_client_config` sets it.
 ///
 /// `TCP_NODELAY` is on because h2 writes a request's HEADERS and DATA frames separately: with
 /// Nagle's algorithm on, the DATA frame waits for the peer's delayed ACK of the HEADERS, which
@@ -1932,6 +1942,7 @@ mod tests {
                     t.ca_file = Some("ca.pem".to_string());
                 }),
                 &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .unwrap();
         output.send(&metric_batch()).await.expect("a trusted CA should let the handshake succeed");
@@ -1947,6 +1958,7 @@ mod tests {
                     t.ca_file = Some("other-ca.pem".to_string());
                 }),
                 &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .unwrap();
         let err = output.send(&metric_batch()).await.expect_err("an untrusted CA should fail");
@@ -1956,46 +1968,80 @@ mod tests {
     #[tokio::test]
     async fn an_https_http_endpoint_with_insecure_skip_verify_succeeds_against_an_untrusted_ca() {
         let addr = canned_tls_http_server(false).await;
-        let output = OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Http)
-            .unwrap()
-            .with_tls(&test_tls_settings(|t| t.insecure_skip_verify = true), &testdata_dir());
+        let output =
+            OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Http).unwrap().with_tls(
+                &test_tls_settings(|t| t.insecure_skip_verify = true),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            );
         let mut output = output.unwrap();
         output.send(&metric_batch()).await.expect("insecure_skip_verify should bypass CA trust");
     }
 
-    #[tokio::test]
-    async fn an_https_grpc_endpoint_is_reachable_over_tls() {
-        // A real handshake with ALPN `h2`, not only a construction check.
-        let acceptor = tokio_rustls::TlsAcceptor::from(test_server_tls_config(false));
+    /// A TLS gRPC peer serving `cfg`, answering every unary call with `grpc-status: 0`.
+    async fn canned_tls_grpc_server(cfg: Arc<rustls::ServerConfig>) -> std::net::SocketAddr {
+        let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else { return };
-                let Ok(tls_stream) = acceptor.accept(stream).await else { continue };
-                let io = TokioIo::new(tls_stream);
-                let svc = hyper::service::service_fn(
-                    move |_req: http::Request<hyper::body::Incoming>| async move {
-                        let mut trailers = HeaderMap::new();
-                        trailers.insert("grpc-status", "0".parse().unwrap());
-                        let body = TestGrpcBody {
-                            data: Some(Bytes::from(grpc_frame(&[], false))),
-                            trailers: Some(trailers),
-                        };
-                        Ok::<_, std::convert::Infallible>(
-                            http::Response::builder()
-                                .status(200)
-                                .header("content-type", "application/grpc+proto")
-                                .body(body)
-                                .unwrap(),
-                        )
-                    },
-                );
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(io, svc)
-                    .await;
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls_stream) = acceptor.accept(stream).await else { return };
+                    let io = TokioIo::new(tls_stream);
+                    let svc = hyper::service::service_fn(
+                        move |_req: http::Request<hyper::body::Incoming>| async move {
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert("grpc-status", "0".parse().unwrap());
+                            let body = TestGrpcBody {
+                                data: Some(Bytes::from(grpc_frame(&[], false))),
+                                trailers: Some(trailers),
+                            };
+                            Ok::<_, std::convert::Infallible>(
+                                http::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/grpc+proto")
+                                    .body(body)
+                                    .unwrap(),
+                            )
+                        },
+                    );
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
             }
         });
+        addr
+    }
+
+    /// The pooled gRPC client's `hyper-rustls` connector holds a clone of the config built at
+    /// startup, and a reloaded `ca_file` still reaches its next connection.
+    #[tokio::test]
+    async fn a_reloaded_ca_file_reaches_the_next_grpc_connection() {
+        use crate::test_support::{fixture_server_config, rewrite_tls_file, scratch_tls_files};
+        let addr =
+            canned_tls_grpc_server(fixture_server_config("server-other", None, &[b"h2"])).await;
+        let dir = scratch_tls_files("otlp-out-grpc-ca-reload", &[("ca.pem", "ca.pem")]);
+        let reloader = logit_pipeline::tls::TlsReloader::new();
+        let settings = test_tls_settings(|t| t.ca_file = Some("ca.pem".to_string()));
+        let mut output = OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Grpc)
+            .unwrap()
+            .with_tls(&settings, &dir, &reloader)
+            .unwrap();
+        output.send(&metric_batch()).await.expect_err("ca.pem trusted a peer under other-ca.pem");
+
+        rewrite_tls_file(&dir, "ca.pem", "other-ca.pem");
+        reloader.check_now();
+
+        output.send(&metric_batch()).await.expect("the reloaded CA should trust the peer");
+    }
+
+    #[tokio::test]
+    async fn an_https_grpc_endpoint_is_reachable_over_tls() {
+        // A real handshake with ALPN `h2`, not only a construction check.
+        let addr = canned_tls_grpc_server(test_server_tls_config(false)).await;
         let mut output = OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Grpc)
             .unwrap()
             .with_tls(
@@ -2003,6 +2049,7 @@ mod tests {
                     t.ca_file = Some("ca.pem".to_string());
                 }),
                 &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .unwrap();
         output.send(&metric_batch()).await.expect("gRPC over TLS should round-trip");
@@ -2018,7 +2065,7 @@ mod tests {
         });
         let mut output = OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Http)
             .unwrap()
-            .with_tls(&with_cert, &testdata_dir())
+            .with_tls(&with_cert, &testdata_dir(), &logit_pipeline::tls::TlsReloader::new())
             .unwrap();
         output.send(&metric_batch()).await.expect("a valid client certificate should be accepted");
 
@@ -2026,7 +2073,7 @@ mod tests {
         let without_cert = test_tls_settings(|t| t.ca_file = Some("ca.pem".to_string()));
         let mut output = OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Http)
             .unwrap()
-            .with_tls(&without_cert, &testdata_dir())
+            .with_tls(&without_cert, &testdata_dir(), &logit_pipeline::tls::TlsReloader::new())
             .unwrap();
         output.send(&metric_batch()).await.expect_err("no client certificate should be rejected");
     }
@@ -2038,6 +2085,7 @@ mod tests {
             .with_tls(
                 &test_tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
                 &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .unwrap()
             .with_timeout(Duration::from_secs(5));
@@ -2048,7 +2096,11 @@ mod tests {
     fn with_tls_on_an_empty_settings_value_is_a_no_op() {
         let output = OtlpOutput::new("https://localhost:4318".to_string(), OtlpTransport::Http)
             .unwrap()
-            .with_tls(&TlsClientSettings::default(), &testdata_dir())
+            .with_tls(
+                &TlsClientSettings::default(),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
             .unwrap();
         assert!(output.tls.is_none(), "an empty tls: block should not build a custom config");
     }
@@ -2060,6 +2112,7 @@ mod tests {
             .with_tls(
                 &test_tls_settings(|t| t.ca_file = Some("does-not-exist.pem".to_string())),
                 &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             ) {
             Ok(_) => panic!("a missing ca_file should fail construction"),
             Err(err) => err,

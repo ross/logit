@@ -914,10 +914,14 @@ impl RemoteWriteOutput {
     /// verification. A no-op when `settings` is empty, since `reqwest` already does TLS for
     /// `https://`. Rule 56 checks the block's shape; the files load and validate here, since
     /// `graph::resolve` never touches the filesystem.
+    ///
+    /// Registers the files with `reloader` under this sink's diagnostics and telemetry as they are
+    /// when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         if settings.is_empty() {
             return Ok(self);
@@ -929,7 +933,13 @@ impl RemoteWriteOutput {
                  otherwise",
             );
         }
-        let cfg = crate::tls::build_client_config(settings, base_dir)?;
+        let cfg = logit_pipeline::tls::build_client_config(
+            settings,
+            base_dir,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?;
         self.client = build_client(self.request_timeout, Some(&cfg));
         self.tls = Some(cfg);
         Ok(self)
@@ -2157,8 +2167,14 @@ mod tests {
     async fn canned_tls_receiver(
         require_client_auth: bool,
     ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
-        let acceptor =
-            tokio_rustls::TlsAcceptor::from(http1_server_tls_config(require_client_auth));
+        canned_tls_receiver_with(http1_server_tls_config(require_client_auth)).await
+    }
+
+    /// [`canned_tls_receiver`] serving `cfg`.
+    async fn canned_tls_receiver_with(
+        cfg: Arc<rustls::ServerConfig>,
+    ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+        let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -2790,6 +2806,7 @@ mod tests {
             .with_tls(
                 &TlsClientSettings { ca_file: Some("ca.pem".to_string()), ..Default::default() },
                 &testdata_tls_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .expect("the fixture CA loads");
         sink.send(&counter_batch(1_000_000_000, 1.0)).await.expect("a trusted CA handshakes");
@@ -2806,6 +2823,7 @@ mod tests {
                     ..Default::default()
                 },
                 &testdata_tls_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .expect("the other CA loads too -- it just doesn't sign this server");
         let err = sink
@@ -2827,9 +2845,74 @@ mod tests {
                     ..Default::default()
                 },
                 &testdata_tls_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .expect("the fixture client certificate loads");
         sink.send(&counter_batch(1_000_000_000, 1.0)).await.expect("mutual TLS handshakes");
+        assert_eq!(only(&seen).path, "/api/v1/write");
+    }
+
+    /// The `reqwest` client holds a clone of the config built at startup, and a reloaded
+    /// `ca_file` still reaches its next connection.
+    #[tokio::test]
+    async fn a_reloaded_ca_file_reaches_the_next_request() {
+        use crate::test_support::{fixture_server_config, rewrite_tls_file, scratch_tls_files};
+        let (url, seen) =
+            canned_tls_receiver_with(fixture_server_config("server-other", None, &[b"http/1.1"]))
+                .await;
+        let dir = scratch_tls_files("prometheus-out-ca-reload", &[("ca.pem", "ca.pem")]);
+        let reloader = logit_pipeline::tls::TlsReloader::new();
+        let mut sink = sender(&url)
+            .with_tls(
+                &TlsClientSettings { ca_file: Some("ca.pem".to_string()), ..Default::default() },
+                &dir,
+                &reloader,
+            )
+            .expect("the fixture CA loads");
+        let batch = counter_batch(1_000_000_000, 1.0);
+        sink.send(&batch).await.expect_err("ca.pem trusted a receiver under other-ca.pem");
+
+        rewrite_tls_file(&dir, "ca.pem", "other-ca.pem");
+        reloader.check_now();
+
+        sink.send(&batch).await.expect("the reloaded CA should trust the receiver");
+        assert_eq!(only(&seen).path, "/api/v1/write");
+    }
+
+    #[tokio::test]
+    async fn a_reloaded_client_certificate_reaches_the_next_request() {
+        use crate::test_support::{fixture_server_config, rewrite_tls_file, scratch_tls_files};
+        let (url, seen) = canned_tls_receiver_with(fixture_server_config(
+            "server",
+            Some("other-ca"),
+            &[b"http/1.1"],
+        ))
+        .await;
+        let dir = scratch_tls_files(
+            "prometheus-out-cert-reload",
+            &[("ca.pem", "ca.pem"), ("cert.pem", "client.pem"), ("key.pem", "client.key")],
+        );
+        let reloader = logit_pipeline::tls::TlsReloader::new();
+        let mut sink = sender(&url)
+            .with_tls(
+                &TlsClientSettings {
+                    ca_file: Some("ca.pem".to_string()),
+                    cert_file: Some("cert.pem".to_string()),
+                    key_file: Some("key.pem".to_string()),
+                    ..Default::default()
+                },
+                &dir,
+                &reloader,
+            )
+            .expect("the fixture client certificate loads");
+        let batch = counter_batch(1_000_000_000, 1.0);
+        sink.send(&batch).await.expect_err("a client under ca.pem was admitted");
+
+        rewrite_tls_file(&dir, "cert.pem", "client-other.pem");
+        rewrite_tls_file(&dir, "key.pem", "client-other.key");
+        reloader.check_now();
+
+        sink.send(&batch).await.expect("the reloaded client certificate should be admitted");
         assert_eq!(only(&seen).path, "/api/v1/write");
     }
 

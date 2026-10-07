@@ -1182,10 +1182,14 @@ impl SyslogOutput {
     /// (`TlsTarget::new`), so it fails startup and not every batch. Paths in `settings` resolve
     /// against `base_dir`, the config file's directory, and load here, since `graph::resolve`
     /// never touches the filesystem.
+    ///
+    /// Registers the files with `reloader` under this sink's diagnostics and telemetry as they are
+    /// when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         if matches!(self.conn, Conn::Udp(_)) {
             anyhow::bail!(
@@ -1199,7 +1203,13 @@ impl SyslogOutput {
                  output will accept any certificate the peer presents, self-signed or otherwise",
             );
         }
-        let config = crate::tls::build_client_config(settings, base_dir)?;
+        let config = logit_pipeline::tls::build_client_config(
+            settings,
+            base_dir,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?;
         self.tls = Some(TlsTarget::new("syslog_out", &self.endpoint, config)?);
         Ok(self)
     }
@@ -1335,8 +1345,9 @@ mod tests {
     use super::*;
     use crate::test_support::{
         assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
-        server_tls_config, sum_of, sums_through_write_loop, testdata_dir, tls_settings, Collector,
-        DialStep, FakeStream, ReadMode, ScriptedDest, ScriptedDial, SendStep, WriteStep,
+        fixture_server_config, rewrite_tls_file, scratch_tls_files, server_tls_config, sum_of,
+        sums_through_write_loop, testdata_dir, tls_settings, Collector, DialStep, FakeStream,
+        ReadMode, ScriptedDest, ScriptedDial, SendStep, WriteStep,
     };
     use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, Registry, Resource};
     use logit_inputs::syslog::SyslogDecoder;
@@ -2069,7 +2080,11 @@ mod tests {
         // `localhost`, not `127.0.0.1` (both SANs), so `host_only` yields a DNS SNI name.
         let endpoint = format!("localhost:{}", collector.addr().port());
         let mut output = SyslogOutput::tcp(endpoint, Duration::from_secs(2))
-            .with_tls(&tls_settings(|t| t.ca_file = Some("ca.pem".to_string())), &testdata_dir())
+            .with_tls(
+                &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
             .expect("a tls: block on the TCP transport is legal");
         output.send(&batch).await.expect("send over TLS should succeed");
         drop(output);
@@ -2079,6 +2094,34 @@ mod tests {
             got, expected,
             "TLS must deliver byte-for-byte the same octet-counted frame plaintext does"
         );
+    }
+
+    /// The stream driver's `TlsTarget` holds the config built at startup, and a reloaded `ca_file`
+    /// still reaches its next dial.
+    #[tokio::test]
+    async fn a_reloaded_ca_file_reaches_the_next_dial() {
+        let mut collector = Collector::tls(
+            fixture_server_config("server-other", None, &[]).into(),
+            ReadMode::ToEof,
+        )
+        .await;
+        let dir = scratch_tls_files("syslog-out-ca-reload", &[("ca.pem", "ca.pem")]);
+        let reloader = logit_pipeline::tls::TlsReloader::new();
+        let mut output = SyslogOutput::tcp(
+            format!("localhost:{}", collector.addr().port()),
+            Duration::from_secs(2),
+        )
+        .with_tls(&tls_settings(|t| t.ca_file = Some("ca.pem".to_string())), &dir, &reloader)
+        .expect("a tls: block on the TCP transport is legal");
+        let batch = batch_with(vec![log_event(0, "rotated", None)]);
+        output.send(&batch).await.expect_err("ca.pem trusted a collector under other-ca.pem");
+
+        rewrite_tls_file(&dir, "ca.pem", "other-ca.pem");
+        reloader.check_now();
+
+        output.send(&batch).await.expect("the reloaded CA should trust the collector");
+        drop(output);
+        assert!(String::from_utf8_lossy(&collector.next().await).contains("rotated"));
     }
 
     #[tokio::test]
@@ -2095,6 +2138,7 @@ mod tests {
                 t.key_file = Some("client.key".to_string());
             }),
             &testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
         )
         .expect("a client certificate is legal on the TCP transport");
         let batch = batch_with(vec![log_event(0, "mutual", None)]);
@@ -2118,7 +2162,11 @@ mod tests {
             format!("localhost:{}", collector.addr().port()),
             Duration::from_secs(2),
         )
-        .with_tls(&tls_settings(|t| t.ca_file = Some("ca.pem".to_string())), &testdata_dir())
+        .with_tls(
+            &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
+            &testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
         .expect("a tls: block on the TCP transport is legal");
         let batch = batch_with(vec![log_event(0, "rejected", None)]);
         // Usually `Ok`, but a fast RST can fail the write; either way never `Rejected` or `Refused`.
@@ -2153,7 +2201,11 @@ mod tests {
             format!("localhost:{}", collector.addr().port()),
             Duration::from_secs(2),
         )
-        .with_tls(&tls_settings(|t| t.ca_file = Some("other-ca.pem".to_string())), &testdata_dir())
+        .with_tls(
+            &tls_settings(|t| t.ca_file = Some("other-ca.pem".to_string())),
+            &testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
         .expect("a tls: block on the TCP transport is legal");
         let batch = batch_with(vec![log_event(0, "untrusted", None)]);
         let err = output.send(&batch).await.expect_err("an untrusted CA must fail the handshake");
@@ -2203,7 +2255,11 @@ mod tests {
             Duration::from_secs(2),
         )
         .with_diagnostics(Diagnostics::new("syslog_out"))
-        .with_tls(&tls_settings(|t| t.insecure_skip_verify = true), &testdata_dir())
+        .with_tls(
+            &tls_settings(|t| t.insecure_skip_verify = true),
+            &testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
         .expect("insecure_skip_verify is legal, if loud");
         let batch = batch_with(vec![log_event(0, "insecure", None)]);
         output.send(&batch).await.expect("insecure_skip_verify should bypass CA trust");
@@ -2285,7 +2341,11 @@ mod tests {
             .with_telemetry(probe.telemetry("out", "syslog_out", "sink"));
         if tls {
             output = output
-                .with_tls(&TlsClientSettings::default(), &testdata_dir())
+                .with_tls(
+                    &TlsClientSettings::default(),
+                    &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
+                )
                 .expect("the default settings and an IP endpoint always build");
         }
         output.conn = Conn::Tcp {
@@ -2424,6 +2484,7 @@ mod tests {
                 .with_tls(
                     &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
                     &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
                 )
                 .expect("a tls: block on the TCP transport is legal");
         output.send(&batch).await.expect("send over TLS should succeed");
@@ -2445,7 +2506,11 @@ mod tests {
             format!("localhost:{}", collector.addr().port()),
             Duration::from_secs(2),
         )
-        .with_tls(&tls_settings(|t| t.ca_file = Some("ca.pem".to_string())), &testdata_dir())
+        .with_tls(
+            &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
+            &testdata_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        )
         .expect("a tls: block on the TCP transport is legal");
 
         let batch = batch_with(vec![log_event(0, "once", None)]);
@@ -2479,7 +2544,11 @@ mod tests {
         let output = SyslogOutput::udp("127.0.0.1:514").unwrap();
         // `.err()` rather than `expect_err`, which would need `SyslogOutput: Debug`.
         let err = output
-            .with_tls(&TlsClientSettings::default(), &testdata_dir())
+            .with_tls(
+                &TlsClientSettings::default(),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
             .err()
             .expect("DTLS is out of scope");
         assert!(err.to_string().contains("transport: tcp"), "got: {err}");
@@ -2506,6 +2575,7 @@ mod tests {
                     .with_tls(
                         &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
                         &testdata_dir(),
+                        &logit_pipeline::tls::TlsReloader::new(),
                     )
                     .unwrap();
             }
@@ -2525,14 +2595,22 @@ mod tests {
     fn with_tls_rejects_an_endpoint_with_no_valid_server_name() {
         for endpoint in ["[fe80::1%eth0]:514", ":514"] {
             let err = SyslogOutput::tcp(endpoint, Duration::from_secs(1))
-                .with_tls(&TlsClientSettings::default(), &testdata_dir())
+                .with_tls(
+                    &TlsClientSettings::default(),
+                    &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
+                )
                 .err()
                 .expect(endpoint);
             assert!(err.to_string().contains(endpoint), "{err}");
         }
         for endpoint in ["127.0.0.1:514", "[::1]:6514", "logs.example.com:6514"] {
             SyslogOutput::tcp(endpoint, Duration::from_secs(1))
-                .with_tls(&TlsClientSettings::default(), &testdata_dir())
+                .with_tls(
+                    &TlsClientSettings::default(),
+                    &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
+                )
                 .unwrap_or_else(|err| panic!("{endpoint}: {err}"));
         }
     }

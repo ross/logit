@@ -526,6 +526,13 @@ the operator-facing account of all of this.
   `internal`'s own `logs:` setting (`warn` by default, `error`, or `off`) captures `logit`'s own
   `warn`-and-above self-diagnostics into the pipeline as ordinary log events through
   `logit_core::telemetry::TelemetryLayer` (`internal-telemetry.md`'s "Logs" section).
+- **TLS certificate reload**: every TLS listener, sink, and `prometheus_in`'s scrape client reloads
+  its certificate, key, and CA files with no restart, on a top-level `tls_reload_interval:` poll
+  (`60s` by default, `0s` off) and on every SIGHUP. A failed load keeps the previous files and
+  never affects readiness. It rotates certificates and doesn't revoke trust, because TLS session
+  resumption stays on. The builders and the reloader are `logit_pipeline::tls`
+  ([ADR `tls-certificate-reload`](docs/adr/tls-certificate-reload.md);
+  [docs/deploying.md](docs/deploying.md)'s "Certificate rotation").
 - **Readiness**: a top-level `admin:` block serves `/readyz`/`/healthz` on a TCP `bind:`, a Unix
   `socket:`, or both, and the `logit ready` probe helper that `Dockerfile`'s `HEALTHCHECK` uses
   ([ADR `admin-readiness-endpoint`](docs/adr/admin-readiness-endpoint.md)).

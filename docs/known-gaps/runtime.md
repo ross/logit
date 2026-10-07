@@ -280,8 +280,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   substitution's resolved type likely caused the failure.
 - **No config hot reload on SIGHUP.** A config change means a restart. A SIGHUP reopens
   `stdio_out`'s and `file_out`'s file targets and logs that the config wasn't reloaded
-  ([ADR `signal-handling`](../adr/signal-handling.md)); TLS material, `types_db:`, and `lua_file`
-  scripts are read once at startup too. Hot reload is out of scope
+  ([ADR `signal-handling`](../adr/signal-handling.md)); `types_db:` and `lua_file` scripts are
+  read once at startup too. TLS certificate, key, and CA files do reload
+  ([ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md)). Hot reload is out of scope
   for `docs/plans/operator-surface.md`, because it needs its own design (diffing the old and new
   resolved `Graph`, deciding which components to reuse versus tear down and rebuild), not a small
   addition to the readiness/exit-code work.

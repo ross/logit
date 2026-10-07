@@ -1,7 +1,8 @@
 //! `logit run`'s signal contract against the real binary (`docs/adr/signal-handling.md`): SIGHUP
-//! never ends the process, never counts toward the second-signal exit, and reopens a `file_out`
-//! target, and a SIGTERM during startup drains once the pipeline starts. Each test reads the
-//! child's self-log on stderr to know a signal was handled, rather than sleeping.
+//! never ends the process, never counts toward the second-signal exit, reopens a `file_out`
+//! target, and checks every TLS component's files for new content, and a SIGTERM during startup
+//! drains once the pipeline starts. Each test reads the child's self-log on stderr to know a
+//! signal was handled, rather than sleeping.
 
 #![cfg(unix)]
 
@@ -181,5 +182,40 @@ async fn a_sighup_after_an_external_rename_reopens_a_file_out_target() {
 
     assert!(!read(&path).contains("before the rotation"), "{}", read(&path));
     assert!(!read(&renamed).contains("after the rotation"), "{}", read(&renamed));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// With `tls_reload_interval: 0s` nothing polls, so a SIGHUP is what finds a renewed certificate:
+/// it checks every TLS component's files, and the listener reports the reload.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sighup_checks_tls_files_with_polling_off() {
+    let dir = scratch_dir("hup-tls");
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls");
+    std::fs::copy(fixtures.join("server.pem"), dir.join("cert.pem")).unwrap();
+    std::fs::copy(fixtures.join("server.key"), dir.join("key.pem")).unwrap();
+    let admin_addr = ephemeral_addr().await;
+    let lines_addr = ephemeral_addr().await;
+    let config = TempConfig::write(
+        "hup-tls",
+        format!(
+            "admin:\n  bind: \"{admin_addr}\"\ntls_reload_interval: 0s\ncomponents:\n  in:\n    \
+             type: lines_in\n    transport: tcp\n    bind: \"{lines_addr}\"\n    tls:\n      \
+             cert_file: \"{cert}\"\n      key_file: \"{key}\"\n  out:\n    type: null_out\n    \
+             sources: [in]\n",
+            cert = dir.join("cert.pem").display(),
+            key = dir.join("key.pem").display(),
+        ),
+    );
+    let (child, stderr) = spawn_run(&config);
+    wait_until_ready(&admin_addr).await;
+
+    std::fs::copy(fixtures.join("server-b.pem"), dir.join("cert.pem")).unwrap();
+    std::fs::copy(fixtures.join("server-b.key"), dir.join("key.pem")).unwrap();
+    send_signal(&child.0, libc::SIGHUP);
+    let line = stderr.wait_for("tls_reloaded");
+    let event: serde_json::Value = serde_json::from_str(&line).expect("a JSON log line");
+    assert_eq!(event["level"], "INFO", "{line}");
+    assert_eq!(event["component"], "in", "{line}");
+    assert!(event["message"].as_str().unwrap().contains("2126-09-13T20:27:39Z"), "{line}");
     std::fs::remove_dir_all(&dir).ok();
 }
