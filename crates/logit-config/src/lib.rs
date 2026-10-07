@@ -35,12 +35,28 @@ pub struct Config {
 }
 
 /// The `admin:` block. Every field defaults, so omitting the block leaves the admin server off.
+/// Set `bind`, `socket`, or both; with both, each serves the same endpoints.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct AdminConfig {
-    /// `host:port` to serve `/readyz` and `/healthz` on. Omitted (the default) means off. No TLS:
-    /// bind this to loopback or a pod-local address, not to a network beyond the process's own.
+    /// `host:port` to serve `/readyz` and `/healthz` on. Omitted (the default) means no TCP
+    /// listener. No TLS: bind this to loopback or a pod-local address, not to a network beyond
+    /// the process's own. Can be set alongside `socket`.
     pub bind: Option<String>,
+    /// A Unix socket path to serve `/readyz` and `/healthz` on, probed with
+    /// `logit ready --admin unix:<path>`. Use it instead of `bind` when two `logit` processes on
+    /// one host can't each have their own port, such as two Kubernetes `hostNetwork` pods
+    /// overlapping during a rollout; probe it with an `exec` probe. Put the socket in a directory
+    /// private to this process, such as a pod's `emptyDir`: the directory must exist, and binding
+    /// replaces a socket file already at the path, so another process's socket there would be
+    /// taken over. Omitted (the default) means no socket.
+    pub socket: Option<String>,
+    /// The `socket` file's permission bits, as a quoted octal string: `"0660"`. Three octal
+    /// digits, optionally after a leading `0`; setuid, setgid, and sticky bits are rejected.
+    /// Defaults to `"0722"`: a client needs only write permission to connect, so the directory's
+    /// permissions are the access control. Quote the value: YAML versions disagree on whether an
+    /// unquoted `0660` is octal, so a YAML number (`660`, `0o660`) is rejected. Requires `socket`.
+    pub socket_mode: Option<SocketMode>,
 }
 
 /// The `shutdown:` block. Every field defaults, so omitting the block starts the drain as soon as
@@ -7624,6 +7640,25 @@ mod tests {
         assert_eq!(config.shutdown.delay, Duration::from_secs(2));
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.shutdown.delay, Duration::ZERO);
+    }
+
+    #[test]
+    fn an_admin_block_parses_a_socket_and_its_mode_alongside_bind() {
+        let config: Config = serde_json::from_str(
+            r#"{"admin": {"bind": "127.0.0.1:9600", "socket": "/run/logit/admin.sock",
+                          "socket_mode": "0660"}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.admin.bind.as_deref(), Some("127.0.0.1:9600"));
+        assert_eq!(config.admin.socket.as_deref(), Some("/run/logit/admin.sock"));
+        assert_eq!(config.admin.socket_mode, SocketMode::new(0o660));
+    }
+
+    #[test]
+    fn an_unknown_field_under_admin_is_rejected() {
+        let err =
+            serde_json::from_str::<Config>(r#"{"admin": {"sockt": "/run/a.sock"}}"#).unwrap_err();
+        assert!(err.to_string().contains("unknown field `sockt`"), "{err}");
     }
 
     #[test]
