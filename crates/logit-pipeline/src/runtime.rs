@@ -8963,7 +8963,7 @@ mod tests {
         );
 
         let stopped_at = stopped_rx.await.expect("the listener should be told to stop");
-        tokio::time::timeout(Duration::from_secs(5), run_task)
+        tokio::time::timeout(RECV_TIMEOUT, run_task)
             .await
             .expect("the run should end once its listener stops")
             .expect("task should not panic")
