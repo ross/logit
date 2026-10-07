@@ -116,12 +116,12 @@ fn severity_for_logs(logs: logit_config::InternalLogs) -> Option<logit_core::Sev
 ///
 /// On Unix the signal handlers ([`Signals::install`]) go in before the config loads, so a signal
 /// during startup is handled, not defaulted. SIGTERM/SIGINT (Ctrl-C on non-Unix) starts a
-/// graceful drain: every listener stops, closing its downstream inboxes and triggering each node's
-/// close-time flush, so an in-flight `aggregate` window is emitted rather than lost. A second
-/// SIGTERM/SIGINT before the drain finishes exits at once with code 130, so a wedged drain stays
-/// killable by the signal that started it. SIGHUP never exits and never reloads the config: it
-/// logs `reopen signal received` and bumps the reopen generation, and each `stdio_out`/`file_out`
-/// file target reopens its path before its next write.
+/// graceful drain, after `shutdown.delay` when set: every listener stops, closing its downstream
+/// inboxes and triggering each node's close-time flush, so an in-flight `aggregate` window is
+/// emitted rather than lost. A second SIGTERM/SIGINT before the drain finishes exits at once with
+/// code 130, so a wedged drain stays killable by the signal that started it. SIGHUP never exits
+/// and never reloads the config: it logs `reopen signal received` and bumps the reopen generation,
+/// and each `stdio_out`/`file_out` file target reopens its path before its next write.
 ///
 /// Every failure before the pipeline reports ready is `RunError::Startup` (exit 1); after, it's a
 /// runtime failure (exit 2). See `docs/deploying.md`'s "Probes and exit codes".
