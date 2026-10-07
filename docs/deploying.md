@@ -1037,6 +1037,23 @@ connection. On `syslog_in`, `graphite_in`, `statsd_in`, or `lines_in` with `tran
 no connections, so any other value is rejected instead of silently ignored. On `prometheus_in` it belongs to the
 remote-write receiver, and rule 55 rejects a non-default value alongside `scrape_targets:`.
 
+### `reuse_port`: two processes on one port
+
+`reuse_port: true` sets `SO_REUSEPORT` on a listener's socket, so a second `logit` process can bind
+the same `bind:` address while the first still holds it: an overlapping replacement during a
+rolling upgrade, for example. It's on `statsd_in`, `syslog_in`, `graphite_in`, `lines_in`, and
+`collectd_in`, over TCP or UDP, and off by default. Both processes must set it and run as the same
+effective user; otherwise the second bind fails with an address-in-use error and startup exits `1`.
+
+While both processes are bound, the kernel picks one of them for each TCP connection or UDP
+datagram by a hash of its source and destination addresses and ports, so traffic splits between
+them per sender, not evenly per event. A TCP connection the kernel has queued but the closing
+process hasn't accepted yet is reset when that process closes its socket, unless the host sets
+`net.ipv4.tcp_migrate_req`. `logit validate` rejects `reuse_port: true` under `transport: unix`
+or `unix_stream`, which have no port to share, and on a multicast `bind:`, whose group already
+delivers every datagram to every member (rule 80). A fuller replacement recipe follows in a later
+section.
+
 ### Recording the sender: `peer`, `proxy_protocol`, and `forwarded`
 
 No listener records who sent an event unless you ask. Three opt-in fields do
