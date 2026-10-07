@@ -103,10 +103,10 @@ Because `SO_MEMINFO` and `TCP_INFO` are per socket, every listener's
 own socket inside a group.
 
 ### 2. TCP close: keep accepting until the close, and document the sysctl
-No code changes how a TCP listener closes. `logit` keeps accepting until the instant it drops the
-listener, which is what the drain already does and what decision 3 extends. A listener that keeps
-accepting keeps its accept queue near empty: a close while accepting reset nothing at 2000
-connections/s in the measurements.
+No code changes how a TCP listener closes. `logit` keeps accepting through the delay
+(decision 3), until the instant the drain drops the listener. A listener that keeps accepting
+keeps its accept queue near empty: a close while accepting reset nothing at 2000 connections/s in
+the measurements.
 
 The connections still exposed are the few that complete their handshake between the last accept
 and the close. Operators close that with `net.ipv4.tcp_migrate_req=1`, which `logit` documents as
@@ -125,10 +125,11 @@ behavior. On the first SIGTERM or SIGINT:
    `shutdown_grace` timers start then, as they do today.
 
 A second SIGTERM or SIGINT during the delay exits `130` at once, as it does during a drain. A node
-that fails during the delay starts the drain at once. A signal that arrives before the process
-ever reported ready skips the delay: a process that was never ready was never in an endpoint set,
-so there's no traffic to move away from it, and holding its ports would only slow a failed rollout
-down. The `drain complete` line's `duration` excludes the delay, so it keeps measuring the drain
+that fails during the delay starts the drain at once. A process that never reported ready skips
+the delay: it was never in an endpoint set, so there's no traffic to move away from it, and holding
+its ports would only slow a failed rollout down. The shutdown driver decides this from the
+readiness phase when it acts on the signal, so a signal held through a fast startup can still wait
+the delay, a gap recorded in [the runtime gaps](../known-gaps/runtime.md). The `drain complete` line's `duration` excludes the delay, so it keeps measuring the drain
 alone.
 
 The delay covers the time the orchestrator needs to stop sending. Kubernetes withdraws a
@@ -168,9 +169,9 @@ During a rolling overlap, two `logit` processes run the same config against the 
   processes, and each emits a partial sum for the same series. Summarization is per process; the
   operator accepts that with the overlap. Delivery stays at-least-once, and nothing is lost at the
   hop ([ADR `delivery-semantics`](delivery-semantics.md)).
-- **Multicast is duplicated.** Both pods receive every datagram of a multicast `collectd_in`, so a
-  downstream count doubles for the overlap. `reuse_port` isn't involved: the multicast bind already
-  sets `SO_REUSEADDR`, which lets both pods join.
+- **Multicast is duplicated.** Both pods receive every datagram of a multicast UDP listener, such
+  as `collectd_in`, so a downstream count doubles for the overlap. `reuse_port` isn't involved: the
+  multicast bind already sets `SO_REUSEADDR`, which lets both pods join.
 - **Prometheus exposition is split.** Each scrape connection reaches one process's registry, so
   successive scrapes can alternate between the two, and counters can look reset during the overlap.
 - **Long-lived connections stay put.** A `logit_out` connection to `logit_in`, an OTLP/gRPC
@@ -214,7 +215,8 @@ not defended.
   cover `reuse_port` as a field of the other mode. `runtime.rs` gains a `RunOptions` and a
   `run_with_options` entry point that carry the delay, and the shutdown driver waits the delay
   between `readiness.draining()` and telling the nodes, cutting the wait short on a second signal
-  or a node failure.
+  or a node failure. Rule 81 validates `admin.socket`, `socket_mode`, and `bind`: a `socket_mode`
+  without `socket`, an empty `bind` or `socket`, or a `bind` starting with `/`.
 - **`logit-inputs`**: `udp.rs`'s `bind_one` and `tcp.rs`'s stream driver take the flag, and every
   HTTP listener and `logit_in` binds through `bind_tcp`.
 - **`logit-outputs`**: `prometheus_out`'s exposition server binds through `bind_tcp`.
@@ -225,12 +227,12 @@ not defended.
 - **Docs that change with the behavior**: `docs/deploying.md`'s "Signal and restart behavior"
   and "Probes and exit codes", plus a rolling-overlap recipe with the sysctl;
   `docs/design/pipeline-graph.md`'s cancellation table gains the delay; the lifecycle line
-  `shutdown delay elapsed` joins `docs/design/internal-telemetry.md`'s lifecycle events and
-  [ADR `tracing-for-self-logging`](tracing-for-self-logging.md)'s set.
+  `shutdown delay elapsed` joins `docs/deploying.md`'s lifecycle-event table.
 - **Known gaps that open**, in [intake gaps](../known-gaps/intake.md): a closing TCP listener
-  resets its accept queue unless `net.ipv4.tcp_migrate_req=1`, and a multicast `collectd_in` is
+  resets its accept queue unless `net.ipv4.tcp_migrate_req=1`, and a multicast UDP listener is
   delivered to every overlapping instance. "One reader per UDP listener" narrows to the in-process
-  form.
+  form. In [runtime gaps](../known-gaps/runtime.md): a signal held through a fast startup can still
+  wait the shutdown delay.
 - **Earlier records**:
   [ADR `udp-intake-batching-and-socket-visibility`](udp-intake-batching-and-socket-visibility.md)
   and [ADR `decoupled-listener-io`](decoupled-listener-io.md) keep in-process fan-in out of scope
