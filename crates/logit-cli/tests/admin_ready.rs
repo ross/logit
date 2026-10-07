@@ -143,7 +143,7 @@ fn logit_ready_against_nothing_listening_exits_1() {
     assert_eq!(output.status.code(), Some(1));
 }
 
-// -- `admin.socket` (ADR `listener-port-sharing-and-shutdown-delay`) --
+// -- `admin.socket` (`docs/adr/listener-port-sharing-and-shutdown-delay.md`) --
 
 /// Writes a config with `admin` as the YAML of its `admin:` block (indented two spaces) and a
 /// `statsd_in` into a `stdio_out`, and spawns `logit run` on it. `shutdown.delay` keeps the

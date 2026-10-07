@@ -242,8 +242,9 @@ directory only this process uses, such as a pod's `emptyDir`.
 Use the socket when two `logit` processes share a network namespace, such as two Kubernetes
 `hostNetwork` pods that overlap during a rollout. They can't both bind one `admin.bind` port, and
 sharing it would let the kubelet's probe of one pod be answered by the other, so each would report
-the other's readiness (ADR `listener-port-sharing-and-shutdown-delay`). A pod-local socket has
-neither problem. Probe it with an `exec` probe:
+the other's readiness
+([ADR `listener-port-sharing-and-shutdown-delay`](adr/listener-port-sharing-and-shutdown-delay.md)).
+A pod-local socket has neither problem. Probe it with an `exec` probe:
 
 ```yaml
 containers:
