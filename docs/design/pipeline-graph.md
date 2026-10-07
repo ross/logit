@@ -460,7 +460,10 @@ component is one that appears in several `sources` lists, with nothing to specia
   counted `logit.component.events.dropped{reason="unrouted"}`, never silently.
 - **Shutdown cascades by channel closure** from listeners toward sinks. A node whose inbox closes
   drains it and exits, which drops its `Fanout`'s senders and closes its consumers' inboxes in
-  turn.
+  turn. With `shutdown.delay` set, the runtime's shutdown driver reports draining at the signal,
+  waits out the delay with every listener still running, and only then sends the shutdown that
+  starts the cascade and every `shutdown_grace` timer
+  (ADR `listener-port-sharing-and-shutdown-delay`).
 
 ### Thread model: only Lua needs its own OS thread
 
@@ -644,6 +647,7 @@ A bare file name is under `crates/logit-pipeline/src/` or `crates/logit-inputs/s
 
 | Site (file, item) | Arms | What a losing arm drops | Why nothing is lost, or what counts it |
 |---|---|---|---|
+| `runtime.rs`, `run_with_options` (shutdown driver) | None: the driver task's `sleep(shutdown_delay)`, cut by the task's `abort()` once every node has exited, or made moot by a node error, whose join-loop branch sends the shutdown itself | The abort drops the sleep, and with it the driver's later shutdown send | Nothing: the delay only postpones the send. A node error has already sent it, so the late send is a no-op, and an abort comes only after every node has exited, so no node waits on it. Nothing to count |
 | `runtime.rs`, `run_input` | `biased`: the listener's `run_until_shutdown`, then the grace backstop (`unconstrained`) | The backstop winning drops the listener's future: whatever it held undelivered at the deadline | A loss bounded by `shutdown_grace`, and the listener's own counters cover what it drops (the UDP listener's rows). `biased` means a listener result ready in the same wake as the backstop, an `Err` included, is returned, not discarded. `unconstrained` keeps a listener that spends its whole coop budget on every poll from deferring the backstop: `Sleep::poll_elapsed` and `wait_for` spend that budget too, so without it the backstop would find none left on every wake |
 | `runtime.rs`, `run_output` (`already_finished`) | `write_loop`, `drain_inbox` | `write_loop` finishing first drops `drain_inbox` mid-`recv` or mid-`push` | `drain_inbox` leaves the batch it was pushing in `in_hand` and unread batches in the inbox, and `run_output`'s sweep takes both. `drain_inbox` finishing first drops nothing: `write_loop` is then awaited to the end |
 | `runtime.rs`, `run_output` (sweep) | `timeout_at(SWEEP_DRAIN_TIMEOUT, inbox.recv())` on the closed inbox | The timeout firing drops a `recv` waiting on an upstream permit still reserved | The inbox is closed first, so a later send fails upstream as `events.dropped{reason="closed_consumer"}`, and a listener with an acknowledgement also refuses that batch to its client. Every batch the sweep takes counts `batches.received`, then is spooled (`Disk`) or counted `dropped{reason="shutdown"}` (`Memory`). The bound covers only `recv`, never a disk `push`. A permit held past the bound is an uncounted exception (`docs/known-gaps/runtime.md`, "Pipeline runtime and graph") |
