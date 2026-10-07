@@ -190,21 +190,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## TLS and connection lifecycle
 
-- **Every TLS-capable component's certificates are loaded once at startup; rotation needs a
-  restart.** All of them read every PEM file at construction (`logit run` startup):
-  - Every TLS listener (`statsd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `datadog_in`,
-    `datadog_trace_in`, `splunk_hec_in`, `logit_in`, and `prometheus_in`'s `bind_tls:`) builds its
-    `rustls::ServerConfig` through `crates/logit-inputs/src/tls.rs::build_server_config`.
-  - Every TLS sink builds its `rustls::ClientConfig` through
-    `crates/logit-outputs/src/tls.rs::build_client_config`.
-  - `prometheus_in`'s scrape client applies `scrape_tls:` to its `reqwest` client through
-    `apply_client_tls`.
-
-  A renewed certificate (a 90-day Let's Encrypt cert, a `cert-manager`-issued one) has no effect
-  until restart ([ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md),
-  [ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)).
-  - **To close:** `rustls::ServerConfig`'s `ResolvesServerCert` (a file-watcher hook) on the server
-    side and an equivalent reload on the client side, behind a SIGHUP or a poll.
 - **No TLS client has a `server_name` override.** Every TLS sink (`otlp_out`, `datadog_out`,
   `datadog_trace_out`, `splunk_hec_out`, `prometheus_out`'s remote-write sender, `logit_out`,
   `syslog_out`, `statsd_out`) and `prometheus_in`'s scrape client check the peer's certificate

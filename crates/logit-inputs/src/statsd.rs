@@ -450,13 +450,17 @@ impl StatsdInput {
     /// Alternatives) and no statsd client speaks it. Fails on either Unix socket too, which is
     /// always plaintext. Graph rules 43 and 65 are what an operator sees; this backstops a caller
     /// that skipped validation.
+    ///
+    /// Registers the files with `reloader` under this listener's diagnostics and telemetry as
+    /// they are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         self.inner = match self.inner {
-            Inner::Tcp(listener) => Inner::Tcp(listener.with_tls(settings, base_dir)?),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_tls(settings, base_dir, reloader)?),
             Inner::Udp(_) => anyhow::bail!(
                 "statsd_in: 'tls:' needs 'transport: tcp' -- TLS is defined over a byte stream, \
                  and DTLS is out of scope (docs/adr/syslog-tcp-ingress-and-tls.md); a Unix socket \
@@ -2333,7 +2337,9 @@ mod tests {
             client_ca_file: None,
         };
         let mut running = start_tcp(|input| {
-            input.with_tls(&settings, &testdata_tls_dir()).expect("a tcp listener takes tls")
+            input
+                .with_tls(&settings, &testdata_tls_dir(), &logit_pipeline::tls::TlsReloader::new())
+                .expect("a tcp listener takes tls")
         })
         .await;
 
@@ -2960,7 +2966,10 @@ mod tests {
         };
         for input in [StatsdInput::unix("/tmp/x.socket"), StatsdInput::unix_stream("/tmp/x.socket")]
         {
-            let err = input.with_tls(&settings, &testdata_tls_dir()).err().expect("must fail");
+            let err = input
+                .with_tls(&settings, &testdata_tls_dir(), &logit_pipeline::tls::TlsReloader::new())
+                .err()
+                .expect("must fail");
             assert!(err.to_string().contains("plaintext"), "{err}");
         }
     }

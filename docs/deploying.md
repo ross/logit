@@ -116,6 +116,8 @@ error.
   with `config_reloaded=false`, and each `stdio_out`/`file_out` file target reopens its path
   before its next write; see
   [Rotating a file output externally](#rotating-a-file-output-externally).
+  It also checks every TLS certificate, key, and CA file for new content at once; see
+  [Certificate rotation](#certificate-rotation).
   It doesn't reload the config: a config change still means a restart. A SIGHUP can arrive in any
   state, a drain included. A foreground `logit run` survives its terminal hanging up too: it keeps
   its ports, and its writes to stdout fail as `Rejected`, so run it under systemd or a container
@@ -3023,10 +3025,102 @@ contradict each other.
 
 **What to watch.** A handshake failure on either side surfaces through the same
 `connection_error`/`network_error` diagnostics and `logit.output.requests{class="network_error"}`/
-listener-side `logit.component.diagnostics` counters as any other transport failure; there's
-nothing TLS-specific beyond that. `docs/known-gaps/intake.md` tracks two open items: **certificates
-are read once at startup, so a renewed certificate needs a restart**, not a live reload; and
-`otlp_out` has no `server_name` override for an endpoint reached by IP or through a proxy.
+listener-side `logit.component.diagnostics` counters as any other transport failure. Certificate
+rotation has its own counter, gauge, and diagnostics; see [Certificate rotation](#certificate-rotation).
+`docs/known-gaps/intake.md` tracks one open item: `otlp_out` has no `server_name` override for an
+endpoint reached by IP or through a proxy.
+
+### Certificate rotation
+
+Every TLS listener, every TLS sink, and `prometheus_in`'s scrape client reload their certificate,
+key, and CA files with no restart. A renewed certificate takes effect without dropping a queue,
+an `aggregate` window, or a UDP port.
+
+`logit` re-reads the files of every `tls:` block (`bind_tls:`, `scrape_tls:`, and `endpoint_tls:`
+included) on a poll and on every SIGHUP. Set the poll with the top-level `tls_reload_interval:`:
+
+```yaml
+tls_reload_interval: 30s   # default 60s; 0s turns the poll off
+
+components:
+  # ...
+```
+
+SIGHUP checks at once whatever the interval, so a renewal hook works with the poll off. SIGHUP
+still reopens `stdio_out`/`file_out` targets too.
+
+Each check compares the bytes of every file with what it last tried to load, following symlinks as
+they stand at that moment. A changed set loads whole or not at all:
+
+- **A good set replaces the old one.** The next full TLS handshake uses it, and `logit` logs
+  `tls_reloaded` at `info`. Open connections keep the certificate they started with until they
+  close.
+- **A bad set is ignored.** A file that's missing or doesn't parse, or a key that doesn't match its
+  certificate, leaves the previous files in use. The reload counts as failed once per distinct
+  content, not once per poll, and a throttled `tls_reload_failed` diagnostic names the file and
+  the reason. A tool that writes the certificate and the key separately can be read between the
+  two writes. That check fails, and the next one loads the complete pair.
+- **Readiness is unaffected.** The old certificate keeps serving, so `/readyz` stays `200`. Watch
+  the metrics instead.
+
+| Metric | Meaning |
+|---|---|
+| `logit.tls.reloads{outcome="reloaded"\|"failed"}` | Reload attempts, per component. Alert on `failed` rising. |
+| `logit.tls.certificate.not_after{side="server"\|"client"}` | Expiry of the leaf certificate in use (`cert_file`), in unix seconds, re-emitted every second. |
+
+Alert when `not_after` comes within a few days of the current time (for example,
+`logit_tls_certificate_not_after - time() < 3 * 86400` in PromQL). It catches a renewal that never
+reached the files, or one that failed to load, because it keeps reporting the certificate in use.
+[Internal telemetry](design/internal-telemetry.md) has the full definitions.
+
+**Reload rotates certificates; it doesn't revoke trust.** TLS session resumption stays on, and a
+resumed connection reuses the verification of the session it resumes. Removing a CA from
+`client_ca_file` or `ca_file` stops new full handshakes that chain to it, but a peer that keeps
+reconnecting can keep resuming an earlier session. To cut off a peer, restart `logit`.
+
+What isn't reloaded: `tls.insecure_skip_verify` and the built-in Mozilla roots (neither is backed
+by a file), and the config file itself.
+
+At startup, a file that's missing or doesn't parse, a `ca_file` with no PEM certificate in it, or
+a `cert_file` and `key_file` that don't match fails the start and names the file. A reload only
+keeps the old files; it never fails the process.
+
+#### cert-manager and mounted Kubernetes Secrets
+
+Point `cert_file`, `key_file`, and `ca_file` at the mounted Secret's paths. Nothing else is
+needed. The kubelet updates a mounted Secret by writing a new directory and swapping its `..data`
+symlink, and the next poll reads the files through the new link. Don't mount the Secret with
+`subPath`: the kubelet never updates a `subPath` mount, so `logit` would keep reading the old
+files. Expect a delay of up to the kubelet's sync period plus `tls_reload_interval` between a
+renewal and the new certificate in use.
+
+```yaml
+tls:
+  cert_file: /etc/logit/tls/tls.crt
+  key_file: /etc/logit/tls/tls.key
+```
+
+#### certbot
+
+Point at the `live/` symlinks, which certbot repoints at each renewal:
+
+```yaml
+tls:
+  cert_file: /etc/letsencrypt/live/EXAMPLE_NAME/fullchain.pem
+  key_file: /etc/letsencrypt/live/EXAMPLE_NAME/privkey.pem
+```
+
+`logit` picks up a renewal within `tls_reload_interval`. For an immediate reload, add a deploy hook
+that sends SIGHUP:
+
+```sh
+certbot renew --deploy-hook 'systemctl kill -s HUP logit.service'
+```
+
+Use `kill -HUP PID` when `logit` doesn't run under systemd. Certbot creates `privkey.pem` readable
+by root only, so give the user `logit` runs as read access to the `live/` and `archive/`
+directories and `privkey.pem` (for example, through a group). A file `logit` can't read counts as
+a failed reload, and the old certificate stays in use until it expires.
 
 ### Trust boundary
 
@@ -3118,8 +3212,9 @@ listener"](#idle_timeout-on-a-tcp-listener) above.
   `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}`. There is no separate
   TLS-specific counter, as with `otlp_in`/`otlp_out`.
 
-`docs/known-gaps/` tracks what's still open: DTLS, certificates read once at startup, and no
-`server_name` override. `idle_timeout` covers the post-handshake idle case.
+`docs/known-gaps/` tracks what's still open: DTLS and no `server_name` override. Certificates
+reload without a restart; see [Certificate rotation](#certificate-rotation). `idle_timeout`
+covers the post-handshake idle case.
 
 A **TCP `graphite_in`** takes the identical `tls:` block, because it runs on the same listener
 driver ([ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)'s 2026-09-14 amendment):

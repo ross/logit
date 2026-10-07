@@ -1028,7 +1028,7 @@ mod tls {
         settings: &TlsServerSettings,
     ) -> (SocketAddr, mpsc::Receiver<Delivered>) {
         let mut input = StatsdInput::tcp("127.0.0.1:0")
-            .with_tls(settings, &testdata_dir())
+            .with_tls(settings, &testdata_dir(), &logit_pipeline::tls::TlsReloader::new())
             .expect("a tls: block is legal on a tcp statsd_in");
         input.bind().await.expect("binding the tls statsd_in listener");
         let addr = input.local_addr().expect("bind() should leave a real address behind");
@@ -1123,7 +1123,7 @@ mod tls {
     ) -> EventBatch {
         let mut output =
             StatsdOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
-                .with_tls(&settings, &testdata_dir())
+                .with_tls(&settings, &testdata_dir(), &logit_pipeline::tls::TlsReloader::new())
                 .expect("a tls: block is legal on a tcp statsd_out");
         output.send(batch).await.expect("send over TLS should succeed");
         // Dropping it EOFs the listener's connection task, which flushes what it has accumulated
@@ -1192,6 +1192,7 @@ mod tls {
                         ..Default::default()
                     },
                     &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
                 )
                 .expect("a tls: block is legal on the tcp transport");
 

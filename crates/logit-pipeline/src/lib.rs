@@ -35,6 +35,7 @@ pub mod runtime;
 pub mod sockstat;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
+pub mod tls;
 pub mod transform;
 
 pub use accumulator::{BatchAccumulator, FlushReason};
