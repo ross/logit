@@ -125,12 +125,18 @@ behavior. On the first SIGTERM or SIGINT:
    `shutdown_grace` timers start then, as they do today.
 
 A second SIGTERM or SIGINT during the delay exits `130` at once, as it does during a drain. A node
-that fails during the delay starts the drain at once. The `drain complete` line's `duration`
-excludes the delay, so it keeps measuring the drain alone.
+that fails during the delay starts the drain at once. A signal that arrives before the process
+ever reported ready skips the delay: a process that was never ready was never in an endpoint set,
+so there's no traffic to move away from it, and holding its ports would only slow a failed rollout
+down. The `drain complete` line's `duration` excludes the delay, so it keeps measuring the drain
+alone.
 
-The delay covers the time a Service needs to stop sending: the readiness probe interval plus
-endpoint propagation. The orchestrator's termination grace (`terminationGracePeriodSeconds`, 30 s
-by default in Kubernetes) must cover the delay plus the drain, or SIGKILL cuts the drain short.
+The delay covers the time the orchestrator needs to stop sending. Kubernetes withdraws a
+terminating pod's endpoint without waiting for a probe, so the delay is sized by how long that
+withdrawal takes to reach kube-proxy, ingresses, and load balancers; a client that routes on its
+own `/readyz` probe adds its probe period times its failure threshold. The orchestrator's
+termination grace (`terminationGracePeriodSeconds`, 30 s by default in Kubernetes) must cover the
+delay plus the drain, or SIGKILL cuts the drain short.
 
 ### 4. `admin:` gains a Unix socket
 `admin:` gains `socket: <path>` and `socket_mode:` beside `bind:`. A config can set either, both,
