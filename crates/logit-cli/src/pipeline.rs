@@ -13,6 +13,7 @@
 //! (TLS material, `lua_file`, `types_db`), a UDP sink binds its local socket, and a check with no
 //! graph rule runs (a syslog `sd_id`), so those fail only at `run`.
 
+use crate::admin::AdminListener;
 use crate::config;
 use crate::signals::Signals;
 use anyhow::Context;
@@ -145,7 +146,7 @@ pub async fn run_pipelines(
         "starting"
     );
 
-    let admin_bind = config.admin.bind.clone();
+    let admin = config.admin.clone();
     let shutdown_delay = config.shutdown.delay;
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let (graph, specs, telemetry, internal) =
@@ -164,21 +165,34 @@ pub async fn run_pipelines(
         tracing::warn!(target: "logit", "{warning}");
     }
 
-    // The admin listener binds here, before `run_with_options` spawns anything, so a bind
+    // The admin listeners bind here, before `run_with_options` spawns anything, so a bind
     // failure is `RunError::Startup`: the guarantee `Input::bind`'s pre-pass gives every listener.
-    let (readiness, admin_server) = match admin_bind {
-        Some(bind) => {
-            let listener = tokio::net::TcpListener::bind(&bind)
-                .await
-                .with_context(|| format!("admin: binding '{bind}'"))
-                .map_err(RunError::Startup)?;
-            let (readiness, readiness_rx) = Readiness::channel();
-            // No shutdown listener of its own: the drain a signal starts is the window `/readyz`
-            // answers `503 draining` in, and a refused connection then looks like a crash. The
-            // `abort()` below, after `run_with_options` returns, is the only teardown.
-            (readiness, Some(tokio::spawn(crate::admin::serve_on(listener, readiness_rx))))
-        }
-        None => (Readiness::disabled(), None),
+    let mut admin_listeners = Vec::new();
+    if let Some(bind) = &admin.bind {
+        let listener = tokio::net::TcpListener::bind(bind)
+            .await
+            .with_context(|| format!("admin: binding '{bind}'"))
+            .map_err(RunError::Startup)?;
+        admin_listeners.push(AdminListener::Tcp(listener));
+    }
+    if let Some(socket) = &admin.socket {
+        let mode = admin.socket_mode.map_or(logit_inputs::unix::DEFAULT_SOCKET_MODE, |m| m.bits());
+        let listener = logit_inputs::unix::bind_listener("admin", Path::new(socket), mode)
+            .map_err(RunError::Startup)?;
+        admin_listeners.push(AdminListener::Unix(listener));
+    }
+    let (readiness, admin_servers) = if admin_listeners.is_empty() {
+        (Readiness::disabled(), Vec::new())
+    } else {
+        let (readiness, readiness_rx) = Readiness::channel();
+        // No shutdown listener of their own: the drain a signal starts is the window `/readyz`
+        // answers `503 draining` in, and a refused connection then looks like a crash. The
+        // `abort()` below, after `run_with_options` returns, is the only teardown.
+        let servers = admin_listeners
+            .into_iter()
+            .map(|listener| tokio::spawn(crate::admin::serve_on(listener, readiness_rx.clone())))
+            .collect();
+        (readiness, servers)
     };
 
     let result = logit_pipeline::run_with_options(
@@ -191,7 +205,7 @@ pub async fn run_pipelines(
     )
     .await;
     drop(signals);
-    if let Some(admin_server) = admin_server {
+    for admin_server in admin_servers {
         admin_server.abort();
     }
     match &result {

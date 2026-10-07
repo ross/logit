@@ -2,7 +2,8 @@
 //!
 //! Two routes, `GET /readyz` and `GET /healthz`, and nothing else: no `/metrics` (ADR
 //! `internal-telemetry-as-pipeline-events` rejects it), no config dump. HTTP/1.1 only, no TLS:
-//! it's a loopback/pod-local endpoint (`docs/deploying.md`). The accept loop has
+//! it's a loopback/pod-local endpoint (`docs/deploying.md`), served over TCP, a Unix socket, or
+//! both, with one [`serve_on`] task per listener. The accept loop has
 //! `logit_inputs::otlp::OtlpInput::run`'s shape (permit-gated, one task per connection) at a
 //! smaller scale.
 
@@ -15,7 +16,8 @@ use logit_pipeline::readiness::{NodeState, Phase, PipelineState};
 use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::watch;
 
 /// Far below `otlp_in`'s 1024: a probe is one cheap GET, and this bounds the worst case to a
@@ -39,44 +41,81 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// closed port then looks to an orchestrator like a crash.
 ///
 /// Returns `()`: the caller only aborts this task, never joins it, so an `Err` would go unread.
-pub async fn serve_on(listener: TcpListener, readiness: watch::Receiver<PipelineState>) {
+/// Each listener gets its own task, so each has its own connection limit.
+pub async fn serve_on(listener: AdminListener, readiness: watch::Receiver<PipelineState>) {
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _peer)) => stream,
-            Err(err) => {
-                // A failed `accept()` never ends this loop: nothing awaits this task, so returning
-                // would take the endpoint down unreported and put a healthy process into a restart
-                // loop under any orchestrator polling `/readyz`. `ConnectionAborted`/
-                // `ConnectionReset`/`Interrupted` are one client's accident and retry at once;
-                // anything else (fd exhaustion, realistically) is process-wide and gets
-                // `ACCEPT_ERROR_BACKOFF` first, or a readable-but-failing listener spins hot.
-                tracing::warn!(target: "logit", error = %err, "admin: accept failed");
-                if !matches!(
-                    err.kind(),
-                    ErrorKind::ConnectionAborted
-                        | ErrorKind::ConnectionReset
-                        | ErrorKind::Interrupted
-                ) {
-                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+        let accepted = match &listener {
+            AdminListener::Tcp(tcp) => match tcp.accept().await {
+                Ok((stream, _peer)) => {
+                    spawn_connection(stream, &connection_limit, &readiness).await;
+                    Ok(())
                 }
-                continue;
-            }
+                Err(err) => Err(err),
+            },
+            AdminListener::Unix(unix) => match unix.accept().await {
+                Ok((stream, _peer)) => {
+                    spawn_connection(stream, &connection_limit, &readiness).await;
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            },
         };
-
-        // Acquired after accept, as in `otlp_in`: while every permit is held, the kernel's
-        // backlog absorbs a burst instead of the connection being refused.
-        let permit =
-            connection_limit.clone().acquire_owned().await.expect("this semaphore is never closed");
-        let readiness = readiness.clone();
-        tokio::spawn(async move {
-            let _permit = permit; // held for the connection's lifetime; released on drop
-            let svc = service_fn(move |req| handle(req, readiness.clone()));
-            let serve = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), svc);
-            let _ = tokio::time::timeout(CONNECTION_TIMEOUT, serve).await;
-        });
+        if let Err(err) = accepted {
+            // A failed `accept()` never ends this loop: nothing awaits this task, so returning
+            // would take the endpoint down unreported and put a healthy process into a restart
+            // loop under any orchestrator polling `/readyz`. `ConnectionAborted`/
+            // `ConnectionReset`/`Interrupted` are one client's accident and retry at once;
+            // anything else (fd exhaustion, realistically) is process-wide and gets
+            // `ACCEPT_ERROR_BACKOFF` first, or a readable-but-failing listener spins hot.
+            tracing::warn!(target: "logit", error = %err, "admin: accept failed");
+            if !matches!(
+                err.kind(),
+                ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::Interrupted
+            ) {
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+            }
+        }
     }
+}
+
+/// A bound admin listener: `admin.bind`'s TCP socket or `admin.socket`'s Unix socket. An enum
+/// rather than a generic accept trait, whose returned future would also have to be `Send` for
+/// `serve_on` to be spawned.
+pub enum AdminListener {
+    Tcp(TcpListener),
+    Unix(UnixListener),
+}
+
+/// Waits for a connection permit, then serves `stream` on its own task.
+///
+/// Acquired after accept, as in `otlp_in`: while every permit is held, the kernel's backlog
+/// absorbs a burst instead of the connection being refused.
+async fn spawn_connection<S>(
+    stream: S,
+    connection_limit: &Arc<tokio::sync::Semaphore>,
+    readiness: &watch::Receiver<PipelineState>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let permit =
+        connection_limit.clone().acquire_owned().await.expect("this semaphore is never closed");
+    let readiness = readiness.clone();
+    tokio::spawn(async move {
+        let _permit = permit; // held for the connection's lifetime; released on drop
+        let _ = tokio::time::timeout(CONNECTION_TIMEOUT, serve_connection(stream, readiness)).await;
+    });
+}
+
+/// Serves one accepted connection, TCP or Unix, until the client closes it.
+async fn serve_connection<S>(stream: S, readiness: watch::Receiver<PipelineState>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let svc = service_fn(move |req| handle(req, readiness.clone()));
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(stream), svc)
+        .await;
 }
 
 async fn handle(
@@ -270,7 +309,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let (readiness, rx) = Readiness::channel();
-        let handle = tokio::spawn(serve_on(listener, rx));
+        let handle = tokio::spawn(serve_on(AdminListener::Tcp(listener), rx));
         Server { addr, readiness, handle }
     }
 
@@ -295,6 +334,53 @@ mod tests {
         assert_eq!(body, "draining");
 
         server.handle.abort();
+    }
+
+    /// `GET /readyz` over a Unix socket with hyper's own HTTP/1 client; returns (status, body).
+    async fn readyz_over_unix(path: &std::path::Path) -> (u16, String) {
+        use http_body_util::{BodyExt, Empty};
+        let stream = tokio::net::UnixStream::connect(path).await.expect("the socket is bound");
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
+        tokio::spawn(conn);
+        let request = http::Request::get("/readyz")
+            .header(http::header::HOST, "localhost")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        // Bounded: a connect lands in the kernel's backlog whether or not anything accepts it.
+        let response = tokio::time::timeout(
+            logit_pipeline::test_util::RECV_TIMEOUT,
+            sender.send_request(request),
+        )
+        .await
+        .expect("no response over the Unix socket")
+        .unwrap();
+        let status = response.status().as_u16();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn readyz_over_a_unix_socket_is_503_before_ready_and_200_after() {
+        let dir = logit_pipeline::test_util::scratch_dir("admin-unix");
+        let path = dir.join("admin.sock");
+        let listener = logit_inputs::unix::bind_listener(
+            "admin",
+            &path,
+            logit_inputs::unix::DEFAULT_SOCKET_MODE,
+        )
+        .unwrap();
+        let (readiness, rx) = Readiness::channel();
+        let handle = tokio::spawn(serve_on(AdminListener::Unix(listener), rx));
+        readiness.begin(&["in".to_string()]);
+
+        assert_eq!(readyz_over_unix(&path).await, (503, "starting".to_string()));
+        readiness.set_node("in", NodeState::Running);
+        readiness.ready();
+        assert_eq!(readyz_over_unix(&path).await, (200, "ok".to_string()));
+
+        handle.abort();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
