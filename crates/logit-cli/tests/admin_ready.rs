@@ -9,7 +9,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use support::{
-    ephemeral_addr, logit_ready, wait_until_ready, KillOnDrop, TempConfig, PROCESS_DEADLINE,
+    ephemeral_addr, logit_ready, logit_ready_env, logit_ready_url, wait_until_probe_succeeds,
+    wait_until_ready, KillOnDrop, TempConfig, PROCESS_DEADLINE,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -140,4 +141,119 @@ fn logit_ready_against_nothing_listening_exits_1() {
     // case.
     let output = logit_ready("127.0.0.1:1");
     assert_eq!(output.status.code(), Some(1));
+}
+
+// -- `admin.socket` (`docs/adr/listener-port-sharing-and-shutdown-delay.md`) --
+
+/// Writes a config with `admin` as the YAML of its `admin:` block (indented two spaces) and a
+/// `statsd_in` into a `stdio_out`, and spawns `logit run` on it. `shutdown.delay` keeps the
+/// process draining after a SIGTERM for longer than any test waits.
+#[cfg(unix)]
+async fn spawn_with_admin(name: &str, admin: &str) -> (TempConfig, KillOnDrop) {
+    let statsd_addr = ephemeral_addr().await;
+    let config = TempConfig::write(
+        name,
+        format!(
+            "admin:\n{admin}shutdown:\n  delay: 60s\ncomponents:\n  in:\n    type: statsd_in\n    \
+             bind: \"{statsd_addr}\"\n  out:\n    type: stdio_out\n    sources: [in]\n"
+        ),
+    );
+    let child = Command::new(env!("CARGO_BIN_EXE_logit"))
+        .arg("run")
+        .arg(&config.0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawning logit run");
+    (config, KillOnDrop(child))
+}
+
+/// Polls `probe` until its stderr says `draining`, or panics after [`PROCESS_DEADLINE`].
+#[cfg(unix)]
+async fn wait_until_draining(probe: impl Fn() -> std::process::Output) {
+    logit_pipeline::test_util::wait_until_within(
+        "logit ready to report draining",
+        PROCESS_DEADLINE,
+        || String::from_utf8_lossy(&probe().stderr).contains("draining"),
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn logit_ready_over_a_unix_socket_reflects_readiness_and_draining() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = logit_pipeline::test_util::scratch_dir("admin-socket");
+    let path = dir.join("admin.sock");
+    let url = format!("unix:{}", path.display());
+    let (_config, child) =
+        spawn_with_admin("admin-socket", &format!("  socket: \"{}\"\n", path.display())).await;
+
+    let word = wait_until_probe_succeeds(|| logit_ready_url(&url)).await;
+    assert_eq!(word, "ok");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o722, "the socket file's mode is {mode:o}");
+    // The URL form names the same socket.
+    assert!(logit_ready_url(&format!("unix://{}", path.display())).status.success());
+
+    support::send_signal(&child.0, libc::SIGTERM);
+    wait_until_draining(|| logit_ready_url(&url)).await;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn logit_ready_reads_a_unix_socket_endpoint_from_logit_admin() {
+    let dir = logit_pipeline::test_util::scratch_dir("admin-socket-env");
+    let path = dir.join("admin.sock");
+    let url = format!("unix:{}", path.display());
+    let (_config, child) =
+        spawn_with_admin("admin-socket-env", &format!("  socket: \"{}\"\n", path.display())).await;
+
+    let word = wait_until_probe_succeeds(|| logit_ready_env(&url)).await;
+    assert_eq!(word, "ok");
+
+    support::send_signal(&child.0, libc::SIGTERM);
+    wait_until_draining(|| logit_ready_env(&url)).await;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A socket file left at the path by an earlier run is replaced, not a startup failure.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_admin_socket_file_is_replaced() {
+    let dir = logit_pipeline::test_util::scratch_dir("admin-socket-stale");
+    let path = dir.join("admin.sock");
+    // Dropping the listener leaves its socket file behind, as a crashed process would.
+    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+    assert!(path.exists());
+    let url = format!("unix:{}", path.display());
+    let (_config, _child) =
+        spawn_with_admin("admin-socket-stale", &format!("  socket: \"{}\"\n", path.display()))
+            .await;
+
+    assert_eq!(wait_until_probe_succeeds(|| logit_ready_url(&url)).await, "ok");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_bind_and_socket_together_both_serve() {
+    let dir = logit_pipeline::test_util::scratch_dir("admin-socket-both");
+    let path = dir.join("admin.sock");
+    let url = format!("unix:{}", path.display());
+    let admin_addr = ephemeral_addr().await;
+    let (_config, child) = spawn_with_admin(
+        "admin-socket-both",
+        &format!("  bind: \"{admin_addr}\"\n  socket: \"{}\"\n", path.display()),
+    )
+    .await;
+
+    assert_eq!(wait_until_ready(&admin_addr).await, "ok");
+    assert_eq!(wait_until_probe_succeeds(|| logit_ready_url(&url)).await, "ok");
+
+    support::send_signal(&child.0, libc::SIGTERM);
+    wait_until_draining(|| logit_ready(&admin_addr)).await;
+    wait_until_draining(|| logit_ready_url(&url)).await;
+    std::fs::remove_dir_all(&dir).ok();
 }

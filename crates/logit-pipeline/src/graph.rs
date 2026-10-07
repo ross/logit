@@ -160,15 +160,15 @@
 //!     `set`/`remove`), a non-finite literal, a non-lowercase `Str` under `normalize: [lower]`, or
 //!     a repeated `normalize` step (`docs/adr/value-allowlist-cardinality-clamp.md`).
 //! 55. A `prometheus_in` with both or neither of `scrape_targets`/`bind`, a non-default field of
-//!     the other mode (`peer`/`proxy_protocol`/`forwarded` among the receiver's), a bind-mode
-//!     `path` not
-//!     starting with `/`, or `metadata_cache.ttl: 0s` with `max_families > 0`
-//!     (`docs/adr/prometheus-remote-write.md`, `docs/adr/listener-peer-address.md`).
+//!     the other mode (`peer`/`proxy_protocol`/`forwarded`/`reuse_port` among the receiver's), a
+//!     bind-mode `path` not starting with `/`, or `metadata_cache.ttl: 0s` with
+//!     `max_families > 0` (`docs/adr/prometheus-remote-write.md`,
+//!     `docs/adr/listener-peer-address.md`).
 //! 56. A `prometheus_out` with both or neither of `bind`/`endpoint`, a non-default field of the
-//!     other mode, `version: 2` with `compression: zstd` (2.0 mandates Snappy), or a sender fault
-//!     in 40's shape: a non-absolute `endpoint`, `timeout: 0s`, a reserved or colliding header, or
-//!     a bad `endpoint_tls` (`docs/adr/prometheus-remote-write.md`,
-//!     `docs/adr/victoriametrics-interop.md`).
+//!     other mode (`reuse_port` among the registry's), `version: 2` with `compression: zstd` (2.0
+//!     mandates Snappy), or a sender fault in 40's shape: a non-absolute `endpoint`,
+//!     `timeout: 0s`, a reserved or colliding header, or a bad `endpoint_tls`
+//!     (`docs/adr/prometheus-remote-write.md`, `docs/adr/victoriametrics-interop.md`).
 //! 57. A datagram listener's `receive.read_batch` above `MAX_READ_BATCH`: the kernel doesn't clamp
 //!     `recvmmsg`'s `vlen`, so this bounds the receive slab and the shutdown-path loss
 //!     (`docs/adr/udp-intake-batching-and-socket-visibility.md`).
@@ -251,6 +251,15 @@
 //! 79. `proxy_protocol: true` on a `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` whose
 //!     transport isn't `tcp`, or on a `datadog_trace_in` without `bind`: a PROXY header leads a
 //!     TCP stream from a network proxy (`docs/adr/listener-peer-address.md`).
+//! 80. `reuse_port: true` where it has no port to share: on a `statsd_in`/`lines_in` under
+//!     `transport: unix`/`unix_stream`, or on a `statsd_in`/`syslog_in`/`graphite_in`/`lines_in`/
+//!     `collectd_in` whose `bind` is a multicast group, which already delivers every datagram to
+//!     every member; or on a `datadog_trace_in` without `bind`, whose `socket` is a Unix socket.
+//!     A new listener that takes `reuse_port` adds a match arm, not a rule number
+//!     (`docs/adr/listener-port-sharing-and-shutdown-delay.md`).
+//! 81. An `admin.socket_mode` without `admin.socket`; an empty `admin.bind` or `admin.socket`; or
+//!     an `admin.bind` starting with `/`, a path that belongs in `socket`
+//!     (`docs/adr/listener-port-sharing-and-shutdown-delay.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -697,7 +706,7 @@ fn is_absolute_http_url(url: &str) -> bool {
 }
 
 pub fn resolve(config: Config) -> anyhow::Result<Graph> {
-    let Config { components, .. } = config;
+    let Config { components, admin, .. } = config;
 
     // Rule 1: at least one component.
     if components.is_empty() {
@@ -2321,6 +2330,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             peer,
             proxy_protocol,
             forwarded,
+            reuse_port,
         } = &component.kind
         else {
             continue;
@@ -2391,6 +2401,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 Some("proxy_protocol")
             } else if forwarded.is_some() {
                 Some("forwarded")
+            } else if *reuse_port {
+                Some("reuse_port")
             } else {
                 None
             };
@@ -2421,6 +2433,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             timeout,
             headers,
             endpoint_tls,
+            reuse_port,
         } = &component.kind
         else {
             continue;
@@ -2499,6 +2512,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         "component '{id}': 'max_series' caps the exposition registry and only \
                          means anything with 'bind' -- a remote-write sender holds no series \
                          between batches"
+                    );
+                }
+                if *reuse_port {
+                    anyhow::bail!(
+                        "component '{id}': 'reuse_port' shares the exposition's listening port \
+                         and only means anything with 'bind' -- a remote-write sender listens on \
+                         nothing"
                     );
                 }
                 if !is_absolute_http_url(endpoint) {
@@ -3678,6 +3698,71 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 80: `reuse_port: true` with no port to share. `bind` is a path under a Unix transport,
+    // so the multicast check only ever parses a `host:port`.
+    for (id, component) in &components {
+        let (kind_name, bind, unix) = match &component.kind {
+            ComponentKind::StatsdIn { reuse_port: true, bind, transport, .. } => (
+                "statsd_in",
+                bind,
+                matches!(transport, StatsdTransport::Unix | StatsdTransport::UnixStream),
+            ),
+            ComponentKind::LinesIn { reuse_port: true, bind, transport, .. } => (
+                "lines_in",
+                bind,
+                matches!(transport, LinesTransport::Unix | LinesTransport::UnixStream),
+            ),
+            ComponentKind::SyslogIn { reuse_port: true, bind, .. } => ("syslog_in", bind, false),
+            ComponentKind::GraphiteIn { reuse_port: true, bind, .. } => {
+                ("graphite_in", bind, false)
+            }
+            ComponentKind::CollectdIn { reuse_port: true, bind, .. } => {
+                ("collectd_in", bind, false)
+            }
+            // Its TCP listener and its Unix socket are separate fields, so the rule names the
+            // field the option needs, as rule 79 does.
+            ComponentKind::DatadogTraceIn { reuse_port: true, bind: None, .. } => {
+                anyhow::bail!(
+                    "component '{id}': datadog_trace_in 'reuse_port' needs 'bind' -- a 'socket' \
+                     is a Unix socket, which has no port to share"
+                );
+            }
+            _ => continue,
+        };
+        if unix {
+            anyhow::bail!(
+                "component '{id}': {kind_name} 'reuse_port' needs a TCP or UDP transport -- a Unix \
+                 socket has no port to share"
+            );
+        }
+        if bind.parse::<std::net::SocketAddr>().is_ok_and(|addr| addr.ip().is_multicast()) {
+            anyhow::bail!(
+                "component '{id}': {kind_name} 'reuse_port' has no effect on the multicast group \
+                 '{bind}' -- every member of a group already receives every datagram"
+            );
+        }
+    }
+
+    // Rule 81: the `admin:` listeners. A path in `bind` would fail as an unresolvable address at
+    // startup with no hint that `socket:` exists.
+    if admin.socket_mode.is_some() && admin.socket.is_none() {
+        anyhow::bail!(
+            "admin: 'socket_mode' needs 'socket' -- there's no socket file to set the mode on"
+        );
+    }
+    if admin.bind.as_deref().is_some_and(str::is_empty) {
+        anyhow::bail!("admin: 'bind' is empty -- give a host:port, or omit it");
+    }
+    if admin.socket.as_deref().is_some_and(str::is_empty) {
+        anyhow::bail!("admin: 'socket' is empty -- give a Unix socket path, or omit it");
+    }
+    if admin.bind.as_deref().is_some_and(|bind| bind.starts_with('/')) {
+        anyhow::bail!(
+            "admin: 'bind' is a path, not a host:port -- serve the admin endpoint on a Unix socket \
+             with 'socket:' instead"
+        );
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is fixed here, once (see [`targets_of`]).
@@ -4065,6 +4150,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             socket_mode: None,
         }
@@ -4201,6 +4287,7 @@ mod tests {
             max_connections: default_max_connections(),
             metadata_cache: MetadataCacheConfig::default(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             forwarded: None,
         }
@@ -4220,6 +4307,7 @@ mod tests {
             max_connections: default_max_connections(),
             metadata_cache: MetadataCacheConfig::default(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             forwarded: None,
         }
@@ -6180,6 +6268,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             forwarded: None,
         }
@@ -6256,6 +6345,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             forwarded: None,
         }
@@ -6822,6 +6912,7 @@ mod tests {
             max_connections: default_max_connections(),
             socket_mode: None,
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             forwarded: None,
         }
@@ -8328,6 +8419,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
         }
     }
@@ -8345,6 +8437,7 @@ mod tests {
             idle_timeout,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
         }
     }
@@ -8907,6 +9000,7 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            reuse_port: false,
         }
     }
 
@@ -8919,6 +9013,7 @@ mod tests {
             handshake_timeout,
             idle_timeout: None,
             max_connections: default_max_connections(),
+            reuse_port: false,
         }
     }
 
@@ -8932,6 +9027,7 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout,
             max_connections: default_max_connections(),
+            reuse_port: false,
         }
     }
 
@@ -8945,6 +9041,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             forwarded: None,
         }
@@ -8961,6 +9058,7 @@ mod tests {
             idle_timeout,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             forwarded: None,
         }
@@ -9188,6 +9286,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             forwarded: None,
         };
@@ -10673,6 +10772,7 @@ mod tests {
             bind: "0.0.0.0:25826".to_string(),
             types_db: types_db.into_iter().map(std::path::PathBuf::from).collect(),
             peer: false,
+            reuse_port: false,
         }
     }
 
@@ -10767,6 +10867,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             max_line_bytes,
             max_frame_bytes,
@@ -10787,6 +10888,7 @@ mod tests {
             idle_timeout,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             max_line_bytes: 8192,
             max_frame_bytes: 1 << 20,
@@ -11112,6 +11214,7 @@ mod tests {
             timeout: logit_config::default_prometheus_endpoint_timeout(),
             headers: HashMap::new(),
             endpoint_tls: logit_config::TlsClientConfig::default(),
+            reuse_port: false,
         }
     }
 
@@ -11128,6 +11231,7 @@ mod tests {
             timeout: logit_config::default_prometheus_endpoint_timeout(),
             headers: HashMap::new(),
             endpoint_tls: logit_config::TlsClientConfig::default(),
+            reuse_port: false,
         }
     }
 
@@ -11779,6 +11883,7 @@ mod tests {
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
             max_connections: default_max_connections(),
+            reuse_port: false,
         };
         let graph = resolve(cfg(vec![
             ("gen", vec![], generate_in_with_counts(Some(2_000_000), 100, None)),
@@ -11813,6 +11918,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             socket_mode: None,
         }
@@ -11831,6 +11937,7 @@ mod tests {
             idle_timeout,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             socket_mode: None,
         }
@@ -11952,6 +12059,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             socket_mode: None,
         }
@@ -12147,6 +12255,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             max_line_bytes: 64 * 1024,
             socket_mode: None,
@@ -12531,6 +12640,175 @@ mod tests {
                 "proxy_protocol": false}"#,
         );
         resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())])).unwrap();
+    }
+
+    // ---- rule 80: `reuse_port` --------------------------------------------------------------
+
+    /// Rules 55, 56, and 80: all 12 kinds that bind a port take `reuse_port: true` on a unicast
+    /// TCP or UDP bind.
+    #[test]
+    fn rule_80_reuse_port_resolves_on_a_unicast_bind() {
+        for json in [
+            r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "reuse_port": true}"#,
+            r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "transport": "tcp",
+                "reuse_port": true}"#,
+            r#"{"type": "syslog_in", "bind": "0.0.0.0:514", "reuse_port": true}"#,
+            r#"{"type": "syslog_in", "bind": "[::]:514", "transport": "tcp",
+                "reuse_port": true}"#,
+            r#"{"type": "graphite_in", "bind": "127.0.0.1:0", "reuse_port": true}"#,
+            r#"{"type": "graphite_in", "bind": "127.0.0.1:0", "transport": "udp",
+                "reuse_port": true}"#,
+            r#"{"type": "lines_in", "bind": "localhost:5170", "reuse_port": true}"#,
+            r#"{"type": "lines_in", "bind": "127.0.0.1:0", "transport": "udp",
+                "reuse_port": true}"#,
+            r#"{"type": "collectd_in", "bind": "0.0.0.0:25826", "reuse_port": true}"#,
+            r#"{"type": "otlp_in", "bind": "0.0.0.0:4318", "reuse_port": true}"#,
+            r#"{"type": "datadog_in", "bind": "0.0.0.0:8080", "reuse_port": true}"#,
+            r#"{"type": "datadog_trace_in", "bind": "0.0.0.0:8126", "socket": "/tmp/apm.socket",
+                "reuse_port": true}"#,
+            r#"{"type": "splunk_hec_in", "bind": "0.0.0.0:8088", "reuse_port": true}"#,
+            r#"{"type": "logit_in", "bind": "0.0.0.0:7070", "reuse_port": true}"#,
+            r#"{"type": "prometheus_in", "bind": "0.0.0.0:9201", "reuse_port": true}"#,
+        ] {
+            let kind = listener_from_json(json);
+            resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+                .unwrap_or_else(|err| panic!("{json} should resolve: {err}"));
+        }
+        let out = listener_from_json(
+            r#"{"type": "prometheus_out", "bind": "0.0.0.0:9090", "reuse_port": true}"#,
+        );
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]))
+            .expect("an exposition takes reuse_port");
+    }
+
+    /// Rule 80: `datadog_trace_in`'s `socket` is a Unix socket, so `reuse_port` needs `bind`.
+    #[test]
+    fn rule_80_rejects_reuse_port_on_a_datadog_trace_in_without_bind() {
+        let kind = listener_from_json(
+            r#"{"type": "datadog_trace_in", "socket": "/tmp/apm.socket", "reuse_port": true}"#,
+        );
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("datadog_trace_in 'reuse_port' needs 'bind'"), "got: {err}");
+    }
+
+    /// Rule 55: `reuse_port` belongs to the remote-write receiver; a scrape client binds nothing.
+    #[test]
+    fn rule_55_rejects_reuse_port_on_a_scrape_client() {
+        let kind = listener_from_json(
+            r#"{"type": "prometheus_in", "scrape_targets": ["http://node-exporter:9100/metrics"],
+                "reuse_port": true}"#,
+        );
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'reuse_port' configures the remote-write receiver"), "got: {err}");
+    }
+
+    /// Rule 56: `reuse_port` belongs to the exposition; a remote-write sender listens on nothing.
+    #[test]
+    fn rule_56_rejects_reuse_port_on_a_remote_write_sender() {
+        let out = listener_from_json(
+            r#"{"type": "prometheus_out", "endpoint": "http://vm:8428/api/v1/write",
+                "reuse_port": true}"#,
+        );
+        let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], out)]));
+        assert!(err.contains("'reuse_port' shares the exposition's listening port"), "got: {err}");
+    }
+
+    /// Rule 80: a Unix socket has no port to share.
+    #[test]
+    fn rule_80_rejects_reuse_port_on_a_unix_transport() {
+        for json in [
+            r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix",
+                "reuse_port": true}"#,
+            r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix_stream",
+                "reuse_port": true}"#,
+            r#"{"type": "lines_in", "bind": "/tmp/lines.socket", "transport": "unix",
+                "reuse_port": true}"#,
+            r#"{"type": "lines_in", "bind": "/tmp/lines.socket", "transport": "unix_stream",
+                "reuse_port": true}"#,
+        ] {
+            let kind = listener_from_json(json);
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains("'reuse_port' needs a TCP or UDP transport"), "{json}: {err}");
+        }
+    }
+
+    /// Rule 80: a multicast group already delivers every datagram to every member.
+    #[test]
+    fn rule_80_rejects_reuse_port_on_a_multicast_bind() {
+        for json in [
+            r#"{"type": "statsd_in", "bind": "239.1.2.3:8125", "reuse_port": true}"#,
+            r#"{"type": "syslog_in", "bind": "239.1.2.3:514", "reuse_port": true}"#,
+            r#"{"type": "graphite_in", "bind": "239.1.2.3:2003", "transport": "udp",
+                "reuse_port": true}"#,
+            r#"{"type": "lines_in", "bind": "239.1.2.3:5170", "transport": "udp",
+                "reuse_port": true}"#,
+            r#"{"type": "collectd_in", "bind": "239.192.74.66:25826", "reuse_port": true}"#,
+            r#"{"type": "collectd_in", "bind": "[ff18::efc0:4a42]:25826", "reuse_port": true}"#,
+        ] {
+            let kind = listener_from_json(json);
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(
+                err.contains("'reuse_port' has no effect on the multicast group"),
+                "{json}: {err}"
+            );
+        }
+    }
+
+    /// Rule 80: `reuse_port: false` stays legal on a Unix transport and a multicast group.
+    #[test]
+    fn rule_80_allows_reuse_port_false_everywhere() {
+        for json in [
+            r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix",
+                "reuse_port": false}"#,
+            r#"{"type": "collectd_in", "bind": "239.192.74.66:25826", "reuse_port": false}"#,
+        ] {
+            let kind = listener_from_json(json);
+            resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+                .unwrap_or_else(|err| panic!("{json} should resolve: {err}"));
+        }
+    }
+
+    // ---- rule 81: the admin listeners -----------------------------------------------------
+
+    fn cfg_with_admin(admin: &str) -> Config {
+        let admin: logit_config::AdminConfig = serde_json::from_str(admin).unwrap();
+        Config { admin, ..cfg(vec![("in", vec![], listener()), ("out", vec!["in"], sink())]) }
+    }
+
+    #[test]
+    fn rule_81_accepts_bind_socket_both_or_neither() {
+        for admin in [
+            r#"{}"#,
+            r#"{"bind": "127.0.0.1:9600"}"#,
+            r#"{"socket": "/run/logit/admin.sock"}"#,
+            r#"{"socket": "/run/logit/admin.sock", "socket_mode": "0660"}"#,
+            r#"{"bind": "127.0.0.1:9600", "socket": "/run/logit/admin.sock"}"#,
+        ] {
+            resolve(cfg_with_admin(admin))
+                .unwrap_or_else(|err| panic!("{admin} should resolve: {err}"));
+        }
+    }
+
+    #[test]
+    fn rule_81_rejects_a_socket_mode_without_a_socket() {
+        let err =
+            expect_err(cfg_with_admin(r#"{"bind": "127.0.0.1:9600", "socket_mode": "0660"}"#));
+        assert!(err.contains("admin: 'socket_mode' needs 'socket'"), "got: {err}");
+    }
+
+    #[test]
+    fn rule_81_rejects_an_empty_bind_or_socket() {
+        let err = expect_err(cfg_with_admin(r#"{"bind": ""}"#));
+        assert!(err.contains("admin: 'bind' is empty"), "got: {err}");
+        let err = expect_err(cfg_with_admin(r#"{"socket": ""}"#));
+        assert!(err.contains("admin: 'socket' is empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rule_81_rejects_a_path_in_bind_and_points_at_socket() {
+        let err = expect_err(cfg_with_admin(r#"{"bind": "/run/logit/admin.sock"}"#));
+        assert!(err.contains("admin: 'bind' is a path"), "got: {err}");
+        assert!(err.contains("'socket:'"), "got: {err}");
     }
 
     // ---- rule 71: lua / lua_file max_memory ------------------------------------------------

@@ -15,7 +15,7 @@ use crate::output::{classify, is_head_only, is_retryable, DeliveryPosture, Fault
 #[cfg(test)]
 use crate::queue::{SinkQueue, SinkQueueConfig};
 use crate::queue::{SinkStore, SinkStoreConfig, StoreItem};
-use crate::readiness::NodeState;
+use crate::readiness::{NodeState, Phase};
 use crate::router::{Destination, Router, RouterScratch};
 use crate::{Edge, Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
 use anyhow::Context;
@@ -157,10 +157,32 @@ pub async fn run_with_shutdown(
 /// a message.
 pub async fn run_with_telemetry(
     graph: Graph,
+    specs: HashMap<String, NodeSpec>,
+    telemetry: HashMap<String, Telemetry>,
+    readiness: Readiness,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), RunError> {
+    run_with_options(graph, specs, telemetry, readiness, shutdown, RunOptions::default()).await
+}
+
+/// Process-level settings for [`run_with_options`]. The default is [`run_with_telemetry`]'s
+/// behavior.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RunOptions {
+    /// How long the runtime waits between `shutdown` resolving and telling the nodes to drain.
+    /// Readiness reports draining for the whole wait, and every listener keeps running. Applies
+    /// only when the phase was `Ready` at the signal.
+    pub shutdown_delay: Duration,
+}
+
+/// Same as [`run_with_telemetry`], with [`RunOptions`].
+pub async fn run_with_options(
+    graph: Graph,
     mut specs: HashMap<String, NodeSpec>,
     mut telemetry: HashMap<String, Telemetry>,
     readiness: Readiness,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    options: RunOptions,
 ) -> Result<(), RunError> {
     // Sorted so a startup failure (an unbindable port, a bad Lua script) names the same component
     // every time. `readiness.begin` publishes the full ordered id list before anything binds, so
@@ -183,14 +205,34 @@ pub async fn run_with_telemetry(
     let drain_started: Arc<std::sync::OnceLock<tokio::time::Instant>> = Arc::default();
     let drain_started_for_driver = drain_started.clone();
     let readiness_for_driver = readiness.clone();
+    let delay = options.shutdown_delay;
     let shutdown_driver = tokio::spawn(async move {
         shutdown.await;
         tracing::info!(target: "logit", "shutdown signal received");
+        // A process that never reported `Ready` was never in an endpoint set, so there is no
+        // traffic to move away and the delay would only hold its ports during a failed rollout.
+        // Read before `draining()` overwrites the phase.
+        let delay = if readiness_for_driver.snapshot().phase == Phase::Ready {
+            delay
+        } else {
+            Duration::ZERO
+        };
         // Before the nodes are told, so `/readyz` stops routing traffic here the instant the
         // signal arrives, not partway through the drain. A no-op if a node already failed: a
         // SIGTERM after a failure must not paper over it.
         readiness_for_driver.draining();
-        let _ = drain_started_for_driver.set(tokio::time::Instant::now());
+        // The delay is the window an orchestrator withdraws this process from its endpoints while
+        // every listener still accepts and reads; readiness already reports draining. Every
+        // grace timer starts at the send below, after it. A node error during the delay starts
+        // the drain from the join loop instead, which makes this task's late `set` and `send`
+        // no-ops; a run that ends on its own aborts this task mid-sleep. Skipped when zero,
+        // because `sleep(ZERO)` still yields to the timer.
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if drain_started_for_driver.set(tokio::time::Instant::now()).is_ok() && !delay.is_zero() {
+            tracing::info!(target: "logit", delay = ?delay, "shutdown delay elapsed");
+        }
         let _ = shutdown_tx_for_driver.send(true);
     });
 
@@ -2923,6 +2965,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -3044,6 +3087,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -3187,6 +3231,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -3365,6 +3410,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -3723,6 +3769,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -3841,6 +3888,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -3980,6 +4028,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -4089,6 +4138,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -4216,6 +4266,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -4324,6 +4375,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -4438,6 +4490,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -4653,6 +4706,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -4762,6 +4816,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -4830,6 +4885,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -4900,6 +4956,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -8305,6 +8362,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -8335,6 +8393,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -8586,6 +8645,7 @@ mod tests {
             idle_timeout: None,
             max_connections: logit_config::default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             socket_mode: None,
         }
@@ -8785,6 +8845,225 @@ mod tests {
             .expect("run_with_telemetry should not hang once shutdown fires")
             .expect("task should not panic")
             .expect("a clean shutdown should end run_with_telemetry with Ok");
+    }
+
+    // -- `RunOptions::shutdown_delay` --
+
+    /// Reports the instant its shutdown receiver fires, then returns. With `bind_gate` set, its
+    /// `bind` reports entry and then waits for the gate, holding the run in `Phase::Starting`.
+    struct StopRecordingInput {
+        stopped: Option<oneshot::Sender<tokio::time::Instant>>,
+        bind_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for StopRecordingInput {
+        async fn bind(&mut self) -> anyhow::Result<()> {
+            if let Some((entered, gate)) = self.bind_gate.take() {
+                let _ = entered.send(());
+                let _ = gate.await;
+            }
+            Ok(())
+        }
+
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+
+        async fn run_until_shutdown(
+            &mut self,
+            _sink: Fanout,
+            mut shutdown: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let _ = shutdown.wait_for(|&due| due).await;
+            if let Some(tx) = self.stopped.take() {
+                let _ = tx.send(tokio::time::Instant::now());
+            }
+            Ok(())
+        }
+    }
+
+    /// Fails once `poke` fires.
+    struct PokedErrInput {
+        poke: Option<oneshot::Receiver<()>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for PokedErrInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            if let Some(poke) = self.poke.take() {
+                let _ = poke.await;
+            }
+            anyhow::bail!("poked")
+        }
+    }
+
+    /// Two listeners into one sink: `in`, built by the caller, and `steady`, which stops only on
+    /// the shutdown `watch`, so the run can't end before that is sent.
+    fn delay_graph(input: Box<dyn Input + Send>) -> (Graph, HashMap<String, NodeSpec>) {
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert("steady".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "out".to_string(),
+            plain_component(vec!["in".to_string(), "steady".to_string()], influxdb_out()),
+        );
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert("in".to_string(), NodeSpec::Input(input, InputRuntimeConfig::default()));
+        specs.insert(
+            "steady".to_string(),
+            NodeSpec::Input(Box::new(ForeverInput), InputRuntimeConfig::default()),
+        );
+        let (tx, _out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+        (g, specs)
+    }
+
+    /// Resolves `shutdown` once the run is `Ready`, checks that readiness flips to `Draining` at
+    /// the same instant, and returns how long after the signal the listener was told to stop.
+    async fn listener_stop_after_signal(options: RunOptions) -> Duration {
+        let (stopped_tx, stopped_rx) = oneshot::channel();
+        let (g, specs) = delay_graph(Box::new(StopRecordingInput {
+            stopped: Some(stopped_tx),
+            bind_gate: None,
+        }));
+        let (readiness, mut rx) = Readiness::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let run_task = tokio::spawn(run_with_options(
+            g,
+            specs,
+            HashMap::new(),
+            readiness,
+            async {
+                let _ = shutdown_rx.await;
+            },
+            options,
+        ));
+        rx.wait_for(|s| s.phase == Phase::Ready).await.expect("readiness channel should stay open");
+
+        let signalled_at = tokio::time::Instant::now();
+        let _ = shutdown_tx.send(());
+        rx.wait_for(|s| s.phase == Phase::Draining)
+            .await
+            .expect("readiness channel should stay open");
+        assert_eq!(
+            tokio::time::Instant::now(),
+            signalled_at,
+            "readiness should report draining at the signal, before any delay"
+        );
+
+        let stopped_at = stopped_rx.await.expect("the listener should be told to stop");
+        tokio::time::timeout(RECV_TIMEOUT, run_task)
+            .await
+            .expect("the run should end once its listener stops")
+            .expect("task should not panic")
+            .expect("a clean shutdown should end the run with Ok");
+        stopped_at.duration_since(signalled_at)
+    }
+
+    /// The paused clock advances only to the next timer deadline, so the gap equals the delay to
+    /// the nanosecond.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_delay_keeps_listeners_running_and_reports_draining_until_it_elapses() {
+        let delay = Duration::from_secs(30);
+        let gap = listener_stop_after_signal(RunOptions { shutdown_delay: delay }).await;
+        assert_eq!(gap, delay);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_default_run_options_stop_listeners_at_the_instant_of_the_signal() {
+        let gap = listener_stop_after_signal(RunOptions::default()).await;
+        assert_eq!(gap, Duration::ZERO);
+    }
+
+    /// The signal lands while `in`'s bind holds the run in `Starting`, so the delay is skipped:
+    /// the listener stops at the signal's instant on the paused clock, not 30 s later.
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_before_ready_skips_the_shutdown_delay() {
+        let (stopped_tx, stopped_rx) = oneshot::channel();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let (g, specs) = delay_graph(Box::new(StopRecordingInput {
+            stopped: Some(stopped_tx),
+            bind_gate: Some((entered_tx, gate_rx)),
+        }));
+        let (readiness, mut rx) = Readiness::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let run_task = tokio::spawn(run_with_options(
+            g,
+            specs,
+            HashMap::new(),
+            readiness,
+            async {
+                let _ = shutdown_rx.await;
+            },
+            RunOptions { shutdown_delay: Duration::from_secs(30) },
+        ));
+        entered_rx.await.expect("the gated bind should start");
+        assert_eq!(rx.borrow().phase, Phase::Starting);
+
+        let signalled_at = tokio::time::Instant::now();
+        let _ = shutdown_tx.send(());
+        rx.wait_for(|s| s.phase == Phase::Draining)
+            .await
+            .expect("readiness channel should stay open");
+        let _ = gate_tx.send(());
+
+        let stopped_at = stopped_rx.await.expect("the listener should be told to stop");
+        assert_eq!(stopped_at.duration_since(signalled_at), Duration::ZERO);
+        run_task
+            .await
+            .expect("task should not panic")
+            .expect("a clean shutdown should end the run with Ok");
+    }
+
+    /// A node failing mid-delay sends the shutdown itself, so the drain doesn't wait out the delay.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_failing_during_the_shutdown_delay_starts_the_drain_at_once() {
+        let delay = Duration::from_secs(3600);
+        let (poke_tx, poke_rx) = oneshot::channel();
+        let (g, specs) = delay_graph(Box::new(PokedErrInput { poke: Some(poke_rx) }));
+        let (readiness, mut rx) = Readiness::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let run_task = tokio::spawn(run_with_options(
+            g,
+            specs,
+            HashMap::new(),
+            readiness,
+            async {
+                let _ = shutdown_rx.await;
+            },
+            RunOptions { shutdown_delay: delay },
+        ));
+        rx.wait_for(|s| s.phase == Phase::Ready).await.expect("readiness channel should stay open");
+
+        let signalled_at = tokio::time::Instant::now();
+        let _ = shutdown_tx.send(());
+        rx.wait_for(|s| s.phase == Phase::Draining)
+            .await
+            .expect("readiness channel should stay open");
+        let _ = poke_tx.send(());
+
+        let err = run_task
+            .await
+            .expect("task should not panic")
+            .expect_err("the poked listener's error should fail the run");
+        assert!(matches!(err, RunError::Runtime(_)), "{err}");
+        assert!(
+            signalled_at.elapsed() < delay,
+            "the run ended {:?} after the signal, waiting out the delay",
+            signalled_at.elapsed()
+        );
     }
 
     /// A listener failing after `Ready` sets `Phase::Failed` and returns `RunError::Runtime`.
@@ -11224,6 +11503,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -11314,6 +11594,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -11381,6 +11662,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -11473,6 +11755,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -11596,6 +11879,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -11676,6 +11960,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -11843,6 +12128,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -11940,6 +12226,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -12024,6 +12311,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -12155,6 +12443,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -12264,6 +12553,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },
@@ -12503,6 +12793,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     socket_mode: None,
                 },

@@ -424,6 +424,16 @@ impl StatsdInput {
         self
     }
 
+    /// Sets `SO_REUSEPORT` on the listening socket (`reuse_port:`); see
+    /// [`UdpListener::with_reuse_port`] and [`TcpListener::with_reuse_port`]. Off by default.
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(listener.with_reuse_port(reuse_port)),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_reuse_port(reuse_port)),
+        };
+        self
+    }
+
     /// Requires a PROXY protocol header on every TCP connection (`proxy_protocol:`); see
     /// [`TcpListener::with_proxy_protocol`]. A datagram listener is left untouched, and graph rule
     /// 79 rejects the option there and on a Unix stream socket.
@@ -2962,5 +2972,117 @@ mod tests {
                 .expect("must fail");
             assert!(err.to_string().contains("plaintext"), "{err}");
         }
+    }
+
+    // ---- `reuse_port` (`StatsdInput::with_reuse_port`) --------------------------------------
+
+    use logit_pipeline::test_util::{fanout_channel, spawn_input, Running, RECV_TIMEOUT};
+    use logit_pipeline::unwrap_batch;
+
+    /// Lines sent to a pair of `reuse_port` listeners, each from a fresh source port.
+    const SPLIT_LINES: usize = 64;
+
+    type Rx = tokio::sync::mpsc::Receiver<logit_pipeline::Delivered>;
+
+    /// Binds two `reuse_port` listeners on one ephemeral port, A first so B can learn the port.
+    async fn reuse_port_pair(
+        build: fn(String) -> StatsdInput,
+    ) -> (std::net::SocketAddr, Running, Rx, Running, Rx) {
+        let mut a = build("127.0.0.1:0".to_string()).with_reuse_port(true);
+        a.bind().await.expect("A should bind");
+        let addr = a.local_addr().expect("a bound listener has an address");
+        let b = build(addr.to_string()).with_reuse_port(true);
+        let (fanout_a, rx_a) = fanout_channel(SPLIT_LINES);
+        let (fanout_b, rx_b) = fanout_channel(SPLIT_LINES);
+        let running_a = spawn_input(a, fanout_a).await;
+        let running_b = spawn_input(b, fanout_b).await;
+        (addr, running_a, rx_a, running_b, rx_b)
+    }
+
+    /// Counts events off both receivers until `SPLIT_LINES` have arrived, within one
+    /// `RECV_TIMEOUT`. Returns how many each listener delivered.
+    async fn count_split(rx_a: &mut Rx, rx_b: &mut Rx) -> (usize, usize) {
+        let (mut a, mut b) = (0, 0);
+        let all_arrived = tokio::time::timeout(RECV_TIMEOUT, async {
+            while a + b < SPLIT_LINES {
+                tokio::select! {
+                    Some(delivered) = rx_a.recv() => a += unwrap_batch(delivered).events.len(),
+                    Some(delivered) = rx_b.recv() => b += unwrap_batch(delivered).events.len(),
+                }
+            }
+        })
+        .await;
+        assert!(all_arrived.is_ok(), "only {a} + {b} of {SPLIT_LINES} lines arrived");
+        (a, b)
+    }
+
+    /// The kernel hashes each datagram's source port to one of the two sockets, so 64 senders
+    /// reach both. Loopback with the default receive buffer drops none of 64 small datagrams,
+    /// which is what makes the total exact; a one-sided split has probability 2 × 2⁻⁶⁴.
+    #[tokio::test]
+    async fn two_reuse_port_listeners_on_one_udp_port_both_deliver() {
+        let (addr, running_a, mut rx_a, running_b, mut rx_b) =
+            reuse_port_pair(StatsdInput::new).await;
+        for i in 0..SPLIT_LINES {
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender should bind");
+            sender.send_to(format!("split.{i}:1|c").as_bytes(), addr).expect("send_to");
+        }
+        let (a, b) = count_split(&mut rx_a, &mut rx_b).await;
+        assert_eq!(a + b, SPLIT_LINES);
+        assert!(a > 0 && b > 0, "both listeners should take a share, got {a} and {b}");
+        running_a.stop().await;
+        running_b.stop().await;
+    }
+
+    /// The TCP twin: the kernel hashes each connection's 4-tuple to one of the two listeners.
+    /// Each connection carries one line and closes; a one-sided split has probability 2 × 2⁻⁶⁴.
+    #[tokio::test]
+    async fn two_reuse_port_listeners_on_one_tcp_port_both_deliver() {
+        let (addr, running_a, mut rx_a, running_b, mut rx_b) =
+            reuse_port_pair(StatsdInput::tcp).await;
+        for i in 0..SPLIT_LINES {
+            let mut stream = TcpStream::connect(addr).await.expect("connect");
+            stream.write_all(format!("split.{i}:1|c\n").as_bytes()).await.expect("write");
+            stream.shutdown().await.expect("shutdown");
+        }
+        let (a, b) = count_split(&mut rx_a, &mut rx_b).await;
+        assert_eq!(a + b, SPLIT_LINES);
+        assert!(a > 0 && b > 0, "both listeners should take a share, got {a} and {b}");
+        running_a.stop().await;
+        running_b.stop().await;
+    }
+
+    fn is_addr_in_use(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+        })
+    }
+
+    /// Without `reuse_port`, a second listener on a held address fails to bind, on either
+    /// transport.
+    #[tokio::test]
+    async fn a_second_listener_without_reuse_port_is_refused() {
+        for build in [StatsdInput::new as fn(String) -> StatsdInput, StatsdInput::tcp] {
+            let mut a = build("127.0.0.1:0".to_string());
+            a.bind().await.expect("A should bind");
+            let addr = a.local_addr().expect("a bound listener has an address");
+            let err = build(addr.to_string()).bind().await.expect_err("the port is held");
+            assert!(is_addr_in_use(&err), "expected EADDRINUSE, got {err:#}");
+        }
+    }
+
+    /// Both Unix transports refuse `reuse_port` at bind, behind the graph rule that rejects it
+    /// first.
+    #[tokio::test]
+    async fn reuse_port_on_either_unix_transport_fails_the_bind() {
+        let dir = TempDir::new("statsd-reuse-port");
+        let path = dir.path().join("dsd.socket");
+        for input in [StatsdInput::unix(&path), StatsdInput::unix_stream(&path)] {
+            let err = input.with_reuse_port(true).bind().await.expect_err("must refuse");
+            assert!(err.to_string().contains("a Unix socket has no port to share"), "{err}");
+        }
+        assert!(!path.exists(), "a refused bind creates no socket file");
     }
 }

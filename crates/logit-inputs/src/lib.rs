@@ -36,7 +36,7 @@ pub mod syslog;
 pub mod tail;
 pub mod tcp;
 pub mod udp;
-mod unix;
+pub mod unix;
 mod zstd;
 
 pub use logit_pipeline::Input;

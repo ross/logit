@@ -22,6 +22,7 @@ pub mod fanout;
 pub mod fault;
 pub mod graph;
 pub mod input;
+pub mod listen;
 pub mod output;
 pub mod queue;
 #[cfg(test)]
@@ -50,7 +51,8 @@ pub use queue::{
 pub use readiness::{NodeState, Phase, PipelineState, Readiness};
 pub use router::{Destination, Router, RouterScratch};
 pub use runtime::{
-    process_batch, route_batch, run, run_with_shutdown, run_with_telemetry, send_batch,
-    unwrap_batch, LuaRuntimeConfig, NodeSpec, RetryConfig, RunError, WriteLoopConfig,
+    process_batch, route_batch, run, run_with_options, run_with_shutdown, run_with_telemetry,
+    send_batch, unwrap_batch, LuaRuntimeConfig, NodeSpec, RetryConfig, RunError, RunOptions,
+    WriteLoopConfig,
 };
 pub use transform::{FlushOutput, FlushedEvent, Transform};

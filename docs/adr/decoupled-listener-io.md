@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-26
+updated: 2026-10-07
 ---
 
 # Decoupled listener I/O
@@ -365,6 +365,11 @@ to ignore the one warning that matters.
 > being built. This section's account of what was known and out of scope when written is otherwise
 > unaffected.
 
+> **Revised by [ADR `listener-port-sharing-and-shutdown-delay`](listener-port-sharing-and-shutdown-delay.md).**
+> The deferral of `SO_REUSEPORT` fan-in above stands for N readers in one process, each holding a
+> `Fanout` clone. The cross-process form, one socket per `logit` process sharing a port during a
+> rolling overlap, is decided by that ADR and leaves the single-`Fanout` shutdown cascade as it is.
+
 ## Consequences
 
 - `crates/logit-pipeline/src/sink_queue.rs` → `queue.rs`: generalized into `BoundedQueue<T: Queued>`;
@@ -391,7 +396,10 @@ to ignore the one warning that matters.
   `logit.component.{datagrams,bytes}.dropped`, `logit.input.receive_buffer.{bytes,requested.bytes}`
   — see `docs/design/internal-telemetry.md`'s catalog.
 - `docs/known-gaps/runtime.md`: the "Delivery I/O is not decoupled…" entry is deleted (both halves
-  closed); new entries record kernel-drop visibility, `recvmmsg`, and `SO_REUSEPORT` as still open.
+  closed); new entries record kernel-drop visibility, `recvmmsg`, and `SO_REUSEPORT` as still open;
+  the cross-process form is decided by
+  [ADR `listener-port-sharing-and-shutdown-delay`](listener-port-sharing-and-shutdown-delay.md),
+  and in-process fan-in stays open.
 - Measured allocation change: `statsd_in`/`syslog_in` per-line decode drops from 2/1 to 1/0
   allocations in steady state (`crates/logit-bench/tests/allocations.rs`, `docs/design/memory.md`
   §2) — a strict improvement, not merely a neutral refactor, because the accumulator's own need for

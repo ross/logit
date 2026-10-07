@@ -86,6 +86,31 @@ error.
 - **A second signal during a stuck drain exits immediately** with status 130, so a restart policy
   waiting on the process can still kill it with the same signal. Only SIGTERM and SIGINT count; a
   SIGHUP never does.
+- **`shutdown.delay` holds the drain back while an orchestrator stops routing traffic.** It's off
+  by default (`0s`). Set, the first SIGTERM or SIGINT logs `shutdown signal received` and flips
+  `/readyz` to `503 draining` at once, then `logit` keeps every listener bound, accepting, and
+  reading for the delay, logs `shutdown delay elapsed`, and starts the drain. Each
+  `receive.shutdown_grace` and `buffer.shutdown_grace` starts counting when the drain starts, not
+  at the signal. A second SIGTERM or SIGINT during the delay still exits 130 at once. A signal
+  that arrives before `ready` skips the delay: the process was never in an endpoint set, so
+  holding its ports would only slow a failed rollout.
+
+  ```yaml
+  shutdown:
+    delay: 15s
+  ```
+
+  In Kubernetes, the kubelet sends SIGTERM while the pod's Service endpoints are still being
+  withdrawn, so without a delay, clients routed to the pod in that window find its listeners
+  closed. Size the delay to cover the time the endpoint removal takes to reach kube-proxy, ingress
+  controllers, and external load balancers, plus, for anything that routes on its own probe of
+  `/readyz`, that probe's period times its failure threshold. Set
+  `terminationGracePeriodSeconds` to at least the delay plus the largest `shutdown_grace` in the
+  config, plus a few seconds' margin, or the kubelet's SIGKILL cuts the drain short. The same
+  budget applies to Docker's `--stop-timeout` and systemd's `TimeoutStopSec=`.
+  [Overlapping two instances on one port](#overlapping-two-instances-on-one-port) puts the delay
+  into a rolling-upgrade recipe, with a `preStop` hook as the fallback where the delay can't be
+  used.
 - **SIGHUP reopens file outputs and never ends the process.** It logs `reopen signal received`
   with `config_reloaded=false`, and each `stdio_out`/`file_out` file target reopens its path
   before its next write; see
@@ -202,6 +227,26 @@ admin:
 **The endpoint has no TLS and no auth.** It is meant to be loopback or pod-local, not exposed
 across a real network boundary.
 
+To serve the same endpoints on a Unix socket, set `socket:` instead of `bind:`, or alongside it:
+
+```yaml
+admin:
+  socket: /run/logit/admin.sock
+  socket_mode: "0722"   # the default
+```
+
+Probe it with `logit ready --admin unix:/run/logit/admin.sock` (`unix:///run/logit/admin.sock`
+also works), or set `LOGIT_ADMIN=unix:/run/logit/admin.sock` and run `logit ready` with no flag.
+The directory must exist, and a socket file already at the path is replaced, so give the socket a
+directory only this process uses, such as a pod's `emptyDir`.
+
+Use the socket when two `logit` processes share a network namespace, such as two Kubernetes
+`hostNetwork` pods that overlap during a rollout. They can't both bind one `admin.bind` port, and
+sharing it would let the probe of one process be answered by the other. The kubelet can't probe a
+Unix socket over HTTP, so use an `exec` probe running `logit ready` with `LOGIT_ADMIN` set;
+[Overlapping two instances on one port](#overlapping-two-instances-on-one-port) has the full pod
+spec. The same `LOGIT_ADMIN` makes the image's `HEALTHCHECK` probe the socket.
+
 `GET /readyz` returns:
 
 - `200 ok` once every listener and every listening sink is bound and every node task is running.
@@ -242,7 +287,8 @@ HEALTHCHECK --interval=10s --timeout=2s --start-period=5s CMD ["logit", "ready"]
 
 On `200` it prints the status word and exits 0. Otherwise it exits 1 and prints the status word the
 server returned, or the connection error if nothing is listening (for example, `admin:` isn't
-configured).
+configured). It gives up after 10 s with no response, so a process that has stopped accepting
+fails the probe instead of holding it open.
 
 ### What to watch on `/readyz`
 
@@ -270,6 +316,180 @@ configured).
   or a listening sink like `prometheus_out`, can't bind, or a Lua script fails to load. Check the
   `starting`/`bound`/`ready` lifecycle log lines in [Self-logging](#self-logging).
 
+## Overlapping two instances on one port
+
+A node-local UDP agent (a `statsd_in`, `syslog_in`, `collectd_in`, `graphite_in`, or `lines_in`
+that senders on the host write to) loses every datagram that arrives while nothing is bound to its
+port. A `systemctl restart` leaves that gap, and in a container world a new version is a new
+container, so no socket survives an upgrade. The only gap-free upgrade is two `logit` processes
+bound to the port at once: the new one starts and becomes ready, and only then does the old one
+stop. Two pods that each have their own network namespace never collide on a port, so this
+section is about pods with `hostNetwork: true` and about hosts. The design and the kernel
+measurements behind it are in
+[ADR `listener-port-sharing-and-shutdown-delay`](adr/listener-port-sharing-and-shutdown-delay.md).
+
+### The three settings
+
+- **`reuse_port: true` on every listener that binds a port.** Without it, the new process's bind
+  fails with an address-in-use error and it exits `1`. Both processes must set it and run as the
+  same effective user; [`reuse_port`](#reuse_port-two-processes-on-one-port) lists the kinds that
+  take it.
+- **`shutdown.delay`, sized to the orchestrator's endpoint withdrawal.** Senders that reach the
+  agent on the node's own address don't need it: the kernel moves the old process's flows to the
+  new one when its socket closes. Traffic routed to the pod through a Service keeps arriving until
+  the endpoint removal propagates, and the delay keeps the old process reading until then.
+  [Signal and restart behavior](#signal-and-restart-behavior) has how to size it.
+- **`admin.socket` instead of, or beside, `admin.bind`.** Don't share the admin port. Each probe
+  connection would reach whichever process the kernel picks, so the old pod could answer the new
+  pod's readiness probe, and the rollout would gate on the wrong process. A socket path inside each
+  pod reaches only that pod ([Probes and exit codes](#probes-and-exit-codes)).
+
+Only listeners share. A `buffer.disk:` spool belongs to one process at a time, so give each pod its
+own spool directory: a new pod that opens a spool the old pod still holds exits `2`. Two
+overlapping `tail_in` or `docker_in` listeners on the same files both deliver every line.
+
+### Kubernetes: a surging DaemonSet
+
+With `maxSurge: 1` and `maxUnavailable: 0`, a DaemonSet rollout starts the new pod on each node
+before it removes the old one, and removes the old one only once the new one is ready. DaemonSet
+`maxSurge` needs Kubernetes 1.22 or later.
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: logit
+spec:
+  selector:
+    matchLabels: { app: logit }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app: logit }
+    spec:
+      hostNetwork: true
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: logit
+          image: ghcr.io/ross/logit:latest
+          args: ["run", "/etc/logit/logit.yaml"]
+          env:
+            - name: LOGIT_ADMIN
+              value: unix:/run/logit/admin.sock
+          readinessProbe:
+            exec: { command: ["logit", "ready"] }
+            periodSeconds: 5
+            timeoutSeconds: 2
+          volumeMounts:
+            - { name: admin, mountPath: /run/logit }
+            - { name: config, mountPath: /etc/logit, readOnly: true }
+      volumes:
+        - { name: admin, emptyDir: {} }
+        - { name: config, configMap: { name: logit } }
+```
+
+The config sets `reuse_port: true` on each listener, `admin.socket: /run/logit/admin.sock`, and
+`shutdown.delay`. What the manifest doesn't show:
+
+- **Don't declare `ports:` on the container.** Under `hostNetwork`, every container port is also a
+  host port, and the scheduler won't place a second pod claiming the same host port on a node, so
+  the surge pod stays `Pending` and the rollout stops.
+- **`terminationGracePeriodSeconds: 30` fits `delay: 10s` and the default 5 s grace.**
+  [Signal and restart behavior](#signal-and-restart-behavior) has the sizing rule.
+- **Give the `exec` probe a `timeoutSeconds` of at least 2.** The kubelet stops the probe at its
+  timeout, and the default 1 s can be too short for the `logit ready` process to start and get an
+  answer. 2 s matches the image's `HEALTHCHECK`.
+- **The `emptyDir` is per pod**, so both pods use the same socket path without colliding.
+
+Where `shutdown.delay` can't be used, such as an older `logit` image, a `preStop` hook can hold
+the signal back instead. It needs a `sleep` binary in the image, which a distroless image lacks,
+and its time counts against `terminationGracePeriodSeconds`:
+
+```yaml
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "10"] }
+```
+
+### What happens during the overlap
+
+What an operator sees in the graphs:
+
+- **Flows pin and move.** The kernel sends each sender's flow (its source and destination address
+  and port) to one process and never splits it. When the new pod joins, about half the flows move
+  to it, with no loss; when the old pod closes, its flows move to the new one. The split is
+  uneven: one measured run sent 2000 datagrams to one process and 6000 to the other.
+- **The old pod's close loses what reaches its socket after it stops reading.** When the drain
+  starts, a UDP listener stops reading, but its socket stays bound until the listener has decoded
+  what it already queued. Flows the kernel still sends to that socket pile up unread and are
+  discarded at the close, with no `logit` counter recording them. With a reader keeping up at 50k
+  datagrams/s, that was 0 to 85 datagrams per close; a stalled reader can lose a full
+  `SO_RCVBUF`. `shutdown.delay` doesn't shrink this window, because the listener keeps reading
+  through the delay and the window opens only when the drain starts.
+- **Per-socket counters cover one process each.** `logit.input.kernel.drops` and the
+  `receive_buffer.*` and `accept_queue.*` gauges describe each pod's own socket, not the port.
+- **An `aggregate` window splits.** A flow that moves mid-window has that window summed in both
+  processes, and each emits a partial value for the same series.
+- **A multicast UDP listener, such as `collectd_in`, is received by both pods**, so a downstream
+  count doubles for the overlap. To avoid it, roll a multicast agent with the DaemonSet default,
+  `maxSurge: 0`, which stops the old pod before the new one starts.
+- **A `prometheus_out` exposition answers from whichever process the scrape reaches**, so
+  successive scrapes can alternate between them, and a counter can look reset.
+- **Long-lived connections stay with the old process** until its drain closes them: a `logit_out`
+  connection to `logit_in`, an OTLP/gRPC stream, or an HTTP keep-alive connection. The client's
+  reconnect lands on the new process, and a `logit_out` resends its in-flight frames, which the
+  new `logit_in` forwards again.
+
+### TCP listeners and `tcp_migrate_req`
+
+When a listener closes, the kernel resets every connection in its accept queue: connections whose
+client already saw `connect()` succeed and may have sent data. With `net.ipv4.tcp_migrate_req=1`
+(Linux 5.14 and later), the kernel moves them to the surviving process instead. `logit` accepts
+through the delay, until the instant the drain drops a listener, so its queue is near empty at the
+close, and the sysctl matters only for connections that finish their handshake in that
+last instant. Every stream client `logit` serves reconnects after a reset.
+
+It's a node-level setting. A `hostNetwork` pod shares the node's network namespace and can't set
+network sysctls, so set it in the node image, from a privileged init DaemonSet, or through your
+distribution's node tuning:
+
+```sh
+sysctl -w net.ipv4.tcp_migrate_req=1    # persist it in /etc/sysctl.d/
+```
+
+### systemd: two instance units
+
+`systemctl restart` stops a unit before it starts it again, so the port is unbound in between, and
+`reuse_port` doesn't help. The overlap form is a template unit run as two instances,
+`logit@a.service` and `logit@b.service`, on one config with `reuse_port: true`. To upgrade, start
+the idle instance, wait until `logit ready --admin unix:/run/logit-b/admin.sock` succeeds, then
+stop the running one. Each instance gets its own admin socket by reading the path from the
+environment, `admin: { socket: !env LOGIT_ADMIN_SOCKET }`. A sink's `buffer.disk:` spool belongs
+to one process at a time, so a second instance opening the same directory exits `2`; give each
+instance its own the same way, `buffer: { disk: { path: !env LOGIT_SPOOL_DIR } }`. `!env`
+substitutes the whole value and two sinks can't share a spool directory, so use one variable per
+spooling sink, such as `LOGIT_SPOOL_DIR_INFLUX`. A spool left by a stopped instance replays when
+that instance next starts. The template's relevant lines:
+
+```ini
+[Service]
+User=logit
+RuntimeDirectory=logit-%i
+StateDirectory=logit-%i
+Environment=LOGIT_ADMIN_SOCKET=/run/logit-%i/admin.sock
+Environment=LOGIT_SPOOL_DIR=/var/lib/logit-%i/spool
+ExecStart=/usr/local/bin/logit run /etc/logit/logit.yaml
+TimeoutStopSec=30
+```
+
+`TimeoutStopSec=` must cover the delay plus the drain, as the termination grace does above. Both
+instances run as the same `User=`, which port sharing requires. Handing the listening sockets to a
+new process, so one unit could upgrade in place, isn't built; the
+[live reload and socket handover research note](plans/live-reload-and-socket-handover.md) has what
+was considered.
+
 ## Self-logging
 
 `logit run` emits leveled, structured self-diagnostics through `tracing`
@@ -290,8 +510,8 @@ so a log collector can parse it instead of scraping text.
 Every component-scoped diagnostic carries a `component` field naming the component that reported
 it. A throttled diagnostic, or a component-owned lifecycle message like `bound`/`recovered`, also
 carries a `key` naming *why*. The process-level lifecycle events (`starting`, `ready`,
-`shutdown signal received`, `reopen signal received`, `drain complete`, `exiting`) carry
-neither, because they describe the process, not a component.
+`shutdown signal received`, `shutdown delay elapsed`, `reopen signal received`,
+`drain complete`, `exiting`) carry neither, because they describe the process, not a component.
 
 **Lifecycle event names are stable `&'static str` values, so you can alert on them directly:**
 
@@ -301,6 +521,7 @@ neither, because they describe the process, not a component.
 | `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`lines_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
+| `shutdown delay elapsed` | info | `shutdown.delay` has run out after a SIGTERM/SIGINT and the drain is starting. Carries `delay`. Not logged when the delay is `0s`, when the signal arrived before `ready`, or when a node failure started the drain first. |
 | `reopen signal received` | info | A SIGHUP arrived. Carries `generation` (SIGHUPs so far) and `config_reloaded=false`: the config isn't reloaded. Logged during a drain too. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks and Lua nodes. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
@@ -1038,6 +1259,27 @@ connection. On `syslog_in`, `graphite_in`, `statsd_in`, or `lines_in` with `tran
 `statsd_in` or `lines_in` with `transport: unix`, leave it at its default: a datagram listener has
 no connections, so any other value is rejected instead of silently ignored. On `prometheus_in` it belongs to the
 remote-write receiver, and rule 55 rejects a non-default value alongside `scrape_targets:`.
+
+### `reuse_port`: two processes on one port
+
+`reuse_port: true` sets `SO_REUSEPORT` on a listener's socket, so a second `logit` process can bind
+the same `bind:` address while the first still holds it: an overlapping replacement during a
+rolling upgrade, for example. It's off by default, and on every kind that binds a port:
+`statsd_in`, `syslog_in`, `graphite_in`, `lines_in`, and `collectd_in` over TCP or UDP;
+`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `logit_in`; `prometheus_in` in
+receiver mode; and `prometheus_out` in exposition mode. Both processes must set it and run as the
+same effective user; otherwise the second bind fails with an address-in-use error and startup
+exits `1`.
+
+While both processes are bound, the kernel picks one of them for each TCP connection or UDP
+datagram by a hash of its source and destination addresses and ports, so traffic splits between
+them per sender, not evenly per event.
+[Overlapping two instances on one port](#overlapping-two-instances-on-one-port) has the upgrade
+recipe and what the split does to the data. `logit validate` rejects `reuse_port: true` under
+`transport: unix` or `unix_stream` and on a `datadog_trace_in` without `bind:`, none of which has
+a port to share; on a multicast `bind:`, whose group already delivers every datagram to every
+member (rule 80); and in `prometheus_in`'s scrape mode or `prometheus_out`'s remote-write mode,
+which bind nothing (rules 55 and 56).
 
 ### Recording the sender: `peer`, `proxy_protocol`, and `forwarded`
 

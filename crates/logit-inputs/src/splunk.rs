@@ -157,6 +157,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
+use logit_pipeline::listen::BindOptions;
 use logit_pipeline::Fanout;
 use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::splunk::response::{
@@ -233,6 +234,8 @@ pub struct SplunkHecInput {
     max_pending_acks: usize,
     /// `peer:` in config. See [`Self::with_peer`].
     peer: bool,
+    /// Socket options set before the bind (`reuse_port:`).
+    bind_options: BindOptions,
     /// `proxy_protocol:` in config. See [`Self::with_proxy_protocol`].
     proxy_protocol: bool,
     /// `forwarded:` in config. See [`Self::with_forwarded`].
@@ -257,6 +260,7 @@ impl SplunkHecInput {
             max_ack_channels: DEFAULT_MAX_ACK_CHANNELS,
             max_pending_acks: DEFAULT_MAX_PENDING_ACKS,
             peer: false,
+            bind_options: BindOptions::default(),
             proxy_protocol: false,
             forwarded: None,
         }
@@ -373,6 +377,13 @@ impl SplunkHecInput {
         self
     }
 
+    /// Sets `SO_REUSEPORT` before the bind (`reuse_port:` in config), so another process can bind
+    /// the same address at the same time. Off by default.
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.bind_options.reuse_port = reuse_port;
+        self
+    }
+
     /// Requires a PROXY protocol header ahead of every connection and stamps the origin it names
     /// (`proxy_protocol:` in config). Off by default. See this module's "Sender address".
     pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
@@ -394,7 +405,7 @@ impl Input for SplunkHecInput {
         if self.listener.is_some() {
             return Ok(()); // idempotent, per `Input::bind`'s contract
         }
-        let listener = TcpListener::bind(&self.bind).await?;
+        let listener = logit_pipeline::listen::bind_tcp(&self.bind, self.bind_options).await?;
         self.diag.info("bound", format_args!("listening on {}", self.bind));
         self.listener = Some(listener);
         Ok(())

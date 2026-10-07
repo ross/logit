@@ -96,6 +96,18 @@ Entry format and the other areas: [the known-gaps index](README.md).
   [ADR `shutdown-accounting-and-cancellation-safety`](../adr/shutdown-accounting-and-cancellation-safety.md)
   names it as an exception in decision 1. **Revisit** if a reconciliation shows a sink's
   `received` short of its producers' `sent` after a shutdown with no `closed_consumer` drops.
+- **A signal that arrives as startup reports ready can still wait `shutdown.delay`.**
+  The shutdown driver parks on the signal almost at once and, once woken, decides whether to skip
+  the delay by reading the readiness phase (`run_with_options`,
+  `crates/logit-pipeline/src/runtime.rs`). A SIGTERM or SIGINT that arrives in the last scheduler
+  turns before `Readiness::ready` wakes the driver, but if `ready()` runs before the woken driver
+  reads the phase, the driver sees `Ready` and waits the full delay before it drains.
+  - **Consequence:** a pod stopped during its own startup can hold its ports for the delay, which
+    the skip exists to avoid. The window is the few scheduler turns between the signal's wakeup
+    and the driver's read of the phase.
+  - **Revisit trigger:** a rollout seen waiting the delay on a pod that was signalled while
+    starting. The fix decides the skip atomically with the phase transition, such as a
+    pending-signal mark that `ready()` honors.
 - **The `fault` seam's rules on one point don't each see every hit.** `logit_pipeline::fault` (a
   test-only seam) checks a scope's rules on a point in the order they were added, and a rule that
   fails an operation returns before any later rule counts it. So a rule counts only the hits no
@@ -296,9 +308,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
 ## Admin endpoint, readiness, and release image
 
 - **The admin endpoint has no TLS and no auth** (`docs/plans/operator-surface.md`, ADR
-  `admin-readiness-endpoint`) — anyone who can reach `admin.bind` can read the pipeline's
-  lifecycle phase and every component's coarse state. It's not deferred: `/readyz`/`/healthz` are
-  loopback/pod-local by design, not meant to cross a real network boundary. Either feature would
+  `admin-readiness-endpoint`) — anyone who can reach `admin.bind`, or write to `admin.socket`, can
+  read the pipeline's lifecycle phase and every component's coarse state. It's not deferred:
+  `/readyz`/`/healthz` are loopback/pod-local by design, not meant to cross a real network
+  boundary. Either feature would
   guard against a threat model this endpoint doesn't have, for a caller already inside the
   process's own network namespace. `prometheus_out`'s exposition endpoint is the *deferred*
   version of this gap; see "`prometheus_out` has no TLS and no auth either" under

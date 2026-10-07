@@ -92,10 +92,25 @@ pub async fn ephemeral_addr() -> String {
     listener.local_addr().unwrap().to_string()
 }
 
-/// Runs `logit ready` against `admin` once.
+/// Runs `logit ready` against the TCP admin address `admin` once.
 pub fn logit_ready(admin: &str) -> std::process::Output {
+    logit_ready_url(&format!("http://{admin}"))
+}
+
+/// Runs `logit ready --admin <url>` once: `url` is `http://…` or `unix:<path>`.
+pub fn logit_ready_url(url: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_logit"))
-        .args(["ready", "--admin", &format!("http://{admin}")])
+        .args(["ready", "--admin", url])
+        .env_remove("LOGIT_ADMIN")
+        .output()
+        .expect("spawning the logit binary")
+}
+
+/// Runs `logit ready` once with no `--admin`, the endpoint given as `LOGIT_ADMIN=<url>`.
+pub fn logit_ready_env(url: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_logit"))
+        .arg("ready")
+        .env("LOGIT_ADMIN", url)
         .output()
         .expect("spawning the logit binary")
 }
@@ -103,9 +118,15 @@ pub fn logit_ready(admin: &str) -> std::process::Output {
 /// Polls `logit ready` until it succeeds, returning its stdout, or panics after
 /// [`PROCESS_DEADLINE`].
 pub async fn wait_until_ready(admin_addr: &str) -> String {
+    wait_until_probe_succeeds(|| logit_ready(admin_addr)).await
+}
+
+/// Polls `probe`, a `logit ready` run, until it succeeds, returning its stdout, or panics after
+/// [`PROCESS_DEADLINE`].
+pub async fn wait_until_probe_succeeds(probe: impl Fn() -> std::process::Output) -> String {
     let deadline = std::time::Instant::now() + PROCESS_DEADLINE;
     loop {
-        let output = logit_ready(admin_addr);
+        let output = probe();
         if output.status.success() {
             return String::from_utf8_lossy(&output.stdout).trim().to_string();
         }

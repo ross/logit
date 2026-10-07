@@ -1045,6 +1045,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "snap",
+ "socket2",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",

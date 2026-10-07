@@ -123,6 +123,7 @@ use crate::peer::{read_proxy_origin, ConnectionAttrs, PeerAttrs};
 use crate::Input;
 use bytes::{Bytes, BytesMut};
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
+use logit_pipeline::listen::BindOptions;
 use logit_pipeline::sockstat;
 use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
 use logit_proto::Decoder;
@@ -981,6 +982,8 @@ pub struct TcpListener<D: Decoder + Clone + Send + 'static> {
     /// Whether every connection opens with a PROXY protocol header (`proxy_protocol:`). See this
     /// module's "PROXY protocol" doc section.
     proxy_protocol: bool,
+    /// Socket options set before the bind (`reuse_port:`).
+    bind_options: BindOptions,
 }
 
 /// Where a [`TcpListener`] binds: a TCP `host:port`, or a Unix stream socket path.
@@ -1034,6 +1037,7 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
             idle_timeout: None,
             peer: false,
             proxy_protocol: false,
+            bind_options: BindOptions::default(),
         }
     }
 
@@ -1203,6 +1207,14 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
         self.proxy_protocol = proxy_protocol;
         self
     }
+
+    /// Sets `SO_REUSEPORT` before the bind (the `reuse_port:` field), so another process can bind
+    /// the same address at the same time. Off by default. [`Input::bind`] refuses it on a Unix
+    /// socket.
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.bind_options.reuse_port = reuse_port;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -1213,7 +1225,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         }
         let listener = match &self.target {
             StreamTarget::Tcp(bind) => {
-                let listener = TokioTcpListener::bind(bind).await?;
+                let listener = logit_pipeline::listen::bind_tcp(bind, self.bind_options).await?;
                 self.diag.info("bound", format_args!("listening on {bind}"));
                 BoundListener::Tcp(listener)
             }
@@ -1221,6 +1233,12 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                 anyhow::bail!(
                     "{kind}: 'proxy_protocol:' needs 'transport: tcp' -- the header comes from a \
                      network proxy"
+                );
+            }
+            StreamTarget::Unix { kind, .. } if self.bind_options.reuse_port => {
+                anyhow::bail!(
+                    "{kind}: 'reuse_port:' needs 'transport: tcp' -- a Unix socket has no port to \
+                     share"
                 );
             }
             StreamTarget::Unix { path, mode, kind } => {

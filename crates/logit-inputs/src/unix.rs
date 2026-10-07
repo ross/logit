@@ -1,5 +1,6 @@
-//! Binding a listener on a Unix socket path, shared by `datadog_trace_in`'s `socket:` and
-//! `statsd_in`'s and `lines_in`'s `transport: unix`/`unix_stream`.
+//! Binding a listener on a Unix socket path, shared by `datadog_trace_in`'s `socket:`,
+//! `statsd_in`'s and `lines_in`'s `transport: unix`/`unix_stream`, and `logit-cli`'s
+//! `admin.socket`.
 //!
 //! Every bind prepares the path the same way, which is what the Datadog Agent does at startup for
 //! its own sockets:
@@ -23,11 +24,11 @@ use tokio::net::{UnixDatagram, UnixListener};
 /// and APM sockets. A client needs only write permission on the file to connect or send, so the
 /// directory's permissions are the access control
 /// (`docs/adr/datadog-agent-and-intake-relay.md`, decision 12).
-pub(crate) const DEFAULT_SOCKET_MODE: u32 = 0o722;
+pub const DEFAULT_SOCKET_MODE: u32 = 0o722;
 
 /// Binds a `SOCK_STREAM` Unix socket at `path` and sets its mode. `kind` names the component in
 /// the error text.
-pub(crate) fn bind_listener(kind: &str, path: &Path, mode: u32) -> anyhow::Result<UnixListener> {
+pub fn bind_listener(kind: &str, path: &Path, mode: u32) -> anyhow::Result<UnixListener> {
     prepare_path(kind, path)?;
     let listener = UnixListener::bind(path)
         .with_context(|| format!("binding the Unix socket {}", path.display()))?;
@@ -50,9 +51,11 @@ pub(crate) fn bind_datagram(kind: &str, path: &Path, mode: u32) -> anyhow::Resul
 fn prepare_path(kind: &str, path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         if !parent.is_dir() {
+            let hint =
+                if kind.starts_with("datadog") { "; the Agent's is /var/run/datadog" } else { "" };
             anyhow::bail!(
                 "{kind}: can't bind the Unix socket {}: its directory {} does not exist (create \
-                 it first; the Agent's is /var/run/datadog)",
+                 it first{hint})",
                 path.display(),
                 parent.display()
             );
@@ -143,5 +146,8 @@ pub(crate) mod tests {
         let path = dir.path().join("missing").join("dsd.socket");
         let err = bind_listener("statsd_in", &path, 0o722).unwrap_err().to_string();
         assert!(err.contains("does not exist"), "{err}");
+        assert!(!err.contains("/var/run/datadog"), "{err}");
+        let err = bind_listener("datadog_trace_in", &path, 0o722).unwrap_err().to_string();
+        assert!(err.contains("the Agent's is /var/run/datadog"), "{err}");
     }
 }

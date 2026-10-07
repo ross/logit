@@ -342,6 +342,7 @@ use logit_core::interner::intern;
 use logit_core::{
     AttrMap, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
 };
+use logit_pipeline::listen::BindOptions;
 use logit_pipeline::Fanout;
 use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::prometheus::compression::{self, DecompressError, Encoding};
@@ -1118,6 +1119,8 @@ pub struct PrometheusReceiver {
     resource: Arc<Resource>,
     /// `peer:` in config. See [`Self::with_peer`].
     peer: bool,
+    /// Socket options set before the bind (`reuse_port:`).
+    bind_options: BindOptions,
     /// `proxy_protocol:` in config. See [`Self::with_proxy_protocol`].
     proxy_protocol: bool,
     /// `forwarded:` in config. See [`Self::with_forwarded`].
@@ -1141,6 +1144,7 @@ impl PrometheusReceiver {
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             resource: Arc::new(Resource::default()),
             peer: false,
+            bind_options: BindOptions::default(),
             proxy_protocol: false,
             forwarded: None,
             diag: Diagnostics::default(),
@@ -1218,6 +1222,13 @@ impl PrometheusReceiver {
         self
     }
 
+    /// Sets `SO_REUSEPORT` before the bind (`reuse_port:` in config), so another process can bind
+    /// the same address at the same time. Off by default.
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.bind_options.reuse_port = reuse_port;
+        self
+    }
+
     /// Requires a PROXY protocol header ahead of every connection and stamps the origin it names
     /// (`proxy_protocol:` in config). Off by default. See this module's "Sender address".
     pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
@@ -1247,7 +1258,7 @@ impl Input for PrometheusReceiver {
         if self.listener.is_some() {
             return Ok(()); // idempotent, per `Input::bind`'s contract
         }
-        let listener = tokio::net::TcpListener::bind(&self.bind).await?;
+        let listener = logit_pipeline::listen::bind_tcp(&self.bind, self.bind_options).await?;
         self.diag.info("bound", format_args!("listening on {}", self.bind));
         self.listener = Some(listener);
         Ok(())

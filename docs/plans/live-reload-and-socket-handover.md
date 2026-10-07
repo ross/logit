@@ -25,18 +25,20 @@ preserves.
   ([ADR `signal-handling`](../adr/signal-handling.md)). It doesn't reload the config;
   `docs/known-gaps/runtime.md` records that gap.
 - **A SIGTERM drain stops every listener first**, then cascades the close-time flush through the
-  graph ([Signal and restart behavior](../deploying.md#signal-and-restart-behavior)). That order is
-  right under a supervisor that restarts the process and wrong in Kubernetes without a `preStop`
-  delay, where a pod should keep reading its sockets until the Service's endpoints have moved.
+  graph ([Signal and restart behavior](../deploying.md#signal-and-restart-behavior)). An optional
+  `shutdown.delay` keeps every listener reading for a set time before that, so a Kubernetes pod
+  keeps serving while the Service's endpoints move
+  ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)).
 - **Certificates reload without a restart.** Every TLS listener, every TLS sink, and
   `prometheus_in`'s scrape client build their rustls config once, through
   `logit_pipeline::tls`, around swappable certificate and verifier pieces. A process-wide poll and
   SIGHUP check the files for new content
   ([ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md)).
 - **Listener sockets bind from config, never from an inherited fd.** `udp.rs`'s `bind_one` goes
-  through `socket2` and sets `SO_REUSEADDR` only for a multicast bind. `tcp.rs` binds through
-  `tokio::net::TcpListener::bind` directly. `unix.rs` unlinks a stale socket path and binds fresh.
-  No listener sets `SO_REUSEPORT`.
+  through `socket2` and sets `SO_REUSEADDR` only for a multicast bind. Every TCP listener binds
+  through `logit_pipeline::listen::bind_tcp`. `unix.rs` unlinks a stale socket path and binds
+  fresh. An opt-in `reuse_port` sets `SO_REUSEPORT` on a UDP or TCP listener, so two processes
+  can share its port.
 - **`Input::bind` is a pre-pass.** Every listener's socket opens before any task spawns, so a bind
   failure fails startup with nothing else running. Any handover design has to feed this pre-pass,
   because that's where a second process's bind would collide with the first's.
@@ -127,7 +129,7 @@ queue. A shared fd has neither problem. HAProxy added its `-x` fd transfer for t
 | How certificates rotate | a certbot deploy hook, which can signal | cert-manager rewrites a mounted Secret with no signal |
 | Who can send a signal | the operator or the supervisor | `docker kill -s HUP`, `kubectl exec`, or a sidecar only with `shareProcessNamespace: true` |
 | How upgrades usually happen | in place | pod replacement; a config change is commonly a checksum annotation that rolls the pods, so config reload becomes the upgrade case |
-| What closes the gap on a UDP port | fd handover to the new process | overlap: a `hostNetwork` DaemonSet with `maxSurge: 1` and `SO_REUSEPORT` on both pods |
+| What closes the gap on a UDP port | fd handover to the new process | overlap: a `hostNetwork` DaemonSet with `maxSurge: 1` and `SO_REUSEPORT` on both pods ([Overlapping two instances on one port](../deploying.md#overlapping-two-instances-on-one-port)) |
 
 ### Host and systemd
 
@@ -157,10 +159,9 @@ systemd as the parent, and one `LISTEN_FDS` reader serves both.
   old socket's receive queue and takes a fraction of the surface.
 - **Without `hostNetwork`, nothing in-process is the bottleneck.** Behind a ClusterIP Service, UDP
   flows pin to a backend through conntrack. The gap is at the Service layer: endpoints update,
-  stale conntrack entries are flushed, and a `preStop` sleep keeps the old pod serving until the
-  endpoints have propagated. What `logit` must do right is keep reading its sockets through the
-  grace period rather than closing them the instant SIGTERM arrives. Today it closes them first,
-  and that works in Kubernetes only because `preStop` delays the signal.
+  stale conntrack entries are flushed, and the old pod must keep serving until the endpoints have
+  propagated. `shutdown.delay` keeps its sockets read through that window instead of closing them
+  the instant SIGTERM arrives, with no `preStop` sleep.
 
 ## TLS certificate reload
 
@@ -198,9 +199,11 @@ Smaller than either reload shape and independent of both.
 - SIGHUP needed a handler regardless of any reload semantics, because without one it was an
   undrained kill under systemd. Decided in [ADR `signal-handling`](../adr/signal-handling.md):
   SIGHUP reopens file targets and never exits.
-- `SO_REUSEPORT` is needed in the container world whichever reload path is taken or not taken, and
-  comes with two open questions: the TCP accept-queue behavior at close, and whether a SIGTERM
-  drain should keep reading sockets for a grace period before closing them. Explored separately.
+- `SO_REUSEPORT` is needed in the container world whichever reload path is taken or not taken.
+  [ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)
+  decides it, with both of its questions answered: the TCP accept-queue behavior at close
+  (documented, with `net.ipv4.tcp_migrate_req=1` as the fix), and a SIGTERM delay during which the
+  sockets keep being read.
 - TLS reload has a clear operator need (90-day certificates) and a contained design. Decided in
   [ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md).
 - Config reload stays a known gap. If it's built, the shapes worth building are 2 or 3, not the
