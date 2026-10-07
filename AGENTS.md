@@ -526,8 +526,8 @@ the operator-facing account of all of this.
   `internal`'s own `logs:` setting (`warn` by default, `error`, or `off`) captures `logit`'s own
   `warn`-and-above self-diagnostics into the pipeline as ordinary log events through
   `logit_core::telemetry::TelemetryLayer` (`internal-telemetry.md`'s "Logs" section).
-- **Readiness**: a top-level `admin:` block serves `/readyz`/`/healthz` and the `logit ready`
-  probe helper that `Dockerfile`'s `HEALTHCHECK` uses
+- **Readiness**: a top-level `admin:` block serves `/readyz`/`/healthz` on a TCP `bind:`, a Unix
+  `socket:`, or both, and the `logit ready` probe helper that `Dockerfile`'s `HEALTHCHECK` uses
   ([ADR `admin-readiness-endpoint`](docs/adr/admin-readiness-endpoint.md)).
 - **Startup binding**: `Input::bind` opens every listener's socket in a pre-pass *before* any
   task is spawned, so a bind failure fails startup with nothing else running.

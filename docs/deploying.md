@@ -226,6 +226,43 @@ admin:
 **The endpoint has no TLS and no auth.** It is meant to be loopback or pod-local, not exposed
 across a real network boundary.
 
+To serve the same endpoints on a Unix socket, set `socket:` instead of `bind:`, or alongside it:
+
+```yaml
+admin:
+  socket: /run/logit/admin.sock
+  socket_mode: "0722"   # the default
+```
+
+Probe it with `logit ready --admin unix:/run/logit/admin.sock` (`unix:///run/logit/admin.sock`
+also works), or set `LOGIT_ADMIN=unix:/run/logit/admin.sock` and run `logit ready` with no flag.
+The directory must exist, and a socket file already at the path is replaced, so give the socket a
+directory only this process uses, such as a pod's `emptyDir`.
+
+Use the socket when two `logit` processes share a network namespace, such as two Kubernetes
+`hostNetwork` pods that overlap during a rollout. They can't both bind one `admin.bind` port, and
+sharing it would let the kubelet's probe of one pod be answered by the other, so each would report
+the other's readiness (ADR `listener-port-sharing-and-shutdown-delay`). A pod-local socket has
+neither problem. Probe it with an `exec` probe:
+
+```yaml
+containers:
+  - name: logit
+    env:
+      - name: LOGIT_ADMIN
+        value: unix:/run/logit/admin.sock
+    readinessProbe:
+      exec: { command: ["logit", "ready"] }
+      periodSeconds: 5
+    volumeMounts:
+      - { name: admin, mountPath: /run/logit }
+volumes:
+  - name: admin
+    emptyDir: {}
+```
+
+The same `LOGIT_ADMIN` makes the image's `HEALTHCHECK` probe the socket.
+
 `GET /readyz` returns:
 
 - `200 ok` once every listener and every listening sink is bound and every node task is running.
@@ -266,7 +303,8 @@ HEALTHCHECK --interval=10s --timeout=2s --start-period=5s CMD ["logit", "ready"]
 
 On `200` it prints the status word and exits 0. Otherwise it exits 1 and prints the status word the
 server returned, or the connection error if nothing is listening (for example, `admin:` isn't
-configured).
+configured). It gives up after 10 s with no response, so a process that has stopped accepting
+fails the probe instead of holding it open.
 
 ### What to watch on `/readyz`
 
