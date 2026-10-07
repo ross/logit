@@ -68,8 +68,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 # For SO_RCVBUF on a UDP listener (docs/adr/decoupled-listener-io.md) -- tokio::net::UdpSocket
 # exposes no socket-option setters, so binding goes through socket2 and converts afterward.
 # Already present transitively (via tokio/hyper) at this exact version -- pinning it as a direct
-# dependency doesn't add a new entry to the dependency tree.
-socket2 = "0.6.5"
+# dependency doesn't add a new entry to the dependency tree. The `all` feature gates
+# `set_reuse_port`, which a UDP listener's `reuse_port:` sets.
+socket2 = { version = "0.6.5", features = ["all"] }
 # OTLP/JSON decoding only (crates/logit-proto/src/otlp/json) -- `AnyValue.bytesValue` is the one
 # field proto3 JSON base64-encodes; everything else in that dialect is hand-parsed (see
 # ADR `otlp-json-decoding`). Already present transitively (via reqwest/rustls) at this exact
