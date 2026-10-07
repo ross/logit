@@ -193,11 +193,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `shutdown.delay` doesn't shrink the window, which opens only when the drain starts. For
     traffic that reaches the process through a Service rather than from the node itself, the delay
     moves that traffic away before the window opens.
-- **A multicast `collectd_in` is delivered to every overlapping instance.** Every socket joined to
+- **A multicast UDP listener is delivered to every overlapping instance.** Every socket joined to
   a multicast group receives every datagram, whatever `SO_REUSEADDR` or `SO_REUSEPORT` it sets
   (measured: 1000 of 1000 at each of two members), and the multicast bind already sets
-  `SO_REUSEADDR`, so two overlapping `logit` instances both bind and both receive.
-  - **Consequence:** during a rolling overlap, every value list reaches both instances, and a
+  `SO_REUSEADDR`, so two overlapping `logit` instances with the same multicast `bind:`, such as a
+  `collectd_in` on collectd's default group, both bind and both receive.
+  - **Consequence:** during a rolling overlap, every datagram reaches both instances, and a
     downstream count or sum doubles until the old one exits.
   - **Workaround:** none beyond not overlapping multicast listeners: stop the old instance before
     the new one starts, as a DaemonSet's default rolling update (`maxSurge: 0`) does.

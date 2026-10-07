@@ -432,8 +432,8 @@ What an operator sees in the graphs:
   `receive_buffer.*` and `accept_queue.*` gauges describe each pod's own socket, not the port.
 - **An `aggregate` window splits.** A flow that moves mid-window has that window summed in both
   processes, and each emits a partial value for the same series.
-- **A multicast `collectd_in` is received by both pods**, so a downstream count doubles for the
-  overlap. To avoid it, roll a multicast agent with the DaemonSet default, `maxSurge: 0`, which
+- **A multicast UDP listener, such as `collectd_in`, is received by both pods**, so a downstream
+  count doubles for the overlap. To avoid it, roll a multicast agent with the DaemonSet default, `maxSurge: 0`, which
   stops the old pod before the new one starts.
 - **A `prometheus_out` exposition answers from whichever process the scrape reaches**, so
   successive scrapes can alternate between them, and a counter can look reset.
