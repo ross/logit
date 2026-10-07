@@ -554,10 +554,14 @@ impl DatadogTraceOutput {
 
     /// Client TLS tuning (`tls:`) for an `https://` endpoint. A no-op when `settings` is empty;
     /// an error on the Unix socket, which is always plaintext.
+    ///
+    /// Registers the files with `reloader` under this sink's diagnostics and telemetry as they are
+    /// when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         if settings.is_empty() {
             return Ok(self);
@@ -571,7 +575,13 @@ impl DatadogTraceOutput {
                  will accept any certificate the peer presents, self-signed or otherwise",
             );
         }
-        let cfg = crate::tls::build_client_config(settings, base_dir)?;
+        let cfg = logit_pipeline::tls::build_client_config(
+            settings,
+            base_dir,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?;
         if let Client::Http { client, .. } = &mut self.client {
             *client = build_client(self.request_timeout, Some(&cfg));
         }
@@ -1682,8 +1692,11 @@ mod tests {
     #[test]
     fn tls_on_the_socket_is_refused() {
         let settings = TlsClientSettings { insecure_skip_verify: true, ..Default::default() };
-        let result =
-            DatadogTraceOutput::unix("/run/apm.socket").with_tls(&settings, Path::new("."));
+        let result = DatadogTraceOutput::unix("/run/apm.socket").with_tls(
+            &settings,
+            Path::new("."),
+            &logit_pipeline::tls::TlsReloader::new(),
+        );
         assert!(result.is_err());
     }
 

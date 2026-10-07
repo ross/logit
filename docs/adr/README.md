@@ -11,8 +11,9 @@ the same date, write the record, then add a row here.
 | ADR | Created | Updated |
 |---|---|---|
 | [Listener port sharing with `SO_REUSEPORT`, a SIGTERM drain delay, and an admin Unix socket](listener-port-sharing-and-shutdown-delay.md) | 2026-10-07 | 2026-10-07 |
+| [TLS certificate reload: swappable resolvers and verifiers, triggered by a file poll and SIGHUP](tls-certificate-reload.md) | 2026-10-07 | 2026-10-07 |
 | [Forwarded-header parsing: one named header per component, the leftmost client, and a shared parser for the HTTP listeners and `http_access`](forwarded-header-parsing.md) | 2026-10-05 | 2026-10-05 |
-| [Signal handling: SIGHUP reopens file targets and never exits, and every handler is installed before config load](signal-handling.md) | 2026-10-05 | 2026-10-05 |
+| [Signal handling: SIGHUP reopens file targets and never exits, and every handler is installed before config load](signal-handling.md) | 2026-10-05 | 2026-10-07 |
 | [Listener peer address: opt-in `network.peer.*` on the shared drivers, and PROXY protocol on TCP](listener-peer-address.md) | 2026-10-05 | 2026-10-05 |
 | [`lines_in`: a plain-lines listener that emits one raw log event per line and parses nothing](plain-lines-listener.md) | 2026-10-05 | 2026-10-05 |
 | [Native hop ack status: the sender pair leads the hop payload, and a rejected `Ack` settles one frame by name](native-hop-ack-status.md) | 2026-10-04 | 2026-10-05 |
@@ -88,7 +89,7 @@ the same date, write the record, then add a row here.
 | [`csv`: positional columns from config, not a header row, and no type coercion](csv-positional-columns.md) | 2026-09-07 | 2026-09-07 |
 | [`tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs](file-tailing-and-docker-json-logs.md) | 2026-09-06 | 2026-10-04 |
 | [`trace_context` grows a `span:` block, and a native `traceparent` parser](trace-context-span-lifting.md) | 2026-09-04 | 2026-10-04 |
-| [TLS for `otlp_out`/`otlp_in`, and a pooled gRPC client to carry it](otlp-tls-and-pooled-grpc-client.md) | 2026-09-03 | 2026-10-05 |
+| [TLS for `otlp_out`/`otlp_in`, and a pooled gRPC client to carry it](otlp-tls-and-pooled-grpc-client.md) | 2026-09-03 | 2026-10-07 |
 | [`scale`: unit conversion by constant factor, and why it stays out of `kv_metrics`](scale-transform.md) | 2026-09-03 | 2026-09-22 |
 | [`LogRecord` gains a native application trace/span reference](log-record-trace-context.md) | 2026-09-03 | 2026-09-24 |
 | [Operator-declared resource attributes: a `set` transform, not a per-input config field](operator-declared-resource-attributes.md) | 2026-09-03 | 2026-09-15 |

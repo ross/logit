@@ -385,7 +385,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        read_once, tapped_duplex, testdata_dir, tls_pair, tls_settings, DialStep, FakeStream,
+        client_config, read_once, tapped_duplex, tls_pair, tls_settings, DialStep, FakeStream,
         ReadStep, ScriptedDial, WriteStep,
     };
 
@@ -911,11 +911,7 @@ mod tests {
         const TIMEOUT: Duration = Duration::from_secs(30);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = listener.local_addr().unwrap().to_string();
-        let config = crate::tls::build_client_config(
-            &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
-            &testdata_dir(),
-        )
-        .unwrap();
+        let config = client_config(&tls_settings(|t| t.ca_file = Some("ca.pem".to_string())));
         let tls = TlsTarget::new("test_out", "localhost:1", config).unwrap();
         let dial = Dial {
             target: Target::Tcp { endpoint: &endpoint, tls: Some(&tls) },
@@ -1139,8 +1135,7 @@ mod tests {
 
     #[test]
     fn a_tls_target_needs_a_server_name_in_the_endpoint_host() {
-        let config =
-            || crate::tls::build_client_config(&Default::default(), &testdata_dir()).unwrap();
+        let config = || client_config(&Default::default());
         for endpoint in ["[fe80::1%eth0]:514", ":514", "bad host:514"] {
             let err = TlsTarget::new("test_out", endpoint, config()).err().expect(endpoint);
             let message = err.to_string();

@@ -1173,6 +1173,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "jiff",
  "libc",
  "logit-config",
  "logit-core",
@@ -1180,12 +1181,16 @@ dependencies = [
  "logit-script",
  "proptest",
  "regex",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots",
 ]
 
 [[package]]
