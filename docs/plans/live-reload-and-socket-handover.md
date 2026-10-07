@@ -1,6 +1,6 @@
 ---
 created: 2026-10-05
-updated: 2026-10-05
+updated: 2026-10-07
 ---
 
 # Research note: live reload, socket handover, and what each deployment world needs
@@ -19,10 +19,11 @@ preserves.
 
 ## What exists today
 
-- **SIGHUP has no handler.** `logit-cli::pipeline::shutdown_signal` listens for SIGTERM and SIGINT
-  only, so SIGHUP takes its default disposition: an immediate terminate with no drain under
-  systemd, and nothing at all as PID 1 in a container. `docs/known-gaps/runtime.md` records the
-  missing config reload.
+- **SIGHUP reopens file targets and never exits.** `crates/logit-cli/src/signals.rs` installs
+  the SIGTERM, SIGINT, and SIGHUP handlers before the config loads. A SIGHUP bumps a reopen
+  generation that `stdio_out` and `file_out` file targets watch
+  ([ADR `signal-handling`](../adr/signal-handling.md)). It doesn't reload the config;
+  `docs/known-gaps/runtime.md` records that gap.
 - **A SIGTERM drain stops every listener first**, then cascades the close-time flush through the
   graph ([Signal and restart behavior](../deploying.md#signal-and-restart-behavior)). That order is
   right under a supervisor that restarts the process and wrong in Kubernetes without a `preStop`
@@ -164,6 +165,17 @@ systemd as the parent, and one `LISTEN_FDS` reader serves both.
 
 ## TLS certificate reload
 
+Decided in [ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md), which settles the
+points below differently in three places:
+
+- The poll compares file content rather than file identity.
+- `prometheus_in`'s scrape client moves onto a shared rustls config instead of being rebuilt
+  behind a swap.
+- New material reaches new *full* handshakes only. A resumed handshake reuses its session's
+  earlier verification, so a reload rotates certificates but doesn't revoke trust in a peer.
+
+The rest of this section is the research as it stood.
+
 Smaller than either reload shape and independent of both.
 
 - **Server side has a seam.** `rustls::ServerConfig`'s `cert_resolver` is an
@@ -184,13 +196,14 @@ Smaller than either reload shape and independent of both.
 
 ## What the research suggests, without deciding it
 
-- SIGHUP needs a handler regardless of any reload semantics, because today it's an undrained kill
-  under systemd. Explored separately.
+- SIGHUP needed a handler regardless of any reload semantics, because without one it was an
+  undrained kill under systemd. Decided in [ADR `signal-handling`](../adr/signal-handling.md):
+  SIGHUP reopens file targets and never exits.
 - `SO_REUSEPORT` is needed in the container world whichever reload path is taken or not taken, and
   comes with two open questions: the TCP accept-queue behavior at close, and whether a SIGTERM
   drain should keep reading sockets for a grace period before closing them. Explored separately.
-- TLS reload has a clear operator need (90-day certificates) and a contained design. Explored
-  separately.
+- TLS reload has a clear operator need (90-day certificates) and a contained design. Decided in
+  [ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md).
 - Config reload stays a known gap. If it's built, the shapes worth building are 2 or 3, not the
   diff. Shape 3 is the robust one for hosts and systemd and doesn't translate to containers
   without a supervisor process. A shared "acquire listeners from a fresh bind, an inherited set,
