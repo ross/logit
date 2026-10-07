@@ -131,7 +131,7 @@ impl TlsClientSettings {
 }
 
 /// Builds a `rustls::ClientConfig` from `settings`, resolving every path against `base_dir` (as
-/// `logit_inputs::tls::build_server_config` does).
+/// `logit_pipeline::tls::build_server_config` does).
 pub(crate) fn build_client_config(
     settings: &TlsClientSettings,
     base_dir: &Path,

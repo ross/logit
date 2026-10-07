@@ -1193,7 +1193,11 @@ mod tests {
             .with_idle_timeout(idle_timeout)
             .with_telemetry(telemetry)
             .with_diagnostics(diag)
-            .with_tls(&tls_server_settings(), &testdata_dir())
+            .with_tls(
+                &tls_server_settings(),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
             .unwrap();
         input.bind().await.expect("bind should succeed");
         let addr = input.local_addr().expect("a bound listener reports its address").to_string();
@@ -2382,7 +2386,11 @@ mod tests {
         let mut probe = TelemetryProbe::new();
         let mut input = LogitInput::new("127.0.0.1:0")
             .with_telemetry(probe.telemetry("in", "logit_in", "listener"))
-            .with_tls(&tls_server_settings(), &testdata_dir())
+            .with_tls(
+                &tls_server_settings(),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
             .unwrap();
         input.bind().await.unwrap();
         let addr = input.local_addr().unwrap();

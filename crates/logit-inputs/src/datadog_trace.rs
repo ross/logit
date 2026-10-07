@@ -248,8 +248,8 @@ const RATES_PAYLOAD_VERSION: &str = "logit-1";
 /// Every service's default rate, 1.0: keep everything (this module's "The trace reply").
 const RATE_BY_SERVICE: &[u8] = br#"{"rate_by_service":{"service:,env:":1.0}}"#;
 
-/// `crate::tls::TlsServerSettings`, re-exported as `datadog_in`'s is.
-pub use crate::tls::TlsServerSettings;
+/// `logit_pipeline::tls::TlsServerSettings`, re-exported as `datadog_in`'s is.
+pub use logit_pipeline::tls::TlsServerSettings;
 
 /// The `datadog_trace_in` listener. See this module's doc.
 pub struct DatadogTraceInput {
@@ -355,13 +355,24 @@ impl DatadogTraceInput {
 
     /// Turns on TLS termination on the TCP listener (`tls:` in config); the Unix socket is always
     /// plaintext. Paths in `settings` resolve against `base_dir`, the config file's directory.
+    ///
+    /// Registers the files with `reloader` under this listener's diagnostics and telemetry as
+    /// they are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         let alpn: &[&[u8]] = &[b"h2", b"http/1.1"];
-        self.tls = Some(Arc::new(crate::tls::build_server_config(settings, base_dir, alpn)?));
+        self.tls = Some(Arc::new(logit_pipeline::tls::build_server_config(
+            settings,
+            base_dir,
+            alpn,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?));
         Ok(self)
     }
 
@@ -2319,7 +2330,9 @@ mod tests {
                 key_file: "server.key".to_string(),
                 client_ca_file: None,
             };
-            input.with_tls(&settings, &testdata_tls_dir()).unwrap()
+            input
+                .with_tls(&settings, &testdata_tls_dir(), &logit_pipeline::tls::TlsReloader::new())
+                .unwrap()
         };
         let mut running = sender_input(false, true, tls).await;
         let mut stream = tokio::net::TcpStream::connect(&running.addr).await.unwrap();

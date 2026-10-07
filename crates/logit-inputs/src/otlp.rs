@@ -225,9 +225,9 @@ pub enum OtlpTransport {
     Grpc,
 }
 
-/// `crate::tls::TlsServerSettings`, re-exported so `logit-cli::pipeline::build_spec` imports it as
+/// `logit_pipeline::tls::TlsServerSettings`, re-exported so `logit-cli::pipeline::build_spec` imports it as
 /// `logit_inputs::otlp::TlsServerSettings`.
-pub use crate::tls::TlsServerSettings;
+pub use logit_pipeline::tls::TlsServerSettings;
 
 pub struct OtlpInput {
     bind: String,
@@ -301,16 +301,27 @@ impl OtlpInput {
 
     /// Turns on TLS termination (`tls:` in config) for either transport. Paths in `settings`
     /// resolve against `base_dir`, the config file's directory.
+    ///
+    /// Registers the files with `reloader` under this listener's diagnostics and telemetry as
+    /// they are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         let alpn: &[&[u8]] = match self.transport {
             OtlpTransport::Http => &[b"h2", b"http/1.1"],
             OtlpTransport::Grpc => &[b"h2"],
         };
-        self.tls = Some(Arc::new(crate::tls::build_server_config(settings, base_dir, alpn)?));
+        self.tls = Some(Arc::new(logit_pipeline::tls::build_server_config(
+            settings,
+            base_dir,
+            alpn,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?));
         Ok(self)
     }
 
@@ -1844,7 +1855,13 @@ mod tests {
     #[tokio::test]
     async fn an_http_request_over_tls_reaches_the_fanout() {
         let (addr, input) = bound_input(OtlpTransport::Http).await;
-        let mut input = input.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap();
+        let mut input = input
+            .with_tls(
+                &test_tls_settings(None),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap();
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
 
@@ -1869,7 +1886,13 @@ mod tests {
     #[tokio::test]
     async fn a_grpc_request_over_tls_reaches_the_fanout() {
         let (addr, input) = bound_input(OtlpTransport::Grpc).await;
-        let mut input = input.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap();
+        let mut input = input
+            .with_tls(
+                &test_tls_settings(None),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap();
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
 
@@ -1907,7 +1930,13 @@ mod tests {
     #[tokio::test]
     async fn a_plaintext_client_against_a_tls_listener_is_refused_not_a_panic() {
         let (addr, input) = bound_input(OtlpTransport::Http).await;
-        let mut input = input.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap();
+        let mut input = input
+            .with_tls(
+                &test_tls_settings(None),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap();
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
 
@@ -1939,8 +1968,13 @@ mod tests {
     #[tokio::test]
     async fn mutual_tls_accepts_a_valid_client_certificate_and_rejects_none() {
         let (addr, input) = bound_input(OtlpTransport::Http).await;
-        let mut input =
-            input.with_tls(&test_tls_settings(Some("ca.pem")), &testdata_dir()).unwrap();
+        let mut input = input
+            .with_tls(
+                &test_tls_settings(Some("ca.pem")),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap();
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
 
@@ -1982,7 +2016,11 @@ mod tests {
         // 500ms handshake timeout also bounds the second half's real rustls handshake, which a
         // debug build under load stretches well past 50ms; the close wait's 5s ceiling is 10x it.
         let mut input = OtlpInput::new("127.0.0.1:0", OtlpTransport::Http)
-            .with_tls(&test_tls_settings(None), &testdata_dir())
+            .with_tls(
+                &test_tls_settings(None),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
             .unwrap()
             .with_handshake_timeout(Duration::from_millis(500));
         input.bind().await.expect("binding an ephemeral port should succeed");
@@ -3003,8 +3041,15 @@ mod tests {
     /// The header goes ahead of the ClientHello, in the clear, as a proxy sends it.
     #[tokio::test]
     async fn a_proxy_header_ahead_of_the_tls_handshake_is_read_first() {
-        let tls =
-            |input: OtlpInput| input.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap();
+        let tls = |input: OtlpInput| {
+            input
+                .with_tls(
+                    &test_tls_settings(None),
+                    &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
+                )
+                .unwrap()
+        };
         let mut running = sender_input(OtlpTransport::Http, false, true, tls).await;
         let mut stream = tokio::net::TcpStream::connect(&running.addr).await.unwrap();
         stream.write_all(&v2_ipv4_header()).await.unwrap();

@@ -799,9 +799,9 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// no such field for graph rule 45 to check. A field can be added if a deployment needs one.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `crate::tls::TlsServerSettings`, re-exported for the receiver's `bind_tls:` block: the
+/// `logit_pipeline::tls::TlsServerSettings`, re-exported for the receiver's `bind_tls:` block: the
 /// server-side twin of [`TlsClientSettings`] above, same convention as `otlp::TlsServerSettings`.
-pub use crate::tls::TlsServerSettings;
+pub use logit_pipeline::tls::TlsServerSettings;
 
 const METADATA_CACHE_SIZE: &str = "logit.input.metadata_cache.size";
 const METADATA_CACHE_EVICTED: &str = "logit.input.metadata_cache.evicted";
@@ -1146,13 +1146,24 @@ impl PrometheusReceiver {
 
     /// Turns on TLS termination (`bind_tls:` in config). Both ALPN protocols the auto builder can
     /// serve are advertised, so a TLS client's negotiation picks what the plaintext path sniffs.
+    ///
+    /// Registers the files with `reloader` under this listener's diagnostics and telemetry as
+    /// they are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_bind_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         let alpn: &[&[u8]] = &[b"h2", b"http/1.1"];
-        self.tls = Some(Arc::new(crate::tls::build_server_config(settings, base_dir, alpn)?));
+        self.tls = Some(Arc::new(logit_pipeline::tls::build_server_config(
+            settings,
+            base_dir,
+            alpn,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?));
         Ok(self)
     }
 
@@ -3364,6 +3375,7 @@ mod tests {
                     client_ca_file: None,
                 },
                 &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .expect("a well-formed bind_tls: block should build fine");
         let mut rx = spawn_receiver(receiver, 4);
@@ -4315,6 +4327,7 @@ mod tests {
                         client_ca_file: None,
                     },
                     &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
                 )
                 .unwrap()
         };

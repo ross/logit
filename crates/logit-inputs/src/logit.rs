@@ -199,7 +199,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const RECEIVER_MAX_WINDOW: u32 = 1024;
 
 /// Re-exported for symmetry with `crate::otlp`'s path; both share `crate::tls`'s definition.
-pub use crate::tls::TlsServerSettings;
+pub use logit_pipeline::tls::TlsServerSettings;
 
 pub struct LogitInput {
     bind: String,
@@ -252,12 +252,23 @@ impl LogitInput {
 
     /// Turns on TLS termination (`tls:` in config). No ALPN, unlike `otlp_in`: this isn't an
     /// HTTP-shaped protocol, so there's nothing to negotiate.
+    ///
+    /// Registers the files with `reloader` under this listener's diagnostics and telemetry as
+    /// they are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
-        self.tls = Some(Arc::new(crate::tls::build_server_config(settings, base_dir, &[])?));
+        self.tls = Some(Arc::new(logit_pipeline::tls::build_server_config(
+            settings,
+            base_dir,
+            &[],
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?));
         Ok(self)
     }
 
@@ -2389,7 +2400,11 @@ mod tests {
         let listener_diag = diag.clone();
         let (addr, input) = bound_input().await;
         let input = input
-            .with_tls(&test_tls_settings(), &testdata_dir())
+            .with_tls(
+                &test_tls_settings(),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
             .unwrap()
             .with_diagnostics(listener_diag)
             .with_max_connections(1)
@@ -2443,8 +2458,14 @@ mod tests {
     #[tokio::test]
     async fn a_tls_listener_at_its_connection_cap_rejects_over_tls_not_in_the_clear() {
         let (addr, input) = bound_input().await;
-        let input =
-            input.with_tls(&test_tls_settings(), &testdata_dir()).unwrap().with_max_connections(1);
+        let input = input
+            .with_tls(
+                &test_tls_settings(),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap()
+            .with_max_connections(1);
         let (sink, _rx) = fanout_into_channel(16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
@@ -3089,8 +3110,15 @@ mod tests {
         tokio_rustls::client::TlsStream<tokio::io::DuplexStream>,
         tokio_rustls::server::TlsStream<tokio::io::DuplexStream>,
     ) {
-        let mut config =
-            crate::tls::build_server_config(&test_tls_settings(), &testdata_dir(), &[]).unwrap();
+        let mut config = logit_pipeline::tls::build_server_config(
+            &test_tls_settings(),
+            &testdata_dir(),
+            &[],
+            &logit_pipeline::tls::TlsReloader::new(),
+            &Diagnostics::default(),
+            &Telemetry::default(),
+        )
+        .unwrap();
         config.send_tls13_tickets = 0;
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let connector = tls_connector().await;

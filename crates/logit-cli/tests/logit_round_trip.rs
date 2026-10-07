@@ -250,6 +250,7 @@ mod tls {
                         client_ca_file: None,
                     },
                     &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
                 )
                 .unwrap()
         })
@@ -280,6 +281,7 @@ mod tls {
                         client_ca_file: Some("ca.pem".to_string()),
                     },
                     &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
                 )
                 .unwrap()
         })
@@ -314,6 +316,7 @@ mod tls {
                         client_ca_file: None,
                     },
                     &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
                 )
                 .unwrap()
         })

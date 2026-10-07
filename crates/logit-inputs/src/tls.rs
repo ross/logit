@@ -1,85 +1,15 @@
-//! Shared TLS construction for this crate's listeners and its one HTTP client.
+//! Client-side TLS for `prometheus_in`'s scrape client.
 //!
-//! [`build_server_config`] builds the `rustls::ServerConfig` every TLS-terminating listener uses:
-//! `otlp_in`, `logit_in`, `prometheus_in`'s remote-write receiver, and the stream listeners in
-//! `crate::tcp`.
-//!
-//! [`TlsClientSettings`]/[`apply_client_tls`] are the client direction, for `prometheus_in`'s
-//! scrape client. They use `reqwest`'s own `Certificate`/`Identity` loaders rather than a
-//! hand-built `rustls::ClientConfig` like `logit_outputs::tls::build_client_config`: those sinks
-//! swap a whole `hyper-rustls` connector, where a `ClientConfig` is the natural seam, but a plain
-//! `reqwest::Client` is smaller to configure through `reqwest` and keeps `rustls` types out of
-//! this crate's HTTP-client path.
+//! [`TlsClientSettings`]/[`apply_client_tls`] use `reqwest`'s own `Certificate`/`Identity` loaders
+//! rather than a hand-built `rustls::ClientConfig` like `logit_outputs::tls::build_client_config`:
+//! those sinks swap a whole `hyper-rustls` connector, where a `ClientConfig` is the natural seam,
+//! but a plain `reqwest::Client` is smaller to configure through `reqwest` and keeps `rustls` types
+//! out of this crate's HTTP-client path. Every listener's server side is in
+//! `logit_pipeline::tls`.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::Context;
-use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-
-/// Server-side TLS for a listener's `tls:` config block, mirroring
-/// `logit_config::TlsServerConfig` (this crate doesn't depend on `logit-config`;
-/// `logit-cli::pipeline::build_spec` converts). Its presence turns TLS on; there's no separate
-/// flag.
-#[derive(Debug, Clone)]
-pub struct TlsServerSettings {
-    /// Certificate chain (PEM) this listener presents to every client.
-    pub cert_file: String,
-    /// Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`.
-    pub key_file: String,
-    /// PEM bundle of CAs. When set, every client must present a certificate chaining to one of
-    /// them (mutual TLS); when absent, any client that completes the handshake is accepted.
-    pub client_ca_file: Option<String>,
-}
-
-/// Builds a `rustls::ServerConfig` from `settings`, with every path resolved against `base_dir`.
-///
-/// `alpn` is the advertised protocol list. An HTTP listener passes `[b"h2", b"http/1.1"]` (so the
-/// client's negotiation picks what `hyper_util::server::conn::auto` would otherwise sniff from
-/// plaintext) or `[b"h2"]` for gRPC; a non-HTTP protocol passes `&[]`.
-pub(crate) fn build_server_config(
-    settings: &TlsServerSettings,
-    base_dir: &Path,
-    alpn: &[&[u8]],
-) -> anyhow::Result<rustls::ServerConfig> {
-    let cert_path = base_dir.join(&settings.cert_file);
-    let key_path = base_dir.join(&settings.key_file);
-    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert_path)
-        .map_err(|e| anyhow::anyhow!("reading tls.cert_file {}: {e}", cert_path.display()))?
-        .collect::<Result<_, _>>()
-        .map_err(|e| anyhow::anyhow!("parsing tls.cert_file {}: {e}", cert_path.display()))?;
-    let key = PrivateKeyDer::from_pem_file(&key_path)
-        .map_err(|e| anyhow::anyhow!("reading tls.key_file {}: {e}", key_path.display()))?;
-
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("the ring crypto provider always supports TLS 1.2/1.3");
-
-    let mut cfg = match &settings.client_ca_file {
-        Some(client_ca_file) => {
-            let ca_path = base_dir.join(client_ca_file);
-            let ca_certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&ca_path)
-                .map_err(|e| {
-                    anyhow::anyhow!("reading tls.client_ca_file {}: {e}", ca_path.display())
-                })?
-                .collect::<Result<_, _>>()
-                .map_err(|e| {
-                    anyhow::anyhow!("parsing tls.client_ca_file {}: {e}", ca_path.display())
-                })?;
-            let mut roots = rustls::RootCertStore::empty();
-            roots.add_parsable_certificates(ca_certs);
-            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-                .build()
-                .map_err(|e| anyhow::anyhow!("building client-cert verifier: {e}"))?;
-            builder.with_client_cert_verifier(verifier).with_single_cert(chain, key)?
-        }
-        None => builder.with_no_client_auth().with_single_cert(chain, key)?,
-    };
-    cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Ok(cfg)
-}
 
 /// Client-side TLS for `prometheus_in`'s scrape client. Mirrors
 /// `logit_outputs::tls::TlsClientSettings` field for field (`logit-cli::pipeline::build_spec`
