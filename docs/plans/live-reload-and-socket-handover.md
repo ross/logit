@@ -36,9 +36,10 @@ preserves.
   `use_preconfigured_tls`. Only `prometheus_in`'s scrape client takes PEM through `reqwest`'s own
   builders (`apply_client_tls`). `docs/known-gaps/intake.md` has the entry.
 - **Listener sockets bind from config, never from an inherited fd.** `udp.rs`'s `bind_one` goes
-  through `socket2` and sets `SO_REUSEADDR` only for a multicast bind. `tcp.rs` binds through
-  `tokio::net::TcpListener::bind` directly. `unix.rs` unlinks a stale socket path and binds fresh.
-  No listener sets `SO_REUSEPORT`; the port-sharing ADR above decides an opt-in `reuse_port`.
+  through `socket2` and sets `SO_REUSEADDR` only for a multicast bind. Every TCP listener binds
+  through `logit_pipeline::listen::bind_tcp`. `unix.rs` unlinks a stale socket path and binds
+  fresh. Both IP paths set `SO_REUSEPORT` only when the kind's opt-in `reuse_port:` is on (the
+  port-sharing ADR above).
 - **`Input::bind` is a pre-pass.** Every listener's socket opens before any task spawns, so a bind
   failure fails startup with nothing else running. Any handover design has to feed this pre-pass,
   because that's where a second process's bind would collide with the first's.
