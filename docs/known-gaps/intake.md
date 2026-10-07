@@ -177,6 +177,16 @@ Entry format and the other areas: [the known-gaps index](README.md).
   Both need a downstream that stays full for the whole grace (5 s by default). Counting them would
   need an event-level drop counter on the accumulator and a per-consumer delivery record in
   `Fanout`, for a loss the grace already bounds.
+- **Datagrams in a UDP socket's kernel receive queue when it closes are lost uncounted.** The
+  kernel discards the queue with the socket. `logit.input.kernel.drops` is the kernel's count of
+  datagrams dropped on a full buffer, and `datagrams.dropped{reason="shutdown"}` covers only what
+  `logit` had already read, so neither records them.
+  - **Consequence:** during a rolling overlap, the closing process loses its queue's contents
+    while the surviving process would have taken them.
+  - **Workaround:** set `shutdown.delay`, and keep the reader ahead of its traffic, so the queue is
+    near empty at the close. At 50k datagrams/s, the measured loss was 0 to 85 datagrams with no
+    delay and 0 with a 5 s delay
+    ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md#what-the-kernel-does)).
 - **A multicast `collectd_in` is delivered to every overlapping instance.** Every socket joined to
   a multicast group receives every datagram, whatever `SO_REUSEADDR` or `SO_REUSEPORT` it sets
   (measured: 1000 of 1000 at each of two members), and the multicast bind already sets

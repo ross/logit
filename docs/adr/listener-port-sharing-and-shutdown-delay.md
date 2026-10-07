@@ -65,6 +65,17 @@ the record.
   reading, or with nothing sent, it gets a clean EOF.
 - **Kernel counters stay per socket.** `SO_MEMINFO` on a group member reports that member's own
   queue and drops, not the port's.
+- **Checked against `logit`.** On the same host, two release-build `logit` processes shared one
+  `statsd_in` UDP port with `reuse_port: true`, each with its own admin Unix socket. 16 source
+  sockets sent 100-byte lines at 50k datagrams/s for 6 s, about 300k per run, and one process got
+  SIGTERM at 3 s; three runs per arm.
+  - With `shutdown: { delay: 5s }`, `/readyz` on the signalled process read `draining` at once
+    while the other read `ok`, `shutdown delay elapsed` followed the signal by 5.001 s, and 0
+    datagrams were lost in all three runs.
+  - With the default `0s` delay, the loss was 0, 0, and 85 datagrams: the closing socket's
+    receive queue, which no `logit` counter sees. `logit.input.kernel.drops` counts drops on a
+    full buffer, not a queue discarded at close.
+  - With `reuse_port` left off, the second process exited `1` with `Address already in use`.
 
 ## Decision
 `logit` lets two processes share a listener's port when the operator opts in, keeps serving for a
