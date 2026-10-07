@@ -116,8 +116,9 @@ attributed to the component that owns the files.
 
 ### Telemetry
 - `logit.tls.reloads{outcome=reloaded|failed}`, a counter.
-- `logit.tls.certificate.not_after{role=server|client}`, a gauge in unix seconds for the leaf
-  certificate in `cert_file`. It's emitted at registration. The reloader also caches each set's
+- `logit.tls.certificate.not_after{side=server|client}`, a gauge in unix seconds for the leaf
+  certificate in `cert_file`. The tag is `side` because `role` is reserved for a point's
+  component identity, and the buffer drops a reserved key. It's emitted at registration. The reloader also caches each set's
   last value and re-emits it on its own 1 s tick, as the UDP and TCP kernel samplers do, because a
   telemetry window carries no value forward and a gauge written once would vanish after one
   window (`docs/design/internal-telemetry.md`'s "Why a constant is re-emitted"). The tick is
