@@ -327,13 +327,17 @@ impl SyslogInput {
     /// Fails on a UDP listener: DTLS (RFC 6012) is out of scope
     /// (`docs/adr/syslog-tcp-ingress-and-tls.md`'s Alternatives). Graph rule 43 is what an operator
     /// sees; this arm backstops a caller that skipped validation.
+    ///
+    /// Registers the files with `reloader` under this listener's diagnostics and telemetry as
+    /// they are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         self.inner = match self.inner {
-            Inner::Tcp(listener) => Inner::Tcp(listener.with_tls(settings, base_dir)?),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_tls(settings, base_dir, reloader)?),
             Inner::Udp(_) => anyhow::bail!(
                 "syslog_in: 'tls:' needs 'transport: tcp' -- there is no syslog-over-DTLS support \
                  (docs/adr/syslog-tcp-ingress-and-tls.md)"
@@ -1953,7 +1957,7 @@ mod tests {
         });
         if let Some(settings) = tls {
             input = input
-                .with_tls(settings, &testdata_tls_dir())
+                .with_tls(settings, &testdata_tls_dir(), &logit_pipeline::tls::TlsReloader::new())
                 .expect("the committed testdata/tls fixtures should load");
         }
         if let Some(diag) = diag {
@@ -2241,7 +2245,11 @@ mod tests {
             client_ca_file: None,
         };
         // `SyslogInput` isn't `Debug`, so `expect_err` is out -- match the `Result` by hand.
-        let err = match SyslogInput::new("127.0.0.1:0").with_tls(&settings, &testdata_tls_dir()) {
+        let err = match SyslogInput::new("127.0.0.1:0").with_tls(
+            &settings,
+            &testdata_tls_dir(),
+            &logit_pipeline::tls::TlsReloader::new(),
+        ) {
             Ok(_) => panic!("tls on a UDP syslog listener must not be accepted"),
             Err(err) => err,
         };

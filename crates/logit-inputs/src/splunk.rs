@@ -203,8 +203,8 @@ pub const DEFAULT_MAX_PENDING_ACKS: usize = 1_000_000;
 /// The header a HEC client names its channel in.
 const CHANNEL_HEADER: &str = "x-splunk-request-channel";
 
-/// `crate::tls::TlsServerSettings`, re-exported as `otlp_in`'s is.
-pub use crate::tls::TlsServerSettings;
+/// `logit_pipeline::tls::TlsServerSettings`, re-exported as `otlp_in`'s is.
+pub use logit_pipeline::tls::TlsServerSettings;
 
 /// The `splunk_hec_in` listener. See this module's doc.
 pub struct SplunkHecInput {
@@ -285,13 +285,24 @@ impl SplunkHecInput {
     /// Turns on TLS termination (`tls:` in config). Paths in `settings` resolve against
     /// `base_dir`, the config file's directory. Both ALPN protocols the auto builder serves are
     /// advertised.
+    ///
+    /// Registers the files with `reloader` under this listener's diagnostics and telemetry as
+    /// they are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         let alpn: &[&[u8]] = &[b"h2", b"http/1.1"];
-        self.tls = Some(Arc::new(crate::tls::build_server_config(settings, base_dir, alpn)?));
+        self.tls = Some(Arc::new(logit_pipeline::tls::build_server_config(
+            settings,
+            base_dir,
+            alpn,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?));
         Ok(self)
     }
 
@@ -2117,7 +2128,7 @@ mod tests {
         };
         let input = SplunkHecInput::new("127.0.0.1:0")
             .with_tokens(vec![TOKEN.to_string()])
-            .with_tls(&settings, &testdata_dir())
+            .with_tls(&settings, &testdata_dir(), &logit_pipeline::tls::TlsReloader::new())
             .unwrap();
         let (addr, mut rx) = start(input, 16).await;
 
@@ -2501,7 +2512,9 @@ mod tests {
                 key_file: "server.key".to_string(),
                 client_ca_file: None,
             };
-            input.with_tls(&settings, &testdata_dir()).unwrap()
+            input
+                .with_tls(&settings, &testdata_dir(), &logit_pipeline::tls::TlsReloader::new())
+                .unwrap()
         };
         let mut running = sender_input(false, true, tls).await;
         let mut roots = rustls::RootCertStore::empty();

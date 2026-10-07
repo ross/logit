@@ -19,21 +19,21 @@ preserves.
 
 ## What exists today
 
-- **SIGHUP reopens file targets and reloads nothing.** Every handler is installed before config
-  load, and SIGHUP reopens `stdio_out`'s and `file_out`'s files without ending the process
-  ([ADR `signal-handling`](../adr/signal-handling.md)). `docs/known-gaps/runtime.md` records the
-  missing config reload.
+- **SIGHUP reopens file targets and never exits.** `crates/logit-cli/src/signals.rs` installs
+  the SIGTERM, SIGINT, and SIGHUP handlers before the config loads. A SIGHUP bumps a reopen
+  generation that `stdio_out` and `file_out` file targets watch
+  ([ADR `signal-handling`](../adr/signal-handling.md)). It doesn't reload the config;
+  `docs/known-gaps/runtime.md` records that gap.
 - **A SIGTERM drain stops every listener first**, then cascades the close-time flush through the
   graph ([Signal and restart behavior](../deploying.md#signal-and-restart-behavior)). An optional
   `shutdown.delay` keeps every listener reading for a set time before that, so a Kubernetes pod
   keeps serving while the Service's endpoints move
   ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)).
-- **Certificates load once at construction.** Every TLS listener holds one
-  `Arc<rustls::ServerConfig>` built by `logit_inputs::tls::build_server_config` and wraps it in a
-  `TlsAcceptor` once. Every TLS sink builds a `rustls::ClientConfig` through
-  `logit_outputs::tls::build_client_config`; the HTTP sinks hand theirs to `reqwest` with
-  `use_preconfigured_tls`. Only `prometheus_in`'s scrape client takes PEM through `reqwest`'s own
-  builders (`apply_client_tls`). `docs/known-gaps/intake.md` has the entry.
+- **Certificates reload without a restart.** Every TLS listener, every TLS sink, and
+  `prometheus_in`'s scrape client build their rustls config once, through
+  `logit_pipeline::tls`, around swappable certificate and verifier pieces. A process-wide poll and
+  SIGHUP check the files for new content
+  ([ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md)).
 - **Listener sockets bind from config, never from an inherited fd.** `udp.rs`'s `bind_one` goes
   through `socket2` and sets `SO_REUSEADDR` only for a multicast bind. Every TCP listener binds
   through `logit_pipeline::listen::bind_tcp`. `unix.rs` unlinks a stale socket path and binds
@@ -165,6 +165,17 @@ systemd as the parent, and one `LISTEN_FDS` reader serves both.
 
 ## TLS certificate reload
 
+Decided in [ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md), which settles the
+points below differently in three places:
+
+- The poll compares file content rather than file identity.
+- `prometheus_in`'s scrape client moves onto a shared rustls config instead of being rebuilt
+  behind a swap.
+- New material reaches new *full* handshakes only. A resumed handshake reuses its session's
+  earlier verification, so a reload rotates certificates but doesn't revoke trust in a peer.
+
+The rest of this section is the research as it stood.
+
 Smaller than either reload shape and independent of both.
 
 - **Server side has a seam.** `rustls::ServerConfig`'s `cert_resolver` is an
@@ -185,15 +196,16 @@ Smaller than either reload shape and independent of both.
 
 ## What the research suggests, without deciding it
 
-- SIGHUP needs a handler regardless of any reload semantics. Decided in
-  [ADR `signal-handling`](../adr/signal-handling.md).
+- SIGHUP needed a handler regardless of any reload semantics, because without one it was an
+  undrained kill under systemd. Decided in [ADR `signal-handling`](../adr/signal-handling.md):
+  SIGHUP reopens file targets and never exits.
 - `SO_REUSEPORT` is needed in the container world whichever reload path is taken or not taken.
   [ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)
   decides it, with both of its questions answered: the TCP accept-queue behavior at close
   (documented, with `net.ipv4.tcp_migrate_req=1` as the fix), and a SIGTERM delay during which the
   sockets keep being read.
-- TLS reload has a clear operator need (90-day certificates) and a contained design. Explored
-  separately.
+- TLS reload has a clear operator need (90-day certificates) and a contained design. Decided in
+  [ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md).
 - Config reload stays a known gap. If it's built, the shapes worth building are 2 or 3, not the
   diff. Shape 3 is the robust one for hosts and systemd and doesn't translate to containers
   without a supervisor process. A shared "acquire listeners from a fresh bind, an inherited set,

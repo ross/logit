@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default, deserialize_with = "deserialize_components")]
@@ -32,6 +32,31 @@ pub struct Config {
     /// block keeps the default: the drain starts as soon as the signal arrives.
     #[serde(default)]
     pub shutdown: ShutdownConfig,
+    /// How often the certificate, key, and CA files of every TLS listener, sink, and scrape client
+    /// are checked for new content. A file whose content changed is loaded and used for the next
+    /// connection, with no restart and no effect on open connections; a file that fails to load
+    /// leaves the previous one in use. Defaults to `60s`; `0s` turns the periodic check off.
+    /// SIGHUP checks at once either way.
+    #[serde(with = "humantime_serde_duration", default = "default_tls_reload_interval")]
+    #[schemars(with = "String")]
+    pub tls_reload_interval: Duration,
+}
+
+/// Not derived: a derived default would give `tls_reload_interval` zero, which turns polling off.
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            components: HashMap::new(),
+            admin: AdminConfig::default(),
+            shutdown: ShutdownConfig::default(),
+            tls_reload_interval: default_tls_reload_interval(),
+        }
+    }
+}
+
+/// `tls_reload_interval`'s default.
+fn default_tls_reload_interval() -> Duration {
+    Duration::from_secs(60)
 }
 
 /// The `admin:` block. Every field defaults, so omitting the block leaves the admin server off.
@@ -4821,6 +4846,16 @@ mod tests {
     // Deserialized via `serde_json` rather than YAML (`logit-cli` owns YAML parsing, and this
     // crate has no YAML dependency): both are self-describing, so this exercises the same
     // tagged-enum disambiguation the real deserializer does.
+
+    #[test]
+    fn tls_reload_interval_defaults_to_a_minute_and_takes_zero() {
+        let omitted: Config = serde_json::from_str(r#"{"components": {}}"#).unwrap();
+        assert_eq!(omitted.tls_reload_interval, Duration::from_secs(60));
+        assert_eq!(Config::default().tls_reload_interval, Duration::from_secs(60));
+        let off: Config =
+            serde_json::from_str(r#"{"components": {}, "tls_reload_interval": "0s"}"#).unwrap();
+        assert_eq!(off.tls_reload_interval, Duration::ZERO);
+    }
 
     fn socket_mode_of(json_value: &str) -> Result<Option<SocketMode>, String> {
         let component: Component = serde_json::from_str(&format!(
