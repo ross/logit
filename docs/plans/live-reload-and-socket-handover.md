@@ -1,6 +1,6 @@
 ---
 created: 2026-10-05
-updated: 2026-10-05
+updated: 2026-10-07
 ---
 
 # Research note: live reload, socket handover, and what each deployment world needs
@@ -19,14 +19,16 @@ preserves.
 
 ## What exists today
 
-- **SIGHUP has no handler.** `logit-cli::pipeline::shutdown_signal` listens for SIGTERM and SIGINT
-  only, so SIGHUP takes its default disposition: an immediate terminate with no drain under
-  systemd, and nothing at all as PID 1 in a container. `docs/known-gaps/runtime.md` records the
+- **SIGHUP reopens file targets and reloads nothing.** Every handler is installed before config
+  load, and SIGHUP reopens `stdio_out`'s and `file_out`'s files without ending the process
+  ([ADR `signal-handling`](../adr/signal-handling.md)). `docs/known-gaps/runtime.md` records the
   missing config reload.
 - **A SIGTERM drain stops every listener first**, then cascades the close-time flush through the
   graph ([Signal and restart behavior](../deploying.md#signal-and-restart-behavior)). That order is
   right under a supervisor that restarts the process and wrong in Kubernetes without a `preStop`
   delay, where a pod should keep reading its sockets until the Service's endpoints have moved.
+  [ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)
+  decides a `shutdown.delay` for it.
 - **Certificates load once at construction.** Every TLS listener holds one
   `Arc<rustls::ServerConfig>` built by `logit_inputs::tls::build_server_config` and wraps it in a
   `TlsAcceptor` once. Every TLS sink builds a `rustls::ClientConfig` through
@@ -36,7 +38,7 @@ preserves.
 - **Listener sockets bind from config, never from an inherited fd.** `udp.rs`'s `bind_one` goes
   through `socket2` and sets `SO_REUSEADDR` only for a multicast bind. `tcp.rs` binds through
   `tokio::net::TcpListener::bind` directly. `unix.rs` unlinks a stale socket path and binds fresh.
-  No listener sets `SO_REUSEPORT`.
+  No listener sets `SO_REUSEPORT`; the port-sharing ADR above decides an opt-in `reuse_port`.
 - **`Input::bind` is a pre-pass.** Every listener's socket opens before any task spawns, so a bind
   failure fails startup with nothing else running. Any handover design has to feed this pre-pass,
   because that's where a second process's bind would collide with the first's.
@@ -184,11 +186,13 @@ Smaller than either reload shape and independent of both.
 
 ## What the research suggests, without deciding it
 
-- SIGHUP needs a handler regardless of any reload semantics, because today it's an undrained kill
-  under systemd. Explored separately.
-- `SO_REUSEPORT` is needed in the container world whichever reload path is taken or not taken, and
-  comes with two open questions: the TCP accept-queue behavior at close, and whether a SIGTERM
-  drain should keep reading sockets for a grace period before closing them. Explored separately.
+- SIGHUP needs a handler regardless of any reload semantics. Decided in
+  [ADR `signal-handling`](../adr/signal-handling.md).
+- `SO_REUSEPORT` is needed in the container world whichever reload path is taken or not taken.
+  [ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)
+  decides it, with both of its questions answered: the TCP accept-queue behavior at close
+  (documented, with `net.ipv4.tcp_migrate_req=1` as the fix), and a SIGTERM delay during which the
+  sockets keep being read.
 - TLS reload has a clear operator need (90-day certificates) and a contained design. Explored
   separately.
 - Config reload stays a known gap. If it's built, the shapes worth building are 2 or 3, not the

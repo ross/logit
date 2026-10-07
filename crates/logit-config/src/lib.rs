@@ -824,6 +824,16 @@ pub enum ComponentKind {
         /// no port; one that didn't, the usual case, gets neither attribute.
         #[serde(default)]
         peer: bool,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits traffic between them by source address and port.
+        /// Both processes must set it and run as the same effective user, or the second bind fails
+        /// with an address-in-use error. Off by default.
+        ///
+        /// Rejected under `transport: unix` or `unix_stream`, which have no port to share, and on a
+        /// multicast `bind:`, whose group already delivers every datagram to every member.
+        #[serde(default)]
+        reuse_port: bool,
         /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
         /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
         /// the original client it names on each event as `client.address` and `client.port`.
@@ -949,6 +959,16 @@ pub enum ComponentKind {
         /// no port; one that didn't, the usual case, gets neither attribute.
         #[serde(default)]
         peer: bool,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits traffic between them by source address and port.
+        /// Both processes must set it and run as the same effective user, or the second bind fails
+        /// with an address-in-use error. Off by default.
+        ///
+        /// Rejected under `transport: unix` or `unix_stream`, which have no port to share, and on a
+        /// multicast `bind:`, whose group already delivers every datagram to every member.
+        #[serde(default)]
+        reuse_port: bool,
         /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
         /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
         /// the original client it names on each event as `client.address` and `client.port`.
@@ -1013,6 +1033,16 @@ pub enum ComponentKind {
         /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
         #[serde(default)]
         peer: bool,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits traffic between them by source address and port.
+        /// Both processes must set it and run as the same effective user, or the second bind fails
+        /// with an address-in-use error. Off by default.
+        ///
+        /// Rejected on a multicast `bind:`, whose group already delivers every datagram to every
+        /// member.
+        #[serde(default)]
+        reuse_port: bool,
     },
     /// Graphite/Carbon metric ingress: carbon's plaintext line protocol or its pickle batch
     /// protocol, over TCP or UDP.
@@ -1100,6 +1130,16 @@ pub enum ComponentKind {
         /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
         #[serde(default)]
         peer: bool,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits traffic between them by source address and port.
+        /// Both processes must set it and run as the same effective user, or the second bind fails
+        /// with an address-in-use error. Off by default.
+        ///
+        /// Rejected on a multicast `bind:`, whose group already delivers every datagram to every
+        /// member.
+        #[serde(default)]
+        reuse_port: bool,
         /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
         /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
         /// the original client it names on each event as `client.address` and `client.port`.
@@ -1217,6 +1257,16 @@ pub enum ComponentKind {
         /// Drop it with a `remove` stage ahead of a sink that shouldn't see it.
         #[serde(default)]
         peer: bool,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits traffic between them by source address and port.
+        /// Both processes must set it and run as the same effective user, or the second bind fails
+        /// with an address-in-use error. Off by default.
+        ///
+        /// Rejected on a multicast `bind:`, whose group already delivers every datagram to every
+        /// member.
+        #[serde(default)]
+        reuse_port: bool,
         /// Requires every connection to open with a PROXY protocol header, version 1 or 2, as a
         /// load balancer such as HAProxy sends with `send-proxy` or `send-proxy-v2`, and stamps
         /// the original client it names on each event as `client.address` and `client.port`.
@@ -1331,6 +1381,13 @@ pub enum ComponentKind {
         /// `client.address`.
         #[serde(default)]
         forwarded: Option<ForwardedHeader>,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits connections between them by source address and
+        /// port. Both processes must set it and run as the same effective user, or the second bind
+        /// fails with an address-in-use error. Off by default.
+        #[serde(default)]
+        reuse_port: bool,
     },
     /// A stand-in for Datadog's intake API: what a Datadog Agent's `dd_url`,
     /// `logs_config.logs_dd_url`, `apm_config.apm_dd_url`, or `additional_endpoints` point at.
@@ -1419,6 +1476,13 @@ pub enum ComponentKind {
         /// `client.address`.
         #[serde(default)]
         forwarded: Option<ForwardedHeader>,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits connections between them by source address and
+        /// port. Both processes must set it and run as the same effective user, or the second bind
+        /// fails with an address-in-use error. Off by default.
+        #[serde(default)]
+        reuse_port: bool,
     },
     /// A stand-in for the Datadog Agent's APM receiver: what a dd-trace tracer sends its traces
     /// and client-computed stats to. Serves `/v0.3`, `/v0.4`, `/v0.5`, and `/v0.7/traces`
@@ -1530,6 +1594,16 @@ pub enum ComponentKind {
         /// `client.address`.
         #[serde(default)]
         forwarded: Option<ForwardedHeader>,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits connections between them by source address and
+        /// port. Both processes must set it and run as the same effective user, or the second bind
+        /// fails with an address-in-use error. Off by default.
+        ///
+        /// Applies to the `bind:` listener only, and is rejected without one: the Unix `socket:`
+        /// has no port to share.
+        #[serde(default)]
+        reuse_port: bool,
     },
     /// A stand-in for Splunk's HTTP Event Collector (HEC): what a HEC client's URL points at,
     /// such as Docker's `splunk` log driver, Splunk's logging libraries, the OpenTelemetry
@@ -1647,6 +1721,13 @@ pub enum ComponentKind {
         /// `client.address`.
         #[serde(default)]
         forwarded: Option<ForwardedHeader>,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits connections between them by source address and
+        /// port. Both processes must set it and run as the same effective user, or the second bind
+        /// fails with an address-in-use error. Off by default.
+        #[serde(default)]
+        reuse_port: bool,
     },
     /// Tails one or more files as a log source, one line per event; rotation-, truncation-, and
     /// checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final
@@ -1754,6 +1835,13 @@ pub enum ComponentKind {
         /// identities).
         #[serde(default = "default_max_connections")]
         max_connections: usize,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits connections between them by source address and
+        /// port. Both processes must set it and run as the same effective user, or the second bind
+        /// fails with an address-in-use error. Off by default.
+        #[serde(default)]
+        reuse_port: bool,
     },
     /// `logit` observing itself: drains every component's buffered self-telemetry on `interval`
     /// and emits it as ordinary events into the graph. At most one per config.
@@ -2914,6 +3002,15 @@ pub enum ComponentKind {
         /// `client.address`.
         #[serde(default)]
         forwarded: Option<ForwardedHeader>,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits connections between them by source address and
+        /// port. Both processes must set it and run as the same effective user, or the second bind
+        /// fails with an address-in-use error. Off by default.
+        ///
+        /// Receiver mode (`bind:`) only; rejected alongside `scrape_targets:`.
+        #[serde(default)]
+        reuse_port: bool,
     },
     /// A synthetic event source for load testing. No socket and no decoder: it renders a
     /// declarative `event:` template as fast as `count`/`rate` allow, so a scenario measures the
@@ -3035,6 +3132,17 @@ pub enum ComponentKind {
         /// `prometheus_in`'s `scrape_tls`/`bind_tls`, because this kind has two modes.
         #[serde(default)]
         endpoint_tls: TlsClientConfig,
+        /// Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an
+        /// overlapping replacement during a rolling upgrade, can bind the same `bind:` address at
+        /// the same time. The kernel then splits connections between them by source address and
+        /// port. Both processes must set it and run as the same effective user, or the second bind
+        /// fails with an address-in-use error. Off by default.
+        ///
+        /// Exposition mode (`bind:`) only; rejected alongside `endpoint:`. During an overlap a
+        /// scrape reaches whichever process the kernel picks, so a counter can appear to reset
+        /// until the old process exits.
+        #[serde(default)]
+        reuse_port: bool,
     },
     /// A sink that drops everything, as cheaply as the runtime allows; the sink end of the
     /// load-test harness. It measures everything upstream of a sink without a real one's
@@ -5988,7 +6096,7 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "collectd_in", "bind": "0.0.0.0:25826"}"#).unwrap();
         match component.kind {
-            ComponentKind::CollectdIn { bind, types_db, peer } => {
+            ComponentKind::CollectdIn { bind, types_db, peer, .. } => {
                 assert_eq!(bind, "0.0.0.0:25826");
                 assert!(types_db.is_empty(), "types_db defaults to no files at all");
                 assert!(!peer, "peer is opt-in");
@@ -6005,7 +6113,7 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::CollectdIn { bind, types_db, peer } => {
+            ComponentKind::CollectdIn { bind, types_db, peer, .. } => {
                 assert!(peer);
                 assert_eq!(bind, "239.192.74.66:25826", "a multicast group is an ordinary bind");
                 assert_eq!(
@@ -6041,7 +6149,9 @@ mod tests {
                 max_connections,
                 peer,
                 proxy_protocol,
+                reuse_port,
             } => {
+                assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert_eq!(max_connections, default_max_connections());
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
@@ -6240,7 +6350,9 @@ mod tests {
                 max_connections,
                 peer,
                 proxy_protocol,
+                reuse_port,
             } => {
+                assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
                 assert_eq!(bind, "0.0.0.0:5514");
@@ -6305,7 +6417,9 @@ mod tests {
                 peer,
                 proxy_protocol,
                 forwarded,
+                reuse_port,
             } => {
+                assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert_eq!(bind, "0.0.0.0:4317");
                 assert_eq!(protocol, OtlpProtocol::Grpc);
                 assert_eq!(tls, None);
@@ -6429,7 +6543,9 @@ mod tests {
                 peer,
                 proxy_protocol,
                 forwarded,
+                reuse_port,
             } => {
+                assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert_eq!(socket_mode, None);
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
@@ -6470,7 +6586,9 @@ mod tests {
                 peer,
                 proxy_protocol,
                 forwarded,
+                reuse_port,
             } => {
+                assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert_eq!(bind, "0.0.0.0:8088");
                 assert_eq!(tls, None);
                 assert!(tokens.is_empty());
@@ -6601,7 +6719,9 @@ mod tests {
                 handshake_timeout,
                 idle_timeout,
                 max_connections,
+                reuse_port,
             } => {
+                assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert_eq!(bind, "0.0.0.0:5140");
                 assert_eq!(tls, None);
                 assert_eq!(max_frame_bytes, None);
@@ -7085,7 +7205,9 @@ mod tests {
                 timeout,
                 headers,
                 endpoint_tls,
+                reuse_port,
             } => {
+                assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert_eq!(bind.as_deref(), Some("127.0.0.1:9464"));
                 assert_eq!(path, "/metrics");
                 assert_eq!(
@@ -7788,7 +7910,9 @@ mod tests {
                 peer,
                 proxy_protocol,
                 forwarded,
+                reuse_port,
             } => {
+                assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert_eq!(max_connections, default_max_connections());
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
@@ -8088,7 +8212,9 @@ mod tests {
                 peer,
                 proxy_protocol,
                 socket_mode,
+                reuse_port,
             } => {
+                assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert!(!peer, "opt-in -- no peer address unless asked for");
                 assert!(!proxy_protocol, "opt-in -- no PROXY header unless asked for");
                 assert_eq!(socket_mode, None);
@@ -8196,6 +8322,46 @@ mod tests {
         }
     }
 
+    /// `reuse_port:` parses on every kind that binds a port and defaults to off.
+    #[test]
+    fn reuse_port_parses_on_every_kind_that_binds_a_port_and_defaults_off() {
+        for kind in [
+            "statsd_in",
+            "syslog_in",
+            "graphite_in",
+            "lines_in",
+            "collectd_in",
+            "otlp_in",
+            "datadog_in",
+            "datadog_trace_in",
+            "splunk_hec_in",
+            "logit_in",
+            "prometheus_in",
+            "prometheus_out",
+        ] {
+            for (extra, expected) in [("", false), (r#", "reuse_port": true"#, true)] {
+                let json = format!(r#"{{"type": "{kind}", "bind": "0.0.0.0:9000"{extra}}}"#);
+                let component: Component = serde_json::from_str(&json).unwrap();
+                let reuse_port = match component.kind {
+                    ComponentKind::StatsdIn { reuse_port, .. }
+                    | ComponentKind::SyslogIn { reuse_port, .. }
+                    | ComponentKind::GraphiteIn { reuse_port, .. }
+                    | ComponentKind::LinesIn { reuse_port, .. }
+                    | ComponentKind::CollectdIn { reuse_port, .. }
+                    | ComponentKind::OtlpIn { reuse_port, .. }
+                    | ComponentKind::DatadogIn { reuse_port, .. }
+                    | ComponentKind::DatadogTraceIn { reuse_port, .. }
+                    | ComponentKind::SplunkHecIn { reuse_port, .. }
+                    | ComponentKind::LogitIn { reuse_port, .. }
+                    | ComponentKind::PrometheusIn { reuse_port, .. }
+                    | ComponentKind::PrometheusOut { reuse_port, .. } => reuse_port,
+                    other => panic!("unexpected kind {other:?}"),
+                };
+                assert_eq!(reuse_port, expected, "for {json}");
+            }
+        }
+    }
+
     /// A typo'd key fails to parse rather than being dropped.
     #[test]
     fn lines_in_rejects_an_unknown_field() {
@@ -8224,7 +8390,9 @@ mod tests {
                 peer,
                 proxy_protocol,
                 socket_mode,
+                reuse_port,
             } => {
+                assert!(!reuse_port, "opt-in -- no SO_REUSEPORT unless asked for");
                 assert_eq!(socket_mode, None);
                 assert_eq!(max_connections, default_max_connections());
                 assert!(!peer, "opt-in -- no peer address unless asked for");

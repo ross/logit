@@ -192,6 +192,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, Telemetry};
+use logit_pipeline::listen::BindOptions;
 use logit_pipeline::Fanout;
 use logit_proto::otlp::grpc::{self, InflateError};
 use logit_proto::otlp::OtlpDecoder;
@@ -259,6 +260,8 @@ pub struct OtlpInput {
     max_connections: usize,
     /// `peer:` in config. See [`Self::with_peer`].
     peer: bool,
+    /// Socket options set before the bind (`reuse_port:`).
+    bind_options: BindOptions,
     /// `proxy_protocol:` in config. See [`Self::with_proxy_protocol`].
     proxy_protocol: bool,
     /// `forwarded:` in config. See [`Self::with_forwarded`].
@@ -278,6 +281,7 @@ impl OtlpInput {
             idle_timeout: None,
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             peer: false,
+            bind_options: BindOptions::default(),
             proxy_protocol: false,
             forwarded: None,
         }
@@ -346,6 +350,13 @@ impl OtlpInput {
         self
     }
 
+    /// Sets `SO_REUSEPORT` before the bind (`reuse_port:` in config), so another process can bind
+    /// the same address at the same time. Off by default.
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.bind_options.reuse_port = reuse_port;
+        self
+    }
+
     /// Requires a PROXY protocol header ahead of every connection and stamps the origin it names
     /// (`proxy_protocol:` in config). Off by default. See this module's "Sender address" section.
     pub fn with_proxy_protocol(mut self, proxy_protocol: bool) -> Self {
@@ -367,7 +378,7 @@ impl Input for OtlpInput {
         if self.listener.is_some() {
             return Ok(()); // idempotent, per `Input::bind`'s contract
         }
-        let listener = TcpListener::bind(&self.bind).await?;
+        let listener = logit_pipeline::listen::bind_tcp(&self.bind, self.bind_options).await?;
         self.diag.info("bound", format_args!("listening on {}", self.bind));
         self.listener = Some(listener);
         Ok(())
@@ -1019,6 +1030,55 @@ mod tests {
         let addr = input.local_addr().expect("bind() should leave a real address behind");
         input.bind().await.expect("second bind should be a harmless no-op");
         assert_eq!(input.local_addr(), Some(addr), "the address must not change");
+    }
+
+    /// Two `reuse_port` listeners on one port both serve requests. The kernel hashes each
+    /// connection's 4-tuple to one of them, and each of the 64 connections comes from a fresh
+    /// source port, so a one-sided split has probability 2 × 2⁻⁶⁴. Every POST is answered
+    /// before the next is sent, so all 64 arrive.
+    #[tokio::test]
+    async fn two_reuse_port_listeners_on_one_port_both_deliver() {
+        use logit_pipeline::test_util::{fanout_channel, spawn_input, RECV_TIMEOUT};
+        const REQUESTS: usize = 64;
+
+        let mut a = OtlpInput::new("127.0.0.1:0", OtlpTransport::Http).with_reuse_port(true);
+        a.bind().await.expect("A should bind");
+        let addr = a.local_addr().expect("a bound listener has an address").to_string();
+        let b = OtlpInput::new(addr.clone(), OtlpTransport::Http).with_reuse_port(true);
+        let (fanout_a, mut rx_a) = fanout_channel(REQUESTS);
+        let (fanout_b, mut rx_b) = fanout_channel(REQUESTS);
+        let running_a = spawn_input(a, fanout_a).await;
+        let running_b = spawn_input(b, fanout_b).await;
+
+        let log_body = br#"{"resourceLogs": [{"scopeLogs": [{"logRecords": [{
+            "timeUnixNano": "1", "body": {"stringValue": "hi"}
+        }]}]}]}"#;
+        for _ in 0..REQUESTS {
+            let response = post_raw(
+                &addr,
+                "/v1/logs",
+                "Content-Type: application/json\r\nConnection: close\r\n",
+                log_body,
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        }
+
+        let (mut got_a, mut got_b) = (0, 0);
+        let all_arrived = tokio::time::timeout(RECV_TIMEOUT, async {
+            while got_a + got_b < REQUESTS {
+                tokio::select! {
+                    Some(d) = rx_a.recv() => got_a += logit_pipeline::unwrap_batch(d).events.len(),
+                    Some(d) = rx_b.recv() => got_b += logit_pipeline::unwrap_batch(d).events.len(),
+                }
+            }
+        })
+        .await;
+        assert!(all_arrived.is_ok(), "only {got_a} + {got_b} of {REQUESTS} requests arrived");
+        assert_eq!(got_a + got_b, REQUESTS);
+        assert!(got_a > 0 && got_b > 0, "both listeners should serve some, got {got_a}, {got_b}");
+        running_a.stop().await;
+        running_b.stop().await;
     }
 
     fn fanout_into_channel() -> (Fanout, mpsc::Receiver<logit_pipeline::Delivered>) {

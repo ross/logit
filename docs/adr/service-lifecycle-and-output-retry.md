@@ -1,6 +1,6 @@
 ---
 created: 2026-08-30
-updated: 2026-10-05
+updated: 2026-10-07
 ---
 
 # Service lifecycle: signal-driven shutdown and bounded output retry
@@ -248,3 +248,10 @@ SIGTERM/SIGINT drain and the second-signal exit `130` above are unchanged. That 
 things: every handler is installed before `config::load`, so a signal during startup is acted on
 once the pipeline runs, and SIGHUP reopens `stdio_out`'s and `file_out`'s file targets instead of
 ending the process. A SIGHUP doesn't count toward the second-signal exit.
+
+## Amendment: a delay before the drain (2026-10-07)
+
+[ADR `listener-port-sharing-and-shutdown-delay`](listener-port-sharing-and-shutdown-delay.md),
+decision 3, adds a top-level `shutdown.delay`, `0s` by default. With a delay set, the first SIGTERM
+or SIGINT flips `/readyz` to draining at once and the listeners keep reading for the delay before
+the drain above starts. The cancel-by-drop drain and the second-signal exit `130` are unchanged.

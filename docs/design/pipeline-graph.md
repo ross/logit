@@ -397,6 +397,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 78. A `socket_mode` on a `statsd_in`/`lines_in` under `transport: tcp`/`udp`, or on a
     `datadog_trace_in` without `socket`.
 79. `proxy_protocol: true` on a listener whose transport isn't `tcp`.
+80. `reuse_port: true` on a Unix-socket transport, on a multicast `bind`, or on a
+    `datadog_trace_in` without `bind`.
 81. An `admin.socket_mode` without `admin.socket`, an empty `admin.bind` or `admin.socket`, or an
     `admin.bind` that is a path.
 
@@ -465,7 +467,7 @@ component is one that appears in several `sources` lists, with nothing to specia
   turn. With `shutdown.delay` set and the process `Ready` at the signal, the runtime's shutdown
   driver reports draining at the signal, waits out the delay with every listener still running,
   and only then sends the shutdown that starts the cascade and every `shutdown_grace` timer
-  (ADR `listener-port-sharing-and-shutdown-delay`).
+  ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)).
 
 ### Thread model: only Lua needs its own OS thread
 

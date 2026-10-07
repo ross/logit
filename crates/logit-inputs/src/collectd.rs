@@ -123,6 +123,13 @@ impl CollectdInput {
         self
     }
 
+    /// Sets `SO_REUSEPORT` on the socket (`reuse_port:`); see [`UdpListener::with_reuse_port`].
+    /// Off by default.
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.inner = self.inner.with_reuse_port(reuse_port);
+        self
+    }
+
     /// The configured `receive:` knobs, for `logit-cli::pipeline`'s wiring tests.
     pub fn receive_config(&self) -> UdpListenerConfig {
         self.inner.config()

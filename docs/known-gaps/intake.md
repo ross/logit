@@ -48,7 +48,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
 - **One reader per UDP listener.** A single read loop is one core's worth of read capacity.
   `SO_REUSEPORT` lets several sockets share one port, with the kernel load-balancing datagrams
   across them: gostatsd's `--max-readers` (default `min(8, NumCPU)`), rsyslog's per-listener thread
-  count (capped at 32). `logit` doesn't build this.
+  count (capped at 32). `logit` builds the cross-process form only: `reuse_port: true` lets two
+  `logit` processes, one socket each, share a port for a rolling overlap
+  ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)).
+  Several readers on one port inside one process is still not built.
   - The batched `recvmmsg(2)` read raised the single-reader ceiling
     ([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)'s
     sweep), so whether one reader is still the bottleneck is now measurable rather than assumed.
@@ -174,6 +177,16 @@ Entry format and the other areas: [the known-gaps index](README.md).
   Both need a downstream that stays full for the whole grace (5 s by default). Counting them would
   need an event-level drop counter on the accumulator and a per-consumer delivery record in
   `Fanout`, for a loss the grace already bounds.
+- **A multicast `collectd_in` is delivered to every overlapping instance.** Every socket joined to
+  a multicast group receives every datagram, whatever `SO_REUSEADDR` or `SO_REUSEPORT` it sets
+  (measured: 1000 of 1000 at each of two members), and the multicast bind already sets
+  `SO_REUSEADDR`, so two overlapping `logit` instances both bind and both receive.
+  - **Consequence:** during a rolling overlap, every value list reaches both instances, and a
+    downstream count or sum doubles until the old one exits.
+  - **Workaround:** none beyond not overlapping multicast listeners: stop the old instance before
+    the new one starts. `reuse_port` is refused on a multicast `bind:`, because there's nothing for
+    it to share
+    ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)).
 
 ## TLS and connection lifecycle
 
@@ -290,6 +303,21 @@ Entry format and the other areas: [the known-gaps index](README.md).
     [ADR `deployment-threat-model`](../adr/deployment-threat-model.md).
   - **Revisit trigger:** a public listener, or an operator seeing memory pressure from concurrent
     large requests.
+- **A closing TCP listener resets its accept queue unless `net.ipv4.tcp_migrate_req=1`.** When a
+  stream listener under `reuse_port: true` closes, the kernel resets every connection sitting in
+  its accept queue, connections whose client already saw `connect()` succeed and may have sent
+  data. With `net.ipv4.tcp_migrate_req=1` (Linux 5.14 and later) the kernel moves them to a
+  surviving member of the group instead (measured: resets equal to the queue length, up to a full
+  backlog of 128, under `=0`; zero in 12 runs under `=1`). `logit` keeps accepting until the
+  instant it closes, so its queue is near empty and the exposure is the few connections that
+  complete a handshake in between
+  ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md),
+  decision 2).
+  - **Consequence:** a client whose connection was reset reconnects and resends; a line it had sent
+    into the reset connection is lost unless its protocol acknowledges.
+  - **Workaround:** set `net.ipv4.tcp_migrate_req=1` on the node. A pod can't set it: under
+    `hostNetwork` it's the node's own network namespace, and a `hostNetwork` pod can't set network
+    sysctls.
 - **A request handler blocked forever in a `Fanout` send holds its connection and permit.** A
   handler parked on a full downstream is backpressure, not idleness, so neither `idle_timeout` nor
   the grace after it closes the connection. It ends when the send completes or the client goes

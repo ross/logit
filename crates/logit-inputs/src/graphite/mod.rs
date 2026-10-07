@@ -305,6 +305,16 @@ impl GraphiteInput {
         self
     }
 
+    /// Sets `SO_REUSEPORT` on the listening socket (`reuse_port:`); see
+    /// [`UdpListener::with_reuse_port`] and [`TcpListener::with_reuse_port`]. Off by default.
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(listener.with_reuse_port(reuse_port)),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_reuse_port(reuse_port)),
+        };
+        self
+    }
+
     /// Requires a PROXY protocol header on every TCP connection (`proxy_protocol:`); see
     /// [`TcpListener::with_proxy_protocol`]. A UDP listener is left untouched, and graph rule 79
     /// rejects the option there.
