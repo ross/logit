@@ -143,9 +143,9 @@ A second SIGTERM or SIGINT during the delay exits `130` at once, as it does duri
 that fails during the delay starts the drain at once. A process that never reported ready skips
 the delay: it was never in an endpoint set, so there's no traffic to move away from it, and holding
 its ports would only slow a failed rollout down. The shutdown driver decides this from the
-readiness phase when it acts on the signal, so a signal held through a fast startup can still wait
-the delay, a gap recorded in [the runtime gaps](../known-gaps/runtime.md). The `drain complete`
-line's `duration` excludes the delay, so it keeps measuring the drain alone.
+readiness phase when it acts on the signal, so a signal that arrives as startup reports ready can
+still wait the delay, a gap recorded in [the runtime gaps](../known-gaps/runtime.md). The
+`drain complete` line's `duration` excludes the delay, so it keeps measuring the drain alone.
 
 The delay covers the time the orchestrator needs to stop sending. Kubernetes withdraws a
 terminating pod's endpoint without waiting for a probe, so the delay is sized by how long that
@@ -247,8 +247,8 @@ not defended.
   resets its accept queue unless `net.ipv4.tcp_migrate_req=1`, a closing UDP socket loses its
   kernel receive queue uncounted, and a multicast UDP listener is delivered to every overlapping
   instance. "One reader per UDP listener" narrows to the in-process form. In
-  [runtime gaps](../known-gaps/runtime.md): a signal held through a fast startup can still wait
-  the shutdown delay.
+  [runtime gaps](../known-gaps/runtime.md): a signal that arrives as startup reports ready can
+  still wait the shutdown delay.
 - **Earlier records**:
   [ADR `udp-intake-batching-and-socket-visibility`](udp-intake-batching-and-socket-visibility.md)
   and [ADR `decoupled-listener-io`](decoupled-listener-io.md) keep in-process fan-in out of scope

@@ -433,8 +433,8 @@ What an operator sees in the graphs:
 - **An `aggregate` window splits.** A flow that moves mid-window has that window summed in both
   processes, and each emits a partial value for the same series.
 - **A multicast UDP listener, such as `collectd_in`, is received by both pods**, so a downstream
-  count doubles for the overlap. To avoid it, roll a multicast agent with the DaemonSet default, `maxSurge: 0`, which
-  stops the old pod before the new one starts.
+  count doubles for the overlap. To avoid it, roll a multicast agent with the DaemonSet default,
+  `maxSurge: 0`, which stops the old pod before the new one starts.
 - **A `prometheus_out` exposition answers from whichever process the scrape reaches**, so
   successive scrapes can alternate between them, and a counter can look reset.
 - **Long-lived connections stay with the old process** until its drain closes them: a `logit_out`
@@ -468,8 +468,10 @@ the idle instance, wait until `logit ready --admin unix:/run/logit-b/admin.sock`
 stop the running one. Each instance gets its own admin socket by reading the path from the
 environment, `admin: { socket: !env LOGIT_ADMIN_SOCKET }`. A sink's `buffer.disk:` spool belongs
 to one process at a time, so a second instance opening the same directory exits `2`; give each
-instance its own the same way, `buffer: { disk: { path: !env LOGIT_SPOOL_DIR } }`. A spool left by
-a stopped instance replays when that instance next starts. The template's relevant lines:
+instance its own the same way, `buffer: { disk: { path: !env LOGIT_SPOOL_DIR } }`. `!env`
+substitutes the whole value and two sinks can't share a spool directory, so use one variable per
+spooling sink, such as `LOGIT_SPOOL_DIR_INFLUX`. A spool left by a stopped instance replays when
+that instance next starts. The template's relevant lines:
 
 ```ini
 [Service]
