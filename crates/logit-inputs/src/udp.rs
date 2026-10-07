@@ -486,8 +486,7 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         self.bind().await?;
-        let socket = self.socket.take().expect("bind() leaves a socket behind");
-        match &socket {
+        match self.socket.take().expect("bind() leaves a socket behind") {
             BoundSocket::Udp(socket) => self.drive(socket, sink, shutdown).await,
             BoundSocket::Unix(socket) => self.drive(socket, sink, shutdown).await,
         }
@@ -496,9 +495,13 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
 
 impl<D: Decoder + Send> UdpListener<D> {
     /// [`Input::run_until_shutdown`]'s body over either socket family.
+    ///
+    /// `socket` moves into `read` and closes when `read` finishes, before `decode` drains the
+    /// queue: a closed socket leaves its `SO_REUSEPORT` group at once, so the kernel hashes its
+    /// flows to the surviving members instead of queueing them on a socket nobody reads.
     async fn drive<S: DatagramSocket>(
         &mut self,
-        socket: &S,
+        socket: S,
         sink: Fanout,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
@@ -1608,8 +1611,8 @@ const KERNEL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// **The final sample runs on every path [`sample_while`] returns on.** Drops in the last fraction
 /// of a second before a fatal socket error or a shutdown are the likeliest to exist, since a
-/// listener usually stops because something went wrong. The socket is still open then (owned by
-/// `run_until_shutdown`, which outlives this future), so the counters are readable.
+/// listener usually stops because something went wrong. This future owns the socket and drops it
+/// only after the final sample, so the counters are readable.
 ///
 /// It is **not** unconditional. One path skips it: `run_input`'s grace backstop
 /// (`logit_pipeline::runtime`, the `shutdown_grace_expired` arm of its `select!`) drops this
@@ -1631,7 +1634,7 @@ const KERNEL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// The `select!`'s arm ordering matters; see [`sample_while`].
 async fn read_loop_sampled<S: DatagramSocket>(
-    socket: &S,
+    socket: S,
     queue: Arc<ReceiveQueue>,
     telemetry: Telemetry,
     diag: Diagnostics,
@@ -1639,8 +1642,8 @@ async fn read_loop_sampled<S: DatagramSocket>(
     read_batch: usize,
     peer: bool,
 ) -> anyhow::Result<()> {
-    let sampler = ReceiveBufferSampler::new(socket, telemetry.clone(), diag.clone());
-    let read = read_loop(socket, queue, telemetry, diag, shutdown, read_batch, peer);
+    let sampler = ReceiveBufferSampler::new(&socket, telemetry.clone(), diag.clone());
+    let read = read_loop(&socket, queue, telemetry, diag, shutdown, read_batch, peer);
     sample_while(sampler, read, KERNEL_SAMPLE_INTERVAL).await
 }
 
@@ -1729,8 +1732,8 @@ where
 struct ReceiveBufferSampler {
     /// The listener socket's descriptor, captured once. `None` only on a platform with no raw
     /// descriptors, where [`logit_pipeline::sockstat`] reports nothing anyway. A bare fd rather
-    /// than a borrow is safe: this sampler lives inside [`read_loop_sampled`], whose `socket`
-    /// argument outlives it.
+    /// than a borrow is safe: this sampler lives inside [`read_loop_sampled`], which owns the
+    /// socket and drops it after the sampler.
     fd: Option<sockstat::RawFd>,
     drops: sockstat::DropCounter,
     telemetry: Telemetry,
@@ -2177,6 +2180,123 @@ mod tests {
             .expect("task should not panic")
             .expect("should shut down without error");
         assert!(rx.try_recv().is_err(), "nothing was ever sent, so nothing should be delivered");
+    }
+
+    /// Datagrams the close-before-drain tests queue behind a downstream nobody reads.
+    const PARKED_BACKLOG: usize = 8;
+
+    /// The payloads `msg-0` to `msg-{PARKED_BACKLOG - 1}`, sorted, for comparing against what
+    /// arrived.
+    fn parked_backlog_payloads() -> Vec<String> {
+        let mut payloads: Vec<String> = (0..PARKED_BACKLOG).map(|i| format!("msg-{i}")).collect();
+        payloads.sort();
+        payloads
+    }
+
+    /// Receives until every backlog datagram has arrived, skipping any probe a test sent, and
+    /// returns the backlog payloads sorted.
+    async fn recv_parked_backlog(
+        rx: &mut mpsc::Receiver<logit_pipeline::Delivered>,
+    ) -> Vec<String> {
+        let mut payloads = Vec::new();
+        while payloads.len() < PARKED_BACKLOG {
+            let batch = logit_pipeline::test_util::recv_batch(rx).await;
+            payloads.extend(batch.events.iter().map(payload).filter(|p| p.starts_with("msg-")));
+        }
+        payloads.sort();
+        payloads
+    }
+
+    /// On shutdown the UDP socket closes while `decode_loop` is still parked on a full
+    /// downstream, and the queued backlog is still delivered in full once downstream drains. A
+    /// socket that closes at once leaves its `SO_REUSEPORT` group at once.
+    ///
+    /// A plain bind of the listener's address, with no `SO_REUSEPORT`, succeeds only once the
+    /// listener's socket is gone.
+    #[tokio::test]
+    async fn shutdown_closes_the_udp_socket_before_the_queue_drains() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let mut listener =
+            UdpListener::new("127.0.0.1:0", TestDecoder::new(), one_event_per_datagram())
+                .with_telemetry(probe.telemetry("statsd_in", "statsd_in", "listener"));
+        listener.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = listener.local_addr().expect("a bound UDP listener has an address");
+        // Capacity 1 and not read until the end: `decode_loop` delivers one event and parks on
+        // the next send.
+        let (fanout, mut rx) = fanout_channel(1);
+        let running = spawn_input(listener, fanout).await;
+        for i in 0..PARKED_BACKLOG {
+            send_datagram(addr, format!("msg-{i}").as_bytes()).await;
+        }
+        probe
+            .wait_for("the whole backlog to be read off the socket", |totals| {
+                totals.sum("logit.input.datagrams", &[]) == PARKED_BACKLOG as f64
+            })
+            .await;
+
+        running.shutdown.send(true).expect("the listener should still be running");
+        logit_pipeline::test_util::wait_until("the listener's socket to close", || {
+            std::net::UdpSocket::bind(addr).is_ok()
+        })
+        .await;
+        assert!(
+            !running.handle.is_finished(),
+            "the premise: the run is still parked on the full downstream, so the socket closed \
+             before the drain finished"
+        );
+
+        assert_eq!(recv_parked_backlog(&mut rx).await, parked_backlog_payloads());
+        running.stop().await;
+    }
+
+    /// [`shutdown_closes_the_udp_socket_before_the_queue_drains`] on a Unix datagram socket: a
+    /// send to the path is refused once nothing holds the socket.
+    #[tokio::test]
+    async fn shutdown_closes_the_unix_datagram_socket_before_the_queue_drains() {
+        let path = scratch_dir("udp-close-before-drain-unix").join("listen.sock");
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let listener = UdpListener::unix(
+            "statsd_in",
+            &path,
+            0o660,
+            TestDecoder::new(),
+            one_event_per_datagram(),
+        )
+        .with_telemetry(probe.telemetry("statsd_in", "statsd_in", "listener"));
+        let (fanout, mut rx) = fanout_channel(1);
+        let running = spawn_input(listener, fanout).await;
+        let client = tokio::net::UnixDatagram::unbound().expect("an unbound client socket");
+        for i in 0..PARKED_BACKLOG {
+            client.send_to(format!("msg-{i}").as_bytes(), &path).await.expect("send_to");
+        }
+        probe
+            .wait_for("the whole backlog to be read off the socket", |totals| {
+                totals.sum("logit.input.datagrams", &[]) == PARKED_BACKLOG as f64
+            })
+            .await;
+
+        running.shutdown.send(true).expect("the listener should still be running");
+        // Non-blocking: while the socket is open and unread, its queue fills and a blocking send
+        // would wait instead of failing.
+        let prober = std::os::unix::net::UnixDatagram::unbound().expect("an unbound probe socket");
+        prober.set_nonblocking(true).expect("set_nonblocking");
+        logit_pipeline::test_util::wait_until(
+            "a send to the listener's path to be refused",
+            || {
+                prober
+                    .send_to(b"probe", &path)
+                    .is_err_and(|err| err.kind() == std::io::ErrorKind::ConnectionRefused)
+            },
+        )
+        .await;
+        assert!(
+            !running.handle.is_finished(),
+            "the premise: the run is still parked on the full downstream, so the socket closed \
+             before the drain finished"
+        );
+
+        assert_eq!(recv_parked_backlog(&mut rx).await, parked_backlog_payloads());
+        running.stop().await;
     }
 
     // -- `Input::bind`/`local_addr` --
@@ -2883,7 +3003,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let sampled = read_loop_sampled(
-            &socket,
+            socket,
             Arc::clone(&queue),
             telemetry.clone(),
             Diagnostics::default(),

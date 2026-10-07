@@ -421,13 +421,11 @@ What an operator sees in the graphs:
   and port) to one process and never splits it. When the new pod joins, about half the flows move
   to it, with no loss; when the old pod closes, its flows move to the new one. The split is
   uneven: one measured run sent 2000 datagrams to one process and 6000 to the other.
-- **The old pod's close loses what reaches its socket after it stops reading.** When the drain
-  starts, a UDP listener stops reading, but its socket stays bound until the listener has decoded
-  what it already queued. Flows the kernel still sends to that socket pile up unread and are
-  discarded at the close, with no `logit` counter recording them. With a reader keeping up at 50k
-  datagrams/s, that was 0 to 85 datagrams per close; a stalled reader can lose a full
-  `SO_RCVBUF`. `shutdown.delay` doesn't shrink this window, because the listener keeps reading
-  through the delay and the window opens only when the drain starts.
+- **The old pod's close loses what sits in its socket's kernel queue.** When the drain starts, a
+  UDP listener stops reading and closes its socket at once, so its flows move to the new pod
+  while it decodes what it already queued. Whatever the kernel held for the socket at the close
+  is discarded, with no `logit` counter recording it. A reader that keeps up holds that queue near
+  empty; a reader stalled under `overflow: block` can lose a full `SO_RCVBUF`.
 - **Per-socket counters cover one process each.** `logit.input.kernel.drops` and the
   `receive_buffer.*` and `accept_queue.*` gauges describe each pod's own socket, not the port.
 - **An `aggregate` window splits.** A flow that moves mid-window has that window summed in both

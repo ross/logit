@@ -75,10 +75,21 @@ the record.
     the senders stopped, so its zero loss in all three runs says nothing about loss at a close
     under load.
   - With the default `0s` delay, the only arm that closed under load, the loss was 0, 0, and 85
-    datagrams: what reached the socket after its read loop stopped and before it closed, which
-    no `logit` counter sees. `logit.input.kernel.drops` counts drops on a full buffer, not a
-    queue discarded at close. A delay doesn't shrink that window; it opens when the drain
-    starts.
+    datagrams, which no `logit` counter sees. `logit.input.kernel.drops` counts drops on a full
+    buffer, not a queue discarded at close. That build kept the socket open, unread, until the
+    listener had drained its receive queue in user space; the listener now closes the socket
+    when its read loop stops, before that drain (ADR `decoupled-listener-io`'s
+    [2026-10-07 amendment](decoupled-listener-io.md#amendment-the-socket-closes-before-the-queue-drains-2026-10-07)).
+    Rerun 23 times per build, alternating builds, this arm lost a few datagrams in some runs of
+    each and couldn't tell them apart: the build that drains first lost 26 in all (in 4 runs,
+    at most 17), the build that closes first 50 (in 6 runs, at most 16), and the 85 didn't
+    recur. With nothing slowing delivery the drain took about 0.5 ms, so the window that change
+    closes held next to nothing; what both builds lose is the socket's kernel queue at the
+    close.
+  - With a `lua` stage slowing delivery below the send rate, so the drain took 4 to 5 s, the
+    build that drains first lost 0, 0, 19236, 11459, and 26132 datagrams per close, uncounted,
+    and the build that closes first lost 0 in all five runs (loss here is sent minus the two
+    processes' `logit.input.datagrams`, so the counted `overflow_oldest` evictions are excluded).
   - With `reuse_port` left off, the second process exited `1` with `Address already in use`.
 
 ## Decision

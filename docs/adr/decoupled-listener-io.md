@@ -419,3 +419,26 @@ are removed with no alias. A listener's `run_until_shutdown` override drains unt
 or `run_input`'s backstop drops it; it doesn't time itself. The same ADR's decision 6 makes
 `run_input`'s `select!` `biased` toward the listener, so a listener's error that is ready in the
 same poll as the backstop is returned, not discarded.
+
+## Amendment: the socket closes before the queue drains (2026-10-07)
+
+"`UdpListener<D: Decoder>`" above drives the read half to completion and the decode half after it,
+but `run_until_shutdown` held the socket until both had returned. On shutdown the read half
+stopped reading at once while the socket stayed open for the whole user-space drain. In an
+`SO_REUSEPORT` group that open, unread socket still took its share of the port's flows, and the
+kernel discarded them when the socket finally closed, uncounted. The loss grows with the drain:
+next to nothing when delivery keeps up and the drain takes about 0.5 ms, and up to 26132
+datagrams per close at 50k datagrams/s when a slow stage stretched it to 4 to 5 s
+([ADR `listener-port-sharing-and-shutdown-delay`](listener-port-sharing-and-shutdown-delay.md)'s
+check against `logit`).
+
+The read half now owns the socket and drops it when it returns, after the final kernel-counter
+sample that
+[ADR `udp-intake-batching-and-socket-visibility`](udp-intake-batching-and-socket-visibility.md)
+requires. The decode half drains the queue after the close, as before. The kernel removes the
+socket from its group at the close and re-hashes its flows to the surviving members, so the loss
+left is what sat in the socket's kernel receive queue at that instant
+([`docs/known-gaps/intake.md`'s "UDP intake" section](../known-gaps/intake.md#udp-intake)). A Unix
+datagram socket goes through the same path; closing it earlier means a sender gets `ECONNREFUSED`
+sooner. The three properties above are unchanged: the read half still closes the queue, and the
+decode half still flushes last.
