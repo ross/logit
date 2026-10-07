@@ -423,6 +423,7 @@ Dotted, lowercase, and namespaced by where the metric comes from:
 |---|---|
 | `logit.component.*` | The uniform set every component gets from the runtime (layer 2, below). |
 | `logit.<kind-family>.*` | Component-specific detail (layer 3), for example `logit.input.datagrams` and `logit.output.requests`. |
+| `logit.tls.*` | A TLS component's certificate files: reloads and the expiry of the certificate it serves. See [TLS certificate reload](#tls-certificate-reload). |
 | `logit.process.*` | Facts about the running process, not any one component. They ride on `internal`'s own `component`/`kind`/`role`; see [Process-level metrics](#process-level-metrics). |
 | `logit.internal.*` | Facts about the `internal` component itself, including `logit.internal.points.dropped`, which names the *offending* component through its `component` attribute, not through the metric name. |
 
@@ -726,7 +727,8 @@ refusal), and `accept_error` (any `accept.errors` reason). These keys
 and the decoder's own `bad_line` throttle listener-wide rather than per connection, because a `Diagnostics` clone shares its original's
 counts ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md)'s
 2026-09-14 amendment). A peer looping connect / bad frame / close is throttled like any other
-repeated failure instead of warning once per TCP handshake. No TCP listener has a TLS-specific
+repeated failure instead of warning once per TCP handshake. Apart from the certificate reload's
+points ([TLS certificate reload](#tls-certificate-reload)), no TCP listener has a TLS-specific
 metric: a handshake failure surfaces as `connection_error`.
 
 `logit.input.accept.errors{reason}` and the `accept_error` key are not the driver's alone. Every
@@ -736,6 +738,22 @@ this driver's TCP and Unix sockets, `logit_in`, `otlp_in`, `prometheus_in`'s bin
 
 There's no stream counterpart of `logit.input.reads`: a stream listener's reads aren't
 message-aligned, so a read count over a frame count wouldn't be a fill ratio of anything.
+
+#### TLS certificate reload
+
+Every listener with a `tls:` block (`bind_tls:` on `prometheus_in`) registers its files with the
+process's one `TlsReloader` (`crates/logit-pipeline/src/tls.rs`), which records these under the
+owning component:
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.tls.reloads{outcome="reloaded"\|"failed"}` | count | a check found new content in the component's files and loaded it, or failed to and kept serving the previous files. The same failed content counts once, not once per check |
+| `logit.tls.certificate.not_after{side="server"}` | gauge | the `notAfter` of the leaf certificate being served, in unix seconds. Emitted at startup and after a reload, and re-emitted every second from a cached value, as [`receive_buffer.bytes` is](#tcp-listeners-the-kernel-accept-queue), so it never drops out of the series. Left out if the certificate's validity can't be read. Alert on it approaching now: it's what catches a renewal that never reached the files |
+
+The tag is `side`, not `role`: `role` is reserved for the component's own identity.
+
+Its `Diagnostics` keys: `tls_reloaded` (at `info`, unthrottled, naming the files and the new
+certificate's expiry) and `tls_reload_failed` (throttled, naming the file and why it failed).
 
 #### Inputs
 
