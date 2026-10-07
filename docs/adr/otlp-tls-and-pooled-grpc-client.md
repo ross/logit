@@ -141,7 +141,8 @@ An operator reaching a privately-CA'd endpoint sets `tls.ca_file` explicitly.
   existing plaintext and gzip round trips.
 - `docs/known-gaps/otlp.md`'s "`otlp_out` has no gRPC TLS" and "opens a fresh connection per
   request" entries are retired; "certificates are loaded once at startup" and "no `server_name`
-  override" are filed as new, smaller ones.
+  override" are filed as new, smaller ones. The first has since closed
+  ([ADR `tls-certificate-reload`](tls-certificate-reload.md)).
 
 ## Amendment: `otlp_in` rejects at the cap and bounds a plaintext connection's first byte (2026-09-14)
 

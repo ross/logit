@@ -28,12 +28,11 @@ preserves.
   graph ([Signal and restart behavior](../deploying.md#signal-and-restart-behavior)). That order is
   right under a supervisor that restarts the process and wrong in Kubernetes without a `preStop`
   delay, where a pod should keep reading its sockets until the Service's endpoints have moved.
-- **Certificates load once at construction.** Every TLS listener holds one
-  `Arc<rustls::ServerConfig>` built by `logit_inputs::tls::build_server_config` and wraps it in a
-  `TlsAcceptor` once. Every TLS sink builds a `rustls::ClientConfig` through
-  `logit_outputs::tls::build_client_config`; the HTTP sinks hand theirs to `reqwest` with
-  `use_preconfigured_tls`. Only `prometheus_in`'s scrape client takes PEM through `reqwest`'s own
-  builders (`apply_client_tls`). `docs/known-gaps/intake.md` has the entry.
+- **Certificates reload without a restart.** Every TLS listener, every TLS sink, and
+  `prometheus_in`'s scrape client build their rustls config once, through
+  `logit_pipeline::tls`, around swappable certificate and verifier pieces. A process-wide poll and
+  SIGHUP check the files for new content
+  ([ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md)).
 - **Listener sockets bind from config, never from an inherited fd.** `udp.rs`'s `bind_one` goes
   through `socket2` and sets `SO_REUSEADDR` only for a multicast bind. `tcp.rs` binds through
   `tokio::net::TcpListener::bind` directly. `unix.rs` unlinks a stale socket path and binds fresh.

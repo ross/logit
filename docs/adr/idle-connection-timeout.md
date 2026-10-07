@@ -266,7 +266,8 @@ comment.
 - **W2** (`logit_in`, and the client-side probe on all four pooled sinks): `idle_timeout` on
   `LogitIn`, rule 53's fourth arm, the ack-driven idle clock and per-read body stall bound in
   `crates/logit-inputs/src/logit.rs` (including its `going_away` helper and module doc), and the
-  `poll_pending_close` probe added to `crates/logit-outputs/src/tls.rs` and called from
+  `poll_pending_close` probe added to `crates/logit-outputs/src/tls.rs` (since reduced to the probe
+  alone; the builders moved to `logit_pipeline::tls`) and called from
   `crates/logit-outputs/src/{logit,syslog,statsd,graphite}.rs` before each reused pooled connection's
   first write.
 - **W3** (`otlp_in`): `idle_timeout` on `OtlpIn`, rule 53's fifth and final arm, and the `Activity`

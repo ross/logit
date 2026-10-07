@@ -30,7 +30,9 @@ of scope -- see Alternatives.
 
 Everything this decision needs already exists in-tree and is reused, not re-decided:
 
-- Shared TLS builders: `crates/logit-inputs/src/tls.rs::build_server_config` and
+- Shared TLS builders (now `logit_pipeline::tls::build_server_config` and `build_client_config`,
+  per [ADR `tls-certificate-reload`](tls-certificate-reload.md)):
+  `crates/logit-inputs/src/tls.rs::build_server_config` and
   `crates/logit-outputs/src/tls.rs::build_client_config`, both `pub(crate)`, already used by
   `otlp_in`/`otlp_out` and `logit_in`/`logit_out`
   ([ADR `otlp-tls-and-pooled-grpc-client`](otlp-tls-and-pooled-grpc-client.md),
@@ -318,7 +320,8 @@ a differently-shaped metric for the same event.
   connection-error diagnostics and counters any other transport failure would.
 - `docs/known-gaps/syslog.md`: "`syslog_in` is UDP-only" and "`syslog_out` has no TLS" both close
   outright (the latter narrowed to DTLS, which stays open as its own row). Two existing rows
-  generalize rather than close: "TLS certificates are loaded once at startup" and "no `server_name`
+  generalize rather than close: "TLS certificates are loaded once at startup" (since closed by
+  [ADR `tls-certificate-reload`](tls-certificate-reload.md)) and "no `server_name`
   override," both currently scoped to `otlp_in`/`otlp_out`, now also describe
   `syslog_in`/`syslog_out` (and `logit_in`/`logit_out`), since none of those components' TLS
   construction differs in either respect. A new row: no idle-connection timeout on a TCP listener --
