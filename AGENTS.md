@@ -531,6 +531,10 @@ the operator-facing account of all of this.
   ([ADR `admin-readiness-endpoint`](docs/adr/admin-readiness-endpoint.md)).
 - **Startup binding**: `Input::bind` opens every listener's socket in a pre-pass *before* any
   task is spawned, so a bind failure fails startup with nothing else running.
+- **Rolling overlap**: `reuse_port`, `shutdown.delay`, and `admin.socket` together let two `logit`
+  processes share a port through an upgrade; [docs/deploying.md](docs/deploying.md)'s
+  "Overlapping two instances on one port" is the recipe
+  ([ADR `listener-port-sharing-and-shutdown-delay`](docs/adr/listener-port-sharing-and-shutdown-delay.md)).
 - **Exit codes**: `1` for a startup failure, `2` for a runtime failure after the process reported
   ready: a listener's loop dying, a Lua thread panicking, exceeding `max_memory`, or wedged
   across shutdown, or a sink whose `buffer.disk:` spool can't open or whose task panics. A failed

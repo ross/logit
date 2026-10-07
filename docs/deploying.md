@@ -104,14 +104,13 @@ error.
   withdrawn, so without a delay, clients routed to the pod in that window find its listeners
   closed. Size the delay to cover the time the endpoint removal takes to reach kube-proxy, ingress
   controllers, and external load balancers, plus, for anything that routes on its own probe of
-  `/readyz`, that probe's period times its failure threshold. A `preStop` hook
-  running `sleep` does the same job, but it needs a `sleep` binary in the image, which a
-  distroless build doesn't have, and it does nothing on a host or under systemd; the built-in
-  delay behaves the same everywhere. Set `terminationGracePeriodSeconds` to at least the delay plus
-  the largest `shutdown_grace` in the config, plus a few seconds' margin, or the kubelet's SIGKILL
-  cuts the drain short. The same budget applies to Docker's `--stop-timeout` and systemd's
-  `TimeoutStopSec=`. See
-  [ADR `listener-port-sharing-and-shutdown-delay`](adr/listener-port-sharing-and-shutdown-delay.md).
+  `/readyz`, that probe's period times its failure threshold. Set
+  `terminationGracePeriodSeconds` to at least the delay plus the largest `shutdown_grace` in the
+  config, plus a few seconds' margin, or the kubelet's SIGKILL cuts the drain short. The same
+  budget applies to Docker's `--stop-timeout` and systemd's `TimeoutStopSec=`.
+  [Overlapping two instances on one port](#overlapping-two-instances-on-one-port) puts the delay
+  into a rolling-upgrade recipe, with a `preStop` hook as the fallback where the delay can't be
+  used.
 - **SIGHUP reopens file outputs and never ends the process.** It logs `reopen signal received`
   with `config_reloaded=false`, and each `stdio_out`/`file_out` file target reopens its path
   before its next write; see
@@ -241,28 +240,10 @@ directory only this process uses, such as a pod's `emptyDir`.
 
 Use the socket when two `logit` processes share a network namespace, such as two Kubernetes
 `hostNetwork` pods that overlap during a rollout. They can't both bind one `admin.bind` port, and
-sharing it would let the kubelet's probe of one pod be answered by the other, so each would report
-the other's readiness
-([ADR `listener-port-sharing-and-shutdown-delay`](adr/listener-port-sharing-and-shutdown-delay.md)).
-A pod-local socket has neither problem. Probe it with an `exec` probe:
-
-```yaml
-containers:
-  - name: logit
-    env:
-      - name: LOGIT_ADMIN
-        value: unix:/run/logit/admin.sock
-    readinessProbe:
-      exec: { command: ["logit", "ready"] }
-      periodSeconds: 5
-    volumeMounts:
-      - { name: admin, mountPath: /run/logit }
-volumes:
-  - name: admin
-    emptyDir: {}
-```
-
-The same `LOGIT_ADMIN` makes the image's `HEALTHCHECK` probe the socket.
+sharing it would let the probe of one process be answered by the other. The kubelet can't probe a
+Unix socket over HTTP, so use an `exec` probe running `logit ready` with `LOGIT_ADMIN` set;
+[Overlapping two instances on one port](#overlapping-two-instances-on-one-port) has the full pod
+spec. The same `LOGIT_ADMIN` makes the image's `HEALTHCHECK` probe the socket.
 
 `GET /readyz` returns:
 
@@ -332,6 +313,168 @@ fails the probe instead of holding it open.
 - **`/readyz` never returning `200` within the orchestrator's startup timeout** means a listener,
   or a listening sink like `prometheus_out`, can't bind, or a Lua script fails to load. Check the
   `starting`/`bound`/`ready` lifecycle log lines in [Self-logging](#self-logging).
+
+## Overlapping two instances on one port
+
+A node-local UDP agent (a `statsd_in`, `syslog_in`, `collectd_in`, `graphite_in`, or `lines_in`
+that senders on the host write to) loses every datagram that arrives while nothing is bound to its
+port. A `systemctl restart` leaves that gap, and in a container world a new version is a new
+container, so no socket survives an upgrade. The only gap-free upgrade is two `logit` processes
+bound to the port at once: the new one starts and becomes ready, and only then does the old one
+stop. Two pods that each have their own network namespace never collide on a port, so this
+section is about pods with `hostNetwork: true` and about hosts. The design and the kernel
+measurements behind it are in
+[ADR `listener-port-sharing-and-shutdown-delay`](adr/listener-port-sharing-and-shutdown-delay.md).
+
+### The three settings
+
+- **`reuse_port: true` on every listener that binds a port.** Without it, the new process's bind
+  fails with an address-in-use error and it exits `1`. Both processes must set it and run as the
+  same effective user; [`reuse_port`](#reuse_port-two-processes-on-one-port) lists the kinds that
+  take it.
+- **`shutdown.delay`, sized to the orchestrator's endpoint withdrawal.** Senders that reach the
+  agent on the node's own address don't need it: the kernel moves the old process's flows to the
+  new one when its socket closes. Traffic routed to the pod through a Service keeps arriving until
+  the endpoint removal propagates, and the delay keeps the old process reading until then.
+  [Signal and restart behavior](#signal-and-restart-behavior) has how to size it.
+- **`admin.socket` instead of, or beside, `admin.bind`.** Don't share the admin port. Each probe
+  connection would reach whichever process the kernel picks, so the old pod could answer the new
+  pod's readiness probe, and the rollout would gate on the wrong process. A socket path inside each
+  pod reaches only that pod ([Probes and exit codes](#probes-and-exit-codes)).
+
+Only listeners share. A `buffer.disk:` spool belongs to one process at a time, so give each pod its
+own spool directory: a new pod that opens a spool the old pod still holds exits `2`. Two
+overlapping `tail_in` or `docker_in` listeners on the same files both deliver every line.
+
+### Kubernetes: a surging DaemonSet
+
+With `maxSurge: 1` and `maxUnavailable: 0`, a DaemonSet rollout starts the new pod on each node
+before it removes the old one, and removes the old one only once the new one is ready. DaemonSet
+`maxSurge` needs Kubernetes 1.22 or later.
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: logit
+spec:
+  selector:
+    matchLabels: { app: logit }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app: logit }
+    spec:
+      hostNetwork: true
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: logit
+          image: ghcr.io/ross/logit:latest
+          args: ["run", "/etc/logit/logit.yaml"]
+          env:
+            - name: LOGIT_ADMIN
+              value: unix:/run/logit/admin.sock
+          readinessProbe:
+            exec: { command: ["logit", "ready"] }
+            periodSeconds: 5
+            timeoutSeconds: 2
+          volumeMounts:
+            - { name: admin, mountPath: /run/logit }
+            - { name: config, mountPath: /etc/logit, readOnly: true }
+      volumes:
+        - { name: admin, emptyDir: {} }
+        - { name: config, configMap: { name: logit } }
+```
+
+The config sets `reuse_port: true` on each listener, `admin.socket: /run/logit/admin.sock`, and
+`shutdown.delay`. What the manifest doesn't show:
+
+- **Don't declare `ports:` on the container.** Under `hostNetwork`, every container port is also a
+  host port, and the scheduler won't place a second pod claiming the same host port on a node, so
+  the surge pod stays `Pending` and the rollout stops.
+- **Size `terminationGracePeriodSeconds` to the delay plus the largest `shutdown_grace`, plus a
+  margin.** With `delay: 10s` and the default 5 s grace, 30 s is enough. A shorter grace ends in
+  SIGKILL partway through the drain.
+- **Give the `exec` probe a `timeoutSeconds` of at least 2.** The default is 1 s, and `logit ready`
+  waits up to 10 s of its own for an answer.
+- **The `emptyDir` is per pod**, so both pods use the same socket path without colliding.
+
+Where `shutdown.delay` can't be used, such as an older `logit` image, a `preStop` hook can hold
+the signal back instead. It needs a `sleep` binary in the image, which a distroless image lacks,
+and its time counts against `terminationGracePeriodSeconds`:
+
+```yaml
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "10"] }
+```
+
+### What happens during the overlap
+
+What an operator sees in the graphs:
+
+- **Flows pin and move.** The kernel sends each sender's flow (its source and destination address
+  and port) to one process and never splits it. When the new pod joins, about half the flows move
+  to it, with no loss; when the old pod closes, its flows move to the new one. The split is
+  uneven: one measured run sent 2000 datagrams to one process and 6000 to the other.
+- **The old pod's close loses its own receive-queue backlog.** For a reader keeping up at 50k
+  datagrams/s, that was 11 to 14 datagrams; for a stalled one, a full `SO_RCVBUF`.
+- **Per-socket counters cover one process each.** `logit.input.kernel.drops` and the
+  `receive_buffer.*` and `accept_queue.*` gauges describe each pod's own socket, not the port.
+- **An `aggregate` window splits.** A flow that moves mid-window has that window summed in both
+  processes, and each emits a partial value for the same series.
+- **A multicast `collectd_in` is received by both pods**, so a downstream count doubles for the
+  overlap. To avoid it, roll a multicast agent with the DaemonSet default, `maxSurge: 0`, which
+  stops the old pod before the new one starts.
+- **A `prometheus_out` exposition answers from whichever process the scrape reaches**, so
+  successive scrapes can alternate between them, and a counter can look reset.
+- **Long-lived connections stay with the old process** until its drain closes them: a `logit_out`
+  connection to `logit_in`, an OTLP/gRPC stream, or an HTTP keep-alive connection. The client's
+  reconnect lands on the new process, and a `logit_out` resends its in-flight frames, which the
+  new `logit_in` forwards again.
+
+### TCP listeners and `tcp_migrate_req`
+
+When a listener closes, the kernel resets every connection in its accept queue: connections whose
+client already saw `connect()` succeed and may have sent data. With `net.ipv4.tcp_migrate_req=1`
+(Linux 5.14 and later), the kernel moves them to the surviving process instead. `logit` accepts
+until the instant it drops a listener, through the delay and the drain, so its queue is near empty
+at the close, and the sysctl matters only for connections that finish their handshake in that
+last instant. Every stream client `logit` serves reconnects after a reset.
+
+It's a node-level setting. A `hostNetwork` pod shares the node's network namespace and can't set
+network sysctls, so set it in the node image, from a privileged init DaemonSet, or through your
+distribution's node tuning:
+
+```sh
+sysctl -w net.ipv4.tcp_migrate_req=1    # persist it in /etc/sysctl.d/
+```
+
+### systemd: two instance units
+
+`systemctl restart` stops a unit before it starts it again, so the port is unbound in between, and
+`reuse_port` doesn't help. The overlap form is a template unit run as two instances,
+`logit@a.service` and `logit@b.service`, on one config with `reuse_port: true`. To upgrade, start
+the idle instance, wait until `logit ready --admin unix:/run/logit-b/admin.sock` succeeds, then
+stop the running one. Each instance gets its own admin socket by reading the path from the
+environment, `admin: { socket: !env LOGIT_ADMIN_SOCKET }`. The template's relevant lines:
+
+```ini
+[Service]
+User=logit
+RuntimeDirectory=logit-%i
+Environment=LOGIT_ADMIN_SOCKET=/run/logit-%i/admin.sock
+ExecStart=/usr/local/bin/logit run /etc/logit/logit.yaml
+TimeoutStopSec=30
+```
+
+`TimeoutStopSec=` must cover the delay plus the drain, as the termination grace does above. Both
+instances run as the same `User=`, which port sharing requires. Handing the listening sockets to a
+new process, so one unit could upgrade in place, isn't built; the
+[live reload and socket handover research note](plans/live-reload-and-socket-handover.md) has what
+was considered.
 
 ## Self-logging
 
@@ -1116,16 +1259,13 @@ exits `1`.
 
 While both processes are bound, the kernel picks one of them for each TCP connection or UDP
 datagram by a hash of its source and destination addresses and ports, so traffic splits between
-them per sender, not evenly per event. A TCP connection the kernel has queued but the closing
-process hasn't accepted yet is reset when that process closes its socket, unless the host sets
-`net.ipv4.tcp_migrate_req`. A `prometheus_out` exposition shared this way answers each scrape
-from whichever process the kernel picks, so a counter can appear to reset until the old process
-exits. `logit validate` rejects `reuse_port: true` under `transport: unix` or `unix_stream` and on
-a `datadog_trace_in` without `bind:`, none of which has a port to share; on a multicast `bind:`,
-whose group already delivers every datagram to every member (rule 80); and in `prometheus_in`'s
-scrape mode or `prometheus_out`'s remote-write mode, which bind nothing (rules 55 and 56). See
-[ADR `listener-port-sharing-and-shutdown-delay`](adr/listener-port-sharing-and-shutdown-delay.md)
-for why the option exists and how a replacement uses it.
+them per sender, not evenly per event.
+[Overlapping two instances on one port](#overlapping-two-instances-on-one-port) has the upgrade
+recipe and what the split does to the data. `logit validate` rejects `reuse_port: true` under
+`transport: unix` or `unix_stream` and on a `datadog_trace_in` without `bind:`, none of which has
+a port to share; on a multicast `bind:`, whose group already delivers every datagram to every
+member (rule 80); and in `prometheus_in`'s scrape mode or `prometheus_out`'s remote-write mode,
+which bind nothing (rules 55 and 56).
 
 ### Recording the sender: `peer`, `proxy_protocol`, and `forwarded`
 
