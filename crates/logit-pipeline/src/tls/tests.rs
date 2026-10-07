@@ -581,10 +581,12 @@ impl Client {
 
     /// A connector over a clone of the config, as each HTTP client holds its own clone.
     ///
-    /// A fresh connector per connection, so a fresh session cache: a resumed handshake skips
-    /// verification on both sides, and these tests are about what a full handshake checks.
+    /// Resumption is off on the clone, since clones share the session store: a resumed handshake
+    /// skips verification on both sides, and these tests are about what a full handshake checks.
     fn connector(&self) -> TlsConnector {
-        TlsConnector::from(Arc::new(self.cfg.clone()))
+        let mut cfg = self.cfg.clone();
+        cfg.resumption = rustls::client::Resumption::disabled();
+        TlsConnector::from(Arc::new(cfg))
     }
 }
 
