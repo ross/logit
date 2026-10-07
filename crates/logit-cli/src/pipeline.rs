@@ -122,7 +122,7 @@ fn severity_for_logs(logs: logit_config::InternalLogs) -> Option<logit_core::Sev
 /// killable by the signal that started it. SIGHUP never exits and never reloads the config: it
 /// logs `reopen signal received` and bumps the reopen generation, each `stdio_out`/`file_out`
 /// file target reopens its path before its next write, and the [`TlsReloader`] checks every TLS
-/// listener's files for new content.
+/// component's files for new content: every listener's, sink's, and scrape client's.
 ///
 /// Every failure before the pipeline reports ready is `RunError::Startup` (exit 1); after, it's a
 /// runtime failure (exit 2). See `docs/deploying.md`'s "Probes and exit codes".
@@ -283,7 +283,7 @@ fn fd_limit_warning(budget: usize, soft_limit: Option<u64>) -> Option<String> {
 /// one buffer. See `docs/design/internal-telemetry.md`.
 ///
 /// `reopen` is the SIGHUP reopen generation every `stdio_out`/`file_out` file target watches;
-/// `None` gives them none. Every TLS listener registers its files with `tls_reloader`.
+/// `None` gives them none. Every TLS component registers its files with `tls_reloader`.
 fn prepare(
     config: Config,
     base_dir: PathBuf,

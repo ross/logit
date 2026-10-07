@@ -1,8 +1,8 @@
 //! `logit run`'s signal contract against the real binary (`docs/adr/signal-handling.md`): SIGHUP
 //! never ends the process, never counts toward the second-signal exit, reopens a `file_out`
-//! target, and checks TLS listeners' files for new content, and a SIGTERM during startup drains once the
-//! pipeline starts. Each test reads the
-//! child's self-log on stderr to know a signal was handled, rather than sleeping.
+//! target, and checks every TLS component's files for new content, and a SIGTERM during startup
+//! drains once the pipeline starts. Each test reads the child's self-log on stderr to know a
+//! signal was handled, rather than sleeping.
 
 #![cfg(unix)]
 
@@ -186,7 +186,7 @@ async fn a_sighup_after_an_external_rename_reopens_a_file_out_target() {
 }
 
 /// With `tls_reload_interval: 0s` nothing polls, so a SIGHUP is what finds a renewed certificate:
-/// it checks every TLS listener's files, and the listener reports the reload.
+/// it checks every TLS component's files, and the listener reports the reload.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sighup_checks_tls_files_with_polling_off() {
     let dir = scratch_dir("hup-tls");

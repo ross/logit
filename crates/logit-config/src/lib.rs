@@ -28,11 +28,11 @@ pub struct Config {
     /// server per `logit run`, not per component.
     #[serde(default)]
     pub admin: AdminConfig,
-    /// How often every TLS listener's certificate, key, and client CA files are checked for new
-    /// content. A file whose content changed is loaded and used for the next connection, with no
-    /// restart and no effect on open connections; a file that fails to load leaves the previous
-    /// one in use. Defaults to `60s`; `0s` turns the periodic check off. SIGHUP checks at once
-    /// either way.
+    /// How often the certificate, key, and CA files of every TLS listener, sink, and scrape client
+    /// are checked for new content. A file whose content changed is loaded and used for the next
+    /// connection, with no restart and no effect on open connections; a file that fails to load
+    /// leaves the previous one in use. Defaults to `60s`; `0s` turns the periodic check off.
+    /// SIGHUP checks at once either way.
     #[serde(with = "humantime_serde_duration", default = "default_tls_reload_interval")]
     #[schemars(with = "String")]
     pub tls_reload_interval: Duration,

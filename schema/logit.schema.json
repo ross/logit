@@ -23,7 +23,7 @@
       }
     },
     "tls_reload_interval": {
-      "description": "How often every TLS listener's certificate, key, and client CA files are checked for new content. A file whose content changed is loaded and used for the next connection, with no restart and no effect on open connections; a file that fails to load leaves the previous one in use. Defaults to `60s`; `0s` turns the periodic check off. SIGHUP checks at once either way.",
+      "description": "How often the certificate, key, and CA files of every TLS listener, sink, and scrape client are checked for new content. A file whose content changed is loaded and used for the next connection, with no restart and no effect on open connections; a file that fails to load leaves the previous one in use. Defaults to `60s`; `0s` turns the periodic check off. SIGHUP checks at once either way.",
       "default": "1m",
       "type": "string"
     }
