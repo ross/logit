@@ -397,6 +397,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 78. A `socket_mode` on a `statsd_in`/`lines_in` under `transport: tcp`/`udp`, or on a
     `datadog_trace_in` without `socket`.
 79. `proxy_protocol: true` on a listener whose transport isn't `tcp`.
+81. An `admin.socket_mode` without `admin.socket`, an empty `admin.bind` or `admin.socket`, or an
+    `admin.bind` that is a path.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

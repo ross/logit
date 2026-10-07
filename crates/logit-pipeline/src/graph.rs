@@ -251,6 +251,9 @@
 //! 79. `proxy_protocol: true` on a `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` whose
 //!     transport isn't `tcp`, or on a `datadog_trace_in` without `bind`: a PROXY header leads a
 //!     TCP stream from a network proxy (`docs/adr/listener-peer-address.md`).
+//! 81. An `admin.socket_mode` without `admin.socket`; an empty `admin.bind` or `admin.socket`; or
+//!     an `admin.bind` starting with `/`, a path that belongs in `socket`
+//!     (`docs/adr/listener-port-sharing-and-shutdown-delay.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -697,7 +700,7 @@ fn is_absolute_http_url(url: &str) -> bool {
 }
 
 pub fn resolve(config: Config) -> anyhow::Result<Graph> {
-    let Config { components, .. } = config;
+    let Config { components, admin, .. } = config;
 
     // Rule 1: at least one component.
     if components.is_empty() {
@@ -3676,6 +3679,26 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                  '{transport}' -- a PROXY header comes from a network proxy ahead of a TCP stream"
             );
         }
+    }
+
+    // Rule 81: the `admin:` listeners. A path in `bind` would fail as an unresolvable address at
+    // startup with no hint that `socket:` exists.
+    if admin.socket_mode.is_some() && admin.socket.is_none() {
+        anyhow::bail!(
+            "admin: 'socket_mode' needs 'socket' -- there's no socket file to set the mode on"
+        );
+    }
+    if admin.bind.as_deref().is_some_and(str::is_empty) {
+        anyhow::bail!("admin: 'bind' is empty -- give a host:port, or omit it");
+    }
+    if admin.socket.as_deref().is_some_and(str::is_empty) {
+        anyhow::bail!("admin: 'socket' is empty -- give a Unix socket path, or omit it");
+    }
+    if admin.bind.as_deref().is_some_and(|bind| bind.starts_with('/')) {
+        anyhow::bail!(
+            "admin: 'bind' is a path, not a host:port -- serve the admin endpoint on a Unix socket \
+             with 'socket:' instead"
+        );
     }
 
     let mut resolved = HashMap::with_capacity(components.len());
@@ -12531,6 +12554,49 @@ mod tests {
                 "proxy_protocol": false}"#,
         );
         resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())])).unwrap();
+    }
+
+    // ---- rule 81: the admin listeners -----------------------------------------------------
+
+    fn cfg_with_admin(admin: &str) -> Config {
+        let admin: logit_config::AdminConfig = serde_json::from_str(admin).unwrap();
+        Config { admin, ..cfg(vec![("in", vec![], listener()), ("out", vec!["in"], sink())]) }
+    }
+
+    #[test]
+    fn rule_81_accepts_bind_socket_both_or_neither() {
+        for admin in [
+            r#"{}"#,
+            r#"{"bind": "127.0.0.1:9600"}"#,
+            r#"{"socket": "/run/logit/admin.sock"}"#,
+            r#"{"socket": "/run/logit/admin.sock", "socket_mode": "0660"}"#,
+            r#"{"bind": "127.0.0.1:9600", "socket": "/run/logit/admin.sock"}"#,
+        ] {
+            resolve(cfg_with_admin(admin))
+                .unwrap_or_else(|err| panic!("{admin} should resolve: {err}"));
+        }
+    }
+
+    #[test]
+    fn rule_81_rejects_a_socket_mode_without_a_socket() {
+        let err =
+            expect_err(cfg_with_admin(r#"{"bind": "127.0.0.1:9600", "socket_mode": "0660"}"#));
+        assert!(err.contains("admin: 'socket_mode' needs 'socket'"), "got: {err}");
+    }
+
+    #[test]
+    fn rule_81_rejects_an_empty_bind_or_socket() {
+        let err = expect_err(cfg_with_admin(r#"{"bind": ""}"#));
+        assert!(err.contains("admin: 'bind' is empty"), "got: {err}");
+        let err = expect_err(cfg_with_admin(r#"{"socket": ""}"#));
+        assert!(err.contains("admin: 'socket' is empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rule_81_rejects_a_path_in_bind_and_points_at_socket() {
+        let err = expect_err(cfg_with_admin(r#"{"bind": "/run/logit/admin.sock"}"#));
+        assert!(err.contains("admin: 'bind' is a path"), "got: {err}");
+        assert!(err.contains("'socket:'"), "got: {err}");
     }
 
     // ---- rule 71: lua / lua_file max_memory ------------------------------------------------
