@@ -465,7 +465,7 @@ component is one that appears in several `sources` lists, with nothing to specia
   turn. With `shutdown.delay` set and the process `Ready` at the signal, the runtime's shutdown
   driver reports draining at the signal, waits out the delay with every listener still running,
   and only then sends the shutdown that starts the cascade and every `shutdown_grace` timer
-  (ADR `listener-port-sharing-and-shutdown-delay`).
+  ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)).
 
 ### Thread model: only Lua needs its own OS thread
 

@@ -111,7 +111,7 @@ error.
   the largest `shutdown_grace` in the config, plus a few seconds' margin, or the kubelet's SIGKILL
   cuts the drain short. The same budget applies to Docker's `--stop-timeout` and systemd's
   `TimeoutStopSec=`. See
-  ADR `listener-port-sharing-and-shutdown-delay`.
+  [ADR `listener-port-sharing-and-shutdown-delay`](adr/listener-port-sharing-and-shutdown-delay.md).
 - **SIGHUP reopens file outputs and never ends the process.** It logs `reopen signal received`
   with `config_reloaded=false`, and each `stdio_out`/`file_out` file target reopens its path
   before its next write; see
