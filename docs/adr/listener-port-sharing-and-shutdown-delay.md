@@ -129,8 +129,8 @@ that fails during the delay starts the drain at once. A process that never repor
 the delay: it was never in an endpoint set, so there's no traffic to move away from it, and holding
 its ports would only slow a failed rollout down. The shutdown driver decides this from the
 readiness phase when it acts on the signal, so a signal held through a fast startup can still wait
-the delay, a gap recorded in [the runtime gaps](../known-gaps/runtime.md). The `drain complete` line's `duration` excludes the delay, so it keeps measuring the drain
-alone.
+the delay, a gap recorded in [the runtime gaps](../known-gaps/runtime.md). The `drain complete`
+line's `duration` excludes the delay, so it keeps measuring the drain alone.
 
 The delay covers the time the orchestrator needs to stop sending. Kubernetes withdraws a
 terminating pod's endpoint without waiting for a probe, so the delay is sized by how long that
