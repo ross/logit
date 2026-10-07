@@ -145,8 +145,9 @@ TLS certificate check; see the 2026-10-07 amendment below.
 [ADR `tls-certificate-reload`](tls-certificate-reload.md) reloads certificate, key, and CA files
 on a process-wide poll, and uses SIGHUP as a second trigger. Its poller subscribes to the reopen
 generation from decision 4, so each SIGHUP that bumps the generation also checks every TLS
-component's files at once, whatever `tls_reload_interval:` is set to, including `0s`. The check
-loads only files whose content changed and keeps the old material if a load fails.
+component's files at once, whatever `tls_reload_interval:` is set to, including `0s`. A set whose
+content changed loads whole, so a renewed certificate pairs with its key before anything swaps,
+and a failed load keeps the old material.
 
 Nothing else in this ADR changes. A SIGHUP still never ends the process, the file targets still
 reopen lazily, and the `reopen signal received` line still says the config isn't reloaded. A

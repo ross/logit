@@ -41,8 +41,8 @@ The current material sits in a `RwLock<Arc<_>>`, and a swap replaces the `Arc`.
 
 - **Server certificate and key.** The listener's `ServerConfig` is built with
   `with_cert_resolver(Arc<ReloadingCert>)` instead of `with_single_cert`. `resolve()` returns the
-  current `Arc<CertifiedKey>`. A new handshake gets the new certificate; an open connection keeps
-  its session.
+  current `Arc<CertifiedKey>`. A new full handshake gets the new certificate; an open connection
+  keeps its session.
 - **Server `client_ca_file`.** A delegating `ClientCertVerifier` wraps a swappable
   `WebPkiClientVerifier`. Its `root_hint_subjects()` returns a borrowed
   `&[DistinguishedName]`, which can't borrow through a lock guard. So the wrapper keeps every hint
@@ -52,6 +52,17 @@ The current material sits in a `RwLock<Arc<_>>`, and a swap replaces the `Arc`.
 - **Client `cert_file` and `key_file`.** The `ClientConfig` is built with
   `with_client_cert_resolver(Arc<ReloadingCert>)`.
 
+Each wrapper serves the current material to a new full handshake. TLS session resumption stays at
+rustls's defaults: a listener keeps its in-memory session cache and sends TLS 1.3 tickets, and a
+sink resumes where the server allows it. A resumed handshake reuses the verification of the
+session it resumes. No certificate is sent and no verifier is called, and the resumed session can
+issue fresh tickets, so a peer that keeps reconnecting can keep resuming indefinitely.
+
+So reload is for rotation, not revocation. Removing a CA from `client_ca_file` or `ca_file` stops
+new full handshakes that chain to it, but doesn't cut off a peer that keeps resuming an earlier
+session, and a resuming client doesn't see a rotated server certificate until it next does a full
+handshake. Revoking trust in a peer needs a restart, which drops every session cache.
+
 `ClientConfig::clone` shares those `Arc`'d resolvers and verifiers. So an HTTP sink's `reqwest`
 client built with `use_preconfigured_tls(cfg.clone())`, and `otlp_out`'s pooled gRPC client built
 with `hyper-rustls`'s `with_tls_config(cfg.clone())`, see each rotation with no client rebuild.
@@ -60,8 +71,7 @@ with `hyper-rustls`'s `with_tls_config(cfg.clone())`, see each rotation with no 
 `prometheus_in`'s `scrape_tls:` client is the one TLS path that doesn't build a rustls config. It
 hands PEM to `reqwest`'s own `Certificate` and `Identity` loaders (`apply_client_tls`), so it has no
 seam to swap through. It moves to the shared `build_client_config` and passes the result with
-`reqwest::ClientBuilder::use_preconfigured_tls`, as every HTTP sink already does. That also fixes
-`apply_client_tls` reading only the first certificate of a `ca_file` bundle. The config keys stay
+`reqwest::ClientBuilder::use_preconfigured_tls`, as every HTTP sink already does. The config keys stay
 `scrape_tls:` and `bind_tls:`.
 
 ### Trigger: a content poll, and SIGHUP
@@ -95,8 +105,10 @@ seam to swap through. It moves to the shared `build_client_config` and passes th
 
 ### Where the code lives
 The shared builders, the wrappers, and the poller (`TlsReloader`) go in a new
-`logit_pipeline::tls` module. `logit-inputs` and `logit-outputs` already depend on
-`logit-pipeline`, rustls is already in its dependency graph, and no crate gains an edge.
+`logit_pipeline::tls` module, because `logit-inputs` and `logit-outputs` already depend on
+`logit-pipeline`. `logit-pipeline` gains direct dependencies on `rustls`, `rustls-pki-types`, and
+`webpki-roots`. All three are already in the workspace lockfile, so no new crate version is added
+and no edge between workspace crates changes.
 `build_server_config` moves there from `crates/logit-inputs/src/tls.rs`, and
 `build_client_config` from `crates/logit-outputs/src/tls.rs`. Each component registers its file
 set with the reloader along with its own `Diagnostics` and `Telemetry`, so a reload's telemetry is
@@ -105,8 +117,13 @@ attributed to the component that owns the files.
 ### Telemetry
 - `logit.tls.reloads{outcome=reloaded|failed}`, a counter.
 - `logit.tls.certificate.not_after{role=server|client}`, a gauge in unix seconds for the leaf
-  certificate in `cert_file`. It's emitted at registration and after every successful reload, so
-  an alert on it catches a rotation that never happened.
+  certificate in `cert_file`. It's emitted at registration. The reloader also caches each set's
+  last value and re-emits it on its own 1 s tick, as the UDP and TCP kernel samplers do, because a
+  telemetry window carries no value forward and a gauge written once would vanish after one
+  window (`docs/design/internal-telemetry.md`'s "Why a constant is re-emitted"). The tick is
+  independent of `tls_reload_interval:`, so the gauge keeps flowing with polling off, and after a
+  failed reload it keeps reporting the certificate still in use. An alert on it catches a
+  rotation that never happened.
 
 The gauge's value comes from a narrow, hand-rolled DER walk: Certificate, then TBSCertificate,
 skipping the optional `[0]` version, the serial, the signature algorithm, and the issuer, then
@@ -136,6 +153,15 @@ unaffected, because rustls has already validated the certificate. If the walk pr
   the fallback.
 - **Fail readiness on a failed reload.** Rejected. A failed reload leaves the process serving a
   valid certificate, and a `503` from `/readyz` would pull a working instance out of rotation.
+- **Disable TLS session resumption.** Rejected. Turning off the server's session cache and
+  tickets and the client's resumption would make every new connection verify against the current
+  material, so removing a CA would revoke trust without a restart. The goal is rotation without a
+  restart, and revocation by restart is acceptable, so it isn't worth a full handshake on every
+  reconnect.
+- **Swap in fresh session stores on every reload.** Rejected for the same reason. Delegating
+  `StoresServerSessions` and `ClientSessionStore` wrappers could drop every cached session when the
+  material changes, at the cost of two more wrappers to get right, for a revocation case a restart
+  already covers.
 - **A dedicated `logit-tls` crate.** Rejected. It would add a crate and its edges for code that
   fits in `logit-pipeline`, which both I/O crates already depend on, and
   [ADR `crate-layout-and-build-speed`](crate-layout-and-build-speed.md) leans against reshaping
@@ -151,8 +177,9 @@ unaffected, because rustls has already validated the certificate. If the walk pr
   generation, spawns its task, and aborts it at shutdown. Tests call its `check_now()` instead of
   waiting out an interval.
 - `docs/design/internal-telemetry.md` gains the two metrics and the reload diagnostics.
-- A rotated certificate reaches new connections only. An open connection keeps the certificate it
-  handshook with until it closes, on both the listener and the sink side.
+- New material reaches new full handshakes only. An open connection keeps the certificate it
+  handshook with until it closes, and a resumed handshake reuses its session's earlier
+  verification, on both the listener and the sink side. Revoking trust in a peer needs a restart.
 - Some things still aren't reloaded: the config itself, `insecure_skip_verify` (its verifier
   accepts everything and has no material), and the `webpki-roots` default trust store, which is
   compiled in. A change to any of them still needs a restart.
