@@ -401,6 +401,7 @@ mod tests {
             idle_timeout: None,
             max_connections: logit_config::default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             socket_mode: None,
         };

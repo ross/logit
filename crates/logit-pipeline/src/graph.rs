@@ -251,6 +251,11 @@
 //! 79. `proxy_protocol: true` on a `syslog_in`/`graphite_in`/`statsd_in`/`lines_in` whose
 //!     transport isn't `tcp`, or on a `datadog_trace_in` without `bind`: a PROXY header leads a
 //!     TCP stream from a network proxy (`docs/adr/listener-peer-address.md`).
+//! 80. `reuse_port: true` where it has no port to share: on a `statsd_in`/`lines_in` under
+//!     `transport: unix`/`unix_stream`, or on a `statsd_in`/`syslog_in`/`graphite_in`/`lines_in`/
+//!     `collectd_in` whose `bind` is a multicast group, which already delivers every datagram to
+//!     every member. A new listener that takes `reuse_port` adds a match arm, not a rule number
+//!     (`docs/adr/listener-port-sharing-and-shutdown-delay.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3678,6 +3683,43 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 80: `reuse_port: true` with no port to share. `bind` is a path under a Unix transport,
+    // so the multicast check only ever parses a `host:port`.
+    for (id, component) in &components {
+        let (kind_name, bind, unix) = match &component.kind {
+            ComponentKind::StatsdIn { reuse_port: true, bind, transport, .. } => (
+                "statsd_in",
+                bind,
+                matches!(transport, StatsdTransport::Unix | StatsdTransport::UnixStream),
+            ),
+            ComponentKind::LinesIn { reuse_port: true, bind, transport, .. } => (
+                "lines_in",
+                bind,
+                matches!(transport, LinesTransport::Unix | LinesTransport::UnixStream),
+            ),
+            ComponentKind::SyslogIn { reuse_port: true, bind, .. } => ("syslog_in", bind, false),
+            ComponentKind::GraphiteIn { reuse_port: true, bind, .. } => {
+                ("graphite_in", bind, false)
+            }
+            ComponentKind::CollectdIn { reuse_port: true, bind, .. } => {
+                ("collectd_in", bind, false)
+            }
+            _ => continue,
+        };
+        if unix {
+            anyhow::bail!(
+                "component '{id}': {kind_name} 'reuse_port' needs a TCP or UDP transport -- a Unix \
+                 socket has no port to share"
+            );
+        }
+        if bind.parse::<std::net::SocketAddr>().is_ok_and(|addr| addr.ip().is_multicast()) {
+            anyhow::bail!(
+                "component '{id}': {kind_name} 'reuse_port' has no effect on the multicast group \
+                 '{bind}' -- every member of a group already receives every datagram"
+            );
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is fixed here, once (see [`targets_of`]).
@@ -4065,6 +4107,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             socket_mode: None,
         }
@@ -8328,6 +8371,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
         }
     }
@@ -8345,6 +8389,7 @@ mod tests {
             idle_timeout,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
         }
     }
@@ -10673,6 +10718,7 @@ mod tests {
             bind: "0.0.0.0:25826".to_string(),
             types_db: types_db.into_iter().map(std::path::PathBuf::from).collect(),
             peer: false,
+            reuse_port: false,
         }
     }
 
@@ -10767,6 +10813,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             max_line_bytes,
             max_frame_bytes,
@@ -10787,6 +10834,7 @@ mod tests {
             idle_timeout,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             max_line_bytes: 8192,
             max_frame_bytes: 1 << 20,
@@ -11813,6 +11861,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             socket_mode: None,
         }
@@ -11831,6 +11880,7 @@ mod tests {
             idle_timeout,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             socket_mode: None,
         }
@@ -11952,6 +12002,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             socket_mode: None,
         }
@@ -12147,6 +12198,7 @@ mod tests {
             idle_timeout: None,
             max_connections: default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             max_line_bytes: 64 * 1024,
             socket_mode: None,
@@ -12531,6 +12583,87 @@ mod tests {
                 "proxy_protocol": false}"#,
         );
         resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())])).unwrap();
+    }
+
+    // ---- rule 80: `reuse_port` --------------------------------------------------------------
+
+    /// Rule 80: all five socket listeners take `reuse_port: true` on a unicast TCP or UDP bind.
+    #[test]
+    fn rule_80_reuse_port_resolves_on_a_unicast_bind() {
+        for json in [
+            r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "reuse_port": true}"#,
+            r#"{"type": "statsd_in", "bind": "127.0.0.1:0", "transport": "tcp",
+                "reuse_port": true}"#,
+            r#"{"type": "syslog_in", "bind": "0.0.0.0:514", "reuse_port": true}"#,
+            r#"{"type": "syslog_in", "bind": "[::]:514", "transport": "tcp",
+                "reuse_port": true}"#,
+            r#"{"type": "graphite_in", "bind": "127.0.0.1:0", "reuse_port": true}"#,
+            r#"{"type": "graphite_in", "bind": "127.0.0.1:0", "transport": "udp",
+                "reuse_port": true}"#,
+            r#"{"type": "lines_in", "bind": "localhost:5170", "reuse_port": true}"#,
+            r#"{"type": "lines_in", "bind": "127.0.0.1:0", "transport": "udp",
+                "reuse_port": true}"#,
+            r#"{"type": "collectd_in", "bind": "0.0.0.0:25826", "reuse_port": true}"#,
+        ] {
+            let kind = listener_from_json(json);
+            resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+                .unwrap_or_else(|err| panic!("{json} should resolve: {err}"));
+        }
+    }
+
+    /// Rule 80: a Unix socket has no port to share.
+    #[test]
+    fn rule_80_rejects_reuse_port_on_a_unix_transport() {
+        for json in [
+            r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix",
+                "reuse_port": true}"#,
+            r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix_stream",
+                "reuse_port": true}"#,
+            r#"{"type": "lines_in", "bind": "/tmp/lines.socket", "transport": "unix",
+                "reuse_port": true}"#,
+            r#"{"type": "lines_in", "bind": "/tmp/lines.socket", "transport": "unix_stream",
+                "reuse_port": true}"#,
+        ] {
+            let kind = listener_from_json(json);
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains("'reuse_port' needs a TCP or UDP transport"), "{json}: {err}");
+        }
+    }
+
+    /// Rule 80: a multicast group already delivers every datagram to every member.
+    #[test]
+    fn rule_80_rejects_reuse_port_on_a_multicast_bind() {
+        for json in [
+            r#"{"type": "statsd_in", "bind": "239.1.2.3:8125", "reuse_port": true}"#,
+            r#"{"type": "syslog_in", "bind": "239.1.2.3:514", "reuse_port": true}"#,
+            r#"{"type": "graphite_in", "bind": "239.1.2.3:2003", "transport": "udp",
+                "reuse_port": true}"#,
+            r#"{"type": "lines_in", "bind": "239.1.2.3:5170", "transport": "udp",
+                "reuse_port": true}"#,
+            r#"{"type": "collectd_in", "bind": "239.192.74.66:25826", "reuse_port": true}"#,
+            r#"{"type": "collectd_in", "bind": "[ff18::efc0:4a42]:25826", "reuse_port": true}"#,
+        ] {
+            let kind = listener_from_json(json);
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(
+                err.contains("'reuse_port' has no effect on the multicast group"),
+                "{json}: {err}"
+            );
+        }
+    }
+
+    /// Rule 80: `reuse_port: false` stays legal on a Unix transport and a multicast group.
+    #[test]
+    fn rule_80_allows_reuse_port_false_everywhere() {
+        for json in [
+            r#"{"type": "statsd_in", "bind": "/tmp/dsd.socket", "transport": "unix",
+                "reuse_port": false}"#,
+            r#"{"type": "collectd_in", "bind": "239.192.74.66:25826", "reuse_port": false}"#,
+        ] {
+            let kind = listener_from_json(json);
+            resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+                .unwrap_or_else(|err| panic!("{json} should resolve: {err}"));
+        }
     }
 
     // ---- rule 71: lua / lua_file max_memory ------------------------------------------------

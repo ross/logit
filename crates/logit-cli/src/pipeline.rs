@@ -389,6 +389,7 @@ fn build_spec(
             peer,
             proxy_protocol,
             socket_mode,
+            reuse_port,
         } => {
             let mut input = match transport {
                 logit_config::StatsdTransport::Udp => {
@@ -412,7 +413,9 @@ fn build_spec(
             .with_max_connections(*max_connections)
             .with_peer(*peer)
             // Rule 79 rejects it off `transport: tcp`.
-            .with_proxy_protocol(*proxy_protocol);
+            .with_proxy_protocol(*proxy_protocol)
+            // Rule 80 rejects it on a Unix transport or a multicast `bind:`.
+            .with_reuse_port(*reuse_port);
             // Off a Unix transport, rule 78 rejects a value.
             if let Some(mode) = socket_mode {
                 input = input.with_socket_mode(mode.bits());
@@ -435,6 +438,7 @@ fn build_spec(
             peer,
             proxy_protocol,
             socket_mode,
+            reuse_port,
         } => {
             let mut input = match transport {
                 logit_config::LinesTransport::Tcp => LinesInput::tcp(bind.clone())
@@ -457,7 +461,9 @@ fn build_spec(
             .with_max_connections(*max_connections)
             .with_peer(*peer)
             // Rule 79 rejects it off `transport: tcp`.
-            .with_proxy_protocol(*proxy_protocol);
+            .with_proxy_protocol(*proxy_protocol)
+            // Rule 80 rejects it on a Unix transport or a multicast `bind:`.
+            .with_reuse_port(*reuse_port);
             if let Some(mode) = socket_mode {
                 input = input.with_socket_mode(mode.bits());
             }
@@ -469,12 +475,14 @@ fn build_spec(
         // `types_db` paths resolve against the config file's directory, like every path here, and
         // are read at startup: a bad file stops the process before it reports ready rather than
         // leaving a listener with no data-source names.
-        CollectdIn { bind, types_db, peer } => {
+        CollectdIn { bind, types_db, peer, reuse_port } => {
             let mut input = CollectdInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
                 .with_receive(receive_config(&component.receive))
-                .with_peer(*peer);
+                .with_peer(*peer)
+                // Rule 80 rejects it on a multicast `bind:`.
+                .with_reuse_port(*reuse_port);
             if !types_db.is_empty() {
                 let paths: Vec<PathBuf> = types_db.iter().map(|p| base_dir.join(p)).collect();
                 let loaded = TypesDb::load(&paths)
@@ -500,6 +508,7 @@ fn build_spec(
             max_connections,
             peer,
             proxy_protocol,
+            reuse_port,
         } => {
             let mut input = GraphiteInput::new(
                 bind.clone(),
@@ -516,7 +525,9 @@ fn build_spec(
             .with_max_connections(*max_connections)
             .with_peer(*peer)
             // Rule 79 rejects it off `transport: tcp`.
-            .with_proxy_protocol(*proxy_protocol);
+            .with_proxy_protocol(*proxy_protocol)
+            // Rule 80 rejects it on a Unix transport or a multicast `bind:`.
+            .with_reuse_port(*reuse_port);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -532,6 +543,7 @@ fn build_spec(
             max_connections,
             peer,
             proxy_protocol,
+            reuse_port,
         } => {
             let mut input = match transport {
                 logit_config::SyslogTransport::Udp => {
@@ -548,7 +560,9 @@ fn build_spec(
             .with_max_connections(*max_connections)
             .with_peer(*peer)
             // Rule 79 rejects it off `transport: tcp`.
-            .with_proxy_protocol(*proxy_protocol);
+            .with_proxy_protocol(*proxy_protocol)
+            // Rule 80 rejects it on a Unix transport or a multicast `bind:`.
+            .with_reuse_port(*reuse_port);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -2059,6 +2073,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
                 socket_mode: None,
             },
@@ -2689,6 +2704,7 @@ mod tests {
                 bind: "127.0.0.1:0".to_string(),
                 types_db,
                 peer: false,
+                reuse_port: false,
             },
         }
     }
@@ -2753,6 +2769,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
                 max_line_bytes: 8192,
                 max_frame_bytes: 1 << 20,
@@ -3116,6 +3133,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
             },
         }
@@ -3296,6 +3314,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
             },
         };
@@ -3485,6 +3504,7 @@ mod tests {
             idle_timeout: None,
             max_connections: 1,
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
         };
         let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
@@ -3617,6 +3637,7 @@ mod tests {
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
             },
         };
@@ -3642,6 +3663,7 @@ mod tests {
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
                 max_line_bytes: 8192,
                 max_frame_bytes: 1 << 20,
@@ -3668,6 +3690,7 @@ mod tests {
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
                 socket_mode: None,
             },
@@ -4938,6 +4961,7 @@ mod tests {
             idle_timeout: None,
             max_connections: logit_config::default_max_connections(),
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             max_line_bytes: logit_config::default_lines_max_line_bytes(),
             socket_mode: None,
@@ -5048,6 +5072,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
                 socket_mode: None,
             },
