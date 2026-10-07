@@ -396,11 +396,11 @@ The config sets `reuse_port: true` on each listener, `admin.socket: /run/logit/a
 - **Don't declare `ports:` on the container.** Under `hostNetwork`, every container port is also a
   host port, and the scheduler won't place a second pod claiming the same host port on a node, so
   the surge pod stays `Pending` and the rollout stops.
-- **Size `terminationGracePeriodSeconds` to the delay plus the largest `shutdown_grace`, plus a
-  margin.** With `delay: 10s` and the default 5 s grace, 30 s is enough. A shorter grace ends in
-  SIGKILL partway through the drain.
-- **Give the `exec` probe a `timeoutSeconds` of at least 2.** The default is 1 s, and `logit ready`
-  waits up to 10 s of its own for an answer.
+- **`terminationGracePeriodSeconds: 30` fits `delay: 10s` and the default 5 s grace.**
+  [Signal and restart behavior](#signal-and-restart-behavior) has the sizing rule.
+- **Give the `exec` probe a `timeoutSeconds` of at least 2.** The kubelet stops the probe at its
+  timeout, and the default 1 s can be too short for the `logit ready` process to start and get an
+  answer. 2 s matches the image's `HEALTHCHECK`.
 - **The `emptyDir` is per pod**, so both pods use the same socket path without colliding.
 
 Where `shutdown.delay` can't be used, such as an older `logit` image, a `preStop` hook can hold
@@ -421,8 +421,13 @@ What an operator sees in the graphs:
   and port) to one process and never splits it. When the new pod joins, about half the flows move
   to it, with no loss; when the old pod closes, its flows move to the new one. The split is
   uneven: one measured run sent 2000 datagrams to one process and 6000 to the other.
-- **The old pod's close loses its own receive-queue backlog.** For a reader keeping up at 50k
-  datagrams/s, that was 11 to 14 datagrams; for a stalled one, a full `SO_RCVBUF`.
+- **The old pod's close loses what reaches its socket after it stops reading.** When the drain
+  starts, a UDP listener stops reading, but its socket stays bound until the listener has decoded
+  what it already queued. Flows the kernel still sends to that socket pile up unread and are
+  discarded at the close, with no `logit` counter recording them. With a reader keeping up at 50k
+  datagrams/s, that was 0 to 85 datagrams per close; a stalled reader can lose a full
+  `SO_RCVBUF`. `shutdown.delay` doesn't shrink this window, because the listener keeps reading
+  through the delay and the window opens only when the drain starts.
 - **Per-socket counters cover one process each.** `logit.input.kernel.drops` and the
   `receive_buffer.*` and `accept_queue.*` gauges describe each pod's own socket, not the port.
 - **An `aggregate` window splits.** A flow that moves mid-window has that window summed in both
@@ -442,8 +447,8 @@ What an operator sees in the graphs:
 When a listener closes, the kernel resets every connection in its accept queue: connections whose
 client already saw `connect()` succeed and may have sent data. With `net.ipv4.tcp_migrate_req=1`
 (Linux 5.14 and later), the kernel moves them to the surviving process instead. `logit` accepts
-until the instant it drops a listener, through the delay and the drain, so its queue is near empty
-at the close, and the sysctl matters only for connections that finish their handshake in that
+through the delay, until the instant the drain drops a listener, so its queue is near empty at the
+close, and the sysctl matters only for connections that finish their handshake in that
 last instant. Every stream client `logit` serves reconnects after a reset.
 
 It's a node-level setting. A `hostNetwork` pod shares the node's network namespace and can't set
@@ -461,13 +466,18 @@ sysctl -w net.ipv4.tcp_migrate_req=1    # persist it in /etc/sysctl.d/
 `logit@a.service` and `logit@b.service`, on one config with `reuse_port: true`. To upgrade, start
 the idle instance, wait until `logit ready --admin unix:/run/logit-b/admin.sock` succeeds, then
 stop the running one. Each instance gets its own admin socket by reading the path from the
-environment, `admin: { socket: !env LOGIT_ADMIN_SOCKET }`. The template's relevant lines:
+environment, `admin: { socket: !env LOGIT_ADMIN_SOCKET }`. A sink's `buffer.disk:` spool belongs
+to one process at a time, so a second instance opening the same directory exits `2`; give each
+instance its own the same way, `buffer: { disk: { path: !env LOGIT_SPOOL_DIR } }`. A spool left by
+a stopped instance replays when that instance next starts. The template's relevant lines:
 
 ```ini
 [Service]
 User=logit
 RuntimeDirectory=logit-%i
+StateDirectory=logit-%i
 Environment=LOGIT_ADMIN_SOCKET=/run/logit-%i/admin.sock
+Environment=LOGIT_SPOOL_DIR=/var/lib/logit-%i/spool
 ExecStart=/usr/local/bin/logit run /etc/logit/logit.yaml
 TimeoutStopSec=30
 ```

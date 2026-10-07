@@ -70,11 +70,15 @@ the record.
   sockets sent 100-byte lines at 50k datagrams/s for 6 s, about 300k per run, and one process got
   SIGTERM at 3 s; three runs per arm.
   - With `shutdown: { delay: 5s }`, `/readyz` on the signalled process read `draining` at once
-    while the other read `ok`, `shutdown delay elapsed` followed the signal by 5.001 s, and 0
-    datagrams were lost in all three runs.
-  - With the default `0s` delay, the loss was 0, 0, and 85 datagrams: the closing socket's
-    receive queue, which no `logit` counter sees. `logit.input.kernel.drops` counts drops on a
-    full buffer, not a queue discarded at close.
+    while the other read `ok`, the port stayed bound through the delay, and
+    `shutdown delay elapsed` followed the signal by 5.001 s. That socket closed about 2 s after
+    the senders stopped, so its zero loss in all three runs says nothing about loss at a close
+    under load.
+  - With the default `0s` delay, the only arm that closed under load, the loss was 0, 0, and 85
+    datagrams: what reached the socket after its read loop stopped and before it closed, which
+    no `logit` counter sees. `logit.input.kernel.drops` counts drops on a full buffer, not a
+    queue discarded at close. A delay doesn't shrink that window; it opens when the drain
+    starts.
   - With `reuse_port` left off, the second process exited `1` with `Address already in use`.
 
 ## Decision
@@ -239,9 +243,9 @@ not defended.
   `shutdown delay elapsed` joins `docs/design/internal-telemetry.md`'s lifecycle events and
   [ADR `tracing-for-self-logging`](tracing-for-self-logging.md)'s set.
 - **Known gaps that open**, in [intake gaps](../known-gaps/intake.md): a closing TCP listener
-  resets its accept queue unless `net.ipv4.tcp_migrate_req=1`, and a multicast `collectd_in` is
-  delivered to every overlapping instance. "One reader per UDP listener" narrows to the in-process
-  form.
+  resets its accept queue unless `net.ipv4.tcp_migrate_req=1`, a multicast `collectd_in` is
+  delivered to every overlapping instance, and a closing UDP socket loses its kernel receive queue
+  uncounted. "One reader per UDP listener" narrows to the in-process form.
 - **Earlier records**:
   [ADR `udp-intake-batching-and-socket-visibility`](udp-intake-batching-and-socket-visibility.md)
   and [ADR `decoupled-listener-io`](decoupled-listener-io.md) keep in-process fan-in out of scope
