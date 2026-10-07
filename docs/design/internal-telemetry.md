@@ -742,13 +742,15 @@ message-aligned, so a read count over a frame count wouldn't be a fill ratio of 
 #### TLS certificate reload
 
 Every listener with a `tls:` block (`bind_tls:` on `prometheus_in`) registers its files with the
-process's one `TlsReloader` (`crates/logit-pipeline/src/tls.rs`), which records these under the
-owning component:
+process's one `TlsReloader` (`crates/logit-pipeline/src/tls.rs`), and so does every client: each
+sink's `tls:` block (`endpoint_tls:` on `prometheus_out`) and `prometheus_in`'s `scrape_tls:`. A
+client registers its `ca_file` and its `cert_file`/`key_file` pair, whichever are set, and nothing
+when neither is. The reloader records these under the owning component:
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.tls.reloads{outcome="reloaded"\|"failed"}` | count | a check found new content in the component's files and loaded it, or failed to and kept serving the previous files. The same failed content counts once, not once per check |
-| `logit.tls.certificate.not_after{side="server"}` | gauge | the `notAfter` of the leaf certificate being served, in unix seconds. Emitted at startup and after a reload, and re-emitted every second from a cached value, as [`receive_buffer.bytes` is](#tcp-listeners-the-kernel-accept-queue), so it never drops out of the series. Left out if the certificate's validity can't be read. Alert on it approaching now: it's what catches a renewal that never reached the files |
+| `logit.tls.reloads{outcome="reloaded"\|"failed"}` | count | a check found new content in the component's files and loaded it, or failed to and kept using the previous files. The same failed content counts once, not once per check |
+| `logit.tls.certificate.not_after{side="server"\|"client"}` | gauge | the `notAfter` of the leaf certificate in use, in unix seconds: a listener's `cert_file` under `server`, a client's under `client`. A client with no `cert_file` has none. Emitted at startup and after a reload, and re-emitted every second from a cached value, as [`receive_buffer.bytes` is](#tcp-listeners-the-kernel-accept-queue), so it never drops out of the series. Left out if the certificate's validity can't be read. Alert on it approaching now: it's what catches a renewal that never reached the files |
 
 The tag is `side`, not `role`: `role` is reserved for the component's own identity.
 

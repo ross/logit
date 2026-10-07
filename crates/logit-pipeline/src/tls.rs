@@ -750,7 +750,7 @@ impl Watched {
                     self.diag.warn_throttled(
                         "tls_reload_failed",
                         format_args!(
-                            "TLS reload failed, still serving the previous files: {err:#}"
+                            "TLS reload failed, still using the previous files: {err:#}"
                         ),
                     );
                 }
