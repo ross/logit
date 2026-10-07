@@ -196,7 +196,8 @@ use logit_pipeline::Fanout;
 use logit_proto::otlp::grpc::{self, InflateError};
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::{Signal, SignalDecoder};
-// Only the test module's `tls_connector` reads PEM files directly; server TLS is `crate::tls`.
+// Only the test module's `tls_connector` reads PEM files directly; server TLS is
+// `logit_pipeline::tls`.
 #[cfg(test)]
 use rustls_pki_types::pem::PemObject;
 #[cfg(test)]

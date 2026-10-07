@@ -198,7 +198,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `tcp_rmem`.
 const RECEIVER_MAX_WINDOW: u32 = 1024;
 
-/// Re-exported for symmetry with `crate::otlp`'s path; both share `crate::tls`'s definition.
+/// Re-exported for symmetry with `crate::otlp`'s path; both share `logit_pipeline::tls`'s
+/// definition.
 pub use logit_pipeline::tls::TlsServerSettings;
 
 pub struct LogitInput {
