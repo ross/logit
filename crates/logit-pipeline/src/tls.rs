@@ -749,9 +749,7 @@ impl Watched {
                     self.telemetry.count("logit.tls.reloads", 1.0, &[("outcome", "failed")]);
                     self.diag.warn_throttled(
                         "tls_reload_failed",
-                        format_args!(
-                            "TLS reload failed, still using the previous files: {err:#}"
-                        ),
+                        format_args!("TLS reload failed, still using the previous files: {err:#}"),
                     );
                 }
             }
