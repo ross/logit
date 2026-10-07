@@ -330,7 +330,6 @@ use crate::http::{
     body_read_error_message, collect_with_stall_bound, drive_with_idle, Activity, BodyReadError,
 };
 use crate::peer::ConnectionPeer;
-use crate::tls::apply_client_tls;
 use crate::Input;
 use bytes::Bytes;
 use http::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
@@ -376,9 +375,8 @@ const ACCEPT_HEADER_VALUE: &str =
 /// `logit/<CARGO_PKG_VERSION>`, a compile-time constant, so sending it allocates nothing.
 const USER_AGENT_VALUE: &str = concat!("logit/", env!("CARGO_PKG_VERSION"));
 
-/// `crate::tls::TlsClientSettings`, re-exported so `logit-cli::pipeline::build_spec` imports it
-/// from this module, as it does `otlp::TlsServerSettings`.
-pub use crate::tls::TlsClientSettings;
+/// `logit_pipeline::tls::TlsClientSettings`, re-exported beside this module's other settings types.
+pub use logit_pipeline::tls::TlsClientSettings;
 
 /// One configured scrape target: the URL to `GET`, its [`redact_url`]ed form (for everything that
 /// isn't the request itself: diagnostics text, `prometheus.target`), and the `Resource` every
@@ -608,12 +606,17 @@ impl PrometheusInput {
     }
 
     /// Sets client-side TLS (`scrape_tls:` in config) for any `https://` target; a no-op if
-    /// `settings` is empty. Built on `reqwest`'s PEM loaders ([`crate::tls::apply_client_tls`]), so
-    /// no `rustls` type appears in this crate's HTTP-client path.
+    /// `settings` is empty. The `rustls::ClientConfig` comes from
+    /// `logit_pipeline::tls::build_client_config`, as every sink's does, so a rotated `ca_file` or
+    /// client certificate reaches the next full handshake without a rebuilt client.
+    ///
+    /// Registers the files with `reloader` under this input's diagnostics and telemetry as they
+    /// are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         if settings.is_empty() {
             return Ok(self);
@@ -625,10 +628,17 @@ impl PrometheusInput {
                  or otherwise",
             );
         }
-        let builder = apply_client_tls(reqwest::Client::builder(), settings, base_dir)?;
-        self.client = builder.build().map_err(|err| {
-            anyhow::anyhow!("prometheus_in: building a TLS-configured client: {err}")
-        })?;
+        let cfg = logit_pipeline::tls::build_client_config(
+            settings,
+            base_dir,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?;
+        self.client =
+            reqwest::Client::builder().use_preconfigured_tls(cfg).build().map_err(|err| {
+                anyhow::anyhow!("prometheus_in: building a TLS-configured client: {err}")
+            })?;
         Ok(self)
     }
 
@@ -800,9 +810,9 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// no such field for graph rule 45 to check. A field can be added if a deployment needs one.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `crate::tls::TlsServerSettings`, re-exported for the receiver's `bind_tls:` block: the
+/// `logit_pipeline::tls::TlsServerSettings`, re-exported for the receiver's `bind_tls:` block: the
 /// server-side twin of [`TlsClientSettings`] above, same convention as `otlp::TlsServerSettings`.
-pub use crate::tls::TlsServerSettings;
+pub use logit_pipeline::tls::TlsServerSettings;
 
 const METADATA_CACHE_SIZE: &str = "logit.input.metadata_cache.size";
 const METADATA_CACHE_EVICTED: &str = "logit.input.metadata_cache.evicted";
@@ -1150,13 +1160,24 @@ impl PrometheusReceiver {
 
     /// Turns on TLS termination (`bind_tls:` in config). Both ALPN protocols the auto builder can
     /// serve are advertised, so a TLS client's negotiation picks what the plaintext path sniffs.
+    ///
+    /// Registers the files with `reloader` under this listener's diagnostics and telemetry as
+    /// they are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_bind_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         let alpn: &[&[u8]] = &[b"h2", b"http/1.1"];
-        self.tls = Some(Arc::new(crate::tls::build_server_config(settings, base_dir, alpn)?));
+        self.tls = Some(Arc::new(logit_pipeline::tls::build_server_config(
+            settings,
+            base_dir,
+            alpn,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?));
         Ok(self)
     }
 
@@ -2057,16 +2078,17 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
 
-    /// A `rustls::ServerConfig` presenting `testdata/tls/server.{pem,key}`, requiring no client
-    /// certificate.
-    fn test_server_tls_config() -> Arc<rustls::ServerConfig> {
+    /// A `rustls::ServerConfig` presenting fixture `cert` (`testdata/tls/<cert>.pem` and `.key`),
+    /// requiring no client certificate.
+    fn test_server_tls_config(cert: &str) -> Arc<rustls::ServerConfig> {
         let dir = testdata_dir();
         let chain: Vec<rustls_pki_types::CertificateDer<'static>> =
-            rustls_pki_types::CertificateDer::pem_file_iter(dir.join("server.pem"))
+            rustls_pki_types::CertificateDer::pem_file_iter(dir.join(format!("{cert}.pem")))
                 .unwrap()
                 .collect::<Result<_, _>>()
                 .unwrap();
-        let key = rustls_pki_types::PrivateKeyDer::from_pem_file(dir.join("server.key")).unwrap();
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_file(dir.join(format!("{cert}.key")))
+            .unwrap();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let cfg = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
@@ -2077,10 +2099,11 @@ mod tests {
         Arc::new(cfg)
     }
 
-    /// A TLS-wrapped `canned_server` replying with a fixed text-0.0.4 body.
-    async fn canned_tls_server() -> SocketAddr {
+    /// A TLS-wrapped `canned_server` presenting fixture `cert`, replying with a fixed text-0.0.4
+    /// body.
+    async fn canned_tls_server(cert: &str) -> SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let acceptor = tokio_rustls::TlsAcceptor::from(test_server_tls_config());
+        let acceptor = tokio_rustls::TlsAcceptor::from(test_server_tls_config(cert));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2105,11 +2128,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_trusted_ca_file_lets_an_https_scrape_succeed() {
-        let addr = canned_tls_server().await;
+        let addr = canned_tls_server("server").await;
         let mut input = input_for(&format!("https://{addr}/metrics"))
             .with_tls(
                 &TlsClientSettings { ca_file: Some("ca.pem".to_string()), ..Default::default() },
                 &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .expect("a well-formed tls: block should build fine");
         let (tx, mut rx) = mpsc::channel(4);
@@ -2126,14 +2150,10 @@ mod tests {
     }
 
     /// `ca_file` is honored: a CA that doesn't sign the server's leaf (`other-ca.pem`,
-    /// `testdata/tls/README.md`) fails the handshake. This does **not** exercise
-    /// `tls_built_in_root_certs(false)`: no bundled root chains to the private test CA either, so
-    /// the handshake fails regardless, and a discriminating leaf isn't reproducible offline. That
-    /// `ca_file` replaces rather than joins the bundled set is taken on trust from `reqwest`'s
-    /// `ClientBuilder::tls_built_in_root_certs` doc.
+    /// `testdata/tls/README.md`) fails the handshake.
     #[tokio::test]
     async fn an_untrusted_ca_file_rejects_an_https_scrape() {
-        let addr = canned_tls_server().await;
+        let addr = canned_tls_server("server").await;
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("scrape", "prometheus_in", "listener");
         let mut input = input_for(&format!("https://{addr}/metrics"))
@@ -2143,6 +2163,7 @@ mod tests {
                     ..Default::default()
                 },
                 &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .expect("a well-formed tls: block should build fine")
             .with_telemetry(telemetry);
@@ -2159,6 +2180,39 @@ mod tests {
             counter_in(&events, "logit.input.scrapes", ("class", "network_error")),
             Some(1.0)
         );
+    }
+
+    /// The scrape client holds a clone of the config built at startup, and a reloaded `ca_file`
+    /// still reaches its next scrape.
+    #[tokio::test]
+    async fn a_reloaded_scrape_ca_file_reaches_the_next_scrape() {
+        let addr = canned_tls_server("server-other").await;
+        let dir = logit_pipeline::test_util::scratch_dir("prometheus-in-ca-reload");
+        std::fs::copy(testdata_dir().join("ca.pem"), dir.join("ca.pem")).unwrap();
+        let reloader = logit_pipeline::tls::TlsReloader::new();
+        let mut input = input_for(&format!("https://localhost:{}/metrics", addr.port()))
+            .with_tls(
+                &TlsClientSettings { ca_file: Some("ca.pem".to_string()), ..Default::default() },
+                &dir,
+                &reloader,
+            )
+            .expect("a well-formed tls: block should build fine");
+        let (tx, mut rx) = mpsc::channel(4);
+        let fanout = Fanout::new(vec![tx]);
+        input.tick(&fanout).await;
+        let batch = recv_batch(&mut rx).await;
+        assert_eq!(
+            synthetic_value(&batch, "up"),
+            0.0,
+            "ca.pem trusted a target under other-ca.pem"
+        );
+
+        std::fs::copy(testdata_dir().join("other-ca.pem"), dir.join("ca.pem")).unwrap();
+        reloader.check_now();
+
+        input.tick(&fanout).await;
+        let batch = recv_batch(&mut rx).await;
+        assert_eq!(synthetic_value(&batch, "up"), 1.0, "the reloaded CA should trust the target");
     }
 
     #[tokio::test]
@@ -3375,6 +3429,7 @@ mod tests {
                     client_ca_file: None,
                 },
                 &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .expect("a well-formed bind_tls: block should build fine");
         let mut rx = spawn_receiver(receiver, 4);
@@ -4326,6 +4381,7 @@ mod tests {
                         client_ca_file: None,
                     },
                     &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
                 )
                 .unwrap()
         };

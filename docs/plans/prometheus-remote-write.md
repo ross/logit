@@ -277,7 +277,8 @@ by rule 40 at `:1875`. The new list belongs in the same file for the same reason
 `bind` spawns `serve` (`:531-541`), `flush`/`Drop` abort that task (`:578-586`). Endpoint mode's
 `bind` is a no-op and its `flush` is `Ok`. The client is built like `otlp_out`'s HTTP path:
 `build_client(timeout, tls)` (`crates/logit-outputs/src/otlp.rs:462`) with
-`logit_outputs::tls::TlsClientSettings`, `User-Agent: logit/<ver>`.
+`logit_outputs::tls::TlsClientSettings` (now `logit_pipeline::tls::TlsClientSettings`),
+`User-Agent: logit/<ver>`.
 
 `send`: partition events by `Event::timestamp`, `events_to_families` per partition with
 `with_stale_markers(true)` and `with_timestamps_always(true)`; an empty result is `Ok(())` with **no

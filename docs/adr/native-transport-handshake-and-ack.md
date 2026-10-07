@@ -152,7 +152,8 @@ idle keep-alive connection's `Fanout` clone open past shutdown — a real gap, t
   "corrupt" for a streaming reader.
 - `crates/logit-inputs/src/logit.rs` / `crates/logit-outputs/src/logit.rs` (new): `LogitInput`/
   `LogitOutput`, both real, tested `ComponentKind` implementations now.
-- `crates/logit-inputs/src/tls.rs` / `crates/logit-outputs/src/tls.rs` (new): the TLS builders
+- `crates/logit-inputs/src/tls.rs` / `crates/logit-outputs/src/tls.rs` (new; both builders now live in
+  `logit_pipeline::tls`, per [ADR `tls-certificate-reload`](tls-certificate-reload.md)): the TLS builders
   `otlp_in`/`otlp_out` already had, extracted so `logit_in`/`logit_out` share them rather than
   duplicating `rustls` construction a third time.
 - `docs/known-gaps/runtime.md`'s schema-drift entry ("the published schema advertises kinds the

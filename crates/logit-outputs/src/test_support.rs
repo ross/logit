@@ -205,6 +205,59 @@ pub(crate) fn tls_settings(overrides: impl FnOnce(&mut TlsClientSettings)) -> Tl
     settings
 }
 
+/// `settings` built against `testdata/tls` as a sink builds them, registered with a reloader
+/// nothing checks.
+pub(crate) fn client_config(settings: &TlsClientSettings) -> rustls::ClientConfig {
+    logit_pipeline::tls::build_client_config(
+        settings,
+        &testdata_dir(),
+        &logit_pipeline::tls::TlsReloader::new(),
+        &logit_core::Diagnostics::default(),
+        &logit_core::Telemetry::default(),
+    )
+    .unwrap()
+}
+
+/// A `rustls::ServerConfig` presenting fixture `cert` (`testdata/tls/<cert>.pem` and `.key`),
+/// requiring a client certificate chaining to fixture `client_ca` when given, built as a listener
+/// builds its own.
+pub(crate) fn fixture_server_config(
+    cert: &str,
+    client_ca: Option<&str>,
+    alpn: &[&[u8]],
+) -> Arc<rustls::ServerConfig> {
+    let settings = logit_pipeline::tls::TlsServerSettings {
+        cert_file: format!("{cert}.pem"),
+        key_file: format!("{cert}.key"),
+        client_ca_file: client_ca.map(|ca| format!("{ca}.pem")),
+    };
+    let cfg = logit_pipeline::tls::build_server_config(
+        &settings,
+        &testdata_dir(),
+        alpn,
+        &logit_pipeline::tls::TlsReloader::new(),
+        &logit_core::Diagnostics::default(),
+        &logit_core::Telemetry::default(),
+    )
+    .unwrap();
+    Arc::new(cfg)
+}
+
+/// Fixtures copied into a fresh scratch directory as `(name, fixture)` pairs, so a reload test
+/// can rewrite them with [`rewrite_tls_file`].
+pub(crate) fn scratch_tls_files(label: &str, files: &[(&str, &str)]) -> PathBuf {
+    let dir = logit_pipeline::test_util::scratch_dir(label);
+    for (name, fixture) in files {
+        std::fs::copy(testdata_dir().join(fixture), dir.join(name)).unwrap();
+    }
+    dir
+}
+
+/// Overwrites `dir/name` in place with `testdata/tls/<fixture>`.
+pub(crate) fn rewrite_tls_file(dir: &std::path::Path, name: &str, fixture: &str) {
+    std::fs::write(dir.join(name), std::fs::read(testdata_dir().join(fixture)).unwrap()).unwrap();
+}
+
 /// A `rustls::ServerConfig` presenting `testdata/tls/server.{pem,key}` (SANs `localhost` and
 /// `127.0.0.1`), optionally requiring a client certificate chaining to `testdata/tls/ca.pem`. No
 /// ALPN: neither RFC 5425 syslog nor statsd over TLS has an identifier.
@@ -685,7 +738,7 @@ where
 /// A tokio-rustls client trusting `testdata/tls/ca.pem`, built as a sink builds its own.
 pub(crate) fn tls_client_connector() -> tokio_rustls::TlsConnector {
     let settings = tls_settings(|s| s.ca_file = Some("ca.pem".to_string()));
-    let client_config = crate::tls::build_client_config(&settings, &testdata_dir()).unwrap();
+    let client_config = client_config(&settings);
     tokio_rustls::TlsConnector::from(Arc::new(client_config))
 }
 

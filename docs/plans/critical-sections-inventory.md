@@ -5090,8 +5090,9 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - `AcceptAnyServerCert` still verifies TLS 1.2/1.3 handshake signatures and reports
     `supported_verify_schemes` from the same provider.
   - No `ClientConfig` reaching `build_grpc_client` has `alpn_protocols` set (a panic otherwise).
-  - There is **no certificate reload** anywhere: a rotated cert requires a process restart. Confirm
-    that is intended and documented in `docs/deploying.md`.
+  - There was **no certificate reload** anywhere when this was written. [ADR
+    `tls-certificate-reload`](../adr/tls-certificate-reload.md) added one, documented in
+    `docs/deploying.md`'s "Certificate rotation".
   - Paths are resolved against the config file's directory consistently on every field.
 - **Observed concerns (unverified):**
   - No cert/key hot reload on any listener or sink. For a long-lived collector with short-lived

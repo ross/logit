@@ -35,7 +35,6 @@ pub mod statsd;
 pub mod syslog;
 pub mod tail;
 pub mod tcp;
-mod tls;
 pub mod udp;
 mod unix;
 mod zstd;
