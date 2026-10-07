@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-09-26
+updated: 2026-10-07
 ---
 
 # A top-level `admin:` block, not a component, for readiness/liveness
@@ -98,3 +98,14 @@ treats it like any non-`200` answer. `/healthz` is unchanged and stays `200`: th
 and a restart doesn't fix a script. The shipped image's `HEALTHCHECK` probes `/readyz`, so a
 stalled script does mark that container unhealthy; the operator-facing consequences are in
 `docs/deploying.md`'s "Probes and exit codes".
+
+## Amendment (2026-10-07): a Unix socket beside `bind:`
+
+[ADR `listener-port-sharing-and-shutdown-delay`](listener-port-sharing-and-shutdown-delay.md),
+decision 4, decides the Unix-socket form this record deferred under "Alternatives considered".
+`admin:` gains `socket:` and `socket_mode:` beside `bind:`, and a config can set either, both, or
+neither. `logit ready --admin unix:<path>` probes the socket, and `logit ready` also reads its
+target from `LOGIT_ADMIN`. The reason is a rolling overlap of two pods under `hostNetwork`: they
+collide on `admin.bind`, and sharing that port would let the old pod answer the new pod's probe. A
+pod-local socket path can't collide. HTTP over the socket, the two routes, and their answers are
+unchanged.

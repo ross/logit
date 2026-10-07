@@ -1,6 +1,6 @@
 ---
 created: 2026-09-18
-updated: 2026-09-26
+updated: 2026-10-07
 ---
 
 # UDP intake batching and socket visibility
@@ -661,6 +661,11 @@ shutdown cascade `decoupled-listener-io` built around exactly one `Fanout` per l
 host or the NIC hands off coalesced segments — not guaranteed in most deployments), is a question W4's
 measurements are positioned to answer and this ADR is not. Building either now would be designing
 ahead of evidence this same plan is about to produce.
+
+> **Revised by [ADR `listener-port-sharing-and-shutdown-delay`](listener-port-sharing-and-shutdown-delay.md).**
+> Sharing one listener's port across processes, one socket per process, is now decided: an opt-in
+> `reuse_port` field for a rolling overlap of two `logit` instances. Several readers on one port
+> inside one process, and `UDP_GRO`, stay out of scope for the reasons above.
 
 ## Alternatives considered
 
