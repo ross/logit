@@ -22,7 +22,8 @@ pub enum Phase {
     Starting,
     /// Every listener bound, every node task (or Lua thread) spawned, nothing has failed.
     Ready,
-    /// A shutdown signal arrived; nodes are draining. Never entered from `Failed`.
+    /// A shutdown signal arrived: `/readyz` withdraws the process now, and the nodes drain once any
+    /// `shutdown.delay` has elapsed. Never entered from `Failed`.
     Draining,
     /// At least one node exited with an error. Terminal.
     Failed,

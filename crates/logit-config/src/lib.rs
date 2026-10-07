@@ -54,11 +54,12 @@ pub struct ShutdownConfig {
     ///
     /// For the whole delay, `/readyz` answers `503 draining`, and every listener stays bound and
     /// keeps accepting connections and reading data. That gives an orchestrator time to stop
-    /// routing traffic here before the listeners close: in Kubernetes, set it to cover the
-    /// readiness probe's period plus the time the Service's endpoints take to update. When the
-    /// delay ends, the drain starts, and each component's `shutdown_grace` starts counting from
-    /// then. A second SIGTERM or SIGINT, during the delay or the drain, still exits at once with
-    /// code `130`.
+    /// routing traffic here before the listeners close. In Kubernetes, size it by how long the
+    /// endpoint withdrawal takes to reach kube-proxy, ingresses, and load balancers; a client that
+    /// routes on its own probe of `/readyz` adds that probe's period times its failure threshold.
+    /// When the delay ends, the drain starts, and each component's `shutdown_grace` starts
+    /// counting from then. A second SIGTERM or SIGINT, during the delay or the drain, still exits
+    /// at once with code `130`.
     ///
     /// The orchestrator's own stop timeout must cover the delay plus the drain, or it kills the
     /// process mid-drain. In Kubernetes, that's `terminationGracePeriodSeconds`.
