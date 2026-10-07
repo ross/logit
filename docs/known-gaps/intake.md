@@ -177,11 +177,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   Both need a downstream that stays full for the whole grace (5 s by default). Counting them would
   need an event-level drop counter on the accumulator and a per-consumer delivery record in
   `Fanout`, for a loss the grace already bounds.
-- **A multicast `collectd_in` is delivered to every overlapping instance.** Every socket joined to
+- **A multicast UDP listener is delivered to every overlapping instance.** Every socket joined to
   a multicast group receives every datagram, whatever `SO_REUSEADDR` or `SO_REUSEPORT` it sets
   (measured: 1000 of 1000 at each of two members), and the multicast bind already sets
-  `SO_REUSEADDR`, so two overlapping `logit` instances both bind and both receive.
-  - **Consequence:** during a rolling overlap, every value list reaches both instances, and a
+  `SO_REUSEADDR`, so two overlapping `logit` instances with the same multicast `bind:`, such as a
+  `collectd_in` on collectd's default group, both bind and both receive.
+  - **Consequence:** during a rolling overlap, every datagram reaches both instances, and a
     downstream count or sum doubles until the old one exits.
   - **Workaround:** none beyond not overlapping multicast listeners: stop the old instance before
     the new one starts. `reuse_port` is refused on a multicast `bind:`, because there's nothing for
