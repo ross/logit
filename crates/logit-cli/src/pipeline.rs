@@ -377,8 +377,8 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
 /// `reopen`, when `Some`, is cloned into every `stdio_out`/`file_out` file target. A clone, not
 /// a `subscribe()`, so a SIGHUP that landed during startup still reads as changed.
 ///
-/// Every TLS listener registers its certificate files with `tls_reloader`, under the component's
-/// own `Diagnostics` and `Telemetry`.
+/// Every TLS component (a listener, a sink, or `prometheus_in`'s scrape client) registers its
+/// certificate files with `tls_reloader`, under the component's own `Diagnostics` and `Telemetry`.
 fn build_spec(
     id: &str,
     component: &ResolvedComponent,
@@ -744,7 +744,7 @@ fn build_spec(
                         .with_headers(headers)?
                         .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                         .with_telemetry(telemetry.clone())
-                        .with_tls(&to_input_tls_client_settings(scrape_tls), base_dir)?,
+                        .with_tls(&to_tls_client_settings(scrape_tls), base_dir, tls_reloader)?,
                 ),
             };
             NodeSpec::Input(input, input_runtime_config(&component.receive))
@@ -1057,7 +1057,7 @@ fn build_spec(
                 .with_compression(to_otlp_compression(*compression))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
-                .with_tls(&to_tls_client_settings(tls), base_dir)?;
+                .with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer, base_dir),
@@ -1080,7 +1080,7 @@ fn build_spec(
                 .with_headers(headers)?
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
-                .with_tls(&to_tls_client_settings(tls), base_dir)?;
+                .with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer, base_dir),
@@ -1107,7 +1107,7 @@ fn build_spec(
                 .with_headers(headers)?
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
-                .with_tls(&to_tls_client_settings(tls), base_dir)?;
+                .with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer, base_dir),
@@ -1135,7 +1135,7 @@ fn build_spec(
                 .with_max_body_bytes(usize::try_from(*max_body_bytes).unwrap_or(usize::MAX))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
-                .with_tls(&to_tls_client_settings(tls), base_dir)?;
+                .with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer, base_dir),
@@ -1150,8 +1150,7 @@ fn build_spec(
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
             if let Some(tls) = tls {
-                // Both `logit` and `otlp` re-export `logit_outputs::tls::TlsClientSettings`.
-                output = output.with_tls(&to_tls_client_settings(tls), base_dir)?;
+                output = output.with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
             }
             NodeSpec::Output(
                 Box::new(output),
@@ -1233,7 +1232,7 @@ fn build_spec(
             // TCP only (RFC 5425; rule 44 rejects `tls:` under UDP). After `with_diagnostics`, so
             // the `insecure_skip_verify` warning lands on this component's diagnostics.
             if let (logit_config::SyslogTransport::Tcp, Some(tls)) = (transport, tls) {
-                output = output.with_tls(&to_tls_client_settings(tls), base_dir)?;
+                output = output.with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
             }
             NodeSpec::Output(
                 Box::new(output),
@@ -1274,7 +1273,7 @@ fn build_spec(
                 .with_telemetry(telemetry.clone());
             // TCP only (rule 52), after `with_diagnostics`, as `SyslogOut`.
             if let (logit_config::StatsdTransport::Tcp, Some(tls)) = (transport, tls) {
-                output = output.with_tls(&to_tls_client_settings(tls), base_dir)?;
+                output = output.with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
             }
             NodeSpec::Output(
                 Box::new(output),
@@ -1369,7 +1368,7 @@ fn build_spec(
                     .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                     .with_telemetry(telemetry.clone())
                     .with_headers(headers)?
-                    .with_tls(&to_tls_client_settings(endpoint_tls), base_dir)?
+                    .with_tls(&to_tls_client_settings(endpoint_tls), base_dir, tls_reloader)?
                     .into(),
                 // Unreachable behind rule 56. An error, not a panic: `build_spec` is callable
                 // without `graph::resolve` having run.
@@ -1786,11 +1785,12 @@ fn to_signal_paths(paths: &logit_config::OtlpPaths) -> SignalPaths {
     }
 }
 
-/// Config's `TlsClientConfig` into `logit-outputs`'s identically shaped `TlsClientSettings`.
+/// Config's `TlsClientConfig` into the identically shaped `logit_pipeline::tls::TlsClientSettings`
+/// every sink and `prometheus_in`'s scrape client take.
 fn to_tls_client_settings(
     tls: &logit_config::TlsClientConfig,
-) -> logit_outputs::otlp::TlsClientSettings {
-    logit_outputs::otlp::TlsClientSettings {
+) -> logit_pipeline::tls::TlsClientSettings {
+    logit_pipeline::tls::TlsClientSettings {
         ca_file: tls.ca_file.clone(),
         cert_file: tls.cert_file.clone(),
         key_file: tls.key_file.clone(),
@@ -1828,19 +1828,6 @@ fn to_tls_server_settings(
         cert_file: tls.cert_file.clone(),
         key_file: tls.key_file.clone(),
         client_ca_file: tls.client_ca_file.clone(),
-    }
-}
-
-/// [`to_tls_client_settings`] for `prometheus_in`'s scrape client, whose `reqwest`-based type is
-/// `logit-inputs`'s own.
-fn to_input_tls_client_settings(
-    tls: &logit_config::TlsClientConfig,
-) -> logit_inputs::prometheus::TlsClientSettings {
-    logit_inputs::prometheus::TlsClientSettings {
-        ca_file: tls.ca_file.clone(),
-        cert_file: tls.cert_file.clone(),
-        key_file: tls.key_file.clone(),
-        insecure_skip_verify: tls.insecure_skip_verify,
     }
 }
 
@@ -3034,12 +3021,13 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
 
-    /// Every TLS listener registers its files with the reloader `prepare` is given, not one of
+    /// Every TLS component registers its files with the reloader `prepare` is given, not one of
     /// its own that nothing ever checks.
     #[test]
-    fn every_tls_listener_registers_with_the_shared_reloader() {
+    fn every_tls_component_registers_with_the_shared_reloader() {
         let tls = "{cert_file: server.pem, key_file: server.key, client_ca_file: ca.pem}";
-        let listeners = [
+        let client = "{ca_file: ca.pem, cert_file: client.pem, key_file: client.key}";
+        let mut inputs = vec![
             format!("type: statsd_in\n    transport: tcp\n    bind: 127.0.0.1:0\n    tls: {tls}"),
             format!("type: lines_in\n    transport: tcp\n    bind: 127.0.0.1:0\n    tls: {tls}"),
             format!("type: graphite_in\n    transport: tcp\n    bind: 127.0.0.1:0\n    tls: {tls}"),
@@ -3051,22 +3039,51 @@ mod tests {
             format!("type: logit_in\n    bind: 127.0.0.1:0\n    tls: {tls}"),
             format!("type: prometheus_in\n    bind: 127.0.0.1:0\n    bind_tls: {tls}"),
         ];
+        inputs.push(format!(
+            "type: prometheus_in\n    scrape_targets: [https://localhost:9100/metrics]\n    \
+             scrape_tls: {client}"
+        ));
+        let sinks = [
+            format!("type: otlp_out\n    endpoint: https://localhost:4318\n    tls: {client}"),
+            format!("type: datadog_out\n    api_key: placeholder\n    tls: {client}"),
+            format!("type: datadog_trace_out\n    endpoint: https://localhost:8126\n    tls: {client}"),
+            format!(
+                "type: splunk_hec_out\n    endpoint: https://localhost:8088/services/collector\n    \
+                 token: placeholder\n    tls: {client}"
+            ),
+            format!("type: logit_out\n    endpoint: localhost:7000\n    tls: {client}"),
+            format!(
+                "type: syslog_out\n    transport: tcp\n    endpoint: localhost:6514\n    \
+                 tls: {client}"
+            ),
+            format!(
+                "type: statsd_out\n    transport: tcp\n    endpoint: localhost:8125\n    \
+                 tls: {client}"
+            ),
+            format!(
+                "type: prometheus_out\n    endpoint: https://localhost:9090/api/v1/write\n    \
+                 version: 1\n    endpoint_tls: {client}"
+            ),
+        ];
         let mut yaml = String::from("components:\n");
-        for (i, listener) in listeners.iter().enumerate() {
-            yaml.push_str(&format!("  in{i}:\n    {listener}\n"));
+        for (i, input) in inputs.iter().enumerate() {
+            yaml.push_str(&format!("  in{i}:\n    {input}\n"));
         }
-        let sources: Vec<String> = (0..listeners.len()).map(|i| format!("in{i}")).collect();
+        let sources: Vec<String> = (0..inputs.len()).map(|i| format!("in{i}")).collect();
         yaml.push_str(&format!(
             "  out:\n    type: null_out\n    sources: [{}]\n",
             sources.join(", ")
         ));
+        for (i, sink) in sinks.iter().enumerate() {
+            yaml.push_str(&format!("  out{i}:\n    {sink}\n    sources: [in0]\n"));
+        }
         let path = logit_pipeline::test_util::scratch_dir("tls-registers").join("logit.yaml");
         std::fs::write(&path, yaml).unwrap();
         let cfg = crate::config::load(&path).unwrap();
 
         let reloader = TlsReloader::new();
         prepare(cfg, testdata_tls_dir(), None, &reloader).expect("the config builds");
-        assert_eq!(reloader.len(), listeners.len());
+        assert_eq!(reloader.len(), inputs.len() + sinks.len());
     }
 
     #[test]

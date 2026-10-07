@@ -1,11 +1,12 @@
 //! Shared TLS construction, and the reloader that swaps rotated certificates in without a restart.
 //!
 //! [`build_server_config`] builds the `rustls::ServerConfig` every TLS-terminating listener uses,
-//! and registers the files it read with a [`TlsReloader`]. The config is built once around
-//! swappable pieces, [`ReloadingCert`] and [`ReloadingClientVerifier`], so a reload reaches the
-//! next handshake with no rebuilt config, and an open connection keeps the certificate it
-//! handshook with. `docs/adr/tls-certificate-reload.md` has the design. The facts a maintainer
-//! needs at the code:
+//! and [`build_client_config`] the `rustls::ClientConfig` every TLS client uses: each sink, and
+//! `prometheus_in`'s scrape client. Each registers the files it read with a [`TlsReloader`]. A
+//! config is built once around swappable pieces, [`ReloadingCert`], [`ReloadingClientVerifier`],
+//! and [`ReloadingServerVerifier`], so a reload reaches the next full handshake with no rebuilt
+//! config or client, and an open connection keeps the certificate it handshook with.
+//! `docs/adr/tls-certificate-reload.md` has the design. The facts a maintainer needs at the code:
 //!
 //! - **A change is a change in content.** [`TlsReloader::check_now`] reads every file of a set and
 //!   compares the bytes with what it last *attempted*, not with what loaded. Opening the configured
@@ -15,6 +16,9 @@
 //! - **A set loads whole or not at all.** A changed set is parsed in full before anything swaps,
 //!   and a failure keeps the old material. A certificate and key that don't match fail the load:
 //!   `CertifiedKey::from_der` runs `keys_match`.
+//! - **A cloned `ClientConfig` shares its swappable pieces.** They sit behind `Arc`s, so a
+//!   `reqwest` client built with `use_preconfigured_tls(cfg.clone())` and a `hyper-rustls`
+//!   connector built with `with_tls_config(cfg.clone())` both see every reload.
 //! - **Errors name a file's config key and path, never a value from the config.**
 
 use std::fmt;
@@ -24,14 +28,15 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use logit_core::{Diagnostics, Telemetry};
-use rustls::client::danger::HandshakeSignatureValid;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use tokio::sync::watch;
 
 /// Server-side TLS for a listener's `tls:` config block, mirroring
@@ -125,19 +130,7 @@ impl ServerMaterial {
         contents: &[Vec<u8>],
         provider: &Arc<CryptoProvider>,
     ) -> anyhow::Result<Self> {
-        let chain = parse_certs(&files[0], &contents[0])?;
-        let key = PrivateKeyDer::from_pem_slice(&contents[1])
-            .map_err(|e| files[1].error(format_args!("parsing: {e}")))?;
-        let not_after = not_after(&chain[0]);
-        let key = CertifiedKey::from_der(chain, key, provider).map_err(|e| {
-            anyhow::anyhow!(
-                "loading {} {} with {} {}: {e}",
-                files[0].label,
-                files[0].path.display(),
-                files[1].label,
-                files[1].path.display()
-            )
-        })?;
+        let (key, not_after) = certified_key(&files[..2], &contents[..2], provider)?;
         let verifier = match (files.get(2), contents.get(2)) {
             (Some(file), Some(contents)) => {
                 let mut roots = rustls::RootCertStore::empty();
@@ -150,7 +143,174 @@ impl ServerMaterial {
             }
             _ => None,
         };
-        Ok(Self { key: Arc::new(key), verifier, not_after })
+        Ok(Self { key, verifier, not_after })
+    }
+}
+
+/// A certificate chain and its key, from parallel `[cert_file, key_file]` slices, with the leaf's
+/// `notAfter`. Fails on a key that doesn't match the leaf.
+fn certified_key(
+    files: &[WatchedFile],
+    contents: &[Vec<u8>],
+    provider: &Arc<CryptoProvider>,
+) -> anyhow::Result<(Arc<CertifiedKey>, Option<i64>)> {
+    let chain = parse_certs(&files[0], &contents[0])?;
+    let key = PrivateKeyDer::from_pem_slice(&contents[1])
+        .map_err(|e| files[1].error(format_args!("parsing: {e}")))?;
+    let not_after = not_after(&chain[0]);
+    let key = CertifiedKey::from_der(chain, key, provider).map_err(|e| {
+        anyhow::anyhow!(
+            "loading {} {} with {} {}: {e}",
+            files[0].label,
+            files[0].path.display(),
+            files[1].label,
+            files[1].path.display()
+        )
+    })?;
+    Ok((Arc::new(key), not_after))
+}
+
+/// Client-side TLS for a sink's `tls:` block, or `prometheus_in`'s `scrape_tls:`, mirroring
+/// `logit_config::TlsClientConfig` (`logit-cli::pipeline::build_spec` converts).
+#[derive(Debug, Clone, Default)]
+pub struct TlsClientSettings {
+    /// PEM bundle of CA certificates to trust *instead of* the bundled Mozilla root set.
+    pub ca_file: Option<String>,
+    /// Client certificate chain (PEM) presented for mutual TLS. Requires `key_file`.
+    pub cert_file: Option<String>,
+    /// Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`. Requires `cert_file`.
+    pub key_file: Option<String>,
+    /// Skips server-certificate verification: still encrypted, but any certificate is accepted.
+    pub insecure_skip_verify: bool,
+}
+
+impl TlsClientSettings {
+    /// `true` if every field is at its default (`logit_config::TlsClientConfig::is_empty`). Not a
+    /// "TLS is off" test for a sink where a `tls:` block's presence alone turns TLS on.
+    pub fn is_empty(&self) -> bool {
+        self.ca_file.is_none()
+            && self.cert_file.is_none()
+            && self.key_file.is_none()
+            && !self.insecure_skip_verify
+    }
+}
+
+/// Builds a `rustls::ClientConfig` from `settings`, with every path resolved against `base_dir`,
+/// and registers its files with `reloader` under the owning component's `diag` and `telemetry`.
+///
+/// Registers `ca_file` and the `cert_file`/`key_file` pair, whichever are set, and nothing when
+/// neither is. `insecure_skip_verify` ignores `ca_file`, and the default Mozilla roots are compiled
+/// in, so neither has anything to reload. ALPN stays empty: `otlp_out`'s gRPC connector panics on
+/// a config that sets it.
+///
+/// Fails on a file that's missing or doesn't parse, and on a key that doesn't match its
+/// certificate: at startup a bad file stops the process, where a reload keeps the old material.
+pub fn build_client_config(
+    settings: &TlsClientSettings,
+    base_dir: &Path,
+    reloader: &TlsReloader,
+    diag: &Diagnostics,
+    telemetry: &Telemetry,
+) -> anyhow::Result<rustls::ClientConfig> {
+    let mut files = Vec::new();
+    if let Some(ca_file) = settings.ca_file.as_ref().filter(|_| !settings.insecure_skip_verify) {
+        files.push(WatchedFile::new("tls.ca_file", base_dir.join(ca_file)));
+    }
+    let has_ca = !files.is_empty();
+    if let (Some(cert_file), Some(key_file)) = (&settings.cert_file, &settings.key_file) {
+        files.push(WatchedFile::new("tls.cert_file", base_dir.join(cert_file)));
+        files.push(WatchedFile::new("tls.key_file", base_dir.join(key_file)));
+    }
+    let contents = files.iter().map(WatchedFile::read).collect::<anyhow::Result<Vec<_>>>()?;
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let material = ClientMaterial::parse(&files, &contents, has_ca, &provider)?;
+    let not_after = material.not_after;
+    let verifier = material.verifier.map(|v| Arc::new(ReloadingServerVerifier::new(v)));
+    let cert = material.key.map(|key| Arc::new(ReloadingCert::new(key)));
+
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("the ring crypto provider always supports TLS 1.2/1.3");
+    // The graph rejects `insecure_skip_verify` with `ca_file` for every client; with a client
+    // certificate it's legal (mutual TLS, no server verification).
+    let builder = match &verifier {
+        _ if settings.insecure_skip_verify => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert((*provider).clone()))),
+        Some(verifier) => builder
+            .dangerous()
+            .with_custom_certificate_verifier(verifier.clone() as Arc<dyn ServerCertVerifier>),
+        None => {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            builder.with_root_certificates(roots)
+        }
+    };
+    let cfg = match &cert {
+        Some(cert) => builder.with_client_cert_resolver(cert.clone()),
+        None => builder.with_no_client_auth(),
+    };
+
+    if !files.is_empty() {
+        let load_files = files.clone();
+        reloader.register(Registration {
+            files,
+            contents,
+            side: "client",
+            not_after,
+            load: Box::new(move |contents| {
+                let material = ClientMaterial::parse(&load_files, contents, has_ca, &provider)?;
+                if let (Some(verifier), Some(next)) = (&verifier, material.verifier) {
+                    verifier.swap(next);
+                }
+                if let (Some(cert), Some(next)) = (&cert, material.key) {
+                    cert.swap(next);
+                }
+                Ok(material.not_after)
+            }),
+            diag: diag.clone(),
+            telemetry: telemetry.clone(),
+        });
+    }
+    Ok(cfg)
+}
+
+/// One parsed client file set: everything a swap needs, built before anything swaps.
+struct ClientMaterial {
+    verifier: Option<Arc<dyn ServerCertVerifier>>,
+    key: Option<Arc<CertifiedKey>>,
+    not_after: Option<i64>,
+}
+
+impl ClientMaterial {
+    /// `files` and `contents` are parallel: a CA bundle first when `has_ca`, then a certificate
+    /// and its key when two files follow.
+    fn parse(
+        files: &[WatchedFile],
+        contents: &[Vec<u8>],
+        has_ca: bool,
+        provider: &Arc<CryptoProvider>,
+    ) -> anyhow::Result<Self> {
+        let verifier = if has_ca {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add_parsable_certificates(parse_certs(&files[0], &contents[0])?);
+            let verifier =
+                WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+                    .build()
+                    .map_err(|e| files[0].error(format_args!("building a verifier: {e}")))?;
+            Some(verifier as Arc<dyn ServerCertVerifier>)
+        } else {
+            None
+        };
+        let pair = usize::from(has_ca);
+        let (key, not_after) = if files.len() == pair + 2 {
+            let (key, not_after) = certified_key(&files[pair..], &contents[pair..], provider)?;
+            (Some(key), not_after)
+        } else {
+            (None, None)
+        };
+        Ok(Self { verifier, key, not_after })
     }
 }
 
@@ -168,8 +328,9 @@ fn parse_certs(
     Ok(certs)
 }
 
-/// A server certificate resolver whose certificate and key can be swapped while the
-/// `ServerConfig` holding it serves. Each handshake resolves the current pair once.
+/// A certificate resolver whose certificate and key can be swapped while the config holding it is
+/// in use: a listener's server certificate, or a client's certificate for mutual TLS. Each full
+/// handshake resolves the current pair once.
 pub struct ReloadingCert {
     current: RwLock<Arc<CertifiedKey>>,
 }
@@ -200,6 +361,21 @@ impl fmt::Debug for ReloadingCert {
 impl ResolvesServerCert for ReloadingCert {
     fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         Some(self.current())
+    }
+}
+
+/// Sends the pair whatever CAs the server hints, as rustls's own single-certificate resolver does.
+impl ResolvesClientCert for ReloadingCert {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        Some(self.current())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
     }
 }
 
@@ -329,6 +505,130 @@ impl ClientCertVerifier for ReloadingClientVerifier {
 
     fn requires_raw_public_keys(&self) -> bool {
         self.current().requires_raw_public_keys()
+    }
+}
+
+/// A server-certificate verifier that delegates to a swappable inner verifier, for a client's
+/// `ca_file`.
+pub struct ReloadingServerVerifier {
+    current: RwLock<Arc<dyn ServerCertVerifier>>,
+}
+
+impl ReloadingServerVerifier {
+    pub fn new(inner: Arc<dyn ServerCertVerifier>) -> Self {
+        Self { current: RwLock::new(inner) }
+    }
+
+    fn current(&self) -> Arc<dyn ServerCertVerifier> {
+        self.current.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    /// Replaces the inner verifier for every later full handshake.
+    pub fn swap(&self, next: Arc<dyn ServerCertVerifier>) {
+        *self.current.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    }
+}
+
+impl fmt::Debug for ReloadingServerVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReloadingServerVerifier")
+    }
+}
+
+/// `root_hint_subjects` keeps the trait's default, `None`, which is what `WebPkiServerVerifier`
+/// returns too; a delegated borrow couldn't outlive the lock guard.
+impl ServerCertVerifier for ReloadingServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        self.current().verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.current().verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.current().verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.current().supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.current().requires_raw_public_keys()
+    }
+}
+
+/// `tls.insecure_skip_verify`'s [`ServerCertVerifier`]: skips chain and hostname validation, but
+/// still verifies the handshake signature with the provider's algorithms.
+#[derive(Debug)]
+pub struct AcceptAnyServerCert(CryptoProvider);
+
+impl ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 
@@ -473,9 +773,9 @@ impl Watched {
 /// The process's registry of watched TLS file sets, and the task that checks them. `Clone` shares
 /// one registry.
 ///
-/// Every TLS component registers at build time ([`build_server_config`]); `logit run` spawns
-/// [`TlsReloader::run`] once. Tests call [`TlsReloader::check_now`] instead of waiting out an
-/// interval.
+/// Every TLS component registers at build time ([`build_server_config`], [`build_client_config`]);
+/// `logit run` spawns [`TlsReloader::run`] once. Tests call [`TlsReloader::check_now`] instead of
+/// waiting out an interval.
 #[derive(Clone, Default)]
 pub struct TlsReloader {
     /// A `std::sync::Mutex`: held across file reads only on a blocking thread, never across an

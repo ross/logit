@@ -530,3 +530,183 @@ async fn the_gauge_tick_reports_the_old_certificate_after_a_failed_reload() {
     assert_eq!(not_after_points(totals), before + 1);
     assert_eq!(totals.gauge(NOT_AFTER, &[("side", "server")]), Some(BASE_NOT_AFTER as f64));
 }
+
+// --- client side ---
+
+/// A client's file set in a scratch directory: `ca.pem` as `ca.pem`, and fixture `client` as
+/// `cert.pem`/`key.pem` when given.
+struct ClientSet {
+    dir: PathBuf,
+    settings: TlsClientSettings,
+}
+
+impl ClientSet {
+    fn new(label: &str, client: Option<&str>) -> Self {
+        let dir = scratch_dir(label);
+        std::fs::copy(fixture("ca.pem"), dir.join("ca.pem")).unwrap();
+        if let Some(client) = client {
+            std::fs::copy(fixture(&format!("{client}.pem")), dir.join("cert.pem")).unwrap();
+            std::fs::copy(fixture(&format!("{client}.key")), dir.join("key.pem")).unwrap();
+        }
+        let settings = TlsClientSettings {
+            ca_file: Some("ca.pem".into()),
+            cert_file: client.map(|_| "cert.pem".into()),
+            key_file: client.map(|_| "key.pem".into()),
+            insecure_skip_verify: false,
+        };
+        Self { dir, settings }
+    }
+
+    fn write(&self, name: &str, from: &str) {
+        std::fs::write(self.dir.join(name), std::fs::read(fixture(from)).unwrap()).unwrap();
+    }
+}
+
+struct Client {
+    cfg: rustls::ClientConfig,
+    reloader: TlsReloader,
+    probe: TelemetryProbe,
+}
+
+impl Client {
+    fn build(set: &ClientSet) -> Self {
+        let probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "otlp_out", "sink");
+        let diag = Diagnostics::new("out").with_telemetry(telemetry.clone());
+        let reloader = TlsReloader::new();
+        let cfg = build_client_config(&set.settings, &set.dir, &reloader, &diag, &telemetry)
+            .expect("building the client config");
+        Self { cfg, reloader, probe }
+    }
+
+    /// A connector over a clone of the config, as each HTTP client holds its own clone.
+    ///
+    /// A fresh connector per connection, so a fresh session cache: a resumed handshake skips
+    /// verification on both sides, and these tests are about what a full handshake checks.
+    fn connector(&self) -> TlsConnector {
+        TlsConnector::from(Arc::new(self.cfg.clone()))
+    }
+}
+
+/// A listener presenting fixture `cert`, requiring a client certificate chaining to fixture
+/// `client_ca` when given.
+async fn serve_fixture(cert: &str, client_ca: Option<&str>) -> SocketAddr {
+    let settings = TlsServerSettings {
+        cert_file: format!("{cert}.pem"),
+        key_file: format!("{cert}.key"),
+        client_ca_file: client_ca.map(|ca| format!("{ca}.pem")),
+    };
+    let cfg = build_server_config(
+        &settings,
+        &fixture(""),
+        &[],
+        &TlsReloader::new(),
+        &Diagnostics::default(),
+        &Telemetry::default(),
+    )
+    .unwrap();
+    serve_echo(cfg).await
+}
+
+/// Whether a handshake with `addr` completes and a frame echoes.
+async fn handshakes(addr: SocketAddr, connector: &TlsConnector) -> bool {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    match tokio::time::timeout(RECV_TIMEOUT, connector.connect(name, tcp))
+        .await
+        .expect("handshake timed out")
+    {
+        Ok(mut stream) => round_trips(&mut stream).await,
+        Err(_) => false,
+    }
+}
+
+#[tokio::test]
+async fn a_rotated_ca_file_trusts_a_server_reissued_under_the_new_ca() {
+    let addr = serve_fixture("server-other", None).await;
+    let set = ClientSet::new("tls-client-ca-file", None);
+    let mut client = Client::build(&set);
+    // Built before the reload: a clone shares the swappable verifier.
+    let connector = client.connector();
+    assert!(!handshakes(addr, &connector).await, "ca.pem trusted a server under other-ca.pem");
+
+    set.write("ca.pem", "other-ca.pem");
+    client.reloader.check_now();
+
+    assert_eq!(client.probe.sum(RELOADS, &[("outcome", "reloaded")]), 1.0);
+    assert!(handshakes(addr, &connector).await, "the rotated CA wasn't trusted");
+    assert!(!handshakes(serve_fixture("server", None).await, &client.connector()).await);
+}
+
+#[tokio::test]
+async fn a_rotated_client_certificate_reaches_the_next_handshake() {
+    let addr = serve_fixture("server", Some("other-ca")).await;
+    let set = ClientSet::new("tls-client-cert", Some("client"));
+    let mut client = Client::build(&set);
+    assert_eq!(client.probe.gauge(NOT_AFTER, &[("side", "client")]), Some(BASE_NOT_AFTER as f64));
+    assert!(!handshakes(addr, &client.connector()).await, "a client under ca.pem was admitted");
+
+    set.write("cert.pem", "client-other.pem");
+    set.write("key.pem", "client-other.key");
+    client.reloader.check_now();
+
+    assert_eq!(client.probe.sum(RELOADS, &[("outcome", "reloaded")]), 1.0);
+    assert_eq!(
+        client.probe.gauge(NOT_AFTER, &[("side", "client")]),
+        not_after(&fixture_der("client-other.pem")).map(|secs| secs as f64)
+    );
+    assert!(handshakes(addr, &client.connector()).await, "the rotated certificate was refused");
+}
+
+#[tokio::test]
+async fn a_client_key_that_doesnt_match_keeps_the_old_certificate_and_counts_one_failure() {
+    let addr = serve_fixture("server", Some("ca")).await;
+    let set = ClientSet::new("tls-client-mismatch", Some("client"));
+    let mut client = Client::build(&set);
+
+    set.write("cert.pem", "client-other.pem");
+    client.reloader.check_now();
+    client.reloader.check_now();
+
+    assert_eq!(client.probe.sum(RELOADS, &[("outcome", "failed")]), 1.0);
+    assert_eq!(client.probe.sum(RELOADS, &[("outcome", "reloaded")]), 0.0);
+    assert!(handshakes(addr, &client.connector()).await, "the old certificate stopped working");
+    assert_eq!(client.probe.gauge(NOT_AFTER, &[("side", "client")]), Some(BASE_NOT_AFTER as f64));
+}
+
+#[test]
+fn a_client_with_no_file_backed_material_registers_nothing() {
+    let reloader = TlsReloader::new();
+    for settings in [
+        TlsClientSettings::default(),
+        TlsClientSettings { insecure_skip_verify: true, ..Default::default() },
+    ] {
+        build_client_config(
+            &settings,
+            &fixture(""),
+            &reloader,
+            &Diagnostics::default(),
+            &Telemetry::default(),
+        )
+        .unwrap();
+    }
+    assert!(reloader.is_empty());
+}
+
+#[test]
+fn client_startup_names_the_file_it_couldnt_read() {
+    let set = ClientSet::new("tls-client-startup-missing", Some("client"));
+    std::fs::remove_file(set.dir.join("key.pem")).unwrap();
+    let reloader = TlsReloader::new();
+    let err = build_client_config(
+        &set.settings,
+        &set.dir,
+        &reloader,
+        &Diagnostics::default(),
+        &Telemetry::default(),
+    )
+    .expect_err("a missing key built a config");
+    let message = err.to_string();
+    assert!(message.contains("tls.key_file") && message.contains("key.pem"), "{message}");
+    assert!(reloader.is_empty(), "a failed build registered its files");
+}

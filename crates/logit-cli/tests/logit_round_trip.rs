@@ -259,6 +259,7 @@ mod tls {
             .with_tls(
                 &TlsClientSettings { ca_file: Some("ca.pem".to_string()), ..Default::default() },
                 &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .unwrap();
 
@@ -295,6 +296,7 @@ mod tls {
                     insecure_skip_verify: false,
                 },
                 &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .unwrap();
 
@@ -335,6 +337,7 @@ mod tls {
                     ..Default::default()
                 },
                 &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
             )
             .unwrap();
 

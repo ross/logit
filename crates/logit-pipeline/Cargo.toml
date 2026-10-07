@@ -24,10 +24,12 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
-# `tls`: the shared listener `ServerConfig` builder and the certificate reloader
-# (docs/adr/tls-certificate-reload.md). Already in the graph through `logit-inputs`.
+# `tls`: the shared listener `ServerConfig` and client `ClientConfig` builders and the certificate
+# reloader (docs/adr/tls-certificate-reload.md). Already in the graph through `logit-inputs` and
+# `logit-outputs`; `webpki-roots` is the Mozilla root set a client trusts with no `ca_file`.
 rustls.workspace = true
 rustls-pki-types.workspace = true
+webpki-roots.workspace = true
 # `tls::not_after`'s calendar arithmetic. Already in the graph through `logit-core`.
 jiff.workspace = true
 

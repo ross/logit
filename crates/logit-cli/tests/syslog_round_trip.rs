@@ -827,6 +827,7 @@ mod tls {
                         ..Default::default()
                     },
                     &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
                 )
                 .expect("a tls: block is legal on a tcp syslog_out");
         let batch = sample_batch();
@@ -863,6 +864,7 @@ mod tls {
                         insecure_skip_verify: false,
                     },
                     &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
                 )
                 .expect("a client certificate is legal on the tcp transport");
         let batch = sample_batch();
@@ -900,6 +902,7 @@ mod tls {
                         ..Default::default()
                     },
                     &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
                 )
                 .expect("a tls: block is legal on the tcp transport");
 

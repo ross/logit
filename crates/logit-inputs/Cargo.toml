@@ -42,7 +42,8 @@ base64.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
-# prometheus_in's scrape client (docs/adr/prometheus-scrape-and-exposition.md).
+# prometheus_in's scrape client (docs/adr/prometheus-scrape-and-exposition.md), on the
+# `rustls::ClientConfig` `logit_pipeline::tls::build_client_config` builds.
 reqwest.workspace = true
 # `generate_in`'s `generation complete` line (docs/plans/load-test-harness.md). Not through
 # `logit_core::Diagnostics` like every other self-diagnostic here: the perf harness reads

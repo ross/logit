@@ -1123,7 +1123,7 @@ mod tls {
     ) -> EventBatch {
         let mut output =
             StatsdOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
-                .with_tls(&settings, &testdata_dir())
+                .with_tls(&settings, &testdata_dir(), &logit_pipeline::tls::TlsReloader::new())
                 .expect("a tls: block is legal on a tcp statsd_out");
         output.send(batch).await.expect("send over TLS should succeed");
         // Dropping it EOFs the listener's connection task, which flushes what it has accumulated
@@ -1192,6 +1192,7 @@ mod tls {
                         ..Default::default()
                     },
                     &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
                 )
                 .expect("a tls: block is legal on the tcp transport");
 

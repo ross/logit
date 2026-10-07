@@ -1,21 +1,17 @@
-//! Client-side TLS shared by every sink that dials out over TLS: [`build_client_config`] turns
-//! the operator-facing [`TlsClientSettings`] into a `rustls::ClientConfig`.
-//!
-//! Also the pieces raw-TCP sinks share whether or not TLS is on: [`AsyncStream`], [`host_only`],
-//! and [`poll_pending_close`], the one-poll probe a pooled sink runs on a reused connection before
+//! The pieces raw-TCP sinks share whether or not TLS is on: [`AsyncStream`], [`host_only`], and
+//! [`poll_pending_close`], the one-poll probe a pooled sink runs on a reused connection before
 //! writing to it.
+//!
+//! Every sink's `rustls::ClientConfig` comes from `logit_pipeline::tls::build_client_config`,
+//! which registers its files for reload; [`TlsClientSettings`] is re-exported from there.
 
 use std::future::poll_fn;
-use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::Poll;
 
-use anyhow::Context;
-use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::CertificateDer;
-use rustls_pki_types::PrivateKeyDer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+pub use logit_pipeline::tls::TlsClientSettings;
 
 /// A plain `TcpStream` or a TLS-wrapped one, behind one object-safe trait, so a sink's connection
 /// field isn't generic (a generic field would make the sink type generic, which
@@ -102,133 +98,6 @@ pub(crate) async fn poll_pending_close<S: AsyncRead + Unpin + ?Sized>(
         }
     })
     .await
-}
-
-/// Client-side TLS settings for a sink's `tls:` block. Mirrors `logit_config::TlsClientConfig`,
-/// since this crate doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s "Crate
-/// layout" section); `logit-cli::pipeline::build_spec` converts between them.
-#[derive(Debug, Clone, Default)]
-pub struct TlsClientSettings {
-    /// PEM bundle of CA certificates to trust *instead of* the bundled Mozilla root set.
-    pub ca_file: Option<String>,
-    /// Client certificate chain (PEM) presented for mutual TLS. Requires `key_file`.
-    pub cert_file: Option<String>,
-    /// Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`. Requires `cert_file`.
-    pub key_file: Option<String>,
-    /// Skips server-certificate verification: still encrypted, but any certificate is accepted.
-    pub insecure_skip_verify: bool,
-}
-
-impl TlsClientSettings {
-    /// `true` if every field is at its default (`logit_config::TlsClientConfig::is_empty`). Not a
-    /// "TLS is off" test for a sink where a `tls:` block's presence alone turns TLS on.
-    pub fn is_empty(&self) -> bool {
-        self.ca_file.is_none()
-            && self.cert_file.is_none()
-            && self.key_file.is_none()
-            && !self.insecure_skip_verify
-    }
-}
-
-/// Builds a `rustls::ClientConfig` from `settings`, resolving every path against `base_dir` (as
-/// `logit_pipeline::tls::build_server_config` does).
-pub(crate) fn build_client_config(
-    settings: &TlsClientSettings,
-    base_dir: &Path,
-) -> anyhow::Result<rustls::ClientConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .expect("the ring crypto provider always supports TLS 1.2/1.3");
-
-    // Both arms reach the same `WantsClientCert` state, so the client certificate below layers on
-    // either way. Graph rules 24, 34, 44, 52, and 56 (`endpoint_tls`) reject
-    // `insecure_skip_verify` with `ca_file` for their sinks; with a client certificate it is legal
-    // (mTLS, no server verification).
-    let builder = if settings.insecure_skip_verify {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert((*provider).clone())))
-    } else {
-        let mut roots = rustls::RootCertStore::empty();
-        match &settings.ca_file {
-            Some(ca_file) => {
-                let path = base_dir.join(ca_file);
-                let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&path)
-                    .with_context(|| format!("reading tls.ca_file {}", path.display()))?
-                    .collect::<Result<_, _>>()
-                    .with_context(|| format!("parsing tls.ca_file {}", path.display()))?;
-                roots.add_parsable_certificates(certs);
-            }
-            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
-        }
-        builder.with_root_certificates(roots)
-    };
-
-    match (&settings.cert_file, &settings.key_file) {
-        (Some(cert_file), Some(key_file)) => {
-            let cert_path = base_dir.join(cert_file);
-            let key_path = base_dir.join(key_file);
-            let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert_path)
-                .with_context(|| format!("reading tls.cert_file {}", cert_path.display()))?
-                .collect::<Result<_, _>>()
-                .with_context(|| format!("parsing tls.cert_file {}", cert_path.display()))?;
-            let key = PrivateKeyDer::from_pem_file(&key_path)
-                .with_context(|| format!("reading tls.key_file {}", key_path.display()))?;
-            Ok(builder.with_client_auth_cert(chain, key)?)
-        }
-        _ => Ok(builder.with_no_client_auth()),
-    }
-}
-
-/// `tls.insecure_skip_verify`'s [`rustls::client::danger::ServerCertVerifier`]: skips chain and
-/// hostname validation, but still verifies the handshake signature with the provider's algorithms.
-#[derive(Debug)]
-struct AcceptAnyServerCert(rustls::crypto::CryptoProvider);
-
-impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls_pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls_pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
 }
 
 #[cfg(test)]
