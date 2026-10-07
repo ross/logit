@@ -1064,6 +1064,30 @@ connection. On `syslog_in`, `graphite_in`, `statsd_in`, or `lines_in` with `tran
 no connections, so any other value is rejected instead of silently ignored. On `prometheus_in` it belongs to the
 remote-write receiver, and rule 55 rejects a non-default value alongside `scrape_targets:`.
 
+### `reuse_port`: two processes on one port
+
+`reuse_port: true` sets `SO_REUSEPORT` on a listener's socket, so a second `logit` process can bind
+the same `bind:` address while the first still holds it: an overlapping replacement during a
+rolling upgrade, for example. It's off by default, and on every kind that binds a port:
+`statsd_in`, `syslog_in`, `graphite_in`, `lines_in`, and `collectd_in` over TCP or UDP;
+`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `logit_in`; `prometheus_in` in
+receiver mode; and `prometheus_out` in exposition mode. Both processes must set it and run as the
+same effective user; otherwise the second bind fails with an address-in-use error and startup
+exits `1`.
+
+While both processes are bound, the kernel picks one of them for each TCP connection or UDP
+datagram by a hash of its source and destination addresses and ports, so traffic splits between
+them per sender, not evenly per event. A TCP connection the kernel has queued but the closing
+process hasn't accepted yet is reset when that process closes its socket, unless the host sets
+`net.ipv4.tcp_migrate_req`. A `prometheus_out` exposition shared this way answers each scrape
+from whichever process the kernel picks, so a counter can appear to reset until the old process
+exits. `logit validate` rejects `reuse_port: true` under `transport: unix` or `unix_stream` and on
+a `datadog_trace_in` without `bind:`, none of which has a port to share; on a multicast `bind:`,
+whose group already delivers every datagram to every member (rule 80); and in `prometheus_in`'s
+scrape mode or `prometheus_out`'s remote-write mode, which bind nothing (rules 55 and 56). See
+[ADR `listener-port-sharing-and-shutdown-delay`](adr/listener-port-sharing-and-shutdown-delay.md)
+for why the option exists and how a replacement uses it.
+
 ### Recording the sender: `peer`, `proxy_protocol`, and `forwarded`
 
 No listener records who sent an event unless you ask. Three opt-in fields do

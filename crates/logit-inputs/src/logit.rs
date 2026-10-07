@@ -170,6 +170,7 @@
 use crate::Input;
 use bytes::{Bytes, BytesMut};
 use logit_core::{Diagnostics, Telemetry};
+use logit_pipeline::listen::BindOptions;
 use logit_pipeline::Fanout;
 use logit_proto::frame::{self, Compression, FrameHeader};
 use logit_proto::native::{self, control};
@@ -218,6 +219,8 @@ pub struct LogitInput {
     handshake_timeout: Duration,
     /// `None`, the default, means no idle timeout (module doc's "Idle timeout").
     idle_timeout: Option<Duration>,
+    /// Socket options set before the bind (`reuse_port:`).
+    bind_options: BindOptions,
 }
 
 impl LogitInput {
@@ -232,6 +235,7 @@ impl LogitInput {
             listener: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             idle_timeout: None,
+            bind_options: BindOptions::default(),
         }
     }
 
@@ -293,6 +297,13 @@ impl LogitInput {
         self.idle_timeout = idle_timeout;
         self
     }
+
+    /// Sets `SO_REUSEPORT` before the bind (`reuse_port:` in config), so another process can bind
+    /// the same address at the same time. Off by default.
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.bind_options.reuse_port = reuse_port;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -301,7 +312,7 @@ impl Input for LogitInput {
         if self.listener.is_some() {
             return Ok(()); // idempotent, per `Input::bind`'s contract
         }
-        let listener = TcpListener::bind(&self.bind).await?;
+        let listener = logit_pipeline::listen::bind_tcp(&self.bind, self.bind_options).await?;
         self.diag.info("bound", format_args!("listening on {}", self.bind));
         self.listener = Some(listener);
         Ok(())

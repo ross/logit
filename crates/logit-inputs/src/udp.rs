@@ -35,6 +35,7 @@
 use crate::peer::{PeerCache, Sender};
 use bytes::Bytes;
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
+use logit_pipeline::listen::BindOptions;
 use logit_pipeline::sockstat;
 use logit_pipeline::{BatchAccumulator, FlushReason, Input};
 use logit_pipeline::{
@@ -300,6 +301,8 @@ pub struct UdpListener<D: Decoder + Send> {
     socket: Option<BoundSocket>,
     /// Whether to stamp each datagram's events with its sender (`peer:`); see this module's doc.
     peer: bool,
+    /// Socket options set before the bind (`reuse_port:`).
+    bind_options: BindOptions,
 }
 
 impl<D: Decoder + Send> UdpListener<D> {
@@ -328,6 +331,7 @@ impl<D: Decoder + Send> UdpListener<D> {
             telemetry: Telemetry::default(),
             socket: None,
             peer: false,
+            bind_options: BindOptions::default(),
         }
     }
 
@@ -399,6 +403,14 @@ impl<D: Decoder + Send> UdpListener<D> {
         self
     }
 
+    /// Sets `SO_REUSEPORT` before the bind (the `reuse_port:` field), so another process can bind
+    /// the same address at the same time. Off by default. A Unix socket or a multicast `bind:`
+    /// refuses it at [`Input::bind`].
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.bind_options.reuse_port = reuse_port;
+        self
+    }
+
     /// This listener's own diagnostics. With [`Self::decoder`], lets a wrapper's test prove its
     /// `with_diagnostics` set both halves.
     #[cfg(test)]
@@ -422,6 +434,12 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
         let bind = match &self.target {
             BindTarget::Ip(bind) => bind,
             BindTarget::Unix { path, mode, kind } => {
+                if self.bind_options.reuse_port {
+                    anyhow::bail!(
+                        "{kind}: 'reuse_port:' needs a UDP bind -- a Unix socket has no port to \
+                         share"
+                    );
+                }
                 let socket = crate::unix::bind_datagram(kind, path, *mode)?;
                 finish_unix_bind(
                     &socket,
@@ -434,9 +452,14 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
                 return Ok(());
             }
         };
-        let (socket, multicast_group) =
-            bind_socket(bind, self.config.receive_buffer_bytes, &self.telemetry, &mut self.diag)
-                .await?;
+        let (socket, multicast_group) = bind_socket(
+            bind,
+            self.bind_options,
+            self.config.receive_buffer_bytes,
+            &self.telemetry,
+            &mut self.diag,
+        )
+        .await?;
         match multicast_group {
             Some(group) => self.diag.info(
                 "bound",
@@ -569,6 +592,7 @@ impl Drop for ResidualOnDrop<'_> {
 ///   family disabled, say), `std`/`tokio`'s own `bind` convention.
 async fn bind_socket(
     bind: &str,
+    opts: BindOptions,
     receive_buffer_bytes: Option<u64>,
     telemetry: &Telemetry,
     diag: &mut Diagnostics,
@@ -579,7 +603,7 @@ async fn bind_socket(
         .await
         .with_context(|| format!("resolving bind address '{bind}'"))?
         .collect();
-    bind_first_available(&addrs, receive_buffer_bytes, telemetry, diag)
+    bind_first_available(&addrs, opts, receive_buffer_bytes, telemetry, diag)
         .with_context(|| format!("binding to '{bind}'"))
 }
 
@@ -588,13 +612,14 @@ async fn bind_socket(
 /// hostname that resolves to several addresses.
 fn bind_first_available(
     addrs: &[std::net::SocketAddr],
+    opts: BindOptions,
     receive_buffer_bytes: Option<u64>,
     telemetry: &Telemetry,
     diag: &mut Diagnostics,
 ) -> anyhow::Result<(tokio::net::UdpSocket, Option<std::net::IpAddr>)> {
     let mut last_err: Option<anyhow::Error> = None;
     for &addr in addrs {
-        match bind_one(addr, receive_buffer_bytes) {
+        match bind_one(addr, opts, receive_buffer_bytes) {
             Ok(bound) => {
                 let socket = finish_bind(bound.socket, receive_buffer_bytes, telemetry, diag)?;
                 return Ok((socket, bound.multicast_group));
@@ -661,6 +686,7 @@ struct Bound {
 /// the UDP read path".
 fn bind_one(
     addr: std::net::SocketAddr,
+    opts: BindOptions,
     receive_buffer_bytes: Option<u64>,
 ) -> anyhow::Result<Bound> {
     use anyhow::Context;
@@ -678,8 +704,20 @@ fn bind_one(
 
     let group = addr.ip();
     if !group.is_multicast() {
+        if opts.reuse_port {
+            socket.set_reuse_port(true).context("setting SO_REUSEPORT")?;
+        }
         socket.bind(&addr.into())?;
         return Ok(Bound { socket, multicast_group: None });
+    }
+
+    // Every member of a group receives every datagram, and members already share the port
+    // through `SO_REUSEADDR`, so `SO_REUSEPORT` would split nothing.
+    if opts.reuse_port {
+        anyhow::bail!(
+            "'reuse_port' has no effect on the multicast group {group}: every member already \
+             receives every datagram"
+        );
     }
 
     socket.set_reuse_address(true).context("setting SO_REUSEADDR, which a multicast bind needs")?;
@@ -2398,9 +2436,10 @@ mod tests {
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         let mut diag = Diagnostics::default();
-        let socket = bind_socket("127.0.0.1:0", None, &telemetry, &mut diag)
-            .await
-            .expect("binding with no explicit receive_buffer_bytes should succeed");
+        let socket =
+            bind_socket("127.0.0.1:0", BindOptions::default(), None, &telemetry, &mut diag)
+                .await
+                .expect("binding with no explicit receive_buffer_bytes should succeed");
         drop(socket);
 
         let events = registry.drain(0);
@@ -2424,9 +2463,14 @@ mod tests {
 
         let telemetry = Telemetry::default();
         let mut diag = Diagnostics::default();
-        let (socket, group) =
-            bind_first_available(&[occupied_addr, free_addr], None, &telemetry, &mut diag)
-                .expect("should fall through to the second, unoccupied candidate");
+        let (socket, group) = bind_first_available(
+            &[occupied_addr, free_addr],
+            BindOptions::default(),
+            None,
+            &telemetry,
+            &mut diag,
+        )
+        .expect("should fall through to the second, unoccupied candidate");
 
         assert_ne!(
             socket.local_addr().unwrap(),
@@ -2435,6 +2479,20 @@ mod tests {
         );
         assert_eq!(group, None, "a unicast bind joins no group");
         drop(occupied); // held until here, so the port stays occupied throughout
+    }
+
+    /// [`bind_one`] refuses `reuse_port` on a group address before it binds or joins anything, so
+    /// this needs no multicast route.
+    #[test]
+    fn bind_one_refuses_reuse_port_on_a_multicast_group() {
+        let opts = BindOptions { reuse_port: true };
+        for group in ["239.192.74.66:25826", "[ff18::efc0:4a42]:25826"] {
+            let err = match bind_one(group.parse().unwrap(), opts, None) {
+                Ok(_) => panic!("{group}: a multicast reuse_port bind must be refused"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains("'reuse_port' has no effect"), "{group}: {err}");
+        }
     }
 
     /// The multicast path of [`bind_one`]: a group address binds the unspecified address on that
@@ -2459,7 +2517,13 @@ mod tests {
 
         let telemetry = Telemetry::default();
         let mut diag = Diagnostics::default();
-        let (socket, group) = match bind_first_available(&[addr], None, &telemetry, &mut diag) {
+        let (socket, group) = match bind_first_available(
+            &[addr],
+            BindOptions::default(),
+            None,
+            &telemetry,
+            &mut diag,
+        ) {
             Ok(bound) => bound,
             Err(err) if is_no_multicast_route(&err) => {
                 println!("skipping: this environment has no multicast route ({err:#})");
@@ -2636,10 +2700,15 @@ mod tests {
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         let mut diag = Diagnostics::default();
-        let (socket, _group) =
-            bind_socket("127.0.0.1:0", Some(TINY_RECEIVE_BUFFER), &telemetry, &mut diag)
-                .await
-                .expect("binding an ephemeral port should succeed");
+        let (socket, _group) = bind_socket(
+            "127.0.0.1:0",
+            BindOptions::default(),
+            Some(TINY_RECEIVE_BUFFER),
+            &telemetry,
+            &mut diag,
+        )
+        .await
+        .expect("binding an ephemeral port should succeed");
         let addr = socket.local_addr().expect("a bound socket has an address");
 
         blast(addr, OVERRUN_DATAGRAMS).await;
@@ -2689,10 +2758,15 @@ mod tests {
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         let mut diag = Diagnostics::default();
-        let (socket, _group) =
-            bind_socket("127.0.0.1:0", Some(TINY_RECEIVE_BUFFER), &telemetry, &mut diag)
-                .await
-                .expect("binding an ephemeral port should succeed");
+        let (socket, _group) = bind_socket(
+            "127.0.0.1:0",
+            BindOptions::default(),
+            Some(TINY_RECEIVE_BUFFER),
+            &telemetry,
+            &mut diag,
+        )
+        .await
+        .expect("binding an ephemeral port should succeed");
         let addr = socket.local_addr().expect("a bound socket has an address");
 
         blast(addr, OVERRUN_DATAGRAMS).await;
@@ -2793,10 +2867,15 @@ mod tests {
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         let mut diag = Diagnostics::default();
-        let (socket, _group) =
-            bind_socket("127.0.0.1:0", Some(TINY_RECEIVE_BUFFER), &telemetry, &mut diag)
-                .await
-                .expect("binding an ephemeral port should succeed");
+        let (socket, _group) = bind_socket(
+            "127.0.0.1:0",
+            BindOptions::default(),
+            Some(TINY_RECEIVE_BUFFER),
+            &telemetry,
+            &mut diag,
+        )
+        .await
+        .expect("binding an ephemeral port should succeed");
         let addr = socket.local_addr().expect("a bound socket has an address");
         // Depth 1 under `block`, nothing popping: the reader parks in `queue.push` for good, the
         // state this wrapper exists to keep sampling through.
@@ -3581,8 +3660,15 @@ mod tests {
         let mut diag = Diagnostics::default();
         // A megabyte requested (doubled, maybe clamped by `net.core.rmem_max`), so a burst sent
         // before anything drains it can't overrun the socket.
-        let (socket, _group) =
-            bind_socket("127.0.0.1:0", Some(1024 * 1024), &telemetry, &mut diag).await.unwrap();
+        let (socket, _group) = bind_socket(
+            "127.0.0.1:0",
+            BindOptions::default(),
+            Some(1024 * 1024),
+            &telemetry,
+            &mut diag,
+        )
+        .await
+        .unwrap();
         let addr = socket.local_addr().expect("a bound socket has an address");
         let queue = test_queue(OverflowPolicy::DropOldest, payloads.len() * 2, &telemetry);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -3740,8 +3826,15 @@ mod tests {
 
         let telemetry = Telemetry::default();
         let mut diag = Diagnostics::default();
-        let (socket, _group) =
-            bind_socket("127.0.0.1:0", Some(1024 * 1024), &telemetry, &mut diag).await.unwrap();
+        let (socket, _group) = bind_socket(
+            "127.0.0.1:0",
+            BindOptions::default(),
+            Some(1024 * 1024),
+            &telemetry,
+            &mut diag,
+        )
+        .await
+        .unwrap();
         let addr = socket.local_addr().expect("a bound socket has an address");
         let queue = test_queue(OverflowPolicy::DropOldest, BURST * 2, &Telemetry::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -3802,7 +3895,14 @@ mod tests {
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         let mut diag = Diagnostics::default();
-        let bound = bind_socket("[::1]:0", Some(4 * 1024 * 1024), &telemetry, &mut diag).await;
+        let bound = bind_socket(
+            "[::1]:0",
+            BindOptions::default(),
+            Some(4 * 1024 * 1024),
+            &telemetry,
+            &mut diag,
+        )
+        .await;
         let Ok((socket, _group)) = bound else {
             println!("skipping: this environment has no usable IPv6 loopback");
             return;
@@ -3990,8 +4090,15 @@ mod tests {
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         let mut diag = Diagnostics::default();
-        let (socket, _group) =
-            bind_socket("127.0.0.1:0", Some(1024 * 1024), &telemetry, &mut diag).await.unwrap();
+        let (socket, _group) = bind_socket(
+            "127.0.0.1:0",
+            BindOptions::default(),
+            Some(1024 * 1024),
+            &telemetry,
+            &mut diag,
+        )
+        .await
+        .unwrap();
         let addr = socket.local_addr().expect("a bound socket has an address");
         let queue = test_queue(OverflowPolicy::Block, 4, &telemetry);
         for i in 0..3u32 {
@@ -4135,8 +4242,14 @@ mod tests {
 
         let telemetry = Telemetry::default();
         let mut diag = Diagnostics::default();
-        let err = bind_first_available(&[occupied_addr], None, &telemetry, &mut diag)
-            .expect_err("the only candidate is already occupied -- must fail, not hang or panic");
+        let err = bind_first_available(
+            &[occupied_addr],
+            BindOptions::default(),
+            None,
+            &telemetry,
+            &mut diag,
+        )
+        .expect_err("the only candidate is already occupied -- must fail, not hang or panic");
         assert!(!err.to_string().is_empty());
         drop(occupied);
     }

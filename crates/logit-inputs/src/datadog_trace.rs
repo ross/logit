@@ -206,6 +206,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, EventBatch, Resource, Telemetry, Value};
+use logit_pipeline::listen::BindOptions;
 use logit_pipeline::Fanout;
 use logit_proto::datadog::{
     DatadogDecoder, HEADER_CLIENT_COMPUTED_STATS, HEADER_CLIENT_COMPUTED_TOP_LEVEL,
@@ -278,6 +279,8 @@ pub struct DatadogTraceInput {
     busy_after: Duration,
     /// `peer:` in config. See [`Self::with_peer`].
     peer: bool,
+    /// Socket options set before the bind (`reuse_port:`).
+    bind_options: BindOptions,
     /// `proxy_protocol:` in config. See [`Self::with_proxy_protocol`].
     proxy_protocol: bool,
     /// `forwarded:` in config. See [`Self::with_forwarded`].
@@ -308,6 +311,7 @@ impl DatadogTraceInput {
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             busy_after: BUSY_AFTER,
             peer: false,
+            bind_options: BindOptions::default(),
             proxy_protocol: false,
             forwarded: None,
         }
@@ -399,6 +403,14 @@ impl DatadogTraceInput {
         self
     }
 
+    /// Sets `SO_REUSEPORT` before the bind (`reuse_port:` in config), so another process can bind
+    /// the same address at the same time. Off by default.
+    /// Applies to the TCP listener only; the Unix socket has no port to share.
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.bind_options.reuse_port = reuse_port;
+        self
+    }
+
     /// Requires a PROXY protocol header ahead of every connection to the TCP listener and stamps
     /// the origin it names (`proxy_protocol:` in config). Off by default; the Unix socket never
     /// reads one. See this module's "Sender address".
@@ -424,7 +436,7 @@ impl Input for DatadogTraceInput {
         }
         if let Some(bind) = &self.bind {
             if self.listener.is_none() {
-                let listener = TcpListener::bind(bind).await?;
+                let listener = logit_pipeline::listen::bind_tcp(bind, self.bind_options).await?;
                 self.diag.info("bound", format_args!("listening on {bind}"));
                 self.listener = Some(listener);
             }
