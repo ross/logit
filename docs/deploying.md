@@ -86,6 +86,30 @@ error.
 - **A second signal during a stuck drain exits immediately** with status 130, so a restart policy
   waiting on the process can still kill it with the same signal. Only SIGTERM and SIGINT count; a
   SIGHUP never does.
+- **`shutdown.delay` holds the drain back while an orchestrator stops routing traffic.** It's off
+  by default (`0s`). Set, the first SIGTERM or SIGINT logs `shutdown signal received` and flips
+  `/readyz` to `503 draining` at once, then `logit` keeps every listener bound, accepting, and
+  reading for the delay, logs `shutdown delay elapsed`, and starts the drain. Each
+  `receive.shutdown_grace` and `buffer.shutdown_grace` starts counting when the drain starts, not
+  at the signal. A second SIGTERM or SIGINT during the delay still exits 130 at once.
+
+  ```yaml
+  shutdown:
+    delay: 15s
+  ```
+
+  In Kubernetes, the kubelet sends SIGTERM while the pod's Service endpoints are still being
+  withdrawn, so without a delay, clients routed to the pod in that window find its listeners
+  closed. Size the delay to cover the time the endpoint removal takes to reach kube-proxy, ingress
+  controllers, and external load balancers, plus, for anything that routes on its own probe of
+  `/readyz`, that probe's period times its failure threshold. A `preStop` hook
+  running `sleep` does the same job, but it needs a `sleep` binary in the image, which a
+  distroless build doesn't have, and it does nothing on a host or under systemd; the built-in
+  delay behaves the same everywhere. Set `terminationGracePeriodSeconds` to at least the delay plus
+  the largest `shutdown_grace` in the config, plus a few seconds' margin, or the kubelet's SIGKILL
+  cuts the drain short. The same budget applies to Docker's `--stop-timeout` and systemd's
+  `TimeoutStopSec=`. See
+  ADR `listener-port-sharing-and-shutdown-delay`.
 - **SIGHUP reopens file outputs and never ends the process.** It logs `reopen signal received`
   with `config_reloaded=false`, and each `stdio_out`/`file_out` file target reopens its path
   before its next write; see
@@ -288,8 +312,8 @@ so a log collector can parse it instead of scraping text.
 Every component-scoped diagnostic carries a `component` field naming the component that reported
 it. A throttled diagnostic, or a component-owned lifecycle message like `bound`/`recovered`, also
 carries a `key` naming *why*. The process-level lifecycle events (`starting`, `ready`,
-`shutdown signal received`, `reopen signal received`, `drain complete`, `exiting`) carry
-neither, because they describe the process, not a component.
+`shutdown signal received`, `shutdown delay elapsed`, `reopen signal received`,
+`drain complete`, `exiting`) carry neither, because they describe the process, not a component.
 
 **Lifecycle event names are stable `&'static str` values, so you can alert on them directly:**
 
@@ -299,6 +323,7 @@ neither, because they describe the process, not a component.
 | `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`lines_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
+| `shutdown delay elapsed` | info | `shutdown.delay` has run out after a SIGTERM/SIGINT and the drain is starting. Carries `delay`. Not logged when the delay is `0s`, or when a node failure started the drain first. |
 | `reopen signal received` | info | A SIGHUP arrived. Carries `generation` (SIGHUPs so far) and `config_reloaded=false`: the config isn't reloaded. Logged during a drain too. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks and Lua nodes. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
