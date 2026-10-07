@@ -4,7 +4,7 @@
   "type": "object",
   "properties": {
     "admin": {
-      "description": "The readiness/liveness HTTP endpoint. Off unless `bind` is set. Process-level: one admin server per `logit run`, not per component.",
+      "description": "The readiness/liveness HTTP endpoint. Off unless `bind` or `socket` is set. Process-level: one admin server per `logit run`, not per component.",
       "default": {
         "bind": null,
         "socket": null,

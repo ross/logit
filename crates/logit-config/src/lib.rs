@@ -24,8 +24,8 @@ pub struct Config {
     #[serde(default, deserialize_with = "deserialize_components")]
     #[schemars(schema_with = "non_empty_components_schema")]
     pub components: HashMap<String, Component>,
-    /// The readiness/liveness HTTP endpoint. Off unless `bind` is set. Process-level: one admin
-    /// server per `logit run`, not per component.
+    /// The readiness/liveness HTTP endpoint. Off unless `bind` or `socket` is set. Process-level:
+    /// one admin server per `logit run`, not per component.
     #[serde(default)]
     pub admin: AdminConfig,
     /// How the process stops on SIGTERM or SIGINT. Process-level, not per component. Omitting the
