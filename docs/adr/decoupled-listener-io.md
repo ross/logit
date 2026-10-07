@@ -426,10 +426,11 @@ same poll as the backstop is returned, not discarded.
 but `run_until_shutdown` held the socket until both had returned. On shutdown the read half
 stopped reading at once while the socket stayed open for the whole user-space drain. In an
 `SO_REUSEPORT` group that open, unread socket still took its share of the port's flows, and the
-kernel discarded them when the socket finally closed: 0, 0, and 85 datagrams per close at
-50k datagrams/s in
-[ADR `listener-port-sharing-and-shutdown-delay`](listener-port-sharing-and-shutdown-delay.md)'s
-check against `logit`, none of them counted.
+kernel discarded them when the socket finally closed, uncounted. The loss grows with the drain:
+next to nothing when delivery keeps up and the drain takes about 0.5 ms, and up to 26132
+datagrams per close at 50k datagrams/s when a slow stage stretched it to 4 to 5 s
+([ADR `listener-port-sharing-and-shutdown-delay`](listener-port-sharing-and-shutdown-delay.md)'s
+check against `logit`).
 
 The read half now owns the socket and drops it when it returns, after the final kernel-counter
 sample that
