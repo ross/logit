@@ -2182,6 +2182,123 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing was ever sent, so nothing should be delivered");
     }
 
+    /// Datagrams the close-before-drain tests queue behind a downstream nobody reads.
+    const PARKED_BACKLOG: usize = 8;
+
+    /// The payloads `msg-0` to `msg-{PARKED_BACKLOG - 1}`, sorted, for comparing against what
+    /// arrived.
+    fn parked_backlog_payloads() -> Vec<String> {
+        let mut payloads: Vec<String> = (0..PARKED_BACKLOG).map(|i| format!("msg-{i}")).collect();
+        payloads.sort();
+        payloads
+    }
+
+    /// Receives until every backlog datagram has arrived, skipping any probe a test sent, and
+    /// returns the backlog payloads sorted.
+    async fn recv_parked_backlog(
+        rx: &mut mpsc::Receiver<logit_pipeline::Delivered>,
+    ) -> Vec<String> {
+        let mut payloads = Vec::new();
+        while payloads.len() < PARKED_BACKLOG {
+            let batch = logit_pipeline::test_util::recv_batch(rx).await;
+            payloads.extend(batch.events.iter().map(payload).filter(|p| p.starts_with("msg-")));
+        }
+        payloads.sort();
+        payloads
+    }
+
+    /// On shutdown the UDP socket closes while `decode_loop` is still parked on a full
+    /// downstream, and the queued backlog is still delivered in full once downstream drains. A
+    /// socket that closes at once leaves its `SO_REUSEPORT` group at once.
+    ///
+    /// A plain bind of the listener's address, with no `SO_REUSEPORT`, succeeds only once the
+    /// listener's socket is gone.
+    #[tokio::test]
+    async fn shutdown_closes_the_udp_socket_before_the_queue_drains() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let mut listener =
+            UdpListener::new("127.0.0.1:0", TestDecoder::new(), one_event_per_datagram())
+                .with_telemetry(probe.telemetry("statsd_in", "statsd_in", "listener"));
+        listener.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = listener.local_addr().expect("a bound UDP listener has an address");
+        // Capacity 1 and not read until the end: `decode_loop` delivers one event and parks on
+        // the next send.
+        let (fanout, mut rx) = fanout_channel(1);
+        let running = spawn_input(listener, fanout).await;
+        for i in 0..PARKED_BACKLOG {
+            send_datagram(addr, format!("msg-{i}").as_bytes()).await;
+        }
+        probe
+            .wait_for("the whole backlog to be read off the socket", |totals| {
+                totals.sum("logit.input.datagrams", &[]) == PARKED_BACKLOG as f64
+            })
+            .await;
+
+        running.shutdown.send(true).expect("the listener should still be running");
+        logit_pipeline::test_util::wait_until("the listener's socket to close", || {
+            std::net::UdpSocket::bind(addr).is_ok()
+        })
+        .await;
+        assert!(
+            !running.handle.is_finished(),
+            "the premise: the run is still parked on the full downstream, so the socket closed \
+             before the drain finished"
+        );
+
+        assert_eq!(recv_parked_backlog(&mut rx).await, parked_backlog_payloads());
+        running.stop().await;
+    }
+
+    /// [`shutdown_closes_the_udp_socket_before_the_queue_drains`] on a Unix datagram socket: a
+    /// send to the path is refused once nothing holds the socket.
+    #[tokio::test]
+    async fn shutdown_closes_the_unix_datagram_socket_before_the_queue_drains() {
+        let path = scratch_dir("udp-close-before-drain-unix").join("listen.sock");
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let listener = UdpListener::unix(
+            "statsd_in",
+            &path,
+            0o660,
+            TestDecoder::new(),
+            one_event_per_datagram(),
+        )
+        .with_telemetry(probe.telemetry("statsd_in", "statsd_in", "listener"));
+        let (fanout, mut rx) = fanout_channel(1);
+        let running = spawn_input(listener, fanout).await;
+        let client = tokio::net::UnixDatagram::unbound().expect("an unbound client socket");
+        for i in 0..PARKED_BACKLOG {
+            client.send_to(format!("msg-{i}").as_bytes(), &path).await.expect("send_to");
+        }
+        probe
+            .wait_for("the whole backlog to be read off the socket", |totals| {
+                totals.sum("logit.input.datagrams", &[]) == PARKED_BACKLOG as f64
+            })
+            .await;
+
+        running.shutdown.send(true).expect("the listener should still be running");
+        // Non-blocking: while the socket is open and unread, its queue fills and a blocking send
+        // would wait instead of failing.
+        let prober = std::os::unix::net::UnixDatagram::unbound().expect("an unbound probe socket");
+        prober.set_nonblocking(true).expect("set_nonblocking");
+        logit_pipeline::test_util::wait_until(
+            "a send to the listener's path to be refused",
+            || {
+                prober
+                    .send_to(b"probe", &path)
+                    .is_err_and(|err| err.kind() == std::io::ErrorKind::ConnectionRefused)
+            },
+        )
+        .await;
+        assert!(
+            !running.handle.is_finished(),
+            "the premise: the run is still parked on the full downstream, so the socket closed \
+             before the drain finished"
+        );
+
+        assert_eq!(recv_parked_backlog(&mut rx).await, parked_backlog_payloads());
+        running.stop().await;
+    }
+
     // -- `Input::bind`/`local_addr` --
 
     /// Bind, learn the address via `local_addr`, then a real datagram sent to it is delivered by

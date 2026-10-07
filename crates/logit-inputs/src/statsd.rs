@@ -3052,6 +3052,96 @@ mod tests {
         running_b.stop().await;
     }
 
+    /// Source sockets in [`a_stopped_reuse_port_listener_hands_its_flows_to_the_survivor`]. A
+    /// split that leaves A no flow fails the test's premise with probability 2⁻³².
+    const STOP_SOURCES: usize = 32;
+
+    /// Lines each source sends before A stops, so A queues a backlog behind its parked consumer.
+    const PRE_STOP_ROUNDS: usize = 4;
+
+    /// When one of a `reuse_port` pair stops while its downstream is still busy, every flow the
+    /// kernel hashed to it reaches the survivor before the stopped listener has drained its own
+    /// queue, and that queue is still delivered in full.
+    #[tokio::test]
+    async fn a_stopped_reuse_port_listener_hands_its_flows_to_the_survivor() {
+        use logit_pipeline::test_util::{recv_batch, wait_until, TelemetryProbe};
+
+        let one_event_per_send = UdpListenerConfig {
+            batch_max_events: 1,
+            batch_flush_interval: Duration::ZERO,
+            ..UdpListenerConfig::default()
+        };
+        let mut probe_a = TelemetryProbe::new();
+        let mut a = StatsdInput::new("127.0.0.1:0")
+            .with_reuse_port(true)
+            .with_receive(one_event_per_send)
+            .with_telemetry(probe_a.telemetry("a", "statsd_in", "listener"));
+        a.bind().await.expect("A should bind");
+        let addr = a.local_addr().expect("a bound listener has an address");
+        let b = StatsdInput::new(addr.to_string()).with_reuse_port(true);
+        // A's consumer holds one batch and isn't read until the end, so A's `decode_loop` parks
+        // on its second send.
+        let (fanout_a, mut rx_a) = fanout_channel(1);
+        let (fanout_b, mut rx_b) = fanout_channel(1024);
+        let running_a = spawn_input(a, fanout_a).await;
+        let running_b = spawn_input(b, fanout_b).await;
+
+        let sources: Vec<std::net::UdpSocket> = (0..STOP_SOURCES)
+            .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").expect("source should bind"))
+            .collect();
+        for round in 0..PRE_STOP_ROUNDS {
+            for (i, source) in sources.iter().enumerate() {
+                source.send_to(format!("pre.{i}.{round}:1|c").as_bytes(), addr).expect("send_to");
+            }
+        }
+        let sent = STOP_SOURCES * PRE_STOP_ROUNDS;
+        let mut at_b = 0usize;
+        wait_until("every pre-stop line to be read by A or delivered by B", || {
+            while let Ok(delivered) = rx_b.try_recv() {
+                at_b += unwrap_batch(delivered).events.len();
+            }
+            at_b as f64 + probe_a.sum("logit.input.datagrams", &[]) == sent as f64
+        })
+        .await;
+        let at_a = sent - at_b;
+        assert!(at_a > 0, "the premise: the kernel hashed at least one source to A");
+
+        running_a.shutdown.send(true).expect("A should still be running");
+        let mut reached_b = std::collections::BTreeSet::new();
+        wait_until("a probe from every source to reach B", || {
+            for (i, source) in sources.iter().enumerate() {
+                if !reached_b.contains(&i) {
+                    source.send_to(format!("probe.{i}:1|c").as_bytes(), addr).expect("send_to");
+                }
+            }
+            while let Ok(delivered) = rx_b.try_recv() {
+                for event in unwrap_batch(delivered).events {
+                    if let Some(i) = metric_name(&event).strip_prefix("probe.") {
+                        reached_b.insert(i.parse::<usize>().expect("a probe names its source"));
+                    }
+                }
+            }
+            reached_b.len() == STOP_SOURCES
+        })
+        .await;
+        assert!(
+            !running_a.handle.is_finished(),
+            "the premise: A is still parked on its full downstream, so its socket closed before \
+             its drain finished"
+        );
+
+        // A probe A read before it saw shutdown is delivered too; only the pre-stop lines count.
+        let mut pre_at_a = 0;
+        while pre_at_a < at_a {
+            let batch = recv_batch(&mut rx_a).await;
+            pre_at_a +=
+                batch.events.iter().filter(|event| metric_name(event).starts_with("pre.")).count();
+        }
+        assert_eq!(pre_at_a, at_a, "A must deliver every line it read before it stopped");
+        running_a.stop().await;
+        running_b.stop().await;
+    }
+
     fn is_addr_in_use(err: &anyhow::Error) -> bool {
         err.chain().any(|cause| {
             cause
