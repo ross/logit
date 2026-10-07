@@ -28,6 +28,10 @@ pub struct Config {
     /// server per `logit run`, not per component.
     #[serde(default)]
     pub admin: AdminConfig,
+    /// How the process stops on SIGTERM or SIGINT. Process-level, not per component. Omitting the
+    /// block keeps the default: the drain starts as soon as the signal arrives.
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
 }
 
 /// The `admin:` block. Every field defaults, so omitting the block leaves the admin server off.
@@ -37,6 +41,29 @@ pub struct AdminConfig {
     /// `host:port` to serve `/readyz` and `/healthz` on. Omitted (the default) means off. No TLS:
     /// bind this to loopback or a pod-local address, not to a network beyond the process's own.
     pub bind: Option<String>,
+}
+
+/// The `shutdown:` block. Every field defaults, so omitting the block starts the drain as soon as
+/// SIGTERM or SIGINT arrives.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct ShutdownConfig {
+    /// How long to keep running after the first SIGTERM or SIGINT before the drain starts.
+    /// Defaults to `0s`, which turns the delay off.
+    ///
+    /// For the whole delay, `/readyz` answers `503 draining`, and every listener stays bound and
+    /// keeps accepting connections and reading data. That gives an orchestrator time to stop
+    /// routing traffic here before the listeners close: in Kubernetes, set it to cover the
+    /// readiness probe's period plus the time the Service's endpoints take to update. When the
+    /// delay ends, the drain starts, and each component's `shutdown_grace` starts counting from
+    /// then. A second SIGTERM or SIGINT, during the delay or the drain, still exits at once with
+    /// code `130`.
+    ///
+    /// The orchestrator's own stop timeout must cover the delay plus the drain, or it kills the
+    /// process mid-drain. In Kubernetes, that's `terminationGracePeriodSeconds`.
+    #[serde(with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub delay: Duration,
 }
 
 /// Deserializes `components:`, prefixing a component's error with its id. A flattened, tagged
@@ -4052,8 +4079,9 @@ pub struct BufferConfig {
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub retry_max_delay: Duration,
-    /// How long the sink keeps draining after a shutdown signal before being cancelled. Defaults
-    /// to `5s`.
+    /// How long the sink keeps draining after the drain starts before being cancelled. The drain
+    /// starts at the shutdown signal, or once `shutdown.delay` has elapsed when that is set.
+    /// Defaults to `5s`.
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub shutdown_grace: Duration,
@@ -4195,7 +4223,8 @@ pub struct ReceiveConfig {
     #[serde(with = "human_bytes::option")]
     #[schemars(with = "Option<String>")]
     pub receive_buffer_bytes: Option<u64>,
-    /// How long a listener keeps draining after a shutdown signal before being cancelled.
+    /// How long a listener keeps draining after the drain starts before being cancelled. The
+    /// drain starts at the shutdown signal, or once `shutdown.delay` has elapsed when that is set.
     /// Defaults to `5s`, matching `buffer.shutdown_grace`, so both ends of the pipeline drain on
     /// the same number.
     #[serde(with = "humantime_serde_duration")]
@@ -7586,6 +7615,20 @@ mod tests {
                 "buffer": {"bogus_field": 1}}"#,
         );
         assert!(result.is_err(), "an unknown buffer field should be rejected");
+    }
+
+    #[test]
+    fn a_shutdown_block_parses_its_delay_and_defaults_to_zero() {
+        let config: Config = serde_json::from_str(r#"{"shutdown": {"delay": "2s"}}"#).unwrap();
+        assert_eq!(config.shutdown.delay, Duration::from_secs(2));
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.shutdown.delay, Duration::ZERO);
+    }
+
+    #[test]
+    fn an_unknown_field_under_shutdown_is_rejected() {
+        let err = serde_json::from_str::<Config>(r#"{"shutdown": {"dely": "2s"}}"#).unwrap_err();
+        assert!(err.to_string().contains("unknown field `dely`"), "{err}");
     }
 
     #[test]

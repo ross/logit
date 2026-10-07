@@ -21,6 +21,17 @@
       "additionalProperties": {
         "$ref": "#/definitions/Component"
       }
+    },
+    "shutdown": {
+      "description": "How the process stops on SIGTERM or SIGINT. Process-level, not per component. Omitting the block keeps the default: the drain starts as soon as the signal arrives.",
+      "default": {
+        "delay": "0s"
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/ShutdownConfig"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -114,7 +125,7 @@
           "type": "string"
         },
         "shutdown_grace": {
-          "description": "How long the sink keeps draining after a shutdown signal before being cancelled. Defaults to `5s`.",
+          "description": "How long the sink keeps draining after the drain starts before being cancelled. The drain starts at the shutdown signal, or once `shutdown.delay` has elapsed when that is set. Defaults to `5s`.",
           "default": "5s",
           "type": "string"
         }
@@ -4192,7 +4203,7 @@
           ]
         },
         "shutdown_grace": {
-          "description": "How long a listener keeps draining after a shutdown signal before being cancelled. Defaults to `5s`, matching `buffer.shutdown_grace`, so both ends of the pipeline drain on the same number.",
+          "description": "How long a listener keeps draining after the drain starts before being cancelled. The drain starts at the shutdown signal, or once `shutdown.delay` has elapsed when that is set. Defaults to `5s`, matching `buffer.shutdown_grace`, so both ends of the pipeline drain on the same number.",
           "default": "5s",
           "type": "string"
         }
@@ -4456,6 +4467,18 @@
           ]
         }
       ]
+    },
+    "ShutdownConfig": {
+      "description": "The `shutdown:` block. Every field defaults, so omitting the block starts the drain as soon as SIGTERM or SIGINT arrives.",
+      "type": "object",
+      "properties": {
+        "delay": {
+          "description": "How long to keep running after the first SIGTERM or SIGINT before the drain starts. Defaults to `0s`, which turns the delay off.\n\nFor the whole delay, `/readyz` answers `503 draining`, and every listener stays bound and keeps accepting connections and reading data. That gives an orchestrator time to stop routing traffic here before the listeners close: in Kubernetes, set it to cover the readiness probe's period plus the time the Service's endpoints take to update. When the delay ends, the drain starts, and each component's `shutdown_grace` starts counting from then. A second SIGTERM or SIGINT, during the delay or the drain, still exits at once with code `130`.\n\nThe orchestrator's own stop timeout must cover the delay plus the drain, or it kills the process mid-drain. In Kubernetes, that's `terminationGracePeriodSeconds`.",
+          "default": "0s",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "Signal": {
       "description": "A signal an event's payload may carry, in OTLP's vocabulary. `traces` corresponds to the event's span.",
