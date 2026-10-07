@@ -1352,8 +1352,10 @@ under `THP=always`. `docs/design/memory.md` §5's caveat says so.
   isolates wakeup cost directly (for example, a wakeup-rate probe independent of `fill`), and this
   session didn't re-run the half-scale-vs-knee CPU comparison the 4-vCPU session used to motivate
   it. The per-binary capacity table characterizes this scenario's headline either way.
-- **The shared-task / `SO_REUSEPORT` follow-up is still open.** This session measured the existing
-  single-listener-task design at higher fidelity, not a multi-task alternative.
+- **The shared-task / in-process `SO_REUSEPORT` follow-up is still open.** This session measured
+  the existing single-listener-task design at higher fidelity, not a multi-task alternative.
+  Sharing a port across processes is a separate decision,
+  [ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md).
 
 Both items the 4-vCPU revision left open, a per-binary capacity metric and confirming the THP
 explanation, are closed above.
