@@ -486,8 +486,7 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         self.bind().await?;
-        let socket = self.socket.take().expect("bind() leaves a socket behind");
-        match &socket {
+        match self.socket.take().expect("bind() leaves a socket behind") {
             BoundSocket::Udp(socket) => self.drive(socket, sink, shutdown).await,
             BoundSocket::Unix(socket) => self.drive(socket, sink, shutdown).await,
         }
@@ -496,9 +495,13 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
 
 impl<D: Decoder + Send> UdpListener<D> {
     /// [`Input::run_until_shutdown`]'s body over either socket family.
+    ///
+    /// `socket` moves into `read` and closes when `read` finishes, before `decode` drains the
+    /// queue: a closed socket leaves its `SO_REUSEPORT` group at once, so the kernel hashes its
+    /// flows to the surviving members instead of queueing them on a socket nobody reads.
     async fn drive<S: DatagramSocket>(
         &mut self,
-        socket: &S,
+        socket: S,
         sink: Fanout,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
@@ -1608,8 +1611,8 @@ const KERNEL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// **The final sample runs on every path [`sample_while`] returns on.** Drops in the last fraction
 /// of a second before a fatal socket error or a shutdown are the likeliest to exist, since a
-/// listener usually stops because something went wrong. The socket is still open then (owned by
-/// `run_until_shutdown`, which outlives this future), so the counters are readable.
+/// listener usually stops because something went wrong. This future owns the socket and drops it
+/// only after the final sample, so the counters are readable.
 ///
 /// It is **not** unconditional. One path skips it: `run_input`'s grace backstop
 /// (`logit_pipeline::runtime`, the `shutdown_grace_expired` arm of its `select!`) drops this
@@ -1631,7 +1634,7 @@ const KERNEL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// The `select!`'s arm ordering matters; see [`sample_while`].
 async fn read_loop_sampled<S: DatagramSocket>(
-    socket: &S,
+    socket: S,
     queue: Arc<ReceiveQueue>,
     telemetry: Telemetry,
     diag: Diagnostics,
@@ -1639,8 +1642,8 @@ async fn read_loop_sampled<S: DatagramSocket>(
     read_batch: usize,
     peer: bool,
 ) -> anyhow::Result<()> {
-    let sampler = ReceiveBufferSampler::new(socket, telemetry.clone(), diag.clone());
-    let read = read_loop(socket, queue, telemetry, diag, shutdown, read_batch, peer);
+    let sampler = ReceiveBufferSampler::new(&socket, telemetry.clone(), diag.clone());
+    let read = read_loop(&socket, queue, telemetry, diag, shutdown, read_batch, peer);
     sample_while(sampler, read, KERNEL_SAMPLE_INTERVAL).await
 }
 
@@ -1729,8 +1732,8 @@ where
 struct ReceiveBufferSampler {
     /// The listener socket's descriptor, captured once. `None` only on a platform with no raw
     /// descriptors, where [`logit_pipeline::sockstat`] reports nothing anyway. A bare fd rather
-    /// than a borrow is safe: this sampler lives inside [`read_loop_sampled`], whose `socket`
-    /// argument outlives it.
+    /// than a borrow is safe: this sampler lives inside [`read_loop_sampled`], which owns the
+    /// socket and drops it after the sampler.
     fd: Option<sockstat::RawFd>,
     drops: sockstat::DropCounter,
     telemetry: Telemetry,
@@ -2883,7 +2886,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let sampled = read_loop_sampled(
-            &socket,
+            socket,
             Arc::clone(&queue),
             telemetry.clone(),
             Diagnostics::default(),
