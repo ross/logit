@@ -166,9 +166,15 @@ systemd as the parent, and one `LISTEN_FDS` reader serves both.
 ## TLS certificate reload
 
 Decided in [ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md), which settles the
-points below differently in two places: the poll compares file content rather than file identity,
-and `prometheus_in`'s scrape client moves onto a shared rustls config instead of being rebuilt
-behind a swap. The rest of this section is the research as it stood.
+points below differently in three places:
+
+- The poll compares file content rather than file identity.
+- `prometheus_in`'s scrape client moves onto a shared rustls config instead of being rebuilt
+  behind a swap.
+- New material reaches new *full* handshakes only. A resumed handshake reuses its session's
+  earlier verification, so a reload rotates certificates but doesn't revoke trust in a peer.
+
+The rest of this section is the research as it stood.
 
 Smaller than either reload shape and independent of both.
 
