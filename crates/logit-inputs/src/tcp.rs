@@ -137,8 +137,8 @@ use tokio::net::UnixListener as TokioUnixListener;
 use tokio::sync::{watch, OwnedSemaphorePermit};
 use tokio_rustls::TlsAcceptor;
 
-/// `crate::tls::TlsServerSettings`, re-exported for symmetry with `crate::logit`/`crate::otlp`.
-pub use crate::tls::TlsServerSettings;
+/// `logit_pipeline::tls::TlsServerSettings`, re-exported for symmetry with `crate::logit`/`crate::otlp`.
+pub use logit_pipeline::tls::TlsServerSettings;
 
 /// How long a connection has, per pre-message phase, before this listener releases its
 /// connection-limit permit: the PROXY header under `proxy_protocol:`, the TLS accept when TLS is
@@ -1099,17 +1099,28 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
     /// protocol isn't HTTP-shaped, so there's nothing to negotiate. Every path in `settings`
     /// resolves against `base_dir` (the config file's directory). Fails on a Unix socket, which
     /// is always plaintext.
+    ///
+    /// Registers the files with `reloader` under this listener's diagnostics and telemetry as
+    /// they are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         if let StreamTarget::Unix { kind, .. } = &self.target {
             anyhow::bail!(
                 "{kind}: 'tls:' needs 'transport: tcp' -- a Unix socket is always plaintext"
             );
         }
-        self.tls = Some(Arc::new(crate::tls::build_server_config(settings, base_dir, &[])?));
+        self.tls = Some(Arc::new(logit_pipeline::tls::build_server_config(
+            settings,
+            base_dir,
+            &[],
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?));
         Ok(self)
     }
 
@@ -2827,7 +2838,13 @@ mod tests {
     #[tokio::test]
     async fn a_tls_connection_round_trips_a_decoded_frame() {
         let (addr, listener) = bound_listener(one_per_frame()).await;
-        let mut listener = listener.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap();
+        let mut listener = listener
+            .with_tls(
+                &test_tls_settings(None),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap();
         let (sink, mut rx) = fanout_into_channel(16);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle =
@@ -2847,7 +2864,13 @@ mod tests {
     #[tokio::test]
     async fn a_client_trusting_the_wrong_ca_is_refused_and_the_listener_keeps_serving() {
         let (addr, listener) = bound_listener(one_per_frame()).await;
-        let mut listener = listener.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap();
+        let mut listener = listener
+            .with_tls(
+                &test_tls_settings(None),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap();
         let (sink, mut rx) = fanout_into_channel(16);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle =
@@ -2874,8 +2897,13 @@ mod tests {
     #[tokio::test]
     async fn mutual_tls_accepts_a_client_certificate_and_refuses_a_client_without_one() {
         let (addr, listener) = bound_listener(one_per_frame()).await;
-        let mut listener =
-            listener.with_tls(&test_tls_settings(Some("ca.pem")), &testdata_dir()).unwrap();
+        let mut listener = listener
+            .with_tls(
+                &test_tls_settings(Some("ca.pem")),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap();
         let (sink, mut rx) = fanout_into_channel(16);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle =
@@ -3010,7 +3038,11 @@ mod tests {
     async fn a_silent_connection_releases_its_permit_after_the_handshake_timeout() {
         let (addr, listener) = bound_listener(one_per_frame()).await;
         let mut listener = listener
-            .with_tls(&test_tls_settings(None), &testdata_dir())
+            .with_tls(
+                &test_tls_settings(None),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
             .unwrap()
             .with_max_connections(1)
             .with_handshake_timeout(Duration::from_millis(50));
@@ -4095,9 +4127,15 @@ mod tests {
     /// The header is read off the raw stream, and the TLS handshake runs on what follows it.
     #[tokio::test]
     async fn tls_runs_behind_the_header() {
-        let mut running =
-            proxied(false, |l| l.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap())
-                .await;
+        let mut running = proxied(false, |l| {
+            l.with_tls(
+                &test_tls_settings(None),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap()
+        })
+        .await;
         let mut stream = connect(&running.addr).await;
         stream.write_all(&v2_ipv4_with_tlv()).await.unwrap();
         let connector = tls_connector("ca.pem", None).await;

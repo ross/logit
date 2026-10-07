@@ -1,6 +1,6 @@
 //! `logit run`'s process signals (`docs/adr/signal-handling.md`): SIGTERM/SIGINT start a graceful
-//! drain and a second one exits 130; SIGHUP bumps the reopen generation file targets watch, and
-//! never exits.
+//! drain and a second one exits 130; SIGHUP bumps the reopen generation that file targets and the
+//! TLS reloader watch, and never exits.
 //!
 //! [`Signals::install`] runs first in `run_pipelines`, before the config loads. On Unix it creates
 //! every tokio `Signal` stream before it returns. Once a stream exists, the signal's default
@@ -57,8 +57,8 @@ impl Signals {
 }
 
 impl Signals {
-    /// A clone of the reopen generation's first receiver, for a file target to watch. A bump
-    /// made before the clone still reads as changed to it.
+    /// A clone of the reopen generation's first receiver, for a file target or the TLS reloader to
+    /// watch. A bump made before the clone still reads as changed to it.
     pub fn reopen_generation(&self) -> watch::Receiver<u64> {
         self.reopen.clone()
     }

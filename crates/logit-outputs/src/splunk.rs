@@ -458,10 +458,14 @@ impl SplunkHecOutput {
 
     /// Client TLS tuning (`tls:`) for an `https://` endpoint. A no-op when `settings` is empty.
     /// The files load and validate here, since `graph::resolve` never touches the filesystem.
+    ///
+    /// Registers the files with `reloader` under this sink's diagnostics and telemetry as they are
+    /// when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         if settings.is_empty() {
             return Ok(self);
@@ -472,7 +476,13 @@ impl SplunkHecOutput {
                  will accept any certificate the peer presents, self-signed or otherwise",
             );
         }
-        self.tls = Some(crate::tls::build_client_config(settings, base_dir)?);
+        self.tls = Some(logit_pipeline::tls::build_client_config(
+            settings,
+            base_dir,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?);
         self.client = None;
         Ok(self)
     }

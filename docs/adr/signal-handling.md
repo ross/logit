@@ -1,6 +1,6 @@
 ---
 created: 2026-10-05
-updated: 2026-10-05
+updated: 2026-10-07
 ---
 
 # Signal handling: SIGHUP reopens file targets and never exits, and every handler is installed before config load
@@ -99,9 +99,9 @@ handler installed, `logit` behaves the same as PID 1, under `--init`, and on a h
   rotator able to signal `logit` manages. `stdout`, or a network sink, stays the recommended container output.
 
 ### Not covered
-A SIGHUP doesn't reload the config, TLS certificates and keys, `collectd_in`'s `types_db:`, or a
-`lua_file` script. Each is read once at startup, and a change to any of them still needs a
-restart. Certificate rotation stays the gap `docs/known-gaps/intake.md` records.
+A SIGHUP doesn't reload the config, `collectd_in`'s `types_db:`, or a `lua_file` script. Each is
+read once at startup, and a change to any of them still needs a restart. A SIGHUP does trigger a
+TLS certificate check; see the 2026-10-07 amendment below.
 
 ## Alternatives considered
 - **SIGHUP as a graceful shutdown.** Rejected. systemd's `ExecReload=/bin/kill -HUP $MAINPID` and
@@ -139,3 +139,17 @@ restart. Certificate rotation stays the gap `docs/known-gaps/intake.md` records.
   `stdio_out` writing to `stdout` fails each write with `EIO`, counted as a `Rejected` drop. nginx,
   rsyslog, and other daemons that handle SIGHUP behave the same way. Run `logit` under systemd or
   a container runtime, not a bare terminal session.
+
+## Amendment: SIGHUP also triggers a TLS certificate check (2026-10-07)
+
+[ADR `tls-certificate-reload`](tls-certificate-reload.md) reloads certificate, key, and CA files
+on a process-wide poll, and uses SIGHUP as a second trigger. Its poller subscribes to the reopen
+generation from decision 4, so each SIGHUP that bumps the generation also checks every TLS
+component's files at once, whatever `tls_reload_interval:` is set to, including `0s`. A set whose
+content changed loads whole, so a renewed certificate pairs with its key before anything swaps,
+and a failed load keeps the old material.
+
+Nothing else in this ADR changes. A SIGHUP still never ends the process, the file targets still
+reopen lazily, and the `reopen signal received` line still says the config isn't reloaded. A
+certbot `--deploy-hook` that sends `kill -HUP` gets an immediate rotation instead of waiting for
+the next poll.

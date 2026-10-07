@@ -181,8 +181,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// timeout, so the Agent hears "busy" well before it would give up on its own.
 const BUSY_AFTER: Duration = Duration::from_secs(5);
 
-/// `crate::tls::TlsServerSettings`, re-exported as `otlp_in`'s is.
-pub use crate::tls::TlsServerSettings;
+/// `logit_pipeline::tls::TlsServerSettings`, re-exported as `otlp_in`'s is.
+pub use logit_pipeline::tls::TlsServerSettings;
 
 /// The `datadog_in` listener. See this module's doc.
 pub struct DatadogInput {
@@ -251,13 +251,24 @@ impl DatadogInput {
     /// Turns on TLS termination (`tls:` in config). Paths in `settings` resolve against
     /// `base_dir`, the config file's directory. Both ALPN protocols the auto builder serves are
     /// advertised.
+    ///
+    /// Registers the files with `reloader` under this listener's diagnostics and telemetry as
+    /// they are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         let alpn: &[&[u8]] = &[b"h2", b"http/1.1"];
-        self.tls = Some(Arc::new(crate::tls::build_server_config(settings, base_dir, alpn)?));
+        self.tls = Some(Arc::new(logit_pipeline::tls::build_server_config(
+            settings,
+            base_dir,
+            alpn,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?));
         Ok(self)
     }
 
@@ -1667,7 +1678,9 @@ mod tests {
                 key_file: "server.key".to_string(),
                 client_ca_file: None,
             };
-            input.with_tls(&settings, &testdata_tls_dir()).unwrap()
+            input
+                .with_tls(&settings, &testdata_tls_dir(), &logit_pipeline::tls::TlsReloader::new())
+                .unwrap()
         };
         let mut running = sender_input(false, true, tls).await;
         let mut stream = tokio::net::TcpStream::connect(&running.addr).await.unwrap();

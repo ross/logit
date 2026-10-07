@@ -46,7 +46,7 @@ use std::time::Duration;
 ///
 /// `tls` is `None` when no `tls:` block is set: `reqwest`'s default already trusts the bundled
 /// Mozilla roots for an `https://` endpoint. `Some` carries a config built from operator settings
-/// by [`crate::tls::build_client_config`].
+/// by `logit_pipeline::tls::build_client_config`.
 ///
 /// `timeout` is the client-wide default; both callers also set a per-request `.timeout(..)`,
 /// which is what bounds each request.
