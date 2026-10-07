@@ -56,6 +56,7 @@ handshake to every request.
 ## Explicitly out of scope (filed in `docs/known-gaps/`)
 
 - **Certificate rotation.** Loaded once at `logit run` startup; a renewed cert needs a restart.
+  Since closed by [ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md).
 - **`server_name` override** for an endpoint reached by IP or through a proxy.
 - **`syslog_out` TLS** (RFC 5425) stays unimplemented, but can now reuse `TlsClientConfig`/
   `TlsServerConfig` directly rather than re-deciding their shape.

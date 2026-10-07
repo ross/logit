@@ -320,13 +320,17 @@ impl GraphiteInput {
     ///
     /// Fails under UDP: carbon has no DTLS receiver. Graph rule 43 is what an operator sees; this
     /// arm backstops a caller that skipped validation.
+    ///
+    /// Registers the files with `reloader` under this listener's diagnostics and telemetry as
+    /// they are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         self.inner = match self.inner {
-            Inner::Tcp(listener) => Inner::Tcp(listener.with_tls(settings, base_dir)?),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_tls(settings, base_dir, reloader)?),
             Inner::Udp(_) => anyhow::bail!(
                 "graphite_in: 'tls:' needs 'transport: tcp' -- carbon has no DTLS receiver \
                  (docs/adr/graphite-carbon-relay.md)"
@@ -1061,7 +1065,15 @@ mod tests {
     #[tokio::test]
     async fn a_tls_connection_round_trips_a_carbon_line() {
         let mut running = start(
-            |input| input.with_tls(&test_tls_settings(), &testdata_dir()).expect("tcp takes tls"),
+            |input| {
+                input
+                    .with_tls(
+                        &test_tls_settings(),
+                        &testdata_dir(),
+                        &logit_pipeline::tls::TlsReloader::new(),
+                    )
+                    .expect("tcp takes tls")
+            },
             Transport::Tcp,
             Protocol::Plaintext,
         )
@@ -1089,7 +1101,15 @@ mod tests {
     #[tokio::test]
     async fn a_tls_client_trusting_the_wrong_ca_is_refused_and_the_listener_keeps_serving() {
         let mut running = start(
-            |input| input.with_tls(&test_tls_settings(), &testdata_dir()).expect("tcp takes tls"),
+            |input| {
+                input
+                    .with_tls(
+                        &test_tls_settings(),
+                        &testdata_dir(),
+                        &logit_pipeline::tls::TlsReloader::new(),
+                    )
+                    .expect("tcp takes tls")
+            },
             Transport::Tcp,
             Protocol::Plaintext,
         )

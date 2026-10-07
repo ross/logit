@@ -247,13 +247,17 @@ impl LinesInput {
     /// Terminates TLS on a TCP listener (`tls:`); paths in `settings` resolve against `base_dir`.
     /// Fails on a datagram listener and on a Unix socket. Graph rules 43 and 65 are what an
     /// operator sees; this backstops a caller that skipped validation.
+    ///
+    /// Registers the files with `reloader` under this listener's diagnostics and telemetry as
+    /// they are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         self.inner = match self.inner {
-            Inner::Tcp(listener) => Inner::Tcp(listener.with_tls(settings, base_dir)?),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_tls(settings, base_dir, reloader)?),
             Inner::Udp(_) => anyhow::bail!(
                 "lines_in: 'tls:' needs 'transport: tcp' -- TLS is defined over a byte stream, \
                  and DTLS is out of scope (docs/adr/syslog-tcp-ingress-and-tls.md); a Unix socket \
@@ -606,7 +610,10 @@ mod tests {
             LinesInput::unix("/tmp/x.socket"),
             LinesInput::unix_stream("/tmp/x.socket"),
         ] {
-            let err = input.with_tls(&settings, &testdata_tls_dir()).err().expect("must fail");
+            let err = input
+                .with_tls(&settings, &testdata_tls_dir(), &logit_pipeline::tls::TlsReloader::new())
+                .err()
+                .expect("must fail");
             assert!(err.to_string().contains("plaintext"), "{err}");
         }
     }
@@ -746,7 +753,7 @@ mod tests {
             client_ca_file: None,
         };
         let input = LinesInput::tcp("127.0.0.1:0")
-            .with_tls(&settings, &testdata_tls_dir())
+            .with_tls(&settings, &testdata_tls_dir(), &logit_pipeline::tls::TlsReloader::new())
             .expect("a tcp listener takes tls");
         let mut started = start(input).await;
 

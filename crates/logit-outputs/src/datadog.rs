@@ -698,10 +698,14 @@ impl DatadogOutput {
     /// Client TLS tuning (`tls:`) for every `https://` request. A no-op when `settings` is
     /// empty. The files load and validate here, since `graph::resolve` never touches the
     /// filesystem.
+    ///
+    /// Registers the files with `reloader` under this sink's diagnostics and telemetry as they are
+    /// when this runs, so call it after `with_diagnostics` and `with_telemetry`.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
         base_dir: &Path,
+        reloader: &logit_pipeline::tls::TlsReloader,
     ) -> anyhow::Result<Self> {
         if settings.is_empty() {
             return Ok(self);
@@ -712,7 +716,13 @@ impl DatadogOutput {
                  will accept any certificate the peer presents, self-signed or otherwise",
             );
         }
-        let cfg = crate::tls::build_client_config(settings, base_dir)?;
+        let cfg = logit_pipeline::tls::build_client_config(
+            settings,
+            base_dir,
+            reloader,
+            &self.diag,
+            &self.telemetry,
+        )?;
         self.client = build_client(self.request_timeout, Some(&cfg));
         self.tls = Some(cfg);
         Ok(self)
