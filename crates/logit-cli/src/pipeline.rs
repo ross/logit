@@ -167,7 +167,9 @@ pub async fn run_pipelines(
     // failure is `RunError::Startup`: the guarantee `Input::bind`'s pre-pass gives every listener.
     let (readiness, admin_server) = match admin_bind {
         Some(bind) => {
-            let listener = tokio::net::TcpListener::bind(&bind)
+            // Never `reuse_port`: with two processes on the port, a readiness probe could be
+            // answered by the one it isn't asking about.
+            let listener = logit_pipeline::listen::bind_tcp(&bind, Default::default())
                 .await
                 .with_context(|| format!("admin: binding '{bind}'"))
                 .map_err(RunError::Startup)?;
@@ -578,6 +580,7 @@ fn build_spec(
             peer,
             proxy_protocol,
             forwarded,
+            reuse_port,
         } => {
             let mut input = OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -589,7 +592,8 @@ fn build_spec(
                 .with_max_connections(*max_connections)
                 .with_peer(*peer)
                 .with_proxy_protocol(*proxy_protocol)
-                .with_forwarded(forwarded.map(to_forwarded_header));
+                .with_forwarded(forwarded.map(to_forwarded_header))
+                .with_reuse_port(*reuse_port);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -605,6 +609,7 @@ fn build_spec(
             peer,
             proxy_protocol,
             forwarded,
+            reuse_port,
         } => {
             let mut input = DatadogInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -616,6 +621,7 @@ fn build_spec(
                 .with_peer(*peer)
                 .with_proxy_protocol(*proxy_protocol)
                 .with_forwarded(forwarded.map(to_forwarded_header))
+                .with_reuse_port(*reuse_port)
                 .with_api_keys(api_keys.clone());
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
@@ -635,6 +641,7 @@ fn build_spec(
             peer,
             proxy_protocol,
             forwarded,
+            reuse_port,
         } => {
             let mut input = SplunkHecInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -646,6 +653,7 @@ fn build_spec(
                 .with_peer(*peer)
                 .with_proxy_protocol(*proxy_protocol)
                 .with_forwarded(forwarded.map(to_forwarded_header))
+                .with_reuse_port(*reuse_port)
                 .with_tokens(tokens.clone())
                 // Saturates on a 32-bit target: a cap past the address space is no cap.
                 .with_max_request_bytes(usize::try_from(*max_request_bytes).unwrap_or(usize::MAX))
@@ -668,6 +676,7 @@ fn build_spec(
             peer,
             proxy_protocol,
             forwarded,
+            reuse_port,
         } => {
             let mut input = DatadogTraceInput::new()
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -678,7 +687,9 @@ fn build_spec(
                 .with_max_connections(*max_connections)
                 .with_peer(*peer)
                 .with_proxy_protocol(*proxy_protocol)
-                .with_forwarded(forwarded.map(to_forwarded_header));
+                .with_forwarded(forwarded.map(to_forwarded_header))
+                // Rule 80 rejects it without `bind`.
+                .with_reuse_port(*reuse_port);
             if let Some(bind) = bind {
                 input = input.with_bind(bind.clone());
             }
@@ -711,6 +722,7 @@ fn build_spec(
             peer,
             proxy_protocol,
             forwarded,
+            reuse_port,
         } => {
             let input: Box<dyn Input + Send> = match bind {
                 Some(bind) => {
@@ -722,6 +734,7 @@ fn build_spec(
                         .with_peer(*peer)
                         .with_proxy_protocol(*proxy_protocol)
                         .with_forwarded(forwarded.map(to_forwarded_header))
+                        .with_reuse_port(*reuse_port)
                         // Unconditional: the receiver reads `max_families: 0` as off, and rule 55
                         // rejects a zero `ttl`.
                         .with_metadata_cache(metadata_cache.max_families, metadata_cache.ttl);
@@ -749,13 +762,15 @@ fn build_spec(
             handshake_timeout,
             idle_timeout,
             max_connections,
+            reuse_port,
         } => {
             let mut input = LogitInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
-                .with_max_connections(*max_connections);
+                .with_max_connections(*max_connections)
+                .with_reuse_port(*reuse_port);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -1340,6 +1355,7 @@ fn build_spec(
             timeout,
             headers,
             endpoint_tls,
+            reuse_port,
         } => {
             // Graph rule 56 guarantees exactly one mode field; `PrometheusOutput` carries the
             // choice as a variant from here on.
@@ -1351,6 +1367,7 @@ fn build_spec(
                         .with_path(path.clone())
                         .with_expire_after(*expire_after)
                         .with_max_series(*max_series)
+                        .with_reuse_port(*reuse_port)
                         .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                         .with_telemetry(telemetry.clone())
                         .into()
@@ -2387,6 +2404,7 @@ mod tests {
                 timeout: logit_config::default_prometheus_endpoint_timeout(),
                 headers: HashMap::new(),
                 endpoint_tls: logit_config::TlsClientConfig::default(),
+                reuse_port: false,
             },
         };
         assert!(matches!(
@@ -2420,6 +2438,7 @@ mod tests {
                     timeout: Duration::from_secs(30),
                     headers: HashMap::from([("X-Scope-OrgID".to_string(), "tenant-a".to_string())]),
                     endpoint_tls: logit_config::TlsClientConfig::default(),
+                    reuse_port: false,
                 },
             };
             assert!(
@@ -2576,6 +2595,7 @@ mod tests {
                     idle_timeout: None,
                     max_connections: logit_config::default_max_connections(),
                     peer: false,
+                    reuse_port: false,
                     proxy_protocol: false,
                     forwarded: None,
                 },
@@ -2648,6 +2668,7 @@ mod tests {
                 max_connections: logit_config::default_max_connections(),
                 metadata_cache: logit_config::MetadataCacheConfig::default(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
                 forwarded: None,
             },
@@ -2680,6 +2701,7 @@ mod tests {
                 max_connections: logit_config::default_max_connections(),
                 metadata_cache: logit_config::MetadataCacheConfig::default(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
                 forwarded: None,
             },
@@ -3104,6 +3126,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
                 forwarded: None,
             },
@@ -3227,6 +3250,7 @@ mod tests {
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                reuse_port: false,
             },
         };
         assert!(matches!(
@@ -3254,6 +3278,7 @@ mod tests {
                 handshake_timeout: Duration::from_secs(5),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                reuse_port: false,
             },
         };
         assert!(matches!(
@@ -3338,6 +3363,7 @@ mod tests {
                 handshake_timeout: Duration::from_millis(50),
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
+                reuse_port: false,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -3366,6 +3392,7 @@ mod tests {
                 idle_timeout: None,
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
                 forwarded: None,
             },
@@ -3541,6 +3568,7 @@ mod tests {
             handshake_timeout: logit_config::default_handshake_timeout(),
             idle_timeout: None,
             max_connections: 1,
+            reuse_port: false,
         };
         let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
 
@@ -3580,6 +3608,7 @@ mod tests {
             idle_timeout: None,
             max_connections: 1,
             peer: false,
+            reuse_port: false,
             proxy_protocol: false,
             forwarded: None,
         };
@@ -3732,6 +3761,7 @@ mod tests {
                 handshake_timeout: logit_config::default_handshake_timeout(),
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
+                reuse_port: false,
             },
         };
         let NodeSpec::Input(mut input, _) =
@@ -3814,6 +3844,7 @@ mod tests {
                 idle_timeout: Some(Duration::from_millis(50)),
                 max_connections: logit_config::default_max_connections(),
                 peer: false,
+                reuse_port: false,
                 proxy_protocol: false,
                 forwarded: None,
             },
@@ -4977,6 +5008,67 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind,
+        }
+    }
+
+    /// Every kind that binds a port passes `reuse_port` through `build_spec` to its socket. A
+    /// placeholder socket holds a TCP and a UDP port with `SO_REUSEPORT` set; each kind's bind on
+    /// that port succeeds with `reuse_port: true` and fails with `EADDRINUSE` with `false`. An arm
+    /// that drops the `with_reuse_port` call fails the first half.
+    #[tokio::test]
+    async fn every_listener_kind_threads_reuse_port_to_its_bind() {
+        use logit_pipeline::listen::{bind_tcp, BindOptions};
+
+        let tcp_holder = bind_tcp("127.0.0.1:0", BindOptions { reuse_port: true }).await.unwrap();
+        let tcp = tcp_holder.local_addr().unwrap().to_string();
+        let udp_holder = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)
+            .expect("a UDP socket");
+        udp_holder.set_reuse_port(true).unwrap();
+        udp_holder.bind(&"127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap().into()).unwrap();
+        let udp = udp_holder.local_addr().unwrap().as_socket().unwrap().to_string();
+
+        let kinds = [
+            format!(r#""type": "statsd_in", "bind": "{udp}""#),
+            format!(r#""type": "statsd_in", "bind": "{tcp}", "transport": "tcp""#),
+            format!(r#""type": "syslog_in", "bind": "{udp}""#),
+            format!(r#""type": "syslog_in", "bind": "{tcp}", "transport": "tcp""#),
+            format!(r#""type": "graphite_in", "bind": "{tcp}""#),
+            format!(r#""type": "graphite_in", "bind": "{udp}", "transport": "udp""#),
+            format!(r#""type": "lines_in", "bind": "{tcp}""#),
+            format!(r#""type": "lines_in", "bind": "{udp}", "transport": "udp""#),
+            format!(r#""type": "collectd_in", "bind": "{udp}""#),
+            format!(r#""type": "otlp_in", "bind": "{tcp}""#),
+            format!(r#""type": "datadog_in", "bind": "{tcp}""#),
+            format!(r#""type": "datadog_trace_in", "bind": "{tcp}""#),
+            format!(r#""type": "splunk_hec_in", "bind": "{tcp}""#),
+            format!(r#""type": "logit_in", "bind": "{tcp}""#),
+            format!(r#""type": "prometheus_in", "bind": "{tcp}""#),
+            format!(r#""type": "prometheus_out", "bind": "{tcp}""#),
+        ];
+        for fields in &kinds {
+            for reuse_port in [true, false] {
+                let json = format!(r#"{{{fields}, "reuse_port": {reuse_port}}}"#);
+                let component: Component = serde_json::from_str(&json).unwrap();
+                let (spec, _) =
+                    build_spec("in", &input_component(component.kind), Path::new(""), None)
+                        .unwrap_or_else(|err| panic!("{json}: {err:#}"));
+                let bound = match spec {
+                    NodeSpec::Input(mut input, _) => input.bind().await,
+                    NodeSpec::Output(mut output, _, _) => output.bind().await,
+                    _ => panic!("{json}: expected an input or output"),
+                };
+                match (reuse_port, bound) {
+                    (true, Ok(())) => {}
+                    (true, Err(err)) => panic!("{json}: should share the port, got {err:#}"),
+                    (false, Ok(())) => panic!("{json}: should fail with the port held"),
+                    (false, Err(err)) => assert!(
+                        err.chain().any(|cause| cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)),
+                        "{json}: expected EADDRINUSE, got {err:#}"
+                    ),
+                }
+            }
         }
     }
 

@@ -592,6 +592,11 @@
               "type": "boolean"
             },
             "receive": true,
+            "reuse_port": {
+              "description": "Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an overlapping replacement during a rolling upgrade, can bind the same `bind:` address at the same time. The kernel then splits connections between them by source address and port. Both processes must set it and run as the same effective user, or the second bind fails with an address-in-use error. Off by default.",
+              "default": false,
+              "type": "boolean"
+            },
             "sources": true,
             "targets": true,
             "tls": {
@@ -678,6 +683,11 @@
               "type": "boolean"
             },
             "receive": true,
+            "reuse_port": {
+              "description": "Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an overlapping replacement during a rolling upgrade, can bind the same `bind:` address at the same time. The kernel then splits connections between them by source address and port. Both processes must set it and run as the same effective user, or the second bind fails with an address-in-use error. Off by default.",
+              "default": false,
+              "type": "boolean"
+            },
             "sources": true,
             "targets": true,
             "tls": {
@@ -760,6 +770,11 @@
               "type": "boolean"
             },
             "receive": true,
+            "reuse_port": {
+              "description": "Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an overlapping replacement during a rolling upgrade, can bind the same `bind:` address at the same time. The kernel then splits connections between them by source address and port. Both processes must set it and run as the same effective user, or the second bind fails with an address-in-use error. Off by default.\n\nApplies to the `bind:` listener only, and is rejected without one: the Unix `socket:` has no port to share.",
+              "default": false,
+              "type": "boolean"
+            },
             "socket": {
               "description": "An absolute path for a Unix stream socket, the Agent's `receiver_socket` (`/var/run/datadog/apm.socket` by default). A tracer finds it through `DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket`. The directory must exist; a stale socket file at the path is replaced, and the new one is made mode `socket_mode`, by default `0722` (the Agent's own), so unprivileged tracers can connect.",
               "default": null,
@@ -878,6 +893,11 @@
               "type": "boolean"
             },
             "receive": true,
+            "reuse_port": {
+              "description": "Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an overlapping replacement during a rolling upgrade, can bind the same `bind:` address at the same time. The kernel then splits connections between them by source address and port. Both processes must set it and run as the same effective user, or the second bind fails with an address-in-use error. Off by default.",
+              "default": false,
+              "type": "boolean"
+            },
             "sources": true,
             "targets": true,
             "tls": {
@@ -1101,6 +1121,11 @@
               ]
             },
             "receive": true,
+            "reuse_port": {
+              "description": "Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an overlapping replacement during a rolling upgrade, can bind the same `bind:` address at the same time. The kernel then splits connections between them by source address and port. Both processes must set it and run as the same effective user, or the second bind fails with an address-in-use error. Off by default.",
+              "default": false,
+              "type": "boolean"
+            },
             "sources": true,
             "targets": true,
             "tls": {
@@ -3209,6 +3234,11 @@
               "type": "boolean"
             },
             "receive": true,
+            "reuse_port": {
+              "description": "Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an overlapping replacement during a rolling upgrade, can bind the same `bind:` address at the same time. The kernel then splits connections between them by source address and port. Both processes must set it and run as the same effective user, or the second bind fails with an address-in-use error. Off by default.\n\nReceiver mode (`bind:`) only; rejected alongside `scrape_targets:`.",
+              "default": false,
+              "type": "boolean"
+            },
             "scrape_targets": {
               "description": "Scrape mode: absolute `http://`/`https://` URLs with a non-empty host. Non-empty selects scrape mode.",
               "default": [],
@@ -3388,6 +3418,11 @@
               "type": "string"
             },
             "receive": true,
+            "reuse_port": {
+              "description": "Sets `SO_REUSEPORT` on the listening socket, so a second `logit` process, such as an overlapping replacement during a rolling upgrade, can bind the same `bind:` address at the same time. The kernel then splits connections between them by source address and port. Both processes must set it and run as the same effective user, or the second bind fails with an address-in-use error. Off by default.\n\nExposition mode (`bind:`) only; rejected alongside `endpoint:`. During an overlap a scrape reaches whichever process the kernel picks, so a counter can appear to reset until the old process exits.",
+              "default": false,
+              "type": "boolean"
+            },
             "sources": true,
             "targets": true,
             "timeout": {

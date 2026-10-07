@@ -80,6 +80,9 @@ snap.workspace = true
 # Datadog Agent does. Both already transitive at these versions via `logit-inputs`.
 flate2.workspace = true
 ruzstd.workspace = true
+# `pipeline.rs`'s `reuse_port` threading test holds a UDP port with `SO_REUSEPORT` set, which
+# `std`/`tokio` sockets can't do. Already a dependency via `logit-inputs`.
+socket2.workspace = true
 # `tests/lua_example.rs` runs `examples/lua/process.lua` in a `ScriptWorker`. Already a
 # transitive dependency via `logit-pipeline`.
 logit-script.workspace = true
