@@ -268,6 +268,7 @@ use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use logit_core::{redact, Diagnostics, Event, EventBatch, Exemplar, Telemetry};
+use logit_pipeline::listen::BindOptions;
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::prometheus::compression::{self, Encoding};
 use logit_proto::prometheus::{
@@ -649,6 +650,8 @@ pub struct ExposeOutput {
     diag: Diagnostics,
     telemetry: Telemetry,
     clock: Clock,
+    /// Socket options set before the bind (`reuse_port:`).
+    bind_options: BindOptions,
 }
 
 impl ExposeOutput {
@@ -666,6 +669,7 @@ impl ExposeOutput {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             clock: Arc::new(Instant::now),
+            bind_options: BindOptions::default(),
         }
     }
 
@@ -682,6 +686,14 @@ impl ExposeOutput {
 
     pub fn with_max_series(mut self, max_series: usize) -> Self {
         self.max_series = max_series;
+        self
+    }
+
+    /// Sets `SO_REUSEPORT` before the bind (`reuse_port:` in config), so another process can bind
+    /// the same address at the same time. Off by default.
+    /// During an overlap a scrape reaches whichever process the kernel picks.
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.bind_options.reuse_port = reuse_port;
         self
     }
 
@@ -736,7 +748,7 @@ impl Output for ExposeOutput {
         if self.server.is_some() {
             return Ok(());
         }
-        let listener = TcpListener::bind(&self.bind)
+        let listener = logit_pipeline::listen::bind_tcp(&self.bind, self.bind_options)
             .await
             .with_context(|| format!("binding prometheus_out on '{}'", self.bind))?;
         let local_addr = listener.local_addr().context("reading prometheus_out's bound address")?;
