@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-10-05
+updated: 2026-10-07
 ---
 
 # TLS for `otlp_out`/`otlp_in`, and a pooled gRPC client to carry it
@@ -116,6 +116,7 @@ An operator reaching a privately-CA'd endpoint sets `tls.ca_file` explicitly.
   `OtlpOutput`/`OtlpInput` construction (`logit run` startup); a renewed cert needs a restart.
   Filed in `docs/known-gaps/otlp.md`; `rustls::ServerConfig`'s `ResolvesServerCert` (a file-watcher
   hook) or a SIGHUP-triggered reload are the shapes to reach for if this becomes real.
+  Superseded by the 2026-10-07 amendment below.
 
 ## Consequences
 
@@ -219,3 +220,14 @@ from the TLS accept, as on that driver.
 Under `proxy_protocol: true`, the PROXY header is read ahead of the TLS accept or the peek, under
 the same `handshake_timeout`. See [ADR `listener-peer-address`](listener-peer-address.md)'s
 2026-10-05 amendment.
+
+## Amendment: certificates reload without a restart (2026-10-07)
+
+The "Certificate rotation via a background reload" alternative above is no longer out of scope.
+[ADR `tls-certificate-reload`](tls-certificate-reload.md) decides it for every TLS component,
+`otlp_out` and `otlp_in` included. `otlp_in`'s `ServerConfig` takes a swappable certificate
+resolver, the shape this ADR named, and the client-CA verifier gets the same treatment. On the
+client side, `otlp_out`'s pooled gRPC client and its HTTP client keep the `ClientConfig` they were
+built with. The config's verifier and certificate resolver are swappable and shared by every
+clone, so neither client is rebuilt on a rotation and the connection pool survives it. The trigger
+is a content poll on the PEM files plus SIGHUP, rather than a file watcher alone.
