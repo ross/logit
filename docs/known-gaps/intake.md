@@ -184,8 +184,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** during a rolling overlap, every value list reaches both instances, and a
     downstream count or sum doubles until the old one exits.
   - **Workaround:** none beyond not overlapping multicast listeners: stop the old instance before
-    the new one starts. `reuse_port` is refused on a multicast `bind:`, because there's nothing for
-    it to share
+    the new one starts, as a DaemonSet's default rolling update (`maxSurge: 0`) does.
+    `reuse_port` is refused on a multicast `bind:`, because there's nothing for it to share
     ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)).
 
 ## TLS and connection lifecycle
@@ -317,7 +317,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     into the reset connection is lost unless its protocol acknowledges.
   - **Workaround:** set `net.ipv4.tcp_migrate_req=1` on the node. A pod can't set it: under
     `hostNetwork` it's the node's own network namespace, and a `hostNetwork` pod can't set network
-    sysctls.
+    sysctls. [Deploying `logit`](../deploying.md#tcp-listeners-and-tcp_migrate_req) names where
+    to set it.
 - **A request handler blocked forever in a `Fanout` send holds its connection and permit.** A
   handler parked on a full downstream is backpressure, not idleness, so neither `idle_timeout` nor
   the grace after it closes the connection. It ends when the send completes or the client goes

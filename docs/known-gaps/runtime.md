@@ -96,6 +96,17 @@ Entry format and the other areas: [the known-gaps index](README.md).
   [ADR `shutdown-accounting-and-cancellation-safety`](../adr/shutdown-accounting-and-cancellation-safety.md)
   names it as an exception in decision 1. **Revisit** if a reconciliation shows a sink's
   `received` short of its producers' `sent` after a shutdown with no `closed_consumer` drops.
+- **A signal held from startup can still wait `shutdown.delay`.** The shutdown driver decides
+  whether to skip the delay when it runs, by reading the readiness phase, not when the signal
+  arrived (`run_with_options`, `crates/logit-pipeline/src/runtime.rs`). A SIGTERM held during
+  startup resolves the driver's wait at once, but if startup reaches `ready` before the driver's
+  task is first polled, the process waits the full delay before it drains.
+  - **Consequence:** a pod stopped during its own startup can hold its ports for the delay, which
+    the skip exists to avoid. The window is the few scheduler turns between the driver's spawn and
+    the `ready` transition.
+  - **Revisit trigger:** a rollout seen waiting the delay on a pod that was signalled while
+    starting. The fix is to record the phase when the signal is observed, before startup can
+    move it.
 - **The `fault` seam's rules on one point don't each see every hit.** `logit_pipeline::fault` (a
   test-only seam) checks a scope's rules on a point in the order they were added, and a rule that
   fails an operation returns before any later rule counts it. So a rule counts only the hits no

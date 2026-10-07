@@ -24,11 +24,10 @@ preserves.
   ([ADR `signal-handling`](../adr/signal-handling.md)). `docs/known-gaps/runtime.md` records the
   missing config reload.
 - **A SIGTERM drain stops every listener first**, then cascades the close-time flush through the
-  graph ([Signal and restart behavior](../deploying.md#signal-and-restart-behavior)). That order is
-  right under a supervisor that restarts the process and wrong in Kubernetes without a `preStop`
-  delay, where a pod should keep reading its sockets until the Service's endpoints have moved.
-  [ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)
-  decides a `shutdown.delay` for it.
+  graph ([Signal and restart behavior](../deploying.md#signal-and-restart-behavior)). An optional
+  `shutdown.delay` keeps every listener reading for a set time before that, so a Kubernetes pod
+  keeps serving while the Service's endpoints move
+  ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)).
 - **Certificates load once at construction.** Every TLS listener holds one
   `Arc<rustls::ServerConfig>` built by `logit_inputs::tls::build_server_config` and wraps it in a
   `TlsAcceptor` once. Every TLS sink builds a `rustls::ClientConfig` through
@@ -36,9 +35,10 @@ preserves.
   `use_preconfigured_tls`. Only `prometheus_in`'s scrape client takes PEM through `reqwest`'s own
   builders (`apply_client_tls`). `docs/known-gaps/intake.md` has the entry.
 - **Listener sockets bind from config, never from an inherited fd.** `udp.rs`'s `bind_one` goes
-  through `socket2` and sets `SO_REUSEADDR` only for a multicast bind. `tcp.rs` binds through
-  `tokio::net::TcpListener::bind` directly. `unix.rs` unlinks a stale socket path and binds fresh.
-  No listener sets `SO_REUSEPORT`; the port-sharing ADR above decides an opt-in `reuse_port`.
+  through `socket2` and sets `SO_REUSEADDR` only for a multicast bind. Every TCP listener binds
+  through `logit_pipeline::listen::bind_tcp`. `unix.rs` unlinks a stale socket path and binds
+  fresh. An opt-in `reuse_port` sets `SO_REUSEPORT` on a UDP or TCP listener, so two processes
+  can share its port.
 - **`Input::bind` is a pre-pass.** Every listener's socket opens before any task spawns, so a bind
   failure fails startup with nothing else running. Any handover design has to feed this pre-pass,
   because that's where a second process's bind would collide with the first's.
@@ -129,7 +129,7 @@ queue. A shared fd has neither problem. HAProxy added its `-x` fd transfer for t
 | How certificates rotate | a certbot deploy hook, which can signal | cert-manager rewrites a mounted Secret with no signal |
 | Who can send a signal | the operator or the supervisor | `docker kill -s HUP`, `kubectl exec`, or a sidecar only with `shareProcessNamespace: true` |
 | How upgrades usually happen | in place | pod replacement; a config change is commonly a checksum annotation that rolls the pods, so config reload becomes the upgrade case |
-| What closes the gap on a UDP port | fd handover to the new process | overlap: a `hostNetwork` DaemonSet with `maxSurge: 1` and `SO_REUSEPORT` on both pods |
+| What closes the gap on a UDP port | fd handover to the new process | overlap: a `hostNetwork` DaemonSet with `maxSurge: 1` and `SO_REUSEPORT` on both pods ([Overlapping two instances on one port](../deploying.md#overlapping-two-instances-on-one-port)) |
 
 ### Host and systemd
 
@@ -159,10 +159,9 @@ systemd as the parent, and one `LISTEN_FDS` reader serves both.
   old socket's receive queue and takes a fraction of the surface.
 - **Without `hostNetwork`, nothing in-process is the bottleneck.** Behind a ClusterIP Service, UDP
   flows pin to a backend through conntrack. The gap is at the Service layer: endpoints update,
-  stale conntrack entries are flushed, and a `preStop` sleep keeps the old pod serving until the
-  endpoints have propagated. What `logit` must do right is keep reading its sockets through the
-  grace period rather than closing them the instant SIGTERM arrives. Today it closes them first,
-  and that works in Kubernetes only because `preStop` delays the signal.
+  stale conntrack entries are flushed, and the old pod must keep serving until the endpoints have
+  propagated. `shutdown.delay` keeps its sockets read through that window instead of closing them
+  the instant SIGTERM arrives, with no `preStop` sleep.
 
 ## TLS certificate reload
 
