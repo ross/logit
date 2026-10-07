@@ -61,7 +61,7 @@ use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{
     DiskQueueConfig, Input, InputRuntimeConfig, NodeSpec, Readiness, RetryConfig, RunError,
-    SinkQueueConfig, SinkStoreConfig, WriteLoopConfig,
+    RunOptions, SinkQueueConfig, SinkStoreConfig, WriteLoopConfig,
 };
 use logit_proto::collectd::{CollectdEncoder, TypesDb};
 use logit_proto::forwarded::ForwardedHeader;
@@ -146,6 +146,7 @@ pub async fn run_pipelines(
     );
 
     let admin_bind = config.admin.bind.clone();
+    let shutdown_delay = config.shutdown.delay;
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let (graph, specs, telemetry, internal) =
         prepare(config, base_dir, Some(signals.reopen_generation())).map_err(RunError::Startup)?;
@@ -163,7 +164,7 @@ pub async fn run_pipelines(
         tracing::warn!(target: "logit", "{warning}");
     }
 
-    // The admin listener binds here, before `run_with_telemetry` spawns anything, so a bind
+    // The admin listener binds here, before `run_with_options` spawns anything, so a bind
     // failure is `RunError::Startup`: the guarantee `Input::bind`'s pre-pass gives every listener.
     let (readiness, admin_server) = match admin_bind {
         Some(bind) => {
@@ -174,15 +175,21 @@ pub async fn run_pipelines(
             let (readiness, readiness_rx) = Readiness::channel();
             // No shutdown listener of its own: the drain a signal starts is the window `/readyz`
             // answers `503 draining` in, and a refused connection then looks like a crash. The
-            // `abort()` below, after `run_with_telemetry` returns, is the only teardown.
+            // `abort()` below, after `run_with_options` returns, is the only teardown.
             (readiness, Some(tokio::spawn(crate::admin::serve_on(listener, readiness_rx))))
         }
         None => (Readiness::disabled(), None),
     };
 
-    let result =
-        logit_pipeline::run_with_telemetry(graph, specs, telemetry, readiness, signals.shutdown())
-            .await;
+    let result = logit_pipeline::run_with_options(
+        graph,
+        specs,
+        telemetry,
+        readiness,
+        signals.shutdown(),
+        RunOptions { shutdown_delay },
+    )
+    .await;
     drop(signals);
     if let Some(admin_server) = admin_server {
         admin_server.abort();
