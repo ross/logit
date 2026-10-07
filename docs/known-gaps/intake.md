@@ -177,22 +177,22 @@ Entry format and the other areas: [the known-gaps index](README.md).
   Both need a downstream that stays full for the whole grace (5 s by default). Counting them would
   need an event-level drop counter on the accumulator and a per-consumer delivery record in
   `Fanout`, for a loss the grace already bounds.
-- **Datagrams that reach a UDP socket after its read loop stops are lost uncounted.** When the
-  drain starts, the read loop returns at the shutdown signal, but the socket stays bound until the
-  decode loop has drained the queue in user space (`crates/logit-inputs/src/udp.rs`). Flows the
-  kernel still sends to that socket pile up unread, and the kernel discards them, with whatever
-  else sat in the receive queue, when the socket closes. `logit.input.kernel.drops` is the
-  kernel's count of datagrams dropped on a full buffer, and
+- **A UDP socket's kernel receive queue at the instant it closes is lost uncounted.** When the
+  drain starts, the read loop returns at the shutdown signal and the socket closes at once, before
+  the decode loop drains the queue in user space (`crates/logit-inputs/src/udp.rs`), so an
+  `SO_REUSEPORT` group re-hashes the closing socket's flows to the survivors straight away. The
+  kernel discards whatever sat in that socket's receive queue at the close.
+  `logit.input.kernel.drops` is the kernel's count of datagrams dropped on a full buffer, and
   `datagrams.dropped{reason="shutdown"}` covers only what `logit` had already read, so neither
   records them.
-  - **Consequence:** during a rolling overlap, the closing process loses what arrives in that
-    window, while the surviving process would have taken it.
-  - **Workaround:** a reader that keeps up, so the decode drain, and with it the window, is short:
-    measured 0 to 85 datagrams per close at 50k datagrams/s
-    ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md#what-the-kernel-does)).
-    `shutdown.delay` doesn't shrink the window, which opens only when the drain starts. For
-    traffic that reaches the process through a Service rather than from the node itself, the delay
-    moves that traffic away before the window opens.
+  - **Consequence:** a reader that keeps up holds that queue near empty, so the loss is small. A
+    reader stalled under `overflow: block` isn't reading the socket while it waits for room in its
+    own queue, so a full `SO_RCVBUF` can sit there at the close and be lost.
+  - **Workaround:** the default `overflow: drop_oldest`, which never stops reading, keeps the
+    kernel queue short; its own evictions are counted. For traffic that reaches the process
+    through a Service rather than from the node itself, `shutdown.delay` moves that traffic away
+    before the close. Measured loss per close:
+    [ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md#what-the-kernel-does).
 - **A multicast UDP listener is delivered to every overlapping instance.** Every socket joined to
   a multicast group receives every datagram, whatever `SO_REUSEADDR` or `SO_REUSEPORT` it sets
   (measured: 1000 of 1000 at each of two members), and the multicast bind already sets

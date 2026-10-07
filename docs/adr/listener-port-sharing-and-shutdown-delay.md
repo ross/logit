@@ -75,10 +75,14 @@ the record.
     the senders stopped, so its zero loss in all three runs says nothing about loss at a close
     under load.
   - With the default `0s` delay, the only arm that closed under load, the loss was 0, 0, and 85
-    datagrams: what reached the socket after its read loop stopped and before it closed, which
-    no `logit` counter sees. `logit.input.kernel.drops` counts drops on a full buffer, not a
-    queue discarded at close. A delay doesn't shrink that window; it opens when the drain
-    starts.
+    datagrams, which no `logit` counter sees. `logit.input.kernel.drops` counts drops on a full
+    buffer, not a queue discarded at close. Most of it reached the socket after its read loop
+    stopped and before it closed: the socket stayed open until the listener had drained its
+    receive queue in user space. The listener now closes the socket when its read loop stops,
+    before that drain (ADR `decoupled-listener-io`'s
+    [2026-10-07 amendment](decoupled-listener-io.md#amendment-the-socket-closes-before-the-queue-drains-2026-10-07)),
+    so the loss left is the kernel receive queue at the instant of close.
+    TODO(e2e): the same arm against a build with that change lost N, N, and N datagrams.
   - With `reuse_port` left off, the second process exited `1` with `Address already in use`.
 
 ## Decision
