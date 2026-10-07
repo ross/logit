@@ -146,17 +146,22 @@ mod tests {
         assert!(listener.local_addr().unwrap().ip().is_loopback());
     }
 
-    /// `listen_queue` reports the backlog the kernel recorded, which is the requested one clamped
-    /// to `net.core.somaxconn` (4096 by default since Linux 5.4).
+    /// The kernel clamps `listen()`'s backlog to `net.core.somaxconn`, so the recorded backlog is
+    /// the smaller of the two.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_backlog_matches_tokios_own_bind() {
         use std::os::fd::AsRawFd;
 
+        let somaxconn: u32 = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+            .expect("somaxconn should be readable")
+            .trim()
+            .parse()
+            .expect("somaxconn is an integer");
         let (listener, _) = ephemeral(BindOptions::default()).await;
         let (depth, backlog) = crate::sockstat::listen_queue(listener.as_raw_fd())
             .expect("TCP_INFO should be readable on a listening socket");
         assert_eq!(depth, 0);
-        assert_eq!(backlog, BACKLOG);
+        assert_eq!(backlog, BACKLOG.min(somaxconn));
     }
 }

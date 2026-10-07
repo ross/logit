@@ -1051,8 +1051,9 @@ them per sender, not evenly per event. A TCP connection the kernel has queued bu
 process hasn't accepted yet is reset when that process closes its socket, unless the host sets
 `net.ipv4.tcp_migrate_req`. `logit validate` rejects `reuse_port: true` under `transport: unix`
 or `unix_stream`, which have no port to share, and on a multicast `bind:`, whose group already
-delivers every datagram to every member (rule 80). A fuller replacement recipe follows in a later
-section.
+delivers every datagram to every member (rule 80). See
+[ADR `listener-port-sharing-and-shutdown-delay`](adr/listener-port-sharing-and-shutdown-delay.md)
+for why the option exists and how a replacement uses it.
 
 ### Recording the sender: `peer`, `proxy_protocol`, and `forwarded`
 
