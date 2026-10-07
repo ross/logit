@@ -170,8 +170,8 @@ unaffected, because rustls has already validated the certificate. If the walk pr
 
 ## Consequences
 - Each TLS listener's and sink's `with_tls` builds through `logit_pipeline::tls` and registers its
-  file set. `crates/logit-inputs/src/tls.rs` and `crates/logit-outputs/src/tls.rs` shrink to
-  nothing, and `apply_client_tls` goes away.
+  file set. `crates/logit-inputs/src/tls.rs` goes away, `crates/logit-outputs/src/tls.rs` keeps
+  `AsyncStream`, `host_only`, and the `poll_pending_close` probe, and `apply_client_tls` goes away.
 - `logit_config::Config` gains `tls_reload_interval`, and `schema/logit.schema.json` changes with
   it.
 - `logit-cli` creates the reloader, threads it through to every component beside the reopen
