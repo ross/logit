@@ -49,7 +49,8 @@ pub struct AdminConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct ShutdownConfig {
     /// How long to keep running after the first SIGTERM or SIGINT before the drain starts.
-    /// Defaults to `0s`, which turns the delay off.
+    /// Defaults to `0s`, which turns the delay off. Skipped when the signal arrives before the
+    /// process has reported ready, since nothing routes traffic to it yet.
     ///
     /// For the whole delay, `/readyz` answers `503 draining`, and every listener stays bound and
     /// keeps accepting connections and reading data. That gives an orchestrator time to stop

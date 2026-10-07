@@ -15,7 +15,7 @@ use crate::output::{classify, is_head_only, is_retryable, DeliveryPosture, Fault
 #[cfg(test)]
 use crate::queue::{SinkQueue, SinkQueueConfig};
 use crate::queue::{SinkStore, SinkStoreConfig, StoreItem};
-use crate::readiness::NodeState;
+use crate::readiness::{NodeState, Phase};
 use crate::router::{Destination, Router, RouterScratch};
 use crate::{Edge, Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
 use anyhow::Context;
@@ -170,7 +170,8 @@ pub async fn run_with_telemetry(
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RunOptions {
     /// How long the runtime waits between `shutdown` resolving and telling the nodes to drain.
-    /// Readiness reports draining for the whole wait, and every listener keeps running.
+    /// Readiness reports draining for the whole wait, and every listener keeps running. Applies
+    /// only when the phase was `Ready` at the signal.
     pub shutdown_delay: Duration,
 }
 
@@ -208,6 +209,14 @@ pub async fn run_with_options(
     let shutdown_driver = tokio::spawn(async move {
         shutdown.await;
         tracing::info!(target: "logit", "shutdown signal received");
+        // A process that never reported `Ready` was never in an endpoint set, so there is no
+        // traffic to move away and the delay would only hold its ports during a failed rollout.
+        // Read before `draining()` overwrites the phase.
+        let delay = if readiness_for_driver.snapshot().phase == Phase::Ready {
+            delay
+        } else {
+            Duration::ZERO
+        };
         // Before the nodes are told, so `/readyz` stops routing traffic here the instant the
         // signal arrives, not partway through the drain. A no-op if a node already failed: a
         // SIGTERM after a failure must not paper over it.
@@ -8822,13 +8831,23 @@ mod tests {
 
     // -- `RunOptions::shutdown_delay` --
 
-    /// Reports the instant its shutdown receiver fires, then returns.
+    /// Reports the instant its shutdown receiver fires, then returns. With `bind_gate` set, its
+    /// `bind` reports entry and then waits for the gate, holding the run in `Phase::Starting`.
     struct StopRecordingInput {
         stopped: Option<oneshot::Sender<tokio::time::Instant>>,
+        bind_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     }
 
     #[async_trait::async_trait]
     impl Input for StopRecordingInput {
+        async fn bind(&mut self) -> anyhow::Result<()> {
+            if let Some((entered, gate)) = self.bind_gate.take() {
+                let _ = entered.send(());
+                let _ = gate.await;
+            }
+            Ok(())
+        }
+
         async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
             std::future::pending::<()>().await;
             unreachable!("pending() never resolves")
@@ -8896,7 +8915,10 @@ mod tests {
     /// the same instant, and returns how long after the signal the listener was told to stop.
     async fn listener_stop_after_signal(options: RunOptions) -> Duration {
         let (stopped_tx, stopped_rx) = oneshot::channel();
-        let (g, specs) = delay_graph(Box::new(StopRecordingInput { stopped: Some(stopped_tx) }));
+        let (g, specs) = delay_graph(Box::new(StopRecordingInput {
+            stopped: Some(stopped_tx),
+            bind_gate: None,
+        }));
         let (readiness, mut rx) = Readiness::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let run_task = tokio::spawn(run_with_options(
@@ -8944,6 +8966,47 @@ mod tests {
     async fn the_default_run_options_stop_listeners_at_the_instant_of_the_signal() {
         let gap = listener_stop_after_signal(RunOptions::default()).await;
         assert_eq!(gap, Duration::ZERO);
+    }
+
+    /// The signal lands while `in`'s bind holds the run in `Starting`, so the delay is skipped:
+    /// the listener stops at the signal's instant on the paused clock, not 30 s later.
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_before_ready_skips_the_shutdown_delay() {
+        let (stopped_tx, stopped_rx) = oneshot::channel();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let (g, specs) = delay_graph(Box::new(StopRecordingInput {
+            stopped: Some(stopped_tx),
+            bind_gate: Some((entered_tx, gate_rx)),
+        }));
+        let (readiness, mut rx) = Readiness::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let run_task = tokio::spawn(run_with_options(
+            g,
+            specs,
+            HashMap::new(),
+            readiness,
+            async {
+                let _ = shutdown_rx.await;
+            },
+            RunOptions { shutdown_delay: Duration::from_secs(30) },
+        ));
+        entered_rx.await.expect("the gated bind should start");
+        assert_eq!(rx.borrow().phase, Phase::Starting);
+
+        let signalled_at = tokio::time::Instant::now();
+        let _ = shutdown_tx.send(());
+        rx.wait_for(|s| s.phase == Phase::Draining)
+            .await
+            .expect("readiness channel should stay open");
+        let _ = gate_tx.send(());
+
+        let stopped_at = stopped_rx.await.expect("the listener should be told to stop");
+        assert_eq!(stopped_at.duration_since(signalled_at), Duration::ZERO);
+        run_task
+            .await
+            .expect("task should not panic")
+            .expect("a clean shutdown should end the run with Ok");
     }
 
     /// A node failing mid-delay sends the shutdown itself, so the drain doesn't wait out the delay.

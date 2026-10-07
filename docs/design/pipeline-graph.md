@@ -460,9 +460,9 @@ component is one that appears in several `sources` lists, with nothing to specia
   counted `logit.component.events.dropped{reason="unrouted"}`, never silently.
 - **Shutdown cascades by channel closure** from listeners toward sinks. A node whose inbox closes
   drains it and exits, which drops its `Fanout`'s senders and closes its consumers' inboxes in
-  turn. With `shutdown.delay` set, the runtime's shutdown driver reports draining at the signal,
-  waits out the delay with every listener still running, and only then sends the shutdown that
-  starts the cascade and every `shutdown_grace` timer
+  turn. With `shutdown.delay` set and the process `Ready` at the signal, the runtime's shutdown
+  driver reports draining at the signal, waits out the delay with every listener still running,
+  and only then sends the shutdown that starts the cascade and every `shutdown_grace` timer
   (ADR `listener-port-sharing-and-shutdown-delay`).
 
 ### Thread model: only Lua needs its own OS thread

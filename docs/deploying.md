@@ -91,7 +91,9 @@ error.
   `/readyz` to `503 draining` at once, then `logit` keeps every listener bound, accepting, and
   reading for the delay, logs `shutdown delay elapsed`, and starts the drain. Each
   `receive.shutdown_grace` and `buffer.shutdown_grace` starts counting when the drain starts, not
-  at the signal. A second SIGTERM or SIGINT during the delay still exits 130 at once.
+  at the signal. A second SIGTERM or SIGINT during the delay still exits 130 at once. A signal
+  that arrives before `ready` skips the delay: the process was never in an endpoint set, so
+  holding its ports would only slow a failed rollout.
 
   ```yaml
   shutdown:
@@ -323,7 +325,7 @@ carries a `key` naming *why*. The process-level lifecycle events (`starting`, `r
 | `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`lines_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
-| `shutdown delay elapsed` | info | `shutdown.delay` has run out after a SIGTERM/SIGINT and the drain is starting. Carries `delay`. Not logged when the delay is `0s`, or when a node failure started the drain first. |
+| `shutdown delay elapsed` | info | `shutdown.delay` has run out after a SIGTERM/SIGINT and the drain is starting. Carries `delay`. Not logged when the delay is `0s`, when the signal arrived before `ready`, or when a node failure started the drain first. |
 | `reopen signal received` | info | A SIGHUP arrived. Carries `generation` (SIGHUPs so far) and `config_reloaded=false`: the config isn't reloaded. Logged during a drain too. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks and Lua nodes. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
