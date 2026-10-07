@@ -38,7 +38,9 @@ LABEL org.opencontainers.image.title="logit" \
       org.opencontainers.image.source="https://github.com/ross/logit" \
       org.opencontainers.image.licenses="MIT"
 
-# Only effective when the config sets `admin.bind` (docs/deploying.md); otherwise `logit ready`
+# Only effective when the config sets `admin.bind` reachable at 127.0.0.1:9600 (the probe's
+# default), or when LOGIT_ADMIN points the probe elsewhere, such as `unix:<path>` for an
+# `admin.socket` (docs/deploying.md); otherwise `logit ready`
 # finds nothing listening and exits 1, as for an unready process. Names the binary because
 # HEALTHCHECK's exec form bypasses ENTRYPOINT.
 HEALTHCHECK --interval=10s --timeout=2s --start-period=5s CMD ["logit", "ready"]

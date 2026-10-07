@@ -51,11 +51,13 @@ enum Command {
     /// Print a config file's component graph as graphviz DOT, even if the config is invalid.
     Graph { path: std::path::PathBuf },
     /// Probe a running `logit`'s `/readyz`: print its status word, and exit 0 on `200` or 1
-    /// otherwise. The target's config must set `admin.bind`; the container image's `HEALTHCHECK`
-    /// runs this.
+    /// otherwise. The target's config must set `admin.bind` or `admin.socket`; the container
+    /// image's `HEALTHCHECK` runs this.
     Ready {
-        /// The target's admin URL: `http://` plus its `admin.bind` address.
-        #[arg(long, default_value = "http://127.0.0.1:9600")]
+        /// The target's admin endpoint: `http://` plus its `admin.bind` address, or `unix:` plus
+        /// its `admin.socket` path (`unix:/run/logit/admin.sock` or
+        /// `unix:///run/logit/admin.sock`).
+        #[arg(long, env = "LOGIT_ADMIN", default_value = "http://127.0.0.1:9600")]
         admin: String,
     },
 }
@@ -119,41 +121,104 @@ fn init_logging(
 }
 
 /// `GET {admin}/readyz`: the status word on `200`, else an error `main` prints and exits 1 on.
+/// `admin` is an `http://` URL, or `unix:` and a socket path.
 ///
-/// Uses `hyper_util`'s legacy client, not `reqwest`: the crate takes no new HTTP client
-/// dependency (docs/plans/operator-surface.md).
+/// Uses `hyper_util`'s legacy client for HTTP and `hyper`'s connection-level client for a Unix
+/// socket, not `reqwest`: the crate takes no new HTTP client dependency
+/// (docs/plans/operator-surface.md).
+///
+/// Bounded by [`PROBE_TIMEOUT`]: a connect to a process that has stopped accepting still lands
+/// in the kernel's backlog, and an unbounded probe would then wait forever for a reply.
 fn check_ready(admin: &str) -> anyhow::Result<String> {
-    use http_body_util::BodyExt;
-    use hyper_util::client::legacy::Client;
-    use hyper_util::rt::TokioExecutor;
-
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("building the tokio runtime")?;
-    let shown = logit_core::redact::url(admin);
     runtime.block_on(async {
-        let uri: hyper::Uri = format!("{}/readyz", admin.trim_end_matches('/'))
-            .parse()
-            .with_context(|| format!("--admin: '{shown}' is not a valid URL"))?;
-        let client = Client::builder(TokioExecutor::new())
-            .build_http::<http_body_util::Empty<bytes::Bytes>>();
-        let response =
-            client.get(uri).await.with_context(|| format!("requesting {shown}/readyz"))?;
-        let status = response.status();
-        let body = response
-            .into_body()
-            .collect()
+        let probe = async {
+            match unix_socket_path(admin) {
+                Some(path) => readyz_over_unix(path).await,
+                None => readyz_over_http(admin).await,
+            }
+        };
+        tokio::time::timeout(PROBE_TIMEOUT, probe)
             .await
-            .context("reading the /readyz response body")?
-            .to_bytes();
-        let word = String::from_utf8_lossy(&body).trim().to_string();
-        if status.is_success() {
-            Ok(word)
-        } else {
-            anyhow::bail!("{word} ({status})")
-        }
+            .unwrap_or_else(|_| anyhow::bail!("no /readyz response within {PROBE_TIMEOUT:?}"))
     })
+}
+
+/// How long `logit ready` waits for a whole `/readyz` exchange. The admin server gives up on a
+/// connection after 5 s, so a live server answers well inside this.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn readyz_over_http(admin: &str) -> anyhow::Result<String> {
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    let shown = logit_core::redact::url(admin);
+    let uri: hyper::Uri = format!("{}/readyz", admin.trim_end_matches('/'))
+        .parse()
+        .with_context(|| format!("--admin: '{shown}' is not a valid URL"))?;
+    let client =
+        Client::builder(TokioExecutor::new()).build_http::<http_body_util::Empty<bytes::Bytes>>();
+    let response = client.get(uri).await.with_context(|| format!("requesting {shown}/readyz"))?;
+    read_readyz(response).await
+}
+
+async fn readyz_over_unix(path: &str) -> anyhow::Result<String> {
+    use hyper_util::rt::TokioIo;
+
+    let stream = tokio::net::UnixStream::connect(path)
+        .await
+        .with_context(|| format!("connecting to the Unix socket {path}"))?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .with_context(|| format!("starting HTTP on the Unix socket {path}"))?;
+    tokio::spawn(conn);
+    let request = hyper::Request::get("/readyz")
+        .header(hyper::header::HOST, "localhost")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .context("building the /readyz request")?;
+    let response = sender
+        .send_request(request)
+        .await
+        .with_context(|| format!("requesting /readyz on the Unix socket {path}"))?;
+    read_readyz(response).await
+}
+
+/// The socket path of a `unix:` admin endpoint, or `None` for any other. Takes `unix:/path` and
+/// the URL form `unix:///path`.
+fn unix_socket_path(admin: &str) -> Option<&str> {
+    let rest = admin.strip_prefix("unix:")?;
+    Some(rest.strip_prefix("//").filter(|path| path.starts_with('/')).unwrap_or(rest))
+}
+
+#[cfg(test)]
+#[test]
+fn unix_socket_path_takes_both_forms_and_leaves_http_alone() {
+    assert_eq!(unix_socket_path("unix:/run/logit/admin.sock"), Some("/run/logit/admin.sock"));
+    assert_eq!(unix_socket_path("unix:///run/logit/admin.sock"), Some("/run/logit/admin.sock"));
+    assert_eq!(unix_socket_path("unix:admin.sock"), Some("admin.sock"));
+    assert_eq!(unix_socket_path("http://127.0.0.1:9600"), None);
+}
+
+/// A `/readyz` response's status word on `200`, else an error carrying the word and the status.
+async fn read_readyz(response: hyper::Response<hyper::body::Incoming>) -> anyhow::Result<String> {
+    use http_body_util::BodyExt;
+
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .context("reading the /readyz response body")?
+        .to_bytes();
+    let word = String::from_utf8_lossy(&body).trim().to_string();
+    if status.is_success() {
+        Ok(word)
+    } else {
+        anyhow::bail!("{word} ({status})")
+    }
 }
 
 fn main() -> anyhow::Result<()> {
