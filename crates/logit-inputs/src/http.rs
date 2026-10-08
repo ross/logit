@@ -275,9 +275,9 @@ where
             }
         }
         // A delivery a handler runs on its own task ([`deliver_detached`]) outlives the
-        // connection only if the client itself closed: it then holds its `Fanout` clone until the
-        // downstream drains, as a handler parked in a send held its connection. Shutdown waits
-        // on it the same way.
+        // connection when the client itself closed, or when the connection's task is aborted: it
+        // then holds its `Fanout` clone until the downstream drains, as a handler parked in a
+        // send held its connection. Shutdown waits on it the same way.
         if connection_finished {
             break;
         }

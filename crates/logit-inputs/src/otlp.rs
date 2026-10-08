@@ -134,6 +134,25 @@
 //! and returns `Ok(())`, so it never reaches the `connection_error` diagnostic: counted, not
 //! diagnosed, as `crate::tcp` does for its own idle closes.
 //!
+//! *Shutdown is the second trigger.* Every connection holds a clone of the shutdown signal, and
+//! [`drive_connection`] races it in the two waits before the close: the wait on a request in
+//! flight and the idle wait. Either trigger runs the same close sequence, which doesn't race the
+//! signal itself. A request in flight is served out, hyper ends an h1 connection after its current
+//! response and GOAWAYs an h2 one, and nothing is answered `503`. A shutdown close isn't counted:
+//! `connections.closed` counts a policy close, and one recorded at shutdown would land after
+//! `internal`'s final drain. The pre-serve steps (the PROXY header, the TLS accept, the first-byte
+//! peek) race the signal as a whole and end with nothing of a request read.
+//!
+//! *The listener owns its connection tasks.* They run in a
+//! [`ConnectionTasks`](crate::listener::ConnectionTasks) local to `run_until_shutdown`, which on
+//! the signal closes the listening socket and waits for them. When `run_input`'s grace backstop
+//! drops that future instead, the set aborts every task still running. The abort costs a client
+//! its response, which it answers by resending, and never a batch: no handler sends on its
+//! connection task (`crate::http`'s module doc). h2 stream tasks and detached deliveries outlive
+//! the abort, bounded by the downstream's own shutdown grace. ADR `idle-connection-timeout`'s
+//! "Amendment: shutdown is the second trigger of the close sequence (2026-10-07)" records the
+//! decision.
+//!
 //! *Why not hyper's `http1().header_read_timeout(..)`.* In the pinned hyper 1.11.1
 //! (`src/proto/h1/conn.rs`) that timer is armed at the *top* of `poll_read_head`, before a header
 //! byte is parsed, and `State::idle` sets `notify_read = true` whenever it is configured ("Next

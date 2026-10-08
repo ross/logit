@@ -52,7 +52,7 @@ Reading that code found each decoder and listener handling unexpected input in i
 
 Some of the code checked out and needs only a test to pin it: `frame.rs` checks both declared
 lengths before allocating; `prometheus_in`'s snappy and zstd paths are bounded; and
-`drive_with_idle`'s wait-out loop has no ceiling by design.
+`drive_connection`'s wait-out loop has no ceiling by design.
 
 ## Decision
 
@@ -210,7 +210,7 @@ Each of these needs crafted input, and none has a free defense. Each is recorded
 - `docs/design/wire-protocol.md` gains each native decoder's measured expansion ratio, and
   `docs/known-gaps/intake.md` gains the dribbled-body cost, the in-flight byte budget follow-up, and
   the non-goals above.
-- Unchanged: `drive_with_idle`'s wait-out loop still has no ceiling. It waits for an in-flight
+- Unchanged: `drive_connection`'s wait-out loop still has no ceiling. It waits for an in-flight
   request to finish before closing an idle connection, and a request blocked in `Fanout::send` is
   backpressure, not idleness ([ADR `idle-connection-timeout`](idle-connection-timeout.md)).
 - A new decoder or listener of peer bytes is held to these rules in review, and gets a fuzz target

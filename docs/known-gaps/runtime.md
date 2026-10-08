@@ -74,9 +74,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   places:
   - `Input::run_until_shutdown`'s default races `run` against the signal with no grace, so the
     drop comes the instant shutdown fires. That covers `prometheus_in` in scrape mode (the scrape
-    in flight, and each target's batch still to send) and `generate_in`. The HTTP listeners'
-    accept loops also use the default, but their connections run on spawned tasks the drop
-    doesn't reach.
+    in flight, and each target's batch still to send) and `generate_in`.
   - `run_input`'s grace backstop drops a listener still draining after its grace: the UDP
     listeners (under [UDP intake](intake.md#udp-intake)), `internal` (under
     [Internal telemetry and self-logging](telemetry.md#internal-telemetry-and-self-logging)), and

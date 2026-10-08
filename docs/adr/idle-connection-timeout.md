@@ -271,7 +271,7 @@ comment.
   `crates/logit-outputs/src/{logit,syslog,statsd,graphite}.rs` before each reused pooled connection's
   first write.
 - **W3** (`otlp_in`): `idle_timeout` on `OtlpIn`, rule 53's fifth and final arm, and the `Activity`
-  tracker, `drive_with_idle` driver, and `collect_with_stall_bound` body-read change in
+  tracker, `drive_connection` driver, and `collect_with_stall_bound` body-read change in
   `crates/logit-inputs/src/otlp.rs`, replacing that file's current idle-related module-doc section
   with the service-level-tracker rationale and the hyper evidence above.
 - **W4** (docs closeout): a new `docs/deploying.md` section covering the semantics, the reset rule,
@@ -300,7 +300,7 @@ A review of the remote-reachable listeners against
 [ADR `untrusted-input-bounds`](untrusted-input-bounds.md) confirmed two properties of this ADR and
 kept both:
 
-- `drive_with_idle`'s wait for an in-flight request has no ceiling. A request blocked in
+- `drive_connection`'s wait for an in-flight request has no ceiling. A request blocked in
   `Fanout::send` is backpressure, which question 1 of this ADR's Context rules out treating as
   idleness, and the request's body read is bounded by the stall timeout on its own.
 - The body stall bound is per frame (per `read` on `logit_in`), not a total deadline, and it is

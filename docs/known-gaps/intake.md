@@ -246,7 +246,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `logit_in` deduplicates its resend.
 - **A hyper listener's `idle_timeout` resets on request completion, not on bytes.** `hyper` owns
   the bytes on every HTTP listener (`otlp_in`, `prometheus_in`'s remote-write receiver,
-  `datadog_in`, `datadog_trace_in`, `splunk_hec_in`), so `crate::http::drive_with_idle` sees only
+  `datadog_in`, `datadog_trace_in`, `splunk_hec_in`), so `crate::http::drive_connection` sees only
   requests starting and finishing.
   - **Consequence:** a request head that dribbles in more slowly than `idle_timeout` on an
     otherwise-quiet keep-alive connection is closed. That's a documented cost, not a bug

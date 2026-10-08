@@ -4,8 +4,8 @@
 //! `internal-telemetry-as-pipeline-events` rejects it), no config dump. HTTP/1.1 only, no TLS:
 //! it's a loopback/pod-local endpoint (`docs/deploying.md`), served over TCP, a Unix socket, or
 //! both, with one [`serve_on`] task per listener. The accept loop has
-//! `logit_inputs::otlp::OtlpInput::run`'s shape (permit-gated, one task per connection) at a
-//! smaller scale.
+//! `logit_inputs::otlp::OtlpInput::run_until_shutdown`'s shape (permit-gated, one task per
+//! connection) at a smaller scale.
 
 use bytes::Bytes;
 use http::{Method, StatusCode};

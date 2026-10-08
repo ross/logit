@@ -37,10 +37,13 @@ pub trait Input {
     /// `service-lifecycle-and-output-retry`). It resolves the instant `shutdown` fires, which is
     /// right for an input with nothing buffered.
     ///
-    /// An override MUST still return within its configured grace
+    /// An override should return within its configured grace
     /// ([`InputRuntimeConfig::shutdown_grace`]): `run_input` (`crate::runtime`) races this against
-    /// that deadline as a backstop, and a listener that exceeds it is cancelled by drop anyway,
-    /// losing (and not counting) whatever it was still draining.
+    /// that deadline as a backstop and cancels a listener still running by drop, losing (and not
+    /// counting) whatever it was still draining. An override may rely on the backstop to end a
+    /// wait it doesn't bound itself, provided the drop loses nothing it can't afford: an HTTP
+    /// listener that waits out a request in flight with no ceiling relies on it, and the drop
+    /// aborts its connection tasks, costing a client its response but never a batch.
     async fn run_until_shutdown(
         &mut self,
         sink: Fanout,
