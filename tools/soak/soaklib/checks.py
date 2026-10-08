@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import collect, telemetry, vm
-from .scenario import LOGIT_SERVICES, SERVICES
+from .scenario import EXPECT_REDUCERS, LOGIT_SERVICES, SERVICES
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
@@ -1141,9 +1141,9 @@ def _step_value(series, t, default=0.0):
 
 def check_recovery(data):
     """Each fault has recovered when, at some SUT drain within `recovery_bound` of its end, the
-    sink's `retrying` is 0, its `buffer.utilization` and the listener's `receive.utilization`
-    are under 0.05, and the ingest rate over the drain interval ending there is at least 95% of
-    the generator's warmup rate. A drain interval another fault overlaps, or that spans two SUT
+    sink's `retrying` is 0, its `buffer.utilization` is under 0.05 or its `buffer.batches` at
+    most 1, the listener's `receive.utilization` is under 0.05, and the ingest rate over the
+    drain interval ending there is at least 95% of the generator's warmup rate. A drain interval another fault overlaps, or that spans two SUT
     lives, isn't eligible; a fault with no eligible interval is skipped and listed. A generator
     `rate_behind` diagnostic turns a throughput shortfall into a WARN."""
     led = _ledger(data)
@@ -1165,6 +1165,7 @@ def check_recovery(data):
                                                      component=led.gen_input, key="rate_behind"))
     retrying = sut.gauge_series("logit.component.retrying", component=led.sink)
     buffer_util = sut.gauge_series("logit.component.buffer.utilization", component=led.sink)
+    buffer_batches = sut.gauge_series("logit.component.buffer.batches", component=led.sink)
     receive_util = sut.gauge_series("logit.component.receive.utilization",
                                     component=led.listener)
     ingest = {ts: v for ts, v, _ in sut.counter_points("logit.input.datagrams",
@@ -1180,6 +1181,10 @@ def check_recovery(data):
         for label, series in (("buffer.utilization", buffer_util),
                               ("receive.utilization", receive_util)):
             value = _step_value(series, end)
+            # One batch in a small queue is a large share of it: a batch the sink holds
+            # while it sends is recovered at any `max_batches`.
+            if label == "buffer.utilization" and _step_value(buffer_batches, end) <= 1:
+                continue
             if value >= RECOVERED_UTILIZATION:
                 problems.append(f"{label} {value:.3f}")
         rate = ingest.get(end, 0) / (end - start)
@@ -1234,11 +1239,126 @@ def check_recovery(data):
     return Result("recovery", status, detail, lines)
 
 
+# ---- per-scenario expectations --------------------------------------------------------------------
+#
+# A scenario's `[[expect]]` tables, copied into `scenario.resolved.json`'s `expect`. The plan's
+# "The scenario schema" has the fields; `scenario._expect_problems()` validates them.
+
+
+def expect_window(data, fault, window):
+    """`(start, end]` of an expectation's window around one fault occurrence: `during` is the
+    fault's span, apply start to revert finish; `after` is the `recovery_bound` after it. The
+    window is open at its start because a drain's deltas cover the interval before it."""
+    if window == "during":
+        return fault.start, fault.end
+    return fault.end, fault.end + data.recovery_bound
+
+
+def reduce_counter(tel, metric, attrs, start, end, reduce):
+    """`(value, note)` for a `sum` metric over the drains timestamped in (start, end]: `delta`
+    sums them, and `min_delta` is the smallest single drain's delta, a drain with no point
+    counting 0, since a loss counter isn't emitted when it's zero. `value` is None when no
+    drain falls in the window."""
+    per_drain = {ts: value for ts, value, _ in tel.counter_points(metric, **attrs)}
+    drains = [d for d in sorted(set(tel.drains) | set(per_drain)) if start < d <= end]
+    if not drains:
+        return None, "no drain in the window"
+    values = [per_drain.get(d, 0) for d in drains]
+    if reduce == "delta":
+        return sum(values), f"over {len(drains)} drain(s)"
+    return min(values), f"smallest of {len(drains)} drain(s)"
+
+
+def reduce_gauge(tel, metric, attrs, start, end, reduce):
+    """`(value, note)` for a gauge over (start, end]: the value in force at `start` (a gauge is
+    exported only in a drain after it was set) and every sample in the window. `last` is the
+    value in force at `end`. `value` is None when the gauge was never set by `end`."""
+    series = tel.gauge_series(metric, **attrs)
+    before = [v for ts, v, _ in series if ts <= start]
+    inside = [v for ts, v, _ in series if start < ts <= end]
+    values = before[-1:] + inside
+    if not values:
+        return None, "no sample by the window's end"
+    note = f"{len(inside)} sample(s)" + (" and the value in force at its start" if before else "")
+    if reduce == "last":
+        return values[-1], note
+    return (max(values) if reduce == "max" else min(values)), note
+
+
+def _expect_occurrences(data, exp):
+    """`(scheduled ids, faults)`: the step ids the resolved schedule has for this expectation,
+    and the faults among them whose apply returned 0."""
+    step = exp.get("step")
+    scheduled = [s["id"] for s in data.resolved.get("steps", [])
+                 if s.get("id") == step or (isinstance(step, int) and not isinstance(step, bool)
+                                            and s.get("spec_index") == step - 1)]
+    faults = [f for f in data.faults if f.step in scheduled]
+    return scheduled, faults
+
+
+def _expect_one(data, exp):
+    name = exp.get("name") or "?"
+    check_id = f"expect.{name}"
+    service, metric, reduce = exp.get("service"), exp.get("metric"), exp.get("reduce")
+    attrs = dict(exp.get("attrs") or {})
+    lo, hi = exp.get("min"), exp.get("max")
+    want = " and ".join(part for part in (
+        None if lo is None else f">= {lo:g}", None if hi is None else f"<= {hi:g}") if part)
+    label = (f"{reduce} of {metric}"
+             + (f"{{{', '.join(f'{k}={v}' for k, v in sorted(attrs.items()))}}}" if attrs else "")
+             + f" on {service}, {exp.get('window')} {exp.get('step')}")
+    scheduled, faults = _expect_occurrences(data, exp)
+    if not scheduled:
+        return Result(check_id, SKIP, f"{label}: the run's schedule has no such step")
+    tel = data.telemetry.get(service)
+    if tel is None:
+        return Result(check_id, FAIL, f"{label}: no {service} telemetry")
+    kind = EXPECT_REDUCERS.get(reduce, "gauge")
+    seen = {p.kind for p in tel.matching(metric)}
+    if seen and kind not in seen:
+        return Result(check_id, FAIL, f"{label}: reduce {reduce} reads a {kind}, and the run's "
+                      f"{metric} points are {', '.join(sorted(seen))}")
+    status = PASS
+    lines = []
+    applied = {f.step for f in faults}
+    for step_id in scheduled:
+        if step_id not in applied:
+            status = FAIL
+            lines.append(f"{step_id}: never applied cleanly, so it has no window")
+    for fault in faults:
+        start, end = expect_window(data, fault, exp.get("window"))
+        reducer = reduce_counter if kind == "sum" else reduce_gauge
+        value, note = reducer(tel, metric, attrs, start, end, reduce)
+        span = f"({data.offset(start)}, {data.offset(end)}]"
+        if value is None:
+            status = FAIL
+            lines.append(f"{fault.step} {span}: {note}")
+            continue
+        ok = (lo is None or value >= lo) and (hi is None or value <= hi)
+        if not ok:
+            status = FAIL
+        shown = _n(value) if float(value).is_integer() else f"{value:.3f}"
+        lines.append(f"{fault.step} {span}: {shown} ({note}), want {want}"
+                     + ("" if ok else ", FAIL"))
+    detail = f"{label}: " + "; ".join(lines)
+    return Result(check_id, status, detail, lines)
+
+
+def check_expect(data):
+    """One row per `[[expect]]`, `expect.<name>`: PASS when the reduced value lies within
+    `min` and `max` in every occurrence of its step, FAIL otherwise. SKIPs as one `expect` row
+    when the scenario has none, and per row when the run's schedule doesn't have the step."""
+    expectations = data.resolved.get("expect") or []
+    if not expectations:
+        return [Result("expect", SKIP, "the scenario has no [[expect]] tables")]
+    return [_expect_one(data, exp) for exp in expectations]
+
+
 CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_intake,
     check_ledger_edge, check_ledger_aggregate, check_ledger_egress, check_ledger_summary,
-    check_identity_sink, check_recovery,
+    check_identity_sink, check_recovery, check_expect,
 )
 
 
@@ -1247,7 +1367,8 @@ def run_all(run_dir):
     results = []
     for check in CHECKS:
         try:
-            results.append(check(data))
+            result = check(data)
+            results.extend(result if isinstance(result, list) else [result])
         except Exception as err:  # a checker bug must not hide the other rows
             results.append(Result(check.__name__.removeprefix("check_"), FAIL,
                                   f"checker error: {type(err).__name__}: {err}"))

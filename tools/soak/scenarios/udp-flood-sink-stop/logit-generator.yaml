@@ -1,0 +1,20 @@
+# The load source in `script/soak`'s udp-flood-sink-stop scenario: 20,000 statsd counter lines a
+# second over UDP to the system under test, one line per datagram. Its `internal` telemetry goes
+# to stdout as NDJSON, so the harness reads what it sent.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 20000
+    batch: 100
+    event:
+      metric: { name: "soak_requests_{seq%100}", kind: sum, value: 1 }
+  statsd:
+    type: statsd_out
+    sources: [load]
+    endpoint: logit:8125
+    format: statsd
+    max_packet_bytes: "32"          # one line per datagram: the ledger's unit
+    buffer: { overflow: drop_newest, retry_max_delay: 1s }   # never stall generate_in
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
