@@ -83,6 +83,8 @@ min = 1080000
 
 # The chain stays blocked until the sink's next retry after the revert, up to its
 # `retry_max_delay` later, so a bound that must hold for the whole episode reads `through`.
+# This row fails until docs/known-gaps/intake.md's "UDP intake" entry "A `drop_oldest` UDP
+# listener takes kernel drops in the drain where a blocked downstream unblocks" closes.
 [[expect]]
 name = "no-kernel-drops"
 service = "logit"

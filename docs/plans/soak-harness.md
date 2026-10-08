@@ -720,8 +720,10 @@ What the runs showed about `logit`:
   the unblock, not the stall. The loss is counted (K in `ledger.wire`, which PASSed). A pause
   of the read loop of a few milliseconds, while the decode loop drained 10,000 queued datagrams
   into `aggregate`, would explain it at 20,000 datagrams a second; that cause is an inference,
-  not verified. `expect.no-kernel-drops` FAILs on it and is left
-  failing. The first run of this scenario, `20261008T223523Z` at a 10 s window, read 0, but its
+  not verified. [`docs/known-gaps/intake.md`](../known-gaps/intake.md)'s "UDP intake" entry "A
+  `drop_oldest` UDP listener takes kernel drops in the drain where a blocked downstream unblocks"
+  records it. `expect.no-kernel-drops` FAILs on it by design, and keeps failing until that entry
+  closes. The first run of this scenario, `20261008T223523Z` at a 10 s window, read 0, but its
   stop never reached the listener, so it shows nothing about an unblock.
 - **A small `max_batches` doesn't make a 90 s outage reach the listener at 10 s windows.**
   `aggregate` sends one batch per window, and the sink's inbox holds 64 batches
