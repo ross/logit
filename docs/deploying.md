@@ -2655,6 +2655,11 @@ retries can send a point that far past its window):
 | service checks | older than 10 minutes |
 | traces, stats | never |
 
+**A metric with more than 100 tags is dropped.** Datadog drops a series, distribution point, or
+sketch whose `tags` list holds more than 100 strings, so `datadog_out` drops it first and counts
+`records.dropped{reason="too_many_tags"}`. The host and the other fields Datadog carries outside
+`tags` don't count. Cut tags upstream with `keep` or `remove` to keep such a metric.
+
 **A disk buffer can't deliver an outage's metrics late.** A `buffer.disk:` on this sink holds
 batches through a Datadog outage, but on replay, the metrics that aged past 1 hour and the logs
 past 18 hours are dropped as stale, not sent. The metrics window is Datadog's documented one, and
@@ -2692,7 +2697,9 @@ answer or a timeout stops the rest, and the whole batch is retried or dropped as
 of it, refusing every batch), also stops the rest, and the sink holds the batch and retries it (`refused`).
 A `413` counts the request's entries `oversize`, and any
 other `4xx` or `3xx` counts them `records.dropped{reason="rejected"}`; neither is retried, and the
-send goes on to the next request. The send is delivered if any request was accepted, and fails
+send goes on to the next request. A series `202` whose body names series Datadog dropped (a point
+too far in the future, say) counts each `records.rejected{route="series"}` and isn't retried.
+The send is delivered if any request was accepted, and fails
 as `rejected`, and is dropped, only when none was. A retry re-sends the requests that succeeded, so the default posture, `at_least_once`,
 can deliver a resend. A trial org stored a resent series point once, the last write winning at
 its `(series, timestamp)`, and an identical log twice. Assume every other route (distribution

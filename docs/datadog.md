@@ -159,6 +159,22 @@ measured from one send time per batch, read when the batch is first tried, so ev
 drops the same points and each counts once. A batch held across retries can therefore
 send a point that far past the end of its window.
 
+### A metric with more than 100 tags is dropped
+
+Datadog drops a series, distribution point, or sketch whose `tags` list holds more than 100
+strings, and only the series route says so. `datadog_out` drops such a record before sending and
+counts it `logit.output.records.dropped{reason="too_many_tags"}`, with a throttled `too_many_tags`
+diagnostic naming its metric. Every attribute the encoder renders as a tag counts, resource
+attributes and repeated values included, but `host.name`, the device, and the other fields with
+their own place on the wire don't. To keep a metric, cut its tags upstream with `keep` or
+`remove`.
+
+The series route also names what it dropped from an accepted request in its `202` body, such as
+a point more than 10 minutes in the future when the sender's clock runs ahead. `datadog_out`
+counts each named series `logit.output.records.rejected{route="series"}`, leaves it out of
+`logit.output.records`, and logs `series_rejected` with the first entry. The batch isn't retried:
+the rest of the request was stored.
+
 ### `at_least_once` duplicates everything but series
 
 The default posture is `at_least_once`, so a `5xx` or a timeout is retried. One batch goes out

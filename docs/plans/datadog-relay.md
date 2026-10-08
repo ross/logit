@@ -64,7 +64,7 @@ or a real Agent and this section is updated then.
 
 | Endpoint | Body and limits | Notes |
 |---|---|---|
-| `POST api.<site>/api/v2/series` | JSON `{series:[{metric, type, points:[{timestamp s, value}], interval, unit, tags[], resources:[{name,type}], source_type_name, metadata.origin}]}`; 512,000 B compressed, 5,242,880 B decompressed; `Content-Encoding: deflate \| zstd1 \| gzip`; header `DD-API-KEY` | `type`: 0 unspecified, 1 count, 2 rate, 3 gauge. No histogram, set, or distribution type. Points must be no more than 1 h in the past or 10 min in the future (what the intake does outside that window: §11). A series with more than 100 tags is dropped the same way. A body over 512 kB compressed gets `413`. A resent point overwrites: one value per `(series, timestamp)`, the last write winning |
+| `POST api.<site>/api/v2/series` | JSON `{series:[{metric, type, points:[{timestamp s, value}], interval, unit, tags[], resources:[{name,type}], source_type_name, metadata.origin}]}`; 512,000 B compressed, 5,242,880 B decompressed; `Content-Encoding: deflate \| zstd1 \| gzip`; header `DD-API-KEY` | `type`: 0 unspecified, 1 count, 2 rate, 3 gauge. No histogram, set, or distribution type. Points must be no more than 1 h in the past or 10 min in the future (what the intake does outside that window: §11). A series with more than 100 tags is dropped the same way (§11 has what a 2026-10-08 run measured). A body over 512 kB compressed gets `413`. A resent point overwrites: one value per `(series, timestamp)`, the last write winning |
 | `POST /api/v1/distribution_points` | JSON `{series:[{metric, host, tags, type:"distribution", points:[[ts,[v…]]]}]}`; `deflate` only | Raw values; Datadog sketches them server side. Limits undocumented; W7b sent 1,052,533 B gzip (150,000 values) and got `202` with every value counted. gzip and zlib deflate are both accepted, raw deflate is `400` |
 | `POST /api/beta/sketches` | protobuf `SketchPayload` | What Agents send. Not in the public spec; Vector's `datadog_metrics` sink sends it with an API key, and W7b's `datadog_out` did too: `aggregate`'s locally built sketches are queryable (`avg`, `count`, `max`) |
 | `POST http-intake.logs.<site>/api/v2/logs` | JSON array of `{message, ddsource, ddtags, hostname, service, status, …}`; 1,000 entries, 5 MB decompressed, 1 MB per log (cut, still 2xx); up to 18 h in the past; `gzip`/`deflate`/`identity`; 202 accepted, retry 408/429/500/503 | Other keys are attributes, nested maps included. Trace correlation auto-detects OTel `trace_id`/`span_id` (32-/16-char lowercase hex) and Datadog `dd.trace_id`/`dd.span_id` (decimal) |
@@ -369,6 +369,30 @@ gauge points 2 h and 3 h old, and none 6 h or older. The 1 h window stays becaus
 Datadog documents. A point more than 10 min ahead was dropped alone, with `202` and an `errors`
 entry naming it, while the rest of its request was stored.
 
+A second trial-org run, on 2026-10-08, measured what the intake drops from a request it answers
+`202`:
+
+- **Series, over protobuf** (what `datadog_out` sends): always `202` with
+  `Content-Type: application/x-protobuf`. A clean request's body is empty. Otherwise it's a
+  protobuf whose field 1, `repeated string errors`, holds one entry per dropped series, naming the
+  metric and never a tag: `Payload validation failed: too many tags in series <metric>: limit=100
+  tags=101`, or `Payload validation failed: series <metric> contains N data points too far in the
+  future`, where N counts that series' future points and a series with other valid points keeps
+  them. Over JSON the same strings come as `{"errors": [...]}`.
+- **The tag limit** counts only the `tags` strings, repeats included; `resources` (host, device,
+  and others) don't count. 100 tags were stored and 101 dropped.
+- **Distribution points and sketches** drop a series with more than 100 tags, or a point too far
+  in the future, silently, answering `202 {"status": "ok"}`. Distribution points answer
+  `400 Payload is empty` when every series in the request was dropped.
+- **Check runs and logs** with 101 tags drew `202` (`{"status": "ok"}` and `{}`); whether either
+  stored them wasn't checked.
+- **A point 2 h old** drew no `errors` entry.
+
+`datadog_out` acts on it ([ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md),
+"Amendment: what an accepted request drops (2026-10-08)"): it drops a metrics record over 100
+tags before sending, counted `records.dropped{reason="too_many_tags"}`, and counts each entry of a
+series `202`'s `errors` as `records.rejected{route="series"}`.
+
 ### 12. Traces to Datadog: the Agent's protocol, not OTLP, for Datadog-origin spans (W5, W7)
 
 Both paths were evaluated against the Agent source (`pkg/trace/writer`, `pkg/trace/agent`,
@@ -513,7 +537,7 @@ each:
   processing, and `datadog_trace_out` derives no Datadog fields from an OTel span (two entries).
 - A libdatadog tracer sends `datadog_trace_in` no client stats.
 - `datadog_out`: size limits tighter than the intake's; not duplicate-safe; metric points older
-  than 1 hour dropped though Datadog would store them; a `202`'s `errors` array unread; an event's
+  than 1 hour dropped though Datadog would store them; Datadog's 100-tag metric limit copied; an event's
   and a service check's host sent as a tag (five entries).
 - `datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.
 - `datadog_out` sends no Agent-style `h`/`ms` aggregates and no explicit-bucket `Histogram`
@@ -521,7 +545,7 @@ each:
 - No plain-lines listener for applications that write JSON lines to an Agent's TCP logs port, and
   `syslog_out` into an Agent's `logs` listener unverified for JSON bodies (§7).
 - What neither the corpus nor the trial org exercised: a stats sketch whose gamma isn't 1.0202
-  (§4), service checks visible in the org, the Agent's dual-shipping and TLS settings against
+  (§4), service checks visible in the org, what the check and logs routes drop from a `202`, the Agent's dual-shipping and TLS settings against
   `datadog_in`, and a real v0.7 tracer, `PUT` sender, or second tracer language.
 - The hand-rolled `DdSketch` store's ~4% CPU on sketch-heavy stages, accepted for bin-for-bin
   parity.

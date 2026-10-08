@@ -94,14 +94,16 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** a `buffer.disk:` replay after an outage longer than 1 hour drops metrics
     the intake might still have stored, counted `records.dropped{reason="stale"}`.
   - **Revisit trigger:** Datadog documents a longer window, or an operator needs the replay.
-- **`datadog_out` treats a `202` as full success, and the intake drops parts of a `202`ed
-  request.** The series route answers `202` with an `errors` array naming what it dropped: a point
-  more than 10 minutes ahead ("contains 1 data points too far in the future"), or a whole series
-  carrying more than 100 tags ("too many tags in series ...: limit=100"). The sink doesn't read
-  the body of a `2xx`, so it counts neither.
-  - **Consequence:** a series over 100 tags reaches no dashboard, and nothing in `logit`'s
-    telemetry says so.
-  - **Workaround:** keep series under 100 tags with `keep` upstream.
+- **`datadog_out` copies Datadog's 100-tag limit on metrics.** A series, distribution point, or
+  sketch whose `tags` list holds more than 100 strings is dropped before sending, counted
+  `records.dropped{reason="too_many_tags"}`, because the intake drops it and only the series
+  route says so (measured on a trial org on 2026-10-08;
+  [the plan's "Timestamp windows" section](../plans/datadog-relay.md#11-timestamp-windows-w5)).
+  - **Consequence:** if Datadog raises the limit, or an org has a higher one, the sink still drops
+    what Datadog would store.
+  - **Workaround:** keep metrics under 100 tags with `keep` or `remove` upstream.
+  - **Revisit trigger:** Datadog documents or answers a different limit; the series route's `202`
+    body states it (`limit=100`).
 - **`datadog_out` sends a Datadog event's and a service check's host as a tag.** Their encoders
   read the host only from `statsd.event.host` and `statsd.service_check.host`, so a `host.name`
   that `set` stamps on the resource renders as a `host.name:<value>` tag, and Datadog shows the
@@ -147,6 +149,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     sketch keeps its own gamma, and dd-trace-py 4.15 computes on 1.015625; nothing in `logit`
     sends one to Datadog yet ([plan §4](../plans/datadog-relay.md#4-sketch-compatibility-w1-settled)).
   - Service checks sent by `datadog_out`, which got `202` but which Datadog has no API to query.
+  - What the check and logs routes drop from a request they answer `202`. A check and a log with
+    101 tags each drew `202` (`{"status":"ok"}` and `{}`) on 2026-10-08, and `datadog_out` reads
+    neither body, so a drop there goes uncounted.
   - The Agent's dual-shipping (`additional_endpoints`) and TLS settings against `datadog_in`.
   - v0.7 traces and a `PUT` from a real tracer, and any tracer other than dd-trace-py.
   - The nested `dd` log fields that dd-trace-js and dd-trace-rb write, which `flatten` expands.
