@@ -74,6 +74,10 @@ impl Drop for LiveConnection {
 /// `Fanout` clone. A set held in an `Arc` that a task captures is a cycle, and the drop aborts
 /// nothing. What an abort costs is in `docs/design/pipeline-graph.md`'s "Cancellation points".
 ///
+/// `crate::tcp` and `logit_in` need no owner: they race the signal at every read, so a task
+/// outlives it only while parked in a send, which ends once the downstream drains or closes. An
+/// HTTP connection can't race the signal mid-request, because hyper owns the read.
+///
 /// A panicking task ends only its own connection: every `JoinError` is discarded, as a bare
 /// `tokio::spawn` discards its handle.
 pub(crate) struct ConnectionTasks(tokio::task::JoinSet<()>);

@@ -147,9 +147,10 @@
 //! [`ConnectionTasks`](crate::listener::ConnectionTasks) local to `run_until_shutdown`, which on
 //! the signal closes the listening socket and waits for them. When `run_input`'s grace backstop
 //! drops that future instead, the set aborts every task still running. The abort costs a client
-//! its response, which it answers by resending, and never a batch: no handler sends on its
-//! connection task (`crate::http`'s module doc). h2 stream tasks and detached deliveries outlive
-//! the abort, bounded by the downstream's own shutdown grace. ADR `idle-connection-timeout`'s
+//! its response, which it answers by resending, and never a batch: no handler awaits
+//! `Fanout::send` on its connection task (`crate::http`'s module doc). h2 stream tasks and
+//! detached deliveries outlive the abort, bounded by the downstream draining or closing
+//! (`docs/design/pipeline-graph.md`'s "Cancellation points"). ADR `idle-connection-timeout`'s
 //! "Amendment: shutdown is the second trigger of the close sequence (2026-10-07)" records the
 //! decision.
 //!
@@ -524,7 +525,9 @@ impl Input for OtlpInput {
                             match tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
                                 .await
                             {
-                                Ok(Ok(tls_stream)) => Prelude::Tls(tls_stream, connection_peer),
+                                Ok(Ok(tls_stream)) => {
+                                    Prelude::Tls(Box::new(tls_stream), connection_peer)
+                                }
                                 Ok(Err(err)) => {
                                     Prelude::Failed(format!("TLS handshake failed: {err}"))
                                 }
@@ -571,7 +574,7 @@ impl Input for OtlpInput {
                 let result = match prelude {
                     Prelude::Tls(tls_stream, connection_peer) => {
                         serve_connection(
-                            TokioIo::new(tls_stream),
+                            TokioIo::new(*tls_stream),
                             transport,
                             sink,
                             telemetry.clone(),
@@ -628,7 +631,8 @@ impl Input for OtlpInput {
 /// Where one connection's pre-serve steps (the PROXY header, the TLS accept, the first-byte
 /// peek) left it.
 enum Prelude {
-    Tls(tokio_rustls::server::TlsStream<tokio::net::TcpStream>, ConnectionPeer),
+    /// Boxed: a rustls session is over 1 KiB, and this is built once per connection.
+    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>, ConnectionPeer),
     Plain(tokio::net::TcpStream, ConnectionPeer),
     /// A close or a reset before the first byte: a TCP health check, not a fault.
     Probe,
@@ -642,6 +646,7 @@ enum Prelude {
 /// `grace` is the budget [`drive_connection`] gives hyper to shut down in once `idle_timeout` or
 /// `shutdown` fires (`handshake_timeout`, reused). `peer` is stamped on every batch each request
 /// decodes into.
+#[allow(clippy::too_many_arguments)] // each listener's own settings, threaded through once
 async fn serve_connection<IO>(
     io: IO,
     transport: OtlpTransport,

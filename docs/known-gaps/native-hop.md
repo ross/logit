@@ -42,7 +42,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     cancel-by-drop shutdown
     ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md))
     depends on every listener releasing its clone.
-  - **Fix:** follow `otlp_in`'s design.
+  - **Fix:** follow the shutdown amendment in
+    [ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md).
 - **`otlp_in`'s TLS-arm `handshake_timeout` bounds the TLS accept and nothing after it.** `hyper`'s
   `hyper_util::server::conn::auto::Builder` reads the first bytes itself to tell HTTP/1.1 from an
   h2 preface, a read `crate::otlp` can't wrap without reimplementing that sniff. The plaintext arm

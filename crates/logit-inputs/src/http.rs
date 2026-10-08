@@ -19,13 +19,13 @@
 //! in its own handlers. It builds its own service and connection future and hands them to
 //! [`drive_connection`], which is the seam.
 //!
-//! **A handler never calls `Fanout::send` on its connection task.** A listener that closes its
+//! **A handler never awaits `Fanout::send` on its connection task.** A listener that closes its
 //! connections at shutdown owns their tasks, and `run_input`'s backstop aborts whichever are
 //! still running at the grace (`crate::listener::ConnectionTasks`). That abort must cost a client
 //! its acknowledgment, which it answers by resending, and never a batch part-way through a send.
 //! Two shapes satisfy the rule: [`deliver_detached`] sends on a task of its own, which the abort
-//! doesn't reach, and [`deliver_with_deadline`] reserves a slot on every consumer before it sends,
-//! so a dropped wait has sent and counted nothing.
+//! doesn't reach, and [`deliver_with_deadline`] sends nothing until it holds a slot on every
+//! consumer, so a wait dropped before then has sent and counted nothing.
 
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Limited};
