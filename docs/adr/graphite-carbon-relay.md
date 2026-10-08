@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-09-30
+updated: 2026-10-07
 ---
 
 # Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch
@@ -462,3 +462,13 @@ unchanged.
 ## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
 
 `Output::duplicate_safe()` is gone, and `at_least_once` is every sink's default posture. `graphite_out` keeps the posture the "Duplicate safety" section argues for, now through the runtime default rather than a `true` from `duplicate_safe()`. The Whisper argument and its boundary for a non-Whisper receiver are unchanged. See [`delivery-semantics.md`](delivery-semantics.md) item 5.
+
+## Amendment: the sub-path table is shared (2026-10-07)
+
+The `multi_value: expand` table moves out of `graphite_out`'s codec into `logit_proto::multi_value`,
+whose module doc is now the canonical copy of the "`multi_value: expand` sub-paths" section above.
+The table itself is unchanged, and so is graphite's wire: every sub-path, its order, its number
+token, and every non-finite skip are what they were, pinned in plaintext and pickle by
+`expand_wire_output_is_unchanged_for_every_kind_in_both_protocols` in
+`crates/logit-proto/src/graphite/encode.rs`. `statsd_out` will render the same table under ADR
+`statsd-out-multi-value-expansion`, so one change to the table changes both sinks.

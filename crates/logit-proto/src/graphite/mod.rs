@@ -79,7 +79,7 @@
 //! | any kind flagged [`logit_core::MetricRecord::FLAG_NO_RECORDED_VALUE`] | dropped | `{reason="no_recorded_value"}` + diag `no_recorded_value` |
 //! | `GaugeDelta` | dropped | `{metric_kind="gauge_delta"}` + diag `gauge_delta_unresolved` |
 //! | `Samples`/`Distribution`/`Histogram`/`ExponentialHistogram`/`Summary`/`Set`/`SetMembers` under [`MultiValue::Skip`] (the default) | dropped, one exhaustive `match` arm each, no wildcard | `{metric_kind="samples"\|"distribution"\|"histogram"\|"exponential_histogram"\|"summary"\|"set"\|"set_members"}` |
-//! | the same seven kinds under [`MultiValue::Expand`] | the sub-path table below | `logit.output.metrics.degraded{metric_kind=…}`, **once per record** however many sub-paths it produced |
+//! | the same seven kinds under [`MultiValue::Expand`] | the sub-path table in [`crate::multi_value`] | `logit.output.metrics.degraded{metric_kind=…}`, **once per record** however many sub-paths it produced |
 //! | `event.timestamp.div_euclid(1_000_000_000) <= 0` | dropped | `{reason="unencodable_timestamp"}` + diag `unencodable_timestamp` |
 //! | attributes under [`Tags::Carbon`] (the default) | `;name=value`, ascending **rendered** name | -- |
 //! | attributes under [`Tags::Drop`] | no tag segment at all | `logit.output.tags.dropped{reason="dialect"}`, once per attribute |
@@ -123,33 +123,10 @@
 //!
 //! ## `MultiValue::Expand` sub-paths
 //!
-//! Every expanded kind adds **at least one** dotted suffix, so an expanded sub-path can never
-//! collide with the path the same record would have produced under [`MultiValue::Skip`], nor with
-//! a scalar record's path unless that record was already named `x.count` by its producer.
-//!
-//! | Kind | Sub-paths |
-//! |---|---|
-//! | `Samples` (via [`logit_core::Samples::sketch`]) / `Distribution` | `.count`, `.sum`, `.q0_5`, `.q0_75`, `.q0_9`, `.q0_95`, `.q0_99` |
-//! | `Histogram` | `.count` (Σ bucket counts), `.sum`/`.min`/`.max` when `Some`, `.bucket_<b>` per bucket (its **own** count, not a cumulative running total -- `logit_core::Histogram`'s doc) |
-//! | `ExponentialHistogram` | `.count`, `.sum`/`.min`/`.max` when `Some`, `.zero_count`; **no buckets** |
-//! | `Summary` | `.count`, `.sum`, `.q<q>` per its own quantiles |
-//! | `Set` | `.count` = [`logit_core::HyperLogLog::estimate`] |
-//! | `SetMembers` | `.count` = the distinct member count |
-//!
-//! `.sum` **is** emitted for a sketch: [`logit_core::DdSketch::sum`] is exact (a plain `f64`
-//! accumulated alongside the bins and added on `merge`), not an estimate like a quantile.
-//!
-//! The quantiles are [`crate::otlp::metrics::DISTRIBUTION_QUANTILES`], the five every
-//! sketch-to-quantiles degradation in this crate reports, so a metric describes itself identically
-//! at `otlp_out`, `prometheus_out`, and `graphite_out`. `influxdb_out` keeps its narrower
-//! `[0.5, 0.9, 0.99]`.
-//!
-//! **Number tokens are injective.** A quantile or bucket bound is formatted with `f64`'s `Display`
-//! and every `.` substituted with `_`: `0.99 → q0_99`, `1.5 → bucket_1_5`,
-//! `-0.5 → bucket_-0_5`, `f64::INFINITY → bucket_inf`. `Display` emits only `-`, digits, at most
-//! one `.`, and `inf`/`-inf`/`NaN`, so two distinct bounds never render to one token (the
-//! collision argument in `crates/logit-outputs/src/influxdb.rs`'s `render_fields`, which rejects
-//! a *rounded* percentile). Graphite needs the substitution because `.` is its hierarchy separator.
+//! [`crate::multi_value`]'s module doc is the canonical table of the dotted sub-paths each kind
+//! expands into, with the rules behind it: every expansion adds at least one suffix, a sketch's
+//! `.sum` is exact, non-finite values are skipped, and number tokens are injective. The encoder
+//! appends each sub-path's suffix to the sanitized path, then the tag segment.
 //!
 //! ## `Protocol` and `Meta`
 //!

@@ -69,7 +69,7 @@ components:
     #                              # backend would take the ";" into a directory name
     # multi_value: skip           # skip (default) drops a multi-value record whole, counted; expand
     #                              # renders the dotted sub-paths (.count, .sum, .q0_5, per-bucket
-    #                              # counts) listed in crates/logit-proto/src/graphite/mod.rs
+    #                              # counts) listed in crates/logit-proto/src/multi_value.rs
     # max_packet_bytes: "1432"    # udp only: bounds one datagram, not one line
     # max_frame_bytes: "1MiB"     # bounds one pickle frame
     # connect_timeout: 5s         # tcp only

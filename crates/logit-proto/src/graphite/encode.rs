@@ -1374,7 +1374,7 @@ mod tests {
         }
     }
 
-    /// Each kind expands to the exact paths in `mod.rs`'s sub-path table.
+    /// Each kind expands to the paths in `crate::multi_value`'s sub-path table.
     #[test]
     fn expand_produces_the_documented_sub_paths_for_every_kind() {
         let cases: Vec<(MetricKind, &str, Vec<&str>)> = vec![

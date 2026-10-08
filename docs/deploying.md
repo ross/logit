@@ -1824,7 +1824,7 @@ one:
   carry.** `Samples`, `Distribution`, `Histogram`, `ExponentialHistogram`, `Summary`, `Set`, and
   `SetMembers` records are dropped whole and counted `logit.output.metrics.skipped{metric_kind=...}`
   instead of guessing at a convention. To keep them, set `multi_value: expand`, which renders the
-  dotted sub-paths tabled in `logit_proto::graphite`'s module doc (`.count`, `.sum`,
+  dotted sub-paths tabled in `logit_proto::multi_value`'s module doc (`.count`, `.sum`,
   `.q0_5`...`.q0_99`, per-bucket counts, and so on), an explicit, named convention counted
   `logit.output.metrics.degraded{metric_kind=...}` once per record.
 - **Size and timeout bounds.** `max_packet_bytes:` (UDP only, default `1432`, at most `65507`, the

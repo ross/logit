@@ -58,8 +58,8 @@
 //! collapses a repeated key first, so this rule never fires inside the pair.
 //! `statsd_in -> aggregate -> graphite_out` pins `multi_value: expand`: a timer's samples flush
 //! through `aggregate`'s default sketch into a `MetricKind::Distribution`, which `graphite_out`
-//! expands into the sub-paths in `crates/logit-proto/src/graphite/mod.rs`'s "`MultiValue::Expand`
-//! sub-paths".
+//! expands into the sub-paths in `crates/logit-proto/src/multi_value.rs`'s module doc
+//! ("Sub-paths").
 
 use bytes::Bytes;
 use logit_core::{Diagnostics, Event, EventBatch, Registry, Resource, Telemetry, Value};
