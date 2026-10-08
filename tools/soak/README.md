@@ -78,7 +78,7 @@ appends `limit 100000` to `args` unless they set a `limit`, so netem's own queue
    because the run directory has everything.
 6. It scores the run. The script exits 1 on any `FAIL`, including a run the driver aborted or
    hit an error in, and 130 when SIGINT, SIGTERM, or SIGHUP interrupted it, whose `run` row
-   FAILs too.
+   FAILs too. `check` on that directory exits 1: only the live run knows it was interrupted.
 
 A run writes `perf/results/soak/<UTC stamp>/` (gitignored, or under `SOAK_OUT`):
 
