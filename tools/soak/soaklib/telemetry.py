@@ -78,6 +78,20 @@ class Telemetry:
         return sum(p.value for p in self.matching(name, **attrs)
                    if start <= p.ts < end and isinstance(p.value, (int, float)))
 
+    def counter_points(self, name, **attrs):
+        """[(ts, summed delta, life)] for a `sum` metric, one entry per drain, in timestamp
+        order. Points sharing a drain (one per attribute set, such as per `reason`) are summed."""
+        by_ts = {}
+        for point in self.matching(name, **attrs):
+            if isinstance(point.value, (int, float)):
+                value, _ = by_ts.get(point.ts, (0, point.life))
+                by_ts[point.ts] = (value + point.value, point.life)
+        return [(ts, value, life) for ts, (value, life) in sorted(by_ts.items())]
+
+    def life_drains(self, life):
+        """The drain timestamps of one process life, in order."""
+        return sorted({p.ts for p in self.points if p.name == UPTIME and p.life == life})
+
     def gauge_series(self, name, **attrs):
         """[(ts, value, life)] for a gauge, in timestamp order."""
         series = [(p.ts, p.value, p.life) for p in self.matching(name, **attrs)

@@ -5,7 +5,11 @@ It covers the duration parser, every `validate()` rejection rule, `expand()`'s c
 repetition, the NDJSON reducers (counters per life split where uptime decreases, gauge series),
 the stderr classifier (a raw `thread '...' panicked at` line included), the slope function, and
 the checks against small synthetic run directories: a failed fault action, an aborted run and its
-exit code, an fd sample inside a later fault, and a steady state too thin to judge.
+exit code, an fd sample inside a later fault, and a steady state too thin to judge. For the
+ledger, it covers the reset-aware VictoriaMetrics total and its split per life, and a two-life
+run whose final life balances and whose earlier life sits inside [0, R], each rule broken in turn:
+a shutdown drop on stderr, a counted and an uncounted egress gap, an empty export, wire loss in
+and out of a fault window and at the end, the sink identity, and recovery.
 """
 
 import copy
@@ -15,7 +19,7 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import checks, driver, scenario, telemetry
+from . import checks, driver, scenario, telemetry, vm
 
 _FAILURES = []
 _PASSED = [0]
@@ -120,15 +124,16 @@ def _expand(root):
     expect(len({s.id for s in long}) == len(long), "expanded step ids are unique")
 
 
-def _line(ts, name, kind, value, component="self", **fields):
+def _line(ts, name, kind, value, component="self", attrs=None, **fields):
     metric = {"name": name, "kind": kind}
     if kind == "sum":
         metric.update(value=value, temporality="delta", monotonic=True)
     else:
         metric["value"] = value
     metric.update(fields)
-    return ('{"timestamp":"%s","metrics":[%s],"attributes":{"component":"%s","kind":"x",'
-            '"role":"sink"}}' % (ts, json.dumps(metric), component))
+    attributes = {"component": component, "kind": "x", "role": "sink", **(attrs or {})}
+    return json.dumps({"timestamp": ts, "metrics": [metric], "attributes": attributes},
+                      separators=(",", ":"))
 
 
 def _ndjson():
@@ -339,6 +344,274 @@ def _checks():
                    f"{check.__name__} PASSes a fault-free hour, got {result}")
 
 
+def _vm_resets():
+    def series(name, values, seconds):
+        return {"metric": {"__name__": name}, "values": values,
+                "timestamps": [int((T0 + s) * 1000) for s in seconds]}
+
+    one = series("a_total", [5, 9, 9, 3, 7, 2], [10, 20, 30, 40, 50, 60])
+    total, segments = vm.reset_aware(one)
+    expect(total == 9 + 7 + 2, f"reset-aware total adds the value after each decrease, got {total}")
+    expect([amount for _, amount in segments] == [9, 7, 2], f"segments per reset, got {segments}")
+    expect(vm.reset_aware({"values": [], "timestamps": []})[0] == 0, "an empty series is 0")
+
+    starts = [T0, T0 + 35]
+    two = [series("a_total", [5, 9, 3, 7], [10, 20, 40, 50]),
+           series("b_total", [1, 4, 2], [10, 20, 40])]
+    by_life, total, resets, mismatched = vm.totals_by_life(two, starts)
+    expect(by_life == {0: 13, 1: 9} and total == 22, f"V split per life, got {by_life} {total}")
+    expect(resets == {"a_total": 1, "b_total": 1} and not mismatched, f"resets, got {resets}")
+    # A series that only lived in the second life has no reset: credited by timestamp, listed.
+    late = [series("c_total", [4, 6], [40, 50])]
+    by_life, _, resets, mismatched = vm.totals_by_life(late, starts)
+    expect(by_life == {1: 6} and mismatched == ["c_total"],
+           f"a series with too few resets is credited by timestamp, got {by_life} {mismatched}")
+
+
+LEDGER = {"vm_selector": "{__name__=~\"x_[0-9]+_total\"}", "generator_input": "load",
+          "generator_sink": "out", "sut_listener": "in", "sut_aggregate": "window",
+          "sut_sink": "sink", "wire_loss_outside_faults": 0.0}
+# The fixture's SUT stop: applied at +101, reverted by +131, so life 1 starts at +131.
+STOP = (101, 131)
+PER_DRAIN = 1000
+
+
+def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_short=0,
+                life0_dropped=0, life1_dropped=0, steady_loss=0, fault_loss=0, end_extra=0,
+                e1_short=0, a1_short=0, ab1_short=0, late_series=False, receive_util=0.0, slow_after_stop=False, rate_behind=0,
+                undelivered=0, empty_export=False):
+    """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
+    per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
+    rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
+    them dropped on stderr, and `v0_extra` reaching VictoriaMetrics after its last drain, and
+    life 1 balances."""
+    gen = []
+    for offset in range(5, 301, 5):
+        stamp = _stamp(T0 + offset)
+        gen.append(_line(stamp, "logit.process.uptime", "gauge", float(offset)))
+        gen.append(_line(stamp, "logit.output.messages", "sum", PER_DRAIN, component="out"))
+        gen.append(_line(stamp, "logit.output.datagrams", "sum", PER_DRAIN, component="out"))
+        gen.append(_line(stamp, "logit.component.events.sent", "sum", PER_DRAIN,
+                         component="load"))
+        gen.append(_line(stamp, "logit.component.batches.sent", "sum", PER_DRAIN // 100,
+                         component="load"))
+        gen.append(_line(stamp, "logit.component.buffer.batches", "gauge", 0, component="out"))
+    if rate_behind:
+        gen.append(_line(_stamp(T0 + 150), "logit.component.diagnostics", "sum", rate_behind,
+                         component="load", attrs={"key": "rate_behind"}))
+
+    sut = []
+    totals = {0: {"W": 0, "E": 0}, 1: {"W": 0, "E": 0}}
+    drains = [(o, 0) for o in range(5, STOP[0], 5)] + [(o, 1) for o in range(135, 321, 5)]
+    last0 = max(o for o, life in drains if life == 0)
+    for offset, life in drains:
+        stamp = _stamp(T0 + offset)
+        start = -1 if life == 0 else STOP[1]
+        sut.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
+        sending = offset <= 300
+        w = PER_DRAIN if sending else 0
+        if life == 1 and offset == 135:
+            w = PER_DRAIN  # the generator's lines from the stop never arrive: fault-window loss
+        if slow_after_stop and life == 1 and offset <= 180:
+            w //= 2
+        if offset == 60:
+            w -= steady_loss
+        if offset == 135:
+            w -= fault_loss
+        if offset == 320:
+            w += end_extra
+        e = w
+        if offset == last0:
+            w += life0_extra
+        if life == 1 and offset == 200:
+            e -= e1_short
+        a = e - (a1_short if life == 1 and offset == 210 else 0)
+        ab = a - (ab1_short if life == 1 and offset == 220 else 0)
+        totals[life]["W"] += w
+        totals[life]["E"] += ab
+        for metric, value, comp in (("logit.input.datagrams", w, "in"),
+                                    ("logit.component.events.sent", e, "in"),
+                                    ("logit.component.events.received", a, "window"),
+                                    ("logit.transform.metrics.absorbed", ab, "window"),
+                                    ("logit.component.batches.received", 1, "sink"),
+                                    ("logit.component.batches.delivered",
+                                     0 if (life == 1 and offset in (200, 205) and undelivered)
+                                     else 1, "sink")):
+            sut.append(_line(stamp, metric, "sum", value, component=comp))
+        sut.append(_line(stamp, "logit.component.buffer.batches", "gauge", 0, component="sink"))
+        sut.append(_line(stamp, "logit.component.buffer.utilization", "gauge", 0.0,
+                         component="sink"))
+        sut.append(_line(stamp, "logit.component.receive.utilization", "gauge",
+                         receive_util if life == 1 else 0.0, component="in"))
+        sut.append(_line(stamp, "logit.component.retrying", "gauge", 0, component="sink"))
+
+    timeline = [_phase("start", 0, t0=T0),
+                _action("apply", "c0s1", "stop", "logit", STOP[0], affects_udp_ingress=True),
+                _action("revert", "c0s1", "stop", "logit", STOP[1] - 1, STOP[1],
+                        affects_udp_ingress=True),
+                _ready("c0s1", "logit", STOP[1] + 1),
+                _phase("end_begin", 300), _phase("end_end", 330)]
+    run_dir = _run_dir(tmp, name, timeline, sut, ledger=LEDGER)
+    (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
+
+    def log(offset, level, message, **fields):
+        return json.dumps({"timestamp": _stamp(T0 + offset), "level": level,
+                           "message": message, "target": "logit", **fields})
+
+    stderr = [log(0, "INFO", "ready")]
+    if shutdown_drops:
+        stderr.append(log(STOP[0] + 0.5, "WARN", f"{shutdown_drops} datagram(s) still in the "
+                          "receive queue when this listener was stopped at its shutdown grace, "
+                          "undecoded", component="in"))
+    for offset, dropped in ((STOP[0] + 0.6, life0_dropped), (321, life1_dropped)):
+        if dropped:
+            stderr.append(log(offset, "WARN", "drain complete", duration="1s",
+                              batches_dropped=dropped))
+        else:
+            stderr.append(log(offset, "INFO", "drain complete", duration="1ms"))
+    (run_dir / "logs" / "logit.stderr").write_text("\n".join(stderr) + "\n")
+
+    ab0 = totals[0]["E"]
+    ab1 = totals[1]["E"]
+    v0 = ab0 + v0_extra
+    v1 = ab1 - v1_short
+    export = []
+    if late_series:
+        # x_1 first appears in life 1, so it has no reset.
+        export = [{"metric": {"__name__": "x_0_total"}, "values": [v0, v1 // 2],
+                   "timestamps": [int((T0 + s) * 1000) for s in (100, 200)]},
+                  {"metric": {"__name__": "x_1_total"}, "values": [v1 - v1 // 2],
+                   "timestamps": [int((T0 + 300) * 1000)]}]
+    elif not empty_export:
+        for index, share in enumerate((v0 // 2, v0 - v0 // 2)):
+            other = (v1 // 2, v1 - v1 // 2)[index]
+            export.append({"metric": {"__name__": f"x_{index}_total"},
+                           "values": [share // 2, share, other // 2, other],
+                           "timestamps": [int((T0 + s) * 1000) for s in (50, 100, 200, 300)]})
+    (run_dir / "vm-export.jsonl").write_text("".join(json.dumps(s) + "\n" for s in export))
+    return run_dir
+
+
+def _ledger_checks():
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            run_dir = _ledger_run(tmp, name, **kwargs)
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        clean = results("ledger-clean")
+        for check_id in ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.aggregate",
+                         "ledger.egress", "ledger.summary", "identity.sink", "recovery"):
+            expect(clean[check_id].status == checks.PASS,
+                   f"{check_id} PASSes the balanced two-life fixture, got {clean[check_id]}")
+        led = checks.Ledger(checks.RunData(Path(tmp) / "ledger-clean"))
+        expect(led.D_log == {0: 20}, f"the listener's shutdown warn line goes into D, got "
+                                     f"{led.D_log}")
+        expect(led.residual(0) == 30, f"life 0's W − D − B − Ab, got {led.residual(0)}")
+        expect(led.R == 77000, f"R from the defaults, got {led.R}")
+        expect("within [0, R]" in clean["ledger.intake"].detail,
+               f"intake reports the earlier life's residual, got {clean['ledger.intake'].detail}")
+        expect("fault (c0s1 stop on logit)" in " ".join(clean["ledger.wire"].lines),
+               "wire buckets the stop as a UDP-affecting window")
+
+        over_r = results("ledger-over-r", life0_extra=80000)
+        expect(over_r["ledger.intake"].status == checks.FAIL,
+               f"intake FAILs an earlier life's residual over R, got {over_r['ledger.intake']}")
+        negative = results("ledger-negative-residual", life0_extra=0, v0_extra=0)
+        expect(negative["ledger.intake"].status == checks.FAIL,
+               "intake FAILs an earlier life's residual under 0, got "
+               f"{negative['ledger.intake']}")
+
+        short = results("ledger-intake", e1_short=5)
+        expect(short["ledger.intake"].status == checks.FAIL,
+               f"intake FAILs W − D != E + B in the final life, got {short['ledger.intake']}")
+        expect(short["ledger.summary"].status == checks.FAIL,
+               f"the summary FAILs a nonzero W − D − E − B, got {short['ledger.summary']}")
+
+        edge = results("ledger-edge", a1_short=7)
+        expect(edge["ledger.edge"].status == checks.FAIL,
+               f"edge FAILs E != A in the final life, got {edge['ledger.edge']}")
+        expect(edge["ledger.summary"].status == checks.FAIL,
+               f"the summary FAILs a nonzero E − A, got {edge['ledger.summary']}")
+        absorbed = results("ledger-aggregate", ab1_short=9)
+        expect(absorbed["ledger.aggregate"].status == checks.FAIL,
+               f"aggregate FAILs Ab != A in the final life, got {absorbed['ledger.aggregate']}")
+        expect(absorbed["ledger.summary"].status == checks.FAIL,
+               f"the summary FAILs a nonzero A − Ab, got {absorbed['ledger.summary']}")
+        late = results("ledger-late-series", late_series=True)
+        expect(late["ledger.egress"].status == checks.WARN
+               and "resets aren't SUT lives − 1" in late["ledger.egress"].detail,
+               f"egress WARNs a series whose resets aren't lives − 1, got {late['ledger.egress']}")
+
+        uncounted = results("ledger-uncounted", v0_extra=-500)
+        expect(uncounted["ledger.egress"].status == checks.FAIL
+               and "uncounted" in uncounted["ledger.egress"].detail,
+               f"egress FAILs an earlier life's positive gap with no batches_dropped, got "
+               f"{uncounted['ledger.egress']}")
+        counted = results("ledger-counted", v0_extra=-500, life0_dropped=3)
+        expect(counted["ledger.egress"].status == checks.PASS
+               and "counted (drain complete batches_dropped 3)" in counted["ledger.egress"].detail,
+               f"egress marks a positive gap with batches_dropped as counted, got "
+               f"{counted['ledger.egress']}")
+        expect(counted["ledger.summary"].status == checks.PASS,
+               f"a counted earlier life leaves the summary PASS, got {counted['ledger.summary']}")
+
+        final_lost = results("ledger-final-uncounted", v1_short=40)
+        expect(final_lost["ledger.egress"].status == checks.FAIL,
+               f"egress FAILs a final-life gap, got {final_lost['ledger.egress']}")
+        expect(final_lost["ledger.summary"].status == checks.FAIL,
+               f"the summary FAILs an uncounted Ab − V, got {final_lost['ledger.summary']}")
+        final_counted = results("ledger-final-counted", v1_short=40, life1_dropped=1)
+        expect(final_counted["ledger.summary"].status == checks.PASS
+               and "Ab − V 40 counted" in final_counted["ledger.summary"].detail,
+               f"the summary shows a counted egress term and judges the rest, got "
+               f"{final_counted['ledger.summary']}")
+        final_dup = results("ledger-final-negative", v1_short=-40)
+        expect(final_dup["ledger.egress"].status == checks.FAIL,
+               f"egress FAILs a negative final-life gap, got {final_dup['ledger.egress']}")
+
+        empty = results("ledger-empty-export", empty_export=True)
+        expect(empty["ledger.egress"].status == checks.FAIL
+               and "no series" in empty["ledger.egress"].detail,
+               f"egress FAILs an export with no series, got {empty['ledger.egress']}")
+
+        steady = results("wire-steady", steady_loss=400)
+        expect(steady["ledger.wire"].status == checks.FAIL,
+               f"wire FAILs loss outside UDP-affecting windows past the tolerance, got "
+               f"{steady['ledger.wire']}")
+        tolerated = results("wire-tolerated", steady_loss=100)
+        expect(tolerated["ledger.wire"].status == checks.PASS,
+               f"wire tolerates one batch per steady-run edge, got {tolerated['ledger.wire']}")
+        in_fault = results("wire-fault", fault_loss=900)
+        expect(in_fault["ledger.wire"].status == checks.PASS,
+               f"wire doesn't judge loss inside a UDP-affecting window, got "
+               f"{in_fault['ledger.wire']}")
+        over_end = results("wire-end", end_extra=300)
+        expect(over_end["ledger.wire"].status == checks.FAIL
+               and "end allowance" in over_end["ledger.wire"].detail,
+               f"wire FAILs W + K past G by more than the end allowance, got "
+               f"{over_end['ledger.wire']}")
+        within_end = results("wire-end-ok", end_extra=60)
+        expect(within_end["ledger.wire"].status == checks.PASS,
+               f"wire allows W + K past G by up to one batch at the end, got "
+               f"{within_end['ledger.wire']}")
+
+        unbalanced = results("identity", undelivered=1)
+        expect(unbalanced["identity.sink"].status == checks.FAIL,
+               f"identity.sink FAILs two batches neither delivered, dropped, nor queued, got "
+               f"{unbalanced['identity.sink']}")
+
+        busy = results("recovery-busy", receive_util=0.5)
+        expect(busy["recovery"].status == checks.FAIL,
+               f"recovery FAILs a receive queue still full, got {busy['recovery']}")
+        slow = results("recovery-slow", slow_after_stop=True)
+        expect(slow["recovery"].status == checks.FAIL,
+               f"recovery FAILs ingest under 95% of the warmup rate, got {slow['recovery']}")
+        behind = results("recovery-behind", slow_after_stop=True, rate_behind=2)
+        expect(behind["recovery"].status == checks.WARN,
+               f"recovery WARNs a shortfall when the generator fell behind, got "
+               f"{behind['recovery']}")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -356,7 +629,8 @@ def run(root, quiet=False):
     root = Path(root)
     _FAILURES.clear()
     _PASSED[0] = 0
-    for part in (_durations, _rules, _expand, _ndjson, _stderr, _slope, _checks, _shipped):
+    for part in (_durations, _rules, _expand, _ndjson, _stderr, _slope, _checks, _vm_resets,
+                 _ledger_checks, _shipped):
         try:
             part(root) if part in (_rules, _expand, _shipped) else part()
         except Exception as err:  # report the part that broke, then keep going

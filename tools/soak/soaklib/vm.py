@@ -4,6 +4,9 @@
 [...], "timestamps": [...]}`, timestamps in milliseconds. Newly ingested samples become
 searchable after VictoriaMetrics flushes its in-memory buffers, which `/internal/force_flush`
 forces.
+
+The ledger's V is `totals_by_life()`: each series' reset-aware total, split at its resets into the
+SUT's process lives.
 """
 
 import json
@@ -99,3 +102,64 @@ def last_total(series):
     """The sum of each series' last value: what the stored counters read now."""
     return sum((one.get("values") or [0])[-1] for one in series if one.get("values"))
 
+
+
+def series_name(one):
+    metric = one.get("metric") or {}
+    labels = ",".join(f"{k}={v}" for k, v in sorted(metric.items()) if k != "__name__")
+    return metric.get("__name__", "?") + (f"{{{labels}}}" if labels else "")
+
+
+def reset_aware(one):
+    """One exported series as `(total, segments)`: the reset-aware total (the first value, then
+    every non-negative step, and on a decrease the new value), and the same total split at each
+    decrease into `[(first_ms, amount)]`, one segment per counter life."""
+    values = one.get("values") or []
+    stamps = one.get("timestamps") or []
+    segments = []
+    previous = None
+    for value, stamp in zip(values, stamps):
+        if previous is None or value < previous:
+            segments.append([stamp, value])
+        else:
+            segments[-1][1] += value - previous
+        previous = value
+    segments = [(stamp, amount) for stamp, amount in segments]
+    return sum(amount for _, amount in segments), segments
+
+
+def totals_by_life(series, life_starts):
+    """The reset-aware total of `series` split per process life of the writer.
+
+    `life_starts` holds each life's start in epoch seconds. A series with one reset fewer than
+    there are lives has its segment k credited to life k; any other series has each segment
+    credited to the life its first sample falls in, and is listed as a mismatch. Returns
+    `(by_life, total, resets, mismatched)`: `{life: amount}`, the overall total, `{series name:
+    resets}`, and the names whose resets weren't lives minus one."""
+    lives = max(1, len(life_starts))
+    by_life = {}
+    resets = {}
+    mismatched = []
+    total = 0
+    for one in series:
+        amount, segments = reset_aware(one)
+        total += amount
+        name = series_name(one)
+        resets[name] = len(segments) - 1
+        if len(segments) == lives:
+            owners = range(lives)
+        else:
+            mismatched.append(name)
+            owners = [life_at(life_starts, stamp / 1000) for stamp, _ in segments]
+        for life, (_, part) in zip(owners, segments):
+            by_life[life] = by_life.get(life, 0) + part
+    return by_life, total, resets, mismatched
+
+
+def life_at(life_starts, t):
+    """The index of the newest life that started at or before `t`, or 0."""
+    life = 0
+    for index, start in enumerate(life_starts):
+        if t >= start:
+            life = index
+    return life

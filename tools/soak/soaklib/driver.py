@@ -115,6 +115,11 @@ class Run:
             f"SOAK_GENERATOR_CONFIG={self.scenario.config_path('generator')}\n"
         )
         shutil.copy(self.scenario.path, self.run_dir / "scenario.toml")
+        # The checks read the SUT's `receive:` limits from this copy.
+        (self.run_dir / "configs").mkdir()
+        for role in sorted(self.scenario.configs):
+            shutil.copy(self.scenario.config_path(role),
+                        self.run_dir / "configs" / self.scenario.configs[role])
         resolved = self.scenario.to_json(self.duration)
         resolved["seed"] = self.seed
         (self.run_dir / "scenario.resolved.json").write_text(
