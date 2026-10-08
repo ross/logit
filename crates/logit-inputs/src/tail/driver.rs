@@ -1378,7 +1378,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
             let deselected = tracked.state == FileState::Deselected;
             let mut taken =
-                close_decoder(&mut tracked, sink, &self.telemetry, &mut self.diag).await;
+                close_decoder(&mut tracked, sink, &self.telemetry, &mut self.diag, CloseMode::Emit)
+                    .await;
             if taken {
                 if let Some(batch) = tracked.accumulator.take() {
                     taken = emit(sink, &self.telemetry, batch, FlushReason::Closed).await;
@@ -1412,14 +1413,22 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     }
 
     /// At shutdown, emits every tracked file's held partial line and decoder state, so an
-    /// unterminated last line isn't lost (with no checkpoint, nothing would re-read it). Unlike
-    /// [`Tailer::reap_drained`], files stay tracked: [`Tailer::write_checkpoint`] runs next and
-    /// needs their offsets.
+    /// unterminated last line isn't lost (with no checkpoint, nothing would re-read it). A decoder
+    /// whose [`TailDecoder::hold_at_shutdown`] is set keeps its partial line unread, and, when a
+    /// checkpoint will replay them, its held lines too; [`Tailer::write_checkpoint`] then leaves
+    /// the offset at their start. Unlike [`Tailer::reap_drained`], files stay tracked:
+    /// `write_checkpoint` runs next and needs their offsets.
     async fn close_all_for_shutdown(&mut self, sink: &Fanout) {
         let ids: Vec<FileId> = self.files.keys().copied().collect();
+        let replayed = self.checkpoint.is_some();
         for id in ids {
             if let Some(tracked) = self.files.get_mut(&id) {
-                if !close_decoder(tracked, sink, &self.telemetry, &mut self.diag).await {
+                let mode = if tracked.decoder.hold_at_shutdown() {
+                    CloseMode::Hold { held_lines: replayed }
+                } else {
+                    CloseMode::Emit
+                };
+                if !close_decoder(tracked, sink, &self.telemetry, &mut self.diag, mode).await {
                     self.untaken = true;
                     return;
                 }
@@ -1456,8 +1465,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// without clearing it, which is why it's a position and not a byte count to subtract. A file
     /// mid-drop checkpoints at the dropped line's start ([`LineSplitter::pending_bytes`] for the
     /// splitter, `held_from` for the decoder), so a restart drops it whole again, at shutdown
-    /// too. Otherwise, at shutdown `close_all_for_shutdown` has already emitted both, so the
-    /// offset is the file's full `offset`.
+    /// too. A decoder that holds at shutdown ([`TailDecoder::hold_at_shutdown`]) leaves both
+    /// unemitted at a clean stop, so the same rule checkpoints at their start and the restart
+    /// re-reads them whole. Otherwise, at shutdown `close_all_for_shutdown` has already emitted
+    /// both, so the offset is the file's full `offset`.
     async fn write_checkpoint(&mut self, force: bool) {
         if self.untaken {
             return;
@@ -1480,21 +1491,37 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     }
 }
 
+/// What [`close_decoder`] emits.
+#[derive(Clone, Copy)]
+enum CloseMode {
+    /// The unterminated last line and the decoder's held lines. A file that rotated away or was
+    /// removed ([`Tailer::reap_drained`]) will gain nothing more, so its tail is final.
+    Emit,
+    /// Leaves the unterminated last line unread, and the decoder's held lines unemitted when
+    /// `held_lines` is true, so a restart reads them whole. `held_lines` is true only when a
+    /// checkpoint will replay them.
+    Hold { held_lines: bool },
+}
+
 /// Emits a file's unterminated last line ([`LineSplitter::take_partial`]) and whatever
-/// [`TailDecoder::close`] produces into its accumulator, flushing if a bound is reached. Used by
-/// [`Tailer::reap_drained`] and [`Tailer::close_all_for_shutdown`]. Returns `false` once an emit
-/// finds no consumer to take its batch, emitting nothing after it.
+/// [`TailDecoder::close`] produces into its accumulator, flushing if a bound is reached, as far
+/// as `mode` allows. Used by [`Tailer::reap_drained`] and [`Tailer::close_all_for_shutdown`].
+/// Returns `false` once an emit finds no consumer to take its batch, emitting nothing after it.
 async fn close_decoder<D: TailDecoder>(
     tracked: &mut TrackedFile<D>,
     sink: &Fanout,
     telemetry: &Telemetry,
     diag: &mut Diagnostics,
+    mode: CloseMode,
 ) -> bool {
     let mut scratch = Vec::new();
+    let hold_partial = matches!(mode, CloseMode::Hold { .. });
+    let hold_held = matches!(mode, CloseMode::Hold { held_lines: true });
 
     // Read before `take_partial` empties the splitter: where the unterminated last line starts.
     let partial_start = tracked.offset - tracked.splitter.pending_bytes();
-    if let Some(partial) = tracked.splitter.take_partial() {
+    let partial = if hold_partial { None } else { tracked.splitter.take_partial() };
+    if let Some(partial) = partial {
         let partial = ensure_utf8(partial, diag);
         // Offered to the decoder like any line `read_one` splits, so counted the same way.
         telemetry.count("logit.input.lines", 1.0, &[]);
@@ -1522,11 +1549,13 @@ async fn close_decoder<D: TailDecoder>(
         }
     }
 
-    tracked.decoder.close(&mut scratch);
-    // `close` emits held lines but not a line being dropped, so `held_from` survives only for a
-    // drop in progress, and the checkpoint stays at that line's start.
-    if !tracked.decoder.holds_entry() {
-        tracked.held_from = None;
+    if !hold_held {
+        tracked.decoder.close(&mut scratch);
+        // `close` emits held lines but not a line being dropped, so `held_from` survives only for
+        // a drop in progress, and the checkpoint stays at that line's start.
+        if !tracked.decoder.holds_entry() {
+            tracked.held_from = None;
+        }
     }
     if !scratch.is_empty() {
         let resource = tracked.decoder.resource();

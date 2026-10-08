@@ -32,8 +32,17 @@ pub trait TailDecoder: Send {
     /// The file is closing (rotated away, removed, or shutdown): emit anything held across lines,
     /// such as `docker_in`'s unfinished partial-entry reassembly. An unterminated last line is
     /// [`LineSplitter::take_partial`]'s job, not this. A line being dropped stays dropped: `close`
-    /// emits held lines only. Default: nothing held.
+    /// emits held lines only. A clean stop skips this call for a decoder whose
+    /// [`TailDecoder::hold_at_shutdown`] is set and whose checkpoint will replay its held lines.
+    /// Default: nothing held.
     fn close(&mut self, _out: &mut Vec<Event>) {}
+
+    /// The writer always finishes a line, so a clean stop leaves this file's unterminated line
+    /// and, when a checkpoint will replay them, its held lines in place rather than emitting
+    /// them. A rotated or removed file still emits both. Default: `false`.
+    fn hold_at_shutdown(&self) -> bool {
+        false
+    }
 
     /// Whether this decoder holds lines it hasn't produced events for yet, or is discarding the
     /// rest of a line it began dropping. The driver records where the oldest such line starts and

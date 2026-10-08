@@ -368,6 +368,10 @@ impl TailDecoder for DockerDecoder {
         self.streams.iter().any(|s| s.partial.is_some() || s.dropping)
     }
 
+    fn hold_at_shutdown(&self) -> bool {
+        true
+    }
+
     fn reset(&mut self) {
         // Both halves: a stale `dropping` would swallow the new generation's first complete
         // entry, as a stale `partial` would splice into it.
@@ -2373,14 +2377,15 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// At shutdown the splitter hands the decoder a torn last envelope, which it rejects; the
-    /// fragment held before it is still emitted.
+    /// With no checkpoint nothing replays the file, so shutdown still emits the held fragment. It
+    /// leaves the torn last envelope unread, so no `bad_line` is raised for it.
     #[tokio::test]
-    async fn a_torn_envelope_at_shutdown_still_emits_the_held_fragment() {
+    async fn without_a_checkpoint_shutdown_still_emits_held_fragments() {
         let root = scratch_dir("docker-torn-shutdown");
         let log = container(&root, &"7".repeat(64), "torn", "nginx:1.25");
         std::fs::write(&log, format!("{}{{\"log\":\"ta", json_file_line("head-"))).unwrap();
 
+        let diag = Diagnostics::new("docker-torn-shutdown");
         let (fanout, mut rx) = fanout_channel(8);
         let mut probe = TelemetryProbe::new();
         let input = DockerInput::new(
@@ -2389,7 +2394,8 @@ mod tests {
             vec![],
             fast_tail_config(),
         )
-        .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        .with_telemetry(probe.telemetry("docker", "docker_in", "listener"))
+        .with_diagnostics(diag.clone());
         let running = spawn_input(input, fanout).await;
         probe
             .wait_for("the fragment's line to be read", |t| t.sum("logit.input.lines", &[]) >= 1.0)
@@ -2397,6 +2403,93 @@ mod tests {
 
         running.stop().await;
         assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["head-"]);
+        assert_eq!(diag.occurrences("bad_line"), 0, "the torn tail is not decoded at shutdown");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A clean stop whose unterminated last line is a torn envelope: shutdown neither decodes it
+    /// nor checkpoints past it, so the restart reads the envelope whole once its end arrives.
+    #[tokio::test]
+    async fn a_clean_restart_mid_envelope_replays_the_torn_line_whole() {
+        let root = scratch_dir("docker-torn-restart");
+        let log = container(&root, &"8".repeat(64), "torn", "nginx:1.25");
+        let whole = json_file_line("whole\n");
+        let torn = json_file_line("full message\n");
+        let (front, back) = torn.split_at(torn.len() / 2);
+        std::fs::write(&log, format!("{whole}{front}")).unwrap();
+        let checkpoint = root.join("checkpoint.json");
+        let mut config = fast_tail_config();
+        config.checkpoint_path = Some(checkpoint.clone());
+
+        let diag = Diagnostics::new("docker-torn-restart");
+        let (fanout, mut rx) = fanout_channel(8);
+        let input = DockerInput::new(
+            root.clone(),
+            ContainerFilter::new(vec![], true),
+            vec![],
+            config.clone(),
+        )
+        .with_diagnostics(diag.clone());
+        let running = spawn_input(input, fanout).await;
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["whole"]);
+        running.stop().await;
+        assert_eq!(diag.occurrences("bad_line"), 0, "the torn tail is not decoded at shutdown");
+        assert_eq!(
+            checkpointed_offset(&checkpoint),
+            Some(whole.len() as u64),
+            "the shutdown checkpoint must stay at the torn line's start"
+        );
+
+        append(&log, back);
+        let (fanout2, mut rx2) = fanout_channel(8);
+        let input2 =
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config);
+        let running2 = spawn_input(input2, fanout2).await;
+        assert_eq!(
+            messages(&recv_events(&mut rx2, 1).await),
+            vec!["full message"],
+            "the restart must read the torn line whole"
+        );
+        running2.stop().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A clean stop while a message is in reassembly: shutdown emits no truncated event and
+    /// checkpoints at the first held fragment, so the restart reassembles the message whole.
+    #[tokio::test]
+    async fn a_clean_restart_mid_reassembly_replays_the_held_fragments_whole() {
+        let (root, log, checkpoint, whole_len, config) =
+            fragment_fixture("docker-held-restart", "");
+
+        let (fanout, mut rx) = fanout_channel(8);
+        let input = DockerInput::new(
+            root.clone(),
+            ContainerFilter::new(vec![], true),
+            vec![],
+            config.clone(),
+        );
+        let running = spawn_input(input, fanout).await;
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["whole"]);
+        assert_eq!(first_nonzero_checkpoint(&checkpoint).await, whole_len);
+        running.stop().await;
+        assert!(rx.try_recv().is_err(), "shutdown must not emit the held fragment");
+        assert_eq!(
+            checkpointed_offset(&checkpoint),
+            Some(whole_len),
+            "the shutdown checkpoint must stay at the first held fragment"
+        );
+
+        append(&log, &json_file_line("tail\n"));
+        let (fanout2, mut rx2) = fanout_channel(8);
+        let input2 =
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config);
+        let running2 = spawn_input(input2, fanout2).await;
+        assert_eq!(
+            messages(&recv_events(&mut rx2, 1).await),
+            vec!["head-tail"],
+            "the restart must reassemble the message from its first fragment"
+        );
+        running2.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2432,7 +2525,11 @@ mod tests {
         // One read takes the whole file, the partial envelope with it.
         assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["whole"]);
         running.stop().await;
-        assert_eq!(diag.occurrences("long_line"), 1, "shutdown decodes the partial and drops it");
+        assert_eq!(
+            diag.occurrences("long_line"),
+            0,
+            "shutdown leaves the partial unread for the restart to decode"
+        );
         assert_eq!(
             checkpointed_offset(&checkpoint),
             Some(whole.len() as u64),
