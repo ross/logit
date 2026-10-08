@@ -1449,7 +1449,7 @@ fn skipped_kind(ctx: &mut EncodeCtx, name: &str, kind: MultiKind) {
     ctx.stats.skipped_kinds.bump(kind);
     let hint = match kind {
         MultiKind::Distribution => {
-            "set `multi_value: expand` to write its count, sum, and quantiles as lines, or \
+            "set `multi_value: expand` to write its count, sum, min, max, and quantiles as lines, or \
              summarize with `aggregate: distributions: samples` to relay the raw ms/h/d data"
         }
         MultiKind::Set => {
