@@ -3094,7 +3094,7 @@ fn graphite_encode_into_100_pickle_events() {
 }
 
 /// Zero: expanding a `Distribution` into `.count`/`.sum`/`.q*` sub-paths reads the existing
-/// `DdSketch` in place (`expand_sketch`).
+/// `DdSketch` in place (`logit_proto::multi_value::expand_dotted`).
 #[test]
 fn graphite_encode_into_100_distribution_events_expanded() {
     let mut encoder =

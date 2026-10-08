@@ -10,19 +10,18 @@
 //!
 //! **Every per-record buffer is a struct field**, cleared and refilled rather than reallocated:
 //! the tag suffix, its arena and slot table, the sanitized path, the rendered line, the in-progress
-//! pickle frame, and the one-datapoint scratch, so a warm encode allocates nothing
-//! (`docs/design/memory.md` §3). The two exceptions are named at their call sites:
-//! `Samples::sketch()` builds a sketch per record (inherent, as at `influxdb_out`), and a
-//! `SetMembers` expansion needs a de-duplication buffer.
+//! pickle frame, the one-datapoint scratch, and the [`DottedScratch`] an expansion formats its
+//! suffixes into, so a warm encode allocates nothing (`docs/design/memory.md` §3). The two
+//! exceptions are [`expand_dotted`]'s: `Samples::sketch()` builds a sketch per record (inherent,
+//! as at `influxdb_out`), and a `SetMembers` expansion needs a de-duplication buffer.
 
 use super::pickle;
 use super::{MultiValue, Protocol, Tags};
-use crate::otlp::metrics::DISTRIBUTION_QUANTILES;
+use crate::multi_value::{expand_dotted, DottedScratch};
 use crate::{FramedEncoder, MessageBuf};
 use logit_core::interner::resolve;
 use logit_core::{
-    DdSketch, Diagnostics, Event, EventBatch, ExpHistogram, Histogram, MetricKind, MetricRecord,
-    Resource, Summary, Telemetry, Value,
+    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
 };
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -113,11 +112,8 @@ pub struct GraphiteEncoder {
     path: String,
     /// `path + sub-path suffix + tag suffix`: the series name on the wire.
     full_path: String,
-    /// The current sub-path suffix under [`MultiValue::Expand`] (`.count`, `.q0_99`, ...); empty
-    /// for a scalar record.
-    suffix: String,
-    /// One formatted number, before its `.` → `_` substitution.
-    number: String,
+    /// Where [`expand_dotted`] formats a quantile or bucket suffix under [`MultiValue::Expand`].
+    dotted: DottedScratch,
     /// One rendered plaintext line.
     line: String,
     /// The pickle frame being packed, **including** its 4-byte length prefix, patched in place
@@ -149,8 +145,7 @@ impl GraphiteEncoder {
             tag_value: String::new(),
             path: String::new(),
             full_path: String::new(),
-            suffix: String::new(),
-            number: String::new(),
+            dotted: DottedScratch::default(),
             line: String::new(),
             frame: Vec::new(),
             datapoint: Vec::new(),
@@ -228,8 +223,7 @@ impl FramedEncoder for GraphiteEncoder {
             tag_value,
             path,
             full_path,
-            suffix,
-            number,
+            dotted,
             line,
             frame,
             datapoint,
@@ -240,8 +234,6 @@ impl FramedEncoder for GraphiteEncoder {
             max_packet_bytes: *max_packet_bytes,
             max_frame_bytes: *max_frame_bytes,
             full_path,
-            suffix,
-            number,
             line,
             frame,
             datapoint,
@@ -284,6 +276,7 @@ impl FramedEncoder for GraphiteEncoder {
                     tags_sanitized,
                     path,
                     *multi_value,
+                    dotted,
                     &mut sink,
                     &mut ctx,
                 );
@@ -300,7 +293,7 @@ impl FramedEncoder for GraphiteEncoder {
 enum Plan {
     /// One datapoint carrying this value.
     Scalar(f64),
-    /// Several dotted sub-paths, which [`expand`] emits.
+    /// Several dotted sub-paths, which [`expand_dotted`] yields.
     Expand,
 }
 
@@ -312,6 +305,7 @@ fn encode_record(
     tags_sanitized: bool,
     path: &mut String,
     multi_value: MultiValue,
+    dotted: &mut DottedScratch,
     sink: &mut Sink,
     ctx: &mut Ctx,
 ) {
@@ -365,13 +359,13 @@ fn encode_record(
     }
 
     match plan {
-        Plan::Scalar(value) => {
-            sink.suffix.clear();
-            sink.emit(path, tag_suffix, value, seconds, ctx);
-        }
+        Plan::Scalar(value) => sink.emit(path, "", tag_suffix, value, seconds, ctx),
         Plan::Expand => {
             ctx.degrade_expanded(metric_kind_tag(&record.kind), name);
-            expand(&record.kind, path, tag_suffix, seconds, sink, ctx);
+            let expanded = expand_dotted(&record.kind, dotted, |suffix, value, _| {
+                sink.emit(path, suffix, tag_suffix, value, seconds, ctx)
+            });
+            debug_assert!(expanded, "only a multi-value kind plans an expansion");
         }
     }
 }
@@ -410,176 +404,6 @@ fn metric_kind_tag(kind: &MetricKind) -> &'static str {
     }
 }
 
-/// The [`MultiValue::Expand`] sub-path table from [`super`]'s module doc, in its order. Every arm
-/// adds at least one dotted suffix, so an expanded path can't collide with the record's scalar
-/// path.
-fn expand(
-    kind: &MetricKind,
-    path: &str,
-    tag_suffix: &str,
-    seconds: i64,
-    sink: &mut Sink,
-    ctx: &mut Ctx,
-) {
-    match kind {
-        // `sketch()` allocates a `DdSketch` per record, inherent to re-summarizing raw values
-        // (as at `influxdb_out`/`otlp_out`).
-        MetricKind::Samples(samples) => {
-            expand_sketch(&samples.sketch(), path, tag_suffix, seconds, sink, ctx)
-        }
-        MetricKind::Distribution(sketch) => {
-            expand_sketch(sketch, path, tag_suffix, seconds, sink, ctx)
-        }
-        MetricKind::Set(hll) => {
-            sub(sink, ctx, path, tag_suffix, seconds, ".count", hll.estimate() as f64)
-        }
-        MetricKind::SetMembers(members) => {
-            // One de-duplication buffer per record, bounded by its member count. A `SetMembers`
-            // here means no `aggregate` ran.
-            let mut distinct: Vec<&[u8]> = members.iter().map(|m| m.as_ref()).collect();
-            distinct.sort_unstable();
-            distinct.dedup();
-            sub(sink, ctx, path, tag_suffix, seconds, ".count", distinct.len() as f64);
-        }
-        MetricKind::Histogram(histogram) => {
-            expand_histogram(histogram, path, tag_suffix, seconds, sink, ctx)
-        }
-        MetricKind::ExponentialHistogram(histogram) => {
-            expand_exp_histogram(histogram, path, tag_suffix, seconds, sink, ctx)
-        }
-        MetricKind::Summary(summary) => {
-            expand_summary(summary, path, tag_suffix, seconds, sink, ctx)
-        }
-        MetricKind::Sum(_) | MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => {
-            unreachable!("a scalar kind never expands")
-        }
-    }
-}
-
-/// `.count`, `.sum`, then one `.q<q>` per [`DISTRIBUTION_QUANTILES`].
-///
-/// `.sum` is emitted because [`DdSketch::sum`] is **exact**, unlike a quantile. A quantile the
-/// sketch can't answer (an empty sketch) or that comes back non-finite is not emitted: the record
-/// is already counted degraded, and a fabricated `inf` is worse than a missing datapoint.
-fn expand_sketch(
-    sketch: &DdSketch,
-    path: &str,
-    tag_suffix: &str,
-    seconds: i64,
-    sink: &mut Sink,
-    ctx: &mut Ctx,
-) {
-    sub(sink, ctx, path, tag_suffix, seconds, ".count", sketch.count() as f64);
-    sub(sink, ctx, path, tag_suffix, seconds, ".sum", sketch.sum());
-    for q in DISTRIBUTION_QUANTILES {
-        let Some(v) = sketch.quantile(q).filter(|v| v.is_finite()) else { continue };
-        sink.suffix.clear();
-        sink.suffix.push_str(".q");
-        push_number_token(sink.suffix, sink.number, q);
-        sink.emit(path, tag_suffix, v, seconds, ctx);
-    }
-}
-
-/// `.count` (Σ bucket counts), `.sum`/`.min`/`.max` when present, then `.bucket_<bound>` per
-/// bucket, each carrying its **own** count, not a cumulative total (`logit_core::Histogram`).
-fn expand_histogram(
-    histogram: &Histogram,
-    path: &str,
-    tag_suffix: &str,
-    seconds: i64,
-    sink: &mut Sink,
-    ctx: &mut Ctx,
-) {
-    let count: u64 = histogram.buckets.iter().map(|(_, c)| *c).sum();
-    sub(sink, ctx, path, tag_suffix, seconds, ".count", count as f64);
-    optional(sink, ctx, path, tag_suffix, seconds, ".sum", histogram.sum);
-    optional(sink, ctx, path, tag_suffix, seconds, ".min", histogram.min);
-    optional(sink, ctx, path, tag_suffix, seconds, ".max", histogram.max);
-    for (bound, bucket_count) in &histogram.buckets {
-        sink.suffix.clear();
-        sink.suffix.push_str(".bucket_");
-        push_number_token(sink.suffix, sink.number, *bound);
-        sink.emit(path, tag_suffix, *bucket_count as f64, seconds, ctx);
-    }
-}
-
-/// `.count`, `.sum`/`.min`/`.max` when present, `.zero_count`, and **no buckets**.
-///
-/// Materializing the `(scale, offset, counts)` buckets as `.bucket_<b>` sub-paths would be the
-/// lossy conversion [`MetricKind::ExponentialHistogram`] exists to avoid, and would mint unbounded
-/// wire paths from one record.
-fn expand_exp_histogram(
-    histogram: &ExpHistogram,
-    path: &str,
-    tag_suffix: &str,
-    seconds: i64,
-    sink: &mut Sink,
-    ctx: &mut Ctx,
-) {
-    sub(sink, ctx, path, tag_suffix, seconds, ".count", histogram.count as f64);
-    optional(sink, ctx, path, tag_suffix, seconds, ".sum", histogram.sum);
-    optional(sink, ctx, path, tag_suffix, seconds, ".min", histogram.min);
-    optional(sink, ctx, path, tag_suffix, seconds, ".max", histogram.max);
-    sub(sink, ctx, path, tag_suffix, seconds, ".zero_count", histogram.zero_count as f64);
-}
-
-/// `.count`, `.sum`, then one `.q<q>` per quantile the summary carries, keyed on the raw quantile:
-/// rounding isn't collision-free (`0.991` and `0.994` would both become `p99`).
-fn expand_summary(
-    summary: &Summary,
-    path: &str,
-    tag_suffix: &str,
-    seconds: i64,
-    sink: &mut Sink,
-    ctx: &mut Ctx,
-) {
-    sub(sink, ctx, path, tag_suffix, seconds, ".count", summary.count as f64);
-    sub(sink, ctx, path, tag_suffix, seconds, ".sum", summary.sum);
-    for (q, v) in &summary.quantiles {
-        if !v.is_finite() {
-            continue;
-        }
-        sink.suffix.clear();
-        sink.suffix.push_str(".q");
-        push_number_token(sink.suffix, sink.number, *q);
-        sink.emit(path, tag_suffix, *v, seconds, ctx);
-    }
-}
-
-/// One sub-path with a literal suffix.
-fn sub(
-    sink: &mut Sink,
-    ctx: &mut Ctx,
-    path: &str,
-    tag_suffix: &str,
-    seconds: i64,
-    suffix: &str,
-    value: f64,
-) {
-    if !value.is_finite() {
-        return;
-    }
-    sink.suffix.clear();
-    sink.suffix.push_str(suffix);
-    sink.emit(path, tag_suffix, value, seconds, ctx);
-}
-
-/// [`sub`] for an `Option` field: absent means "not reported", which must not be written as zero.
-#[allow(clippy::too_many_arguments)]
-fn optional(
-    sink: &mut Sink,
-    ctx: &mut Ctx,
-    path: &str,
-    tag_suffix: &str,
-    seconds: i64,
-    suffix: &str,
-    value: Option<f64>,
-) {
-    if let Some(value) = value {
-        sub(sink, ctx, path, tag_suffix, seconds, suffix, value);
-    }
-}
-
 /// The wire-writing half: everything that knows about lines, frames, and size caps. Holds the
 /// reusable buffers by reference; `datapoints_in_frame` is the only state that outlives one
 /// datapoint.
@@ -588,8 +412,6 @@ struct Sink<'a> {
     max_packet_bytes: usize,
     max_frame_bytes: usize,
     full_path: &'a mut String,
-    suffix: &'a mut String,
-    number: &'a mut String,
     line: &'a mut String,
     frame: &'a mut Vec<u8>,
     datapoint: &'a mut Vec<u8>,
@@ -598,12 +420,20 @@ struct Sink<'a> {
 }
 
 impl Sink<'_> {
-    /// Writes one datapoint: `path` + the current [`Sink::suffix`] + `tag_suffix`, carrying
-    /// `value` at `seconds`.
-    fn emit(&mut self, path: &str, tag_suffix: &str, value: f64, seconds: i64, ctx: &mut Ctx) {
+    /// Writes one datapoint: `path` + `suffix` (a sub-path's, or empty for a scalar record) +
+    /// `tag_suffix`, carrying `value` at `seconds`.
+    fn emit(
+        &mut self,
+        path: &str,
+        suffix: &str,
+        tag_suffix: &str,
+        value: f64,
+        seconds: i64,
+        ctx: &mut Ctx,
+    ) {
         self.full_path.clear();
         self.full_path.push_str(path);
-        self.full_path.push_str(self.suffix.as_str());
+        self.full_path.push_str(suffix);
         self.full_path.push_str(tag_suffix);
 
         match self.protocol {
@@ -877,18 +707,6 @@ fn is_forbidden_in_tag_value(c: char) -> bool {
     c == ';' || c.is_whitespace() || c.is_control()
 }
 
-/// Appends `v` as a sub-path token: Rust's `{}` rendering with every `.` substituted by `_`.
-///
-/// **Injective**, so expanded sub-paths don't collide ([`super`]'s module doc): `0.5 → 0_5`,
-/// `5 → 5`, `0.05 → 0_05`, `-0.5 → -0_5`, `inf → inf`.
-fn push_number_token(out: &mut String, scratch: &mut String, v: f64) {
-    scratch.clear();
-    let _ = write!(scratch, "{v}");
-    for c in scratch.chars() {
-        out.push(if c == '.' { '_' } else { c });
-    }
-}
-
 // -- counters -------------------------------------------------------------------------------------
 
 /// The telemetry/diagnostics/stats triple every drop site needs, carried together so a drop is
@@ -1078,7 +896,8 @@ mod tests {
     use super::*;
     use logit_core::interner::intern;
     use logit_core::{
-        AttrMap, ExpHistogram, HyperLogLog, MetricList, Registry, Samples, Sum, Temporality,
+        AttrMap, DdSketch, ExpHistogram, Histogram, HyperLogLog, MetricList, Registry, Samples,
+        Sum, Summary, Temporality,
     };
     use std::sync::Arc;
 
