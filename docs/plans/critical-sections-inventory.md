@@ -5794,12 +5794,12 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 ### CODEC-06 — statsd/DogStatsD encoder — service-check status coercion and multi-value rendering
 - **Location:** `crates/logit-outputs/src/statsd.rs` (`render_service_check`, status coercion; `render_event`, event line rendering), module-wide `Samples`/`SetMembers` expansion (search `sketch()`/`raw`/`format: dogstatsd` in the same file)
 - **What it does:** The mirror of the statsd_in decoder — encodes `Event`/`MetricRecord`s back to statsd/DogStatsD wire lines, including `Sum`(delta,monotonic)/`Gauge`/`GaugeDelta`/`Samples`/`SetMembers`/events/service checks. `render_service_check` must produce a status in `0..=3`: it prefers an explicit `statsd.service_check.status` carrier if present and valid, else coerces the underlying Gauge's float value with `.round()` and a bounds check (`is_finite() && (0.0..=3.0).contains(&rounded)`) before the `rounded as u64` cast, dropping and counting otherwise.
-- **Why sensitive:** custom, lossless-roundtrip (ADR `statsd-output.md`'s round-trip claim: `statsd_in -> statsd_out` must be byte-identical modulo named normalizations), hot-path, data-loss (post-sketch kinds `Distribution`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary` and cumulative/non-monotonic `Sum` are deliberately dropped-and-counted per `docs/known-gaps/` — confirmed documented gap, not a surprise).
+- **Why sensitive:** custom, lossless-roundtrip (ADR `statsd-output.md`'s round-trip claim: `statsd_in -> statsd_out` must be byte-identical modulo named normalizations), hot-path, data-loss (post-sketch kinds `Distribution`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary` and cumulative/non-monotonic `Sum` expand into per-component lines under `multi_value: expand`, the default, and drop under `skip`, counted either way per `docs/known-gaps/` — a documented gap, not a surprise).
 - **Invariants to verify:**
   - the `rounded as u64` cast is only reached when `gauge_value.is_finite() && (0.0..=3.0).contains(&rounded)` — confirm this guard can't be bypassed by an intermediate NaN produced by `.round()` itself (NaN's `.round()` is NaN, which fails `is_finite()`, so this should hold, but worth an explicit test with `f64::NAN`/`f64::INFINITY`/`-0.0` as the carried gauge value)
   - a config-declared `statsd.service_check.status` carrier outside `0..=3` correctly falls through to the gauge-coercion path rather than being trusted (the `Some(s) if s <= 3 => s` arm)
   - the documented lossless round trip actually holds byte-for-byte for `format: dogstatsd` on timers/sets, and holds modulo the ADR's *named* normalizations only (multi-value line split, `h`/`d` -> `ms`) under `format: statsd`
-  - dropped post-sketch metric kinds are counted, not silently discarded (accounting invariant, per `docs/known-gaps/`)
+  - expanded or skipped post-sketch metric kinds are counted, not silently discarded (accounting invariant, per `docs/known-gaps/`)
 - **Observed concerns (unverified):** none spotted — the status-coercion guard reads correct by inspection.
 - **Existing coverage:** `crates/logit-outputs/src/statsd.rs`'s extensive `#[cfg(test)] mod tests` (module has 5223 lines total, the bulk apparently tests). ADR `statsd-output.md` claims and documents the round-trip guarantee and its exceptions explicitly; `docs/known-gaps/` names the dropped-kind list.
 - **Suggested verification approach:** targeted unit tests feeding `f64::NAN`, `f64::INFINITY`, `f64::NEG_INFINITY`, `-0.0`, and values just outside `[0,3]` (e.g. `3.4999999`, `-0.0000001`) as the service-check gauge value; a differential round-trip test against a real DogStatsD-speaking client/agent if not already covered by an interop fixture.
@@ -7756,7 +7756,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `statsd_dialect_splits_multi_value_samples_and_normalizes_h_and_d_to_ms` (multi-value samples per
   dialect), `an_oversize_event_line_is_dropped_via_the_existing_oversize_path`).
   Integration: `crates/logit-cli/tests/statsd_round_trip.rs`. ADRs: `statsd-output`,
-  `framed-encoder`, `lossless-transit`; [`docs/known-gaps/statsd.md`](../known-gaps/statsd.md) for the post-sketch-kind and
+  `framed-encoder`, `lossless-transit`; [`docs/known-gaps/statsd.md`](../known-gaps/statsd.md) for the post-sketch-kind expansion and
   unit/rename debt.
 - **Suggested verification approach:** Construct a realistic worst-case `Samples` record from a
   full-size `statsd_in` datagram and measure the rendered line against the default 1432 cap;

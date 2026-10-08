@@ -1,12 +1,15 @@
 ---
 created: 2026-09-10
-updated: 2026-09-30
+updated: 2026-10-07
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
 
 ## Status
-Accepted
+Accepted. Superseded in part on 2026-10-07 by [ADR
+`statsd-out-multi-value-expansion`](statsd-out-multi-value-expansion.md): "Metric-kind coverage"
+and the amendment's "What's still deferred". Summarized kinds leave as dotted counter and gauge
+lines by default instead of dropping.
 
 ## Context
 
@@ -87,6 +90,14 @@ question — emit one line per fixed quantile (losing the ability to compute an 
 downstream percentile)? Synthesize N samples at the sketch's own quantile boundaries (fabricating
 a population that never existed)? — and deserves its own ADR once there's a concrete consumer to
 design against, not a default picked in passing here.
+
+[Superseded in part on 2026-10-07 by [ADR
+`statsd-out-multi-value-expansion`](statsd-out-multi-value-expansion.md): the consumers are Etsy
+statsd and the Datadog Agent, which flush a timer as separate scalar metrics. `statsd_out` now
+writes each summarized kind as one dotted line per component under `multi_value: expand`, its
+default, and drops it, counted, only under `multi_value: skip`. Neither candidate above was
+chosen as written: there's no synthesized population, and the quantile lines sit beside `.count`
+and `.sum` counters.]
 
 ### Relative gauges: opt-in native encoding, off by default
 
@@ -331,6 +342,13 @@ the default-summarized case (`docs/known-gaps/statsd.md`). This is [ADR `lossles
 guessed at a sketch-to-lines mapping (still deserving its own design, per the original Decision
 section above, should a concrete consumer ever need one), and the kinds it can't encode are now
 exactly the kinds *only* an explicit `aggregate` choice, or a config limit, can produce.
+
+[Superseded in part on 2026-10-07 by [ADR
+`statsd-out-multi-value-expansion`](statsd-out-multi-value-expansion.md): these kinds no longer
+drop by default. They expand into per-component lines, counted
+`logit.output.metrics.degraded{metric_kind}`, and `EncodeStats::dropped_unsupported_kind` is gone.
+The raw shapes are still the only lossless path, and raw retention is now a choice for fidelity,
+not a requirement to keep timers and sets at all.]
 
 **A repeated tag key is a separate, model-level gap, not a `statsd_out` one.** `#team:a,team:b` is
 legal DogStatsD (a repeated tag key), but `AttrMap` is a map, not a multiset, so the second
@@ -764,3 +782,22 @@ most 65507, the largest UDP payload, and an IPv6 endpoint is sent to over an IPv
 ## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
 
 `Output::duplicate_safe()` is gone. The posture this ADR chose is unchanged: `statsd_out` is the one sink that defaults to `at_most_once`, and it now declares that through `Output::default_posture()` instead of a `false` from `duplicate_safe()`. Every other sink defaults to `at_least_once`. The reasoning above (a resent `hits:5|c` increments the counter a second time) is the reason for the exception. See [`delivery-semantics.md`](delivery-semantics.md) item 5.
+
+## Amendment: post-sketch kinds expand by default (2026-10-07)
+
+[ADR `statsd-out-multi-value-expansion`](statsd-out-multi-value-expansion.md) settles the mapping
+this ADR deferred. `statsd_out` takes `multi_value: skip | expand`, `expand` by default:
+
+- A `Distribution`, `Set`, `Histogram`, `ExponentialHistogram`, or `Summary` leaves as one line
+  per component, named with the dotted suffixes in `logit_proto::multi_value`'s module doc.
+- A count, sum, bucket, or zero count of a per-window kind is `|c`; every other component is
+  `|g`, through this ADR's negative-gauge pair.
+- A cumulative `Sum` is one bare gauge, and a non-monotonic delta `Sum` one bare counter.
+- Each expanded record counts `logit.output.metrics.degraded{metric_kind}`, and `skip` counts
+  `logit.output.metrics.skipped{metric_kind}`. `messages.dropped{reason="unsupported_kind"}` is
+  removed.
+
+`Samples` and `SetMembers` keep their native lines under both settings, so the raw relay this
+ADR's first amendment describes is unchanged and stays the only lossless one.
+`crates/logit-outputs/src/statsd.rs`'s module doc, "Multi-value kinds: `multi_value`", is the
+canonical copy of the type-letter table.

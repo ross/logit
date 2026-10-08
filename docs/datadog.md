@@ -87,7 +87,10 @@ A local Agent gives you:
 - its own retry and buffering;
 - Unix-socket locality for DogStatsD and APM;
 - Agent-side aggregation of `h` and `ms` into `.avg`/`.count`/`.median`/`.95percentile`/`.max`,
-  and of `d` into sketches.
+  and of `d` into sketches. That needs the raw lines: with `aggregate`'s defaults, `statsd_out`
+  turns each timer into `.count`/`.sum`/`.q*` counter and gauge lines the Agent stores as they
+  are. Use `distributions: samples` and `sets: members`, or no `aggregate`, in front of a
+  `statsd_out` to an Agent.
 
 It costs you:
 

@@ -3,8 +3,10 @@
 //!
 //! [`expand_dotted`] walks a record's components in table order and hands each to the caller as a
 //! suffix, a value, and its [`Part`]; the caller owns the name, the tags, and the wire. Its
-//! consumer is `graphite_out` ([`crate::graphite`]). `splunk_hec_out` follows the OTel
-//! `splunk_hec` exporter's shape instead, which lives in `crate::splunk::metrics`, not here.
+//! consumers are `graphite_out` ([`crate::graphite`]) and `statsd_out`, which types each
+//! component `|c` or `|g` by its [`Part`] (`logit_outputs::statsd`'s module doc). `splunk_hec_out`
+//! follows the OTel `splunk_hec` exporter's shape instead, which lives in
+//! `crate::splunk::metrics`, not here.
 //!
 //! [`MultiValue`] is the switch a sink exposes for these kinds: `Skip` drops the record, `Expand`
 //! renders it through the sink's table.
@@ -49,11 +51,14 @@ use logit_core::{DdSketch, ExpHistogram, Histogram, MetricKind, Summary};
 use std::fmt::Write as _;
 
 /// What a sink does with a metric kind its one-number-per-point wire can't carry natively
-/// (`graphite_out`, `splunk_hec_out`). Each codec's module doc lists what `Expand` renders.
+/// (`graphite_out`, `splunk_hec_out`, `statsd_out`). Each codec's module doc lists what `Expand`
+/// renders.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum MultiValue {
     /// Drop the record, counted `logit.output.metrics.skipped{metric_kind=…}`. The default, since
-    /// an expansion's naming convention is one the receiver may know nothing about.
+    /// an expansion's naming convention is one the receiver may know nothing about. `statsd_out`
+    /// defaults to `Expand` instead, because a statsd server's own flush writes these dotted
+    /// names.
     #[default]
     Skip,
     /// Expand into the per-codec series its module doc lists, counted
