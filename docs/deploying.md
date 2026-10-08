@@ -1988,17 +1988,14 @@ Two real receivers, Etsy statsd and the Datadog Agent, were checked against a de
 distribution, sets, counters, and a `|T`-stamped line over two windows:
 
 - Etsy statsd 0.10.2 (`format: statsd`, console backend) flushed `req.latency.count` 3 and
-  `req.latency.sum` 60 as counters, `req.latency.q0_5` 19.93 through `q0_99` 29.83 and
-  `uniq.users.count` 2 as gauges, the negative timer's quantiles as `-4` after the `0|g` then
-  `-4|g` pair, and `statsd.bad_lines_seen` 0 in every flush, with its own `timers` and `sets`
-  tables empty.
+  `req.latency.sum` 60 as counters, `req.latency.min` 10, `req.latency.max` 30,
+  `req.latency.q0_5` 19.93 through `q0_99` 29.83, and `uniq.users.count` 2 as gauges, the
+  negative timer's minimum, maximum, and quantiles as `-4` after the `0|g` then `-4|g` pair, and
+  `statsd.bad_lines_seen` 0 in every flush, with its own `timers` and `sets` tables empty.
 - Datadog Agent 7.83.3 (`format: dogstatsd`) parsed every packet with zero errors and forwarded
-  `.count` and `.sum` as rates (`0.3` and `6` over its 10 s interval), the quantiles and
-  `uniq.users.count` as plain gauges with `env:dev` intact, the negative quantiles as `-4`, and
-  the `|T`-stamped counter at its wire timestamp.
-
-That check ran before a sketch expanded `.min` and `.max`. Both are ordinary gauges, written as
-the quantiles are, including the `0|g` then `-v|g` pair for a negative value.
+  `.count` and `.sum` as rates (`0.3` and `6` over its 10 s interval), `.min`, `.max`, the
+  quantiles, and `uniq.users.count` as plain gauges with `env:dev` intact, the negative minimum,
+  maximum, and quantiles as `-4`, and the `|T`-stamped counter at its wire timestamp.
 
 ## Tailing files and Docker logs
 
