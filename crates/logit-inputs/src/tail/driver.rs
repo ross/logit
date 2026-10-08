@@ -1415,9 +1415,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// At shutdown, emits every tracked file's held partial line and decoder state, so an
     /// unterminated last line isn't lost (with no checkpoint, nothing would re-read it). A decoder
     /// whose [`TailDecoder::hold_at_shutdown`] is set keeps its partial line unread, and, when a
-    /// checkpoint will replay them, its held lines too, but only while the file is `Active`; [`Tailer::write_checkpoint`] then leaves
-    /// the offset at their start. Unlike [`Tailer::reap_drained`], files stay tracked:
-    /// `write_checkpoint` runs next and needs their offsets.
+    /// checkpoint will replay them, its held lines too, but only while the file is `Active`;
+    /// [`Tailer::write_checkpoint`] then leaves the offset at their start. Unlike
+    /// [`Tailer::reap_drained`], files stay tracked: `write_checkpoint` runs next and needs their
+    /// offsets.
     async fn close_all_for_shutdown(&mut self, sink: &Fanout) {
         let ids: Vec<FileId> = self.files.keys().copied().collect();
         let replayed = self.checkpoint.is_some();
@@ -1469,10 +1470,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// without clearing it, which is why it's a position and not a byte count to subtract. A file
     /// mid-drop checkpoints at the dropped line's start ([`LineSplitter::pending_bytes`] for the
     /// splitter, `held_from` for the decoder), so a restart drops it whole again, at shutdown
-    /// too. A decoder that holds at shutdown ([`TailDecoder::hold_at_shutdown`]) leaves both
-    /// unemitted at a clean stop, so the same rule checkpoints at their start and the restart
-    /// re-reads them whole. Otherwise, at shutdown `close_all_for_shutdown` has already emitted
-    /// both, so the offset is the file's full `offset`.
+    /// too. An `Active` file whose decoder holds at shutdown ([`TailDecoder::hold_at_shutdown`])
+    /// leaves both unemitted at a clean stop, so the same rule checkpoints at their start and the
+    /// restart re-reads them whole. Otherwise, at shutdown `close_all_for_shutdown` has already
+    /// emitted both, so the offset is the file's full `offset`.
     async fn write_checkpoint(&mut self, force: bool) {
         if self.untaken {
             return;

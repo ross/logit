@@ -591,8 +591,9 @@ one after the restart.
   `bad_line`.
 - Only an `Active` file holds. A `Draining` file (rotated away or removed) or a `Deselected` one
   still emits both at a clean stop, as `reap_drained` does when it reaps one: the restart never
-  re-reads its inode, so a held checkpoint offset would lose the fragments. It gains no more
-  bytes, so its tail is final.
+  re-reads its inode, so a held checkpoint offset would lose the fragments. A `Draining` file
+  gains no more bytes, so its tail is final. Nothing more is read from a `Deselected` file in this
+  run, so what it holds is all this run will emit.
 
 The cross-stream replay gap in `docs/known-gaps/tailing.md` ("`held_from` is the oldest held
 line across both streams") now applies at a clean stop as well as after a crash. The checkpoint
