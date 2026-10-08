@@ -333,9 +333,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
   read and the TLS accept; for `logit_in`, the TLS accept and the `Hello` read. Each phase gets its
   own `handshake_timeout`, back to back.
   - **Consequence:** the listener's shutdown takes up to `handshake_timeout` longer per remaining
-    phase (10s at the default under TLS). The task's `Fanout` clone holds downstream inboxes open
-    that long, so an `aggregate`'s close-time window can arrive after a sink's 5s grace and is
-    dropped, counted as `closed_consumer` or a shutdown drop.
+    phase (10s at the default: `logit_in` under TLS, or the TCP driver with both `proxy_protocol:`
+    and TLS). The task's `Fanout` clone holds downstream inboxes open that long, so an
+    `aggregate`'s close-time window can arrive after a sink's 5s grace and is dropped, counted as
+    `closed_consumer` or a shutdown drop.
   - **Revisit trigger:** race the signal in the prelude, as the HTTP listeners do
     ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)'s shutdown amendment,
     decision 6).

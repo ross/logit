@@ -81,7 +81,8 @@ error.
 
 - **SIGTERM or SIGINT starts a graceful drain**, not an immediate kill. Every listener's inbox
   closes as if the listener had finished on its own, which flushes any in-flight `aggregate` window
-  before exit. An orchestrator sending SIGTERM ahead of SIGKILL doesn't silently drop a window of
+  before exit (one exception: a TCP or `logit_in` connection still in its prelude at the signal;
+  see [Intake gaps](known-gaps/intake.md)). An orchestrator sending SIGTERM ahead of SIGKILL doesn't silently drop a window of
   metrics.
 - **SIGTERM closes every HTTP listener's connections.** `otlp_in`, `datadog_in`,
   `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver stop accepting
