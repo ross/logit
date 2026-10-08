@@ -39,7 +39,7 @@ LEDGER_KEYS = {
 THRESHOLD_KEYS = {"progress_window", "rss_growth_mib_per_hour", "fd_growth"}
 EXPECT_KEYS = {"name", "service", "metric", "component", "attrs", "step", "window", "reduce",
                "min", "max"}
-EXPECT_WINDOWS = ("during", "after")
+EXPECT_WINDOWS = ("during", "after", "through")
 # Each reducer reads one metric kind: a counter (`sum`, a delta per drain) or a gauge.
 EXPECT_REDUCERS = {"delta": "sum", "min_delta": "sum", "max": "gauge", "min": "gauge",
                    "last": "gauge"}
@@ -325,7 +325,10 @@ def from_dict(raw, path):
         if "component" in raw_one:
             if "component" in attrs:
                 problems.append(f"{where}: `component` is set both alone and in `attrs`")
-            attrs["component"] = raw_one["component"]
+            elif not isinstance(raw_one["component"], str):
+                problems.append(f"{where}: `component` must be a string")
+            else:
+                attrs["component"] = raw_one["component"]
         expectations.append(Expectation(
             index=index, name=raw_one.get("name", ""), service=raw_one.get("service", ""),
             metric=raw_one.get("metric", ""), attrs=attrs, step=raw_one.get("step", ""),
@@ -442,7 +445,8 @@ def _expect_problems(scenario, duration):
             problems.append(f"{where}: `name` must be lowercase letters, digits, `_`, or `-`")
         elif exp.name in names:
             problems.append(f"{where}: `name` repeats another expectation's")
-        names.add(exp.name)
+        else:
+            names.add(exp.name)
         if exp.service not in LOGIT_SERVICES:
             problems.append(f"{where}: unknown service `{exp.service}`; telemetry comes from "
                             f"{' or '.join(LOGIT_SERVICES)}")
@@ -451,11 +455,11 @@ def _expect_problems(scenario, duration):
         if exp.window not in EXPECT_WINDOWS:
             problems.append(f"{where}: unknown window `{exp.window}`; one of "
                             f"{', '.join(EXPECT_WINDOWS)}")
-        kind = EXPECT_REDUCERS.get(exp.reduce)
+        kind = EXPECT_REDUCERS.get(exp.reduce) if isinstance(exp.reduce, str) else None
         if kind is None:
             problems.append(f"{where}: unknown reduce `{exp.reduce}`; one of "
                             f"{', '.join(EXPECT_REDUCERS)}")
-        elif METRIC_KINDS.get(exp.metric, kind) != kind:
+        elif isinstance(exp.metric, str) and METRIC_KINDS.get(exp.metric, kind) != kind:
             problems.append(f"{where}: reduce `{exp.reduce}` reads a {kind}, and {exp.metric} "
                             f"is a {METRIC_KINDS[exp.metric]}")
         bounds = [b for b in (exp.min, exp.max) if b is not None]

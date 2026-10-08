@@ -78,13 +78,26 @@ window = "during"
 reduce = "delta"
 min = 1
 
+# The chain stays blocked until the sink's next retry after the revert, up to its
+# `retry_max_delay` later, so a bound that must hold for the whole episode reads `through`.
 [[expect]]
 name = "no-kernel-drops"
 service = "logit"
 metric = "logit.input.kernel.drops"
 component = "statsd"
 step = "c0s1"
-window = "during"
+window = "through"
+reduce = "delta"
+max = 0
+
+# `block` at the sink holds every batch: none is dropped, whatever the outage's length.
+[[expect]]
+name = "sink-never-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "victoria_metrics"
+step = "c0s1"
+window = "through"
 reduce = "delta"
 max = 0
 

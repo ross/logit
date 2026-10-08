@@ -55,13 +55,15 @@ window = "during"
 reduce = "delta"
 min = 1
 
+# The chain stays blocked until the sink's next retry after the revert, up to its
+# `retry_max_delay` later, so a bound that must hold for the whole episode reads `through`.
 [[expect]]
 name = "block-never-evicts"
 service = "logit"
 metric = "logit.component.datagrams.dropped"
 component = "statsd"
 step = "c0s1"
-window = "during"
+window = "through"
 reduce = "delta"
 max = 0
 

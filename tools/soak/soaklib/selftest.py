@@ -11,11 +11,12 @@ and at a life start with none, and a two-life run whose final life balances and 
 life's residual reaches V, each rule broken in turn: shutdown drops on stderr, a counted and an
 uncounted egress gap, an earlier life's residual that never reaches V, an empty export, wire loss
 in and out of a fault window and at the end, the sink identity, and recovery, a two-batch sink
-queue holding one batch included. Empty SUT telemetry, and lives the timeline disagrees with,
+queue holding one batch and a one-batch queue it fills included. Empty SUT telemetry, and lives the timeline disagrees with,
 SKIP every ledger row. For `[[expect]]`, it covers every validation rule and each reducer
-against a synthetic run: the window's open start, a drain with no point, a gauge's value in force
-at the window's start, attribute filters, a step index across cycles, a step the schedule
-lacks, and a step whose apply failed.
+against a synthetic run: the window's open start, `through` reaching past the revert, a drain
+with no point, a gauge's value in force at the window's start and never across a SUT life,
+attribute filters, a step index across cycles, a step the schedule lacks, and a step whose apply
+failed.
 """
 
 import copy
@@ -139,6 +140,8 @@ def _expect_rules(root):
            "the resolved scenario carries its expectations")
     scenario.from_dict(with_expect(step=4, min=None, max=3), path)
     expect(True, "a step index and a lone max are accepted")
+    scenario.from_dict(with_expect(window="through"), path)
+    expect(True, "the through window is accepted")
 
     cases = [
         (dict(windw="during"), "unknown key `windw`", "an unknown expect key"),
@@ -165,6 +168,10 @@ def _expect_rules(root):
         (dict(attrs={"component": "x"}), "set both alone and in `attrs`",
          "component set twice"),
         (dict(attrs={"count": 2}), "`attrs` must be a table of strings", "a non-string attr"),
+        (dict(component=5), "`component` must be a string", "a non-string component"),
+        (dict(name=["a"]), "`name` must be lowercase", "a list-valued name"),
+        (dict(reduce=["max"]), "unknown reduce", "a list-valued reduce"),
+        (dict(metric=["x"]), "`metric` must name a metric", "a list-valued metric"),
     ]
     for changes, needle, what in cases:
         _refused(path, with_expect(**changes), needle, what)
@@ -724,6 +731,9 @@ def _ledger_checks():
         small = results("recovery-small-queue", buffer_batches=1, buffer_util=0.5)
         expect(small["recovery"].status == checks.PASS,
                f"recovery PASSes a small queue holding one batch, got {small['recovery']}")
+        full = results("recovery-full-queue", buffer_batches=1, buffer_util=1.0)
+        expect(full["recovery"].status == checks.FAIL,
+               f"recovery FAILs a one-batch queue that one batch fills, got {full['recovery']}")
         backed_up = results("recovery-backed-up", buffer_batches=2, buffer_util=0.5)
         expect(backed_up["recovery"].status == checks.FAIL,
                f"recovery FAILs a queue holding two batches over 5% full, got "
@@ -749,6 +759,7 @@ def _expect_run(tmp, name, expectations, apply_rc=0, second_cycle=False):
       `reason=overflow_oldest`, and 7 at +140 under `reason=shutdown`.
     - `logit.component.buffer.batches{component=sink}`: set to 5 at +50, 2 at +120, 0 at +200,
       and 3 at +330. Nothing else sets it, as a gauge only drains after it's set.
+    - `logit.input.kernel.drops{component=in}`: 5 at +200, after the revert.
     - `logit.component.inbox.full{component=window}` exported as a gauge, a kind mismatch."""
     stdout = []
     for offset in range(5, 451, 5):
@@ -766,6 +777,8 @@ def _expect_run(tmp, name, expectations, apply_rc=0, second_cycle=False):
             value = {50: 5, 120: 2, 200: 0, 330: 3}[offset]
             stdout.append(_line(stamp, "logit.component.buffer.batches", "gauge", value,
                                 component="sink"))
+        if offset == 200:
+            stdout.append(_line(stamp, "logit.input.kernel.drops", "sum", 5, component="in"))
         stdout.append(_line(stamp, "logit.component.inbox.full", "gauge", 1, component="window"))
     timeline = [_phase("start", 0, t0=T0),
                 _action("apply", "c0s1", "stop", "victoria-metrics", 100, rc=apply_rc),
@@ -817,8 +830,13 @@ def _expect_checks():
             min=9000, max=9000)
         one("attrs filter on reason", checks.PASS, metric="logit.component.datagrams.dropped",
             attrs={"component": "in", "reason": "overflow_oldest"}, min=130, max=130)
-        one("a loss counter never emitted reads 0", checks.PASS,
+        one("a loss counter never emitted in the window reads 0", checks.PASS,
             metric="logit.input.kernel.drops", max=0)
+        # through is (+100, +235]: 27 drains, two missing.
+        one("through spans the fault and its recovery_bound", checks.PASS, window="through",
+            min=25000, max=25000)
+        one("through sees a counter that moves after the revert", checks.FAIL,
+            window="through", metric="logit.input.kernel.drops", max=0)
         one("a counter that should stay 0 FAILs when it moved", checks.FAIL,
             metric="logit.component.datagrams.dropped", max=0)
 
@@ -850,6 +868,32 @@ def _expect_checks():
                f"one row per expectation, got {result}")
 
 
+def _gauge_lives():
+    """A gauge a previous process set isn't in force in the next one. Life 0 drains every 5 s
+    from +5 to +100 and sets `retrying` to 1 at +100; life 1 starts at +130, drains from +135,
+    and sets it to 0 at +150."""
+    lines = []
+    for offset in list(range(5, 101, 5)) + list(range(135, 201, 5)):
+        stamp = _stamp(T0 + offset)
+        uptime = offset if offset <= 100 else offset - 130
+        lines.append(_line(stamp, "logit.process.uptime", "gauge", float(uptime)))
+        if offset in (100, 150):
+            lines.append(_line(stamp, "logit.component.retrying", "gauge",
+                               1 if offset == 100 else 0, component="sink"))
+    tel = telemetry.parse_ndjson(lines)
+    attrs = {"component": "sink"}
+    value, _ = checks.reduce_gauge(tel, "logit.component.retrying", attrs, T0 + 130, T0 + 175,
+                                   "max")
+    expect(value == 0, f"a window opening between lives ignores the earlier life's value, "
+                       f"got {value}")
+    value, _ = checks.reduce_gauge(tel, "logit.component.retrying", attrs, T0 + 137, T0 + 145,
+                                   "last")
+    expect(value is None, f"a gauge the covering life hasn't set yet is unset, got {value}")
+    value, _ = checks.reduce_gauge(tel, "logit.component.retrying", attrs, T0 + 100, T0 + 120,
+                                   "last")
+    expect(value == 1, f"the value in force inside one life still counts, got {value}")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -868,7 +912,7 @@ def run(root, quiet=False):
     _FAILURES.clear()
     _PASSED[0] = 0
     for part in (_durations, _rules, _expect_rules, _expand, _ndjson, _stderr, _slope, _checks,
-                 _vm_resets, _ledger_checks, _expect_checks, _shipped):
+                 _vm_resets, _ledger_checks, _expect_checks, _gauge_lives, _shipped):
         try:
             part(root) if part in (_rules, _expect_rules, _expand, _shipped) else part()
         except Exception as err:  # report the part that broke, then keep going

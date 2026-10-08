@@ -1,10 +1,11 @@
-# A UDP flood into `statsd_in` while VictoriaMetrics is stopped for 60 s, with the receive queue
-# and the sink buffer at their defaults: the listener's socket keeps being read, so the kernel
-# drops nothing while the sink is out. The schema is docs/plans/soak-harness.md's "The scenario
-# schema".
+# A UDP flood into `statsd_in` while VictoriaMetrics is stopped for 60 s, with a two-batch
+# blocking sink queue and a 500 ms aggregate window so the stop backs up to the listener, and
+# the receive queue at its defaults: the listener evicts and counts the oldest datagrams and
+# keeps reading its socket, so the kernel drops nothing. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
 
 name = "udp-flood-sink-stop"
-description = "a 20,000 lines/s statsd flood with a 60s VictoriaMetrics stop: the listener keeps reading, the kernel drops nothing"
+description = "a 20,000 lines/s statsd flood with a 60s VictoriaMetrics stop backing up to a default receive queue: the listener evicts and keeps reading, the kernel drops nothing"
 duration = "5m"           # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "60s"          # >= recovery_bound
@@ -35,6 +36,29 @@ action = "stop"
 on = "victoria-metrics"
 for = "60s"
 
+# The stop reaches the listener: `aggregate`'s inbox fills, and the receive queue evicts its
+# oldest datagrams and counts them.
+[[expect]]
+name = "aggregate-inbox-full"
+service = "logit"
+metric = "logit.component.inbox.full"
+component = "window"
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "listener-evicts"
+service = "logit"
+metric = "logit.component.datagrams.dropped"
+component = "statsd"
+attrs = { reason = "overflow_oldest" }
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1
+
 # Every drain during the stop reads datagrams, and the stop's total is at least 90% of 60 s at
 # the generator's rate.
 [[expect]]
@@ -57,13 +81,15 @@ window = "during"
 reduce = "delta"
 min = 1080000
 
+# The chain stays blocked until the sink's next retry after the revert, up to its
+# `retry_max_delay` later, so a bound that must hold for the whole episode reads `through`.
 [[expect]]
 name = "no-kernel-drops"
 service = "logit"
 metric = "logit.input.kernel.drops"
 component = "statsd"
 step = "c0s1"
-window = "during"
+window = "through"
 reduce = "delta"
 max = 0
 

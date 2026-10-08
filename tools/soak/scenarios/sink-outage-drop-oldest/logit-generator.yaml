@@ -1,5 +1,5 @@
-# The load source in `script/soak`'s statsd-vm scenario: 2,000 statsd counter lines a second over
-# UDP to the system under test, one line per datagram. Its `internal` telemetry goes to stdout as
+# The load source in `script/soak`'s sink-outage-drop-oldest scenario: 2,000 statsd counter lines a second
+# over UDP to the system under test, one line per datagram. Its `internal` telemetry goes to stdout as
 # NDJSON, so the harness reads what it sent.
 admin: { bind: 127.0.0.1:9600 }
 components:

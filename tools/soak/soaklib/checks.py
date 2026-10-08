@@ -1182,8 +1182,9 @@ def check_recovery(data):
                               ("receive.utilization", receive_util)):
             value = _step_value(series, end)
             # One batch in a small queue is a large share of it: a batch the sink holds
-            # while it sends is recovered at any `max_batches`.
-            if label == "buffer.utilization" and _step_value(buffer_batches, end) <= 1:
+            # while it sends is recovered at any `max_batches`, unless that batch fills it.
+            if (label == "buffer.utilization" and value < 1.0
+                    and _step_value(buffer_batches, end) <= 1):
                 continue
             if value >= RECOVERED_UTILIZATION:
                 problems.append(f"{label} {value:.3f}")
@@ -1247,10 +1248,14 @@ def check_recovery(data):
 
 def expect_window(data, fault, window):
     """`(start, end]` of an expectation's window around one fault occurrence: `during` is the
-    fault's span, apply start to revert finish; `after` is the `recovery_bound` after it. The
-    window is open at its start because a drain's deltas cover the interval before it."""
+    fault's span, apply start to revert finish; `after` is the `recovery_bound` after it; and
+    `through` is both, for a bound that must hold until the effect ends, since a blocked chain
+    stays blocked until the sink's next retry after the revert. The window is open at its start
+    because a drain's deltas cover the interval before it."""
     if window == "during":
         return fault.start, fault.end
+    if window == "through":
+        return fault.start, fault.end + data.recovery_bound
     return fault.end, fault.end + data.recovery_bound
 
 
@@ -1269,12 +1274,25 @@ def reduce_counter(tel, metric, attrs, start, end, reduce):
     return min(values), f"smallest of {len(drains)} drain(s)"
 
 
+def _life_at(tel, t):
+    """The process life whose drains cover `t`, or None when no running life does: before the
+    first drain, or after a life's last drain and before the next life starts."""
+    for life in range(len(tel.life_starts) - 1, -1, -1):
+        drains = tel.life_drains(life)
+        if drains and drains[0] <= t:
+            return life if t <= drains[-1] else None
+    return None
+
+
 def reduce_gauge(tel, metric, attrs, start, end, reduce):
-    """`(value, note)` for a gauge over (start, end]: the value in force at `start` (a gauge is
-    exported only in a drain after it was set) and every sample in the window. `last` is the
-    value in force at `end`. `value` is None when the gauge was never set by `end`."""
+    """`(value, note)` for a gauge over (start, end]: the value in force at `start` and every
+    sample in the window. The value in force comes from the life whose drains cover `start`
+    only (a gauge is exported only in a drain after it was set), so a gauge a previous process
+    set reads as unset in the next. `last` is the value in force at `end`. `value` is None when
+    the gauge was never set by `end`."""
     series = tel.gauge_series(metric, **attrs)
-    before = [v for ts, v, _ in series if ts <= start]
+    life = _life_at(tel, start)
+    before = [v for ts, v, point_life in series if ts <= start and point_life == life]
     inside = [v for ts, v, _ in series if start < ts <= end]
     values = before[-1:] + inside
     if not values:

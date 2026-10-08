@@ -1,11 +1,14 @@
-# A 90 s VictoriaMetrics outage against a four-batch sink queue under `overflow: drop_oldest`:
-# the sink evicts and counts its oldest batches while intake never stalls, and the queue drains
-# to empty once VictoriaMetrics is back. Under `temporality: cumulative` a later total supersedes
-# an evicted one, so the ledger's egress should still balance. The schema is
+# A 90 s VictoriaMetrics outage against a two-batch sink queue under `overflow: drop_oldest`:
+# the sink evicts and counts its oldest batches and keeps taking batches off its inbox, so
+# `aggregate` never blocks and intake never stalls, and the queue drains to empty once
+# VictoriaMetrics is back. The SUT's 500 ms aggregate window is what would fill the sink's
+# 64-batch inbox within the stop if the sink stopped taking batches. Under
+# `temporality: cumulative` a later total supersedes an evicted one, so the ledger's egress
+# should still balance. The schema is
 # docs/plans/soak-harness.md's "The scenario schema".
 
 name = "sink-outage-drop-oldest"
-description = "statsd-vm with a 4-batch drop_oldest sink queue: a 90s VictoriaMetrics stop evicts batches at the sink, never at intake"
+description = "statsd-vm with 500ms windows and a 2-batch drop_oldest sink queue: a 90s VictoriaMetrics stop evicts batches at the sink and never blocks aggregate or intake"
 duration = "5m30s"        # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "60s"          # >= recovery_bound
@@ -47,13 +50,24 @@ window = "during"
 reduce = "delta"
 min = 1
 
+# The sink keeps draining its inbox, so nothing upstream blocks at any point of the episode.
+[[expect]]
+name = "aggregate-never-blocks"
+service = "logit"
+metric = "logit.component.inbox.full"
+component = "window"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
 [[expect]]
 name = "listener-no-drops"
 service = "logit"
 metric = "logit.component.datagrams.dropped"
 component = "statsd"
 step = "c0s1"
-window = "during"
+window = "through"
 reduce = "delta"
 max = 0
 
@@ -63,7 +77,7 @@ service = "logit"
 metric = "logit.component.receive.utilization"
 component = "statsd"
 step = "c0s1"
-window = "during"
+window = "through"
 reduce = "max"
 max = 0.05
 
