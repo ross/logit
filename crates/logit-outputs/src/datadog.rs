@@ -98,6 +98,18 @@
 //! feed this sink directly: its spans are raw tracer output. Route them to `datadog_trace_out` and
 //! a real Agent, and OTel spans to `otlp_out`.
 //!
+//! **A metric over Datadog's tag limit.** A series, distribution point, or sketch whose `tags`
+//! list holds more than 100 strings is dropped by the intake, so this sink drops it first and
+//! counts `records.dropped{reason="too_many_tags"}`, one per record, with a throttled
+//! `too_many_tags` diagnostic naming the route and the first record's metric name. The count is
+//! the list the encoder writes (`logit_proto::datadog::series::metric_tag_count`): every rendered
+//! attribute, repeats included, and not the host, device, or other carriers, which go in fields of
+//! their own. A trial org stored 100 tags and dropped 101 on all three routes on 2026-10-08;
+//! `resources` didn't count. The series route names such a drop in its `202` body (below), but the
+//! distribution-points and sketches routes drop it silently, answering `202 {"status": "ok"}`, so
+//! only the sink can count it there. A record of a kind the route then skips anyway (a cumulative
+//! `Sum`, say) is counted here, not by the encoder.
+//!
 //! ## Size limits
 //!
 //! | Route | Entries per request | Uncompressed body | Body on the wire |
@@ -150,7 +162,18 @@
 //! request was accepted, and fails with the first rejection when every request was rejected.
 //!
 //! Datadog documents its intake statuses by HTTP code, the same on every route, with a free-text
-//! body; no documented body code changes a status's meaning, so the status decides. `Rejected`
+//! body; no documented body code changes a status's meaning, so the status decides the class.
+//! A series `2xx` body is read too, for what Datadog dropped from an accepted request: it's empty
+//! for a clean request, and otherwise a protobuf whose field 1, `repeated string errors`, holds one
+//! entry per series dropped ("Payload validation failed: series <metric> contains 1 data points
+//! too far in the future", "... too many tags in series <metric>: limit=100 tags=101"), recorded
+//! from a trial org on 2026-10-08. Each entry counts one record `records.rejected`, at most the
+//! request's entries, and comes out of `records`, with a throttled `series_rejected` diagnostic
+//! quoting the first entry. The verdict stays `Ok`: the rest of the request was stored, and a retry
+//! would resend it. The read stops at 4 MiB, and an entry past it isn't counted. The
+//! other routes' `2xx` bodies aren't read: distribution points and sketches answer
+//! `{"status": "ok"}` whatever they drop, and what the check and logs routes drop from a `202` is
+//! unmeasured (`docs/known-gaps/datadog.md`). `Rejected`
 //! counts the request's entries `records.dropped{reason="rejected"}` (`oversize` for a `413`) with
 //! a throttled `request_rejected` diagnostic; a `403` warns `api_key_rejected`, and any other
 //! `Refused` warns `request_refused`. Each quotes the first 256 bytes of the body, scrubbed of the
@@ -158,7 +181,7 @@
 //!
 //! | Response | Class | Why | Evidence |
 //! |---|---|---|---|
-//! | `2xx` (logs answer `202`) | `Ok` | accepted for processing | [send logs][logs-api] |
+//! | `2xx` (logs answer `202`) | `Ok` | accepted for processing; on the series route, each `errors` entry in the body counts one record `records.rejected` | [send logs][logs-api]; a trial org's series `202` bodies, 2026-10-08 |
 //! | `400` | `Rejected` | "Bad request (likely an issue in the payload formatting)": this body; the Agent drops it too | [send logs][logs-api], [Agent retry guide][agent-retry] |
 //! | `401` | `Refused` | "Unauthorized (likely a missing API Key)": the key rides on every request | [send logs][logs-api] |
 //! | `403` | `Refused` | "Permission issue (likely using an invalid API Key)", or a key sent to another `site`: one org-wide key on every route, so every request gets it; the Agent retries it after refreshing the key | [send logs][logs-api], the Agent's [`transaction.go`][agent-tx] |
@@ -208,35 +231,38 @@
 //! | `logit.output.requests{route, class}` | one per request; `class` is [`crate::http::status_class`]'s, or `network_error` |
 //! | `logit.output.request.duration{route}` | one timer per request |
 //! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; not for a refused connection |
-//! | `logit.output.records{route}` | entries in a request Datadog accepted |
-//! | `logit.output.records.dropped{route, reason}` | `stale`, `oversize`, `needs_agent_processing`, `not_datadog_origin`, `rejected`, as above |
+//! | `logit.output.records{route}` | entries in a request Datadog accepted, less those its series `202` body names |
+//! | `logit.output.records.rejected{route}` | series a `202` body names as dropped; the series route only |
+//! | `logit.output.records.dropped{route, reason}` | `stale`, `too_many_tags`, `oversize`, `needs_agent_processing`, `not_datadog_origin`, `rejected`, as above |
 //!
 //! Plus everything [`DatadogEncoder`] counts itself (`logit.output.metrics.skipped`, including
 //! `unsupported_kind`-style skips by `metric_kind`; `metrics.degraded`; `tags.dropped`;
 //! `spans.degraded`; `stats.*`), which this sink doesn't repeat.
 //!
 //! **Once per batch or per attempt** (ADR `sink-send-path-and-attempt-accounting`, decision 1).
-//! What the plan and the encoder decide counts once per batch: `stale`, `needs_agent_processing`,
-//! `not_datadog_origin`, an event too large to send alone, and the encoder's counters and
-//! diagnostics, through handles gated by the sink's `BatchAccounting`. The plan is unit 0 and each
-//! route its own unit, so a route an earlier attempt never reached counts on the attempt that
-//! first encodes it. The transport counters, a `413`'s `oversize`, and a rejected request's
-//! `rejected` count per attempt.
+//! What the plan and the encoder decide counts once per batch: `stale`, `too_many_tags`,
+//! `needs_agent_processing`, `not_datadog_origin`, an event too large to send alone, and the
+//! encoder's counters and diagnostics, through handles gated by the sink's `BatchAccounting`. The
+//! plan is unit 0 and each route its own unit, so a route an earlier attempt never reached counts
+//! on the attempt that first encodes it. The transport counters, `records.rejected`, a `413`'s
+//! `oversize`, and a rejected request's `rejected` count per attempt.
 
 use crate::accounting::BatchAccounting;
 use crate::http::classify_status;
 use crate::http::{
-    build_client, classify_reqwest_error, error_read_bytes, read_body_prefix, redacted_snippet,
-    split_encode, status_class, Caps, Encoded, Outcomes,
+    build_client, classify_reqwest_error, error_read_bytes, read_body_bytes, read_body_prefix,
+    read_varint, redacted_snippet, skip_field, split_encode, status_class, Caps, Encoded, Outcomes,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
 use anyhow::Context;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
-use logit_core::{redact, Diagnostics, EventBatch, MetricKind, Telemetry};
+use logit_core::interner::resolve;
+use logit_core::{redact, Diagnostics, EventBatch, MetricKind, Symbol, Telemetry};
 use logit_pipeline::{BatchContext, Fault, Output, SeqId};
 use logit_proto::datadog::events::EventFormat;
+use logit_proto::datadog::series::metric_tag_count;
 use logit_proto::datadog::{
     is_datadog_event, is_datadog_stats, is_service_check, trace_readiness, DatadogEncoder,
     TraceReadiness,
@@ -261,6 +287,7 @@ const REQUEST_DURATION: &str = "logit.output.request.duration";
 const REQUEST_BYTES: &str = "logit.output.request.bytes";
 const RECORDS: &str = "logit.output.records";
 const RECORDS_DROPPED: &str = "logit.output.records.dropped";
+const RECORDS_REJECTED: &str = "logit.output.records.rejected";
 
 const MINUTE: i64 = 60 * 1_000_000_000;
 /// Datadog's series window: a point more than 1h old or 10 min ahead is rejected.
@@ -270,6 +297,16 @@ const METRIC_MAX_AHEAD: i64 = 10 * MINUTE;
 const LOG_MAX_AGE: i64 = 18 * 60 * MINUTE;
 /// Service checks: 10 min.
 const CHECK_MAX_AGE: i64 = 10 * MINUTE;
+
+/// The most `tags` strings a series, distribution, or sketch may carry. Measured on a trial org on
+/// 2026-10-08: 100 tags were stored and 101 dropped, duplicates counted and `resources` not; the
+/// series route names the drop in its `202` body, and the other two drop it silently.
+const MAX_METRIC_TAGS: usize = 100;
+
+/// How much of a series `2xx` body to read for its `errors` (module doc's "Faults, retries, and
+/// duplicate safety"): one entry per dropped series, each about 100 bytes plus the metric name, for
+/// up to 10,000 series per request. Entries past it go uncounted.
+const SERIES_ERRORS_READ_BYTES: usize = 4 * 1024 * 1024;
 
 /// Whether request bodies are compressed. Mirrors `logit_config::DatadogCompression`, which
 /// `logit-cli::pipeline::build_spec` translates, since this crate doesn't depend on
@@ -486,21 +523,26 @@ fn now_nanos() -> i64 {
 /// Where the sink reads its send time: [`now_nanos`], or a test's scripted clock.
 type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
 
-/// [`plan`]'s result: each route's items, indexed by `Route as usize`, and what the stale filter
-/// and the trace readiness gate dropped, which the sink counts once per batch.
+/// [`plan`]'s result: each route's items, indexed by `Route as usize`, and what the stale filter,
+/// the tag limit, and the trace readiness gate dropped, which the sink counts once per batch.
 #[derive(Debug, Default)]
 struct Plan {
     routes: [Vec<Item>; 8],
     /// Records dropped `stale`, per route, indexed as `routes`.
     stale: [usize; 8],
+    /// Records dropped `too_many_tags`, per route, indexed as `routes`.
+    too_many_tags: [usize; 8],
+    /// Per route, the first such record's metric name and tag count, for the diagnostic.
+    too_many_tags_first: [Option<(Symbol, usize)>; 8],
     /// Spans the trace route drops, per [`TraceReadiness::drop_reason`].
     needs_agent_processing: usize,
     not_datadog_origin: usize,
 }
 
 /// Each route's items for `batch` (module doc's "Routes") at send time `now`, after the stale
-/// filter and the trace readiness gate. Counts nothing: [`DatadogOutput::count_plan_drops`] counts
-/// the drops, so the sink can skip them when a retry repeats the plan.
+/// filter, the tag limit, and the trace readiness gate. Counts nothing:
+/// [`DatadogOutput::count_plan_drops`] counts the drops, so the sink can skip them when a retry
+/// repeats the plan.
 fn plan(batch: &EventBatch, now: i64) -> Plan {
     let resource = &batch.resource;
     let readiness = if batch.events.iter().any(|e| e.span.is_some()) {
@@ -547,6 +589,8 @@ fn plan(batch: &EventBatch, now: i64) -> Plan {
         }
         let metric_stale =
             age > METRIC_MAX_AGE || event.timestamp.saturating_sub(now) > METRIC_MAX_AHEAD;
+        // Every metrics route writes the same `tags` list for each of the event's records.
+        let mut tag_count = None;
         for (route, n) in [
             (Route::Series, series),
             (Route::DistributionPoints, samples),
@@ -557,6 +601,21 @@ fn plan(batch: &EventBatch, now: i64) -> Plan {
             }
             if metric_stale {
                 stale[route as usize] += n;
+                continue;
+            }
+            let tags = *tag_count.get_or_insert_with(|| metric_tag_count(resource, event));
+            if tags > MAX_METRIC_TAGS {
+                plan.too_many_tags[route as usize] += n;
+                let first = &mut plan.too_many_tags_first[route as usize];
+                if first.is_none() {
+                    let record =
+                        event.metrics[usize::from(check)..].iter().find(|r| match r.kind {
+                            MetricKind::Samples(_) => route == Route::DistributionPoints,
+                            MetricKind::Distribution(_) => route == Route::Sketches,
+                            _ => route == Route::Series,
+                        });
+                    *first = record.map(|r| (r.name, tags));
+                }
             } else {
                 push(route, n);
             }
@@ -788,10 +847,23 @@ impl DatadogOutput {
         }
     }
 
-    /// Counts what [`plan`] dropped, per route and reason.
-    fn count_plan_drops(&self, plan: &Plan) {
+    /// Counts what [`plan`] dropped, per route and reason, and diagnoses the tag-limit drops.
+    fn count_plan_drops(&mut self, plan: &Plan) {
         for route in ROUTES {
             self.dropped(route, "stale", plan.stale[route as usize]);
+            let n = plan.too_many_tags[route as usize];
+            self.dropped(route, "too_many_tags", n);
+            if let Some((name, tags)) = plan.too_many_tags_first[route as usize] {
+                self.diag.warn_throttled(
+                    "too_many_tags",
+                    format_args!(
+                        "dropped {n} record(s) on the {} route over Datadog's limit of \
+                         {MAX_METRIC_TAGS} tags; the first, {}, carries {tags}",
+                        route.name(),
+                        resolve(name)
+                    ),
+                );
+            }
         }
         self.dropped(Route::Traces, "needs_agent_processing", plan.needs_agent_processing);
         self.dropped(Route::Traces, "not_datadog_origin", plan.not_datadog_origin);
@@ -903,7 +975,8 @@ impl DatadogOutput {
     /// `request.bytes` counts a request that may have left: any answer, and any error but a
     /// [`Fault::Clean`] one, which never connected. A rejection counts the request's entries
     /// dropped here, `oversize` for a `413` and `rejected` for any other 3xx or 4xx that
-    /// [`classify_status`] doesn't read as `Refused`.
+    /// [`classify_status`] doesn't read as `Refused`. A series `2xx` counts the entries its body
+    /// names `records.rejected` ([`series_errors`]).
     async fn post(&mut self, route: Route, encoded: Encoded, entries: usize) -> anyhow::Result<()> {
         let url = self.url(route);
         let tags = [("route", route.name())];
@@ -941,14 +1014,34 @@ impl DatadogOutput {
             1.0,
             &[("route", route.name()), ("class", status_class(status))],
         );
+        let key = self.api_key.to_str().unwrap_or_default();
         if status.is_success() {
-            self.telemetry.count(RECORDS, entries as f64, &tags);
+            let rejected = if route == Route::Series {
+                let body = read_body_bytes(response, SERIES_ERRORS_READ_BYTES).await;
+                let errors = series_errors(&body);
+                let rejected = errors.len().min(entries);
+                if let Some(first) = errors.first() {
+                    let first = redacted_snippet(&String::from_utf8_lossy(first), key);
+                    self.telemetry.count(RECORDS_REJECTED, rejected as f64, &tags);
+                    self.diag.warn_throttled(
+                        "series_rejected",
+                        format_args!(
+                            "{} accepted the request but dropped {rejected} of {entries} \
+                             series; the first: {first}",
+                            redact::url(&url)
+                        ),
+                    );
+                }
+                rejected
+            } else {
+                0
+            };
+            self.telemetry.count(RECORDS, (entries - rejected) as f64, &tags);
             return Ok(());
         }
         let url = redact::url(&url);
         // Bounded, and scrubbed of the key before it reaches a diagnostic or the error
         // ([`redacted_snippet`]).
-        let key = self.api_key.to_str().unwrap_or_default();
         let body = read_body_prefix(response, error_read_bytes(key)).await;
         let snippet = redacted_snippet(&body, key);
         let fault = match status.as_u16() {
@@ -1001,6 +1094,34 @@ impl DatadogOutput {
         .context(fault);
         Err(err)
     }
+}
+
+/// The `errors` of a series `2xx` body: protobuf field 1, `repeated string`, one entry per series
+/// the intake dropped. Not in the Agent's payload protos, so read by hand. An empty body is a clean
+/// request; anything that stops parsing ends the list there, so garbage counts nothing, and an
+/// entry the read limit cut short isn't counted.
+fn series_errors(body: &[u8]) -> Vec<&[u8]> {
+    let mut errors = Vec::new();
+    let mut pos = 0;
+    while pos < body.len() {
+        let Some(key) = read_varint(body, &mut pos) else { break };
+        let (field, wire_type) = (key >> 3, key & 0x7);
+        if (field, wire_type) != (1, 2) {
+            if skip_field(body, &mut pos, wire_type).is_none() {
+                break;
+            }
+            continue;
+        }
+        let Some(entry) = read_varint(body, &mut pos)
+            .and_then(|len| pos.checked_add(usize::try_from(len).ok()?))
+            .and_then(|end| body.get(pos..end).map(|entry| (entry, end)))
+        else {
+            break;
+        };
+        errors.push(entry.0);
+        pos = entry.1;
+    }
+    errors
 }
 
 #[async_trait::async_trait]
@@ -1388,6 +1509,71 @@ mod tests {
         }
     }
 
+    // ---- the tag limit -----------------------------------------------------------------------
+
+    /// A record named `name` of `kind` whose event carries `tags` distinct tags and a host, which
+    /// goes in a wire field of its own rather than `tags`.
+    fn tagged(name: &str, kind: MetricKind, tags: usize) -> Event {
+        let mut attrs = AttrMap::new();
+        attrs.insert(logit_proto::datadog::ATTR_HOST_NAME, Value::str("h"));
+        for i in 0..tags {
+            attrs.insert(format!("k{i}").as_str(), Value::str("v"));
+        }
+        Event::metric(NOW, attrs, MetricRecord::new(intern(name), kind))
+    }
+
+    /// On each metrics route, a record with 100 tags is sent and one with 101 isn't, counted
+    /// `too_many_tags` and diagnosed by its metric name, never a tag.
+    #[tokio::test]
+    async fn a_record_over_the_tag_limit_is_dropped_on_each_metrics_route() {
+        let mut s = DdSketch::new();
+        s.add(1.0);
+        let routes: [(&str, &str, MetricKind); 3] = [
+            ("series", "/api/v2/series", MetricKind::Gauge(1.0)),
+            (
+                "distribution_points",
+                "/api/v1/distribution_points",
+                MetricKind::Samples(Samples::new([1.0])),
+            ),
+            ("sketches", "/api/beta/sketches", MetricKind::Distribution(s)),
+        ];
+        for (route, path, kind) in routes {
+            let (addr, log) = accepting().await;
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("out", "datadog_out", "sink");
+            let mut out = sink(addr)
+                .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry);
+            let b = batch(vec![
+                tagged("keep", kind.clone(), MAX_METRIC_TAGS),
+                tagged("drop", kind.clone(), MAX_METRIC_TAGS + 1),
+                tagged("keep2", kind, 3),
+            ]);
+            out.send_at(&b, NOW).await.unwrap();
+
+            let captured = log.lock().unwrap().clone();
+            assert_eq!(paths(&log), [path], "{route}");
+            let body = captured[0].decoded();
+            let mut decoder = DatadogDecoder::new();
+            let sent = match route {
+                "series" => decoder.decode_series_v2_protobuf(&body, NOW),
+                "distribution_points" => decoder.decode_distribution_points(&body, NOW),
+                _ => decoder.decode_sketches(&body, NOW),
+            }
+            .unwrap();
+            let names: Vec<_> =
+                sent.events.iter().map(|e| resolve(e.metrics[0].name).to_string()).collect();
+            assert_eq!(names, ["keep", "keep2"], "{route}");
+
+            let points = registry.drain(0);
+            let tags = [("route", route), ("reason", "too_many_tags")];
+            assert_eq!(total(&points, RECORDS_DROPPED, &tags), 1.0, "{route}");
+            assert_eq!(total(&points, RECORDS, &[("route", route)]), 2.0, "{route}");
+            let diag = [("key", "too_many_tags")];
+            assert_eq!(total(&points, "logit.component.diagnostics", &diag), 1.0, "{route}");
+        }
+    }
+
     // ---- the readiness gate ------------------------------------------------------------------
 
     /// Only the Agent-processed chunk is sent; the raw tracer chunk and the OTel span are counted
@@ -1672,6 +1858,79 @@ mod tests {
         );
     }
 
+    // ---- a series 202's errors ---------------------------------------------------------------
+
+    /// A series `202` body naming two series over the tag limit, recorded from a Datadog trial org
+    /// on 2026-10-08 (`/api/v2/series` over protobuf, `Content-Type: application/x-protobuf`).
+    /// Field 1, length `0x6e`, twice; the metric names are the recording's own.
+    const SERIES_202_TWO_ERRORS: &[u8] = b"\
+        \x0a\x6ePayload validation failed: too many tags in series \
+        logit.w0202.1791476884.tags101_two.bad1: limit=100 tags=101\
+        \x0a\x6ePayload validation failed: too many tags in series \
+        logit.w0202.1791476884.tags101_two.bad2: limit=100 tags=102";
+
+    /// The same run's body for one series with points too far in the future.
+    const SERIES_202_FUTURE: &[u8] = b"\
+        \x0a\x6ePayload validation failed: series logit.w0202.1791476884.future15 contains 1 \
+        data points too far in the future";
+
+    /// `records` and `records.rejected` on the series route after sending `gauges` gauges against
+    /// an intake answering every series request `202` with `body`.
+    async fn series_202(gauges: usize, body: &'static [u8]) -> (f64, f64, Vec<Event>) {
+        let (addr, _log) = per_path_recorder(move |_, _| Reply::Answer(202, body.to_vec())).await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "datadog_out", "sink");
+        let mut out = sink(addr)
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry);
+        let b = batch((0..gauges).map(|_| gauge(NOW)).collect());
+        out.send_at(&b, NOW).await.expect("a 202 is accepted whatever its body names");
+        let points = registry.drain(0);
+        let tags = [("route", "series")];
+        (total(&points, RECORDS, &tags), total(&points, RECORDS_REJECTED, &tags), points)
+    }
+
+    /// Each entry of a series `202`'s `errors` is one series Datadog dropped: counted
+    /// `records.rejected` and taken out of `records`, with the first entry quoted once.
+    #[tokio::test]
+    async fn a_series_202_naming_dropped_series_counts_them_rejected() {
+        let (records, rejected, points) = series_202(3, SERIES_202_TWO_ERRORS).await;
+        assert_eq!((records, rejected), (1.0, 2.0));
+        let diag = [("key", "series_rejected")];
+        assert_eq!(total(&points, "logit.component.diagnostics", &diag), 1.0);
+
+        let (records, rejected, _) = series_202(3, SERIES_202_FUTURE).await;
+        assert_eq!((records, rejected), (2.0, 1.0));
+    }
+
+    /// An empty body is a clean request, and a body that isn't the `errors` message counts
+    /// nothing: every series counts as stored.
+    #[tokio::test]
+    async fn a_series_202_with_no_errors_counts_every_series() {
+        for body in [&b""[..], b"{\"status\":\"ok\"}", b"\xff\xff\xff", b"\x0a\x6ePayload"] {
+            let (records, rejected, points) = series_202(3, body).await;
+            assert_eq!((records, rejected), (3.0, 0.0), "{body:?}");
+            let diag = [("key", "series_rejected")];
+            assert_eq!(total(&points, "logit.component.diagnostics", &diag), 0.0, "{body:?}");
+        }
+    }
+
+    /// More entries than the request held series count no more than it held.
+    #[tokio::test]
+    async fn a_series_202_rejects_no_more_than_the_request_sent() {
+        let (records, rejected, _) = series_202(1, SERIES_202_TWO_ERRORS).await;
+        assert_eq!((records, rejected), (0.0, 1.0));
+    }
+
+    /// Unknown fields are skipped, so an entry after one still counts.
+    #[test]
+    fn series_errors_skips_unknown_fields() {
+        let mut body = vec![0x10, 0x05, 0x1a, 0x02, b'h', b'i', 0x25, 0, 0, 0, 0];
+        body.extend_from_slice(SERIES_202_FUTURE);
+        assert_eq!(series_errors(&body).len(), 1);
+        assert_eq!(series_errors(SERIES_202_TWO_ERRORS).len(), 2);
+    }
+
     // ---- the key -----------------------------------------------------------------------------
 
     /// Collects rendered `tracing` output.
@@ -1872,11 +2131,12 @@ mod tests {
         metric(ts, MetricKind::Distribution(s))
     }
 
-    /// Two of `plan`'s drops and a codec count on each of the series, sketches, and logs routes;
+    /// Three of `plan`'s drops and a codec count on each of the series, sketches, and logs routes;
     /// the sketches route sends nothing, so the batch is one series and one logs request.
     fn encode_side_batch() -> EventBatch {
         batch(vec![
             gauge(NOW),
+            tagged("wide", MetricKind::Gauge(1.0), MAX_METRIC_TAGS + 1),
             non_monotonic_delta(NOW),
             gauge(NOW - 2 * HOUR),
             oversized_sketch(NOW),
@@ -1885,8 +2145,10 @@ mod tests {
         ])
     }
 
-    const ENCODE_SIDE: [SumSeries<'static>; 6] = [
+    const ENCODE_SIDE: [SumSeries<'static>; 8] = [
         (RECORDS_DROPPED, &[("route", "series"), ("reason", "stale")]),
+        (RECORDS_DROPPED, &[("route", "series"), ("reason", "too_many_tags")]),
+        ("logit.component.diagnostics", &[("key", "too_many_tags")]),
         (RECORDS_DROPPED, &[("route", "traces"), ("reason", "not_datadog_origin")]),
         ("logit.output.metrics.skipped", &[("metric_kind", "non_monotonic_delta_sum")]),
         ("logit.output.metrics.skipped", &[("reason", "oversized_sketch")]),

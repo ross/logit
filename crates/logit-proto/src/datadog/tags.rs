@@ -96,6 +96,32 @@ fn render_one(key: &str, value: &Value, out: &mut Vec<String>, dropped: &mut Dro
     }
 }
 
+/// How many tags [`render_tags`] would write for the same pairs and `skip`, without formatting
+/// any of them.
+pub fn count_tags<'a>(
+    pairs: impl IntoIterator<Item = (Symbol, &'a Value)>,
+    skip: &[Symbol],
+) -> usize {
+    pairs
+        .into_iter()
+        .filter(|(key, _)| !skip.contains(key))
+        .map(|(_, value)| count_one(value))
+        .sum()
+}
+
+fn count_one(value: &Value) -> usize {
+    match value {
+        Value::Str(_)
+        | Value::Bool(true)
+        | Value::I64(_)
+        | Value::U64(_)
+        | Value::F64(_)
+        | Value::Timestamp(_) => 1,
+        Value::Array(items) => items.iter().map(count_one).sum(),
+        Value::Bool(false) | Value::Map(_) | Value::Bytes(_) | Value::Null => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +154,39 @@ mod tests {
         out.sort();
         assert_eq!(out, ["env:prod", "n:3", "team:a", "team:b", "urgent"]);
         assert_eq!(dropped, Dropped { unrepresentable: 1 });
+    }
+
+    /// `count_tags` agrees with `render_tags` on every `Value` variant, nested arrays and
+    /// duplicates included.
+    #[test]
+    fn counting_agrees_with_rendering() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("s", Value::str("x"));
+        attrs.insert("on", Value::Bool(true));
+        attrs.insert("off", Value::Bool(false));
+        attrs.insert("i", Value::I64(-1));
+        attrs.insert("u", Value::U64(1));
+        attrs.insert("f", Value::F64(1.5));
+        attrs.insert("t", Value::Timestamp(0));
+        attrs.insert("m", Value::Map(Box::new(AttrMap::new())));
+        attrs.insert("b", Value::Bytes(vec![1].into()));
+        attrs.insert("null", Value::Null);
+        attrs.insert(
+            "a",
+            Value::Array(vec![
+                Value::str("x"),
+                Value::str("x"),
+                Value::Bool(false),
+                Value::Null,
+                Value::Array(vec![Value::I64(1), Value::Bool(true)]),
+            ]),
+        );
+        attrs.insert("skipped", Value::str("x"));
+        let skip = [intern("skipped")];
+        let mut out = Vec::new();
+        render_tags(attrs.iter(), &skip, &mut out);
+        assert_eq!(count_tags(attrs.iter(), &skip), out.len());
+        assert_eq!(out.len(), 10);
     }
 
     #[test]
