@@ -399,7 +399,7 @@ never completes. A reviewer can answer each decision below yes or no.
    client sees a reset and resends a batch the pipeline already took. That is ordinary
    at-least-once ([ADR `delivery-semantics`](delivery-semantics.md)). This narrows, at shutdown,
    two earlier rules: the in-flight tracker's "kept until that request completes rather than
-   dropped out from under it" and the 2026-09-25 wait-out amendment's "`drive_with_idle`'s wait
+   dropped out from under it" and the 2026-09-25 wait-out amendment's "`drive_connection`'s wait
    for an in-flight request has no ceiling". Both protect a batch blocked in `Fanout::send`,
    and no handler is blocked there on the connection task, so an abort discards no batch. The code
    PRs record in the module doc of `crates/logit-inputs/src/http.rs` that a handler never awaits
