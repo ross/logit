@@ -27,12 +27,14 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit:** add a `cargo check --manifest-path fuzz/Cargo.toml` step to `script/check` if it
     works on the stable toolchain (`libfuzzer-sys` compiles on stable; only `cargo fuzz run`
     needs nightly), or else a build step in the nightly image, run by hand.
-- **`logit_in`'s and `internal`'s shutdown grace is fixed at 5s, not operator-tunable.** Graph
-  rule 17 rejects a `receive:` block on both, because neither is a datagram, stream, or tail
-  listener, so both always get `ReceiveConfig::default().shutdown_grace`. `LogitInput` uses it to
-  close idle connections cleanly, and `InternalInput` for its final drain of buffered
-  self-telemetry (`crates/logit-inputs/src/internal.rs`). It's a gap if a deployment needs a
-  different number; no `receive:`-shaped knob exists.
+- **`logit_in`'s, `internal`'s, and the five HTTP listeners' shutdown grace is fixed at 5s, not
+  operator-tunable.** Graph rule 17 rejects a `receive:` block on all seven (`otlp_in`,
+  `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver
+  are the five), because none is a datagram, stream, or tail listener, so each always gets
+  `ReceiveConfig::default().shutdown_grace`. `LogitInput` and the HTTP listeners use it to close
+  connections cleanly, and `InternalInput` for its final drain of buffered self-telemetry
+  (`crates/logit-inputs/src/internal.rs`). It's a gap if a deployment needs a different number;
+  no `receive:`-shaped knob exists.
 - **`otlp_in`'s TLS-arm `handshake_timeout` bounds the TLS accept and nothing after it.** `hyper`'s
   `hyper_util::server::conn::auto::Builder` reads the first bytes itself to tell HTTP/1.1 from an
   h2 preface, a read `crate::otlp` can't wrap without reimplementing that sniff. The plaintext arm

@@ -326,6 +326,16 @@ Entry format and the other areas: [the known-gaps index](README.md).
   the grace after it closes the connection. It ends when the send completes or the client goes
   away ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)'s 2026-09-25 amendments).
   Closing it would drop a batch that never reached the fanout.
+- **A connection in its prelude holds a TCP listener's shutdown for up to `handshake_timeout`.**
+  The shared TCP driver (`crates/logit-inputs/src/tcp.rs`, for `syslog_in`, `graphite_in`,
+  `statsd_in`, and `lines_in` over TCP) and `logit_in` don't race the shutdown signal while a
+  connection is in its prelude: the PROXY header read, the TLS accept, and the first-byte peek.
+  - **Consequence:** while such a connection exists at the signal, the listener's shutdown takes
+    up to `handshake_timeout` longer (5s by default, the length of the listener grace). Nothing is
+    lost, because the connection had delivered no data.
+  - **Revisit:** race the signal in the prelude, as the HTTP listeners do
+    ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)'s shutdown amendment,
+    decision 6).
 - **`proxy_protocol:` accepts a PROXY header from any peer.** A stream listener under
   `proxy_protocol: true` has no allowlist of trusted proxy addresses, so a client that reaches the
   port directly can write its own header and name any address as `client.address`

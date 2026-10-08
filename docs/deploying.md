@@ -83,6 +83,14 @@ error.
   closes as if the listener had finished on its own, which flushes any in-flight `aggregate` window
   before exit. An orchestrator sending SIGTERM ahead of SIGKILL doesn't silently drop a window of
   metrics.
+- **SIGTERM closes every HTTP listener's connections.** `otlp_in`, `datadog_in`,
+  `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver stop accepting
+  at the signal, close their idle keep-alive and gRPC connections at once, and serve out any
+  request in flight. An HTTP/2 connection gets a `GOAWAY`, so an OpenTelemetry SDK exporter
+  reconnects instead of reusing it. Two bounds cap the wait: each connection gets
+  `handshake_timeout` to finish (5s by default), and the listener as a whole gets a fixed 5s. A
+  request still in flight at that point is reset, and the client resends it, so a batch the
+  pipeline had already taken can arrive twice (at-least-once).
 - **A second signal during a stuck drain exits immediately** with status 130, so a restart policy
   waiting on the process can still kill it with the same signal. Only SIGTERM and SIGINT count; a
   SIGHUP never does.
@@ -436,8 +444,9 @@ What an operator sees in the graphs:
 - **A `prometheus_out` exposition answers from whichever process the scrape reaches**, so
   successive scrapes can alternate between them, and a counter can look reset.
 - **Long-lived connections stay with the old process** until its drain closes them: a `logit_out`
-  connection to `logit_in`, an OTLP/gRPC stream, or an HTTP keep-alive connection. The client's
-  reconnect lands on the new process, and a `logit_out` resends its in-flight frames, which the
+  connection to `logit_in`, an OTLP/gRPC stream, or an HTTP keep-alive connection. The drain
+  closes an HTTP or gRPC connection as soon as the delay ends and its request in flight, if any,
+  completes, within the 5s listener grace. The client's reconnect lands on the new process, and a `logit_out` resends its in-flight frames, which the
   new `logit_in` forwards again.
 
 ### TCP listeners and `tcp_migrate_req`
@@ -1115,7 +1124,9 @@ holds its connection-cap permit forever, and enough of them fill the listener's
 and to `prometheus_in` in remote-write receiver mode, which shares `otlp_in`'s HTTP idle machinery
 and has no `handshake_timeout`; see
 [Prometheus remote-write](#prometheus-remote-write-receiving-sending-and-picking-a-version). See
-[ADR `idle-connection-timeout`](adr/idle-connection-timeout.md) for the full design.
+[ADR `idle-connection-timeout`](adr/idle-connection-timeout.md) for the full design. On the HTTP
+listeners, the same close sequence runs for every connection when a shutdown signal arrives; see
+[Signal and restart behavior](#signal-and-restart-behavior).
 
 ```yaml
 components:
@@ -3705,7 +3716,7 @@ reconnecting doesn't show as `connection_error` on the far end.
 
 `docs/known-gaps/native-hop.md` tracks what's still open: `logit_in` acknowledges frames in the
 order they arrive, so a batch slow to forward holds up the ones behind it, and `logit_in`'s shutdown
-grace is fixed at 5s with no `receive:`-shaped knob to change it.
+grace, like the five HTTP listeners', is fixed at 5s with no `receive:`-shaped knob to change it.
 
 ## The nginx-side recipe
 
