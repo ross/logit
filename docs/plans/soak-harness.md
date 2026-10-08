@@ -452,6 +452,70 @@ across runs:
 - Shutdown drops come from stderr, because they land after `internal`'s final drain.
 - The self-test doesn't run in CI.
 
+### W1a: the first `statsd-vm` run (2026-10-08)
+
+Run `20261008T194345Z`: `script/soak run statsd-vm` at the scenario's 15 minutes, from `soak/w0`
+at `c4464f27` with the W1a files uncommitted. Images: `logit:soak` built from that tree
+(`sha256:78a95c90bb4a`), `logit-soak-netem:local`, and
+`victoriametrics/victoria-metrics:v1.152.0`. Host: Fedora, Linux 7.1.13, 32 CPUs, 128 GiB,
+Docker 29.7.2, Python 3.14.7, `net.core.rmem_max` 4194304. The table below is from re-scoring
+the run directory with `check` after one wording change to the `ready` detail:
+
+| Check | Status | Detail |
+|---|---|---|
+| `exit` | PASS | 3 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 2 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 5 sink fault line(s) inside fault windows, 0 outside, 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 74 health sample(s) healthy outside fault windows; 2 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 5 30s window(s) with deliveries outside fault windows; 6 freshness sample(s) under 30s |
+| `rss_slope` | PASS | MiB/h per service/life: logit/1 +6.1, generator/0 +2.3 (limit 64) |
+| `fd_slope` | PASS | warmup median -> end: logit 12->12, generator 11->12 (limit +8) |
+| `ledger.wire` | SKIP | W1b: not built yet |
+| `ledger.intake` | SKIP | W1b: not built yet |
+| `ledger.edge` | SKIP | W1b: not built yet |
+| `ledger.aggregate` | SKIP | W1b: not built yet |
+| `ledger.egress` | SKIP | W1b: not built yet |
+| `identity.sink` | SKIP | W1b: not built yet |
+| `recovery` | SKIP | W1b: not built yet |
+
+What the timeline did:
+
+- All seven faults and their reverts ran within 0.3 s of their planned offsets, each with
+  `rc == 0`. Each netem `show` matched its step (`limit 100000 delay 200ms 50ms`, `loss 30%`,
+  `loss 10%`), and each clear left `noqueue`. The partition recorded and restored the aliases
+  `logit` and `soak-statsd-vm-logit-1`.
+- After the unpause and after the start, `logit ready` answered on the first probe (0.1 s).
+- The SUT's 200 ms delay and 30% loss on its remote-write logged no `retrying` line: TCP
+  retransmission absorbed both. The five sink fault lines were the SUT's `retrying` during the
+  VictoriaMetrics stop (first failure, then the once-a-minute repeat), its `retrying` with an
+  `ambiguous` timeout during the partition, and the generator's `retrying` while the SUT was
+  stopped and while it was partitioned (`logit:8125` doesn't resolve then). The SUT logged
+  `recovered` after each.
+- The end sequence's quiet wait held after 20 s, the SUT stopped with exit code 0, and the export
+  held 100 series with one reset each, from the SUT's restart. Summed reset-aware, they total
+  1,722,774 increments (W1b's ledger compares that against what the generator sent).
+
+What was surprising, and how the driver changed for it:
+
+- `aggregate` stops writing a series once it's idle; `series_retention` keeps the series' state,
+  not its output. So once the generator stops, no newer samples arrive to mark aggregate windows.
+  The quiet wait holds the total for two windows measured from the stored samples' spacing
+  (10 s here) instead of waiting for two newer sample timestamps, which a 5-minute smoke run
+  showed never arrive.
+- Fault windows plus `recovery_bound` cover most of the 11-minute cycle, so steady state is
+  thin: `progress` judged five 30-second windows, and `rss_slope` judged the SUT only over its
+  second life's last 130 s (27 samples). Its first life had three steady-state samples, too few
+  to judge.
+- A run shorter than warmup, one cycle, and cooldown keeps only the steps that end before
+  cooldown starts: the 5-minute smoke run (`20261008T192852Z`) ran the first netem step only,
+  and a 4-minute run runs none.
+
+A negative control, run `20261008T194140Z` (4 minutes, no faults): `docker kill -s KILL` of the
+SUT 72 s in ended the schedule at the next watchdog poll ("logit is exited (exit code 137) with
+no step behind it"), and `exit` FAILed ("logit exited at +72s with code 137, outside every
+scheduled stop"). `self_log` WARNed on the generator's `retrying` outside any fault window, and
+the script exited 1.
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
