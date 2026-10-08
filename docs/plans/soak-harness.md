@@ -335,9 +335,10 @@ from stderr: the listener's `warn` lines go into D, and the `drain complete` lin
 - An earlier SUT life ends under load, at a scheduled `stop` or `restart`. Its hops are compared
   at its last drain and reported, and judged only through `ledger.egress` and the life's sum
   W − D − B − Ab, which must lie between 0 and the residual R that can be in flight at the
-  signal: the receive queue (`receive.max_datagrams`), one accumulator batch
-  (`receive.batch_max_events`), and `aggregate`'s inbox (64 batches of at most
-  `receive.batch_max_events` each).
+  signal: the receive queue (`receive.max_datagrams`) plus 67 batches of at most
+  `receive.batch_max_events` each: the accumulator, the batch the listener holds while its send
+  waits for a slot on a full inbox, `aggregate`'s 64-slot inbox, and the batch `aggregate` has
+  taken off that inbox but not yet absorbed.
 
 The rows:
 
@@ -501,11 +502,12 @@ across runs:
 - **W1b**:
   - The self-test fixtures pass, and a 15-minute run's `results.md` has every ledger row.
   - Two negative controls, each run once and documented in the PR body:
-    - A final total lost at shutdown: the SUT sink set to `buffer: {shutdown_grace: 1s}`, and
-      VictoriaMetrics stopped by hand during the cooldown and started again after the SUT stops.
-      The batches holding the last window's totals drop at shutdown, `drain complete` reports
-      them, and `ledger.egress` reports a positive gap as counted while the summary row's other
-      terms stay 0.
+    - A final total lost at shutdown, as a control scenario the driver runs: a `stop` on
+      `victoria-metrics` spanning a scheduled `stop` on `logit`, with the SUT sink set to
+      `buffer: {shutdown_grace: 1s}`, so the driver owns the VictoriaMetrics start and the port
+      re-read. The batches holding that life's last totals drop at shutdown, `drain complete`
+      reports them, that life's `ledger.egress` reports a positive gap as counted, and its
+      W − D − B − Ab stays within [0, R].
     - A wrong `vm_selector` FAILs `ledger.egress` rather than passing with nothing to compare.
 - **W2 through W5**: each new scenario passes `self-test` validation and the shipped-config test,
   and a run of it is recorded under "Findings".
