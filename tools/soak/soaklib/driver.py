@@ -12,8 +12,11 @@ needs at the code:
   schedule at once (fail fast). The end sequence, collection, and scoring still run.
 - `docker exec` into a paused container blocks, so readiness is never probed while a step holds
   the container paused.
-- The `try`/`finally` around the run collects logs and tears the project down on every exit,
-  Ctrl-C included, unless `--keep`.
+- The `try`/`finally` around the run collects logs and tears the project down on every exit
+  but SIGKILL, unless `--keep`. SIGTERM and SIGHUP raise `KeyboardInterrupt` as SIGINT does;
+  Python's default for both ends the process without running `finally`.
+- After a SIGHUP the terminal can be gone, so output goes through `_print`, which drops it
+  rather than fail the run: the run directory holds everything.
 
 Every time in `timeline.jsonl`, `watchdog.jsonl`, `stats.ndjson`, and `vm-freshness.jsonl` is
 epoch seconds (`t`, `started_at`, `finished_at`), with `offset` measured from the timeline's zero:
@@ -21,7 +24,10 @@ the moment the stack was up and VictoriaMetrics answered `/health`.
 """
 
 import json
+import os
 import shutil
+import signal
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -48,6 +54,29 @@ class Abort(Exception):
 
 def _now():
     return time.time()
+
+
+def _print(text, stream=None):
+    stream = stream or sys.stdout
+    try:
+        print(text, file=stream, flush=True)
+    except OSError:
+        # Swap in /dev/null so the interpreter's flush at exit can't fail the exit code too.
+        devnull = open(os.devnull, "w")
+        if stream is sys.stdout:
+            sys.stdout = devnull
+        else:
+            sys.stderr = devnull
+
+
+def exit_code(results, ended=None):
+    """130 for an interrupted run, 1 for an aborted or errored one or any `FAIL` row, else 0.
+    `ended` is the phase the driver ended on: `interrupted`, `aborted`, `error`, or None."""
+    if ended == "interrupted":
+        return 130
+    if ended in ("aborted", "error"):
+        return 1
+    return 1 if any(result.status == checks.FAIL for result in results) else 0
 
 
 class Run:
@@ -100,7 +129,7 @@ class Run:
 
     def say(self, text):
         offset = "" if self.t0 is None else f"[{scenario_mod.format_duration(_now() - self.t0)}] "
-        print(f"soak: {offset}{text}", flush=True)
+        _print(f"soak: {offset}{text}")
 
     def offset(self, t):
         return None if self.t0 is None else round(t - self.t0, 3)
@@ -116,39 +145,42 @@ class Run:
     def execute(self):
         """Runs everything after `prepare()`. Returns the process exit code."""
         if self.docker.project_containers():
-            print(f"soak: compose project '{self.project}' already has containers on this "
-                  "daemon.\n  Not this run's to stop. If it is yours, run:\n"
-                  f"  {' '.join(self.docker.prefix)} compose -p {self.project} "
-                  f"-f {self.docker.compose_file} down -v", flush=True)
+            _print(f"soak: compose project '{self.project}' already has containers on this "
+                   "daemon.\n  Not this run's to stop. If it is yours, run:\n"
+                   f"  {' '.join(self.docker.prefix)} compose -p {self.project} "
+                   f"-f {self.docker.compose_file} down -v")
             return 1
         collect.provenance(self.run_dir, self.root.parent.parent, self.docker,
                            [self.image, NETEM_IMAGE, VM_IMAGE], self.scenario.name,
                            self.duration, self.seed, self.argv)
         self.say(f"run directory {self.run_dir}")
-        interrupted = False
+        ended = None
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, signal.default_int_handler)
         try:
             self.up()
             self.loop()
             self.end_sequence()
         except KeyboardInterrupt:
-            interrupted = True
+            ended = "interrupted"
             self.phase("interrupted")
             self.say("interrupted; collecting and tearing down")
         except Abort as err:
+            ended = "aborted"
             self.phase("aborted", reason=str(err))
             self.say(f"aborted: {err}")
         except Exception:
+            ended = "error"
             self.phase("error", traceback=traceback.format_exc())
             self.say("driver error; collecting and tearing down")
-            traceback.print_exc()
+            _print(traceback.format_exc(), sys.stderr)
         finally:
             self.teardown()
         results = checks.run_all(self.run_dir)
         report.write(self.run_dir, results)
-        print(report.markdown_table(results), flush=True)
+        _print(report.markdown_table(results))
         self.say(f"results in {self.run_dir}/results.md")
-        failed = any(result.status == "FAIL" for result in results)
-        return 130 if interrupted else (1 if failed else 0)
+        return exit_code(results, ended)
 
     def up(self):
         self.say(f"starting compose project {self.project}")
@@ -271,8 +303,10 @@ class Run:
             self.started_at[service] = (info.get("State") or {}).get("StartedAt")
             if service in scenario_mod.LOGIT_SERVICES:
                 self.pending_ready[service] = {"since": _now(), "step": step.id, "why": "start"}
-            if service == "victoria-metrics":
-                self.refresh_vm_base()
+        # Docker can publish a new host port on a start and on a network reconnect, so any
+        # revert re-reads it; the freshness poll would otherwise query a dead port.
+        if service == "victoria-metrics" and (restarted or kind == "revert"):
+            self.refresh_vm_base()
 
     def poll_ready(self):
         for service, pending in list(self.pending_ready.items()):

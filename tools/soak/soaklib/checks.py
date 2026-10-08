@@ -8,7 +8,7 @@ A "fault window" is a fault's span, from its apply starting to its revert finish
 scenario's `recovery_bound` after it. Checks that judge steady state skip fault windows, the
 warmup where the check says so, and everything from the end sequence on.
 
-The ledger, `identity.sink`, and `recovery` checks are W1b's; here they report `SKIP`.
+The ledger, `identity.sink`, and `recovery` checks aren't built yet and report `SKIP`.
 """
 
 import json
@@ -39,6 +39,11 @@ MIB = 1024 * 1024
 # A life's RSS slope is judged only over at least this many samples spanning this long.
 SLOPE_MIN_SAMPLES = 6
 SLOPE_MIN_SPAN_S = 60
+# `progress` and `rss_slope` WARN when what they judged spans less than this share of the run
+# after warmup, so a PASS resting on a few minutes of a fault-dense, hours-long run says so.
+COVERAGE_MIN_SHARE = 0.05
+# Phases that mean the driver didn't run the schedule to its end sequence.
+RUN_FAIL_PHASES = ("aborted", "error", "interrupted")
 
 
 @dataclass
@@ -130,6 +135,8 @@ class RunData:
         last = max((r.get("t") or r.get("finished_at") or 0 for r in self.timeline), default=0)
         self.end = phases.get("end_begin", phases.get("fail_fast", {})).get("t") or last
 
+        # A fault whose apply returned nonzero gets no window, so nothing after it is excused;
+        # `timeline` FAILs the action itself.
         self.faults = []
         applies = {}
         for record in self.timeline:
@@ -137,9 +144,11 @@ class RunData:
                 applies[record["step"]] = record
             elif record.get("event") == "revert" and record["step"] in applies:
                 apply = applies.pop(record["step"])
-                self.faults.append(self._fault(apply, record["finished_at"]))
+                if not apply.get("rc"):
+                    self.faults.append(self._fault(apply, record["finished_at"]))
         for apply in applies.values():
-            self.faults.append(self._fault(apply, self.end))
+            if not apply.get("rc"):
+                self.faults.append(self._fault(apply, self.end))
 
         self.telemetry = {}
         self.stderr = {}
@@ -176,6 +185,29 @@ class RunData:
         return [(f.start, f.end + extra) for f in self.faults
                 if (on is None or f.on == on) and (actions is None or f.action in actions)]
 
+    def post_warmup_s(self):
+        """Seconds from the end of warmup to the end sequence, or 0 with no timeline start."""
+        if self.t0 is None:
+            return 0.0
+        return max(0.0, self.end - (self.t0 + self.warmup))
+
+    def coverage(self, judged_s):
+        """(share, text) for `judged_s` seconds of the run after warmup; share is None when the
+        run has no time after warmup."""
+        post = self.post_warmup_s()
+        if post <= 0:
+            return None, f"{judged_s:.0f}s judged, no time after warmup"
+        share = judged_s / post
+        return share, (f"{judged_s:.0f}s of {post:.0f}s after warmup judged ({share:.0%}; WARN "
+                       f"under {COVERAGE_MIN_SHARE:.0%})")
+
+    def steady_span(self, points):
+        """Seconds between consecutive [(ts, value)] points with no fault window between them:
+        a life's samples can sit on both sides of a fault that took most of the run."""
+        windows = self.windows()
+        return sum(b - a for (a, _), (b, _) in zip(points, points[1:])
+                   if not any(start < b and end > a for start, end in windows))
+
     def in_window(self, t, windows):
         return any(start <= t <= end for start, end in windows)
 
@@ -208,6 +240,63 @@ class RunData:
 # ---- the watchdog --------------------------------------------------------------------------------
 
 
+def check_run(data):
+    """FAILs a run the driver didn't take from `start` through `end_end`: aborted, errored,
+    interrupted, or missing either phase. The driver still exits 130 when interrupted."""
+    lines = []
+    for name in RUN_FAIL_PHASES:
+        record = data.phases.get(name)
+        if record is None:
+            continue
+        reason = record.get("reason") or ""
+        if name == "error":
+            reason = (record.get("traceback") or "").strip().splitlines()[-1:] or [""]
+            reason = reason[0]
+        lines.append(f"{name} at {data.offset(record.get('t'))}" + (f": {reason[:300]}"
+                                                                     if reason else ""))
+    lines += [f"no {name} phase" for name in ("start", "end_end") if name not in data.phases]
+    if lines:
+        return Result("run", FAIL, "; ".join(lines), lines)
+    return Result("run", PASS, "ran from start through end_end")
+
+
+def check_timeline(data):
+    """FAILs when the schedule didn't run as written: an apply or revert that returned nonzero,
+    a fail-fast stop, or a start or unpause of a `logit` service with no `ready` record. An
+    early revert in the end sequence isn't probed, so it needs none."""
+    if data.t0 is None:
+        return Result("timeline", SKIP, "no timeline start")
+    lines = []
+    actions = [r for r in data.timeline if r.get("event") in ("apply", "revert")]
+    for record in actions:
+        if record.get("rc"):
+            lines.append(f"{record['event']} {record.get('step')} ({record.get('action')} on "
+                         f"{record.get('on')}) at {data.offset(record.get('started_at'))} "
+                         f"returned rc {record['rc']}: {(record.get('stderr') or '')[:160]}")
+    fail_fast = data.phases.get("fail_fast")
+    if fail_fast is not None:
+        lines.append(f"fail fast at {data.offset(fail_fast.get('t'))}: "
+                     f"{fail_fast.get('reason')}")
+    probed = {(r.get("on"), r.get("step")) for r in data.timeline if r.get("event") == "ready"}
+    starts = 0
+    for record in actions:
+        event, action = record["event"], record.get("action")
+        if not ((event == "revert" and action in ("stop", "pause"))
+                or (event == "apply" and action == "restart")):
+            continue
+        if record.get("on") not in LOGIT_SERVICES or record.get("early"):
+            continue
+        starts += 1
+        if (record["on"], record.get("step")) not in probed:
+            lines.append(f"{record['on']} {'unpaused' if action == 'pause' else 'started'} at "
+                         f"{data.offset(record.get('finished_at'))} ({record.get('step')}) "
+                         "with no readiness probe recorded")
+    if lines:
+        return Result("timeline", FAIL, lines[0], lines)
+    return Result("timeline", PASS, f"{len(actions)} apply/revert action(s) returned 0; "
+                  f"{starts} start(s) or unpause(s) each probed; no fail fast")
+
+
 def check_exit(data):
     if not data.inspect:
         return Result("exit", SKIP, "no inspect/ files")
@@ -217,7 +306,7 @@ def check_exit(data):
     for record in data.timeline:
         if record.get("event") in ("apply", "revert") and record.get("action") in ("stop",
                                                                                      "restart"):
-            if record["event"] == "apply":
+            if record["event"] == "apply" and not record.get("rc"):
                 stop_windows.setdefault(record["on"], []).append(
                     (record["started_at"] - 1, record["finished_at"] + 1))
     end_begin = data.phases.get("end_begin", {}).get("t")
@@ -385,10 +474,13 @@ def check_progress(data):
     status = PASS
     lines = []
     judged = 0
+    judged_after_warmup_s = 0.0
     for start, end in data.quiet_intervals(data.t0 + window):
         t = start
         while t + window <= end:
             judged += 1
+            if t >= data.t0 + data.warmup:
+                judged_after_warmup_s += window
             delivered = sut.counter_in("logit.component.batches.delivered", t, t + window,
                                        component=sink)
             if delivered <= 0:
@@ -423,8 +515,12 @@ def check_progress(data):
             status = FAIL
             lines.append(f"VictoriaMetrics freshness at {data.offset(t)}: "
                          f"{record.get('error') or f'newest sample {age}s old'}")
+    share, coverage = data.coverage(judged_after_warmup_s)
+    if share is not None and share < COVERAGE_MIN_SHARE:
+        status = worst([status, WARN])
+        lines.append(f"delivery windows cover little of the run: {coverage}")
     detail = (f"{judged} {window:.0f}s window(s) with deliveries outside fault windows; "
-              f"{fresh_judged} freshness sample(s) under {FRESHNESS_MAX_AGE_S}s")
+              f"{fresh_judged} freshness sample(s) under {FRESHNESS_MAX_AGE_S}s; {coverage}")
     return Result("progress", status, detail if status == PASS else lines[0], lines)
 
 
@@ -468,14 +564,17 @@ def check_rss_slope(data):
     status = PASS
     lines = []
     judged = []
+    coverage = []
     for service in LOGIT_SERVICES:
         by_life, source = _rss_points(data, service)
+        judged_s = 0.0
         for life, points in sorted(by_life.items()):
             span = points[-1][0] - points[0][0] if points else 0
             if len(points) < SLOPE_MIN_SAMPLES or span < SLOPE_MIN_SPAN_S:
                 lines.append(f"{service} life {life}: {len(points)} sample(s) over {span:.0f}s, "
                              "too few to judge")
                 continue
+            judged_s += data.steady_span(points)
             per_hour = slope(points) * SECONDS_PER_HOUR / MIB
             judged.append(f"{service}/{life} {per_hour:+.1f}")
             line = (f"{service} life {life}: {per_hour:+.1f} MiB/h over {len(points)} samples, "
@@ -483,9 +582,16 @@ def check_rss_slope(data):
             lines.append(line)
             if per_hour > limit:
                 status = worst([status, over])
+        if by_life:
+            share, text = data.coverage(judged_s)
+            coverage.append(f"{service} {text}")
+            if share is not None and share < COVERAGE_MIN_SHARE:
+                status = worst([status, WARN])
+                lines.append(f"{service}: slopes cover little of the run: {text}")
     if not judged:
         return Result("rss_slope", SKIP, "no life with enough steady-state samples", lines)
-    detail = f"MiB/h per service/life: {', '.join(judged)} (limit {limit:g})"
+    detail = (f"MiB/h per service/life: {', '.join(judged)} (limit {limit:g}); "
+              f"{'; '.join(coverage)}")
     return Result("rss_slope", status, detail, lines)
 
 
@@ -514,7 +620,7 @@ def check_fd_slope(data):
             lines.append(f"{service}: {end_value:g} fds at the end, {baseline:g} in the warmup")
         for fault in data.faults:
             after = fault.end + data.recovery_bound
-            sample = next((v for ts, v in series if ts >= after), None)
+            sample = next((v for ts, v in series if ts >= after and data.steady(ts)), None)
             if sample is not None and sample - baseline > growth:
                 status = FAIL
                 lines.append(f"{service}: {sample:g} fds {data.recovery_bound:.0f}s after "
@@ -526,28 +632,29 @@ def check_fd_slope(data):
     return Result("fd_slope", status, detail if status == PASS else lines[0], lines)
 
 
-# ---- W1b ----------------------------------------------------------------------------------------
+# ---- not built yet: each reports SKIP ------------------------------------------------------------
 
 
-def _w1b(check_id):
+def _unbuilt(check_id):
     def stub(data):
-        return Result(check_id, SKIP, "W1b: not built yet")
+        return Result(check_id, SKIP, "not built yet")
     stub.__name__ = f"check_{check_id.replace('.', '_')}"
     return stub
 
 
-check_ledger_wire = _w1b("ledger.wire")
-check_ledger_intake = _w1b("ledger.intake")
-check_ledger_edge = _w1b("ledger.edge")
-check_ledger_aggregate = _w1b("ledger.aggregate")
-check_ledger_egress = _w1b("ledger.egress")
-check_identity_sink = _w1b("identity.sink")
-check_recovery = _w1b("recovery")
+check_ledger_wire = _unbuilt("ledger.wire")
+check_ledger_intake = _unbuilt("ledger.intake")
+check_ledger_edge = _unbuilt("ledger.edge")
+check_ledger_aggregate = _unbuilt("ledger.aggregate")
+check_ledger_egress = _unbuilt("ledger.egress")
+check_identity_sink = _unbuilt("identity.sink")
+check_recovery = _unbuilt("recovery")
 
 CHECKS = (
-    check_exit, check_restarts, check_self_log, check_ready, check_progress, check_rss_slope,
-    check_fd_slope, check_ledger_wire, check_ledger_intake, check_ledger_edge,
-    check_ledger_aggregate, check_ledger_egress, check_identity_sink, check_recovery,
+    check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
+    check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_intake,
+    check_ledger_edge, check_ledger_aggregate, check_ledger_egress, check_identity_sink,
+    check_recovery,
 )
 
 

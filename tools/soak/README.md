@@ -15,7 +15,7 @@ standard library only.
 ```sh
 script/soak list                                 # the shipped scenarios
 script/soak self-test                            # the driver's pure parts; no docker
-script/soak run statsd-vm                        # the scenario's own duration (15 minutes)
+script/soak run statsd-vm                        # the scenario's own duration (16 minutes)
 script/soak run statsd-vm --duration 5m --keep   # shorter, and leave the stack up afterward
 script/soak check perf/results/soak/<stamp>      # re-score a run offline
 ```
@@ -38,7 +38,7 @@ telemetry as NDJSON and stderr the JSON self-log. Their configs pass `logit vali
 `scenarios/*/logit-*.yaml`.
 
 `statsd-vm` sends 2,000 statsd lines a second, one per UDP datagram, through `aggregate` into
-remote-write 1.0 (zstd) to VictoriaMetrics. Its 11-minute cycle delays and drops the SUT's
+remote-write 1.0 (zstd) to VictoriaMetrics. Its 13-minute cycle delays and drops the SUT's
 remote-write, drops the generator's UDP, stops VictoriaMetrics, and pauses, stops, and
 partitions the SUT.
 
@@ -73,8 +73,12 @@ appends `limit 100000` to `args` unless they set a `limit`, so netem's own queue
    series.
 5. It collects each service's stdout and stderr separately with `docker logs`, and its final
    `docker inspect`, then tears the project down (`down -v --remove-orphans`) unless `--keep`.
-   This step runs on every exit, Ctrl-C included.
-6. It scores the run. The script exits 1 on any `FAIL`.
+   This step runs on every exit but SIGKILL: SIGINT (Ctrl-C), SIGTERM, and SIGHUP each stop the
+   schedule and reach it. After a SIGHUP the driver drops its terminal output and carries on,
+   because the run directory has everything.
+6. It scores the run. The script exits 1 on any `FAIL`, including a run the driver aborted or
+   hit an error in, and 130 when SIGINT, SIGTERM, or SIGHUP interrupted it, whose `run` row
+   FAILs too.
 
 A run writes `perf/results/soak/<UTC stamp>/` (gitignored, or under `SOAK_OUT`):
 
@@ -96,12 +100,14 @@ rule only holds in steady state. The plan's "The checks" has the full rules.
 
 | Check | `FAIL`s when |
 |---|---|
+| `run` | the driver aborted, hit an error, or was interrupted, or the timeline lacks its `start` or `end_end` phase |
+| `timeline` | a fault's apply or revert returned nonzero, the schedule failed fast, or a start or unpause of a `logit` service has no readiness probe; a fault whose apply failed gets no window |
 | `exit` | a `logit` container exits outside a scheduled stop or with a nonzero code, or any container is OOM-killed |
 | `restarts` | a container starts with no scheduled start or restart behind it |
 | `self_log` | stderr has an `exiting` line with a nonzero code, a panic, or an `ERROR` line other than a sink's `retrying`; sink fault lines outside a fault window `WARN` |
 | `ready` | a `logit` container is unhealthy outside a fault window, or isn't ready within 30 s of a start |
-| `progress` | the SUT's sink delivers nothing in a `progress_window` outside fault windows with work queued (a hang), a `logit` container's telemetry goes quiet, or VictoriaMetrics' newest sample is 30 s old; a sink still retrying past `recovery_bound` `WARN`s |
-| `rss_slope` | resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead |
+| `progress` | the SUT's sink delivers nothing in a `progress_window` outside fault windows with work queued (a hang), a `logit` container's telemetry goes quiet, or VictoriaMetrics' newest sample is 30 s old; a sink still retrying past `recovery_bound` `WARN`s, and so do windows covering under 5% of the run after warmup |
+| `rss_slope` | resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead, and so do slopes covering under 5% of the run after warmup |
 | `fd_slope` | open file descriptors end, or sit after a recovery, more than `fd_growth` above the warmup median |
 
 The loss ledger, the sink conservation identity, and the recovery check aren't built yet and

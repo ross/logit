@@ -18,7 +18,8 @@ from pathlib import Path
 SERVICES = ("logit", "generator", "victoria-metrics")
 LOGIT_SERVICES = ("logit", "generator")
 
-# Every action W1 supports. faults.py implements them; the names must match its ACTIONS.
+# Every action the scenario schema accepts. faults.py implements them; the names must match its
+# ACTIONS.
 ACTION_NAMES = ("netem", "pause", "stop", "restart", "partition")
 
 # Faults during which a container's network namespace is gone or unusable for a one-shot

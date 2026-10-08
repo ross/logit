@@ -75,7 +75,7 @@ def cmd_check(args):
     results = checks.run_all(run_dir)
     report.write(run_dir, results)
     print(report.markdown_table(results))
-    return 1 if any(result.status == checks.FAIL for result in results) else 0
+    return driver.exit_code(results)
 
 
 def cmd_self_test(args):

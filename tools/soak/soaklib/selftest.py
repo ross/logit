@@ -3,15 +3,19 @@ every shipped scenario. `run` calls it first, so a broken reducer or rule can't 
 
 It covers the duration parser, every `validate()` rejection rule, `expand()`'s cycle
 repetition, the NDJSON reducers (counters per life split where uptime decreases, gauge series),
-the stderr classifier (a raw `thread '...' panicked at` line included), and the slope function.
+the stderr classifier (a raw `thread '...' panicked at` line included), the slope function, and
+the checks against small synthetic run directories: a failed fault action, an aborted run and its
+exit code, an fd sample inside a later fault, and a steady state too thin to judge.
 """
 
 import copy
 import json
+import tempfile
 import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
 
-from . import checks, scenario, telemetry
+from . import checks, driver, scenario, telemetry
 
 _FAILURES = []
 _PASSED = [0]
@@ -79,7 +83,7 @@ def _rules(root):
              "netem during a stop")
     _refused(path, mutate(lambda r: r.update(cooldown="30s")), "shorter than recovery_bound",
              "cooldown under recovery_bound")
-    _refused(path, mutate(lambda r: r["step"][0].update(at="10m")), "after the 11m cycle",
+    _refused(path, mutate(lambda r: r["step"][0].update(at="12m")), "after the 13m cycle",
              "a step past its cycle")
     _refused(path, mutate(lambda r: r["step"][0].update(action="kill")), "unknown action",
              "an unknown action")
@@ -106,13 +110,13 @@ def _expand(root):
     path, base = _base(root)
     loaded = scenario.from_dict(copy.deepcopy(base), path)
     full = scenario.expand(loaded)
-    expect(len(full) == 7, f"expand(15m) has 7 steps, got {len(full)}")
+    expect(len(full) == 7, f"expand(16m) has 7 steps, got {len(full)}")
     expect(full[0].start == 60 and full[0].end == 180, "the first step starts after warmup")
-    expect(all(s.end <= 900 - 120 for s in full), "no fault ends inside cooldown")
+    expect(all(s.end <= 960 - 120 for s in full), "no fault ends inside cooldown")
     short = scenario.expand(loaded, 300)
     expect([s.id for s in short] == ["c0s1"], f"expand(5m) keeps only c0s1, got {short}")
     long = scenario.expand(loaded, 2000)
-    expect(len(long) == 18, f"expand(2000s) repeats the cycle, got {len(long)}")
+    expect(len(long) == 15, f"expand(2000s) repeats the cycle, got {len(long)}")
     expect(len({s.id for s in long}) == len(long), "expanded step ids are unique")
 
 
@@ -196,6 +200,145 @@ def _slope():
     expect(checks.parse_mem("45.5MiB / 31GiB") == 45.5 * 1024 * 1024, "docker stats MemUsage")
 
 
+T0 = telemetry.parse_rfc3339("2026-10-08T12:00:00Z")
+RESOLVED = {"name": "fixture", "duration": 600.0, "warmup": 60.0, "cooldown": 120.0,
+            "recovery_bound": 45.0, "ledger": {"sut_sink": "sink"},
+            "thresholds": {"progress_window": 30.0, "fd_growth": 8,
+                           "rss_growth_mib_per_hour": 64}}
+
+
+def _stamp(t):
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _phase(name, offset, **extra):
+    return {"event": "phase", "phase": name, "t": T0 + offset, **extra}
+
+
+def _action(event, step, action, on, start, end=None, **extra):
+    return {"event": event, "step": step, "action": action, "on": on, "rc": 0,
+            "started_at": T0 + start, "finished_at": T0 + (start + 1 if end is None else end),
+            **extra}
+
+
+def _ready(step, on, offset):
+    return {"event": "ready", "on": on, "step": step, "why": "start", "ok": True,
+            "ready_s": 0.1, "t": T0 + offset}
+
+
+def _run_dir(tmp, name, timeline, stdout=(), **resolved):
+    run_dir = Path(tmp) / name
+    (run_dir / "logs").mkdir(parents=True)
+    (run_dir / "timeline.jsonl").write_text("".join(json.dumps(r) + "\n" for r in timeline))
+    (run_dir / "scenario.resolved.json").write_text(json.dumps({**RESOLVED, **resolved}))
+    if stdout:
+        (run_dir / "logs" / "logit.stdout").write_text("\n".join(stdout) + "\n")
+    return run_dir
+
+
+def _status(run_dir, check):
+    return check(checks.RunData(run_dir))
+
+
+def _sut_stdout(end_s, fds=lambda offset: 10):
+    """A SUT's NDJSON every 5 s: uptime, one delivered batch, flat RSS, and `fds(offset)`."""
+    lines = []
+    for offset in range(0, int(end_s), 5):
+        stamp = _stamp(T0 + offset)
+        lines.append(_line(stamp, "logit.process.uptime", "gauge", offset + 1.0))
+        lines.append(_line(stamp, "logit.component.batches.delivered", "sum", 1,
+                           component="sink"))
+        lines.append(_line(stamp, "logit.process.memory.resident.bytes", "gauge", 50 * 2 ** 20))
+        lines.append(_line(stamp, "logit.process.fds", "gauge", fds(offset)))
+    return lines
+
+
+def _checks():
+    with tempfile.TemporaryDirectory() as tmp:
+        start, end = _phase("start", 0, t0=T0), [_phase("end_begin", 400), _phase("end_end", 450)]
+
+        clean = _run_dir(tmp, "clean", [start, _action("apply", "c0s1", "netem", "logit", 60),
+                                        _action("revert", "c0s1", "netem", "logit", 180)] + end)
+        expect(_status(clean, checks.check_timeline).status == checks.PASS,
+               "timeline PASSes actions that returned 0")
+        expect(_status(clean, checks.check_run).status == checks.PASS,
+               "run PASSes a timeline from start through end_end")
+        expect(len(checks.RunData(clean).faults) == 1, "a clean apply opens a fault window")
+
+        failed = _run_dir(tmp, "failed", [
+            start, _action("apply", "c0s1", "netem", "logit", 60, rc=2,
+                           stderr="Error: Specified qdisc kind is unknown."),
+            _action("revert", "c0s1", "netem", "logit", 180)] + end)
+        result = _status(failed, checks.check_timeline)
+        expect(result.status == checks.FAIL and "rc 2" in result.detail,
+               f"timeline FAILs an apply with rc 2, got {result}")
+        expect(checks.RunData(failed).faults == [], "a failed apply opens no fault window")
+
+        fail_fast = _run_dir(tmp, "fail-fast", [start, _phase("fail_fast", 72, reason="x")] + end)
+        expect(_status(fail_fast, checks.check_timeline).status == checks.FAIL,
+               "timeline FAILs a fail-fast phase")
+
+        stop = [_action("apply", "c0s1", "stop", "logit", 60),
+                _action("revert", "c0s1", "stop", "logit", 90)]
+        unprobed = _run_dir(tmp, "unprobed", [start] + stop + end)
+        result = _status(unprobed, checks.check_timeline)
+        expect(result.status == checks.FAIL and "no readiness probe" in result.detail,
+               f"timeline FAILs a start with no ready record, got {result}")
+        probed = _run_dir(tmp, "probed", [start] + stop + [_ready("c0s1", "logit", 92)] + end)
+        expect(_status(probed, checks.check_timeline).status == checks.PASS,
+               "timeline PASSes a start with a ready record")
+        early = _run_dir(tmp, "early", [start, stop[0], _phase("end_begin", 80),
+                                        {**stop[1], "early": True}, _phase("end_end", 450)])
+        expect(_status(early, checks.check_timeline).status == checks.PASS,
+               "timeline needs no ready record after an early revert")
+
+        aborted = _run_dir(tmp, "aborted", [
+            {"event": "phase", "phase": "up_begin", "t": T0 - 10},
+            {"event": "phase", "phase": "up_end", "t": T0 - 5, "rc": 1},
+            {"event": "phase", "phase": "aborted", "t": T0 - 5,
+             "reason": "compose up failed: pull access denied"},
+            {"event": "phase", "phase": "collected", "t": T0},
+            {"event": "phase", "phase": "down", "t": T0 + 1, "rc": 0}])
+        results = checks.run_all(aborted)
+        run_row = next(r for r in results if r.id == "run")
+        expect(run_row.status == checks.FAIL and "aborted" in run_row.detail
+               and "no start" in run_row.detail, f"run FAILs an aborted run, got {run_row}")
+        expect(driver.exit_code(results) == 1, "check exits 1 on an aborted run dir")
+        passing = [checks.Result("x", checks.PASS, "")]
+        expect(driver.exit_code(passing, "aborted") == 1, "run exits 1 when aborted")
+        expect(driver.exit_code(passing, "error") == 1, "run exits 1 on a driver error")
+        expect(driver.exit_code(passing, "interrupted") == 130, "run exits 130 when interrupted")
+        expect(driver.exit_code(passing) == 0, "run exits 0 with no FAIL")
+
+        # c0s1's recovery ends at +145, inside c0s2's window, where the fds rise; the
+        # after-recovery sample must come from steady state, at +250.
+        fd_timeline = [start, _action("apply", "c0s1", "pause", "generator", 60, 61),
+                       _action("revert", "c0s1", "pause", "generator", 100, 100),
+                       _action("apply", "c0s2", "stop", "victoria-metrics", 140, 141),
+                       _action("revert", "c0s2", "stop", "victoria-metrics", 200, 200)] + end
+        fd_run = _run_dir(tmp, "fd", fd_timeline,
+                          _sut_stdout(400, lambda o: 30 if 140 <= o <= 245 else 10))
+        result = _status(fd_run, checks.check_fd_slope)
+        expect(result.status == checks.PASS,
+               f"fd_slope skips an after-recovery sample inside a later fault, got {result}")
+
+        # A fault over almost the whole hour leaves about 150 s of steady state after warmup,
+        # 4% of the run.
+        long_end = [_phase("end_begin", 3600), _phase("end_end", 3650)]
+        thin = _run_dir(tmp, "thin", [start, _action("apply", "c0s1", "netem", "logit", 100),
+                                      _action("revert", "c0s1", "netem", "logit", 3450)]
+                        + long_end, _sut_stdout(3600), duration=3600.0)
+        for check in (checks.check_progress, checks.check_rss_slope):
+            result = _status(thin, check)
+            expect(result.status == checks.WARN and "cover little" in " ".join(result.lines),
+                   f"{check.__name__} WARNs on thin coverage, got {result}")
+        wide = _run_dir(tmp, "wide", [start] + long_end, _sut_stdout(3600), duration=3600.0)
+        for check in (checks.check_progress, checks.check_rss_slope):
+            result = _status(wide, check)
+            expect(result.status == checks.PASS,
+                   f"{check.__name__} PASSes a fault-free hour, got {result}")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -213,7 +356,7 @@ def run(root, quiet=False):
     root = Path(root)
     _FAILURES.clear()
     _PASSED[0] = 0
-    for part in (_durations, _rules, _expand, _ndjson, _stderr, _slope, _shipped):
+    for part in (_durations, _rules, _expand, _ndjson, _stderr, _slope, _checks, _shipped):
         try:
             part(root) if part in (_rules, _expand, _shipped) else part()
         except Exception as err:  # report the part that broke, then keep going

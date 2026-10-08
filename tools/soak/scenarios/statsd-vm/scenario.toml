@@ -3,11 +3,11 @@
 
 name = "statsd-vm"
 description = "generator -> statsd_in (UDP) -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics"
-duration = "15m"          # --duration overrides; the cycle repeats while it fits before cooldown
+duration = "16m"          # warmup + one cycle + cooldown; --duration overrides
 warmup = "60s"            # no faults: baseline rate, RSS, fds
 cooldown = "120s"         # no faults at the end; >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
-cycle = "11m"             # step offsets are relative to each cycle's start
+cycle = "13m"             # >= last recovery (11m45s) + 2 x progress_window
 
 [configs]
 sut = "logit-sut.yaml"
@@ -27,6 +27,8 @@ progress_window = "30s"
 rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
 fd_growth = 8
 
+# Step offsets are relative to each cycle's start; the cycle repeats while it fits before
+# cooldown.
 [[step]]
 at = "0s"
 action = "netem"
