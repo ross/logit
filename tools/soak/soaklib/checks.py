@@ -8,7 +8,8 @@ A "fault window" is a fault's span, from its apply starting to its revert finish
 scenario's `recovery_bound` after it. Checks that judge steady state skip fault windows, the
 warmup where the check says so, and everything from the end sequence on.
 
-`SKIP` means a check had nothing to read, such as a run with no telemetry.
+`SKIP` means a check had nothing it could judge, such as a run with no telemetry, or SUT
+telemetry whose process lives disagree with the timeline.
 """
 
 import json
@@ -653,10 +654,11 @@ DEFAULT_BATCH_MAX_EVENTS = 1000
 # inbox, `aggregate`'s 64-slot inbox, and the batch `aggregate` has taken but not yet absorbed.
 RESIDUAL_BATCHES = 67
 # The UDP listener's `warn` lines for datagrams it counted as `datagrams.dropped{reason=
-# "shutdown"}` after `internal`'s final drain (`crates/logit-inputs/src/udp.rs`, `ReadHalf` and
-# `ResidualOnDrop`).
+# "shutdown"}` after `internal`'s final drain (`crates/logit-inputs/src/udp.rs`: `ReadHalf`,
+# `ResidualOnDrop`, and `Undecoded`).
 SHUTDOWN_DROP_RE = re.compile(
-    r"^(\d+) datagram\(s\) (?:still in the receive queue|read off the socket but never queued)")
+    r"^(\d+) datagram\(s\) (?:still in the receive queue|read off the socket but never queued"
+    r"|taken off the receive queue but not decoded)")
 # `recovery`'s limits for the gauges and the ingest rate, against the warmup baseline.
 RECOVERED_UTILIZATION = 0.05
 RECOVERED_RATE_SHARE = 0.95
@@ -697,14 +699,31 @@ class Ledger:
         self.gen_sink = cfg.get("generator_sink")
         self.sut = data.telemetry.get("logit")
         self.gen = data.telemetry.get("generator")
+        # Reasons every row that reads the SUT's telemetry SKIPs.
         self.problems = []
         if self.sut is None:
             self.problems.append("no SUT telemetry")
             self.lives = []
             return
+        if not self.sut.drains:
+            self.problems.append("SUT telemetry has no logit.process.uptime points")
+            self.lives = []
+            return
         self.life_starts = self.sut.life_starts
         self.lives = list(range(len(self.life_starts))) or [0]
         self.final = self.lives[-1]
+        # Each start of the SUT container begins a life: a stop's revert, an end-sequence early
+        # one included, and a restart's apply. An unpause doesn't. A life telemetry missed (one
+        # under `internal`'s interval) would merge two lives' windows, so the ledger isn't judged.
+        expected = 1 + sum(
+            1 for record in data.timeline
+            if record.get("on") == "logit" and not record.get("rc")
+            and ((record.get("event") == "revert" and record.get("action") == "stop")
+                 or (record.get("event") == "apply" and record.get("action") == "restart")))
+        if len(self.lives) != expected:
+            self.problems.append(
+                f"SUT telemetry shows {len(self.lives)} life/lives where logit.process.uptime "
+                f"decreases, but the timeline starts the SUT into {expected}")
 
         sut, listener = self.sut, self.listener
         self.W = sut.counter_by_life("logit.input.datagrams", component=listener)
@@ -753,8 +772,6 @@ class Ledger:
             batches = sum(self.gen.counter_by_life("logit.component.batches.sent",
                                                    component=self.gen_input).values())
             self.gen_batch = sent / batches if batches else 0.0
-        else:
-            self.problems.append("no generator telemetry")
 
         text = self._sut_config_text()
         max_datagrams = _yaml_int(text, "max_datagrams") or DEFAULT_MAX_DATAGRAMS
@@ -797,12 +814,16 @@ class Ledger:
         return self.get("W", life) - self.D(life) - self.get("B", life) - self.get("Ab", life)
 
     def egress(self, life):
-        """`(status, verdict, gap)` for one life's Ab − V: `ok`, `counted`, or `uncounted`."""
+        """`(status, verdict, gap)` for one life's egress: `ok`, `counted`, or `uncounted`.
+
+        The final life's gap is Ab − V. An earlier life's is W − D − B − V, the residual plus
+        Ab − V, because the close-time window delivers what that life read but hadn't absorbed
+        by its last drain into V."""
         gap = self.get("Ab", life) - self.get("V", life)
+        if life != self.final:
+            gap += self.residual(life)
         dropped = self.batches_dropped.get(life, 0)
         if gap == 0:
-            return PASS, "ok", gap
-        if life != self.final and -self.R <= gap < 0:
             return PASS, "ok", gap
         if gap > 0 and dropped > 0:
             return PASS, "counted", gap
@@ -816,8 +837,8 @@ def _ledger(data):
 
 
 def _skip_without_sut(check_id, led):
-    if not led.lives or led.sut is None:
-        return Result(check_id, SKIP, "; ".join(led.problems) or "no SUT telemetry")
+    if led.problems:
+        return Result(check_id, SKIP, "; ".join(led.problems))
     return None
 
 
@@ -947,7 +968,8 @@ def _per_life_lines(led):
 
 
 def check_ledger_intake(data):
-    """The final life's W − D == E + B; each earlier life's W − D − B − Ab in [0, R]."""
+    """The final life's W − D == E + B; each earlier life's W − D − B − Ab in [0, R], a sanity
+    bound. `ledger.egress` ties that residual to V."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.intake", led)
     if skipped:
@@ -1002,9 +1024,10 @@ def check_ledger_aggregate(data):
 
 
 def check_ledger_egress(data):
-    """Ab − V per life: 0, or within [−R, 0] for an earlier life, passes; a positive gap with
-    that life's `drain complete` `batches_dropped` above 0 is counted, never reconciled; any
-    other gap is uncounted loss. An export with no series can't pass."""
+    """The egress gap per life, Ab − V for the final life and W − D − B − V for an earlier one:
+    0 passes; a positive gap with that life's `drain complete` `batches_dropped` above 0 is
+    counted, never reconciled; any other gap is uncounted loss. An export with no series can't
+    pass."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.egress", led)
     if skipped:
@@ -1016,8 +1039,13 @@ def check_ledger_egress(data):
         verdict_status, verdict, gap = led.egress(life)
         status = worst([status, verdict_status])
         dropped = led.batches_dropped.get(life, 0)
-        part = (f"life {life}{' (final)' if life == led.final else ''}: Ab {_n(led.get('Ab', life))}"
-                f" − V {_n(led.get('V', life))} = {_n(gap)}, {verdict}")
+        ab_v = led.get("Ab", life) - led.get("V", life)
+        if life == led.final:
+            part = (f"life {life} (final): Ab {_n(led.get('Ab', life))} − V "
+                    f"{_n(led.get('V', life))} = {_n(gap)}, {verdict}")
+        else:
+            part = (f"life {life}: W − D − B − V {_n(gap)} = residual {_n(led.residual(life))} "
+                    f"+ Ab − V {_n(ab_v)}, {verdict}")
         if gap > 0:
             part += f" (drain complete batches_dropped {_n(dropped)})"
         parts.append(part)
@@ -1192,6 +1220,10 @@ def check_recovery(data):
                                         "time(s)" if behind > 0 else ""))
             status = worst([status, verdict])
             lines.append(f"{name}: not recovered by {data.offset(b)}: {'; '.join(problems)}")
+    if judged == 0:
+        return Result("recovery", WARN, f"none of {len(data.faults)} fault(s) had an eligible "
+                      f"drain interval within recovery_bound {data.recovery_bound:g}s of its "
+                      "end", lines)
     failing = [line for line in lines if "not recovered" in line]
     detail = (f"{judged} of {len(data.faults)} fault(s) judged, each recovered within "
               f"recovery_bound {data.recovery_bound:g}s of its end; warmup rate "

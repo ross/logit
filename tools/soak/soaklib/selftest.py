@@ -6,10 +6,12 @@ repetition, the NDJSON reducers (counters per life split where uptime decreases,
 the stderr classifier (a raw `thread '...' panicked at` line included), the slope function, and
 the checks against small synthetic run directories: a failed fault action, an aborted run and its
 exit code, an fd sample inside a later fault, and a steady state too thin to judge. For the
-ledger, it covers the reset-aware VictoriaMetrics total and its split per life, and a two-life
-run whose final life balances and whose earlier life sits inside [0, R], each rule broken in turn:
-a shutdown drop on stderr, a counted and an uncounted egress gap, an empty export, wire loss in
-and out of a fault window and at the end, the sink identity, and recovery.
+ledger, it covers the reset-aware VictoriaMetrics total and its split per life, at a decrease
+and at a life start with none, and a two-life run whose final life balances and whose earlier
+life's residual reaches V, each rule broken in turn: shutdown drops on stderr, a counted and an
+uncounted egress gap, an earlier life's residual that never reaches V, an empty export, wire loss
+in and out of a fault window and at the end, the sink identity, and recovery. Empty SUT
+telemetry, and lives the timeline disagrees with, SKIP every ledger row.
 """
 
 import copy
@@ -366,6 +368,13 @@ def _vm_resets():
     by_life, _, resets, mismatched = vm.totals_by_life(late, starts)
     expect(by_life == {1: 6} and mismatched == ["c_total"],
            f"a series with too few resets is credited by timestamp, got {by_life} {mismatched}")
+    # A restart whose first value isn't below the last life's final value shows no decrease.
+    rising = [{"metric": {"__name__": "d_total"}, "values": [100, 300, 350, 550, 750],
+               "timestamps": [s * 1000 for s in (2900, 2910, 3010, 3020, 3030)]}]
+    by_life, total, resets, mismatched = vm.totals_by_life(rising, [1000, 3000])
+    expect(by_life == {0: 300, 1: 750} and total == 1050 and resets == {"d_total": 1}
+           and not mismatched,
+           f"V splits at a life boundary with no decrease, got {by_life} {total} {resets}")
 
 
 LEDGER = {"vm_selector": "{__name__=~\"x_[0-9]+_total\"}", "generator_input": "load",
@@ -379,12 +388,13 @@ PER_DRAIN = 1000
 def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_short=0,
                 life0_dropped=0, life1_dropped=0, steady_loss=0, fault_loss=0, end_extra=0,
                 e1_short=0, a1_short=0, ab1_short=0, late_series=False, receive_util=0.0, slow_after_stop=False, rate_behind=0,
-                undelivered=0, empty_export=False):
+                undelivered=0, empty_export=False, ab0_short=0, merged_lives=False,
+                empty_sut=False, **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
-    them dropped on stderr, and `v0_extra` reaching VictoriaMetrics after its last drain, and
-    life 1 balances."""
+    them dropped on stderr over two of the listener's shutdown lines, and `v0_extra` reaching
+    VictoriaMetrics after its last drain, and life 1 balances."""
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -406,7 +416,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
     last0 = max(o for o, life in drains if life == 0)
     for offset, life in drains:
         stamp = _stamp(T0 + offset)
-        start = -1 if life == 0 else STOP[1]
+        start = -1 if life == 0 or merged_lives else STOP[1]
         sut.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
         sending = offset <= 300
         w = PER_DRAIN if sending else 0
@@ -427,6 +437,8 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             e -= e1_short
         a = e - (a1_short if life == 1 and offset == 210 else 0)
         ab = a - (ab1_short if life == 1 and offset == 220 else 0)
+        if life == 0:
+            ab -= ab0_short
         totals[life]["W"] += w
         totals[life]["E"] += ab
         for metric, value, comp in (("logit.input.datagrams", w, "in"),
@@ -451,7 +463,9 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                         affects_udp_ingress=True),
                 _ready("c0s1", "logit", STOP[1] + 1),
                 _phase("end_begin", 300), _phase("end_end", 330)]
-    run_dir = _run_dir(tmp, name, timeline, sut, ledger=LEDGER)
+    run_dir = _run_dir(tmp, name, timeline, sut, ledger=LEDGER, **resolved)
+    if empty_sut:
+        (run_dir / "logs" / "logit.stdout").write_text("")
     (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
 
     def log(offset, level, message, **fields):
@@ -460,9 +474,13 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
 
     stderr = [log(0, "INFO", "ready")]
     if shutdown_drops:
-        stderr.append(log(STOP[0] + 0.5, "WARN", f"{shutdown_drops} datagram(s) still in the "
-                          "receive queue when this listener was stopped at its shutdown grace, "
-                          "undecoded", component="in"))
+        undecoded = shutdown_drops // 4
+        stderr.append(log(STOP[0] + 0.5, "WARN", f"{shutdown_drops - undecoded} datagram(s) "
+                          "still in the receive queue when this listener was stopped at its "
+                          "shutdown grace, undecoded", component="in"))
+        stderr.append(log(STOP[0] + 0.5, "WARN", f"{undecoded} datagram(s) taken off the "
+                          "receive queue but not decoded when this listener was stopped at its "
+                          "shutdown grace", component="in"))
     for offset, dropped in ((STOP[0] + 0.6, life0_dropped), (321, life1_dropped)):
         if dropped:
             stderr.append(log(offset, "WARN", "drain complete", duration="1s",
@@ -504,7 +522,7 @@ def _ledger_checks():
             expect(clean[check_id].status == checks.PASS,
                    f"{check_id} PASSes the balanced two-life fixture, got {clean[check_id]}")
         led = checks.Ledger(checks.RunData(Path(tmp) / "ledger-clean"))
-        expect(led.D_log == {0: 20}, f"the listener's shutdown warn line goes into D, got "
+        expect(led.D_log == {0: 20}, f"the listener's shutdown warn lines go into D, got "
                                      f"{led.D_log}")
         expect(led.residual(0) == 30, f"life 0's W − D − B − Ab, got {led.residual(0)}")
         expect(led.R == 77000, f"R from the defaults, got {led.R}")
@@ -541,6 +559,18 @@ def _ledger_checks():
         expect(late["ledger.egress"].status == checks.WARN
                and "resets aren't SUT lives − 1" in late["ledger.egress"].detail,
                f"egress WARNs a series whose resets aren't lives − 1, got {late['ledger.egress']}")
+
+        unreached = results("ledger-residual-unreached", life0_extra=77020, v0_extra=0)
+        expect(unreached["ledger.intake"].status == checks.PASS
+               and unreached["ledger.egress"].status == checks.FAIL
+               and "residual 77,000 + Ab − V 0, uncounted" in unreached["ledger.egress"].detail,
+               f"egress FAILs an earlier life's residual that never reached V, got "
+               f"{unreached['ledger.egress']}")
+        unabsorbed = results("ledger-unabsorbed", ab0_short=750, v0_extra=0)
+        expect(unabsorbed["ledger.egress"].status == checks.FAIL
+               and "Ab − V 0, uncounted" in unabsorbed["ledger.egress"].detail,
+               f"egress FAILs an earlier life's lines read but neither absorbed nor delivered, "
+               f"got {unabsorbed['ledger.egress']}")
 
         uncounted = results("ledger-uncounted", v0_extra=-500)
         expect(uncounted["ledger.egress"].status == checks.FAIL
@@ -599,6 +629,23 @@ def _ledger_checks():
         expect(unbalanced["identity.sink"].status == checks.FAIL,
                f"identity.sink FAILs two batches neither delivered, dropped, nor queued, got "
                f"{unbalanced['identity.sink']}")
+
+        rows = ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.aggregate",
+                "ledger.egress", "ledger.summary", "identity.sink", "recovery")
+        no_sut = results("ledger-empty-sut", empty_sut=True)
+        expect(all(no_sut[r].status == checks.SKIP and "no logit.process.uptime points"
+                   in no_sut[r].detail for r in rows),
+               f"every ledger row SKIPs empty SUT telemetry, got "
+               f"{[no_sut[r] for r in rows]}")
+        merged = results("ledger-merged-lives", merged_lives=True)
+        expect(all(merged[r].status == checks.SKIP and "timeline starts the SUT into 2"
+                   in merged[r].detail for r in rows),
+               f"every ledger row SKIPs lives the timeline disagrees with, got "
+               f"{[merged[r] for r in rows]}")
+        unjudged = results("recovery-unjudged", recovery_bound=1.0)
+        expect(unjudged["recovery"].status == checks.WARN,
+               f"recovery WARNs when no fault has an eligible interval, got "
+               f"{unjudged['recovery']}")
 
         busy = results("recovery-busy", receive_util=0.5)
         expect(busy["recovery"].status == checks.FAIL,
