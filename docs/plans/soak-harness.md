@@ -362,9 +362,9 @@ from stderr: the listener's `warn` lines go into D, and the `drain complete` lin
 
 The number of SUT lives in telemetry must equal 1 plus the timeline's SUT starts: each `revert`
 of a `stop` on `logit`, an end-sequence early one included, and each `apply` of a `restart`, with
-`rc` 0. An unpause doesn't start a life. A life shorter than `internal`'s interval exports no
-uptime point and merges into its neighbor, so on a mismatch every ledger, `identity.sink`, and
-`recovery` row SKIPs with the reason. They also SKIP when the SUT's telemetry has no
+`rc` 0. An unpause doesn't start a life. A life shorter than `internal`'s interval leaves at most
+its shutdown uptime point, so the next life's first uptime isn't lower and the two merge; on a
+mismatch every ledger, `identity.sink`, and `recovery` row SKIPs with the reason. They also SKIP when the SUT's telemetry has no
 `logit.process.uptime` point.
 
 The rows:

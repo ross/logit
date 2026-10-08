@@ -375,6 +375,13 @@ def _vm_resets():
     expect(by_life == {0: 300, 1: 750} and total == 1050 and resets == {"d_total": 1}
            and not mismatched,
            f"V splits at a life boundary with no decrease, got {by_life} {total} {resets}")
+    # A decrease inside one life plus an absence from another keeps the segment count at the
+    # number of lives; crediting by position would hide the mismatch and misplace the amounts.
+    folded = [{"metric": {"__name__": "e_total"}, "values": [100, 200, 50, 80, 10, 20],
+               "timestamps": [s * 1000 for s in (1100, 1200, 1300, 1400, 2100, 2200)]}]
+    by_life, total, resets, mismatched = vm.totals_by_life(folded, [1000, 2000, 3000])
+    expect(by_life == {0: 280, 1: 20} and total == 300 and mismatched == ["e_total"],
+           f"V credits each segment to its own life, got {by_life} {total} {mismatched}")
 
 
 LEDGER = {"vm_selector": "{__name__=~\"x_[0-9]+_total\"}", "generator_input": "load",

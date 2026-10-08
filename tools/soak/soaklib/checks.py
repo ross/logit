@@ -713,8 +713,9 @@ class Ledger:
         self.lives = list(range(len(self.life_starts))) or [0]
         self.final = self.lives[-1]
         # Each start of the SUT container begins a life: a stop's revert, an end-sequence early
-        # one included, and a restart's apply. An unpause doesn't. A life telemetry missed (one
-        # under `internal`'s interval) would merge two lives' windows, so the ledger isn't judged.
+        # one included, and a restart's apply. An unpause doesn't. A life under `internal`'s
+        # interval leaves at most its shutdown uptime point, so the next life's first uptime isn't
+        # lower and the two merge; the ledger isn't judged over merged windows.
         expected = 1 + sum(
             1 for record in data.timeline
             if record.get("on") == "logit" and not record.get("rc")

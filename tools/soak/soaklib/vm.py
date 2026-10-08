@@ -138,13 +138,12 @@ def reset_aware(one, life_starts=()):
 def totals_by_life(series, life_starts):
     """The reset-aware total of `series` split per process life of the writer.
 
-    `life_starts` holds each life's start in epoch seconds. A series with one segment per life
-    (split at its resets and at each life start, so one reset fewer than there are lives) has its
-    segment k credited to life k; any other series, one absent from a life or with a decrease
-    inside one, has each segment credited to the life its first sample falls in, and is listed as
-    a mismatch. Returns
+    `life_starts` holds each life's start in epoch seconds. No segment spans a life start, so
+    each is credited to the life its first sample falls in. A series with one segment per life
+    (one reset fewer than there are lives) is the expected shape; one absent from a life, or with
+    a decrease inside one, is listed as a mismatch. Returns
     `(by_life, total, resets, mismatched)`: `{life: amount}`, the overall total, `{series name:
-    resets}`, and the names whose resets weren't lives minus one."""
+    resets}`, and the mismatched names."""
     lives = max(1, len(life_starts))
     by_life = {}
     resets = {}
@@ -155,11 +154,9 @@ def totals_by_life(series, life_starts):
         total += amount
         name = series_name(one)
         resets[name] = len(segments) - 1
-        if len(segments) == lives:
-            owners = range(lives)
-        else:
+        owners = [life_at(life_starts, stamp / 1000) for stamp, _ in segments]
+        if owners != list(range(lives)):
             mismatched.append(name)
-            owners = [life_at(life_starts, stamp / 1000) for stamp, _ in segments]
         for life, (_, part) in zip(owners, segments):
             by_life[life] = by_life.get(life, 0) + part
     return by_life, total, resets, mismatched
