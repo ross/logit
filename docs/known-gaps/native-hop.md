@@ -31,8 +31,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   operator-tunable.** Graph rule 17 rejects a `receive:` block on all seven (`otlp_in`,
   `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver
   are the five), because none is a datagram, stream, or tail listener, so each always gets
-  `ReceiveConfig::default().shutdown_grace`. `LogitInput` and the HTTP listeners use it to close
-  connections cleanly, and `InternalInput` for its final drain of buffered self-telemetry
+  `ReceiveConfig::default().shutdown_grace`. `LogitInput` uses it to close connections cleanly,
+  the HTTP listeners as the deadline at which `run_input` aborts any connection still open, and
+  `InternalInput` for its final drain of buffered self-telemetry
   (`crates/logit-inputs/src/internal.rs`). It's a gap if a deployment needs a different number;
   no `receive:`-shaped knob exists.
 - **`otlp_in`'s TLS-arm `handshake_timeout` bounds the TLS accept and nothing after it.** `hyper`'s

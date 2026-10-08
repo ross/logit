@@ -326,14 +326,17 @@ Entry format and the other areas: [the known-gaps index](README.md).
   the grace after it closes the connection. It ends when the send completes or the client goes
   away ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)'s 2026-09-25 amendments).
   Closing it would drop a batch that never reached the fanout.
-- **A connection in its prelude holds a TCP listener's shutdown for up to `handshake_timeout`.**
-  The shared TCP driver (`crates/logit-inputs/src/tcp.rs`, for `syslog_in`, `graphite_in`,
-  `statsd_in`, and `lines_in` over TCP) and `logit_in` don't race the shutdown signal while a
-  connection is in its prelude: the PROXY header read, the TLS accept, and the first-byte peek.
-  - **Consequence:** while such a connection exists at the signal, the listener's shutdown takes
-    up to `handshake_timeout` longer (5s by default, the length of the listener grace). Nothing is
-    lost, because the connection had delivered no data.
-  - **Revisit:** race the signal in the prelude, as the HTTP listeners do
+- **A connection in its prelude holds a TCP listener's shutdown for up to `handshake_timeout`
+  per phase.** The shared TCP driver (`crates/logit-inputs/src/tcp.rs`, for `syslog_in`,
+  `graphite_in`, `statsd_in`, and `lines_in` over TCP) and `logit_in` don't race the shutdown
+  signal during a connection's prelude. For the TCP driver the unraced phases are the PROXY header
+  read and the TLS accept; for `logit_in`, the TLS accept and the `Hello` read. Each phase gets its
+  own `handshake_timeout`, back to back.
+  - **Consequence:** the listener's shutdown takes up to `handshake_timeout` longer per remaining
+    phase (10s at the default under TLS). The task's `Fanout` clone holds downstream inboxes open
+    that long, so an `aggregate`'s close-time window can arrive after a sink's 5s grace and is
+    dropped, counted as `closed_consumer` or a shutdown drop.
+  - **Revisit trigger:** race the signal in the prelude, as the HTTP listeners do
     ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)'s shutdown amendment,
     decision 6).
 - **`proxy_protocol:` accepts a PROXY header from any peer.** A stream listener under

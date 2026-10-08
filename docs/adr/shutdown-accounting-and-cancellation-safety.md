@@ -554,7 +554,8 @@ wire so the peer resends. Four uncounted losses the audit found are now in `docs
 - A torn line or frame in `stdio_out` and `file_out` after a grace-cut `send`, as this ADR's
   consequences record.
 - `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s receiver can hold the
-  graph open past shutdown, as `otlp_in` can.
+  graph open past shutdown, as `otlp_in` can (since closed by [ADR `idle-connection-timeout`](idle-connection-timeout.md)'s
+  shutdown amendment).
 
 Site comments that restated a row now point at the table, and the runtime, `Input`, and `tcp.rs`
 module docs point at it once. No behavior changes.

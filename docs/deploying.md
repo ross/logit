@@ -85,12 +85,13 @@ error.
   metrics.
 - **SIGTERM closes every HTTP listener's connections.** `otlp_in`, `datadog_in`,
   `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver stop accepting
-  at the signal, close their idle keep-alive and gRPC connections at once, and serve out any
+  when the drain starts (at the signal, or after `shutdown.delay`), close their idle keep-alive and gRPC connections at once, and serve out any
   request in flight. An HTTP/2 connection gets a `GOAWAY`, so an OpenTelemetry SDK exporter
-  reconnects instead of reusing it. Two bounds cap the wait: each connection gets
-  `handshake_timeout` to finish (5s by default), and the listener as a whole gets a fixed 5s. A
-  request still in flight at that point is reset, and the client resends it, so a batch the
-  pipeline had already taken can arrive twice (at-least-once).
+  reconnects instead of reusing it. Two bounds cap the wait: a connection with nothing in flight
+  gets `handshake_timeout` to close (5s by default; a fixed 5s on the remote-write receiver), and
+  the listener as a whole gets a fixed 5s, which also ends a request still being served: it is
+  reset, and the client resends it, so a batch the pipeline had already taken can arrive twice
+  (at-least-once).
 - **A second signal during a stuck drain exits immediately** with status 130, so a restart policy
   waiting on the process can still kill it with the same signal. Only SIGTERM and SIGINT count; a
   SIGHUP never does.
