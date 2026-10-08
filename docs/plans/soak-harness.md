@@ -79,6 +79,10 @@ tools/soak/
     scenario.toml
     logit-sut.yaml
     logit-generator.yaml
+  scenarios/statsd-vm-lost-total/  # W1b's negative control: a final total lost at shutdown
+    scenario.toml
+    logit-sut.yaml
+    logit-generator.yaml
 ```
 
 Subcommands: `run <scenario> [--duration 20m] [--seed N] [--keep] [--out DIR]`, `list`,
@@ -329,7 +333,7 @@ one event is one increment.
 | E | SUT `logit.component.events.sent{component=statsd}` |
 | A | aggregate `logit.component.events.received` |
 | Ab | aggregate `logit.transform.metrics.absorbed` |
-| V | the reset-aware total of `vm-export.jsonl`: add each series' first value, then every non-negative step, and on a decrease add the new value. Resets per series should equal SUT lives minus one, else WARN. The resets also split V per SUT life |
+| V | the reset-aware total of `vm-export.jsonl`: add each series' first value, then every non-negative step, and on a decrease or at a SUT life start add the new value. V splits per SUT life at each series' decreases and at each life start, placing a sample by its timestamp, which is the SUT's own window time; a restart whose first value isn't below the last one shows no decrease. A series should have one segment per SUT life, else WARN |
 
 The generator sets `max_packet_bytes: "32"`, so one datagram carries one line of about 20 bytes,
 and G uses `output.messages` (what the kernel took), not `events.sent`. While the SUT is down,
@@ -347,12 +351,21 @@ from stderr: the listener's `warn` lines go into D, and the `drain complete` lin
   end sequence), so nothing arrives after its final drain. `ledger.intake`, `ledger.edge`,
   `ledger.aggregate`, and `ledger.egress` are judged with no tolerance for it.
 - An earlier SUT life ends under load, at a scheduled `stop` or `restart`. Its hops are compared
-  at its last drain and reported, and judged only through `ledger.egress` and the life's sum
-  W − D − B − Ab, which must lie between 0 and the residual R that can be in flight at the
-  signal: the receive queue (`receive.max_datagrams`) plus 67 batches of at most
+  at its last drain and reported. Its residual W − D − B − Ab, what it read but hadn't absorbed
+  by that drain, must lie between 0 and the residual R that can be in flight at the signal: the
+  receive queue (`receive.max_datagrams`) plus 67 batches of at most
   `receive.batch_max_events` each: the accumulator, the batch the listener holds while its send
   waits for a slot on a full inbox, `aggregate`'s 64-slot inbox, and the batch `aggregate` has
-  taken off that inbox but not yet absorbed.
+  taken off that inbox but not yet absorbed. The close-time window delivers that residual into
+  V, so `ledger.egress` judges the life's W − D − B − V as it judges the final life's Ab − V.
+  The [0, R] bound only catches a residual no shutdown could leave.
+
+The number of SUT lives in telemetry must equal 1 plus the timeline's SUT starts: each `revert`
+of a `stop` on `logit`, an end-sequence early one included, and each `apply` of a `restart`, with
+`rc` 0. An unpause doesn't start a life. A life shorter than `internal`'s interval exports no
+uptime point and merges into its neighbor, so on a mismatch every ledger, `identity.sink`, and
+`recovery` row SKIPs with the reason. They also SKIP when the SUT's telemetry has no
+`logit.process.uptime` point.
 
 The rows:
 
@@ -373,9 +386,10 @@ The rows:
 - `ledger.intake`: W − D == E + B, for the final life.
 - `ledger.edge`: E == A, a single-consumer edge, for the final life.
 - `ledger.aggregate`: Ab == A, for the final life.
-- `ledger.egress`, per life: Ab − V, with V split at each series' reset. A gap of 0 passes, and
-  so does a gap between −R and 0 for an earlier life, whose close-time window reached
-  VictoriaMetrics after its last drain. A positive gap is lost increments. It is reported with
+- `ledger.egress`, per life: Ab − V for the final life, and W − D − B − V for an earlier one,
+  the residual plus Ab − V, because its close-time window delivers the residual to
+  VictoriaMetrics after its last drain. The detail shows both parts. A gap of 0 passes. A
+  positive gap is lost increments. It is reported with
   that life's `drain complete` `batches_dropped` beside it, and is **counted** only when that
   count is above 0. The two are never reconciled: `batches_dropped` counts batches, and under
   `temporality: cumulative` a dropped batch loses only the increments since its series' last
@@ -389,8 +403,9 @@ The rows:
   interval ending there of at least 95% of the warmup baseline. Only intervals after the fault's
   end, inside one SUT life, and clear of every other fault are eligible, because a dense schedule
   often starts the next fault before `recovery_bound` runs out; a fault with no eligible interval
-  is listed as skipped. A generator `rate_behind` diagnostic makes the throughput part WARN,
-  because the generator limited the rate, not the SUT.
+  is listed as skipped, and with no fault judged the row WARNs. A generator `rate_behind`
+  diagnostic makes the throughput part WARN, because the generator limited the rate, not the
+  SUT.
 - `ledger.summary`, for the final life: uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V),
   which must be 0, with each term shown beside it and wire loss beside them as "by design". When
   `ledger.egress` is counted, its term is shown as counted and the row judges the other three.
@@ -458,7 +473,7 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
 |---|---|---|---|---|
 | W0 | `soak/w0` | `soak/w0: ADR and plan for a soak harness` | S | — |
 | W1a | `soak/w1a` | `soak/w1a: the soak driver, collector, and watchdog, with the statsd-vm scenario` | M | W0 |
-| W1b | `soak/w1b` | `soak/w1b: the soak loss ledger, identities, and recovery checks` | M | W1a |
+| W1b | `soak/w1b` | `soak/w1b: the loss ledger, sink identity, and recovery checks` | M | W1a |
 | W2 | `soak/w2` | `soak/w2: sink-outage and UDP-flood soak scenarios` | M | W1b |
 | W3 | `soak/w3` | `soak/w3: disk-spool kill -9 replay soak` | M | W2 |
 | W4 | `soak/w4` | `soak/w4: seeded random schedules and hours-long soaks` | M | W3 |
@@ -477,8 +492,9 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
   `ndjson.rs` reader list; a first run recorded under "Findings".
 - **W1b**: the ledger, `identity.sink`, and `recovery` checks, and the stderr shutdown-drop
   reductions (the listener's `warn` lines and `drain complete`'s `batches_dropped`); self-test
-  fixtures for a VictoriaMetrics export with resets and a stderr log with shutdown drops; a
-  16-minute run recorded under "Findings".
+  fixtures for a VictoriaMetrics export with resets and a stderr log with shutdown drops; the
+  `statsd-vm-lost-total` control scenario; a 16-minute run and both negative controls recorded
+  under "Findings".
 - **W2**: sink-outage variants, the verification
   [`buffered-sink-delivery.md`](buffered-sink-delivery.md) describes (a 90 s stop under `block`,
   then `drop_oldest` with a small `max_batches`), and a UDP flood with the sink stopped,
@@ -589,7 +605,7 @@ ledger rows:
 | `ledger.intake` | PASS | final life 1: W − D 643,600 vs E + B 643,600; life 0: W − D − B − Ab 0 within [0, R] (R 77,000 = 10,000 + 67 x 1,000) |
 | `ledger.edge` | PASS | final life 1: E 643,600 == A 643,600 (listener to aggregate) |
 | `ledger.aggregate` | PASS | final life 1: Ab 643,600 == A 643,600 (every event absorbed) |
-| `ledger.egress` | PASS | life 0: Ab 1,200,496 − V 1,200,496 = 0, ok; life 1 (final): Ab 643,600 − V 643,600 = 0, ok (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.egress` | PASS | life 0: W − D − B − V 0 = residual 0 + Ab − V 0, ok; life 1 (final): Ab 643,600 − V 643,600 = 0, ok (R 77,000 = 10,000 + 67 x 1,000) |
 | `ledger.summary` | PASS | final life 1: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V 0; wire G − (W + K) 12,125 over the run, by design |
 | `identity.sink` | PASS | final life 1 at +980s: received 26 vs delivered 26 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
 | `recovery` | PASS | 7 of 7 fault(s) judged, each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
@@ -628,9 +644,9 @@ Two negative controls:
 
 - Run `20261008T205911Z`, the `statsd-vm-lost-total` control (5 minutes): the SUT stopped 30 s
   into a 90 s VictoriaMetrics stop, with its sink's `shutdown_grace` at 1 s. Its first life's
-  `drain complete` logged `batches_dropped` 4, and `ledger.egress` read "life 0: Ab 192,100 − V
-  128,800 = 63,300, counted (drain complete batches_dropped 4); life 1 (final): Ab 418,100 − V
-  418,100 = 0, ok". Life 0's W − D − B − Ab was 0, inside [0, R]. `ledger.summary` passed with
+  `drain complete` logged `batches_dropped` 4, and `ledger.egress` read "life 0: W − D − B − V
+  63,300 = residual 0 + Ab − V 63,300, counted (drain complete batches_dropped 4); life 1
+  (final): Ab 418,100 − V 418,100 = 0, ok". `ledger.summary` passed with
   every term 0, and so did every other row.
 - Run `20261008T210459Z`, `statsd-vm` for 4 minutes from a scratch copy of the scenario whose
   `vm_selector` matched no series: `ledger.egress` FAILed ("no series in vm-export.jsonl match
