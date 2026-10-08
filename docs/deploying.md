@@ -1824,8 +1824,8 @@ one:
   carry.** `Samples`, `Distribution`, `Histogram`, `ExponentialHistogram`, `Summary`, `Set`, and
   `SetMembers` records are dropped whole and counted `logit.output.metrics.skipped{metric_kind=...}`
   instead of guessing at a convention. To keep them, set `multi_value: expand`, which renders the
-  dotted sub-paths tabled in `logit_proto::multi_value`'s module doc (`.count`, `.sum`,
-  `.q0_5`...`.q0_99`, per-bucket counts, and so on), an explicit, named convention counted
+  dotted sub-paths tabled in `logit_proto::multi_value`'s module doc (`.count`, `.sum`, `.min`,
+  `.max`, `.q0_5`...`.q0_99`, per-bucket counts, and so on), an explicit, named convention counted
   `logit.output.metrics.degraded{metric_kind=...}` once per record.
 - **Size and timeout bounds.** `max_packet_bytes:` (UDP only, default `1432`, at most `65507`, the
   largest UDP payload) bounds a datagram, not a single line, like `statsd_out`'s setting. `max_frame_bytes:` (default `1MiB`, Twisted's
@@ -1947,13 +1947,16 @@ these lines, among others:
 ```text
 req.latency.count:3|c
 req.latency.sum:60|c
+req.latency.min:10|g
+req.latency.max:30|g
 req.latency.q0_5:19.93163168041631|g
 req.latency.q0_99:29.827084345008355|g
 uniq.users.count:2|g
 ```
 
-- **The suffixes:** `.count`, `.sum`, and `.q0_5`, `.q0_75`, `.q0_9`, `.q0_95`, `.q0_99` for a
-  timer's sketch; `.count` for a set; `.count`, `.sum`, `.min`, `.max`, and `.bucket_<bound>` for
+- **The suffixes:** `.count`, `.sum`, `.min`, `.max`, and `.q0_5`, `.q0_75`, `.q0_9`, `.q0_95`,
+  `.q0_99` for a timer's sketch, nine lines per timer series (an empty sketch writes only `.count`
+  and `.sum`); `.count` for a set; `.count`, `.sum`, `.min`, `.max`, and `.bucket_<bound>` for
   a histogram; `.zero_count` in place of buckets for an exponential histogram; and `.q<quantile>`
   for a summary. No suffix contains a character the statsd grammar reserves, so every line
   decodes back under its full name.
@@ -1964,8 +1967,8 @@ uniq.users.count:2|g
   they're running totals that a counter would add to themselves on every flush.
 - **Sums:** a cumulative sum is one gauge of its running total, and a non-monotonic delta sum is
   one counter, each under the metric's own name.
-- **What's lost:** a downstream server keeps the last quantile or set count it received, so two
-  senders' quantiles don't merge into a true global one. Each expanded record counts
+- **What's lost:** a downstream server keeps the last quantile, minimum, maximum, or set count it
+  received, so two senders' quantiles and extremes don't merge into true global ones. Each expanded record counts
   `logit.output.metrics.degraded{metric_kind}`. A split-collection topology that needs a correct
   global percentile keeps the sketch and sends it over the native hop (`logit_out`).
 - **Name collisions:** a timer named `x` writes `x.count`. A producer that also sends its own
@@ -1977,7 +1980,7 @@ Raw timer samples and set members never expand. To relay the timer and set lines
 the receiver computes its own aggregates, configure the `aggregate` with `distributions: samples`
 and `sets: members`, or relay with no `aggregate` (see "Raw samples and set members" below).
 Behind a Datadog Agent, prefer that: with `aggregate`'s defaults the Agent receives `.count`,
-`.sum`, and `.q*` as plain counts and gauges, and never computes its own timer aggregates or
+`.sum`, `.min`, `.max`, and `.q*` as plain counts and gauges, and never computes its own timer aggregates or
 `d`-type distributions.
 
 Two real receivers, Etsy statsd and the Datadog Agent, were checked against a default
@@ -1993,6 +1996,9 @@ distribution, sets, counters, and a `|T`-stamped line over two windows:
   `.count` and `.sum` as rates (`0.3` and `6` over its 10 s interval), the quantiles and
   `uniq.users.count` as plain gauges with `env:dev` intact, the negative quantiles as `-4`, and
   the `|T`-stamped counter at its wire timestamp.
+
+That check ran before a sketch expanded `.min` and `.max`. Both are ordinary gauges, written as
+the quantiles are, including the `0|g` then `-v|g` pair for a negative value.
 
 ## Tailing files and Docker logs
 

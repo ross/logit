@@ -6,8 +6,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   downstream as a sketch would.** `Distribution`, `Set`, `Histogram`, `ExponentialHistogram`,
   `Summary`, and a cumulative or non-monotonic `Sum` exist only after a stage has summarized, and
   no statsd line carries a `DdSketch` or a `HyperLogLog`. Under `multi_value: expand`, the default,
-  each leaves as dotted `.count`/`.sum`/`.q*`/`.bucket_*` counter and gauge lines, counted
-  `logit.output.metrics.degraded{metric_kind}`
+  each leaves as dotted `.count`/`.sum`/`.min`/`.max`/`.q*`/`.bucket_*` counter and gauge lines,
+  counted `logit.output.metrics.degraded{metric_kind}`
   ([ADR `statsd-out-multi-value-expansion`](../adr/statsd-out-multi-value-expansion.md)).
   - **What round-trips:** a `statsd_in -> statsd_out` relay with no `aggregate`, or with one
     configured `distributions: samples`/`sets: members`, relays a timer or set line intact:

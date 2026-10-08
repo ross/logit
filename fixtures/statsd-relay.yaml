@@ -6,10 +6,10 @@
 #
 # `windowed` runs `aggregate`'s default `distributions: sketch`/`sets: estimate`, which summarizes
 # every timer and set into a sketch or an estimate. `statsd_out` writes each as dotted lines
-# (`req.latency.count|c`, `req.latency.sum|c`, `req.latency.q0_99|g`, `uniq.users.count|g`) under
-# its default `multi_value: expand` (docs/adr/statsd-out-multi-value-expansion.md). Configure
-# `distributions: samples`/`sets: members` to relay the timer and set lines themselves, so the
-# central agent computes its own aggregates.
+# (`req.latency.count|c`, `req.latency.sum|c`, `req.latency.max|g`, `req.latency.q0_99|g`,
+# `uniq.users.count|g`) under its default `multi_value: expand`
+# (docs/adr/statsd-out-multi-value-expansion.md). Configure `distributions: samples`/`sets: members`
+# to relay the timer and set lines themselves, so the central agent computes its own aggregates.
 components:
   statsd_in:
     type: statsd_in

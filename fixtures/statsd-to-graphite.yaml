@@ -24,7 +24,8 @@ components:
     # Every field below is its default; omit it for the same effect
     # (docs/adr/aggregation-window-semantics.md).
     # distributions: sketch      # sketch (default) | samples -- expand renders either as
-    #                            # .count/.sum/.q0_5.../.q0_99 (raw samples are sketched first)
+    #                            # .count/.sum/.min/.max/.q0_5.../.q0_99 (raw samples are
+    #                            # sketched first)
     # sets: estimate             # estimate (default) | members -- expand renders either as .count
 
   graphite_out:

@@ -90,6 +90,9 @@ The dotted suffixes are graphite's, unchanged:
 | `Summary` | `.count`, `.sum`, `.q<q>` per quantile it carries |
 | `Set` | `.count` (the estimate) |
 
+Amended (2026-10-07): the `Distribution` row gains `.min` and `.max` after `.sum`; see the
+amendment at the end.
+
 The table moves into a new shared module, `logit_proto::multi_value`, whose module doc becomes
 its one canonical copy. Both `graphite_out` and `statsd_out` call it, and it reports each
 component's suffix, value, and part (count, sum, bucket, zero count, quantile, min, max, or
@@ -101,6 +104,7 @@ distinct count). This ADR summarizes the table; the module doc is authoritative.
 - **Splunk's table stays its own.** It follows an external exporter's naming, which isn't the
   dotted convention statsd and carbon consumers read.
 - **The `Distribution` row gains no `.min` or `.max`.** See "Why no `.min` or `.max`" below.
+  Superseded (2026-10-07): see the amendment at the end.
 
 A non-finite component is skipped, and the rest of the record is still written. An empty sketch
 yields `.count 0` and `.sum 0` and no quantiles.
@@ -214,6 +218,8 @@ an operator to opt in. A statsd server holds a name only for its flush interval,
 nothing per name.
 
 ### Why no `.min` or `.max`
+Superseded (2026-10-07): see the amendment.
+
 A `DdSketch` tracks its own minimum and maximum, and Etsy statsd's `.lower`/`.upper` and the
 Agent's `.max` show consumers want them. They aren't added:
 
@@ -259,7 +265,8 @@ Agent's `.max` show consumers want them. They aren't added:
   `graphite_out` has the same note in its module doc. Nothing guards it.
 - **One timer series becomes about seven lines.** A `Distribution` writes seven lines per flush, so
   a downstream statsd server stores seven names, and a downstream `logit` interns seven names and
-  carries seven records, where the raw relay carried one.
+  carries seven records, where the raw relay carried one. Amended (2026-10-07): nine lines, with
+  `.min` and `.max`.
 - **Behind a Datadog Agent, raw retention stays the better choice.** With `aggregate`'s defaults,
   the Agent receives `.count`, `.sum`, and `.q*` lines as plain counts and gauges and never sees a
   distribution, so its own timer aggregates and percentiles are never computed. To keep the Agent's own timer aggregates and its `d` sketches, use
@@ -272,3 +279,32 @@ Agent's `.max` show consumers want them. They aren't added:
   default; they leave as per-component lines that don't merge downstream as a sketch would, and
   `skip` restores the drop. The entry stays tracked as debt against
   [ADR `lossless-transit`](lossless-transit.md).
+
+## Amendment: a sketch's min and max expand (2026-10-07)
+
+The shared table's `Samples`/`Distribution` row gains `.min` and `.max`, after `.sum` and before
+the quantiles, the order the `Histogram` row already uses. This supersedes "Why no `.min` or
+`.max`" above. `logit_proto::multi_value`'s module doc remains the canonical table.
+
+| Kind | Components |
+|---|---|
+| `Distribution` | `.count`, `.sum`, `.min`, `.max`, `.q0_5`, `.q0_75`, `.q0_9`, `.q0_95`, `.q0_99` |
+
+- **Why now.** The reasons for holding them back were graphite's wire, which this amendment
+  changes, with its own record in [ADR `graphite-carbon-relay`](graphite-carbon-relay.md),
+  and a judgment that five quantiles bound the distribution well enough. Etsy statsd's
+  `.lower`/`.upper` and the Agent's `.max` show the extremes are what operators alert on, and a
+  `q0_99` isn't a maximum: an outlier above it is invisible without `.max`.
+- **Where the values come from.** `DdSketch::min` and `DdSketch::max` are tracked from the
+  observations alongside its sum, not read from bins. A sketch decoded from bins alone, such as
+  one from the DDSketch protobuf, derives all three from bin representatives, so they're
+  approximate there, as its quantiles are.
+- **Empty sketch.** An empty sketch has no minimum or maximum, so it still writes `.count 0` and
+  `.sum 0` and nothing else.
+- **Type letter.** Both are gauges (`|g`), per "Type letter per component" above: an extreme
+  doesn't add across windows or senders. A negative minimum or maximum goes through the
+  `0|g` + `-v|g` pair, as a negative quantile does.
+- **Line count.** A `Distribution` writes nine lines per flush instead of seven, which updates the
+  "about seven lines" consequence above. The encoder still allocates nothing for them.
+- **Merging downstream.** Like a quantile, a downstream statsd server keeps the last sender's
+  `.min` and `.max`, so two senders' extremes don't combine into the true global extreme.
