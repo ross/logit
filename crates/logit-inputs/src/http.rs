@@ -659,6 +659,52 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Reads one HTTP/1.1 response, its head and its `Content-Length` body, off a keep-alive
+/// connection, where `read_to_end` would wait for the close. Panics after
+/// `logit_pipeline::test_util::RECV_TIMEOUT` or on a close mid-response.
+#[cfg(test)]
+pub(crate) async fn read_response<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+    what: &str,
+) -> String {
+    async fn read_some<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
+        buf: &mut [u8],
+        deadline: tokio::time::Instant,
+        what: &str,
+    ) -> usize {
+        use tokio::io::AsyncReadExt;
+        let read = tokio::time::timeout_at(deadline, stream.read(buf))
+            .await
+            .unwrap_or_else(|_| panic!("{what}: no complete response in time"))
+            .unwrap_or_else(|err| panic!("{what}: read failed: {err}"));
+        assert_ne!(read, 0, "{what}: the connection closed mid-response");
+        read
+    }
+
+    let deadline = tokio::time::Instant::now() + logit_pipeline::test_util::RECV_TIMEOUT;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let read = read_some(stream, &mut byte, deadline, what).await;
+        head.extend_from_slice(&byte[..read]);
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok())?
+        })
+        .unwrap_or(0usize);
+    let mut body = vec![0u8; length];
+    let mut filled = 0;
+    while filled < length {
+        filled += read_some(stream, &mut body[filled..], deadline, what).await;
+    }
+    head + &String::from_utf8_lossy(&body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

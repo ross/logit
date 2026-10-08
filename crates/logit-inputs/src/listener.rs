@@ -13,6 +13,7 @@
 //! it returns. Classifying per error, rather than wrapping the accept call, lets the same helper
 //! follow `AcceptQueueSampler::accept` and `UnixListener::accept` unchanged.
 
+use crate::peer::ConnectionPeer;
 use logit_core::{Diagnostics, Telemetry};
 use std::io;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -101,6 +102,19 @@ impl ConnectionTasks {
     pub(crate) async fn drain(mut self) {
         while self.0.join_next().await.is_some() {}
     }
+}
+
+/// Where one HTTP connection's pre-serve steps (the PROXY header, the TLS accept, the first-byte
+/// peek) left it. Built inside the race against shutdown, so a listener matches on it once the
+/// race is won.
+pub(crate) enum Prelude {
+    /// Boxed: a rustls session is over 1 KiB, and this is built once per connection.
+    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>, ConnectionPeer),
+    Plain(tokio::net::TcpStream, ConnectionPeer),
+    /// A close or a reset before the first byte: a TCP health check, not a fault.
+    Probe,
+    Failed(String),
+    ProxyRejected(anyhow::Error),
 }
 
 /// The pause after a `Resource` or `Other` accept error, so a sustained one (fd exhaustion) can't

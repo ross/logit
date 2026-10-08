@@ -197,6 +197,7 @@
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, drive_connection, Activity, BodyReadError,
 };
+use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
 use crate::Input;
 use bytes::Bytes;
@@ -628,20 +629,8 @@ impl Input for OtlpInput {
     }
 }
 
-/// Where one connection's pre-serve steps (the PROXY header, the TLS accept, the first-byte
-/// peek) left it.
-enum Prelude {
-    /// Boxed: a rustls session is over 1 KiB, and this is built once per connection.
-    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>, ConnectionPeer),
-    Plain(tokio::net::TcpStream, ConnectionPeer),
-    /// A close or a reset before the first byte: a TCP health check, not a fault.
-    Probe,
-    Failed(String),
-    ProxyRejected(anyhow::Error),
-}
-
 /// Serves one accepted (and, with TLS on, handshaken) connection to completion. Generic over the
-/// IO type so the plaintext and TLS cases share everything below `run`'s `tls_acceptor` branch.
+/// IO type so the plaintext and TLS cases share everything after the [`Prelude`].
 ///
 /// `grace` is the budget [`drive_connection`] gives hyper to shut down in once `idle_timeout` or
 /// `shutdown` fires (`handshake_timeout`, reused). `peer` is stamped on every batch each request
