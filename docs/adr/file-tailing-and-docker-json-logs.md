@@ -569,7 +569,8 @@ documented gap (`docs/known-gaps/tailing.md`). An `Active` file is never reaped 
 ## Amendment: `docker_in` holds its unterminated tail and held fragments at a clean stop (2026-10-08)
 
 **Decision:** at a clean stop, `docker_in` emits neither its file's unterminated last line nor a
-held reassembly. The final checkpoint stays at their start, and the restart reads them whole.
+held reassembly from an `Active` file. The final checkpoint stays at their start, and the restart
+reads them whole.
 
 Shutdown used to run `close_decoder` on every file: `take_partial` decoded the unterminated line,
 and `TailDecoder::close` flushed held fragments as a truncated event. The final checkpoint then
@@ -588,7 +589,9 @@ one after the restart.
   the first held fragment. With no checkpoint nothing replays the file, so `close` still emits the
   held fragments rather than lose them. The torn tail is still not decoded, so it raises no
   `bad_line`.
-- A file reaped after rotation or removal (`reap_drained`) still emits both. It gains no more
+- Only an `Active` file holds. A `Draining` file (rotated away or removed) or a `Deselected` one
+  still emits both at a clean stop, as `reap_drained` does when it reaps one: the restart never
+  re-reads its inode, so a held checkpoint offset would lose the fragments. It gains no more
   bytes, so its tail is final.
 
 The cross-stream replay gap in `docs/known-gaps/tailing.md` ("`held_from` is the oldest held

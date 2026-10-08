@@ -2493,6 +2493,39 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A file rotated away mid-reassembly is `Draining`, and a restart never re-reads its inode,
+    /// so a clean stop still emits its held fragment instead of checkpointing against it. The
+    /// 2 s poll interval keeps the reap grace from elapsing before the stop.
+    #[tokio::test]
+    async fn a_clean_stop_emits_the_held_fragment_of_a_draining_file() {
+        let (root, log, _checkpoint, _whole_len, mut config) =
+            fragment_fixture("docker-draining-held", "");
+        config.poll_interval = Duration::from_secs(2);
+
+        let (fanout, mut rx) = fanout_channel(8);
+        let mut probe = TelemetryProbe::new();
+        let input =
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config)
+                .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running = spawn_input(input, fanout).await;
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["whole"]);
+        probe
+            .wait_for("the fragment's line to be read", |t| t.sum("logit.input.lines", &[]) >= 2.0)
+            .await;
+
+        std::fs::rename(&log, log.with_extension("log.1")).unwrap();
+        std::fs::write(&log, json_file_line("fresh\n")).unwrap();
+        assert_eq!(
+            messages(&recv_events(&mut rx, 1).await),
+            vec!["fresh"],
+            "the scan that opened the fresh file left the rotated one draining"
+        );
+
+        running.stop().await;
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["head-"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A json-file envelope with no `\n` yet, whose `log` is a fragment over a 10-byte bound.
     fn oversized_partial_envelope() -> String {
         json_file_line(&"y".repeat(40)).trim_end_matches('\n').to_string()

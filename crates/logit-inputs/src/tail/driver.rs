@@ -1415,7 +1415,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// At shutdown, emits every tracked file's held partial line and decoder state, so an
     /// unterminated last line isn't lost (with no checkpoint, nothing would re-read it). A decoder
     /// whose [`TailDecoder::hold_at_shutdown`] is set keeps its partial line unread, and, when a
-    /// checkpoint will replay them, its held lines too; [`Tailer::write_checkpoint`] then leaves
+    /// checkpoint will replay them, its held lines too, but only while the file is `Active`; [`Tailer::write_checkpoint`] then leaves
     /// the offset at their start. Unlike [`Tailer::reap_drained`], files stay tracked:
     /// `write_checkpoint` runs next and needs their offsets.
     async fn close_all_for_shutdown(&mut self, sink: &Fanout) {
@@ -1423,11 +1423,15 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let replayed = self.checkpoint.is_some();
         for id in ids {
             if let Some(tracked) = self.files.get_mut(&id) {
-                let mode = if tracked.decoder.hold_at_shutdown() {
-                    CloseMode::Hold { held_lines: replayed }
-                } else {
-                    CloseMode::Emit
-                };
+                // Only an `Active` file is re-read by the restart: a `Draining` file's inode is
+                // no longer at a matched path, and a `Deselected` file's resume offset is
+                // process-local.
+                let mode =
+                    if tracked.state == FileState::Active && tracked.decoder.hold_at_shutdown() {
+                        CloseMode::Hold { held_lines: replayed }
+                    } else {
+                        CloseMode::Emit
+                    };
                 if !close_decoder(tracked, sink, &self.telemetry, &mut self.diag, mode).await {
                     self.untaken = true;
                     return;

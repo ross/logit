@@ -39,7 +39,8 @@ pub trait TailDecoder: Send {
 
     /// The writer always finishes a line, so a clean stop leaves this file's unterminated line
     /// and, when a checkpoint will replay them, its held lines in place rather than emitting
-    /// them. A rotated or removed file still emits both. Default: `false`.
+    /// them. A file that is no longer `Active` (rotated away, removed, or de-selected) still emits
+    /// both, because a restart won't read it. Default: `false`.
     fn hold_at_shutdown(&self) -> bool {
         false
     }
