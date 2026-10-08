@@ -386,10 +386,11 @@ never completes. A reviewer can answer each decision below yes or no.
    `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md):
    the runtime alone enforces a listener's grace), dropping the set aborts every remaining
    connection task and its `Fanout` clone. This departs from the shared TCP driver and `logit_in`,
-   whose bare `tokio::spawn` tasks need no owner: they race the signal at every read, so a task
-   outlives it only while parked in a send, which ends when the downstream drains or closes
-   (decision 5). An HTTP connection can't race the signal mid-request because hyper owns the read,
-   so its task needs an owner the backstop can abort.
+   whose bare `tokio::spawn` tasks need no owner: past the prelude, which `handshake_timeout`
+   bounds, they race the signal at every read, so a task outlives it only in its prelude or
+   while parked in a send, which ends when the downstream drains or closes (decision 5). An HTTP
+   connection can't race the signal mid-request because hyper owns the read, so its task needs an
+   owner the backstop can abort.
 4. **An abort costs the acknowledgment, never a batch.** No HTTP handler awaits `Fanout::send` on
    the connection task. `otlp_in` and the receiver deliver on a detached task
    (`deliver_detached`), which an abort doesn't cancel. The Datadog pair use `send_with_deadline`,
@@ -398,12 +399,12 @@ never completes. A reviewer can answer each decision below yes or no.
    client sees a reset and resends a batch the pipeline already took. That is ordinary
    at-least-once ([ADR `delivery-semantics`](delivery-semantics.md)). This narrows, at shutdown,
    two earlier rules: the in-flight tracker's "kept until that request completes rather than
-   dropped out from under it" and the 2026-09-25 wait-out amendment's "a handler blocked forever
-   in a send holds its connection and permit". Both protect a batch blocked in `Fanout::send`,
+   dropped out from under it" and the 2026-09-25 wait-out amendment's "`drive_with_idle`'s wait
+   for an in-flight request has no ceiling". Both protect a batch blocked in `Fanout::send`,
    and no handler is blocked there on the connection task, so an abort discards no batch. The code
    PRs record in the module doc of `crates/logit-inputs/src/http.rs` that a handler never awaits
    `Fanout::send` on the connection task: it uses `deliver_detached`, or `deliver_with_deadline`,
-   which sends nothing until every slot is held.
+   which sends each batch only once every consumer's slot for it is held.
 5. **Some tasks outlive an abort, and each ends in bounded time.** hyper spawns h2 stream handlers
    through `TokioExecutor`, outside the set, and detached deliveries are outside it too. A body
    read fails once its connection is gone. `send_with_deadline` is bounded by `busy_after`. A
