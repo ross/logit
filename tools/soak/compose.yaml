@@ -1,0 +1,41 @@
+# The stack `script/soak` drives for one scenario: VictoriaMetrics, the `logit` under test, and a
+# second `logit` as the load source. See README.md here and docs/plans/soak-harness.md's "Compose".
+#
+# The driver runs this under the compose project `soak-<scenario>` with an `--env-file` it writes
+# into the run directory, which sets:
+#
+#   SOAK_IMAGE             the `logit` release image tag (`logit:soak`)
+#   SOAK_SUT_CONFIG        absolute path of the scenario's `logit` config for the service `logit`
+#   SOAK_GENERATOR_CONFIG  absolute path of the scenario's config for the service `generator`
+#
+# No `container_name` and no `name:`, so a second scenario under another project can't collide
+# with this one. The one published port is VictoriaMetrics on an ephemeral loopback port, which
+# the driver reads with `compose port` after every start of that service.
+
+x-logit: &logit
+  image: ${SOAK_IMAGE:-logit:soak}
+  # A crash must stay observable: nothing restarts a container but the driver's own steps.
+  restart: "no"
+  logging: { driver: json-file }
+  # stdout carries the `internal` NDJSON, stderr the JSON self-log; the driver collects them apart
+  # with `docker logs`.
+  entrypoint: ["logit", "--log-format", "json", "run", "/config.yaml"]
+  command: []
+
+services:
+  victoria-metrics:
+    image: victoriametrics/victoria-metrics:v1.152.0
+    command:
+      - -retentionPeriod=100y
+    ports: ["127.0.0.1::8428"]
+
+  logit:
+    <<: *logit
+    depends_on: [victoria-metrics]
+    volumes: ["${SOAK_SUT_CONFIG:?set by script/soak}:/config.yaml:ro,z"]
+
+  generator:
+    <<: *logit
+    depends_on:
+      logit: { condition: service_healthy }
+    volumes: ["${SOAK_GENERATOR_CONFIG:?set by script/soak}:/config.yaml:ro,z"]

@@ -1,0 +1,73 @@
+# A generated statsd stream into `logit` and out to VictoriaMetrics, under a dense schedule of
+# network and lifecycle faults. The schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "statsd-vm"
+description = "generator -> statsd_in (UDP) -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics"
+duration = "15m"          # --duration overrides; the cycle repeats while it fits before cooldown
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "11m"             # step offsets are relative to each cycle's start
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no rates here
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+sut_aggregate = "window"
+sut_sink = "victoria_metrics"
+wire_loss_outside_faults = 0.0
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+[[step]]
+at = "0s"
+action = "netem"
+on = "logit"
+args = "delay 200ms 50ms"
+for = "120s"
+
+[[step]]
+at = "3m"
+action = "netem"
+on = "logit"
+args = "loss 30%"
+for = "90s"
+
+[[step]]
+at = "5m"
+action = "netem"
+on = "generator"
+args = "loss 10%"
+for = "60s"
+
+[[step]]
+at = "6m30s"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+[[step]]
+at = "8m30s"
+action = "pause"
+on = "logit"
+for = "30s"
+
+[[step]]
+at = "9m30s"
+action = "stop"
+on = "logit"
+for = "30s"
+
+[[step]]
+at = "10m15s"
+action = "partition"
+on = "logit"
+for = "45s"

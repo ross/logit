@@ -1,0 +1,115 @@
+# soak
+
+`script/soak` runs real `logit` containers for minutes under network and lifecycle faults on a
+timeline, and reports crashes, restarts, error lines, hangs, and memory and file-descriptor
+growth as one `PASS`, `WARN`, `FAIL`, or `SKIP` row per check.
+[ADR `soak-harness`](../../docs/adr/soak-harness.md) records why it's built this way, and
+[`docs/plans/soak-harness.md`](../../docs/plans/soak-harness.md) is the design: the scenario
+schema, the driver loop, every check, and a "Findings" section with what runs showed.
+
+The script runs on the host and drives docker (`$DOCKER`, `sudo docker` by default), like
+`script/victoria-interop` and `script/shape-survey`. It isn't part of `script/cibuild`, and no
+test depends on it running. It needs Python 3.11 or later on the host (`tomllib`); the driver is
+standard library only.
+
+```sh
+script/soak list                                 # the shipped scenarios
+script/soak self-test                            # the driver's pure parts; no docker
+script/soak run statsd-vm                        # the scenario's own duration (15 minutes)
+script/soak run statsd-vm --duration 5m --keep   # shorter, and leave the stack up afterward
+script/soak check perf/results/soak/<stamp>      # re-score a run offline
+```
+
+## What it runs
+
+A scenario is a directory under `scenarios/`: a `scenario.toml` timeline beside one ordinary
+`logit` config per `logit` service. `compose.yaml` starts three services under the compose
+project `soak-<scenario>`:
+
+| Service | Image | Role |
+|---|---|---|
+| `victoria-metrics` | `victoriametrics/victoria-metrics:v1.152.0` | the backend, `-retentionPeriod=100y`, published on an ephemeral loopback port the driver queries |
+| `logit` | `logit:soak`, built from the current tree | the system under test (SUT), with the scenario's `configs.sut` |
+| `generator` | `logit:soak` | the load source, a second `logit` with the scenario's `configs.generator` |
+
+Both `logit` services run `logit --log-format json run`, so stdout carries the `internal`
+telemetry as NDJSON and stderr the JSON self-log. Their configs pass `logit validate`:
+`script/validate`, the `every_shipped_config_loads_and_validates` test, and every `run` cover
+`scenarios/*/logit-*.yaml`.
+
+`statsd-vm` sends 2,000 statsd lines a second, one per UDP datagram, through `aggregate` into
+remote-write 1.0 (zstd) to VictoriaMetrics. Its 11-minute cycle delays and drops the SUT's
+remote-write, drops the generator's UDP, stops VictoriaMetrics, and pauses, stops, and
+partitions the SUT.
+
+### Faults
+
+| Action | What it does | Revert |
+|---|---|---|
+| `netem` | a one-shot `logit-soak-netem:local` container in the target's network namespace sets a root `tc netem` qdisc with the step's `args` | the same container clears it |
+| `pause` | `docker pause` | `docker unpause` |
+| `stop` | `docker stop -t 30` | `docker start` |
+| `restart` | `docker restart -t 30` | none |
+| `partition` | `docker network disconnect` from every network | `docker network connect`, passing back each alias recorded before the disconnect |
+
+A root qdisc shapes the target's egress only: `netem` on `logit` impairs its remote-write, not
+the statsd arriving at it. To impair the UDP into the SUT, put `netem` on `generator`. The driver
+appends `limit 100000` to `args` unless they set a `limit`, so netem's own queue never drops.
+
+## A run
+
+1. `script/soak` runs the self-test, builds `logit:soak` from `Dockerfile` and
+   `logit-soak-netem:local` from `netem/` (set `SOAK_SKIP_IMAGE=1` to reuse both), and validates
+   the scenario's configs in `logit:soak`.
+2. The driver refuses to start if the compose project already has containers, then brings the
+   stack up with `docker compose up --wait`, which waits on each `logit` service's `logit ready`
+   health check.
+3. On a 1-second tick it applies each fault and its revert on schedule, probes `logit ready`
+   after every start, restart, or unpause of a `logit` service, inspects every container every
+   5 s, and samples `docker stats` and VictoriaMetrics' newest sample every 30 s. A `logit`
+   container that exits or restarts with no step behind it ends the schedule at once.
+4. At the end it reverts active faults, stops the generator, waits until VictoriaMetrics' totals
+   hold across two aggregate windows, stops the SUT (expecting exit 0), and exports every stored
+   series.
+5. It collects each service's stdout and stderr separately with `docker logs`, and its final
+   `docker inspect`, then tears the project down (`down -v --remove-orphans`) unless `--keep`.
+   This step runs on every exit, Ctrl-C included.
+6. It scores the run. The script exits 1 on any `FAIL`.
+
+A run writes `perf/results/soak/<UTC stamp>/` (gitignored, or under `SOAK_OUT`):
+
+| File | Contents |
+|---|---|
+| `results.md`, `results.json` | one row per check, then each check's detail lines |
+| `timeline.jsonl` | every phase, fault, revert, and readiness probe, with planned and actual times, `rc`, `stderr`, and `netem show` output |
+| `watchdog.jsonl` | each container's `docker inspect` state every 5 s |
+| `stats.ndjson`, `vm-freshness.jsonl` | the 30-second `docker stats` and VictoriaMetrics freshness samples |
+| `vm-export.jsonl` | VictoriaMetrics' `/api/v1/export` of the scenario's `vm_selector` at the end |
+| `logs/<service>.stdout`, `.stderr` | each service's output across every life of its container |
+| `inspect/<service>.json` | each container's final `docker inspect` |
+| `provenance.txt`, `compose.env`, `scenario.toml`, `scenario.resolved.json` | what ran, on what host, from which commit, and the expanded schedule |
+
+## The checks
+
+Each check skips fault windows, a fault's span plus the scenario's `recovery_bound`, where its
+rule only holds in steady state. The plan's "The checks" has the full rules.
+
+| Check | `FAIL`s when |
+|---|---|
+| `exit` | a `logit` container exits outside a scheduled stop or with a nonzero code, or any container is OOM-killed |
+| `restarts` | a container starts with no scheduled start or restart behind it |
+| `self_log` | stderr has an `exiting` line with a nonzero code, a panic, or an `ERROR` line other than a sink's `retrying`; sink fault lines outside a fault window `WARN` |
+| `ready` | a `logit` container is unhealthy outside a fault window, or isn't ready within 30 s of a start |
+| `progress` | the SUT's sink delivers nothing in a `progress_window` outside fault windows with work queued (a hang), a `logit` container's telemetry goes quiet, or VictoriaMetrics' newest sample is 30 s old; a sink still retrying past `recovery_bound` `WARN`s |
+| `rss_slope` | resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead |
+| `fd_slope` | open file descriptors end, or sit after a recovery, more than `fd_growth` above the warmup median |
+
+The loss ledger, the sink conservation identity, and the recovery check aren't built yet and
+report `SKIP`.
+
+## Cleanup and a shared daemon
+
+Everything a run creates belongs to the `soak-<scenario>` project, apart from the one-shot netem
+containers, which remove themselves. The script refuses to start while that project has
+containers, and prints the `down` command for a stack a crashed or `--keep` run left behind. Two
+different scenarios can run at once; it never prunes.
