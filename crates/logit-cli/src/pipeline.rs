@@ -1297,6 +1297,7 @@ fn build_spec(
             transport,
             format,
             relative_gauges,
+            multi_value,
             max_packet_bytes,
             connect_timeout,
             tls,
@@ -1315,8 +1316,9 @@ fn build_spec(
                     StatsdOutput::unix_stream(endpoint.clone(), *connect_timeout)
                 }
             };
-            let encoder =
-                StatsdEncoder::new(statsd_format(*format)).with_relative_gauges(*relative_gauges);
+            let encoder = StatsdEncoder::new(statsd_format(*format))
+                .with_relative_gauges(*relative_gauges)
+                .with_multi_value(statsd_multi_value(*multi_value));
             let mut output = output
                 .with_encoder(encoder)
                 .with_max_packet_bytes(*max_packet_bytes as usize)
@@ -1765,6 +1767,14 @@ fn splunk_multi_value(cfg: logit_config::SplunkMultiValue) -> logit_proto::Multi
     match cfg {
         logit_config::SplunkMultiValue::Skip => logit_proto::MultiValue::Skip,
         logit_config::SplunkMultiValue::Expand => logit_proto::MultiValue::Expand,
+    }
+}
+
+/// Config's `StatsdMultiValue` into `logit_proto::MultiValue`.
+fn statsd_multi_value(cfg: logit_config::StatsdMultiValue) -> logit_proto::MultiValue {
+    match cfg {
+        logit_config::StatsdMultiValue::Skip => logit_proto::MultiValue::Skip,
+        logit_config::StatsdMultiValue::Expand => logit_proto::MultiValue::Expand,
     }
 }
 
@@ -5324,6 +5334,7 @@ mod tests {
                 transport,
                 format: logit_config::StatsdFormat::default(),
                 relative_gauges: false,
+                multi_value: logit_config::StatsdMultiValue::default(),
                 max_packet_bytes: 1432,
                 connect_timeout: Duration::from_secs(5),
                 tls,
@@ -5412,6 +5423,7 @@ mod tests {
                         transport: logit_config::StatsdTransport::Tcp,
                         format: logit_config::StatsdFormat::default(),
                         relative_gauges: false,
+                        multi_value: logit_config::StatsdMultiValue::default(),
                         max_packet_bytes: 1432,
                         connect_timeout: Duration::from_secs(5),
                         tls: Some(logit_config::TlsClientConfig::default()),

@@ -71,10 +71,11 @@ out of the generic tag segment, so a carrier set only on the resource is honored
 counted (`dropped_dialect_fields`) under `format: statsd`, which has no equivalent segment.
 `statsd.*` attributes are filtered out of the generic `|#k:v` tag segment (`build_tag_suffix`),
 never re-emitted as tags. `Distribution`/`Set`/
-`Histogram`/`ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum` remain dropped and
-counted (`unsupported_metric_kind`) — reachable now only once `aggregate` has explicitly summarized
+`Histogram`/`ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum` remained dropped
+and counted (`unsupported_metric_kind`) — reachable only once `aggregate` has explicitly summarized
 (its defaults, `distributions: sketch`/`sets: estimate`), exactly the "opt-in summarization"
-carve-out the ADR names. `GaugeDelta` is still only emitted under the opt-in
+carve-out the ADR names. (Since 2026-10-07 they expand into dotted counter and gauge lines by
+default instead: [ADR `statsd-out-multi-value-expansion`](../adr/statsd-out-multi-value-expansion.md).) `GaugeDelta` is still only emitted under the opt-in
 `relative_gauges: true`, unchanged by this workstream.
 
 Preserved end to end now: metric names, counters (sample-rate-extrapolated, unchanged), absolute
@@ -585,10 +586,15 @@ What's left is what the ADR's "cross-protocol egress stays best-effort" clause a
 plus a short list of genuine model debt — both already tracked in `docs/known-gaps/` rather than
 newly discovered here:
 
-- `statsd_out` still drops post-sketch metric kinds (`Distribution`/`Set`/`Histogram`/
+- ~~`statsd_out` still drops post-sketch metric kinds (`Distribution`/`Set`/`Histogram`/
   `ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum`) — reachable only once
   `aggregate` has explicitly summarized, which is the ADR's own opt-in-summarization carve-out, not
-  a like-to-like loss (`docs/known-gaps/`'s "`statsd_out` drops post-sketch metric kinds" entry).
+  a like-to-like loss~~ — **narrowed as of 2026-10-07**: they leave as dotted per-component counter
+  and gauge lines under `multi_value: expand`, the default
+  ([ADR `statsd-out-multi-value-expansion`](../adr/statsd-out-multi-value-expansion.md)), and drop
+  only under `multi_value: skip`. What remains is that quantiles and set estimates don't merge
+  downstream as a sketch would (`docs/known-gaps/statsd.md`'s "`statsd_out` writes summarized
+  metric kinds as per-component lines" entry).
 - ~~`logit_proto::Encoder`'s one-`Bytes`-per-batch contract still doesn't fit `syslog_out`'s/
   `statsd_out`'s per-message framing, so both bypass the trait entirely — unchanged by this
   plan~~ — **closed as of 2026-09-12**: both now implement `logit_proto::FramedEncoder` over a

@@ -1824,8 +1824,8 @@ one:
   carry.** `Samples`, `Distribution`, `Histogram`, `ExponentialHistogram`, `Summary`, `Set`, and
   `SetMembers` records are dropped whole and counted `logit.output.metrics.skipped{metric_kind=...}`
   instead of guessing at a convention. To keep them, set `multi_value: expand`, which renders the
-  dotted sub-paths tabled in `logit_proto::graphite`'s module doc (`.count`, `.sum`,
-  `.q0_5`...`.q0_99`, per-bucket counts, and so on), an explicit, named convention counted
+  dotted sub-paths tabled in `logit_proto::multi_value`'s module doc (`.count`, `.sum`, `.min`,
+  `.max`, `.q0_5`...`.q0_99`, per-bucket counts, and so on), an explicit, named convention counted
   `logit.output.metrics.degraded{metric_kind=...}` once per record.
 - **Size and timeout bounds.** `max_packet_bytes:` (UDP only, default `1432`, at most `65507`, the
   largest UDP payload) bounds a datagram, not a single line, like `statsd_out`'s setting. `max_frame_bytes:` (default `1MiB`, Twisted's
@@ -1935,6 +1935,67 @@ components:
 - **`max_packet_bytes:` isn't bounded by the UDP ceiling here.** A `unix` datagram's limit is the
   socket's send buffer (`net.core.wmem_default`, 212 992 bytes on a default kernel); a larger
   packet is refused `EMSGSIZE` and counted `oversize_datagram`, as over UDP.
+
+### `statsd_out`: sketches, sets, and histograms
+
+No statsd line carries a sketch or a set estimate, and `aggregate`'s defaults (`distributions:
+sketch`, `sets: estimate`) turn every timer into one and every set into the other. `statsd_out`'s
+`multi_value: expand`, the default, writes each of these as one line per component, the shape a
+statsd server's own flush has. Three timer samples (10, 20, and 30) and two set members leave as
+these lines, among others:
+
+```text
+req.latency.count:3|c
+req.latency.sum:60|c
+req.latency.min:10|g
+req.latency.max:30|g
+req.latency.q0_5:19.93163168041631|g
+req.latency.q0_99:29.827084345008355|g
+uniq.users.count:2|g
+```
+
+- **The suffixes:** `.count`, `.sum`, `.min`, `.max`, and `.q0_5`, `.q0_75`, `.q0_9`, `.q0_95`,
+  `.q0_99` for a timer's sketch, nine lines per timer series (an empty sketch writes only `.count`
+  and `.sum`); `.count` for a set; `.count`, `.sum`, `.min`, `.max`, and `.bucket_<bound>` for
+  a histogram; `.zero_count` in place of buckets for an exponential histogram; and `.q<quantile>`
+  for a summary. No suffix contains a character the statsd grammar reserves, so every line
+  decodes back under its full name.
+- **Counter or gauge:** a count, sum, or bucket from a window's worth of data is a counter
+  (`|c`), so a downstream statsd server adds it up across its flush interval and across every
+  `logit` that sends it. Quantiles, minimums, maximums, and a set's count are gauges (`|g`): they
+  don't add. A cumulative histogram's and a summary's counts and sums are gauges too, because
+  they're running totals that a counter would add to themselves on every flush.
+- **Sums:** a cumulative sum is one gauge of its running total, and a non-monotonic delta sum is
+  one counter, each under the metric's own name.
+- **What's lost:** a downstream server keeps the last quantile, minimum, maximum, or set count it
+  received, so two senders' quantiles and extremes don't merge into true global ones. Each expanded record counts
+  `logit.output.metrics.degraded{metric_kind}`. A split-collection topology that needs a correct
+  global percentile keeps the sketch and sends it over the native hop (`logit_out`).
+- **Name collisions:** a timer named `x` writes `x.count`. A producer that also sends its own
+  `x.count` writes to the same name at the receiver, and nothing guards against it.
+- **`multi_value: skip`** drops these kinds instead, counted
+  `logit.output.metrics.skipped{metric_kind}` with a throttled `unsupported_metric_kind` warning.
+
+Raw timer samples and set members never expand. To relay the timer and set lines themselves, so
+the receiver computes its own aggregates, configure the `aggregate` with `distributions: samples`
+and `sets: members`, or relay with no `aggregate` (see "Raw samples and set members" below).
+Behind a Datadog Agent, prefer that: with `aggregate`'s defaults the Agent receives `.count`,
+`.sum`, `.min`, `.max`, and `.q*` as plain counts and gauges, and never computes its own timer aggregates or
+`d`-type distributions.
+
+Two real receivers, Etsy statsd and the Datadog Agent, were checked against a default
+`statsd_in -> aggregate -> statsd_out` relay fed timers (one of them negative), a histogram, a
+distribution, sets, counters, and a `|T`-stamped line over two windows:
+
+- Etsy statsd 0.10.2 (`format: statsd`, console backend) flushed `req.latency.count` 3 and
+  `req.latency.sum` 60 as counters, `req.latency.min` 10, `req.latency.max` 30,
+  `req.latency.q0_5` 19.93 through `q0_99` 29.83, and `uniq.users.count` 2 as gauges, the
+  negative timer's minimum, maximum, and quantiles as `-4` after the `0|g` then `-4|g` pair, and
+  `statsd.bad_lines_seen` 0 in every flush, with its own `timers` and `sets` tables empty.
+- Datadog Agent 7.83.3 (`format: dogstatsd`) parsed every packet with zero errors and forwarded
+  `.count` and `.sum` as rates (`0.3` and `6` over its 10 s interval), `.min`, `.max`, the
+  quantiles, and `uniq.users.count` as plain gauges with `env:dev` intact, the negative minimum,
+  maximum, and quantiles as `-4`, and the `|T`-stamped counter at its wire timestamp.
 
 ## Tailing files and Docker logs
 
@@ -2193,8 +2254,11 @@ consumer, but a gap in that series' graph). Hitting the cap also warns under
 
 By default, `aggregate` summarizes a raw `Samples`/`SetMembers` series as soon as it absorbs it:
 into a `DdSketch` (`distributions: sketch`) or a `HyperLogLog` (`sets: estimate`), so no raw
-observation survives past the window. To keep the individual values or the exact member set, for a
-`statsd_in -> aggregate -> statsd_out` relay or any consumer downstream, opt into raw retention:
+observation survives past the window. To keep the individual values or the exact member set for a
+consumer downstream, opt into raw retention. A `statsd_in -> aggregate -> statsd_out` relay keeps
+its timers and sets either way, as dotted counter and gauge lines by default (see "`statsd_out`:
+sketches, sets, and histograms" above); raw retention is what relays the original timer and set
+lines instead:
 
 - `distributions: samples` retains raw values for the whole window, bounded by
   `max_samples_per_series` (default `1000`).

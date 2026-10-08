@@ -15,6 +15,7 @@ pub mod graphite;
 pub mod json;
 pub mod msgbuf;
 pub mod msgpack;
+pub mod multi_value;
 pub mod native;
 pub mod otlp;
 pub mod prometheus;
@@ -22,6 +23,7 @@ pub mod proxy;
 pub mod splunk;
 
 pub use msgbuf::MessageBuf;
+pub use multi_value::MultiValue;
 
 use logit_core::{Event, EventBatch, Resource, Scope};
 use std::sync::Arc;
@@ -127,19 +129,6 @@ pub trait FramedEncoder {
 /// allows 20 more bytes, but an endpoint can be a hostname whose family config validation can't
 /// know, so every UDP sink is bounded by the IPv4 figure.
 pub const MAX_UDP_PAYLOAD_BYTES: usize = 65_507;
-
-/// What a sink does with a metric kind its one-number-per-point wire can't carry natively
-/// (`graphite_out`, `splunk_hec_out`). Each codec's module doc lists what `Expand` renders.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum MultiValue {
-    /// Drop the record, counted `logit.output.metrics.skipped{metric_kind=…}`. The default, since
-    /// an expansion's naming convention is one the receiver may know nothing about.
-    #[default]
-    Skip,
-    /// Expand into the per-codec series its module doc lists, counted
-    /// `logit.output.metrics.degraded{metric_kind=…}` once per record.
-    Expand,
-}
 
 /// Which OTLP service a payload belongs to.
 ///

@@ -2,20 +2,27 @@
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
-- **`statsd_out` drops post-sketch metric kinds — `Distribution`/`Set`/`Histogram`/
-  `ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum`, counted
-  (`unsupported_metric_kind`).** These kinds exist only after a stage has summarized, and a merged
-  `DdSketch`/`HyperLogLog` has no lossless statsd rendering. `docs/adr/statsd-output.md`'s Decision
-  section explains why that mapping needs its own design rather than a guess. `statsd_out` encodes
-  the raw `Samples`/`SetMembers` shapes that `statsd_in` decodes `ms`/`h`/`d`/`s` to, so:
+- **`statsd_out` writes summarized metric kinds as per-component lines that don't merge
+  downstream as a sketch would.** `Distribution`, `Set`, `Histogram`, `ExponentialHistogram`,
+  `Summary`, and a cumulative or non-monotonic `Sum` exist only after a stage has summarized, and
+  no statsd line carries a `DdSketch` or a `HyperLogLog`. Under `multi_value: expand`, the default,
+  each leaves as dotted `.count`/`.sum`/`.min`/`.max`/`.q*`/`.bucket_*` counter and gauge lines,
+  counted `logit.output.metrics.degraded{metric_kind}`
+  ([ADR `statsd-out-multi-value-expansion`](../adr/statsd-out-multi-value-expansion.md)).
   - **What round-trips:** a `statsd_in -> statsd_out` relay with no `aggregate`, or with one
-    configured `distributions: samples`/`sets: members`, relays a timer or set line intact.
-  - **What drops:** `aggregate`'s default summarizing config (`distributions: sketch`/`sets:
-    estimate`) drops every timer and set metric. The `samples`/`members` config keeps a window's
-    raw shape only while every sample in it shares one sample rate and the window stays under
-    `max_samples_per_series`/`max_set_members_per_series`. Past either limit, `aggregate` falls
-    back to a sketch or estimate for that window, which this sink drops and counts the same way
-    (`docs/adr/statsd-output.md`'s amendment).
+    configured `distributions: samples`/`sets: members`, relays a timer or set line intact:
+    `Samples` and `SetMembers` never expand.
+  - **What degrades:** `aggregate`'s defaults (`distributions: sketch`/`sets: estimate`) turn every
+    timer and set into a sketch or an estimate, which leaves expanded. Counts and sums merge
+    correctly across senders at a statsd server; quantiles, extremes, and set estimates are
+    gauges, so the receiver keeps the last sender's value. The `samples`/`members` config keeps a
+    window's raw shape only while every sample in it shares one sample rate and the window stays
+    under `max_samples_per_series`/`max_set_members_per_series`. Past either limit, `aggregate`
+    falls back to a sketch or estimate for that window, which this sink expands and counts the
+    same way.
+  - **What drops:** `multi_value: skip` restores the drop, counted
+    `logit.output.metrics.skipped{metric_kind}` with a throttled `unsupported_metric_kind`
+    warning.
 
   Tracked as debt against [ADR `lossless-transit`](../adr/lossless-transit.md); the closing
   assessment's residual-debt list is in

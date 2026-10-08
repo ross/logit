@@ -100,7 +100,7 @@ Sinks live in `crates/logit-outputs`.
 | `stdio_out` | `crates/logit-outputs/src/stdio.rs`, render in `human.rs` | an exhaustive, sectioned text block per event (default, `message: escaped \| multiline`), `format: json` (one object per event per line, `ndjson.rs`, what every harness reader consumes), or `format: native`; its file target is `file_out` with an empty rotation policy | [ADR `human-render-block-format`](docs/adr/human-render-block-format.md), [ADR `stream-json-format`](docs/adr/stream-json-format.md), [ADR `file-output-native-format`](docs/adr/file-output-native-format.md) |
 | `file_out` | `crates/logit-outputs/src/file.rs` | rotating file sink sharing `stdio_out`'s implementation | [ADR `rotating-file-output`](docs/adr/rotating-file-output.md) |
 | `syslog_out` | `crates/logit-outputs/src/syslog.rs` | RFC 3164/5424 over UDP, TCP, or TLS (RFC 5425) | [ADR `syslog-output`](docs/adr/syslog-output.md) |
-| `statsd_out` | `crates/logit-outputs/src/statsd.rs` | statsd/DogStatsD over UDP, TCP (optionally TLS), or a Unix socket (`unix`, `unix_stream`) | [ADR `statsd-output`](docs/adr/statsd-output.md) |
+| `statsd_out` | `crates/logit-outputs/src/statsd.rs` | statsd/DogStatsD over UDP, TCP (optionally TLS), or a Unix socket (`unix`, `unix_stream`); `multi_value: expand` (the default) writes a sketch, set estimate, histogram, or summary as dotted counter and gauge lines | [ADR `statsd-output`](docs/adr/statsd-output.md), [ADR `statsd-out-multi-value-expansion`](docs/adr/statsd-out-multi-value-expansion.md) |
 | `otlp_out` | `crates/logit-outputs/src/otlp.rs` | OTLP logs, metrics, and traces over OTLP/HTTP and OTLP/gRPC | [ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md) |
 | `datadog_out` | `crates/logit-outputs/src/datadog.rs` | Datadog's intake API: series, distribution points, sketches, service checks, events, logs, and Agent-processed APM traces and stats, one request per route; drops stale points and unprocessed traces, counted | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `datadog_trace_out` | `crates/logit-outputs/src/datadog_trace.rs` | a Datadog Agent's APM API (traces and `/v0.6/stats`), v0.4 or v0.7, over TCP or the Agent's Unix socket, restoring the tracer's request headers | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
@@ -253,7 +253,8 @@ Datadog pairs, and [docs/plans/splunk-relay.md](docs/plans/splunk-relay.md) for 
   exporter's span object decoded back to a `SpanRecord`.
 
 Residual debt lives in `docs/known-gaps/statsd.md` and `docs/known-gaps/syslog.md`: post-sketch
-metric kinds at `statsd_out`, and `statsd_out` carrying no `unit` and no native rename/prefix and
+metric kinds leaving `statsd_out` as per-component lines whose quantiles and set estimates don't
+merge downstream, and `statsd_out` carrying no `unit` and no native rename/prefix and
 stamping an egress timestamp only on a `|T`-marked line. The Datadog pairs' and the Splunk pair's
 residual debt is in `docs/known-gaps/datadog.md` and `docs/known-gaps/splunk.md`, each listed by
 its plan's closing assessment.
@@ -268,9 +269,12 @@ Per pair:
   no `aggregate` in between, or one configured `distributions: samples`/`sets: members`,
   round-trips timers and sets byte-for-byte under `format: dogstatsd`. Under `format: statsd` it's
   lossless modulo the ADR's permitted normalizations: multi-value lines split, and `h`/`d`
-  normalize to `ms`. Only post-sketch kinds
+  normalize to `ms`. Post-sketch kinds
   (`Distribution`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary`, and a cumulative or
-  non-monotonic `Sum`) are dropped and counted (`docs/known-gaps/statsd.md`).
+  non-monotonic `Sum`) leave as dotted per-component counter and gauge lines under
+  `multi_value: expand`, the default, counted degraded, and drop under `skip`
+  ([ADR `statsd-out-multi-value-expansion`](docs/adr/statsd-out-multi-value-expansion.md),
+  `docs/known-gaps/statsd.md`).
 - **`otlp_in -> otlp_out`**: logs, metrics, and traces, over both OTLP/HTTP and a hand-rolled
   OTLP/gRPC transport. `otlp_in`'s HTTP side accepts OTLP/JSON as well as protobuf
   ([ADR `otlp-json-decoding`](docs/adr/otlp-json-decoding.md)). The protobuf types are committed
@@ -370,7 +374,8 @@ Per pair:
   `splunk_hec_out` put the same names in Splunk. `index`/`source`/`sourcetype`/`host` ride on the
   resource, set upstream with `set`; a body decodes into one batch per distinct envelope.
   Metrics are one number per name, so multi-number kinds follow `graphite_out`'s
-  `multi_value: skip | expand` (`logit_proto::MultiValue`, shared by both sinks), with
+  `multi_value: skip | expand` (`logit_proto::MultiValue`, shared with `graphite_out` and
+  `statsd_out`, which share the dotted table in `logit_proto::multi_value`), with
   histograms and summaries in the exporter's `_bucket`/`le` and `<n>_<q>`/`qt` shape. Spans leave
   as the exporter's JSON span object and are detected by shape on the way in. The encoder writes
   one object per `MessageBuf` entry, so `splunk_hec_out` packs bodies under `max_body_bytes` and,

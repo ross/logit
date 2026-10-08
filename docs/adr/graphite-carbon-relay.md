@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-09-30
+updated: 2026-10-07
 ---
 
 # Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch
@@ -143,6 +143,9 @@ kind adds **at least one** suffix, so an expanded path can never collide with a 
 | `Summary` | `.count`, `.sum`, `.q<q>` per its own quantiles |
 | `Set` | `.count` = `estimate()` |
 | `SetMembers` | `.count` = distinct member count |
+
+Amended (2026-10-07): the `Samples`/`Distribution` row gains `.min` and `.max`; see "Amendment: a
+sketch's min and max".
 
 `Samples` goes through `logit_core::Samples::sketch()` (`crates/logit-core/src/metric.rs`);
 quantiles are `crate::otlp::metrics::DISTRIBUTION_QUANTILES`
@@ -462,3 +465,33 @@ unchanged.
 ## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
 
 `Output::duplicate_safe()` is gone, and `at_least_once` is every sink's default posture. `graphite_out` keeps the posture the "Duplicate safety" section argues for, now through the runtime default rather than a `true` from `duplicate_safe()`. The Whisper argument and its boundary for a non-Whisper receiver are unchanged. See [`delivery-semantics.md`](delivery-semantics.md) item 5.
+
+## Amendment: the sub-path table is shared (2026-10-07)
+
+The `multi_value: expand` table moves out of `graphite_out`'s codec into `logit_proto::multi_value`,
+whose module doc is now the canonical copy of the "`multi_value: expand` sub-paths" section above.
+The table itself is unchanged, and so is graphite's wire: every sub-path, its order, its number
+token, and every non-finite skip are what they were, pinned in plaintext and pickle by
+`expand_wire_output_is_unchanged_for_every_kind_in_both_protocols` in
+`crates/logit-proto/src/graphite/encode.rs`.
+[ADR `statsd-out-multi-value-expansion`](statsd-out-multi-value-expansion.md) has `statsd_out`
+render the same table, so once it does, one change to the table changes both sinks.
+
+## Amendment: a sketch's min and max (2026-10-07)
+
+`multi_value: expand` now writes two more sub-paths per `Samples` or `Distribution` record:
+`.min` and `.max`, after `.sum` and before the quantiles, read from `DdSketch::min` and
+`DdSketch::max`. This is a wire change. An expanded timer now leaves as nine datapoints where it
+left as seven, and a carbon server creates two more whisper files per series the first time they
+arrive. An empty sketch writes neither, since it has no observation to report.
+
+The values are tracked from the observations, as `.sum` is, so they're the samples' real extremes.
+A sketch decoded from bins alone derives them from bin representatives, and they're approximate
+there.
+
+The golden test that pins every kind's plaintext and pickle output records the new sub-paths. It's
+renamed `expand_wire_output_is_pinned_for_every_kind_in_both_protocols` in
+`crates/logit-proto/src/graphite/encode.rs`, since it no longer holds the output unchanged.
+[ADR `statsd-out-multi-value-expansion`](statsd-out-multi-value-expansion.md)'s amendment records
+the same change from `statsd_out`'s side, and `logit_proto::multi_value`'s module doc is the
+canonical table.
