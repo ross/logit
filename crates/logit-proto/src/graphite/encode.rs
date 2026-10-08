@@ -1713,6 +1713,107 @@ mod tests {
         assert_eq!(lines, vec!["sys.cpu.count;env=prod 2 1700000000"]);
     }
 
+    /// Every multi-value kind's expansion in both protocols, including a tagged event, a `Summary`
+    /// with a non-finite quantile, and a histogram whose `sum` is NaN: every plaintext line, and
+    /// the pickle frame's datapoints and length. A change to the sub-path order, a suffix, a number
+    /// token, or a non-finite skip fails here.
+    #[test]
+    fn expand_wire_output_is_unchanged_for_every_kind_in_both_protocols() {
+        let mut tags = AttrMap::new();
+        tags.insert("env", "prod");
+        let tagged_distribution = Event::metric(
+            TS,
+            tags,
+            MetricRecord::new(
+                intern("sys.cpu"),
+                MetricKind::Distribution(sketch(&[1.0, 2.0, 3.0])),
+            ),
+        );
+        let nan_sum_histogram = Histogram {
+            buckets: vec![(-0.5, 4), (0.05, 1)],
+            temporality: Temporality::Cumulative,
+            sum: Some(f64::NAN),
+            min: None,
+            max: Some(2.0),
+        };
+        let events = vec![
+            event(MetricKind::Samples(Samples::new([1.0, 2.0, 3.0]))),
+            tagged_distribution,
+            event(MetricKind::Histogram(histogram())),
+            event(MetricKind::Histogram(nan_sum_histogram)),
+            event(MetricKind::ExponentialHistogram(exp_histogram())),
+            event(MetricKind::Summary(Summary {
+                quantiles: vec![(0.5, 1.0), (0.9, f64::NAN), (0.99, 9.0)],
+                count: 4,
+                sum: 12.0,
+            })),
+            event(MetricKind::Set(hyper_log_log())),
+            event(set_members()),
+        ];
+        let batch = batch(events);
+
+        let expected = [
+            "sys.cpu.count 3 1700000000",
+            "sys.cpu.sum 6 1700000000",
+            "sys.cpu.q0_5 2.009103080990281 1700000000",
+            "sys.cpu.q0_75 3 1700000000",
+            "sys.cpu.q0_9 3 1700000000",
+            "sys.cpu.q0_95 3 1700000000",
+            "sys.cpu.q0_99 3 1700000000",
+            "sys.cpu.count;env=prod 3 1700000000",
+            "sys.cpu.sum;env=prod 6 1700000000",
+            "sys.cpu.q0_5;env=prod 2.009103080990281 1700000000",
+            "sys.cpu.q0_75;env=prod 3 1700000000",
+            "sys.cpu.q0_9;env=prod 3 1700000000",
+            "sys.cpu.q0_95;env=prod 3 1700000000",
+            "sys.cpu.q0_99;env=prod 3 1700000000",
+            "sys.cpu.count 6 1700000000",
+            "sys.cpu.sum 12 1700000000",
+            "sys.cpu.min 0.25 1700000000",
+            "sys.cpu.max 9 1700000000",
+            "sys.cpu.bucket_0_5 1 1700000000",
+            "sys.cpu.bucket_5 2 1700000000",
+            "sys.cpu.bucket_inf 3 1700000000",
+            "sys.cpu.count 5 1700000000",
+            "sys.cpu.max 2 1700000000",
+            "sys.cpu.bucket_-0_5 4 1700000000",
+            "sys.cpu.bucket_0_05 1 1700000000",
+            "sys.cpu.count 5 1700000000",
+            "sys.cpu.sum 10 1700000000",
+            "sys.cpu.min 1 1700000000",
+            "sys.cpu.max 4 1700000000",
+            "sys.cpu.zero_count 2 1700000000",
+            "sys.cpu.count 4 1700000000",
+            "sys.cpu.sum 12 1700000000",
+            "sys.cpu.q0_5 1 1700000000",
+            "sys.cpu.q0_99 9 1700000000",
+            "sys.cpu.count 2 1700000000",
+            "sys.cpu.count 2 1700000000",
+        ];
+
+        let (lines, _, stats, _) = encode_with(&batch, |e| e.with_multi_value(MultiValue::Expand));
+        assert_eq!(lines, expected, "plaintext");
+        assert_eq!(stats.degraded_expanded_kind, 8, "one per record");
+
+        // Pickle carries the same datapoints, in the same order, in one frame.
+        let (frames, metas, _, _) = encode_raw_with(&batch, |e| {
+            e.with_multi_value(MultiValue::Expand).with_protocol(Protocol::Pickle)
+        });
+        assert_eq!(metas, vec![expected.len()], "pickle");
+        let points: Vec<(String, f64, f64)> = expected
+            .iter()
+            .map(|line| {
+                let mut fields = line.split(' ');
+                let path = fields.next().unwrap().to_string();
+                let value: f64 = fields.next().unwrap().parse().unwrap();
+                let seconds: f64 = fields.next().unwrap().parse().unwrap();
+                (path, seconds, value)
+            })
+            .collect();
+        assert_eq!(decode_frames(&frames), vec![points], "pickle");
+        assert_eq!(frames[0].len(), 1302, "pickle frame bytes");
+    }
+
     // -- framing ------------------------------------------------------------------------------------
 
     #[test]
