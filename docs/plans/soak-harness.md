@@ -70,7 +70,7 @@ tools/soak/
     faults.py      ACTIONS: name -> (apply, revert, affects_udp_ingress, affects_egress)
     driver.py      up, warmup, 1 s scheduler, watchdog polls, end sequence, collect
     collect.py     provenance, logs, inspect, stats, vm export, timeline/watchdog jsonl
-    telemetry.py   NDJSON -> points; counter sums per process life; gauge series
+    telemetry.py   NDJSON -> points; counter sums per process life; gauge series; stderr lines
     vm.py          export()/force_flush()/freshness() against the published loopback port
     checks.py      one function per check -> Result(id, status, detail)
     report.py      results.md / results.json
@@ -216,8 +216,8 @@ Each netem change is a one-shot
 `docker run --rm --network container:<id> --cap-add NET_ADMIN logit-soak-netem set|clear|show`.
 The qdisc outlives the `tc` process, and nothing long-lived joins the target's namespace, so netem
 stays out of `compose up --wait`. The driver appends `limit 100000` unless the spec sets a
-`limit`, because netem's default `limit 1000` tail-drops locally at 2,000 packets/s under a 200 ms
-delay.
+`limit`, as headroom so netem's own queue never drops a packet: a delay on the generator at
+2,000 packets/s, or the burst after an outage, can exceed netem's default `limit 1000`.
 
 A root qdisc on a container's default-route interface shapes that container's egress only:
 
@@ -284,8 +284,9 @@ A "fault window" below is a fault's span plus `recovery_bound` after it.
 - `restarts`: every `StartedAt` change matches a scheduled start or restart.
 - `self_log`: FAIL on an `exiting` line with `code != 0`, a `key == "thread_panicked"` line, or
   the raw `thread '…' panicked at` text, which isn't JSON, so stderr is checked line by line.
-  ERROR lines keyed `retrying`, `send_failed`, or `degraded` are expected inside a fault window
-  and WARN outside one. Any other ERROR line FAILs.
+  An ERROR line keyed `retrying` is expected inside a fault window and WARNs outside one. A
+  WARN line keyed `send_failed`, or whose message is `degraded`, does the same. Any other
+  ERROR line FAILs.
 - `ready`: `Health.Status` is `healthy` outside fault windows, and a container is ready within
   30 s of each start. A paused container fails the image's `HEALTHCHECK`, so health is judged
   only outside fault windows.
@@ -314,36 +315,62 @@ one event is one increment.
 | E | SUT `logit.component.events.sent{component=statsd}` |
 | A | aggregate `logit.component.events.received` |
 | Ab | aggregate `logit.transform.metrics.absorbed` |
-| V | the reset-aware total of `vm-export.jsonl`: add each series' first value, then every non-negative step, and on a decrease add the new value. Resets per series should equal SUT lives minus one, else WARN |
+| V | the reset-aware total of `vm-export.jsonl`: add each series' first value, then every non-negative step, and on a decrease add the new value. Resets per series should equal SUT lives minus one, else WARN. The resets also split V per SUT life |
 
 The generator sets `max_packet_bytes: "32"`, so one datagram carries one line of about 20 bytes,
 and G uses `output.messages` (what the kernel took), not `events.sent`. While the SUT is down,
 `statsd_out`'s per-batch name resolution fails `Clean` and nothing is sent.
+
+**Which life a hop is judged in.** `internal`'s final drain runs when the shutdown signal fires
+([`internal-telemetry.md`](../design/internal-telemetry.md), "`internal`: the drain"), and no
+drain exports the work after it: the listener decodes what its receive queue still holds and
+flushes its accumulator (`FlushReason::Shutdown`), `aggregate` absorbs those events, and its
+close-time window still reaches VictoriaMetrics. Shutdown drops land after it too, so they come
+from stderr: the listener's `warn` lines go into D, and the `drain complete` line's
+`batches_dropped` (batches, across every node) goes beside `ledger.egress`.
+
+- The final SUT life ends after the generator stops and the VictoriaMetrics total holds (§5's
+  end sequence), so nothing arrives after its final drain. `ledger.intake`, `ledger.edge`,
+  `ledger.aggregate`, and `ledger.egress` are judged with no tolerance for it.
+- An earlier SUT life ends under load, at a scheduled `stop` or `restart`. Its hops are compared
+  at its last drain and reported, and judged only through `ledger.egress` and the life's sum
+  W − D − B − Ab, which must lie between 0 and the residual R that can be in flight at the
+  signal: the receive queue (`receive.max_datagrams`), one accumulator batch
+  (`receive.batch_max_events`), and `aggregate`'s inbox (64 batches of at most
+  `receive.batch_max_events` each).
+
+The rows:
 
 - `ledger.wire` is G − (W + K). This loss is uncounted **by design**: UDP on the network, netem
   drops, and the kernel receive queue at socket close
   ([`docs/known-gaps/intake.md`](../known-gaps/intake.md), "UDP intake"). It is reported,
   bucketed by drain timestamp, and fails only when the loss outside UDP-affecting windows (netem
   on `generator`; any `logit` stop, pause, restart, or partition) exceeds
-  `wire_loss_outside_faults`. Up to one batch (100 lines) negative at the end is allowed, for a
-  generator send cancelled at shutdown, whose counts are lost.
-- `ledger.intake`: W − D == E + B per life, exact after a graceful stop.
-- `ledger.edge`: E == A, a single-consumer edge.
-- `ledger.aggregate`: Ab == A.
-- `ledger.egress`: Ab − V == 0, else explained only by counted `shutdown` drops on the sink in
-  that life. Shutdown drops land after `internal`'s final drain
-  ([`internal-telemetry.md`](../design/internal-telemetry.md), "`internal`: the drain"), so
-  they come from stderr: the `drain complete` line's `batches_dropped` and the listener's `warn`
-  lines. Anything else is **uncounted loss, FAIL**.
+  `wire_loss_outside_faults`. At the end, G can fall short of W + K, because what the
+  generator's sink sends after the generator's final drain is never exported, and a send
+  cancelled at shutdown loses its counts. A negative gap of up to the generator sink's
+  `buffer.batches` at its last drain plus one batch (100 lines each) is allowed.
+- `ledger.intake`: W − D == E + B, for the final life.
+- `ledger.edge`: E == A, a single-consumer edge, for the final life.
+- `ledger.aggregate`: Ab == A, for the final life.
+- `ledger.egress`, per life: Ab − V, with V split at each series' reset. A gap of 0 passes, and
+  so does a gap between −R and 0 for an earlier life, whose close-time window reached
+  VictoriaMetrics after its last drain. A positive gap is lost increments. It is reported with
+  that life's `drain complete` `batches_dropped` beside it, and is **counted** only when that
+  count is above 0. The two are never reconciled: `batches_dropped` counts batches, and under
+  `temporality: cumulative` a dropped batch loses only the increments since its series' last
+  delivered total, which no log line states. Any other gap is **uncounted loss, FAIL**.
 - `identity.sink`: at the last quiet SUT drain before shutdown,
   `batches.received == batches.delivered + batches.dropped (every reason) + buffer.batches`,
-  allowing one batch in flight. Checked there, not at exit, for the same reason.
+  allowing one batch in flight. Checked there, not at exit, because the sink's last delivery and
+  its shutdown drops land after the final drain.
 - `recovery`: within `recovery_bound` of each fault's end, `retrying` is 0,
   `buffer.utilization` and `receive.utilization` are under 0.05, and the ingest rate is at least
   95% of the warmup baseline. A generator `rate_behind` diagnostic makes the throughput row WARN,
   because the generator limited the rate, not the SUT.
-- The summary row: uncounted = (W − D − E − B) + (E − A) + (Ab − V − counted), which must be 0,
-  with wire loss shown beside it as "by design".
+- The summary row, for the final life: uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V),
+  which must be 0, with each term shown beside it and wire loss beside them as "by design". When
+  `ledger.egress` is counted, its term is shown as counted and the row judges the other three.
 
 ### 7. The first scenario's configs (W1a)
 
@@ -416,15 +443,19 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
-  `faults.py`, `driver.py`, `collect.py`, and `report.py`; the watchdog checks; `run`, `list`,
-  `check`, and `self-test`; the `statsd-vm` scenario. The globs in `script/validate` and in
+  `faults.py`, `driver.py`, `collect.py`, and `report.py`; `telemetry.py` (counter sums per
+  process life, gauge series, and the stderr line classifier); `vm.py` (`freshness()`,
+  `export()`, and `force_flush()`); `checks.py` with the watchdog checks; `selftest.py` with
+  fixtures for NDJSON with two lives and a `panicked at` line; `run`, `list`, `check`, and
+  `self-test`; the `statsd-vm` scenario. The globs in `script/validate` and in
   `every_shipped_config_loads_and_validates` (`crates/logit-cli/src/config.rs`, whose
   `["tools/victoria-interop", "tools/splunk-interop"]` loop gains `tools/soak/scenarios/*/`);
   `tools/soak/README.md`; an AGENTS.md "Harnesses" entry and Environment table row; the
   `ndjson.rs` reader list; a first run recorded under "Findings".
-- **W1b**: the `telemetry.py` and `vm.py` reducers, the ledger, `identity.sink`, `recovery`, and
-  stderr shutdown-drop parsing; self-test fixtures (NDJSON with two lives, a VictoriaMetrics export
-  with resets, a `panicked at` line); a 15-minute run recorded under "Findings".
+- **W1b**: the ledger, `identity.sink`, and `recovery` checks, and the stderr shutdown-drop
+  reductions (the listener's `warn` lines and `drain complete`'s `batches_dropped`); self-test
+  fixtures for a VictoriaMetrics export with resets and a stderr log with shutdown drops; a
+  15-minute run recorded under "Findings".
 - **W2**: sink-outage variants, the verification
   [`buffered-sink-delivery.md`](buffered-sink-delivery.md) describes (a 90 s stop under `block`,
   then `drop_oldest` with a small `max_batches`), and a UDP flood with the sink stopped,
@@ -449,7 +480,9 @@ across runs:
 
 - UDP wire loss is by design and reported, not judged, outside the threshold on windows with no
   UDP-affecting fault.
-- Shutdown drops come from stderr, because they land after `internal`'s final drain.
+- The listener's shutdown flush, `aggregate`'s close-time window, and shutdown drops land after
+  `internal`'s final drain, so the per-hop ledger is exact only for the final SUT life, and
+  shutdown drops come from stderr.
 - The self-test doesn't run in CI.
 
 ## Verification
@@ -467,10 +500,12 @@ across runs:
     the README.
 - **W1b**:
   - The self-test fixtures pass, and a 15-minute run's `results.md` has every ledger row.
-  - Three negative controls, each run once and documented in the PR body:
-    - A SUT config with `buffer: {max_batches: 8, overflow: drop_oldest}` makes `ledger.egress`
-      report counted drops and still PASS the uncounted row.
-    - A `docker kill -s KILL` of the SUT mid-run FAILs `exit`.
+  - Two negative controls, each run once and documented in the PR body:
+    - A final total lost at shutdown: the SUT sink set to `buffer: {shutdown_grace: 1s}`, and
+      VictoriaMetrics stopped by hand during the cooldown and started again after the SUT stops.
+      The batches holding the last window's totals drop at shutdown, `drain complete` reports
+      them, and `ledger.egress` reports a positive gap as counted while the summary row's other
+      terms stay 0.
     - A wrong `vm_selector` FAILs `ledger.egress` rather than passing with nothing to compare.
 - **W2 through W5**: each new scenario passes `self-test` validation and the shipped-config test,
   and a run of it is recorded under "Findings".
