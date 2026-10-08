@@ -32,12 +32,20 @@ Four facts about the running system shape the design:
 
 - `docker compose logs` merges a container's stdout and stderr, and `docker logs` keeps them
   apart across every life of a container that is stopped and started but never recreated.
-- `internal`'s final drain runs before the shutdown-time counts exist.
-  `datagrams.dropped{reason="shutdown"}`, a sink's `batches.dropped{reason="shutdown"}`, and the
-  sink's last delivery land after it
-  ([`internal-telemetry.md`](../design/internal-telemetry.md), "`internal`: the drain", and the
-  `shutdown` row of "UDP listeners: `ReceiveQueue` and the kernel socket"). They reach stderr
-  only, as the listener's `warn` lines and the `drain complete` line's `batches_dropped`.
+- `internal`'s final drain runs when the shutdown signal fires, and no drain exports what
+  happens after it ([`internal-telemetry.md`](../design/internal-telemetry.md), "`internal`: the
+  drain", and the `shutdown` row of "UDP listeners: `ReceiveQueue` and the kernel socket"):
+  - the listener decodes what its receive queue still holds and flushes its accumulator;
+  - `aggregate` absorbs those events and flushes its close-time window, which still reaches the
+    backend;
+  - the sink makes its last delivery;
+  - `datagrams.dropped{reason="shutdown"}` and a sink's `batches.dropped{reason="shutdown"}` are
+    counted. These reach stderr only, as the listener's `warn` lines and the `drain complete`
+    line's `batches_dropped`.
+
+  So per-hop counts are exact only for a process life whose input stopped before the signal:
+  the final life, after the generator stops and the backend's total holds. A life that ends
+  under load leaves a bounded residual that no drain reports.
 - `/readyz` stays `200 ok` while a sink retries and holds its queue
   ([`deploying.md`](../deploying.md), "Probes and exit codes"), so readiness can't detect a sink
   that stops making progress.
@@ -110,6 +118,9 @@ datagram.**
   threshold.
 - Shutdown-time drops are read from stderr, and the sink conservation identity is checked at the
   last quiet telemetry drain before shutdown, not at exit.
+- The per-hop ledger is judged with no tolerance for the final SUT life only. A life that ends
+  under load is compared at its last drain and judged within a bound: what the receive queue,
+  one accumulator batch, and `aggregate`'s inbox can hold at the signal.
 - A hang is the absence of sink progress (`batches.delivered` flat with work queued) outside fault
   windows and their recovery bound, not a readiness failure.
 
