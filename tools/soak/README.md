@@ -54,10 +54,10 @@ tables (see [Expectations](#expectations)):
 
 | Scenario | Fault | What its expectations assert |
 |---|---|---|
-| `sink-outage-block` | VictoriaMetrics stopped 90 s; the sink's queue is 2 batches under `overflow: block` | the sink's queue fills, backpressure reaches the listener, whose receive queue drops the oldest datagrams and counts them while the kernel drops nothing, and the sink drains after |
-| `sink-outage-drop-oldest` | VictoriaMetrics stopped 90 s; the sink's queue is 4 batches under `overflow: drop_oldest` | the sink evicts and counts batches while the listener drops nothing and its receive queue stays under 5% full, and the sink drains after |
-| `udp-flood-sink-stop` | 20,000 lines/s; VictoriaMetrics stopped 60 s; every queue at its default | the listener reads datagrams in every drain of the stop, at 90% of the generator's rate, and the kernel drops nothing |
-| `udp-flood-sink-stop-block` | as `udp-flood-sink-stop`, with `receive: {overflow: block}` and a 2-batch blocking sink queue | the stop backs up to the listener, the kernel drops, `logit` evicts nothing, and every queue drains after |
+| `sink-outage-block` | VictoriaMetrics stopped 90 s; the sink's queue is 2 batches under `overflow: block` | the sink's queue fills, backpressure reaches the listener, whose receive queue drops the oldest datagrams and counts them while the kernel and the sink drop nothing, and the sink drains after |
+| `sink-outage-drop-oldest` | VictoriaMetrics stopped 90 s; the sink's queue is 2 batches under `overflow: drop_oldest` | the sink evicts and counts batches while `aggregate` never blocks, the listener drops nothing, and its receive queue stays under 5% full, and the sink drains after |
+| `udp-flood-sink-stop` | 20,000 lines/s; VictoriaMetrics stopped 60 s; a 2-batch blocking sink queue, the receive queue at its default | the stop backs up to the listener, which evicts and counts the oldest datagrams and reads datagrams in every drain of the stop, at 90% of the generator's rate, and the kernel drops nothing |
+| `udp-flood-sink-stop-block` | as `udp-flood-sink-stop`, with `receive: {overflow: block, max_datagrams: 10000}` | the stop backs up to the listener, the kernel drops, `logit` evicts nothing, and every queue drains after |
 
 ### Faults
 
@@ -152,15 +152,18 @@ service = "logit"                       # logit or generator
 metric = "logit.component.buffer.batches"
 component = "victoria_metrics"          # and any other attribute under attrs = { ... }
 step = "c0s1"                           # an expanded step id, or a [[step]] index for every cycle
-window = "during"                       # the fault's span, or `after`: the recovery_bound after it
+window = "during"                       # the fault's span; `after`, the recovery_bound after it; `through`, both
 reduce = "max"                          # counters: delta, min_delta; gauges: max, min, last
 min = 2                                 # min, max, or both
 ```
 
 `min_delta` is the smallest single drain's delta, so `min = 1` asserts a counter rose in every
 drain of the window. A gauge reducer includes the value in force at the window's start, because
-`internal` exports a gauge only in a drain after it was set. A scenario with no `[[expect]]`
-gets one `expect` row that SKIPs.
+`internal` exports a gauge only in a drain after it was set, taken from the SUT life running at
+that start only. A bound that must hold for the whole episode, such as a loss counter that must
+stay 0, uses `through`: a chain blocked behind a sink stays blocked until the sink's next retry,
+up to its `retry_max_delay` after the revert. A scenario with no `[[expect]]` gets one `expect`
+row that SKIPs.
 
 ## Cleanup and a shared daemon
 
