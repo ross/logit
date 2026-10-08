@@ -1980,9 +1980,9 @@ Behind a Datadog Agent, prefer that: with `aggregate`'s defaults the Agent recei
 `.sum`, and `.q*` as plain counts and gauges, and never computes its own timer aggregates or
 `d`-type distributions.
 
-Both receivers were checked with real software, a default `statsd_in -> aggregate -> statsd_out`
-relay fed timers (one of them negative), a histogram, a distribution, sets, counters, and a
-`|T`-stamped line over two windows:
+Two real receivers, Etsy statsd and the Datadog Agent, were checked against a default
+`statsd_in -> aggregate -> statsd_out` relay fed timers (one of them negative), a histogram, a
+distribution, sets, counters, and a `|T`-stamped line over two windows:
 
 - Etsy statsd 0.10.2 (`format: statsd`, console backend) flushed `req.latency.count` 3 and
   `req.latency.sum` 60 as counters, `req.latency.q0_5` 19.93 through `q0_99` 29.83 and
