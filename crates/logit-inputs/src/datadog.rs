@@ -1673,14 +1673,8 @@ mod tests {
         running.handle.abort();
         logit_pipeline::test_util::expect_closed(&mut client, "an aborted connection").await;
         recv_batch(&mut rx).await;
-        logit_pipeline::test_util::assert_no_batch(
-            &mut rx,
-            // A negative window, ended early by the inbox closing: a send that survived the abort
-            // would hold a `Fanout` clone and deliver inside it, the slot being free.
-            Duration::from_millis(200),
-            "the aborted request's batch",
-        )
-        .await;
+        // A reservation that survived the abort would hold a `Fanout` clone and deliver its batch
+        // before the inbox could close, so the close below is the negative assertion.
         expect_inbox_closed(&mut rx).await;
         probe
             .wait_for("the connections gauge to read 0", |t| {
