@@ -1,8 +1,9 @@
 # soak
 
 `script/soak` runs real `logit` containers for minutes under network and lifecycle faults on a
-timeline, and reports crashes, restarts, error lines, hangs, and memory and file-descriptor
-growth as one `PASS`, `WARN`, `FAIL`, or `SKIP` row per check.
+timeline, and reports crashes, restarts, error lines, hangs, memory and file-descriptor
+growth, and uncounted data loss as one `PASS`, `WARN`, `FAIL`, or `SKIP` row per check. A check
+reports `SKIP` only when it has nothing to read, such as a run with no telemetry.
 [ADR `soak-harness`](../../docs/adr/soak-harness.md) records why it's built this way, and
 [`docs/plans/soak-harness.md`](../../docs/plans/soak-harness.md) is the design: the scenario
 schema, the driver loop, every check, and a "Findings" section with what runs showed.
@@ -41,6 +42,11 @@ telemetry as NDJSON and stderr the JSON self-log. Their configs pass `logit vali
 remote-write 1.0 (zstd) to VictoriaMetrics. Its 13-minute cycle delays and drops the SUT's
 remote-write, drops the generator's UDP, stops VictoriaMetrics, and pauses, stops, and
 partitions the SUT.
+
+`statsd-vm-lost-total` is a 5-minute negative control for the ledger: the SUT stops while
+VictoriaMetrics is down, with a 1 s sink `shutdown_grace`, so its first life's last totals drop at
+shutdown. A correct ledger reports that life's `ledger.egress` gap as counted, never as a
+`FAIL`.
 
 ### Faults
 
@@ -91,7 +97,7 @@ A run writes `perf/results/soak/<UTC stamp>/` (gitignored, or under `SOAK_OUT`):
 | `vm-export.jsonl` | VictoriaMetrics' `/api/v1/export` of the scenario's `vm_selector` at the end |
 | `logs/<service>.stdout`, `.stderr` | each service's output across every life of its container |
 | `inspect/<service>.json` | each container's final `docker inspect` |
-| `provenance.txt`, `compose.env`, `scenario.toml`, `scenario.resolved.json` | what ran, on what host, from which commit, and the expanded schedule |
+| `provenance.txt`, `compose.env`, `scenario.toml`, `scenario.resolved.json`, `configs/` | what ran, on what host, from which commit, the expanded schedule, and a copy of each `logit` config |
 
 ## The checks
 
@@ -109,9 +115,18 @@ rule only holds in steady state. The plan's "The checks" has the full rules.
 | `progress` | the SUT's sink delivers nothing in a `progress_window` outside fault windows with work queued (a hang), a `logit` container's telemetry goes quiet, or VictoriaMetrics' newest sample is 30 s old; a sink still retrying past `recovery_bound` `WARN`s, and so do windows covering under 5% of the run after warmup |
 | `rss_slope` | resident memory grows faster than `rss_growth_mib_per_hour` in steady state; a run shorter than an hour `WARN`s instead, and so do slopes covering under 5% of the run after warmup |
 | `fd_slope` | open file descriptors end, or sit after a recovery, more than `fd_growth` above the warmup median |
+| `ledger.wire` | the generator's lines minus what the SUT read or the kernel dropped (G − (W + K)), loss by design, exceeds `wire_loss_outside_faults` outside UDP-affecting fault windows, with one generator batch of tolerance per window edge; the detail lists the gap per run of drain intervals, and the generator's own counted `drop_newest` loss beside it |
+| `ledger.intake` | the final SUT life's datagrams read minus dropped differ from the events sent plus bad lines; or an earlier life's read-but-unabsorbed residual (W − D − B − Ab) falls outside [0, R], R being the receive queue plus 67 batches |
+| `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listener's events sent differ from those `aggregate` received, or those it received from those it absorbed |
+| `ledger.egress` | a SUT life's absorbed increments minus VictoriaMetrics' reset-aware total (Ab − V) is nonzero, other than an earlier life's gap in [−R, 0] or a positive gap that life's `drain complete` line counts in `batches_dropped`; or the export matched no series. A series whose resets aren't SUT lives − 1 `WARN`s |
+| `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0; a counted egress term is shown and not judged |
+| `identity.sink` | at the final life's last drain before shutdown, the sink's batches received differ from delivered + dropped + queued by more than one batch in flight |
+| `recovery` | within `recovery_bound` of a fault's end, no drain interval clear of other faults shows the sink not retrying, its buffer and the listener's receive queue under 5% full, and ingest at 95% of the warmup rate; a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN` |
 
-The loss ledger, the sink conservation identity, and the recovery check aren't built yet and
-report `SKIP`.
+The plan's "The ledger and identities" defines each symbol. Shutdown-time drops land after
+`internal`'s final drain, so the ledger reads them from stderr: the listener's `warn` lines into
+D, and `drain complete`'s `batches_dropped` beside `ledger.egress`. The per-hop rows are exact
+only for the final SUT life, because an earlier life stops under load.
 
 ## Cleanup and a shared daemon
 

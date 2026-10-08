@@ -87,7 +87,8 @@ Subcommands: `run <scenario> [--duration 20m] [--seed N] [--keep] [--out DIR]`, 
 images, and `SOAK_OUT=<dir>` moves the results.
 
 A run writes `perf/results/soak/<UTC stamp>/` (gitignored): `compose.env`, a copy of
-`scenario.toml`, `scenario.resolved.json`, `provenance.txt`, `timeline.jsonl`,
+`scenario.toml`, `scenario.resolved.json`, `configs/` (each `logit` config, so the ledger reads
+the SUT's `receive:` limits), `provenance.txt`, `timeline.jsonl`,
 `watchdog.jsonl`, `stats.ndjson`, `vm-freshness.jsonl`, `vm-export.jsonl`,
 `logs/<svc>.stdout` and `logs/<svc>.stderr`, `inspect/<svc>.json`, `results.md`, and
 `results.json`. `check <run-dir>` re-scores a run offline from these files alone.
@@ -360,7 +361,12 @@ The rows:
   ([`docs/known-gaps/intake.md`](../known-gaps/intake.md), "UDP intake"). It is reported,
   bucketed by drain timestamp, and fails only when the loss outside UDP-affecting windows (netem
   on `generator`; any `logit` stop, pause, restart, or partition) exceeds
-  `wire_loss_outside_faults`. At the end, G can fall short of W + K, because what the
+  `wire_loss_outside_faults` times the lines sent there, beyond a tolerance of one generator
+  batch per window edge. The two processes' drains are out of phase, so G is interpolated
+  linearly at each SUT drain timestamp; across a run of steady intervals the interpolation
+  telescopes, and each edge of the run errs by at most one batch. The generator sink's own
+  `drop_newest` loss while the SUT is unreachable is counted and never in G; the row shows it
+  beside the wire gap. At the end, G can fall short of W + K, because what the
   generator's sink sends after the generator's final drain is never exported, and a send
   cancelled at shutdown loses its counts. A negative gap of up to the generator sink's
   `buffer.batches` at its last drain plus one batch (100 lines each) is allowed.
@@ -378,11 +384,14 @@ The rows:
   `batches.received == batches.delivered + batches.dropped (every reason) + buffer.batches`,
   allowing one batch in flight. Checked there, not at exit, because the sink's last delivery and
   its shutdown drops land after the final drain.
-- `recovery`: within `recovery_bound` of each fault's end, `retrying` is 0,
-  `buffer.utilization` and `receive.utilization` are under 0.05, and the ingest rate is at least
-  95% of the warmup baseline. A generator `rate_behind` diagnostic makes the throughput row WARN,
+- `recovery`: within `recovery_bound` of each fault's end, some SUT drain shows `retrying` at 0,
+  `buffer.utilization` and `receive.utilization` under 0.05, and an ingest rate over the drain
+  interval ending there of at least 95% of the warmup baseline. Only intervals after the fault's
+  end, inside one SUT life, and clear of every other fault are eligible, because a dense schedule
+  often starts the next fault before `recovery_bound` runs out; a fault with no eligible interval
+  is listed as skipped. A generator `rate_behind` diagnostic makes the throughput part WARN,
   because the generator limited the rate, not the SUT.
-- The summary row, for the final life: uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V),
+- `ledger.summary`, for the final life: uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V),
   which must be 0, with each term shown beside it and wire loss beside them as "by design". When
   `ledger.egress` is counted, its term is shown as counted and the row judges the other three.
 
@@ -566,6 +575,68 @@ Two negative controls:
   `interrupted`, collected the logs, and took the project down within 1.4 s, leaving no
   `soak-statsd-vm` container. `results.md` was written, `run` FAILed ("interrupted at +91s; no
   end_end phase"), `exit` FAILed on the SUT left running, and the script exited 130.
+
+### W1b: the ledger on a 16-minute `statsd-vm` run (2026-10-08)
+
+Run `20261008T211129Z`: `script/soak run statsd-vm` at the scenario's 16 minutes, from
+`soak/w1b` at `ba532233` with the ledger checks uncommitted, on W1a's images and host
+(`logit:soak` `sha256:78a95c90bb4a`; no Rust changed). Every watchdog row matched W1a's run. The
+ledger rows:
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.wire` | PASS | G 1,915,900 = W 1,844,096 + K 59,679 + wire 12,125 (by design: 12,107 in UDP-affecting windows, 31 steady, -13 at the end; steady limit 500); the generator's counted drop_newest loss, not in G: 16,400 event(s) in 164 batch(es) |
+| `ledger.intake` | PASS | final life 1: W − D 643,600 vs E + B 643,600; life 0: W − D − B − Ab 0 within [0, R] (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.edge` | PASS | final life 1: E 643,600 == A 643,600 (listener to aggregate) |
+| `ledger.aggregate` | PASS | final life 1: Ab 643,600 == A 643,600 (every event absorbed) |
+| `ledger.egress` | PASS | life 0: Ab 1,200,496 − V 1,200,496 = 0, ok; life 1 (final): Ab 643,600 − V 643,600 = 0, ok (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.summary` | PASS | final life 1: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V 0; wire G − (W + K) 12,125 over the run, by design |
+| `identity.sink` | PASS | final life 1 at +980s: received 26 vs delivered 26 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `recovery` | PASS | 7 of 7 fault(s) judged, each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+
+Where the generated lines went:
+
+- The generator produced 1,932,300 lines. Its `statsd_out` dropped 16,400 of them (164 batches,
+  `drop_newest`) while `logit:8125` didn't resolve during the SUT's stop and partition. The
+  generator counts that loss, and it never reaches G.
+- Of G's 1,915,900 lines, the SUT's kernel dropped 59,679 (K) while the SUT was paused and its
+  receive buffer filled. That loss is counted too.
+- The wire gap of 12,125 is the loss uncounted by design. 11,922 of it falls in the 10% netem
+  loss on the generator, about 10% of that minute's 120,000 lines, and 185 in the SUT's pause,
+  stop, and partition windows. Outside UDP-affecting windows the gap was 31, under the 500 that
+  five window edges allow.
+- Everything the SUT read reached VictoriaMetrics: V equals Ab in both lives, and each of the 100
+  series reset once, at the SUT's restart. The first life's residual at its last drain was 0, so
+  its close-time window added nothing after that drain.
+
+Re-scored with these checks, W1a's run `20261008T202436Z` gives the same picture: V is 1,842,707,
+equal to Ab in both lives, not the 1,722,774 estimated before the ledger existed. Its wire gap is
+12,014, and its generator dropped 17,700 lines.
+
+The wire rule as built: G is cumulative at each generator drain and is interpolated linearly at
+each SUT drain timestamp, because the two processes' drains are out of phase by up to an
+`internal` interval. Across a run of steady drain intervals the interpolation telescopes, so each
+edge of the run, against a fault window or the end sequence, errs by at most one generator batch.
+`wire_loss_outside_faults = 0.0` therefore means no loss beyond one batch per edge.
+
+`recovery` judges a fault at any SUT drain within `recovery_bound` of its end whose interval lies
+after the fault, inside one SUT life, and clear of every other fault. Judging only the drain at
+`recovery_bound` would have judged two of this schedule's seven faults, because the next fault
+starts before `recovery_bound` runs out after five of them.
+
+Two negative controls:
+
+- Run `20261008T205911Z`, the `statsd-vm-lost-total` control (5 minutes): the SUT stopped 30 s
+  into a 90 s VictoriaMetrics stop, with its sink's `shutdown_grace` at 1 s. Its first life's
+  `drain complete` logged `batches_dropped` 4, and `ledger.egress` read "life 0: Ab 192,100 − V
+  128,800 = 63,300, counted (drain complete batches_dropped 4); life 1 (final): Ab 418,100 − V
+  418,100 = 0, ok". Life 0's W − D − B − Ab was 0, inside [0, R]. `ledger.summary` passed with
+  every term 0, and so did every other row.
+- Run `20261008T210459Z`, `statsd-vm` for 4 minutes from a scratch copy of the scenario whose
+  `vm_selector` matched no series: `ledger.egress` FAILed ("no series in vm-export.jsonl match
+  vm_selector '{__name__=~"no_such_metric_total"}'; life 0 (final): Ab 492,400 − V 0 = 492,400,
+  uncounted"), `ledger.summary` FAILed on the same 492,400, `progress` FAILed on the empty
+  freshness samples, and the script exited 1.
 
 ## Verification
 
