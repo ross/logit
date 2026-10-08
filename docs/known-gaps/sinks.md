@@ -42,9 +42,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** the sink holds silently until shutdown. No attempt fails, so
     `logit.component.retrying` never reads `1` and no `retrying` line is logged. The queue fills
     behind it under its `buffer:` bounds, and then the default `overflow: block` stops the
-    sink's sources: every other sink fed from them stops with it, and a listener upstream pushes
-    back on its clients. The stall shows only as `logit.component.inbox.full` and
-    `inbox.blocked.duration` on the sink.
+    sink's sources: every other sink fed from them stops with it. A stream or HTTP listener
+    upstream then pushes back on its clients, and a UDP listener's receive queue drops. On the
+    sink, the stall shows first as `logit.component.buffer.utilization` at `1` with
+    `buffer.push.blocked.duration` samples, then as `logit.component.inbox.full` and
+    `inbox.blocked.duration` once its inbox fills.
   - **Workaround:** when the output matters, write it with `file_out` and have the reader follow
     the file. When `stdio_out` is only for watching, set `buffer.overflow: drop_oldest` on it, so
     a stalled reader costs that sink's batches and nothing else.
