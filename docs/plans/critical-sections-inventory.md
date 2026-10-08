@@ -974,7 +974,8 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
     are discarded uncounted. Worth checking against the "FIN and RST agree" claim.
   - *Documented:* a connection still within its idle budget at shutdown holds things open until the
     grace backstop — [`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)'s
-    "`otlp_in` can hold the graph open past shutdown" entry.
+    "`datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write
+    receiver can hold the graph open past shutdown" entry.
 - **Existing coverage:** `tcp.rs` tests: `a_clean_close_flushes_whatever_is_accumulated`,
   `an_abrupt_close_with_a_buffered_partial_frame_counts_it_truncated`,
   `shutdown_mid_message_counts_the_buffered_partial_frame`,
@@ -3277,8 +3278,9 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     looks benign — but an input that returns `Err` at exactly the same instant can have that error swallowed by
     the grace arm. Low confidence this is reachable in practice; worth one look.
   - **Context (documented, not a surprise):** `docs/known-gaps/` records that a datagram in flight at signal
-    time is lost uncounted, that `otlp_in` can hold the graph open past shutdown (connection-spawned `Fanout`
-    clones), and that `logit_in`/`internal` grace is fixed at 5s.
+    time is lost uncounted, that four HTTP listeners (`datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and
+    `prometheus_in`'s remote-write receiver) can hold the graph open past shutdown
+    (connection-spawned `Fanout` clones), and that `logit_in`/`internal` grace is fixed at 5s.
 - **Existing coverage:** `run_with_shutdown_flushes_an_in_flight_window_before_exiting`,
   `a_non_overriding_input_returns_at_the_instant_shutdown_fires_not_after_the_grace`,
   `an_overriding_input_draining_within_its_grace_completes_and_delivers`,
@@ -4943,7 +4945,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     fail first with `b` holding only its filler). Reserving every consumer first was tried and
     dropped: without a deadline it deadlocks a diamond graph (`fanout.rs`'s module doc).
 - **Observed concerns (unverified):**
-  - The wait-out loop (`drive_connection`'s post-`shutdown` loop) has no overall ceiling: `grace` restarts each iteration as long
+  - The wait-out loop (`drive_connection`'s post-`graceful` loop) has no overall ceiling: `grace` restarts each iteration as long
     as `in_flight > 0`. A client that keeps a request in flight indefinitely (a handler blocked on
     a permanently-full downstream) keeps the connection and its permit alive past the idle close.
     That is the intended trade-off (better than losing the batch), but it means `idle_timeout` is
@@ -4951,9 +4953,14 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     in the comment, so this is a "confirm it's the intended contract" item.** **Holds** as the
     contract: `docs/known-gaps/` ("TLS and connection lifecycle") records that a handler blocked
     forever in a send holds its connection and permit.
-  - `otlp_in`'s accept loop (`OtlpInput::run` in `otlp.rs`) does not race shutdown at all, and connections hold
+  - ~~`otlp_in`'s accept loop (`OtlpInput::run` in `otlp.rs`) does not race shutdown at all, and connections hold
     `Fanout` clones — already recorded in `docs/known-gaps/` ("`otlp_in` can hold the graph open
-    past shutdown"), narrowed but not closed by `idle_timeout`. **Context, documented.**
+    past shutdown"), narrowed but not closed by `idle_timeout`.~~ **fixed (#576):** `otlp_in`
+    overrides `run_until_shutdown`, its accept loop races the signal, and `drive_connection` closes
+    each connection on it. The other four HTTP listeners keep the gap
+    ([`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)'s "`datadog_in`,
+    `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver can hold the
+    graph open past shutdown" entry).
   - The `logit.input.connections` gauge decrement (`live_connections.fetch_sub` in
     `OtlpInput::run`'s spawned task) is a statement, not a guard —
     same panic-leaks-the-gauge shape as `logit_in`. **High confidence in the shape.** **fixed**:

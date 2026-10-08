@@ -193,8 +193,9 @@ where
     let mut closing = false;
 
     loop {
-        // `wait_for` below covers a signal sent while waiting; this covers one sent before the
-        // receiver was cloned, which never wakes a `changed`.
+        // `wait_for` also sees a signal sent before the clone, but an unbiased `select!` can pick
+        // another ready arm and loop; this breaks at once then, before the idle checks below can
+        // close the connection as an idle close and count it.
         if *shutdown.borrow() {
             closing = true;
             break;
