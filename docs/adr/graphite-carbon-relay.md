@@ -470,6 +470,6 @@ whose module doc is now the canonical copy of the "`multi_value: expand` sub-pat
 The table itself is unchanged, and so is graphite's wire: every sub-path, its order, its number
 token, and every non-finite skip are what they were, pinned in plaintext and pickle by
 `expand_wire_output_is_unchanged_for_every_kind_in_both_protocols` in
-`crates/logit-proto/src/graphite/encode.rs`. `statsd_out` renders the same table under
-[ADR `statsd-out-multi-value-expansion`](statsd-out-multi-value-expansion.md), so one change to
-the table changes both sinks.
+`crates/logit-proto/src/graphite/encode.rs`.
+[ADR `statsd-out-multi-value-expansion`](statsd-out-multi-value-expansion.md) has `statsd_out`
+render the same table, so once it does, one change to the table changes both sinks.
