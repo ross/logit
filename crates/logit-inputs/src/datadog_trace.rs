@@ -201,7 +201,7 @@ use crate::http::{
     media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding, MediaType,
     Undelivered,
 };
-use crate::listener::ConnectionTasks;
+use crate::listener::{ConnectionTasks, Prelude};
 use crate::peer::{ConnectionPeer, PeerAttrs};
 use crate::Input;
 use bytes::Bytes;
@@ -228,7 +228,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
@@ -608,17 +608,6 @@ impl AcceptContext {
     }
 }
 
-/// Where one TCP connection's pre-serve steps (the PROXY header, the TLS accept, the first-byte
-/// peek) left it.
-enum Prelude {
-    /// Boxed: a rustls session is over 1 KiB, and this is built once per connection.
-    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>, Arc<Shared>),
-    Plain(TcpStream, Arc<Shared>),
-    /// Ended before serving: a health-check probe or a rejected PROXY header (`Ok`), or a failed
-    /// handshake or first byte (`Err`).
-    Done(Result<(), String>),
-}
-
 /// The TCP accept loop: `datadog_in`'s, including the accept-queue gauges, the PROXY header under
 /// `proxy_protocol:` and then the TLS handshake or plaintext first-byte peek, each bounded inside
 /// the spawned task, and a clean close or a reset before the first byte treated as a health check.
@@ -671,32 +660,24 @@ async fn accept_tcp(
                 let origin = if context.proxy_protocol {
                     match crate::peer::read_proxy_origin(&mut stream, handshake_timeout).await {
                         Ok(origin) => Some(origin),
-                        Err(err) => {
-                            context.telemetry.count(
-                                "logit.input.connections.rejected",
-                                1.0,
-                                &[("reason", "proxy_header")],
-                            );
-                            context.diag.clone().warn_throttled("proxy_header", err);
-                            return Prelude::Done(Ok(()));
-                        }
+                        Err(err) => return Prelude::ProxyRejected(err),
                     }
                 } else {
                     None
                 };
-                let shared =
-                    context.shared(ConnectionPeer::tcp(peer, context.record_peer, origin.as_ref()));
+                let connection_peer =
+                    ConnectionPeer::tcp(peer, context.record_peer, origin.as_ref());
                 match tls_acceptor {
                     Some(acceptor) => {
                         match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
                         {
-                            Ok(Ok(tls_stream)) => Prelude::Tls(Box::new(tls_stream), shared),
-                            Ok(Err(err)) => {
-                                Prelude::Done(Err(format!("TLS handshake failed: {err}")))
+                            Ok(Ok(tls_stream)) => {
+                                Prelude::Tls(Box::new(tls_stream), connection_peer)
                             }
-                            Err(_elapsed) => Prelude::Done(Err(format!(
+                            Ok(Err(err)) => Prelude::Failed(format!("TLS handshake failed: {err}")),
+                            Err(_elapsed) => Prelude::Failed(format!(
                                 "TLS handshake did not complete within {handshake_timeout:?}"
-                            ))),
+                            )),
                         }
                     }
                     None => {
@@ -706,17 +687,17 @@ async fn accept_tcp(
                         match first_byte {
                             // A clean close or a reset before the first byte is a health-check
                             // probe, not a fault (`crate::otlp`'s "not a fault").
-                            Ok(Ok(0)) => Prelude::Done(Ok(())),
+                            Ok(Ok(0)) => Prelude::Probe,
                             Ok(Err(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
-                                Prelude::Done(Ok(()))
+                                Prelude::Probe
                             }
-                            Ok(Ok(_)) => Prelude::Plain(stream, shared),
-                            Ok(Err(err)) => Prelude::Done(Err(format!(
-                                "waiting for a first byte failed: {err}"
-                            ))),
-                            Err(_elapsed) => Prelude::Done(Err(format!(
+                            Ok(Ok(_)) => Prelude::Plain(stream, connection_peer),
+                            Ok(Err(err)) => {
+                                Prelude::Failed(format!("waiting for a first byte failed: {err}"))
+                            }
+                            Err(_elapsed) => Prelude::Failed(format!(
                                 "no first byte received within {handshake_timeout:?}"
-                            ))),
+                            )),
                         }
                     }
                 }
@@ -728,27 +709,37 @@ async fn accept_tcp(
                 _ = conn_shutdown.wait_for(|&due| due) => return Ok(()),
             };
             match prelude {
-                Prelude::Tls(tls_stream, shared) => {
+                Prelude::Tls(tls_stream, connection_peer) => {
                     serve_connection(
                         TokioIo::new(*tls_stream),
-                        shared,
+                        context.shared(connection_peer),
                         idle_timeout,
                         handshake_timeout,
                         conn_shutdown,
                     )
                     .await
                 }
-                Prelude::Plain(stream, shared) => {
+                Prelude::Plain(stream, connection_peer) => {
                     serve_connection(
                         TokioIo::new(stream),
-                        shared,
+                        context.shared(connection_peer),
                         idle_timeout,
                         handshake_timeout,
                         conn_shutdown,
                     )
                     .await
                 }
-                Prelude::Done(result) => result,
+                Prelude::Probe => Ok(()),
+                Prelude::Failed(err) => Err(err),
+                Prelude::ProxyRejected(err) => {
+                    context.telemetry.count(
+                        "logit.input.connections.rejected",
+                        1.0,
+                        &[("reason", "proxy_header")],
+                    );
+                    context.diag.clone().warn_throttled("proxy_header", err);
+                    Ok(())
+                }
             }
         });
     }
@@ -2308,32 +2299,6 @@ mod tests {
         stream.write_all(&body).await.unwrap();
     }
 
-    /// Reads one response's head and its `Content-Length` body off a keep-alive connection,
-    /// returning the head.
-    async fn read_keep_alive_response<S: tokio::io::AsyncRead + Unpin>(
-        stream: &mut S,
-        what: &str,
-    ) -> String {
-        let read = async {
-            let mut buf = Vec::new();
-            let mut byte = [0u8; 1];
-            while !buf.ends_with(b"\r\n\r\n") {
-                let n = stream.read(&mut byte).await.unwrap();
-                assert_eq!(n, 1, "{what}: the connection closed inside a response head");
-                buf.push(byte[0]);
-            }
-            let head = String::from_utf8_lossy(&buf).into_owned();
-            let length: usize =
-                header_of(&head, "content-length").map_or(0, |v| v.parse().unwrap());
-            let mut body = vec![0u8; length];
-            stream.read_exact(&mut body).await.unwrap();
-            head
-        };
-        tokio::time::timeout(logit_pipeline::test_util::RECV_TIMEOUT, read)
-            .await
-            .unwrap_or_else(|_| panic!("{what}: no response within the receive timeout"))
-    }
-
     /// One request answered on a keep-alive connection, which is then idle (`KA::Idle`).
     async fn answered_keep_alive<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         stream: &mut S,
@@ -2341,7 +2306,7 @@ mod tests {
         what: &str,
     ) {
         write_keep_alive_traces(stream).await;
-        let head = read_keep_alive_response(stream, what).await;
+        let head = crate::http::read_response(stream, what).await;
         assert!(head.starts_with("HTTP/1.1 200"), "{what}: {head}");
         recv_batch(rx).await;
     }
@@ -2439,7 +2404,7 @@ mod tests {
         // The TCP request fills the edge's one slot, and the Unix request parks behind it.
         let mut over_tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
         write_keep_alive_traces(&mut over_tcp).await;
-        let head = read_keep_alive_response(&mut over_tcp, "the TCP request").await;
+        let head = crate::http::read_response(&mut over_tcp, "the TCP request").await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         let mut over_unix = UnixStream::connect(&path).await.unwrap();
         write_keep_alive_traces(&mut over_unix).await;
@@ -2453,7 +2418,7 @@ mod tests {
         logit_pipeline::test_util::expect_closed(&mut over_tcp, "the TCP connection").await;
         recv_batch(&mut rx).await;
         recv_batch(&mut rx).await;
-        let head = read_keep_alive_response(&mut over_unix, "the parked Unix request").await;
+        let head = crate::http::read_response(&mut over_unix, "the parked Unix request").await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         logit_pipeline::test_util::expect_closed(&mut over_unix, "the Unix connection").await;
         tokio::time::timeout(logit_pipeline::test_util::RECV_TIMEOUT, running.handle)
@@ -2488,7 +2453,7 @@ mod tests {
 
         let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
         write_keep_alive_traces(&mut client).await;
-        let head = read_keep_alive_response(&mut client, "the request that fills the slot").await;
+        let head = crate::http::read_response(&mut client, "the request that fills the slot").await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         write_keep_alive_traces(&mut client).await;
         probe
@@ -2509,7 +2474,7 @@ mod tests {
         running.shutdown.send(true).unwrap();
         recv_batch(&mut rx).await;
         recv_batch(&mut rx).await;
-        let head = read_keep_alive_response(&mut client, "the parked request").await;
+        let head = crate::http::read_response(&mut client, "the parked request").await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         logit_pipeline::test_util::expect_closed(&mut client, "the parked request's connection")
             .await;
