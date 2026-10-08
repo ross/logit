@@ -377,31 +377,41 @@ never completes. A reviewer can answer each decision below yes or no.
    waits for its connection tasks.
 2. **On the signal, each connection runs the close sequence this ADR defines.** The shutdown arm
    applies only to the waits before the close. The close sequence itself has no shutdown arm.
-   Requests in flight are served to completion. There is no `503` on shutdown: hyper's
-   `graceful_shutdown` stops new h1 requests after the current one and sends `GOAWAY` on h2.
+   Requests in flight are served to completion until the listener's backstop (decision 3). There
+   is no `503` on shutdown: hyper's `graceful_shutdown` stops new h1 requests after the current
+   one and sends `GOAWAY` on h2.
 3. **A `tokio::task::JoinSet` owns the connection tasks.** The set is a local of the listener's
    `run_until_shutdown` future, and nothing a task holds captures it. When the runtime's grace
    backstop drops that future (decision 7 of [ADR
    `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md):
    the runtime alone enforces a listener's grace), dropping the set aborts every remaining
    connection task and its `Fanout` clone. This departs from the shared TCP driver and `logit_in`,
-   whose bare `tokio::spawn` tasks need no owner because `handshake_timeout` bounds each of their
-   waits. An HTTP connection's wait for an in-flight request has no bound of its own (see the
-   2026-09-25 wait-out amendment).
-4. **An abort costs the acknowledgment, never a batch.** No HTTP handler calls `Fanout::send` on
+   whose bare `tokio::spawn` tasks need no owner: they race the signal at every read, so a task
+   outlives it only while parked in a send, which ends when the downstream drains or closes
+   (decision 5). An HTTP connection can't race the signal mid-request because hyper owns the read,
+   so its task needs an owner the backstop can abort.
+4. **An abort costs the acknowledgment, never a batch.** No HTTP handler awaits `Fanout::send` on
    the connection task. `otlp_in` and the receiver deliver on a detached task
-   (`deliver_detached`), which an abort doesn't cancel. The Datadog pair and `splunk_hec_in` use
-   `send_with_deadline`, which reserves every consumer's slot before it sends and counts nothing
-   until it does. The client sees a reset and resends a batch the pipeline already took. That is
-   ordinary at-least-once ([ADR `delivery-semantics`](delivery-semantics.md)). The module doc of
-   `crates/logit-inputs/src/http.rs` records the rule that a handler never sends in-task.
+   (`deliver_detached`), which an abort doesn't cancel. The Datadog pair use `send_with_deadline`,
+   which reserves every consumer's slot before it sends and counts nothing until it does, and
+   `splunk_hec_in` sends its first batch that way and the rest through `deliver_detached`. The
+   client sees a reset and resends a batch the pipeline already took. That is ordinary
+   at-least-once ([ADR `delivery-semantics`](delivery-semantics.md)). This narrows, at shutdown,
+   two earlier rules: the in-flight tracker's "kept until that request completes rather than
+   dropped out from under it" and the 2026-09-25 wait-out amendment's "a handler blocked forever
+   in a send holds its connection and permit". Both protect a batch blocked in `Fanout::send`,
+   and no handler is blocked there on the connection task, so an abort discards no batch. The code
+   PRs record in the module doc of `crates/logit-inputs/src/http.rs` that a handler never awaits
+   `Fanout::send` on the connection task: it uses `deliver_detached`, or `deliver_with_deadline`,
+   which sends nothing until every slot is held.
 5. **Some tasks outlive an abort, and each ends in bounded time.** hyper spawns h2 stream handlers
    through `TokioExecutor`, outside the set, and detached deliveries are outside it too. A body
    read fails once its connection is gone. `send_with_deadline` is bounded by `busy_after`. A
    parked detached send is bounded by its downstream draining or closing: a sink closes its inbox
-   at its own `buffer.shutdown_grace`, a transform drains once its downstream closes, and a Lua
-   node is revoked at 2 s. So the bound on the last `Fanout` clone is the largest downstream
-   grace, which the process already waits for, not the listener's 5 s.
+   at its own `buffer.shutdown_grace`, a transform or a healthy Lua node drains once its
+   downstream closes, and a Lua node wedged inside a call is revoked 2 s after the signal or its
+   last progress. So the bound on the last `Fanout` clone is the largest downstream grace, which
+   the process already waits for, not the listener's 5 s.
 6. **The pre-serve prelude races the signal.** The PROXY header read, TLS accept, and first-byte
    peek return cleanly if the signal wins, because nothing of a request has been read. Otherwise a
    connection in its prelude holds the listener for `handshake_timeout`, which by default equals
@@ -418,7 +428,7 @@ never completes. A reviewer can answer each decision below yes or no.
 9. **There is no new grace knob.** The close grace stays `handshake_timeout`, which is what
    flushes a `GOAWAY`. The outer bound is the runtime's fixed 5 s grace for a listener with no
    `receive:` block. By default the two are equal, so the backstop ends an h1 connection stopped
-   mid-head or an h2 connection still handshaking, and nothing is in flight on either.
+   mid-head, an h2 connection still handshaking, and any request still in flight.
 
 ### Consequences
 

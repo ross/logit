@@ -116,10 +116,10 @@ its own `Fanout` clone (the cancel-by-drop shutdown mechanism [ADR
 `service-lifecycle-and-output-retry`](service-lifecycle-and-output-retry.md) depends on requires
 nothing to outlive the listener's own future), so each connection races its next-frame read against
 a cloned shutdown signal and, once idle at a frame boundary, sends `Reject{GOING_AWAY}` and closes.
-An already-in-flight frame is allowed to finish. The HTTP listeners (`otlp_in` and
-the rest) carry their own override, per [ADR
+An already-in-flight frame is allowed to finish. `otlp_in` and the other HTTP listeners have no
+such override yet (`docs/known-gaps/native-hop.md`); [ADR
 `idle-connection-timeout`](idle-connection-timeout.md)'s "Amendment: shutdown is the second
-trigger of the close sequence".
+trigger of the close sequence" decides theirs.
 
 ## Alternatives considered
 

@@ -54,9 +54,11 @@ and close, precisely the way they already do today when a listener finishes on i
 **No `Input` trait change, and no cooperation required from any listener implementation** — this is
 the decision this ADR is actually making, over the alternative of widening `Input::run` with a
 cancellation parameter (see Alternatives). `syslog_in` (a later workstream) inherits shutdown for
-free the moment it exists. The five HTTP listeners are the exception: they cooperate so the backstop can reach their
-spawned connection tasks ([ADR `idle-connection-timeout`](idle-connection-timeout.md), "Amendment:
-shutdown is the second trigger of the close sequence").
+free the moment it exists. Listeners with something to drain later took an override,
+`Input::run_until_shutdown` ([ADR `decoupled-listener-io`](decoupled-listener-io.md)), under the
+runtime's grace backstop; the five HTTP listeners will join them per [ADR
+`idle-connection-timeout`](idle-connection-timeout.md)'s "Amendment: shutdown is the second
+trigger of the close sequence".
 
 `crates/logit-cli/src/pipeline.rs::run_pipelines` installs the real signal handler:
 `SignalKind::terminate()`/`SignalKind::interrupt()` under `#[cfg(unix)]`, `tokio::signal::ctrl_c()`
