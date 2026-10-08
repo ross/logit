@@ -460,6 +460,8 @@ components:
   # `browser_in` feeds this sink directly, not through a `*_trace` stage: it's already a span,
   # with no companion log line. Its blocks appear once someone loads the landing page in a browser
   # (or POSTs to `/v1/traces` by hand); `traffic`'s curl loop never sends to it.
+  # A write to stdout has no time bound, so `drop_oldest` keeps a stalled container log driver
+  # from filling this sink's buffer and then stopping the sources it shares with Loki and Tempo.
   stdout:
     type: stdio_out
     sources:
@@ -472,6 +474,8 @@ components:
         redis_parse,
         browser_in,
       ]
+    buffer:
+      overflow: drop_oldest
 
   # Loki's OTLP ingestion accepts logs only (it registers no `TracesService`/`MetricsService`).
   # `otlp_out` counts a signal Loki rejects `records.dropped{reason="rejected"}` and warns, so a

@@ -40,9 +40,19 @@ Entry format and the other areas: [the known-gaps index](README.md).
   but it can't cancel the write on that thread, and every later write queues behind it, so the
   sink can't bound the attempt as `Output::send`'s contract asks.
   - **Consequence:** the sink holds silently until shutdown. No attempt fails, so
-    `logit.component.retrying` never reads `1` and no `retrying` line is logged; the queue fills
-    behind it under its `buffer:` bounds.
-  - **Workaround:** write to a file with `file_out`, and have the reader follow the file.
+    `logit.component.retrying` never reads `1` and no `retrying` line is logged. The queue fills
+    behind it under its `buffer:` bounds, and then the default `overflow: block` stops the
+    sink's sources: every other sink fed from them stops with it. A stream or HTTP listener
+    upstream then pushes back on its clients, and a UDP listener's receive queue drops. On the
+    sink, the stall shows first as `logit.component.buffer.utilization` at `1` with
+    `buffer.push.blocked.duration` samples, then as `logit.component.inbox.full` and
+    `inbox.blocked.duration` once its inbox fills.
+  - **Workaround:** when the output matters, write it with `file_out` and have the reader follow
+    the file. When `stdio_out` is only for watching, set `buffer.overflow: drop_oldest` on it, so
+    a stalled reader costs that sink's batches and nothing else.
+  - **Why it stays a gap:** bounding the write needs a nonblocking stdout, and `O_NONBLOCK` is a
+    flag on the file description `logit` shares with its parent and siblings, so setting it can
+    break their writes.
 - **No runtime bound on a sink's attempt; each sink bounds its own.** The runtime wraps
   `Output::send` in no timeout ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "A
   retryable fault retries until it succeeds"). The HTTP and gRPC sinks bound each request with

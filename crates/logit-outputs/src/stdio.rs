@@ -41,6 +41,11 @@
 //! receives no batch keeps the old inode open until its next one. A `stdout` or `stderr` target
 //! ignores the generation.
 //!
+//! **No write bound on a stdout or stderr pipe.** tokio writes stdout and stderr on a blocking
+//! thread, so a timeout around the write can't cancel it, and later writes queue behind it. A
+//! reader that stops reading holds this sink with no fault reported; see
+//! `docs/known-gaps/sinks.md` for why it stays a gap and what operators do instead.
+//!
 //! **Delivery posture.** The one case the posture decides is a write the shutdown grace cuts off,
 //! which is `Ambiguous`: under the default, `at_least_once`
 //! (`docs/adr/delivery-semantics.md`, item 5), the batch stays queued, so a `buffer.disk:` spool

@@ -635,9 +635,15 @@ An error the sink attaches no fault to is treated as `Rejected`.
 - **An attempt has no runtime timeout.** The sink's own transport timeout bounds each one:
   `request_timeout`, the HTTP client's timeouts, or, on `syslog_out`, `statsd_out`, and
   `graphite_out` over a stream, `connect_timeout`, which also bounds each write's progress. The
-  shutdown grace cuts an attempt short. `stdio_out` writing to a stdout or stderr pipe has no
-  bound ([`docs/known-gaps/sinks.md`](known-gaps/sinks.md)): a reader that stops reading holds
-  the sink silently until shutdown.
+  shutdown grace cuts an attempt short.
+- **`stdio_out` writing to a stdout or stderr pipe has no bound**
+  ([`docs/known-gaps/sinks.md`](known-gaps/sinks.md)). A reader that stops reading, such as a
+  stalled log shipper, a paused pager, or a Docker log driver in its default `mode: blocking`,
+  holds the sink silently until shutdown. Once its buffer fills, the default
+  `buffer.overflow: block` stops its sources, so every other sink fed from them stops too. Don't
+  put a stdout or stderr `stdio_out` on a critical path. When the output matters, use `file_out`.
+  When the sink is only for watching, set `buffer.overflow: drop_oldest` on it, as
+  [`demo/logit.yaml`](../demo/logit.yaml) does.
 
 **To see a hold:**
 
