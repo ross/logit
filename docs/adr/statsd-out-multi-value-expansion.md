@@ -120,7 +120,9 @@ Three cases fall outside the table:
 - **A cumulative `Sum`**, monotonic or not, is one bare `name:v|g` line: the running total as a
   gauge, with no suffix.
 - **A non-monotonic delta `Sum`** is one bare `name:v|c` line. A statsd counter takes a signed
-  increment, and `statsd_in` decodes `-5|c` to the same non-monotonic delta.
+  increment, and statsd has no carrier for the non-monotonic flag: `statsd_in` reads `-5|c` back
+  as a delta `Sum` flagged monotonic, the kind `statsd_out`'s delta-monotonic arm already writes
+  as `|c`. The flag is what's lost, which is why the record counts as degraded.
 
 `aggregate` re-emits a series' attributes on its flush, so a `Distribution` still carries
 `statsd.type` (`ms`, `h`, or `d`). Expansion ignores it: the carrier names the raw wire type of
@@ -149,7 +151,8 @@ An expanded line is an ordinary metric line:
 - **Tags and extras.** Each line carries the event's `|#tags` and the DogStatsD extras
   (`|c:<container-id>`, `|e:<external-data>`, `|card:<cardinality>`, `|T<unix-seconds>`) any
   metric line from that event carries. No expanded line carries `@<rate>`: the components describe
-  what `aggregate` already absorbed, and a sample rate on a `|c` line would extrapolate twice, as
+  what an upstream summary already absorbed (a `DdSketch` built by `aggregate` has each sample's
+  rate folded into its count and sum), and a sample rate on a `|c` line would extrapolate twice, as
   `crates/logit-outputs/src/statsd.rs`'s module doc already rules for counters
   under "Sample rate: never for a counter, real for `Samples`".
 - **`format: statsd`.** The tag segment is dropped and counted as for any event, and each dropped
@@ -166,8 +169,11 @@ Each record is counted once, however many lines it writes or fails to write:
 - **`expand`** counts `logit.output.metrics.degraded{metric_kind}`.
 
 The `metric_kind` tag is one of `distribution`, `set`, `histogram`, `exponential_histogram`,
-`summary`, `cumulative_sum`, or `non_monotonic_delta_sum`. These are the counters
-`graphite_out` and `splunk_hec_out` already report for the same switch. A dashboard reading
+`summary`, `cumulative_sum`, or `non_monotonic_delta_sum`. The counter names are the ones
+`graphite_out` and `splunk_hec_out` already report for the same switch, and the first five tag
+values are theirs too. The two `Sum` values are this sink's own: `graphite_out` writes every `Sum`
+bare and never tags one, and `splunk_hec_out` splits the cases differently (`delta_sum`,
+`non_monotonic_sum`) because its wire carries a cumulative monotonic `Sum` natively. A dashboard reading
 `degraded` sees how much of the sink's traffic left as per-component lines instead of a sketch.
 
 `logit.output.messages.dropped{reason="unsupported_kind"}` and the `EncodeStats` field behind it
@@ -186,10 +192,12 @@ They're the raw shapes `statsd_in` decodes, and a `statsd_in -> statsd_out` rela
 `aggregate`, or with raw retention, still round-trips a timer or set line intact. A `Gauge`,
 `GaugeDelta`, and delta monotonic `Sum` render as they do today.
 
-So the expansion renders only what an explicit `aggregate` already summarized, and
-[ADR `lossless-transit`](lossless-transit.md)'s "Summarization is opt-in and named" rule is
-untouched: the sink summarizes nothing, and every line it writes is a component the upstream
-summary already held. The expansion is a named, counted degradation. It isn't one of the
+So the expansion renders only components an upstream summary already held, whether an explicit
+`aggregate` produced it or a producer sent it that way (`otlp_in`, `prometheus_in`, and
+`datadog_in` all decode histograms, summaries, cumulative sums, or sketches straight from the
+wire, and those pipelines change from drop to expand under the default too). The sink summarizes
+nothing, so [ADR `lossless-transit`](lossless-transit.md)'s "Summarization is opt-in and named"
+rule is untouched. The expansion is a named, counted degradation. It isn't one of the
 like-protocol pair's permitted normalizations, and `statsd_in -> statsd_out` stays lossless only
 on the raw shapes.
 
