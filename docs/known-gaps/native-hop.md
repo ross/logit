@@ -33,17 +33,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   close idle connections cleanly, and `InternalInput` for its final drain of buffered
   self-telemetry (`crates/logit-inputs/src/internal.rs`). It's a gap if a deployment needs a
   different number; no `receive:`-shaped knob exists.
-- **`datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver
-  can hold the graph open past shutdown.** Each connection they spawn holds its own `Fanout`
-  clone, and none overrides `Input::run_until_shutdown` the way `logit_in` and `otlp_in` do
-  (`crates/logit-inputs/src/otlp.rs`'s module doc, "Idle timeout").
-  - **Consequence:** a keep-alive HTTP/gRPC connection still within its `idle_timeout:` budget, or
-    with none configured, when shutdown begins can hold its `Fanout` clone open indefinitely. The
-    cancel-by-drop shutdown
-    ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md))
-    depends on every listener releasing its clone.
-  - **Fix:** follow the shutdown amendment in
-    [ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md).
 - **`otlp_in`'s TLS-arm `handshake_timeout` bounds the TLS accept and nothing after it.** `hyper`'s
   `hyper_util::server::conn::auto::Builder` reads the first bytes itself to tell HTTP/1.1 from an
   h2 preface, a read `crate::otlp` can't wrap without reimplementing that sniff. The plaintext arm
