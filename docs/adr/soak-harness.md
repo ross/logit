@@ -126,8 +126,9 @@ the compose layout, the driver loop, the full list of checks, and the workstream
 - **A long-lived netem sidecar sharing the target's namespace (`network_mode: service:...`).** It
   keeps the old namespace across a `stop` and `start` of the target and loses its interface on a
   network disconnect, so it fails during the faults it exists to apply.
-- **`logit-perf` as the sender.** It drives one process to measure throughput and exits; it has no
-  long-running paced UDP sender with its own telemetry.
+- **`logit-perf` as the sender.** Its UDP sender is finite, reads its target from a scenario
+  file, stops through the harness's own channel, and reports nothing about what it sent. Making it
+  a standalone paced sender with telemetry is a Rust change and an image before any scenario runs.
 - **A Python producer.** It would need its own counting and pacing, and its sent count would
   share no unit or code path with the SUT's telemetry.
 - **A checker container for VictoriaMetrics queries.** One more image and lifecycle to manage; a
