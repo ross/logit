@@ -98,7 +98,8 @@ its one canonical copy. Both `graphite_out` and `statsd_out` call it, and it rep
 component's suffix, value, and part (count, sum, bucket, zero count, quantile, min, max, or
 distinct count). This ADR summarizes the table; the module doc is authoritative.
 
-- **Graphite's wire output doesn't change.** The extraction moves code, the table, and the
+- **Graphite's wire output doesn't change.** (Superseded for the sketch row, 2026-10-07: see
+  "Amendment: a sketch's min and max expand".) The extraction moves code, the table, and the
   number-token injectivity argument; a golden test pins every kind's plaintext and pickle output
   across the move.
 - **Splunk's table stays its own.** It follows an external exporter's naming, which isn't the
@@ -268,8 +269,9 @@ Agent's `.max` show consumers want them. They aren't added:
   carries seven records, where the raw relay carried one. Amended (2026-10-07): nine lines, with
   `.min` and `.max`.
 - **Behind a Datadog Agent, raw retention stays the better choice.** With `aggregate`'s defaults,
-  the Agent receives `.count`, `.sum`, and `.q*` lines as plain counts and gauges and never sees a
-  distribution, so its own timer aggregates and percentiles are never computed. To keep the Agent's own timer aggregates and its `d` sketches, use
+  the Agent receives `.count`, `.sum`, `.min`, `.max`, and `.q*` lines as plain counts and gauges
+  and never sees a distribution, so its own timer aggregates and percentiles are never computed.
+  To keep the Agent's own timer aggregates and its `d` sketches, use
   `distributions: samples` and `sets: members`, or no `aggregate` at all.
 - **Two older ADRs gain amendments with the code.** [ADR `statsd-output`](statsd-output.md)'s
   "Metric-kind coverage" and "What's still deferred" sections and
