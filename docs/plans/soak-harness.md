@@ -711,8 +711,8 @@ What the runs showed about `logit`:
 
 - **Under the default `receive.overflow: drop_oldest`, the kernel dropped 79 datagrams as a
   blocked chain unblocked.** Run `20261008T231010Z`, `udp-flood-sink-stop`: the listener evicted
-  and counted 532,590 datagrams, 426,090 of them during the stop and 6,500 in the drain after
-  the revert, and read 100,000 datagrams in every drain throughout, but
+  and counted 532,590 datagrams, 426,090 of them during the stop and 106,500 in the two drains
+  after the revert, and read 100,000 datagrams in every drain throughout, but
   `logit.input.kernel.drops` read 79 in the drain at +128.4 s, 8 s after the revert, the drain in
   which the receive queue went from full to empty and the chain unblocked; that drain read 99,921
   datagrams. [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md) says the socket keeps
@@ -746,11 +746,11 @@ What the runs showed about `logit`:
   "Inbox side" now says so; it used to say a blocking sink "shows sustained `inbox.full` once
   its buffer fills", and the expectations assert `delta >= 1`.
 - **A blocked chain stays blocked until the sink's next retry, not until the revert.** In
-  `udp-flood-sink-stop-block`, 18,900 of the 516,666 kernel drops landed in the drain after
+  `udp-flood-sink-stop-block`, 119,075 of the 516,666 kernel drops landed in the two drains after
   VictoriaMetrics started again, until the sink's backoff (`retry_max_delay`, 10 s) reached it
   (205,000 of 602,465 in the earlier attempt `20261008T224118Z`). `sink-outage-block`'s listener
   likewise counted 6,100 of its 92,100 `overflow_oldest` drops in the drain after the revert, and
-  `udp-flood-sink-stop`'s 6,500 of 532,590. This is the documented behavior, and it's why every
+  `udp-flood-sink-stop`'s 106,500 of 532,590. This is the documented behavior, and it's why every
   bound that must hold for the whole episode reads the `through` window.
 - **`drop_oldest` at the sink never stalled intake.** `sink-outage-drop-oldest`'s sink evicted
   181 batches and kept taking batches off its inbox, so `aggregate`'s `inbox.full` read 0 over
