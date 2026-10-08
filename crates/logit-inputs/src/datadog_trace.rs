@@ -533,9 +533,8 @@ impl Input for DatadogTraceInput {
                 }
             }
         };
-        // A fatal `Err` from either loop drops the other, whose `ConnectionTasks` aborts its
-        // connections; shutdown waits for both drains (`docs/design/pipeline-graph.md`'s
-        // "Cancellation points").
+        // Both loops are awaited to the end: see `docs/design/pipeline-graph.md`'s "Cancellation
+        // points".
         tokio::try_join!(tcp_loop, unix_loop)?;
         Ok(())
     }
