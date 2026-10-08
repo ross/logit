@@ -144,7 +144,7 @@
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
-    deliver_detached, deliver_with_deadline, drive_with_idle, is_length_limit, json_response,
+    deliver_detached, deliver_with_deadline, drive_connection, is_length_limit, json_response,
     matches_any_key, now_nanos, Activity, BodyReadError, DecompressError, Encoding, Undelivered,
 };
 use crate::peer::ConnectionPeer;
@@ -803,12 +803,13 @@ where
     });
     let builder = crate::http::auto_builder();
     let conn = builder.serve_connection(io, svc);
-    drive_with_idle(
+    drive_connection(
         conn,
         |conn| conn.graceful_shutdown(),
         &activity,
         idle_timeout,
         grace,
+        crate::http::never_shutdown(),
         &telemetry,
     )
     .await

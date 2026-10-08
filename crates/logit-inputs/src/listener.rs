@@ -1,11 +1,13 @@
-//! Bookkeeping every connection-oriented listener shares: the `logit.input.connections` gauge and
-//! the accept-error posture (`docs/design/internal-telemetry.md`).
+//! Bookkeeping every connection-oriented listener shares: the `logit.input.connections` gauge,
+//! the connection-task set, and the accept-error posture (`docs/design/internal-telemetry.md`).
 //!
 //! The gauge is a drop guard ([`LiveConnection`]) rather than an increment and a decrement around
 //! a connection's serving future, so every way a connection task ends, a panic included, brings
 //! it back down. tokio runs a task's `poll` under `catch_unwind` and drops the task's future on a
 //! panic, which runs the guard's `Drop`; no build profile sets `panic = "abort"`. ADR
 //! `untrusted-input-bounds` ("Every listener") records the rule.
+//!
+//! A listener that closes its connections at shutdown spawns them into [`ConnectionTasks`].
 //!
 //! An accept loop hands every `accept()` error to [`absorb_accept_error`] and ends only on the one
 //! it returns. Classifying per error, rather than wrapping the accept call, lets the same helper
@@ -60,6 +62,40 @@ impl Drop for LiveConnection {
     fn drop(&mut self) {
         let live = self.0.count.fetch_sub(1, Ordering::Relaxed) - 1;
         self.0.publish(live);
+    }
+}
+
+/// The connection tasks of one listener run, owned by that run's future so dropping the future
+/// aborts them.
+///
+/// **A local of the listener's `run_until_shutdown` future, never captured by a task.** Dropping
+/// it is how `run_input`'s grace backstop reaches the connection tasks: the backstop drops the
+/// listener future, this set drops with it, and every task still running is aborted along with its
+/// `Fanout` clone. A set held in an `Arc` that a task captures is a cycle, and the drop aborts
+/// nothing. What an abort costs is in `docs/design/pipeline-graph.md`'s "Cancellation points".
+///
+/// A panicking task ends only its own connection: every `JoinError` is discarded, as a bare
+/// `tokio::spawn` discards its handle.
+pub(crate) struct ConnectionTasks(tokio::task::JoinSet<()>);
+
+impl ConnectionTasks {
+    pub(crate) fn new() -> Self {
+        Self(tokio::task::JoinSet::new())
+    }
+
+    /// Spawns one connection's task, first reaping every task that has finished. Reaping on each
+    /// spawn bounds the set at `max_connections + 1` with no extra wake per connection.
+    pub(crate) fn spawn<F>(&mut self, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        while self.0.try_join_next().is_some() {}
+        self.0.spawn(task);
+    }
+
+    /// Waits for every connection task to end.
+    pub(crate) async fn drain(mut self) {
+        while self.0.join_next().await.is_some() {}
     }
 }
 

@@ -134,7 +134,7 @@
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
-    deliver_with_deadline, drive_with_idle, error_response, is_length_limit, json_response,
+    deliver_with_deadline, drive_connection, error_response, is_length_limit, json_response,
     matches_any_key, media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding,
     MediaType, Undelivered,
 };
@@ -530,12 +530,13 @@ where
     });
     let builder = crate::http::auto_builder();
     let conn = builder.serve_connection(io, svc);
-    drive_with_idle(
+    drive_connection(
         conn,
         |conn| conn.graceful_shutdown(),
         &activity,
         idle_timeout,
         grace,
+        crate::http::never_shutdown(),
         &telemetry,
     )
     .await

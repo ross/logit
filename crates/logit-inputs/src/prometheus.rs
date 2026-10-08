@@ -327,7 +327,7 @@
 //! `logit.input.metrics.skipped{reason}` counts what it stepped over, native histograms included.
 
 use crate::http::{
-    body_read_error_message, collect_with_stall_bound, drive_with_idle, Activity, BodyReadError,
+    body_read_error_message, collect_with_stall_bound, drive_connection, Activity, BodyReadError,
 };
 use crate::peer::ConnectionPeer;
 use crate::Input;
@@ -1476,15 +1476,16 @@ where
         }
     });
     // Bound to a local: `auto::Connection` borrows its builder, so a temporary would not live long
-    // enough to be held across `drive_with_idle`'s loop.
+    // enough to be held across `drive_connection`'s loop.
     let builder = crate::http::auto_builder();
     let conn = builder.serve_connection(io, svc);
-    drive_with_idle(
+    drive_connection(
         conn,
         |conn| conn.graceful_shutdown(),
         &activity,
         idle_timeout,
         grace,
+        crate::http::never_shutdown(),
         &telemetry,
     )
     .await
@@ -1613,7 +1614,7 @@ async fn write_response(
     let limited = Limited::new(req.into_body(), MAX_REQUEST_BYTES);
     let compressed = match collect_with_stall_bound(limited, stall).await {
         Ok(bytes) => bytes,
-        // A body that stopped arriving is the sender's clock, not its size. `drive_with_idle`
+        // A body that stopped arriving is the sender's clock, not its size. `drive_connection`
         // applies no deadline while a request is in flight, so without this a half-uploaded
         // request would hold its permit forever; the connection closes once this response is out.
         //
@@ -3304,7 +3305,7 @@ mod tests {
         );
     }
 
-    /// The routes table's `408` row: `drive_with_idle` applies no deadline while a request is in
+    /// The routes table's `408` row: `drive_connection` applies no deadline while a request is in
     /// flight, so a peer that stops mid-body would otherwise hold its permit forever.
     #[tokio::test]
     async fn a_body_that_stops_arriving_is_408_and_closes_the_connection() {
@@ -3316,7 +3317,7 @@ mod tests {
             .with_telemetry(telemetry)
             // The per-frame body bound is derived from `idle_timeout`.
             .with_idle_timeout(Some(Duration::from_millis(100)))
-            // The grace `drive_with_idle` gives hyper to write the 408 out and close.
+            // The grace `drive_connection` gives hyper to write the 408 out and close.
             .with_handshake_timeout(Duration::from_millis(200));
         let mut rx = spawn_receiver(receiver, 4);
         let body = request_body(
@@ -3500,7 +3501,7 @@ mod tests {
 
         expect_closed(&mut keep_alive, "a keep-alive connection quiet past its idle_timeout").await;
 
-        // hyper's graceful close can send the FIN before `drive_with_idle` counts, so the close
+        // hyper's graceful close can send the FIN before `drive_connection` counts, so the close
         // alone doesn't say the count is in.
         let mut probe = TelemetryProbe::with_registry(registry);
         let totals = probe

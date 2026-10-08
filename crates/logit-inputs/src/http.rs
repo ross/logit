@@ -2,7 +2,7 @@
 //! `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`, and
 //! `splunk_hec_in`): the connection builders that pin hyper's HTTP/2 settings ([`auto_builder`],
 //! [`h2_builder`]), the idle-timeout tracker ([`Activity`], [`InFlight`]), the connection driver
-//! that acts on it ([`drive_with_idle`]), and the bounded request-body read
+//! that acts on it ([`drive_connection`]), and the bounded request-body read
 //! ([`collect_with_stall_bound`], which holds one buffer per body however many reads it arrives
 //! in). All five listeners build and read through these. The two Datadog listeners and
 //! `splunk_hec_in` also share their request helpers here: `Content-Encoding` and `Content-Type`
@@ -17,7 +17,15 @@
 //! `serve_connection` is not shared: each listener dispatches on its own protocol (`otlp_in` uses
 //! [`hyper_util::server::conn::auto`] for HTTP and `hyper::server::conn::http2` for gRPC) and wires
 //! in its own handlers. It builds its own service and connection future and hands them to
-//! [`drive_with_idle`], which is the seam.
+//! [`drive_connection`], which is the seam.
+//!
+//! **A handler never calls `Fanout::send` on its connection task.** A listener that closes its
+//! connections at shutdown owns their tasks, and `run_input`'s backstop aborts whichever are
+//! still running at the grace (`crate::listener::ConnectionTasks`). That abort must cost a client
+//! its acknowledgment, which it answers by resending, and never a batch part-way through a send.
+//! Two shapes satisfy the rule: [`deliver_detached`] sends on a task of its own, which the abort
+//! doesn't reach, and [`deliver_with_deadline`] reserves a slot on every consumer before it sends,
+//! so a dropped wait has sent and counted nothing.
 
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Limited};
@@ -73,7 +81,7 @@ pub(crate) fn h2_builder() -> http2::Builder<TokioExecutor> {
     builder
 }
 
-/// One connection's idle state, shared between its service and [`drive_with_idle`].
+/// One connection's idle state, shared between its service and [`drive_connection`].
 ///
 /// A service-level tracker, not a timer around the socket (`crate::otlp`'s "Idle timeout" doc
 /// section).
@@ -90,7 +98,7 @@ pub(crate) struct Activity {
     /// Set by a handler whose request body stalled: close this connection as soon as its
     /// response is out, rather than leaving it to the idle deadline.
     close_after: AtomicBool,
-    /// Wakes [`drive_with_idle`] when any of the three above changes, so a finished request
+    /// Wakes [`drive_connection`] when any of the three above changes, so a finished request
     /// re-arms the deadline and a `close_after` is acted on now rather than at the next deadline.
     changed: tokio::sync::Notify,
 }
@@ -156,22 +164,24 @@ impl Drop for InFlight {
 }
 
 /// Polls one hyper connection future to completion, closing it once [`Activity`] has been idle
-/// for `idle` or a handler asked for a close after a stalled body.
+/// for `idle`, a handler asked for a close after a stalled body, or `shutdown` fires.
 ///
-/// `shutdown` is the connection's own `graceful_shutdown`, passed in because `auto::Connection`
+/// `graceful` is the connection's own `graceful_shutdown`, passed in because `auto::Connection`
 /// and `http2::Connection` share the signature (`self: Pin<&mut Self>`) but no trait. With
-/// `idle: None` this is `conn.await`. The close sequence's semantics and hyper evidence are in
-/// `crate::otlp`'s "Idle timeout" doc section.
+/// `idle: None` no deadline applies and only `shutdown` or a close request ends the connection
+/// from this side. A dropped `shutdown` sender reads as shutdown. The close sequence's semantics
+/// and hyper evidence are in `crate::otlp`'s "Idle timeout" doc section.
 ///
 /// **`conn` is polled the whole time, including while waiting for an in-flight request to
 /// finish.** For h1 a handler's future is polled *inside* this connection future, so waiting on
 /// `changed` alone would deadlock: only that request finishing can send the notification.
-pub(crate) async fn drive_with_idle<C, E>(
+pub(crate) async fn drive_connection<C, E>(
     conn: C,
-    shutdown: impl FnOnce(Pin<&mut C>),
+    graceful: impl FnOnce(Pin<&mut C>),
     activity: &Activity,
     idle: Option<std::time::Duration>,
     grace: std::time::Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
     telemetry: &Telemetry,
 ) -> Result<(), String>
 where
@@ -179,17 +189,28 @@ where
     E: std::fmt::Display,
 {
     let mut conn = std::pin::pin!(conn);
-    let Some(idle) = idle else {
-        return conn.await.map_err(|e| e.to_string());
-    };
+    // Set when shutdown starts the close rather than the idle policy: only the policy is counted.
+    let mut closing = false;
 
     loop {
+        // `wait_for` below covers a signal sent while waiting; this covers one sent before the
+        // receiver was cloned, which never wakes a `changed`.
+        if *shutdown.borrow() {
+            closing = true;
+            break;
+        }
+        // Each `select!` here races shutdown: see `docs/design/pipeline-graph.md`'s
+        // "Cancellation points". The arm sets a flag and breaks; the close runs after the loop.
         if activity.in_flight() > 0 {
             // Working, so no deadline applies. Keep polling, and wake when the count changes so
             // the deadline re-arms from the instant that request finished.
             tokio::select! {
                 result = conn.as_mut() => return result.map_err(|e| e.to_string()),
                 () = activity.changed.notified() => continue,
+                _ = shutdown.wait_for(|&due| due) => {
+                    closing = true;
+                    break;
+                }
             }
         }
         if activity.close_requested() {
@@ -197,9 +218,10 @@ where
         }
         // `checked_add` because `last_progress + idle` can overflow for an absurd (but legal)
         // `idle_timeout`, and rule 53 caps nothing above `0s`; the fallback never arrives.
-        let deadline =
-            activity.last_progress().checked_add(idle).unwrap_or_else(crate::tcp::far_future);
-        if tokio::time::Instant::now() >= deadline {
+        let deadline = idle.map(|idle| {
+            activity.last_progress().checked_add(idle).unwrap_or_else(crate::tcp::far_future)
+        });
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             break;
         }
         tokio::select! {
@@ -207,19 +229,25 @@ where
             // Both arms loop rather than deciding here: the deadline is recomputed from the
             // current `last_progress` at the top, so a request that finished during the sleep
             // moves the deadline out instead of closing.
-            () = tokio::time::sleep_until(deadline) => continue,
+            () = tokio::time::sleep_until(deadline.unwrap_or_else(crate::tcp::far_future)),
+                if deadline.is_some() => continue,
             () = activity.changed.notified() => continue,
+            _ = shutdown.wait_for(|&due| due) => {
+                closing = true;
+                break;
+            }
         }
     }
 
-    // Idle, or a stalled body asked for this. Ask hyper to close, give it `grace`, then drop the
+    // Idle, a stalled body, or shutdown. Ask hyper to close, give it `grace`, then drop the
     // connection whatever that returned. `graceful_shutdown` alone leaves two cases parked, an h1
     // head stopped mid-way (`KA::Busy`) and an h2 connection still handshaking, and those spend
     // the grace. A pre-sniff `ReadVersion` does not: `graceful_shutdown` cancels it and the first
     // poll below resolves at once to `Err("Cancelled")`, which is why the result is discarded
     // (`crate::otlp`'s "Idle timeout" doc section). Returning is the drop: the socket closes with
-    // the pinned future.
-    shutdown(conn.as_mut());
+    // the pinned future. Nothing below races shutdown: a request in flight is served out whatever
+    // the trigger, and `run_input`'s backstop bounds the wait.
+    graceful(conn.as_mut());
     loop {
         if tokio::time::timeout(grace, conn.as_mut()).await.is_ok() {
             break;
@@ -254,8 +282,21 @@ where
             break;
         }
     }
-    telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "idle")]);
+    // A shutdown close isn't counted: it would land after `internal`'s final drain, and
+    // `connections.closed` counts a policy close (`crate::otlp`'s "Idle timeout" doc section).
+    if !closing {
+        telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "idle")]);
+    }
     Ok(())
+}
+
+/// A shutdown receiver that never fires, for a listener that keeps
+/// [`logit_pipeline::Input::run_until_shutdown`]'s default and so has no signal to hand
+/// [`drive_connection`]. The sender lives in a static, so the receiver never reads it as dropped.
+pub(crate) fn never_shutdown() -> tokio::sync::watch::Receiver<bool> {
+    static SENDER: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> =
+        std::sync::OnceLock::new();
+    SENDER.get_or_init(|| tokio::sync::watch::channel(false).0).subscribe()
 }
 
 /// Why reading a request body stopped short.
@@ -553,7 +594,7 @@ impl Undelivered {
 /// count them dropped a second time.
 ///
 /// The task holds a `Fanout` clone until the downstream takes the last batch, as a parked handler
-/// does ([`drive_with_idle`]'s wait-out loop). A panic inside it is resumed here; a task cancelled
+/// does ([`drive_connection`]'s wait-out loop). A panic inside it is resumed here; a task cancelled
 /// by a runtime shutting down reports every batch as undelivered, since which of them went out is
 /// unknown and the client must not be told they all did.
 pub(crate) async fn deliver_detached(
