@@ -27,23 +27,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit:** add a `cargo check --manifest-path fuzz/Cargo.toml` step to `script/check` if it
     works on the stable toolchain (`libfuzzer-sys` compiles on stable; only `cargo fuzz run`
     needs nightly), or else a build step in the nightly image, run by hand.
-- **`logit_in`'s and `internal`'s shutdown grace is fixed at 5s, not operator-tunable.** Graph
-  rule 17 rejects a `receive:` block on both, because neither is a datagram, stream, or tail
-  listener, so both always get `ReceiveConfig::default().shutdown_grace`. `LogitInput` uses it to
-  close idle connections cleanly, and `InternalInput` for its final drain of buffered
-  self-telemetry (`crates/logit-inputs/src/internal.rs`). It's a gap if a deployment needs a
-  different number; no `receive:`-shaped knob exists.
-- **`otlp_in` can hold the graph open past shutdown.** Each connection `OtlpInput::run` spawns
-  holds its own `Fanout` clone, and the input doesn't override `Input::run_until_shutdown` the way
-  `logit_in` does (`crates/logit-inputs/src/logit.rs`'s module doc comment). `datadog_in`,
-  `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver share the shape
-  and the gap: each spawns its connections the same way and keeps the default.
-  - **Consequence:** a keep-alive HTTP/gRPC connection still within its `idle_timeout:` budget, or
-    with none configured, when shutdown begins can hold its `Fanout` clone open indefinitely. The
-    cancel-by-drop shutdown
-    ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md))
-    depends on every listener releasing its clone.
-  - **Fix:** follow `logit_in`'s design.
+- **`logit_in`'s, `internal`'s, and the five HTTP listeners' shutdown grace is fixed at 5s, not
+  operator-tunable.** Graph rule 17 rejects a `receive:` block on all seven (`otlp_in`,
+  `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver
+  are the five), because none is a datagram, stream, or tail listener, so each always gets
+  `ReceiveConfig::default().shutdown_grace`. `LogitInput` uses it to close connections cleanly,
+  the HTTP listeners as the deadline at which `run_input` aborts any connection still open, and
+  `InternalInput` for its final drain of buffered self-telemetry
+  (`crates/logit-inputs/src/internal.rs`). It's a gap if a deployment needs a different number;
+  no `receive:`-shaped knob exists.
 - **`otlp_in`'s TLS-arm `handshake_timeout` bounds the TLS accept and nothing after it.** `hyper`'s
   `hyper_util::server::conn::auto::Builder` reads the first bytes itself to tell HTTP/1.1 from an
   h2 preface, a read `crate::otlp` can't wrap without reimplementing that sniff. The plaintext arm

@@ -537,7 +537,7 @@ so `docs/design/pipeline-graph.md`'s "Cancellation points" table has 42 rows. Th
 - The runtime's remaining sites: `deliver_with_retry`'s per-attempt timeout, `run_lua_loop`,
   `watch_lua_thread`, the default `Input::run_until_shutdown`, and
   `Fanout::send_with_deadline`.
-- `internal`, `prometheus_in`'s scrape request timeout, the shared HTTP driver (`drive_with_idle`,
+- `internal`, `prometheus_in`'s scrape request timeout, the shared HTTP driver (`drive_connection`,
   `collect_with_stall_bound`), every listener's TLS-accept and first-byte bound,
   `datadog_trace_in`'s two accept loops, `AcceptQueueSampler::accept_every`, and `logit_in`'s
   accept, header, handshake, body, and control-write sites.
@@ -554,7 +554,8 @@ wire so the peer resends. Four uncounted losses the audit found are now in `docs
 - A torn line or frame in `stdio_out` and `file_out` after a grace-cut `send`, as this ADR's
   consequences record.
 - `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s receiver can hold the
-  graph open past shutdown, as `otlp_in` can.
+  graph open past shutdown, as `otlp_in` can (since closed by [ADR `idle-connection-timeout`](idle-connection-timeout.md)'s
+  shutdown amendment).
 
 Site comments that restated a row now point at the table, and the runtime, `Input`, and `tcp.rs`
 module docs point at it once. No behavior changes.

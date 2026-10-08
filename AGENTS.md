@@ -482,7 +482,9 @@ Per pair:
   ([ADR `env-yaml-tag`](docs/adr/env-yaml-tag.md)), which is why `influxdb_out`'s `token` is a
   plain string, not an env-specific field.
 - **Lifecycle**: [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md)
-  covers signal-driven shutdown. `crates/logit-inputs/src/statsd.rs` and
+  covers signal-driven shutdown. The five HTTP listeners own their connection tasks and close
+  them on the signal ([ADR `idle-connection-timeout`](docs/adr/idle-connection-timeout.md)'s
+  shutdown amendment). `crates/logit-inputs/src/statsd.rs` and
   `crates/logit-outputs/src/influxdb.rs` are the reference listener and sink.
 - **Sink faults**: a failed send is `Clean`, `Ambiguous`, `Rejected`, or `Refused`
   ([ADR `sink-fault-classes`](docs/adr/sink-fault-classes.md)). `write_loop` drops a `Rejected`

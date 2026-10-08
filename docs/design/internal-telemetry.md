@@ -715,7 +715,7 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 | `logit.input.connections.rejected{reason="limit"}` | count | a connection closed at the connection cap, before any TLS handshake |
 | `logit.input.connections.rejected{reason="proxy_header"}` | count | a connection under `proxy_protocol: true` whose PROXY header was missing, malformed, cut short by the peer closing, or not complete within `handshake_timeout`; read before any TLS handshake |
 | `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
-| `logit.input.connections.closed{reason="idle"}` | count | an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set |
+| `logit.input.connections.closed{reason="idle"}` | count | an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. A close at shutdown is not counted: there is no `reason="shutdown"`, because the runtime would record it after `internal`'s final drain |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
 | `logit.input.frames.dropped{reason="oversize"\|"malformed"\|"truncated"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses |
 

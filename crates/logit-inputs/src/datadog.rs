@@ -7,10 +7,10 @@
 //! live in that codec's module doc; this module owns HTTP: routing, authentication, compression,
 //! size caps, and backpressure.
 //!
-//! The accept loop, connection cap, handshake timeout, and idle timeout are `otlp_in`'s, copied
-//! rather than shared because the telemetry and dispatch are each listener's own; the idle
-//! machinery and bounded body read are shared ([`crate::http`]). `crate::otlp`'s module doc has the
-//! reasoning for each, and it applies here unchanged. The request helpers (`Content-Encoding`,
+//! The accept loop, connection cap, handshake timeout, idle timeout, and shutdown close are
+//! `otlp_in`'s, copied rather than shared because the telemetry and dispatch are each listener's
+//! own; the connection driver and bounded body read are shared ([`crate::http`]). `crate::otlp`'s
+//! module doc has the reasoning for each, and it applies here unchanged. The request helpers (`Content-Encoding`,
 //! bounded decompression, the JSON response shapes, deadline-bounded delivery) live in
 //! [`crate::http`] too, shared with `datadog_trace_in` ([`crate::datadog_trace`]).
 //!
@@ -134,10 +134,11 @@
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
-    deliver_with_deadline, drive_with_idle, error_response, is_length_limit, json_response,
+    deliver_with_deadline, drive_connection, error_response, is_length_limit, json_response,
     matches_any_key, media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding,
     MediaType, Undelivered,
 };
+use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
 use crate::Input;
 use bytes::Bytes;
@@ -157,6 +158,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
 /// The cap on a request's compressed body, on every route: 5 MiB, the Agent's own decompressed
@@ -361,6 +363,19 @@ impl Input for DatadogInput {
     /// handshake or a plaintext first-byte peek, each bounded inside the spawned task; a clean
     /// close or a reset before the first byte treated as a health check.
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
+        // A never-firing `watch`, so `run` and `run_until_shutdown` share one implementation. The
+        // sender lives for this scope: a dropped sender reads as shutdown.
+        let (_tx, rx) = watch::channel(false);
+        self.run_until_shutdown(sink, rx).await
+    }
+
+    /// `otlp_in`'s shutdown close: the accept races the signal, the listening socket closes on
+    /// it, and the connection tasks drain (`crate::otlp`'s "Idle timeout").
+    async fn run_until_shutdown(
+        &mut self,
+        sink: Fanout,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
         self.bind().await?;
         let listener = self.listener.take().expect("bind() leaves a listener behind");
         let connection_limit = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
@@ -371,12 +386,28 @@ impl Input for DatadogInput {
         let mut accept_queue =
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
         let mut accept_diag = self.diag.clone();
+        // A local of this future, so `run_input`'s backstop dropping it aborts every connection
+        // still open (`crate::listener::ConnectionTasks`).
+        let mut tasks = crate::listener::ConnectionTasks::new();
         loop {
-            let (mut stream, peer) = match accept_queue.accept(&listener).await {
+            // Both waits race shutdown: see `docs/design/pipeline-graph.md`'s "Cancellation
+            // points".
+            let accepted = tokio::select! {
+                accepted = accept_queue.accept(&listener) => accepted,
+                _ = shutdown.wait_for(|&due| due) => break,
+            };
+            let (mut stream, peer) = match accepted {
                 Ok(accepted) => accepted,
                 Err(err) => {
-                    crate::listener::absorb_accept_error(err, &self.telemetry, &mut accept_diag)
-                        .await?;
+                    tokio::select! {
+                        biased;
+                        absorbed = crate::listener::absorb_accept_error(
+                            err,
+                            &self.telemetry,
+                            &mut accept_diag,
+                        ) => absorbed?,
+                        _ = shutdown.wait_for(|&due| due) => break,
+                    }
                     continue;
                 }
             };
@@ -399,85 +430,117 @@ impl Input for DatadogInput {
             let live_connections = live_connections.clone();
             let (record_peer, proxy_protocol) = (self.peer, self.proxy_protocol);
             let forwarded = self.forwarded;
-            tokio::spawn(async move {
+            let mut conn_shutdown = shutdown.clone();
+            tasks.spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
 
                 // Counted out on drop, so a panicking handler brings the gauge back down too.
                 let live = live_connections.enter();
 
-                // Ahead of the TLS accept and the first-byte peek, both of which would otherwise
-                // read the header's bytes as the request's (`crate::otlp`'s "Sender address").
-                let origin = if proxy_protocol {
-                    match crate::peer::read_proxy_origin(&mut stream, handshake_timeout).await {
-                        Ok(origin) => Some(origin),
-                        Err(err) => {
-                            drop(live);
-                            telemetry.count(
-                                "logit.input.connections.rejected",
-                                1.0,
-                                &[("reason", "proxy_header")],
-                            );
-                            diag.warn_throttled("proxy_header", err);
-                            return;
+                // Races shutdown as a whole (`docs/design/pipeline-graph.md`'s "Cancellation
+                // points"): nothing of a request has been read before it ends.
+                let prelude = async {
+                    // Ahead of the TLS accept and the first-byte peek, both of which would
+                    // otherwise read the header's bytes as the request's (`crate::otlp`'s "Sender
+                    // address").
+                    let origin = if proxy_protocol {
+                        match crate::peer::read_proxy_origin(&mut stream, handshake_timeout).await {
+                            Ok(origin) => Some(origin),
+                            Err(err) => return Prelude::ProxyRejected(err),
                         }
-                    }
-                } else {
-                    None
-                };
-                let shared = Arc::new(Shared {
-                    sink,
-                    telemetry,
-                    diag: diag.clone(),
-                    api_keys,
-                    busy_after,
-                    peer: ConnectionPeer::tcp(peer, record_peer, origin.as_ref())
-                        .with_forwarded(forwarded, &diag),
-                });
+                    } else {
+                        None
+                    };
+                    let connection_peer = ConnectionPeer::tcp(peer, record_peer, origin.as_ref())
+                        .with_forwarded(forwarded, &diag);
 
-                let result = match tls_acceptor {
-                    Some(acceptor) => {
-                        match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
-                        {
-                            Ok(Ok(tls_stream)) => {
-                                serve_connection(
-                                    TokioIo::new(tls_stream),
-                                    shared,
-                                    idle_timeout,
-                                    handshake_timeout,
-                                )
+                    match tls_acceptor {
+                        Some(acceptor) => {
+                            match tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
                                 .await
+                            {
+                                Ok(Ok(tls_stream)) => {
+                                    Prelude::Tls(Box::new(tls_stream), connection_peer)
+                                }
+                                Ok(Err(err)) => {
+                                    Prelude::Failed(format!("TLS handshake failed: {err}"))
+                                }
+                                Err(_elapsed) => Prelude::Failed(format!(
+                                    "TLS handshake did not complete within {handshake_timeout:?}"
+                                )),
                             }
-                            Ok(Err(err)) => Err(format!("TLS handshake failed: {err}")),
-                            Err(_elapsed) => Err(format!(
-                                "TLS handshake did not complete within {handshake_timeout:?}"
-                            )),
+                        }
+                        None => {
+                            let first_byte =
+                                tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
+                                    .await;
+                            match first_byte {
+                                // A clean close or a reset before the first byte is a
+                                // health-check probe, not a fault (`crate::otlp`'s "not a fault").
+                                Ok(Ok(0)) => Prelude::Probe,
+                                Ok(Err(err))
+                                    if err.kind() == std::io::ErrorKind::ConnectionReset =>
+                                {
+                                    Prelude::Probe
+                                }
+                                Ok(Ok(_)) => Prelude::Plain(stream, connection_peer),
+                                Ok(Err(err)) => Prelude::Failed(format!(
+                                    "waiting for a first byte failed: {err}"
+                                )),
+                                Err(_elapsed) => Prelude::Failed(format!(
+                                    "no first byte received within {handshake_timeout:?}"
+                                )),
+                            }
                         }
                     }
-                    None => {
-                        let first_byte =
-                            tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
-                                .await;
-                        match first_byte {
-                            // A clean close or a reset before the first byte is a health-check
-                            // probe, not a fault (`crate::otlp`'s "not a fault").
-                            Ok(Ok(0)) => Ok(()),
-                            Ok(Err(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
-                                Ok(())
-                            }
-                            Ok(Ok(_)) => {
-                                serve_connection(
-                                    TokioIo::new(stream),
-                                    shared,
-                                    idle_timeout,
-                                    handshake_timeout,
-                                )
-                                .await
-                            }
-                            Ok(Err(err)) => Err(format!("waiting for a first byte failed: {err}")),
-                            Err(_elapsed) => {
-                                Err(format!("no first byte received within {handshake_timeout:?}"))
-                            }
-                        }
+                };
+                let prelude = tokio::select! {
+                    prelude = prelude => prelude,
+                    _ = conn_shutdown.wait_for(|&due| due) => return,
+                };
+
+                let shared = |peer| {
+                    Arc::new(Shared {
+                        sink,
+                        telemetry: telemetry.clone(),
+                        diag: diag.clone(),
+                        api_keys,
+                        busy_after,
+                        peer,
+                    })
+                };
+                let result = match prelude {
+                    Prelude::Tls(tls_stream, connection_peer) => {
+                        serve_connection(
+                            TokioIo::new(*tls_stream),
+                            shared(connection_peer),
+                            idle_timeout,
+                            handshake_timeout,
+                            conn_shutdown,
+                        )
+                        .await
+                    }
+                    Prelude::Plain(stream, connection_peer) => {
+                        serve_connection(
+                            TokioIo::new(stream),
+                            shared(connection_peer),
+                            idle_timeout,
+                            handshake_timeout,
+                            conn_shutdown,
+                        )
+                        .await
+                    }
+                    Prelude::Probe => Ok(()),
+                    Prelude::Failed(err) => Err(err),
+                    Prelude::ProxyRejected(err) => {
+                        drop(live);
+                        telemetry.count(
+                            "logit.input.connections.rejected",
+                            1.0,
+                            &[("reason", "proxy_header")],
+                        );
+                        diag.warn_throttled("proxy_header", err);
+                        return;
                     }
                 };
 
@@ -486,6 +549,12 @@ impl Input for DatadogInput {
                 }
             });
         }
+
+        // Closed before the drain: under `reuse_port` the kernel keeps hashing new connections to
+        // a bound socket that nothing accepts on any more.
+        drop(listener);
+        tasks.drain().await;
+        Ok(())
     }
 }
 
@@ -508,6 +577,7 @@ async fn serve_connection<IO>(
     shared: Arc<Shared>,
     idle_timeout: Option<Duration>,
     grace: Duration,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<(), String>
 where
     IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
@@ -530,12 +600,13 @@ where
     });
     let builder = crate::http::auto_builder();
     let conn = builder.serve_connection(io, svc);
-    drive_with_idle(
+    drive_connection(
         conn,
         |conn| conn.graceful_shutdown(),
         &activity,
         idle_timeout,
         grace,
+        shutdown,
         &telemetry,
     )
     .await
@@ -1467,6 +1538,182 @@ mod tests {
         assert!(!is_host_metadata(EVENT));
         assert!(!is_host_metadata(br#"{"apiKey":"k","events":{},"internalHostname":"h"}"#));
         assert!(!is_host_metadata(b"[1]"), "not an object: left for the decoder to reject");
+    }
+
+    // ---- shutdown -----------------------------------------------------------------------------
+    //
+    // Every test here goes through `spawn_input` and `Running`, so the listener runs
+    // `run_until_shutdown` with a real signal. "Returned" means `Running::stop`'s 5s ceiling.
+
+    /// The close grace (`handshake_timeout`, reused) for this section. Short, so a close that
+    /// spends the whole grace returns 50x inside `Running::stop`'s 5s ceiling and never ties it.
+    const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+
+    /// Far past any wait in this section, so a request parked on a full edge stays parked rather
+    /// than being answered `503` at the busy bound.
+    const PARKED_BUSY_AFTER: Duration = Duration::from_secs(30);
+
+    /// A running listener whose one consumer is a capacity-1 edge carrying its own telemetry, so
+    /// a send parked on it counts `logit.component.inbox.full` the moment it parks. Returns the
+    /// probe over both the listener's and the consumer's telemetry.
+    async fn shutdown_listener(
+        input: DatadogInput,
+    ) -> (
+        String,
+        logit_pipeline::test_util::Running,
+        mpsc::Receiver<logit_pipeline::Delivered>,
+        logit_pipeline::test_util::TelemetryProbe,
+    ) {
+        let probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let mut input = input
+            .with_telemetry(probe.telemetry("datadog_in", "datadog_in", "listener"))
+            .with_busy_after(PARKED_BUSY_AFTER);
+        input.bind().await.expect("binding an ephemeral port");
+        let addr = input.local_addr().expect("bind() leaves an address").to_string();
+        let (tx, rx) = mpsc::channel(1);
+        let edge = logit_pipeline::fanout::Edge::new(tx)
+            .with_telemetry(probe.telemetry("sink", "null_out", "sink"));
+        let running =
+            logit_pipeline::test_util::spawn_input(input, Fanout::from_edges(vec![edge])).await;
+        (addr, running, rx, probe)
+    }
+
+    fn plaintext_shutdown_input() -> DatadogInput {
+        DatadogInput::new("127.0.0.1:0").with_handshake_timeout(SHUTDOWN_GRACE)
+    }
+
+    /// One series POST on an open stream with no `Connection: close`, so hyper waits for the next
+    /// request rather than closing.
+    async fn write_series(stream: &mut tokio::net::TcpStream, addr: &str) {
+        let request = format!(
+            "POST /api/v1/series HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n",
+            SERIES_V1.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(SERIES_V1).await.unwrap();
+    }
+
+    /// Two series POSTs on one keep-alive connection: the first fills the edge's one slot and is
+    /// answered, the second parks in `send_with_deadline`. Returns once the park is counted.
+    async fn park_a_request(
+        addr: &str,
+        probe: &mut logit_pipeline::test_util::TelemetryProbe,
+    ) -> tokio::net::TcpStream {
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        write_series(&mut client, addr).await;
+        let response =
+            crate::http::read_response(&mut client, "the POST that fills the slot").await;
+        assert!(response.starts_with("HTTP/1.1 202"), "got: {response}");
+        write_series(&mut client, addr).await;
+        probe
+            .wait_for("the second POST to park on the full edge", |t| {
+                t.sum("logit.component.inbox.full", &[]) >= 1.0
+            })
+            .await;
+        client
+    }
+
+    /// Every `Fanout` clone is gone once the listener has returned: the inbox reads closed.
+    async fn expect_inbox_closed(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) {
+        let next = tokio::time::timeout(logit_pipeline::test_util::RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("the inbox should close once the listener returned");
+        assert!(next.is_none(), "no batch is left after the ones the test drained");
+    }
+
+    /// An h1 keep-alive connection between requests is closed by shutdown, the listener returns,
+    /// and no `Fanout` clone outlives it.
+    #[tokio::test]
+    async fn shutdown_closes_an_idle_keep_alive_connection_and_the_listener_returns() {
+        let (addr, running, mut rx, _probe) = shutdown_listener(plaintext_shutdown_input()).await;
+        let mut keep_alive = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        write_series(&mut keep_alive, &addr).await;
+        let response = crate::http::read_response(&mut keep_alive, "the keep-alive POST").await;
+        assert!(response.starts_with("HTTP/1.1 202"), "got: {response}");
+        recv_batch(&mut rx).await;
+
+        running.stop().await;
+        logit_pipeline::test_util::expect_closed(&mut keep_alive, "a keep-alive connection").await;
+        expect_inbox_closed(&mut rx).await;
+    }
+
+    /// A request parked on a full downstream when shutdown fires is served out: both batches
+    /// reach the consumer, the client gets its `202`, then the connection closes and the listener
+    /// returns.
+    #[tokio::test]
+    async fn shutdown_serves_a_parked_request_out_then_closes_its_connection() {
+        let (addr, running, mut rx, mut probe) =
+            shutdown_listener(plaintext_shutdown_input()).await;
+        let mut client = park_a_request(&addr, &mut probe).await;
+
+        running.shutdown.send(true).unwrap();
+        recv_batch(&mut rx).await;
+        recv_batch(&mut rx).await;
+        let response = crate::http::read_response(&mut client, "the parked POST").await;
+        assert!(response.starts_with("HTTP/1.1 202"), "got: {response}");
+        logit_pipeline::test_util::expect_closed(&mut client, "the parked request's connection")
+            .await;
+        tokio::time::timeout(logit_pipeline::test_util::RECV_TIMEOUT, running.handle)
+            .await
+            .expect("the listener should return once its connection closed")
+            .expect("the listener task should not panic")
+            .expect("the listener should return Ok");
+        expect_inbox_closed(&mut rx).await;
+    }
+
+    /// Dropping the listener's future (what `run_input`'s grace backstop does) aborts its
+    /// connection tasks. The parked batch's reservation drops with its task, so it's never sent,
+    /// and the client, never answered, resends it: only the batch that filled the slot arrives.
+    #[tokio::test]
+    async fn dropping_the_listener_future_aborts_a_parked_request_and_sends_nothing_more() {
+        let (addr, running, mut rx, mut probe) =
+            shutdown_listener(plaintext_shutdown_input()).await;
+        let mut client = park_a_request(&addr, &mut probe).await;
+
+        running.handle.abort();
+        logit_pipeline::test_util::expect_closed(&mut client, "an aborted connection").await;
+        recv_batch(&mut rx).await;
+        // A reservation that survived the abort would hold a `Fanout` clone and deliver its batch
+        // before the inbox could close, so the close below is the negative assertion.
+        expect_inbox_closed(&mut rx).await;
+        probe
+            .wait_for("the connections gauge to read 0", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
+    }
+
+    /// A connection still in its TLS accept when shutdown fires ends at once rather than at its
+    /// `handshake_timeout`. That timeout is an hour, far past `Running::stop`'s 5s ceiling, so the
+    /// stop returns in time only if the prelude races the signal; the gauge reading 0 right after
+    /// it shows the connection's task ended before the listener returned.
+    #[tokio::test]
+    async fn shutdown_ends_a_connection_still_in_its_tls_accept() {
+        let settings = TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        };
+        let input = DatadogInput::new("127.0.0.1:0")
+            .with_tls(&settings, &testdata_tls_dir(), &logit_pipeline::tls::TlsReloader::new())
+            .unwrap()
+            .with_handshake_timeout(Duration::from_secs(3600));
+        let (addr, running, _rx, mut probe) = shutdown_listener(input).await;
+
+        // Raw TCP, no ClientHello: the task waits in `acceptor.accept`.
+        let _silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        probe
+            .wait_for("the connections gauge to read 1", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(1.0)
+            })
+            .await;
+
+        running.stop().await;
+        assert_eq!(
+            probe.gauge("logit.input.connections", &[]),
+            Some(0.0),
+            "the connection's task ended before the listener returned"
+        );
     }
 
     // ---- sender address: `peer:` and `proxy_protocol:` ----------------------------------------

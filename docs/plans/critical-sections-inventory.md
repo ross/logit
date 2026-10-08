@@ -247,7 +247,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [WIRE-06](#wire-06--logit_in-per-connection-frame-loop-eager-body-allocation-idle-bounds-ack-as-backpressure) | P0 | `logit_in` per-connection frame loop: eager body allocation, idle bounds, ack-as-backpressure | `crates/logit-inputs/src/logit.rs` (`serve_connection`, `read_frame_body`) | findings → #372 |
 | [WIRE-08](#wire-08--logit_out-send-path-one-frame-in-flight-partial-write-semantics-fault-classification) | P0 | `logit_out` send path: one-frame-in-flight, partial-write semantics, fault classification | `crates/logit-outputs/src/logit.rs` (`Conn`, `LogitOutput`, `Output::send`) | findings → #452 |
 | [WIRE-10](#wire-10--hand-rolled-grpc-server-framing-length-prefixed-messages-trailers-gzip-bounds) | P0 | Hand-rolled gRPC server framing: length-prefixed messages, trailers, gzip bounds | `crates/logit-inputs/src/otlp.rs` (`handle_grpc`, `grpc_unframe`, `inflate`) | findings → #374 |
-| [WIRE-11](#wire-11--shared-hyper-connection-lifecycle-idle-tracking-graceful-shutdown-body-stall-bounds) | P0 | Shared hyper connection lifecycle: idle tracking, graceful shutdown, body stall bounds | `crates/logit-inputs/src/http.rs` (`Activity`, `drive_with_idle`) | findings → #374 |
+| [WIRE-11](#wire-11--shared-hyper-connection-lifecycle-idle-tracking-graceful-shutdown-body-stall-bounds) | P0 | Shared hyper connection lifecycle: idle tracking, graceful shutdown, body stall bounds | `crates/logit-inputs/src/http.rs` (`Activity`, `drive_connection`) | findings → #374 |
 | [WIRE-15](#wire-15--prometheus_in-remote-write-receiver-ingress-permits-deadlines-body-limits-snappy-bounds-version-dispatch) | P0 | `prometheus_in` remote-write receiver ingress: permits, deadlines, body limits, snappy bounds, version dispatch | `crates/logit-inputs/src/prometheus.rs` (`PrometheusReceiver`, `write_response`, `MAX_REQUEST_BYTES`) | findings → #374 |
 | [CODEC-16](#codec-16--otlpjson-anyvalue-decode--unbounded-recursion-on-attacker-controlled-nesting) | P2 | OTLP/JSON `AnyValue` decode — unbounded recursion on attacker-controlled nesting | `crates/logit-proto/src/otlp/json/mod.rs` (`any_value`) | reviewed @dc39d1c (pinned, no change) |
 | [CORE-05](#core-05--ddsketch-wrapper-merge-panics-on-a-config-mismatch-reachable-from-the-wire) | P0 | `DdSketch` wrapper: `merge` panics on a config mismatch reachable from the wire | `crates/logit-core/src/metric.rs` (`DdSketch`, `DdSketch::merge`, `DdSketch::from_java_bytes`) | findings → #369 |
@@ -972,9 +972,9 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
     its buffer as part of raising the error on most paths), but `Oversize` raised in `next_line`
     (the terminator-already-buffered, `Fatal` arm) returns *without* clearing `buf`, so those bytes
     are discarded uncounted. Worth checking against the "FIN and RST agree" claim.
-  - *Documented:* a connection still within its idle budget at shutdown holds things open until the
-    grace backstop — [`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md)'s
-    "`otlp_in` can hold the graph open past shutdown" entry.
+  - ~~*Documented:* a connection still within its idle budget at shutdown holds things open until
+    the grace backstop.~~ **closed:** every HTTP listener closes its connections at shutdown
+    ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)'s shutdown amendment).
 - **Existing coverage:** `tcp.rs` tests: `a_clean_close_flushes_whatever_is_accumulated`,
   `an_abrupt_close_with_a_buffered_partial_frame_counts_it_truncated`,
   `shutdown_mid_message_counts_the_buffered_partial_frame`,
@@ -3277,8 +3277,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     looks benign — but an input that returns `Err` at exactly the same instant can have that error swallowed by
     the grace arm. Low confidence this is reachable in practice; worth one look.
   - **Context (documented, not a surprise):** `docs/known-gaps/` records that a datagram in flight at signal
-    time is lost uncounted, that `otlp_in` can hold the graph open past shutdown (connection-spawned `Fanout`
-    clones), and that `logit_in`/`internal` grace is fixed at 5s.
+    time is lost uncounted, and that `logit_in`/`internal` grace is fixed at 5s.
 - **Existing coverage:** `run_with_shutdown_flushes_an_in_flight_window_before_exiting`,
   `a_non_overriding_input_returns_at_the_instant_shutdown_fires_not_after_the_grace`,
   `an_overriding_input_draining_within_its_grace_completes_and_delivers`,
@@ -4884,7 +4883,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
 
 ---
 ### WIRE-11 — Shared hyper connection lifecycle: idle tracking, graceful shutdown, body stall bounds
-- **Location:** `crates/logit-inputs/src/http.rs` (`Activity`, `InFlight`, `drive_with_idle`,
+- **Location:** `crates/logit-inputs/src/http.rs` (`Activity`, `InFlight`, `drive_connection`,
   `BodyReadError`/`collect_with_stall_bound`, `body_read_error_message`); users at
   `crates/logit-inputs/src/otlp.rs` (`OtlpInput::run`'s accept loop, permit, first-byte `peek`,
   TLS accept bound, and `serve_connection`), plus `crates/logit-inputs/src/prometheus.rs`'s
@@ -4897,10 +4896,10 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   the connection. Request bodies get a separate per-frame stall bound.
 - **Why sensitive:** concurrency (an `AtomicUsize` + `Mutex<Instant>` + `Notify` shared between a
   service closure and the driver loop); cancellation (three nested `select!`s over a pinned
-  connection future — `drive_with_idle`'s in-flight `select!`, its deadline `select!`, and the
+  connection future — `drive_connection`'s in-flight `select!`, its deadline `select!`, and the
   wait-out `select!`);
   data-loss (dropping a connection whose handler is inside `Fanout::send` discards a batch that
-  never reached the fanout — the explicit reason for `drive_with_idle`'s wait-out loop);
+  never reached the fanout — the explicit reason for `drive_connection`'s wait-out loop);
   backpressure (the whole design exists so backpressure never looks like idleness);
   nontrivial-3p-use(hyper/hyper-util) — the close sequence is justified against *pinned* hyper
   1.11.1 / hyper-util 0.1.20 internals (`KA::Idle` vs `KA::Busy`, `ReadVersion` resolving
@@ -4914,18 +4913,18 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     `in_flight == 0` with a stale `last_progress`.
   - The `notified()` arms cannot miss a notification (`Notify::notify_one` stores a permit, so a
     notification racing the `select!` arm's creation is not lost — verify for all three sites).
-  - ~~The wait-out loop in `drive_with_idle` cannot spin forever against a peer that keeps starting new
+  - ~~The wait-out loop in `drive_connection` cannot spin forever against a peer that keeps starting new
     requests — the comment argues only "continuing to be served" extends it; confirm a pipelined
     h1 client or an h2 client opening streams cannot hold it open indefinitely.~~ **retired.** A
     fresh-context refuter pipelined requests inside the grace behind a slow consumer: they were
     served in turn and the connection then closed, so only being served extends the window.
-  - `conn` keeps being polled while waiting on `in_flight` (the deadlock `drive_with_idle`'s doc
+  - `conn` keeps being polled while waiting on `in_flight` (the deadlock `drive_connection`'s doc
     comment names) on both the h1 and h2 arms.
   - The pinned-hyper claims still hold against the version in `Cargo.lock`. **Holds, one claim
     corrected**: the derivation was re-run against hyper 1.11.1, hyper-util 0.1.20, and h2 0.4.19
     (the per-claim table is ADR `idle-connection-timeout`'s second 2026-09-25 amendment). The
     pre-sniff `ReadVersion` is not a case the grace exists for: its first grace poll resolves at
-    once to the discarded `Err("Cancelled")`. `drive_with_idle`'s comment and `otlp.rs`'s module
+    once to the discarded `Err("Cancelled")`. `drive_connection`'s comment and `otlp.rs`'s module
     doc say so now.
   - `collect_with_stall_bound`'s bound is per-frame, never total, and drops trailers exactly as
     `Collected::to_bytes` does. **fixed: one buffer per body.** The bound and trailer handling
@@ -4943,7 +4942,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     fail first with `b` holding only its filler). Reserving every consumer first was tried and
     dropped: without a deadline it deadlocks a diamond graph (`fanout.rs`'s module doc).
 - **Observed concerns (unverified):**
-  - The wait-out loop (`drive_with_idle`'s post-`shutdown` loop) has no overall ceiling: `grace` restarts each iteration as long
+  - The wait-out loop (`drive_connection`'s post-`graceful` loop) has no overall ceiling: `grace` restarts each iteration as long
     as `in_flight > 0`. A client that keeps a request in flight indefinitely (a handler blocked on
     a permanently-full downstream) keeps the connection and its permit alive past the idle close.
     That is the intended trade-off (better than losing the batch), but it means `idle_timeout` is
@@ -4951,9 +4950,12 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     in the comment, so this is a "confirm it's the intended contract" item.** **Holds** as the
     contract: `docs/known-gaps/` ("TLS and connection lifecycle") records that a handler blocked
     forever in a send holds its connection and permit.
-  - `otlp_in`'s accept loop (`OtlpInput::run` in `otlp.rs`) does not race shutdown at all, and connections hold
+  - ~~`otlp_in`'s accept loop (`OtlpInput::run` in `otlp.rs`) does not race shutdown at all, and connections hold
     `Fanout` clones — already recorded in `docs/known-gaps/` ("`otlp_in` can hold the graph open
-    past shutdown"), narrowed but not closed by `idle_timeout`. **Context, documented.**
+    past shutdown"), narrowed but not closed by `idle_timeout`.~~ **fixed (#576):** `otlp_in`
+    overrides `run_until_shutdown`, its accept loop races the signal, and `drive_connection` closes
+    each connection on it. The other four HTTP listeners do the same, and the known-gaps entry
+    is gone.
   - The `logit.input.connections` gauge decrement (`live_connections.fetch_sub` in
     `OtlpInput::run`'s spawned task) is a statement, not a guard —
     same panic-leaks-the-gauge shape as `logit_in`. **High confidence in the shape.** **fixed**:
@@ -5196,7 +5198,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   `MAX_CONCURRENT_CONNECTIONS` = 1024, `HANDSHAKE_TIMEOUT`; `PrometheusReceiver`'s `Input::bind`/
   `run`; `serve_write_connection`; `handle_write`; `write_response`: routing, body collection,
   snappy bounds; `header_str`, `no_content`, `text_response`, `with_written_headers`); shared
-  `crates/logit-inputs/src/http.rs` (`Activity`, `InFlight`, `drive_with_idle`,
+  `crates/logit-inputs/src/http.rs` (`Activity`, `InFlight`, `drive_connection`,
   `collect_with_stall_bound`)
 - **What it does:** `bind` opens the `TcpListener` idempotently; `run` accepts, samples
   accept-queue gauges (`crate::tcp::AcceptQueueSampler`), takes a **non-blocking**
@@ -5207,7 +5209,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   with an optional per-frame stall bound, `snap::raw::decompress_len` checked against 4 MiB
   *before* expansion, then `decompress_vec`, decode, `sink.send`, `204`.
 - **Why sensitive:** untrusted-input (an unauthenticated peer drives compression ratio, frame
-  cadence, header set, stream count); concurrency + cancellation (permits, `drive_with_idle`'s
+  cadence, header set, stream count); concurrency + cancellation (permits, `drive_connection`'s
   select loop, the grace window that deliberately waits out an in-flight `Fanout::send`);
   backpressure (the `204` is issued *after* `sink.send`, so channel pressure becomes sender-side
   flow control); protocol state machine (the route/status table and 2.0's `-Written` contract);
@@ -5625,7 +5627,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   these frames, and the `Truncated`-vs-`Malformed` classification is what keeps a torn spool file
   resyncable instead of truncated. Whoever surveys `logit-pipeline`'s `DiskQueue` should treat
   `frame.rs` as shared, not as transport-only.
-- `crates/logit-inputs/src/http.rs` (`Activity`, `InFlight`, `drive_with_idle`,
+- `crates/logit-inputs/src/http.rs` (`Activity`, `InFlight`, `drive_connection`,
   `collect_with_stall_bound`, `body_read_error_message`) is shared by `otlp_in` and
   `prometheus_in`'s remote-write receiver. Its correctness is pinned to hyper 1.11.1 /
   hyper-util 0.1.20 internals by explicit reference; **a dependency bump is a re-verification

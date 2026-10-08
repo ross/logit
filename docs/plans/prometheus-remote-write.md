@@ -210,10 +210,12 @@ structs behind one `Input`); `tick` is untouched. In receiver mode `Input::bind`
 is an accept loop copied from `otlp_in`'s (`crates/logit-inputs/src/otlp.rs:369-500`): auto h1/h2
 builder, optional TLS via `crate::tls::TlsServerSettings`, connection permits, first-byte peek,
 handshake timeout. That loop's otlp-specific tags mean it is **copied, not shared**; what does hoist
-cleanly, in its own commit with zero `otlp_in` behaviour change, is `drive_with_idle`
+cleanly, in its own commit with zero `otlp_in` behaviour change, is `drive_connection`
 (`otlp.rs:688-700`) and `Activity`/`InFlight` (`:594-680`) into a shared `logit_inputs::http`
 module. `serve_connection` stays otlp-specific. There is no listener-level graceful shutdown
 anywhere in the repo; "graceful then bounded drop" is per-connection, as `otlp_in` does it.
+[Since superseded: the HTTP listeners now close their connections at shutdown; see [ADR
+`idle-connection-timeout`](../adr/idle-connection-timeout.md)'s shutdown amendment.]
 
 Routes:
 
