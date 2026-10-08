@@ -101,6 +101,10 @@
 //! kinds, `|c:`/`|T` under DogStatsD, relative-gauge deltas, and the negative-absolute-gauge
 //! two-line idiom.
 //!
+//! A summarized kind is no normalization either. `aggregate`'s defaults turn a timer into a
+//! `Distribution` and a set into a `Set`, which `statsd_out` expands into dotted counter and gauge
+//! lines, a counted degradation; the `statsd_in_default_aggregate_*` tests decode those lines back.
+//!
 //! `mod tcp`, `mod tls`, and `mod unix` add no entry to this list: every transport shares
 //! `StatsdEncoder`/`StatsdDecoder`, and only the framing differs. UDP newline-*joins* a batch's
 //! lines into one datagram; TCP newline-*terminates* each line, so the TCP capture is the UDP bytes
@@ -667,6 +671,145 @@ async fn statsd_in_aggregate_statsd_out_relay_is_exact() {
         "the sink should emit one multi-value ms line with every timer value (rate preserved, \
          here the default 1.0) and one |s line per distinct member"
     );
+}
+
+// ---- A default `aggregate` into `statsd_out`'s `multi_value` -------------------------------------
+
+/// The lines the default-`aggregate` tests send: three timer samples, two set members, two counter
+/// increments, and a gauge, all tagged `env:dev`.
+const DEFAULT_AGGREGATE_INPUT: &[u8] = b"req.latency:10|ms|#env:dev\nreq.latency:20|ms|#env:dev\n\
+req.latency:30|ms|#env:dev\nuniq.users:alice|s|#env:dev\nuniq.users:bob|s|#env:dev\n\
+hits:1|c|#env:dev\nhits:1|c|#env:dev\ntemp:21|g|#env:dev";
+
+/// Decodes [`DEFAULT_AGGREGATE_INPUT`] through the live `statsd_in`, folds it through an
+/// `aggregate` with every default (`distributions: sketch`, `sets: estimate`), sends the flush
+/// through a `statsd_out` built from `encoder` back into the live `statsd_in`, and returns that
+/// second decode as `name -> (kind, env tag)`.
+async fn relay_through_a_default_aggregate(
+    harness: &mut Harness,
+    encoder: StatsdEncoder,
+) -> std::collections::BTreeMap<String, (logit_core::MetricKind, Option<String>)> {
+    let batch = harness.send_raw_and_decode(DEFAULT_AGGREGATE_INPUT).await;
+    assert_eq!(batch.events.len(), 8, "one event per line");
+
+    let mut aggregator = Aggregator::new(Duration::from_secs(10));
+    let resource = batch.resource.clone();
+    for mut event in batch.events {
+        assert!(!aggregator.process(&resource, &mut event), "every metric is absorbed");
+    }
+    let mut flushed = aggregator.flush(1_700_000_000_000_000_000);
+    assert_eq!(flushed.len(), 1, "one (resource, scope) group");
+    let (flush_resource, flush_scope, events) = flushed.remove(0);
+    let out_batch = EventBatch {
+        resource: flush_resource,
+        scope: flush_scope,
+        events: events.into_iter().map(|(event, _links)| event).collect(),
+    };
+
+    let mut to_input =
+        StatsdOutput::udp(harness.input_addr.to_string()).unwrap().with_encoder(encoder);
+    to_input.send(&out_batch).await.expect("send to the live statsd_in");
+    let decoded = recv_batch(&mut harness.rx).await;
+
+    let mut by_name = std::collections::BTreeMap::new();
+    for event in decoded.events {
+        let env = event.attributes.get("env").and_then(|v| v.as_str()).map(String::from);
+        for metric in event.metrics {
+            let name = logit_core::interner::resolve(metric.name).to_string();
+            let previous = by_name.insert(name.clone(), (metric.kind, env.clone()));
+            assert!(previous.is_none(), "{name} decoded twice");
+        }
+    }
+    by_name
+}
+
+/// The value of a decoded `|c` line: `statsd_in` reads it as a delta, monotonic `Sum`.
+fn counter_value(kind: &logit_core::MetricKind) -> Option<f64> {
+    match kind {
+        logit_core::MetricKind::Sum(s)
+            if s.temporality == logit_core::Temporality::Delta && s.monotonic =>
+        {
+            Some(s.value)
+        }
+        _ => None,
+    }
+}
+
+fn gauge_value(kind: &logit_core::MetricKind) -> Option<f64> {
+    match kind {
+        logit_core::MetricKind::Gauge(v) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Asserts the decode of an expanded default-`aggregate` relay: `.count` and `.sum` counters, five
+/// non-decreasing `.q*` gauges inside the samples' range (within the sketch's relative error), the
+/// set's estimate as a gauge, and the counter and gauge as themselves. `env` is the tag every
+/// line should carry back.
+fn assert_expanded_decode(
+    decoded: &std::collections::BTreeMap<String, (logit_core::MetricKind, Option<String>)>,
+    env: Option<&str>,
+) {
+    let counter = |name: &str| {
+        let (kind, _) = decoded.get(name).unwrap_or_else(|| panic!("{name} missing: {decoded:?}"));
+        counter_value(kind).unwrap_or_else(|| panic!("{name} isn't a counter: {kind:?}"))
+    };
+    let gauge = |name: &str| {
+        let (kind, _) = decoded.get(name).unwrap_or_else(|| panic!("{name} missing: {decoded:?}"));
+        gauge_value(kind).unwrap_or_else(|| panic!("{name} isn't a gauge: {kind:?}"))
+    };
+    assert_eq!(counter("req.latency.count"), 3.0);
+    assert_eq!(counter("req.latency.sum"), 60.0);
+    let quantiles: Vec<f64> = ["q0_5", "q0_75", "q0_9", "q0_95", "q0_99"]
+        .iter()
+        .map(|q| gauge(&format!("req.latency.{q}")))
+        .collect();
+    assert!(quantiles.windows(2).all(|w| w[0] <= w[1]), "non-decreasing: {quantiles:?}");
+    assert!(
+        quantiles.iter().all(|q| (10.0 * 0.98..=30.0 * 1.02).contains(q)),
+        "inside the samples' range: {quantiles:?}"
+    );
+    assert_eq!(gauge("uniq.users.count"), 2.0);
+    assert_eq!(counter("hits"), 2.0);
+    assert_eq!(gauge("temp"), 21.0);
+    assert_eq!(decoded.len(), 2 + 5 + 3, "nothing else decoded: {decoded:?}");
+    for (name, (_, tag)) in decoded {
+        assert_eq!(tag.as_deref(), env, "{name}'s env tag");
+    }
+}
+
+/// `aggregate`'s defaults turn the timer into a `Distribution` and the set into a `Set`; the
+/// default `statsd_out` writes their components as lines `statsd_in` decodes back as counters
+/// and gauges.
+#[tokio::test]
+async fn statsd_in_default_aggregate_statsd_out_expands_timers_and_sets_into_lines_statsd_in_decodes(
+) {
+    let mut harness = Harness::new().await;
+    let decoded =
+        relay_through_a_default_aggregate(&mut harness, StatsdEncoder::new(Format::DogStatsd))
+            .await;
+    assert_expanded_decode(&decoded, Some("dev"));
+}
+
+#[tokio::test]
+async fn statsd_in_default_aggregate_statsd_out_expands_timers_and_sets_under_format_statsd() {
+    let mut harness = Harness::new().await;
+    let decoded =
+        relay_through_a_default_aggregate(&mut harness, StatsdEncoder::new(Format::Statsd)).await;
+    assert_expanded_decode(&decoded, None);
+}
+
+#[tokio::test]
+async fn statsd_in_default_aggregate_statsd_out_under_skip_drops_timers_and_sets_and_keeps_counters(
+) {
+    let mut harness = Harness::new().await;
+    let encoder =
+        StatsdEncoder::new(Format::DogStatsd).with_multi_value(logit_proto::MultiValue::Skip);
+    let decoded = relay_through_a_default_aggregate(&mut harness, encoder).await;
+    let names: Vec<&str> = decoded.keys().map(String::as_str).collect();
+    assert_eq!(names, ["hits", "temp"], "{decoded:?}");
+    assert_eq!(counter_value(&decoded["hits"].0), Some(2.0));
+    assert_eq!(gauge_value(&decoded["temp"].0), Some(21.0));
 }
 
 // ---- `|T` carrier survives `aggregate`'s flush-time rebuild -------------------------------------
