@@ -102,7 +102,7 @@ Sinks live in `crates/logit-outputs`.
 | `syslog_out` | `crates/logit-outputs/src/syslog.rs` | RFC 3164/5424 over UDP, TCP, or TLS (RFC 5425) | [ADR `syslog-output`](docs/adr/syslog-output.md) |
 | `statsd_out` | `crates/logit-outputs/src/statsd.rs` | statsd/DogStatsD over UDP, TCP (optionally TLS), or a Unix socket (`unix`, `unix_stream`); `multi_value: expand` (the default) writes a sketch, set estimate, histogram, or summary as dotted counter and gauge lines | [ADR `statsd-output`](docs/adr/statsd-output.md), [ADR `statsd-out-multi-value-expansion`](docs/adr/statsd-out-multi-value-expansion.md) |
 | `otlp_out` | `crates/logit-outputs/src/otlp.rs` | OTLP logs, metrics, and traces over OTLP/HTTP and OTLP/gRPC | [ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md) |
-| `datadog_out` | `crates/logit-outputs/src/datadog.rs` | Datadog's intake API: series, distribution points, sketches, service checks, events, logs, and Agent-processed APM traces and stats, one request per route; drops stale points and unprocessed traces, counted | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
+| `datadog_out` | `crates/logit-outputs/src/datadog.rs` | Datadog's intake API: series, distribution points, sketches, service checks, events, logs, and Agent-processed APM traces and stats, one request per route; drops stale points, metrics over 100 tags, and unprocessed traces, counted | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `datadog_trace_out` | `crates/logit-outputs/src/datadog_trace.rs` | a Datadog Agent's APM API (traces and `/v0.6/stats`), v0.4 or v0.7, over TCP or the Agent's Unix socket, restoring the tracer's request headers | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `splunk_hec_out` | `crates/logit-outputs/src/splunk.rs` | Splunk's HEC as `/event` JSON in the OTel `splunk_hec` exporter's shape: logs, metrics (`multi_value: skip \| expand`), and spans as events; envelope from resource attributes, gzip, size-capped bodies, a code-6 drop-and-resend, Splunk Cloud's oversize code 6 split once, a busy `429`/`503` retried before any body is accepted, opt-in `ack:` | [ADR `splunk-hec-relay`](docs/adr/splunk-hec-relay.md) |
 | `prometheus_out` | `crates/logit-outputs/src/prometheus.rs` | serves an exposition endpoint, or sends remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
@@ -349,9 +349,9 @@ Per pair:
   stats, relayed rather than recomputed. `datadog_in` decodes gzip, deflate, and zstd (`ruzstd`)
   and answers a full pipeline `503` after a bounded wait. `datadog_out` sends a trace chunk only
   when its root carries the Agent's `_top_level` mark, so `datadog_trace_in` must not feed it;
-  it drops stale points before sending, and isn't duplicate-safe. Normalizations include
-  whole-second metric timestamps, one point per series, `avg` recomputed from `sum`/`cnt`, and a
-  batch per `TracerPayload`
+  it drops stale points and metrics over 100 tags before sending, and isn't duplicate-safe.
+  Normalizations include whole-second metric timestamps, one point per series, `avg` recomputed
+  from `sum`/`cnt`, and a batch per `TracerPayload`
   ([ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md),
   [fixtures/datadog-intake-standin.yaml](fixtures/datadog-intake-standin.yaml),
   [fixtures/datadog-direct.yaml](fixtures/datadog-direct.yaml)).

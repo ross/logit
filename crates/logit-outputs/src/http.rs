@@ -96,8 +96,14 @@ pub(crate) const ERROR_BODY_SNIPPET_BYTES: usize = 256;
 /// carried on, so only the latter gets an ellipsis. A chunk boundary mid-character is
 /// `from_utf8_lossy`'s to handle; `body_snippet` cuts back to a character boundary anyway. A read
 /// error isn't propagated: the status is the primary signal, and a partial body beats none.
-pub(crate) async fn read_body_prefix(mut response: reqwest::Response, max: usize) -> String {
-    let limit = max.saturating_add(4);
+pub(crate) async fn read_body_prefix(response: reqwest::Response, max: usize) -> String {
+    let buf = read_body_bytes(response, max.saturating_add(4)).await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// At most `limit` bytes of `response`'s body, as bytes: [`read_body_prefix`]'s bounded read, for
+/// a body that isn't text. A read error ends the body where it stopped.
+pub(crate) async fn read_body_bytes(mut response: reqwest::Response, limit: usize) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < limit {
         match response.chunk().await {
@@ -106,7 +112,7 @@ pub(crate) async fn read_body_prefix(mut response: reqwest::Response, max: usize
         }
     }
     buf.truncate(limit);
-    String::from_utf8_lossy(&buf).into_owned()
+    buf
 }
 
 /// The first `max` bytes of `body`, trimmed, on a character boundary, with an ellipsis when
@@ -400,6 +406,51 @@ fn fit<T: Copy, M, F: FnMut(&[T]) -> Option<Encoded<M>>>(
         let mid = items.len() / 2;
         fit(&items[..mid], caps, gate, depth + 1, encode, split);
         fit(&items[mid..], caps, gate, depth + 1, encode, split);
+    }
+}
+
+/// Reads a protobuf varint at `buf[*pos]`, advancing `*pos`. `None` if truncated or longer than
+/// a 64-bit varint can be.
+pub(crate) fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        let byte = *buf.get(*pos)?;
+        *pos += 1;
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+}
+
+/// Advances `pos` past one uninteresting field's value. `None` if it runs past the end of `bytes`
+/// or is a group (wire types 3/4, deprecated, and emitted by neither OTLP nor Datadog).
+pub(crate) fn skip_field(bytes: &[u8], pos: &mut usize, wire_type: u64) -> Option<()> {
+    match wire_type {
+        0 => read_varint(bytes, pos).map(|_| ()),
+        1 => {
+            *pos += 8;
+            (*pos <= bytes.len()).then_some(())
+        }
+        2 => {
+            let len = read_varint(bytes, pos)? as usize;
+            let end = pos.checked_add(len)?;
+            if end > bytes.len() {
+                return None;
+            }
+            *pos = end;
+            Some(())
+        }
+        5 => {
+            *pos += 4;
+            (*pos <= bytes.len()).then_some(())
+        }
+        _ => None,
     }
 }
 

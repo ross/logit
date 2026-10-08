@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-10-05
+updated: 2026-10-08
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -347,3 +347,30 @@ instead of changing the directory.
   value above `0777` is rejected when the config is parsed.
 - **Graph rule 78 rejects `socket_mode` where there's no socket file**: a `statsd_in` or `lines_in`
   under `transport: tcp` or `udp`, and a `datadog_trace_in` without `socket`.
+
+## Amendment: what an accepted request drops (2026-10-08)
+
+The intake drops part of a request it answers `202`. A trial-org run on 2026-10-08 measured two
+causes on the metrics routes: a series, distribution point, or sketch with more than 100 `tags`
+strings (repeats counted, `resources` not), and a point more than 10 minutes in the future. The
+series route names each dropped series in its `202` body, a protobuf `repeated string errors`; the
+distribution-points and sketches routes drop silently and answer `202 {"status": "ok"}`. The run's
+check and logs requests drew `202` with no sign of a drop, so what those routes drop is unmeasured.
+`datadog_out` now handles both:
+
+- **A measured destination limit the sink can check for itself is enforced before sending.** The
+  sink drops a metrics record whose rendered `tags` list is over 100 strings and counts it
+  `records.dropped{reason="too_many_tags"}`, once per batch. On two of the three routes this is
+  the only count of the loss anyone gets. The cost is that the sink copies Datadog's limit: if
+  Datadog raises it, the sink drops records Datadog would store
+  ([`docs/known-gaps/datadog.md`](../known-gaps/datadog.md)). The future-point limit already had
+  this treatment as part of the stale filter.
+- **A series `2xx` body's `errors` count as rejected records, and the verdict stays `Ok`.** Each
+  entry counts one `records.rejected{route="series"}`, at most the request's entries, and comes
+  out of `records`. The rest of the request was stored, so a retry would resend it, and a named
+  series over the tag limit would be dropped again: the response class table's `2xx` row stays
+  `Ok`, and the named series are counted, not retried. This
+  is the backstop for what the sink can't predict, such as a sender's clock running ahead of the
+  intake's. It follows `otlp_out`'s partial success
+  ([ADR `sink-fault-classes`](sink-fault-classes.md)), and counts per attempt like the other
+  answers a destination gives.

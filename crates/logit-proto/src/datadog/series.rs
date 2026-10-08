@@ -11,7 +11,7 @@ use super::service_checks::{
     ATTR_SERVICE_CHECK_HOST, ATTR_SERVICE_CHECK_MESSAGE, ATTR_SERVICE_CHECK_NAME,
     ATTR_SERVICE_CHECK_STATUS,
 };
-use super::tags::{insert_tags, render_tags};
+use super::tags::{count_tags, insert_tags, render_tags};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
 use super::{
     is_datadog_stats, is_service_check, DatadogDecoder, DatadogEncoder, ATTR_DEVICE,
@@ -797,8 +797,7 @@ impl DatadogEncoder {
     /// whatever `route` can't write.
     pub(super) fn carriers(&self, resource: &Resource, event: &Event, route: Route) -> Carriers {
         let consumed = &*CONSUMED;
-        let skip: &[Symbol] =
-            if is_service_check(resource, event) { &CONSUMED_WITH_CHECK } else { consumed };
+        let skip = tag_skip(resource, event);
         let mut c = Carriers::default();
         let dropped = render_tags(merged(resource, event), skip, &mut c.tags);
         let mut unrepresentable = dropped.unrepresentable;
@@ -1085,6 +1084,23 @@ impl DatadogEncoder {
     }
 }
 
+/// The attributes a metrics route never renders as a tag for `event`: the carriers it reads into
+/// wire fields of their own, and a service check's `statsd.service_check.*` too.
+fn tag_skip(resource: &Resource, event: &Event) -> &'static [Symbol] {
+    if is_service_check(resource, event) {
+        &CONSUMED_WITH_CHECK
+    } else {
+        &*CONSUMED
+    }
+}
+
+/// The length of the `tags` list every metrics route (series, distribution points, sketches)
+/// writes for each of `event`'s records, counting nothing. Host, device, and the other carriers
+/// aren't in it.
+pub fn metric_tag_count(resource: &Resource, event: &Event) -> usize {
+    count_tags(merged(resource, event), tag_skip(resource, event))
+}
+
 /// The index of an event's first record a metrics route may send: `1` for a service check, whose
 /// record 0 is [`DatadogEncoder::encode_service_checks`]'s alone (skipped silently, as fan-out),
 /// else `0`. For APM stats ([`is_datadog_stats`]), which belong wholly to the stats routes, it is
@@ -1152,6 +1168,38 @@ mod tests {
 
     fn one_event_batch(attrs: AttrMap, kind: MetricKind) -> EventBatch {
         batch(vec![Event::metric(TS, attrs, MetricRecord::new(intern("m"), kind))])
+    }
+
+    /// `metric_tag_count` is the length of the `tags` list the series encoder writes: carriers
+    /// (host, device, a service check's own fields) excluded, resource tags and repeats included.
+    #[test]
+    fn metric_tag_count_is_the_wire_tag_count() {
+        let mut resource = Resource::default();
+        resource.attributes.insert("region", Value::str("eu"));
+        let mut plain = AttrMap::new();
+        plain.insert(ATTR_HOST_NAME, Value::str("h"));
+        plain.insert(ATTR_DEVICE, Value::str("d"));
+        plain.insert("team", Value::Array(vec![Value::str("a"), Value::str("a")]));
+        let mut check = plain.clone();
+        check.insert(ATTR_SERVICE_CHECK_NAME, Value::str("app.ok"));
+        check.insert(ATTR_SERVICE_CHECK_MESSAGE, Value::str("fine"));
+        let mut check_event =
+            Event::metric(TS, check, MetricRecord::new(intern("app.ok"), MetricKind::Gauge(0.0)));
+        check_event.metrics.push(MetricRecord::new(intern("m"), MetricKind::Gauge(1.0)));
+        let plain_event =
+            Event::metric(TS, plain, MetricRecord::new(intern("m"), MetricKind::Gauge(1.0)));
+        for event in [plain_event, check_event] {
+            let batch = EventBatch {
+                resource: Arc::new(resource.clone()),
+                scope: None,
+                events: vec![event],
+            };
+            let (mut e, _) = encoder();
+            let body = e.encode_series_v2_protobuf(&batch).unwrap();
+            let payload = MetricPayload::decode(body).unwrap();
+            assert_eq!(payload.series[0].tags.len(), 3, "region:eu, team:a twice");
+            assert_eq!(metric_tag_count(&batch.resource, &batch.events[0]), 3);
+        }
     }
 
     #[test]

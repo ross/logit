@@ -141,7 +141,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, classify_status, read_body_prefix,
-    status_class, Outcomes, ERROR_BODY_SNIPPET_BYTES,
+    read_varint, skip_field, status_class, Outcomes, ERROR_BODY_SNIPPET_BYTES,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -833,25 +833,6 @@ fn gzip(payload: &[u8]) -> Vec<u8> {
     encoder.finish().expect("finishing an in-memory GzEncoder never fails")
 }
 
-/// Reads a protobuf varint at `buf[*pos]`, advancing `*pos`. `None` if truncated or longer than
-/// a 64-bit varint can be.
-fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
-    let mut result: u64 = 0;
-    let mut shift = 0u32;
-    loop {
-        let byte = *buf.get(*pos)?;
-        *pos += 1;
-        result |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Some(result);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return None;
-        }
-    }
-}
-
 /// Reads `partial_success.rejected_<signal>`/`.error_message` from an `Export*ServiceResponse`
 /// (`crates/logit-proto/proto/opentelemetry/proto/collector/*/v1/*_service.proto`, not generated;
 /// `logit-proto`'s `otlp` module doc says why). All three signals share the shape: field 1 is
@@ -909,32 +890,6 @@ fn parse_partial_success_message(bytes: &[u8]) -> (i64, String) {
         }
     }
     (rejected, message)
-}
-
-/// Advances `pos` past one uninteresting field's value. `None` if it runs past the end of `bytes`
-/// or is a group (wire types 3/4, deprecated and never emitted by an OTLP collector).
-fn skip_field(bytes: &[u8], pos: &mut usize, wire_type: u64) -> Option<()> {
-    match wire_type {
-        0 => read_varint(bytes, pos).map(|_| ()),
-        1 => {
-            *pos += 8;
-            (*pos <= bytes.len()).then_some(())
-        }
-        2 => {
-            let len = read_varint(bytes, pos)? as usize;
-            let end = pos.checked_add(len)?;
-            if end > bytes.len() {
-                return None;
-            }
-            *pos = end;
-            Some(())
-        }
-        5 => {
-            *pos += 4;
-            (*pos <= bytes.len()).then_some(())
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]
