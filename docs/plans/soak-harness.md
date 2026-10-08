@@ -102,11 +102,11 @@ The first scenario, `tools/soak/scenarios/statsd-vm/scenario.toml`:
 ```toml
 name = "statsd-vm"
 description = "generator -> statsd_in (UDP) -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics"
-duration = "15m"          # --duration overrides; the cycle repeats while it fits before cooldown
+duration = "16m"          # warmup + one cycle + cooldown; --duration overrides
 warmup = "60s"            # no faults: baseline rate, RSS, fds
 cooldown = "120s"         # no faults at the end; >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
-cycle = "11m"             # step offsets are relative to each cycle's start
+cycle = "13m"             # >= last recovery (11m45s) + 2 x progress_window
 
 [configs]
 sut = "logit-sut.yaml"
@@ -126,6 +126,8 @@ progress_window = "30s"
 rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
 fd_growth = 8
 
+# Step offsets are relative to each cycle's start; the cycle repeats while it fits before
+# cooldown.
 [[step]]
 at = "0s"
 action = "netem"
@@ -263,9 +265,11 @@ ticket with `${DOCKER} version` first.
    exit 0; call VictoriaMetrics `/internal/force_flush`; write `vm-export.jsonl` from
    `/api/v1/export` with `match[]=<vm_selector>` and `start=0`.
 5. Collect: `docker logs` per service into `.stdout` and `.stderr`, and `inspect/<svc>.json`.
-   Then `compose down -v --remove-orphans`, unless `--keep`. A `try`/`finally` makes Ctrl-C still
-   collect.
-6. Score with `checks.run_all(run_dir)` into `results.md` and `results.json`. Exit 1 on any FAIL.
+   Then `compose down -v --remove-orphans`, unless `--keep`. A `try`/`finally` makes SIGINT still
+   collect, and the driver routes SIGTERM and SIGHUP into SIGINT's `KeyboardInterrupt`, because
+   Python's default for both ends the process without running `finally`.
+6. Score with `checks.run_all(run_dir)` into `results.md` and `results.json`. Exit 1 on any FAIL
+   or an aborted or errored run, and 130 when interrupted.
 
 ### 6. The checks (W1a, W1b)
 
@@ -275,10 +279,17 @@ doc gains `tools/soak/` in its list of readers. Counters (`kind: sum`, delta) su
 life**, split where `logit.process.uptime` decreases, with the number of lives cross-checked
 against the timeline. Gauges are series.
 
-A "fault window" below is a fault's span plus `recovery_bound` after it.
+A "fault window" below is a fault's span plus `recovery_bound` after it. A fault whose apply
+returned nonzero has none, so nothing after it is excused.
 
 **The watchdog (W1a):**
 
+- `run`: the timeline has `start` and `end_end`, and no `aborted`, `error`, or `interrupted`
+  phase. An interrupted run FAILs so its `results.md` can't read as a pass; the driver still
+  exits 130 for it.
+- `timeline`: every apply and revert returned 0, the schedule didn't fail fast, and every
+  start or unpause of a `logit` service has a `ready` record. An early revert in the end
+  sequence isn't probed, so it needs none.
 - `exit`: every exit falls inside a scheduled stop with code 0, the final exit is 0, and
   `OOMKilled` is false.
 - `restarts`: every `StartedAt` change matches a scheduled start or restart.
@@ -296,11 +307,13 @@ A "fault window" below is a fault's span plus `recovery_bound` after it.
   freshness sample is under 30 s old. After a fault, `retrying` at 1 with `retries` rising and
   `buffer.batches` falling is a slow drain: PASS within `recovery_bound`, WARN beyond it. No
   deliveries with `retries` and `errors` flat while `buffer.batches` is above 0 or `inbox.full`
-  rises is a **hang, FAIL**.
+  rises is a **hang, FAIL**. Delivery windows covering under 5% of the run after warmup WARN,
+  so a PASS that rests on a few windows says so.
 - `rss_slope` and `fd_slope`: the least-squares slope of `logit.process.memory.resident.bytes`
   per life, over samples outside fault windows after warmup, against `rss_growth_mib_per_hour`.
   `logit.process.fds` at the end minus the warmup median is at most `fd_growth`, and returns to
-  baseline after each recovery. `docker stats` RSS is the fallback series.
+  baseline at the first steady-state sample after each recovery. `docker stats` RSS is the
+  fallback series. Judged slopes covering under 5% of the run after warmup WARN.
 
 **The ledger and identities (W1b).** One unit runs through the ledger: a datagram is one line is
 one event is one increment.
@@ -456,7 +469,7 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
 - **W1b**: the ledger, `identity.sink`, and `recovery` checks, and the stderr shutdown-drop
   reductions (the listener's `warn` lines and `drain complete`'s `batches_dropped`); self-test
   fixtures for a VictoriaMetrics export with resets and a stderr log with shutdown drops; a
-  15-minute run recorded under "Findings".
+  16-minute run recorded under "Findings".
 - **W2**: sink-outage variants, the verification
   [`buffered-sink-delivery.md`](buffered-sink-delivery.md) describes (a 90 s stop under `block`,
   then `drop_oldest` with a small `max_batches`), and a UDP flood with the sink stopped,
@@ -475,7 +488,7 @@ parent's branch and is brought up to date with `git merge origin/main`, never a 
 
 ## Findings
 
-W1a records its first run here, and W1b records a 15-minute run with every check. Each records
+W1a records its first run here, and W1b records a 16-minute run with every check. Each records
 the commit, image tags, host, and the verbatim `results.md` table. Known limits that stay true
 across runs:
 
@@ -488,46 +501,44 @@ across runs:
 
 ### W1a: the first `statsd-vm` run (2026-10-08)
 
-Run `20261008T194345Z`: `script/soak run statsd-vm` at the scenario's 15 minutes, from `soak/w0`
-at `c4464f27` with the W1a files uncommitted. Images: `logit:soak` built from that tree
-(`sha256:78a95c90bb4a`), `logit-soak-netem:local`, and
+Run `20261008T202436Z`: `script/soak run statsd-vm` at the scenario's 16 minutes, from
+`soak/w1a` at `03724bae` with documentation edits uncommitted. Images: `logit:soak`
+(`sha256:78a95c90bb4a`, built from the same Rust), `logit-soak-netem:local`, and
 `victoriametrics/victoria-metrics:v1.152.0`. Host: Fedora, Linux 7.1.13, 32 CPUs, 128 GiB,
-Docker 29.7.2, Python 3.14.7, `net.core.rmem_max` 4194304. The table below is from re-scoring
-the run directory with `check` after one wording change to the `ready` detail:
+Docker 29.7.2, Python 3.14.7, `net.core.rmem_max` 4194304.
 
 | Check | Status | Detail |
 |---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 14 apply/revert action(s) returned 0; 2 start(s) or unpause(s) each probed; no fail fast |
 | `exit` | PASS | 3 exit(s) of the logit services, each a scheduled stop with code 0 |
 | `restarts` | PASS | 2 start(s), each a scheduled start or restart |
 | `self_log` | PASS | 5 sink fault line(s) inside fault windows, 0 outside, 0 other ERROR, 0 non-JSON |
-| `ready` | PASS | 74 health sample(s) healthy outside fault windows; 2 start(s) or unpause(s) ready in time, slowest ready 0.1s |
-| `progress` | PASS | 5 30s window(s) with deliveries outside fault windows; 6 freshness sample(s) under 30s |
-| `rss_slope` | PASS | MiB/h per service/life: logit/1 +6.1, generator/0 +2.3 (limit 64) |
-| `fd_slope` | PASS | warmup median -> end: logit 12->12, generator 11->12 (limit +8) |
-| `ledger.wire` | SKIP | W1b: not built yet |
-| `ledger.intake` | SKIP | W1b: not built yet |
-| `ledger.edge` | SKIP | W1b: not built yet |
-| `ledger.aggregate` | SKIP | W1b: not built yet |
-| `ledger.egress` | SKIP | W1b: not built yet |
-| `identity.sink` | SKIP | W1b: not built yet |
-| `recovery` | SKIP | W1b: not built yet |
+| `ready` | PASS | 92 health sample(s) healthy outside fault windows; 2 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 7 30s window(s) with deliveries outside fault windows; 8 freshness sample(s) under 30s; 180s of 900s after warmup judged (20%; WARN under 5%) |
+| `rss_slope` | PASS | MiB/h per service/life: logit/1 -15.0, generator/0 -16.7 (limit 64); logit 190s of 900s after warmup judged (21%; WARN under 5%); generator 200s of 900s after warmup judged (22%; WARN under 5%) |
+| `fd_slope` | PASS | warmup median -> end: logit 12->12, generator 11.5->11 (limit +8) |
+| `ledger.wire` | SKIP | not built yet |
+| `ledger.intake` | SKIP | not built yet |
+| `ledger.edge` | SKIP | not built yet |
+| `ledger.aggregate` | SKIP | not built yet |
+| `ledger.egress` | SKIP | not built yet |
+| `identity.sink` | SKIP | not built yet |
+| `recovery` | SKIP | not built yet |
 
 What the timeline did:
 
-- All seven faults and their reverts ran within 0.3 s of their planned offsets, each with
+- All seven faults and their reverts ran within 0.4 s of their planned offsets, each with
   `rc == 0`. Each netem `show` matched its step (`limit 100000 delay 200ms 50ms`, `loss 30%`,
   `loss 10%`), and each clear left `noqueue`. The partition recorded and restored the aliases
   `logit` and `soak-statsd-vm-logit-1`.
 - After the unpause and after the start, `logit ready` answered on the first probe (0.1 s).
 - The SUT's 200 ms delay and 30% loss on its remote-write logged no `retrying` line: TCP
-  retransmission absorbed both. The five sink fault lines were the SUT's `retrying` during the
-  VictoriaMetrics stop (first failure, then the once-a-minute repeat), its `retrying` with an
-  `ambiguous` timeout during the partition, and the generator's `retrying` while the SUT was
-  stopped and while it was partitioned (`logit:8125` doesn't resolve then). The SUT logged
-  `recovered` after each.
+  retransmission absorbed both. The five sink fault lines are the SUT's `retrying` during the
+  VictoriaMetrics stop and the partition, and the generator's while the SUT was stopped or
+  partitioned (`logit:8125` doesn't resolve then). The SUT logged `recovered` after each.
 - The end sequence's quiet wait held after 20 s, the SUT stopped with exit code 0, and the export
-  held 100 series with one reset each, from the SUT's restart. Summed reset-aware, they total
-  1,722,774 increments (W1b's ledger compares that against what the generator sent).
+  held 100 series.
 
 What was surprising, and how the driver changed for it:
 
@@ -536,19 +547,25 @@ What was surprising, and how the driver changed for it:
   The quiet wait holds the total for two windows measured from the stored samples' spacing
   (10 s here) instead of waiting for two newer sample timestamps, which a 5-minute smoke run
   showed never arrive.
-- Fault windows plus `recovery_bound` cover most of the 11-minute cycle, so steady state is
-  thin: `progress` judged five 30-second windows, and `rss_slope` judged the SUT only over its
-  second life's last 130 s (27 samples). Its first life had three steady-state samples, too few
-  to judge.
+- Fault windows plus `recovery_bound` cover most of the cycle. At 11 minutes, each cycle left
+  15 s of steady state, too short for a `progress_window`, so a long run would have judged
+  `progress` only in warmup and cooldown. The 13-minute cycle leaves 75 s after the last
+  recovery. In this run `progress` judged 20% of the time after warmup, and `rss_slope` judged
+  the SUT only in its second life (190 s); its first life had three steady-state samples.
 - A run shorter than warmup, one cycle, and cooldown keeps only the steps that end before
   cooldown starts: the 5-minute smoke run (`20261008T192852Z`) ran the first netem step only,
   and a 4-minute run runs none.
 
-A negative control, run `20261008T194140Z` (4 minutes, no faults): `docker kill -s KILL` of the
-SUT 72 s in ended the schedule at the next watchdog poll ("logit is exited (exit code 137) with
-no step behind it"), and `exit` FAILed ("logit exited at +72s with code 137, outside every
-scheduled stop"). `self_log` WARNed on the generator's `retrying` outside any fault window, and
-the script exited 1.
+Two negative controls:
+
+- Run `20261008T194140Z` (4 minutes, no faults): `docker kill -s KILL` of the SUT 72 s in ended
+  the schedule at the next watchdog poll ("logit is exited (exit code 137) with no step behind
+  it"). `exit` FAILed ("logit exited at +72s with code 137, outside every scheduled stop"),
+  `timeline` FAILed on the fail-fast stop, and the script exited 1.
+- Run `20261008T204136Z` (4 minutes, no faults): SIGTERM to the driver 91 s in recorded
+  `interrupted`, collected the logs, and took the project down within 1.4 s, leaving no
+  `soak-statsd-vm` container. `results.md` was written, `run` FAILed ("interrupted at +91s; no
+  end_end phase"), `exit` FAILed on the SUT left running, and the script exited 130.
 
 ## Verification
 
@@ -556,7 +573,7 @@ the script exited 1.
   `docs/adr/README.md` and `docs/plans/README.md` each gained a row.
 - **W1a**:
   - `script/soak self-test` passes, and `script/soak list` shows `statsd-vm`.
-  - `script/soak run statsd-vm --duration 15m` on a dev machine: the stack comes up under
+  - `script/soak run statsd-vm` at its own duration on a dev machine: the stack comes up under
     `--wait`; every step and revert appears in `timeline.jsonl` with `rc == 0` and a matching
     `netem show`; `docker logs` yields separate NDJSON stdout and JSON stderr; `results.md` has
     every watchdog check.
@@ -564,7 +581,7 @@ the script exited 1.
   - `script/validate` and `script/check` pass with the new globs, and `doc_links.rs` passes for
     the README.
 - **W1b**:
-  - The self-test fixtures pass, and a 15-minute run's `results.md` has every ledger row.
+  - The self-test fixtures pass, and a 16-minute run's `results.md` has every ledger row.
   - Two negative controls, each run once and documented in the PR body:
     - A final total lost at shutdown, as a control scenario the driver runs: a `stop` on
       `victoria-metrics` spanning a scheduled `stop` on `logit`, with the SUT sink set to
