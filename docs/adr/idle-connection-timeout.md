@@ -1,6 +1,6 @@
 ---
 created: 2026-09-14
-updated: 2026-10-02
+updated: 2026-10-07
 ---
 
 # Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe
@@ -360,3 +360,83 @@ trigger.
 ## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
 
 `Output::duplicate_safe()` is gone, and `logit_out` now defaults to `at_least_once`. The ambiguous `logit_out` fault this ADR describes is retried for up to `buffer.retry_budget` by default instead of dropped, and until the native hop deduplicates a resend can reach `logit_in`'s consumers twice. `buffer.delivery: at_most_once` restores the drop. See [`delivery-semantics.md`](delivery-semantics.md) item 5.
+
+## Amendment: shutdown is the second trigger of the close sequence (2026-10-07)
+
+The close sequence above (`graceful_shutdown`, a `handshake_timeout` grace, never a drop while a
+request is in flight) has one trigger: an idle connection. A shutdown signal is a second trigger.
+Without it, a keep-alive connection holds its `Fanout` clone past the signal, and the
+cancel-by-drop shutdown in [ADR `service-lifecycle-and-output-retry`](service-lifecycle-and-output-retry.md)
+never completes. A reviewer can answer each decision below yes or no.
+
+1. **The five hyper-based listeners override `Input::run_until_shutdown`.** They are `otlp_in`,
+   `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver.
+   The accept loop and its accept-error backoff race the signal. The listener drops its listening
+   socket the instant it sees the signal, per decision 2 of [ADR
+   `listener-port-sharing-and-shutdown-delay`](listener-port-sharing-and-shutdown-delay.md), then
+   waits for its connection tasks.
+2. **On the signal, each connection runs the close sequence this ADR defines.** The shutdown arm
+   applies only to the waits before the close. The close sequence itself has no shutdown arm.
+   Requests in flight are served to completion until the listener's backstop (decision 3). There
+   is no `503` on shutdown: hyper's `graceful_shutdown` stops new h1 requests after the current
+   one and sends `GOAWAY` on h2.
+3. **A `tokio::task::JoinSet` owns the connection tasks.** The set is a local of the listener's
+   `run_until_shutdown` future, and nothing a task holds captures it. When the runtime's grace
+   backstop drops that future (decision 7 of [ADR
+   `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md):
+   the runtime alone enforces a listener's grace), dropping the set aborts every remaining
+   connection task and its `Fanout` clone. This departs from the shared TCP driver and `logit_in`,
+   whose bare `tokio::spawn` tasks need no owner: past the prelude, which `handshake_timeout`
+   bounds, they race the signal at every read, so a task outlives it only in its prelude or
+   while parked in a send, which ends when the downstream drains or closes (decision 5). An HTTP
+   connection can't race the signal mid-request because hyper owns the read, so its task needs an
+   owner the backstop can abort.
+4. **An abort costs the acknowledgment, never a batch.** No HTTP handler awaits `Fanout::send` on
+   the connection task. `otlp_in` and the receiver deliver on a detached task
+   (`deliver_detached`), which an abort doesn't cancel. The Datadog pair use `send_with_deadline`,
+   which reserves every consumer's slot before it sends and counts nothing until it does, and
+   `splunk_hec_in` sends its first batch that way and the rest through `deliver_detached`. The
+   client sees a reset and resends a batch the pipeline already took. That is ordinary
+   at-least-once ([ADR `delivery-semantics`](delivery-semantics.md)). This narrows, at shutdown,
+   two earlier rules: the in-flight tracker's "kept until that request completes rather than
+   dropped out from under it" and the 2026-09-25 wait-out amendment's "`drive_with_idle`'s wait
+   for an in-flight request has no ceiling". Both protect a batch blocked in `Fanout::send`,
+   and no handler is blocked there on the connection task, so an abort discards no batch. The code
+   PRs record in the module doc of `crates/logit-inputs/src/http.rs` that a handler never awaits
+   `Fanout::send` on the connection task: it uses `deliver_detached`, or `deliver_with_deadline`,
+   which sends each batch only once every consumer's slot for it is held.
+5. **Some tasks outlive an abort, and each ends in bounded time.** hyper spawns h2 stream handlers
+   through `TokioExecutor`, outside the set, and detached deliveries are outside it too. A body
+   read fails once its connection is gone. `send_with_deadline` is bounded by `busy_after`. A
+   parked detached send is bounded by its downstream draining or closing: a sink closes its inbox
+   at its own `buffer.shutdown_grace`, a transform or a healthy Lua node drains once its
+   downstream closes, and a Lua node wedged inside a call is revoked 2 s after the signal or its
+   last progress. So the bound on the last `Fanout` clone is the largest downstream grace, which
+   the process already waits for, not the listener's 5 s.
+6. **The pre-serve prelude races the signal.** The PROXY header read, TLS accept, and first-byte
+   peek return cleanly if the signal wins, because nothing of a request has been read. Otherwise a
+   connection in its prelude holds the listener for `handshake_timeout`, which by default equals
+   the 5 s backstop.
+7. **A fatal accept error aborts live connections.** The error ends the listener, and the set
+   drops with the future. No drain runs on this path: the runtime sends shutdown only after it
+   joins the error, so no backstop is running yet.
+8. **There is no `logit.input.connections.closed{reason="shutdown"}` counter.** The runtime would
+   record it after `internal`'s final drain, so it would never be exported (decision 4 of [ADR
+   `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md)).
+   The TCP driver and `logit_in` count no shutdown close, and
+   [`internal-telemetry.md`](../design/internal-telemetry.md) defines `connections.closed` as a
+   policy close.
+9. **There is no new grace knob.** The close grace stays `handshake_timeout`, which is what
+   flushes a `GOAWAY`. The outer bound is the runtime's fixed 5 s grace for a listener with no
+   `receive:` block. By default the two are equal, so the backstop ends an h1 connection stopped
+   mid-head, an h2 connection still handshaking, and any request still in flight.
+
+### Consequences
+
+- The "`otlp_in` can hold the graph open past shutdown" entry in
+  [`docs/known-gaps/native-hop.md`](../known-gaps/native-hop.md) closes. The code PRs delete it
+  once all five listeners carry the override.
+- `tcp.rs` and `logit_in` keep the prelude gap decision 6 closes for the HTTP listeners. The
+  code PRs file it as a follow-up in [`docs/known-gaps/intake.md`](../known-gaps/intake.md).
+- Every new `select!` or `timeout` this work adds gets a row in the "Cancellation points" table of
+  [`docs/design/pipeline-graph.md`](../design/pipeline-graph.md), in the PR that adds it.
