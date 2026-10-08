@@ -19,7 +19,7 @@
 //!
 //! | Kind | Sub-paths |
 //! |---|---|
-//! | `Samples` (via [`logit_core::Samples::sketch`]) / `Distribution` | `.count`, `.sum`, `.q0_5`, `.q0_75`, `.q0_9`, `.q0_95`, `.q0_99` |
+//! | `Samples` (via [`logit_core::Samples::sketch`]) / `Distribution` | `.count`, `.sum`, `.min`/`.max` when non-empty, `.q0_5`, `.q0_75`, `.q0_9`, `.q0_95`, `.q0_99` |
 //! | `Histogram` | `.count` (Σ bucket counts), `.sum`/`.min`/`.max` when `Some`, `.bucket_<b>` per bucket (its **own** count, not a cumulative running total -- `logit_core::Histogram`'s doc) |
 //! | `ExponentialHistogram` | `.count`, `.sum`/`.min`/`.max` when `Some`, `.zero_count`; **no buckets** |
 //! | `Summary` | `.count`, `.sum`, `.q<q>` per its own quantiles |
@@ -28,10 +28,14 @@
 //!
 //! A non-finite value (a NaN `sum`, an infinite quantile) is skipped, never emitted: the record is
 //! already counted degraded by its sink, and a fabricated `inf` is worse than a missing component.
-//! An empty sketch yields `.count 0` and `.sum 0` and no quantiles, since it can't answer one.
+//! An empty sketch yields `.count 0` and `.sum 0` and no extremes or quantiles, since it has no
+//! observation to report.
 //!
-//! `.sum` **is** emitted for a sketch: [`logit_core::DdSketch::sum`] is exact (a plain `f64`
-//! accumulated alongside the bins and added on `merge`), not an estimate like a quantile.
+//! A sketch's `.sum`, `.min`, and `.max` are tracked from the observations themselves (plain
+//! `f64`s kept alongside the bins and combined on `merge`), not estimated from bins like a
+//! quantile. The exception is a sketch decoded from bins alone, such as one from the DDSketch
+//! protobuf: there [`logit_core::DdSketch::stats_exact`] is `false`, and all three are derived
+//! from bin representatives, so they're approximate.
 //!
 //! The quantiles are [`crate::otlp::metrics::DISTRIBUTION_QUANTILES`], the five every
 //! sketch-to-quantiles degradation in this crate reports, so a metric describes itself identically
@@ -142,7 +146,8 @@ pub fn expand_dotted(
     true
 }
 
-/// `.count`, `.sum`, then one `.q<q>` per [`DISTRIBUTION_QUANTILES`] the sketch can answer.
+/// `.count`, `.sum`, `.min`/`.max` when the sketch has an observation, then one `.q<q>` per
+/// [`DISTRIBUTION_QUANTILES`] the sketch can answer.
 fn expand_sketch(
     sketch: &DdSketch,
     scratch: &mut DottedScratch,
@@ -150,6 +155,8 @@ fn expand_sketch(
 ) {
     component(emit, ".count", sketch.count() as f64, Part::Count);
     component(emit, ".sum", sketch.sum(), Part::Sum);
+    optional(emit, ".min", sketch.min(), Part::Min);
+    optional(emit, ".max", sketch.max(), Part::Max);
     for q in DISTRIBUTION_QUANTILES {
         let Some(v) = sketch.quantile(q) else { continue };
         numbered(scratch, emit, ".q", q, v, Part::Quantile);
@@ -283,6 +290,8 @@ mod tests {
         let quantiles = [
             (".count", Count),
             (".sum", Sum),
+            (".min", Min),
+            (".max", Max),
             (".q0_5", Quantile),
             (".q0_75", Quantile),
             (".q0_9", Quantile),
@@ -408,6 +417,19 @@ mod tests {
         assert_eq!(
             suffixes_and_parts(&summary),
             owned(&[(".count", Part::Count), (".q0_5", Part::Quantile)])
+        );
+    }
+
+    #[test]
+    fn a_sketch_reports_its_own_min_and_max_including_a_negative_min() {
+        let (parts, _) = expand(&MetricKind::Distribution(sketch(&[-4.0, 2.5, 1.0])));
+        let extremes: Vec<_> = parts
+            .into_iter()
+            .filter(|(_, _, part)| matches!(part, Part::Min | Part::Max))
+            .collect();
+        assert_eq!(
+            extremes,
+            vec![(".min".to_string(), -4.0, Part::Min), (".max".to_string(), 2.5, Part::Max)]
         );
     }
 

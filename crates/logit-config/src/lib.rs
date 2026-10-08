@@ -2821,7 +2821,8 @@ pub enum ComponentKind {
         /// (what `aggregate` makes of timers by default), a set estimate (what it makes of sets),
         /// a histogram, an exponential histogram, a summary, or a cumulative or non-monotonic
         /// sum. `expand` (the default) writes one line per component, named by a dotted suffix:
-        /// `.count`, `.sum`, and `.q0_5` through `.q0_99` for a sketch, `.count` for a set,
+        /// `.count`, `.sum`, `.min`, `.max`, and `.q0_5` through `.q0_99` for a sketch, `.count`
+        /// for a set,
         /// `.count`, `.sum`, `.min`, `.max`, and `.bucket_<bound>` for a histogram, `.zero_count`
         /// for an exponential histogram, and `.q<quantile>` for a summary. A count, sum, bucket,
         /// or zero count from a per-window kind (a sketch, or a delta histogram) is a counter

@@ -3047,7 +3047,7 @@ fn statsd_encode_into_100_events() {
     expect_allocs("statsd_out: encode_into 100 events", stats, 0);
 }
 
-/// Zero for 100 single-value `Distribution` events under the default `multi_value: expand`, seven
+/// Zero for 100 single-value `Distribution` events under the default `multi_value: expand`, nine
 /// lines each: the expansion reads the already-built `DdSketch` in place
 /// (`logit_proto::multi_value::expand_dotted`), and its quantile suffixes format into the
 /// encoder's reused `DottedScratch`.
@@ -3063,7 +3063,7 @@ fn statsd_encode_into_100_distribution_events_expanded() {
     let mut out = MessageBuf::default();
 
     let (stats_out, stats) = measure_framed(&mut encoder, &batch, &mut out);
-    assert_eq!(out.len(), 700);
+    assert_eq!(out.len(), 900);
     assert_eq!(stats_out.degraded_kinds.distribution, 100);
     expect_allocs("statsd_out: encode_into 100 Distribution events (expand)", stats, 0);
 }
@@ -3114,7 +3114,7 @@ fn graphite_encode_into_100_pickle_events() {
     expect_allocs("graphite_out: encode_into 100 pickle events", alloc_stats, 0);
 }
 
-/// Zero: expanding a `Distribution` into `.count`/`.sum`/`.q*` sub-paths reads the existing
+/// Zero: expanding a `Distribution` into `.count`/`.sum`/`.min`/`.max`/`.q*` sub-paths reads the existing
 /// `DdSketch` in place (`logit_proto::multi_value::expand_dotted`).
 #[test]
 fn graphite_encode_into_100_distribution_events_expanded() {

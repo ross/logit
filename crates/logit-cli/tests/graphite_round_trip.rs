@@ -791,7 +791,8 @@ async fn statsd_in_to_aggregate_to_graphite_out_expands_a_timer_into_the_documen
         .await;
     let text = std::str::from_utf8(&captured).expect("ascii output");
     // Parsed into (path, value) pairs so the values are pinned, not just the paths.
-    // `DdSketch::count` and `::sum` are exact, so `.count`/`.sum` are deterministic.
+    // A sketch built from observations tracks its count, sum, min, and max from the samples
+    // themselves, not its bins, so those four sub-paths are deterministic.
     let lines: Vec<(&str, f64)> = text
         .lines()
         .filter(|line| !line.is_empty())
@@ -817,6 +818,8 @@ async fn statsd_in_to_aggregate_to_graphite_out_expands_a_timer_into_the_documen
 
     assert_eq!(value_of(".count"), 3.0, "three timer samples");
     assert_eq!(value_of(".sum"), 60.0, "10 + 20 + 30");
+    assert_eq!(value_of(".min"), 10.0, "the smallest sample");
+    assert_eq!(value_of(".max"), 30.0, "the largest sample");
 
     // The five quantiles carry `DdSketch`'s relative-error bound rather than an exact value, so
     // pin the two properties that bound is guaranteed to hold: non-decreasing, and within the

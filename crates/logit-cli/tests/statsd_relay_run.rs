@@ -83,6 +83,8 @@ async fn a_default_statsd_relay_expands_an_aggregated_timer_and_set() {
     };
     assert_eq!(counter("req.latency.count"), 2.0);
     assert_eq!(counter("req.latency.sum"), 30.0);
+    assert!(matches!(decoded["req.latency.min"], MetricKind::Gauge(v) if v == 10.0), "{decoded:?}");
+    assert!(matches!(decoded["req.latency.max"], MetricKind::Gauge(v) if v == 20.0), "{decoded:?}");
     assert!(matches!(decoded["uniq.users.count"], MetricKind::Gauge(v) if v == 2.0), "{decoded:?}");
     for q in ["q0_5", "q0_75", "q0_9", "q0_95", "q0_99"] {
         let name = format!("req.latency.{q}");

@@ -742,8 +742,8 @@ fn gauge_value(kind: &logit_core::MetricKind) -> Option<f64> {
     }
 }
 
-/// Asserts the decode of an expanded default-`aggregate` relay: `.count` and `.sum` counters, five
-/// non-decreasing `.q*` gauges inside the samples' range (within the sketch's relative error), the
+/// Asserts the decode of an expanded default-`aggregate` relay: `.count` and `.sum` counters,
+/// `.min` and `.max` gauges, five non-decreasing `.q*` gauges inside the samples' range (within the sketch's relative error), the
 /// set's estimate as a gauge, and the counter and gauge as themselves. `env` is the tag every
 /// line should carry back.
 fn assert_expanded_decode(
@@ -760,6 +760,8 @@ fn assert_expanded_decode(
     };
     assert_eq!(counter("req.latency.count"), 3.0);
     assert_eq!(counter("req.latency.sum"), 60.0);
+    assert_eq!(gauge("req.latency.min"), 10.0);
+    assert_eq!(gauge("req.latency.max"), 30.0);
     let quantiles: Vec<f64> = ["q0_5", "q0_75", "q0_9", "q0_95", "q0_99"]
         .iter()
         .map(|q| gauge(&format!("req.latency.{q}")))
@@ -772,7 +774,7 @@ fn assert_expanded_decode(
     assert_eq!(gauge("uniq.users.count"), 2.0);
     assert_eq!(counter("hits"), 2.0);
     assert_eq!(gauge("temp"), 21.0);
-    assert_eq!(decoded.len(), 2 + 5 + 3, "nothing else decoded: {decoded:?}");
+    assert_eq!(decoded.len(), 2 + 2 + 5 + 3, "nothing else decoded: {decoded:?}");
     for (name, (_, tag)) in decoded {
         assert_eq!(tag.as_deref(), env, "{name}'s env tag");
     }

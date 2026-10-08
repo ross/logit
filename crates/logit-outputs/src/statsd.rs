@@ -117,8 +117,8 @@
 //!
 //! [`MultiValue::Expand`] (the default, for a [`StatsdEncoder::new`] as for the config field)
 //! writes one line per component, named `<name><suffix>` with the dotted suffixes of
-//! `logit_proto::multi_value`'s module doc (the one copy of that table: `.count`, `.sum`, `.q0_5`
-//! through `.q0_99`, `.bucket_<b>`, `.zero_count`, `.min`, `.max`), in its order, and counts the
+//! `logit_proto::multi_value`'s module doc (the one copy of that table: `.count`, `.sum`, `.min`,
+//! `.max`, `.q0_5` through `.q0_99`, `.bucket_<b>`, `.zero_count`), in its order, and counts the
 //! record once in `EncodeStats::degraded_kinds`. [`MultiValue::Skip`] drops the record, counted
 //! once in `EncodeStats::skipped_kinds` with a throttled `unsupported_metric_kind` warning.
 //! `expand` warns nothing: it's the default path.
@@ -2757,7 +2757,7 @@ mod tests {
     fn the_encoder_defaults_to_expand() {
         let (msgs, stats) =
             encode(vec![metric_event("d", MetricKind::Distribution(sketch_of(&[1.0])), &[])]);
-        assert_eq!(msgs.len(), 7, "{msgs:?}");
+        assert_eq!(msgs.len(), 9, "{msgs:?}");
         assert_eq!(stats.degraded_kinds.distribution, 1);
         assert_eq!(stats.skipped_kinds.total(), 0);
     }
@@ -2771,7 +2771,8 @@ mod tests {
             metric_event("e", exp_histogram(Temporality::Delta), &[]),
             metric_event("s", MetricKind::Set(hll_of(&[b"a", b"b"])), &[]),
         ]);
-        let mut expected = vec!["d.count:3|c".to_string(), "d.sum:60|c".to_string()];
+        let mut expected =
+            ["d.count:3|c", "d.sum:60|c", "d.min:10|g", "d.max:30|g"].map(String::from).to_vec();
         expected.extend(quantile_lines("d", &sketch, ""));
         expected.extend(
             [
@@ -2868,6 +2869,17 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_sketch_min_is_one_zero_then_delta_gauge_entry() {
+        let (msgs, _) =
+            encode(vec![metric_event("d", MetricKind::Distribution(sketch_of(&[-4.0, 2.0])), &[])]);
+        assert_eq!(msgs[..4], ["d.count:2|c", "d.sum:-2|c", "d.min:0|g\nd.min:-4|g", "d.max:2|g"]);
+        let events = decode_one(&msgs[2]);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == 0.0));
+        assert!(matches!(events[1].metrics[0].kind, MetricKind::GaugeDelta(v) if v == -4.0));
+    }
+
+    #[test]
     fn expanded_lines_carry_tags_and_dialect_extras_and_never_a_sample_rate() {
         let sketch = sketch_of(&[1.0, 2.0]);
         let attrs = [
@@ -2879,7 +2891,12 @@ mod tests {
         let (msgs, _) =
             encode(vec![metric_event("d", MetricKind::Distribution(sketch.clone()), &attrs)]);
         let tail = "|#env:prod|c:abc|T1700000000";
-        let mut expected = vec![format!("d.count:2|c{tail}"), format!("d.sum:3|c{tail}")];
+        let mut expected = vec![
+            format!("d.count:2|c{tail}"),
+            format!("d.sum:3|c{tail}"),
+            format!("d.min:1|g{tail}"),
+            format!("d.max:2|g{tail}"),
+        ];
         expected.extend(quantile_lines("d", &sketch, tail));
         assert_eq!(msgs, expected);
         assert!(msgs.iter().all(|m| !m.contains("|@")), "no expanded line carries a rate");
@@ -2897,11 +2914,12 @@ mod tests {
             vec![metric_event("d", MetricKind::Distribution(sketch.clone()), &attrs)],
             Format::Statsd,
         );
-        let mut expected = vec!["d.count:2|c".to_string(), "d.sum:3|c".to_string()];
+        let mut expected =
+            ["d.count:2|c", "d.sum:3|c", "d.min:1|g", "d.max:2|g"].map(String::from).to_vec();
         expected.extend(quantile_lines("d", &sketch, ""));
         assert_eq!(msgs, expected);
         assert_eq!(stats.tags_dropped_dialect, 1, "one wire tag, counted once per event");
-        assert_eq!(stats.dropped_dialect_fields, 14, "two extras on each of seven lines");
+        assert_eq!(stats.dropped_dialect_fields, 18, "two extras on each of nine lines");
     }
 
     #[test]
@@ -2932,7 +2950,7 @@ mod tests {
             metric_event("b", MetricKind::Distribution(sketch_of(&[2.0])), &[]),
             metric_event("h", delta_histogram(), &[]),
         ]);
-        assert_eq!(msgs.len(), 7 + 7 + 7);
+        assert_eq!(msgs.len(), 9 + 9 + 7);
         assert_eq!(
             stats.degraded_kinds,
             KindCounts { distribution: 2, histogram: 1, ..KindCounts::default() }
@@ -3077,7 +3095,7 @@ mod tests {
         let batch = batch_with(vec![metric_event("lat", MetricKind::Distribution(sketch), &[])]);
         let (expected, _) =
             encode_with(&mut StatsdEncoder::new(Format::DogStatsd), batch.events.clone());
-        assert_eq!(expected.len(), 7);
+        assert_eq!(expected.len(), 9);
 
         let cap = 40;
         let mut collector = Collector::udp().await;
@@ -3093,7 +3111,7 @@ mod tests {
             let text = String::from_utf8(datagram).unwrap();
             received.extend(text.split('\n').map(String::from));
         }
-        assert!(datagrams > 1, "seven lines can't share one {cap}-byte datagram");
+        assert!(datagrams > 1, "nine lines can't share one {cap}-byte datagram");
         assert_eq!(received, expected);
     }
 

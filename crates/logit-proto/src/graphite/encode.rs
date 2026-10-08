@@ -1384,6 +1384,8 @@ mod tests {
                 vec![
                     "sys.cpu.count",
                     "sys.cpu.sum",
+                    "sys.cpu.min",
+                    "sys.cpu.max",
                     "sys.cpu.q0_5",
                     "sys.cpu.q0_75",
                     "sys.cpu.q0_9",
@@ -1397,6 +1399,8 @@ mod tests {
                 vec![
                     "sys.cpu.count",
                     "sys.cpu.sum",
+                    "sys.cpu.min",
+                    "sys.cpu.max",
                     "sys.cpu.q0_5",
                     "sys.cpu.q0_75",
                     "sys.cpu.q0_9",
@@ -1464,15 +1468,17 @@ mod tests {
         assert_eq!(lines, vec!["sys.cpu.count 2 1700000000"], "three members, two distinct");
     }
 
-    /// A sketch's `.sum` is emitted, since `DdSketch::sum` is exact.
+    /// A sketch's `.sum`, `.min`, and `.max` are the observations' own, not bin estimates.
     #[test]
-    fn a_sketch_emits_an_exact_sum() {
+    fn a_sketch_emits_an_exact_sum_min_and_max() {
         let (lines, _, _, _) = encode_with(
             &batch(vec![event(MetricKind::Distribution(sketch(&[1.0, 2.0, 3.0])))]),
             |e| e.with_multi_value(MultiValue::Expand),
         );
         assert!(lines.contains(&"sys.cpu.sum 6 1700000000".to_string()), "{lines:?}");
         assert!(lines.contains(&"sys.cpu.count 3 1700000000".to_string()), "{lines:?}");
+        assert!(lines.contains(&"sys.cpu.min 1 1700000000".to_string()), "{lines:?}");
+        assert!(lines.contains(&"sys.cpu.max 3 1700000000".to_string()), "{lines:?}");
     }
 
     /// Number tokens are injective over the five bounds a rounding scheme would most likely merge.
@@ -1537,7 +1543,7 @@ mod tests {
     /// the pickle frame's datapoints and length. A change to the sub-path order, a suffix, a number
     /// token, or a non-finite skip fails here.
     #[test]
-    fn expand_wire_output_is_unchanged_for_every_kind_in_both_protocols() {
+    fn expand_wire_output_is_pinned_for_every_kind_in_both_protocols() {
         let mut tags = AttrMap::new();
         tags.insert("env", "prod");
         let tagged_distribution = Event::metric(
@@ -1574,6 +1580,8 @@ mod tests {
         let expected = [
             "sys.cpu.count 3 1700000000",
             "sys.cpu.sum 6 1700000000",
+            "sys.cpu.min 1 1700000000",
+            "sys.cpu.max 3 1700000000",
             "sys.cpu.q0_5 2.009103080990281 1700000000",
             "sys.cpu.q0_75 3 1700000000",
             "sys.cpu.q0_9 3 1700000000",
@@ -1581,6 +1589,8 @@ mod tests {
             "sys.cpu.q0_99 3 1700000000",
             "sys.cpu.count;env=prod 3 1700000000",
             "sys.cpu.sum;env=prod 6 1700000000",
+            "sys.cpu.min;env=prod 1 1700000000",
+            "sys.cpu.max;env=prod 3 1700000000",
             "sys.cpu.q0_5;env=prod 2.009103080990281 1700000000",
             "sys.cpu.q0_75;env=prod 3 1700000000",
             "sys.cpu.q0_9;env=prod 3 1700000000",
@@ -1630,7 +1640,7 @@ mod tests {
             })
             .collect();
         assert_eq!(decode_frames(&frames), vec![points], "pickle");
-        assert_eq!(frames[0].len(), 1302, "pickle frame bytes");
+        assert_eq!(frames[0].len(), 1448, "pickle frame bytes");
     }
 
     // -- framing ------------------------------------------------------------------------------------
