@@ -97,22 +97,65 @@
 //! `Value::Str`/`Value::U64`) and is filtered out of the tag segment uncounted, like any
 //! wrong-typed carrier.
 //!
-//! ## Metric-kind coverage: raw kinds in, sketches still deferred
+//! ## Metric-kind coverage
 //!
-//! Encoded: a delta, monotonic `Sum` (`MetricKind::counter`, `|c`), `Gauge`/`GaugeDelta` (`|g`),
-//! `Samples` (`|ms`/`|h`/`|d`), and `SetMembers` (`|s`). `Samples`/`SetMembers` are the raw shapes
-//! `statsd_in` decodes losslessly (`docs/adr/lossless-transit.md`'s "summarization is opt-in and
-//! named"), so a `statsd_in -> statsd_out` relay with no `aggregate` round-trips a timer or set
-//! line intact. Dropped and counted (`EncodeStats::dropped_unsupported_kind`, recorded in
-//! `docs/known-gaps/statsd.md`): `Distribution`, `Set`, `Histogram`, `ExponentialHistogram`,
-//! `Summary`, and a cumulative or non-monotonic `Sum`, the kinds that exist only after some stage
-//! summarized.
+//! Each written as its own native line: a delta, monotonic `Sum` (`MetricKind::counter`, `|c`),
+//! `Gauge`/`GaugeDelta` (`|g`), `Samples` (`|ms`/`|h`/`|d`), and `SetMembers` (`|s`).
+//! `Samples`/`SetMembers` are the raw shapes `statsd_in` decodes losslessly
+//! (`docs/adr/lossless-transit.md`'s "summarization is opt-in and named"), so a
+//! `statsd_in -> statsd_out` relay with no `aggregate`, or with `aggregate`'s
+//! `distributions: samples` and `sets: members`, round-trips a timer or set line intact. They
+//! never expand, under either `multi_value` setting.
 //!
-//! **So a `statsd_in -> aggregate -> statsd_out` relay drops every timer/set metric under
-//! `aggregate`'s default summarizing config.** That default turns `Samples` into a `Distribution`
-//! sketch and `SetMembers` into a `Set` estimate, neither of which has a lossless statsd rendering
-//! (`docs/adr/statsd-output.md`'s "What's still deferred" section). Configuring that `aggregate`
-//! with `distributions: samples` / `sets: members` keeps the raw shapes flowing to this sink.
+//! Every other kind exists only after some stage summarized, and has no single statsd line:
+//! `Distribution`, `Set`, `Histogram`, `ExponentialHistogram`, `Summary`, and a cumulative or
+//! non-monotonic `Sum`. `aggregate`'s defaults turn every timer into a `Distribution` and every
+//! set into a `Set`, so these are the common case on a `statsd_in -> aggregate -> statsd_out`
+//! relay. What becomes of them is the next section.
+//!
+//! ## Multi-value kinds: `multi_value`
+//!
+//! [`MultiValue::Expand`] (the default, for a [`StatsdEncoder::new`] as for the config field)
+//! writes one line per component, named `<name><suffix>` with the dotted suffixes of
+//! `logit_proto::multi_value`'s module doc (the one copy of that table: `.count`, `.sum`, `.q0_5`
+//! through `.q0_99`, `.bucket_<b>`, `.zero_count`, `.min`, `.max`), in its order, and counts the
+//! record once in `EncodeStats::degraded_kinds`. [`MultiValue::Skip`] drops the record, counted
+//! once in `EncodeStats::skipped_kinds` with a throttled `unsupported_metric_kind` warning.
+//! `expand` warns nothing: it's the default path.
+//!
+//! Each component's type letter depends on whether a statsd server, which sums every `|c` line
+//! for a name across its flush interval and across senders, would sum it correctly:
+//!
+//! | Component | `Distribution`, delta `Histogram`, delta `ExponentialHistogram` | cumulative `Histogram`/`ExponentialHistogram`, every `Summary` |
+//! |---|---|---|
+//! | `.count`, `.sum`, `.bucket_<b>`, `.zero_count` (`Part::is_additive`) | `\|c` | `\|g` |
+//! | `.q<q>`, `.min`, `.max` | `\|g` | `\|g` |
+//!
+//! - A `Set`'s `.count` is `|g`: a cardinality estimate, and two estimates don't add.
+//! - A cumulative `Sum`, monotonic or not, is one bare `name:v|g`: its running total as a gauge.
+//! - A non-monotonic delta `Sum` is one bare `name:v|c`: a statsd counter takes a signed
+//!   increment, and the non-monotonic flag, which statsd can't carry, is what degrades.
+//! - A running total is a gauge, never `|c`: sent as a counter it would be added to itself on
+//!   every flush.
+//!
+//! Every `|g` component goes through the negative-gauge path ("Negative absolute gauges" below):
+//! `-0` writes `0`, and a negative value is the indivisible `0|g` + `-v|g` pair. A `|c`
+//! component needs no pair. `aggregate` re-emits a series' attributes, so an expanded
+//! `Distribution` still carries `statsd.type`; expansion ignores it, since it names the wire type
+//! of samples that are gone.
+//!
+//! An expanded line is an ordinary metric line. It carries the event's `|#` tags and dialect
+//! extras, and never `@<rate>`: a summary already absorbed each sample's rate, and a rate on a
+//! `|c` line would extrapolate twice. Each line is its own [`MessageBuf`] entry (a negative pair
+//! is one), so the packer can split an expansion across datagrams, and a line over
+//! `max_packet_bytes` drops alone. Under `Format::Statsd`, `tags_dropped_dialect` counts per wire
+//! tag per event, as for every event, and `dropped_dialect_fields` counts per expanded line.
+//! A non-finite component is skipped and the rest of the record is still written; a non-finite
+//! bare `Sum` is dropped, counted `dropped_unencodable_value`, and not counted degraded.
+//!
+//! Downstream, the counts and sums merge across senders; quantiles, extremes, and set estimates
+//! are per-sender values (`docs/adr/statsd-out-multi-value-expansion.md`; the debt is in
+//! `docs/known-gaps/statsd.md`).
 //!
 //! ## Relative gauges
 //!
@@ -341,7 +384,8 @@ use logit_core::{
     Value,
 };
 use logit_pipeline::{BatchContext, DeliveryPosture, SeqId};
-use logit_proto::{FramedEncoder, MessageBuf};
+use logit_proto::multi_value::{expand_dotted, DottedScratch};
+use logit_proto::{FramedEncoder, MessageBuf, MultiValue};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
@@ -384,7 +428,13 @@ pub struct EncodeStats {
     /// `otlp_out` this sink can't keep the point flagged; it drops it rather than write its default
     /// value as a fabricated sample (`docs/known-gaps/mappings.md`'s cross-protocol table).
     pub dropped_no_recorded_value: usize,
-    pub dropped_unsupported_kind: usize,
+    /// Records of a multi-value kind dropped under [`MultiValue::Skip`], one per record, by
+    /// `metric_kind`. See the module doc's "Multi-value kinds: `multi_value`" section.
+    pub skipped_kinds: KindCounts,
+    /// Records of a multi-value kind written as per-component lines under [`MultiValue::Expand`],
+    /// one per record however many lines it wrote. See the module doc's "Multi-value kinds:
+    /// `multi_value`" section.
+    pub degraded_kinds: KindCounts,
     /// One bucket for every kind of unencodable input: a non-finite value in a
     /// `Samples`/`Sum`/`Gauge`/`GaugeDelta`; an out-of-range `Samples.sample_rate` (the line is
     /// still written, without `@rate`); an empty `Samples`/`SetMembers` record; or an event whose
@@ -428,11 +478,88 @@ pub struct EncodeStats {
     pub dropped_invalid_event_fields: usize,
 }
 
+/// A metric kind with no single statsd line, as the `metric_kind` tag on
+/// `logit.output.metrics.skipped` and `logit.output.metrics.degraded` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiKind {
+    Distribution,
+    Set,
+    Histogram,
+    ExponentialHistogram,
+    Summary,
+    CumulativeSum,
+    NonMonotonicDeltaSum,
+}
+
+impl MultiKind {
+    /// The kind as a diagnostic names it.
+    fn display(self) -> &'static str {
+        match self {
+            MultiKind::Distribution => "Distribution",
+            MultiKind::Set => "Set",
+            MultiKind::Histogram => "Histogram",
+            MultiKind::ExponentialHistogram => "ExponentialHistogram",
+            MultiKind::Summary => "Summary",
+            MultiKind::CumulativeSum => "cumulative Sum",
+            MultiKind::NonMonotonicDeltaSum => "non-monotonic Sum",
+        }
+    }
+}
+
+/// One record count per `metric_kind` tag value, for [`EncodeStats::skipped_kinds`] and
+/// [`EncodeStats::degraded_kinds`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct KindCounts {
+    pub distribution: usize,
+    pub set: usize,
+    pub histogram: usize,
+    pub exponential_histogram: usize,
+    pub summary: usize,
+    pub cumulative_sum: usize,
+    pub non_monotonic_delta_sum: usize,
+}
+
+impl KindCounts {
+    fn bump(&mut self, kind: MultiKind) {
+        let slot = match kind {
+            MultiKind::Distribution => &mut self.distribution,
+            MultiKind::Set => &mut self.set,
+            MultiKind::Histogram => &mut self.histogram,
+            MultiKind::ExponentialHistogram => &mut self.exponential_histogram,
+            MultiKind::Summary => &mut self.summary,
+            MultiKind::CumulativeSum => &mut self.cumulative_sum,
+            MultiKind::NonMonotonicDeltaSum => &mut self.non_monotonic_delta_sum,
+        };
+        *slot += 1;
+    }
+
+    /// Every count beside its `metric_kind` tag value.
+    fn tagged(&self) -> [(&'static str, usize); 7] {
+        [
+            ("distribution", self.distribution),
+            ("set", self.set),
+            ("histogram", self.histogram),
+            ("exponential_histogram", self.exponential_histogram),
+            ("summary", self.summary),
+            ("cumulative_sum", self.cumulative_sum),
+            ("non_monotonic_delta_sum", self.non_monotonic_delta_sum),
+        ]
+    }
+
+    /// The sum over every kind.
+    pub fn total(&self) -> usize {
+        self.tagged().iter().map(|(_, n)| n).sum()
+    }
+}
+
 /// Encodes events as statsd lines. Pure: no socket, so every grammar, sanitization, and packing
 /// test runs against it directly.
 pub struct StatsdEncoder {
     format: Format,
     relative_gauges: bool,
+    /// What a multi-value kind becomes; [`MultiValue::Expand`] unless
+    /// [`StatsdEncoder::with_multi_value`] says otherwise, matching the config default.
+    multi_value: MultiValue,
     /// The longest line this encoder emits. A longer line is dropped whole
     /// (`EncodeStats::dropped_oversize_line`), never truncated, since the datagram packer
     /// (`crate::datagram::send_datagrams`) could never fit it in a datagram. `usize::MAX` (the
@@ -460,6 +587,8 @@ pub struct StatsdEncoder {
     /// The current event's escaped text. Its own buffer because the `_e{tlen,xlen}` header needs
     /// both lengths before either field is written into `line`.
     text_buf: String,
+    /// The suffix buffers [`expand_dotted`] formats a quantile or bucket into.
+    dotted: DottedScratch,
 }
 
 impl StatsdEncoder {
@@ -467,6 +596,7 @@ impl StatsdEncoder {
         Self {
             format,
             relative_gauges: false,
+            multi_value: MultiValue::Expand,
             max_packet_bytes: usize::MAX,
             diag: Diagnostics::default(),
             tag_suffix: String::new(),
@@ -476,11 +606,19 @@ impl StatsdEncoder {
             scratch: String::new(),
             title_buf: String::new(),
             text_buf: String::new(),
+            dotted: DottedScratch::default(),
         }
     }
 
     pub fn with_relative_gauges(mut self, relative_gauges: bool) -> Self {
         self.relative_gauges = relative_gauges;
+        self
+    }
+
+    /// What a multi-value kind becomes: per-component lines ([`MultiValue::Expand`], the
+    /// default) or a counted drop ([`MultiValue::Skip`]).
+    pub fn with_multi_value(mut self, multi_value: MultiValue) -> Self {
+        self.multi_value = multi_value;
         self
     }
 
@@ -502,8 +640,8 @@ impl FramedEncoder for StatsdEncoder {
     type Stats = EncodeStats;
 
     /// Encodes every event in `batch` into `out` (cleared first). Never fails: a per-metric
-    /// problem (an unsupported kind, an unresolved delta, a non-finite value, an oversize line) is
-    /// a drop counted in the returned [`EncodeStats`].
+    /// problem (a skipped multi-value kind, an unresolved delta, a non-finite value, an oversize
+    /// line) is a drop counted in the returned [`EncodeStats`].
     fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf) -> EncodeStats {
         out.clear();
         let mut stats = EncodeStats::default();
@@ -537,6 +675,7 @@ impl FramedEncoder for StatsdEncoder {
 
                 let mut ctx = EncodeCtx {
                     format: self.format,
+                    multi_value: self.multi_value,
                     tag_suffix: &self.tag_suffix,
                     statsd_type: carriers.statsd_type,
                     container_id: carriers.container_id,
@@ -582,6 +721,7 @@ impl FramedEncoder for StatsdEncoder {
 
             let mut ctx = EncodeCtx {
                 format: self.format,
+                multi_value: self.multi_value,
                 tag_suffix: &self.tag_suffix,
                 statsd_type: carriers.statsd_type,
                 container_id: carriers.container_id,
@@ -603,6 +743,7 @@ impl FramedEncoder for StatsdEncoder {
                                 &mut self.line,
                                 &mut self.name,
                                 &mut self.member,
+                                &mut self.dotted,
                                 self.relative_gauges,
                                 metric,
                                 &mut ctx,
@@ -629,6 +770,7 @@ impl FramedEncoder for StatsdEncoder {
                     &mut self.line,
                     &mut self.name,
                     &mut self.member,
+                    &mut self.dotted,
                     self.relative_gauges,
                     metric,
                     &mut ctx,
@@ -662,6 +804,7 @@ fn is_dogstatsd_event(resource: &Resource, event: &Event) -> bool {
 /// is honored.
 struct EncodeCtx<'a> {
     format: Format,
+    multi_value: MultiValue,
     tag_suffix: &'a str,
     statsd_type: Option<&'a str>,
     container_id: Option<&'a str>,
@@ -1106,12 +1249,14 @@ fn push_line(
 }
 
 /// Encodes one metric into `ctx.out`: no entry for a dropped metric, one for most kinds (a
-/// negative-gauge pair is one two-line entry), one per member for `SetMembers`, and one per value
-/// for `Samples` under `Format::Statsd`. `name`/`member` are reused scratch buffers.
+/// negative-gauge pair is one two-line entry), one per member for `SetMembers`, one per value
+/// for `Samples` under `Format::Statsd`, and one per component for an expanded multi-value kind.
+/// `name`/`member`/`dotted` are reused scratch buffers.
 fn render_metric(
     line: &mut String,
     name: &mut String,
     member: &mut String,
+    dotted: &mut DottedScratch,
     relative_gauges: bool,
     metric: &MetricRecord,
     ctx: &mut EncodeCtx,
@@ -1154,22 +1299,10 @@ fn render_metric(
                 return;
             }
             line.clear();
-            line.push_str(name);
-            line.push(':');
-            push_float(line, s.value);
-            line.push_str("|c");
-            append_tags(line, ctx.tag_suffix);
-            append_dialect_extras(line, ctx);
+            write_counter_line(line, name, "", s.value, ctx);
             push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
         }
-        MetricKind::Sum(s) => {
-            let kind_name = if s.temporality == Temporality::Cumulative {
-                "cumulative Sum"
-            } else {
-                "non-monotonic Sum"
-            };
-            dropped_unsupported_kind(ctx.stats, ctx.diag, name, kind_name, None);
-        }
+        MetricKind::Sum(s) => render_other_sum(line, name, s, ctx),
         MetricKind::Gauge(v) => {
             if !v.is_finite() {
                 ctx.stats.dropped_unencodable_value += 1;
@@ -1179,21 +1312,7 @@ fn render_metric(
                 );
                 return;
             }
-            // `f64`'s `Display` renders `-0.0` as `"-0"`, which the decoder's `"g"` arm reads as a
-            // no-op `GaugeDelta` (it checks the leading `-` before parsing). Normalize the sign so
-            // `-0.0` is a plain `name:0|g` reset and the pair below is only for real negatives.
-            // `stdio_out`'s `gauge_delta_negative_zero_does_not_double_the_sign` is the same trap.
-            let v = if *v == 0.0 { 0.0 } else { *v };
-            line.clear();
-            if v.is_sign_negative() {
-                // One indivisible entry (module doc's "Negative absolute gauges").
-                write_gauge_line(line, name, 0.0, ctx);
-                line.push('\n');
-                write_gauge_line(line, name, v, ctx);
-            } else {
-                write_gauge_line(line, name, v, ctx);
-            }
-            push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
+            render_gauge_entry(line, name, "", *v, ctx);
         }
         MetricKind::GaugeDelta(v) => {
             if !relative_gauges {
@@ -1225,34 +1344,26 @@ fn render_metric(
             append_dialect_extras(line, ctx);
             push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
         }
-        MetricKind::Distribution(_) => dropped_unsupported_kind(
-            ctx.stats,
-            ctx.diag,
-            name,
-            "Distribution",
-            Some(
-                "summarize with `aggregate: distributions: samples` to relay the raw ms/h/d data \
-                 through this sink instead",
-            ),
-        ),
-        MetricKind::Set(_) => dropped_unsupported_kind(
-            ctx.stats,
-            ctx.diag,
-            name,
-            "Set",
-            Some(
-                "summarize with `aggregate: sets: members` to relay the raw set members through \
-                 this sink instead",
-            ),
-        ),
+        // One arm per kind, no wildcard, so a new `MetricKind` variant is a compile error here.
+        MetricKind::Distribution(_) => {
+            render_multi_value(line, name, dotted, &metric.kind, MultiKind::Distribution, ctx)
+        }
+        MetricKind::Set(_) => {
+            render_multi_value(line, name, dotted, &metric.kind, MultiKind::Set, ctx)
+        }
         MetricKind::Histogram(_) => {
-            dropped_unsupported_kind(ctx.stats, ctx.diag, name, "Histogram", None)
+            render_multi_value(line, name, dotted, &metric.kind, MultiKind::Histogram, ctx)
         }
+        MetricKind::ExponentialHistogram(_) => render_multi_value(
+            line,
+            name,
+            dotted,
+            &metric.kind,
+            MultiKind::ExponentialHistogram,
+            ctx,
+        ),
         MetricKind::Summary(_) => {
-            dropped_unsupported_kind(ctx.stats, ctx.diag, name, "Summary", None)
-        }
-        MetricKind::ExponentialHistogram(_) => {
-            dropped_unsupported_kind(ctx.stats, ctx.diag, name, "ExponentialHistogram", None)
+            render_multi_value(line, name, dotted, &metric.kind, MultiKind::Summary, ctx)
         }
         MetricKind::Samples(samples) => render_samples(line, name.as_str(), samples, ctx),
         MetricKind::SetMembers(members) => {
@@ -1261,42 +1372,142 @@ fn render_metric(
     }
 }
 
-/// Counts and warns for a `MetricKind` [`render_metric`] can't encode. Its match stays exhaustive
-/// with no wildcard, so a new `MetricKind` variant is a compile error there. `hint` names the
-/// `aggregate` config that relays the kind's raw form instead (`Distribution`/`Set` only; the rest
-/// have no raw statsd counterpart).
-fn dropped_unsupported_kind(
-    stats: &mut EncodeStats,
-    diag: &mut Diagnostics,
-    name: &str,
-    kind_name: &str,
-    hint: Option<&str>,
-) {
-    stats.dropped_unsupported_kind += 1;
-    match hint {
-        Some(hint) => diag.warn_throttled(
-            "unsupported_metric_kind",
-            format_args!(
-                "statsd_out: {kind_name} metrics are not implemented yet (metric {name:?}); \
-                 dropping -- {hint}"
-            ),
-        ),
-        None => diag.warn_throttled(
-            "unsupported_metric_kind",
-            format_args!(
-                "statsd_out: {kind_name} metrics are not implemented yet (metric {name:?}); dropping"
-            ),
-        ),
+/// A `Sum` that isn't delta and monotonic. Under [`MultiValue::Expand`], a cumulative `Sum`
+/// becomes one bare gauge entry of its running total and a non-monotonic delta `Sum` one bare
+/// counter line, the record counted degraded; under [`MultiValue::Skip`], a counted drop.
+fn render_other_sum(line: &mut String, name: &str, sum: &logit_core::Sum, ctx: &mut EncodeCtx) {
+    let kind = if sum.temporality == Temporality::Cumulative {
+        MultiKind::CumulativeSum
+    } else {
+        MultiKind::NonMonotonicDeltaSum
     };
+    if ctx.multi_value == MultiValue::Skip {
+        skipped_kind(ctx, name, kind);
+        return;
+    }
+    if !sum.value.is_finite() {
+        ctx.stats.dropped_unencodable_value += 1;
+        ctx.diag.warn_throttled(
+            "unencodable_value",
+            format_args!("statsd_out: non-finite sum value on {name:?}; dropping"),
+        );
+        return;
+    }
+    ctx.stats.degraded_kinds.bump(kind);
+    match kind {
+        MultiKind::CumulativeSum => render_gauge_entry(line, name, "", sum.value, ctx),
+        _ => {
+            line.clear();
+            write_counter_line(line, name, "", sum.value, ctx);
+            push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
+        }
+    }
 }
 
-/// Appends one `name:v|g` line, tags and dialect extras included; `Gauge`'s plain and pair cases
-/// share it.
-fn write_gauge_line(line: &mut String, name: &str, v: f64, ctx: &mut EncodeCtx) {
+/// A `Distribution`, `Set`, `Histogram`, `ExponentialHistogram`, or `Summary`. Under
+/// [`MultiValue::Expand`], one entry per component [`expand_dotted`] reports, typed by the module
+/// doc's "Multi-value kinds: `multi_value`" table, the record counted degraded once; under
+/// [`MultiValue::Skip`], a counted drop.
+fn render_multi_value(
+    line: &mut String,
+    name: &str,
+    dotted: &mut DottedScratch,
+    kind: &MetricKind,
+    multi: MultiKind,
+    ctx: &mut EncodeCtx,
+) {
+    if ctx.multi_value == MultiValue::Skip {
+        skipped_kind(ctx, name, multi);
+        return;
+    }
+    ctx.stats.degraded_kinds.bump(multi);
+    // A per-window kind's count, sum, buckets, and zero count add up correctly at a statsd
+    // server, which sums every `|c` line for a name; a running total sent as `|c` would be
+    // added to itself on every flush.
+    let per_window = match kind {
+        MetricKind::Distribution(_) => true,
+        MetricKind::Histogram(h) => h.temporality == Temporality::Delta,
+        MetricKind::ExponentialHistogram(h) => h.temporality == Temporality::Delta,
+        _ => false,
+    };
+    let expanded = expand_dotted(kind, dotted, |suffix, value, part| {
+        if per_window && part.is_additive() {
+            line.clear();
+            write_counter_line(line, name, suffix, value, ctx);
+            push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
+        } else {
+            render_gauge_entry(line, name, suffix, value, ctx);
+        }
+    });
+    debug_assert!(expanded, "only a multi-value kind reaches render_multi_value");
+}
+
+/// Counts and warns for a multi-value kind dropped under [`MultiValue::Skip`]. The hint names the
+/// setting that writes it instead, and for a `Distribution` or `Set` the `aggregate` setting that
+/// relays its raw form.
+fn skipped_kind(ctx: &mut EncodeCtx, name: &str, kind: MultiKind) {
+    ctx.stats.skipped_kinds.bump(kind);
+    let hint = match kind {
+        MultiKind::Distribution => {
+            "set `multi_value: expand` to write its count, sum, and quantiles as lines, or \
+             summarize with `aggregate: distributions: samples` to relay the raw ms/h/d data"
+        }
+        MultiKind::Set => {
+            "set `multi_value: expand` to write its estimated count as a gauge, or summarize \
+             with `aggregate: sets: members` to relay the raw set members"
+        }
+        _ => "set `multi_value: expand` to write one line per component",
+    };
+    ctx.diag.warn_throttled(
+        "unsupported_metric_kind",
+        format_args!(
+            "statsd_out: {} (metric {name:?}) has no single statsd line; dropping under \
+             `multi_value: skip` -- {hint}",
+            kind.display()
+        ),
+    );
+}
+
+/// Pushes one gauge entry for `name` + `suffix`: a plain `name:v|g` line, or for a negative
+/// value the indivisible `name:0|g` + `name:-v|g` pair (module doc's "Negative absolute gauges").
+fn render_gauge_entry(line: &mut String, name: &str, suffix: &str, v: f64, ctx: &mut EncodeCtx) {
+    // `f64`'s `Display` renders `-0.0` as `"-0"`, which the decoder's `"g"` arm reads as a
+    // no-op `GaugeDelta` (it checks the leading `-` before parsing). Normalize the sign so
+    // `-0.0` is a plain `name:0|g` reset and the pair below is only for real negatives.
+    // `stdio_out`'s `gauge_delta_negative_zero_does_not_double_the_sign` is the same trap.
+    let v = if v == 0.0 { 0.0 } else { v };
+    line.clear();
+    if v.is_sign_negative() {
+        write_gauge_line(line, name, suffix, 0.0, ctx);
+        line.push('\n');
+        write_gauge_line(line, name, suffix, v, ctx);
+    } else {
+        write_gauge_line(line, name, suffix, v, ctx);
+    }
+    push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
+}
+
+/// Appends one `name<suffix>:v|g` line, tags and dialect extras included; both lines of a
+/// negative pair share it.
+fn write_gauge_line(line: &mut String, name: &str, suffix: &str, v: f64, ctx: &mut EncodeCtx) {
     line.push_str(name);
+    line.push_str(suffix);
     line.push(':');
     push_float(line, v);
     line.push_str("|g");
+    append_tags(line, ctx.tag_suffix);
+    append_dialect_extras(line, ctx);
+}
+
+/// Appends one `name<suffix>:v|c` line, tags and dialect extras included. Never `@<rate>`: a
+/// counter's rate is already divided out (module doc's "Sample rate: never for a counter, real
+/// for `Samples`").
+fn write_counter_line(line: &mut String, name: &str, suffix: &str, v: f64, ctx: &mut EncodeCtx) {
+    line.push_str(name);
+    line.push_str(suffix);
+    line.push(':');
+    push_float(line, v);
+    line.push_str("|c");
     append_tags(line, ctx.tag_suffix);
     append_dialect_extras(line, ctx);
 }
@@ -1733,11 +1944,6 @@ fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     );
     telemetry.count(
         "logit.output.messages.dropped",
-        stats.dropped_unsupported_kind as f64,
-        &[("reason", "unsupported_kind")],
-    );
-    telemetry.count(
-        "logit.output.messages.dropped",
         stats.dropped_no_recorded_value as f64,
         &[("reason", "no_recorded_value")],
     );
@@ -1796,6 +2002,12 @@ fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
         stats.members_sanitized as f64,
         &[("reason", "member_sanitized")],
     );
+    for (metric_kind, n) in stats.skipped_kinds.tagged() {
+        telemetry.count("logit.output.metrics.skipped", n as f64, &[("metric_kind", metric_kind)]);
+    }
+    for (metric_kind, n) in stats.degraded_kinds.tagged() {
+        telemetry.count("logit.output.metrics.degraded", n as f64, &[("metric_kind", metric_kind)]);
+    }
 }
 
 impl StatsdOutput {
@@ -2464,8 +2676,321 @@ mod tests {
         assert_eq!(msgs[0], "free:0|g");
     }
 
+    // -- Multi-value kinds ----------------------------------------------------------------------
+
+    fn sketch_of(values: &[f64]) -> logit_core::DdSketch {
+        let mut sketch = logit_core::DdSketch::new();
+        for v in values {
+            sketch.add(*v);
+        }
+        sketch
+    }
+
+    /// The five `.q*` lines a `Distribution` named `name` over `sketch` expands to, each `|g`
+    /// followed by `tail`.
+    fn quantile_lines(name: &str, sketch: &logit_core::DdSketch, tail: &str) -> Vec<String> {
+        [("0_5", 0.5), ("0_75", 0.75), ("0_9", 0.9), ("0_95", 0.95), ("0_99", 0.99)]
+            .iter()
+            .map(|(token, q)| format!("{name}.q{token}:{}|g{tail}", sketch.quantile(*q).unwrap()))
+            .collect()
+    }
+
+    fn skip_encoder() -> StatsdEncoder {
+        StatsdEncoder::new(Format::DogStatsd).with_multi_value(MultiValue::Skip)
+    }
+
+    fn delta_histogram() -> MetricKind {
+        MetricKind::Histogram(logit_core::Histogram {
+            buckets: vec![(0.5, 1), (5.0, 2), (f64::INFINITY, 3)],
+            temporality: Temporality::Delta,
+            sum: Some(12.0),
+            min: Some(0.25),
+            max: Some(9.0),
+        })
+    }
+
+    fn exp_histogram(temporality: Temporality) -> MetricKind {
+        MetricKind::ExponentialHistogram(logit_core::ExpHistogram {
+            scale: 0,
+            zero_count: 2,
+            zero_threshold: 0.0,
+            positive: (0, vec![1, 2]),
+            negative: (0, vec![]),
+            temporality,
+            count: 5,
+            sum: Some(10.0),
+            min: Some(1.0),
+            max: Some(4.0),
+        })
+    }
+
+    fn summary(quantiles: Vec<(f64, f64)>, count: u64, sum: f64) -> MetricKind {
+        MetricKind::Summary(logit_core::Summary { quantiles, count, sum })
+    }
+
+    fn sum_kind(value: f64, temporality: Temporality, monotonic: bool) -> MetricKind {
+        MetricKind::Sum(logit_core::Sum { value, temporality, monotonic })
+    }
+
+    fn hll_of(members: &[&[u8]]) -> logit_core::HyperLogLog {
+        let mut hll = logit_core::HyperLogLog::new();
+        for m in members {
+            hll.insert(m);
+        }
+        hll
+    }
+
+    /// One record of each of the seven `metric_kind` tags.
+    fn one_of_each_multi_value_kind() -> Vec<Event> {
+        vec![
+            metric_event("d", MetricKind::Distribution(sketch_of(&[1.0, 2.0])), &[]),
+            metric_event("s", MetricKind::Set(hll_of(&[b"a"])), &[]),
+            metric_event("h", delta_histogram(), &[]),
+            metric_event("e", exp_histogram(Temporality::Delta), &[]),
+            metric_event("q", summary(vec![(0.5, 1.0)], 1, 1.0), &[]),
+            metric_event("c", sum_kind(5.0, Temporality::Cumulative, true), &[]),
+            metric_event("n", sum_kind(-2.0, Temporality::Delta, false), &[]),
+        ]
+    }
+
     #[test]
-    fn distribution_set_histogram_and_summary_each_drop_with_a_clear_message() {
+    fn the_encoder_defaults_to_expand() {
+        let (msgs, stats) =
+            encode(vec![metric_event("d", MetricKind::Distribution(sketch_of(&[1.0])), &[])]);
+        assert_eq!(msgs.len(), 7, "{msgs:?}");
+        assert_eq!(stats.degraded_kinds.distribution, 1);
+        assert_eq!(stats.skipped_kinds.total(), 0);
+    }
+
+    #[test]
+    fn every_post_sketch_kind_expands_into_the_shared_sub_paths_with_its_type_letters() {
+        let sketch = sketch_of(&[10.0, 20.0, 30.0]);
+        let (msgs, stats) = encode(vec![
+            metric_event("d", MetricKind::Distribution(sketch.clone()), &[]),
+            metric_event("h", delta_histogram(), &[]),
+            metric_event("e", exp_histogram(Temporality::Delta), &[]),
+            metric_event("s", MetricKind::Set(hll_of(&[b"a", b"b"])), &[]),
+        ]);
+        let mut expected = vec!["d.count:3|c".to_string(), "d.sum:60|c".to_string()];
+        expected.extend(quantile_lines("d", &sketch, ""));
+        expected.extend(
+            [
+                "h.count:6|c",
+                "h.sum:12|c",
+                "h.min:0.25|g",
+                "h.max:9|g",
+                "h.bucket_0_5:1|c",
+                "h.bucket_5:2|c",
+                "h.bucket_inf:3|c",
+                "e.count:5|c",
+                "e.sum:10|c",
+                "e.min:1|g",
+                "e.max:4|g",
+                "e.zero_count:2|c",
+                "s.count:2|g",
+            ]
+            .map(String::from),
+        );
+        assert_eq!(msgs, expected);
+        assert_eq!(stats.degraded_kinds.distribution, 1);
+        assert_eq!(stats.degraded_kinds.histogram, 1);
+        assert_eq!(stats.degraded_kinds.exponential_histogram, 1);
+        assert_eq!(stats.degraded_kinds.set, 1);
+    }
+
+    #[test]
+    fn a_cumulative_histogram_and_a_summary_write_counts_and_sums_as_gauges() {
+        let MetricKind::Histogram(mut histogram) = delta_histogram() else { unreachable!() };
+        histogram.temporality = Temporality::Cumulative;
+        let (msgs, _) = encode(vec![
+            metric_event("h", MetricKind::Histogram(histogram), &[]),
+            metric_event("e", exp_histogram(Temporality::Cumulative), &[]),
+            metric_event("q", summary(vec![(0.5, 1.0), (0.99, 9.0)], 4, 12.0), &[]),
+        ]);
+        assert_eq!(
+            msgs,
+            vec![
+                "h.count:6|g",
+                "h.sum:12|g",
+                "h.min:0.25|g",
+                "h.max:9|g",
+                "h.bucket_0_5:1|g",
+                "h.bucket_5:2|g",
+                "h.bucket_inf:3|g",
+                "e.count:5|g",
+                "e.sum:10|g",
+                "e.min:1|g",
+                "e.max:4|g",
+                "e.zero_count:2|g",
+                "q.count:4|g",
+                "q.sum:12|g",
+                "q.q0_5:1|g",
+                "q.q0_99:9|g",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cumulative_sum_expands_to_a_bare_gauge_of_its_running_total() {
+        let (msgs, stats) = encode(vec![
+            metric_event("total", sum_kind(42.0, Temporality::Cumulative, true), &[]),
+            metric_event("level", sum_kind(7.0, Temporality::Cumulative, false), &[]),
+            metric_event("debt", sum_kind(-3.0, Temporality::Cumulative, false), &[]),
+        ]);
+        assert_eq!(msgs, vec!["total:42|g", "level:7|g", "debt:0|g\ndebt:-3|g"]);
+        assert_eq!(stats.degraded_kinds.cumulative_sum, 3);
+    }
+
+    #[test]
+    fn a_non_monotonic_delta_sum_expands_to_a_bare_counter() {
+        let (msgs, stats) = encode(vec![
+            metric_event("drift", sum_kind(-5.0, Temporality::Delta, false), &[]),
+            metric_event("rise", sum_kind(2.5, Temporality::Delta, false), &[]),
+        ]);
+        assert_eq!(msgs, vec!["drift:-5|c", "rise:2.5|c"]);
+        assert_eq!(stats.degraded_kinds.non_monotonic_delta_sum, 2);
+    }
+
+    #[test]
+    fn a_negative_quantile_is_one_zero_then_delta_gauge_entry() {
+        let (msgs, _) =
+            encode(vec![metric_event("q", summary(vec![(0.5, -3.0), (0.9, -0.0)], 2, -3.0), &[])]);
+        assert_eq!(
+            msgs,
+            vec!["q.count:2|g", "q.sum:0|g\nq.sum:-3|g", "q.q0_5:0|g\nq.q0_5:-3|g", "q.q0_9:0|g"],
+            "each negative gauge is one two-line entry, and -0 is a plain zero"
+        );
+        // The pair decodes to the absolute value, not a relative adjustment.
+        let events = decode_one(&msgs[2]);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == 0.0));
+        assert!(matches!(events[1].metrics[0].kind, MetricKind::GaugeDelta(v) if v == -3.0));
+    }
+
+    #[test]
+    fn expanded_lines_carry_tags_and_dialect_extras_and_never_a_sample_rate() {
+        let sketch = sketch_of(&[1.0, 2.0]);
+        let attrs = [
+            ("env", Value::str("prod")),
+            ("statsd.container_id", Value::str("abc")),
+            ("statsd.timestamp", Value::U64(1_700_000_000)),
+            ("statsd.type", Value::str("h")),
+        ];
+        let (msgs, _) =
+            encode(vec![metric_event("d", MetricKind::Distribution(sketch.clone()), &attrs)]);
+        let tail = "|#env:prod|c:abc|T1700000000";
+        let mut expected = vec![format!("d.count:2|c{tail}"), format!("d.sum:3|c{tail}")];
+        expected.extend(quantile_lines("d", &sketch, tail));
+        assert_eq!(msgs, expected);
+        assert!(msgs.iter().all(|m| !m.contains("|@")), "no expanded line carries a rate");
+    }
+
+    #[test]
+    fn expanded_lines_under_format_statsd_drop_tags_once_and_extras_per_line() {
+        let sketch = sketch_of(&[1.0, 2.0]);
+        let attrs = [
+            ("env", Value::str("prod")),
+            ("statsd.container_id", Value::str("abc")),
+            ("statsd.timestamp", Value::U64(1_700_000_000)),
+        ];
+        let (msgs, stats) = encode_with_format(
+            vec![metric_event("d", MetricKind::Distribution(sketch.clone()), &attrs)],
+            Format::Statsd,
+        );
+        let mut expected = vec!["d.count:2|c".to_string(), "d.sum:3|c".to_string()];
+        expected.extend(quantile_lines("d", &sketch, ""));
+        assert_eq!(msgs, expected);
+        assert_eq!(stats.tags_dropped_dialect, 1, "one wire tag, counted once per event");
+        assert_eq!(stats.dropped_dialect_fields, 14, "two extras on each of seven lines");
+    }
+
+    #[test]
+    fn samples_and_set_members_render_natively_under_both_multi_value_settings() {
+        let events = || {
+            vec![
+                metric_event("t", MetricKind::Samples(logit_core::Samples::new([1.0, 2.0])), &[]),
+                metric_event(
+                    "u",
+                    MetricKind::SetMembers(vec![bytes::Bytes::from_static(b"a")]),
+                    &[],
+                ),
+            ]
+        };
+        for multi_value in [MultiValue::Expand, MultiValue::Skip] {
+            let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_multi_value(multi_value);
+            let (msgs, stats) = encode_with(&mut encoder, events());
+            assert_eq!(msgs, vec!["t:1:2|ms", "u:a|s"], "{multi_value:?}");
+            assert_eq!(stats.degraded_kinds, KindCounts::default(), "{multi_value:?}");
+            assert_eq!(stats.skipped_kinds, KindCounts::default(), "{multi_value:?}");
+        }
+    }
+
+    #[test]
+    fn expand_counts_one_degraded_record_however_many_lines_it_writes() {
+        let (msgs, stats) = encode(vec![
+            metric_event("a", MetricKind::Distribution(sketch_of(&[1.0])), &[]),
+            metric_event("b", MetricKind::Distribution(sketch_of(&[2.0])), &[]),
+            metric_event("h", delta_histogram(), &[]),
+        ]);
+        assert_eq!(msgs.len(), 7 + 7 + 7);
+        assert_eq!(
+            stats.degraded_kinds,
+            KindCounts { distribution: 2, histogram: 1, ..KindCounts::default() }
+        );
+    }
+
+    #[test]
+    fn an_empty_sketch_expands_to_zero_count_and_sum_only() {
+        let (msgs, stats) = encode(vec![metric_event(
+            "d",
+            MetricKind::Distribution(logit_core::DdSketch::new()),
+            &[],
+        )]);
+        assert_eq!(msgs, vec!["d.count:0|c", "d.sum:0|c"]);
+        assert_eq!(stats.degraded_kinds.distribution, 1);
+    }
+
+    #[test]
+    fn an_expanded_line_over_max_packet_bytes_drops_only_that_line() {
+        // "q.q0_99:123456789.125|g" is 23 bytes; every other line fits in 12.
+        let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_max_packet_bytes(12);
+        let (msgs, stats) = encode_with(
+            &mut encoder,
+            vec![metric_event("q", summary(vec![(0.5, 1.0), (0.99, 123456789.125)], 1, 1.0), &[])],
+        );
+        assert_eq!(msgs, vec!["q.count:1|g", "q.sum:1|g", "q.q0_5:1|g"]);
+        assert_eq!(stats.dropped_oversize_line, 1);
+        assert_eq!(stats.degraded_kinds.summary, 1, "the record still counts degraded once");
+    }
+
+    #[test]
+    fn expanded_suffixes_need_no_name_sanitizing() {
+        let (msgs, _) = encode(vec![metric_event(
+            "h",
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: vec![(-0.5, 1), (1e21, 1), (f64::INFINITY, 1)],
+                temporality: Temporality::Delta,
+                sum: Some(1.0),
+                min: None,
+                max: None,
+            }),
+            &[],
+        )]);
+        let names: Vec<String> = msgs
+            .iter()
+            .map(|m| {
+                let events = decode_one(m);
+                logit_core::interner::resolve(events[0].metrics[0].name).to_string()
+            })
+            .collect();
+        let rendered: Vec<&str> = msgs.iter().map(|m| m.split(':').next().unwrap()).collect();
+        assert_eq!(names, rendered, "each suffix decodes back as part of the name, unchanged");
+        assert!(rendered.contains(&"h.bucket_-0_5"), "{rendered:?}");
+        assert!(rendered.contains(&"h.bucket_inf"), "{rendered:?}");
+    }
+
+    #[test]
+    fn distribution_set_histogram_and_summary_each_drop_under_skip() {
         let events = vec![
             metric_event("d", MetricKind::Distribution(logit_core::DdSketch::new()), &[]),
             metric_event("s", MetricKind::Set(logit_core::HyperLogLog::default()), &[]),
@@ -2480,68 +3005,167 @@ mod tests {
                 }),
                 &[],
             ),
-            metric_event(
-                "q",
-                MetricKind::Summary(logit_core::Summary { quantiles: vec![], count: 0, sum: 0.0 }),
-                &[],
-            ),
+            metric_event("q", summary(vec![], 0, 0.0), &[]),
         ];
-        let (msgs, stats) = encode(events);
+        let (msgs, stats) = encode_with(&mut skip_encoder(), events);
         assert!(msgs.is_empty());
-        assert_eq!(stats.dropped_unsupported_kind, 4);
+        assert_eq!(
+            stats.skipped_kinds,
+            KindCounts {
+                distribution: 1,
+                set: 1,
+                histogram: 1,
+                summary: 1,
+                ..KindCounts::default()
+            }
+        );
+        assert_eq!(stats.degraded_kinds, KindCounts::default());
     }
 
     #[test]
-    fn exponential_histogram_drops_with_a_clear_message() {
-        let events = vec![metric_event(
-            "e",
-            MetricKind::ExponentialHistogram(logit_core::ExpHistogram {
-                scale: 0,
-                zero_count: 0,
-                zero_threshold: 0.0,
-                positive: (0, vec![]),
-                negative: (0, vec![]),
-                temporality: Temporality::Cumulative,
-                count: 0,
-                sum: None,
-                min: None,
-                max: None,
-            }),
-            &[],
-        )];
-        let (msgs, stats) = encode(events);
+    fn exponential_histogram_drops_under_skip() {
+        let (msgs, stats) = encode_with(
+            &mut skip_encoder(),
+            vec![metric_event("e", exp_histogram(Temporality::Cumulative), &[])],
+        );
         assert!(msgs.is_empty());
-        assert_eq!(stats.dropped_unsupported_kind, 1);
+        assert_eq!(stats.skipped_kinds.exponential_histogram, 1);
     }
 
     #[test]
-    fn a_cumulative_sum_is_dropped_and_a_delta_monotonic_sum_still_encodes_as_c() {
-        let (msgs, stats) = encode(vec![
-            metric_event(
-                "cumulative",
-                MetricKind::Sum(logit_core::Sum {
-                    value: 5.0,
-                    temporality: Temporality::Cumulative,
-                    monotonic: true,
-                }),
-                &[],
-            ),
-            metric_event("delta", MetricKind::counter(3.0), &[]),
-        ]);
+    fn cumulative_and_non_monotonic_sums_drop_under_skip_and_a_delta_monotonic_sum_still_encodes_as_c(
+    ) {
+        let (msgs, stats) = encode_with(
+            &mut skip_encoder(),
+            vec![
+                metric_event("cumulative", sum_kind(5.0, Temporality::Cumulative, true), &[]),
+                metric_event("drift", sum_kind(-1.0, Temporality::Delta, false), &[]),
+                metric_event("delta", MetricKind::counter(3.0), &[]),
+            ],
+        );
         assert_eq!(msgs, vec!["delta:3|c"]);
-        assert_eq!(stats.dropped_unsupported_kind, 1);
+        assert_eq!(stats.skipped_kinds.cumulative_sum, 1);
+        assert_eq!(stats.skipped_kinds.non_monotonic_delta_sum, 1);
     }
 
     #[test]
-    fn a_dropped_distribution_does_not_take_a_healthy_counter_on_the_same_event_with_it() {
+    fn a_skipped_distribution_does_not_take_a_healthy_counter_on_the_same_event_with_it() {
         let mut event = metric_event("ok", MetricKind::counter(1.0), &[]);
         event.metrics.push(MetricRecord::new(
             intern("bad"),
             MetricKind::Distribution(logit_core::DdSketch::new()),
         ));
-        let (msgs, stats) = encode(vec![event]);
+        let (msgs, stats) = encode_with(&mut skip_encoder(), vec![event]);
         assert_eq!(msgs, vec!["ok:1|c"]);
-        assert_eq!(stats.dropped_unsupported_kind, 1);
+        assert_eq!(stats.skipped_kinds.distribution, 1);
+    }
+
+    #[test]
+    fn an_expanded_distribution_sits_beside_a_healthy_counter_on_the_same_event() {
+        let mut event = metric_event("ok", MetricKind::counter(1.0), &[]);
+        event.metrics.push(MetricRecord::new(
+            intern("lat"),
+            MetricKind::Distribution(logit_core::DdSketch::new()),
+        ));
+        let (msgs, _) = encode(vec![event]);
+        assert_eq!(msgs, vec!["ok:1|c", "lat.count:0|c", "lat.sum:0|c"]);
+    }
+
+    #[tokio::test]
+    async fn an_expanded_distribution_packs_as_independent_lines_across_datagrams() {
+        let sketch = sketch_of(&[10.0, 20.0, 30.0]);
+        let batch = batch_with(vec![metric_event("lat", MetricKind::Distribution(sketch), &[])]);
+        let (expected, _) =
+            encode_with(&mut StatsdEncoder::new(Format::DogStatsd), batch.events.clone());
+        assert_eq!(expected.len(), 7);
+
+        let cap = 40;
+        let mut collector = Collector::udp().await;
+        let mut output =
+            StatsdOutput::udp(collector.addr().to_string()).unwrap().with_max_packet_bytes(cap);
+        output.send(&batch).await.expect("send should succeed");
+        let mut received = Vec::new();
+        let mut datagrams = 0;
+        while received.len() < expected.len() {
+            let datagram = collector.next().await;
+            assert!(datagram.len() <= cap, "{} bytes over a {cap}-byte cap", datagram.len());
+            datagrams += 1;
+            let text = String::from_utf8(datagram).unwrap();
+            received.extend(text.split('\n').map(String::from));
+        }
+        assert!(datagrams > 1, "seven lines can't share one {cap}-byte datagram");
+        assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn an_expanded_negative_quantile_pair_is_one_packer_unit() {
+        let mut out = MessageBuf::default();
+        StatsdEncoder::new(Format::DogStatsd).encode_into(
+            &batch_with(vec![metric_event("q", summary(vec![(0.5, -3.0)], 1, 1.0), &[])]),
+            &mut out,
+        );
+        let entries: Vec<&[u8]> = out.iter().collect();
+        assert_eq!(entries.len(), 3, "count, sum, and one entry for the pair");
+        assert_eq!(entries[2], b"q.q0_5:0|g\nq.q0_5:-3|g");
+    }
+
+    #[test]
+    fn skip_and_expand_report_metric_kind_once_per_record_and_never_unsupported_kind() {
+        let tags = [
+            "distribution",
+            "set",
+            "histogram",
+            "exponential_histogram",
+            "summary",
+            "cumulative_sum",
+            "non_monotonic_delta_sum",
+        ];
+        for (multi_value, counted, other) in [
+            (MultiValue::Skip, "logit.output.metrics.skipped", "logit.output.metrics.degraded"),
+            (MultiValue::Expand, "logit.output.metrics.degraded", "logit.output.metrics.skipped"),
+        ] {
+            let mut probe = TelemetryProbe::new();
+            let telemetry = probe.telemetry("out", "statsd_out", "sink");
+            let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_multi_value(multi_value);
+            let mut out = MessageBuf::default();
+            let stats = encoder.encode_into(&batch_with(one_of_each_multi_value_kind()), &mut out);
+            report_encode_stats(&telemetry, &stats);
+            for tag in tags {
+                let kind = [("metric_kind", tag)];
+                assert_eq!(probe.sum(counted, &kind), 1.0, "{multi_value:?} {counted} {tag}");
+                assert_eq!(probe.sum(other, &kind), 0.0, "{multi_value:?} {other} {tag}");
+            }
+            assert_eq!(
+                probe.sum("logit.output.messages.dropped", &[("reason", "unsupported_kind")]),
+                0.0
+            );
+        }
+    }
+
+    #[test]
+    fn skip_warns_unsupported_metric_kind_and_expand_warns_nothing() {
+        for (multi_value, warned) in [(MultiValue::Skip, true), (MultiValue::Expand, false)] {
+            let registry = logit_core::Registry::new();
+            let telemetry = registry.telemetry_for("out", "statsd_out", "sink");
+            let mut encoder = StatsdEncoder::new(Format::DogStatsd)
+                .with_multi_value(multi_value)
+                .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry));
+            let mut out = MessageBuf::default();
+            encoder.encode_into(&batch_with(one_of_each_multi_value_kind()), &mut out);
+            let keys: Vec<String> = registry
+                .drain(0)
+                .into_iter()
+                .filter_map(|e| e.attributes.get("key").and_then(|v| v.as_str()).map(String::from))
+                .collect();
+            assert_eq!(
+                keys.iter().any(|k| k == "unsupported_metric_kind"),
+                warned,
+                "{multi_value:?}: {keys:?}"
+            );
+            if !warned {
+                assert!(keys.is_empty(), "expand emits no diagnostic: {keys:?}");
+            }
+        }
     }
 
     // -- Samples --------------------------------------------------------------------------------
@@ -5176,18 +5800,21 @@ mod tests {
 
     // -- Attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) ----------
 
-    /// A dropped tag, a dropped gauge delta with its diagnostic, and one line that encodes.
+    /// A dropped tag, a dropped gauge delta with its diagnostic, an expanded distribution, and
+    /// one line that encodes.
     fn encode_side_batch() -> EventBatch {
         batch_with(vec![
             metric_event("hits", MetricKind::counter(1.0), &[("bad", Value::Null)]),
             metric_event("conns", MetricKind::GaugeDelta(5.0), &[]),
+            metric_event("lat", MetricKind::Distribution(logit_core::DdSketch::new()), &[]),
         ])
     }
 
-    const ENCODE_SIDE: [(&str, &[(&str, &str)]); 4] = [
+    const ENCODE_SIDE: [(&str, &[(&str, &str)]); 5] = [
         ("logit.output.messages.dropped", &[("reason", "unresolved_gauge_delta")]),
         ("logit.output.tags.dropped", &[("reason", "unrepresentable")]),
         ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
+        ("logit.output.metrics.degraded", &[("metric_kind", "distribution")]),
         ("logit.output.batch.bytes", &[]),
     ];
 
@@ -5289,7 +5916,7 @@ mod tests {
         let sums =
             sums_through_write_loop(&mut output, &mut probe, "statsd_out", batches, fast_retry())
                 .await;
-        for (name, tags) in &ENCODE_SIDE[..3] {
+        for (name, tags) in &ENCODE_SIDE[..4] {
             assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
         }
     }
@@ -5313,7 +5940,7 @@ mod tests {
             output.send(&encode_side_batch()).await.expect("accepted");
         }
         let totals = probe.poll();
-        for (name, tags) in &ENCODE_SIDE[..3] {
+        for (name, tags) in &ENCODE_SIDE[..4] {
             assert_eq!(totals.sum(name, tags), 3.0, "{name} {tags:?}");
         }
     }

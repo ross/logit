@@ -3027,6 +3027,15 @@
               "default": "1432",
               "type": "string"
             },
+            "multi_value": {
+              "description": "What to do with a metric kind that holds more than one number: a distribution sketch (what `aggregate` makes of timers by default), a set estimate (what it makes of sets), a histogram, an exponential histogram, a summary, or a cumulative or non-monotonic sum. `expand` (the default) writes one line per component, named by a dotted suffix: `.count`, `.sum`, and `.q0_5` through `.q0_99` for a sketch, `.count` for a set, `.count`, `.sum`, `.min`, `.max`, and `.bucket_<bound>` for a histogram, `.zero_count` for an exponential histogram, and `.q<quantile>` for a summary. A count, sum, bucket, or zero count from a per-window kind (a sketch, or a delta histogram) is a counter (`|c`), which a statsd server adds up across flushes and senders; every other component, including a set's count and every quantile, minimum, and maximum, is a gauge (`|g`). A cumulative sum is one gauge of its running total, and a non-monotonic delta sum is one counter, both under the metric's own name. Each expanded record is counted as degraded, because a statsd server can't merge quantiles or set estimates from several senders. `skip` drops these kinds instead, counted. Raw timer samples and set members always leave as their own `ms`/`h`/`d` and `s` lines under either setting.",
+              "default": "expand",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/StatsdMultiValue"
+                }
+              ]
+            },
             "receive": true,
             "relative_gauges": {
               "description": "Encodes a relative gauge adjustment (statsd's `+n`/`-n` syntax) natively as a signed value, instead of dropping it with a `gauge_delta_unresolved` diagnostic. Off by default: a delta reaching any sink usually means the pipeline is missing an `aggregate`, so this is an opt-in relay behavior.",
@@ -4655,6 +4664,14 @@
       "enum": [
         "dogstatsd",
         "statsd"
+      ]
+    },
+    "StatsdMultiValue": {
+      "description": "What `statsd_out` does with a metric kind that holds more than one number: write one dotted line per component (`expand`, the default), or drop it, counted (`skip`).",
+      "type": "string",
+      "enum": [
+        "skip",
+        "expand"
       ]
     },
     "StatsdTransport": {

@@ -3047,6 +3047,27 @@ fn statsd_encode_into_100_events() {
     expect_allocs("statsd_out: encode_into 100 events", stats, 0);
 }
 
+/// Zero for 100 single-value `Distribution` events under the default `multi_value: expand`, seven
+/// lines each: the expansion reads the already-built `DdSketch` in place
+/// (`logit_proto::multi_value::expand_dotted`), and its quantile suffixes format into the
+/// encoder's reused `DottedScratch`.
+#[test]
+fn statsd_encode_into_100_distribution_events_expanded() {
+    let mut encoder = StatsdEncoder::new(StatsdFormat::DogStatsd);
+    let event = fixtures::distribution_event();
+    let batch = EventBatch {
+        resource: fixtures::resource(),
+        scope: None,
+        events: (0..100).map(|_| event.clone()).collect(),
+    };
+    let mut out = MessageBuf::default();
+
+    let (stats_out, stats) = measure_framed(&mut encoder, &batch, &mut out);
+    assert_eq!(out.len(), 700);
+    assert_eq!(stats_out.degraded_kinds.distribution, 100);
+    expect_allocs("statsd_out: encode_into 100 Distribution events (expand)", stats, 0);
+}
+
 /// Zero: `CollectdEncoder` reuses its `packet`/`list`/`values` scratch, and `Identity` has a
 /// hand-written `clone_from` that refills each field in place. `#[derive(Clone)]`'s default
 /// `clone_from` is `*self = source.clone()`, which would allocate a `Vec` per non-empty identity

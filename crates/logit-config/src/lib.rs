@@ -2817,6 +2817,24 @@ pub enum ComponentKind {
         /// `aggregate`, so this is an opt-in relay behavior.
         #[serde(default)]
         relative_gauges: bool,
+        /// What to do with a metric kind that holds more than one number: a distribution sketch
+        /// (what `aggregate` makes of timers by default), a set estimate (what it makes of sets),
+        /// a histogram, an exponential histogram, a summary, or a cumulative or non-monotonic
+        /// sum. `expand` (the default) writes one line per component, named by a dotted suffix:
+        /// `.count`, `.sum`, and `.q0_5` through `.q0_99` for a sketch, `.count` for a set,
+        /// `.count`, `.sum`, `.min`, `.max`, and `.bucket_<bound>` for a histogram, `.zero_count`
+        /// for an exponential histogram, and `.q<quantile>` for a summary. A count, sum, bucket,
+        /// or zero count from a per-window kind (a sketch, or a delta histogram) is a counter
+        /// (`|c`), which a statsd server adds up across flushes and senders; every other
+        /// component, including a set's count and every quantile, minimum, and maximum, is a
+        /// gauge (`|g`). A cumulative sum is one gauge of its running total, and a non-monotonic
+        /// delta sum is one counter, both under the metric's own name. Each expanded record is
+        /// counted as degraded, because a statsd server can't merge quantiles or set estimates
+        /// from several senders. `skip` drops these kinds instead, counted. Raw timer samples
+        /// and set members always leave as their own `ms`/`h`/`d` and `s` lines under either
+        /// setting.
+        #[serde(default)]
+        multi_value: StatsdMultiValue,
         /// Bounds one packet's worth of packed lines (several statsd lines newline-joined per
         /// send), not a single line's length: a UDP or Unix datagram, or one length-prefixed
         /// `unix_stream` packet. A byte-count string. Defaults to `"1432"`, the statsd and
@@ -3912,6 +3930,16 @@ pub enum GraphiteTags {
     #[default]
     Carbon,
     Drop,
+}
+
+/// What `statsd_out` does with a metric kind that holds more than one number: write one dotted
+/// line per component (`expand`, the default), or drop it, counted (`skip`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StatsdMultiValue {
+    Skip,
+    #[default]
+    Expand,
 }
 
 /// What `graphite_out` does with a metric kind carbon's one-number-per-datapoint wire cannot
@@ -7040,7 +7068,7 @@ mod tests {
     }
 
     #[test]
-    fn statsd_out_defaults_to_dogstatsd_over_udp_with_relative_gauges_off() {
+    fn statsd_out_defaults_to_dogstatsd_over_udp_with_relative_gauges_off_and_multi_value_expand() {
         let component: Component = serde_json::from_str(
             r#"{"type": "statsd_out", "sources": ["in"], "endpoint": "127.0.0.1:8125"}"#,
         )
@@ -7051,6 +7079,7 @@ mod tests {
                 transport,
                 format,
                 relative_gauges,
+                multi_value,
                 max_packet_bytes,
                 connect_timeout,
                 tls,
@@ -7059,11 +7088,36 @@ mod tests {
                 assert_eq!(transport, StatsdTransport::Udp);
                 assert_eq!(format, StatsdFormat::Dogstatsd);
                 assert!(!relative_gauges);
+                assert_eq!(multi_value, StatsdMultiValue::Expand);
                 assert_eq!(max_packet_bytes, 1432);
                 assert_eq!(connect_timeout, Duration::from_secs(5));
                 assert_eq!(tls, None);
             }
             other => panic!("expected StatsdOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn statsd_out_multi_value_accepts_skip_and_expand_and_rejects_other_spellings() {
+        for (spelling, expected) in
+            [("skip", StatsdMultiValue::Skip), ("expand", StatsdMultiValue::Expand)]
+        {
+            let component: Component = serde_json::from_str(&format!(
+                r#"{{"type": "statsd_out", "sources": ["in"], "endpoint": "127.0.0.1:8125",
+                    "multi_value": "{spelling}"}}"#
+            ))
+            .unwrap();
+            match component.kind {
+                ComponentKind::StatsdOut { multi_value, .. } => assert_eq!(multi_value, expected),
+                other => panic!("expected StatsdOut, got {other:?}"),
+            }
+        }
+        for spelling in ["Expand", "expanded", "drop", "true"] {
+            let result: Result<Component, _> = serde_json::from_str(&format!(
+                r#"{{"type": "statsd_out", "sources": ["in"], "endpoint": "127.0.0.1:8125",
+                    "multi_value": "{spelling}"}}"#
+            ));
+            assert!(result.is_err(), "{spelling:?} must not be accepted");
         }
     }
 
