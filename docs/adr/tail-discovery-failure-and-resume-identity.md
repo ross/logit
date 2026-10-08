@@ -290,7 +290,8 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
   - `attrs` past the envelope cap's slack dropping an entry;
   - the checkpoint pinned by the oldest held line across both streams;
   - the checkpoint pinned by a line that never ends;
-  - the shutdown tail emitted as a `bad_line`.
+  - the shutdown tail emitted as a `bad_line` (closed 2026-10-08; see [ADR
+    `file-tailing-and-docker-json-logs`](file-tailing-and-docker-json-logs.md)'s amendment).
 
   The perf items (a 64 KiB read buffer allocated per
   call, per-pass `Vec`s, byte-by-byte newline search) wait for a perf session with a tail
@@ -308,7 +309,7 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
   - A `TailDecoder` hook the splitter calls for an envelope it drops, so `docker_in` can release
     a held fragment the drop would otherwise splice onto the next line.
   - A decoder opt-out from `take_partial` at shutdown, so `docker_in` checkpoints before a torn
-    envelope instead of emitting it as a `bad_line`.
+    envelope instead of emitting it as a `bad_line`. Done 2026-10-08.
 
 ## Running it
 

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-10-04
+updated: 2026-10-08
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -565,3 +565,36 @@ once it has been draining for a `poll_interval` and a later scan has run). `read
 a read error as EOF, because a handle that keeps erroring would never be reaped otherwise, so the
 reap drops the file's unread tail. The error is diagnosed `read_error`, and the loss is a
 documented gap (`docs/known-gaps/tailing.md`). An `Active` file is never reaped on a read error.
+
+## Amendment: `docker_in` holds its unterminated tail and held fragments at a clean stop (2026-10-08)
+
+**Decision:** at a clean stop, `docker_in` emits neither its file's unterminated last line nor a
+held reassembly from an `Active` file. The final checkpoint stays at their start, and the restart
+reads them whole.
+
+Shutdown used to run `close_decoder` on every file: `take_partial` decoded the unterminated line,
+and `TailDecoder::close` flushed held fragments as a truncated event. The final checkpoint then
+covered both. dockerd always ends an envelope with `\n`, so for `docker_in` the unterminated line
+is a write in progress. The decoder rejected it as `bad_line`, and the checkpoint skipped past it,
+so the envelope was lost. A message in reassembly was split into two events, one at the stop and
+one after the restart.
+
+- `TailDecoder::hold_at_shutdown` (default `false`) lets a decoder opt in, and `DockerDecoder` does.
+  `tail_in` keeps the default, because its writer can leave an unterminated last line as final
+  data. Its split-at-a-clean-stop gap stays (`docs/known-gaps/tailing.md`).
+- A holding decoder never has `take_partial` called at shutdown. `write_checkpoint` already
+  subtracts the splitter's pending bytes, so the offset lands on the torn line's start.
+- A holding decoder's `close` is skipped only when a checkpoint is configured. `held_from` then
+  survives, and the offset is the smaller of the line boundary and `held_from`, so it lands on
+  the first held fragment. With no checkpoint nothing replays the file, so `close` still emits the
+  held fragments rather than lose them. The torn tail is still not decoded, so it raises no
+  `bad_line`.
+- Only an `Active` file holds. A `Draining` file (rotated away or removed) or a `Deselected` one
+  still emits both at a clean stop, as `reap_drained` does when it reaps one: the restart never
+  re-reads its inode, so a held checkpoint offset would lose the fragments. A `Draining` file
+  gains no more bytes, so its tail is final. Nothing more is read from a `Deselected` file in this
+  run, so what it holds is all this run will emit.
+
+The cross-stream replay gap in `docs/known-gaps/tailing.md` ("`held_from` is the oldest held
+line across both streams") now applies at a clean stop as well as after a crash. The checkpoint
+format and the config are unchanged.

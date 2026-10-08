@@ -83,7 +83,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   rename, so its rotation count can't hit this window (`crates/logit-perf/src/file_load.rs`'s
   module doc).
 - **`tail_in` splits a line held unterminated at a clean stop into two events.** Shutdown emits the
-  partial line as it stands, and the checkpoint records the end of what was read, so the rest of
+  partial line as it stands (`docker_in` holds it instead), and the checkpoint records the end of what was read, so the rest of
   the line, written later, arrives after the restart as a line of its own. The exception is a line
   being dropped for `max_line_bytes`: its checkpoint stays at its start, and it's dropped whole
   again. See
@@ -158,18 +158,13 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `crates/logit-inputs/src/docker.rs`.
 - **`held_from` is the oldest held line across both streams, so a long reassembly on one stream
   pins the checkpoint.** The other stream's lines after that offset are already emitted, and a
-  crash replays them. Replay, not loss.
+  crash or a clean stop replays them. Replay, not loss.
 - **A line that never ends pins the checkpoint while it is being dropped.** A `\r`-only progress
   bar is the case: dockerd writes it as 16 KiB partial entries but never a closing one, because
   only `\n` ends a message. A drop for `max_line_bytes` therefore runs until a newline that may
   never come, and a crash replays everything since the drop began. Replay, not loss, but
   unbounded.
   - **To close:** persist per-stream drop state in the checkpoint.
-- **At shutdown, `docker_in`'s unterminated tail is almost always a dockerd write in progress,
-  and it is emitted as a `bad_line`.** `close_decoder`'s `take_partial` turns the tail into a
-  rejected line, and the final checkpoint then skips past it, so that line's content never becomes
-  an event.
-  - **To close:** let a decoder opt out of `take_partial` at shutdown.
 - **`inotify` doesn't reliably fire over network or FUSE-backed mounts** (NFS chief among them),
   and `watch: auto` falls back to polling only on outright setup failure, not on a mount type it
   can't detect in advance.
