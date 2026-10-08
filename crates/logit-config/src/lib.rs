@@ -2685,6 +2685,14 @@ pub enum ComponentKind {
         /// `stdout` (the default), `stderr`, or a file path, which resolves against the config
         /// file's directory when relative. A file is reopened on SIGHUP before the next write, so
         /// an external log rotator can rename it.
+        ///
+        /// A write to a stdout or stderr pipe has no time bound. If the reader stops reading (a
+        /// stalled log shipper, a paused pager, a container log driver in blocking mode), the
+        /// sink stops without reporting a failure. Once its buffer fills, the default
+        /// `buffer.overflow: block` stops its sources, and every other sink fed from them stops
+        /// too. When the output matters, use `file_out` and have the reader follow the file. When
+        /// this sink is only for watching, set `buffer.overflow: drop_oldest` so a stalled reader
+        /// drops this sink's batches instead.
         #[serde(default)]
         target: StdioTarget,
         /// Which encoder writes through this sink: `human` (the default) is the readable text;
