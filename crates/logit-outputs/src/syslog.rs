@@ -39,7 +39,7 @@
 //!
 //! Per event, per field, first hit wins: the `syslog.*` attribute, then the configured default,
 //! then a format-appropriate absence (`-` for RFC 5424's NILVALUE, an omitted token for RFC 3164).
-//! `syslog.severity` outranks `log.severity` because `syslog_in`'s `map_severity` is lossy: it
+//! `syslog.severity` outranks `log.severity` because `logit_proto::syslog`'s `map_severity` is lossy: it
 //! collapses syslog's eight severities onto five `Severity` variants (0-2 all become `Fatal`, 5 and
 //! 6 both become `Info`). Preferring the raw attribute keeps a relay byte-faithful;
 //! [`syslog_severity_of`] is the fallback for a log record that didn't come from `syslog_in`.
@@ -88,7 +88,7 @@
 //! - **A duplicate SD-ID is refused, not emitted twice.** When `sd_id` already names a key of the
 //!   event's own `syslog.sd`, the opt-in element is skipped
 //!   ([`EncodeStats::dropped_sd_id_collision`], a throttled `invalid_structured_data` diagnostic
-//!   naming the collision). `syslog_in`'s `parse_structured_data` rejects a repeated SD-ID, so
+//!   naming the collision). `logit_proto::syslog`'s `parse_structured_data` rejects a repeated SD-ID, so
 //!   emitting both would make a `syslog_in -> syslog_out -> syslog_in` relay fail at the far end.
 //!
 //! **RFC 3164 output never emits STRUCTURED-DATA**, since 3164 has no such field: `syslog.sd` and

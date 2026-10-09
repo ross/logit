@@ -102,7 +102,7 @@ impl SyslogInput {
     ///
     /// Both must carry it: the driver reports transport failures (`framing_error`/
     /// `connection_error` on TCP) and the decoder reports every rejected message as `bad_line`,
-    /// on either transport, since [`Decoder::decode_into`] never fails here. Miss one and that
+    /// on either transport, since [`logit_proto::Decoder::decode_into`] never fails here. Miss one and that
     /// class of failure reports under no component id with telemetry disabled.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.inner = match self.inner {

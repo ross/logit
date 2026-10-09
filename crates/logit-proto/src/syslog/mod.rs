@@ -56,7 +56,7 @@
 //!   throttled `timestamp_out_of_range`. One that doesn't parse (`Malformed`) rejects the line.
 //!
 //! To carry the sender's time instead, place a `timestamp` transform (`format: rfc3164`, `from:
-//! syslog.timestamp`) after this input: it resolves `event.timestamp` from the attribute, and
+//! syslog.timestamp`) after `syslog_in`: it resolves `event.timestamp` from the attribute, and
 //! uses an RFC 5424 `Value::Timestamp` as-is (`docs/adr/timestamp-transform.md`).
 //!
 //! **RFC 5424 STRUCTURED-DATA becomes `syslog.sd`.** `parse_structured_data` is a quote-aware

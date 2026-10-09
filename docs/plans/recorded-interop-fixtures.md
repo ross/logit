@@ -304,7 +304,7 @@ different — `omfwd`'s `target`/`protocol` point at `raw_capture.py`'s TCP list
 Reuses `rsyslog-entrypoint.sh` unchanged, since it only ever runs whatever config is mounted at
 `/etc/rsyslog-fixture.conf`. One new fixture, `testdata/interop/syslog/rsyslog-tcp-000.raw` — see
 that directory's `README.md` for its row — and one new test,
-`interop_fixture_rsyslog_tcp_non_transparent_frame` in `crates/logit-inputs/src/tcp.rs`, which
+`interop_fixture_rsyslog_tcp_non_transparent_frame` in `crates/logit-proto/src/syslog/decode.rs`, which
 reads the fixture, pushes it through `Framer`, and decodes the resulting frame with
 `SyslogDecoder`.
 
