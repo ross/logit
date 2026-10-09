@@ -24,7 +24,8 @@ both slower and not something users should have to write by hand. This ADR is th
 ## Decision
 
 **Two distinct `ComponentKind`s/`Transform`s, `logfmt` and `kv`, sharing one module
-(`crates/logit-transforms/src/logfmt.rs`) and a scan tail (`merge_into`, `unescape`,
+(`crates/logit-transforms/src/logfmt.rs`, with its scanners in
+`crates/logit-proto/src/message/logfmt.rs`) and a scan tail (`merge_into`, `unescape`,
 `find_bytes`/`trim_ws_range`) but not a mode flag.** `keep`/`remove` and `keep_signals`/
 `drop_signals` are the existing precedent for "separate kinds sharing a module" over "one kind
 with a `mode:` field" -- the two grammars diverge enough (quoting/escaping vs. none, fixed

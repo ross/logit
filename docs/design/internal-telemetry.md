@@ -1426,7 +1426,8 @@ non-string message or `field`, non-UTF-8 bytes, or no match. No `Diagnostics`.
 
 ##### `logfmt` and `kv`
 
-`crates/logit-transforms/src/logfmt.rs`,
+`crates/logit-transforms/src/logfmt.rs` (the pair counters in
+`crates/logit-proto/src/message/logfmt.rs`),
 [ADR `logfmt-and-kv-parsing`](../adr/logfmt-and-kv-parsing.md).
 
 `logit.transform.pairs.parsed` / `.pairs.skipped`, once per pair: `.skipped` counts a pair the
