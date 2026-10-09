@@ -9,7 +9,7 @@
 
 use super::part::{self, DsValue, PartError, PartHeader};
 use super::types_db::{DataSource, TypesDb};
-use super::{cdtime_to_nanos, CDTIME_ONE_SECOND, MAX_VALUES_PER_LIST};
+use super::{cdtime_to_nanos, CDTIME_ONE_SECOND, DATA_MAX_NAME_LEN, MAX_VALUES_PER_LIST};
 use crate::{CodecError, Decoder};
 use bytes::Bytes;
 use logit_core::interner::{intern, Symbol};
@@ -20,6 +20,12 @@ use logit_core::{
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::sync::Arc;
+
+/// The most bytes of a Plugin or Type a record name carries: [`DATA_MAX_NAME_LEN`] minus the
+/// NUL, the longest string collectd's own receiver takes. A list interns one name per data
+/// source in the never-evicting interner, so a longer part would be copied there up to
+/// [`MAX_VALUES_PER_LIST`] times; the `collectd.*` attribute keeps every byte.
+const MAX_NAME_SEGMENT_BYTES: usize = DATA_MAX_NAME_LEN - 1;
 
 /// Decodes collectd binary-protocol datagrams, with no socket, so framing, stickiness, and
 /// malformed-input tests run against it directly.
@@ -325,6 +331,8 @@ impl CollectdDecoder {
 
         let plugin_bytes = &bytes[plugin.clone()];
         let type_bytes = &bytes[type_.clone()];
+        let plugin_name = &plugin_bytes[..plugin_bytes.len().min(MAX_NAME_SEGMENT_BYTES)];
+        let type_name = &type_bytes[..type_bytes.len().min(MAX_NAME_SEGMENT_BYTES)];
         // One `types.db` lookup per Values part, not per data source. It borrows `self.types_db`
         // alongside `self.name`/`self.diag` (disjoint fields), so nothing is cloned per list.
         let data_sources =
@@ -339,9 +347,9 @@ impl CollectdDecoder {
                 .expect("every data-source type byte was validated above");
 
             self.name.clear();
-            push_lossy(&mut self.name, plugin_bytes);
+            push_lossy(&mut self.name, plugin_name);
             self.name.push('.');
-            push_lossy(&mut self.name, type_bytes);
+            push_lossy(&mut self.name, type_name);
             // A single-data-source list is `<plugin>.<type>` either way, as collectd's
             // `write_graphite` omits the lone data source's name (conventionally `value`).
             match data_sources {
@@ -800,6 +808,32 @@ pub(crate) mod tests {
         let names: Vec<&str> =
             events[0].metrics.iter().map(|record| resolve(record.name)).collect();
         assert_eq!(names, vec!["load.load.0", "load.load.1", "load.load.2"]);
+    }
+
+    /// A Plugin or Type past collectd's 127 bytes is cut to 127 in the record name, which is
+    /// interned once per data source, and kept whole in its attribute.
+    #[test]
+    fn a_long_plugin_or_type_is_cut_in_the_record_name_and_kept_in_the_attribute() {
+        let plugin = vec![b'p'; 4000];
+        let type_ = "t".repeat(126) + "é";
+        let events = decode(
+            PacketBuilder::new()
+                .string(part::TYPE_HOST, b"web-1")
+                .string(part::TYPE_PLUGIN, &plugin)
+                .string(part::TYPE_TYPE, type_.as_bytes())
+                .values(&[gauge(0.1), gauge(0.2)])
+                .build(),
+        );
+        let names: Vec<&str> =
+            events[0].metrics.iter().map(|record| resolve(record.name)).collect();
+        let cut = format!("{}.{}\u{fffd}", "p".repeat(127), "t".repeat(126));
+        assert_eq!(names, vec![format!("{cut}.0"), format!("{cut}.1")]);
+        assert_eq!(
+            events[0].attributes.get(ATTR_PLUGIN).and_then(|v| v.as_str()).map(str::len),
+            Some(4000),
+            "the attribute keeps every byte"
+        );
+        assert_eq!(events[0].attributes.get(ATTR_TYPE).and_then(|v| v.as_str()), Some(&*type_));
     }
 
     #[test]

@@ -17,8 +17,8 @@
 //!   event is a value list of 1 to `MAX_VALUES_PER_LIST` records with host, plugin, and type, or
 //!   a notification with a host, a non-empty message, and a severity of 1, 2, or 4; every
 //!   attribute is a `collectd.*` key, every string a `Str` when valid UTF-8 and a `Bytes` when
-//!   not, sliced from the datagram; a record's name is `<plugin>.<type>`, with `.<i>` after it
-//!   in a list of more than one; a NaN GAUGE is a flagged `0.0`;
+//!   not, sliced from the datagram; a record's name is `<plugin>.<type>`, each cut to 127 bytes,
+//!   with `.<i>` after it in a list of more than one; a NaN GAUGE is a flagged `0.0`;
 //! - the second-generation fixed point: `W = encode(decode(x))` may differ from `x` by the
 //!   module doc's "Permitted normalizations", so the property starts at `W`, packed at
 //!   `DEFAULT_MAX_PACKET_BYTES`: decoding each datagram of `W` and encoding the events again gives
@@ -35,7 +35,8 @@ use logit_core::{
 use logit_proto::collectd::part::{self, TYPE_ENCRYPTION, TYPE_SIGNATURE};
 use logit_proto::collectd::{
     CollectdDecoder, CollectdEncoder, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE,
-    ATTR_SEVERITY, ATTR_TYPE, ATTR_TYPE_INSTANCE, DEFAULT_MAX_PACKET_BYTES, MAX_VALUES_PER_LIST,
+    ATTR_SEVERITY, ATTR_TYPE, ATTR_TYPE_INSTANCE, DATA_MAX_NAME_LEN, DEFAULT_MAX_PACKET_BYTES,
+    MAX_VALUES_PER_LIST,
 };
 use logit_proto::{CodecError, Decoder, FramedEncoder, MessageBuf};
 use std::sync::Arc;
@@ -78,9 +79,10 @@ fn framing_walk(datagram: &[u8]) -> (Vec<(usize, u16, usize)>, usize) {
     (parts, at)
 }
 
-/// `bytes` as a record name segment, as the decoder writes one: U+FFFD per invalid sequence.
+/// `bytes` as a record name segment, as the decoder writes one: its first 127 bytes, U+FFFD per
+/// invalid sequence.
 fn lossy(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+    String::from_utf8_lossy(&bytes[..bytes.len().min(DATA_MAX_NAME_LEN - 1)]).into_owned()
 }
 
 fn check_string(datagram: &Bytes, key: &str, value: &Value) -> Bytes {
