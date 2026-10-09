@@ -2091,11 +2091,17 @@ mod tests {
     /// A key can be split by the read limit itself, not only by the snippet cut, leaving a
     /// fragment `redacted_snippet`'s whole-key match can't catch. Its remnant strip bounds what
     /// such a fragment can leak to fewer than 4 bytes.
+    ///
+    /// A split fragment reaches the snippet only when the body opens with whitespace: the snippet
+    /// is cut from the trimmed body, so trimming shifts the read limit's cut inside it. Without
+    /// that, a key the read splits starts past the snippet's 256 bytes.
     #[tokio::test]
     async fn a_key_split_by_the_read_limit_leaks_no_more_than_a_few_bytes() {
-        let start = error_read_bytes(KEY) - 3;
-        let prefix = "x".repeat(start);
-        let body = format!("{prefix}{KEY}");
+        // `read_body_prefix` reads 4 bytes past `error_read_bytes`, so the read keeps the key's
+        // first 7 bytes, and the trimmed body (filler plus fragment) fits in the snippet whole.
+        let indent = " ".repeat(KEY.len() + 8);
+        let filler = "x".repeat(error_read_bytes(KEY) + 4 - 7 - indent.len());
+        let body = format!("{indent}{filler}{KEY}");
 
         let (addr, _log) = intake(move |_| (500, body.clone())).await;
         let err = sink(addr).send_at(&batch(vec![gauge(NOW)]), NOW).await.unwrap_err();
@@ -2103,6 +2109,7 @@ mod tests {
         // digits (`34563` holds `3456`), so only the response snippet after it is checked.
         let message = format!("{err:#}");
         let (_, snippet) = message.split_once("): ").expect("a response snippet");
+        assert!(snippet.starts_with(&filler), "{message}");
         assert!(!contains_key_run_longer_than(snippet, KEY, 3), "{message}");
     }
 
