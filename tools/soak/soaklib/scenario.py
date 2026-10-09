@@ -553,9 +553,9 @@ def private_env_copy(env_file, names):
     show it."""
     values = read_env_file(env_file)
     directory = tempfile.mkdtemp(prefix=PRIVATE_ENV_PREFIX)
+    # `mkstemp` creates the file 0600.
     fd, path = tempfile.mkstemp(suffix=".env", dir=directory)
     with os.fdopen(fd, "w") as out:
-        os.fchmod(out.fileno(), 0o600)
         for name in names:
             if name in values:
                 out.write(f"{name}={values[name]}\n")
@@ -583,6 +583,39 @@ def missing_env(scenario, env_file):
     except OSError:
         return list(scenario.target["env"])
     return [name for name in scenario.target["env"] if not values.get(name, "").strip()]
+
+
+# Compose reads the private copy with dotenv rules: `$NAME` interpolates, ` #` starts a
+# comment, quotes and `\` are parsed, and an unmatched quote fails `up` with an error that
+# quotes the value. A value free of these reaches the SUT as written.
+_COMPOSE_ALTERED = (("$", "a `$`"), ("'", "a single quote"), ('"', "a double quote"),
+                    ("`", "a backtick"), ("\\", "a backslash"), ("#", "a `#`"))
+
+
+def unsafe_env(scenario, env_file):
+    """`NAME contains <kind of character>` for each `[target] env` variable whose value in
+    `env_file` holds a character compose's env-file parser would alter or reject, in the
+    scenario's order. Names only, so no caller can print a value; a file that can't be read
+    yields nothing, since `missing_env` reports it."""
+    if not scenario.external or not scenario.target["env"]:
+        return []
+    try:
+        values = read_env_file(env_file)
+    except OSError:
+        return []
+    problems = []
+    for name in scenario.target["env"]:
+        value = values.get(name, "")
+        kinds = [label for char, label in _COMPOSE_ALTERED if char in value]
+        if any(char.isspace() for char in value):
+            kinds.append("whitespace")
+        if kinds:
+            problems.append(f"{name} contains {', '.join(kinds)}")
+    return problems
+
+
+UNSAFE_ENV_REASON = ("compose reads the env file with dotenv rules and would alter or reject "
+                     "such a value")
 
 
 def _parse_random(table, problems, dur):

@@ -129,19 +129,26 @@ script/soak run statsd-datadog
 - `SOAK_EXTERNAL_ENV=<file>` names another file, such as a shell file of dev secrets. The
   script refuses a file git doesn't ignore, asking the repository the file is in, because it
   holds credentials; everything under `perf/results/` is ignored, and a file in no repository
-  passes.
+  passes. Any other git failure, such as `git` missing from `PATH` or a repository that
+  `safe.directory` rejects, is refused with git's message.
 - The file can be plain or shell-sourceable: `NAME=value` or `export NAME=value` lines, `#`
   comment lines, and blank lines. One pair of matching single or double quotes around a value
   is removed, and nothing inside them is expanded. A `#` after a value is part of the value. A
   name set twice takes its last value.
 - The script refuses to start when the file doesn't set a listed variable or sets it empty,
   and names the variable, never its value.
+- The script also refuses a listed value that contains `$`, a single or double quote, a
+  backtick, `\`, `#`, or whitespace, naming the variable and the kind of character. Compose
+  reads the private copy below with dotenv rules, so it would expand `$NAME`, cut a value at
+  ` #`, parse quotes and `\`, and fail on an unmatched quote with an error that quotes the
+  value. A value without those characters reaches the SUT as written.
 - Docker never reads your file. The script writes the listed variables as plain `NAME=value`
   lines to a private copy, mode 0600 in a new temporary directory outside the repo, for
   `logit validate`'s `--env-file`, and removes it before the run starts. The driver makes its
   own copy for compose's second `--env-file` and removes it when the run ends. No value goes
-  on a command line, and the run directory never holds one. A run killed with SIGKILL leaves
-  its copy in the temporary directory (`soak-env-*`). Each `inspect/<svc>.json` has every
+  on a command line, and the run directory never holds one. Only a run killed with SIGKILL
+  leaves its copy in the temporary directory (`soak-env-*`); SIGINT, SIGTERM, and SIGHUP
+  remove it. Each `inspect/<svc>.json` has every
   `Config.Env` value replaced by `<redacted>`, because the SUT's environment carries the key.
 - A variable reaches the SUT only when `compose.yaml` passes it in the `logit` service's
   `environment:`. Today that's `DD_API_KEY`, and the scenario check refuses any other name in

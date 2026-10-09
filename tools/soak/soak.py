@@ -91,7 +91,8 @@ def cmd_check(args):
 
 def cmd_target(args):
     """Prints the scenario's target kind, for script/soak. With `--env-file`, exits 1 naming each
-    `[target] env` variable the file doesn't set or sets empty, never a value; with
+    `[target] env` variable the file doesn't set, sets empty, or sets to a value compose would
+    alter, never a value; with
     `--private-copy` too, writes those variables to a private plain copy and prints its path,
     which the caller removes with its directory."""
     try:
@@ -106,6 +107,11 @@ def cmd_target(args):
     if missing:
         print(f"soak: external target {loaded.target['name']}: {args.env_file} doesn't set "
               f"{', '.join(missing)}", file=sys.stderr)
+        return 1
+    unsafe = scenario.unsafe_env(loaded, args.env_file)
+    if unsafe:
+        print(f"soak: external target {loaded.target['name']}: in {args.env_file}, "
+              f"{'; '.join(unsafe)}; {scenario.UNSAFE_ENV_REASON}", file=sys.stderr)
         return 1
     if args.private_copy:
         print(scenario.private_env_copy(args.env_file, loaded.target["env"]))

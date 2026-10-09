@@ -225,7 +225,6 @@ class Run:
                            self.duration, self.seed, self.argv, self.seed_source)
         self.say(f"run directory {self.run_dir}")
         ended = None
-        interrupt_on_signals()
         try:
             self.up()
             self.loop()
@@ -619,7 +618,15 @@ def run(root, scenario_path, duration, seed, keep, out_dir, argv, image, externa
             raise scenario_mod.ScenarioError([
                 f"external target {scenario.target['name']}: {external_env} doesn't set "
                 f"{', '.join(missing)} (set SOAK_EXTERNAL_ENV to another file)"])
+        unsafe = scenario_mod.unsafe_env(scenario, external_env)
+        if unsafe:
+            raise scenario_mod.ScenarioError([
+                f"external target {scenario.target['name']}: in {external_env}, "
+                f"{'; '.join(unsafe)}; {scenario_mod.UNSAFE_ENV_REASON}"])
     run = Run(root, scenario, duration, seed, keep, out_dir, argv, image, external_env)
+    # Before `prepare()` writes the private env copy, so a SIGTERM or SIGHUP from here on
+    # unwinds through the code that removes it.
+    interrupt_on_signals()
     try:
         run.prepare()
     except BaseException:

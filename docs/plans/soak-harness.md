@@ -686,15 +686,22 @@ fixed or random, on `victoria-metrics`, which an external target's stack doesn't
 `perf/results/soak-external.env`, as `script/splunk-interop`'s cloud mode reads its env file.
 The file can be in shell form: `scenario.read_env_file`'s docstring is the grammar (`export`
 lines, one pair of quotes removed, `#` comments). It refuses a file the repository holding it
-doesn't ignore, and one that doesn't set a listed variable or sets it empty, naming the
-variable and never its value (`soak.py target <scenario> --env-file`, which the driver
-repeats). Docker never reads the operator's file, because neither `docker run --env-file` nor
-compose's reliably reads an `export` line or strips quotes. The script writes the listed
+doesn't ignore, and a git failure other than "not a git repository" rather than reading it as
+no repository. It refuses a file that doesn't set a listed variable or sets it empty, and one
+that sets a listed variable to a value containing `$`, `'`, `"`, a backtick, `\`, `#`, or
+whitespace, naming the variable (and the kind of character) and never its value
+(`soak.py target <scenario> --env-file`, which the driver repeats before any docker command).
+Compose reads the private copy below with dotenv rules: it interpolates `$NAME`, cuts a value
+at ` #`, parses quotes and `\`, and fails `up` on an unmatched quote with an error that quotes
+the value, which the driver would record in `timeline.jsonl`. A value without those characters
+stays literal. Docker never reads the operator's file, because neither `docker run --env-file`
+nor compose's reliably reads an `export` line or strips quotes. The script writes the listed
 variables as plain `KEY=value` lines to a private copy (mode 0600, in a new temporary directory
 outside the repo and the run directory) for `logit validate` and removes it before the driver
 starts; the driver writes its own for every `compose` call's second `--env-file` and removes it
-when `execute()` returns. No value is passed as a command-line argument, and the run directory
-holds none.
+when `execute()` returns or `prepare()` raises. The driver installs its SIGTERM and SIGHUP
+handlers before it writes the copy, so only a SIGKILL leaves one behind. No value is passed as
+a command-line argument, and the run directory holds none.
 
 **The driver.** Compose runs without the `local` profile, so without `victoria-metrics`. The
 driver skips VictoriaMetrics' `/health` poll, the freshness samples, `force_flush`, the quiet
@@ -1465,9 +1472,12 @@ What the run showed:
   same rows, every detail included. `check` on a synthetic 8-hour run directory finishes in
   seconds. W4 is done once a 1-hour `random-faults` run and an 8-hour one are recorded under
   "Findings"; neither has been made yet.
-- **W5**: the self-test passes, and each new rule fails it when reverted (50 reverts: every
+- **W5**: the self-test passes, and each new rule fails it when reverted (60 reverts: every
   `[target]` validation rule, the env file check and its parsing (`export` lines and quotes
-  included), the private copy's directory, mode, content, and removal, the compose arguments and
+  included), each kind of character the compose check refuses and that check in both
+  `soak.py target` and the driver, the private copy's directory, a mode other than 0600, its
+  content, and its removal when `execute()` returns and when `prepare()` raises, the signal
+  handlers installed before `prepare()`, the compose arguments and
   profiles, compose.yaml's profile, passthrough, and optional dependency, the sink-drain wait's
   three conditions and interval, each SKIP, and each `ledger.sent` verdict). `statsd-datadog`
   passes `self-test` validation, the shipped-config test, and `logit validate` in `logit:soak`

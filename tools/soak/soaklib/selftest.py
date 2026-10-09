@@ -1894,6 +1894,86 @@ def _target_rules(root):
         except scenario.ScenarioError as err:
             expect("doesn't set DD_API_KEY" in str(err) and "abc" not in str(err),
                    f"a run names the missing variable, got {err}")
+        _unsafe_env(root, loaded, env, path, tmp)
+        _prepare_raises(root, path, env, tmp)
+
+
+def _unsafe_env(root, loaded, env, path, tmp):
+    """A listed value holding a character compose's env-file parser alters or rejects is
+    refused by name, by `unsafe_env`, `soak.py target --env-file`, and `driver.run`."""
+    env.write_text("DD_API_KEY=FAKEkey0123\n")
+    expect(scenario.unsafe_env(loaded, env) == [], "a plain value passes the compose check")
+    cases = [("$", "a `$`"), ("'", "a single quote"), ('"', "a double quote"),
+             ("`", "a backtick"), ("\\", "a backslash"), ("#", "a `#`"), (" ", "whitespace"),
+             ("\t", "whitespace")]
+    for char, label in cases:
+        env.write_text(f"DD_API_KEY=FAKE{char}key\n")
+        got = scenario.unsafe_env(loaded, env)
+        expect(got == [f"DD_API_KEY contains {label}"],
+               f"a value with {label} is refused by name, got {got}")
+    env.write_text("export DD_API_KEY=\"FAKEkey0123\n")
+    out = subprocess.run([sys.executable, str(root / "soak.py"), "target", "statsd-datadog",
+                          "--env-file", str(env), "--private-copy"],
+                         capture_output=True, text=True, timeout=60)
+    if out.stdout.strip():
+        scenario.remove_private_env(Path(out.stdout.strip()))
+    expect(out.returncode == 1 and out.stdout == ""
+           and "DD_API_KEY contains a double quote" in out.stderr
+           and "FAKEkey" not in out.stderr,
+           f"soak.py target refuses an unmatched quote by name and writes no copy, got "
+           f"{out.returncode} {out.stdout!r} {out.stderr.strip()[-300:]!r}")
+
+    class Refused(Exception):
+        pass
+
+    def no_docker(*args, **kwargs):
+        raise Refused()
+
+    # With the check removed, the run must stop here rather than reach the daemon.
+    real_docker, real_signals = driver.Docker, driver.interrupt_on_signals
+    driver.Docker, driver.interrupt_on_signals = no_docker, lambda: None
+    try:
+        driver.run(root, path, None, None, False, Path(tmp) / "unsafe", [], "logit:soak", env)
+        expect(False, "a run with a quote in DD_API_KEY started")
+    except Refused:
+        expect(False, "a run with a quote in DD_API_KEY reached prepare()")
+    except scenario.ScenarioError as err:
+        expect("DD_API_KEY contains a double quote" in str(err) and "FAKEkey" not in str(err)
+               and not (Path(tmp) / "unsafe").exists(),
+               f"a run refuses an unsafe value by name before it writes anything, got {err}")
+    finally:
+        driver.Docker, driver.interrupt_on_signals = real_docker, real_signals
+
+
+def _prepare_raises(root, path, env, tmp):
+    """`driver.run` installs its signal handlers before `prepare()`, and removes the private
+    env copy when `prepare()` raises after writing it."""
+    env.write_text("DD_API_KEY=FAKEkey0123\n")
+    order = []
+
+    class Raising:
+        def __init__(self, project, compose_file, env_files, profiles=(), prefix=None):
+            order.append(("docker", Path(env_files[-1])))
+            raise RuntimeError("no daemon")
+
+    real_docker, real_signals = driver.Docker, driver.interrupt_on_signals
+    driver.Docker = Raising
+    driver.interrupt_on_signals = lambda: order.append(("signals", None))
+    try:
+        driver.run(root, path, None, None, False, Path(tmp) / "raises", [], "logit:soak", env)
+        expect(False, "a run whose Docker constructor raised returned")
+    except RuntimeError:
+        pass
+    finally:
+        driver.Docker, driver.interrupt_on_signals = real_docker, real_signals
+    kinds = [kind for kind, _ in order]
+    expect(kinds == ["signals", "docker"],
+           f"run() installs its signal handlers before prepare(), got {kinds}")
+    copies = [copy_path for kind, copy_path in order if kind == "docker"]
+    expect(len(copies) == 1 and copies[0].parent.name.startswith(scenario.PRIVATE_ENV_PREFIX)
+           and not copies[0].parent.exists(),
+           f"run() removes the private env copy when prepare() raises after writing it, got "
+           f"{copies}")
 
 
 class _BusyDocker:

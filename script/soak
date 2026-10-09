@@ -67,14 +67,24 @@ if [ "$(python3 "${TOOLS_DIR}/soak.py" target "${scenario}")" = external ]; then
     EXTERNAL_ENV="$(readlink -f -- "${EXTERNAL_ENV}")"
     # The file holds credentials, so it must be one git would never commit: the check asks the
     # repository the file is in, which for a file outside this worktree isn't this one. A file
-    # in no repository can't be committed.
+    # in no repository can't be committed. Any other git failure, such as a repository
+    # safe.directory rejects, is refused rather than read as no repository.
     env_dir="$(dirname -- "${EXTERNAL_ENV}")"
-    if git -C "${env_dir}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
-        && ! git -C "${env_dir}" check-ignore -q "${EXTERNAL_ENV}"; then
-        echo "soak: ${EXTERNAL_ENV} is not git-ignored; keep credentials under perf/results/" >&2
+    if ! command -v git >/dev/null 2>&1; then
+        echo "soak: git isn't on PATH, and it checks that ${EXTERNAL_ENV} is git-ignored" >&2
         exit 1
     fi
-    # Names each variable the file doesn't set, never a value, and prints the copy's path.
+    if git_err="$(LC_ALL=C git -C "${env_dir}" rev-parse --is-inside-work-tree 2>&1 >/dev/null)"; then
+        if ! git -C "${env_dir}" check-ignore -q "${EXTERNAL_ENV}"; then
+            echo "soak: ${EXTERNAL_ENV} is not git-ignored; keep credentials under perf/results/" >&2
+            exit 1
+        fi
+    elif [[ "${git_err}" != *"not a git repository"* ]]; then
+        echo "soak: can't tell whether ${EXTERNAL_ENV} is git-ignored: ${git_err}" >&2
+        exit 1
+    fi
+    # Names each variable the file doesn't set or sets to a value compose would alter, never a
+    # value, and prints the copy's path.
     env_copy="$(python3 "${TOOLS_DIR}/soak.py" target "${scenario}" --env-file "${EXTERNAL_ENV}" --private-copy)"
     export SOAK_EXTERNAL_ENV="${EXTERNAL_ENV}"
     validate_env=(--env-file "${env_copy}")
