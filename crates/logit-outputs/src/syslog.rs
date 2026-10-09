@@ -88,8 +88,9 @@
 //! - **A duplicate SD-ID is refused, not emitted twice.** When `sd_id` already names a key of the
 //!   event's own `syslog.sd`, the opt-in element is skipped
 //!   ([`EncodeStats::dropped_sd_id_collision`], a throttled `invalid_structured_data` diagnostic
-//!   naming the collision). `logit_proto::syslog`'s `parse_structured_data` rejects a repeated SD-ID, so
-//!   emitting both would make a `syslog_in -> syslog_out -> syslog_in` relay fail at the far end.
+//!   naming the collision). `logit_proto::syslog`'s `parse_structured_data` fails the RFC 5424
+//!   parse on a repeated SD-ID, so emitting both would make the far end of a
+//!   `syslog_in -> syslog_out -> syslog_in` relay read the line as RFC 3164 and lose its structure.
 //!
 //! **RFC 3164 output never emits STRUCTURED-DATA**, since 3164 has no such field: `syslog.sd` and
 //! the opt-in element are dropped on a `5424 -> 3164` relay. That's a permitted normalization (a
@@ -859,8 +860,9 @@ fn write_structured_data(
         let has_extra_attrs =
             attrs.iter().any(|(sym, _)| !interner::resolve(sym).starts_with("syslog."));
         if has_extra_attrs {
-            // `syslog_in` rejects a repeated SD-ID, so on a collision the origin's element wins
-            // and the opt-in one is dropped rather than make the far end reject the line.
+            // `syslog_in` reads a line with a repeated SD-ID as RFC 3164, so on a collision the
+            // origin's element wins and the opt-in one is dropped rather than make the far end
+            // lose the line's structure.
             let collides = matches!(
                 attrs.get("syslog.sd"),
                 Some(Value::Map(sd)) if sd.get(&cfg.sd_id).is_some()
@@ -3050,7 +3052,7 @@ mod tests {
     }
 
     /// On an SD-ID collision the origin's element wins and the opt-in one is dropped and counted,
-    /// since `syslog_in` rejects a repeated SD-ID.
+    /// since `syslog_in` reads a line with a repeated SD-ID as RFC 3164.
     #[test]
     fn structured_data_skips_the_opt_in_element_when_its_sd_id_collides_with_an_existing_one() {
         let mut attrs = AttrMap::new();

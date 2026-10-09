@@ -56,14 +56,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)), so a `0x0A` inside
     an octet-counted MSG survives end to end. The HAProxy CBOR entry records why the decoder that
     would consume such a payload was measured and not built.
-- **A tag-less RFC 3164 message whose MSG starts with `1 ` is dropped as malformed RFC 5424.**
-  `<14>1 worker died` is what Python's `SysLogHandler` sends for a message starting `1 `, and it
-  matches the RFC 5424 dialect sniff (`crates/logit-proto/src/syslog/mod.rs`'s "Dialect
-  disambiguation"). Version `1` is the one RFC 5424 version, so a line that fails to parse as it
-  is rejected (`bad_line`) instead of reparsed as RFC 3164, and nothing on the line tells the two
-  apart. A MSG starting with any other digit and a space falls back to RFC 3164 and is kept.
-  - **Workaround:** give the sender a tag (`SysLogHandler.ident`, or `logger -t`), or a timestamp,
-    so the line doesn't start with a digit after `<PRI>`.
 - **Non-goal: no cap on STRUCTURED-DATA elements or PARAMs per line.** `parse_structured_data`
   (`crates/logit-proto/src/syslog/decode.rs`) reads the line in one forward pass that never
   recurses or backtracks, and the line is bounded by the frame cap (`MAX_FRAME_BYTES`, 64 KiB) or

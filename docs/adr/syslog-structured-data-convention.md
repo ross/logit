@@ -66,16 +66,19 @@ has:
   legitimate literal backslash as the start of an escape it doesn't recognize.
   `PARAM-VALUE` is then required to be valid UTF-8 once unescaped (it's defined as
   `UTF-8-STRING`).
-- **Duplicate `SD-ID` rejects the line.** An `SD-ID` repeated within one message has no defined
-  merge between the two elements sharing it, so this parser rejects the whole line rather than
-  silently picking one (last-wins or first-wins would both be a guess the RFC doesn't license).
-- **Any other grammar violation rejects the whole line** — a missing `=`, a missing opening or
-  closing quote, an unterminated element, an SD-NAME outside 1..=32 PRINTUSASCII-minus-`=SP]"` —
-  with a `bad_line` diagnostic naming what was violated and its byte offset. This is the same
-  strictness every other malformed RFC 5424 field on the line already gets (a bad PRI, a bad
-  TIMESTAMP): STRUCTURED-DATA is not a special, more-tolerant case. The exceptions are the
-  leniencies that lose nothing, such as an unescaped `]` inside a quoted PARAM-VALUE, which
-  `crates/logit-proto/src/syslog/mod.rs`'s "Leniencies" lists.
+- **Duplicate `SD-ID` fails the line's RFC 5424 parse.** An `SD-ID` repeated within one message
+  has no defined merge between the two elements sharing it, so this parser fails the whole RFC
+  5424 parse rather than silently picking one (last-wins or first-wins would both be a guess the
+  RFC doesn't license).
+- **Any other grammar violation fails the whole RFC 5424 parse** — a missing `=`, a missing
+  opening or closing quote, an unterminated element, an SD-NAME outside 1..=32
+  PRINTUSASCII-minus-`=SP]"`. This is the same strictness every other malformed RFC 5424 field on
+  the line already gets (a bad TIMESTAMP): STRUCTURED-DATA is not a special, more-tolerant case.
+  A line that fails the RFC 5424 parse is read as RFC 3164 instead, its whole remainder after PRI
+  kept as MSG and no `syslog.sd` stamped, with a `sniff_fallback` diagnostic naming what was
+  violated and its byte offset (`crates/logit-proto/src/syslog/mod.rs`'s "Dialect
+  disambiguation"). The exceptions are the leniencies that lose nothing, such as an unescaped `]`
+  inside a quoted PARAM-VALUE, which that module doc's "Leniencies" lists.
 
 ### Emit rules (`crates/logit-outputs/src/syslog.rs`'s `write_structured_data`, `write_sd_element`, `write_sd_param`, `push_sd_escaped`)
 
@@ -110,11 +113,11 @@ has:
   **SD-ID collision.** RFC 5424's grammar permits `@` inside an ordinary `SD-ID`, so a peer that
   happens to use the same PEN-qualified id `syslog_out` was configured with would otherwise make
   the sink emit two SD-ELEMENTs sharing one SD-ID, which §6.3.1 forbids and which `syslog_in`
-  rejects outright. The encoder guards against it: when `structured_data.sd_id` already appears as
-  a key of the event's own `syslog.sd`, the opt-in element is skipped for that event, counted under
-  `dropped_sd_id_collision`, and reported through the throttled `invalid_structured_data` diagnostic
-  naming the collision. The origin's element wins because it is real data; the opt-in element is
-  a convenience the operator can rename.
+  reads as RFC 3164, losing the structure. The encoder guards against it: when
+  `structured_data.sd_id` already appears as a key of the event's own `syslog.sd`, the opt-in
+  element is skipped for that event, counted under `dropped_sd_id_collision`, and reported through
+  the throttled `invalid_structured_data` diagnostic naming the collision. The origin's element
+  wins because it is real data; the opt-in element is a convenience the operator can rename.
 
 ### Timestamp precedence
 
@@ -177,10 +180,10 @@ at all.
   event carrying it, and answers "what bytes arrived" rather than "does the information survive."
 - **Lenient SD parsing that tolerates grammar errors** (skip a malformed element rather than
   reject the line, or accept an SD-NAME outside the 32-byte limit). Rejected on two grounds:
-  consistency with every other RFC 5424 field this dialect already parses strictly (a bad PRI or
-  TIMESTAMP rejects the line, not just the field), and a lenient parse can't be inverted exactly —
-  `syslog_out` would have no faithful way to re-emit whatever was tolerated, breaking the
-  byte-faithful relay this convention exists to enable.
+  consistency with every other RFC 5424 field this dialect already parses strictly (a bad
+  TIMESTAMP fails the whole RFC 5424 parse, not only the field), and a lenient parse can't be
+  inverted exactly — `syslog_out` would have no faithful way to re-emit whatever was tolerated,
+  breaking the byte-faithful relay this convention exists to enable.
 - **Shipping a default private enterprise number** (e.g. RFC 5424's own `32473` example) for the
   opt-in `structured_data` element. Rejected: `32473` was never assigned to this project — silently
   minting SD-ELEMENTs under it would misrepresent their origin to any receiver that looks the PEN

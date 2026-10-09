@@ -1806,21 +1806,19 @@ fn syslog_survives_seeded_bit_flips_over_every_capture() {
     }
 }
 
-/// RFC 5424 §6.3.3 caps an SD-NAME at 32 bytes, for an SD-ID and a PARAM-NAME alike.
+/// RFC 5424 §6.3.3 caps an SD-NAME at 32 bytes, for an SD-ID and a PARAM-NAME alike. A line past
+/// it isn't RFC 5424, so it falls back to RFC 3164 with its whole MSG and no `syslog.sd`.
 #[test]
-fn syslog_sd_names_are_accepted_at_32_bytes_and_rejected_at_33() {
+fn syslog_sd_names_are_accepted_at_32_bytes_and_fall_back_at_33() {
     let (at, past) = ("i".repeat(32), "i".repeat(33));
     for (id, param) in [(&at, &at), (&past, &at), (&at, &past)] {
         let line = format!(r#"<134>1 - - - - - [{id} {param}="v"] msg"#);
-        let events = syslog_decode(line.as_bytes());
+        let event = syslog_event(line.as_bytes());
         let fits = id.len() <= 32 && param.len() <= 32;
-        assert_eq!(
-            events.len(),
-            usize::from(fits),
-            "SD-ID {} and PARAM-NAME {}",
-            id.len(),
-            param.len()
-        );
+        let label = format!("SD-ID {} and PARAM-NAME {}", id.len(), param.len());
+        assert_eq!(event.attributes.get("syslog.sd").is_some(), fits, "{label}");
+        let message = if fits { "msg" } else { &line[5..] };
+        assert_eq!(syslog_message(&event), message, "{label}");
     }
 }
 
@@ -1846,10 +1844,11 @@ fn syslog_a_thousand_repeated_param_names_fold_into_one_array_in_order() {
     assert_eq!(syslog_message(&event), "msg");
 }
 
-/// A PARAM-VALUE cut off at the end of the input, in its body or right after a backslash, is a
-/// rejected line under either mode, never a panic or an index past the end.
+/// A PARAM-VALUE cut off at the end of the input, in its body or right after a backslash, fails
+/// the RFC 5424 parse under either mode, never a panic or an index past the end, and the line
+/// falls back to RFC 3164 with its whole MSG.
 #[test]
-fn syslog_a_param_value_cut_off_at_the_end_of_the_input_rejects_the_line() {
+fn syslog_a_param_value_cut_off_at_the_end_of_the_input_falls_back() {
     for line in [
         &br#"<134>1 - - - - - [a@1 k="abc"#[..],
         br#"<134>1 - - - - - [a@1 k="abc\"#,
@@ -1859,7 +1858,9 @@ fn syslog_a_param_value_cut_off_at_the_end_of_the_input_rejects_the_line() {
         for splitting in [true, false] {
             let mut out = Vec::new();
             syslog_decoder(splitting).decode_into(Bytes::from_static(line), 0, &mut out).unwrap();
-            assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(line));
+            assert_eq!(out.len(), 1, "{:?}", String::from_utf8_lossy(line));
+            assert!(out[0].attributes.get("syslog.sd").is_none());
+            assert_eq!(syslog_message(&out[0]).as_bytes(), &line[5..]);
         }
     }
 }
@@ -1895,9 +1896,8 @@ fn syslog_rfc3164_timestamp_needs_all_15_bytes() {
 }
 
 /// A tag-less RFC 3164 MSG starting with a digit and a space, against the dialect sniff
-/// (`crates/logit-proto/src/syslog/mod.rs`'s "Dialect disambiguation"): any digit but `1` falls
-/// back to RFC 3164 with a `sniff_fallback`; two digits never sniff; `1` is rejected as malformed
-/// RFC 5424, the gap `docs/known-gaps/syslog.md` records.
+/// (`crates/logit-proto/src/syslog/mod.rs`'s "Dialect disambiguation"): any digit, `1` included,
+/// falls back to RFC 3164 with a `sniff_fallback`, and two digits never sniff.
 #[test]
 fn syslog_a_digit_led_rfc3164_msg_against_the_dialect_sniff() {
     let registry = logit_core::Registry::new();
@@ -1915,7 +1915,13 @@ fn syslog_a_digit_led_rfc3164_msg_against_the_dialect_sniff() {
         (out, keys)
     };
 
-    for line in [&b"<13>4 requests failed"[..], b"<13>0 a b c", b"<13>9 lives"] {
+    for line in [
+        &b"<13>4 requests failed"[..],
+        b"<13>0 a b c",
+        b"<13>9 lives",
+        b"<14>1 worker died",
+        b"<13>1 2 3 msg",
+    ] {
         let (events, keys) = decode_with_diag(line);
         assert_eq!(events.len(), 1, "{:?}", String::from_utf8_lossy(line));
         assert_eq!(syslog_message(&events[0]), std::str::from_utf8(&line[4..]).unwrap());
@@ -1925,10 +1931,6 @@ fn syslog_a_digit_led_rfc3164_msg_against_the_dialect_sniff() {
     let (events, keys) = decode_with_diag(b"<13>10 workers started");
     assert_eq!(syslog_message(&events[0]), "10 workers started");
     assert!(keys.is_empty(), "a two-digit token never sniffs as RFC 5424: {keys:?}");
-
-    let (events, keys) = decode_with_diag(b"<14>1 worker died");
-    assert!(events.is_empty(), "version 1 never falls back");
-    assert_eq!(keys, ["bad_line"]);
 }
 
 /// The input that makes the most events per byte: `<0>`, the shortest accepted line, and its `LF`,

@@ -17,19 +17,17 @@
 //! the only version it defines and the only one any sender writes, so the sniff reads one digit: a
 //! two- or three-digit token (`<13>10 workers started`) comes only from a tag-less RFC 3164 MSG,
 //! and parses as RFC 3164. The sniff is still a guess, since a tag-less RFC 3164 MSG starting
-//! `4 requests failed` matches it too. After a match:
+//! `4 requests failed` matches it too, and so does `<14>1 worker died`, the shape Python's
+//! `SysLogHandler` sends for a message starting `1 `.
 //!
-//! - **Version `1`:** a failed RFC 5424 parse rejects the line as malformed RFC 5424. That
-//!   includes a tag-less RFC 3164 MSG starting `1 ` (`<14>1 worker died`, the shape Python's
-//!   `SysLogHandler` sends), which nothing on the line tells apart from a malformed RFC 5424 line
-//!   (`docs/known-gaps/syslog.md`).
-//! - **Any other digit, `0` included:** a failed parse is taken for a false-positive sniff, and the
-//!   line is reparsed as RFC 3164 (whose parse never fails) with a throttled `sniff_fallback`
-//!   diagnostic. A line that parses is RFC 5424, with no diagnostic, and its VERSION isn't kept:
-//!   `syslog_out` writes `1`. `0` is outside RFC 5424's grammar and is read the same way.
-//!
-//! So each RFC 5424 field rejection below rejects a version-`1` line and sends any other version
-//! to the RFC 3164 fallback.
+//! **A line that sniffs as RFC 5424 but doesn't parse as one is RFC 3164**, whatever its version:
+//! it is reparsed as RFC 3164, whose parse never fails and keeps every byte (a tag-less line's
+//! whole remainder after PRI is its MSG), with a throttled `sniff_fallback` naming the RFC 5424
+//! rule it broke. Rejecting the line would drop a real sender's message, and the diagnostic still
+//! surfaces a malformed RFC 5424 sender. So below, a field that *fails the RFC 5424 parse* sends
+//! the line to this fallback. A line that parses is RFC 5424, with no diagnostic, and its VERSION
+//! isn't kept: `syslog_out` writes `1`. `0` is outside RFC 5424's grammar and is read the same
+//! way.
 //!
 //! ## Mapping
 //!
@@ -63,7 +61,8 @@
 //!   RFC 3164's absent timestamp, which omits the attribute.
 //! - A well-formed RFC 5424 TIMESTAMP outside the `i64`-nanosecond range
 //!   (`TimestampError::OutOfRange`) keeps the event, omits `syslog.timestamp`, and reports a
-//!   throttled `timestamp_out_of_range`. One that doesn't parse (`Malformed`) rejects the line.
+//!   throttled `timestamp_out_of_range`. One that doesn't parse (`Malformed`) fails the RFC 5424
+//!   parse.
 //!
 //! To carry the sender's time instead, place a `timestamp` transform (`format: rfc3164`, `from:
 //! syslog.timestamp`) after `syslog_in`: it resolves `event.timestamp` from the attribute, and
@@ -84,8 +83,8 @@
 //!   `Value::Array` of `Value::Str` in wire order.
 //! - `PARAM-VALUE` is a quoted UTF-8 string in which only `\"`, `\\`, and `\]` are escapes,
 //!   unescaped on decode; a backslash before any other byte is kept, with that byte.
-//! - Any other violation rejects the line, with a `bad_line` naming the rule and its byte offset,
-//!   apart from the leniencies under "Leniencies".
+//! - Any other violation fails the RFC 5424 parse, and the `sniff_fallback` names the rule and its
+//!   byte offset, apart from the leniencies under "Leniencies".
 //!
 //! **A leading RFC 5424 §6.4 UTF-8 BOM (`EF BB BF`) on MSG is stripped**, so it doesn't leak into
 //! `log.message` as U+FEFF: it is a `MSG-UTF8` signal, not payload. It is stripped only when the
@@ -95,7 +94,7 @@
 //! bytes.** `decode_into` splits on the `\n` byte with no whole-line UTF-8 check. PRI is ASCII
 //! digits, and the RFC 3164 timestamp is ASCII by its shape check. RFC 5424's HOSTNAME, APP-NAME,
 //! PROCID, MSGID, and STRUCTURED-DATA names are PRINTUSASCII by grammar and validated where
-//! extracted, and a violation rejects the line. RFC 3164 gives HOSTNAME no character set, so an
+//! extracted, and a violation fails the RFC 5424 parse. RFC 3164 gives HOSTNAME no character set, so an
 //! RFC 3164 HOSTNAME is any valid UTF-8 without a space, which keeps a non-ASCII hostname; its TAG
 //! and PID are `is_tag_shaped`'s classes. RFC 3164's header parse never fails, because the sniff
 //! fallback depends on that: a non-UTF-8 RFC 3164 HOSTNAME candidate is left unstamped with a
@@ -135,8 +134,10 @@
 //!
 //! ## Leniencies
 //!
-//! Each of these accepts a line the RFC grammar rejects and loses nothing doing so. Every other
-//! departure from the grammar above rejects the line.
+//! Each of these reads a line as RFC 5424 where the RFC grammar wouldn't, and loses nothing doing
+//! so. Every other departure from the RFC 5424 grammar above fails the RFC 5424 parse, and the
+//! line falls back to RFC 3164 ("Dialect disambiguation"). Only a malformed PRI rejects a line,
+//! as a throttled `bad_line`.
 //!
 //! - **RFC 5424 header.**
 //!   - An empty field (two spaces in a row) is read as nil: HOSTNAME, APP-NAME, PROCID, and MSGID

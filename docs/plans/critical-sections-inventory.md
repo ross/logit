@@ -5873,7 +5873,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 
 ### CODEC-07 — RFC 3164/5424 syslog parser — PRI/TIMESTAMP framing and dialect sniffing
 - **Location:** `crates/logit-proto/src/syslog/decode.rs` (`parse_line`: PRI parsing, dialect sniff between RFC 3164/5424; `parse_3164_timestamp`, fixed 15-byte timestamp shape; `is_tag_shaped`, bracketed-PID heuristic)
-- **What it does:** Parses the leading `<PRI>` field (validates it's 1-3 ASCII digits, rejects leading zeros except literal `0`, rejects PRI > 191 which would decode to an impossible facility/severity), then sniffs whether what follows is RFC 5424 (a digit followed by a space, i.e. VERSION) or falls back to RFC 3164. `parse_3164_timestamp` checks a fixed 15-byte `Mmm dd hh:mm:ss` shape with an explicit `s.len() < 15` guard before any indexing. The 5424 sniff has an explicit fallback: if the sniffed "version" fails to parse as 5424 but isn't literally `'1'`, it's treated as a false-positive sniff and reparsed as 3164 (with a diagnostic) rather than dropped.
+- **What it does:** Parses the leading `<PRI>` field (validates it's 1-3 ASCII digits, rejects leading zeros except literal `0`, rejects PRI > 191 which would decode to an impossible facility/severity), then sniffs whether what follows is RFC 5424 (a digit followed by a space, i.e. VERSION) or falls back to RFC 3164. `parse_3164_timestamp` checks a fixed 15-byte `Mmm dd hh:mm:ss` shape with an explicit `s.len() < 15` guard before any indexing. The 5424 sniff has an explicit fallback: a line whose sniffed version fails to parse as 5424, whatever the version, is treated as a false-positive sniff and reparsed as 3164 (with a `sniff_fallback` diagnostic) rather than dropped.
 - **Why sensitive:** untrusted-input (raw syslog datagrams/TCP lines from arbitrary senders), custom (no syslog-parsing crate — full hand-rolled grammar for two RFCs at once), lossless-roundtrip (ADR `syslog-output.md`/`syslog-tcp-ingress-and-tls.md`; `syslog_in -> syslog_out` must round-trip per `lossless-transit.md`).
 - **Invariants to verify:**
   - every fixed-width slice (`&s[..15]` in `parse_3164_timestamp`, `&after_lt[..gt]` in `parse_line`) is preceded by a length check that makes the slice always in-bounds (confirmed present for both in this pass: `s.len() < 15` guard, and `gt` is itself bounded by `position()` finding `>` within `after_lt` so `gt <= after_lt.len()`)
@@ -5889,20 +5889,27 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   `U64(5)` and `U64(7)` and relayed as `5` and `7`. `syslog.pid` is now a `U64` only for
   canonical decimal, pinned by `a_non_canonical_numeric_pid_stays_a_str` in `decode.rs`, shown
   failing with the fix reverted. No recorded sender writes either form. `is_tag_shaped`'s numeric
-  branch, a subset of its PRINTUSASCII branch, is folded into it. Four doc-versus-code items,
-  decided against RFC 3164 §4.1, RFC 5424 §6, and the recorded corpus, are doc fixes in
-  `crates/logit-proto/src/syslog/mod.rs`:
+  branch, a subset of its PRINTUSASCII branch, is folded into it. Four doc-versus-code items
+  were decided against RFC 3164 §4.1, RFC 5424 §6, and the recorded corpus, each recorded in
+  `crates/logit-proto/src/syslog/mod.rs`; the first is also a code fix:
   - The dialect sniff reads one VERSION digit because `1` is the only version. A two- or
     three-digit token comes only from a tag-less RFC 3164 MSG (`<13>10 workers started`) and
     parses as RFC 3164. A version other than `1` that parses is RFC 5424, with no diagnostic,
-    and isn't kept. A tag-less RFC 3164 MSG starting `1 `, which Python's `SysLogHandler` sends
-    for a message starting that way, is rejected as malformed RFC 5424: nothing on the line
-    tells the two apart, so `docs/known-gaps/syslog.md` records it with a workaround.
+    and isn't kept. A version-`1` line that failed the RFC 5424 parse was rejected, which
+    dropped a tag-less RFC 3164 MSG starting `1 `: `<14>1 worker died` is what Python's
+    `SysLogHandler`, which writes no tag or timestamp, sends for a message starting that way.
+    Under ADR `deployment-threat-model` that line has to survive, so one rule now covers every
+    version: a line that sniffs as RFC 5424 but doesn't parse as one is RFC 3164, its bytes kept,
+    with a throttled `sniff_fallback` naming the broken rule. The tests that pinned the
+    rejection (a bad TIMESTAMP, a 33-byte SD-NAME, a duplicate SD-ID, an unterminated element, a
+    cut-off PARAM-VALUE, `syslog_round_trip.rs`'s oversize SD-NAME) now pin the fallback and its
+    diagnostic, and `a_tag_less_rfc3164_msg_starting_1_space_falls_back_to_rfc3164` fails with
+    the version-`1` rejection restored. Only a malformed PRI still rejects a line.
   - RFC 3164 gives HOSTNAME no character set, so an RFC 3164 HOSTNAME is any valid UTF-8 token,
     which keeps a non-ASCII hostname. The doc said PRINTUSASCII.
   - An empty RFC 5424 TIMESTAMP (a double space) is read as nil, a `Value::Null`, as an empty
     HOSTNAME, APP-NAME, PROCID, or MSGID already was. No recorded sender writes one, and reading
-    it as nil loses nothing, where rejecting the line would drop it.
+    it as nil loses nothing, where failing the RFC 5424 parse would turn it into RFC 3164.
   - The module doc's "any violation rejects the line" gives way to a "Leniencies" list, the one
     copy, naming each departure from the grammar that is accepted because it loses nothing:
     empty fields, unchecked field lengths, nine fractional-second digits, an unchecked SD-ID
@@ -5910,35 +5917,37 @@ socket/driver glue and the native wire format are out of scope (other surveys co
     RFC 3164 timestamp and an optional SP after it, and an unchecked TAG length. ADR
     `syslog-structured-data-convention`'s strictness bullet points at it.
 
-  Checked with a new `syslog` fuzz target, with byte 0 choosing line splitting, and five
-  oracles: a datagram decodes to the same events as its `\n`-separated pieces, one `\r`
-  stripped, decoded one at a time with splitting off; a datagram whose first byte isn't a digit
-  decodes to the same events as the frames an `Rfc6587Auto` `Framer` cuts from the same bytes,
-  plus its `finish` remainder; with splitting off, a frame `x` holding no `\n` decodes as the
-  splitting decoder decodes `x` once a counted `\n` is added, and as the splitting decoder
-  decodes `x + "\r"` once a counted `\r\n` is added; every value satisfies the model
-  (facility at most 23, severity at most 7 and mapped onto `log.severity`, every SD-ID and
-  PARAM-NAME 1 to 32 SD-NAME bytes, `syslog.pid` a `U64` or a non-decimal `Str`, every `Str`
-  valid UTF-8); and every header field and message is a slice of the input, a PARAM-VALUE being
-  the one copy. A 600-second campaign (`script/unsafe-check fuzz syslog`, fork mode, debug
-  assertions on) ran 12,499,372 inputs in 634 seconds, about 19,700 exec/s, to a 1,574-input, 250
-  KB corpus with no crash. With `parse_line`'s PRI bound raised from 191 to 199, a run crashed on
-  the facility oracle in its first second. `crates/logit-proto/tests/robustness.rs` gains a syslog
-  section: every truncation and 300 bit flips of each of the 7 recorded captures under both
-  modes, SD-NAMEs at 32 and 33 bytes, 1,000 repeated PARAM-NAMEs folding into one array, a
-  PARAM-VALUE cut off at the end of the input, PRI `0`, `191`, `192`, and `00`, RFC 3164
-  timestamps at 14 and 15 bytes, digit-led MSGs against the sniff, a 64 KiB line of distinct
-  SD-NAMEs, and the worst case's largest allocation: a 27 MiB `Vec` for 16,384 `<0>` lines in
-  64 KiB behind the target's marker event, the reason for its 32 MiB malloc limit. The observed
-  concerns:
+  Checked with a new `syslog` fuzz target, with byte 0 choosing line splitting, and five oracles:
+  a datagram decodes to the same events as its `\n`-separated pieces, one `\r` stripped, decoded
+  one at a time with splitting off; a datagram whose first byte isn't a digit decodes to the same
+  events as the frames an `Rfc6587Auto` `Framer` cuts from the same bytes, plus its `finish`
+  remainder; with splitting off, a frame `x` holding no `\n` decodes as the splitting decoder
+  decodes `x` once a counted `\n` is added, and as the splitting decoder decodes `x + "\r"` once a
+  counted `\r\n` is added; every value satisfies the model (facility at most 23, severity at most
+  7 and mapped onto `log.severity`, every SD-ID and PARAM-NAME 1 to 32 SD-NAME bytes, `syslog.pid`
+  a `U64` or a non-decimal `Str`, every `Str` valid UTF-8); and every header field and message is
+  a slice of the input, a PARAM-VALUE being the one copy. A 600-second campaign
+  (`script/unsafe-check fuzz syslog`, fork mode, debug assertions on) ran 12,499,372 inputs in 634
+  seconds, about 19,700 exec/s, to a 1,574-input, 250 KB corpus with no crash. With `parse_line`'s
+  PRI bound raised from 191 to 199, a run crashed on the facility oracle in its first second.
+  After the version-`1` fallback landed, a 120-second run of the target with its new fallback
+  oracle ran 1,505,712 inputs, about 12,400 exec/s, to a 1,619-input corpus with no crash.
+  `crates/logit-proto/tests/robustness.rs` gains a syslog section: every truncation and 300 bit
+  flips of each of the 7 recorded captures under both modes, SD-NAMEs at 32 and 33 bytes, 1,000
+  repeated PARAM-NAMEs folding into one array, a PARAM-VALUE cut off at the end of the input, PRI
+  `0`, `191`, `192`, and `00`, RFC 3164 timestamps at 14 and 15 bytes, digit-led MSGs against the
+  sniff, a 64 KiB line of distinct SD-NAMEs, and the worst case's largest allocation: a 27 MiB
+  `Vec` for 16,384 `<0>` lines in 64 KiB behind the target's marker event, the reason for its 32
+  MiB malloc limit. The observed concerns:
   - *Fixed-width slices:* every one is bounded. `&s[..15]` follows `s.len() < 15`,
     `&after_lt[..gt]` takes `gt` from `position` inside `after_lt`, and the rest come from
     `split_first_token`, `strip_suffix`, and `rposition`. The robustness section's 14- and
     15-byte timestamps, every truncation of each capture, and the campaign found no panic.
   - *The sniff:* `parse_line` calls `parse_5424` and `parse_3164` at most once each, so the
     fallback can't loop, and it reports one `sniff_fallback` per line. The robustness section
-    pins versions `0`, `4`, and `9` falling back, `10` never sniffing, and `1` rejecting with one
-    `bad_line`.
+    pins versions `0`, `1`, `4`, and `9` falling back, each with one `sniff_fallback`, and `10`
+    never sniffing; the fuzz target's fallback oracle checks a line is an event if and only if
+    its PRI is valid.
   - *`is_tag_shaped`:* `rposition` finds the `[` inside `body`, and `body.last() == Some(&b']')`
     is checked before `body[open + 1..body.len() - 1]` is sliced. That range can't be inverted:
     `body[open]` is `[`, so it isn't the last byte. The fuzz model oracle checks every
@@ -5947,7 +5956,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 
 ### CODEC-08 — RFC 5424 STRUCTURED-DATA parser — bounded loop, no recursion, param folding
 - **Location:** `crates/logit-proto/src/syslog/decode.rs` (`parse_sd_name`; `parse_param_value`, escape handling; `insert_param`, repeated-PARAM-NAME folding; `parse_structured_data`, the SD-ELEMENT loop)
-- **What it does:** Parses RFC 5424's `[SD-ID PARAM-NAME="PARAM-VALUE" ...][...]` structured-data blocks: a `while`/`loop` state machine advancing a `pos` cursor through the byte slice, never recursing. `parse_sd_name` bounds SD-NAME/PARAM-NAME to 1-32 bytes per RFC 5424. `parse_param_value` unescapes `\"`, `\\`, `\]` (keeping any other backslash-prefixed byte literal, rather than erroring or dropping the backslash). Repeated PARAM-NAMEs within one SD-ELEMENT fold into a `Value::Array` in encounter order (`insert_param`), and duplicate SD-IDs across elements are rejected outright (`parse_structured_data`'s `sd.get(id).is_some()` check).
+- **What it does:** Parses RFC 5424's `[SD-ID PARAM-NAME="PARAM-VALUE" ...][...]` structured-data blocks: a `while`/`loop` state machine advancing a `pos` cursor through the byte slice, never recursing. `parse_sd_name` bounds SD-NAME/PARAM-NAME to 1-32 bytes per RFC 5424. `parse_param_value` unescapes `\"`, `\\`, `\]` (keeping any other backslash-prefixed byte literal, rather than erroring or dropping the backslash). Repeated PARAM-NAMEs within one SD-ELEMENT fold into a `Value::Array` in encounter order (`insert_param`), and duplicate SD-IDs across elements fail the whole RFC 5424 parse (`parse_structured_data`'s `sd.get(id).is_some()` check), so the line falls back to RFC 3164.
 - **Why sensitive:** untrusted-input, custom (hand-rolled recursive-descent-shaped but iterative state machine), lossless-roundtrip (structured data is one of `lossless-transit.md`'s named model-v2 additions — `syslog.sd`).
 - **Invariants to verify:**
   - the whole parser is genuinely non-recursive and its `pos` cursor strictly advances every iteration of every `loop`/`while` (confirmed by direct reading in this pass for `parse_param_value`'s loop and the outer SD-ELEMENT loop's structure in `parse_structured_data`) — so its only bound on work/memory is the overall line-length cap enforced upstream by the listener (not this file), not a hardcoded SD-element or nesting count; confirm the upstream `max_line_bytes` (or equivalent) config actually applies before this parser ever sees the bytes, since this file has no depth/count cap of its own
@@ -5963,7 +5972,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   `a_line_rejected_inside_structured_data_interns_nothing` said a rejected line interns nothing,
   but a PARAM-NAME is interned as its PARAM completes and an SD-ID as its element closes, before
   the rest of the line is validated, and the test covered only a line rejected before either.
-  The test, now `a_line_rejected_inside_structured_data_interns_only_the_names_it_completed`,
+  The test, now `a_line_whose_structured_data_fails_interns_only_the_names_it_completed`,
   pins both sides, and the comment says what interns. Deferring the interns is a non-goal under
   ADR `deployment-threat-model`: a sender that writes a malformed line writes the same names
   each time, so the interner grows without bound only for crafted input that writes millions of
@@ -5983,20 +5992,22 @@ socket/driver glue and the native wire format are out of scope (other surveys co
     `syslog_a_64_kib_line_of_distinct_sd_names_decodes_whole` pins the worst case decoding whole.
   - *The 32-byte bound:* enforced where the name is cut. `parse_sd_name` scans the run of
     SD-NAME bytes once and rejects a name past 32 bytes before anything uses it, and a rejection
-    ends the parse, so a long name costs one scan of its own length. Pinned at 32 and 33 bytes
+    ends the STRUCTURED-DATA parse (the line falls back to RFC 3164), so a long name costs one
+    scan of its own length. Pinned at 32 and 33 bytes
     for an SD-ID and a PARAM-NAME in the robustness section; the fuzz model oracle checks every
     decoded name is 1 to 32 SD-NAME bytes.
   - *The `.expect`s on PRINTUSASCII:* sound. `is_sd_name_byte` is `is_printusascii_byte`
     (`33..=126`) minus `=`, `]`, and `"`, all ASCII, so a name is valid UTF-8; the campaign never
     reached either `expect`.
 
-  `parse_param_value`'s two `None` arms, an unterminated value and a trailing backslash, reject
-  the line at the end of the input under both modes, and 1,000 repeated PARAM-NAMEs in one
+  `parse_param_value`'s two `None` arms, an unterminated value and a trailing backslash, fail
+  the RFC 5424 parse at the end of the input under both modes, and the line falls back to RFC
+  3164 whole, and 1,000 repeated PARAM-NAMEs in one
   element fold into one `Value::Array` in wire order, both pinned in the robustness section.
 
 ### CODEC-09 — syslog encoder — structured-data escaping, header-field sanitization, and oversize/truncation handling
 - **Location:** `crates/logit-outputs/src/syslog.rs` (`encode_event`, `push_message_str`, `push_message_bytes`), `syslog.rs` (`resolve_facility`/`resolve_severity`/`write_rfc5424_header`/`write_rfc3164_header`/`sanitize_5424_field`/`sanitize_3164_token`/`is_valid_sd_name`), `syslog.rs` (`push_sd_escaped`, `write_structured_data`, `write_sd_element`, `write_sd_param`), `syslog.rs` (`sanitize_msg`/`sanitize_msg_bytes`/`truncate_on_char_boundary`/`truncate_bytes`/`frame_octet_counting`) — directly read line-by-line this pass (superseding a prior placeholder in this file that had not been).
-- **What it does:** The mirror of the syslog parser above — renders `Event`s back to RFC 3164/5424 wire lines over UDP/TCP/TLS. `resolve_facility`/`resolve_severity` reconstruct PRI from `syslog.facility`/`syslog.severity` attributes (each independently range-checked, `default_facility` clamped to `.min(23)` at construction, `SyslogEncoder::new`), so `pri = facility*8+severity` is arithmetically incapable of exceeding 191 or underflowing — the exact malformed shape the decoder rejects on ingest. Every header field (HOSTNAME/APP-NAME/PROCID/MSGID/TAG) is sanitized to `PRINTUSASCII` with a per-field byte cap (`sanitize_5424_field`/`sanitize_3164_token`, iterating `char`s but only ever pushing single-byte ASCII, so the `scratch.len() >= max_len` cap is exact, never off-by-a-multibyte-char). STRUCTURED-DATA (`write_structured_data`) sorts SD-IDs and PARAM-NAMEs by name bytes before writing (`AttrMap` iteration order is intern order, not wire order — sorting makes output a pure function of the data) and explicitly detects/avoids a collision between an origin's own `syslog.sd` element and the opt-in `structured_data` config block sharing an SD-ID (would otherwise emit a wire line the decoder's own duplicate-SD-ID rule would reject). Message bodies go through `sanitize_msg`/`sanitize_msg_bytes` (byte-level twin for non-UTF-8 `Value::Bytes`, avoiding lossy conversion) which neutralize `\n`/`\r`/NUL/other C0/DEL with backslash mnemonics — the framing-level defense (RFC 6587 octet-counting, `frame_octet_counting`) is a second, independent layer against the same message-forging class, not a redundant one. If the header alone exceeds `max_message_bytes` the whole message is dropped (counted `dropped_oversize_header`) rather than truncating a header field into something a receiver would misparse; the message body is truncated on a UTF-8 char boundary (`truncate_on_char_boundary`) or raw byte boundary (`truncate_bytes`) instead.
+- **What it does:** The mirror of the syslog parser above — renders `Event`s back to RFC 3164/5424 wire lines over UDP/TCP/TLS. `resolve_facility`/`resolve_severity` reconstruct PRI from `syslog.facility`/`syslog.severity` attributes (each independently range-checked, `default_facility` clamped to `.min(23)` at construction, `SyslogEncoder::new`), so `pri = facility*8+severity` is arithmetically incapable of exceeding 191 or underflowing — the exact malformed shape the decoder rejects on ingest. Every header field (HOSTNAME/APP-NAME/PROCID/MSGID/TAG) is sanitized to `PRINTUSASCII` with a per-field byte cap (`sanitize_5424_field`/`sanitize_3164_token`, iterating `char`s but only ever pushing single-byte ASCII, so the `scratch.len() >= max_len` cap is exact, never off-by-a-multibyte-char). STRUCTURED-DATA (`write_structured_data`) sorts SD-IDs and PARAM-NAMEs by name bytes before writing (`AttrMap` iteration order is intern order, not wire order — sorting makes output a pure function of the data) and explicitly detects/avoids a collision between an origin's own `syslog.sd` element and the opt-in `structured_data` config block sharing an SD-ID (would otherwise emit a wire line the decoder's own duplicate-SD-ID rule reads as RFC 3164). Message bodies go through `sanitize_msg`/`sanitize_msg_bytes` (byte-level twin for non-UTF-8 `Value::Bytes`, avoiding lossy conversion) which neutralize `\n`/`\r`/NUL/other C0/DEL with backslash mnemonics — the framing-level defense (RFC 6587 octet-counting, `frame_octet_counting`) is a second, independent layer against the same message-forging class, not a redundant one. If the header alone exceeds `max_message_bytes` the whole message is dropped (counted `dropped_oversize_header`) rather than truncating a header field into something a receiver would misparse; the message body is truncated on a UTF-8 char boundary (`truncate_on_char_boundary`) or raw byte boundary (`truncate_bytes`) instead.
 - **Why sensitive:** custom, lossless-roundtrip (explicit ADR-level `syslog_in -> syslog_out` round-trip claim), data-loss (a field syslog's wire can carry but `Event` can't represent is tracked debt per AGENTS.md's "lossless-transit" rule; STRUCTURED-DATA's wire *order* for an interleaved repeated PARAM-NAME, e.g. `a b a`, is also normalized to grouped/sorted rather than preserved — documented in `docs/known-gaps/`, not a surprise).
 - **Invariants to verify:**
   - `push_sd_escaped` is the exact inverse of the decoder's `parse_param_value` unescaping: it escapes `"`/`\`/`]` per RFC 5424 §6.3.3, *and additionally* pre-converts `\n`/`\r`/NUL/other-C0/DEL to `sanitize_msg`'s own two-character mnemonics before that escaping pass runs — so a literal newline becomes the three wire bytes `\`,`\`,`n` (verified: Rust source `"\\\\n"` is literally backslash-backslash-n), which the decoder's `\\` rule folds back into two-character text `\n`, never a real newline; confirm this two-step composition is exactly symmetric with the decoder for every one of the 4 special mnemonic cases plus the generic `\xNN` case.

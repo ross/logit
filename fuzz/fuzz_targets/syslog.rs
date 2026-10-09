@@ -14,9 +14,12 @@
 //!   splitting decoder decodes `x`, and `x + "\r\n"` and the splitting decoder's `x + "\r"` both
 //!   decode as `x` does. So `x + "\n"`, `x + "\r\n"`, and `x` split agree whenever `x` doesn't end
 //!   in `\r`: one `\r` before the counted `\n` comes off, and a `\r` in front of that is payload;
-//! - the model (`crates/logit-proto/src/syslog/mod.rs`'s "Mapping"): every event is a log record
-//!   at `received_at` with nothing else on it; facility is at most 23 and severity at most 7, and
-//!   `log.severity` is severity's mapping; every SD-ID and PARAM-NAME is 1 to 32 PRINTUSASCII bytes
+//! - fallback: a line or frame is an event if and only if it opens with a valid PRI, since a line
+//!   that sniffs as RFC 5424 and fails that parse is read as RFC 3164, which never fails
+//!   (`crates/logit-proto/src/syslog/mod.rs`'s "Dialect disambiguation");
+//! - the model (that module doc's "Mapping"): every event is a log record at `received_at` with
+//!   nothing else on it; facility is at most 23 and severity at most 7, and `log.severity` is
+//!   severity's mapping; every SD-ID and PARAM-NAME is 1 to 32 PRINTUSASCII bytes
 //!   without `=`, `]`, `"`, or a space; a PARAM-VALUE is a `Str`, or an `Array` of two `Str`s or
 //!   more; `syslog.pid` is a `U64`, or a `Str` that isn't canonical decimal fitting a `u64`; every
 //!   `Str` is valid UTF-8, and a `Bytes` message isn't;
@@ -66,6 +69,18 @@ fn concat(a: &[u8], b: &[u8]) -> Vec<u8> {
 
 fn strip_one_cr(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+/// Whether `line` opens with a PRI the decoder accepts: `<`, one to three digits with no leading
+/// zero (`0` alone excepted) naming at most 191, then `>`.
+fn has_valid_pri(line: &[u8]) -> bool {
+    let Some(rest) = line.strip_prefix(b"<") else { return false };
+    let Some(gt) = rest.iter().position(|&b| b == b'>') else { return false };
+    let digits = &rest[..gt];
+    (1..=3).contains(&digits.len())
+        && digits.iter().all(u8::is_ascii_digit)
+        && (digits.len() == 1 || digits[0] != b'0')
+        && std::str::from_utf8(digits).unwrap().parse::<u32>().unwrap() <= 191
 }
 
 fn is_sd_name(name: &str) -> bool {
@@ -196,6 +211,8 @@ fuzz_target!(|data: &[u8]| {
             framed.decode(Bytes::copy_from_slice(strip_one_cr(piece)), &mut pieces);
         }
         assert_eq!(whole, pieces, "lines: the datagram and its pieces one at a time disagree");
+        let valid = data.split(|&b| b == b'\n').filter(|l| has_valid_pri(strip_one_cr(l))).count();
+        assert_eq!(whole.len() - 1, valid, "fallback: every line with a valid PRI is one event");
 
         if data.first().is_some_and(|b| !b.is_ascii_digit()) {
             assert!(data.len() <= MAX_FRAME_BYTES);
@@ -212,7 +229,8 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(whole, stream, "tcp: the datagram and the same bytes as a stream disagree");
         }
     } else {
-        assert!(whole.len() <= 2, "modes: a frame is one message");
+        let frame = data.strip_suffix(b"\n").map_or(data, strip_one_cr);
+        assert_eq!(whole.len() - 1, usize::from(has_valid_pri(frame)), "fallback: a frame's event");
         if !data.contains(&b'\n') {
             let mut split = Syslog::new(true);
             let mut framed = Syslog::new(false);

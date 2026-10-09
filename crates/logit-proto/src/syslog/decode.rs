@@ -267,13 +267,12 @@ fn parse_line(
                 keys,
             ) {
                 Ok(event) => Ok(event),
-                // Version `1` is the only one real senders emit, so its failure is malformed RFC
-                // 5424. Any other digit failing is likely a tag-less RFC 3164 MSG starting with a
-                // digit and a space, so reparse as RFC 3164, which never fails.
-                Err(err) if version == '1' => Err(err),
+                // Whatever the version, a line that doesn't parse as RFC 5424 is most likely a
+                // tag-less RFC 3164 MSG starting with a digit and a space (`<14>1 worker died`),
+                // and rejecting it would drop it, so reparse it as RFC 3164, which never fails and
+                // keeps the whole remainder as MSG. Reported, so a malformed RFC 5424 sender or a
+                // future version still shows.
                 Err(err) => {
-                    // Reported so a future RFC 5424 version past `1` doesn't get reparsed as RFC
-                    // 3164 unnoticed.
                     diag.warn_throttled(
                         "sniff_fallback",
                         format_args!(
@@ -812,6 +811,30 @@ mod tests {
         message_val(event).as_str().unwrap()
     }
 
+    /// Decodes `line`, which sniffs as RFC 5424 and fails that parse, asserting it falls back to
+    /// RFC 3164 with a `sniff_fallback`: one event whose MSG is everything after PRI, with no
+    /// RFC 5424 field stamped (`super`'s module doc, "Dialect disambiguation").
+    fn falls_back(line: &str) -> Event {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog", "input");
+        let diag = Diagnostics::new("syslog_in").with_telemetry(telemetry);
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default())).with_diagnostics(diag);
+        let batch = decoder.decode(Bytes::from(line.to_string())).expect("decode should succeed");
+        let event = only_event(batch.events);
+        let after_pri = &line[line.find('>').unwrap() + 1..];
+        assert_eq!(message_str(&event), after_pri, "{line}: the whole remainder is MSG");
+        for key in ["syslog.timestamp", "syslog.msgid", "syslog.sd"] {
+            assert!(event.attributes.get(key).is_none(), "{line}: {key} is not stamped");
+        }
+        let keys: Vec<_> = registry
+            .drain(0)
+            .iter()
+            .filter_map(|e| e.attributes.get("key").and_then(Value::as_str).map(String::from))
+            .collect();
+        assert_eq!(keys, ["sniff_fallback"], "{line}");
+        event
+    }
+
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
         let mut diag = Diagnostics::default();
@@ -974,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn rfc5424_invalid_timestamp_is_rejected_rather_than_treated_as_absent() {
+    fn rfc5424_invalid_timestamp_falls_back_rather_than_being_treated_as_absent() {
         for ts in [
             "2024-02-31T00:00:00Z",      // February has no 31st day
             "2023-02-29T00:00:00Z",      // 2023 is not a leap year
@@ -986,11 +1009,7 @@ mod tests {
             // `logit_core::time` RFC 3339 parser accepts up to 9, a harmless leniency.
             "2024-01-01T00:00:00.1234567890Z",
         ] {
-            let line = format!("<134>1 {ts} - - - - - msg");
-            assert!(
-                matches!(parse_err(&line), CodecError::Malformed(_)),
-                "expected timestamp {ts:?} to be rejected"
-            );
+            falls_back(&format!("<134>1 {ts} - - - - - msg"));
         }
     }
 
@@ -1368,28 +1387,35 @@ mod tests {
     }
 
     #[test]
-    fn structured_data_33_char_sd_name_is_rejected() {
+    fn structured_data_33_char_sd_name_falls_back() {
+        // Past RFC 5424's 32-byte limit, so the line isn't RFC 5424.
         let id = "a".repeat(33);
-        let line = format!(r#"<134>1 - - - - - [{id} k="v"] msg"#);
-        assert!(
-            matches!(parse_err(&line), CodecError::Malformed(_)),
-            "a 33-byte SD-NAME exceeds RFC 5424's 32-byte limit and must be rejected"
-        );
+        falls_back(&format!(r#"<134>1 - - - - - [{id} k="v"] msg"#));
     }
 
     #[test]
-    fn structured_data_duplicate_sd_id_is_rejected() {
-        let line = r#"<134>1 - - - - - [ex@32473 k="v"][ex@32473 j="w"] msg"#;
-        assert!(matches!(parse_err(line), CodecError::Malformed(_)));
+    fn structured_data_duplicate_sd_id_falls_back() {
+        falls_back(r#"<134>1 - - - - - [ex@32473 k="v"][ex@32473 j="w"] msg"#);
     }
 
-    /// A line rejected inside `parse_structured_data` before its first PARAM or SD-ELEMENT
-    /// completes interns nothing, whether it is an RFC 3164 line routed there by the sniff or a
-    /// version-`1` line with a malformed SD-ELEMENT. A line rejected later has interned the names
-    /// it completed: the exposure `parse_structured_data`'s comment accepts. `nextest` runs each
-    /// test in its own process, so `interner::len()` reflects only this test.
+    /// The tag-less RFC 3164 line Python's `SysLogHandler` sends for a message starting `1 `:
+    /// version `1` gets the same fallback as every other version.
     #[test]
-    fn a_line_rejected_inside_structured_data_interns_only_the_names_it_completed() {
+    fn a_tag_less_rfc3164_msg_starting_1_space_falls_back_to_rfc3164() {
+        let event = falls_back("<14>1 worker died");
+        assert_eq!(event.attributes.get("syslog.severity"), Some(&Value::U64(6)));
+        assert!(event.attributes.get("syslog.tag").is_none());
+        assert!(event.attributes.get("syslog.hostname").is_none());
+        falls_back("<13>1 2 3 msg");
+    }
+
+    /// A line whose STRUCTURED-DATA fails before its first PARAM or SD-ELEMENT completes interns
+    /// nothing, whatever its version, and falls back to RFC 3164 with its whole MSG. A line that
+    /// fails later has interned the names it completed: the exposure `parse_structured_data`'s
+    /// comment accepts. `nextest` runs each test in its own process, so `interner::len()`
+    /// reflects only this test.
+    #[test]
+    fn a_line_whose_structured_data_fails_interns_only_the_names_it_completed() {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
         // Warm-up: initializes `KEYS` before the window opens.
         drop(
@@ -1409,26 +1435,26 @@ mod tests {
             "the line falls back to RFC 3164 and keeps its whole MSG"
         );
 
-        // A genuine version-`1` line whose SD-ELEMENT is malformed: rejected, no event at all.
-        let rejected = Bytes::from_static(b"<134>1 - - - - - [badelem@1 msg");
-        let events = decoder.decode(rejected).expect("decode should succeed").events;
-        assert!(events.is_empty(), "a malformed SD-ELEMENT rejects the whole line");
+        // A version-`1` line whose SD-ELEMENT is malformed: it falls back the same way.
+        let malformed = Bytes::from_static(b"<134>1 - - - - - [badelem@1 msg");
+        let events = decoder.decode(malformed).expect("decode should succeed").events;
+        assert_eq!(message_str(&only_event(events)), "1 - - - - - [badelem@1 msg");
 
         assert_eq!(
             logit_core::interner::len(),
             before,
-            "nothing on a line rejected before a PARAM completes reaches the interner"
+            "nothing on a line that fails before a PARAM completes reaches the interner"
         );
 
-        // One complete PARAM and one closed element, then a malformed second element: the line is
-        // rejected, and the completed PARAM-NAME and SD-ID are interned.
+        // One complete PARAM and one closed element, then a malformed second element: the line
+        // falls back, and the completed PARAM-NAME and SD-ID are interned.
         let late = Bytes::from_static(b"<134>1 - - - - - [first@1 done=\"v\"][second@1 broken");
         let events = decoder.decode(late).expect("decode should succeed").events;
-        assert!(events.is_empty(), "a malformed second SD-ELEMENT rejects the whole line");
+        assert!(only_event(events).attributes.get("syslog.sd").is_none());
         assert_eq!(
             logit_core::interner::len(),
             before + 2,
-            "`done` and `first@1` completed before the rejection, and nothing else did"
+            "`done` and `first@1` completed before the failure, and nothing else did"
         );
     }
 
@@ -1461,9 +1487,8 @@ mod tests {
     }
 
     #[test]
-    fn structured_data_unterminated_element_is_rejected() {
-        let line = r#"<134>1 - - - - - [ex@32473 k="v""#;
-        assert!(matches!(parse_err(line), CodecError::Malformed(_)));
+    fn structured_data_unterminated_element_falls_back() {
+        falls_back(r#"<134>1 - - - - - [ex@32473 k="v""#);
     }
 
     #[test]
