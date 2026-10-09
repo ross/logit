@@ -46,10 +46,16 @@ SENT, a rejected batch and rejected records each FAILing with the status and the
 non-2xx answer inside and outside a fault window, counted drops and encoder skips WARNing, a
 batch neither delivered nor dropped, and no request telemetry; the rows that read V SKIP; and a
 local run's `ledger.sent` SKIPs.
+
+No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
+suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
+a slip in a part's own stand-ins included, gets rc 127 from `Docker.run`'s `OSError` instead of
+running a command. A part that passes `prefix=` names its own fake and is unaffected.
 """
 
 import copy
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -62,6 +68,7 @@ from . import checks, collect, docker, driver, faults, report, scenario, telemet
 
 _FAILURES = []
 _PASSED = [0]
+_NO_DAEMON = "/nonexistent/soak-self-test-docker"
 
 
 def expect(condition, what):
@@ -1886,16 +1893,43 @@ def _target_rules(root):
         for jsonl in (vm_run.timeline, vm_run.watchdog, vm_run.stats, vm_run.freshness,
                       vm_run.capture):
             jsonl.close()
-        env.write_text("DD_API_KEY=\n")
-        try:
-            driver.run(root, path, None, None, False, Path(tmp) / "refused", [], "logit:soak",
-                       env)
-            expect(False, "a run with DD_API_KEY empty started")
-        except scenario.ScenarioError as err:
-            expect("doesn't set DD_API_KEY" in str(err) and "abc" not in str(err),
-                   f"a run names the missing variable, got {err}")
+        _empty_env(root, env, path, tmp)
         _unsafe_env(root, loaded, env, path, tmp)
         _prepare_raises(root, path, env, tmp)
+
+
+class _Refused(Exception):
+    pass
+
+
+def _no_docker(*args, **kwargs):
+    """Stands in for `driver.Docker` around a `driver.run` that must stop before
+    `prepare()`."""
+    raise _Refused()
+
+
+def _empty_env(root, env, path, tmp):
+    """`driver.run` refuses an env file that sets a listed variable empty, by name, before it
+    builds a `Docker`."""
+    env.write_text("DD_API_KEY=\n")
+    real_docker, real_signals = driver.Docker, driver.interrupt_on_signals
+    driver.Docker, driver.interrupt_on_signals = _no_docker, lambda: None
+    try:
+        driver.run(root, path, None, None, False, Path(tmp) / "refused", [], "logit:soak", env)
+        expect(False, "a run with DD_API_KEY empty started")
+    except _Refused:
+        expect(False, "a run with DD_API_KEY empty reached prepare()")
+    except scenario.ScenarioError as err:
+        expect("doesn't set DD_API_KEY" in str(err) and "abc" not in str(err),
+               f"a run names the missing variable, got {err}")
+    finally:
+        driver.Docker, driver.interrupt_on_signals = real_docker, real_signals
+
+
+def _isolated():
+    """`run` points `$DOCKER` at a path that doesn't exist for the whole suite."""
+    expect(os.environ.get("DOCKER") == _NO_DAEMON and docker.docker_argv() == [_NO_DAEMON],
+           f"the self-test runs with DOCKER={_NO_DAEMON}, got {os.environ.get('DOCKER')!r}")
 
 
 def _unsafe_env(root, loaded, env, path, tmp):
@@ -1923,19 +1957,13 @@ def _unsafe_env(root, loaded, env, path, tmp):
            f"soak.py target refuses an unmatched quote by name and writes no copy, got "
            f"{out.returncode} {out.stdout!r} {out.stderr.strip()[-300:]!r}")
 
-    class Refused(Exception):
-        pass
-
-    def no_docker(*args, **kwargs):
-        raise Refused()
-
     # With the check removed, the run must stop here rather than reach the daemon.
     real_docker, real_signals = driver.Docker, driver.interrupt_on_signals
-    driver.Docker, driver.interrupt_on_signals = no_docker, lambda: None
+    driver.Docker, driver.interrupt_on_signals = _no_docker, lambda: None
     try:
         driver.run(root, path, None, None, False, Path(tmp) / "unsafe", [], "logit:soak", env)
         expect(False, "a run with a quote in DD_API_KEY started")
-    except Refused:
+    except _Refused:
         expect(False, "a run with a quote in DD_API_KEY reached prepare()")
     except scenario.ScenarioError as err:
         expect("DD_API_KEY contains a double quote" in str(err) and "FAKEkey" not in str(err)
@@ -2284,17 +2312,26 @@ def run(root, quiet=False):
     root = Path(root)
     _FAILURES.clear()
     _PASSED[0] = 0
-    for part in (_durations, _rules, _expect_rules, _expand, _random, _log_capture, _signals,
-                 _deadlines,
-                 _hung_inspect, _inspect_redacted, _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks, _kill_watchdog,
-                 _kill_ledger, _expect_checks, _gauge_lives, _target_rules, _sink_drain,
-                 _external_checks, _report, _shipped):
-        try:
-            takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
-                          _target_rules, _sink_drain, _shipped)
-            part(root) if part in takes_root else part()
-        except Exception as err:  # report the part that broke, then keep going
-            _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")
+    # `soak.py run` goes on to the real run after this, so the caller's `$DOCKER` comes back.
+    previous = os.environ.get("DOCKER")
+    os.environ["DOCKER"] = _NO_DAEMON
+    try:
+        for part in (_isolated, _durations, _rules, _expect_rules, _expand, _random,
+                     _log_capture, _signals, _deadlines, _hung_inspect, _inspect_redacted,
+                     _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks,
+                     _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
+                     _sink_drain, _external_checks, _report, _shipped):
+            try:
+                takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
+                              _target_rules, _sink_drain, _shipped)
+                part(root) if part in takes_root else part()
+            except Exception as err:  # report the part that broke, then keep going
+                _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")
+    finally:
+        if previous is None:
+            os.environ.pop("DOCKER", None)
+        else:
+            os.environ["DOCKER"] = previous
     if _FAILURES:
         for failure in _FAILURES:
             print(f"self-test FAIL: {failure}")

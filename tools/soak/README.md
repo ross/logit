@@ -129,8 +129,8 @@ script/soak run statsd-datadog
 - `SOAK_EXTERNAL_ENV=<file>` names another file, such as a shell file of dev secrets. The
   script refuses a file git doesn't ignore, asking the repository the file is in, because it
   holds credentials; everything under `perf/results/` is ignored, and a file in no repository
-  passes. Any other git failure, such as `git` missing from `PATH` or a repository that
-  `safe.directory` rejects, is refused with git's message.
+  passes. Any other git failure is refused: a missing `git` by name, and any other failure,
+  such as a repository that `safe.directory` rejects, with git's message.
 - The file can be plain or shell-sourceable: `NAME=value` or `export NAME=value` lines, `#`
   comment lines, and blank lines. One pair of matching single or double quotes around a value
   is removed, and nothing inside them is expanded. A `#` after a value is part of the value. A
