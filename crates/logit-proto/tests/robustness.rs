@@ -884,8 +884,8 @@ const GRAPHITE_RECEIVED_AT: i64 = 1_699_000_000_123_456_789;
 /// to a whole second and carries.
 #[test]
 fn graphite_timestamps_resolve_to_the_exact_reading() {
-    let before = f64::from_bits(9_223_372_036.854_775_807f64.to_bits() - 1);
-    let after = f64::from_bits(9_223_372_036.854_775_807f64.to_bits() + 1);
+    let before = f64::from_bits(9_223_372_036.854_776_f64.to_bits() - 1);
+    let after = f64::from_bits(9_223_372_036.854_776_f64.to_bits() + 1);
     let cases: &[(String, i64)] = &[
         ("1700000000.25".into(), 1_700_000_000_250_000_000),
         ("1700000000.0000000001".into(), 1_700_000_000_000_000_000),
