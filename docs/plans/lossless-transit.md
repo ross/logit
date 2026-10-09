@@ -44,7 +44,7 @@ field. `EventBatch` (`crates/logit-core/src/event.rs`) has a `resource: Arc<Reso
 
 ### statsd_in -> statsd_out (W3, landed)
 
-Decode (`crates/logit-inputs/src/statsd.rs`): `ms`/`h`/`d` lines decode straight to a raw
+Decode (`crates/logit-proto/src/statsd/`): `ms`/`h`/`d` lines decode straight to a raw
 `MetricKind::Samples` — one `Event` per line, every colon-separated value in `Samples`'s own inline
 `SmallVec`, `sample_rate` carried verbatim with no sketching or extrapolation at decode time at
 all. The wire type letter survives as `statsd.type` (`ms`/`h`/`d`) since all three land on the same

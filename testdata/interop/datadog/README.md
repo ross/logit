@@ -151,8 +151,9 @@ Each item below was UNVERIFIED in `docs/plans/datadog-relay.md` or ADR
   decoder: nothing `Malformed`, skipped, degraded, or diagnosed, then the codec's fixed point, then
   the facts above (metric names and kinds, the sketch's count and sum, the events' titles, the
   check's message, the log lines, the span tree and its `_top_level` marks, the stats groups).
-- `crates/logit-inputs/src/statsd.rs`'s `interop_fixture_unix_*` tests decode every datagram and,
-  through the `unix_stream` framer, every stream frame, and check each construct's origin fields.
+- `crates/logit-proto/src/statsd/decode.rs`'s `interop_fixture_unix_*` tests decode every datagram
+  and, through the `unix_stream` framer, every stream frame, and check each construct's origin
+  fields.
 - `crates/logit-inputs/src/datadog_trace.rs` holds `/info` to `agent-info.json` and to the
   recording's reply file, and maps the recorded tracer headers.
 - `crates/logit-cli/tests/datadog_in_round_trip.rs` and `datadog_trace_in_round_trip.rs` replay

@@ -988,9 +988,10 @@ Two facts bound how much that matters:
 So the exposure is narrow: **a string used in key or metric-name position that never repeats.** In
 practice that means:
 
-- **statsd metric names** (`intern(name)` in `statsd.rs`'s `build_event`), which are
-  client-controlled and where putting an id in the name is a well-worn anti-pattern:
-  `user.<id>.logins`, `deploys.<sha>`, `orders.<order_id>.latency`. One such client is enough.
+- **statsd metric names** (`intern(name)` in `crates/logit-proto/src/statsd/decode.rs`'s
+  `build_event`), which are client-controlled and where putting an id in the name is a well-worn
+  anti-pattern: `user.<id>.logins`, `deploys.<sha>`, `orders.<order_id>.latency`. One such client is
+  enough.
 - Secondarily, **JSON object keys** from log bodies (`json.rs`) when a producer puts data in key
   position (`{"req_a1b2c3": {...}}`), and **DogStatsD tag keys** for the same reason. Both are
   schema-shaped in normal use and unbounded only when abused.

@@ -54,7 +54,7 @@ TAP = "tap_input"
 def parse_line(line: str) -> tuple[int, int] | None:
     """One statsd line -> (events it decodes to, attributes each of those events carries).
 
-    A minimal reimplementation of the grammar `crates/logit-inputs/src/statsd.rs` reads:
+    A minimal reimplementation of the grammar `crates/logit-proto/src/statsd/mod.rs` documents:
     `<name>:<v1>[:<v2>...]|<type>[|@rate][|#tags][|c:<id>][|T<secs>]`, from the wire alone.
 
     Returns None for a line this check doesn't model: DogStatsD events (`_e{`) and service checks
