@@ -33,7 +33,7 @@ The workflow builds through `script/image` itself, given `IMAGE_REPO=ghcr.io/ros
 build definition, per [ADR `scripts-to-rule-them-all`](scripts-to-rule-them-all.md). The publish
 job runs without a `container:` directive, unlike `ci.yml`'s single job
 ([ADR `containerized-development`](containerized-development.md)): that job runs *inside* the
-`rust:1.98.1-bookworm` image and has no Docker daemon of its own to build against, and GitHub-hosted
+CI image ([ADR `ci-image-on-ghcr`](ci-image-on-ghcr.md)) and has no Docker daemon of its own to build against, and GitHub-hosted
 runners don't support docker-in-docker out of the box.
 
 ## Alternatives considered

@@ -1,6 +1,6 @@
 ---
 created: 2026-08-28
-updated: 2026-08-28
+updated: 2026-10-09
 ---
 
 # Containerized development environment
@@ -40,3 +40,10 @@ whoever hits them first:
   group (noted in the README as the removal path).
 - Anyone in a `docker` group, or using rootless Podman, overrides one Makefile variable and needs no
   other changes.
+
+## Amendment (2026-10-09): CI runs `Dockerfile.dev` itself
+
+CI used to run the `rust` base image with the same dependencies installed by workflow steps. It now
+runs `Dockerfile.dev`'s `ci` stage, published to GHCR, and the `dev` stage contributors build sits
+on top of that stage ([ADR `ci-image-on-ghcr`](ci-image-on-ghcr.md)). "CI runs the same image"
+now holds for everything but the `dev` user.
