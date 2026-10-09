@@ -157,7 +157,8 @@ writes no final drain and no stderr shutdown lines, so up to one 5 s `internal` 
 counters is lost and its D has no stderr part; `ledger.egress` judges its Ab − V within a band
 instead of for equality, and the plan's "Which life a hop is judged in" derives the band. The
 band can't see a lost middle window, or a lost last one when the last flush and drain coincide;
-`ledger.windows` and `ledger.replay` do.
+`ledger.windows` catches both unless the kill lands within 0.1 × the aggregate interval of the
+last flush, and `ledger.replay` catches a replay two or more batches short.
 
 ### Expectations
 

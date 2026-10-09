@@ -488,11 +488,13 @@ The rows:
   startup. A series with no sample in a life FAILs too. Each FAIL names the series and the gap.
   The interval comes from the config, never the median spacing, which moves once half the
   windows are missing. A last window lost to a kill that lands within 0.1 × the interval of the
-  life's last flush passes.
+  life's last flush passes, and the kill time is the `docker kill` call's start, which can run
+  about a second ahead of the signal.
 - `ledger.replay`, for each killed life followed by another, else SKIP: the next life's
   first-drain `buffer.disk.replayed` equals the killed life's `buffer.batches` at its last
   drain, one batch in flight allowed. `identity.sink` balances on whatever `replayed` reports,
-  so only this row sees a replay short of what the killed process queued. A killed life with no
+  so only this row sees a replay two or more batches short of what the killed process queued;
+  a single lost batch is `ledger.windows`'s to catch, as a lost window. A killed life with no
   disk spool replays 0, so this row FAILs whenever it had batches queued.
 - `identity.sink`: at the last quiet SUT drain before shutdown,
   `batches.received + buffer.disk.replayed == batches.delivered + batches.dropped (every
