@@ -1288,11 +1288,16 @@ def check_ledger_windows(data):
         return Result("ledger.windows", FAIL, "no series in vm-export.jsonl match vm_selector")
     max_gap, tail_bound, head_bound = 1.5 * interval, 1.1 * interval, 2 * interval
     # Faults during which the SUT writes no window by design: a paused process flushes nothing,
-    # and with the SUT or the generator partitioned no line arrives, and `aggregate` emits a
-    # series only in a window that updated it. A gap spanning one is excused when it starts
-    # within `max_gap` before the fault and ends within `head_bound` after it, as a new life's
-    # first sample does, so a window lost beside the fault still FAILs.
-    silent = [(f.start, f.end, f"{f.step} {f.action} on {f.on}") for f in data.faults
+    # and with the SUT or the generator partitioned or stopped no line arrives, and `aggregate`
+    # emits a series only in a window that updated it. A gap spanning one is excused when it
+    # starts within `tail_bound` before the fault, where the last window before it closes, and
+    # ends within `tail_bound` after it: the first window to close after the fault can hold no
+    # line, and the next one closes an interval later. A restarted generator sends its first
+    # line only after it starts, so a generator stop gets `head_bound` after it, as a new life's
+    # first sample does. A lost window beside the fault FAILs once it moves the gap's end past
+    # its bound; one lost inside that bound is excused.
+    silent = [(f.start, f.end, head_bound if (f.on, f.action) == ("generator", "stop")
+               else tail_bound, f"{f.step} {f.action} on {f.on}") for f in data.faults
               if (f.on, f.action) in WINDOWLESS_FAULTS]
     excused = []
     problems = []
@@ -1310,8 +1315,8 @@ def check_ledger_windows(data):
                 continue
             for a, b in zip(stamps, stamps[1:]):
                 if b - a > max_gap:
-                    cover = next((label for start, end, label in silent
-                                  if start - a <= max_gap and b - end <= head_bound
+                    cover = next((label for start, end, after, label in silent
+                                  if start - a <= tail_bound and b - end <= after
                                   and a < end and b > start), None)
                     if cover is not None:
                         excused.append(f"{name}: life {life} gap {b - a:g}s across {cover}")
@@ -1335,9 +1340,9 @@ def check_ledger_windows(data):
              f"last sample within {tail_bound:g}s (1.1 x) of the kill, a later life's first "
              f"within {head_bound:g}s (2 x) of its start")
     if silent:
-        rules += (f"; a gap across a pause or partition that silences the SUT excused when it "
-                  f"starts within {max_gap:g}s before the fault and ends within {head_bound:g}s "
-                  f"after it, {len(excused)} excused")
+        rules += (f"; a gap across a fault that silences the SUT excused when it starts "
+                  f"within {tail_bound:g}s before the fault and ends within {tail_bound:g}s "
+                  f"after it ({head_bound:g}s after a generator stop), {len(excused)} excused")
     if problems:
         return Result("ledger.windows", FAIL,
                       f"missing windows, {len(problems)} finding(s), first: {problems[0]} "

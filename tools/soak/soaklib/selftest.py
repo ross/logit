@@ -23,7 +23,9 @@ edges, with and without a residual, a surplus below it and a lost last window ab
 with no stderr part, the final life's sink identity counting a spool's replayed batches,
 `ledger.windows` against lost middle, tail, and head windows, and `ledger.replay` against a
 short replay. `ledger.wire` counts a steady run's surplus as 0, and `ledger.windows` excuses a
-gap across a pause or partition that silences the SUT, but not a window lost beside one.
+gap across a fault that silences the SUT, but not one starting or ending past its bound on
+either side, the one window lost right before or right after the fault included, and gives a
+generator stop its own longer bound after it.
 
 For a `[random]` schedule, it covers every validation rule, a pinned head of the shipped
 scenario's schedule (so a seed keeps reproducing a recorded run), determinism, and, for 12 seeds
@@ -31,11 +33,15 @@ at five durations up to 24 hours, that every drawn schedule passes `validate()`,
 and `for` ranges, leaves two progress windows after each recovery, and is a prefix of a longer
 run's; the schedule rules against hand-built schedules; and where the seed is recorded. It also
 covers the chunked log capture against a fake `docker logs` with out-of-order and late lines
-and a failed chunk, the polls' absolute deadlines, and a hung daemon ending an inspect round.
+and a failed chunk whose record keeps the CLI's error, the polls' absolute deadlines, a hung
+daemon ending an inspect round, and a SIGTERM or SIGHUP inherited as ignored staying ignored.
 """
 
 import copy
 import json
+import signal
+import subprocess
+import sys
 import tempfile
 import tomllib
 from datetime import datetime, timezone
@@ -451,7 +457,10 @@ def _random(root):
 class _FakeLogs:
     """A container log for `LogCapture`, read as moby's json-file reader does: `--since` skips
     lines before it only until the first line at or after it, and `--until` stops at the first
-    line after it. `fail_next` makes the next call write its first line and return 1."""
+    line after it. `fail_next` makes the next call write its first line and `FAIL_TEXT` to the
+    stderr file, as the CLI does, and return 1 with an empty `Result.stderr`."""
+
+    FAIL_TEXT = "Error response from daemon: No such container: id1"
 
     def __init__(self):
         self.lines = []
@@ -478,7 +487,9 @@ class _FakeLogs:
         with open(stdout_path, "w") as out, open(stderr_path, "w") as err:
             for stream, text in chosen:
                 (out if stream == "stdout" else err).write(text + "\n")
-        return docker.Result(1 if failing else 0, "", "timed out" if failing else "")
+            if failing:
+                err.write(self.FAIL_TEXT + "\n")
+        return docker.Result(1 if failing else 0, "", "")
 
 
 def _ns(text):
@@ -544,6 +555,9 @@ def _log_capture():
         records = collect.read_jsonl(Path(tmp) / "log-chunks.jsonl")
         expect(len(records) == len(fake.calls) and [r["rc"] for r in records] == [0, 0, 1, 0],
                f"every chunk is recorded in log-chunks.jsonl, got {records}")
+        expect(records[2].get("stderr", "").endswith(_FakeLogs.FAIL_TEXT),
+               f"a failed chunk's record keeps the CLI's error from its stderr file, got "
+               f"{records[2]}")
         expect(not list(logs.glob(".*.chunk")), "no temporary chunk file is left behind")
 
 
@@ -582,6 +596,25 @@ def _hung_inspect(root):
         driver._now = real_now
     expect(run.docker.calls == 1 and len(run.watchdog) == 1,
            f"a timed-out inspect ends the round, got {run.docker.calls} call(s)")
+
+
+def _signals(root):
+    """`interrupt_on_signals` in a child process, so this one's handlers stay as they are."""
+    probe = ("import signal, sys\n"
+             "sys.path.insert(0, sys.argv[1])\n"
+             "from soaklib import driver\n"
+             "if sys.argv[2] == 'ignored':\n"
+             "    signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+             "driver.interrupt_on_signals()\n"
+             "names = {signal.SIG_IGN: 'ignored', signal.default_int_handler: 'interrupt'}\n"
+             "print(names.get(signal.getsignal(signal.SIGTERM), 'other'),\n"
+             "      names.get(signal.getsignal(signal.SIGHUP), 'other'))\n")
+    for inherited, want in (("ignored", "interrupt ignored"), ("default", "interrupt interrupt")):
+        out = subprocess.run([sys.executable, "-c", probe, str(root), inherited],
+                             capture_output=True, text=True, timeout=60)
+        expect(out.stdout.strip() == want,
+               f"with SIGHUP inherited {inherited}, SIGTERM and SIGHUP end up {want!r}, got "
+               f"{out.stdout.strip()!r} {out.stderr.strip()[-300:]!r}")
 
 
 def _deadlines():
@@ -1366,7 +1399,8 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
     delivers them in its first drain. `drop` deletes the export's samples at those offsets from
     every series; `every_window` sets `[ledger] vm_every_window`. `kill_residual` lines are read
     in the drain before life 1's last and never absorbed. `silence` is `(service, action)` of a
-    fault over +240..+270 in life 2."""
+    fault over +240..+270 in life 2, or `(service, action, start, end)` of one over those
+    offsets."""
     queued = replayed if queued is None else queued
     gen = []
     for offset in range(5, 301, 5):
@@ -1422,9 +1456,9 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
                         affects_udp_ingress=True),
                 _ready("c0s2", "logit", KILL_KILL[1] + 1)]
     if silence is not None:
-        on, action = silence
-        timeline += [_action("apply", "c0s3", action, on, 240, 240.2),
-                     _action("revert", "c0s3", action, on, 269.8, 270)]
+        on, action, s_start, s_end = (*silence, 240, 270) if len(silence) == 2 else silence
+        timeline += [_action("apply", "c0s3", action, on, s_start, s_start + 0.2),
+                     _action("revert", "c0s3", action, on, s_end - 0.2, s_end)]
     timeline += [_phase("end_begin", 300), _phase("end_end", 330)]
     ledger = {**LEDGER, "vm_every_window": True} if every_window else LEDGER
     run_dir = _run_dir(tmp, name, timeline, sut, ledger=ledger,
@@ -1563,6 +1597,51 @@ def _kill_ledger():
         expect(beside["ledger.windows"].status == checks.FAIL
                and "life 2 gap 60s from +220s to +280s" in beside["ledger.windows"].detail,
                f"windows FAILs a window lost beside a pause, got {beside['ledger.windows']}")
+        # A pause over +245..+265 between the 10 s samples: the last one before it at +240, the
+        # first after it at +270, each 5 s from the fault; the bound on both sides is 11 s.
+        pause = ("logit", "pause", 245, 265)
+        inside = results("windows-inside", drop=(250, 260), silence=pause)
+        expect(inside["ledger.windows"].status == checks.PASS
+               and "2 excused" in inside["ledger.windows"].detail,
+               f"windows excuses the two windows inside a pause, got {inside['ledger.windows']}")
+        before = results("windows-lost-before", drop=(240, 250, 260), silence=pause)
+        expect(before["ledger.windows"].status == checks.FAIL
+               and "life 2 gap 40s from +230s to +270s" in before["ledger.windows"].detail,
+               f"windows FAILs the one window lost right before a pause, got "
+               f"{before['ledger.windows']}")
+        after = results("windows-lost-after", drop=(250, 260, 270), silence=pause)
+        expect(after["ledger.windows"].status == checks.FAIL
+               and "life 2 gap 40s from +240s to +280s" in after["ledger.windows"].detail,
+               f"windows FAILs the one window lost right after a pause, got "
+               f"{after['ledger.windows']}")
+        edge_after = results("windows-edge-after", drop=(250, 260),
+                             silence=("logit", "pause", 249.1, 259.1))
+        past_after = results("windows-past-after", drop=(250, 260),
+                             silence=("logit", "pause", 248.9, 258.9))
+        expect(edge_after["ledger.windows"].status == checks.PASS
+               and past_after["ledger.windows"].status == checks.FAIL,
+               f"windows excuses a gap ending 10.9 s after a pause and FAILs one ending 11.1 s "
+               f"after it, got {edge_after['ledger.windows']} {past_after['ledger.windows']}")
+        edge_before = results("windows-edge-before", drop=(250, 260),
+                              silence=("logit", "pause", 250.9, 260.9))
+        past_before = results("windows-past-before", drop=(250, 260),
+                              silence=("logit", "pause", 251.1, 261.1))
+        expect(edge_before["ledger.windows"].status == checks.PASS
+               and past_before["ledger.windows"].status == checks.FAIL,
+               f"windows excuses a gap starting 10.9 s before a pause and FAILs one starting "
+               f"11.1 s before it, got {edge_before['ledger.windows']} "
+               f"{past_before['ledger.windows']}")
+        restart = ("generator", "stop", 245, 265)
+        started = results("windows-generator-stop", drop=(250, 260, 270), silence=restart)
+        expect(started["ledger.windows"].status == checks.PASS
+               and "2 excused" in started["ledger.windows"].detail,
+               f"windows gives a generator stop 2 x the interval after it, got "
+               f"{started['ledger.windows']}")
+        late = results("windows-generator-stop-late", drop=(250, 260, 270, 280, 290),
+                       silence=("generator", "stop", 245, 279))
+        expect(late["ledger.windows"].status == checks.FAIL,
+               f"windows FAILs a gap ending past 2 x the interval after a generator stop, got "
+               f"{late['ledger.windows']}")
         netem = results("windows-netem", drop=(250, 260, 270), silence=("logit", "netem"))
         expect(netem["ledger.windows"].status == checks.FAIL,
                f"windows doesn't excuse a gap across a fault that leaves the SUT writing "
@@ -1636,11 +1715,13 @@ def run(root, quiet=False):
     root = Path(root)
     _FAILURES.clear()
     _PASSED[0] = 0
-    for part in (_durations, _rules, _expect_rules, _expand, _random, _log_capture, _deadlines,
+    for part in (_durations, _rules, _expect_rules, _expand, _random, _log_capture, _signals,
+                 _deadlines,
                  _hung_inspect, _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks, _kill_watchdog,
                  _kill_ledger, _expect_checks, _gauge_lives, _report, _shipped):
         try:
-            takes_root = (_rules, _expect_rules, _expand, _random, _hung_inspect, _shipped)
+            takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
+                          _shipped)
             part(root) if part in takes_root else part()
         except Exception as err:  # report the part that broke, then keep going
             _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")

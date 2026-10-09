@@ -21,7 +21,8 @@ needs at the code:
   the container paused.
 - The `try`/`finally` around the run collects logs and tears the project down on every exit
   but SIGKILL, unless `--keep`. SIGTERM and SIGHUP raise `KeyboardInterrupt` as SIGINT does;
-  Python's default for both ends the process without running `finally`.
+  Python's default for both ends the process without running `finally`. A signal inherited as
+  ignored stays ignored, so `nohup` keeps a run alive past a closed terminal.
 - After a SIGHUP the terminal can be gone, so output goes through `_print`, which drops it
   rather than fail the run: the run directory holds everything.
 
@@ -84,6 +85,15 @@ def _print(text, stream=None):
             sys.stdout = devnull
         else:
             sys.stderr = devnull
+
+
+def interrupt_on_signals():
+    """Makes SIGTERM and SIGHUP raise `KeyboardInterrupt`, except one this process inherited as
+    ignored: `nohup` ignores SIGHUP so a run outlives its terminal, and bash resends SIGHUP to
+    its jobs when it exits."""
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(signum) is not signal.SIG_IGN:
+            signal.signal(signum, signal.default_int_handler)
 
 
 def exit_code(results, ended=None):
@@ -180,8 +190,7 @@ class Run:
                            self.duration, self.seed, self.argv, self.seed_source)
         self.say(f"run directory {self.run_dir}")
         ended = None
-        for signum in (signal.SIGTERM, signal.SIGHUP):
-            signal.signal(signum, signal.default_int_handler)
+        interrupt_on_signals()
         try:
             self.up()
             self.loop()

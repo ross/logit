@@ -173,7 +173,12 @@ class LogCapture:
                 if until is not None:
                     self.cursors[container] = until + 1
             else:
-                entry["stderr"] = result.stderr.strip()[-500:]
+                # `logs_to` sends the CLI's stderr to `err`, so the reason is there.
+                try:
+                    said = err.read_text(errors="replace").strip()
+                except OSError:
+                    said = ""
+                entry["stderr"] = (said or result.stderr.strip())[-500:]
             for chunk_path in (out, err):
                 chunk_path.unlink(missing_ok=True)
             self.record.write(entry)
