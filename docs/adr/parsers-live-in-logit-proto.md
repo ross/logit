@@ -22,8 +22,8 @@ AGENTS.md's Inputs section already states the intent: "Listeners live in `crates
 codecs in `crates/logit-proto`." Four parsers of bytes a producer controls don't follow it, so
 none of them can be fuzzed:
 
-- the TCP stream `Framer` in `crates/logit-inputs/src/tcp.rs`, which every TCP listener but
-  `logit_in` frames with;
+- the stream `Framer` in `crates/logit-inputs/src/tcp.rs`, which frames every `tcp` and
+  `unix_stream` transport of `syslog_in`, `statsd_in`, `graphite_in`, and `lines_in`;
 - `StatsdDecoder` in `crates/logit-inputs/src/statsd.rs`;
 - `SyslogDecoder` in `crates/logit-inputs/src/syslog.rs`;
 - the json, csv, logfmt, and kv tokenizers in `crates/logit-transforms/src/{json,csv,logfmt}.rs`,

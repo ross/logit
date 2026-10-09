@@ -55,21 +55,8 @@ the decoder.
 
 The canonical target table lives only in `script/unsafe-check`'s `FUZZ_TARGETS` array, one
 `<target>|<max_len>|<malloc_limit_mb>|<extra args>` entry per target, where the fourth column
-holds extra libFuzzer arguments (see "The driver"). Nothing else lists them. In prose, the
-targets cover the following (the "untrusted-input parsers" amendment below has the current
-list):
-
-- the native frame envelope, read in a loop with `resync` the way the disk spool reads it;
-- native batch decode, for both batch codecs (v1 and v2 with its provenance trailer);
-- native control messages (`Hello`, `HelloAck`, `Ack`, `Reject`);
-- `DdSketch` bytes (decode, then a `to_bytes` fixed-point oracle) and `DdSketch` merge (two decoded
-  halves merged, then `quantile` and `to_bytes`);
-- `HyperLogLog` bytes (decode, `estimate`, `insert`, `merge`, `to_bytes`, and drop, since the
-  drop is where a wrong allocation `Layout` would surface);
-- OTLP protobuf, OTLP/JSON, and gRPC framing followed by protobuf decode, with the first input
-  byte choosing the signal;
-- Prometheus remote-write decompression (oracle: output never exceeds the cap) and remote-write
-  decode, with the first byte choosing 1.0 or 2.0.
+holds extra libFuzzer arguments (see "The driver"). Nothing else lists them. What each target
+covers is described in prose under the "untrusted-input parsers" amendment below.
 
 ### Seeds, corpus, and artifacts
 
@@ -301,7 +288,7 @@ The inventory's cluster 9, "Untrusted-input parsers", gives every hand-rolled pa
 bytes a target. Most of those parsers live outside `logit-core` and `logit-proto` today, so
 [ADR `parsers-live-in-logit-proto`](parsers-live-in-logit-proto.md) moves them behind the seam
 this ADR's "The `fuzz/` crate" requires first. This amendment records what changes in the
-harness. It supersedes the prose target list under "Targets"; the campaign tables under "Running
+harness. It holds the prose description of every target, which "Targets" points at; the campaign tables under "Running
 it" keep the names each campaign ran under.
 
 ### Targets
