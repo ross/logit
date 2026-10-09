@@ -51,7 +51,7 @@
 //! - [`super::MAX_PICKLE_DEPTH`] bounds open `MARK`s, and [`super::MAX_PICKLE_ITEMS`] bounds the
 //!   stack, each arena, and the memo independently. A memo key must also be ordinal
 //!   (`key <= self.memo.len()`, one new slot per `BINPUT`/`LONG_BINPUT`/`MEMOIZE`), so one
-//!   `LONG_BINPUT` can't grow the memo to an attacker-chosen size;
+//!   corrupt `LONG_BINPUT` can't grow the memo to the size its key names;
 //! - `LONG1`/`LONG4` accept a magnitude of at most 8 bytes: carbon's timestamps are seconds;
 //! - the stack must hold **exactly one** value at `STOP`, and it must be a list.
 //!
@@ -264,9 +264,10 @@ impl PickleReader {
     /// and calls `on_datapoint` once per well-shaped `(path, (timestamp, value))` item, in list
     /// order. Returns how many items were skipped for being the wrong shape.
     ///
-    /// A wrong-shaped *item* is skipped, never fatal. A disallowed opcode, a declared length past
-    /// the input, a bound, or a payload that doesn't leave exactly one list on the stack fails the
-    /// whole frame with [`CodecError::Malformed`].
+    /// A wrong-shaped *item* is skipped. A disallowed opcode, a declared length past the input, a
+    /// string that isn't UTF-8, a bound, or a payload that doesn't leave exactly one list on the
+    /// stack fails the whole frame with [`CodecError::Malformed`], and so does a non-empty list
+    /// item inside a list grown by `APPEND`/`APPENDS` (`append_range`'s tail rule).
     ///
     /// `path` borrows `input`, so the caller can make it a zero-copy [`bytes::Bytes`] slice.
     pub fn read_datapoints<'a>(
@@ -620,9 +621,11 @@ impl PickleReader {
     /// `target + 1`.
     ///
     /// The list must be the **tail** of the arena (`start + len == lists.len()`), as carbon's
-    /// `EMPTY_LIST MARK … APPENDS` shape gives. Interleaved open lists are rejected: nothing real
-    /// produces them, and supporting them needs a per-list `Vec` or a compaction pass whose cost a
-    /// hostile sender chooses.
+    /// `EMPTY_LIST MARK … APPENDS` shape gives, CPython's batches of 1,000 included. Interleaved
+    /// open lists are rejected, which fails a list-shaped datapoint, `[path, [ts, value]]`, built
+    /// inside a list still to be appended to: carbon's receiver accepts one, but no surveyed
+    /// producer writes one (`docs/known-gaps/mappings.md`'s `decode (Graphite)` rows). Supporting
+    /// them needs a per-list `Vec` or a compaction pass whose cost the frame's shape chooses.
     fn append_range(&mut self, target: usize, from: usize) -> Result<(), CodecError> {
         let PValue::List { start, len } = self.stack[target] else {
             return Err(malformed("pickle APPEND/APPENDS onto something that is not a list"));
@@ -647,8 +650,8 @@ impl PickleReader {
             )));
         }
         // A memo key must be ordinal: CPython hands out keys sequentially, so a real stream only
-        // overwrites a slot or appends the next. A key past that would size the memo from an
-        // attacker-chosen index ("Bounds").
+        // overwrites a slot or appends the next. A key past that would size the memo from a
+        // corrupt index ("Bounds").
         if key > self.memo.len() {
             return Err(malformed(format!(
                 "pickle memo key {key} skips ahead of the {} entries written so far",
@@ -783,7 +786,7 @@ mod tests {
     ];
 
     /// class Thing: pass; pickle.dumps(Thing(), protocol=2) -- `GLOBAL` 0x63 then `NEWOBJ` 0x81,
-    /// the shape a hostile payload uses to make an unpickler construct an arbitrary object.
+    /// the shape that makes a general unpickler construct an arbitrary object.
     const CPYTHON_GLOBAL: &[u8] = &[
         0x80, 0x02, 0x63, 0x5f, 0x5f, 0x6d, 0x61, 0x69, 0x6e, 0x5f, 0x5f, 0x0a, 0x54, 0x68, 0x69,
         0x6e, 0x67, 0x0a, 0x71, 0x00, 0x29, 0x81, 0x71, 0x01, 0x2e,
@@ -1042,7 +1045,7 @@ mod tests {
     /// `PROTO 2, EMPTY_LIST, LONG_BINPUT 499999, STOP`: a key that skips ahead is rejected by
     /// `memo_put`'s ordinal check before the memo grows to ~8 MB. The allocation side is
     /// `crates/logit-proto/tests/robustness.rs`'s
-    /// `graphite_pickle_never_allocates_from_a_hostile_memo_key`.
+    /// `graphite_pickle_never_allocates_from_a_corrupt_memo_key`.
     #[test]
     fn a_memo_key_that_skips_ahead_is_rejected() {
         let payload = [OP_PROTO, 2, OP_EMPTY_LIST, OP_LONG_BINPUT, 0x1f, 0xa1, 0x07, 0x00, OP_STOP];
@@ -1138,7 +1141,7 @@ mod tests {
         assert_eq!(points, vec![point("x.y", 5.0, 2.0)]);
     }
 
-    /// Every prefix of every fixture, valid or hostile: the reader must return, never panic.
+    /// Every prefix of every fixture, accepted or rejected: the reader must return, never panic.
     #[test]
     fn every_single_byte_truncation_of_every_fixture_fails_without_panicking() {
         for payload in [

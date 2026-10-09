@@ -260,8 +260,9 @@ impl CollectdDecoder {
     /// wire order.
     ///
     /// **Every length and type check happens before any allocation.** The declared data-source
-    /// count is attacker-controlled (up to 65535), and sizing anything from it before checking it
-    /// against the part's length is the bug `crates/logit-proto/tests/robustness.rs` catches.
+    /// count comes off the wire (up to 65535, whatever a corrupt or misconfigured sender writes),
+    /// and sizing anything from it before checking it against the part's length is the bug
+    /// `crates/logit-proto/tests/robustness.rs` catches.
     fn decode_values(
         &mut self,
         bytes: &Bytes,

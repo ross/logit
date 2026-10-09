@@ -79,5 +79,8 @@ up in the script's own log, the same discipline `../collectd/README.md` describe
   decodes protocol 1, whose carbon payloads use only allowlisted binary opcodes. Hand-built unit
   tests with CPython-dump provenance comments in `crates/logit-proto/src/graphite/pickle.rs` cover
   both instead of a fixture (`object_construction_opcodes_are_rejected` over a protocol-0 dump,
-  `a_cpython_protocol_1_dump_decodes` over a protocol-1 one), because no modern sender is left to
-  capture one from: Python's own `pickle.DEFAULT_PROTOCOL` has been 3 or higher since Python 3.0.
+  `a_cpython_protocol_1_dump_decodes` over a protocol-1 one). Python's own
+  `pickle.DEFAULT_PROTOCOL` has been 3 or higher since Python 3.0, but protocol 0 still has
+  senders: Dropwizard Metrics' `PickledGraphite` writes it by hand, and a Python 2 producer's
+  default is protocol 0. `docs/known-gaps/mappings.md`'s `decode (Graphite)` rows record the
+  rejection.

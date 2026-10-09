@@ -49,15 +49,15 @@
 //! | finite value (`3`, `-1.5`, `1e5`, or a pickle `"3.14"` string) | `Gauge(v)` | -- |
 //! | NaN / ±inf | line skipped | `logit.input.metrics.skipped{reason="non_finite_value"}` + diag `non_finite_value` |
 //! | `timestamp == -1` | `received_at` (carbon's own rule) | -- |
-//! | `timestamp > 0`, integral or fractional | `(ts * 1e9) as i64` | -- |
+//! | `timestamp > 0`, integral or fractional | whole seconds and the sub-second part scaled to nanoseconds separately, the part rounded half away from zero, saturating at `i64::MAX`; under half a nanosecond reads as `0` | -- |
 //! | any other `timestamp` (`<= 0`, non-finite, unparseable) | skipped | `logit.input.metrics.skipped{reason="bad_timestamp"}` + diag `bad_timestamp` |
 //! | not exactly 3 whitespace-separated fields; an unparseable value; non-UTF-8 bytes; an empty path | skipped | `logit.input.metrics.skipped{reason="bad_line"}` + diag `bad_line` |
 //! | malformed tag (a `;` segment with no `=`, an empty name, or an empty value) | the **whole line** is skipped -- carbon's own `TaggedSeries.parse` raises rather than dropping the one tag | `logit.input.metrics.skipped{reason="bad_tag"}` + diag `bad_tag` |
-//! | empty / whitespace-only line | skipped, **uncounted** (packet padding, a trailing `\n`) | -- |
+//! | empty / ASCII-whitespace-only line | skipped, **uncounted** (packet padding, a trailing `\n`); a line of Unicode whitespace is a `bad_line` | -- |
 //! | line longer than `max_line_bytes` (TCP) | the framer drops it and resynchronizes at the next `\n`; the line after it still decodes, and the connection stays up | `logit.input.frames.dropped{reason="oversize"}`, or `reason="drained"` when the line crossed the bound before its `\n` arrived, after which the connection discards input until its next `\n` + diag `framing_error` |
 //! | pickle frame longer than `max_frame_bytes` | the connection is closed -- there is no resync point in a length-framed stream | `logit.input.frames.dropped{reason="oversize"}` + diag `framing_error` |
-//! | a disallowed pickle opcode, or the depth/item caps | `CodecError::Malformed`, the whole frame is dropped | diag `bad_pickle` |
-//! | a pickle item that is not `(str, (num, num))` | **that datapoint** is skipped; the rest of the frame still decodes | `logit.input.metrics.skipped{reason="bad_shape"}` + diag `bad_shape` |
+//! | a disallowed pickle opcode, a declared length past the payload, a string that isn't UTF-8, the depth/item caps, or a non-empty list item in a list grown by `APPEND`/`APPENDS` ([`pickle::PickleReader::read_datapoints`]) | `CodecError::Malformed`, the whole frame is dropped | diag `bad_pickle` |
+//! | any other pickle item that is not `(str, (num, num))` | **that datapoint** is skipped; the rest of the frame still decodes | `logit.input.metrics.skipped{reason="bad_shape"}` + diag `bad_shape` |
 //! | `Resource` / `Scope` | the decoder's own shared default / `None` | -- |
 //!
 //! Framing is the listener's job: the two oversize rows are counted and diagnosed by the shared TCP
@@ -206,7 +206,7 @@ pub const DEFAULT_MAX_PACKET_BYTES: usize = 1432;
 
 /// The longest plaintext line `graphite_in` assembles before draining to the next `\n`. (Twisted's
 /// `LineReceiver` defaults to 16384, which carbon keeps.) 8 KiB is past any real tagged path and
-/// keeps one hostile connection from growing an unbounded read buffer.
+/// keeps one misbehaving connection from growing an unbounded read buffer.
 pub const DEFAULT_MAX_LINE_BYTES: usize = 8192;
 
 /// Twisted's `Int32StringReceiver.MAX_LENGTH`, which carbon's pickle receiver inherits: a frame
@@ -219,8 +219,11 @@ pub const DEFAULT_MAX_FRAME_BYTES: usize = 1 << 20;
 pub const MAX_PICKLE_DEPTH: usize = 16;
 
 /// The most values the restricted pickle reader holds at once, bounding the stack, each of the
-/// two arenas, and the memo independently. 500k is more than [`DEFAULT_MAX_FRAME_BYTES`] can
-/// encode; the cap stops a crafted frame from making the reader's own `Vec`s the denial of service.
+/// two arenas, and the memo independently. A real batch's datapoint is about 20 bytes (a
+/// five-byte `BININT` second, a nine-byte `BINFLOAT`, its path or a memo reference to it) and
+/// adds four values to the tuple arena, so a [`DEFAULT_MAX_FRAME_BYTES`] frame stays near 200k;
+/// a frame of one-byte opcodes or tiny integer datapoints can reach the cap. The cap keeps a
+/// corrupt frame from making the reader's own `Vec`s the denial of service.
 pub const MAX_PICKLE_ITEMS: usize = 500_000;
 
 /// Which carbon wire protocol a decoder reads or an encoder writes.
