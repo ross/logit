@@ -903,7 +903,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   - *Low confidence, 32-bit only:* `u32::from_be_bytes(prefix) as usize` in `next_length_prefixed` is
     lossless on 64-bit but the comparison against `max_frame_bytes: usize` would behave differently on a 32-bit
     target. No such target ships today.
-- **Existing coverage:** `tcp.rs` framer tests (~20 tests: latch, split pushes, embedded
+- **Existing coverage:** `crates/logit-proto/src/framing.rs`'s framer tests (~20 tests: latch, split pushes, embedded
   newline, CR stripping, empty lines, oversize under both policies, drain-to-next-line, ten-digit
   and leading-zero counts, length-prefix assembly and over-bound), plus the recorded-interop replay
   `interop_fixture_rsyslog_tcp_non_transparent_frame`. ADRs: `syslog-tcp-ingress-and-tls`,

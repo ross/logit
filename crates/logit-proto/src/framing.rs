@@ -5,8 +5,8 @@
 //! **Framing is chosen per listener, not guessed.** A [`FramingMode`] is fixed when the listener
 //! is built: RFC 6587's auto-detecting pair for `syslog_in`, LF-delimited lines for a line
 //! protocol whose messages may *start* with a digit (`graphite_in` plaintext, `statsd_in`,
-//! `lines_in`), carbon's 4-byte big-endian length prefix (`docs/adr/graphite-carbon-relay.md`), or DogStatsD's
-//! 4-byte little-endian one (`statsd_in`'s `transport: unix_stream`; ADR
+//! `lines_in`), carbon's 4-byte big-endian length prefix (`docs/adr/graphite-carbon-relay.md`),
+//! or DogStatsD's 4-byte little-endian one (`statsd_in`'s `transport: unix_stream`; ADR
 //! `datadog-agent-and-intake-relay`, decision 12).
 //!
 //! The sockets, the first-byte and idle deadlines, and what a [`FrameError`] costs a connection

@@ -311,7 +311,8 @@ Deliberately **not** octet-counted: `rsyslog-tcp.conf` sets `protocol="tcp"` wit
 `TCP_Framing` parameter, which is rsyslog's own default — RFC 6587 §3.4.2 non-transparent
 (LF-terminated) framing — and that stock default, not the opt-in octet-counting mode, is the
 framing a real rsyslog forwarder actually puts on the wire and the one `logit`'s auto-detecting
-TCP listener (`crates/logit-inputs/src/tcp.rs`'s `Framer`) most needs to be checked against.
+TCP listener (`crates/logit-proto/src/framing.rs`'s `Framer`, which `crates/logit-inputs/src/tcp.rs`
+drives) most needs to be checked against.
 Octet-counted rsyslog (`TCP_Framing="octet-counted"`) and syslog-ng (over any transport) remain
 unstarted follow-on work — see `testdata/interop/syslog/README.md`'s own "what isn't covered here
 (yet)" section.
