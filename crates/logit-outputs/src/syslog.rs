@@ -189,7 +189,7 @@ use crate::Output;
 use anyhow::Context;
 use logit_core::time::{format_rfc3339_utc, write_rfc3164_utc};
 use logit_core::{interner, AttrMap, Diagnostics, Event, EventBatch, Severity, Telemetry, Value};
-use logit_pipeline::{BatchContext, SeqId};
+use logit_pipeline::{BatchContext, DeliveryPosture, SeqId};
 use logit_proto::{FramedEncoder, MessageBuf, MAX_UDP_PAYLOAD_BYTES};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -1325,8 +1325,13 @@ impl Output for SyslogOutput {
         self.accounting.observe();
     }
 
-    /// One attempt ([`SyslogOutput::attempt`]). An `Ok` disarms the batch accounting on every
-    /// path, a batch that encoded to nothing included.
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        self.accounting.observe_posture(posture);
+    }
+
+    /// One attempt ([`SyslogOutput::attempt`]). A final result (`Ok`, or a fault
+    /// `write_loop` won't retry) disarms the batch accounting on every path, a batch that encoded
+    /// to nothing included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)

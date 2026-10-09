@@ -2102,8 +2102,13 @@ impl Output for StatsdOutput {
         self.accounting.observe();
     }
 
-    /// One attempt ([`StatsdOutput::attempt`]). An `Ok` disarms the batch accounting on every
-    /// path, a batch that encoded to nothing included.
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        self.accounting.observe_posture(posture);
+    }
+
+    /// One attempt ([`StatsdOutput::attempt`]). A final result (`Ok`, or a fault
+    /// `write_loop` won't retry) disarms the batch accounting on every path, a batch that encoded
+    /// to nothing included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)

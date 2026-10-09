@@ -175,26 +175,32 @@ counts each named series `logit.output.records.rejected{route="series"}`, leaves
 `logit.output.records`, and logs `series_rejected` with the first entry. The batch isn't retried:
 the rest of the request was stored.
 
-### `at_least_once` duplicates everything but series
+### `at_least_once` can duplicate a request, and everything but series is stored twice
 
 The default posture is `at_least_once`, so a `5xx` or a timeout is retried. One batch goes out
 over up to eight routes, each as one or more requests (one per event, and a route over its size
-cap is split), and a retry re-sends the ones that succeeded. A route Datadog rejects for its
+cap is split). The sink remembers which requests of the batch Datadog settled, and a retry sends
+only the rest, so a request Datadog accepted isn't resent. A route Datadog rejects for its
 content (a `400`, or a `413`, counted `oversize`) is counted `records.dropped{reason="rejected"}`
-and the send goes on to the next route, so one rejected route doesn't fail the batch or stop the
+and the send goes on to the next request, so one rejected route doesn't fail the batch or stop the
 others. A `403` (an invalid API key, or one sent to another `site`) logs `api_key_rejected`; a
 `401` (a missing key) or a `404` (a route the configured `site` doesn't serve) logs
 `request_refused`. Each would answer every batch the same way, so the sink holds the batch and
-retries it until the key or the site is fixed; watch
-`logit.component.retrying` for it. A failure after any request of the
-batch was accepted counts as ambiguous ([ADR `delivery-semantics`](adr/delivery-semantics.md),
-item 9), so `at_least_once` retries it and `at_most_once` drops the batch. Datadog stores a
-resent series point once, the last write winning at its `(series, timestamp)`, but stores a
-resent log twice. Every
-other route is assumed to duplicate too: expect duplicate logs, spans, events, and checks, and
-inflated distribution point, sketch, and APM stats counts, which no upstream `aggregate` setting
-prevents. `datadog_trace_out` is the same: an Agent dedupes nothing. To drop the batch on a `5xx`
-or a timeout instead, set `buffer: {delivery: at_most_once}` on the sink.
+retries it until the key or the site is fixed, sending only the requests not yet settled; watch
+`logit.component.retrying` for it. A hold applies under `at_most_once` too.
+
+Two cases still send a request twice. The request that drew the `5xx` or timeout is resent, and
+it may have been applied. A `buffer.disk:` batch replayed after a crash is a new batch, so every
+request of it is sent again. Datadog stores a resent series point once, the last write winning at
+its `(series, timestamp)`, but stores a resent log twice. Every other route is assumed to
+duplicate too: expect duplicate logs, spans, events, and checks, and inflated distribution point,
+sketch, and APM stats counts, which no upstream `aggregate` setting prevents. `datadog_trace_out`
+is the same: an Agent dedupes nothing.
+
+To drop the batch on an ambiguous failure instead, set `buffer: {delivery: at_most_once}` on the
+sink. It then drops only what Datadog didn't accept, and counts those entries
+`records.dropped{reason="ambiguous_at_most_once"}` per route. The count for a route the batch never
+reached is an upper bound.
 
 ### Events go uncompressed
 
