@@ -75,7 +75,7 @@ use crate::datagram::{Datagrams, Framing, Report, UdpDest};
 use crate::stream::{Dial, PooledStream, Target};
 use anyhow::Context;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::{BatchContext, Output, SeqId};
+use logit_pipeline::{BatchContext, DeliveryPosture, Output, SeqId};
 use logit_proto::graphite::{GraphiteEncoder, Protocol};
 use logit_proto::{FramedEncoder, MessageBuf};
 use std::time::Duration;
@@ -268,8 +268,13 @@ impl Output for GraphiteOutput {
         self.accounting.observe();
     }
 
-    /// One attempt ([`GraphiteOutput::attempt`]). An `Ok` disarms the batch accounting on every
-    /// path, a batch that encoded to nothing included.
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        self.accounting.observe_posture(posture);
+    }
+
+    /// One attempt ([`GraphiteOutput::attempt`]). A final result (`Ok`, or a fault
+    /// `write_loop` won't retry) disarms the batch accounting on every path, a batch that encoded
+    /// to nothing included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
