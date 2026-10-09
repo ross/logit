@@ -2,10 +2,10 @@
 # Development and build image for logit: the container contributors build and test in, so the host
 # needs no Rust or LuaJIT build deps. The production runtime image is Dockerfile.
 #
-# Two stages. `ci` is the toolchain and is what CI runs: `script/ci-image` publishes it to
+# Two stages. `ci` is the toolchain for CI: `script/ci-image` publishes it to
 # ghcr.io/ross/logit-ci, tagged by this file's hash (docs/adr/ci-image-on-ghcr.md). Any edit to
-# this file, comments included, changes that tag and needs a republish. `dev` adds the host-matched
-# user and is what compose.yaml builds.
+# this file, comments included, changes that tag. `dev` adds the host-matched user and is what
+# compose.yaml builds.
 FROM rust:1.98.1-bookworm AS ci
 
 # Build deps for the vendored LuaJIT build (mlua "vendored" feature) and general native-dep builds.

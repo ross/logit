@@ -57,5 +57,6 @@ host-matched user on top of `ci`.
   `ci.yml` bump.
 - The base image still comes from Docker Hub, but only in the manual publish job, not on every CI
   run.
-- The image holds no cargo registry, because the tool installs use build cache mounts. `ci.yml`'s
-  `actions/cache` still covers the registry and `target`.
+- The image holds no cargo registry, because the tool installs use build cache mounts.
+  For `actions/cache` to cover it, `ci.yml` has to name `/usr/local/cargo/registry`, the image's
+  `CARGO_HOME`, not `~/.cargo/registry`: a container job's `HOME` is `/github/home`.
