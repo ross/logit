@@ -167,6 +167,19 @@ fn is_printusascii(b: &[u8]) -> bool {
     b.iter().all(|&c| is_printusascii_byte(c))
 }
 
+/// A PROCID or `tag[pid]` token as a `u64` when it is canonical decimal: ASCII digits with no
+/// leading zero, or `0` (`super`'s module doc, `syslog.pid`). `u64::from_str` alone would also take
+/// `+5` and `007`, which `syslog_out` would then write as `5` and `7`.
+fn canonical_pid(token: &[u8]) -> Option<u64> {
+    let canonical = !token.is_empty()
+        && token.iter().all(u8::is_ascii_digit)
+        && (token.len() == 1 || token[0] != b'0');
+    if !canonical {
+        return None;
+    }
+    std::str::from_utf8(token).ok()?.parse().ok()
+}
+
 /// The `syslog.*` carrier keys, interned once per process so each line pays a sorted
 /// `insert_sym`, not an interner hash and shard lock. A `LazyLock` rather than a decoder field
 /// (as collectd's `AttrKeys` is) because the parsers are free functions; `KEYS.x` is one acquire
@@ -323,11 +336,9 @@ fn is_tag_shaped(token: &[u8]) -> bool {
         if pid.is_empty() {
             return false;
         }
-        // Numeric fitting `u64`, or PRINTUSASCII without `]` so the bracket still balances
-        // (`super`'s module doc, `syslog.pid`).
-        let numeric_fits_u64 = pid.iter().all(|b| b.is_ascii_digit())
-            && std::str::from_utf8(pid).is_ok_and(|s| s.parse::<u64>().is_ok());
-        if !numeric_fits_u64 && !pid.iter().all(|&b| is_printusascii_byte(b) && b != b']') {
+        // PRINTUSASCII without `]`, so the bracket still balances (`super`'s module doc,
+        // `syslog.pid`). Every decimal PID is in that class.
+        if !pid.iter().all(|&b| is_printusascii_byte(b) && b != b']') {
             return false;
         }
         &body[..open]
@@ -397,9 +408,9 @@ fn parse_3164(
             let name = &tag_body[..open];
             let pid_bytes = &tag_body[open + 1..tag_body.len() - 1];
             attrs.insert_sym(KEYS.tag, Value::Str(subslice::share(line, name)));
-            match std::str::from_utf8(pid_bytes).ok().and_then(|s| s.parse::<u64>().ok()) {
+            match canonical_pid(pid_bytes) {
                 Some(n) => attrs.insert_sym(KEYS.pid, Value::U64(n)),
-                // `is_tag_shaped` guarantees a non-`u64` PID is PRINTUSASCII, so valid UTF-8.
+                // `is_tag_shaped` guarantees the PID is PRINTUSASCII, so valid UTF-8.
                 None => attrs.insert_sym(KEYS.pid, Value::Str(subslice::share(line, pid_bytes))),
             }
         } else {
@@ -578,10 +589,14 @@ fn parse_structured_data(s: &[u8], keys: &mut KeyCache) -> Result<(Option<Value>
         let id_bytes = parse_sd_name(s, &mut pos)?;
         let id = std::str::from_utf8(id_bytes)
             .expect("parse_sd_name only accepts PRINTUSASCII, always valid UTF-8");
-        // `AttrMap::get`, not an intern: the element may still be rejected, and the sniff
-        // routes RFC 3164 lines containing `[token` through here before falling back. Interning
-        // now would keep producer-controlled text for the process's life, outside
-        // `docs/design/memory.md` §4's accepted exposure; it happens at the insert below.
+        // `AttrMap::get`, not an intern, so a line rejected before its first PARAM or
+        // SD-ELEMENT completes interns nothing; the sniff routes RFC 3164 lines containing
+        // `[token` through here before falling back. A completed PARAM's name and a closed
+        // element's SD-ID are interned as they complete, before the rest of the line is
+        // validated, so a line rejected later has interned those. That is the interner exposure
+        // `docs/design/memory.md`'s "Interning: the bargain, and its bounds" accepts, under ADR
+        // `deployment-threat-model`: a sender writing a malformed line writes it with the same
+        // names each time.
         if sd.get(id).is_some() {
             return Err(SdError::new(elem_start, format!("duplicate SD-ID {id:?}")));
         }
@@ -663,8 +678,9 @@ fn parse_5424(
     let mut attrs = AttrMap::new();
     attrs.insert_sym(KEYS.facility, Value::U64(facility as u64));
     attrs.insert_sym(KEYS.severity, Value::U64(severity_num as u64));
-    // Nil is an explicit `Value::Null`; unparseable rejects the line like a bad PRI; parseable but
-    // out of `i64`-nanosecond range keeps the event without the attribute (`super`'s module doc).
+    // Nil or empty is an explicit `Value::Null`; unparseable rejects the line like a bad PRI;
+    // parseable but out of `i64`-nanosecond range keeps the event without the attribute (`super`'s
+    // module doc).
     match nil_or(ts_field) {
         None => {
             attrs.insert_sym(KEYS.timestamp, Value::Null);
@@ -707,11 +723,11 @@ fn parse_5424(
                 String::from_utf8_lossy(pid)
             )));
         }
-        match std::str::from_utf8(pid).expect("validated PRINTUSASCII above").parse::<u64>() {
-            Ok(n) => {
+        match canonical_pid(pid) {
+            Some(n) => {
                 attrs.insert_sym(KEYS.pid, Value::U64(n));
             }
-            Err(_) => {
+            None => {
                 attrs.insert_sym(KEYS.pid, Value::Str(subslice::share(line, pid)));
             }
         }
@@ -1367,12 +1383,13 @@ mod tests {
         assert!(matches!(parse_err(line), CodecError::Malformed(_)));
     }
 
-    /// A line rejected inside `parse_structured_data` interns nothing, whether it is an RFC 3164
-    /// line routed there by the sniff or a version-`1` line with a malformed SD-ELEMENT
-    /// (`docs/design/memory.md` §4). `nextest` runs each test in its own process, so
-    /// `interner::len()` reflects only this test.
+    /// A line rejected inside `parse_structured_data` before its first PARAM or SD-ELEMENT
+    /// completes interns nothing, whether it is an RFC 3164 line routed there by the sniff or a
+    /// version-`1` line with a malformed SD-ELEMENT. A line rejected later has interned the names
+    /// it completed: the exposure `parse_structured_data`'s comment accepts. `nextest` runs each
+    /// test in its own process, so `interner::len()` reflects only this test.
     #[test]
-    fn a_line_rejected_inside_structured_data_interns_nothing() {
+    fn a_line_rejected_inside_structured_data_interns_only_the_names_it_completed() {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
         // Warm-up: initializes `KEYS` before the window opens.
         drop(
@@ -1400,8 +1417,47 @@ mod tests {
         assert_eq!(
             logit_core::interner::len(),
             before,
-            "an SD-ID from a line that never validated must not reach the interner"
+            "nothing on a line rejected before a PARAM completes reaches the interner"
         );
+
+        // One complete PARAM and one closed element, then a malformed second element: the line is
+        // rejected, and the completed PARAM-NAME and SD-ID are interned.
+        let late = Bytes::from_static(b"<134>1 - - - - - [first@1 done=\"v\"][second@1 broken");
+        let events = decoder.decode(late).expect("decode should succeed").events;
+        assert!(events.is_empty(), "a malformed second SD-ELEMENT rejects the whole line");
+        assert_eq!(
+            logit_core::interner::len(),
+            before + 2,
+            "`done` and `first@1` completed before the rejection, and nothing else did"
+        );
+    }
+
+    /// `syslog.pid` is `U64` only for canonical decimal, so a PID `u64::from_str` would rewrite
+    /// (`+5`, `007`) stays the `Str` the sender wrote and relays unchanged.
+    #[test]
+    fn a_non_canonical_numeric_pid_stays_a_str() {
+        for (line, pid) in [
+            ("<134>1 - - - +5 - - msg", "+5"),
+            ("<134>1 - - - 007 - - msg", "007"),
+            ("<13>app[+5]: msg", "+5"),
+            ("<13>app[007]: msg", "007"),
+        ] {
+            let event = only_event(decode(line));
+            assert_eq!(
+                event.attributes.get("syslog.pid").and_then(Value::as_str),
+                Some(pid),
+                "{line}"
+            );
+        }
+        for (line, pid) in [
+            ("<134>1 - - - 0 - - msg", 0),
+            ("<134>1 - - - 18446744073709551615 - - msg", u64::MAX),
+            ("<13>app[0]: msg", 0),
+            ("<13>app[42]: msg", 42),
+        ] {
+            let event = only_event(decode(line));
+            assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(pid)), "{line}");
+        }
     }
 
     #[test]

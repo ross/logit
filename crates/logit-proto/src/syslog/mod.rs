@@ -12,14 +12,24 @@
 //!
 //! ## Dialect disambiguation
 //!
-//! Per message, right after `<PRI>`: a digit then a space (`1 `) means RFC 5424, anything else
-//! RFC 3164. This sniff is a guess, since RFC 5424's VERSION allows `1`-`999` and a tag-less RFC
-//! 3164 line whose MSG starts `4 requests failed` matches it too. A failed RFC 5424 parse with
-//! version `1` (the only version real senders emit) is rejected as malformed RFC 5424. A failed
-//! parse with any other digit is taken for a false-positive sniff: the line is reparsed as RFC
-//! 3164 (whose parse never fails) with a throttled `sniff_fallback` diagnostic, which would
-//! surface a future RFC 5424 version. So each RFC 5424 field rejection below rejects a version-`1`
-//! line and sends any other version to the RFC 3164 fallback.
+//! Per message, right after `<PRI>`: one ASCII digit then a space (`1 `) means RFC 5424, anything
+//! else RFC 3164. RFC 5424's VERSION is one to three digits (`NONZERO-DIGIT 0*2DIGIT`), but `1` is
+//! the only version it defines and the only one any sender writes, so the sniff reads one digit: a
+//! two- or three-digit token (`<13>10 workers started`) comes only from a tag-less RFC 3164 MSG,
+//! and parses as RFC 3164. The sniff is still a guess, since a tag-less RFC 3164 MSG starting
+//! `4 requests failed` matches it too. After a match:
+//!
+//! - **Version `1`:** a failed RFC 5424 parse rejects the line as malformed RFC 5424. That
+//!   includes a tag-less RFC 3164 MSG starting `1 ` (`<14>1 worker died`, the shape Python's
+//!   `SysLogHandler` sends), which nothing on the line tells apart from a malformed RFC 5424 line
+//!   (`docs/known-gaps/syslog.md`).
+//! - **Any other digit, `0` included:** a failed parse is taken for a false-positive sniff, and the
+//!   line is reparsed as RFC 3164 (whose parse never fails) with a throttled `sniff_fallback`
+//!   diagnostic. A line that parses is RFC 5424, with no diagnostic, and its VERSION isn't kept:
+//!   `syslog_out` writes `1`. `0` is outside RFC 5424's grammar and is read the same way.
+//!
+//! So each RFC 5424 field rejection below rejects a version-`1` line and sends any other version
+//! to the RFC 3164 fallback.
 //!
 //! ## Mapping
 //!
@@ -48,9 +58,9 @@
 //!
 //! - RFC 5424's RFC 3339 form is a `Value::Timestamp`.
 //! - RFC 3164's is the raw `Value::Str`, since resolving it needs a guess.
-//! - A nil RFC 5424 TIMESTAMP (`-`) is an explicit `Value::Null`, so `syslog_out` or a Lua script
-//!   can tell "the sender said no timestamp" from RFC 3164's absent timestamp, which omits the
-//!   attribute.
+//! - A nil RFC 5424 TIMESTAMP (`-`), or an empty one (see "Leniencies"), is an explicit
+//!   `Value::Null`, so `syslog_out` or a Lua script can tell "the sender said no timestamp" from
+//!   RFC 3164's absent timestamp, which omits the attribute.
 //! - A well-formed RFC 5424 TIMESTAMP outside the `i64`-nanosecond range
 //!   (`TimestampError::OutOfRange`) keeps the event, omits `syslog.timestamp`, and reports a
 //!   throttled `timestamp_out_of_range`. One that doesn't parse (`Malformed`) rejects the line.
@@ -74,25 +84,33 @@
 //!   `Value::Array` of `Value::Str` in wire order.
 //! - `PARAM-VALUE` is a quoted UTF-8 string in which only `\"`, `\\`, and `\]` are escapes,
 //!   unescaped on decode; a backslash before any other byte is kept, with that byte.
-//! - Any violation rejects the line, with a `bad_line` naming the rule and its byte offset.
+//! - Any other violation rejects the line, with a `bad_line` naming the rule and its byte offset,
+//!   apart from the leniencies under "Leniencies".
 //!
 //! **A leading RFC 5424 §6.4 UTF-8 BOM (`EF BB BF`) on MSG is stripped**, so it doesn't leak into
 //! `log.message` as U+FEFF: it is a `MSG-UTF8` signal, not payload. It is stripped only when the
 //! whole MSG is valid UTF-8; a non-UTF-8 MSG has no `Value::Str` to strip it from.
 //!
 //! **Header fields are parsed off raw bytes and validated one by one; only MSG may hold non-UTF-8
-//! bytes.** `decode_into` splits on the `\n` byte with no whole-line UTF-8 check.
-//! PRI, the RFC 3164 timestamp, HOSTNAME, TAG/APP-NAME, PROCID, MSGID, and STRUCTURED-DATA are
-//! PRINTUSASCII by grammar and validated where extracted. A violation in an RFC 5424 field rejects
-//! the line. RFC 3164's header parse never fails, because the sniff fallback depends on that: a
-//! non-UTF-8 RFC 3164 HOSTNAME candidate is left unstamped with a throttled `hostname_not_utf8`.
-//! MSG is validated on its own: valid UTF-8 becomes `Value::Str`, and invalid UTF-8 becomes
-//! `Value::Bytes` rather than rejecting the line, since RFC 5424 allows arbitrary binary MSG-ANY.
+//! bytes.** `decode_into` splits on the `\n` byte with no whole-line UTF-8 check. PRI is ASCII
+//! digits, and the RFC 3164 timestamp is ASCII by its shape check. RFC 5424's HOSTNAME, APP-NAME,
+//! PROCID, MSGID, and STRUCTURED-DATA names are PRINTUSASCII by grammar and validated where
+//! extracted, and a violation rejects the line. RFC 3164 gives HOSTNAME no character set, so an
+//! RFC 3164 HOSTNAME is any valid UTF-8 without a space, which keeps a non-ASCII hostname; its TAG
+//! and PID are `is_tag_shaped`'s classes. RFC 3164's header parse never fails, because the sniff
+//! fallback depends on that: a non-UTF-8 RFC 3164 HOSTNAME candidate is left unstamped with a
+//! throttled `hostname_not_utf8`. MSG is validated on its own: valid UTF-8 becomes `Value::Str`,
+//! and invalid UTF-8 becomes `Value::Bytes` rather than rejecting the line, since RFC 5424 allows
+//! arbitrary binary MSG-ANY.
 //!
-//! **`syslog.pid`** is `Value::U64` when PROCID or a `tag[pid]` bracket parses as one, and
-//! `Value::Str` of the raw token otherwise: RFC 5424's PROCID is free-form PRINTUSASCII. For RFC
-//! 3164, `is_tag_shaped` accepts non-numeric bracket content that is PRINTUSASCII without `]`
-//! (so the bracket still balances), so the `[...]` isn't absorbed into the message body.
+//! **`syslog.pid`** is `Value::U64` when PROCID or a `tag[pid]` bracket is a canonical decimal
+//! that fits a `u64` (ASCII digits with no leading zero, or `0`), and `Value::Str` of the raw token
+//! otherwise, so `+5` and `007` relay as written: RFC 5424's PROCID is free-form PRINTUSASCII. For
+//! RFC 3164, `is_tag_shaped` accepts bracket content that is PRINTUSASCII without `]` (so the
+//! bracket still balances), so the `[...]` isn't absorbed into the message body.
+//!
+//! **Every header field and MSG is a slice of the input; a PARAM-VALUE is a copy**, since it is
+//! built byte by byte as its escapes are read.
 //!
 //! ## The RFC 3164 header
 //!
@@ -114,6 +132,32 @@
 //! process name (letters, digits, `_`, `-`, `.`, `/`, optionally a bracketed PID). Otherwise a
 //! tag-less message starting `{"status": 200, ...}` would have `{"status":` taken for a tag and
 //! part of its body eaten; no real tag contains `{` or `"`.
+//!
+//! ## Leniencies
+//!
+//! Each of these accepts a line the RFC grammar rejects and loses nothing doing so. Every other
+//! departure from the grammar above rejects the line.
+//!
+//! - **RFC 5424 header.**
+//!   - An empty field (two spaces in a row) is read as nil: HOSTNAME, APP-NAME, PROCID, and MSGID
+//!     stamp nothing, and TIMESTAMP is `Value::Null`.
+//!   - Field lengths aren't checked. RFC 5424 caps HOSTNAME at 255 bytes, APP-NAME at 48, PROCID at
+//!     128, and MSGID at 32; a longer field is kept whole.
+//!   - TIMESTAMP takes up to nine fractional-second digits where RFC 5424 allows six, the limit of
+//!     `logit_core::time`'s RFC 3339 parser.
+//! - **STRUCTURED-DATA.**
+//!   - An SD-ID is any SD-NAME. RFC 5424 §6.3.2's `name@<private enterprise number>` form, or an
+//!     IANA-registered name, isn't checked.
+//!   - An unescaped `]` inside a quoted PARAM-VALUE is a literal `]`: the closing `"` ends the
+//!     value, not the bracket.
+//!   - The SP between STRUCTURED-DATA and MSG is optional, so `[a@1 k="v"]msg` and `-msg` both
+//!     have MSG `msg`.
+//! - **RFC 3164 header.**
+//!   - The timestamp is matched by shape only: three ASCII letters, a space- or zero-padded day,
+//!     and `hh:mm:ss` digits. The month name and the digits' ranges aren't checked, and the 15
+//!     bytes are kept verbatim in `syslog.timestamp`.
+//!   - The space after the timestamp is optional.
+//!   - TAG's 32-character limit isn't checked.
 
 pub mod decode;
 

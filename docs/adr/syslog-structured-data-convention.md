@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-04
+updated: 2026-10-09
 ---
 
 # RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission
@@ -73,7 +73,9 @@ has:
   closing quote, an unterminated element, an SD-NAME outside 1..=32 PRINTUSASCII-minus-`=SP]"` —
   with a `bad_line` diagnostic naming what was violated and its byte offset. This is the same
   strictness every other malformed RFC 5424 field on the line already gets (a bad PRI, a bad
-  TIMESTAMP): STRUCTURED-DATA is not a special, more-tolerant case.
+  TIMESTAMP): STRUCTURED-DATA is not a special, more-tolerant case. The exceptions are the
+  leniencies that lose nothing, such as an unescaped `]` inside a quoted PARAM-VALUE, which
+  `crates/logit-proto/src/syslog/mod.rs`'s "Leniencies" lists.
 
 ### Emit rules (`crates/logit-outputs/src/syslog.rs`'s `write_structured_data`, `write_sd_element`, `write_sd_param`, `push_sd_escaped`)
 
@@ -132,8 +134,9 @@ before an event reaches `syslog_out`.
 
 ### `syslog.pid`
 
-`Value::U64` when PROCID (5424) or a `tag[pid]` bracket (3164) parses as one; `Value::Str` of the
-raw token otherwise. RFC 5424's PROCID is free-form PRINTUSASCII, not necessarily numeric, and this
+`Value::U64` when PROCID (5424) or a `tag[pid]` bracket (3164) is canonical decimal that fits a
+`u64` (no sign, no leading zero); `Value::Str` of the raw token otherwise, so `+5` and `007` relay
+as written. RFC 5424's PROCID is free-form PRINTUSASCII, not necessarily numeric, and this
 project now keeps a non-numeric one rather than dropping it. `resolve_pid` mirrors this on encode
 ([`Pid::U64`]/[`Pid::Str`]): a `Pid::Str` is sanitized and capped at 128 bytes (5424's own PROCID
 maximum) on 5424 output, and rendered as `tag[pid]` after the same cap on 3164 output (3164 defines
