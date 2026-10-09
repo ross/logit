@@ -76,7 +76,11 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # targets' 64 admits `decode_batch_body`'s events `Vec` regrowing by doubling past its initial
 # 4,096: a batch of one-byte empty events at `max_len` regrows to about 56 MiB. `proxy_header`'s
 # `max_len` admits the largest PROXY v2 header, 16 plus 65,535 bytes, and one payload byte behind
-# it. `forwarded`'s 4,096 is past any forwarding header a proxy writes. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
+# it. `forwarded`'s 4,096 is past any forwarding header a proxy writes. `stream_framing`'s `max_len`
+# is its 4 selector bytes, the longest frame header (`65536 `, six bytes), and a frame of
+# `MAX_FRAME_BYTES`, so an at-bound frame fits under every framing; its only growing allocation is
+# the framer's buffer, never larger than the input, so 16 MiB is ample, and it needs no fork mode
+# because the framer interns nothing. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
 #
 # `native_batch` and `native_hop_batch` run in fork mode: the process-wide interner never evicts, so a
 # long-lived fuzz process accumulates every dictionary string it decodes until the arena outgrows
@@ -97,6 +101,7 @@ FUZZ_TARGETS=(
     "prom_remote_write|65536|64|"
     "proxy_header|65552|16|"
     "forwarded|4096|16|"
+    "stream_framing|65546|16|"
 )
 
 # The sanitizer builds' RUSTFLAGS differ from miri's and careful's, so they get their own volume

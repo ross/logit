@@ -119,3 +119,10 @@ path = "fuzz_targets/forwarded.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "stream_framing"
+path = "fuzz_targets/stream_framing.rs"
+test = false
+doc = false
+bench = false
