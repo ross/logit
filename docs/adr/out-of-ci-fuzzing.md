@@ -162,7 +162,7 @@ harness, not by CI.
   nightly, carries `clang`, and has a driver script. A second image would repeat all of that and
   drift from it. Only the target volume needs to be separate.
 - **Structured targets through `arbitrary`.** Rejected for these targets. Every decoder here takes
-  bytes from a peer, so raw bytes are the input space an attacker controls. `arbitrary`-derived
+  bytes from a peer, so raw bytes are the input space a peer writes. `arbitrary`-derived
   inputs start from well-typed values and reach the decoders only through an encoder, which skips
   the malformed inputs the fuzzer exists to find. A later target for an encoder-side invariant can
   use it.
