@@ -9,6 +9,18 @@
 //! or DogStatsD's 4-byte little-endian one (`statsd_in`'s `transport: unix_stream`; ADR
 //! `datadog-agent-and-intake-relay`, decision 12).
 //!
+//! **What a connection holds.** Between pushes, after `next_frame` returns `Ok(None)`, the buffer
+//! holds at most `max_frame_bytes` under LF framing, `max_frame_bytes + 10` under octet counting
+//! (nine count digits and the SP), and `max_frame_bytes + 4` under a length prefix; a drain in
+//! progress holds nothing. The line bound is checked after a push, not during it, so the peak
+//! inside a push is that plus one push: `max_frame_bytes + READ_BUFFER_BYTES` under LF framing,
+//! since the driver pushes at most [`READ_BUFFER_BYTES`] at a time.
+//!
+//! **FIN and RST agree.** A connection's remainder is decided by [`Framer::finish`] on a clean EOF
+//! and by [`Framer::abandon`] on every other end, and the two count the same bytes the same way.
+//! The one exception is `Rfc6587Auto`'s LF framing, where a FIN delivers a remainder with
+//! content as a final message.
+//!
 //! The sockets, the first-byte and idle deadlines, and what a [`FrameError`] costs a connection
 //! are the driver's: `crates/logit-inputs/src/tcp.rs`'s module doc.
 
@@ -19,7 +31,8 @@ use bytes::{Bytes, BytesMut};
 /// calls it.
 ///
 /// Not configurable on `syslog_in` or `statsd_in`. `graphite_in` overrides it with its own
-/// `max_line_bytes`/`max_frame_bytes`, which carbon's receivers expose. It is *not* tied to
+/// `max_line_bytes`/`max_frame_bytes`, which carbon's receivers expose, and `lines_in` with its
+/// `max_line_bytes`, which defaults to this value. It is *not* tied to
 /// `syslog_out`'s `max_message_bytes` (8192): that is a sender-side knob an operator may raise,
 /// and a receiver ceiling tracking it would need re-tuning in lockstep with every sender. 64 KiB
 /// matches the practical per-message ceiling the UDP driver's 65507-byte read buffer already
@@ -53,7 +66,8 @@ pub enum FramingMode {
     /// life (`docs/adr/syslog-tcp-ingress-and-tls.md`). `syslog_in`'s mode, and nothing else's.
     Rfc6587Auto,
     /// LF-delimited lines only, never octet counting, whatever the first byte is. `graphite_in`
-    /// plaintext and `statsd_in`.
+    /// plaintext, `statsd_in`'s `tcp`, and `lines_in`'s `tcp` and `unix_stream`, each under
+    /// [`Oversize::DrainToNextLine`].
     Lines {
         /// What a line past the frame bound does.
         oversize: Oversize,
@@ -71,10 +85,13 @@ pub enum FramingMode {
 /// What [`FramingMode::Lines`] does with a line past the frame bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Oversize {
-    /// Close the connection, as RFC 6587 framing does: a line past the ceiling can only get
-    /// longer, and under octet counting there is no resync point.
+    /// Close the connection: a line past the ceiling can only get longer. The policy
+    /// `Rfc6587Auto`'s LF framing always applies (`syslog_in`). No shipped listener configures
+    /// `Lines { oversize: Fatal }`; it stays for a line protocol that prefers a close to a resync.
     Fatal,
-    /// Skip that one line and resynchronize at the next `LF`, counting the skip **once**. Carbon's
+    /// Skip that one line and resynchronize at the next `LF`, counting the skip **once**: as
+    /// [`FrameError::Drained`] if the line crossed the bound with no `LF` buffered, so the framer
+    /// discards input until one arrives, else as [`FrameError::OversizeSkipped`]. Carbon's
     /// behaviour (`docs/adr/graphite-carbon-relay.md`): one pathological datapoint must not cost a
     /// busy relay's whole connection, and an LF-delimited stream has an unambiguous resync point.
     DrainToNextLine,
@@ -197,7 +214,7 @@ pub struct Framer {
     mode: FramingMode,
     /// The largest single frame this connection will assemble. Per listener, not a constant:
     /// `syslog_in`/`statsd_in` take [`MAX_FRAME_BYTES`], a `graphite_in` takes its operator-facing
-    /// `max_line_bytes`/`max_frame_bytes`.
+    /// `max_line_bytes`/`max_frame_bytes`, and a `lines_in` its `max_line_bytes`.
     max_frame_bytes: usize,
     /// `None` only under [`FramingMode::Rfc6587Auto`] before the first byte arrives (the latch
     /// rule is on [`Framing`]). Both explicit modes set it at construction.
@@ -404,8 +421,8 @@ impl Framer {
                 match self.mode {
                     // RFC 6587 §3.4.2 can't distinguish "the sender finished and closed" from
                     // "the sender died mid-message", and permits a final message with no
-                    // terminator, so this is an ordinary message. (`LengthPrefixed` never gets
-                    // here: its framing is never `NonTransparent`.)
+                    // terminator, so this is an ordinary message. (Neither length-prefixed mode
+                    // gets here: its framing is never `NonTransparent`.)
                     FramingMode::Rfc6587Auto
                     | FramingMode::LengthPrefixed
                     | FramingMode::LengthPrefixedLe => Ok(Some(line)),
@@ -524,8 +541,9 @@ impl Framer {
     /// A 4-byte payload length, then that many payload bytes: big-endian for Twisted's
     /// `Int32StringReceiver` ([`FramingMode::LengthPrefixed`]), little-endian for DogStatsD's
     /// stream socket ([`FramingMode::LengthPrefixedLe`]); `read_len` is the byte order. The prefix
-    /// is validated and stripped here, so the decoder gets one unframed payload, which
-    /// `GraphiteDecoder`'s pickle path expects (framing is the listener's job).
+    /// is validated and stripped here, so the decoder gets one unframed payload: `GraphiteDecoder`'s
+    /// pickle path expects one pickle, and `StatsdDecoder` one packet of lines, as it gets from a
+    /// datagram (framing is the listener's job).
     ///
     /// A declared length past the bound is [`FrameError::Oversize`] and fatal: unlike an
     /// LF-delimited stream there is no resync point to skip to. A short buffer is `Ok(None)`.
@@ -1003,33 +1021,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_length_prefixed_frame_split_across_pushes_is_assembled() {
-        let payload = b"a pickled batch";
-        let mut wire = (payload.len() as u32).to_be_bytes().to_vec();
-        wire.extend_from_slice(payload);
-
-        let mut framer = Framer::new(FramingMode::LengthPrefixed, MAX_FRAME_BYTES);
-        assert_eq!(framer.framing(), Some(Framing::LengthPrefixed));
-        assert_eq!(Framing::LengthPrefixed.as_str(), "length_prefixed");
-
-        // One byte per push, so the prefix itself straddles pushes: a reader that assumed a
-        // whole prefix per read, or read it little-endian, fails this.
-        let mut got = Vec::new();
-        for byte in &wire {
-            got.extend(push_and_drain(&mut framer, &[*byte]));
-        }
-        assert_eq!(got, vec!["a pickled batch".to_string()]);
-
-        let mut both = wire.clone();
-        both.extend_from_slice(&wire);
-        assert_eq!(
-            push_and_drain(&mut framer, &both).len(),
-            2,
-            "two frames back to back in one push come out in order"
-        );
-    }
-
     /// A remainder that carries no message: whitespace under `Lines`, a lone `CR` under
     /// `Rfc6587Auto`'s LF framing. [`Framer::finish`] drops it uncounted, so an RST over the same
     /// bytes must count nothing either.
@@ -1085,6 +1076,33 @@ mod tests {
                 Ok(None) => panic!("a FIN over a remainder with content counts it: {label}"),
             }
         }
+    }
+
+    #[test]
+    fn a_length_prefixed_frame_split_across_pushes_is_assembled() {
+        let payload = b"a pickled batch";
+        let mut wire = (payload.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(payload);
+
+        let mut framer = Framer::new(FramingMode::LengthPrefixed, MAX_FRAME_BYTES);
+        assert_eq!(framer.framing(), Some(Framing::LengthPrefixed));
+        assert_eq!(Framing::LengthPrefixed.as_str(), "length_prefixed");
+
+        // One byte per push, so the prefix itself straddles pushes: a reader that assumed a
+        // whole prefix per read, or read it little-endian, fails this.
+        let mut got = Vec::new();
+        for byte in &wire {
+            got.extend(push_and_drain(&mut framer, &[*byte]));
+        }
+        assert_eq!(got, vec!["a pickled batch".to_string()]);
+
+        let mut both = wire.clone();
+        both.extend_from_slice(&wire);
+        assert_eq!(
+            push_and_drain(&mut framer, &both).len(),
+            2,
+            "two frames back to back in one push come out in order"
+        );
     }
 
     #[test]
