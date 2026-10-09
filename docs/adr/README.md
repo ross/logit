@@ -10,6 +10,7 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [Run CI in an image prebaked from `Dockerfile.dev` and published to GHCR](ci-image-on-ghcr.md) | 2026-10-09 | 2026-10-09 |
 | [A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle](soak-harness.md) | 2026-10-08 | 2026-10-08 |
 | [`statsd_out` multi-value expansion: summarized kinds leave as dotted counter and gauge lines by default](statsd-out-multi-value-expansion.md) | 2026-10-07 | 2026-10-07 |
 | [Listener port sharing with `SO_REUSEPORT`, a SIGTERM drain delay, and an admin Unix socket](listener-port-sharing-and-shutdown-delay.md) | 2026-10-07 | 2026-10-07 |
@@ -19,9 +20,9 @@ the same date, write the record, then add a row here.
 | [Listener peer address: opt-in `network.peer.*` on the shared drivers, and PROXY protocol on TCP](listener-peer-address.md) | 2026-10-05 | 2026-10-05 |
 | [`lines_in`: a plain-lines listener that emits one raw log event per line and parses nothing](plain-lines-listener.md) | 2026-10-05 | 2026-10-05 |
 | [Native hop ack status: the sender pair leads the hop payload, and a rejected `Ack` settles one frame by name](native-hop-ack-status.md) | 2026-10-04 | 2026-10-05 |
-| [Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink](sink-fault-classes.md) | 2026-10-04 | 2026-10-05 |
+| [Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink](sink-fault-classes.md) | 2026-10-04 | 2026-10-09 |
 | [jiff is the one calendar implementation, behind the codecs' strict RFC 5424 contract](jiff-for-calendar-time.md) | 2026-10-04 | 2026-10-04 |
-| [`timestamp`: resolving `event.timestamp` from an attribute, with jiff for calendar time](timestamp-transform.md) | 2026-10-04 | 2026-10-04 |
+| [`timestamp`: resolving `event.timestamp` from an attribute, with jiff for calendar time](timestamp-transform.md) | 2026-10-04 | 2026-10-09 |
 | [Lua refusals: `Event.new` raises a refusal from a Lua shim, not as an mlua callback error](lua-refusals-raised-from-lua.md) | 2026-10-03 | 2026-10-03 |
 | [Crate layout: don't split crates to speed up the dev build](crate-layout-and-build-speed.md) | 2026-10-03 | 2026-10-03 |
 | [Release profile: fat LTO and one codegen unit, measured against thin LTO and 16 units](release-build-profile.md) | 2026-10-03 | 2026-10-03 |
@@ -46,7 +47,7 @@ the same date, write the record, then add a row here.
 | [Durable checkpoint writes, observed spool I/O failures, and a feature-gated fault-injection seam](durable-checkpoint-writes-and-fault-injection.md) | 2026-09-24 | 2026-09-28 |
 | [Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`](datadog-agent-and-intake-relay.md) | 2026-09-23 | 2026-10-08 |
 | [`sample`: consistent, keyed event sampling with an operator override](consistent-sampling-component.md) | 2026-09-22 | 2026-09-22 |
-| [Publish the release image to GHCR, `latest` only, on manual dispatch](publish-release-image-to-ghcr.md) | 2026-09-22 | 2026-09-22 |
+| [Publish the release image to GHCR, `latest` only, on manual dispatch](publish-release-image-to-ghcr.md) | 2026-09-22 | 2026-10-09 |
 | [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-10-05 |
 | [Out-of-CI verification of raw-`libc` `unsafe`: a throwaway nightly image, not a Dockerfile.dev change](out-of-ci-unsafe-verification.md) | 2026-09-21 | 2026-09-25 |
 | [`flatten`: dotted-key expansion as an opt-in, operator-placed transform](flatten-transform.md) | 2026-09-21 | 2026-09-21 |
@@ -124,4 +125,4 @@ the same date, write the record, then add a row here.
 | [Developer workflow: Scripts to Rule Them All, and PR-based development](scripts-to-rule-them-all.md) | 2026-08-28 | 2026-08-28 |
 | [User scripting language: Lua (LuaJIT)](scripting-language-lua.md) | 2026-08-28 | 2026-08-28 |
 | [Service-to-service protocol: native wire format, OTLP as a bridge](native-wire-format-with-otlp-bridge.md) | 2026-08-28 | 2026-08-28 |
-| [Containerized development environment](containerized-development.md) | 2026-08-28 | 2026-08-28 |
+| [Containerized development environment](containerized-development.md) | 2026-08-28 | 2026-10-09 |

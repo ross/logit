@@ -501,7 +501,7 @@ Per pair:
   panics, still fails its node and exits `2`. `buffer.delivery: at_most_once` drops an `Ambiguous` fault instead of
   retrying it ([ADR `delivery-semantics`](docs/adr/delivery-semantics.md)). The shared HTTP
   driver (`crates/logit-outputs/src/http.rs`) supplies a status-only default that each HTTP
-  sink's table refines, and `otlp_out` retries only the signals a destination hasn't settled.
+  sink's table refines, and `otlp_out`, `datadog_out`, and `datadog_trace_out` retry only the signals or requests a destination hasn't settled.
 - **Trace propagation**: every `Delivered` (one `Fanout` edge's channel payload) carries a real
   `TraceContext`, propagated as a child of its parent for the two node kinds with an unambiguous
   one to propagate: `Transform::process`/`ScriptWorker::process`'s non-flush path, and
@@ -556,6 +556,8 @@ the operator-facing account of all of this.
 - **Release image**: `ghcr.io/ross/logit:latest`, pushed by hand via `workflow_dispatch` rather
   than on every merge
   ([ADR `publish-release-image-to-ghcr`](docs/adr/publish-release-image-to-ghcr.md)).
+  The CI image, `ghcr.io/ross/logit-ci`, is likewise published by hand
+  ([ADR `ci-image-on-ghcr`](docs/adr/ci-image-on-ghcr.md)).
 
 ### Demo, examples, and fixtures
 
@@ -674,6 +676,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
 | `script/image [tag]` | Build the production runtime image (`Dockerfile`, not `Dockerfile.dev`) |
+| `script/ci-image [build\|tag\|check]` | Build the CI image (`Dockerfile.dev`'s `ci` stage) tagged by that file's hash, or print the tag; `IMAGE_PUSH=1` pushes it unless the tag exists. `check` is CI's first step and fails when the image doesn't match the checkout's `Dockerfile.dev`, so any edit to `Dockerfile.dev` needs a republish via the "Publish CI image" workflow (`--ref <branch>`) and a tag bump in `ci.yml` ([ADR `ci-image-on-ghcr`](docs/adr/ci-image-on-ghcr.md)) |
 | `script/demo [compose args]` | Run the self-contained demo stack (`demo/`) — the release image, no dev container |
 | `script/vm up\|shell\|status\|down\|build\|push\|pull` | Create, use, and destroy a disposable Azure VM for perf measurement (`docs/adr/disposable-azure-perf-vm.md`). `down` deletes the resource group — the only way back to $0. **The operator runs `up` and `down`**; an agent does the measuring in between — `build <ref\|dir\|tarball>...` stashes another binary to measure (`perf/bins/<slug>/logit`, fed to `logit-perf run --logit-bin`), `push`/`pull` `scp` files to/from it |
 | `script/unsafe-check miri\|careful\|inject\|all\|fuzz\|fuzz-all\|fuzz-tmin\|fuzz-seed\|shell` | Out-of-CI, nightly-only verification of the codebase's three raw-`libc` `unsafe` call sites (`crates/logit-inputs/src/udp.rs`'s `recvmmsg`, `crates/logit-pipeline/src/sockstat.rs`'s `getsockopt`, `crates/logit-inputs/src/tail/watch.rs`'s hand-rolled inotify — [ADR `out-of-ci-unsafe-verification`](docs/adr/out-of-ci-unsafe-verification.md)) in its own throwaway image (`tools/unsafe-check/Dockerfile`, not `Dockerfile.dev`). `miri` runs the pure-helper tests miri can execute (it has no shims for `recvmmsg`/`inotify`); `careful` runs the real crates under `cargo-careful`'s debug-assertion std; `inject <strace-inject-spec> [-- <cargo test args>]` forces an errno (EINTR/EAGAIN/…) via `strace -e inject=`, needing `--cap-add SYS_PTRACE`. The same image runs `cargo-fuzz` over the decoders that read a peer's or the disk spool's bytes ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)): `fuzz <target> [-- <libfuzzer args>]` runs one target under ASan for `FUZZ_SECONDS` (default 600), `fuzz-all [seconds]` runs every target in the script's `FUZZ_TARGETS` table (default 120 s each) and prints a summary with a `fuzz-tmin <target> <crash file>` line per crash, which minimizes it, and `fuzz-seed` rewrites the committed seeds. Not part of `cibuild` |
