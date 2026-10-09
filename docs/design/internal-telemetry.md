@@ -801,12 +801,11 @@ and `oversize` is a packet declaring more than 64 KiB, which closes the connecti
 **On either transport:** a line that *parses* badly isn't a framing error. It's the decoder's own
 `bad_line`, throttled per listener because every connection's decoder clone shares one set of
 counts. The driver's `bad_frame` key fires only for the single whole-frame failure
-`StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. A sampled `ms`/`h`/`d`
-line whose `@<rate>` implies a weight above `MAX_SAMPLE_WEIGHT` (the bound on how far decode-time
-sample-rate extrapolation can inflate a `Distribution`'s `count()`) is clamped rather than
-extrapolated without bound, and reported as
-`logit.component.diagnostics{key="sample_rate_clamped"}`. No separate counter is needed, because
-the bridge already mirrors every occurrence.
+`StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. The decoder carries a
+sampled `ms`/`h`/`d` line's `@<rate>` verbatim and clamps nothing; `aggregate` bounds the weight a
+rate implies at `Samples::MAX_WEIGHT` and reports a clamp as
+`logit.transform.samples.weight_clamped` and a `sample_rate_clamped` diagnostic under its own
+component, not `statsd_in`'s.
 
 ##### `syslog_in`
 

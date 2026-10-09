@@ -24,9 +24,10 @@ use std::sync::{Arc, LazyLock};
 /// It also shares its `Diagnostics` throttle counts, so `bad_line` throttles listener-wide.
 ///
 /// On TCP the driver hands this one already-delimited line, so [`Self::decode_into`]'s `\n` split
-/// is a single iteration, not a second framing pass. That is why no `with_line_splitting` switch is
-/// needed, unlike `syslog_in`'s `SyslogDecoder`: an octet-counted syslog frame may contain a
-/// `\n`, and a statsd line never can.
+/// is a single iteration. A UDP or Unix datagram, and a `unix_stream` length-prefixed packet, may
+/// hold many lines, and the split is their only line framing. Either way no `with_line_splitting`
+/// switch is needed, unlike `syslog_in`'s `SyslogDecoder`: an octet-counted syslog frame may
+/// contain a `\n` that is message content, and a statsd line never can.
 #[derive(Clone)]
 pub struct StatsdDecoder {
     resource: Arc<Resource>,
@@ -198,8 +199,9 @@ fn insert_origin_field(attributes: &mut AttrMap, bytes: &Bytes, field: &str) -> 
 /// Parses a `|T<unix-seconds>`/`d:<unix-seconds>` value into `(nanos, secs)`: `nanos` for
 /// `Event::timestamp`, `secs` for the `statsd.timestamp` carrier.
 ///
-/// A non-digit, or seconds whose nanosecond conversion overflows `i64`, rejects the line rather
-/// than falling back to receipt time.
+/// Anything `u64::from_str` refuses, or seconds whose nanosecond conversion overflows `i64`,
+/// rejects the line rather than falling back to receipt time. `from_str` takes a leading `+`
+/// (`super`'s module doc has why that stays).
 fn parse_wire_seconds(secs: &str, line: &str) -> Result<(i64, u64), CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
     let secs: u64 = secs.parse().map_err(|_| malformed())?;
@@ -1138,6 +1140,26 @@ mod tests {
         let events = decode("a:1|c|Tbad\nb:2|c");
         assert_eq!(events.len(), 1, "only the malformed-T line should be dropped");
         assert_eq!(intern("b"), only_metric(events).name);
+    }
+
+    /// The integer fields take what `u64::from_str` takes, a leading `+` and leading zeros
+    /// included (`super`'s module doc, under the rejection rules): each names the same number.
+    #[test]
+    fn integer_fields_accept_a_leading_plus_and_leading_zeros() {
+        for line in ["hits:1|c|T+1700000000", "hits:1|c|T01700000000"] {
+            let events = decode(line);
+            assert_eq!(events.len(), 1, "{line}");
+            assert_eq!(
+                events[0].attributes.get("statsd.timestamp"),
+                Some(&Value::U64(1_700_000_000)),
+                "{line}"
+            );
+        }
+        let event = &decode("_e{+2,+4}:hi|body|d:+5")[0];
+        assert_eq!(event.attributes.get("statsd.timestamp"), Some(&Value::U64(5)));
+        assert_eq!(event.log.as_ref().unwrap().message.as_str(), Some("body"));
+        let check = &decode("_sc|check|+1")[0];
+        assert_eq!(check.attributes.get("statsd.service_check.status"), Some(&Value::U64(1)));
     }
 
     /// `|c:`/`|T`/`@rate`/`#tags` combine freely, in any order, on the same line.
