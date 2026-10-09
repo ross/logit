@@ -297,7 +297,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CODEC-01](#codec-01--hand-rolled-restricted-pickle-stack-machine-reader-opcode-allowlist) | P1 | Hand-rolled restricted pickle stack-machine reader (opcode allowlist) | `crates/logit-proto/src/graphite/pickle.rs` (`PickleReader::parse`, `PickleReader::read_datapoints`) | in-progress (untrusted/w9) |
 | [CODEC-02](#codec-02--historical-pickle-memo-growth-dos-fixed-regression-sensitive) | P1 | Historical pickle memo-growth DoS (fixed, regression-sensitive) | `crates/logit-proto/src/graphite/pickle.rs` (`PickleReader::memo_put`) | in-progress (untrusted/w9) |
 | [CODEC-03](#codec-03--carbon-plaintextpickle-decode-entry-point-and-timestamp-arithmetic) | P1 | Carbon plaintext/pickle decode entry point and timestamp arithmetic | `crates/logit-proto/src/graphite/decode.rs` (`GraphiteDecoder::decode_into`, `resolve_timestamp`) | in-progress (untrusted/w9) |
-| [CODEC-05](#codec-05--dogstatsdstatsd-line-decoder--per-line-dispatch-and-event-text-unescaping) | P1 | DogStatsD/statsd line decoder — per-line dispatch and event-text unescaping | `crates/logit-proto/src/statsd/decode.rs` (`StatsdDecoder::decode_into`, `unescape_event_text`) | in-progress (untrusted/w7) |
+| [CODEC-05](#codec-05--dogstatsdstatsd-line-decoder--per-line-dispatch-and-event-text-unescaping) | P1 | DogStatsD/statsd line decoder — per-line dispatch and event-text unescaping | `crates/logit-proto/src/statsd/decode.rs` (`StatsdDecoder::decode_into`, `unescape_event_text`) | findings → untrusted/w7 |
 | [CODEC-07](#codec-07--rfc-31645424-syslog-parser--pritimestamp-framing-and-dialect-sniffing) | P1 | RFC 3164/5424 syslog parser — PRI/TIMESTAMP framing and dialect sniffing | `crates/logit-proto/src/syslog/decode.rs` (`parse_line`, `parse_3164_timestamp`) | in-progress (untrusted/w8) |
 | [CODEC-10](#codec-10--collectd-binary-decoder--tlv-part-framing-and-the-values-part-lengthcount-gate) | P1 | collectd binary decoder — TLV part framing and the Values-part length/count gate | `crates/logit-proto/src/collectd/part.rs` (`read_part`) | in-progress (untrusted/w9) |
 | [CODEC-12](#codec-12--prometheus-textopenmetrics-decoder--line-grammar-family-assembler-and-cumulative-bucket-reconstruction) | P1 | Prometheus text/OpenMetrics decoder — line grammar, family assembler, and cumulative-bucket reconstruction | `crates/logit-proto/src/prometheus/text.rs` (`parse_with`, `Parser`, `parse_sample`) | in-progress (untrusted/w10) |
@@ -5821,6 +5821,41 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Existing coverage:** `crates/logit-proto/src/statsd/decode.rs`'s `#[cfg(test)] mod tests` (grammar, event/service-check parsing, tag folding). `crates/logit-inputs/tests/statsd_to_aggregate.rs` (integration through `aggregate`). ADR `statsd-output.md` (mirror), `lossless-transit.md`. Not confirmed in this pass whether `crates/logit-proto/tests/robustness.rs` includes a statsd fuzz/truncation section comparable to graphite's/collectd's — worth checking explicitly (the module doc for statsd wasn't found to make the same "highest-risk parser" claim graphite's does, which may just mean it's simpler grammar, not that it's untested).
 - **Suggested verification approach:** a proptest specifically constructing adversarial `_e{...}` event bodies with runs of `\n` escapes (including odd/malformed patterns like a trailing lone backslash) to stress the capacity arithmetic; confirm `crates/logit-proto/tests/robustness.rs` coverage for statsd specifically (grep found graphite/collectd sections but this pass didn't confirm a statsd one).
 - **Priority:** P1 — v0.1's target protocol, untrusted input, custom grammar; no bug found but capacity arithmetic and pointer-reconstruction patterns deserve a fuzz pass given the DoS history in the sibling graphite codec.
+- **Verified (untrusted/w7):** findings. A finite counter value divided by a sample rate below 1
+  could overflow: `hits:1e308|c|@0.1` decoded to a `Sum` of `inf`, which the model forbids. The
+  counter arm now rejects the line as `bad_line`, pinned by a unit test in `decode.rs` shown
+  failing with the fix reverted. Coverage can't tell one magnitude from another, so the fuzz
+  target didn't reach this on its own: two 120-second runs with the check removed, one with
+  `-use_value_profile=1`, found nothing, while the target's finite oracle panics on the input
+  directly. Four doc-versus-code items are corrected: the integer fields accept a leading `+`
+  and leading zeros, which no recorded client writes and which name the same number, so the
+  grammar doc now says so and a test pins it; the type doc's one-line-per-call claim now covers
+  a datagram and a `unix_stream` packet, which hold many; `docs/design/internal-telemetry.md`'s
+  decode-time clamp is re-pointed at `aggregate`'s `Samples::MAX_WEIGHT`; and `statsd_out`'s
+  module doc names `parse_line` as the free function it is. Checked with a new `statsd` fuzz
+  target and four oracles: a datagram decodes to the same events as its lines one at a time,
+  and invalid UTF-8 is `Err` with `out` unchanged; every value satisfies the model (finite
+  values, a non-empty name, non-empty `Samples` and `SetMembers`, a rate in `(0, 1]`, valid
+  UTF-8); a timestamp is the receipt time or the wire second `statsd.timestamp` names; and every
+  string is a slice of the datagram except an unescaped event message. A 600-second campaign
+  (`script/unsafe-check fuzz statsd`, debug assertions on) ran 11,105,241 inputs at about 17,500
+  exec/s to a 1,136-input, 798 KB corpus with no crash. With `parse_finite_value`'s check
+  removed, a run crashed on the gauge oracle in 18 seconds.
+  `crates/logit-proto/tests/robustness.rs` gains a statsd section: every truncation and 300 bit flips of each of the 65 recorded
+  datagrams, the unescape table, the `|T` boundary, and the worst case's largest allocation:
+  a 54 MiB `Vec` for two `a:1:1:…|c` lines in 64 KiB (the second append doubles `out`), the
+  reason for the target's 56 MiB malloc limit. The other invariants held: per-line isolation,
+  and non-finite rejection at every value parser. The observed concerns:
+  - *Capacity arithmetic:* pinned. The robustness unescape table (runs of up to 64 `\n`
+    escapes, empty text, a trailing lone `\`, `\\n`, and multibyte text around an escape)
+    compares against `str::replace` with the `debug_assert_eq!(out.len(), out.capacity())` live,
+    and the fuzz campaign ran with it live too. `escapes == 0` returns before the subtraction,
+    and each escape consumes two bytes, so `raw.len() - escapes` can't underflow.
+  - *Pointer reconstruction:* resolved by `logit_core::subslice::share` (untrusted/w1), which
+    range-checks the slice and copies one that lies outside the datagram, so a refactor that
+    passes an owned string gets a copy, not wrong bytes. The fuzz target's provenance oracle
+    checks every field it shares.
+  - *No robustness section:* added, as above.
 
 ### CODEC-06 — statsd/DogStatsD encoder — service-check status coercion and multi-value rendering
 - **Location:** `crates/logit-outputs/src/statsd.rs` (`render_service_check`, status coercion; `render_event`, event line rendering), module-wide `Samples`/`SetMembers` expansion (search `sketch()`/`raw`/`format: dogstatsd` in the same file)
