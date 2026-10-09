@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-04
+updated: 2026-10-09
 ---
 
 # `timestamp`: resolving `event.timestamp` from an attribute, with jiff for calendar time
@@ -141,8 +141,8 @@ decides what a valid zone or pattern is.
 **The time zone database is the system's.** With jiff's default features, a named zone reads
 `/usr/share/zoneinfo`, or `TZDIR` when set, on Linux; the database isn't bundled into the binary.
 `debian:bookworm-slim` (the release image base) and `rust:1.98.1-bookworm` (dev and CI) ship
-`tzdata` as a `required`-priority package; `Dockerfile`, `Dockerfile.dev`, and CI install it
-explicitly anyway so the dependency is declared. A scratch or distroless image has to add it. `UTC`
+`tzdata` as a `required`-priority package; `Dockerfile` and `Dockerfile.dev` (whose `ci` stage CI
+runs) install it explicitly anyway so the dependency is declared. A scratch or distroless image has to add it. `UTC`
 and fixed offsets need no database. A named zone that fails to load, or any named zone when no
 database is found, is a `logit validate` and startup error, never a per-event skip: nothing per
 event looks a zone up by name, because `%Q` is rejected in patterns.
