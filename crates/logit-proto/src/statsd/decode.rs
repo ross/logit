@@ -511,8 +511,15 @@ fn build_event(
 ) -> Result<Event, CodecError> {
     let kind = match type_part {
         "c" => {
-            let value = parse_finite_value(raw_value, "counter", line)?;
-            MetricKind::counter(value / sample_rate)
+            let value = parse_finite_value(raw_value, "counter", line)? / sample_rate;
+            // A rate below 1 multiplies, so a finite value near `f64::MAX` can extrapolate to
+            // infinity, which no `Sum` may carry.
+            if !value.is_finite() {
+                return Err(CodecError::Malformed(format!(
+                    "counter value overflows when extrapolated by its sample rate: {line:?}"
+                )));
+            }
+            MetricKind::counter(value)
         }
         "g" => {
             // A leading '+' or '-' is a relative adjustment: the spec has no syntax for a negative
@@ -648,6 +655,22 @@ mod tests {
                 "expected {value} to be rejected"
             );
         }
+    }
+
+    /// A finite value divided by a small rate can pass `f64::MAX`: `1e308 / 0.1` is `inf`.
+    #[test]
+    fn a_counter_whose_extrapolation_overflows_is_rejected() {
+        for line in ["hits:1e308|c|@0.1", "hits:-1e308|c|@0.5", "hits:1:1e308|c|@0.01"] {
+            let err = parse_err(line);
+            assert!(
+                matches!(&err, CodecError::Malformed(msg) if msg.starts_with("counter value overflows")),
+                "{line}: {err:?}"
+            );
+        }
+        let metric = only_metric(decode("hits:1e307|c|@0.5"));
+        assert!(
+            matches!(metric.kind, MetricKind::Sum(logit_core::Sum { value, .. }) if value == 2e307)
+        );
     }
 
     #[test]

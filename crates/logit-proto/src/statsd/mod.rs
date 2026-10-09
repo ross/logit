@@ -64,8 +64,9 @@
 //!
 //! A line is rejected as `bad_line` when it has no `:` or an empty name, no `|<type>`, an unknown
 //! type, a `c`/`g`/`ms`/`h`/`d` value that doesn't parse or isn't finite (`NaN`/`inf` parse as
-//! `f64`; `s` members are opaque and never parsed), or an `@rate` that doesn't parse, isn't
-//! finite, or is outside `(0, 1]` (checked even on a `g`/`s` line, which ignores the rate).
+//! `f64`; `s` members are opaque and never parsed), a `c` value whose extrapolation overflows to
+//! infinity (`1e308|c|@0.1`), or an `@rate` that doesn't parse, isn't finite, or is outside
+//! `(0, 1]` (checked even on a `g`/`s` line, which ignores the rate).
 //!
 //! ## DogStatsD tags
 //!
