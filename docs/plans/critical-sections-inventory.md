@@ -5911,7 +5911,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
     HOSTNAME, APP-NAME, PROCID, or MSGID already was. No recorded sender writes one, and reading
     it as nil loses nothing, where failing the RFC 5424 parse would turn it into RFC 3164.
   - The module doc's "any violation rejects the line" gives way to a "Leniencies" list, the one
-    copy, naming each header the RFC grammar wouldn't accept and the decoder does: any one-digit
+    copy, naming each line shape the RFC grammar wouldn't accept and the decoder does: any one-digit
     VERSION, `0` included, not kept; empty fields; unchecked field lengths; nine fractional-second
     digits; an unchecked SD-ID form; an unescaped `]` in a quoted PARAM-VALUE; an optional SP
     before MSG; the shape-only RFC 3164 timestamp and an optional SP after it; and an unchecked

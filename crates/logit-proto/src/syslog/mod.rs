@@ -134,7 +134,7 @@
 //!
 //! ## Leniencies
 //!
-//! Each of these accepts a header the RFC grammar wouldn't. All but the first keep every byte of
+//! Each of these accepts a line the RFC grammar wouldn't. All but the first keep every byte of
 //! the line. Every other departure from the RFC 5424 grammar above fails the RFC 5424 parse, and
 //! the line falls back to RFC 3164 ("Dialect disambiguation"). Only a malformed PRI rejects a
 //! line, as a throttled `bad_line`.
