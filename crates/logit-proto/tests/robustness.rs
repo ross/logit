@@ -16,7 +16,10 @@
 //! the 32-byte SD-NAME bound, repeated PARAM-NAMEs folding into one array, a PARAM-VALUE cut off at
 //! the end of the input, the PRI range, the RFC 3164 timestamp's 15 bytes, a digit-led RFC 3164
 //! MSG against the dialect sniff, a 64 KiB line of distinct SD-NAMEs, and the largest allocation
-//! a 64 KiB datagram makes.
+//! a 64 KiB datagram makes. The collectd section pins a Values count past the cap with its own
+//! matching length; the graphite section pins `resolve_timestamp`'s table against an exact
+//! reading, CPython's batched `APPENDS`, list-shaped pickle datapoints, and, in both, the largest
+//! allocation the worst 64 KiB input makes.
 //!
 //! For each decoder: every single-byte truncation of a valid input, thousands of seeded bit flips,
 //! length fields inflated past the input, and, for `decode_batch`, `Value` nesting past the depth
@@ -542,16 +545,16 @@ fn collectd_decode_survives_seeded_bit_flips() {
     assert_bit_flips_never_panic(&packet, 4000, |bytes| decode_collectd(bytes));
 }
 
-/// A Values part declaring 65535 data sources in 20 bytes: the attacker-chosen count must be
-/// checked against the part's length before anything is sized from it.
+/// A Values part declaring 65535 data sources in 20 bytes, as a sender's corrupt count would: the
+/// count must be checked against the part's length before anything is sized from it.
 #[test]
 fn collectd_decode_rejects_a_values_count_inflated_far_past_what_the_input_holds() {
-    let mut hostile = Vec::new();
-    hostile.extend_from_slice(&0x0006u16.to_be_bytes()); // Values
-    hostile.extend_from_slice(&20u16.to_be_bytes()); // a 20-byte part...
-    hostile.extend_from_slice(&65535u16.to_be_bytes()); // ...declaring 65535 data sources
-    hostile.extend_from_slice(&[0xAA; 14]);
-    let bytes = Bytes::from(hostile);
+    let mut corrupt = Vec::new();
+    corrupt.extend_from_slice(&0x0006u16.to_be_bytes()); // Values
+    corrupt.extend_from_slice(&20u16.to_be_bytes()); // a 20-byte part...
+    corrupt.extend_from_slice(&65535u16.to_be_bytes()); // ...declaring 65535 data sources
+    corrupt.extend_from_slice(&[0xAA; 14]);
+    let bytes = Bytes::from(corrupt);
     assert!(decode_collectd(&bytes), "an impossible data-source count must be rejected");
 
     let peak = peak_live_bytes(|| {
@@ -559,6 +562,113 @@ fn collectd_decode_rejects_a_values_count_inflated_far_past_what_the_input_holds
     });
     // 65535 data sources is ~590 KB; a few KB means the count was checked first.
     assert!(peak < 4096, "peak live bytes {peak} suggests the values count was trusted");
+}
+
+/// One collectd part: `type u16 BE, len u16 BE` (the length includes the header), payload.
+fn collectd_part(out: &mut Vec<u8>, part_type: u16, payload: &[u8]) {
+    out.extend_from_slice(&part_type.to_be_bytes());
+    out.extend_from_slice(&((4 + payload.len()) as u16).to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+/// Host, Plugin, and Type parts naming one series, so a Values part after them dispatches.
+fn collectd_identity() -> Vec<u8> {
+    let mut out = Vec::new();
+    collectd_part(&mut out, 0x0000, b"h\0");
+    collectd_part(&mut out, 0x0002, b"p\0");
+    collectd_part(&mut out, 0x0004, b"t\0");
+    out
+}
+
+/// A Values part of `count` GAUGEs whose `len` is `6 + 9 * count`, the one the count implies.
+fn collectd_gauges(out: &mut Vec<u8>, count: u16) {
+    let mut payload = count.to_be_bytes().to_vec();
+    payload.extend(std::iter::repeat_n(1u8, count.into()));
+    for _ in 0..count {
+        payload.extend_from_slice(&1.5f64.to_le_bytes());
+    }
+    collectd_part(out, 0x0006, &payload);
+}
+
+/// `decode_values` checks `len` against the count, then the count against
+/// `MAX_VALUES_PER_LIST`. A count of 65 with its own matching length passes the first check and
+/// fails the second, and a count of 64 passes both. Behind an earlier list the failure is a
+/// `bad_part` that keeps that list; alone it fails the datagram. A 65-count part whose length
+/// doesn't match fails the first check instead, with its own message.
+#[test]
+fn collectd_a_values_count_past_the_cap_with_a_matching_length_fails_the_cap_check() {
+    let decode = |datagram: &[u8]| {
+        let mut decoder =
+            logit_proto::collectd::CollectdDecoder::new(Arc::new(Resource::default()))
+                .with_diagnostics(logit_core::Diagnostics::new("collectd_in"));
+        let mut events = Vec::new();
+        let result = decoder.decode_into(Bytes::copy_from_slice(datagram), 0, &mut events);
+        (result.map(|_| ()), events, decoder.diag().occurrences("bad_part"))
+    };
+
+    let mut at_cap = collectd_identity();
+    collectd_gauges(&mut at_cap, 64);
+    let (result, events, _) = decode(&at_cap);
+    assert!(result.is_ok());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].metrics.len(), 64);
+
+    let mut past_cap = collectd_identity();
+    collectd_gauges(&mut past_cap, 65);
+    let (result, events, _) = decode(&past_cap);
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "malformed input: collectd: values part declares 65 data source(s), outside 1..=64"
+    );
+    assert!(events.is_empty());
+
+    let mut behind_a_list = collectd_identity();
+    collectd_gauges(&mut behind_a_list, 1);
+    collectd_gauges(&mut behind_a_list, 65);
+    let (result, events, bad_parts) = decode(&behind_a_list);
+    assert!(result.is_ok(), "a list already decoded keeps the datagram");
+    assert_eq!(events.len(), 1, "the list before the bad part is kept");
+    assert_eq!(bad_parts, 1);
+
+    let mut mismatched = collectd_identity();
+    let mut payload = 65u16.to_be_bytes().to_vec();
+    payload.extend(std::iter::repeat_n(1u8, 64 * 9));
+    collectd_part(&mut mismatched, 0x0006, &payload);
+    let (result, _, _) = decode(&mismatched);
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "malformed input: collectd: values part declares 65 data source(s) in 582 bytes, \
+         expected 591"
+    );
+}
+
+/// The input that makes the most events per byte: one notification's Severity and Host, then
+/// Message parts of one character each, six bytes an event, filling a 65,507-byte UDP payload.
+/// That is 10,914 events, so `out` doubles to 16,384 864-byte `Event`s, a measured 13.5 MiB
+/// `Vec`, which `script/unsafe-check`'s `collectd` malloc limit sits above. A one-value list costs
+/// 15 bytes, so value lists come to fewer events.
+#[test]
+fn collectd_worst_case_datagram_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 16 << 20;
+    const UDP_PAYLOAD: usize = 65_507;
+    let mut datagram = Vec::new();
+    collectd_part(&mut datagram, 0x0101, &4u64.to_be_bytes());
+    collectd_part(&mut datagram, 0x0000, b"h\0");
+    let header = datagram.len();
+    while datagram.len() + 6 <= UDP_PAYLOAD {
+        collectd_part(&mut datagram, 0x0100, b"m\0");
+    }
+    let mut events = 0;
+    let (peak, largest) = peak_and_largest_allocation(|| {
+        let mut out = vec![Event::empty(-1, AttrMap::new())];
+        let mut decoder =
+            logit_proto::collectd::CollectdDecoder::new(Arc::new(Resource::default()));
+        decoder.decode_into(Bytes::from(datagram.clone()), 0, &mut out).unwrap();
+        events = out.len() - 1;
+    });
+    eprintln!("{} bytes, {events} events, peak {peak}, largest {largest}", datagram.len());
+    assert_eq!(events, (datagram.len() - header) / 6, "one event per Message part");
+    assert!(largest < MALLOC_LIMIT, "largest allocation {largest}");
 }
 
 // -- graphite -----------------------------------------------------------------------------------
@@ -627,11 +737,11 @@ fn graphite_pickle_survives_seeded_bit_flips() {
 /// peak is only its own small `Vec`s.
 #[test]
 fn graphite_pickle_rejects_a_string_length_inflated_far_past_what_the_input_holds() {
-    let mut hostile = vec![0x80, 0x02, 0x58];
-    hostile.extend_from_slice(&u32::MAX.to_le_bytes());
-    hostile.extend_from_slice(b"short");
-    hostile.push(0x2e);
-    let bytes = Bytes::from(hostile);
+    let mut corrupt = vec![0x80, 0x02, 0x58];
+    corrupt.extend_from_slice(&u32::MAX.to_le_bytes());
+    corrupt.extend_from_slice(b"short");
+    corrupt.push(0x2e);
+    let bytes = Bytes::from(corrupt);
     assert!(decode_graphite(&bytes, Protocol::Pickle), "an impossible length must be rejected");
 
     let peak = peak_live_bytes(|| {
@@ -644,11 +754,11 @@ fn graphite_pickle_rejects_a_string_length_inflated_far_past_what_the_input_hold
 #[test]
 fn graphite_pickle_rejects_a_64_bit_string_length() {
     for opcode in [0x8du8, 0x8e] {
-        let mut hostile = vec![0x80, 0x05, opcode];
-        hostile.extend_from_slice(&u64::MAX.to_le_bytes());
-        hostile.extend_from_slice(b"short");
-        hostile.push(0x2e);
-        let bytes = Bytes::from(hostile);
+        let mut corrupt = vec![0x80, 0x05, opcode];
+        corrupt.extend_from_slice(&u64::MAX.to_le_bytes());
+        corrupt.extend_from_slice(b"short");
+        corrupt.push(0x2e);
+        let bytes = Bytes::from(corrupt);
         assert!(decode_graphite(&bytes, Protocol::Pickle), "opcode {opcode:#04x}");
 
         let peak = peak_live_bytes(|| {
@@ -665,10 +775,10 @@ fn graphite_pickle_rejects_a_64_bit_string_length() {
 fn graphite_pickle_rejects_nesting_past_the_depth_cap() {
     let depth = logit_proto::graphite::MAX_PICKLE_DEPTH;
     for marks in [depth, depth + 1, 100_000] {
-        let mut hostile = vec![0x80u8, 0x02];
-        hostile.extend(std::iter::repeat_n(0x28u8, marks));
-        hostile.push(0x2e);
-        let bytes = Bytes::from(hostile);
+        let mut corrupt = vec![0x80u8, 0x02];
+        corrupt.extend(std::iter::repeat_n(0x28u8, marks));
+        corrupt.push(0x2e);
+        let bytes = Bytes::from(corrupt);
         assert!(decode_graphite(&bytes, Protocol::Pickle), "{marks} marks must be rejected");
     }
 }
@@ -687,12 +797,12 @@ fn graphite_pickle_rejects_inflated_long_and_frame_lengths() {
     assert!(decode_graphite(&Bytes::from(frame), Protocol::Pickle));
 }
 
-/// `PROTO 2, EMPTY_LIST, LONG_BINPUT 499999, STOP` (9 bytes): a memo key with nothing behind it
-/// must be rejected, not grow the memo to 500,000 slots (~8 MB).
+/// `PROTO 2, EMPTY_LIST, LONG_BINPUT 499999, STOP` (9 bytes): a corrupt memo key with nothing
+/// behind it must be rejected, not grow the memo to 500,000 slots (~8 MB).
 #[test]
-fn graphite_pickle_never_allocates_from_a_hostile_memo_key() {
-    let hostile = vec![0x80, 0x02, 0x5d, 0x72, 0x1f, 0xa1, 0x07, 0x00, 0x2e];
-    let bytes = Bytes::from(hostile);
+fn graphite_pickle_never_allocates_from_a_corrupt_memo_key() {
+    let corrupt = vec![0x80, 0x02, 0x5d, 0x72, 0x1f, 0xa1, 0x07, 0x00, 0x2e];
+    let bytes = Bytes::from(corrupt);
     assert!(
         decode_graphite(&bytes, Protocol::Pickle),
         "a memo key skipping ahead must be rejected"
@@ -717,14 +827,250 @@ fn graphite_pickle_rejects_every_opcode_outside_the_allowlist() {
             continue;
         }
         // Trailing operand bytes, so a refusal is the allowlist, not a short read.
-        let mut hostile = vec![0x80u8, 0x02, opcode];
-        hostile.extend_from_slice(&[0u8; 16]);
-        hostile.push(0x2e);
+        let mut corrupt = vec![0x80u8, 0x02, opcode];
+        corrupt.extend_from_slice(&[0u8; 16]);
+        corrupt.push(0x2e);
         assert!(
-            decode_graphite(&Bytes::from(hostile), Protocol::Pickle),
+            decode_graphite(&Bytes::from(corrupt), Protocol::Pickle),
             "opcode {opcode:#04x} must not be accepted"
         );
     }
+}
+
+/// The exact reading of a positive, finite `seconds` in nanoseconds, from the `f64`'s mantissa
+/// and exponent with integer arithmetic: rounded half away from zero, as `f64::round` rounds,
+/// and saturating at `i64::MAX`. The oracle `resolve_timestamp`'s split arithmetic is checked
+/// against.
+fn exact_nanos(seconds: f64) -> i64 {
+    assert!(seconds.is_finite() && seconds > 0.0);
+    let bits = seconds.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = (bits & ((1 << 52) - 1)) as i128;
+    let (mantissa, exponent) =
+        if biased == 0 { (fraction, -1074) } else { (fraction | (1 << 52), biased - 1075) };
+    // A normal mantissa is at least 2^52, so a non-negative exponent is 2^52 seconds or more.
+    if exponent >= 0 {
+        return i64::MAX;
+    }
+    let scaled = mantissa * 1_000_000_000;
+    let shift = -exponent;
+    // `scaled` is under 2^83, so a wider shift leaves less than half a nanosecond.
+    if shift > 84 {
+        return 0;
+    }
+    let whole = scaled >> shift;
+    let rest = scaled & ((1i128 << shift) - 1);
+    let nanos = whole + i128::from(rest >= 1i128 << (shift - 1));
+    i64::try_from(nanos).unwrap_or(i64::MAX)
+}
+
+/// The timestamp one plaintext line `a.b 1 <field>` decodes to, or `None` if it's skipped.
+fn graphite_timestamp(field: &str) -> Option<i64> {
+    let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default()));
+    let mut events = Vec::new();
+    let line = Bytes::from(format!("a.b 1 {field}"));
+    decoder.decode_into(line, GRAPHITE_RECEIVED_AT, &mut events).unwrap();
+    assert!(events.len() <= 1);
+    events.first().map(|event| event.timestamp)
+}
+
+const GRAPHITE_RECEIVED_AT: i64 = 1_699_000_000_123_456_789;
+
+/// `resolve_timestamp`'s table, through the plaintext decoder: whole seconds and the sub-second
+/// part are scaled separately and summed, saturating. From 2^20 seconds up the sub-second
+/// product is exact, so the decoder agrees with [`exact_nanos`] at every row there. Below it the
+/// product rounds once: `0.5011891235` lands a nanosecond above the exact reading of its `f64`,
+/// which is the reading of the decimal the sender wrote. `0.9999999999`'s sub-second part rounds
+/// to a whole second and carries.
+#[test]
+fn graphite_timestamps_resolve_to_the_exact_reading() {
+    let before = f64::from_bits(9_223_372_036.854_775_807f64.to_bits() - 1);
+    let after = f64::from_bits(9_223_372_036.854_775_807f64.to_bits() + 1);
+    let cases: &[(String, i64)] = &[
+        ("1700000000.25".into(), 1_700_000_000_250_000_000),
+        ("1700000000.0000000001".into(), 1_700_000_000_000_000_000),
+        ("1700000000.0000001".into(), 1_700_000_000_000_000_000),
+        ("2147483647".into(), 2_147_483_647_000_000_000),
+        ("2147483648.5".into(), 2_147_483_648_500_000_000),
+        ("1048576.0000000005".into(), 1_048_576_000_000_000),
+        ("9223372036.854775807".into(), i64::MAX),
+        (format!("{before}"), 9_223_372_036_854_774_475),
+        (format!("{after}"), i64::MAX),
+        ("1e300".into(), i64::MAX),
+        ("4.9e-324".into(), 0),
+        ("0.9999999999".into(), 1_000_000_000),
+        ("0.5011891235".into(), 501_189_124),
+    ];
+    for (field, nanos) in cases {
+        assert_eq!(graphite_timestamp(field), Some(*nanos), "{field}");
+        let seconds: f64 = field.parse().unwrap();
+        if seconds >= (1u64 << 20) as f64 {
+            assert_eq!(exact_nanos(seconds), *nanos, "{field}: the exact reading");
+        }
+    }
+    assert_eq!(exact_nanos(0.501_189_123_5), 501_189_123, "the exact reading below 2^20");
+
+    for field in ["-1", "-1.0", "-1e0", "-1.000"] {
+        assert_eq!(graphite_timestamp(field), Some(GRAPHITE_RECEIVED_AT), "{field}: the sentinel");
+    }
+    for field in ["-1.0000000000000002", "-0.0", "0", "-0.9999999999999999", "NaN", "inf"] {
+        assert_eq!(graphite_timestamp(field), None, "{field}: not a positive instant");
+    }
+}
+
+/// Builds the bytes CPython's `pickle.dumps(points, protocol=2)` writes for a list of more than
+/// one `(str, (int, float))` tuple whose ints fit `BININT`, after `Modules/_pickle.c`'s
+/// `batch_list_exact`: `EMPTY_LIST`, then `MARK … APPENDS` per batch of 1,000 items, the last
+/// batch however short; every string and tuple memoized in order, `BINPUT` up to key 255 and
+/// `LONG_BINPUT` after.
+fn cpython_protocol_2(points: &[(String, i32, f64)]) -> Vec<u8> {
+    fn put(out: &mut Vec<u8>, key: &mut u32) {
+        match u8::try_from(*key) {
+            Ok(short) => out.extend_from_slice(&[0x71, short]),
+            Err(_) => {
+                out.push(0x72);
+                out.extend_from_slice(&key.to_le_bytes());
+            }
+        }
+        *key += 1;
+    }
+    let mut out = vec![0x80, 0x02, 0x5d];
+    let mut key = 0;
+    put(&mut out, &mut key);
+    for batch in points.chunks(1000) {
+        out.push(0x28);
+        for (path, seconds, value) in batch {
+            out.push(0x58);
+            out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            out.extend_from_slice(path.as_bytes());
+            put(&mut out, &mut key);
+            out.push(0x4a);
+            out.extend_from_slice(&seconds.to_le_bytes());
+            out.push(0x47);
+            out.extend_from_slice(&value.to_be_bytes());
+            out.push(0x86);
+            put(&mut out, &mut key);
+            out.push(0x86);
+            put(&mut out, &mut key);
+        }
+        out.push(0x65);
+    }
+    out.push(0x2e);
+    out
+}
+
+fn pickle_decode(payload: &[u8]) -> Result<Vec<Event>, CodecError> {
+    let mut decoder =
+        GraphiteDecoder::new(Arc::new(Resource::default())).with_protocol(Protocol::Pickle);
+    let mut events = Vec::new();
+    decoder.decode_into(Bytes::copy_from_slice(payload), 0, &mut events)?;
+    Ok(events)
+}
+
+/// CPython splits a list of more than 1,000 items into `MARK … APPENDS` batches onto the one list,
+/// and 3,001 is four of them, the last holding one item. Each batch extends the list at the tail
+/// of the reader's list arena, which `append_range` requires, so every datapoint decodes. The
+/// length and FNV-1a hash are those of CPython 3.14.7's own dump of the same list, so the builder
+/// writes CPython's bytes.
+#[test]
+fn graphite_pickle_decodes_cpythons_batched_appends_in_full() {
+    let points: Vec<(String, i32, f64)> =
+        (0..3001).map(|i| (format!("b.{i}"), 1_700_000_000 + i, f64::from(i))).collect();
+    let payload = cpython_protocol_2(&points);
+    let fnv = payload.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &b| {
+        (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    assert_eq!((payload.len(), fnv), (CPYTHON_3001_LEN, CPYTHON_3001_FNV), "not CPython's bytes");
+    let events = pickle_decode(&payload).expect("a batched list decodes");
+    assert_eq!(events.len(), 3001, "every datapoint, across all four batches");
+    for (event, (path, seconds, value)) in events.iter().zip(&points) {
+        assert_eq!(logit_core::interner::resolve(event.metrics[0].name), path);
+        assert_eq!(event.timestamp, i64::from(*seconds) * 1_000_000_000);
+        assert!(matches!(event.metrics[0].kind, logit_core::MetricKind::Gauge(v) if v == *value));
+    }
+}
+
+const CPYTHON_3001_LEN: usize = 124_181;
+const CPYTHON_3001_FNV: u64 = 0x5948_4b3a_3842_6e28;
+
+/// `pickle.dumps([['a.b', [1700000000, 0.5]]], protocol=2)`: carbon's receiver unpacks any
+/// two-element sequence, so it takes list-shaped datapoints, but this reader keeps each list as a
+/// range at the tail of one arena. The inner `[1700000000, 0.5]` is filled before the datapoint
+/// list around it, which then can't be extended, so the frame fails. No recorded or surveyed
+/// producer writes a list here (CPython callers, og-rek in carbon-relay-ng, Dropwizard, Diamond,
+/// statsite, and graphitesend all write tuples), so it's a non-goal, recorded in
+/// `docs/known-gaps/mappings.md`. og-rek's `MARK … LIST` builds a list in one step, so a list item
+/// there costs only itself.
+#[test]
+fn graphite_pickle_list_shaped_datapoints_fail_the_frame() {
+    // EMPTY_LIST BINPUT 0 EMPTY_LIST BINPUT 1 MARK X'a.b' BINPUT 2 EMPTY_LIST BINPUT 3 MARK
+    // J1700000000 G0.5 APPENDS APPENDS APPEND STOP: CPython 3.14.7's bytes.
+    let mut nested = vec![0x80, 0x02, 0x5d, 0x71, 0x00, 0x5d, 0x71, 0x01, 0x28, 0x58, 3, 0, 0, 0];
+    nested.extend_from_slice(b"a.b");
+    nested.extend_from_slice(&[0x71, 0x02, 0x5d, 0x71, 0x03, 0x28, 0x4a, 0x00, 0xf1, 0x53, 0x65]);
+    nested.extend_from_slice(&[0x47, 0x3f, 0xe0, 0, 0, 0, 0, 0, 0, 0x65, 0x65, 0x61, 0x2e]);
+    let err = pickle_decode(&nested).expect_err("a list-shaped datapoint fails the frame");
+    assert_eq!(
+        err.to_string(),
+        "malformed input: pickle APPEND/APPENDS onto a list this reader cannot extend"
+    );
+
+    // MARK (path, (ts, value)) EMPTY_LIST MARK BININT1 1 BININT1 2 APPENDS LIST STOP: a list item
+    // inside og-rek's one-step list is a wrong-shaped item, skipped.
+    let mut og_rek = vec![0x80, 0x02, 0x28, 0x55, 3];
+    og_rek.extend_from_slice(b"a.b");
+    og_rek.extend_from_slice(&[0x4a, 0x00, 0xf1, 0x53, 0x65, 0x47, 0x3f, 0xe0, 0, 0, 0, 0, 0, 0]);
+    og_rek.extend_from_slice(&[0x86, 0x86, 0x5d, 0x28, 0x4b, 1, 0x4b, 2, 0x65, 0x6c, 0x2e]);
+    let events = pickle_decode(&og_rek).expect("og-rek's MARK … LIST decodes");
+    assert_eq!(events.len(), 1, "the tuple datapoint decodes and the list item is skipped");
+}
+
+/// The input that makes the most events per byte, `BINGET` of one memoized datapoint repeated to
+/// fill a 64 KiB payload: two bytes per event, 32,759 of them, so the decoder's `out` doubles to
+/// 32,768 864-byte `Event`s, a measured 27 MiB `Vec`. The largest single allocation is what
+/// `script/unsafe-check`'s `graphite_pickle` malloc limit sits above. The reader's own arenas
+/// hold one 16-byte value per byte at most.
+#[test]
+fn graphite_pickle_worst_case_payload_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 32 << 20;
+    let mut payload = vec![0x80, 0x02, 0x5d, 0x28, 0x58, 1, 0, 0, 0, b'a', 0x4b, 1, 0x4b, 1];
+    payload.extend_from_slice(&[0x86, 0x86, 0x71, 0x00]);
+    while payload.len() + 4 <= 1 << 16 {
+        payload.extend_from_slice(&[0x68, 0x00]);
+    }
+    payload.extend_from_slice(&[0x65, 0x2e]);
+    let mut events = 0;
+    let (peak, largest) = peak_and_largest_allocation(|| {
+        let mut out = vec![Event::empty(-1, AttrMap::new())];
+        let mut decoder =
+            GraphiteDecoder::new(Arc::new(Resource::default())).with_protocol(Protocol::Pickle);
+        decoder.decode_into(Bytes::from(payload.clone()), 0, &mut out).unwrap();
+        events = out.len() - 1;
+    });
+    eprintln!("{} bytes, {events} events, peak {peak}, largest {largest}", payload.len());
+    assert_eq!(events, (payload.len() - 20) / 2 + 1, "one event per BINGET, and the first");
+    assert!(largest < MALLOC_LIMIT, "largest allocation {largest}");
+}
+
+/// The plaintext counterpart: `a 1 1`, the shortest line that decodes, and its `LF`, filling a
+/// 64 KiB datagram. That is one 864-byte `Event` per six bytes, 10,922 of them, so `out` doubles
+/// to 16,384 `Event`s, a measured 13.5 MiB `Vec`, which `script/unsafe-check`'s
+/// `graphite_plaintext` malloc limit sits above.
+#[test]
+fn graphite_plaintext_worst_case_datagram_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 16 << 20;
+    let mut datagram = b"a 1 1\n".repeat(MAX_FRAME_BYTES / 6);
+    datagram.pop();
+    let mut events = 0;
+    let (peak, largest) = peak_and_largest_allocation(|| {
+        let mut out = vec![Event::empty(-1, AttrMap::new())];
+        let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default()));
+        decoder.decode_into(Bytes::from(datagram.clone()), 0, &mut out).unwrap();
+        events = out.len() - 1;
+    });
+    eprintln!("{} bytes, {events} events, peak {peak}, largest {largest}", datagram.len());
+    assert_eq!(events, MAX_FRAME_BYTES / 6, "one event per line");
+    assert!(largest < MALLOC_LIMIT, "largest allocation {largest}");
 }
 
 // -- control messages -----------------------------------------------------------------------
