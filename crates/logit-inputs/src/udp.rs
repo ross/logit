@@ -1819,6 +1819,13 @@ impl ReceiveBufferSampler {
     }
 }
 
+/// How many consecutive full pops [`decode_loop`] decodes before it yields the task to
+/// `read_loop`. Bounds the reader's gap through a backlog to this many pop batches of decoding;
+/// a shorter cadence polls the socket so often that each `recvmmsg` returns fewer datagrams, which
+/// costs syscalls per event under a flood of small datagrams (ADR
+/// `udp-intake-batching-and-socket-visibility`'s backlog-drain amendment has the numbers).
+const YIELD_EVERY_FULL_POPS: usize = 16;
+
 /// Pops datagrams from `queue`, decodes and accumulates them into batches, and sends each
 /// completed batch through `sink`, independent of how fast `read_loop` fills `queue`. Uses
 /// [`ReceiveQueue::pop_many`], not `peek`/`commit`: a datagram that fails to decode is diagnosed
@@ -1838,6 +1845,14 @@ impl ReceiveBufferSampler {
 ///
 /// Owns `sink` (the `Fanout`): dropping this future closes every downstream inbox, the shutdown
 /// cascade in `docs/adr/service-lifecycle-and-output-retry.md`.
+///
+/// **Why it yields after a run of full pops.** Nothing else in the loop returns to the scheduler
+/// while the queue holds datagrams and downstream has room, so a backlog left by a stalled
+/// downstream would decode in one poll, for milliseconds in which `read_loop` never calls
+/// `recvmmsg` and the kernel's receive buffer overflows. A pop shorter than `pop_batch` emptied
+/// the queue and the next `pop_many` parks anyway, so a decoder that keeps up never reaches the
+/// yield; [`YIELD_EVERY_FULL_POPS`] says why the cadence is coarser than every full pop. ADR
+/// `udp-intake-batching-and-socket-visibility`'s backlog-drain amendment has the measurements.
 ///
 /// Flushes the accumulator's final contents (`FlushReason::Shutdown`) only once `pop_many` reports
 /// closed-and-empty (a return of `0`), after `read_loop` can push nothing new: the same "flush only
@@ -1862,6 +1877,8 @@ async fn decode_loop<D: Decoder + Send>(
     let remainder_diag = diag.clone();
     // Untouched with `peer` off: no datagram carries a sender.
     let mut peers = PeerCache::default();
+    // Consecutive pops that filled `pop_batch`; see the yield at the end of the loop.
+    let mut full_pops = 0usize;
     let has_interval = !batching.flush_interval.is_zero();
     let mut next_flush =
         has_interval.then(|| tokio::time::Instant::now() + batching.flush_interval);
@@ -1951,6 +1968,21 @@ async fn decode_loop<D: Decoder + Send>(
                     diag.warn_throttled("bad_datagram", err);
                 }
             }
+        }
+
+        // A full pop means more is likely queued, and `pop_many` on a non-empty queue spends no
+        // coop budget, so without this a deep backlog decodes in one poll while `read_loop`, the
+        // other arm of `UdpListener::drive`'s `select!`, goes unpolled. `yield_now`, not
+        // `consume_budget`: the read arm spends the shared budget to zero on a flood. A partial
+        // pop emptied the queue, so the next `pop_many` parks and the run of full pops restarts.
+        if count == batching.pop_batch {
+            full_pops += 1;
+            if full_pops >= YIELD_EVERY_FULL_POPS {
+                full_pops = 0;
+                tokio::task::yield_now().await;
+            }
+        } else {
+            full_pops = 0;
         }
     }
 }
@@ -3882,6 +3914,109 @@ mod tests {
         let sixty_four = deliver_burst(64, &payloads, &registry).await;
         assert_eq!(one, payloads, "read_batch: 1 must deliver the whole burst in order");
         assert_eq!(sixty_four, one, "the batch size must not be observable in the event stream");
+    }
+
+    /// A `decode_loop` over a receive queue, polled by hand. The queue and the loop take the
+    /// default config but for `batch_max_events`, raised past any depth used here so no `emit`
+    /// runs and nothing but the loop's own yield, or `pop_many` on an empty queue, can return
+    /// `Pending`.
+    struct HandPolledDecode {
+        queue: Arc<ReceiveQueue>,
+        decode: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+        next_datagram: usize,
+    }
+
+    impl HandPolledDecode {
+        fn new() -> Self {
+            let config =
+                UdpListenerConfig { batch_max_events: 1 << 20, ..UdpListenerConfig::default() };
+            let queue: Arc<ReceiveQueue> = Arc::new(BoundedQueue::with_metrics(
+                config.queue_config(),
+                &RECEIVE_QUEUE_METRICS,
+                Telemetry::default(),
+            ));
+            let (fanout, rx) = recording_fanout(64);
+            // Never read: the loop only has to find room, which the 64-batch channel gives it.
+            std::mem::forget(rx);
+            let decoder = Box::leak(Box::new(TestDecoder::new()));
+            let decode = Box::pin(decode_loop(
+                decoder,
+                Arc::clone(&queue),
+                fanout,
+                config.batching(),
+                Telemetry::default(),
+                Diagnostics::default(),
+            ));
+            Self { queue, decode, next_datagram: 0 }
+        }
+
+        /// Queues `count` small datagrams.
+        async fn push(&mut self, count: usize) {
+            let mut datagrams: Vec<Datagram> = (0..count)
+                .map(|i| Datagram {
+                    bytes: Bytes::from(format!("msg-{}", self.next_datagram + i)),
+                    received_at: (self.next_datagram + i) as i64,
+                    peer: None,
+                })
+                .collect();
+            self.next_datagram += count;
+            self.queue.push_many(&mut datagrams).await;
+        }
+
+        /// Polls the loop once.
+        async fn poll_once(&mut self) {
+            std::future::poll_fn(|cx| {
+                let _ = self.decode.as_mut().poll(cx);
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+
+        /// Drops the loop and returns how many datagrams it left queued.
+        fn finish(self) -> usize {
+            // `take_all` is for when no other future of the queue is alive.
+            drop(self.decode);
+            self.queue.take_all().len()
+        }
+    }
+
+    /// A backlog twice `YIELD_EVERY_FULL_POPS` pop batches deep, with downstream open, decodes
+    /// `YIELD_EVERY_FULL_POPS` pop batches per poll, so `UdpListener::drive`'s read arm is polled
+    /// partway through the backlog instead of after all of it.
+    #[tokio::test]
+    async fn a_decode_burst_through_a_deep_queue_yields_after_a_run_of_full_pops() {
+        let pop_batch = UdpListenerConfig::default().read_batch;
+        let run = YIELD_EVERY_FULL_POPS * pop_batch;
+        let mut decode = HandPolledDecode::new();
+        decode.push(2 * run).await;
+        decode.poll_once().await;
+        assert_eq!(
+            decode.finish(),
+            run,
+            "one poll of decode_loop should take {YIELD_EVERY_FULL_POPS} pop batches of \
+             {pop_batch} off a deep queue"
+        );
+    }
+
+    /// A pop shorter than `pop_batch` emptied the queue, so it doesn't yield and it restarts the
+    /// run of full pops. One poll over fifteen full pops and a partial one drains the queue and
+    /// parks; the next poll then decodes a whole run of sixteen full pops before it yields. A
+    /// counter the partial pop didn't reset would yield after the first of them and leave
+    /// fifteen batches queued.
+    #[tokio::test]
+    async fn a_partial_pop_restarts_the_run_of_full_pops() {
+        let pop_batch = UdpListenerConfig::default().read_batch;
+        let run = YIELD_EVERY_FULL_POPS * pop_batch;
+        let mut decode = HandPolledDecode::new();
+        decode.push(run - pop_batch + 10).await;
+        decode.poll_once().await;
+        decode.push(run).await;
+        decode.poll_once().await;
+        assert_eq!(
+            decode.finish(),
+            0,
+            "a run of full pops after a partial pop should start from zero and be decoded whole"
+        );
     }
 
     /// Byte-exact across the legal size range in one batch: zero-length, small, and one at the
