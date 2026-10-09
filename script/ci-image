@@ -1,0 +1,57 @@
+#!/bin/bash
+# Usage: IMAGE_PUSH=1 script/ci-image [build|tag|check]
+# Builds the CI image, the `ci` stage of Dockerfile.dev, and tags it
+# `<CI_IMAGE_REPO>:<first 12 hex of Dockerfile.dev's sha256>` (default repo
+# `ghcr.io/ross/logit-ci`). See docs/adr/ci-image-on-ghcr.md.
+#
+#   script/ci-image tag      print the image reference for the current Dockerfile.dev
+#   script/ci-image [build]  build it; with IMAGE_PUSH=1, push it after a `docker login ghcr.io`,
+#                            unless the tag already exists (tags are never overwritten)
+#   script/ci-image check    inside the CI container: fail unless the image was built from the
+#                            checked-out Dockerfile.dev
+#
+# Calls $DOCKER directly, not common.sh's `run`: `run` executes inside the dev container, and this
+# needs the host's Docker daemon. `check` runs in the CI image and never touches Docker.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+CI_IMAGE_REPO="${CI_IMAGE_REPO:-ghcr.io/ross/logit-ci}"
+HASH="$(sha256sum Dockerfile.dev | cut -c1-12)"
+REF="${CI_IMAGE_REPO}:${HASH}"
+
+case "${1:-build}" in
+tag)
+    echo "${REF}"
+    ;;
+check)
+    BUILT="$(cat /etc/logit-ci-image 2>/dev/null || echo missing)"
+    if [ "${BUILT}" != "${HASH}" ]; then
+        echo "error: this CI image was built from Dockerfile.dev ${BUILT}, but the checkout's is ${HASH}." >&2
+        echo "Dockerfile.dev changed: run the \"Publish CI image\" workflow (gh workflow run \"Publish CI image\" --ref <branch>)," >&2
+        echo "then set ci.yml's container image to ${REF}." >&2
+        exit 1
+    fi
+    echo "OK: CI image matches Dockerfile.dev (${HASH})"
+    ;;
+build)
+    if [ -n "${IMAGE_PUSH:-}" ] && ${DOCKER} manifest inspect "${REF}" >/dev/null 2>&1; then
+        echo "${REF} already exists; tags are never overwritten, so nothing to build or push"
+        exit 0
+    fi
+    ${DOCKER} build -f Dockerfile.dev --target ci \
+        --build-arg "CI_IMAGE_SOURCE=${HASH}" \
+        --label org.opencontainers.image.source=https://github.com/ross/logit \
+        -t "${REF}" .
+    echo "Built ${REF}"
+    if [ -n "${IMAGE_PUSH:-}" ]; then
+        ${DOCKER} push "${REF}"
+        ${DOCKER} inspect --format '{{index .RepoDigests 0}}' "${REF}"
+    fi
+    ;;
+*)
+    echo "usage: script/ci-image [build|tag|check]" >&2
+    exit 2
+    ;;
+esac

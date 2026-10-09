@@ -1153,8 +1153,13 @@ impl Output for RemoteWriteOutput {
         self.accounting.observe();
     }
 
-    /// One attempt ([`RemoteWriteOutput::attempt`]). An `Ok` disarms the batch accounting on
-    /// every path, a batch that sent no request included.
+    /// Lets a final `Ambiguous` under `at_most_once` disarm the batch accounting.
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        self.accounting.observe_posture(posture);
+    }
+
+    /// One attempt ([`RemoteWriteOutput::attempt`]). A final result disarms the batch accounting
+    /// on every path, a batch that sent no request included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
