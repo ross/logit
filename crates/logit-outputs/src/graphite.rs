@@ -75,7 +75,7 @@ use crate::datagram::{Datagrams, Framing, Report, UdpDest};
 use crate::stream::{Dial, PooledStream, Target};
 use anyhow::Context;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::{BatchContext, Output, SeqId};
+use logit_pipeline::{BatchContext, DeliveryPosture, Output, SeqId};
 use logit_proto::graphite::{GraphiteEncoder, Protocol};
 use logit_proto::{FramedEncoder, MessageBuf};
 use std::time::Duration;
@@ -266,6 +266,10 @@ impl Output for GraphiteOutput {
     /// Arms this sink's batch accounting (`crate::accounting`).
     fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
         self.accounting.observe();
+    }
+
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        self.accounting.observe_posture(posture);
     }
 
     /// One attempt ([`GraphiteOutput::attempt`]). A final result (`Ok`, or a fault

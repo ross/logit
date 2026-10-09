@@ -408,11 +408,8 @@ failed request's own:
   requests sit at the settled positions, a silent loss rather than muted counts. A send is now
   final when it returns `Ok` or a fault `write_loop` won't retry under the posture
   (`logit_pipeline::is_retryable`): `Rejected` under either posture, and `Ambiguous` under
-  `at_most_once`. A retryable failure leaves the batch armed, which retries rely on. The sinks that
-  forward `Output::observe_posture` into the accounting are `otlp_out`, `prometheus_out`'s remote
-  write, and both Datadog sinks. `statsd_out` doesn't forward it, so its accounting stays armed
-  after an `Ambiguous` failure; it keeps no per-request memory, so the only effect is muted counts
-  on a direct `send` that skips `observe_batch`.
+  `at_most_once`. A retryable failure leaves the batch armed, which retries rely on. Every sink with a
+  `BatchAccounting` forwards `Output::observe_posture` into it, so the rule holds for each.
 - **The settled bits grow.** They were `u32` bitsets, and a route's chunk count is unbounded (byte
   cap bisection), so a request index has no bound. An encode unit stays a bit index below 32.
 
@@ -426,8 +423,8 @@ failed request's own:
   every event of a dropped batch, including events whose requests were delivered; the per-route
   `records.dropped` is the precise count. A later route's count is the plan's weight for `datadog_out`
   and the stats group count for `datadog_trace_out`, an upper bound: it includes entries the encode
-  would have skipped or dropped `oversize` or `too_many_tags`, which no reason counts because the
-  batch dropped before that route.
+  would have skipped or dropped `oversize`, which no reason counts because the batch dropped before
+  that route.
 - A request's `rejected` drop, a `413`'s `oversize`, and `records` for an accepted request count
   once per batch, not once per attempt.
 - The memory is in-process, and the request that drew an `Ambiguous` answer is resent under

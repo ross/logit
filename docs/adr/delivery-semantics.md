@@ -493,8 +493,9 @@ succeeds and its metrics request fails with gRPC `UNIMPLEMENTED`. No `send` ever
    continuing only spends requests. A `datadog_out` `events` route sends one request per event.
    An OTLP credential can be scoped per signal (a Grafana Cloud access policy can grant
    `traces:write` without `metrics:write`), so `otlp_out`'s auth answers fall under item 2.
-4. **`Clean` or `Ambiguous`**: stop and return it through item 9's `after_delivery` rule,
-   unchanged.
+4. **`Clean` or `Ambiguous`**: stop and return it. [Since the per-request retry amendments to
+   [ADR `sink-fault-classes`](sink-fault-classes.md), the stop returns the failed request's own
+   fault; only `splunk_hec_out` still applies item 9's `after_delivery` rule.]
 5. **End of the send**: if any request was accepted, return `Ok`, even when others were rejected.
    If none was accepted and some were rejected, return the first rejected error, still
    explicitly `Permanent`.

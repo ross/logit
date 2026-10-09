@@ -55,7 +55,7 @@ use logit_core::interner::resolve;
 use logit_core::{
     DdSketch, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
 };
-use logit_pipeline::{BatchContext, SeqId};
+use logit_pipeline::{BatchContext, DeliveryPosture, SeqId};
 use logit_proto::{CodecError, Encoder};
 use std::collections::HashMap;
 // `write!` into a `String`: formats straight into the output buffer, no `String` per number
@@ -205,6 +205,10 @@ impl Output for InfluxDbOutput {
     /// Arms this sink's batch accounting (`crate::accounting`).
     fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
         self.accounting.observe();
+    }
+
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        self.accounting.observe_posture(posture);
     }
 
     /// One attempt ([`InfluxDbOutput::attempt`]). A final result (`Ok`, or a fault

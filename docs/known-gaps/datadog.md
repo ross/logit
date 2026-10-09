@@ -231,9 +231,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     batch, which re-arms the gate and replaces the time. `logit_pipeline::send_batch`, which the
     benchmarks use, is the one caller that skips it. Because it never calls `observe_batch`, no
     gate is armed and no send time is stored, so its repeated sends to one sink leave no state.
-    `statsd_out` doesn't forward `observe_posture` (its default posture is `at_most_once`), so its
-    accounting stays armed after an `Ambiguous` failure too; it keeps no per-request memory, so
-    the only effect is the muted counts.
   - **Fix, if a caller ever needs it:** a runtime signal that a batch ended (an `Output` method,
     which decision 2 declined to add). A sink can't clear on a retryable `Err` without breaking
     the reuse the retries need.
