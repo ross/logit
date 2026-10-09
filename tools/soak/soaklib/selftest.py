@@ -608,6 +608,23 @@ def _hung_inspect(root):
            f"a timed-out inspect ends the round, got {run.docker.calls} call(s)")
 
 
+
+class _EnvDocker:
+    def inspect(self, container, timeout=None):
+        return {"Id": container, "State": {"Status": "exited"},
+                "Config": {"Env": ["DD_API_KEY=secret", "PATH=/usr/bin"]}}
+
+
+def _inspect_redacted():
+    with tempfile.TemporaryDirectory() as tmp:
+        collect.service_inspect(tmp, _EnvDocker(), {"logit": "a"})
+        text = (Path(tmp) / "inspect" / "logit.json").read_text()
+        written = json.loads(text)
+        expect("secret" not in text
+               and written["Config"]["Env"] == ["DD_API_KEY=<redacted>", "PATH=<redacted>"]
+               and written["State"] == {"Status": "exited"},
+               f"inspect/<svc>.json keeps no environment value, got {written['Config']}")
+
 def _signals(root):
     """`interrupt_on_signals` in a child process, so this one's handlers stay as they are."""
     probe = ("import signal, sys\n"
@@ -895,7 +912,8 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 e1_short=0, a1_short=0, ab1_short=0, late_series=False, receive_util=0.0, slow_after_stop=False, rate_behind=0,
                 undelivered=0, empty_export=False, ab0_short=0, merged_lives=False,
                 empty_sut=False, buffer_batches=0, buffer_util=0.0, steady_surplus=0,
-                external=False, sut_extra=(), stderr_extra=(), **resolved):
+                external=False, sut_extra=(), stderr_extra=(), timeline_extra=(),
+                **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
@@ -971,7 +989,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 _action("revert", "c0s1", "stop", "logit", STOP[1] - 1, STOP[1],
                         affects_udp_ingress=True),
                 _ready("c0s1", "logit", STOP[1] + 1),
-                _phase("end_begin", 300), _phase("end_end", 330)]
+                _phase("end_begin", 300), _phase("end_end", 330)] + list(timeline_extra)
     if external:
         resolved.setdefault("target", {"kind": "external", "name": "datadog",
                                        "env": ["DD_API_KEY"]})
@@ -1903,17 +1921,19 @@ def _sink_drain(root):
 
 
 def _datadog_lines(rejected_at=None, retry_at=(), stale=0, skipped=0, records=True,
-                   batch=True):
-    """`datadog_out` telemetry for the ledger fixture's SUT drains: one request answered 2xx
+                   batch=True, cls="2xx", reason="rejected", named=0, queued_at=None):
+    """`datadog_out` telemetry for the ledger fixture's SUT drains: one request answered `cls`
     and 100 records accepted per drain, plus what each keyword adds. A rejection at
-    `rejected_at` drops its records (`records`) and its batch (`batch`): a request rejected
-    while another of the batch's was accepted drops records only."""
+    `rejected_at` drops its records (`records`, under `reason`) and its batch (`batch`): a
+    request rejected while another of the batch's was accepted drops records only. `named`
+    records come out of an accepted body at +250; `queued_at` adds three batches received
+    there and never sent, for a `buffer_batches=3` fixture."""
     drains = [o for o in range(5, STOP[0], 5)] + [o for o in range(135, 321, 5)]
     lines = []
     for offset in drains:
         stamp = _stamp(T0 + offset)
         lines.append(_line(stamp, "logit.output.requests", "sum", 1, component="sink",
-                           attrs={"route": "series", "class": "2xx"}))
+                           attrs={"route": "series", "class": cls}))
         lines.append(_line(stamp, "logit.output.records", "sum", 100, component="sink",
                            attrs={"route": "series"}))
     for offset in retry_at:
@@ -1925,7 +1945,7 @@ def _datadog_lines(rejected_at=None, retry_at=(), stale=0, skipped=0, records=Tr
                            attrs={"route": "series", "class": "4xx"}))
         if records:
             lines.append(_line(stamp, "logit.output.records.dropped", "sum", 100,
-                               component="sink", attrs={"route": "series", "reason": "rejected"}))
+                               component="sink", attrs={"route": "series", "reason": reason}))
         if batch:
             lines.append(_line(stamp, "logit.component.batches.dropped", "sum", 1,
                                component="sink", attrs={"reason": "rejected"}))
@@ -1937,6 +1957,12 @@ def _datadog_lines(rejected_at=None, retry_at=(), stale=0, skipped=0, records=Tr
     if skipped:
         lines.append(_line(_stamp(T0 + 250), "logit.output.metrics.skipped", "sum", skipped,
                            component="sink", attrs={"metric_kind": "cumulative_sum"}))
+    if named:
+        lines.append(_line(_stamp(T0 + 250), "logit.output.records.rejected", "sum", named,
+                           component="sink", attrs={"route": "series"}))
+    if queued_at is not None:
+        lines.append(_line(_stamp(T0 + queued_at), "logit.component.batches.received", "sum",
+                           3, component="sink"))
     return lines
 
 
@@ -1996,7 +2022,7 @@ def _external_checks():
         unquoted = results("external-rejected-no-line",
                            sut_extra=_datadog_lines(rejected_at=250))
         expect(unquoted["ledger.sent"].status == checks.FAIL
-               and "no request_rejected or series_rejected line" in
+               and "no request_rejected line on stderr" in
                unquoted["ledger.sent"].detail,
                f"a rejection with no stderr line still FAILs, got {unquoted['ledger.sent']}")
         stale = results("external-stale", sut_extra=_datadog_lines(stale=7, skipped=3))
@@ -2008,6 +2034,54 @@ def _external_checks():
         expect(short["ledger.sent"].status == checks.FAIL
                and "outside [0, 1]" in short["ledger.sent"].detail,
                f"a batch neither delivered nor dropped FAILs, got {short['ledger.sent']}")
+        refused = results("external-refused", sut_extra=_datadog_lines(), stderr_extra=[
+            (250, "WARN", "Datadog refused the API key: https://api.datadoghq.com/api/v2/series "
+             "answered 403 -- check 'api_key', and that 'site' is the one the key belongs to",
+             {"component": "sink", "key": "api_key_rejected"})])["ledger.sent"]
+        expect(refused.status == checks.FAIL and "1 api_key_rejected line(s)" in refused.detail
+               and "status 403: api_key_rejected at" in refused.detail,
+               f"a refused key FAILs quoting the line, got {refused}")
+        queued = results("external-queued", sut_extra=_datadog_lines(queued_at=250),
+                         buffer_batches=3)["ledger.sent"]
+        expect(queued.status == checks.FAIL and "3 batch(es) left unsent" in queued.detail
+               and "gap 0" in queued.detail,
+               f"batches still queued at the final life's quiet drain FAIL, got {queued}")
+        undrained = results("external-undrained", sut_extra=_datadog_lines(), timeline_extra=[
+            _phase("sink_drained", 320, held=False, hold_s=20, polls=60, bound_s=120,
+                   buffer_batches=2, retrying=1, newest_drain=T0 + 320)])["ledger.sent"]
+        expect(undrained.status == checks.FAIL and "held=false after 120s" in undrained.detail
+               and "buffer.batches 2 left unsent" in undrained.detail,
+               f"a sink_drained that never held FAILs with the count, got {undrained}")
+        drained = results("external-drained", sut_extra=_datadog_lines(), timeline_extra=[
+            _phase("sink_drained", 320, held=True, hold_s=20, polls=3, waited_s=24,
+                   buffer_batches=0, retrying=0, newest_drain=T0 + 320)])["ledger.sent"]
+        expect(drained.status == checks.PASS and drained.detail.startswith("SENT"),
+               f"a sink_drained that held reads SENT, got {drained}")
+        no_2xx = results("external-no-2xx", sut_extra=_datadog_lines(cls="4xx"))["ledger.sent"]
+        expect(no_2xx.status == checks.FAIL and "answered 2xx (4xx" in no_2xx.detail,
+               f"no request answered 2xx FAILs, got {no_2xx}")
+        oversize = (250, "WARN", "https://api.datadoghq.com/api/v2/series answered 413, request "
+                    "too large, 100 record(s) dropped: too big",
+                    {"component": "sink", "key": "request_rejected"})
+        too_big = results("external-oversize", sut_extra=_datadog_lines(
+            rejected_at=250, batch=False, reason="oversize"), stderr_extra=[oversize])
+        expect(too_big["ledger.sent"].status == checks.FAIL
+               and "100 record(s) dropped oversize" in too_big["ledger.sent"].detail
+               and "status 413" in too_big["ledger.sent"].detail,
+               f"records dropped oversize FAIL with the status, got {too_big['ledger.sent']}")
+        series_202 = (240, "WARN", "https://api.datadoghq.com/api/v2/series accepted the request "
+                      "but dropped 2 of 100 series; the first: too many tags",
+                      {"component": "sink", "key": "series_rejected"})
+        named = results("external-named", sut_extra=_datadog_lines(named=2),
+                        stderr_extra=[series_202])["ledger.sent"]
+        expect(named.status == checks.FAIL and "2 record(s) named dropped" in named.detail
+               and "a 2xx whose body named dropped series: series_rejected" in named.detail,
+               f"records named in a 202 body FAIL quoting series_rejected, got {named}")
+        both = results("external-202-then-400", sut_extra=_datadog_lines(rejected_at=250),
+                       stderr_extra=[series_202, rejection])["ledger.sent"]
+        expect(both.status == checks.FAIL and "status 400: request_rejected" in both.detail
+               and "a 2xx whose body" not in both.detail,
+               f"a 400's drop quotes the 400, not an earlier 202, got {both}")
         silent = results("external-no-requests")
         expect(silent["ledger.sent"].status == checks.FAIL
                and "no logit.output.requests" in silent["ledger.sent"].detail,
@@ -2056,7 +2130,7 @@ def run(root, quiet=False):
     _PASSED[0] = 0
     for part in (_durations, _rules, _expect_rules, _expand, _random, _log_capture, _signals,
                  _deadlines,
-                 _hung_inspect, _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks, _kill_watchdog,
+                 _hung_inspect, _inspect_redacted, _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks, _kill_watchdog,
                  _kill_ledger, _expect_checks, _gauge_lives, _target_rules, _sink_drain,
                  _external_checks, _report, _shipped):
         try:

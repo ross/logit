@@ -148,7 +148,7 @@ class RunData:
         self.thresholds = self.resolved.get("thresholds", {})
         self.ledger = self.resolved.get("ledger", {})
         self.duration = float(self.resolved.get("duration", 0))
-        # A run recorded before targets existed has none: the local target.
+        # A run directory with no target is a local one.
         self.target = self.resolved.get("target") or {"kind": LOCAL_TARGET,
                                                       "name": LOCAL_TARGET}
         self.external = self.target.get("kind") == EXTERNAL_TARGET
@@ -701,11 +701,13 @@ RECOVERED_RATE_SHARE = 0.95
 NO_BACKEND = "external target: no backend query"
 # `ledger.sent`'s reading of an external sink's telemetry (`datadog_out`'s module doc, "Faults,
 # retries, and duplicate safety" and "Telemetry"): the `records.dropped` reasons and the batch
-# drop reason that mean the destination refused the data, and the diagnostics quoting its
-# answer. Every other counted drop WARNs.
+# drop reason that mean the destination refused the data, the diagnostics quoting its answer to
+# a dropped request, and the diagnostics for a refusal the sink holds its queue on. Every other
+# counted drop WARNs.
 REJECTED_RECORD_REASONS = ("rejected", "oversize")
 REJECTED_BATCH_REASONS = ("rejected",)
 REJECTION_KEYS = ("request_rejected", "series_rejected")
+REFUSAL_KEYS = ("api_key_rejected", "request_refused")
 _ANSWERED_RE = re.compile(r"answered (\d{3})")
 # `(service, action)` faults during which the SUT writes no `aggregate` window: `ledger.windows`
 # excuses a gap across one.
@@ -1429,22 +1431,9 @@ def _by_attr(tel, name, attr, **attrs):
 def check_ledger_sent(data):
     """For an external target, where the ledger ends at the sink's telemetry: `SENT` (a PASS
     whose detail starts with the word) when every batch the sink received ended in an accepted
-    response. Per SUT life, at its last quiet drain (the final life's second-to-last, as for
-    `identity.sink`; an earlier life's last), `batches.received + buffer.disk.replayed ==
-    delivered + dropped + buffer.batches`, one batch in flight allowed. Over the run:
-
-    - FAIL: that identity off; a batch dropped `rejected`; records dropped `rejected` or
-      `oversize`, or named in a series `202` body (`records.rejected`), each with the status and
-      the sink's throttled `request_rejected`/`series_rejected` text from stderr; no request
-      answered `2xx`; no `logit.output.requests` at all.
-    - WARN: any other counted drop (a batch's `overflow_*` or `shutdown`, `drain complete`'s
-      `batches_dropped`, a record's `stale` or `too_many_tags`, an encoder's
-      `metrics.skipped`), and a request answered other than `2xx` (a `429`, a `5xx`, a
-      timeout's `network_error`) in a drain outside every fault window. Inside one it's the
-      fault's expected retry.
-
-    A `2xx` is the end of the evidence: nothing queries the destination for what it stored. A
-    local target SKIPs: `ledger.egress` judges its delivery against VictoriaMetrics."""
+    response, judged per SUT life by the sink's batch identity and over the run by its drops,
+    refusals, and request classes. A local target SKIPs. The plan's "Pass/fail" section
+    (`docs/plans/soak-harness.md`) lists each FAIL and WARN."""
     if not data.external:
         return Result("ledger.sent", SKIP, "local target: ledger.egress judges delivery against "
                       "VictoriaMetrics")
@@ -1492,25 +1481,36 @@ def check_ledger_sent(data):
         lines.append(text)
         if not 0 <= gap <= 1:
             off_identity.append(f"{text}, outside [0, 1]")
+        if life == led.final and queued > 0:
+            off_identity.append(f"life {life}'s buffer.batches at its quiet drain at "
+                                f"{data.offset(at)} is {_n(queued)}: {_n(queued)} batch(es) "
+                                "left unsent")
 
-    rejections = [entry for entry in data.stderr.get("logit", [])
-                  if entry.kind == "json" and entry.key in REJECTION_KEYS
-                  and entry.component == sink]
+    diagnostics = [entry for entry in data.stderr.get("logit", [])
+                   if entry.kind == "json" and entry.key in REJECTION_KEYS + REFUSAL_KEYS
+                   and entry.component == sink]
 
-    def quoted():
-        if not rejections:
-            return "no request_rejected or series_rejected line on stderr"
-        first = rejections[0]
+    def quoted(*keys):
+        """The first stderr line carrying one of `keys`, with the status it names."""
+        first = next((entry for entry in diagnostics if entry.key in keys), None)
+        if first is None:
+            return f"no {' or '.join(keys)} line on stderr"
         answered = _ANSWERED_RE.search(first.message)
         status_text = (f"status {answered.group(1)}" if answered
                        else "a 2xx whose body named dropped series")
         return (f"{status_text}: {first.key} at {data.offset(first.ts)}: {first.message[:300]}")
 
+    for key in REFUSAL_KEYS:
+        count = sum(1 for entry in diagnostics if entry.key == key)
+        if count:
+            flag(FAIL, f"the destination refused a request, so the sink held its queue: "
+                       f"{count} {key} line(s) ({quoted(key)})")
+
     batch_drops = _by_attr(sut, "logit.component.batches.dropped", "reason", component=sink)
     for reason, value in sorted(batch_drops.items()):
         if reason in REJECTED_BATCH_REASONS:
             flag(FAIL, f"{_n(value)} batch(es) dropped {reason}, the destination refused them "
-                       f"({quoted()})")
+                       f"({quoted('request_rejected')})")
         else:
             flag(WARN, f"{_n(value)} batch(es) dropped {reason}, counted")
     shutdown = sum(led.batches_dropped.values())
@@ -1521,13 +1521,13 @@ def check_ledger_sent(data):
     for reason, value in sorted(record_drops.items()):
         if reason in REJECTED_RECORD_REASONS:
             flag(FAIL, f"{_n(value)} record(s) dropped {reason}, the destination refused them "
-                       f"({quoted()})")
+                       f"({quoted('request_rejected')})")
         else:
             flag(WARN, f"{_n(value)} record(s) dropped {reason} before sending, counted")
     named = sum(sut.counter_by_life("logit.output.records.rejected", component=sink).values())
     if named:
         flag(FAIL, f"{_n(named)} record(s) named dropped in an accepted response's body "
-                   f"({quoted()})")
+                   f"({quoted('series_rejected')})")
     skipped_metrics = _by_attr(sut, "logit.output.metrics.skipped", "reason", component=sink)
     skipped_metrics.update({f"metric_kind={k}": v for k, v in _by_attr(
         sut, "logit.output.metrics.skipped", "metric_kind", component=sink).items()
@@ -1542,6 +1542,12 @@ def check_ledger_sent(data):
 
     for text in off_identity:
         flag(FAIL, text)
+    drained = data.phases.get("sink_drained")
+    if drained and not drained.get("held"):
+        left = drained.get("buffer_batches")
+        flag(FAIL, f"the sink's queue never emptied after the generator stopped: sink_drained "
+                   f"held=false after {drained.get('bound_s')}s with buffer.batches "
+                   f"{'unknown' if left is None else _n(left)} left unsent")
 
     requests = sut.matching("logit.output.requests", component=sink)
     classes = {}
@@ -1574,7 +1580,7 @@ def check_ledger_sent(data):
     accepted = sum(sut.counter_by_life("logit.output.records", component=sink).values())
     lines.insert(0, f"requests by class: {shown or 'none'}; records accepted {_n(accepted)}")
     lines += [f"{entry.key} at {data.offset(entry.ts)}: {entry.message[:300]}"
-              for entry in rejections]
+              for entry in diagnostics]
 
     summary = (f"requests {shown or 'none'}; records accepted {_n(accepted)}; "
                + "; ".join(identities) + f" (one batch in flight allowed); {NO_BACKEND}, so a "

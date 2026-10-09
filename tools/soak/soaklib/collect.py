@@ -205,9 +205,14 @@ def service_logs(run_dir, docker, ids, capture=None):
 
 
 def service_inspect(run_dir, docker, ids):
-    """`inspect/<svc>.json`: each container's final `docker inspect`."""
+    """`inspect/<svc>.json`: each container's final `docker inspect`, every `Config.Env` value
+    replaced by `<redacted>`, because an external target's credentials ride in the
+    environment."""
     out = Path(run_dir) / "inspect"
     out.mkdir(exist_ok=True)
     for service, container in ids.items():
         info = docker.inspect(container)
+        config = (info or {}).get("Config") or {}
+        if config.get("Env"):
+            config["Env"] = [f"{entry.partition('=')[0]}=<redacted>" for entry in config["Env"]]
         (out / f"{service}.json").write_text(json.dumps(info, indent=2, sort_keys=True) + "\n")
