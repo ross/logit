@@ -842,7 +842,8 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
 
 ### NET-08 — TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix
 - **Location:** `crates/logit-proto/src/framing.rs` — `struct Framer`, `Framer::new`,
-  `Framer::push` (the latch), `next_frame`, `finish`, `oversize_policy`, `next_line`,
+  `Framer::push` (the latch), `next_frame`, `finish`, `abandon` (with the private
+  `remainder_is_blank` they share), `oversize_policy`, `next_line`,
   `next_length_prefixed`, `next_octet_counted`, `strip_cr`. Supporting types: `FramingMode`,
   `Oversize`, `Framing`, `FrameError`. Constants: `MAX_FRAME_BYTES`, `READ_BUFFER_BYTES`,
   `LENGTH_PREFIX_BYTES` with its assert against `graphite::pickle`'s.
@@ -885,7 +886,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   - **`finish()` and `report_buffered_tail` agree**: identical buffered bytes followed by FIN vs.
     RST produce the same counter, except the one documented case (`Rfc6587Auto` LF arm emits the
     remainder as a real final message).
-  - **`OversizeSkipped` is the only non-fatal variant** (`FrameError::is_fatal`) and the framer is genuinely
+  - **`OversizeSkipped` and `Drained` are the only non-fatal variants** (`FrameError::is_fatal`) and the framer is genuinely
     resynchronized when it is returned (the drain latch or the consumed terminator).
   - Leading-zero octet counts, zero counts, and non-digit-before-SP are all rejected rather than
     silently reinterpreted (`next_octet_counted`'s digit/SP loop, `digits == 0` check, and
@@ -907,7 +908,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   newline, CR stripping, empty lines, oversize under both policies, drain-to-next-line, ten-digit
   and leading-zero counts, length-prefix assembly and over-bound), plus the recorded-interop replay
   `interop_fixture_rsyslog_tcp_non_transparent_frame`. ADRs: `syslog-tcp-ingress-and-tls`,
-  `graphite-carbon-relay`, `idle-connection-timeout`.
+  `graphite-carbon-relay`, `idle-connection-timeout`. Since `untrusted/w6`: the `stream_framing` fuzz target (six oracles), `crates/logit-proto/tests/robustness.rs`'s "framing" section, and the FIN/RST agreement tests in `framing.rs` and `tcp.rs`.
 - **Suggested verification approach:** **a fuzz target** — `Framer` is pure, synchronous, and takes
   arbitrary bytes, which makes it the single best fuzzing candidate in this area (drive
   `push`/`next_frame`/`finish` over `cargo-fuzz` or `arbitrary`-driven proptest with randomized
