@@ -53,7 +53,7 @@
 //! All of it comes from the shared drivers (`crate::statsd`'s module doc lists them per
 //! transport), plus the datagram-side oversize count above.
 
-use crate::tcp::{FramingMode, Oversize, TcpListener, TcpListenerConfig, TlsServerSettings};
+use crate::tcp::{TcpListener, TcpListenerConfig, TlsServerSettings};
 use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
@@ -61,6 +61,7 @@ use logit_core::{
     AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Scope, Telemetry, Value,
 };
 use logit_pipeline::Fanout;
+use logit_proto::framing::{FramingMode, Oversize};
 use logit_proto::{CodecError, Decoder};
 use std::path::Path;
 use std::sync::Arc;
@@ -68,7 +69,7 @@ use tokio::sync::watch;
 
 /// `max_line_bytes`' default, the stream driver's own frame bound.
 /// `logit_config::default_lines_max_line_bytes` mirrors it by hand.
-pub const DEFAULT_MAX_LINE_BYTES: usize = crate::tcp::MAX_FRAME_BYTES;
+pub const DEFAULT_MAX_LINE_BYTES: usize = logit_proto::framing::MAX_FRAME_BYTES;
 
 /// Which driver a [`LinesInput`] wraps, chosen once by `transport:`. `Udp` also covers
 /// `transport: unix` and `Tcp` covers `unix_stream`: the drivers own the socket family.

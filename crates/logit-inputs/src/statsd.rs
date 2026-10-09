@@ -44,7 +44,7 @@
 //! of newline-separated lines), as the `datadog` Python client writes it to a real Agent's socket
 //! (`testdata/interop/datadog/README.md`; `interop_fixture_a_unix_stream_capture_*` replays it). A
 //! packet declaring more than
-//! [`MAX_FRAME_BYTES`](crate::tcp::MAX_FRAME_BYTES) closes the connection, counted
+//! [`MAX_FRAME_BYTES`](logit_proto::framing::MAX_FRAME_BYTES) closes the connection, counted
 //! `logit.input.frames.dropped{reason="oversize"}`: a length-framed stream has no resync point.
 //! The rest of this section is `tcp`'s.
 //!
@@ -64,7 +64,7 @@
 //! such licence.
 //!
 //! Oversize is **recoverable**: a line past the driver's 64 KiB
-//! [`MAX_FRAME_BYTES`](crate::tcp::MAX_FRAME_BYTES) is dropped, counted once as
+//! [`MAX_FRAME_BYTES`](logit_proto::framing::MAX_FRAME_BYTES) is dropped, counted once as
 //! `logit.input.frames.dropped{reason="oversize"}`, and the connection resynchronizes at the next
 //! `LF`. `graphite_in` makes the same call for carbon plaintext
 //! (`docs/adr/graphite-carbon-relay.md`): one pathological line must not cost every other metric
@@ -238,7 +238,7 @@
 //! `impl From<&str> for Value`. Tag keys and the metric name don't need this: both only reach
 //! [`logit_core::interner::intern`], which copies into its own table regardless.
 
-use crate::tcp::{FramingMode, Oversize, TcpListener, TcpListenerConfig, TlsServerSettings};
+use crate::tcp::{TcpListener, TcpListenerConfig, TlsServerSettings};
 use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
@@ -249,6 +249,7 @@ use logit_core::{
     Samples, Scope, Severity, Symbol, Telemetry, Value,
 };
 use logit_pipeline::Fanout;
+use logit_proto::framing::{FramingMode, Oversize};
 use logit_proto::{CodecError, Decoder};
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
@@ -299,7 +300,7 @@ impl StatsdInput {
                 )
                 .with_framing(
                     FramingMode::Lines { oversize: Oversize::DrainToNextLine },
-                    crate::tcp::MAX_FRAME_BYTES,
+                    logit_proto::framing::MAX_FRAME_BYTES,
                 ),
             ),
         }
@@ -331,7 +332,7 @@ impl StatsdInput {
                     StatsdDecoder::new(Arc::new(Resource::default())),
                     TcpListenerConfig::default(),
                 )
-                .with_framing(FramingMode::LengthPrefixedLe, crate::tcp::MAX_FRAME_BYTES),
+                .with_framing(FramingMode::LengthPrefixedLe, logit_proto::framing::MAX_FRAME_BYTES),
             ),
         }
     }
@@ -2717,8 +2718,10 @@ mod tests {
     #[test]
     fn interop_fixture_a_unix_stream_capture_frames_as_le_length_prefixed_packets() {
         let frames_of = |name: &str| {
-            let mut framer =
-                crate::tcp::Framer::new(FramingMode::LengthPrefixedLe, crate::tcp::MAX_FRAME_BYTES);
+            let mut framer = logit_proto::framing::Framer::new(
+                FramingMode::LengthPrefixedLe,
+                logit_proto::framing::MAX_FRAME_BYTES,
+            );
             framer.push(&datadog_interop_fixture(name));
             let mut frames = Vec::new();
             while let Some(frame) = framer.next_frame().expect("a recorded frame is well formed") {
@@ -2916,7 +2919,7 @@ mod tests {
         let mut running = start_unix(StatsdInput::unix_stream(&path)).await;
 
         let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        let declared = (crate::tcp::MAX_FRAME_BYTES as u32 + 1).to_le_bytes();
+        let declared = (logit_proto::framing::MAX_FRAME_BYTES as u32 + 1).to_le_bytes();
         client.write_all(&declared).await.unwrap();
         client.flush().await.unwrap();
         let mut buf = [0u8; 1];

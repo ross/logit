@@ -53,10 +53,10 @@
 //!
 //! ## Framing
 //!
-//! Framing is the listener's job, not the decoder's: the driver's [`Framer`](crate::tcp::Framer)
-//! runs under a [`FramingMode`] chosen from `protocol:`. **Never [`FramingMode::Rfc6587Auto`]**: a
-//! carbon path may begin with a digit, which that mode would read as an RFC 6587 octet count and
-//! reframe the whole connection on.
+//! Framing is the listener's job, not the decoder's: the driver's
+//! [`Framer`](logit_proto::framing::Framer) runs under a [`FramingMode`] chosen from `protocol:`.
+//! **Never [`FramingMode::Rfc6587Auto`]**: a carbon path may begin with a digit, which that mode
+//! would read as an RFC 6587 octet count and reframe the whole connection on.
 //!
 //! | Protocol | Frame | Over the bound |
 //! |---|---|---|
@@ -70,10 +70,10 @@
 //! **A terminator-less line at EOF is dropped, not ingested.** Carbon's `\n` is the only signal a
 //! line is complete, so a sender that dies mid-line leaves a truncation. Without its newline,
 //! `svc.web01.cpu 42.5 17000` would parse cleanly and produce a gauge stamped 1970.
-//! [`FramingMode::Lines`] makes [`crate::tcp::Framer::finish`] return `Truncated` (counted
-//! `logit.input.frames.dropped{reason="truncated"}`), so a clean FIN and an abrupt RST agree about
-//! identical bytes. [`FramingMode::Rfc6587Auto`] does the opposite, because RFC 6587 §3.4.2 says a
-//! final syslog message needs no terminator.
+//! [`FramingMode::Lines`] makes [`logit_proto::framing::Framer::finish`] return `Truncated`
+//! (counted `logit.input.frames.dropped{reason="truncated"}`), so a clean FIN and an abrupt RST
+//! agree about identical bytes. [`FramingMode::Rfc6587Auto`] does the opposite, because RFC 6587
+//! §3.4.2 says a final syslog message needs no terminator.
 //!
 //! **One `decode_into` per line, not per read**, on carbon's hottest path: one `Arc` clone and one
 //! `absorb` per line. The ADR's "`graphite_in` TCP is now `logit_inputs::tcp`" section records the
@@ -116,11 +116,12 @@
 //! `logit.input.frames.dropped{reason}`, and `logit.component.receive.flushed{reason}`. The
 //! decoder's `logit.input.metrics.skipped{reason}` is reported under both.
 
-use crate::tcp::{FramingMode, Oversize, TcpListener, TcpListenerConfig, TlsServerSettings};
+use crate::tcp::{TcpListener, TcpListenerConfig, TlsServerSettings};
 use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use logit_core::{Diagnostics, Resource, Telemetry};
 use logit_pipeline::Fanout;
+use logit_proto::framing::{FramingMode, Oversize};
 use logit_proto::graphite::{
     GraphiteDecoder, Protocol, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_LINE_BYTES,
 };
@@ -1275,7 +1276,8 @@ mod tests {
     }
 
     /// Decodes every length-prefixed pickle frame a recorded connection holds, stripping each
-    /// prefix as `crate::tcp::Framer` does: the decoder expects one unframed payload per call.
+    /// prefix as `logit_proto::framing::Framer` does: the decoder expects one unframed payload per
+    /// call.
     fn decode_interop_pickle(name: &str) -> (Vec<Event>, Arc<Registry>) {
         let (mut decoder, registry) = interop_decoder(Protocol::Pickle);
         let raw = interop_fixture(name);

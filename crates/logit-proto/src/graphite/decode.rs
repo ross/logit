@@ -6,7 +6,7 @@
 //! stack ([`super::pickle`]).
 //!
 //! **Framing is not this decoder's job.** `graphite_in`'s listener, through the shared TCP driver's
-//! `Framer` (`crates/logit-inputs/src/tcp.rs`), owns the read buffer, the `max_line_bytes` drain,
+//! [`Framer`](crate::framing::Framer), owns the read buffer, the `max_line_bytes` drain,
 //! and the 4-byte pickle length prefix. [`GraphiteDecoder::decode_into`] gets a whole UDP datagram
 //! (possibly several lines) or one delimited message: a plaintext line or an unframed pickle
 //! payload. Line splitting still runs, since a UDP datagram may carry several lines.

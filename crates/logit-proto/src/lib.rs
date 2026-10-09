@@ -11,6 +11,7 @@ pub mod collectd;
 pub mod datadog;
 pub mod forwarded;
 pub mod frame;
+pub mod framing;
 pub mod graphite;
 pub mod json;
 pub mod msgbuf;
