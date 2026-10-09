@@ -196,31 +196,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     through a Service rather than from the node itself, `shutdown.delay` moves that traffic away
     before the close. Measured loss per close:
     [ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md#what-the-kernel-does).
-- **A `drop_oldest` UDP listener takes kernel drops in the drain where a blocked downstream
-  unblocks.** Under the default `receive.overflow: drop_oldest`, the read loop keeps reading the
-  socket while the downstream is stalled
-  ([ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)), and through the stall it
-  does. The kernel drops datagrams at the end of the stall instead.
-  - **Measured:** `script/soak`'s `udp-flood-sink-stop` scenario, run `20261008T231010Z`
-    ([the soak harness plan](../plans/soak-harness.md)'s "Findings"). A `statsd_in` fed 20,000
-    one-line datagrams/s sat behind `aggregate` and a 2-batch sink queue through a 60 s sink
-    stop. It read 100,000 datagrams in every 5 s drain, with its 10,000-datagram receive queue
-    full and `logit.input.kernel.drops` at 0. In the drain where the chain unblocked, 8 s after
-    the destination returned (the sink's retry backoff), the kernel dropped 79 datagrams and
-    `logit.input.datagrams` read 99,921. No other drain in the run had a kernel drop.
-  - **Consequence:** the loss is counted and bounded by one drain. `logit.input.kernel.drops`
-    records it, and the soak ledger's wire row balanced with it.
-  - **Cause, not verified:** the read loop pausing for a few milliseconds while the decode loop
-    drains the full receive queue into the downstream in a burst. At 20,000 datagrams/s, that's
-    enough to overflow the run's 212,992-byte socket buffer, the kernel default. Read and decode
-    share one task (the first entry in this section), and
-    [ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)
-    describes how they hand off.
-  - **Workaround:** a larger `receive.receive_buffer_bytes` gives the kernel more room during the
-    pause. It's untested here, and the kernel clamps a request above `net.core.rmem_max`.
-  - **To close:** investigate with the read loop instrumented, to find what it waits on in that
-    drain. The `udp-flood-sink-stop` scenario's `no-kernel-drops` row, over its `through`
-    window, is the regression check, and fails until then.
 - **A multicast UDP listener is delivered to every overlapping instance.** Every socket joined to
   a multicast group receives every datagram, whatever `SO_REUSEADDR` or `SO_REUSEPORT` it sets
   (measured: 1000 of 1000 at each of two members), and the multicast bind already sets
