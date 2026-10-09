@@ -985,14 +985,19 @@ What the runs showed about `logit`:
   which the receive queue went from full to empty and the chain unblocked; that drain read 99,921
   datagrams. [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md) says the socket keeps
   being read while the downstream is stalled, and through the stop it was: the drops came from
-  the unblock, not the stall. The loss is counted (K in `ledger.wire`, which PASSed). A pause
-  of the read loop of a few milliseconds, while the decode loop drained 10,000 queued datagrams
-  into `aggregate`, would explain it at 20,000 datagrams a second; that cause is an inference,
-  not verified. [`docs/known-gaps/intake.md`](../known-gaps/intake.md)'s "UDP intake" entry "A
-  `drop_oldest` UDP listener takes kernel drops in the drain where a blocked downstream unblocks"
-  records it. `expect.no-kernel-drops` FAILs on it by design, and keeps failing until that entry
-  closes. The first run of this scenario, `20261008T223523Z` at a 10 s window, read 0, but its
-  stop never reached the listener, so it shows nothing about an unblock.
+  the unblock, not the stall. The loss is counted (K in `ledger.wire`, which PASSed). The first
+  run of this scenario, `20261008T223523Z` at a 10 s window, read 0, but its stop never reached
+  the listener, so it shows nothing about an unblock.
+
+  Resolved: the decode loop drained the backlog in one poll while the read loop went unpolled,
+  and PR #596 makes `decode_loop` yield after 16 consecutive full pops
+  ([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)'s
+  "Amendment: a backlog drain starves the reader, and the one yield it needed (2026-10-09)").
+  Four runs of this scenario against the fixed binary read 0 kernel drops with every row passing:
+  `20261009T003527Z` and `20261009T141302Z` from the fix's own branch, and `20261009T152642Z` and
+  `20261009T153202Z` from an image rebuilt with no cache from the merged `soak/w2` tree. An
+  intermediate run, `20261009T151548Z` (45 drops), ran an image the record can't tie to the fix,
+  so it isn't counted.
 - **A small `max_batches` doesn't make a 90 s outage reach the listener at 10 s windows.**
   `aggregate` sends one batch per window, and the sink's inbox holds 64 batches
   (`CHANNEL_CAPACITY` in `crates/logit-pipeline/src/runtime.rs`) between `aggregate` and the
@@ -1223,12 +1228,84 @@ first drain replayed 0 vs killed life 0's last-drain buffer.batches 6, off by -6
 row passes, `ledger.summary` included, because the final life balanced. The 120,000 is the 60 s
 of increments between the VictoriaMetrics stop and the kill.
 
-### W4: random schedules and long runs (no run yet)
+### W4: random schedules and long runs (2026-10-09)
 
-No `random-faults` run has been made. The first runs, in order, are a 1-hour smoke at the
-scenario's own duration and seed (`script/soak run random-faults`, 14 faults), then 8 hours
-(`--duration 8h`, 113 faults for seed 20261009). Each is recorded here with the commit, image
-tags, host, the seed, the verbatim `results.md` table, and what the schedule did.
+Run `20261009T135848Z`: `SOAK_SKIP_IMAGE=1 script/soak run random-faults`, the scenario's own
+1 hour and seed 20261009 (14 faults), from `soak/w4` at `82a0448f` on W1a's images
+(`logit:soak` `sha256:78a95c90bb4a`, VictoriaMetrics v1.152.0) on a 32-core host. Overall PASS, and
+every row passed. A first attempt died at the signal self-test because `nohup` hands the run
+an ignored `SIGHUP`, which the self-test's "default" case assumed was not; `82a0448f` has the
+self-test set the inherited dispositions itself.
+
+The drawn schedule (offsets in seconds from the start; `r8` reverted 1.2 s late and `r2` applied
+1.2 s late, both while the driver was busy with the previous step):
+
+| Id | Offset | Action | Service | Args | Duration |
+|---|---|---|---|---|---|
+| r1 | 260 | kill | logit | | 54 s |
+| r2 | 451 | netem | logit | `delay 1s` | 140 s |
+| r3 | 810 | kill | logit | | 29 s |
+| r4 | 1014 | stop | logit | | 75 s |
+| r5 | 1240 | netem | generator | `delay 1s` | 113 s |
+| r6 | 1520 | kill | logit | | 56 s |
+| r7 | 1700 | partition | victoria-metrics | | 60 s |
+| r8 | 1934 | netem | generator | `loss 10%` | 77 s |
+| r9 | 2210 | netem | generator | `loss 10%` | 80 s |
+| r10 | 2433 | stop | victoria-metrics | | 41 s |
+| r11 | 2620 | partition | victoria-metrics | | 78 s |
+| r12 | 2861 | partition | generator | | 36 s |
+| r13 | 3028 | kill | logit | | 25 s |
+| r14 | 3222 | netem | logit | `delay 1s` | 111 s |
+
+The rows of `results.md` (the `ledger.egress` detail trimmed to its per-life verdicts and bands,
+which are identical in shape for every killed life):
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 28 apply/revert action(s) returned 0; 5 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 7 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (4 kill(s)) |
+| `restarts` | PASS | 6 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 12 sink fault line(s) inside fault windows, 0 outside, 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 790 health sample(s) healthy outside fault windows; 5 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 59 30s window(s) with deliveries outside fault windows; 67 freshness sample(s) under 30s; 1740s of 3540s after warmup judged (49%; WARN under 5%) |
+| `rss_slope` | PASS | MiB/h per service/life: logit/0 -3.9, logit/1 +6.9, logit/2 -11.4, logit/3 +4.1, logit/4 +0.8, logit/5 -16.2, generator/0 -2.5 (limit 64); logit 1850s of 3540s after warmup judged (52%; WARN under 5%); generator 1855s of 3540s after warmup judged (52%; WARN under 5%) |
+| `fd_slope` | PASS | warmup median -> end: logit 15->15, generator 12->12 (limit +8) |
+| `ledger.wire` | PASS | G 7,059,278 = W 7,014,509 + K 0 + wire 44,769 (by design: 46,083 in UDP-affecting windows, -1,323 steady, 9 at the end; steady loss judged 75, each run at 0 or more, against limit 1,900); the generator's counted drop_newest loss, not in G: 153,200 event(s) in 1,532 batch(es) |
+| `ledger.intake` | PASS | final life 5: W − D 1,144,200 vs E + B 1,144,200; lives 0 to 4: W − D − B − Ab 0 within [0, R] (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.edge` | PASS | final life 5: E 1,144,200 == A 1,144,200 (listener to aggregate) |
+| `ledger.aggregate` | PASS | final life 5: Ab 1,144,200 == A 1,144,200 (every event absorbed) |
+| `ledger.egress` | PASS | life 0 (killed): Ab 528,800 − V 528,800 = 0, ok (band [-10,000, 30,001]); life 1 (killed): Ab 1,060,900 − V 1,050,900 = 10,000, within band (band [-9,999, 29,997]); life 2: W − D − B − V 0 = residual 0 + Ab − V 0, ok; life 3 (killed): Ab 929,900 − V 929,900 = 0, ok (band [-10,001, 30,002]); life 4 (killed): Ab 2,942,809 − V 2,942,809 = 0, ok (band [-10,002, 30,006]); life 5 (final): Ab 1,144,200 − V 1,144,200 = 0, ok |
+| `ledger.windows` | PASS | 100 series x 6 life/lives, widest gap 10.002s (gaps <= 15s (1.5 x the 10s aggregate interval), a killed life's last sample within 11s (1.1 x) of the kill, a later life's first within 20s (2 x) of its start; a gap across a fault that silences the SUT excused when it starts within 11s before the fault and ends within 11s after it (20s after a generator stop), 100 excused) |
+| `ledger.replay` | PASS | life 1's first drain replayed 0 vs killed life 0's last-drain buffer.batches 1; life 2's first drain replayed 0 vs killed life 1's last-drain buffer.batches 0; life 4's first drain replayed 0 vs killed life 3's last-drain buffer.batches 1; life 5's first drain replayed 0 vs killed life 4's last-drain buffer.batches 1 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 5: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V 0; wire G − (W + K) 44,769 over the run, by design |
+| `identity.sink` | PASS | final life 5 at +3623s: received 55 vs delivered 55 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `recovery` | PASS | 14 of 14 fault(s) judged, each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect` | SKIP | the scenario has no [[expect]] tables |
+
+What the run showed:
+
+- **Life 1's Ab − V of 10,000 is inside its band.** The kill came with one 10 s aggregate window
+  at 2,000/s unflushed, and the spool holds what reached the sink, not what the aggregate hadn't
+  flushed. The band's high edge is 29,997. The other three killed lives balanced to 0.
+- **`ledger.replay` replayed 0 at every restart**, against 0 or 1 queued batches at each kill.
+  The sink was idle at each kill, so the spool had nothing to replay. The fixed
+  `spool-kill-replay` scenario remains the replay test.
+- **Steady-state coverage was 49% of the post-warmup time for `progress` and 52% for the RSS
+  slopes**, as the schedule promises: faults and their recovery take the rest.
+- **Wire loss was 44,769, all inside UDP-affecting windows.** Those windows lost 46,083, and the
+  steady buckets summed to −1,323, which the check clamps to 0 per bucket (judged 75 against a
+  limit of 1,900). The negative buckets are interpolation error at the bucket edges, the artefact
+  the clamp exists for.
+- **The generator's own counted `drop_newest` loss was 153,200 events** (1,532 batches) while the
+  SUT was down. It is outside G by definition and the run counted it.
+- **RSS slopes were −16.2 to +6.9 MiB/h per life** (limit 64) and file descriptors stayed flat
+  (logit 15 to 15, generator 12 to 12).
+- **The health sampler took 790 samples**, all healthy outside fault windows, and the slowest
+  readiness after a start was 0.1 s.
+
+This run is the 1-hour smoke. W4 isn't done until the 8-hour run (`--duration 8h`, 113 faults for
+seed 20261009) is recorded here, per "Verification".
 
 What W4 measured without a run:
 
