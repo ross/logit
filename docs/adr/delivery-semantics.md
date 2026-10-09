@@ -37,9 +37,9 @@ None says what `logit` aims for, so behavior follows from defaults nobody chose:
   cursor in memory, and the cursor reaches disk on a later commit, a segment roll, or shutdown.
   A crash replays the batch in flight and every batch committed since the last cursor write,
   under either posture.
-- **Three sinks duplicate under `at_most_once`.** `otlp_out`, `datadog_out`, and
-  `datadog_trace_out` send several requests per batch and report a connect failure `Clean` after
-  an earlier request was accepted. The retry resends what was accepted. [ADR
+- **Three sinks duplicated under `at_most_once`.** `otlp_out`, `datadog_out`, and
+  `datadog_trace_out` send several requests per batch and reported a connect failure `Clean` after
+  an earlier request was accepted. The retry resent what was accepted. [ADR
   `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md)'s Follow-ups
   leave that classification to its own record. This is that record.
 - **An input can acknowledge a batch nothing kept.** `Fanout` skips a closed consumer, counts
@@ -280,9 +280,10 @@ request no longer stops the send, so the rule above applies to `Clean` and `Ambi
 only.]
 
 [Narrowed again by [ADR `sink-fault-classes`](sink-fault-classes.md)'s "Amendment: `otlp_out`
-retries per signal (2026-10-05)": `otlp_out` resends no accepted signal on a retry, so the rule no
-longer applies to it, and a failed signal's own class is the batch's. `datadog_out` and
-`datadog_trace_out` keep it.]
+retries per signal (2026-10-05)" and "Amendment: the Datadog sinks retry per request (2026-10-09)":
+`otlp_out`, `datadog_out`, and `datadog_trace_out` resend no accepted request on a retry, so the
+rule no longer applies to them, and a failed request's own class is the batch's. Only
+`splunk_hec_out` still applies it.]
 
 ### 10. A replaying input is at-least-once up to the in-memory queues
 
@@ -498,8 +499,9 @@ succeeds and its metrics request fails with gRPC `UNIMPLEMENTED`. No `send` ever
    If none was accepted and some were rejected, return the first rejected error, still
    explicitly `Permanent`.
 
-**Why `Clean` and `Ambiguous` still stop.** The runtime retries the whole batch on either, so
-attempting more requests first only adds duplicates to the retry.
+**Why `Clean` and `Ambiguous` still stop.** The runtime retries the batch on either, so
+attempting more requests first only adds duplicates to the retry. [Narrowed by the two per-request
+retry amendments to `sink-fault-classes`: the retry resends only the requests not yet settled.]
 
 **Why a sink-wide refusal stops.** A refusal of Datadog's org-wide API key says nothing about
 the request that carried it. Going on would repeat the refusal once per remaining request. An
@@ -516,8 +518,8 @@ operator remedy for a mixed source is `has_signal` or `keep_signals` ahead of th
 `otlp_out` names in its throttled `signal_rejected` warning. The Datadog sinks reuse their
 `request_rejected` diagnostic.
 
-**Counting.** `records.dropped{reason="rejected"}` is a server-verdict drop, so it counts per
-attempt, whether or not the send ends `Ok` ([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md),
+**Counting.** `records.dropped{reason="rejected"}` is a server-verdict drop, so it counts on the
+attempt that got the verdict, whether or not the send ends `Ok` ([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md),
 decision 1). Layer 2's `events.dropped{reason="send_failed"}` counts the batch only when the whole
 send failed. A partly accepted batch is delivered modulo these counted losses, the posture
 OTLP `partial_success` and Splunk's code 6 already have.

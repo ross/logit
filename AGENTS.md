@@ -501,7 +501,7 @@ Per pair:
   panics, still fails its node and exits `2`. `buffer.delivery: at_most_once` drops an `Ambiguous` fault instead of
   retrying it ([ADR `delivery-semantics`](docs/adr/delivery-semantics.md)). The shared HTTP
   driver (`crates/logit-outputs/src/http.rs`) supplies a status-only default that each HTTP
-  sink's table refines, and `otlp_out` retries only the signals a destination hasn't settled.
+  sink's table refines, and `otlp_out`, `datadog_out`, and `datadog_trace_out` retry only the signals or requests a destination hasn't settled.
 - **Trace propagation**: every `Delivered` (one `Fanout` edge's channel payload) carries a real
   `TraceContext`, propagated as a child of its parent for the two node kinds with an unambiguous
   one to propagate: `Transform::process`/`ScriptWorker::process`'s non-flush path, and

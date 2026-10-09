@@ -67,26 +67,27 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** extra requests on these routes, never a `413`.
   - **Revisit trigger:** Datadog documents these routes' limits, or the extra requests show up in
     a sink's request rate.
-- **A `datadog_out` resend isn't idempotent: Datadog stores a resent log twice.** A batch is
-  several requests, and a retry resends the ones that succeeded; `datadog_trace_out` does the
-  same across its routes. Neither remembers which requests of a batch were accepted, as
-  `otlp_out` does per signal. A trial org received two resends:
+- **A `datadog_out` or `datadog_trace_out` resend isn't idempotent: Datadog stores a resent log
+  twice.** Both sinks remember which requests of a batch the destination settled, so a retry
+  resends only the rest ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "Amendment: the
+  Datadog sinks retry per request (2026-10-09)"). A resend still happens in two places: the
+  request that drew an `Ambiguous` answer is resent under `at_least_once` and may have been
+  applied, and a `buffer.disk:` replay after a crash resends every request of the batch because the
+  memory is in-process (`docs/known-gaps/sinks.md`, "The per-request retry memory of `otlp_out` and
+  the Datadog sinks is in-process"; `docs/known-gaps/native-hop.md`, "A disk-backed sink replays
+  delivered and dropped batches after a crash"). A trial org received two resends:
   - A series point resent at the same `(series, timestamp)` was stored once, the last write
     winning: a count sent twice read 5, not 10, and a gauge sent as 7 then 9 read 9.
   - An identical log posted twice was stored as two logs.
 
   Every other route (distribution points, sketches, events, checks, traces, stats) is assumed to
   store a resend again until measured.
-  - **Consequence:** the default posture, `at_least_once`, retries a `5xx` or timeout and accepts
-    duplicates on every route but series: duplicate logs, and assumed inflated distribution,
-    sketch, event, check, trace, and stats counts. `buffer: {delivery: at_most_once}` drops the
-    batch instead.
-  - **To close:** remember the accepted requests per batch and resend only the rest, as
-    `otlp_out` does per signal ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md),
-    "Amendment: `otlp_out` retries per signal (2026-10-05)"). A request is a chunk of a route
-    that `split_encode` (`crates/logit-outputs/src/http.rs`) cuts, so the memory keys on the
-    chunk, not the route.
-  - **Revisit trigger:** a measurement showing another route dedupes a resend.
+  - **Consequence:** the default posture, `at_least_once`, accepts a duplicate of the one request
+    that drew a `5xx` or timeout, and of a whole batch on a crash replay: duplicate logs, and
+    assumed inflated distribution, sketch, event, check, trace, and stats counts. Series points
+    overwrite. `buffer: {delivery: at_most_once}` drops that request's batch instead.
+  - **Revisit trigger:** a measurement showing another route dedupes a resend, or an operator who
+    needs the replay to be duplicate-free.
 - **`datadog_out` drops metric points older than 1 hour, which Datadog would store.** The sink
   uses the documented series window, which is stricter than the intake;
   [the plan's "Timestamp windows" section](../plans/datadog-relay.md#11-timestamp-windows-w5) has
@@ -214,20 +215,27 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** none known. Both sinks classify by status alone, so a body shape that
     differs changes only the text the diagnostics quote.
   - **Revisit trigger:** a recorded `4xx` response from a real Datadog intake or Agent.
-- **A sink sent to again without `observe_batch`, after a batch whose last attempt failed, keeps
-  that batch's state.** `observe_batch` arms the attempt gate of every sink that has one, and on
-  `datadog_out` it also fixes the batch's send time. Only an `Ok` disarms the gate and clears the
-  time, because the sink can't tell a final failed attempt from one the runtime will retry
-  ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+- **A sink sent to again without `observe_batch`, after a batch whose last attempt failed
+  retryably, keeps that batch's state.** `observe_batch` arms the attempt gate of every sink that
+  has one, and on `datadog_out` it also fixes the batch's send time. A final send disarms the gate
+  and clears the time: `Ok`, or a fault `write_loop` won't retry under the sink's posture
+  (`Rejected`, or `Ambiguous` under `at_most_once`). A retryable failure (`Clean`, `Refused`, or
+  `Ambiguous` under `at_least_once`) leaves them, because the runtime may retry and the retry needs
+  the gate, the settled-request memory, and the send time ([ADR
+  `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
   decisions 2 and 3). A caller that then calls `send` with a new batch and no `observe_batch`
   finds the gate armed: the new batch's encode-side counts for units the failed batch encoded are
-  muted, and on `datadog_out` the stale windows are measured from the failed batch's send time.
+  muted, on `datadog_out` the stale windows are measured from the failed batch's send time, and
+  both Datadog sinks and `otlp_out` skip the requests at the settled positions.
   - **Consequence:** none on a shipped path. `write_loop` calls `observe_batch` before every
     batch, which re-arms the gate and replaces the time. `logit_pipeline::send_batch`, which the
     benchmarks use, is the one caller that skips it. Because it never calls `observe_batch`, no
     gate is armed and no send time is stored, so its repeated sends to one sink leave no state.
+    `statsd_out` doesn't forward `observe_posture` (its default posture is `at_most_once`), so its
+    accounting stays armed after an `Ambiguous` failure too; it keeps no per-request memory, so
+    the only effect is the muted counts.
   - **Fix, if a caller ever needs it:** a runtime signal that a batch ended (an `Output` method,
-    which decision 2 declined to add). A sink can't clear on `Err` without breaking the reuse the
-    retries need.
-  - `datadog::tests::a_direct_send_after_a_failed_batch_reuses_its_send_time_and_armed_gate`
+    which decision 2 declined to add). A sink can't clear on a retryable `Err` without breaking
+    the reuse the retries need.
+  - `datadog::tests::a_direct_send_after_a_retryable_failure_reuses_its_send_time_and_armed_gate`
     pins the behavior, so a change to it is noticed.

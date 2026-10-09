@@ -90,3 +90,18 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `FileTarget::note_written` uncalled for bytes that may have reached the file, so a size
     rotation can come late. The error carries no `Fault`, so the batch drops as `Rejected`
     instead of retrying.
+
+- **The per-request retry memory of `otlp_out`, `datadog_out`, and `datadog_trace_out` is
+  in-process.** Each sends one batch as several requests and remembers per batch which the
+  destination settled, so a retry resends only the rest ([ADR
+  `sink-fault-classes`](../adr/sink-fault-classes.md), "Amendment: `otlp_out` retries per signal
+  (2026-10-05)" and "Amendment: the Datadog sinks retry per request (2026-10-09)"). The memory
+  lives in `BatchAccounting` (`crates/logit-outputs/src/accounting.rs`), not on disk.
+  - **Consequence:** a `buffer.disk:` replay after a crash is a new batch and resends every
+    request, accepted ones included (`docs/known-gaps/native-hop.md`, "A disk-backed sink replays
+    delivered and dropped batches after a crash"). Under `at_least_once`, the request that drew an
+    `Ambiguous` answer is resent too, and may have been applied. Whether either duplicates depends
+    on the destination: Datadog stores a resent series point once and a resent log twice
+    (`docs/known-gaps/datadog.md`).
+  - **Revisit trigger:** an operator who needs a crash replay to skip delivered requests, which
+    needs the settled set in the spool's frames.
