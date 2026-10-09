@@ -11,6 +11,9 @@ pub mod redact;
 /// better at a call site than a bare `keep`.
 pub mod sampling;
 pub mod sketch;
+/// Zero-copy `Bytes` subslices with a range check. Not re-exported: `subslice::share` names what
+/// it shares.
+pub mod subslice;
 pub mod telemetry;
 /// `{name}` placeholder templates. Not re-exported: the names are generic enough that
 /// `template::Template` reads better than `Template`.

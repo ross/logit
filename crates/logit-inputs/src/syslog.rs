@@ -148,6 +148,7 @@ use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
 use logit_core::interner::{intern, KeyCache};
+use logit_core::subslice;
 use logit_core::time::{parse_rfc3339_to_nanos, TimestampError};
 use logit_core::{
     AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Scope, Severity, Symbol,
@@ -494,21 +495,9 @@ impl Decoder for SyslogDecoder {
     }
 }
 
-/// Rebuilds `sub` as a `Bytes` sharing `line`'s allocation, by pointer arithmetic.
-///
-/// `sub` must be a slice of `line`, never a copy, so the offset is in bounds. This keeps every
-/// extracted field a zero-copy slice of the datagram (`docs/design/data-model.md`'s
-/// "`bytes::Bytes` everywhere strings and blobs appear"). An unescaped PARAM-VALUE is not a slice
-/// and goes through `Bytes::from` instead.
-fn slice_of(line: &Bytes, sub: &[u8]) -> Bytes {
-    let line_start = line.as_ptr() as usize;
-    let sub_start = sub.as_ptr() as usize;
-    let start = sub_start - line_start;
-    line.slice(start..start + sub.len())
-}
-
 /// Splits `s` at the first ASCII space into `(token, rest)`, consuming the space. With no space,
-/// `rest` is `&s[s.len()..]`, not `b""`, so it stays a subslice of `s` as [`slice_of`] requires.
+/// `rest` is `&s[s.len()..]`, not `b""`, so it stays a suffix of `s` and an empty field shares the
+/// line rather than taking [`subslice::share`]'s copy path.
 fn split_first_token(s: &[u8]) -> (&[u8], &[u8]) {
     match s.iter().position(|&b| b == b' ') {
         Some(i) => (&s[..i], &s[i + 1..]),
@@ -744,14 +733,14 @@ fn parse_3164(
     attrs.insert_sym(KEYS.severity, Value::U64(severity_num as u64));
     if let Some(ts) = ts_token {
         // ASCII by construction in `parse_3164_timestamp`.
-        attrs.insert_sym(KEYS.timestamp, Value::Str(slice_of(line, ts)));
+        attrs.insert_sym(KEYS.timestamp, Value::Str(subslice::share(line, ts)));
     }
     if let Some(host) = hostname {
         if !host.is_empty() {
             // RFC 3164 parsing never fails (the sniff fallback depends on it), and `Value::Str`
             // must be valid UTF-8, so a non-UTF-8 HOSTNAME is skipped and reported instead.
             if std::str::from_utf8(host).is_ok() {
-                attrs.insert_sym(KEYS.hostname, Value::Str(slice_of(line, host)));
+                attrs.insert_sym(KEYS.hostname, Value::Str(subslice::share(line, host)));
             } else {
                 diag.warn_throttled(
                     "hostname_not_utf8",
@@ -770,14 +759,14 @@ fn parse_3164(
             // `is_tag_shaped` already validated the bracketed-PID shape.
             let name = &tag_body[..open];
             let pid_bytes = &tag_body[open + 1..tag_body.len() - 1];
-            attrs.insert_sym(KEYS.tag, Value::Str(slice_of(line, name)));
+            attrs.insert_sym(KEYS.tag, Value::Str(subslice::share(line, name)));
             match std::str::from_utf8(pid_bytes).ok().and_then(|s| s.parse::<u64>().ok()) {
                 Some(n) => attrs.insert_sym(KEYS.pid, Value::U64(n)),
                 // `is_tag_shaped` guarantees a non-`u64` PID is PRINTUSASCII, so valid UTF-8.
-                None => attrs.insert_sym(KEYS.pid, Value::Str(slice_of(line, pid_bytes))),
+                None => attrs.insert_sym(KEYS.pid, Value::Str(subslice::share(line, pid_bytes))),
             }
         } else {
-            attrs.insert_sym(KEYS.tag, Value::Str(slice_of(line, tag_body)));
+            attrs.insert_sym(KEYS.tag, Value::Str(subslice::share(line, tag_body)));
         }
     }
 
@@ -818,7 +807,7 @@ fn field_value(line: &Bytes, field: &[u8], label: &str) -> Result<Option<Value>,
                     String::from_utf8_lossy(f)
                 )));
             }
-            Ok(Some(Value::Str(slice_of(line, f))))
+            Ok(Some(Value::Str(subslice::share(line, f))))
         }
     }
 }
@@ -829,9 +818,9 @@ fn message_value(line: &Bytes, msg: &[u8], strip_bom: bool) -> Value {
     match std::str::from_utf8(msg) {
         Ok(s) => {
             let s = if strip_bom { s.strip_prefix('\u{FEFF}').unwrap_or(s) } else { s };
-            Value::Str(slice_of(line, s.as_bytes()))
+            Value::Str(subslice::share(line, s.as_bytes()))
         }
-        Err(_) => Value::Bytes(slice_of(line, msg)),
+        Err(_) => Value::Bytes(subslice::share(line, msg)),
     }
 }
 
@@ -1026,9 +1015,9 @@ fn parse_5424(
     let (app_field, rest) = split_first_token(rest);
     let (procid_field, rest) = split_first_token(rest);
     let (msgid_field, rest) = split_first_token(rest);
-    // For an absolute `SdError` offset. `rest` is a subslice of `line` via `split_first_token`,
-    // so the subtraction is sound as in `slice_of`.
-    let sd_base = rest.as_ptr() as usize - line.as_ptr() as usize;
+    // For an absolute `SdError` offset. `after_version` and every `rest` `split_first_token`
+    // returns are suffixes of `line`, so the length difference is where `rest` starts.
+    let sd_base = line.len() - rest.len();
     let (sd_value, sd_offset) = parse_structured_data(rest, keys).map_err(|e| {
         malformed(format!("STRUCTURED-DATA at byte {}: {}", sd_base + e.offset, e.message))
     })?;
@@ -1085,7 +1074,7 @@ fn parse_5424(
                 attrs.insert_sym(KEYS.pid, Value::U64(n));
             }
             Err(_) => {
-                attrs.insert_sym(KEYS.pid, Value::Str(slice_of(line, pid)));
+                attrs.insert_sym(KEYS.pid, Value::Str(subslice::share(line, pid)));
             }
         }
     }
@@ -1334,8 +1323,8 @@ mod tests {
 
     #[test]
     fn rfc3164_tag_with_no_trailing_space_and_empty_message_does_not_panic() {
-        // A TAG-shaped token with nothing after it: the empty MSG must be a real subslice of the
-        // line, or `slice_of`'s pointer arithmetic underflows and panics.
+        // A TAG-shaped token with nothing after it: the empty MSG is an empty field at the end of
+        // the line, which must decode without a panic.
         let event = only_event(decode("<13>nginx:"));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("nginx"));
         assert_eq!(message_str(&event), "");
@@ -1591,12 +1580,8 @@ mod tests {
             Value::Str(b) => b.clone(),
             other => panic!("expected Value::Str, got {other:?}"),
         };
-        let base_start = bytes.as_ptr() as usize;
-        let base_end = base_start + bytes.len();
-        let msg_start = msg.as_ptr() as usize;
-        let msg_end = msg_start + msg.len();
         assert!(
-            msg_start >= base_start && msg_end <= base_end,
+            logit_core::subslice::within(&bytes, &msg),
             "message should be a slice of the original datagram, not a copy"
         );
     }

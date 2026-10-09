@@ -169,7 +169,7 @@
 //! `#urgent,urgent:1` -> `urgent: Array[Bool(true), Str("1")]` (re-emitted by `statsd_out` as
 //! `urgent,urgent:1`) and `#urgent:1,urgent` -> `Array[Str("1"), Bool(true)]` ->
 //! `urgent:1,urgent`. Array order is wire order; the attribute map stays sorted by `Symbol`, so tag
-//! key order doesn't change. Element values are zero-copy `slice_of` slices, like a scalar tag
+//! key order doesn't change. Element values are zero-copy datagram slices, like a scalar tag
 //! value.
 //!
 //! **The fold applies to the `#` payload only.** Every `#` segment on a line unions into the same
@@ -233,8 +233,8 @@
 //! `statsd.container_id`, `statsd.external_data`, `statsd.cardinality` and `#tags` as above.
 //!
 //! **Tag values, `|c:<id>`, and set members are zero-copy slices of the datagram**, like every
-//! field [`crate::syslog`] extracts: `slice_of` rebuilds each `Bytes` by pointer arithmetic into
-//! the datagram passed to [`StatsdDecoder::decode_into`], rather than copying through
+//! field [`crate::syslog`] extracts: [`logit_core::subslice::share`] rebuilds each `Bytes` as a
+//! slice of the datagram passed to [`StatsdDecoder::decode_into`], rather than copying through
 //! `impl From<&str> for Value`. Tag keys and the metric name don't need this: both only reach
 //! [`logit_core::interner::intern`], which copies into its own table regardless.
 
@@ -242,6 +242,7 @@ use crate::tcp::{FramingMode, Oversize, TcpListener, TcpListenerConfig, TlsServe
 use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
+use logit_core::subslice;
 use logit_core::{
     interner::{intern, KeyCache},
     AttrMap, BodyFormat, Diagnostics, Event, LogRecord, MetricKind, MetricRecord, Resource,
@@ -600,7 +601,7 @@ impl Decoder for StatsdDecoder {
             }
             // Per-line isolation: clients pack independent metrics into one datagram, so a bad
             // line is reported and skipped without discarding the others.
-            match parse_line(&bytes, text, line, received_at, &mut self.keys) {
+            match parse_line(&bytes, line, received_at, &mut self.keys) {
                 Ok(mut line_events) => out.append(&mut line_events),
                 Err(err) => {
                     self.diag.warn_throttled("bad_line", err);
@@ -610,19 +611,6 @@ impl Decoder for StatsdDecoder {
         // statsd has no instrumentation scope.
         Ok((self.resource.clone(), None))
     }
-}
-
-/// Rebuilds `sub` as a `Bytes` sharing `bytes`'s allocation, by pointer arithmetic.
-///
-/// `sub` must be a `&str` slice of `text`, and `text` the `str::from_utf8` view of `bytes`; every
-/// caller gets `sub` by slicing (`split`, `split_once`, `trim*`, indexing), never by copying.
-/// Mirrors [`crate::syslog`]'s `slice_of`. There is no fallback copy, unlike
-/// `logit-transforms::json::borrowed_str_bytes`: nothing sliced here is ever unescaped first.
-fn slice_of(bytes: &Bytes, text: &str, sub: &str) -> Bytes {
-    let text_start = text.as_ptr() as usize;
-    let sub_start = sub.as_ptr() as usize;
-    let start = sub_start - text_start;
-    bytes.slice(start..start + sub.len())
 }
 
 /// The `statsd.*` carrier keys, interned once per process so each line pays a sorted
@@ -663,21 +651,15 @@ struct StatsdKeys {
 /// Folds a `#<tag>[:<value>],...` payload (the text after `#`) into `attributes`, for a metric
 /// line, an event, or a service check alike.
 ///
-/// A valued tag is a zero-copy [`slice_of`] the datagram; a bare one is `Value::Bool(true)`. A
+/// A valued tag is a zero-copy slice of the datagram; a bare one is `Value::Bool(true)`. A
 /// repeated key folds into a `Value::Array` in wire order and an exact duplicate token is deduped;
 /// the module doc's "DogStatsD tags" section has the full rule and what it leaves alone. The
 /// remove-then-insert per token is two binary searches over the sorted map, the same two-step
 /// [`crate::syslog`]'s `insert_param` uses.
-fn insert_tags(
-    attributes: &mut AttrMap,
-    bytes: &Bytes,
-    text: &str,
-    tags: &str,
-    keys: &mut KeyCache,
-) {
+fn insert_tags(attributes: &mut AttrMap, bytes: &Bytes, tags: &str, keys: &mut KeyCache) {
     for tag in tags.split(',').filter(|t| !t.is_empty()) {
         let (key, value) = match tag.split_once(':') {
-            Some((k, v)) => (k, Value::Str(slice_of(bytes, text, v))),
+            Some((k, v)) => (k, Value::Str(subslice::share(bytes, v.as_bytes()))),
             None => (tag, Value::Bool(true)),
         };
         let key = keys.get_or_intern(key);
@@ -710,8 +692,9 @@ fn tag_element_eq(a: &Value, b: &Value) -> bool {
 
 /// Stamps `statsd.container_id`, a protocol-namespaced carrier (`docs/adr/lossless-transit.md`),
 /// as a zero-copy datagram slice, for a metric line's `|c:` and an event's or service check's `c:`.
-fn insert_container_id(attributes: &mut AttrMap, bytes: &Bytes, text: &str, container_id: &str) {
-    attributes.insert_sym(KEYS.container_id, Value::Str(slice_of(bytes, text, container_id)));
+fn insert_container_id(attributes: &mut AttrMap, bytes: &Bytes, container_id: &str) {
+    attributes
+        .insert_sym(KEYS.container_id, Value::Str(subslice::share(bytes, container_id.as_bytes())));
 }
 
 /// Stamps `statsd.external_data` (`|e:`) or `statsd.cardinality` (`|card:`) when `field` is one
@@ -719,12 +702,18 @@ fn insert_container_id(attributes: &mut AttrMap, bytes: &Bytes, text: &str, cont
 /// are protocol-namespaced carriers (`docs/adr/lossless-transit.md`), zero-copy datagram slices
 /// kept verbatim, last segment wins. `card:` values aren't checked against the Agent's
 /// `none|low|orchestrator|high`: a relay carries what the client sent.
-fn insert_origin_field(attributes: &mut AttrMap, bytes: &Bytes, text: &str, field: &str) -> bool {
+fn insert_origin_field(attributes: &mut AttrMap, bytes: &Bytes, field: &str) -> bool {
     if let Some(external_data) = field.strip_prefix("e:") {
-        attributes.insert_sym(KEYS.external_data, Value::Str(slice_of(bytes, text, external_data)));
+        attributes.insert_sym(
+            KEYS.external_data,
+            Value::Str(subslice::share(bytes, external_data.as_bytes())),
+        );
         true
     } else if let Some(cardinality) = field.strip_prefix("card:") {
-        attributes.insert_sym(KEYS.cardinality, Value::Str(slice_of(bytes, text, cardinality)));
+        attributes.insert_sym(
+            KEYS.cardinality,
+            Value::Str(subslice::share(bytes, cardinality.as_bytes())),
+        );
         true
     } else {
         false
@@ -746,21 +735,20 @@ fn parse_wire_seconds(secs: &str, line: &str) -> Result<(i64, u64), CodecError> 
     Ok((nanos, secs))
 }
 
-/// Parses one line. `bytes`/`text` are the whole datagram and its `&str` view, threaded down for
-/// [`slice_of`]; `line` must be a slice of `text`.
+/// Parses one line. `bytes` is the whole datagram, threaded down so every field shares it;
+/// `line` borrows from it.
 fn parse_line(
     bytes: &Bytes,
-    text: &str,
     line: &str,
     timestamp: i64,
     keys: &mut KeyCache,
 ) -> Result<Vec<Event>, CodecError> {
     // Only these two sigils are special; a legal `_`-prefixed metric name falls through.
     if line.starts_with("_e{") {
-        return parse_event(bytes, text, line, timestamp, keys).map(|event| vec![event]);
+        return parse_event(bytes, line, timestamp, keys).map(|event| vec![event]);
     }
     if line.starts_with("_sc|") {
-        return parse_service_check(bytes, text, line, timestamp, keys).map(|event| vec![event]);
+        return parse_service_check(bytes, line, timestamp, keys).map(|event| vec![event]);
     }
 
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
@@ -788,11 +776,11 @@ fn parse_line(
             }
             sample_rate = parsed;
         } else if let Some(tags) = extra.strip_prefix('#') {
-            insert_tags(&mut attributes, bytes, text, tags, keys);
+            insert_tags(&mut attributes, bytes, tags, keys);
         } else if let Some(container_id) = extra.strip_prefix("c:") {
             // Carried verbatim, `ci-`/`in-` prefixes included, on every metric type.
-            insert_container_id(&mut attributes, bytes, text, container_id);
-        } else if insert_origin_field(&mut attributes, bytes, text, extra) {
+            insert_container_id(&mut attributes, bytes, container_id);
+        } else if insert_origin_field(&mut attributes, bytes, extra) {
             // `|e:`/`|card:`, stamped by the call itself.
         } else if let Some(secs) = extra.strip_prefix('T') {
             // DogStatsD v1.3+ point timestamp, accepted on every type.
@@ -831,14 +819,16 @@ fn parse_line(
             samples.sample_rate = sample_rate;
             let mut attrs = attributes.clone();
             // Stamped after the tags, so it overwrites a `#statsd.type` tag.
-            attrs.insert_sym(KEYS.type_, Value::Str(slice_of(bytes, text, type_part)));
+            attrs.insert_sym(KEYS.type_, Value::Str(subslice::share(bytes, type_part.as_bytes())));
             let kind = MetricKind::Samples(samples);
             Ok(vec![Event::metric(line_timestamp, attrs, MetricRecord::new(intern(name), kind))])
         }
         "s" => {
             // `sample_rate` is ignored: a set member is not a count to extrapolate.
-            let members: Vec<Bytes> =
-                values_part.split(':').map(|raw_value| slice_of(bytes, text, raw_value)).collect();
+            let members: Vec<Bytes> = values_part
+                .split(':')
+                .map(|raw_value| subslice::share(bytes, raw_value.as_bytes()))
+                .collect();
             Ok(vec![Event::metric(
                 line_timestamp,
                 attributes.clone(),
@@ -853,7 +843,6 @@ fn parse_line(
 /// checks").
 fn parse_event(
     bytes: &Bytes,
-    text: &str,
     line: &str,
     timestamp: i64,
     keys: &mut KeyCache,
@@ -875,7 +864,7 @@ fn parse_event(
     let after_text = &after_title[text_len..];
 
     let mut attributes = AttrMap::new();
-    attributes.insert_sym(KEYS.event_title, Value::Str(slice_of(bytes, text, title)));
+    attributes.insert_sym(KEYS.event_title, Value::Str(subslice::share(bytes, title.as_bytes())));
 
     let mut line_timestamp = timestamp;
     let mut severity = None;
@@ -884,23 +873,28 @@ fn parse_event(
         let fields = after_text.strip_prefix('|').ok_or_else(malformed)?;
         for field in fields.split('|') {
             if let Some(tags) = field.strip_prefix('#') {
-                insert_tags(&mut attributes, bytes, text, tags, keys);
+                insert_tags(&mut attributes, bytes, tags, keys);
             } else if let Some(container_id) = field.strip_prefix("c:") {
-                insert_container_id(&mut attributes, bytes, text, container_id);
-            } else if insert_origin_field(&mut attributes, bytes, text, field) {
+                insert_container_id(&mut attributes, bytes, container_id);
+            } else if insert_origin_field(&mut attributes, bytes, field) {
                 // `e:`/`card:`, stamped by the call itself.
             } else if let Some(secs) = field.strip_prefix("d:") {
                 let (nanos, secs) = parse_wire_seconds(secs, line)?;
                 line_timestamp = nanos;
                 attributes.insert_sym(KEYS.timestamp, Value::U64(secs));
             } else if let Some(host) = field.strip_prefix("h:") {
-                attributes.insert_sym(KEYS.event_host, Value::Str(slice_of(bytes, text, host)));
+                attributes.insert_sym(
+                    KEYS.event_host,
+                    Value::Str(subslice::share(bytes, host.as_bytes())),
+                );
             } else if let Some(priority) = field.strip_prefix("p:") {
                 if priority != "normal" && priority != "low" {
                     return Err(malformed());
                 }
-                attributes
-                    .insert_sym(KEYS.event_priority, Value::Str(slice_of(bytes, text, priority)));
+                attributes.insert_sym(
+                    KEYS.event_priority,
+                    Value::Str(subslice::share(bytes, priority.as_bytes())),
+                );
             } else if let Some(alert_type) = field.strip_prefix("t:") {
                 severity = Some(match alert_type {
                     "error" => Severity::Error,
@@ -910,14 +904,18 @@ fn parse_event(
                 });
                 attributes.insert(
                     "statsd.event.alert_type",
-                    Value::Str(slice_of(bytes, text, alert_type)),
+                    Value::Str(subslice::share(bytes, alert_type.as_bytes())),
                 );
             } else if let Some(key) = field.strip_prefix("k:") {
-                attributes
-                    .insert_sym(KEYS.event_aggregation_key, Value::Str(slice_of(bytes, text, key)));
+                attributes.insert_sym(
+                    KEYS.event_aggregation_key,
+                    Value::Str(subslice::share(bytes, key.as_bytes())),
+                );
             } else if let Some(source) = field.strip_prefix("s:") {
-                attributes
-                    .insert_sym(KEYS.event_source_type, Value::Str(slice_of(bytes, text, source)));
+                attributes.insert_sym(
+                    KEYS.event_source_type,
+                    Value::Str(subslice::share(bytes, source.as_bytes())),
+                );
             }
             // Any other field, `|T` included, is ignored.
         }
@@ -927,7 +925,7 @@ fn parse_event(
         line_timestamp,
         attributes,
         LogRecord {
-            message: unescape_event_text(bytes, text, raw_text),
+            message: unescape_event_text(bytes, raw_text),
             severity,
             body_format: BodyFormat::Raw,
             trace: None,
@@ -944,10 +942,10 @@ fn parse_event(
 /// Zero-copy when there is nothing to unescape. Otherwise one allocation: each escape shrinks by
 /// one byte, so the buffer is sized exactly and `Bytes::from(Vec)` takes its no-copy
 /// `len == capacity` path, where `String::replace`'s slack would cost a second allocation.
-fn unescape_event_text(bytes: &Bytes, text: &str, raw: &str) -> Value {
+fn unescape_event_text(bytes: &Bytes, raw: &str) -> Value {
     let escapes = raw.matches("\\n").count();
     if escapes == 0 {
-        return Value::Str(slice_of(bytes, text, raw));
+        return Value::Str(subslice::share(bytes, raw.as_bytes()));
     }
     let mut out = Vec::with_capacity(raw.len() - escapes);
     let mut rest = raw;
@@ -965,7 +963,6 @@ fn unescape_event_text(bytes: &Bytes, text: &str, raw: &str) -> Value {
 /// service checks").
 fn parse_service_check(
     bytes: &Bytes,
-    text: &str,
     line: &str,
     timestamp: i64,
     keys: &mut KeyCache,
@@ -987,7 +984,8 @@ fn parse_service_check(
 
     let mut attributes = AttrMap::new();
     // Always stamped: `MetricRecord` has nowhere else to carry the raw name.
-    attributes.insert_sym(KEYS.service_check_name, Value::Str(slice_of(bytes, text, name)));
+    attributes
+        .insert_sym(KEYS.service_check_name, Value::Str(subslice::share(bytes, name.as_bytes())));
     attributes.insert_sym(KEYS.service_check_status, Value::U64(status as u64));
 
     let mut line_timestamp = timestamp;
@@ -997,21 +995,23 @@ fn parse_service_check(
             if let Some(message) = field.strip_prefix("m:") {
                 attributes.insert(
                     "statsd.service_check.message",
-                    Value::Str(slice_of(bytes, text, message)),
+                    Value::Str(subslice::share(bytes, message.as_bytes())),
                 );
             } else if let Some(tags) = field.strip_prefix('#') {
-                insert_tags(&mut attributes, bytes, text, tags, keys);
+                insert_tags(&mut attributes, bytes, tags, keys);
             } else if let Some(container_id) = field.strip_prefix("c:") {
-                insert_container_id(&mut attributes, bytes, text, container_id);
-            } else if insert_origin_field(&mut attributes, bytes, text, field) {
+                insert_container_id(&mut attributes, bytes, container_id);
+            } else if insert_origin_field(&mut attributes, bytes, field) {
                 // `e:`/`card:`, stamped by the call itself.
             } else if let Some(secs) = field.strip_prefix("d:") {
                 let (nanos, secs) = parse_wire_seconds(secs, line)?;
                 line_timestamp = nanos;
                 attributes.insert_sym(KEYS.timestamp, Value::U64(secs));
             } else if let Some(host) = field.strip_prefix("h:") {
-                attributes
-                    .insert_sym(KEYS.service_check_host, Value::Str(slice_of(bytes, text, host)));
+                attributes.insert_sym(
+                    KEYS.service_check_host,
+                    Value::Str(subslice::share(bytes, host.as_bytes())),
+                );
             }
             // Any other field, `|T` included, is ignored.
         }
@@ -1157,7 +1157,7 @@ mod tests {
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
         let text = std::str::from_utf8(&bytes).unwrap();
-        parse_line(&bytes, text, text, 0, &mut KeyCache::new())
+        parse_line(&bytes, text, 0, &mut KeyCache::new())
             .expect_err("expected this line to be rejected")
     }
 
@@ -1439,7 +1439,7 @@ mod tests {
 
     #[test]
     fn dogstatsd_tag_value_is_a_zero_copy_slice_of_the_datagram() {
-        // The structural pin for `slice_of`, like `crate::syslog`'s
+        // The structural pin for the zero-copy tag value, like `crate::syslog`'s
         // `emitted_message_is_a_zero_copy_slice_of_the_datagram`. The repeated `team` key checks
         // that each `Value::Array` element is a datagram slice too, not a copy.
         let datagram = Bytes::from("page.views:1|c|#env:prod,team:a,team:b".to_string());
@@ -1463,12 +1463,8 @@ mod tests {
 
     /// Asserts `slice` points inside `datagram`'s allocation rather than at a copy.
     fn assert_shares_datagram_allocation(datagram: &Bytes, slice: &Bytes, what: &str) {
-        let base_start = datagram.as_ptr() as usize;
-        let base_end = base_start + datagram.len();
-        let start = slice.as_ptr() as usize;
-        let end = start + slice.len();
         assert!(
-            start >= base_start && end <= base_end,
+            logit_core::subslice::within(datagram, slice),
             "{what} should be a slice of the original datagram, not a copy"
         );
     }
@@ -1978,8 +1974,7 @@ mod tests {
         let Some(Value::Str(value)) = out[0].attributes.get("statsd.external_data") else {
             panic!("expected a Str");
         };
-        let range = datagram.as_ptr_range();
-        assert!(range.contains(&value.as_ptr()), "expected a slice of the datagram");
+        assert!(logit_core::subslice::within(&datagram, value), "expected a slice of the datagram");
     }
 
     /// `m:` ends at the next `|`, as every other field does and as the Agent reads it: a real
