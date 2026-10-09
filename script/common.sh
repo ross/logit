@@ -19,8 +19,8 @@ in_project_environment() {
 
 # run <cmd...>: execute a command in the project's environment.
 #
-# In CI (`$CI`, set by GitHub Actions) the job already runs inside the equivalent image via the
-# workflow's `container:` directive, so commands run directly: GitHub-hosted runners don't support
+# In CI (`$CI`, set by GitHub Actions) the job already runs inside Dockerfile.dev's `ci` stage via
+# the workflow's `container:` directive, so commands run directly: GitHub-hosted runners don't support
 # the docker-in-docker a nested `docker compose run` would need. Locally, commands run inside the
 # dev container built from Dockerfile.dev.
 run() {

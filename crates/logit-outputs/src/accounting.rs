@@ -14,28 +14,86 @@
 //!
 //! A sink that sends one batch as several requests can also remember, per armed batch, which
 //! requests the destination settled ([`BatchAccounting::settle`]), so a retry resends only the
-//! rest. The memory has the gate's lifetime: `observe` clears it, an `Ok` send disarms it, and
+//! rest. The memory has the gate's lifetime: `observe` clears it, a final send disarms it, and
 //! unarmed nothing is settled, so a caller that never calls `observe_batch` resends every
-//! request. `otlp_out` keys it by signal (`crate::otlp`, "One `send`, several requests").
+//! request. `otlp_out` keys it by signal (`crate::otlp`, "One `send`, several requests"), and
+//! `datadog_out` by the request's place in the attempt's send order (`crate::datadog`, "Faults,
+//! retries, and duplicate safety").
+//!
+//! A send is final when it returns `Ok` or a fault `write_loop` won't retry under the sink's
+//! posture ([`logit_pipeline::is_retryable`]). Only a final send disarms: a retryable failure
+//! leaves the batch armed for the retry, which is what lets it skip what was settled. The posture
+//! is `at_least_once` until the sink forwards `Output::observe_posture` through
+//! [`BatchAccounting::observe_posture`], so a sink that doesn't stays armed after an `Ambiguous`
+//! failure, and a direct `send` of another batch after it, with no `observe_batch`, runs muted.
 
 use logit_core::CountGate;
+use logit_pipeline::DeliveryPosture;
 
-/// The per-batch state behind a sink's [`CountGate`]. A unit is a bit index below 32: `0` for a
-/// sink that encodes a batch in one piece.
-#[derive(Debug, Default)]
+/// The per-batch state behind a sink's [`CountGate`]. An encode unit is a bit index below 32: `0`
+/// for a sink that encodes a batch in one piece. A request index has no bound.
+#[derive(Debug)]
 pub(crate) struct BatchAccounting {
     gate: CountGate,
+    /// `write_loop`'s posture, which decides whether a failed send is final.
+    posture: DeliveryPosture,
     /// Set by [`BatchAccounting::observe`], cleared by [`BatchAccounting::delivered`]. Unarmed,
     /// the gate never mutes.
     armed: bool,
     /// Units already encoded for the armed batch.
     counted: u32,
-    /// Requests of the armed batch the destination accepted, as bits; a request's bit index is
-    /// the sink's own numbering, separate from the encode units.
-    accepted: u32,
-    /// Requests of the armed batch the destination rejected, as bits; their records are counted
-    /// dropped, and a resend would be rejected again.
-    rejected: u32,
+    /// Requests of the armed batch the destination accepted; a request's index is the sink's own
+    /// numbering, separate from the encode units.
+    accepted: RequestBits,
+    /// Requests of the armed batch the destination rejected; their records are counted dropped,
+    /// and a resend would be rejected again.
+    rejected: RequestBits,
+}
+
+impl Default for BatchAccounting {
+    fn default() -> Self {
+        Self {
+            gate: CountGate::default(),
+            posture: DeliveryPosture::AtLeastOnce,
+            armed: false,
+            counted: 0,
+            accepted: RequestBits::default(),
+            rejected: RequestBits::default(),
+        }
+    }
+}
+
+/// A growable set of request indexes. A `datadog_out` route cut by body size has no bound on its
+/// request count, so a fixed-width word can't hold them.
+#[derive(Debug, Default)]
+struct RequestBits(Vec<u64>);
+
+impl RequestBits {
+    fn set(&mut self, index: u32) {
+        let (word, bit) = Self::locate(index);
+        if self.0.len() <= word {
+            self.0.resize(word + 1, 0);
+        }
+        self.0[word] |= bit;
+    }
+
+    fn get(&self, index: u32) -> bool {
+        let (word, bit) = Self::locate(index);
+        self.0.get(word).is_some_and(|w| w & bit != 0)
+    }
+
+    fn any(&self) -> bool {
+        self.0.iter().any(|&w| w != 0)
+    }
+
+    /// Empties the set, keeping its allocation for the next batch.
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn locate(index: u32) -> (usize, u64) {
+        ((index / u64::BITS) as usize, 1 << (index % u64::BITS))
+    }
 }
 
 impl BatchAccounting {
@@ -44,33 +102,42 @@ impl BatchAccounting {
         &self.gate
     }
 
+    /// Records `write_loop`'s posture: `Output::observe_posture`.
+    pub(crate) fn observe_posture(&mut self, posture: DeliveryPosture) {
+        self.posture = posture;
+    }
+
+    /// The posture [`BatchAccounting::observe_posture`] recorded, `at_least_once` until then.
+    pub(crate) fn posture(&self) -> DeliveryPosture {
+        self.posture
+    }
+
     /// Arms the gate for a new batch, with no unit counted: `Output::observe_batch`.
     pub(crate) fn observe(&mut self) {
         self.armed = true;
         self.counted = 0;
-        self.accepted = 0;
-        self.rejected = 0;
+        self.accepted.clear();
+        self.rejected.clear();
     }
 
     /// Records the destination's verdict on `request` of the armed batch: accepted, or rejected.
     /// Unarmed, it records nothing.
     pub(crate) fn settle(&mut self, request: u32, accepted: bool) {
-        debug_assert!(request < u32::BITS, "request {request} is past the bitset");
         if self.armed {
             let bits = if accepted { &mut self.accepted } else { &mut self.rejected };
-            *bits |= 1 << request;
+            bits.set(request);
         }
     }
 
     /// Whether the destination already settled `request` of the armed batch, so a retry skips
     /// it.
     pub(crate) fn settled(&self, request: u32) -> bool {
-        self.armed && (self.accepted | self.rejected) & (1 << request) != 0
+        self.armed && (self.accepted.get(request) || self.rejected.get(request))
     }
 
     /// Whether the destination accepted any request of the armed batch on an earlier attempt.
     pub(crate) fn any_accepted(&self) -> bool {
-        self.armed && self.accepted != 0
+        self.armed && self.accepted.any()
     }
 
     /// Runs one encode of `unit` with the gate muted when it repeats, and returns whether it was
@@ -99,15 +166,25 @@ impl BatchAccounting {
         self.gate.set_muted(false);
     }
 
-    /// Disarms after an `Ok` send, so a later `send` with no `observe_batch` counts.
+    /// Disarms after a final send, so a later `send` with no `observe_batch` counts.
     fn delivered(&mut self) {
         self.armed = false;
     }
 
-    /// Passes `result` through, disarming on `Ok`. Each sink's `send` returns through this at its
-    /// one exit, so no early `Ok` leaves the accounting armed.
+    /// Whether `result` ends the batch: `Ok`, or a fault `write_loop` won't retry under the
+    /// recorded posture.
+    pub(crate) fn is_final<T>(&self, result: &anyhow::Result<T>) -> bool {
+        match result {
+            Ok(_) => true,
+            Err(err) => !logit_pipeline::is_retryable(logit_pipeline::classify(err), self.posture),
+        }
+    }
+
+    /// Passes `result` through, disarming when it's final ([`BatchAccounting::is_final`]). Each
+    /// sink's `send` returns through this at its one exit, so no early return leaves the
+    /// accounting armed.
     pub(crate) fn finish<T>(&mut self, result: anyhow::Result<T>) -> anyhow::Result<T> {
-        if result.is_ok() {
+        if self.is_final(&result) {
             self.delivered();
         }
         result
@@ -178,6 +255,22 @@ mod tests {
         assert!(!accounting.any_accepted());
     }
 
+    /// A request index past one 64-bit word is remembered, and `observe` clears it.
+    #[test]
+    fn a_request_past_the_first_word_is_settled_and_cleared() {
+        let mut accounting = BatchAccounting::default();
+        accounting.observe();
+        accounting.settle(70, false);
+        assert!(accounting.settled(70));
+        assert!(!accounting.settled(6) && !accounting.settled(69) && !accounting.settled(200));
+        assert!(!accounting.any_accepted(), "a rejection is not an acceptance");
+        accounting.settle(130, true);
+        assert!(accounting.settled(130) && accounting.any_accepted());
+        accounting.observe();
+        assert!(!accounting.settled(70) && !accounting.settled(130));
+        assert!(!accounting.any_accepted());
+    }
+
     #[test]
     fn unarmed_or_after_delivery_nothing_is_settled() {
         let mut accounting = BatchAccounting::default();
@@ -187,6 +280,52 @@ mod tests {
         accounting.settle(1, true);
         accounting.delivered();
         assert!(!accounting.settled(1) && !accounting.any_accepted(), "an Ok send disarms");
+    }
+
+    fn failed(fault: logit_pipeline::Fault) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("send failed").context(fault))
+    }
+
+    /// `finish` disarms on `Ok` and on a fault `write_loop` won't retry under the posture, and
+    /// leaves the batch armed for a retry otherwise.
+    #[test]
+    fn finish_disarms_on_a_final_verdict_only() {
+        use logit_pipeline::Fault::*;
+        use DeliveryPosture::*;
+        let cases = [
+            (AtLeastOnce, Clean, false),
+            (AtLeastOnce, Refused, false),
+            (AtLeastOnce, Ambiguous, false),
+            (AtLeastOnce, Rejected, true),
+            (AtMostOnce, Clean, false),
+            (AtMostOnce, Refused, false),
+            (AtMostOnce, Ambiguous, true),
+            (AtMostOnce, Rejected, true),
+        ];
+        for (posture, fault, disarms) in cases {
+            let mut accounting = BatchAccounting::default();
+            accounting.observe_posture(posture);
+            accounting.observe();
+            accounting.settle(0, true);
+            assert!(accounting.finish(failed(fault)).is_err());
+            assert_eq!(accounting.settled(0), !disarms, "{posture:?}, {fault}");
+        }
+        let mut accounting = BatchAccounting::default();
+        accounting.observe();
+        accounting.settle(0, true);
+        assert!(accounting.finish(Ok(())).is_ok());
+        assert!(!accounting.settled(0), "an Ok disarms");
+    }
+
+    /// With no posture observed, `Ambiguous` is retryable, so the batch stays armed.
+    #[test]
+    fn the_posture_is_at_least_once_until_observed() {
+        let mut accounting = BatchAccounting::default();
+        assert_eq!(accounting.posture(), DeliveryPosture::AtLeastOnce);
+        accounting.observe();
+        accounting.settle(0, true);
+        let _ = accounting.finish(failed(logit_pipeline::Fault::Ambiguous));
+        assert!(accounting.settled(0));
     }
 
     #[test]
