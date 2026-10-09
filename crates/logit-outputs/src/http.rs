@@ -219,7 +219,8 @@ pub(crate) fn classify_reqwest_error(err: &reqwest::Error) -> Fault {
     }
 }
 
-/// The fault of a failed request in a `send` of several requests. `sent_any` says whether an
+/// The fault of a failed request in a `send` of several requests, for a sink whose retry resends
+/// the whole batch (`splunk_hec_out`). `sent_any` says whether an
 /// earlier request of the same `send` was accepted; once one was, a [`Fault::Clean`] or
 /// [`Fault::Refused`] failure becomes [`Fault::Ambiguous`]. Both mean the destination holds
 /// nothing of the batch, and `write_loop` retries them under every posture, `at_most_once`

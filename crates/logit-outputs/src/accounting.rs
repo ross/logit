@@ -16,7 +16,9 @@
 //! requests the destination settled ([`BatchAccounting::settle`]), so a retry resends only the
 //! rest. The memory has the gate's lifetime: `observe` clears it, a final send disarms it, and
 //! unarmed nothing is settled, so a caller that never calls `observe_batch` resends every
-//! request. `otlp_out` keys it by signal (`crate::otlp`, "One `send`, several requests").
+//! request. `otlp_out` keys it by signal (`crate::otlp`, "One `send`, several requests"), and
+//! `datadog_out` by the request's place in the attempt's send order (`crate::datadog`, "Faults,
+//! retries, and duplicate safety").
 //!
 //! A send is final when it returns `Ok` or a fault `write_loop` won't retry under the sink's
 //! posture ([`logit_pipeline::is_retryable`]). Only a final send disarms: a retryable failure
@@ -103,6 +105,11 @@ impl BatchAccounting {
     /// Records `write_loop`'s posture: `Output::observe_posture`.
     pub(crate) fn observe_posture(&mut self, posture: DeliveryPosture) {
         self.posture = posture;
+    }
+
+    /// The posture [`BatchAccounting::observe_posture`] recorded, `at_least_once` until then.
+    pub(crate) fn posture(&self) -> DeliveryPosture {
+        self.posture
     }
 
     /// Arms the gate for a new batch, with no unit counted: `Output::observe_batch`.
@@ -314,6 +321,7 @@ mod tests {
     #[test]
     fn the_posture_is_at_least_once_until_observed() {
         let mut accounting = BatchAccounting::default();
+        assert_eq!(accounting.posture(), DeliveryPosture::AtLeastOnce);
         accounting.observe();
         accounting.settle(0, true);
         let _ = accounting.finish(failed(logit_pipeline::Fault::Ambiguous));
