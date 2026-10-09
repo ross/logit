@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-08
+updated: 2026-10-09
 ---
 
 # Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger
@@ -89,10 +89,12 @@ tools/soak/
   scenarios/udp-flood-sink-stop-block/
   scenarios/spool-kill-replay/          # W3: a SIGKILL inside a sink outage, a disk spool
   scenarios/random-faults/              # W4: a seeded random schedule, meant for hours
+  scenarios/statsd-datadog/             # W5: an external Datadog target, no backend query
 ```
 
 Subcommands: `run <scenario> [--duration 20m] [--seed N] [--keep] [--out DIR]`, `list`,
-`check <run-dir>`, and `self-test`, which also runs at the start of `run`, as
+`check <run-dir>`, `target <scenario> [--env-file FILE]` (W5: the target's kind, for
+`script/soak`), and `self-test`, which also runs at the start of `run`, as
 `survey_self_test` does for `script/shape-survey`. Environment: `SOAK_SKIP_IMAGE=1` reuses the
 images, and `SOAK_OUT=<dir>` moves the results.
 
@@ -302,6 +304,8 @@ has no drain (a counter) or the gauge was never set by its end, the run's points
 are of the other kind, or the step was scheduled but its apply didn't return 0. A scenario with
 no `[[expect]]` gets one `expect` row that SKIPs.
 
+A scenario may name an external target in a `[target]` table (W5); see "External targets".
+
 ### 3. Compose (W1a)
 
 The project is `soak-<scenario>`, so two scenarios can run at once. The driver refuses a project
@@ -314,7 +318,7 @@ service (W4; see "The driver loop and end sequence" for the arithmetic), and
 | Service | Image and settings |
 |---|---|
 | `victoria-metrics` | `victoriametrics/victoria-metrics:v1.152.0`, `-retentionPeriod=100y`, `ports: ["127.0.0.1::8428"]`, so the host driver polls freshness every 30 s and dumps the final export with no checker container. The driver re-reads the port after any start of this service |
-| `logit` (the SUT) | `depends_on: [victoria-metrics]` |
+| `logit` (the SUT) | `depends_on: [victoria-metrics]`, not required from W5, when `victoria-metrics` moved to the compose profile `local` the driver enables for a local target only; `environment:` passes each variable an external target may list (`DD_API_KEY`), empty when unset |
 | `generator` | `depends_on: {logit: {condition: service_healthy}}` |
 
 Configs mount from absolute paths in `compose.env` (`SOAK_SUT_CONFIG`,
@@ -396,7 +400,7 @@ ticket with `${DOCKER} version` first.
      The cursor is per container id, which a stop and start keep.
    - **Fail fast:** a `logit` container leaving `running`, or a `StartedAt` change, with no step
      behind it ends the timeline at once. The end sequence and collection still run.
-4. End: revert active faults; `docker stop -t 30` the generator; wait until the VictoriaMetrics
+4. End (for an external target, W5, see "External targets"): revert active faults; `docker stop -t 30` the generator; wait until the VictoriaMetrics
    total holds across two aggregate windows (90 s bound); `docker stop -t 60` the SUT, expecting
    exit 0; call VictoriaMetrics `/internal/force_flush`; write `vm-export.jsonl` from
    `/api/v1/export` with `match[]=<vm_selector>` and `start=0`.
@@ -601,6 +605,8 @@ The rows:
 - `ledger.summary`, for the final life: uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V),
   which must be 0, with each term shown beside it and wire loss beside them as "by design". When
   `ledger.egress` is counted, its term is shown as counted and the row judges the other three.
+- `ledger.sent` (W5), for an external target, else SKIP: the ledger ends at the sink's own
+  telemetry; see "External targets".
 - `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
   window around one step; see "The scenario schema".
 
@@ -656,7 +662,93 @@ components:
 any fault in the schedule. The SUT's address can change across a stop and start; `statsd_out`
 resolves `logit` once per batch, so the generator follows it.
 
-### 8. Not in this stack
+### 8. External targets (W5)
+
+A scenario whose sink delivers outside the stack declares it, and nothing queries the
+destination:
+
+```toml
+[target]
+kind = "external"          # default when absent: "victoria-metrics" (the local service)
+name = "datadog"           # a label for results; no backend query
+env = ["DD_API_KEY"]       # variables the run needs, from the external env file
+```
+
+`validate()` refuses an unknown key or kind; for an external target, a `name` that isn't
+lowercase letters, digits, `_`, or `-`, an `env` that isn't an array of distinct variable names,
+or a name compose.yaml doesn't pass to the SUT (`scenario.EXTERNAL_ENV_PASSED`, today
+`DD_API_KEY`); a `name` or `env` on the local target; `[ledger] vm_selector` or
+`vm_every_window` on an external target, which `vm_selector` isn't required for; and any fault,
+fixed or random, on `victoria-metrics`, which an external target's stack doesn't run.
+`scenario.resolved.json` records the target, and a run directory with none is a local one.
+
+**Credentials.** `script/soak` reads the variables from `SOAK_EXTERNAL_ENV`, by default
+`perf/results/soak-external.env`, as `script/splunk-interop`'s cloud mode reads its env file.
+It refuses a file git doesn't ignore, and one that doesn't set a listed variable or sets it
+empty, naming the variable and never its value (`soak.py target <scenario> --env-file`, which
+the driver repeats). It passes the file to `logit validate` and to every `compose` call as a
+second `--env-file`; the run directory holds no copy.
+
+**The driver.** Compose runs without the `local` profile, so without `victoria-metrics`. The
+driver skips VictoriaMetrics' `/health` poll, the freshness samples, `force_flush`, the quiet
+wait, and the export. At the end it reverts active faults, stops the generator, and waits, up to
+120 s, for a SUT drain at least two `aggregate` intervals after the generator stopped whose
+sink `buffer.batches` reads 0 and `retrying` 0 or unset, read from the newest 400 lines of the
+SUT's stdout; then it stops the SUT. The wait is a `sink_drained` phase in `timeline.jsonl`,
+`held` false when the bound ran out. Faults keep their meaning: `netem` and `partition` on
+`logit` shape or cut its egress to the internet, and `kill`, `stop`, and `pause` on `logit`
+work as before.
+
+**The checks.** `ledger.egress` and `ledger.windows` SKIP with "external target: no backend
+query", `ledger.summary` shows its Ab − V term as SKIP and judges the other three, and
+`progress` reports no freshness samples. `ledger.replay` reads only telemetry, so it stays, as
+do `ledger.wire`, `ledger.intake`, `ledger.edge`, `ledger.aggregate`, `identity.sink`,
+`recovery`, and `self_log`, whose sink fault keys (`retrying`, `send_failed`, `degraded`) are
+the runtime's, not a sink's own; `datadog_out`'s `request_rejected`, `series_rejected`,
+`api_key_rejected`, and `request_refused` are WARN lines, which `self_log` doesn't judge.
+`ledger.sent` ends the ledger at the sink, from `datadog_out`'s telemetry
+(`crates/logit-outputs/src/datadog.rs`, "Telemetry"):
+
+- Per SUT life, at its last quiet drain (the final life's second-to-last, an earlier life's
+  last), `batches.received + buffer.disk.replayed == delivered + dropped (every reason) +
+  buffer.batches`, one batch in flight allowed. Off: FAIL.
+- A batch dropped `rejected`, records dropped `rejected` or `oversize`, or records a series
+  `202` body names (`logit.output.records.rejected`): FAIL, with the status and the first
+  `request_rejected` or `series_rejected` line from stderr. Under per-request verdicts a
+  rejected request drops its records and the batch survives when another request was accepted,
+  so both counters are read.
+- No `logit.output.requests` point, or none of class `2xx`: FAIL.
+- Any other counted drop (a batch's `overflow_*` or `shutdown` reason, `drain complete`'s
+  `batches_dropped`, a record's `stale`, `too_many_tags`, or other pre-send reason, the
+  encoder's `metrics.skipped`): WARN.
+- A request of class other than `2xx` (`4xx` holds a `429` too, `5xx`, `network_error`) in a
+  drain whose interval overlaps a fault window is the fault's retry; outside every one it
+  WARNs with the count, because the destination has a floor of errors of its own.
+
+The row is a PASS whose detail starts with `SENT` when nothing above fires. `SENT` is a PASS
+rather than a fifth status so `results.md` keeps PASS, WARN, FAIL, and SKIP and `worst()` needs
+no new rank. A `2xx` is the end of the evidence: the harness can't see a point the intake took
+and later discarded, nor tell an overwritten resend from a duplicate. `datadog_out` resends a
+whole batch after an ambiguous failure under `at_least_once`; a resent series point overwrites
+the stored one and a resent log is stored again
+([`docs/known-gaps/datadog.md`](../known-gaps/datadog.md)), so the shipped scenario sends series
+only.
+
+**The scenario.** `statsd-datadog` is `statsd-vm`'s generator and topology at 2,000 lines/s,
+renamed `logit.soak.requests_{seq%100}`, through a 10 s `aggregate` into `datadog_out` (default
+site, `api_key: !env DD_API_KEY`, `buffer: {disk: {path: /tmp/soak-spool}}`), with a `set` that
+stamps `host.name` and `datadog.interval`. The aggregate is `temporality: delta`: the series
+route skips a cumulative `Sum`, and a statsd counter is a Datadog `count` of each window's
+increment. Its 12-minute cycle runs `netem delay 300ms 100ms` (90 s) and `netem loss 20%`
+(60 s) on `logit`, a 60 s partition, a 30 s pause, and a 30 s kill, each followed by at least
+90 s. Its expectations: `batches.dropped` 0 through each fault, `retrying` 0 after the
+partition, `records.dropped{reason="stale"}` 0 through the partition and the kill, and
+`buffer.disk.truncated` 0 through the kill. `retrying` is exported only once the sink first
+retries, so a row after a netem step, which TCP can absorb, would fail on a gauge never set;
+and with the intake reachable the sink's queue is often empty at the kill, so no row asks for a
+replay above 0: `ledger.replay` ties the replay to the killed life's last `buffer.batches`.
+
+### 9. Not in this stack
 
 toxiproxy and TCP-level faults it alone can express; per-peer `tc filter` and `ifb` ingress
 shaping until a scenario needs them (W2 at the earliest); a checker container; any CI job.
@@ -715,7 +807,11 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
   host, which has 32 cores, 125 GB of RAM, 716 GB of free disk, and Docker's default `json-file`
   log driver with no daemon-level rotation, so compose sets each container's rotation.
 - **W5**: an external target (Datadog) with a gitignored env file, as in `script/splunk-interop`'s
-  cloud mode. The ledger ends at the sink's telemetry (`SENT`), with no backend query.
+  cloud mode. The ledger ends at the sink's telemetry (`SENT`), with no backend query. The
+  `[target]` table, the `local` compose profile, `SOAK_EXTERNAL_ENV`, the end sequence's wait
+  for the sink's queue, `ledger.sent`, the SKIPs of the rows that read V, and the
+  `statsd-datadog` scenario ("External targets"); self-test fixtures for every `[target]` rule,
+  the wait, and `ledger.sent`'s verdicts.
 
 Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
@@ -1150,6 +1246,13 @@ What W4 measured without a run:
   rows; a 24-hour directory went from 135 s and 1,935 MiB to 13 s and 678 MiB. The recorded
   W1b, W2, and W3 runs score the same rows, every detail included, before and after.
 
+### W5: an external Datadog target (no run yet)
+
+No `statsd-datadog` run has been made: it needs a Datadog API key in
+`perf/results/soak-external.env`, and the first run is the repository owner's. It's recorded here
+with the commit, image tags, host, the Datadog site, the verbatim `results.md` table, and what
+the org showed for the `logit.soak.requests_*` series, which the harness itself doesn't query.
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
@@ -1189,5 +1292,12 @@ What W4 measured without a run:
   same rows, every detail included. `check` on a synthetic 8-hour run directory finishes in
   seconds. W4 is done once a 1-hour `random-faults` run and an 8-hour one are recorded under
   "Findings"; neither has been made yet.
-- **W5**: each new scenario passes `self-test` validation and the shipped-config test, and a
-  run of it is recorded under "Findings".
+- **W5**: the self-test passes, and each new rule fails it when reverted (42 reverts: every
+  `[target]` validation rule, the env file check and its parsing, the compose arguments and
+  profiles, compose.yaml's profile, passthrough, and optional dependency, the sink-drain wait's
+  three conditions and interval, each SKIP, and each `ledger.sent` verdict). `statsd-datadog`
+  passes `self-test` validation, the shipped-config test, and `logit validate` in `logit:soak`
+  with a placeholder key. `docker compose config` renders the local shape with
+  `victoria-metrics` and the external shape without it. Re-scoring the recorded W3 run gives the
+  same rows, every detail included, plus a `ledger.sent` SKIP. W5 is done once a run of
+  `statsd-datadog` is recorded under "Findings".
