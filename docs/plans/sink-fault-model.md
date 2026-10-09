@@ -219,8 +219,9 @@ hands the sink its resolved posture. HTTP `401`/`403` and gRPC
 `UNAUTHENTICATED`/`PERMISSION_DENIED` stay `Rejected` for that signal's request, so a credential
 scoped per signal delivers its signals once. Closes `docs/known-gaps/otlp.md`'s mixed-signal
 entry; `demo/logit.yaml`'s `trace_only` gate is a noise filter rather than a correctness
-requirement, and its comment says so. The Datadog sinks keep their whole-batch retry
-(`docs/known-gaps/datadog.md`).
+requirement, and its comment says so. The Datadog sinks took the same per-request memory
+later ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "Amendment: the Datadog sinks
+retry per request (2026-10-09)").
 
 ### W5: operator docs sweep (`fault/w5`)
 
@@ -270,9 +271,9 @@ signals a destination hasn't settled. What the stream leaves open:
   compressed bound is read and refused by name; a streaming drain would extend that to
   uncompressed frames (`docs/known-gaps/native-hop.md`, "An oversize frame from an uncompressed
   sender is refused by name only within a sliver over the cap").
-- **The Datadog sinks retry a batch whole.** A retry resends the requests Datadog already
-  accepted; per-request memory like `otlp_out`'s per-signal memory would end it
-  (`docs/known-gaps/datadog.md`, "A `datadog_out` resend isn't idempotent").
+- **The Datadog sinks retried a batch whole.** Per-request memory like `otlp_out`'s per-signal
+  memory ended it ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "Amendment: the
+  Datadog sinks retry per request (2026-10-09)").
 - **A dead-letter path and an oversize split are follow-ups** with their own records, as the
   non-goals above say. Until a dead-letter path exists, a `Rejected` batch shows in
   `batches.dropped{reason="rejected"}` and a log event and nowhere else.

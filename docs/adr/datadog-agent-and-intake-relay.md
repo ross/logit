@@ -321,16 +321,15 @@ The decisions:
   route, so every batch gets it (a tracer answers the same `404` by downgrading its API version).
   A `415` is `Refused` for the same reason: the Agent doesn't take that version's body format. A
   `401`, `403`, `405`, or `407` is `Refused`: the Agent has no credential, so a proxy or a wrong
-  path answered. An Agent's `429` is `Clean` before any request of the send was accepted, because
+  path answered. An Agent's `429` is `Clean`, because
   the receiver turns the payload away before reading it ("trace-agent is overwhelmed, a payload has
-  been rejected"), and `Ambiguous` after one was. A `400` and a `413` are `Rejected`.
-- **A route refused after another was accepted retries the batch whole.** The refusal reads as
-  `Ambiguous` (`crate::http::after_delivery`), so `at_least_once` resends every route, the accepted
-  ones included, and `at_most_once` drops the batch. Reading the refused route as `Rejected`
-  instead would drop that route's records from every batch until the operator fixed the key, the
-  base URL, or the `version:`, the loss `Refused` exists to prevent. The resend costs a second copy
-  of what the accepted routes carried: a series point overwrites, a log or trace is stored again
-  (this record's "Delivery posture" text).
+  been rejected"). A `400` and a `413` are `Rejected`.
+- **A route refused after another was accepted holds the batch and resends only the unsettled
+  requests.** The refusal keeps its own class under both postures, and each retry sends the refused
+  route's requests alone ([ADR `sink-fault-classes`](sink-fault-classes.md), "Amendment: the
+  Datadog sinks retry per request (2026-10-09)"). Reading the refused route as `Rejected` instead
+  would drop that route's records from every batch until the operator fixed the key, the base URL,
+  or the `version:`, the loss `Refused` exists to prevent.
 
 ## Amendment: the socket mode is configurable (2026-10-05)
 
@@ -372,5 +371,5 @@ check and logs requests drew `202` with no sign of a drop, so what those routes 
   `Ok`, and the named series are counted, not retried. This
   is the backstop for what the sink can't predict, such as a sender's clock running ahead of the
   intake's. It follows `otlp_out`'s partial success
-  ([ADR `sink-fault-classes`](sink-fault-classes.md)), and counts per attempt like the other
+  ([ADR `sink-fault-classes`](sink-fault-classes.md)), and counts once per batch for the request that drew it, like the other
   answers a destination gives.
