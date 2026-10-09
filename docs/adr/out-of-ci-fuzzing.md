@@ -288,8 +288,8 @@ The inventory's cluster 9, "Untrusted-input parsers", gives every hand-rolled pa
 bytes a target. Most of those parsers live outside `logit-core` and `logit-proto` today, so
 [ADR `parsers-live-in-logit-proto`](parsers-live-in-logit-proto.md) moves them behind the seam
 this ADR's "The `fuzz/` crate" requires first. This amendment records what changes in the
-harness. It holds the prose description of every target, which "Targets" points at; the campaign tables under "Running
-it" keep the names each campaign ran under.
+harness. It holds the prose description of every target, which "Targets" points at; the
+campaign tables under "Running it" keep the names each campaign ran under.
 
 ### Targets
 
