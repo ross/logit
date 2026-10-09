@@ -244,12 +244,32 @@ impl Framer {
         self.seen_bytes
     }
 
-    /// Bytes held but not yet formed into a frame. Read by the stream driver's
-    /// `report_buffered_tail` (`crates/logit-inputs/src/tcp.rs`) on the paths
-    /// that end a connection without reaching [`Framer::finish`] (a peer RST mid-message, or
-    /// shutdown), so a discarded partial frame is still counted.
+    /// Bytes held but not yet formed into a frame, bounded as this module's doc says. What a
+    /// connection that ends here loses is [`Framer::abandon`]'s to decide, not this count's: a
+    /// blank remainder holds bytes and loses nothing.
     pub fn buffered(&self) -> usize {
         self.buf.len()
+    }
+
+    /// What a connection that ends without a clean EOF loses: a peer RST mid-message, a shutdown,
+    /// or an idle close. The stream driver's `report_buffered_tail`
+    /// (`crates/logit-inputs/src/tcp.rs`) counts the returned error. Discards the remainder.
+    ///
+    /// Agrees with [`Framer::finish`] over the same bytes: `None` for an empty or blank remainder
+    /// ([`Self::remainder_is_blank`]) and for a drain's tail, [`FrameError::Truncated`] otherwise.
+    /// The one difference is `Rfc6587Auto`'s LF framing, where `finish` delivers a remainder with
+    /// content as a final message and this counts it `truncated`: no FIN means the sender never
+    /// said it was done.
+    pub fn abandon(&mut self) -> Option<FrameError> {
+        let held = self.buf.len();
+        let lost = held > 0 && !self.draining && !self.remainder_is_blank();
+        self.buf.clear();
+        self.scanned = 0;
+        lost.then(|| {
+            FrameError::Truncated(format!(
+                "the connection ended abruptly with {held} byte(s) of an incomplete frame buffered"
+            ))
+        })
     }
 
     /// Appends whatever came off the socket. Under [`FramingMode::Rfc6587Auto`] only, latches
@@ -362,12 +382,13 @@ impl Framer {
                         )),
                     });
                 }
+                let blank = self.remainder_is_blank();
                 let line = self.buf.split_to(self.buf.len()).freeze();
                 self.scanned = 0;
-                let line = strip_cr(line);
-                if line.is_empty() {
+                if blank {
                     return Ok(None);
                 }
+                let line = strip_cr(line);
                 match self.mode {
                     // RFC 6587 §3.4.2 can't distinguish "the sender finished and closed" from
                     // "the sender died mid-message", and permits a final message with no
@@ -380,22 +401,31 @@ impl Framer {
                     // without one is a truncated frame, not a short message; carbon's own
                     // receiver discards it. Emitting it would turn a sender dying mid-line into a
                     // datapoint with a truncated path or timestamp, and would make a clean FIN
-                    // disagree with an RST, which `report_buffered_tail` counts `truncated`.
-                    FramingMode::Lines { .. } => {
-                        // Whitespace only (trailing padding, a bare `CR`, a keepalive): nothing
-                        // was lost, so nothing is counted, as `next_frame` does for an empty line.
-                        if line.iter().all(|b| b.is_ascii_whitespace()) {
-                            return Ok(None);
-                        }
-                        Err(FrameError::Truncated(format!(
-                            "the peer closed with a {}-byte unterminated line buffered; a \
-                             line-framed stream's LF is its only completeness signal, so the \
-                             remainder is dropped",
-                            line.len()
-                        )))
-                    }
+                    // disagree with an RST, which `abandon` counts `truncated`.
+                    FramingMode::Lines { .. } => Err(FrameError::Truncated(format!(
+                        "the peer closed with a {}-byte unterminated line buffered; a \
+                         line-framed stream's LF is its only completeness signal, so the \
+                         remainder is dropped",
+                        line.len()
+                    ))),
                 }
             }
+        }
+    }
+
+    /// Whether the buffered remainder carries no message, so a connection ending on it lost
+    /// nothing and neither [`Framer::finish`] nor [`Framer::abandon`] counts it. Under
+    /// [`FramingMode::Lines`] that is whitespace only (trailing padding, a bare `CR`), as
+    /// `next_frame` skips an empty line; under `Rfc6587Auto`'s LF framing, nothing left once one
+    /// `CR` is stripped, since a whitespace remainder there is a final message `finish` delivers.
+    /// Under a declared length, only an empty buffer.
+    fn remainder_is_blank(&self) -> bool {
+        match (self.framing, self.mode) {
+            (Some(Framing::NonTransparent), FramingMode::Lines { .. }) => {
+                self.buf.iter().all(u8::is_ascii_whitespace)
+            }
+            (Some(Framing::NonTransparent), _) => matches!(&self.buf[..], b"" | b"\r"),
+            _ => self.buf.is_empty(),
         }
     }
 
@@ -951,6 +981,63 @@ mod tests {
             2,
             "two frames back to back in one push come out in order"
         );
+    }
+
+    /// A remainder that carries no message: whitespace under `Lines`, a lone `CR` under
+    /// `Rfc6587Auto`'s LF framing. [`Framer::finish`] drops it uncounted, so an RST over the same
+    /// bytes must count nothing either.
+    #[test]
+    fn a_blank_remainder_is_counted_by_neither_a_fin_nor_an_rst() {
+        let drain = FramingMode::Lines { oversize: Oversize::DrainToNextLine };
+        let fatal = FramingMode::Lines { oversize: Oversize::Fatal };
+        let cases: [(FramingMode, &[u8]); 4] = [
+            (drain, b"a.b 1 17000\n \t"),
+            (fatal, b"a.b 1 17000\n\r"),
+            (drain, b"a.b 1 17000\r\n\r\r "),
+            (FramingMode::Rfc6587Auto, b"<13>a\n\r"),
+        ];
+        for (mode, wire) in cases {
+            let label = format!("{mode:?} {:?}", String::from_utf8_lossy(wire));
+            let mut fin = Framer::new(mode, MAX_FRAME_BYTES);
+            let mut rst = Framer::new(mode, MAX_FRAME_BYTES);
+            assert_eq!(push_and_drain(&mut fin, wire).len(), 1, "{label}");
+            assert_eq!(push_and_drain(&mut rst, wire).len(), 1, "{label}");
+            assert!(rst.buffered() > 0, "the case leaves its remainder buffered: {label}");
+            assert_eq!(fin.finish(), Ok(None), "a FIN drops the blank remainder: {label}");
+            assert_eq!(rst.abandon(), None, "and an RST over the same bytes agrees: {label}");
+            assert_eq!(rst.buffered(), 0, "the remainder is discarded either way: {label}");
+        }
+    }
+
+    /// The FIN/RST rule for a remainder that does carry bytes: both count it `truncated`, except
+    /// `Rfc6587Auto`'s LF framing, where a FIN delivers it as RFC 6587 §3.4.2 permits.
+    #[test]
+    fn a_remainder_with_content_is_truncated_by_an_rst_under_every_framing() {
+        let cases: [(FramingMode, &[u8], bool); 6] = [
+            (FramingMode::Rfc6587Auto, b"<13>a\n<13>half", true),
+            (FramingMode::Rfc6587Auto, b"<13>a\n ", true),
+            (FramingMode::Rfc6587Auto, b"9 <13>", false),
+            (FramingMode::Lines { oversize: Oversize::DrainToNextLine }, b"a.b 1", false),
+            (FramingMode::LengthPrefixed, &[0, 0, 0, 9, b'h'], false),
+            (FramingMode::LengthPrefixedLe, &[9, 0], false),
+        ];
+        for (mode, wire, fin_delivers) in cases {
+            let label = format!("{mode:?} {:?}", String::from_utf8_lossy(wire));
+            let mut fin = Framer::new(mode, MAX_FRAME_BYTES);
+            let mut rst = Framer::new(mode, MAX_FRAME_BYTES);
+            push_and_drain(&mut fin, wire);
+            push_and_drain(&mut rst, wire);
+            let rst = rst.abandon().unwrap_or_else(|| panic!("an RST counts: {label}"));
+            assert_eq!(rst.reason(), "truncated", "{label}");
+            match fin.finish() {
+                Ok(Some(_)) => assert!(fin_delivers, "only auto LF delivers on a FIN: {label}"),
+                Err(err) => {
+                    assert!(!fin_delivers, "{label}");
+                    assert_eq!(err.reason(), "truncated", "a FIN agrees: {label}");
+                }
+                Ok(None) => panic!("a FIN over a remainder with content counts it: {label}"),
+            }
+        }
     }
 
     #[test]

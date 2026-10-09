@@ -1040,7 +1040,7 @@ where
         // has not observed, so it would miss shutdown already being true. The `Ref` temporary
         // drops at the end of this statement, before any `.await`.
         if *shutdown.borrow() {
-            report_buffered_tail(&framer, &telemetry, diag);
+            report_buffered_tail(&mut framer, &telemetry, diag);
             if let Some(batch) = accumulator.take() {
                 emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
             }
@@ -1088,7 +1088,7 @@ where
                     // Idle: policy, not a fault, so `Ok(())` and no `connection_error` (this
                     // module's "Idle timeout" doc section). A buffered partial frame is counted
                     // `truncated`, as on the shutdown and RST paths.
-                    report_buffered_tail(&framer, &telemetry, diag);
+                    report_buffered_tail(&mut framer, &telemetry, diag);
                     if let Some(batch) = accumulator.take() {
                         emit(&sink, &telemetry, batch, FlushReason::Closed).await;
                     }
@@ -1103,7 +1103,7 @@ where
         match step {
             ReadStep::Bytes => {}
             ReadStep::Shutdown => {
-                report_buffered_tail(&framer, &telemetry, diag);
+                report_buffered_tail(&mut framer, &telemetry, diag);
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
                 }
@@ -1146,7 +1146,7 @@ where
             ReadStep::Failed(err) => {
                 // The connection broke, but what was already decoded is good: deliver it before
                 // surfacing the error as `connection_error`.
-                report_buffered_tail(&framer, &telemetry, diag);
+                report_buffered_tail(&mut framer, &telemetry, diag);
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Closed).await;
                 }
@@ -1247,24 +1247,16 @@ fn report_frame_error(err: &FrameError, telemetry: &Telemetry, diag: &mut Diagno
 /// Reports a partial frame still held by the [`Framer`] when a connection ends *without* a clean
 /// EOF: a peer RST mid-message, a shutdown or idle close before the sender finished one.
 ///
-/// Dropping those bytes is correct, since no complete message was sent, but it is counted as
-/// `logit.input.frames.dropped{reason="truncated"}` so the loss is visible. This agrees with what
-/// the same bytes followed by a FIN would do ([`Framer::finish`]) under octet counting, a length
-/// prefix, and [`FramingMode::Lines`]; only [`FramingMode::Rfc6587Auto`]'s LF arm instead emits
-/// the remainder on a FIN, as RFC 6587 permits. A no-op when nothing is buffered, the ordinary
-/// case.
-fn report_buffered_tail(framer: &Framer, telemetry: &Telemetry, diag: &mut Diagnostics) {
-    let held = framer.buffered();
-    if held == 0 {
-        return;
+/// Dropping those bytes is correct, since no complete message was sent, but [`Framer::abandon`]
+/// returns them as `logit.input.frames.dropped{reason="truncated"}` so the loss is visible. It
+/// agrees with what the same bytes followed by a FIN would do ([`Framer::finish`]), a blank
+/// remainder counted by neither; only [`FramingMode::Rfc6587Auto`]'s LF arm instead emits a
+/// remainder with content on a FIN, as RFC 6587 permits. A no-op when nothing is buffered, the
+/// ordinary case.
+fn report_buffered_tail(framer: &mut Framer, telemetry: &Telemetry, diag: &mut Diagnostics) {
+    if let Some(err) = framer.abandon() {
+        report_frame_error(&err, telemetry, diag);
     }
-    report_frame_error(
-        &FrameError::Truncated(format!(
-            "the connection ended abruptly with {held} byte(s) of an incomplete frame buffered"
-        )),
-        telemetry,
-        diag,
-    );
 }
 
 /// Sends one batch. `sink.send` mints a fresh [`logit_pipeline::TraceContext::new_root`] once
@@ -2189,6 +2181,42 @@ mod tests {
         );
         assert_eq!(drained.sum("logit.component.receive.flushed", &[("reason", "closed")]), 1.0);
         assert_eq!(drained.sum("logit.input.connections.closed", &[("reason", "idle")]), 1.0);
+
+        handle.abort();
+    }
+
+    /// A lone `CR` after the last `LF` carries no message, so an idle close counts nothing, as a
+    /// FIN over the same bytes does (`Framer::abandon`).
+    #[tokio::test]
+    async fn an_idle_close_with_only_a_bare_cr_buffered_counts_nothing() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let config = TcpListenerConfig {
+            batch_flush_interval: Duration::ZERO,
+            ..TcpListenerConfig::default()
+        };
+        let (addr, listener) = bound_listener(config).await;
+        let mut listener =
+            listener.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_millis(100)));
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>complete\n\r").await.unwrap();
+
+        // Only the idle close's flush delivers the frame, so the `CR` was read by then.
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>complete"]);
+        expect_closed(&mut client, "a connection quiet past its idle_timeout").await;
+
+        let drained = Totals::of(registry.drain(0));
+        assert_eq!(drained.sum("logit.input.connections.closed", &[("reason", "idle")]), 1.0);
+        assert_eq!(
+            drained.sum("logit.input.frames.dropped", &[("reason", "truncated")]),
+            0.0,
+            "a bare CR is not a truncated frame"
+        );
 
         handle.abort();
     }
