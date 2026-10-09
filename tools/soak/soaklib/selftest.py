@@ -2041,6 +2041,12 @@ def _external_checks():
         expect(refused.status == checks.FAIL and "1 api_key_rejected line(s)" in refused.detail
                and "status 403: api_key_rejected at" in refused.detail,
                f"a refused key FAILs quoting the line, got {refused}")
+        refusal = results("external-request-refused", sut_extra=_datadog_lines(), stderr_extra=[
+            (250, "WARN", "https://api.datadoghq.com/api/v2/series answered 401: unauthorized",
+             {"component": "sink", "key": "request_refused"})])["ledger.sent"]
+        expect(refusal.status == checks.FAIL and "1 request_refused line(s)" in refusal.detail
+               and "status 401: request_refused at" in refusal.detail,
+               f"a request_refused line FAILs quoting it, got {refusal}")
         queued = results("external-queued", sut_extra=_datadog_lines(queued_at=250),
                          buffer_batches=3)["ledger.sent"]
         expect(queued.status == checks.FAIL and "3 batch(es) left unsent" in queued.detail
@@ -2082,6 +2088,23 @@ def _external_checks():
         expect(both.status == checks.FAIL and "status 400: request_rejected" in both.detail
                and "a 2xx whose body" not in both.detail,
                f"a 400's drop quotes the 400, not an earlier 202, got {both}")
+        early_400 = (240,) + rejection[1:]
+        late_202 = (250,) + series_202[1:]
+        named_late = results("external-400-then-202", sut_extra=_datadog_lines(named=2),
+                             stderr_extra=[early_400, late_202])["ledger.sent"]
+        expect(named_late.status == checks.FAIL
+               and "a 2xx whose body named dropped series: series_rejected" in named_late.detail
+               and "status 400" not in named_late.detail,
+               f"named records quote series_rejected, not an earlier 400, got {named_late}")
+        pre_send = (250, "WARN", "dropped one event on the series route: it encodes to 9000000 "
+                    "bytes (800000 compressed), over the route's per-request limit",
+                    {"component": "sink", "key": "oversize"})
+        too_large = results("external-too-large", sut_extra=_datadog_lines(
+            rejected_at=250, batch=False, reason="oversize"), stderr_extra=[pre_send])
+        expect(too_large["ledger.sent"].status == checks.FAIL
+               and "dropped before sending: oversize at" in too_large["ledger.sent"].detail
+               and "it encodes to 9000000 bytes" in too_large["ledger.sent"].detail,
+               f"a pre-send oversize drop quotes its line, got {too_large['ledger.sent']}")
         silent = results("external-no-requests")
         expect(silent["ledger.sent"].status == checks.FAIL
                and "no logit.output.requests" in silent["ledger.sent"].detail,

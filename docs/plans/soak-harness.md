@@ -718,8 +718,8 @@ and a diagnostic, and "Telemetry"). This list is the canonical copy of its verdi
   balances a queued batch, so it can't catch one the run ended with.
 - A batch dropped `rejected`, records dropped `rejected` or `oversize`, or records a series
   `202` body names (`logit.output.records.rejected`): FAIL, with the status and the first
-  stderr line with the key that explains it, `request_rejected` for a drop and
-  `series_rejected` for a `202` body. Under per-request verdicts a rejected request drops its
+  stderr line with the key that explains it: `request_rejected` or `oversize` for a record drop
+  (refused by the destination, or too large to send), and `series_rejected` for a `202` body. Under per-request verdicts a rejected request drops its
   records and the batch survives when another request was accepted, so both counters are read.
 - An `api_key_rejected` or `request_refused` line from the sink on stderr: FAIL, quoting the
   first. The sink reads that answer as `Refused` and holds its queue with no exit, so the run

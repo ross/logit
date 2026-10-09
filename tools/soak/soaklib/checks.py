@@ -701,12 +701,12 @@ RECOVERED_RATE_SHARE = 0.95
 NO_BACKEND = "external target: no backend query"
 # `ledger.sent`'s reading of an external sink's telemetry (`datadog_out`'s module doc, "Faults,
 # retries, and duplicate safety" and "Telemetry"): the `records.dropped` reasons and the batch
-# drop reason that mean the destination refused the data, the diagnostics quoting its answer to
-# a dropped request, and the diagnostics for a refusal the sink holds its queue on. Every other
-# counted drop WARNs.
+# drop reason that mean the destination refused the data or it was too large to send, the
+# diagnostics quoting its answer to a dropped request (or the pre-send `oversize` drop), and the
+# diagnostics for a refusal the sink holds its queue on. Every other counted drop WARNs.
 REJECTED_RECORD_REASONS = ("rejected", "oversize")
 REJECTED_BATCH_REASONS = ("rejected",)
-REJECTION_KEYS = ("request_rejected", "series_rejected")
+REJECTION_KEYS = ("request_rejected", "series_rejected", "oversize")
 REFUSAL_KEYS = ("api_key_rejected", "request_refused")
 _ANSWERED_RE = re.compile(r"answered (\d{3})")
 # `(service, action)` faults during which the SUT writes no `aggregate` window: `ledger.windows`
@@ -1496,8 +1496,12 @@ def check_ledger_sent(data):
         if first is None:
             return f"no {' or '.join(keys)} line on stderr"
         answered = _ANSWERED_RE.search(first.message)
-        status_text = (f"status {answered.group(1)}" if answered
-                       else "a 2xx whose body named dropped series")
+        if answered:
+            status_text = f"status {answered.group(1)}"
+        elif first.key == "oversize":
+            status_text = "dropped before sending"
+        else:
+            status_text = "a 2xx whose body named dropped series"
         return (f"{status_text}: {first.key} at {data.offset(first.ts)}: {first.message[:300]}")
 
     for key in REFUSAL_KEYS:
@@ -1520,8 +1524,8 @@ def check_ledger_sent(data):
     record_drops = _by_attr(sut, "logit.output.records.dropped", "reason", component=sink)
     for reason, value in sorted(record_drops.items()):
         if reason in REJECTED_RECORD_REASONS:
-            flag(FAIL, f"{_n(value)} record(s) dropped {reason}, the destination refused them "
-                       f"({quoted('request_rejected')})")
+            flag(FAIL, f"{_n(value)} record(s) dropped {reason}, refused by the destination "
+                       f"or too large to send ({quoted('request_rejected', 'oversize')})")
         else:
             flag(WARN, f"{_n(value)} record(s) dropped {reason} before sending, counted")
     named = sum(sut.counter_by_life("logit.output.records.rejected", component=sink).values())
