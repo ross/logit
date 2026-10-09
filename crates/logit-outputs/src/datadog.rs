@@ -76,10 +76,11 @@
 //!
 //! The send time is read once per batch, in `observe_batch`, and every attempt at the batch
 //! measures from it: staleness isn't monotonic in the clock (a point too far ahead becomes fresh),
-//! so a clock read per attempt could drop a point on one attempt and send it on the next. An `Ok`
-//! clears it, and the next `observe_batch` replaces it. A `send` with no `observe_batch` reads the
-//! clock itself only when no earlier batch left a time behind: after a batch whose last attempt
-//! failed, it reuses that batch's time (`docs/known-gaps/datadog.md`).
+//! so a clock read per attempt could drop a point on one attempt and send it on the next. A final
+//! result (`Ok`, or a fault `write_loop` won't retry under the sink's posture) clears it, and the
+//! next `observe_batch` replaces it. A `send` with no `observe_batch` reads the clock itself only
+//! when no earlier batch left a time behind: after a batch whose last attempt failed with a fault
+//! `write_loop` would retry, it reuses that batch's time (`docs/known-gaps/datadog.md`).
 //!
 //! A retryable fault retries until the batch is delivered or shutdown cuts it, bounded by the
 //! sink's `buffer:`. Staleness is judged against the batch's one send time, so a batch held
@@ -260,7 +261,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use logit_core::interner::resolve;
 use logit_core::{redact, Diagnostics, EventBatch, MetricKind, Symbol, Telemetry};
-use logit_pipeline::{BatchContext, Fault, Output, SeqId};
+use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::datadog::events::EventFormat;
 use logit_proto::datadog::series::metric_tag_count;
 use logit_proto::datadog::{
@@ -664,7 +665,8 @@ pub struct DatadogOutput {
     telemetry: Telemetry,
     accounting: BatchAccounting,
     /// The send time of the batch `observe_batch` last armed, read by every attempt at it so each
-    /// reaches the same stale verdict; cleared by an `Ok`, replaced by the next `observe_batch`.
+    /// reaches the same stale verdict; cleared by a final result
+    /// ([`BatchAccounting::is_final`]), replaced by the next `observe_batch`.
     /// `None` reads the clock per `send`.
     batch_now: Option<i64>,
     /// [`now_nanos`], or a test's scripted clock.
@@ -942,11 +944,12 @@ impl DatadogOutput {
         outcomes.finish()
     }
 
-    /// One attempt at send time `now` ([`DatadogOutput::attempt`]). An `Ok` clears the batch's
-    /// send time and disarms the batch accounting, a batch that sent nothing included.
+    /// One attempt at send time `now` ([`DatadogOutput::attempt`]). A final result (`Ok`, or a
+    /// fault `write_loop` won't retry) clears the batch's send time and disarms the batch
+    /// accounting, a batch that sent nothing included.
     async fn send_at(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
         let result = self.attempt(batch, now).await;
-        if result.is_ok() {
+        if self.accounting.is_final(&result) {
             self.batch_now = None;
         }
         self.accounting.finish(result)
@@ -1133,10 +1136,16 @@ impl Output for DatadogOutput {
         self.batch_now = Some((self.clock)());
     }
 
+    /// Lets a final `Ambiguous` under `at_most_once` disarm the batch accounting and clear the
+    /// batch's send time.
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        self.accounting.observe_posture(posture);
+    }
+
     /// One or more requests per route the batch needs, sequentially; a rejected request is counted
     /// and the rest go on, and a refused key or a `Clean` or `Ambiguous` failure stops the send
     /// (module doc's "Faults, retries, and duplicate safety"). The send time is the one the last
-    /// `observe_batch` fixed until an `Ok` clears it, else the clock's.
+    /// `observe_batch` fixed until a final result clears it, else the clock's.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let now = self.batch_now.unwrap_or_else(|| (self.clock)());
         self.send_at(batch, now).await
@@ -2409,14 +2418,11 @@ mod tests {
         assert_a_batch_after_a_dropped_one_reads_the_clock_again(rejected, fast_retry()).await;
     }
 
-    /// Pins a documented corner (`docs/known-gaps/datadog.md`): after a batch whose last attempt
-    /// failed, a `send` with no `observe_batch` reuses that batch's send time and finds the gate
-    /// armed. The failed batch fixed `NOW`, so the direct send's point 11 min ahead is stale there
-    /// and dropped (it would be fresh at the clock's next reading, `NOW + 2 min`), and its `stale`
-    /// drop is muted, since the failed batch already encoded the plan's unit. Its `Ok` clears both,
-    /// so the next direct send reads the clock and sends the same point.
+    /// A rejected batch is final, so a `send` after it with no `observe_batch` reads the clock
+    /// and counts live: the point 11 min past `NOW` is fresh at the clock's second reading,
+    /// `NOW + 2 min`, and the stale point beside it counts its `stale` drop.
     #[tokio::test]
-    async fn a_direct_send_after_a_failed_batch_reuses_its_send_time_and_armed_gate() {
+    async fn a_direct_send_after_a_rejected_batch_reads_the_clock_and_counts() {
         let (clock, reads) = stepping_clock(NOW);
         let rejected_first = |p: &str, k| {
             if p == SERIES && k == 0 {
@@ -2433,6 +2439,39 @@ mod tests {
             sums_through_write_loop(&mut output, &mut probe, "datadog_out", batches, fast_retry())
                 .await;
         assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+
+        let ahead = NOW + 11 * MINUTE;
+        output.send(&batch(vec![gauge(ahead), gauge(NOW - 2 * HOUR)])).await.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "the direct send reads the clock");
+        assert_eq!(series_points(&log.lock().unwrap()), [vec![NOW], vec![ahead]]);
+        let sums: Sums =
+            probe.poll().sums().map(|(n, t, v)| ((n.to_string(), t.to_vec()), v)).collect();
+        assert_eq!(sum_of(&sums, RECORDS_DROPPED, &[("reason", "stale")]), 1.0, "and counts");
+    }
+
+    /// Pins a documented corner (`docs/known-gaps/datadog.md`): after a batch whose last attempt
+    /// failed with a fault `write_loop` would retry, a `send` with no `observe_batch` reuses that
+    /// batch's send time and finds the gate armed. The failed batch fixed `NOW`, so the direct
+    /// send's point 11 min ahead is stale there and dropped (it would be fresh at the clock's next
+    /// reading, `NOW + 2 min`), and its `stale` drop is muted, since the failed batch already
+    /// encoded the plan's unit. Its `Ok` clears both, so the next direct send reads the clock and
+    /// sends the same point.
+    #[tokio::test]
+    async fn a_direct_send_after_a_retryable_failure_reuses_its_send_time_and_armed_gate() {
+        let (clock, reads) = stepping_clock(NOW);
+        let busy_first = |p: &str, k| {
+            if p == SERIES && k == 0 {
+                Reply::Answer(503, Vec::new())
+            } else {
+                accepted(p)
+            }
+        };
+        let (addr, log) = per_path_recorder(busy_first).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(addr, &probe).with_clock(clock);
+        output.observe_batch(BatchContext::default(), SeqId { id: [0; 16], seq: 1 });
+        let err = output.send(&batch(vec![gauge(NOW)])).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
 
         let ahead = NOW + 11 * MINUTE;
         output.send(&batch(vec![gauge(ahead)])).await.unwrap();

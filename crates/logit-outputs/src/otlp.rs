@@ -598,6 +598,7 @@ impl Output for OtlpOutput {
 
     fn observe_posture(&mut self, posture: DeliveryPosture) {
         self.posture = posture;
+        self.accounting.observe_posture(posture);
     }
 
     /// One attempt ([`OtlpOutput::attempt`]). An `Ok` disarms the batch accounting on every path,
