@@ -26,8 +26,11 @@ queries: the stack runs without `victoria-metrics`, faults on it are refused, an
 ends at the sink's own telemetry (docs/plans/soak-harness.md's "External targets").
 """
 
+import os
 import random
 import re
+import shutil
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,6 +67,7 @@ EXTERNAL_ENV_PASSED = ("DD_API_KEY",)
 VM_LEDGER_KEYS = {"vm_selector", "vm_every_window"}
 _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+PRIVATE_ENV_PREFIX = "soak-env-"
 STEP_KEYS = {"at", "action", "on", "args", "for"}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
@@ -514,17 +518,58 @@ def _parse_target(table, problems):
 
 
 def read_env_file(path):
-    """`{name: value}` from a `KEY=VALUE` env file, the last line for a key winning, skipping
-    blank lines and `#` comments. Values are taken as written, quotes included, as
-    `docker run --env-file` takes them. Raises `OSError` when the file can't be read."""
+    """`{name: value}` from an env file, in plain or shell `export` form. Raises `OSError` when
+    the file can't be read.
+
+    The grammar, one assignment per line:
+
+    - `KEY=value` or `export KEY=value`; space around the key and the value is dropped.
+    - A value wrapped in one pair of matching single or double quotes loses that pair, once,
+      and nothing inside it is unescaped or expanded.
+    - Blank lines, `#` comment lines, and lines with no `=` are skipped. A `#` after a value is
+      part of the value.
+    - A key set twice takes its last value.
+    """
     values = {}
     for line in Path(path).read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        values[key.strip()] = value
+        key = re.sub(r"^export\s+", "", key.strip())
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values[key] = value
     return values
+
+
+def private_env_copy(env_file, names):
+    """Writes the `names` `env_file` sets as plain `KEY=value` lines to a new file, mode 0600,
+    in a new private temporary directory, and returns its path; `remove_private_env` removes
+    both. Docker's and compose's `--env-file` read this copy, because neither reliably reads an
+    `export` line or strips quotes. The copy holds credentials, so it lives outside the repo and
+    the run directory, and a value never goes on a command line, where a process listing would
+    show it."""
+    values = read_env_file(env_file)
+    directory = tempfile.mkdtemp(prefix=PRIVATE_ENV_PREFIX)
+    fd, path = tempfile.mkstemp(suffix=".env", dir=directory)
+    with os.fdopen(fd, "w") as out:
+        os.fchmod(out.fileno(), 0o600)
+        for name in names:
+            if name in values:
+                out.write(f"{name}={values[name]}\n")
+    return Path(path)
+
+
+def remove_private_env(path):
+    """Removes a `private_env_copy` file and its directory. A `None` or missing path is a
+    no-op, and a path whose directory `private_env_copy` didn't name is left alone."""
+    if path is None:
+        return
+    directory = Path(path).parent
+    if directory.name.startswith(PRIVATE_ENV_PREFIX):
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def missing_env(scenario, env_file):

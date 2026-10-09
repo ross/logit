@@ -11,8 +11,9 @@
 #   SOAK_SKIP_IMAGE=1   reuse the existing logit:soak and logit-soak-netem:local images
 #   SOAK_OUT=<dir>      where run directories go (default perf/results/soak)
 #   SOAK_EXTERNAL_ENV=<f>  an external-target scenario's env file: the variables its [target]
-#                       table lists, such as DD_API_KEY (default perf/results/soak-external.env);
-#                       it must be git-ignored. See tools/soak/README.md's "External targets".
+#                       table lists, such as DD_API_KEY, as KEY=value or shell export lines
+#                       (default perf/results/soak-external.env); it must be git-ignored. See
+#                       tools/soak/README.md's "External targets".
 
 set -euo pipefail
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
@@ -44,9 +45,19 @@ scenario_dir="${TOOLS_DIR}/scenarios/${scenario}"
 
 python3 "${TOOLS_DIR}/soak.py" self-test
 
-# An external target reads its credentials from an env file the driver passes to compose as a
-# second `--env-file`; nothing else needs one.
+# An external target reads its credentials from the operator's env file. `logit validate` gets a
+# private plain copy of the target's variables, since `docker run --env-file` doesn't read an
+# `export` line; the copy is removed before the driver starts, and the driver makes its own.
 validate_env=()
+env_copy=""
+remove_env_copy() {
+    if [ -n "${env_copy}" ]; then
+        rm -f -- "${env_copy}"
+        rmdir -- "$(dirname -- "${env_copy}")"
+        env_copy=""
+    fi
+}
+trap remove_env_copy EXIT
 if [ "$(python3 "${TOOLS_DIR}/soak.py" target "${scenario}")" = external ]; then
     EXTERNAL_ENV="${SOAK_EXTERNAL_ENV:-${ROOT}/perf/results/soak-external.env}"
     if [ ! -f "${EXTERNAL_ENV}" ]; then
@@ -54,15 +65,19 @@ if [ "$(python3 "${TOOLS_DIR}/soak.py" target "${scenario}")" = external ]; then
         exit 1
     fi
     EXTERNAL_ENV="$(readlink -f -- "${EXTERNAL_ENV}")"
-    # The file holds credentials, so it must be one git would never commit.
-    if ! git -C "${ROOT}" check-ignore -q "${EXTERNAL_ENV}"; then
+    # The file holds credentials, so it must be one git would never commit: the check asks the
+    # repository the file is in, which for a file outside this worktree isn't this one. A file
+    # in no repository can't be committed.
+    env_dir="$(dirname -- "${EXTERNAL_ENV}")"
+    if git -C "${env_dir}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        && ! git -C "${env_dir}" check-ignore -q "${EXTERNAL_ENV}"; then
         echo "soak: ${EXTERNAL_ENV} is not git-ignored; keep credentials under perf/results/" >&2
         exit 1
     fi
-    # Names each variable the file doesn't set, never a value.
-    python3 "${TOOLS_DIR}/soak.py" target "${scenario}" --env-file "${EXTERNAL_ENV}"
+    # Names each variable the file doesn't set, never a value, and prints the copy's path.
+    env_copy="$(python3 "${TOOLS_DIR}/soak.py" target "${scenario}" --env-file "${EXTERNAL_ENV}" --private-copy)"
     export SOAK_EXTERNAL_ENV="${EXTERNAL_ENV}"
-    validate_env=(--env-file "${EXTERNAL_ENV}")
+    validate_env=(--env-file "${env_copy}")
 fi
 
 # The driver runs every docker command as `sudo -n` so an expired ticket fails instead of
@@ -89,6 +104,9 @@ for config in "${scenario_dir}"/logit-*.yaml; do
         exit 1
     }
 done
+
+remove_env_copy
+trap - EXIT
 
 export DOCKER SOAK_IMAGE="${IMAGE}"
 exec python3 "${TOOLS_DIR}/soak.py" "$@"

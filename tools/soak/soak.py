@@ -91,7 +91,9 @@ def cmd_check(args):
 
 def cmd_target(args):
     """Prints the scenario's target kind, for script/soak. With `--env-file`, exits 1 naming each
-    `[target] env` variable the file doesn't set or sets empty, never a value."""
+    `[target] env` variable the file doesn't set or sets empty, never a value; with
+    `--private-copy` too, writes those variables to a private plain copy and prints its path,
+    which the caller removes with its directory."""
     try:
         loaded = scenario.load(scenario_path(args.scenario))
     except scenario.ScenarioError as err:
@@ -105,6 +107,8 @@ def cmd_target(args):
         print(f"soak: external target {loaded.target['name']}: {args.env_file} doesn't set "
               f"{', '.join(missing)}", file=sys.stderr)
         return 1
+    if args.private_copy:
+        print(scenario.private_env_copy(args.env_file, loaded.target["env"]))
     return 0
 
 
@@ -136,6 +140,9 @@ def main(argv=None):
                                            "check that the file sets its variables")
     target.add_argument("scenario")
     target.add_argument("--env-file", help="the external target's env file to check")
+    target.add_argument("--private-copy", action="store_true",
+                        help="with --env-file, write the target's variables to a private "
+                             "plain KEY=value copy and print its path")
     target.set_defaults(func=cmd_target)
 
     sub.add_parser("self-test", help="test the driver's pure parts").set_defaults(

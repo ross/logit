@@ -39,7 +39,8 @@ daemon ending an inspect round, and a SIGTERM or SIGHUP inherited as ignored sta
 For an external target, it covers every `[target]` validation rule and what such a target
 refuses (a VictoriaMetrics ledger key, a fault on `victoria-metrics`), that compose.yaml passes
 each variable a target may list and keeps `victoria-metrics` in the `local` profile, the env
-file check, the compose arguments and profile each kind of run gets, the end sequence's wait for
+file check and its `export` and quote grammar, the private plain copy compose reads (its
+directory, mode, content, and removal, an early return from `execute()` included), the compose arguments and profile each kind of run gets, the end sequence's wait for
 the sink's queue to empty, and the checks over an external two-life run: `ledger.sent` reading
 SENT, a rejected batch and rejected records each FAILing with the status and the sink's text, a
 non-2xx answer inside and outside a fault window, counted drops and encoder skips WARNing, a
@@ -1816,6 +1817,34 @@ def _target_rules(root):
         expect(scenario.missing_env(loaded, env) == [], "the last line for a key wins")
         expect(scenario.missing_env(local, Path(tmp) / "nothing") == [],
                "a local target needs no env file")
+        env.write_text("# shell form\n\nexport DD_API_KEY='abc def'\nexport  OTHER=\"x\"\n"
+                       "PLAIN= y \nHASH=a#b\nODD='z\"\nTWICE=''x''\n")
+        values = scenario.read_env_file(env)
+        expect(values == {"DD_API_KEY": "abc def", "OTHER": "x", "PLAIN": "y", "HASH": "a#b",
+                          "ODD": "'z\"", "TWICE": "'x'"},
+               f"read_env_file strips export and one pair of matching quotes, got {values}")
+        copy_path = scenario.private_env_copy(env, ["DD_API_KEY", "MISSING"])
+        try:
+            copy_dir = copy_path.parent
+            expect(copy_dir.name.startswith(scenario.PRIVATE_ENV_PREFIX)
+                   and not copy_dir.is_relative_to(tmp)
+                   and not copy_dir.is_relative_to(root.parent.parent),
+                   f"the private copy is in its own temporary directory, got {copy_path}")
+            expect((copy_path.stat().st_mode & 0o777) == 0o600
+                   and (copy_dir.stat().st_mode & 0o777) == 0o700,
+                   f"the private copy is mode 0600 in a 0700 directory, got "
+                   f"{copy_path.stat().st_mode:o} {copy_dir.stat().st_mode:o}")
+            expect(copy_path.read_text() == "DD_API_KEY=abc def\n",
+                   "the private copy holds the listed variables it sets, plain and unquoted")
+        finally:
+            scenario.remove_private_env(copy_path)
+        expect(not copy_dir.exists(), "remove_private_env removes the copy's directory")
+        bystander = Path(tmp) / "keep" / "x.env"
+        bystander.parent.mkdir()
+        bystander.write_text("")
+        scenario.remove_private_env(bystander)
+        expect(bystander.exists(), "remove_private_env leaves a directory it didn't make")
+        env.write_text("export DD_API_KEY=abc\n")
 
         argv = docker.Docker("p", "c.yaml", ["a.env", "b.env"], ["local"], prefix=["docker"])
         expect(argv.compose_args() == ["compose", "--progress", "quiet", "-p", "p", "-f",
@@ -1827,15 +1856,28 @@ def _target_rules(root):
         run = driver.Run(root, loaded, loaded.duration, None, False, tmp, [], "logit:soak",
                          env)
         run.prepare()
-        expect(run.docker.profiles == [] and run.docker.env_files[-1] == str(env),
-               f"an external run has no local profile and passes its env file last, got "
-               f"{run.docker.profiles} {run.docker.env_files}")
+        private = run.private_env
+        expect(run.docker.profiles == [] and private is not None
+               and run.docker.env_files[-1] == str(private)
+               and private.read_text() == "DD_API_KEY=abc\n"
+               and not private.is_relative_to(run.run_dir),
+               f"an external run has no local profile and passes a plain private copy of its "
+               f"env file last, got {run.docker.profiles} {run.docker.env_files}")
         expect("DD_API_KEY" not in (run.run_dir / "compose.env").read_text()
                and json.loads((run.run_dir / "scenario.resolved.json").read_text())
                ["target"]["name"] == "datadog",
                "compose.env holds no credential, and the resolved scenario names the target")
         for jsonl in (run.timeline, run.watchdog, run.stats, run.freshness, run.capture):
             jsonl.close()
+        run.docker = _BusyDocker()
+        real_print = driver._print
+        driver._print = lambda text, stream=None: None
+        try:
+            code = run.execute()
+        finally:
+            driver._print = real_print
+        expect(code == 1 and not private.exists() and not private.parent.exists(),
+               "execute() removes the private env copy, an early return included")
         vm_run = driver.Run(root, local, local.duration, None, False, Path(tmp) / "vm", [],
                             "logit:soak")
         vm_run.prepare()
@@ -1852,6 +1894,17 @@ def _target_rules(root):
         except scenario.ScenarioError as err:
             expect("doesn't set DD_API_KEY" in str(err) and "abc" not in str(err),
                    f"a run names the missing variable, got {err}")
+
+
+class _BusyDocker:
+    """A daemon where the run's compose project already has containers, so `execute()` returns
+    before it starts anything."""
+
+    prefix = ["docker"]
+    compose_file = "compose.yaml"
+
+    def project_containers(self):
+        return ["leftover"]
 
 
 class _TailDocker:

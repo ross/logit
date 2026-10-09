@@ -684,10 +684,17 @@ fixed or random, on `victoria-metrics`, which an external target's stack doesn't
 
 **Credentials.** `script/soak` reads the variables from `SOAK_EXTERNAL_ENV`, by default
 `perf/results/soak-external.env`, as `script/splunk-interop`'s cloud mode reads its env file.
-It refuses a file git doesn't ignore, and one that doesn't set a listed variable or sets it
-empty, naming the variable and never its value (`soak.py target <scenario> --env-file`, which
-the driver repeats). It passes the file to `logit validate` and to every `compose` call as a
-second `--env-file`; the run directory holds no copy.
+The file can be in shell form: `scenario.read_env_file`'s docstring is the grammar (`export`
+lines, one pair of quotes removed, `#` comments). It refuses a file the repository holding it
+doesn't ignore, and one that doesn't set a listed variable or sets it empty, naming the
+variable and never its value (`soak.py target <scenario> --env-file`, which the driver
+repeats). Docker never reads the operator's file, because neither `docker run --env-file` nor
+compose's reliably reads an `export` line or strips quotes. The script writes the listed
+variables as plain `KEY=value` lines to a private copy (mode 0600, in a new temporary directory
+outside the repo and the run directory) for `logit validate` and removes it before the driver
+starts; the driver writes its own for every `compose` call's second `--env-file` and removes it
+when `execute()` returns. No value is passed as a command-line argument, and the run directory
+holds none.
 
 **The driver.** Compose runs without the `local` profile, so without `victoria-metrics`. The
 driver skips VictoriaMetrics' `/health` poll, the freshness samples, `force_flush`, the quiet
@@ -1458,8 +1465,9 @@ What the run showed:
   same rows, every detail included. `check` on a synthetic 8-hour run directory finishes in
   seconds. W4 is done once a 1-hour `random-faults` run and an 8-hour one are recorded under
   "Findings"; neither has been made yet.
-- **W5**: the self-test passes, and each new rule fails it when reverted (42 reverts: every
-  `[target]` validation rule, the env file check and its parsing, the compose arguments and
+- **W5**: the self-test passes, and each new rule fails it when reverted (50 reverts: every
+  `[target]` validation rule, the env file check and its parsing (`export` lines and quotes
+  included), the private copy's directory, mode, content, and removal, the compose arguments and
   profiles, compose.yaml's profile, passthrough, and optional dependency, the sink-drain wait's
   three conditions and interval, each SKIP, and each `ledger.sent` verdict). `statsd-datadog`
   passes `self-test` validation, the shipped-config test, and `logit validate` in `logit:soak`

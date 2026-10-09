@@ -118,21 +118,31 @@ name = "datadog"           # a label for results; nothing queries it
 env = ["DD_API_KEY"]       # variables the SUT's config reads with !env
 ```
 
-To run one, put each listed variable in `perf/results/soak-external.env`, one `NAME=value` line
-each with no quotes, then run the scenario. Replace `DATADOG_API_KEY` with your key:
+To run one, put each listed variable in `perf/results/soak-external.env`, then run the
+scenario. Replace `DATADOG_API_KEY` with your key:
 
 ```sh
 echo 'DD_API_KEY=DATADOG_API_KEY' > perf/results/soak-external.env
 script/soak run statsd-datadog
 ```
 
-- `SOAK_EXTERNAL_ENV=<file>` names another file. The script refuses a file git doesn't ignore,
-  because it holds credentials; everything under `perf/results/` is ignored.
+- `SOAK_EXTERNAL_ENV=<file>` names another file, such as a shell file of dev secrets. The
+  script refuses a file git doesn't ignore, asking the repository the file is in, because it
+  holds credentials; everything under `perf/results/` is ignored, and a file in no repository
+  passes.
+- The file can be plain or shell-sourceable: `NAME=value` or `export NAME=value` lines, `#`
+  comment lines, and blank lines. One pair of matching single or double quotes around a value
+  is removed, and nothing inside them is expanded. A `#` after a value is part of the value. A
+  name set twice takes its last value.
 - The script refuses to start when the file doesn't set a listed variable or sets it empty,
-  and names the variable, never its value. It passes the file to `logit validate` and to
-  compose as a second `--env-file`; the run directory never holds a copy. Each
-  `inspect/<svc>.json` has every `Config.Env` value replaced by `<redacted>`, because the SUT's
-  environment carries the key.
+  and names the variable, never its value.
+- Docker never reads your file. The script writes the listed variables as plain `NAME=value`
+  lines to a private copy, mode 0600 in a new temporary directory outside the repo, for
+  `logit validate`'s `--env-file`, and removes it before the run starts. The driver makes its
+  own copy for compose's second `--env-file` and removes it when the run ends. No value goes
+  on a command line, and the run directory never holds one. A run killed with SIGKILL leaves
+  its copy in the temporary directory (`soak-env-*`). Each `inspect/<svc>.json` has every
+  `Config.Env` value replaced by `<redacted>`, because the SUT's environment carries the key.
 - A variable reaches the SUT only when `compose.yaml` passes it in the `logit` service's
   `environment:`. Today that's `DD_API_KEY`, and the scenario check refuses any other name in
   `env`.

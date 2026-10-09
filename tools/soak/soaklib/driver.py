@@ -26,7 +26,9 @@ needs at the code:
 - After a SIGHUP the terminal can be gone, so output goes through `_print`, which drops it
   rather than fail the run: the run directory holds everything.
 - An external target (`[target] kind = "external"`) runs without the `local` compose profile,
-  so with no `victoria-metrics`, and passes `SOAK_EXTERNAL_ENV` as a second `--env-file`. Nothing
+  so with no `victoria-metrics`. It passes compose a second `--env-file`: a plain `KEY=value`
+  copy of the variables `SOAK_EXTERNAL_ENV` sets for the target, in a private temporary
+  directory outside the repo and the run directory, removed when `execute()` returns. Nothing
   queries the destination: no readiness, freshness, flush, or export. The end sequence waits for
   the SUT sink's queue to empty instead of for the stored total to hold.
 
@@ -125,9 +127,11 @@ class Run:
         self.root = Path(root)
         self.scenario = scenario
         self.external = scenario.external
-        # The external target's env file, passed to compose after compose.env; never copied
-        # into the run directory, since it holds credentials.
+        # The operator's env file for an external target. Compose reads `private_env`, a plain
+        # copy outside the run directory, since the file can be in shell `export` form and
+        # holds credentials.
         self.external_env = external_env
+        self.private_env = None
         self.duration = duration
         # The seed a random schedule is drawn with: --seed, else the scenario's own.
         self.seed = scenario.seed_for(seed)
@@ -172,7 +176,10 @@ class Run:
         (self.run_dir / "scenario.resolved.json").write_text(
             json.dumps(resolved, indent=2, sort_keys=True) + "\n"
         )
-        env_files = [env_file] + ([self.external_env] if self.external else [])
+        if self.external:
+            self.private_env = scenario_mod.private_env_copy(self.external_env,
+                                                             self.scenario.target["env"])
+        env_files = [env_file] + ([self.private_env] if self.external else [])
         profiles = [] if self.external else [LOCAL_PROFILE]
         self.docker = Docker(self.project, self.root / "compose.yaml", env_files, profiles)
         self.ctx = faults.Context(docker=self.docker, ids=self.ids, netem_image=NETEM_IMAGE)
@@ -198,7 +205,14 @@ class Run:
     # ---- the run -------------------------------------------------------------------------------
 
     def execute(self):
-        """Runs everything after `prepare()`. Returns the process exit code."""
+        """Runs everything after `prepare()`, then removes the private env copy. Returns the
+        process exit code."""
+        try:
+            return self._execute()
+        finally:
+            scenario_mod.remove_private_env(self.private_env)
+
+    def _execute(self):
         if self.docker.project_containers():
             _print(f"soak: compose project '{self.project}' already has containers on this "
                    "daemon.\n  Not this run's to stop. If it is yours, run:\n"
@@ -606,5 +620,9 @@ def run(root, scenario_path, duration, seed, keep, out_dir, argv, image, externa
                 f"external target {scenario.target['name']}: {external_env} doesn't set "
                 f"{', '.join(missing)} (set SOAK_EXTERNAL_ENV to another file)"])
     run = Run(root, scenario, duration, seed, keep, out_dir, argv, image, external_env)
-    run.prepare()
+    try:
+        run.prepare()
+    except BaseException:
+        scenario_mod.remove_private_env(run.private_env)
+        raise
     return run.execute()

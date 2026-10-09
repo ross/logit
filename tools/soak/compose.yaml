@@ -8,9 +8,9 @@
 #   SOAK_SUT_CONFIG        absolute path of the scenario's `logit` config for the service `logit`
 #   SOAK_GENERATOR_CONFIG  absolute path of the scenario's config for the service `generator`
 #
-# A scenario with an external target (`[target] kind = "external"`) gets a second `--env-file`,
-# `SOAK_EXTERNAL_ENV` (perf/results/soak-external.env by default), holding the variables its
-# `[target] env` lists. The `logit` service's `environment:` passes each variable scenario.py's
+# A scenario with an external target (`[target] kind = "external"`) gets a second `--env-file`:
+# a private plain copy of the variables its `[target] env` lists, taken from `SOAK_EXTERNAL_ENV`
+# (perf/results/soak-external.env by default) and removed when the run ends. The `logit` service's `environment:` passes each variable scenario.py's
 # `EXTERNAL_ENV_PASSED` names, empty when unset.
 #
 # `victoria-metrics` is in the `local` profile, which the driver enables for a local-target
