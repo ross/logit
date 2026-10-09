@@ -236,7 +236,8 @@ The wire carries no data-source names, so records are named as follows:
 | not in the configured files, or no `types_db:` configured at all | index naming, no diagnostic: a type missing from `types.db` is routine |
 
 Index naming is `<plugin>.<type>` for a single-source list and `<plugin>.<type>.<i>` (0-based)
-otherwise.
+otherwise. Every name carries at most the first 127 bytes of `<plugin>` and of `<type>`, the
+longest collectd's own receiver takes; the `collectd.*` attributes keep every byte.
 
 **A protocol-namespaced attribute is not the default for a new codec.** A codec adds one only when
 the wire says something the model would otherwise throw away or reinterpret. The Graphite/Carbon
