@@ -1,0 +1,27 @@
+name: Publish CI image
+
+# Manual only (docs/adr/ci-image-on-ghcr.md). Builds the `ci` stage of Dockerfile.dev and pushes it
+# to `ghcr.io/ross/logit-ci`, tagged by Dockerfile.dev's hash; an existing tag is never
+# overwritten. Run it when Dockerfile.dev changes, from the Actions tab or
+# `gh workflow run "Publish CI image" --ref <branch>`, then set ci.yml's container image to the
+# tag it prints.
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # No `container:`: this job needs the runner's own Docker daemon, as publish.yml does.
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DOCKER: docker
+      IMAGE_PUSH: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - run: ./script/ci-image

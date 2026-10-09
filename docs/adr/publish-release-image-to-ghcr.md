@@ -1,6 +1,6 @@
 ---
 created: 2026-09-22
-updated: 2026-09-22
+updated: 2026-10-09
 ---
 
 # Publish the release image to GHCR, `latest` only, on manual dispatch
@@ -59,3 +59,9 @@ runners don't support docker-in-docker out of the box.
   via `script/image`.
 - Nothing in CI builds or smoke-tests the production `Dockerfile` outside of this manual publish —
   `script/cibuild` still doesn't touch it (`docs/known-gaps/runtime.md`).
+
+## Amendment (2026-10-09): a second package for CI
+
+[ADR `ci-image-on-ghcr`](ci-image-on-ghcr.md) publishes a second package, `ghcr.io/ross/logit-ci`,
+with the same registry, `GITHUB_TOKEN` login, and manual-dispatch posture. It differs in its tag:
+the hash of `Dockerfile.dev`, never overwritten, where this image keeps the mutable `latest`.

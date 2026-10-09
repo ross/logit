@@ -1,11 +1,12 @@
 # syntax=docker/dockerfile:1
 # Development and build image for logit: the container contributors build and test in, so the host
 # needs no Rust or LuaJIT build deps. The production runtime image is Dockerfile.
-FROM rust:1.98.1-bookworm
-
-ARG USERNAME=dev
-ARG USER_UID=1000
-ARG USER_GID=1000
+#
+# Two stages. `ci` is the toolchain and is what CI runs: `script/ci-image` publishes it to
+# ghcr.io/ross/logit-ci, tagged by this file's hash (docs/adr/ci-image-on-ghcr.md). Any edit to
+# this file, comments included, changes that tag and needs a republish. `dev` adds the host-matched
+# user and is what compose.yaml builds.
+FROM rust:1.98.1-bookworm AS ci
 
 # Build deps for the vendored LuaJIT build (mlua "vendored" feature) and general native-dep builds.
 # tzdata: named time zones in a `timestamp` component read /usr/share/zoneinfo
@@ -42,6 +43,17 @@ RUN --mount=type=cache,id=logit-dev-cargo-registry,target=/usr/local/cargo/regis
     --mount=type=cache,id=logit-dev-cargo-tools-target,target=/tmp/cargo-tools-target,sharing=locked \
     CARGO_TARGET_DIR=/tmp/cargo-tools-target \
     cargo install cargo-audit --version ${CARGO_AUDIT_VERSION} --locked
+
+# Records which Dockerfile.dev hash this image was built from, for `script/ci-image check`. Last in
+# the stage so the changing build arg never invalidates the tool layers above.
+ARG CI_IMAGE_SOURCE=unset
+RUN echo "${CI_IMAGE_SOURCE}" > /etc/logit-ci-image
+
+FROM ci AS dev
+
+ARG USERNAME=dev
+ARG USER_UID=1000
+ARG USER_GID=1000
 
 # Match the host user (see compose.yaml `user: "1000:1000"`) so bind-mounted files written from
 # inside the container come back owned by the host account, not root.
