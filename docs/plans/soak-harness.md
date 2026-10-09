@@ -1330,12 +1330,94 @@ What W4 measured without a run:
   rows; a 24-hour directory went from 135 s and 1,935 MiB to 13 s and 678 MiB. The recorded
   W1b, W2, and W3 runs score the same rows, every detail included, before and after.
 
-### W5: an external Datadog target (no run yet)
+### W5: an external Datadog target (2026-10-09)
 
-No `statsd-datadog` run has been made: it needs a Datadog API key in
-`perf/results/soak-external.env`, and the first run is the repository owner's. It's recorded here
-with the commit, image tags, host, the Datadog site, the verbatim `results.md` table, and what
-the org showed for the `logit.soak.requests_*` series, which the harness itself doesn't query.
+Run `20261009T155153Z`: `SOAK_SKIP_IMAGE=1 script/soak run statsd-datadog`, the scenario's own
+14 minutes, from `soak/w5` at `7a496043` with no modified paths, against a real org on
+Datadog's default site (`datadoghq.com`, US1), on a 32-core host (`logit:soak`
+`sha256:549cfaa6d1ee`, `logit-soak-netem:local` `sha256:75afae37640e`). The 8-hour
+`random-faults` run was on the same host and daemon throughout. Overall PASS: every row passed
+but `ledger.egress` and `ledger.windows`, which an external target SKIPs.
+
+The five faults, as `timeline.jsonl` recorded them (offsets in seconds from the start; each
+applied and reverted on schedule with `rc` 0, in under 0.4 s):
+
+| Step | Offset | Action | Service | Args | Duration |
+|---|---|---|---|---|---|
+| c0s1 | 60 | netem | logit | `delay 300ms 100ms` | 90 s |
+| c0s2 | 240 | netem | logit | `loss 20%` | 60 s |
+| c0s3 | 390 | partition | logit | | 60 s |
+| c0s4 | 540 | pause | logit | | 30 s |
+| c0s5 | 660 | kill | logit | | 30 s |
+
+The rows of `results.md` (the `ledger.sent` detail trimmed to its headline numbers and per-life identities):
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 10 apply/revert action(s) returned 0; 2 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 3 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (1 kill(s)) |
+| `restarts` | PASS | 1 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 3 sink fault line(s) inside fault windows, 0 outside, 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 128 health sample(s) healthy outside fault windows; 2 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 8 30s window(s) with deliveries outside fault windows; no freshness samples (external target: no backend query); 210s of 780s after warmup judged (27%; WARN under 5%) |
+| `rss_slope` | PASS | MiB/h per service/life: logit/0 +10.0, logit/1 -4.5, generator/0 -10.5 (limit 64); logit 260s of 780s after warmup judged (33%; WARN under 5%); generator 260s of 780s after warmup judged (33%; WARN under 5%) |
+| `fd_slope` | PASS | warmup median -> end: logit 15->15, generator 11->11 (limit +8) |
+| `ledger.wire` | PASS | G 1,645,600 = W 1,582,621 + K 59,779 + wire 3,200 (by design: 3,322 in UDP-affecting windows, -57 steady, -66 at the end; steady loss judged 78, each run at 0 or more, against limit 700); the generator's counted drop_newest loss, not in G: 46,500 event(s) in 465 batch(es) |
+| `ledger.intake` | PASS | final life 1: W − D 360,100 vs E + B 360,100; life 0: W − D − B − Ab 0 within [0, R] (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.edge` | PASS | final life 1: E 360,100 == A 360,100 (listener to aggregate) |
+| `ledger.aggregate` | PASS | final life 1: Ab 360,100 == A 360,100 (every event absorbed) |
+| `ledger.egress` | SKIP | external target: no backend query; ledger.sent judges the sink |
+| `ledger.windows` | SKIP | external target: no backend query |
+| `ledger.replay` | PASS | life 1's first drain replayed 0 vs killed life 0's last-drain buffer.batches 1 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 1: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V SKIP (external target: no backend query); wire G − (W + K) 3,200 over the run, by design |
+| `ledger.sent` | PASS | SENT to datadog: every batch received ended in an accepted response; requests 2xx 74, network_error 9; records accepted 7,400; life 0 at +659s: received 60 vs delivered 59 + dropped 0 + buffer.batches 1, gap 0; life 1 at +865s: received 15 vs delivered 15 + dropped 0 + buffer.batches 0, gap 0 |
+| `identity.sink` | PASS | final life 1 at +865s: received 15 vs delivered 15 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `recovery` | PASS | 5 of 5 fault(s) judged, each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect.no-drop-delay` | PASS | delta of logit.component.batches.dropped{component=datadog} on logit, through c0s1: c0s1 (+60s, +195s]: 0 (over 27 drain(s)), want <= 0 |
+| `expect.no-drop-loss` | PASS | delta of logit.component.batches.dropped{component=datadog} on logit, through c0s2: c0s2 (+240s, +345s]: 0 (over 21 drain(s)), want <= 0 |
+| `expect.no-drop-partition` | PASS | delta of logit.component.batches.dropped{component=datadog} on logit, through c0s3: c0s3 (+390s, +495s]: 0 (over 21 drain(s)), want <= 0 |
+| `expect.no-drop-pause` | PASS | delta of logit.component.batches.dropped{component=datadog} on logit, through c0s4: c0s4 (+540s, +615s]: 0 (over 15 drain(s)), want <= 0 |
+| `expect.no-drop-kill` | PASS | delta of logit.component.batches.dropped{component=datadog} on logit, through c0s5: c0s5 (+660s, +735s]: 0 (over 8 drain(s)), want <= 0 |
+| `expect.retrying-clears` | PASS | last of logit.component.retrying{component=datadog} on logit, after c0s3: c0s3 (+450s, +495s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
+| `expect.no-stale-partition` | PASS | delta of logit.output.records.dropped{component=datadog, reason=stale} on logit, through c0s3: c0s3 (+390s, +495s]: 0 (over 21 drain(s)), want <= 0 |
+| `expect.no-stale-kill` | PASS | delta of logit.output.records.dropped{component=datadog, reason=stale} on logit, through c0s5: c0s5 (+660s, +735s]: 0 (over 8 drain(s)), want <= 0 |
+| `expect.no-torn-tail` | PASS | delta of logit.component.buffer.disk.truncated{component=datadog} on logit, through c0s5: c0s5 (+660s, +735s]: 0 (over 8 drain(s)), want <= 0 |
+
+What the run showed:
+
+- **`datadog_out` held through every fault and dropped nothing.** `batches.dropped` stayed 0
+  through the netem delay and loss, the 60 s partition, the 30 s pause, and the kill; no record
+  dropped `stale` through the partition or the kill; and the spool truncated no torn tail at the
+  restart. The sink sent 74 requests that answered `2xx`, 7,400 series records accepted (100
+  series per 10 s window), and its per-life identity balanced in both lives: life 0 at +659 s
+  received 60 against 59 delivered and 1 queued, and life 1 at +865 s received 15 against 15
+  delivered. The end sequence's `sink_drained` phase held with `buffer.batches` 0 after 26.8 s.
+- **The nine `network_error` requests were the partition's.** All nine fall in drains reported
+  from +413 s to +443 s, inside the partition's window (+390 s to +450 s); the sink logged one
+  `retrying` line (`operation timed out`) and one `recovered` line 1.3 s after the revert, and
+  `retrying` read 0 afterward. Neither netem step produced a failed request: TCP absorbed the
+  delay and the 20% loss.
+- **The kill replayed nothing, against one batch queued.** The killed life's last drain read
+  `buffer.batches` 1 and the next life replayed 0, inside the one batch in flight
+  `ledger.replay` allows: that batch was sent between the drain and the kill. As in W4, the sink
+  was idle at the kill, so this run doesn't exercise a non-zero replay; `spool-kill-replay`
+  remains the replay test.
+- **`ledger.sent`'s evidence ends at the `2xx`.** The harness doesn't query Datadog, so it
+  can't see a point the intake accepted and later discarded, and this entry doesn't record what
+  the org showed for the `logit.soak.requests_*` series.
+- **Wire loss was 3,200, inside UDP-affecting windows.** Those windows lost 3,322, almost all
+  of it (3,235) in the kill's window; the steady buckets summed to −57 and the end to −66,
+  interpolation error at the bucket edges. The SUT's kernel counted 59,779 receive-buffer drops
+  (K), reported at the end of the pause. Separately, the generator's `statsd_out` counted
+  46,500 events dropped `overflow_newest` (465 batches) in drains reported from +429 s to
+  +454 s: in the partition
+  it couldn't resolve `logit`, its queue filled, and it dropped the newest. Both counts are
+  outside the uncounted total, which was 0 in both lives.
+- **RSS slopes were −10.5 to +10.0 MiB/h per life** (limit 64), over short judged spans (100 s
+  to 640 s), and file descriptors stayed flat (logit 15 to 15, generator 11 to 11).
+- **Readiness after the unpause and the restart was 0.1 s**, and all 128 health samples outside
+  fault windows were healthy.
 
 ## Verification
 
