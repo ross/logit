@@ -882,14 +882,19 @@ What the runs showed about `logit`:
   which the receive queue went from full to empty and the chain unblocked; that drain read 99,921
   datagrams. [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md) says the socket keeps
   being read while the downstream is stalled, and through the stop it was: the drops came from
-  the unblock, not the stall. The loss is counted (K in `ledger.wire`, which PASSed). A pause
-  of the read loop of a few milliseconds, while the decode loop drained 10,000 queued datagrams
-  into `aggregate`, would explain it at 20,000 datagrams a second; that cause is an inference,
-  not verified. [`docs/known-gaps/intake.md`](../known-gaps/intake.md)'s "UDP intake" entry "A
-  `drop_oldest` UDP listener takes kernel drops in the drain where a blocked downstream unblocks"
-  records it. `expect.no-kernel-drops` FAILs on it by design, and keeps failing until that entry
-  closes. The first run of this scenario, `20261008T223523Z` at a 10 s window, read 0, but its
-  stop never reached the listener, so it shows nothing about an unblock.
+  the unblock, not the stall. The loss is counted (K in `ledger.wire`, which PASSed). The first
+  run of this scenario, `20261008T223523Z` at a 10 s window, read 0, but its stop never reached
+  the listener, so it shows nothing about an unblock.
+
+  Resolved: the decode loop drained the backlog in one poll while the read loop went unpolled,
+  and PR #596 makes `decode_loop` yield after 16 consecutive full pops
+  ([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)'s
+  "Amendment: a backlog drain starves the reader, and the one yield it needed (2026-10-09)").
+  Four runs of this scenario against the fixed binary read 0 kernel drops with every row passing:
+  `20261009T003527Z` and `20261009T141302Z` from the fix's own branch, and `20261009T152642Z` and
+  `20261009T153202Z` from an image rebuilt with no cache from the merged `soak/w2` tree. An
+  intermediate run, `20261009T151548Z` (45 drops), ran an image the record can't tie to the fix,
+  so it isn't counted.
 - **A small `max_batches` doesn't make a 90 s outage reach the listener at 10 s windows.**
   `aggregate` sends one batch per window, and the sink's inbox holds 64 batches
   (`CHANNEL_CAPACITY` in `crates/logit-pipeline/src/runtime.rs`) between `aggregate` and the
