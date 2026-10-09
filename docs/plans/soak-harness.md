@@ -1125,8 +1125,9 @@ of increments between the VictoriaMetrics stop and the kill.
 Run `20261009T135848Z`: `SOAK_SKIP_IMAGE=1 script/soak run random-faults`, the scenario's own
 1 hour and seed 20261009 (14 faults), from `soak/w4` at `82a0448f` on W1a's images
 (`logit:soak` `sha256:78a95c90bb4a`, VictoriaMetrics v1.152.0) on a 32-core host. Overall PASS, and
-every row passed. A first attempt died at the signal self-test because `nohup` leaves `SIGINT`
-ignored in the shell; `82a0448f` sets the inherited dispositions in the self-test itself.
+every row passed. A first attempt died at the signal self-test because `nohup` hands the run
+an ignored `SIGHUP`, which the self-test's "default" case assumed was not; `82a0448f` has the
+self-test set the inherited dispositions itself.
 
 The drawn schedule (offsets in seconds from the start; `r8` reverted 1.2 s late and `r2` applied
 1.2 s late, both while the driver was busy with the previous step):
