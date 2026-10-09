@@ -71,7 +71,9 @@
 //! Oversize is **recoverable**: a line past the driver's 64 KiB
 //! [`MAX_FRAME_BYTES`](logit_proto::framing::MAX_FRAME_BYTES) is dropped, counted once as
 //! `logit.input.frames.dropped{reason="oversize"}`, and the connection resynchronizes at the next
-//! `LF`. `graphite_in` makes the same call for carbon plaintext
+//! `LF`. A line that crossed the bound before its `LF` arrived counts `reason="drained"` in place
+//! of `oversize`: the connection then discards input until its next `LF`, which a sender that never
+//! sends one keeps it doing. `graphite_in` makes the same call for carbon plaintext
 //! (`docs/adr/graphite-carbon-relay.md`): one pathological line must not cost every other metric
 //! on the connection, and an LF-delimited stream has an unambiguous resync point. There is **no
 //! `max_line_bytes` field**: unlike carbon, no statsd server has such a knob for an operator to
@@ -84,7 +86,8 @@
 //! `logit.input.receive_buffer.bytes`, and the driver's `bad_datagram` for a whole-datagram decode
 //! failure. Under `transport: tcp`: `logit.input.connections` (gauge),
 //! `logit.input.connections.rejected{reason="limit"}`, `logit.input.frames`/`.frame.bytes` (one
-//! frame is one statsd line), `logit.input.frames.dropped{reason="oversize"|"truncated"}`,
+//! frame is one statsd line),
+//! `logit.input.frames.dropped{reason="oversize"|"drained"|"truncated"}`,
 //! `logit.component.receive.flushed{reason}` from the per-connection batch assembly, and
 //! `framing_error`/`connection_error` diagnostics. `unix` reports what `udp` does, but a full
 //! Unix datagram queue blocks or refuses the sender instead of dropping, so

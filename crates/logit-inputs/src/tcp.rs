@@ -1179,7 +1179,7 @@ where
                     // Its own diagnostic key, not `connection_error`: the cause is the peer's
                     // framing, not I/O.
                     report_frame_error(&err, &telemetry, diag);
-                    // A non-fatal error (`FrameError::OversizeSkipped`) has already resynchronized
+                    // A non-fatal error (`OversizeSkipped`, `Drained`) has already resynchronized
                     // the framer: it dropped one line and either consumed its terminator or
                     // latched the drain state that will.
                     if !err.is_fatal() {

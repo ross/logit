@@ -767,7 +767,9 @@ pub enum ComponentKind {
     /// Under `transport: tcp` a message is one LF-delimited line; there is no `framing:` field
     /// and no octet-counted alternative, because a statsd line may begin with a digit. A line
     /// longer than 64 KiB is dropped and counted (`logit.input.frames.dropped{reason="oversize"}`);
-    /// the connection stays open and the next line still decodes.
+    /// the connection stays open and the next line still decodes. A line that passed 64 KiB before
+    /// its newline arrived counts `reason="drained"` instead: the connection discards input until
+    /// its next newline.
     ///
     /// `tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS
     /// listener. It applies to `transport: tcp` only and is rejected under any other transport.
@@ -1012,7 +1014,9 @@ pub enum ComponentKind {
         /// The longest line this listener accepts, not counting its `\n`, under every transport.
         /// A longer line is dropped and counted once as
         /// `logit.input.frames.dropped{reason="oversize"}`, and the line after it still decodes; a
-        /// stream connection skips to the next newline and stays open. A byte-count string
+        /// stream connection skips to the next newline and stays open, and counts
+        /// `reason="drained"` instead when the line passed this bound before its newline arrived,
+        /// because it discards input until that newline. A byte-count string
         /// (`"65536"`, `"64KiB"`). Defaults to `"64KiB"`; `0` is rejected.
         #[serde(default = "default_lines_max_line_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
@@ -1181,9 +1185,10 @@ pub enum ComponentKind {
         #[serde(default)]
         proxy_protocol: bool,
         /// The longest plaintext line this listener assembles before dropping it and draining to
-        /// the next newline (counted once as `logit.input.frames.dropped{reason="oversize"}`; the
-        /// line after it still decodes). A byte-count string (`"8192"`, `"16KiB"`). Defaults to
-        /// `"8192"`, past any real tagged path while keeping one hostile connection from growing
+        /// the next newline (counted once as `logit.input.frames.dropped{reason="oversize"}`, or
+        /// `reason="drained"` when the line passed this bound before its newline arrived; the line
+        /// after it still decodes). A byte-count string (`"8192"`, `"16KiB"`). Defaults to
+        /// `"8192"`, past any real tagged path while keeping one runaway connection from growing
         /// an unbounded read buffer. `0` is rejected. TCP plaintext only; a UDP datagram is its
         /// own frame.
         #[serde(default = "default_graphite_max_line_bytes", with = "human_bytes")]

@@ -120,10 +120,10 @@ impl Framing {
 
 /// Why [`Framer`] could not produce the next frame.
 ///
-/// All but [`FrameError::OversizeSkipped`] are fatal *to the connection*
-/// ([`FrameError::is_fatal`]), so the driver counts, diagnoses, and closes: an untrusted octet
-/// count leaves no way to find the next frame, a declared length past the ceiling has nothing
-/// buffered after it, and a line past the ceiling would only get longer.
+/// All but [`FrameError::OversizeSkipped`] and [`FrameError::Drained`] are fatal *to the
+/// connection* ([`FrameError::is_fatal`]), so the driver counts, diagnoses, and closes: a corrupt
+/// octet count leaves no way to find the next frame, a declared length past the ceiling has
+/// nothing buffered after it, and a line past the ceiling would only get longer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
     /// A frame larger than this listener's frame bound -- a declared octet count or length prefix
@@ -137,29 +137,39 @@ pub enum FrameError {
     /// length promised are missing; under [`FramingMode::Lines`], a non-whitespace remainder has
     /// no `LF`. Nothing was wrong with what the peer sent; it stopped. See [`Framer::finish`].
     Truncated(String),
-    /// One line past the frame bound under [`Oversize::DrainToNextLine`]: dropped, counted, and
-    /// resynchronized at the next `LF`. The one **non-fatal** variant: the connection stays open
-    /// and the next line still decodes.
+    /// One line past the frame bound under [`Oversize::DrainToNextLine`] whose `LF` was already
+    /// buffered, or that the peer closed on: dropped and counted, and the next line frames with
+    /// no drain state. **Non-fatal**: the connection stays open and the next line still decodes.
     OversizeSkipped(String),
+    /// One line that crossed the frame bound under [`Oversize::DrainToNextLine`] with no `LF`
+    /// buffered: dropped and counted once, and the framer then discards every byte up to and
+    /// including the connection's next `LF`. **Non-fatal**, like `OversizeSkipped`, but its own
+    /// reason: a connection that never sends another `LF` (a binary protocol pointed at a line
+    /// port) discards input for its whole life, and this is what tells it apart from one long
+    /// line that ended.
+    Drained(String),
 }
 
 impl FrameError {
     /// The `reason` tag on `logit.input.frames.dropped`
     /// (`docs/design/internal-telemetry.md`'s "Naming" section). `OversizeSkipped` shares
     /// `oversize` with its fatal sibling: the operator cares that a frame was too big, and
-    /// `is_fatal` says whether the connection survived.
+    /// `is_fatal` says whether the connection survived. `Drained` is `drained`.
     pub fn reason(&self) -> &'static str {
         match self {
             FrameError::Oversize(_) | FrameError::OversizeSkipped(_) => "oversize",
+            FrameError::Drained(_) => "drained",
             FrameError::Malformed(_) => "malformed",
             FrameError::Truncated(_) => "truncated",
         }
     }
 
-    /// Whether this error ends the connection. Only [`FrameError::OversizeSkipped`] does not:
-    /// every other variant leaves the framer with no trustworthy resync point.
+    /// Whether this error ends the connection. [`FrameError::OversizeSkipped`] and
+    /// [`FrameError::Drained`] do not, because each leaves the framer resynchronized (the
+    /// terminator consumed, or the drain state latched); every other variant leaves it with no
+    /// trustworthy resync point.
     pub fn is_fatal(&self) -> bool {
-        !matches!(self, FrameError::OversizeSkipped(_))
+        !matches!(self, FrameError::OversizeSkipped(_) | FrameError::Drained(_))
     }
 }
 
@@ -169,7 +179,8 @@ impl std::fmt::Display for FrameError {
             FrameError::Oversize(detail)
             | FrameError::Malformed(detail)
             | FrameError::Truncated(detail)
-            | FrameError::OversizeSkipped(detail) => f.write_str(detail),
+            | FrameError::OversizeSkipped(detail)
+            | FrameError::Drained(detail) => f.write_str(detail),
         }
     }
 }
@@ -198,7 +209,8 @@ pub struct Framer {
     scanned: usize,
     /// Set when a line passed the bound with no `LF` under [`Oversize::DrainToNextLine`]:
     /// everything up to and including the next `LF` belongs to that abandoned line and is
-    /// discarded uncounted (the skip was counted once, when the bound was crossed).
+    /// discarded uncounted (the line was counted once, as [`FrameError::Drained`], when the bound
+    /// was crossed).
     draining: bool,
     /// Whether this connection has ever produced a byte: the first-byte deadline's predicate
     /// ([`Self::first_byte_seen`]).
@@ -331,9 +343,9 @@ impl Framer {
     ///
     /// So under every framing a clean FIN and an abrupt RST agree about the same bytes: the
     /// stream driver's `ReadStep::Eof` arm routes this `Err` through `report_frame_error`, and
-    /// its `report_buffered_tail` reports the RST case identically
-    /// (`crates/logit-inputs/src/tcp.rs`). The one case with no counter
-    /// either way is a drain in progress, whose bytes were counted when the bound was crossed.
+    /// its `report_buffered_tail` reports the RST case through [`Framer::abandon`], which shares
+    /// this method's blank-remainder rule (`crates/logit-inputs/src/tcp.rs`). Neither counts a
+    /// drain in progress, whose line was counted `drained` when it crossed the bound.
     pub fn finish(&mut self) -> Result<Option<Bytes>, FrameError> {
         if self.buf.is_empty() {
             return Ok(None);
@@ -477,9 +489,9 @@ impl Framer {
                         self.buf.clear();
                         self.scanned = 0;
                         self.draining = true;
-                        FrameError::OversizeSkipped(format!(
+                        FrameError::Drained(format!(
                             "a line reached {held} bytes with no LF, over the {bound}-byte bound; \
-                             skipping it and draining to the next newline"
+                             skipping it, and this connection discards input until its next LF"
                         ))
                     }
                 });
@@ -902,7 +914,7 @@ mod tests {
         // Past the bound with no terminator: abandon the line and discard until its `LF`.
         framer.push(&[b'x'; 40]);
         let err = framer.next_frame().expect_err("40 bytes with no LF is past the 16-byte bound");
-        assert_eq!(err.reason(), "oversize", "{err}");
+        assert_eq!(err.reason(), "drained", "{err}");
         assert!(!err.is_fatal(), "a line protocol resynchronizes at the next LF: {err}");
         assert_eq!(framer.next_frame(), Ok(None), "still draining, nothing to hand over");
 
@@ -921,6 +933,41 @@ mod tests {
         assert_eq!(err.reason(), "oversize", "{err}");
         assert!(!err.is_fatal(), "{err}");
         assert_eq!(push_and_drain(&mut terminated, b""), vec!["survivor"]);
+    }
+
+    /// Only a line that enters the drain state counts `drained`; a line whose `LF` is buffered, a
+    /// remainder the peer closed on, and `Oversize::Fatal` keep `oversize`.
+    #[test]
+    fn only_a_line_that_enters_the_drain_state_counts_drained() {
+        let drain = FramingMode::Lines { oversize: Oversize::DrainToNextLine };
+
+        let mut crossing = Framer::new(drain, 16);
+        let err = push_and_expect_error(&mut crossing, &[b'x'; 17]);
+        assert_eq!(err, FrameError::Drained(err.to_string()));
+        assert_eq!(err.reason(), "drained");
+        assert!(!err.is_fatal(), "{err}");
+        assert!(err.to_string().contains("discards input until its next LF"), "{err}");
+        // Many more pushes without an `LF` are the same dropped line: nothing more is counted.
+        for _ in 0..64 {
+            assert_eq!(push_and_drain(&mut crossing, &[b'y'; 100]), Vec::<String>::new());
+            assert_eq!(crossing.buffered(), 0, "the drain holds nothing");
+        }
+        assert_eq!(push_and_drain(&mut crossing, b"tail\nnext\n"), vec!["next"]);
+
+        let mut terminated = Framer::new(drain, 16);
+        let err = push_and_expect_error(&mut terminated, b"0123456789abcdefg\n");
+        assert_eq!(err.reason(), "oversize", "the LF was buffered, so no drain: {err}");
+        assert!(!err.is_fatal(), "{err}");
+
+        let mut closed = Framer::new(drain, 16);
+        closed.push(&[b'x'; 17]);
+        let err = closed.finish().expect_err("a remainder over the bound at EOF is dropped");
+        assert_eq!(err.reason(), "oversize", "a closed connection drains nothing: {err}");
+
+        let mut fatal = Framer::new(FramingMode::Lines { oversize: Oversize::Fatal }, 16);
+        let err = push_and_expect_error(&mut fatal, &[b'x'; 17]);
+        assert_eq!(err.reason(), "oversize", "{err}");
+        assert!(err.is_fatal(), "{err}");
     }
 
     /// Under `Lines` an unterminated remainder at a clean EOF is truncated, unlike under

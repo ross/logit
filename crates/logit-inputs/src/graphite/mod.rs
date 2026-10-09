@@ -61,7 +61,7 @@
 //! | Protocol | Frame | Over the bound |
 //! |---|---|---|
 //! | plaintext, UDP | the datagram | nothing to bound: a datagram is already one read |
-//! | plaintext, TCP | [`FramingMode::Lines`] with [`Oversize::DrainToNextLine`]: one `\n`-delimited line (a trailing `\r` stripped) per `decode_into` | a line past `max_line_bytes` is dropped and counted **once** as `logit.input.frames.dropped{reason="oversize"}`; the connection stays open and the next line still decodes |
+//! | plaintext, TCP | [`FramingMode::Lines`] with [`Oversize::DrainToNextLine`]: one `\n`-delimited line (a trailing `\r` stripped) per `decode_into` | a line past `max_line_bytes` is dropped and counted **once** as `logit.input.frames.dropped{reason="oversize"}`, or `reason="drained"` if it crossed the bound before its `\n` arrived, so the connection discards input until its next `\n`; the connection stays open and the next line still decodes |
 //! | pickle, TCP | [`FramingMode::LengthPrefixed`]: a 4-byte big-endian length prefix then that many payload bytes, handed to `decode_into` unframed | a frame declaring more than `max_frame_bytes` **closes the connection** (`logit.input.frames.dropped{reason="oversize"}`, diagnostic `framing_error`): a length-framed stream has no resync point |
 //!
 //! A pickle payload that fails to decode (a disallowed opcode, a depth or item cap) drops that
@@ -721,16 +721,24 @@ mod tests {
         running.handle.abort();
     }
 
-    /// A line past `max_line_bytes` is counted once and the next line still decodes.
+    /// A line past `max_line_bytes` that crosses it with no `LF` is counted once as `drained`, and
+    /// the next line still decodes.
     #[tokio::test]
     async fn an_oversize_tcp_line_is_skipped_and_the_next_one_still_decodes() {
         let mut running =
             start(|input| input.with_max_line_bytes(64), Transport::Tcp, Protocol::Plaintext).await;
+        let mut probe = TelemetryProbe::with_registry(running.registry.clone());
         let mut stream = running.connect().await;
         let long_path = "x".repeat(200);
         stream.write_all(long_path.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The count proves the framer crossed the bound with no `LF` buffered, so the rest of
+        // the line lands in the drain.
+        probe
+            .wait_for("the line counted drained", |t| {
+                t.sum("logit.input.frames.dropped", &[("reason", "drained")]) >= 1.0
+            })
+            .await;
         stream.write_all(format!(" 1 {TIMESTAMP}\n").as_bytes()).await.unwrap();
         stream.write_all(line("after.oversize").as_bytes()).await.unwrap();
 
@@ -738,14 +746,14 @@ mod tests {
         assert_eq!(batch.events.len(), 1, "only the survivor is delivered");
         assert_eq!(resolve(batch.events[0].metrics[0].name), "after.oversize");
 
-        let drained = running.registry.drain(0);
         assert_eq!(
-            metric_sum(&drained, "logit.input.frames.dropped", Some(("reason", "oversize"))),
+            probe.sum("logit.input.frames.dropped", &[("reason", "drained")]),
             1.0,
             "counted once when the bound was crossed, not once per byte drained"
         );
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]), 0.0);
         assert_eq!(
-            metric_sum(&drained, "logit.component.diagnostics", Some(("key", "framing_error"))),
+            probe.sum("logit.component.diagnostics", &[("key", "framing_error")]),
             1.0,
             "and diagnosed on the driver's own framing key"
         );
