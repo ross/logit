@@ -134,12 +134,13 @@
 //!
 //! ## Leniencies
 //!
-//! Each of these reads a line as RFC 5424 where the RFC grammar wouldn't, and loses nothing doing
-//! so. Every other departure from the RFC 5424 grammar above fails the RFC 5424 parse, and the
-//! line falls back to RFC 3164 ("Dialect disambiguation"). Only a malformed PRI rejects a line,
-//! as a throttled `bad_line`.
+//! Each of these accepts a header the RFC grammar wouldn't. All but the first keep every byte of
+//! the line. Every other departure from the RFC 5424 grammar above fails the RFC 5424 parse, and
+//! the line falls back to RFC 3164 ("Dialect disambiguation"). Only a malformed PRI rejects a
+//! line, as a throttled `bad_line`.
 //!
 //! - **RFC 5424 header.**
+//!   - VERSION is any one digit, `0` included, and isn't kept: `syslog_out` writes `1`.
 //!   - An empty field (two spaces in a row) is read as nil: HOSTNAME, APP-NAME, PROCID, and MSGID
 //!     stamp nothing, and TIMESTAMP is `Value::Null`.
 //!   - Field lengths aren't checked. RFC 5424 caps HOSTNAME at 255 bytes, APP-NAME at 48, PROCID at

@@ -472,7 +472,7 @@ fn message_value(line: &Bytes, msg: &[u8], strip_bom: bool) -> Value {
 }
 
 /// One STRUCTURED-DATA grammar violation. `offset` is relative to [`parse_structured_data`]'s
-/// input; the caller adds its base for the `bad_line` message.
+/// input; the caller adds its base for the `sniff_fallback` message.
 #[derive(Debug)]
 struct SdError {
     offset: usize,
@@ -677,9 +677,9 @@ fn parse_5424(
     let mut attrs = AttrMap::new();
     attrs.insert_sym(KEYS.facility, Value::U64(facility as u64));
     attrs.insert_sym(KEYS.severity, Value::U64(severity_num as u64));
-    // Nil or empty is an explicit `Value::Null`; unparseable rejects the line like a bad PRI;
-    // parseable but out of `i64`-nanosecond range keeps the event without the attribute (`super`'s
-    // module doc).
+    // Nil or empty is an explicit `Value::Null`; unparseable fails the RFC 5424 parse, so the line
+    // falls back to RFC 3164; parseable but out of `i64`-nanosecond range keeps the event without
+    // the attribute (`super`'s module doc).
     match nil_or(ts_field) {
         None => {
             attrs.insert_sym(KEYS.timestamp, Value::Null);

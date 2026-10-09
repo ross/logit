@@ -6,7 +6,8 @@ updated: 2026-10-09
 # RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission
 
 ## Status
-Accepted
+Accepted. Amended 2026-10-09: a line whose RFC 5424 parse fails, STRUCTURED-DATA included, is
+read as RFC 3164 instead of dropped (see the amendment at the end).
 
 ## Context
 
@@ -178,12 +179,13 @@ at all.
   normalized attributes). Already rejected in [ADR `lossless-transit`](lossless-transit.md)'s own
   Alternatives: it goes stale the instant a transform touches the event, doubles memory for every
   event carrying it, and answers "what bytes arrived" rather than "does the information survive."
-- **Lenient SD parsing that tolerates grammar errors** (skip a malformed element rather than
-  reject the line, or accept an SD-NAME outside the 32-byte limit). Rejected on two grounds:
-  consistency with every other RFC 5424 field this dialect already parses strictly (a bad
-  TIMESTAMP fails the whole RFC 5424 parse, not only the field), and a lenient parse can't be
-  inverted exactly — `syslog_out` would have no faithful way to re-emit whatever was tolerated,
-  breaking the byte-faithful relay this convention exists to enable.
+- **Lenient SD parsing that tolerates grammar errors**: skip a malformed element and keep the
+  rest of the line as RFC 5424, or accept an SD-NAME outside the 32-byte limit. Still rejected
+  on two grounds: consistency with every other RFC 5424 field this dialect parses strictly (a
+  bad TIMESTAMP fails the whole RFC 5424 parse, not only the field), and a lenient parse can't
+  be inverted, so `syslog_out` would have no faithful way to re-emit whatever was
+  tolerated, breaking the byte-faithful relay this convention exists to enable. The amendment's
+  fallback isn't this: it keeps no partial `syslog.sd`, and reads the whole line as RFC 3164.
 - **Shipping a default private enterprise number** (e.g. RFC 5424's own `32473` example) for the
   opt-in `structured_data` element. Rejected: `32473` was never assigned to this project — silently
   minting SD-ELEMENTs under it would misrepresent their origin to any receiver that looks the PEN
@@ -236,3 +238,24 @@ at all.
   `crates/logit-cli/src/pipeline.rs`'s `SyslogOut` arm is the sole place a config `sd_id` crosses
   into `SyslogEncoder::with_structured_data` and its `anyhow::Result` becomes a config-time error;
   `schema/logit.schema.json` regenerated.
+
+## Amendment (2026-10-09): a failed RFC 5424 parse falls back to RFC 3164
+
+**Decision.** A line that sniffs as RFC 5424 but doesn't parse as one is read as RFC 3164: its
+whole remainder after PRI becomes MSG, unless the RFC 3164 header rule finds a tag in it, and no
+`syslog.sd` is stamped. A throttled `sniff_fallback` diagnostic names the broken rule and its
+byte offset. Only a malformed PRI rejects a line, as `bad_line`.
+
+**Why.** [ADR `deployment-threat-model`](deployment-threat-model.md) requires a real sender's
+line to survive. Python's `SysLogHandler` writes no tag or timestamp, so a message beginning with
+`1 ` arrives as `<14>1 worker died`, which matches the RFC 5424 sniff, fails the parse, and was
+dropped. Telling that line apart from a malformed RFC 5424 line isn't possible from its bytes.
+Either way the line failed the parse and was lost, so keeping it as RFC 3164 costs nothing, and
+the diagnostic still surfaces a malformed RFC 5424 sender.
+
+**What "strict" means now.** The STRUCTURED-DATA grammar under "Parse rules" is as strict as
+before, and a violation still means no `syslog.sd`. What changes is the consequence: a violation
+changes the line's dialect instead of dropping it.
+
+`crates/logit-proto/src/syslog/mod.rs`'s "Dialect disambiguation" holds the rule, and its
+"Leniencies" lists the departures from the grammar that are accepted as RFC 5424.
