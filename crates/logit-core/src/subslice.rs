@@ -94,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_slice_one_past_the_end_is_outside() {
+    fn an_empty_slice_two_past_the_end_is_outside() {
         let backing = *b"hello, world!";
         let base = &backing[..12];
         let past = &backing[13..];

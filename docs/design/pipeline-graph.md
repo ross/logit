@@ -826,7 +826,7 @@ logit-core   logit-config   logit-script
                     logit-cli                        — CLI + the kind → impl registry
 ```
 
-Pure parsers of producer bytes, wire protocols and log-message text alike, live in `logit-proto`
+Pure parsers of producer bytes, wire protocols and log-message text alike, belong in `logit-proto`
 below the impl crates, and a listener or transform wraps one
 ([ADR `parsers-live-in-logit-proto`](../adr/parsers-live-in-logit-proto.md)).
 
