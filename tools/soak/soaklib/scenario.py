@@ -21,9 +21,10 @@ LOGIT_SERVICES = ("logit", "generator")
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
 ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition")
-# Actions that only make sense against a `logit` process: a `kill` exists to end one with no
-# shutdown, and the watchdog judges its exit code only for `logit` services.
-LOGIT_ONLY_ACTIONS = ("kill",)
+# Actions allowed on the SUT only. A `kill` exists to end a `logit` process with no shutdown;
+# on the generator, the lines it sent after its last telemetry drain reach the SUT with no G
+# behind them, and `ledger.wire` would net them against real loss.
+SUT_ONLY_ACTIONS = ("kill",)
 
 # Faults during which a container's network namespace is gone or unusable for a one-shot
 # `docker run --network container:<id>`.
@@ -39,6 +40,7 @@ LEDGER_KEYS = {
     "vm_selector", "generator_input", "generator_sink", "sut_listener", "sut_aggregate",
     "sut_sink", "wire_loss_outside_faults",
 }
+OPTIONAL_LEDGER_KEYS = {"vm_every_window"}
 THRESHOLD_KEYS = {"progress_window", "rss_growth_mib_per_hour", "fd_growth"}
 EXPECT_KEYS = {"name", "service", "metric", "component", "attrs", "step", "window", "reduce",
                "min", "max"}
@@ -64,6 +66,7 @@ METRIC_KINDS = {
     "logit.component.retrying": "gauge",
     "logit.component.buffer.disk.replayed": "sum",
     "logit.component.buffer.disk.segments": "gauge",
+    "logit.component.buffer.disk.truncated": "sum",
 }
 _EXPECT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _STEP_ID = re.compile(r"^c(\d+)s(\d+)$")
@@ -269,17 +272,17 @@ def from_dict(raw, path):
     configs = raw.get("configs", {})
     ledger = raw.get("ledger", {})
     thresholds = dict(raw.get("thresholds", {}))
-    for table, keys, where in (
-        (configs, CONFIG_KEYS, "configs"),
-        (ledger, LEDGER_KEYS, "ledger"),
-        (thresholds, THRESHOLD_KEYS, "thresholds"),
+    for table, keys, optional, where in (
+        (configs, CONFIG_KEYS, set(), "configs"),
+        (ledger, LEDGER_KEYS, OPTIONAL_LEDGER_KEYS, "ledger"),
+        (thresholds, THRESHOLD_KEYS, set(), "thresholds"),
     ):
         if not isinstance(table, dict):
             problems.append(f"`{where}` must be a table")
             continue
         for key in sorted(keys - set(table)):
             problems.append(f"{where}: missing `{key}`")
-        for key in sorted(set(table) - keys):
+        for key in sorted(set(table) - keys - optional):
             problems.append(f"{where}: unknown key `{key}`")
     if "progress_window" in thresholds:
         thresholds["progress_window"] = dur(thresholds, "progress_window", "thresholds")
@@ -370,6 +373,8 @@ def validate(scenario, duration=None, seed=None):
         problems.append("cycle must be longer than 0s")
     if scenario.thresholds.get("progress_window", 0) <= 0:
         problems.append("thresholds.progress_window must be longer than 0s")
+    if not isinstance(scenario.ledger.get("vm_every_window", False), bool):
+        problems.append("ledger.vm_every_window must be true or false")
 
     for spec in scenario.steps:
         where = f"step {spec.index + 1} ({spec.action or '?'} on {spec.on or '?'})"
@@ -380,8 +385,11 @@ def validate(scenario, duration=None, seed=None):
             problems.append(f"{where}: unknown action `{spec.action}`{hint}")
         if spec.on not in SERVICES:
             problems.append(f"{where}: unknown service `{spec.on}`")
-        elif spec.action in LOGIT_ONLY_ACTIONS and spec.on not in LOGIT_SERVICES:
-            problems.append(f"{where}: {spec.action} is for {' or '.join(LOGIT_SERVICES)} only")
+        elif spec.action in SUT_ONLY_ACTIONS and spec.on != "logit":
+            problems.append(
+                f"{where}: {spec.action} is for logit only: on the generator, the lines it sent "
+                "after its last telemetry drain reach the SUT with no G behind them, so "
+                "ledger.wire would net them against real loss")
         if spec.for_ <= 0:
             problems.append(f"{where}: `for` must be longer than 0s")
         if spec.action == "netem":

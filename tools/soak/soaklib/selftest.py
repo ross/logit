@@ -16,10 +16,13 @@ SKIP every ledger row. For `[[expect]]`, it covers every validation rule and eac
 against a synthetic run: the window's open start, `through` reaching past the revert, a drain
 with no point, a gauge's value in force at the window's start and never across a SUT life,
 attribute filters, a step index across cycles, a step the schedule lacks, and a step whose apply
-failed. For a `kill`, it covers its validation rules, the watchdog around it (exit code 137 only
-inside a scheduled kill, its start, its readiness probe, and the stdout gap it leaves), and a
-three-life run whose middle life ends by a kill: its egress band at both edges, a D with no
-stderr part, and the final life's sink identity counting a spool's replayed batches.
+failed. For a `kill`, it covers its validation rules (the SUT only), the watchdog around it
+(exit code 137 only inside a scheduled kill, its start, its readiness probe, and the stdout gap
+it leaves), and a three-life run whose middle life ends by a kill: its egress band at both
+edges, with and without a residual, a surplus below it and a lost last window above it, a D
+with no stderr part, the final life's sink identity counting a spool's replayed batches,
+`ledger.windows` against lost middle, tail, and head windows, and `ledger.replay` against a
+short replay. `ledger.wire` counts a steady run's surplus as 0.
 """
 
 import copy
@@ -92,8 +95,8 @@ def _rules(root):
                             "args": "delay 10ms", "for": "10s"})
 
     def netem_in_kill(raw):
-        raw["step"].append({"at": "11m10s", "action": "kill", "on": "generator", "for": "20s"})
-        raw["step"].append({"at": "11m20s", "action": "netem", "on": "generator",
+        raw["step"].append({"at": "11m10s", "action": "kill", "on": "logit", "for": "20s"})
+        raw["step"].append({"at": "11m20s", "action": "netem", "on": "logit",
                             "args": "delay 10ms", "for": "5s"})
 
     def kill_vm(raw):
@@ -103,15 +106,26 @@ def _rules(root):
     def kill_generator(raw):
         raw["step"].append({"at": "11m10s", "action": "kill", "on": "generator", "for": "20s"})
 
-    _refused(path, mutate(netem_in_kill), "netem on generator during its kill",
+    def kill_sut(raw):
+        raw["step"].append({"at": "11m10s", "action": "kill", "on": "logit", "for": "20s"})
+
+    _refused(path, mutate(netem_in_kill), "netem on logit during its kill",
              "netem during a kill")
-    _refused(path, mutate(kill_vm), "kill is for logit or generator only",
-             "a kill on victoria-metrics")
+    _refused(path, mutate(kill_vm), "kill is for logit only", "a kill on victoria-metrics")
+    _refused(path, mutate(kill_generator), "with no G behind them", "a kill on the generator")
     try:
-        loaded = scenario.from_dict(mutate(kill_generator), path)
-        expect(loaded.steps[-1].action == "kill", "a kill on the generator loads")
+        loaded = scenario.from_dict(mutate(kill_sut), path)
+        expect(loaded.steps[-1].action == "kill", "a kill on the SUT loads")
     except scenario.ScenarioError as err:
-        expect(False, f"a kill on the generator is refused: {err.problems}")
+        expect(False, f"a kill on the SUT is refused: {err.problems}")
+    _refused(path, mutate(lambda r: r["ledger"].update(vm_every_window="yes")),
+             "ledger.vm_every_window must be true or false", "a non-boolean vm_every_window")
+    try:
+        loaded = scenario.from_dict(mutate(lambda r: r["ledger"].update(vm_every_window=True)),
+                                    path)
+        expect(loaded.ledger["vm_every_window"] is True, "vm_every_window = true loads")
+    except scenario.ScenarioError as err:
+        expect(False, f"vm_every_window = true is refused: {err.problems}")
     expect(set(faults.ACTIONS) == set(scenario.ACTION_NAMES),
            f"faults.ACTIONS and scenario.ACTION_NAMES name the same actions, got "
            f"{sorted(faults.ACTIONS)} vs {sorted(scenario.ACTION_NAMES)}")
@@ -495,7 +509,8 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 life0_dropped=0, life1_dropped=0, steady_loss=0, fault_loss=0, end_extra=0,
                 e1_short=0, a1_short=0, ab1_short=0, late_series=False, receive_util=0.0, slow_after_stop=False, rate_behind=0,
                 undelivered=0, empty_export=False, ab0_short=0, merged_lives=False,
-                empty_sut=False, buffer_batches=0, buffer_util=0.0, **resolved):
+                empty_sut=False, buffer_batches=0, buffer_util=0.0, steady_surplus=0,
+                **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
@@ -532,6 +547,8 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             w //= 2
         if offset == 60:
             w -= steady_loss
+        if offset == 250:
+            w += steady_surplus
         if offset == 135:
             w -= fault_loss
         if offset == 320:
@@ -715,6 +732,11 @@ def _ledger_checks():
         expect(steady["ledger.wire"].status == checks.FAIL,
                f"wire FAILs loss outside UDP-affecting windows past the tolerance, got "
                f"{steady['ledger.wire']}")
+        masked = results("wire-surplus-masks", steady_loss=400, steady_surplus=400)
+        expect(masked["ledger.wire"].status == checks.FAIL
+               and "steady loss judged 350" in masked["ledger.wire"].detail,
+               f"wire FAILs steady loss that a surplus in another steady run would net out, "
+               f"got {masked['ledger.wire']}")
         tolerated = results("wire-tolerated", steady_loss=100)
         expect(tolerated["ledger.wire"].status == checks.PASS,
                f"wire tolerates one batch per steady-run edge, got {tolerated['ledger.wire']}")
@@ -980,22 +1002,32 @@ def _kill_watchdog():
                f"progress doesn't flag the stdout gap a kill leaves, got {result}")
 
 
-# The kill fixture's SUT config: a small R (100 + 67 x 10 = 770), so the band's high side is
-# testable against a 200-lines-per-second run.
-KILL_SUT_CONFIG = "receive: { max_datagrams: 100, batch_max_events: 10 }\n"
+# The kill fixture's SUT config: a small R (100 + 67 x 10 = 770), and the 10 s aggregate
+# interval the band and `ledger.windows` read.
+KILL_SUT_CONFIG = ("components:\n"
+                   "  in: { type: statsd_in, receive: { max_datagrams: 100, "
+                   "batch_max_events: 10 } }\n"
+                   "  window:\n"
+                   "    type: aggregate\n"
+                   "    interval: 10s   # every window\n")
 # Life 0 ends at a stop over +101..+131; life 1 at a kill over +203..+213; life 2 is final.
 KILL_STOP = (101, 131)
 KILL_KILL = (203, 213)
 
 
-def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3):
+def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=None, drop=(),
+              every_window=True, kill_residual=0):
     """A three-life run for the ledger: life 1 ends by a kill. The generator and the SUT move
     `PER_DRAIN` lines per 5 s drain (200/s), and the export samples every 10 s. Lives 0 and 2
-    balance. Life 1's W − D − B − V is `kill_gap`, Ab − V alone, the window the kill discarded;
-    its band is [−1,000, 2,770]: 200/s x the 5 s drain interval below, R 770 + 200/s x the
-    10 s window above. `stray_drop` puts a listener shutdown-drop line inside life 1, which a
-    killed life can't write. Life 2's sink opens a spool holding `replayed` batches life 1
-    queued, and delivers them in its first drain."""
+    balance. Life 1's Ab − V is `kill_gap`, the window the kill discarded; its band is
+    [−1,000, 3,000]: the residual 0 plus 200/s x the 5 s drain interval below, 200/s x the 10 s
+    window plus 200/s x the drain interval above. `stray_drop` puts a listener shutdown-drop
+    line inside life 1, which a killed life can't write. Life 1's last drain shows `queued`
+    batches (default `replayed`), and life 2's sink opens a spool holding `replayed` of them and
+    delivers them in its first drain. `drop` deletes the export's samples at those offsets from
+    every series; `every_window` sets `[ledger] vm_every_window`. `kill_residual` lines are read
+    in the drain before life 1's last and never absorbed."""
+    queued = replayed if queued is None else queued
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -1019,7 +1051,8 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3):
             sut.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
             w = PER_DRAIN if offset <= 300 else 0
             absorbed[life] = absorbed.get(life, 0) + w
-            for metric, value, comp in (("logit.input.datagrams", w, "in"),
+            unabsorbed = kill_residual if life == 1 and offset == offsets[-2] else 0
+            for metric, value, comp in (("logit.input.datagrams", w + unabsorbed, "in"),
                                         ("logit.component.events.sent", w, "in"),
                                         ("logit.component.events.received", w, "window"),
                                         ("logit.transform.metrics.absorbed", w, "window"),
@@ -1030,8 +1063,10 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3):
             if offset == 215 and replayed:
                 sut.append(_line(stamp, "logit.component.buffer.disk.replayed", "sum", replayed,
                                  component="sink"))
-            for metric, comp in (("logit.component.buffer.batches", "sink"),
-                                 ("logit.component.buffer.utilization", "sink"),
+            sut.append(_line(stamp, "logit.component.buffer.batches", "gauge",
+                             queued if offset == offsets[-1] and life == 1 else 0,
+                             component="sink"))
+            for metric, comp in (("logit.component.buffer.utilization", "sink"),
                                  ("logit.component.receive.utilization", "in"),
                                  ("logit.component.retrying", "sink")):
                 sut.append(_line(stamp, metric, "gauge", 0, component=comp))
@@ -1047,7 +1082,8 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3):
                         affects_udp_ingress=True),
                 _ready("c0s2", "logit", KILL_KILL[1] + 1),
                 _phase("end_begin", 300), _phase("end_end", 330)]
-    run_dir = _run_dir(tmp, name, timeline, sut, ledger=LEDGER,
+    ledger = {**LEDGER, "vm_every_window": True} if every_window else LEDGER
+    run_dir = _run_dir(tmp, name, timeline, sut, ledger=ledger,
                        configs={"sut": "logit-sut.yaml"})
     (run_dir / "configs").mkdir()
     (run_dir / "configs" / "logit-sut.yaml").write_text(KILL_SUT_CONFIG)
@@ -1075,8 +1111,10 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3):
         for life in (0, 1, 2):
             share = totals[life] // 2 if index == 0 else totals[life] - totals[life] // 2
             n = len(stamps[life])
-            values += [share * (i + 1) // n for i in range(n)]
-            timestamps += [int((T0 + s) * 1000) for s in stamps[life]]
+            for i, s in enumerate(stamps[life]):
+                if s not in drop:
+                    values.append(share * (i + 1) // n)
+                    timestamps.append(int((T0 + s) * 1000))
         export.append({"metric": {"__name__": f"x_{index}_total"}, "values": values,
                        "timestamps": timestamps})
     (run_dir / "vm-export.jsonl").write_text("".join(json.dumps(s) + "\n" for s in export))
@@ -1085,7 +1123,7 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3):
 
 def _kill_ledger():
     rows = ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.aggregate", "ledger.egress",
-            "ledger.summary", "identity.sink", "recovery")
+            "ledger.windows", "ledger.replay", "ledger.summary", "identity.sink", "recovery")
     with tempfile.TemporaryDirectory() as tmp:
         def results(name, **kwargs):
             return {r.id: r for r in checks.run_all(_kill_run(tmp, name, **kwargs))}
@@ -1098,30 +1136,98 @@ def _kill_ledger():
         expect(led.killed == [1] and led.R == 770, f"life 1 is the killed one and R is 770, got "
                                                     f"{led.killed} {led.R}")
         egress = clean["ledger.egress"].detail
-        expect("life 1 (killed): W − D − B − V 1,500 = residual 0 + Ab − V 1,500, within band"
-               in egress and "band [-1,000, 2,770]: ingest 200/s" in egress
+        expect("life 1 (killed): Ab 14,000 − V 12,500 = 1,500, within band" in egress
+               and "band [-1,000, 3,000]: ingest 200/s" in egress
+               and "residual W − D − B − Ab 0 at its last drain" in egress
                and "D has no stderr part" in egress,
                f"egress reports the killed life's gap inside its band, got {egress}")
         expect("life 2 (final): Ab 18,000 − V 18,000 = 0, ok" in egress,
                f"the final life stays exact, got {egress}")
 
-        edge_high = results("kill-high-edge", kill_gap=2770)
+        edge_high = results("kill-high-edge", kill_gap=3000)
         expect(edge_high["ledger.egress"].status == checks.PASS,
-               f"a killed life's gap of R + one window of ingest passes, got "
+               f"a killed life's gap of one window plus one drain interval of ingest passes, got "
                f"{edge_high['ledger.egress']}")
-        over = results("kill-over", kill_gap=2771)
+        over = results("kill-over", kill_gap=3001)
         expect(over["ledger.egress"].status == checks.FAIL
-               and "life 1 (killed): W − D − B − V 2,771" in over["ledger.egress"].detail
-               and "uncounted" in over["ledger.egress"].detail,
+               and "life 1 (killed): Ab 14,000 − V 10,999 = 3,001, uncounted"
+               in over["ledger.egress"].detail,
                f"egress FAILs a killed life's gap above its band as uncounted, got "
                f"{over['ledger.egress']}")
         low = results("kill-low-edge", kill_gap=-1000)
         expect(low["ledger.egress"].status == checks.PASS,
-               f"a killed life's V may exceed W − D − B by one drain interval of ingest, got "
+               f"a killed life's V may exceed Ab by one drain interval of ingest, got "
                f"{low['ledger.egress']}")
         under = results("kill-under", kill_gap=-1001)
-        expect(under["ledger.egress"].status == checks.FAIL,
-               f"egress FAILs a killed life's gap below its band, got {under['ledger.egress']}")
+        expect(under["ledger.egress"].status == checks.FAIL
+               and "= -1,001, surplus" in under["ledger.egress"].detail,
+               f"egress FAILs a killed life's gap below its band as a surplus, got "
+               f"{under['ledger.egress']}")
+        residual = results("kill-residual", kill_residual=500, kill_gap=2600)
+        detail = residual["ledger.egress"].detail
+        expect(residual["ledger.egress"].status == checks.PASS
+               and "Ab 14,000 − V 11,400 = 2,600, within band (band [-1,500, 3,000]" in detail
+               and "residual W − D − B − Ab 500 at its last drain" in detail,
+               f"a killed life's residual is reported beside Ab − V, never added to it, got "
+               f"{residual['ledger.egress']}")
+        residual_low = results("kill-residual-low", kill_residual=500, kill_gap=-1500)
+        expect(residual_low["ledger.egress"].status == checks.PASS,
+               f"a killed life's V may exceed Ab by its residual plus one drain interval of "
+               f"ingest, got {residual_low['ledger.egress']}")
+        residual_under = results("kill-residual-under", kill_residual=500, kill_gap=-1501)
+        expect(residual_under["ledger.egress"].status == checks.FAIL,
+               f"egress FAILs a surplus past the residual plus one drain interval, got "
+               f"{residual_under['ledger.egress']}")
+        last = results("kill-last-window", drop=(200,))
+        expect(last["ledger.egress"].status == checks.FAIL
+               and "uncounted" in last["ledger.egress"].detail
+               and last["ledger.windows"].status == checks.FAIL,
+               f"losing the killed life's last spooled window FAILs egress and windows, got "
+               f"{last['ledger.egress']} {last['ledger.windows']}")
+
+        expect(clean["ledger.windows"].status == checks.PASS
+               and "2 series x 3 life/lives, widest gap 10s" in clean["ledger.windows"].detail,
+               f"windows PASSes a sample in every window, got {clean['ledger.windows']}")
+        middle = results("kill-middle-windows", drop=(150, 160, 170, 180, 190))
+        expect(middle["ledger.windows"].status == checks.FAIL
+               and "x_0_total: life 1 gap 60s from +140s to +200s"
+               in middle["ledger.windows"].detail
+               and middle["ledger.egress"].status == checks.PASS,
+               f"windows FAILs five lost middle windows, which egress can't see, got "
+               f"{middle['ledger.windows']} {middle['ledger.egress']}")
+        tail = results("kill-tail-windows", drop=(180, 190, 200))
+        expect(tail["ledger.windows"].status == checks.FAIL
+               and "killed life 1's last sample at +170s, 33s before the kill at +203s"
+               in tail["ledger.windows"].detail,
+               f"windows FAILs a killed life's lost tail, got {tail['ledger.windows']}")
+        head = results("kill-head-windows", drop=(220, 230))
+        expect(head["ledger.windows"].status == checks.FAIL
+               and "life 2's first sample at +240s, 27s after the life started"
+               in head["ledger.windows"].detail,
+               f"windows FAILs a later life's late first sample, got {head['ledger.windows']}")
+        unset = results("kill-windows-unset", every_window=False)
+        expect(unset["ledger.windows"].status == checks.SKIP,
+               f"windows SKIPs without vm_every_window, got {unset['ledger.windows']}")
+        expect(checks._component_duration(KILL_SUT_CONFIG, "window", "interval") == 10.0
+               and checks._component_duration("components:\n  window: { type: aggregate, "
+                                              "interval: 2m }\n", "window", "interval") == 120.0
+               and checks._component_duration(KILL_SUT_CONFIG, "in", "interval") is None,
+               "the aggregate interval reads from a block or flow component, and only its own")
+
+        expect(clean["ledger.replay"].status == checks.PASS
+               and "life 2's first drain replayed 3 vs killed life 1's last-drain "
+               "buffer.batches 3" in clean["ledger.replay"].detail,
+               f"replay ties the killed life's queue to the next life's replay, got "
+               f"{clean['ledger.replay']}")
+        short = results("kill-short-replay", replayed=1, queued=6)
+        expect(short["ledger.replay"].status == checks.FAIL
+               and "off by -5" in short["ledger.replay"].detail
+               and short["identity.sink"].status == checks.PASS,
+               f"replay FAILs 1 of 6 queued batches replayed, which identity.sink balances, got "
+               f"{short['ledger.replay']} {short['identity.sink']}")
+        in_flight = results("kill-replay-in-flight", replayed=3, queued=4)
+        expect(in_flight["ledger.replay"].status == checks.PASS,
+               f"replay allows one batch in flight, got {in_flight['ledger.replay']}")
 
         expect("received 21 + replayed 3 vs delivered 24" in clean["identity.sink"].detail,
                f"identity.sink counts a spool's replayed batches as received, got "

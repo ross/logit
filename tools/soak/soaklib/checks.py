@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import collect, faults, telemetry, vm
-from .scenario import EXPECT_REDUCERS, LOGIT_SERVICES, SERVICES
+from .scenario import EXPECT_REDUCERS, LOGIT_SERVICES, SERVICES, parse_duration
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
@@ -708,6 +708,30 @@ def _yaml_int(text, key):
     return int(match.group(1)) if match else None
 
 
+def _component_duration(text, component, key):
+    """A duration field of one component in a YAML text, block or flow style, in seconds, or
+    None. The component's block is its `<component>:` line and every deeper-indented line after
+    it."""
+    lines = (text or "").splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(rf"^(\s*){re.escape(component)}\s*:(.*)$", line)
+        if not match:
+            continue
+        indent = len(match.group(1))
+        block = [match.group(2)]
+        for following in lines[index + 1:]:
+            if following.strip() and len(following) - len(following.lstrip()) <= indent:
+                break
+            block.append(following)
+        found = re.search(rf"\b{key}\s*:\s*[\"']?([0-9][0-9a-z.]*)", "\n".join(block))
+        if found:
+            try:
+                return parse_duration(found.group(1))
+            except ValueError:
+                return None
+    return None
+
+
 class Ledger:
     """The ledger's symbols per SUT process life, read once from a run's telemetry, stderr, and
     VictoriaMetrics export. Lives are the SUT's; the generator's G is one number for the run."""
@@ -762,12 +786,14 @@ class Ledger:
         self.Ab = sut.counter_by_life("logit.transform.metrics.absorbed",
                                       component=self.aggregate)
 
-        # The lives a scheduled `kill` ended: the life in force when the kill was applied.
-        self.killed = sorted({
-            vm.life_at(self.life_starts, record["started_at"])
+        # The lives a scheduled `kill` ended, each the life in force when the kill was applied,
+        # with the time it was.
+        self.killed_at = {
+            vm.life_at(self.life_starts, record["started_at"]): record["started_at"]
             for record in data.timeline
             if record.get("event") == "apply" and record.get("action") == "kill"
-            and record.get("on") == "logit" and not record.get("rc")})
+            and record.get("on") == "logit" and not record.get("rc")}
+        self.killed = sorted(self.killed_at)
 
         # Shutdown drops and `drain complete` land after the final drain, so they come from
         # stderr, each credited to the life its timestamp falls in. A killed life writes neither,
@@ -813,6 +839,8 @@ class Ledger:
         batch_max = _yaml_int(text, "batch_max_events") or DEFAULT_BATCH_MAX_EVENTS
         self.R = max_datagrams + RESIDUAL_BATCHES * batch_max
         self.R_text = f"R {_n(self.R)} = {_n(max_datagrams)} + {RESIDUAL_BATCHES} x {_n(batch_max)}"
+        # The aggregate's configured window, in seconds, or None when the config doesn't say.
+        self.interval = _component_duration(text, self.aggregate or "", "interval")
 
     def _sut_config_text(self):
         """The SUT config: the run directory's copy, else the path `compose.env` names."""
@@ -849,15 +877,15 @@ class Ledger:
         return self.get("W", life) - self.D(life) - self.get("B", life) - self.get("Ab", life)
 
     def kill_band(self, life):
-        """`(low, high, text)`: the gap a killed life's W − D − B − V may show with nothing
-        lost, from its ingest rate over its last drain interval.
+        """`(low, high, text)`: the Ab − V a killed life may show with nothing lost, from its
+        ingest rate over its last drain interval.
 
-        A kill writes no final drain, so the reads after the life's last drain are in no
-        counter, and an `aggregate` flush between that drain and the kill can carry them into V:
-        V can exceed W − D − B by up to one drain interval of ingest, the low side. The kill
-        also discards `aggregate`'s unflushed window, whose events Ab counts and V never
-        holds, on top of the residual that can be in flight at a drain: the high side is R plus
-        one aggregate window of ingest, the window being the export's sample spacing."""
+        Below: the residual at the last drain and the reads after it, up to one drain interval,
+        are in no Ab, and an `aggregate` flush before the kill can carry them into V. Above: the
+        kill discards `aggregate`'s unflushed window, whose events Ab counts and V never holds,
+        up to one aggregate interval of ingest, plus one drain interval of queue growth after
+        the last drain. The residual itself is reported beside the band and never judged with
+        it: `ledger.intake` bounds it."""
         drains = self.sut.life_drains(life)
         gaps = [b - a for a, b in zip(drains, drains[1:])]
         interval = statistics.median(gaps) if gaps else 0.0
@@ -865,32 +893,41 @@ class Ledger:
             "logit.input.datagrams", component=self.listener))
             if point_life == life and drains and ts == drains[-1]), 0)
         rate = last_w / gaps[-1] if gaps and gaps[-1] > 0 else 0.0
-        window = vm.sample_spacing_s(self.series) or 0.0
-        low = -round(rate * interval)
-        high = self.R + round(rate * window)
+        window = self.interval
+        source = "configured"
+        if window is None:
+            window = vm.sample_spacing_s(self.series) or 0.0
+            source = "the export's sample spacing, the config naming none"
+        residual = max(0, self.residual(life))
+        low = -(residual + round(rate * interval))
+        high = round(rate * window) + round(rate * interval)
         text = (f"band [{_n(low)}, {_n(high)}]: ingest {rate:,.0f}/s over the last drain "
-                f"interval, x {interval:g}s drain interval below; R + {window:g}s aggregate "
-                "window above")
+                f"interval; below, the residual {_n(residual)} plus one {interval:g}s drain "
+                f"interval of ingest, absorbed after the last drain and flushed before the "
+                f"kill; above, one {window:g}s aggregate window ({source}) unflushed at the "
+                f"kill plus one drain interval of queue growth after the last drain")
         return low, high, text
 
     def egress(self, life):
-        """`(status, verdict, gap)` for one life's egress: `ok`, `counted`, `within band`, or
-        `uncounted`.
+        """`(status, verdict, gap)` for one life's egress: `ok`, `counted`, `within band`,
+        `surplus`, or `uncounted`.
 
-        The final life's gap is Ab − V. An earlier life's is W − D − B − V, the residual plus
-        Ab − V, because the close-time window delivers what that life read but hadn't absorbed
-        by its last drain into V. A killed life has no close-time window and no `drain
-        complete`: its gap passes inside `kill_band`, and anything outside it is uncounted."""
+        The final life's gap is Ab − V. A stopped earlier life's is W − D − B − V, the residual
+        plus Ab − V, because the close-time window delivers what that life read but hadn't
+        absorbed by its last drain into V. A killed life has no close-time window and no `drain
+        complete`: its gap is Ab − V alone, judged inside `kill_band`; below the band it is a
+        surplus, above it uncounted loss. Its residual is what the kill lost from the receive
+        queue and inbox, by design, and is reported, not judged here."""
         gap = self.get("Ab", life) - self.get("V", life)
-        if life != self.final:
-            gap += self.residual(life)
         if life in self.killed and life != self.final:
             low, high, _ = self.kill_band(life)
             if gap == 0:
                 return PASS, "ok", gap
             if low <= gap <= high:
                 return PASS, "within band", gap
-            return FAIL, "uncounted", gap
+            return FAIL, ("surplus" if gap < low else "uncounted"), gap
+        if life != self.final:
+            gap += self.residual(life)
         dropped = self.batches_dropped.get(life, 0)
         if gap == 0:
             return PASS, "ok", gap
@@ -992,6 +1029,9 @@ def check_ledger_wire(data):
         else:
             runs.append([start, end, kind, label, g, wk])
     sums = {"fault": 0.0, "steady": 0.0, "end": 0.0}
+    # Each steady run counts at 0 when W + K exceeds G in it, so a surplus in one run can't
+    # net out loss in another.
+    steady_lost = 0.0
     g_steady = 0.0
     edges = 0
     for index, (start, end, kind, label, g, wk) in enumerate(runs):
@@ -999,13 +1039,14 @@ def check_ledger_wire(data):
         lines.append(f"[{data.offset(start)}, {data.offset(end)}] {kind} ({label}): "
                      f"G {_n(round(g))}, W+K {_n(wk)}, gap {_n(round(g - wk))}")
         if kind == "steady":
+            steady_lost += max(0.0, g - wk)
             g_steady += g
             edges += sum(1 for other in (index - 1, index + 1)
                          if 0 <= other < len(runs) and runs[other][2] != "steady")
 
     limit = float(data.ledger.get("wire_loss_outside_faults", 0.0))
     tolerance = led.gen_batch * edges
-    judged = sums["steady"] + max(0.0, sums["end"])
+    judged = steady_lost + max(0.0, sums["end"])
     allowed = limit * g_steady + tolerance
     if judged > allowed:
         status = FAIL
@@ -1023,7 +1064,8 @@ def check_ledger_wire(data):
     detail = (f"G {_n(led.G)} = W {_n(W)} + K {_n(K)} + wire {_n(gap)} (by design: "
               f"{_n(round(sums['fault']))} in UDP-affecting windows, "
               f"{_n(round(sums['steady']))} steady, {_n(round(sums['end']))} at the end; "
-              f"steady limit {_n(round(allowed))}); the generator's counted drop_newest loss, "
+              f"steady loss judged {_n(round(steady_lost))}, each run at 0 or more, against "
+              f"limit {_n(round(allowed))}); the generator's counted drop_newest loss, "
               f"not in G: {_n(led.gen_dropped_events)} event(s) in "
               f"{_n(led.gen_dropped_batches)} batch(es)")
     if status != PASS:
@@ -1094,10 +1136,11 @@ def check_ledger_aggregate(data):
 
 
 def check_ledger_egress(data):
-    """The egress gap per life, Ab − V for the final life and W − D − B − V for an earlier one:
-    0 passes; a positive gap with that life's `drain complete` `batches_dropped` above 0 is
-    counted, never reconciled; a killed life's gap passes inside `Ledger.kill_band`; any other
-    gap is uncounted loss. An export with no series can't pass."""
+    """The egress gap per life, Ab − V for the final life and a killed one, and W − D − B − V
+    for a stopped earlier one: 0 passes; a positive gap with that life's `drain complete`
+    `batches_dropped` above 0 is counted, never reconciled; a killed life's gap passes inside
+    `Ledger.kill_band`; any other gap is uncounted loss, or a surplus below a killed life's
+    band. An export with no series can't pass."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.egress", led)
     if skipped:
@@ -1113,14 +1156,17 @@ def check_ledger_egress(data):
         if life == led.final:
             part = (f"life {life} (final): Ab {_n(led.get('Ab', life))} − V "
                     f"{_n(led.get('V', life))} = {_n(gap)}, {verdict}")
-        else:
-            killed = " (killed)" if life in led.killed else ""
-            part = (f"life {life}{killed}: W − D − B − V {_n(gap)} = residual "
-                    f"{_n(led.residual(life))} + Ab − V {_n(ab_v)}, {verdict}")
-        if life in led.killed and life != led.final:
+        elif life in led.killed:
             _, _, band = led.kill_band(life)
-            part += f" ({band}; D has no stderr part: a SIGKILL logs no shutdown drops)"
-        elif gap > 0:
+            part = (f"life {life} (killed): Ab {_n(led.get('Ab', life))} − V "
+                    f"{_n(led.get('V', life))} = {_n(gap)}, {verdict} ({band}); residual "
+                    f"W − D − B − Ab {_n(led.residual(life))} at its last drain, what the kill "
+                    "lost from the receive queue and inbox, by design, not judged here; D has "
+                    "no stderr part: a SIGKILL logs no shutdown drops")
+        else:
+            part = (f"life {life}: W − D − B − V {_n(gap)} = residual "
+                    f"{_n(led.residual(life))} + Ab − V {_n(ab_v)}, {verdict}")
+        if gap > 0 and not (life in led.killed and life != led.final):
             part += f" (drain complete batches_dropped {_n(dropped)})"
         parts.append(part)
     if not led.series:
@@ -1207,6 +1253,103 @@ def check_identity_sink(data):
               f"delivered {_n(delivered)} + dropped {_n(dropped)} + buffer.batches {_n(queued)}, "
               f"gap {_n(gap)} (one batch in flight allowed)")
     return Result("identity.sink", PASS if 0 <= gap <= 1 else FAIL, detail)
+
+
+def check_ledger_windows(data):
+    """Opt-in, under `[ledger] vm_every_window`: every series has a sample for every
+    `aggregate` window of every SUT life. Per life and series, consecutive samples are at most
+    1.5 x the configured interval apart; a killed life's last sample is at most 1.1 x the
+    interval before the kill, because the kill discards only the window in progress, and 10%
+    covers a flush's own lateness; and a later life's first sample is at most 2 x the interval
+    after the life starts, the first window plus startup. Opt-in because `aggregate` emits a
+    series only in a window that updated it, so an idle series has gaps by design. Under
+    `temporality: cumulative` V reads only each life's last value, so a lost middle window
+    changes no total and only this row sees it."""
+    if data.ledger.get("vm_every_window") is not True:
+        return Result("ledger.windows", SKIP, "not enabled ([ledger] vm_every_window)")
+    led = _ledger(data)
+    skipped = _skip_without_sut("ledger.windows", led)
+    if skipped:
+        return skipped
+    interval = led.interval
+    if not interval:
+        return Result("ledger.windows", FAIL, f"the SUT config names no interval for aggregate "
+                      f"{led.aggregate!r}, so no window can be judged")
+    if not led.series:
+        return Result("ledger.windows", FAIL, "no series in vm-export.jsonl match vm_selector")
+    max_gap, tail_bound, head_bound = 1.5 * interval, 1.1 * interval, 2 * interval
+    problems = []
+    widest = 0.0
+    for one in led.series:
+        name = vm.series_name(one)
+        by_life = {}
+        for stamp in one.get("timestamps") or []:
+            t = stamp / 1000
+            by_life.setdefault(vm.life_at(led.life_starts, t), []).append(t)
+        for life in led.lives:
+            stamps = sorted(by_life.get(life, []))
+            if not stamps:
+                problems.append(f"{name}: no sample in life {life}")
+                continue
+            for a, b in zip(stamps, stamps[1:]):
+                widest = max(widest, b - a)
+                if b - a > max_gap:
+                    problems.append(f"{name}: life {life} gap {b - a:g}s from "
+                                    f"{data.offset(a)} to {data.offset(b)}")
+            if life in led.killed_at and life != led.final:
+                kill = led.killed_at[life]
+                if stamps[-1] < kill - tail_bound:
+                    problems.append(f"{name}: killed life {life}'s last sample at "
+                                    f"{data.offset(stamps[-1])}, {kill - stamps[-1]:g}s before "
+                                    f"the kill at {data.offset(kill)}")
+            if life > 0 and stamps[0] > led.life_starts[life] + head_bound:
+                problems.append(f"{name}: life {life}'s first sample at "
+                                f"{data.offset(stamps[0])}, "
+                                f"{stamps[0] - led.life_starts[life]:g}s after the life started "
+                                f"at {data.offset(led.life_starts[life])}")
+    rules = (f"gaps <= {max_gap:g}s (1.5 x the {interval:g}s aggregate interval), a killed life's "
+             f"last sample within {tail_bound:g}s (1.1 x) of the kill, a later life's first "
+             f"within {head_bound:g}s (2 x) of its start")
+    if problems:
+        return Result("ledger.windows", FAIL,
+                      f"missing windows, {len(problems)} finding(s), first: {problems[0]} "
+                      f"({rules})", problems)
+    return Result("ledger.windows", PASS,
+                  f"{len(led.series)} series x {len(led.lives)} life/lives, widest gap "
+                  f"{widest:g}s ({rules})")
+
+
+def check_ledger_replay(data):
+    """For each killed life followed by another: the next life's first-drain
+    `buffer.disk.replayed` equals the killed life's `buffer.batches` at its last drain, one
+    batch in flight allowed. What a kill leaves queued comes back only through a disk spool's
+    replay at open, so a short replay is lost windows `identity.sink` balances away."""
+    led = _ledger(data)
+    skipped = _skip_without_sut("ledger.replay", led)
+    if skipped:
+        return skipped
+    pairs = [life for life in led.killed if life + 1 in led.lives]
+    if not pairs:
+        return Result("ledger.replay", SKIP, "no killed life followed by another")
+    sut, sink = led.sut, led.sink
+    status = PASS
+    parts = []
+    for life in pairs:
+        drains = sut.life_drains(life)
+        nxt = sut.life_drains(life + 1)
+        queued = next((v for ts, v, point_life in reversed(sut.gauge_series(
+            "logit.component.buffer.batches", component=sink))
+            if point_life == life and drains and ts <= drains[-1]), 0)
+        replayed = sum(v for ts, v, point_life in sut.counter_points(
+            "logit.component.buffer.disk.replayed", component=sink)
+            if point_life == life + 1 and nxt and ts == nxt[0])
+        ok = abs(replayed - queued) <= 1
+        status = worst([status, PASS if ok else FAIL])
+        parts.append(f"life {life + 1}'s first drain replayed {_n(replayed)} vs killed life "
+                     f"{life}'s last-drain buffer.batches {_n(queued)}"
+                     + ("" if ok else ", off by " + _n(replayed - queued)))
+    return Result("ledger.replay", status,
+                  "; ".join(parts) + " (one batch in flight allowed)")
 
 
 def _step_value(series, t, default=0.0):
@@ -1455,8 +1598,8 @@ def check_expect(data):
 CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_intake,
-    check_ledger_edge, check_ledger_aggregate, check_ledger_egress, check_ledger_summary,
-    check_identity_sink, check_recovery, check_expect,
+    check_ledger_edge, check_ledger_aggregate, check_ledger_egress, check_ledger_windows,
+    check_ledger_replay, check_ledger_summary, check_identity_sink, check_recovery, check_expect,
 )
 
 

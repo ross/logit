@@ -25,6 +25,9 @@ sut_listener = "statsd"
 sut_aggregate = "window"
 sut_sink = "victoria_metrics"
 wire_loss_outside_faults = 0.0
+# Every series is written about 200 times a window, so each has a sample in every window, and
+# a spooled window lost in the middle or at the tail shows as a gap.
+vm_every_window = true
 
 [thresholds]
 progress_window = "30s"
@@ -45,7 +48,8 @@ action = "kill"
 on = "logit"
 for = "30s"
 
-# The spool holds every window the outage queues.
+# The spool is open. A 64 MiB segment never rotates at this load, so this reads 1 from warmup on
+# and fails only without a spool; spool-queues-windows shows it filling.
 [[expect]]
 name = "spool-holds-the-outage"
 service = "logit"
@@ -66,7 +70,8 @@ window = "during"
 reduce = "max"
 min = 2
 
-# The restarted process finds the killed one's records at open.
+# The restarted process finds the killed one's records at open; ledger.replay ties the count to
+# what the killed process had queued.
 [[expect]]
 name = "spool-replayed-at-restart"
 service = "logit"
@@ -76,6 +81,17 @@ step = "c0s2"
 window = "after"
 reduce = "delta"
 min = 1
+
+# A torn tail is the other way a spool loses records: the restarted process truncates none.
+[[expect]]
+name = "no-torn-tail"
+service = "logit"
+metric = "logit.component.buffer.disk.truncated"
+component = "victoria_metrics"
+step = "c0s2"
+window = "through"
+reduce = "delta"
+max = 0
 
 # A replay happens once, at open: delivering the backlog once VictoriaMetrics is back opens
 # nothing.
