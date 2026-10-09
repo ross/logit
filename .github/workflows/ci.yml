@@ -12,33 +12,25 @@ jobs:
       # `.config/nextest.toml`'s `ci` profile: more test threads than the runner has vCPUs.
       NEXTEST_PROFILE: ci
     container:
-      # Same image family contributors build locally (Dockerfile.dev / ADR `containerized-development`); script/common.sh
-      # detects $CI (set by GitHub Actions) and runs commands directly against it instead of
-      # trying to `docker compose run` from inside a container.
-      image: docker.io/library/rust:1.98.1-bookworm
+      # Dockerfile.dev's `ci` stage, published by the "Publish CI image" workflow and tagged by
+      # Dockerfile.dev's hash (docs/adr/ci-image-on-ghcr.md). `script/ci-image tag` prints the
+      # tag for the checked-out Dockerfile.dev. script/common.sh detects $CI (set by GitHub
+      # Actions) and runs commands directly in it instead of `docker compose run`.
+      image: ghcr.io/ross/logit-ci:0827e2f8eb86
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install native build deps (vendored LuaJIT via mlua)
-        # tzdata: named time zones in a `timestamp` component read /usr/share/zoneinfo
-        # (docs/adr/timestamp-transform.md).
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends clang cmake pkg-config libssl-dev tzdata
-          rustup component add rustfmt clippy
-
-      - name: Install cargo tools
-        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
-        with:
-          tool: cargo-nextest@0.9.144,cargo-deny@0.20.2,cargo-audit@0.22.2
-          fallback: none
+      - name: Check the CI image matches Dockerfile.dev
+        run: ./script/ci-image check
 
       - uses: actions/cache@v4
         with:
+          # The image's CARGO_HOME is /usr/local/cargo; `~` is /github/home in a container job.
           path: |
-            ~/.cargo/registry
+            /usr/local/cargo/registry/index
+            /usr/local/cargo/registry/cache
             target
           # The root manifest's [profile.*] tables decide what the cached target dir holds.
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
 
       - run: ./script/cibuild

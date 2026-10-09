@@ -96,8 +96,10 @@ nature. The encode-side counters are the only ones that measure the batch and no
 
      [For `otlp_out`, a rejected signal's `records.dropped{reason="rejected"}` counts once per
      batch: [ADR `sink-fault-classes`](sink-fault-classes.md)'s "Amendment: `otlp_out` retries per
-     signal (2026-10-05)" remembers the signal and a retry doesn't resend it. The Datadog and
-     Splunk sinks still count their server-verdict drops per attempt.]
+     signal (2026-10-05)" remembers the signal and a retry doesn't resend it. So do the Datadog
+     sinks, per request ("Amendment: the Datadog sinks retry per request (2026-10-09)"): a rejected
+     request's drop and a `413`'s `oversize` count once per batch. Splunk's still count per
+     attempt.]
 
    `docs/design/internal-telemetry.md` and `docs/deploying.md` state the third class's
    repetition, so an operator reading a drop counter on an unhealthy sink knows what it measures.
@@ -122,10 +124,12 @@ nature. The encode-side counters are the only ones that measure the batch and no
      attempt, arms the gate and clears the units counted. Each encode runs as a synchronous
      closure through `BatchAccounting::encode(unit, ..)`: an encode of a unit the armed batch has
      already encoded runs muted, and the gate unmutes when the closure returns, so nothing awaits
-     while it's muted. An `Ok` send disarms the gate.
+     while it's muted. A final send disarms the gate: `Ok`, or a fault `write_loop` won't retry under
+     the sink's posture (see "Amendment: the Datadog sinks retry per request" in [ADR
+     `sink-fault-classes`](sink-fault-classes.md)).
    - An unarmed gate never mutes. A caller of `send` that never calls `observe_batch` (a unit
      test, a benchmark, `logit_pipeline::send_batch`) sees every encode counted, unless an earlier
-     batch whose last attempt failed left the gate armed (`docs/known-gaps/`).
+     batch whose last attempt failed retryably left the gate armed (`docs/known-gaps/`).
    - The encode-side counts a sink emits itself (`statsd_out`'s and `syslog_out`'s `EncodeStats`,
      `influxdb_out`'s `tags.normalized`, every sink's `batch.bytes`) are skipped when `encode`
      reports a repeat. The datagram packer's over-cap skip isn't one of them: it counts per
@@ -174,11 +178,10 @@ nature. The encode-side counters are the only ones that measure the batch and no
    A changing verdict would break decision 2 too: the plan decides which items each route holds,
    and a route re-encoded muted on attempt 2 would then hold items its attempt-1 encode never
    counted. `observe_batch` reads the clock once and stores the send time; every attempt at the
-   batch reads the stored one; an `Ok` clears it, where the gate disarms, and the next
+   batch reads the stored one; a final send clears it, where the gate disarms, and the next
    `observe_batch` replaces it. A `send` with no `observe_batch` reads the clock itself only when no
-   earlier batch left a time behind: after a batch whose last attempt failed, the sink can't tell a
-   final attempt from one the runtime will retry, so the time stays, as the armed gate does
-   (`docs/known-gaps/`). The runtime calls `observe_batch` before every batch, so no shipped
+   earlier batch left a time behind: after a batch whose last attempt failed retryably, the runtime
+   may retry, so the time stays, as the armed gate does (`docs/known-gaps/`). The runtime calls `observe_batch` before every batch, so no shipped
    path reaches that case. The send time is read only by the
    plan's stale filter: no payload, header, or sketch carries it. `datadog_trace_out` has no
    clock-dependent drop. (Amended by `sink/w7`.)
@@ -975,7 +978,7 @@ sinks: per-route units, `split_encode`'s bisection, and `datadog_out`'s per-batc
 - **The clock.** `datadog_out`'s `send` read the wall clock on every attempt. A point 11 minutes
   ahead of the first attempt's clock was dropped as `stale` there and sent by an attempt two
   minutes later. `observe_batch` now reads the clock once, through a `clock` field a test can
-  script; `send` uses that time until an `Ok` clears it. `plan` returns its items and drops as a
+  script; `send` uses that time until a final send clears it. `plan` returns its items and drops as a
   `Plan` and counts nothing, since it can't borrow the sink inside `BatchAccounting::encode`.
 - **Bisection.** `CountGate::muted` in `logit-core`, and `split_encode`'s gate parameter
   (decision 2's amendment).
@@ -989,7 +992,10 @@ sinks: per-route units, `split_encode`'s bisection, and `datadog_out`'s per-batc
   `with_telemetry`.
 - **What stays per attempt, on ungated handles**: `requests`, `request.duration`,
   `request.bytes`, `records`, a `413`'s `records.dropped{reason="oversize"}`, and the
-  `request_rejected` and `api_key_rejected` diagnostics.
+  `request_rejected` and `api_key_rejected` diagnostics. [Each counts per request sent: a settled
+  request isn't resent ("Amendment: the Datadog sinks retry per request (2026-10-09)" in [ADR
+  `sink-fault-classes`](sink-fault-classes.md)), so `records`, `oversize`, and a rejected request's
+  `rejected` count once per batch.]
 - **`request.bytes`** (decision 14): both sinks' `post` count it on an answer and on an error
   that isn't `Fault::Clean`. A refused connection counted 41 bytes for one gauge on `datadog_out`
   before; on `datadog_trace_out` a refused TCP connection and a missing socket file together
@@ -1091,6 +1097,11 @@ Unix socket for `datadog_trace_out`. Each applies it outside the code that count
 `logit.output.requests{class}` and `logit.output.request.bytes`, so a refused request still
 counts `network_error` and no bytes after an accepted one. The three `docs/known-gaps/` entries
 are closed.
+
+[Narrowed by [ADR `sink-fault-classes`](sink-fault-classes.md)'s "Amendment: `otlp_out` retries per
+signal (2026-10-05)" and "Amendment: the Datadog sinks retry per request (2026-10-09)": `otlp_out`,
+`datadog_out`, and `datadog_trace_out` resend no accepted request, so they no longer apply
+`after_delivery`. Only `splunk_hec_out` does.]
 
 [`otlp_out` no longer applies it: [ADR `sink-fault-classes`](sink-fault-classes.md)'s
 "Amendment: `otlp_out` retries per signal (2026-10-05)" keeps the signals a batch's destination

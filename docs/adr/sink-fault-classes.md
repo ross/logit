@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-05
+updated: 2026-10-09
 ---
 
 # Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink
@@ -169,7 +169,7 @@ and in an amendment to the sink's own record:
   and a `5xx` as a server failure (`crates/logit-outputs/src/datadog.rs`, "Faults, retries, and
   duplicate safety"; [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md),
   "Amendment: response classes (2026-10-04)").
-- `datadog_trace_out`: an Agent's `429` is `Clean` before any request of the send was accepted, a
+- `datadog_trace_out`: an Agent's `429` is `Clean`, a
   `415` is `Refused`, and a `408` and a `501` are `Ambiguous`
   (`crates/logit-outputs/src/datadog_trace.rs`, "Faults, retries, and duplicate safety";
   [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md), "Amendment: response
@@ -327,8 +327,8 @@ batch's class is the failed signal's own:
 - **`after_delivery` no longer applies to `otlp_out`.** Item 9 of `delivery-semantics` turns a
   `Clean` after an accepted request into `Ambiguous` so that a retry under `at_most_once` doesn't
   resend it. With accepted signals never resent there's nothing to protect, so a `Clean` or
-  `Refused` answer holds. `crate::http::Outcomes::resuming` is the fold without the conversion;
-  the Datadog sinks keep `Outcomes::new`.
+  `Refused` answer holds. `crate::http::Outcomes::new` is the fold without the conversion; only
+  `splunk_hec_out` still applies `after_delivery`.
 - **The sink learns its posture.** `Output::observe_posture` hands a sink the posture `write_loop`
   resolved, once, before the first batch. `otlp_out` reads it to count the per-signal records an
   `at_most_once` drop loses; the runtime counts the batch as before.
@@ -361,6 +361,73 @@ batch's class is the failed signal's own:
   `records.dropped` is the precise count.
 - A disk-buffered batch replayed after a restart is a new batch: the memory is in-process, so the
   replay sends every signal again.
-- `datadog_out` and `datadog_trace_out` still retry a batch whole, resending the requests already
-  accepted. Per-request memory has the same shape, keyed on each request `split_encode` cuts; it's
-  a follow-up, tracked in `docs/known-gaps/datadog.md`'s resend entry.
+- `datadog_out` and `datadog_trace_out` take the same shape, keyed on each request `split_encode`
+  cuts ("Amendment: the Datadog sinks retry per request (2026-10-09)", below).
+- The memory is in-process, so a replay after a crash resends every signal; the entry is
+  `docs/known-gaps/sinks.md`, "The per-request retry memory of `otlp_out` and the Datadog sinks
+  is in-process".
+
+## Amendment: the Datadog sinks retry per request (2026-10-09)
+
+`datadog_out` and `datadog_trace_out` send a batch as several requests: one per route, a route cut
+into requests by `split_encode` under an entry count and a byte cap. Until this amendment a
+`5xx` or timeout on request N made the runtime retry the batch whole, and the retry resent
+requests 1 to N-1 that Datadog or the Agent had accepted. A `Clean` or `Refused` answer after an
+accepted request was turned `Ambiguous` by `after_delivery`, so under `at_most_once` the batch
+dropped with the requests it never sent.
+
+**Decision.** Both sinks follow `otlp_out`'s shape with a request, not a signal, as the unit. Each
+attempt numbers its requests `0, 1, 2, ...` in send order across routes, one per `split_encode`
+chunk. The sink remembers per batch which requests the destination settled, accepted or rejected,
+and a retry re-encodes the batch and resends only the unsettled requests. The batch's class is the
+failed request's own:
+
+| What the requests got | Effect on the batch |
+|---|---|
+| a `Refused` or `Clean` failure, after any number of accepted requests | holds under both postures; each retry sends the requests not yet settled |
+| an `Ambiguous` failure, under `at_least_once` | retries the requests not yet settled; the failed one may arrive twice |
+| an `Ambiguous` failure, under `at_most_once` | drops the batch; the failed request's entries, those of the rest of its route's unsettled requests, and those of every later route count `logit.output.records.dropped{route, reason="ambiguous_at_most_once"}` |
+| every request sent `Rejected`, none accepted on any attempt | drops the batch `rejected`, unchanged |
+| any request accepted on any attempt, the rest `Rejected` | `Ok`, the rejected requests counted, unchanged |
+
+- **The request index is a pure function of the batch.** The settled bits are positional, so the
+  plan and the cuts must come out the same on every attempt. They depend only on the batch and, for
+  `datadog_out`, on the send time `observe_batch` pins (decision 3 of [ADR
+  `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md)); the codecs
+  read no clock and `split_encode` is deterministic. Anything that makes the plan or the cuts
+  depend on per-attempt state breaks the index. Each sink's `attempt` doc records the invariant.
+- **`after_delivery` no longer applies to these sinks.** With accepted requests never resent, a
+  `Clean` or `Refused` answer keeps its own class and holds under both postures. A `Refused` route
+  under `at_most_once`, such as a wrong `endpoints.logs` or a `404`, now holds the batch where it
+  used to drop it, as a batch carrying only that route already did. `datadog_trace_out`'s `429` is
+  always `Clean`. Reading a refused route as `Rejected` would still drop its records from every
+  batch, so the classification argument in each sink's module doc stands. `Outcomes::new` takes
+  whether a request was accepted before the attempt; `after_delivery` stays for `splunk_hec_out`.
+- **`finish` disarms on a final verdict.** `BatchAccounting::finish` used to disarm only on `Ok`.
+  With positional bits, a direct `send` of a new batch after a dropped one would skip whichever
+  requests sit at the settled positions, a silent loss rather than muted counts. A send is now
+  final when it returns `Ok` or a fault `write_loop` won't retry under the posture
+  (`logit_pipeline::is_retryable`): `Rejected` under either posture, and `Ambiguous` under
+  `at_most_once`. A retryable failure leaves the batch armed, which retries rely on. Every sink with a
+  `BatchAccounting` forwards `Output::observe_posture` into it, so the rule holds for each.
+- **The settled bits grow.** They were `u32` bitsets, and a route's chunk count is unbounded (byte
+  cap bisection), so a request index has no bound. An encode unit stays a bit index below 32.
+
+**Consequences.**
+
+- A batch to a destination that fails mid-send delivers each accepted request once, however often
+  a later request is retried.
+- Every attempt still encodes the whole batch, the settled requests included; only their `POST`
+  is skipped. The gate mutes their encode-side counters on a repeat.
+- Under `at_most_once`, `logit.component.events.dropped{reason="ambiguous_at_most_once"}` counts
+  every event of a dropped batch, including events whose requests were delivered; the per-route
+  `records.dropped` is the precise count. A later route's count is the plan's weight for `datadog_out`
+  and the stats group count for `datadog_trace_out`, an upper bound: it includes entries the encode
+  would have skipped or dropped `oversize`, which no reason counts because the batch dropped before
+  that route.
+- A request's `rejected` drop, a `413`'s `oversize`, and `records` for an accepted request count
+  once per batch, not once per attempt.
+- The memory is in-process, and the request that drew an `Ambiguous` answer is resent under
+  `at_least_once` and may land twice. A `buffer.disk:` replay after a crash resends every request.
+  Both are `docs/known-gaps/sinks.md`, "The per-request retry memory of `otlp_out` and the Datadog
+  sinks is in-process".
