@@ -301,11 +301,14 @@ targets cover:
 - `native_batch` and `native_hop_batch`: the two native payload shapes, a bare batch and a hop
   batch with its sender pair and provenance trailer, both under the default decode budget;
 - `native_control`: the native control messages;
-- `sketch_bytes`, `sketch_merge`, and `hll_bytes`: `DdSketch` and `HyperLogLog` bytes, as the
-  Decision describes;
+- `sketch_bytes`, `sketch_merge`, and `hll_bytes`: `DdSketch` bytes (decode, then a `to_bytes`
+  fixed-point oracle), `DdSketch` merge (two decoded halves merged, then `quantile` and
+  `to_bytes`), and `HyperLogLog` bytes (decode, `estimate`, `insert`, `merge`, `to_bytes`, and
+  drop, where a wrong allocation `Layout` would surface);
 - `otlp_proto`, `otlp_json`, and `otlp_grpc`: OTLP protobuf, OTLP/JSON, and gRPC framing followed
-  by protobuf decode;
-- `prom_decompress` and `prom_remote_write`: remote-write decompression and decode;
+  by protobuf decode, with the first input byte choosing the signal;
+- `prom_decompress` and `prom_remote_write`: remote-write decompression (oracle: output never
+  exceeds the cap) and decode, with the first byte choosing 1.0 or 2.0;
 - `proxy_header`: the start of a stream through `logit_proto::proxy::parse`;
 - `forwarded`: one forwarding header's value through `logit_proto::forwarded::parse`.
 
