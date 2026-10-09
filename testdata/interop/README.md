@@ -5,7 +5,7 @@ committed. The producers are syslog senders, collectd, OTel SDKs, carbon senders
 vmagent, statsd/DogStatsD clients, a Datadog Agent, a dd-trace tracer, and four Splunk HEC
 clients. The fixtures check `logit`'s decoders against what those producers put on the wire:
 
-- `crates/logit-inputs/src/syslog.rs`
+- `crates/logit-proto/src/syslog/`
 - `crates/logit-proto/src/statsd/`
 - `crates/logit-proto/src/collectd/`
 - `crates/logit-proto/src/otlp/`
@@ -143,7 +143,7 @@ asserting byte-for-byte fixture equality tests this directory's stability, not `
 
 For the pattern, see the `interop_fixture_*` tests in these files:
 
-- `crates/logit-inputs/src/syslog.rs`
+- `crates/logit-proto/src/syslog/decode.rs`
 - `crates/logit-inputs/src/collectd.rs`: they assert a value list's data-source count and kinds,
   its `collectd.*` identity, and its interval.
 - `crates/logit-inputs/src/graphite/mod.rs`: they assert a decoded path prefix, that every kind is

@@ -34,7 +34,7 @@ same misunderstanding.
   Collector's `file` exporter fed by `telemetrygen` (three fixtures — traces, logs, metrics). See
   `testdata/interop/syslog/README.md` and `testdata/interop/otlp/README.md` for the full
   provenance table.
-- Seven Rust tests in `crates/logit-inputs/src/syslog.rs` (`interop_fixture_*`) reading every
+- Seven Rust tests in `crates/logit-proto/src/syslog/decode.rs` (`interop_fixture_*`) reading every
   syslog fixture and asserting on decoded message content, tags, and severity — not byte-for-byte
   fixture equality (§2 explains why).
 
@@ -193,9 +193,10 @@ Re-running `script/record-fixtures` will not reproduce the exact bytes committed
 hostnames land in RFC 3164's HOSTNAME field, timestamps are real wall-clock time, RFC 5424's
 `syncAccuracy` is a real measured value, and telemetrygen's trace/span ids are randomly generated
 every run. This is *expected*, not a flaw to fix: the corpus is "a real capture from a real
-producer, checked into git," not a byte-stable golden file. `crates/logit-inputs/src/syslog.rs`'s
-`interop_fixture_*` tests assert on decoded, identifiable values (message content, tag, severity)
-for exactly this reason — see `testdata/interop/README.md`'s "Consuming these fixtures" section.
+producer, checked into git," not a byte-stable golden file.
+`crates/logit-proto/src/syslog/decode.rs`'s `interop_fixture_*` tests assert on decoded,
+identifiable values (message content, tag, severity) for exactly this reason — see
+`testdata/interop/README.md`'s "Consuming these fixtures" section.
 
 ### Findings worth recording so they don't need rediscovering
 
@@ -319,14 +320,15 @@ unstarted follow-on work — see `testdata/interop/syslog/README.md`'s own "what
 
 ## Consuming tests, and what they assert
 
-`crates/logit-inputs/src/syslog.rs`'s `interop_fixture_*` tests (seven, one per syslog fixture)
-read `testdata/interop/syslog/*.raw` via a `testdata_dir()`-style helper (mirroring
+`crates/logit-proto/src/syslog/decode.rs`'s `interop_fixture_*` tests (seven, one per syslog
+fixture) read `testdata/interop/syslog/*.raw` via a `testdata_dir()`-style helper (mirroring
 `crates/logit-inputs/src/otlp.rs`'s existing TLS-fixture helper of the same shape) and assert on
 `message_str`, `syslog.tag`, and severity — not on the fixture's raw bytes staying stable across a
-re-record. One of them (`interop_fixture_python_syslog_handler_json_body_is_clean_for_the_json_transform`)
-goes one step further and round-trips the decoded message through `serde_json::from_str`, which is
-the actual empirical check that `NoNulSysLogHandler`'s fix still holds against Python's real
-handler output today, not just against a hand-typed literal shaped like it.
+re-record. One of them
+(`interop_fixture_python_syslog_handler_json_body_is_clean_for_the_json_transform`) goes one step
+further and round-trips the decoded message through `serde_json::from_str`, which is the actual
+empirical check that `NoNulSysLogHandler`'s fix still holds against Python's real handler output
+today, not just against a hand-typed literal shaped like it.
 
 ## Amendment (2026-09-18): statsd/DogStatsD, recorded
 
