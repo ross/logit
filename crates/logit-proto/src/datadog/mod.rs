@@ -18,9 +18,9 @@
 //! ([ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)'s carrier rule); the
 //! constants below are the only spelling. `host.name` carries a series' `host` resource, a
 //! sketch's `host`, or a log's `hostname` fallback. Events and service checks reuse
-//! `crates/logit-inputs/src/statsd.rs`'s `statsd.event.*` / `statsd.service_check.*` names: they
-//! are the same Datadog concepts DogStatsD carries. Tags fold into attributes by [`tags`]'s rule;
-//! timestamps convert by [`time`]'s.
+//! `crates/logit-proto/src/statsd/decode.rs`'s `statsd.event.*` / `statsd.service_check.*` names:
+//! they are the same Datadog concepts DogStatsD carries. Tags fold into attributes by [`tags`]'s
+//! rule; timestamps convert by [`time`]'s.
 //!
 //! **The listener adds sender attributes after decode.** Under `datadog_in`'s or
 //! `datadog_trace_in`'s `peer:`, `proxy_protocol:`, or `forwarded:`, `network.peer.*` or

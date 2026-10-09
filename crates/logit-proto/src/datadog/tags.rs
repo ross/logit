@@ -1,8 +1,8 @@
 //! Datadog tag lists (`["env:prod", "team:a", "urgent"]`) to and from attributes, the rule every
 //! Datadog codec here shares with `statsd_in`'s DogStatsD `|#` segment
-//! (`crates/logit-inputs/src/statsd.rs`'s `insert_tags`): the key ends at the first `:`, a bare
-//! token is `Bool(true)`, a repeated key folds into an `Array` in wire order, and only an exact
-//! duplicate token is deduped (the Agent's own rule; `urgent` and `urgent:1` both survive).
+//! (`crates/logit-proto/src/statsd/decode.rs`'s `insert_tags`): the key ends at the first `:`, a
+//! bare token is `Bool(true)`, a repeated key folds into an `Array` in wire order, and only an
+//! exact duplicate token is deduped (the Agent's own rule; `urgent` and `urgent:1` both survive).
 
 use logit_core::interner::{intern, resolve};
 use logit_core::{AttrMap, Symbol, Value};

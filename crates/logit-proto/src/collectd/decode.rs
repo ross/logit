@@ -97,7 +97,7 @@ impl CollectdDecoder {
 
     /// This decoder's diagnostics handle.
     ///
-    /// Public, unlike `StatsdDecoder`/`SyslogDecoder`'s test-only equivalents, because
+    /// Public, unlike `SyslogDecoder`'s test-only equivalent, because
     /// `collectd_in` lives in `logit-inputs`, and its test that `with_diagnostics` reached the
     /// decoder can't call a crate-private accessor.
     pub fn diag(&self) -> &Diagnostics {

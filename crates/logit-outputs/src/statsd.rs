@@ -70,11 +70,11 @@
 //!
 //! A DogStatsD `|#` segment is a **list** of `key[:value]` tokens, not a map: `#team:a,team:b` is
 //! two live tags, and a query grouping by `team` places the point in both groups.
-//! `logit_inputs::statsd::insert_tags` folds a repeated key into a [`Value::Array`] in wire order
-//! (as `syslog_in` does for a repeated PARAM-NAME), and this sink inverts it: an `Array` attribute
-//! expands to one wire tag per element, in array order, each through the same [`push_one_tag`] a
-//! scalar tag uses. A `Bool(true)` element emits the bare form (`#urgent`), so a bare/valued mix
-//! (`#urgent,urgent:1`) relays intact.
+//! `logit_proto::statsd::decode::insert_tags` folds a repeated key into a [`Value::Array`] in wire
+//! order (as `syslog_in` does for a repeated PARAM-NAME), and this sink inverts it: an `Array`
+//! attribute expands to one wire tag per element, in array order, each through the same
+//! [`push_one_tag`] a scalar tag uses. A `Bool(true)` element emits the bare form (`#urgent`), so a
+//! bare/valued mix (`#urgent,urgent:1`) relays intact.
 //!
 //! What it does *not* do:
 //!
@@ -171,10 +171,11 @@
 //!
 //! ## Negative absolute gauges
 //!
-//! The grammar has no syntax for a negative absolute gauge (`logit_inputs::statsd::build_event`'s
-//! `"g"` arm reads *any* leading `-` as a delta), so a naive `Gauge(-5.0)` would render as
-//! `name:-5|g` and decode as `GaugeDelta(-5.0)`. This sink emits the idiom Etsy statsd and
-//! DogStatsD both document for the case: `name:0|g` immediately followed by `name:-5|g`. The two
+//! The grammar has no syntax for a negative absolute gauge
+//! (`logit_proto::statsd::decode::build_event`'s `"g"` arm reads *any* leading `-` as a delta), so
+//! a naive `Gauge(-5.0)` would render as `name:-5|g` and decode as `GaugeDelta(-5.0)`. This sink
+//! emits the idiom Etsy statsd and DogStatsD both document for the case: `name:0|g` immediately
+//! followed by `name:-5|g`. The two
 //! lines go into the [`MessageBuf`] as **one indivisible entry** (joined by an embedded `\n`) so
 //! the packer can never split them across two datagrams: if the first datagram were lost, `-5`
 //! would apply to whatever stale value the receiver's gauge held. This is the only entry that
@@ -962,7 +963,7 @@ fn push_one_tag(
         stats.tags_dropped_unrepresentable += 1;
         return false;
     }
-    // `Bool(true)` is what `logit_inputs::statsd::parse_line` produces for a bare tag
+    // `Bool(true)` is what `logit_proto::statsd::decode::parse_line` produces for a bare tag
     // (`#urgent`). Emitting `key:true` would round-trip as `Value::Str("true")`.
     let bare = matches!(value, Value::Bool(true));
     let rendered_value = if bare { None } else { tag_value(scratch, value) };
@@ -2202,9 +2203,9 @@ mod tests {
         DialStep, FakeStream, ReadMode, ScriptedDest, ScriptedDial, SendStep, WriteStep,
     };
     use logit_core::{interner::intern, AttrMap, BodyFormat, LogRecord, MetricRecord, Resource};
-    use logit_inputs::statsd::StatsdDecoder;
     use logit_pipeline::test_util::{TelemetryProbe, RECV_TIMEOUT};
     use logit_pipeline::Fault;
+    use logit_proto::statsd::StatsdDecoder;
     use logit_proto::Decoder;
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;

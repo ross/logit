@@ -173,7 +173,7 @@ fn statsd_decode_one_set_line() {
 }
 
 /// A repeated DogStatsD tag key folds into a `Value::Array` at decode
-/// (`crates/logit-inputs/src/statsd.rs`'s "DogStatsD tags" section). Four allocations:
+/// (`crates/logit-proto/src/statsd/mod.rs`'s "DogStatsD tags" section). Four allocations:
 /// [`statsd_decode_one_line`]'s per-line/per-batch `Vec<Event>` pair, plus two for the `Array`.
 /// `insert_tags` builds its `Vec` spine (`vec![existing, value]`), and `build_event`'s
 /// `attributes.clone()`, run once even for a single-value line, deep-copies that spine. A scalar

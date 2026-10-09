@@ -22,6 +22,7 @@ pub mod otlp;
 pub mod prometheus;
 pub mod proxy;
 pub mod splunk;
+pub mod statsd;
 
 pub use msgbuf::MessageBuf;
 pub use multi_value::MultiValue;
