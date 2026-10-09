@@ -1657,7 +1657,7 @@ fn statsd_event_text_unescapes_as_str_replace_does() {
         assert_eq!(
             logit_core::subslice::within(&bytes, message),
             !text.contains("\\n"),
-            "{datagram:?}: a slice exactly when nothing was unescaped"
+            "{datagram:?}: a slice if and only if nothing was unescaped"
         );
     }
 }

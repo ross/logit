@@ -515,7 +515,7 @@ fn build_event(
         "c" => {
             let value = parse_finite_value(raw_value, "counter", line)? / sample_rate;
             // A rate below 1 multiplies, so a finite value near `f64::MAX` can extrapolate to
-            // infinity, which no `Sum` may carry.
+            // infinity, which this decoder rejects as it does a literal `inf` counter.
             if !value.is_finite() {
                 return Err(CodecError::Malformed(format!(
                     "counter value overflows when extrapolated by its sample rate: {line:?}"

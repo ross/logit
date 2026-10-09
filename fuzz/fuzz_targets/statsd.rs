@@ -14,7 +14,7 @@
 //! - provenance: every `Value::Str` attribute, tag values and array elements included, and every
 //!   set member, is a slice of the datagram. An event's message is too, unless its text had a
 //!   `\n` escape to unescape, the one copy path (`crates/logit-proto/src/statsd/mod.rs`'s
-//!   "DogStatsD events and service checks"): a message is a slice exactly when it holds no
+//!   "DogStatsD events and service checks"): a message is a slice if and only if it holds no
 //!   newline.
 #![no_main]
 
@@ -83,7 +83,7 @@ fn check_event(datagram: &Bytes, event: &Event) {
         assert_eq!(
             subslice::within(datagram, message),
             !message.contains(&b'\n'),
-            "provenance: a message is a slice exactly when nothing was unescaped"
+            "provenance: a message is a slice if and only if nothing was unescaped"
         );
         return;
     }

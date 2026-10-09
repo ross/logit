@@ -91,7 +91,7 @@ the largest allocation a valid input of `max_len` bytes can need. For the native
 MiB, because a legitimate 64 MiB lz4 frame allocates its full `uncompressed_len`.
 
 The fourth `FUZZ_TARGETS` column holds extra libFuzzer arguments for one target, passed by `fuzz`
-and never by `fuzz-tmin`. The two native batch targets use it to run in fork mode (`-fork=1
+and never by `fuzz-tmin`. The two native batch targets and `statsd` use it to run in fork mode (`-fork=1
 -ignore_ooms=0`). The process-wide interner never evicts, so a long-lived fuzz process
 accumulates every dictionary string it decodes until the arena outgrows the malloc limit, and
 fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal. Fork
@@ -326,7 +326,7 @@ symbol-table rules are reachable, and a fixed-point oracle on every input.
 
 ### Seeds and differential corpora
 
-`seedgen` also reads `testdata/interop/{statsd,syslog,graphite,collectd}/`, and every corpus
+`seedgen` also reads `testdata/interop/{statsd,syslog,graphite,collectd,datadog}/`, and every corpus
 under `testdata/differential/`. A differential corpus differs from `testdata/interop/`, which
 holds captured bytes that don't reproduce: it's generated, deterministic, and carries a reference
 implementation's reading of each case beside the case's bytes. `script/differential <corpus>`
