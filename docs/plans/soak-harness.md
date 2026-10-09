@@ -29,7 +29,7 @@ Non-goals:
 - High load as a goal. The first scenario runs 2,000 events/s; throughput is `script/perf`'s job.
 - A CI cadence. The harness runs by hand, like the other out-of-CI harnesses.
 - An external target before W5.
-- Seeded random schedules before W4. `--seed` is accepted and recorded, and refused until then.
+- The perf VM. Hours-long runs use the development host (see W4).
 - Per-kind conservation rules beyond the first scenario's. They come with the scenarios that need
   them.
 
@@ -88,6 +88,7 @@ tools/soak/
   scenarios/udp-flood-sink-stop/
   scenarios/udp-flood-sink-stop-block/
   scenarios/spool-kill-replay/          # W3: a SIGKILL inside a sink outage, a disk spool
+  scenarios/random-faults/              # W4: a seeded random schedule, meant for hours
 ```
 
 Subcommands: `run <scenario> [--duration 20m] [--seed N] [--keep] [--out DIR]`, `list`,
@@ -99,8 +100,8 @@ A run writes `perf/results/soak/<UTC stamp>/` (gitignored): `compose.env`, a cop
 `scenario.toml`, `scenario.resolved.json`, `configs/` (each `logit` config, so the ledger reads
 the SUT's `receive:` limits), `provenance.txt`, `timeline.jsonl`,
 `watchdog.jsonl`, `stats.ndjson`, `vm-freshness.jsonl`, `vm-export.jsonl`,
-`logs/<svc>.stdout` and `logs/<svc>.stderr`, `inspect/<svc>.json`, `results.md`, and
-`results.json`. `check <run-dir>` re-scores a run offline from these files alone.
+`logs/<svc>.stdout` and `logs/<svc>.stderr`, `log-chunks.jsonl` (W4: one record per `docker logs`
+chunk), `inspect/<svc>.json`, `results.md`, and `results.json`. `check <run-dir>` re-scores a run offline from these files alone.
 
 Host prerequisites: Python 3.11 or later (`tomllib`). `Dockerfile.dev` has no Python, so the
 self-test doesn't run in CI; only the config globs do.
@@ -197,7 +198,56 @@ for = "45s"
   the lines a killed generator sent after its last telemetry drain reach the SUT with no G
   behind them, and `ledger.wire` would net them against real loss.
 - `[ledger] vm_every_window`, optional, is `true` or `false`.
-- `--seed` is refused until W4 adds a `[random]` table.
+- A scenario has `cycle` with `[[step]]` tables or a `[random]` table (W4), never both.
+  `--seed` is refused for a fixed schedule, because no seed changes it.
+
+**Random schedules (W4).** A `[random]` table replaces `cycle` and `[[step]]`:
+
+```toml
+[random]
+seed = 20261009                       # --seed overrides
+gap = { min = "2m", max = "4m" }      # from one fault's end, or warmup's, to the next start
+
+[[random.fault]]                      # one table per allowed fault
+weight = 3                            # picked in proportion to its weight
+action = "netem"
+on = "logit"
+args = ["delay 200ms 50ms", "loss 30%", "delay 1s", "rate 1mbit"]   # netem only; one per draw
+for = { min = "60s", max = "3m" }
+```
+
+`expand(scenario, duration, seed)` draws from `random.Random(seed)`, one fault at a time from
+the end of warmup: a gap, a template by weight, its `for`, and for netem one of its `args`, each
+a whole number of seconds. It stops at the first fault that would end after cooldown starts, so
+a shorter run's schedule is a prefix of a longer one's for the same seed. Steps are `r1`, `r2`,
+and so on, and are ordinary steps: the driver runs them, `scenario.resolved.json` records them
+with the seed, and `check` re-scores the run from them. The draws use `Random.random()` only,
+whose sequence for an integer seed Python keeps stable across versions, and the self-test pins
+the shipped scenario's first three faults, so `--seed N` reproduces a recorded run.
+
+One fault at a time is how a random schedule meets every rule above by construction: no two
+faults overlap on any container, so none overlaps another on its own, and no netem lands in a
+namespace fault. `validate()` checks the `[random]` table, then expands the schedule at the
+scenario's own duration and the run's and checks each step against the same rules. Its rules
+for the table:
+
+- `seed` is an integer 0 or more; `gap` and each `for` are `{ min, max }` durations with min at
+  most max, and `for.min` above 0; `weight` is a number above 0; actions and services are known,
+  and `kill` is on `logit` only; a netem template has `args`, none of them a clear, and no other
+  action has `args`; unknown keys are refused.
+- `gap.min` is at least `recovery_bound + 2 x progress_window`, so every fault's recovery is
+  followed by at least two judged progress windows, and `cooldown` is at least `gap.min`, for the
+  last fault.
+- The scenario's own duration fits warmup, `gap.max`, and the longest `for.max`, so every draw
+  of the first fault fits.
+- `[[expect]]` is refused: a row names a step, and a random schedule's steps change with the
+  seed. The watchdog, the ledger, and `recovery` judge a random schedule.
+
+With `random-faults`' ranges, 50 seeds at 8 hours draw 109 to 120 faults, and the time after
+warmup outside every fault window is 51% to 56% of the run (45% to 50% in whole progress
+windows), far above the 5% at which `progress` and `rss_slope` WARN. `gap.min` alone guarantees
+at least `(gap.min − recovery_bound) / (gap.min + the longest for.max)`, 25% here; the self-test
+holds every 8- and 24-hour schedule it draws to that.
 
 **A `kill` (W3)** is `docker kill -s KILL` on the SUT, reverted by `docker start` with
 the same readiness probe a `stop`'s revert gets. The process gets no shutdown signal, so it
@@ -257,7 +307,8 @@ no `[[expect]]` gets one `expect` row that SKIPs.
 The project is `soak-<scenario>`, so two scenarios can run at once. The driver refuses a project
 that already has containers, as `script/victoria-interop` does, and never prunes. An `x-logit`
 anchor sets `image: ${SOAK_IMAGE}`, `restart: "no"` (a crash must stay observable),
-`logging: {driver: json-file}`, and
+`logging: {driver: json-file}` with `max-size: 20m`, `max-file: "5"`, and `compress: "true"` on every
+service (W4; see "The driver loop and end sequence" for the arithmetic), and
 `entrypoint: ["logit", "--log-format", "json", "run", "/config.yaml"]`.
 
 | Service | Image and settings |
@@ -273,7 +324,7 @@ Nothing in a container writes to the run directory in W1, so it needs no `chmod 
 
 Collection uses `docker logs <id> >svc.stdout 2>svc.stderr`, not `docker compose logs`, which
 merges the two streams. `docker logs` spans every life of a container that is stopped and started
-but never recreated.
+but never recreated. From W4 the driver appends it in chunks during the run (§5).
 
 ### 4. Netem scope (W1a)
 
@@ -301,7 +352,15 @@ back with `--alias` on the reconnect, because `docker network connect` drops the
 ### 5. The driver loop and end sequence (W1a)
 
 The driver is single-threaded on a 1 s tick. Every subprocess has a timeout: 60 s, and
-`docker stop` gets its `-t` plus 15 s. `$DOCKER` is split with `shlex`, and `-n` is inserted
+`docker stop` gets its `-t` plus 15 s. The polls use shorter ones (W4): `docker inspect` and
+`docker stats` 15 s, and a `docker logs` chunk 60 s. An inspect round, and a chunk round, stops at
+its first failed call, so a daemon that stops answering costs each poll one timeout per round,
+not one per container, and the polls can't stack into minutes of stall.
+
+Every deadline is absolute, measured from the timeline's zero (W4): the tick is `t0 + n`, each
+step runs at its offset, and each poll's next deadline is the next multiple of its period after
+the poll ran. A late tick or a slow poll delays what follows it but never moves a later
+deadline, so over hours the periods don't drift. `$DOCKER` is split with `shlex`, and `-n` is inserted
 after `sudo` so an expired ticket fails loudly instead of prompting; `script/soak` primes the
 ticket with `${DOCKER} version` first.
 
@@ -320,18 +379,33 @@ ticket with `${DOCKER} version` first.
      `State.FinishedAt`, `RestartCount`, and `Health.Status` with its last log entry.
    - Every 30 s, `docker stats --no-stream` into `stats.ndjson` (an RSS series that still works
      when `internal` is wedged), and VictoriaMetrics freshness: the newest sample timestamp across
-     `vm_selector` from `/api/v1/export` with `start` 120 s back.
+     `vm_selector` from `/api/v1/export` with `start` 120 s back. Each query covers those 120 s
+     only, so its cost doesn't grow with the run.
+   - Every 5 minutes (W4), `docker logs --since <cursor> --until <now − 5 s>` per container,
+     appended to `logs/<svc>.stdout` and `.stderr` and recorded in `log-chunks.jsonl`. The
+     boundaries follow the daemon's `json-file` reader: `--since` skips lines timestamped before
+     it only until the first line at or after it, then passes every later line in file order,
+     and `--until` stops at the first line timestamped after it. The next chunk's `--since` is
+     the last `--until` plus 1 ns, so it starts at the line the last chunk stopped at, and the
+     chunks partition the file by position, with no line repeated or skipped even where
+     stdout's and stderr's timestamps interleave out of order. A line the daemon writes more
+     than 5 s after its timestamp, behind the next chunk's start, would be lost; the daemon
+     writes each line as it reads it. A chunk is written to temporary files and appended only
+     when `docker logs` returns 0, so a failed chunk is retried whole from the same cursor.
+     The cursor is per container id, which a stop and start keep.
    - **Fail fast:** a `logit` container leaving `running`, or a `StartedAt` change, with no step
      behind it ends the timeline at once. The end sequence and collection still run.
 4. End: revert active faults; `docker stop -t 30` the generator; wait until the VictoriaMetrics
    total holds across two aggregate windows (90 s bound); `docker stop -t 60` the SUT, expecting
    exit 0; call VictoriaMetrics `/internal/force_flush`; write `vm-export.jsonl` from
    `/api/v1/export` with `match[]=<vm_selector>` and `start=0`.
-5. Collect: `docker logs` per service into `.stdout` and `.stderr`, and `inspect/<svc>.json`.
+5. Collect: the last `docker logs` chunk per service, from its cursor to the end, into
+   `.stdout` and `.stderr`, and `inspect/<svc>.json`.
    Then `compose down -v --remove-orphans`, unless `--keep`. A `try`/`finally` makes SIGINT still
    collect, and the driver routes SIGTERM and SIGHUP into SIGINT's `KeyboardInterrupt`, because
    Python's default for both ends the process without running `finally`.
-6. Score with `checks.run_all(run_dir)` into `results.md` and `results.json`. Exit 1 on any FAIL
+6. Score with `checks.run_all(run_dir)` into `results.md` and `results.json`, whose header
+   names the seed of a random schedule. Exit 1 on any FAIL
    or an aborted or errored run, and 130 when interrupted.
 
 ### 6. The checks (W1a, W1b)
@@ -489,7 +563,12 @@ The rows:
   The interval comes from the config, never the median spacing, which moves once half the
   windows are missing. A last window lost to a kill that lands within 0.1 × the interval of the
   life's last flush passes, and the kill time is the `docker kill` call's start, which can run
-  about a second ahead of the signal.
+  about a second ahead of the signal. A gap across a fault that silences the SUT is excused
+  (W4): a `pause` of `logit` flushes nothing, and a `partition` of `logit`, or a `pause`, `stop`,
+  or `partition` of the generator, stops lines arriving, and `aggregate` writes a series only
+  in a window that updated it. The gap is excused only when it starts within 1.5 × the interval
+  before the fault and ends within 2 × the interval after it, the bound a new life's first
+  sample gets, so a window lost beside the fault still FAILs.
 - `ledger.replay`, for each killed life followed by another, else SKIP: the next life's
   first-drain `buffer.disk.replayed` equals the killed life's `buffer.batches` at its last
   drain, one batch in flight allowed. `identity.sink` balances on whatever `replayed` reports,
@@ -619,8 +698,13 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
   and its expectations assert `buffer.disk.replayed` above 0 once, at the restart, then 0, and
   no torn tail (`buffer.disk.truncated` 0 through the kill). A run of it, and a negative control
   without the spool, are recorded under "Findings".
-- **W4**: seeded random schedules (a `[random]` table), hours-long runs (chunked
-  `docker logs --since/--until`), and running on the perf VM through `script/vm push`.
+- **W4**: seeded random schedules (a `[random]` table and `--seed`; "The scenario schema"),
+  hours-long runs (chunked `docker logs --since/--until`, rotated `json-file` logs, absolute
+  poll deadlines, bounded poll timeouts; "The driver loop and end sequence"), `check` fast
+  enough for an 8-hour run, `ledger.windows` excusing gaps across faults that silence the SUT,
+  and the `random-faults` scenario. The perf VM is dropped: long runs happen on the development
+  host, which has 32 cores, 125 GB of RAM, 716 GB of free disk, and Docker's default `json-file`
+  log driver with no daemon-level rotation, so compose sets each container's rotation.
 - **W5**: an external target (Datadog) with a gitignored env file, as in `script/splunk-interop`'s
   cloud mode. The ledger ends at the sink's telemetry (`SENT`), with no backend query.
 
@@ -1027,6 +1111,36 @@ first drain replayed 0 vs killed life 0's last-drain buffer.batches 6, off by -6
 row passes, `ledger.summary` included, because the final life balanced. The 120,000 is the 60 s
 of increments between the VictoriaMetrics stop and the kill.
 
+### W4: random schedules and long runs (no run yet)
+
+No `random-faults` run has been made. The first runs, in order, are a 1-hour smoke at the
+scenario's own duration and seed (`script/soak run random-faults`, 14 faults), then 8 hours
+(`--duration 8h`, 113 faults for seed 20261009). Each is recorded here with the commit, image
+tags, host, the seed, the verbatim `results.md` table, and what the schedule did.
+
+What W4 measured without a run:
+
+- **Log rates.** In the recorded W1b, W2, and W3 runs, the SUT's stdout ran 3.4 to 4.2 KB/s and
+  the generator's 4.3 to 4.6 KB/s (17 to 23 KB per 5 s drain), stderr under 50 B/s, whatever the
+  load: `internal` writes the same points per drain at 2,000 and at 20,000 lines/s. Stored by
+  `json-file`, which wraps and escapes each line, that is at most 6.4 KB/s per container.
+- **Rotation window.** At 6.4 KB/s a 20 MB file fills in about 52 minutes, and with
+  `max-file: 5` the daemon keeps at least the four newest full files, about 3.5 hours, so a
+  5-minute chunk interval has a margin of about 40. The daemon holds at most 100 MB per
+  container, less with `compress`.
+- **Run-directory growth.** An 8-hour run writes about 100 MB of SUT stdout and 130 MB of
+  generator stdout, 8 MB of `watchdog.jsonl` (3 records of about 440 bytes every 5 s), 1 MB of
+  `stats.ndjson`, and 6 MB of `vm-export.jsonl` (100 series, a sample every 10 s): about
+  250 MB. A 24-hour run writes about 750 MB.
+- **`check` cost.** A synthetic 8-hour directory (a real `statsd-vm` run's drains replayed
+  across the 30 SUT lives seed 20261009's schedule implies, with a matching timeline, watchdog,
+  and export; 240 MB) took 17.6 s and 661 MiB to score: `Telemetry.matching` scanned every point
+  on each of `progress`'s 458 `counter_in` calls, and `g_at` and `life_drains` rescanned too, so
+  the cost grew with the square of the run. Indexing points by name, bisecting, caching each
+  life's drains, and interning attribute dicts brought it to 3.3 s and 243 MiB, with identical
+  rows; a 24-hour directory went from 135 s and 1,935 MiB to 13 s and 678 MiB. The recorded
+  W1b, W2, and W3 runs score the same rows, every detail included, before and after.
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
@@ -1057,5 +1171,12 @@ of increments between the VictoriaMetrics stop and the kill.
   passes `self-test` validation and the shipped-config test, and a run of it, every row PASS, is
   recorded under "Findings", with a negative control: the same scenario without the spool, whose
   killed life's `ledger.egress` FAILs as uncounted and whose `ledger.replay` FAILs.
-- **W4 and W5**: each new scenario passes `self-test` validation and the shipped-config test,
-  and a run of it is recorded under "Findings".
+- **W4**: the self-test passes, and each new rule fails it when reverted (46 rules: every
+  `[random]` validation and schedule rule, the draw order, the seed's recording, the
+  `ledger.windows` excusal, the chunk boundaries and failure handling, and the poll deadlines
+  and round timeouts). `random-faults` passes `self-test` validation, the shipped-config test,
+  and `logit validate` in `logit:soak`. Re-scoring the recorded W1b, W2, and W3 runs gives the
+  same rows, every detail included. `check` on a synthetic 8-hour run directory finishes in
+  seconds. A 1-hour `random-faults` run and an 8-hour one are recorded under "Findings".
+- **W5**: each new scenario passes `self-test` validation and the shipped-config test, and a
+  run of it is recorded under "Findings".

@@ -1,7 +1,7 @@
 # soak
 
-`script/soak` runs real `logit` containers for minutes under network and lifecycle faults on a
-timeline, and reports crashes, restarts, error lines, hangs, memory and file-descriptor
+`script/soak` runs real `logit` containers for minutes or hours under network and lifecycle
+faults on a timeline, and reports crashes, restarts, error lines, hangs, memory and file-descriptor
 growth, and uncounted data loss as one `PASS`, `WARN`, `FAIL`, or `SKIP` row per check. A check
 reports `SKIP` only when it has nothing it can judge, such as a run with no telemetry, or SUT
 telemetry whose process lives disagree with the timeline.
@@ -19,6 +19,8 @@ script/soak list                                 # the shipped scenarios
 script/soak self-test                            # the driver's pure parts; no docker
 script/soak run statsd-vm                        # the scenario's own duration (16 minutes)
 script/soak run statsd-vm --duration 5m --keep   # shorter, and leave the stack up afterward
+script/soak run random-faults --duration 8h      # a seeded random schedule; see "Long runs"
+script/soak run random-faults --seed 7           # the same scenario, another schedule
 script/soak check perf/results/soak/<stamp>      # re-score a run offline
 ```
 
@@ -70,6 +72,14 @@ VictoriaMetrics, and `ledger.replay` ties the restarted process's replay to what
 had queued. The spool lives in the container's own filesystem, which a `kill` and `start`
 keep, because the driver never recreates a container.
 
+`random-faults` (1 hour by default, meant for `--duration 8h`) is `statsd-vm`'s stream with
+`spool-kill-replay`'s disk-spooled sink and `vm_every_window`, under a seeded random schedule
+(see [Random schedules](#random-schedules)): netem delay, jitter, loss, and rate limits on
+`logit` and on `generator`; `stop`, `pause`, `kill`, and `partition` of `logit`; `stop` and
+`partition` of VictoriaMetrics; and `partition` of the generator. Each fault lasts 20 s to 3
+minutes, one at a time, with 2 to 4 minutes of quiet between them. Over 8 hours that is about 113
+faults, and about half the run is judged steady state.
+
 ### Faults
 
 | Action | What it does | Revert |
@@ -95,13 +105,14 @@ appends `limit 100000` to `args` unless they set a `limit`, so netem's own queue
    health check.
 3. On a 1-second tick it applies each fault and its revert on schedule, probes `logit ready`
    after every start, restart, or unpause of a `logit` service, inspects every container every
-   5 s, and samples `docker stats` and VictoriaMetrics' newest sample every 30 s. A `logit`
+   5 s, samples `docker stats` and VictoriaMetrics' newest sample every 30 s, and appends each
+   container's new log lines every 5 minutes. A `logit`
    container that exits or restarts with no step behind it ends the schedule at once.
 4. At the end it reverts active faults, stops the generator, waits until VictoriaMetrics' totals
    hold across two aggregate windows, stops the SUT (expecting exit 0), and exports every stored
    series.
-5. It collects each service's stdout and stderr separately with `docker logs`, and its final
-   `docker inspect`, then tears the project down (`down -v --remove-orphans`) unless `--keep`.
+5. It collects the rest of each service's stdout and stderr separately with `docker logs`, and
+   its final `docker inspect`, then tears the project down (`down -v --remove-orphans`) unless `--keep`.
    This step runs on every exit but SIGKILL: SIGINT (Ctrl-C), SIGTERM, and SIGHUP each stop the
    schedule and reach it. After a SIGHUP the driver drops its terminal output and carries on,
    because the run directory has everything.
@@ -119,8 +130,9 @@ A run writes `perf/results/soak/<UTC stamp>/` (gitignored, or under `SOAK_OUT`):
 | `stats.ndjson`, `vm-freshness.jsonl` | the 30-second `docker stats` and VictoriaMetrics freshness samples |
 | `vm-export.jsonl` | VictoriaMetrics' `/api/v1/export` of the scenario's `vm_selector` at the end |
 | `logs/<service>.stdout`, `.stderr` | each service's output across every life of its container |
+| `log-chunks.jsonl` | one record per `docker logs` call: its `--since`, `--until`, exit code, and bytes |
 | `inspect/<service>.json` | each container's final `docker inspect` |
-| `provenance.txt`, `compose.env`, `scenario.toml`, `scenario.resolved.json`, `configs/` | what ran, on what host, from which commit, the expanded schedule, and a copy of each `logit` config |
+| `provenance.txt`, `compose.env`, `scenario.toml`, `scenario.resolved.json`, `configs/` | what ran, on what host, from which commit, the seed of a random schedule, the expanded schedule, and a copy of each `logit` config |
 
 ## The checks
 
@@ -142,7 +154,7 @@ rule only holds in steady state. The plan's "The checks" has the full rules.
 | `ledger.intake` | the final SUT life's datagrams read minus dropped differ from the events sent plus bad lines; or an earlier life's read-but-unabsorbed residual (W − D − B − Ab) falls outside [0, R], R being the receive queue plus 67 batches |
 | `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listener's events sent differ from those `aggregate` received, or those it received from those it absorbed |
 | `ledger.egress` | the final SUT life's absorbed increments minus VictoriaMetrics' reset-aware total (Ab − V), or a stopped earlier life's datagrams read minus dropped, bad lines, and that total (W − D − B − V), is nonzero, other than a positive gap that life's `drain complete` line counts in `batches_dropped`; a killed life's Ab − V falls outside its band (below, a surplus: the residual plus one drain interval of ingest; above, uncounted: one aggregate interval plus one drain interval of ingest), with the residual the kill lost reported beside it; or the export matched no series. A series without one segment per SUT life `WARN`s |
-| `ledger.windows` | under `[ledger] vm_every_window = true` only: a series in a SUT life has two samples more than 1.5 aggregate intervals apart, a killed life's last sample is more than 1.1 intervals before the kill, or a later life's first is more than 2 intervals after its start. The interval comes from the SUT config |
+| `ledger.windows` | under `[ledger] vm_every_window = true` only: a series in a SUT life has two samples more than 1.5 aggregate intervals apart, a killed life's last sample is more than 1.1 intervals before the kill, or a later life's first is more than 2 intervals after its start. The interval comes from the SUT config. A gap across a `pause` or `partition` of `logit`, or a `pause`, `stop`, or `partition` of the generator, is excused when it starts within 1.5 intervals before the fault and ends within 2 after it: the SUT writes no window then |
 | `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight |
 | `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0; a counted egress term is shown and not judged |
 | `identity.sink` | at the final life's last drain before shutdown, the sink's batches received, plus those a disk spool replayed at open, differ from delivered + dropped + queued by more than one batch in flight |
@@ -184,6 +196,68 @@ that start only. A bound that must hold for the whole episode, such as a loss co
 stay 0, uses `through`: a chain blocked behind a sink stays blocked until the sink's next retry,
 up to its `retry_max_delay` after the revert. A scenario with no `[[expect]]` gets one `expect`
 row that SKIPs.
+
+### Random schedules
+
+A `[random]` table replaces `cycle` and the `[[step]]` tables. The driver draws one fault at a
+time from the seed, so faults never overlap: a gap, then a fault template picked by weight, its
+`for`, and for netem one of its `args`. The plan's "The scenario schema" has every rule.
+
+```toml
+[random]
+seed = 20261009                       # --seed overrides
+gap = { min = "2m", max = "4m" }      # quiet time before each fault
+
+[[random.fault]]
+weight = 3
+action = "netem"
+on = "logit"
+args = ["delay 200ms 50ms", "loss 30%", "delay 1s", "rate 1mbit"]   # one per draw
+for = { min = "60s", max = "3m" }
+```
+
+- `gap.min` must be at least `recovery_bound + 2 x progress_window`, and `cooldown` at least
+  `gap.min`, so every fault's recovery is followed by steady state the checks judge.
+- `[[expect]]` can't be used with `[random]`, because its rows name steps, and the steps change
+  with the seed. The watchdog, the ledger, and `recovery` judge a random schedule.
+- `--seed N` draws another schedule from the same scenario. It's refused for a fixed schedule.
+  The seed is in `provenance.txt`, the header of `results.md`, `results.json`, and
+  `scenario.resolved.json`, which also holds the drawn steps (`r1`, `r2`, ...), so
+  `script/soak run <scenario> --seed N --duration D` reproduces a run's schedule, and `check`
+  re-scores it from the directory alone. A shorter `--duration` runs a prefix of the same
+  schedule.
+- `script/soak list` shows each random scenario's seed and how many faults its own duration
+  draws.
+
+## Long runs
+
+To run for hours, keep the driver alive when the terminal closes: a closed terminal sends
+SIGHUP, which ends the schedule, collects, and tears down, so an unprotected 8-hour run stops at
+the first disconnect. Run it in `tmux` or `screen`:
+
+```sh
+tmux new -s soak 'script/soak run random-faults --duration 8h 2>&1 | tee soak-8h.log'
+```
+
+`nohup script/soak run random-faults --duration 8h > soak-8h.log 2>&1 &` works too when
+`$DOCKER` needs no password (`DOCKER=docker`, or `sudo` without one). The driver runs every docker
+command as `sudo -n`, which fails instead of prompting, and with no terminal there's nothing to
+prompt on; `tmux` keeps the terminal the ticket was primed on. Follow a run with
+`tail -f perf/results/soak/<stamp>/timeline.jsonl`.
+
+What an 8-hour run costs, from the recorded runs' rates:
+
+| Resource | 8 hours | 24 hours |
+|---|---|---|
+| Run directory | about 250 MB: 100 MB SUT stdout, 130 MB generator stdout, 8 MB `watchdog.jsonl`, 6 MB `vm-export.jsonl` | about 750 MB |
+| Docker's own log files | at most 100 MB per container (5 rotated files of 20 MB) | the same |
+| `check` | about 4 s and 250 MB of RAM | about 15 s and 700 MB |
+| Containers | three; each `logit` process held about 15 MiB RSS in the recorded runs | the same |
+
+Each container's `json-file` log rotates at 20 MB and keeps 5 files. Telemetry fills one at
+about 6.4 KB/s, so the daemon holds about 3.5 hours of each container's log, and the driver
+appends the new lines every 5 minutes, well inside that. The plan's "Findings" has the
+arithmetic and the `check` timings on a synthetic 8-hour run directory.
 
 ## Cleanup and a shared daemon
 
