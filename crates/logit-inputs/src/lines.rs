@@ -43,7 +43,7 @@
 //! [`Event::log`] at the driver's `received_at`, no attributes, a [`LogRecord`] with
 //! [`BodyFormat::Raw`] and no severity, trace, or event name. The message is a zero-copy
 //! `Bytes` slice of the frame or datagram: [`Value::Str`] when the line is valid UTF-8,
-//! [`Value::Bytes`] otherwise, as `crate::syslog` keeps a MSG. Every event shares one
+//! [`Value::Bytes`] otherwise, as `logit_proto::syslog` keeps a MSG. Every event shares one
 //! `Arc<Resource>`, empty, across every connection's decoder clone. The decoder attaches nothing
 //! about the peer; under `peer:` the driver, stream or datagram, stamps its address after decode
 //! ([`crate::peer`]).

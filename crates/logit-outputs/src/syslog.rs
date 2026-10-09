@@ -1,4 +1,4 @@
-//! RFC 3164 / RFC 5424 syslog egress over UDP or TCP, the mirror of `logit_inputs::syslog`. A
+//! RFC 3164 / RFC 5424 syslog egress over UDP or TCP, the mirror of `logit_proto::syslog`. A
 //! relay: header fields round-trip from the `syslog.*` attributes `SyslogDecoder` writes, and
 //! configured defaults apply only to an event that never passed through `syslog_in`. See
 //! `docs/adr/syslog-output.md`.
@@ -22,8 +22,8 @@
 //!   format, so an origin instant survives a `5424 -> 3164` or `5424 -> 5424` relay.
 //! - `Value::Str` (3164's raw 15-byte token, no year or timezone) is written verbatim only on a
 //!   3164 output, and only if it has that shape ([`is_rfc3164_timestamp_shape`]). A 5424 output
-//!   has nowhere to put it, so it falls through rather than make the guess `syslog_in`'s module
-//!   doc declines to make on the way in.
+//!   has nowhere to put it, so it falls through rather than make the guess `logit_proto::syslog`'s
+//!   module doc declines to make on the way in.
 //! - `Value::Null` (5424's nil `-`) renders as `-` on a 5424 output. RFC 3164 has no NILVALUE
 //!   TIMESTAMP, so a 3164 output falls through.
 //! - An absent attribute, or any other variant, falls through.
@@ -531,9 +531,10 @@ fn resolve_severity(attrs: &AttrMap, log_severity: Option<Severity>) -> u8 {
     }
 }
 
-/// The lossy inverse of `syslog_in::map_severity`, for an event with no `syslog.severity`.
-/// `Fatal` maps to `2` (crit), not `0` (emerg): `emerg` means "system unusable", a claim `Fatal`
-/// never makes. `Trace` has no syslog equivalent and maps to `7` (debug), as `Debug` does.
+/// The lossy inverse of `logit_proto::syslog`'s `map_severity`, for an event with no
+/// `syslog.severity`. `Fatal` maps to `2` (crit), not `0` (emerg): `emerg` means "system unusable",
+/// a claim `Fatal` never makes. `Trace` has no syslog equivalent and maps to `7` (debug), as
+/// `Debug` does.
 fn syslog_severity_of(severity: Severity) -> u8 {
     match severity {
         Severity::Trace => 7,
@@ -1350,9 +1351,9 @@ mod tests {
         ReadMode, ScriptedDest, ScriptedDial, SendStep, WriteStep,
     };
     use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, Registry, Resource};
-    use logit_inputs::syslog::SyslogDecoder;
     use logit_pipeline::test_util::TelemetryProbe;
     use logit_pipeline::Fault;
+    use logit_proto::syslog::SyslogDecoder;
     use logit_proto::Decoder;
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;
@@ -3222,7 +3223,7 @@ mod tests {
     // input.
     mod fixed_point {
         use super::*;
-        use logit_inputs::syslog::SyslogDecoder;
+        use logit_proto::syslog::SyslogDecoder;
         use logit_proto::Decoder;
         use proptest::prelude::*;
         use std::collections::HashSet;

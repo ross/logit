@@ -407,7 +407,7 @@ mod tests {
     }
 
     /// A log whose message is raw bytes rather than a `Str` -- what `syslog_in` hands over for a
-    /// datagram whose MSG isn't valid UTF-8 (`crates/logit-inputs/src/syslog.rs`).
+    /// datagram whose MSG isn't valid UTF-8 (`crates/logit-proto/src/syslog/mod.rs`).
     fn bytes_log_event(message: &'static [u8]) -> Event {
         let mut event = log_event("");
         event.log.as_mut().unwrap().message = Value::Bytes(Bytes::from_static(message));

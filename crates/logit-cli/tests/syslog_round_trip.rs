@@ -59,7 +59,7 @@
 //! 9. **A non-UTF-8 RFC 3164 HOSTNAME is dropped.** `parse_3164` never fails a line over its
 //!    HOSTNAME, because `parse_line`'s version-sniff fallback depends on that, so it skips the
 //!    `syslog.hostname` attribute and reports a throttled `hostname_not_utf8` diagnostic. Pinned by
-//!    a unit test in `logit_inputs::syslog`:
+//!    a unit test in `logit_proto::syslog`:
 //!    `a_non_utf8_rfc3164_hostname_is_skipped_with_a_throttled_diagnostic`.
 //!
 //! `mod tcp` and `mod tls` add no entry to this list: both transports share
@@ -69,10 +69,11 @@
 use bytes::Bytes;
 use logit_core::zoned::Zone;
 use logit_core::{Event, EventBatch, Value};
-use logit_inputs::syslog::{SyslogDecoder, SyslogInput};
+use logit_inputs::syslog::SyslogInput;
 use logit_outputs::syslog::{Format, SyslogEncoder, SyslogOutput};
 use logit_pipeline::test_util::{recv_batch, RECV_TIMEOUT};
 use logit_pipeline::{Delivered, Fanout, Input, Output, Transform};
+use logit_proto::syslog::SyslogDecoder;
 use logit_proto::Decoder;
 use logit_transforms::{TimestampFormat, TimestampResolver};
 use std::net::SocketAddr;

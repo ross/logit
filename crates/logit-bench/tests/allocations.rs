@@ -92,8 +92,8 @@ fn syslog_decode_100_lines() {
 }
 
 /// Two allocations for one line. Tag values are zero-copy slices of the datagram, as in
-/// `syslog.rs`, so they cost nothing ([`statsd_tag_values_share_the_datagram_allocation`] pins
-/// that structurally).
+/// `logit_proto::syslog`, so they cost nothing
+/// ([`statsd_tag_values_share_the_datagram_allocation`] pins that structurally).
 ///
 /// Syslog pays one `Vec<Event>` total; statsd pays two. The multi-value grammar (`name:1:2:3|c`)
 /// makes `parse_line` collect one line's events into its own `Vec` before `decode` appends them to
