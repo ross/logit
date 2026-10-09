@@ -59,6 +59,15 @@ tables (see [Expectations](#expectations)):
 | `udp-flood-sink-stop` | 20,000 lines/s; VictoriaMetrics stopped 60 s; a 2-batch blocking sink queue, the receive queue at its default | the stop backs up to the listener, which evicts and counts the oldest datagrams and reads datagrams in every drain of the stop, at 90% of the generator's rate, and the kernel drops nothing; that last row fails today, because the kernel drops a few datagrams in the drain where the chain unblocks ([`docs/known-gaps/intake.md`](../../docs/known-gaps/intake.md)'s "UDP intake") |
 | `udp-flood-sink-stop-block` | as `udp-flood-sink-stop`, with `receive: {overflow: block, max_datagrams: 10000}` | the stop backs up to the listener, the kernel drops, `logit` evicts nothing, and every queue drains after |
 
+`spool-kill-replay` (6 minutes 15 seconds) is `statsd-vm` with its sink on a disk spool
+(`buffer: {disk: {path: /tmp/soak-spool}}`). VictoriaMetrics stops for 150 s, and 60 s into that
+the SUT is killed with SIGKILL and started again 30 s later, while VictoriaMetrics is still down.
+Its expectations assert that the spool queues windows during the outage, the restarted process
+replays the killed one's records once and never again, the sink drops nothing, and it stops
+retrying after the outage. The ledger shows whether the killed life's totals reached
+VictoriaMetrics. The spool lives in the container's own filesystem, which a `kill` and `start`
+keep, because the driver never recreates a container.
+
 ### Faults
 
 | Action | What it does | Revert |
@@ -66,6 +75,7 @@ tables (see [Expectations](#expectations)):
 | `netem` | a one-shot `logit-soak-netem:local` container in the target's network namespace sets a root `tc netem` qdisc with the step's `args` | the same container clears it |
 | `pause` | `docker pause` | `docker unpause` |
 | `stop` | `docker stop -t 30` | `docker start` |
+| `kill` | `docker kill -s KILL`, on `logit` or `generator` only: no shutdown signal, so no final telemetry drain, no shutdown drops, and exit code 137 | `docker start` |
 | `restart` | `docker restart -t 30` | none |
 | `partition` | `docker network disconnect` from every network | `docker network connect`, passing back each alias recorded before the disconnect |
 
@@ -119,8 +129,8 @@ rule only holds in steady state. The plan's "The checks" has the full rules.
 |---|---|
 | `run` | the driver aborted, hit an error, or was interrupted, or the timeline lacks its `start` or `end_end` phase |
 | `timeline` | a fault's apply or revert returned nonzero, the schedule failed fast, or a start or unpause of a `logit` service has no readiness probe; a fault whose apply failed gets no window |
-| `exit` | a `logit` container exits outside a scheduled stop or with a nonzero code, or any container is OOM-killed |
-| `restarts` | a container starts with no scheduled start or restart behind it |
+| `exit` | a `logit` container exits outside a scheduled stop, restart, or kill, or with a code other than the one that action leaves (0, or 137 for a kill), or any container is OOM-killed |
+| `restarts` | a container starts with no scheduled start or restart behind it: the revert of a `stop` or `kill`, or a `restart` |
 | `self_log` | stderr has an `exiting` line with a nonzero code, a panic, or an `ERROR` line other than a sink's `retrying`; sink fault lines outside a fault window `WARN` |
 | `ready` | a `logit` container is unhealthy outside a fault window, or isn't ready within 30 s of a start |
 | `progress` | the SUT's sink delivers nothing in a `progress_window` outside fault windows with work queued (a hang), a `logit` container's telemetry goes quiet, or VictoriaMetrics' newest sample is 30 s old; a sink still retrying past `recovery_bound` `WARN`s, and so do windows covering under 5% of the run after warmup |
@@ -129,16 +139,19 @@ rule only holds in steady state. The plan's "The checks" has the full rules.
 | `ledger.wire` | the generator's lines minus what the SUT read or the kernel dropped (G − (W + K)), loss by design, exceeds `wire_loss_outside_faults` outside UDP-affecting fault windows, with one generator batch of tolerance per window edge; the detail lists the gap per run of drain intervals, and the generator's own counted `drop_newest` loss beside it |
 | `ledger.intake` | the final SUT life's datagrams read minus dropped differ from the events sent plus bad lines; or an earlier life's read-but-unabsorbed residual (W − D − B − Ab) falls outside [0, R], R being the receive queue plus 67 batches |
 | `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listener's events sent differ from those `aggregate` received, or those it received from those it absorbed |
-| `ledger.egress` | the final SUT life's absorbed increments minus VictoriaMetrics' reset-aware total (Ab − V), or an earlier life's datagrams read minus dropped, bad lines, and that total (W − D − B − V), is nonzero, other than a positive gap that life's `drain complete` line counts in `batches_dropped`; or the export matched no series. A series without one segment per SUT life `WARN`s |
+| `ledger.egress` | the final SUT life's absorbed increments minus VictoriaMetrics' reset-aware total (Ab − V), or an earlier life's datagrams read minus dropped, bad lines, and that total (W − D − B − V), is nonzero, other than a positive gap that life's `drain complete` line counts in `batches_dropped`; a killed life's W − D − B − V falls outside its band (below: one drain interval of ingest; above: R plus one aggregate window of ingest); or the export matched no series. A series without one segment per SUT life `WARN`s |
 | `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0; a counted egress term is shown and not judged |
-| `identity.sink` | at the final life's last drain before shutdown, the sink's batches received differ from delivered + dropped + queued by more than one batch in flight |
+| `identity.sink` | at the final life's last drain before shutdown, the sink's batches received, plus those a disk spool replayed at open, differ from delivered + dropped + queued by more than one batch in flight |
 | `recovery` | within `recovery_bound` of a fault's end, no drain interval clear of other faults shows the sink not retrying, its buffer under 5% full or holding at most one batch, the listener's receive queue under 5% full, and ingest at 95% of the warmup rate; a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN`, and so does a run where no fault had an eligible interval |
 | `expect.<name>` | a scenario's own `[[expect]]` bound doesn't hold; see [Expectations](#expectations) |
 
 The plan's "The ledger and identities" defines each symbol. Shutdown-time drops land after
 `internal`'s final drain, so the ledger reads them from stderr: the listener's `warn` lines into
 D, and `drain complete`'s `batches_dropped` beside `ledger.egress`. The per-hop rows are exact
-only for the final SUT life, because an earlier life stops under load.
+only for the final SUT life, because an earlier life stops under load. A life a `kill` ended
+writes no final drain and no stderr shutdown lines, so up to one 5 s `internal` interval of its
+counters is lost and its D has no stderr part; `ledger.egress` judges it within a band instead
+of for equality, and the plan's "Which life a hop is judged in" derives the band.
 
 ### Expectations
 

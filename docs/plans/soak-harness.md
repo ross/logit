@@ -87,6 +87,7 @@ tools/soak/
   scenarios/sink-outage-drop-oldest/
   scenarios/udp-flood-sink-stop/
   scenarios/udp-flood-sink-stop-block/
+  scenarios/spool-kill-replay/          # W3: a SIGKILL inside a sink outage, a disk spool
 ```
 
 Subcommands: `run <scenario> [--duration 20m] [--seed N] [--keep] [--out DIR]`, `list`,
@@ -188,12 +189,24 @@ for = "45s"
 - Every fault carries `for`, so its revert is scheduled with it. `netem clear` is a revert, never
   a step.
 - No two faults overlap on one container.
-- No netem on a container during its `stop`, `pause`, or `partition`, because the qdisc is lost
-  with the namespace and `docker run --network container:<id>` needs a running target.
+- No netem on a container during its `stop`, `kill`, `pause`, or `partition`, because the qdisc
+  is lost with the namespace and `docker run --network container:<id>` needs a running target.
 - No fault ends inside `cooldown`, and `cooldown` is at least `recovery_bound`.
 - Actions and services are known. W1's actions are `netem`, `pause`, `stop`, `restart`, and
-  `partition`, on `logit`, `generator`, or `victoria-metrics`.
+  `partition`, on `logit`, `generator`, or `victoria-metrics`. W3 adds `kill`, on `logit` or
+  `generator` only.
 - `--seed` is refused until W4 adds a `[random]` table.
+
+**A `kill` (W3)** is `docker kill -s KILL` on a `logit` service, reverted by `docker start` with
+the same readiness probe a `stop`'s revert gets. The process gets no shutdown signal, so it
+writes no final `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line,
+and Docker records exit code 137. `validate()` treats it as a `stop`: it holds the container's
+namespace, so no netem on that container during it, it is UDP-affecting on the SUT, and it may
+not overlap another fault on its container. The watchdog accepts the exit inside a scheduled
+`kill` with code 137 only, and counts the revert as a start for `timeline`, `restarts`, `ready`,
+and the lives cross-check. The ledger pays for it: up to one `internal` interval of the killed
+life's counters is lost, so that life's egress is judged within a band, not for equality (see "Which
+life a hop is judged in").
 
 The expected rate is never configured. It is measured from the generator's own `events.sent`
 over the warmup.
@@ -367,7 +380,7 @@ one event is one increment.
 | G | generator `logit.output.messages{component=statsd}`; precondition: equals `logit.output.datagrams` |
 | W | SUT `logit.input.datagrams{component=statsd}` |
 | K | SUT `logit.input.kernel.drops` |
-| D | SUT `logit.component.datagrams.dropped` under every reason, from telemetry, plus `shutdown` drops from stderr |
+| D | SUT `logit.component.datagrams.dropped` under every reason, from telemetry, plus `shutdown` drops from stderr, except in a killed life, which writes none |
 | B | SUT `logit.component.diagnostics{key=bad_line}` |
 | E | SUT `logit.component.events.sent{component=statsd}` |
 | A | aggregate `logit.component.events.received` |
@@ -398,10 +411,28 @@ from stderr: the listener's `warn` lines go into D, and the `drain complete` lin
   taken off that inbox but not yet absorbed. The close-time window delivers that residual into
   V, so `ledger.egress` judges the life's W − D − B − V as it judges the final life's Ab − V.
   The [0, R] bound only catches a residual no shutdown could leave.
+- An earlier SUT life ended by a scheduled `kill` has no final drain, no close-time window, and
+  no stderr shutdown lines. Its hops are compared at its last drain, which is an ordinary one,
+  and reported; its residual must still lie in [0, R]. Three things differ from a stopped life.
+  The reads after its last drain, up to one `internal` interval (5 s), are in no counter, and an
+  `aggregate` flush between that drain and the kill can carry them into V, so V can exceed
+  W − D − B. The kill discards `aggregate`'s unflushed window: its events are in W, E, A, and Ab
+  up to the last drain, and never in V. And there is no `drain complete` line, so a gap can't
+  be counted. `ledger.egress` therefore judges the life's W − D − B − V within a band and never
+  calls a gap inside it uncounted: at least −(rate × drain interval), and at most R + rate ×
+  aggregate window, where the rate is the life's W over its last drain interval, the drain
+  interval is the median of its drain gaps, and the aggregate window is the export's sample
+  spacing. The detail states the band and the rate. A gap outside the band is **uncounted**.
+  D takes nothing from stderr for this life, because a SIGKILL logs no shutdown drops.
+- What a killed life's sink had queued reaches VictoriaMetrics only if a later life sends it,
+  as a disk spool's replay does. Those samples carry the killed life's own window timestamps,
+  because `aggregate` stamps each flush with its own clock, so V credits them to the killed
+  life by timestamp, not to the life that delivered them. `identity.sink` stays on the final
+  life, whose shutdown is ordinary.
 
 The number of SUT lives in telemetry must equal 1 plus the timeline's SUT starts: each `revert`
-of a `stop` on `logit`, an end-sequence early one included, and each `apply` of a `restart`, with
-`rc` 0. An unpause doesn't start a life. A life shorter than `internal`'s interval leaves at most
+of a `stop` or a `kill` on `logit`, an end-sequence early one included, and each `apply` of a
+`restart`, with `rc` 0. An unpause doesn't start a life. A life shorter than `internal`'s interval leaves at most
 its shutdown uptime point, so the next life's first uptime isn't lower and the two merge; on a
 mismatch every ledger, `identity.sink`, and `recovery` row SKIPs with the reason. They also SKIP when the SUT's telemetry has no
 `logit.process.uptime` point.
@@ -412,7 +443,7 @@ The rows:
   drops, and the kernel receive queue at socket close
   ([`docs/known-gaps/intake.md`](../known-gaps/intake.md), "UDP intake"). It is reported,
   bucketed by drain timestamp, and fails only when the loss outside UDP-affecting windows (netem
-  on `generator`; any `logit` stop, pause, restart, or partition) exceeds
+  on `generator`; any `logit` stop, kill, pause, restart, or partition) exceeds
   `wire_loss_outside_faults` times the lines sent there, beyond a tolerance of one generator
   batch per window edge. The two processes' drains are out of phase, so G is interpolated
   linearly at each SUT drain timestamp; across a run of steady intervals the interpolation
@@ -432,10 +463,12 @@ The rows:
   that life's `drain complete` `batches_dropped` beside it, and is **counted** only when that
   count is above 0. The two are never reconciled: `batches_dropped` counts batches, and under
   `temporality: cumulative` a dropped batch loses only the increments since its series' last
-  delivered total, which no log line states. Any other gap is **uncounted loss, FAIL**.
+  delivered total, which no log line states. A killed life's gap passes inside its band (see
+  "Which life a hop is judged in"). Any other gap is **uncounted loss, FAIL**.
 - `identity.sink`: at the last quiet SUT drain before shutdown,
-  `batches.received == batches.delivered + batches.dropped (every reason) + buffer.batches`,
-  allowing one batch in flight. Checked there, not at exit, because the sink's last delivery and
+  `batches.received + buffer.disk.replayed == batches.delivered + batches.dropped (every
+  reason) + buffer.batches`, allowing one batch in flight. A disk spool opens holding the
+  batches an earlier process queued, which this life delivers but never received. Checked there, not at exit, because the sink's last delivery and
   its shutdown drops land after the final drain.
 - `recovery`: within `recovery_bound` of each fault's end, some SUT drain shows `retrying` at 0,
   `buffer.utilization` under 0.05, or under 1.0 with `buffer.batches` at most 1 (one batch in a
@@ -544,9 +577,15 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
   under `block`, then `drop_oldest` with a small `max_batches`), and `udp-flood-sink-stop` and
   `udp-flood-sink-stop-block`, [`decoupled-listener-io.md`](decoupled-listener-io.md)'s deferred
   soak. A run of each is recorded under "Findings". No scenario needed per-peer `tc filter`.
-- **W3**: disk-spool `kill -9` replay, from [`durable-sink-buffer.md`](durable-sink-buffer.md): a
-  `kill` action, a named volume for `buffer.disk.path`, SIGKILL lives in the ledger (the last
-  5 s or less of telemetry is lost), and `buffer.disk.replayed` above 0 once, then 0.
+- **W3**: disk-spool `kill -9` replay, the manual soak
+  [`durable-sink-buffer.md`](durable-sink-buffer.md)'s "Verification" describes: a `kill` action
+  (§2) and its watchdog rules; SIGKILL lives in the ledger, judged within a band because up to
+  one `internal` interval of a killed life's telemetry is lost; self-test fixtures for the
+  watchdog around a kill and a three-life NDJSON whose middle life ends by a kill; and the
+  `spool-kill-replay` scenario, whose SUT spools to `/tmp/soak-spool` in its own container
+  filesystem, which a `kill` and `start` keep, so it needs no volume. Its expectations assert
+  `buffer.disk.replayed` above 0 once, at the restart, then 0. A run of it, and a negative
+  control without the spool, are recorded under "Findings".
 - **W4**: seeded random schedules (a `[random]` table), hours-long runs (chunked
   `docker logs --since/--until`), and running on the perf VM through `script/vm push`.
 - **W5**: an external target (Datadog) with a gitignored env file, as in `script/splunk-interop`'s
@@ -861,6 +900,87 @@ The kernel started dropping about 40 s into the stop, once the sink's queue and 
 `aggregate`'s inbox, and the receive queue had filled; from then on the listener read nothing
 until the chain unblocked. Every datagram the kernel took is in K, so the wire gap stayed 0.
 
+### W3: a SIGKILL replayed from a disk spool (2026-10-09)
+
+Run `20261009T000850Z`: `script/soak run spool-kill-replay` at its own 6 minutes 15 seconds,
+from `soak/w3` at `38d94234` with the W3 changes uncommitted, on W1a's images and host
+(`logit:soak` `sha256:78a95c90bb4a`; no Rust changed). VictoriaMetrics stopped at +60 s for
+150 s; the SUT was killed at +120 s and started at +150 s, and answered `logit ready` on the
+first probe. The run first scored `identity.sink` FAIL, which the harness fix below closes; the
+table is the re-score, which `soak.py check` produces from the run directory alone:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 4 apply/revert action(s) returned 0; 1 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 3 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (1 kill(s)) |
+| `restarts` | PASS | 2 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 3 sink fault line(s) inside fault windows, 0 outside, 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 64 health sample(s) healthy outside fault windows; 1 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 4 30s window(s) with deliveries outside fault windows; 5 freshness sample(s) under 30s; 90s of 315s after warmup judged (29%; WARN under 5%) |
+| `rss_slope` | PASS | MiB/h per service/life: logit/1 +0.0, generator/0 +11.4 (limit 64); logit 110s of 315s after warmup judged (35%; WARN under 5%); generator 115s of 315s after warmup judged (37%; WARN under 5%) |
+| `fd_slope` | PASS | warmup median -> end: logit 15->15, generator 11->11 (limit +8) |
+| `ledger.wire` | PASS | G 762,400 = W 759,000 + K 0 + wire 3,400 (by design: 3,437 in UDP-affecting windows, -39 steady, 1 at the end; steady limit 300); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 1: W − D 510,200 vs E + B 510,200; life 0: W − D − B − Ab 0 within [0, R] (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.edge` | PASS | final life 1: E 510,200 == A 510,200 (listener to aggregate) |
+| `ledger.aggregate` | PASS | final life 1: Ab 510,200 == A 510,200 (every event absorbed) |
+| `ledger.egress` | PASS | life 0 (killed): W − D − B − V 0 = residual 0 + Ab − V 0, ok (band [-10,000, 97,000]: ingest 2,000/s over the last drain interval, x 4.99991s drain interval below; R + 10s aggregate window above; D has no stderr part: a SIGKILL logs no shutdown drops); life 1 (final): Ab 510,200 − V 510,200 = 0, ok (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.summary` | PASS | final life 1: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V 0; wire G − (W + K) 3,400 over the run, by design |
+| `identity.sink` | PASS | final life 1 at +400s: received 23 + replayed 6 vs delivered 29 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `recovery` | PASS | 1 of 2 fault(s) judged, each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect.spool-holds-the-outage` | PASS | max of logit.component.buffer.disk.segments{component=victoria_metrics} on logit, during c0s1: c0s1 (+60s, +210s]: 1 (14 sample(s) and the value in force at its start), want >= 1 |
+| `expect.spool-queues-windows` | PASS | max of logit.component.buffer.batches{component=victoria_metrics} on logit, during c0s1: c0s1 (+60s, +210s]: 12 (14 sample(s) and the value in force at its start), want >= 2 |
+| `expect.spool-replayed-at-restart` | PASS | delta of logit.component.buffer.disk.replayed{component=victoria_metrics} on logit, after c0s2: c0s2 (+150s, +195s]: 6 (over 8 drain(s)), want >= 1 |
+| `expect.no-second-replay` | PASS | delta of logit.component.buffer.disk.replayed{component=victoria_metrics} on logit, after c0s1: c0s1 (+210s, +255s]: 0 (over 9 drain(s)), want <= 0 |
+| `expect.sink-never-drops` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics} on logit, through c0s1: c0s1 (+60s, +255s]: 0 (over 33 drain(s)), want <= 0 |
+| `expect.retrying-clears` | PASS | last of logit.component.retrying{component=victoria_metrics} on logit, after c0s1: c0s1 (+210s, +255s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
+
+What the run showed about `logit`:
+
+- **The spool kept every window the killed process queued.** The first process spooled the six
+  10 s windows it flushed between the VictoriaMetrics stop and the kill (+68 s through +118 s).
+  The second process found them at open (`buffer.disk.replayed` 6), held them behind its own
+  windows while VictoriaMetrics stayed down (the queue peaked at 12 batches), and delivered all
+  of them 2.5 s after VictoriaMetrics started (`recovered` at +212.7 s). The export holds all
+  100 series at each of those six timestamps, which only the second process could have sent.
+- **The killed life's egress balanced to zero.** Its last `aggregate` flush (sample timestamp
+  +118 s) and its last drain (+118.4 s) fell together, 1.6 s before the kill, and no flush
+  followed, so its W − D − B − V was 0, not only inside the band. `drain complete` is absent for that life, as a
+  SIGKILL implies, and the replay count stayed 0 after VictoriaMetrics returned.
+- `buffer.disk.segments` read 1 throughout, warmup included: at the default 64 MiB
+  `segment_bytes` the active segment never rotates in this run, so `spool-holds-the-outage` only
+  shows the spool is open. `spool-queues-windows` is the expectation that shows it filling.
+
+What the run showed about the harness:
+
+- **`identity.sink` didn't account for a spool's replay.** The first score read "received 23 vs
+  delivered 29 + dropped 0 + buffer.batches 0, gap -6": the six replayed batches were delivered
+  in the final life but received in the killed one. The identity now adds the life's
+  `buffer.disk.replayed` to the received side, and the self-test's three-life fixture pins it.
+- The generator's `statsd_out` dropped nothing while the SUT was down: its queue held the 30 s
+  of batches and sent them once `logit` answered again. The 3,437 lines of wire gap in
+  UDP-affecting windows are about what the killed process read in the 1.6 s after its last
+  drain (3,200 at 2,000 a second), which no counter exported, plus what its kernel receive queue
+  held at the kill; the split between the two isn't measured.
+- `vm.totals_by_life` credits the replayed samples to the killed life by their own timestamps,
+  as "Which life a hop is judged in" says: V for life 0 is 248,800, equal to its W and Ab.
+
+The negative control, run `20261009T002208Z`, is the same scenario from a scratch copy outside
+`tools/soak/scenarios/` whose SUT has no `disk:` block, so the sink's queue is in memory. Its
+first process queued the same six windows (`buffer.batches` peaked at 6) and lost them with the
+kill. `ledger.egress` FAILed: "life 0 (killed): W − D − B − V 120,000 = residual 0 + Ab − V
+120,000, uncounted (band [-9,999, 96,999]: ingest 2,000/s over the last drain interval, x
+5.00005s drain interval below; R + 10s aggregate window above; D has no stderr part: a SIGKILL
+logs no shutdown drops)". `expect.spool-holds-the-outage` and `expect.spool-replayed-at-restart`
+FAILed too, and every other row PASSed, `ledger.summary` included, because the final life
+balanced. The 120,000 is the 60 s of increments between the VictoriaMetrics stop and the kill.
+
+The band's high side is dominated by R (77,000 of the 97,000 here), so an in-memory queue lost to
+a kill shows as uncounted only once it holds more than about 48 s of increments at 2,000 lines
+a second. A kill earlier in an outage, or a lower rate, would lose a queue inside the band and
+pass. Tightening it means replacing R by the life's measured residual at its last drain, which
+the band doesn't use yet.
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
@@ -887,5 +1007,9 @@ until the chain unblocked. Every datagram the kernel took is in K, so the wire g
 - **W2**: the self-test passes, and each new expectation fails with its rule reverted. Each new
   scenario passes `self-test` validation and the shipped-config test, and a run of it, every row
   PASS, is recorded under "Findings".
-- **W3 through W5**: each new scenario passes `self-test` validation and the shipped-config test,
+- **W3**: the self-test passes, and each new rule fails it when reverted. `spool-kill-replay`
+  passes `self-test` validation and the shipped-config test, and a run of it, every row PASS, is
+  recorded under "Findings", with a negative control: the same scenario without the spool, whose
+  killed life's `ledger.egress` FAILs as uncounted.
+- **W4 and W5**: each new scenario passes `self-test` validation and the shipped-config test,
   and a run of it is recorded under "Findings".
