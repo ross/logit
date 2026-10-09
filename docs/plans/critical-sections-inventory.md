@@ -6845,7 +6845,7 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   In practice two `Bytes` never coincide like this from one `serde_json::Deserializer::from_slice`
   call, but this is exactly the kind of pointer-provenance reasoning that's easy to get subtly
   wrong and hard to catch by testing).
-- **Existing coverage:** `json.rs` unit tests (the `#[cfg(test)]` module), plus
+- **Existing coverage:** `crates/logit-transforms/src/json.rs`'s unit tests (the `#[cfg(test)]` module), plus
   `crates/logit-bench/tests/allocations.rs`'s `json_parse_one_event`/`json_parse_wide_json_event`/
   `json_parse_reordered_keys_event` (allocation-count pins, which indirectly also exercise the
   zero-copy path -- a regression to copying would likely fail these). ADR:
@@ -6873,9 +6873,8 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
     something upstream bounds a single log line to well under 4 GiB, since a longer line would
     silently truncate/wrap these offsets via the `as u32` casts in `split_row`'s `out.push`
     calls).
-  - `split_row`'s precondition "`!line.is_empty()`" (its doc comment) is enforced by the caller
-    (`process` returns early on an empty message) -- verify every call site still upholds this if
-    the function is ever reused elsewhere.
+  - `split_row` treats an empty `line` as one empty field (its doc comment, pinned by a test), and
+    `process` still returns early on an empty message, so the transform never reaches that case.
   - The single UTF-8 validity check on the whole message (`std::str::from_utf8(&raw)` in `process`) is claimed sufficient to
     guarantee every subsequently-sliced field is also valid UTF-8, reasoning that `delimiter`/`"`
     are single ASCII bytes and never fall inside a multi-byte sequence -- verify this reasoning
@@ -6931,7 +6930,7 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   infinite loop; the resynchronization logic is subtle enough (three separate "value" arms in
   `parse_logfmt`, each advancing `i` differently) that a fuzz target would be higher-value here
   than more manual reading.
-- **Existing coverage:** `logfmt.rs` has a large test module covering quoting,
+- **Existing coverage:** `crates/logit-transforms/src/logfmt.rs` has a large test module covering quoting,
   escapes, unterminated quotes, bare keys, and `kv`'s three empty/bareword/no-separator segment
   shapes; `crates/logit-bench/tests/allocations.rs` pins allocation counts for the escaped-value
   case. ADR: `logfmt-and-kv-parsing.md`.
