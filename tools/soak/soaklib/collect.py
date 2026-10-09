@@ -178,7 +178,7 @@ class LogCapture:
                     said = err.read_text(errors="replace").strip()
                 except OSError:
                     said = ""
-                entry["stderr"] = (said or result.stderr.strip())[-500:]
+                entry["stderr"] = (result.stderr.strip() or said)[-500:]
             for chunk_path in (out, err):
                 chunk_path.unlink(missing_ok=True)
             self.record.write(entry)

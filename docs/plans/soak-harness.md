@@ -574,8 +574,9 @@ The rows:
   after it: the first window to close after the fault can hold no line, and the next one closes
   an interval later. A generator `stop` gets 2 × the interval after it, the bound a new life's
   first sample gets, because the restarted generator sends its first line only after it
-  starts. A window lost beside the fault FAILs once it moves the gap's end past its bound; one
-  lost inside that bound is excused. A recorded `statsd-vm` run's margins were 1.6 s before a
+  starts; that allowance is assumed, since no shipped scenario stops the generator. A window
+  lost beside the fault FAILs once it moves the gap's start or end past its bound; one lost
+  inside that bound is excused. A recorded `statsd-vm` run's margins were 1.6 s before a
   pause and 10.1 s after a partition at a 10 s interval.
 - `ledger.replay`, for each killed life followed by another, else SKIP: the next life's
   first-drain `buffer.disk.replayed` equals the killed life's `buffer.batches` at its last

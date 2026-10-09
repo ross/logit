@@ -1294,7 +1294,8 @@ def check_ledger_windows(data):
     # ends within `tail_bound` after it: the first window to close after the fault can hold no
     # line, and the next one closes an interval later. A restarted generator sends its first
     # line only after it starts, so a generator stop gets `head_bound` after it, as a new life's
-    # first sample does. A lost window beside the fault FAILs once it moves the gap's end past
+    # first sample does; that allowance is assumed, since no shipped scenario stops the
+    # generator. A lost window beside the fault FAILs once it moves the gap's start or end past
     # its bound; one lost inside that bound is excused.
     silent = [(f.start, f.end, head_bound if (f.on, f.action) == ("generator", "stop")
                else tail_bound, f"{f.step} {f.action} on {f.on}") for f in data.faults
