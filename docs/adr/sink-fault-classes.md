@@ -421,7 +421,7 @@ failed request's own:
 - A batch to a destination that fails mid-send delivers each accepted request once, however often
   a later request is retried.
 - Every attempt still encodes the whole batch, the settled requests included; only their `POST`
-  is skipped. Their encode counts nothing because the gate is muted.
+  is skipped. The gate mutes their encode-side counters on a repeat.
 - Under `at_most_once`, `logit.component.events.dropped{reason="ambiguous_at_most_once"}` counts
   every event of a dropped batch, including events whose requests were delivered; the per-route
   `records.dropped` is the precise count. A later route's count is the plan's weight for `datadog_out`

@@ -601,7 +601,8 @@ impl Output for OtlpOutput {
         self.accounting.observe_posture(posture);
     }
 
-    /// One attempt ([`OtlpOutput::attempt`]). An `Ok` disarms the batch accounting on every path,
+    /// One attempt ([`OtlpOutput::attempt`]). A final result (`Ok`, or a fault
+    /// `write_loop` won't retry) disarms the batch accounting on every path,
     /// a batch that encoded to nothing included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
