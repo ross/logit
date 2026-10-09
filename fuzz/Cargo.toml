@@ -140,3 +140,24 @@ path = "fuzz_targets/syslog.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "graphite_plaintext"
+path = "fuzz_targets/graphite_plaintext.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "graphite_pickle"
+path = "fuzz_targets/graphite_pickle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "collectd"
+path = "fuzz_targets/collectd.rs"
+test = false
+doc = false
+bench = false

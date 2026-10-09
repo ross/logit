@@ -4,13 +4,22 @@
 //! A target that takes a selector byte gets it prepended, matching the target's own doc: the
 //! OTLP targets' signal (`0` logs, `1` metrics, `2` traces), `prom_decompress`'s encoding,
 //! `prom_remote_write`'s version, `stream_framing`'s four bytes of mode, bound, and chunking,
-//! and `syslog`'s line splitting (`1` on, `0` off). [`generate`] is deterministic, so a rerun
+//! `syslog`'s line splitting (`1` on, `0` off), `graphite_pickle`'s mode (`0` a payload, `1` a
+//! build spec), and `collectd`'s two-byte cut position. [`generate`] is deterministic, so a rerun
 //! rewrites the same bytes and leaves `git status` clean.
 
 use bytes::{Bytes, BytesMut};
 use logit_core::interner::intern;
-use logit_core::{DdSketch, EventBatch, HyperLogLog, Mapping, Provenance};
+use logit_core::{
+    AttrMap, DdSketch, Event, EventBatch, HyperLogLog, LogRecord, Mapping, MetricKind,
+    MetricRecord, Provenance, Resource, Severity, Sum, Temporality, Value,
+};
+use logit_proto::collectd::{
+    CollectdEncoder, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE, ATTR_SEVERITY,
+    ATTR_TYPE, ATTR_TYPE_INSTANCE, DEFAULT_MAX_PACKET_BYTES, MAX_VALUES_PER_LIST,
+};
 use logit_proto::frame::{write_frame, write_frame_with_flags, Compression, FLAG_CONTROL};
+use logit_proto::graphite::pickle::write_datapoints;
 use logit_proto::native::control::{
     Ack, AckStatus, ControlMessage, Hello, HelloAck, Reject, ACK_REJECTED_DECODE_BUDGET,
 };
@@ -20,10 +29,11 @@ use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{decompress_bounded, Encoding};
 use logit_proto::prometheus::remote_write::Version;
 use logit_proto::proxy::V2_SIGNATURE;
-use logit_proto::{Signal, SignalEncoder, SignalPayload};
+use logit_proto::{FramedEncoder, MessageBuf, Signal, SignalEncoder, SignalPayload};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 /// A seed larger than this is left out: libFuzzer's `-max_len` would truncate it anyway, and the
 /// seeds are committed.
@@ -245,6 +255,18 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
 
     for (name, bytes) in syslog_seeds(testdata)? {
         add("syslog", name, bytes);
+    }
+
+    for (name, bytes) in graphite_plaintext_seeds(testdata)? {
+        add("graphite_plaintext", name, bytes);
+    }
+
+    for (name, bytes) in graphite_pickle_seeds(testdata)? {
+        add("graphite_pickle", name, bytes);
+    }
+
+    for (name, bytes) in collectd_seeds(testdata)? {
+        add("collectd", name, bytes);
     }
 
     let mut skipped = Vec::new();
@@ -552,6 +574,284 @@ fn syslog_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     Ok(out)
 }
 
+/// collectd's `write_graphite` capture as one datagram and as its first read cycle's 25 lines,
+/// one per seed, and constructed lines for the shapes `crates/logit-proto/src/graphite/mod.rs`'s
+/// decode table names: tags, a repeated tag key, malformed tags, the `-1` sentinel, fractional and
+/// boundary timestamps, non-finite values, a non-UTF-8 line, and Unicode whitespace.
+fn graphite_plaintext_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let capture = std::fs::read(testdata.join("interop/graphite/write-graphite-000.raw"))?;
+    let mut out = vec![("write-graphite-000".to_string(), capture.clone())];
+    for (i, line) in capture.split_inclusive(|&b| b == b'\n').take(25).enumerate() {
+        out.push((format!("write-graphite-000-line-{i:02}"), line.to_vec()));
+    }
+    for (name, datagram) in [
+        ("tags", &b"sys.cpu;env=prod;host=web-1 0.5 1700000000\nsys.mem;k=a=b 2 1700000001"[..]),
+        ("repeated-tag", b"a.b;team=a;team=b 1 1700000000"),
+        ("bad-tags", b"a.b;novalue 1 1\na.b;=v 1 1\na.b;n= 1 1\n;k=v 1 1\na.b; 1 1"),
+        ("sentinel", b"a.b 1 -1\na.b 1 -1.0\na.b 1 -1e0\na.b 1 -1.0000000000000002\na.b 1 -0.0"),
+        ("fractional", b"a.b 1 1700000000.25\na.b 1 0.9999999999\na.b 1 0.5011891235"),
+        ("boundaries", b"a.b 1 2147483647\na.b 1 2147483648.5\na.b 1 9223372036.854775807\na.b 1 1e300\na.b 1 4.9e-324"),
+        ("values", b"a.b NaN 1\na.b inf 1\na.b -inf 1\na.b 1e308 1\na.b -0 1\na.b 5e-324 1\na.b +1.5 1"),
+        ("fields", b"a.b 1\na.b 1 1 1\n\t a.b\t1  1 \r\n   \n"),
+        ("non-utf8", b"good 1 1\nbad.\xff 1 1\ngood.two 1 1"),
+        ("unicode-whitespace", "a.b\u{a0}1\u{2003}1700000000\na\u{85}b 1 1".as_bytes()),
+        ("sanitized", b"a/b\\c 1 1\na.b;x!=1;x^=2;t=~v 1 1\na.\x01b 1 1"),
+    ] {
+        out.push((format!("constructed-{name}"), datagram.to_vec()));
+    }
+    Ok(out)
+}
+
+/// `p = 'robustness.host.cpu;env=prod'; pickle.dumps([(p, (1700000000, 0.5)),
+/// ('robustness.host.mem', (1700000001, 2**31 + 5)), (p, (1700000002, -1.25))], protocol=2)`,
+/// CPython 3.14's bytes, copied from `crates/logit-proto/tests/robustness.rs`'s
+/// `GRAPHITE_PICKLE`: a memoized repeat through `BINGET` and a `LONG1` value.
+const CPYTHON_MEMOIZED: &[u8] = &[
+    0x80, 0x02, 0x5d, 0x71, 0x00, 0x28, 0x58, 0x1c, 0x00, 0x00, 0x00, 0x72, 0x6f, 0x62, 0x75, 0x73,
+    0x74, 0x6e, 0x65, 0x73, 0x73, 0x2e, 0x68, 0x6f, 0x73, 0x74, 0x2e, 0x63, 0x70, 0x75, 0x3b, 0x65,
+    0x6e, 0x76, 0x3d, 0x70, 0x72, 0x6f, 0x64, 0x71, 0x01, 0x4a, 0x00, 0xf1, 0x53, 0x65, 0x47, 0x3f,
+    0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86, 0x71, 0x02, 0x86, 0x71, 0x03, 0x58, 0x13, 0x00,
+    0x00, 0x00, 0x72, 0x6f, 0x62, 0x75, 0x73, 0x74, 0x6e, 0x65, 0x73, 0x73, 0x2e, 0x68, 0x6f, 0x73,
+    0x74, 0x2e, 0x6d, 0x65, 0x6d, 0x71, 0x04, 0x4a, 0x01, 0xf1, 0x53, 0x65, 0x8a, 0x05, 0x05, 0x00,
+    0x00, 0x80, 0x00, 0x86, 0x71, 0x05, 0x86, 0x71, 0x06, 0x68, 0x01, 0x4a, 0x02, 0xf1, 0x53, 0x65,
+    0x47, 0xbf, 0xf4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86, 0x71, 0x07, 0x86, 0x71, 0x08, 0x65,
+    0x2e,
+];
+
+/// Under mode `0`: the two recorded pickle captures with their length prefix stripped, a CPython
+/// dump with memoized repeats and a `LONG1`, `write_datapoints` output, and hand-assembled
+/// payloads in the shapes other producers write (og-rek's `MARK … LIST`, one `APPEND` per item,
+/// protocol 1's `MARK … TUPLE`, a stray `None`, a numeric-string value, the memo key past 255 a
+/// batch of more than 256 datapoints reaches, and a list-shaped datapoint). Under mode `1`: build
+/// specs covering every item kind under each of the three outer-list shapes.
+fn graphite_pickle_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    const PAYLOAD: u8 = 0;
+    const BUILD: u8 = 1;
+    let mut out = Vec::new();
+    for stem in ["graphite-pickle-p2-000", "graphite-pickle-p5-000"] {
+        let capture = std::fs::read(testdata.join(format!("interop/graphite/{stem}.raw")))?;
+        let mut rest = &capture[..];
+        let mut frame = 0;
+        while let Some((prefix, body)) = rest.split_first_chunk::<4>() {
+            let len = u32::from_be_bytes(*prefix) as usize;
+            let (payload, tail) = body.split_at(len.min(body.len()));
+            out.push((format!("{stem}-{frame}"), prefixed(PAYLOAD, payload)));
+            rest = tail;
+            frame += 1;
+        }
+    }
+    out.push(("cpython-memoized".to_string(), prefixed(PAYLOAD, CPYTHON_MEMOIZED)));
+
+    let written: [(&str, Vec<(&str, i64, f64)>); 4] = [
+        ("one", vec![("sys.cpu;host=web-1", 1_700_000_000, 0.5)]),
+        ("sentinel-and-long1", vec![("a.b", -1, 1.0), ("far.future", (1 << 31) + 5, -2.25)]),
+        (
+            "non-finite",
+            vec![("a.b", 1_700_000_000, f64::NAN), ("c.d", 1_700_000_000, f64::INFINITY)],
+        ),
+        ("bad-timestamps", vec![("a.b", 0, 1.0), ("a.b", -2, 1.0), ("a.b", i64::MAX, 1.0)]),
+    ];
+    for (name, datapoints) in written {
+        let mut payload = Vec::new();
+        write_datapoints(&mut payload, datapoints);
+        out.push((format!("written-{name}"), prefixed(PAYLOAD, &payload)));
+    }
+    let many: Vec<(String, i64, f64)> =
+        (0..300).map(|i| (format!("m.{i}"), 1_700_000_000 + i, i as f64)).collect();
+    let mut payload = Vec::new();
+    write_datapoints(&mut payload, many.iter().map(|(p, t, v)| (p.as_str(), *t, *v)));
+    out.push(("written-300".to_string(), prefixed(PAYLOAD, &payload)));
+
+    // `X` is `BINUNICODE`, `U` `SHORT_BINSTRING`, `J` `BININT`, `K` `BININT1`, `G` `BINFLOAT`,
+    // `(` `MARK`, `t` `TUPLE`, `\x86` `TUPLE2`, `l` `LIST`, `a` `APPEND`, `]` `EMPTY_LIST`.
+    let float_one = [0x47, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0];
+    let mut og_rek = vec![0x80, 2, 0x28, 0x55, 3];
+    og_rek.extend_from_slice(b"a.b");
+    og_rek.extend_from_slice(&[0x4a, 0x00, 0xf1, 0x53, 0x65]);
+    og_rek.extend_from_slice(&float_one);
+    og_rek.extend_from_slice(&[0x86, 0x86, 0x6c, 0x2e]);
+    out.push(("og-rek-mark-list".to_string(), prefixed(PAYLOAD, &og_rek)));
+    let mut append_each = vec![0x80, 2, 0x5d];
+    for path in [&b"a.b"[..], b"c.d"] {
+        append_each.extend_from_slice(&[0x28, 0x55, 3]);
+        append_each.extend_from_slice(path);
+        append_each.extend_from_slice(&[0x28, 0x4b, 7]);
+        append_each.extend_from_slice(&float_one);
+        append_each.extend_from_slice(&[0x74, 0x74, 0x61]);
+    }
+    append_each.push(0x2e);
+    out.push(("append-each-protocol-1-tuples".to_string(), prefixed(PAYLOAD, &append_each)));
+    let mut mixed = vec![0x80, 2, 0x5d, 0x28, 0x4e, 0x58, 3, 0, 0, 0];
+    mixed.extend_from_slice(b"a.b");
+    mixed.extend_from_slice(&[0x58, 3, 0, 0, 0]);
+    mixed.extend_from_slice(b"1.5");
+    mixed.extend_from_slice(&[0x58, 3, 0, 0, 0]);
+    mixed.extend_from_slice(b"2.5");
+    mixed.extend_from_slice(&[0x86, 0x86, 0x65, 0x2e]);
+    out.push(("none-and-numeric-strings".to_string(), prefixed(PAYLOAD, &mixed)));
+    let mut list_shaped = vec![0x80, 2, 0x5d, 0x28, 0x5d, 0x28, 0x58, 3, 0, 0, 0];
+    list_shaped.extend_from_slice(b"a.b");
+    list_shaped.extend_from_slice(&[0x5d, 0x28, 0x4b, 1]);
+    list_shaped.extend_from_slice(&float_one);
+    list_shaped.extend_from_slice(&[0x65, 0x65, 0x65, 0x2e]);
+    out.push(("list-shaped-datapoint".to_string(), prefixed(PAYLOAD, &list_shaped)));
+
+    // A build spec's first byte picks the outer list (`0` `APPENDS`, `1` `LIST`, `2` one `APPEND`
+    // per item); each byte after it is one item, `byte % 7` its kind and `byte / 7` its number.
+    let every_kind: Vec<u8> = (0..14).collect();
+    for (outer, name) in [(0u8, "appends"), (1, "list"), (2, "append-each")] {
+        let spec = [&[outer][..], &every_kind].concat();
+        out.push((format!("build-{name}-every-kind"), prefixed(BUILD, &spec)));
+        // Alternating a new tuple (kind 0) and a memo repeat of an earlier one (kind 2).
+        let tuples: Vec<u8> =
+            [outer].into_iter().chain((0..40).map(|i| 7 * (i / 2) + 2 * (i % 2))).collect();
+        out.push((format!("build-{name}-tuples-and-repeats"), prefixed(BUILD, &tuples)));
+    }
+    Ok(out)
+}
+
+/// The four recorded collectd datagrams, and `CollectdEncoder` output for constructed events:
+/// value lists with elided identity, every data-source kind, a NaN GAUGE, a notification, and a
+/// list of `MAX_VALUES_PER_LIST` values; a list of one more, whose length matches its count,
+/// behind those lists; and a datagram with Signature and Encryption parts. Each seed's
+/// two-byte cut falls mid-datagram but the last's.
+fn collectd_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let cut_at_half = |datagram: &[u8]| -> Vec<u8> {
+        let cut = (datagram.len() / 2) as u16;
+        [&cut.to_be_bytes()[..], datagram].concat()
+    };
+    let mut out = Vec::new();
+    let mut paths: Vec<_> = std::fs::read_dir(testdata.join("interop/collectd"))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "raw"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        out.push((stem, cut_at_half(&std::fs::read(&path)?)));
+    }
+
+    let identity =
+        |plugin: &str, instance: Option<&str>, type_: &str, type_instance: Option<&str>| {
+            let mut attrs = AttrMap::new();
+            attrs.insert(ATTR_HOST, "seed-host");
+            attrs.insert(ATTR_PLUGIN, plugin);
+            if let Some(instance) = instance {
+                attrs.insert(ATTR_PLUGIN_INSTANCE, instance);
+            }
+            attrs.insert(ATTR_TYPE, type_);
+            if let Some(type_instance) = type_instance {
+                attrs.insert(ATTR_TYPE_INSTANCE, type_instance);
+            }
+            attrs.insert(ATTR_INTERVAL, Value::F64(10.0));
+            attrs
+        };
+    let list = |attrs: AttrMap, kinds: Vec<MetricKind>| {
+        let mut event = Event::empty(1_700_000_000_123_456_789, attrs);
+        for (i, kind) in kinds.into_iter().enumerate() {
+            event.metrics.push(MetricRecord::new(intern(&format!("seed.{i}")), kind));
+        }
+        event
+    };
+    let sum = |value: f64, temporality: Temporality, monotonic: bool| {
+        MetricKind::Sum(Sum { value, temporality, monotonic })
+    };
+    let mut nan = MetricRecord::new(intern("seed.nan"), MetricKind::Gauge(0.0));
+    nan.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+    let mut nan_list = list(identity("memory", None, "memory", Some("free")), vec![]);
+    nan_list.metrics.push(nan);
+
+    let mut notification_attrs = identity("load", None, "load", None);
+    notification_attrs.remove(ATTR_INTERVAL);
+    notification_attrs.insert(ATTR_SEVERITY, Value::U64(2));
+    let notification = Event::log(
+        1_700_000_001_000_000_000,
+        notification_attrs,
+        LogRecord {
+            message: Value::str("load is above its warning threshold"),
+            severity: Some(Severity::Warn),
+            body_format: logit_core::BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
+    );
+
+    let batches: Vec<(&str, Vec<Event>)> = vec![
+        (
+            "lists",
+            vec![
+                list(identity("load", None, "load", None), vec![MetricKind::Gauge(0.5); 3]),
+                list(
+                    identity("interface", Some("eth0"), "if_octets", None),
+                    vec![
+                        sum(1.0, Temporality::Cumulative, false),
+                        sum(2.0, Temporality::Cumulative, false),
+                    ],
+                ),
+                list(
+                    identity("interface", Some("eth0"), "if_packets", None),
+                    vec![sum(3.0, Temporality::Cumulative, false); 2],
+                ),
+                list(
+                    identity("cpu", Some("0"), "cpu", Some("user")),
+                    vec![sum(7.0, Temporality::Cumulative, true)],
+                ),
+                list(
+                    identity("cpu", Some("0"), "cpu", Some("idle")),
+                    vec![sum(9.0, Temporality::Delta, true)],
+                ),
+                nan_list,
+            ],
+        ),
+        ("notification", vec![notification]),
+        (
+            "max-values",
+            vec![list(
+                identity("wide", None, "wide", None),
+                vec![MetricKind::Gauge(1.0); MAX_VALUES_PER_LIST],
+            )],
+        ),
+    ];
+    for (name, events) in batches {
+        let batch = EventBatch { resource: Arc::new(Resource::default()), scope: None, events };
+        let mut packets: MessageBuf<usize> = MessageBuf::default();
+        CollectdEncoder::new()
+            .with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES)
+            .encode_into(&batch, &mut packets);
+        for (i, packet) in packets.iter().enumerate() {
+            out.push((format!("encoded-{name}-{i}"), cut_at_half(packet)));
+        }
+    }
+
+    // A Signature part (skipped by length) ahead of a list, then an Encryption part, which stops
+    // the walk, with bytes after it that would otherwise be a malformed part.
+    let mut signed = Vec::new();
+    signed.extend_from_slice(&[0x02, 0x00, 0x00, 0x28]);
+    signed.extend_from_slice(&[0xab; 36]);
+    let first = out.iter().find(|(name, _)| name == "encoded-lists-0").unwrap().1[2..].to_vec();
+    signed.extend_from_slice(&first);
+    signed.extend_from_slice(&[
+        0x02, 0x10, 0x00, 0x08, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x06, 0x00, 0x01,
+    ]);
+    out.push(("signed-then-encrypted".to_string(), [&[0xff, 0xff][..], &signed].concat()));
+
+    // The encoded lists, then a Values part of `MAX_VALUES_PER_LIST + 1` GAUGEs whose length is
+    // the one that count implies: past the cap, so a `bad_part` that keeps the lists before it.
+    let mut past_cap = first;
+    let count = MAX_VALUES_PER_LIST + 1;
+    past_cap.extend_from_slice(&0x0006u16.to_be_bytes());
+    past_cap.extend_from_slice(&((6 + 9 * count) as u16).to_be_bytes());
+    past_cap.extend_from_slice(&(count as u16).to_be_bytes());
+    past_cap.extend(std::iter::repeat_n(1u8, count));
+    for _ in 0..count {
+        past_cap.extend_from_slice(&1.5f64.to_le_bytes());
+    }
+    out.push(("values-count-past-the-cap".to_string(), cut_at_half(&past_cap)));
+    Ok(out)
+}
+
 fn prefixed(selector: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + body.len());
     out.push(selector);
@@ -610,7 +910,10 @@ mod tests {
         assert_eq!(
             targets,
             [
+                "collectd",
                 "forwarded",
+                "graphite_pickle",
+                "graphite_plaintext",
                 "hll_bytes",
                 "native_batch",
                 "native_control",
