@@ -1,15 +1,12 @@
 //! `logfmt` and `kv`: parse a log message as `key=value` pairs and merge them into the event's
 //! attributes, as `json` does for JSON. See `docs/adr/logfmt-and-kv-parsing.md`.
 //!
-//! `logfmt` is the de-facto convention (`level=info msg="hello world" dur=3ms`):
-//! whitespace-delimited pairs, `"`-quoted values with backslash escapes, no required config. `kv`
-//! is a literal splitter with required `pair_sep`/`kv_sep` and no quoting (`a=1&b=2`,
-//! `a: 1, b: 2`). They're two `ComponentKind`s sharing this module, not one kind with a mode flag.
-//!
-//! Both are stateless and always produce `Value::Str` (or `Value::Bool(true)` for an opted-in
-//! bareword), never a number; `scale`/`kv_metrics` downstream coerce through `crate::numeric`.
-//! The parse itself is `logit_proto::message::logfmt`; this module holds the merge, the UTF-8
-//! check, and the diagnostics.
+//! `logfmt` is the de-facto convention (`level=info msg="hello world" dur=3ms`) with no required
+//! config; `kv` takes a required `pair_sep`/`kv_sep` (`a=1&b=2`, `a: 1, b: 2`). They're two
+//! `ComponentKind`s sharing this module, not one kind with a mode flag. The grammars, and the
+//! rule that a value is never a number, are `logit_proto::message::logfmt`'s; `scale`/`kv_metrics`
+//! downstream coerce through `crate::numeric`. This module holds the merge, the UTF-8 check, and
+//! the diagnostics.
 
 use bytes::Bytes;
 use logit_core::interner::KeyCache;
