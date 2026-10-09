@@ -2099,8 +2099,11 @@ mod tests {
 
         let (addr, _log) = intake(move |_| (500, body.clone())).await;
         let err = sink(addr).send_at(&batch(vec![gauge(NOW)]), NOW).await.unwrap_err();
+        // The message also names the request URL, whose ephemeral port can hold a run of KEY's
+        // digits (`34563` holds `3456`), so only the response snippet after it is checked.
         let message = format!("{err:#}");
-        assert!(!contains_key_run_longer_than(&message, KEY, 3), "{message}");
+        let (_, snippet) = message.split_once("): ").expect("a response snippet");
+        assert!(!contains_key_run_longer_than(snippet, KEY, 3), "{message}");
     }
 
     /// Whether `text` contains a contiguous run of more than `max_run` bytes that is itself a
