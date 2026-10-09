@@ -416,8 +416,10 @@ Per pair:
   generic stream driver, `logit-inputs::tcp::TcpListener` (`crates/logit-inputs/src/tcp.rs`),
   which provides:
   - an accept loop and a connection cap (`max_connections:`, 1024 by default);
-  - per-listener framing: RFC 6587's auto-detecting pair for `syslog_in`, LF-delimited lines for
-    `statsd_in`, `lines_in`, and carbon plaintext, and carbon's 4-byte length prefix for pickle;
+  - per-listener framing through `logit_proto::framing`'s `Framer`
+    (`crates/logit-proto/src/framing.rs`): RFC 6587's auto-detecting pair for `syslog_in`,
+    LF-delimited lines for `statsd_in`, `lines_in`, and carbon plaintext, and carbon's 4-byte
+    length prefix for pickle;
   - `handshake_timeout:`, bounding each pre-message phase;
   - an opt-in `idle_timeout:`, bounding the quiet gaps after them (off by default;
     [ADR `idle-connection-timeout`](docs/adr/idle-connection-timeout.md));
