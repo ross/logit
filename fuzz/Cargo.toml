@@ -126,3 +126,10 @@ path = "fuzz_targets/stream_framing.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "statsd"
+path = "fuzz_targets/statsd.rs"
+test = false
+doc = false
+bench = false

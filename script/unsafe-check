@@ -80,11 +80,16 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # is its 4 selector bytes, the longest frame header (`65536 `, six bytes), and a frame of
 # `MAX_FRAME_BYTES`, so an at-bound frame fits under every framing; its only growing allocation is
 # the framer's buffer, never larger than the input, so 16 MiB is ample, and it needs no fork mode
-# because the framer interns nothing. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
+# because the framer interns nothing. `statsd`'s `max_len` is `MAX_FRAME_BYTES`, the largest
+# packet any transport hands the decoder, above UDP's 65,507-byte payload. Its worst input,
+# `a:1:1:…|c`, is one 864-byte `Event` per two bytes, and a second line's append doubles `out` past
+# the first line's exact fit: a measured 54 MiB `Vec`, which
+# `crates/logit-proto/tests/robustness.rs`'s statsd section pins under 56. `extra args` go to
+# `fuzz` only, never to `fuzz-tmin`.
 #
-# `native_batch` and `native_hop_batch` run in fork mode: the process-wide interner never evicts, so a
-# long-lived fuzz process accumulates every dictionary string it decodes until the arena outgrows
-# the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a
+# `native_batch`, `native_hop_batch`, and `statsd` run in fork mode: the process-wide interner
+# never evicts, so a long-lived fuzz process accumulates every dictionary string, metric name, and
+# tag key it decodes until the arena outgrows the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a
 # child fatal, as it is outside fork mode.
 FUZZ_TARGETS=(
     "native_frame|262144|65|"
@@ -102,6 +107,7 @@ FUZZ_TARGETS=(
     "proxy_header|65552|16|"
     "forwarded|4096|16|"
     "stream_framing|65546|16|"
+    "statsd|65536|56|-fork=1 -ignore_ooms=0"
 )
 
 # The sanitizer builds' RUSTFLAGS differ from miri's and careful's, so they get their own volume
