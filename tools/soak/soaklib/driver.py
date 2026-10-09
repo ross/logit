@@ -287,7 +287,7 @@ class Run:
         """Keeps the expected-state sets in step with an action, and queues readiness probes."""
         service = step.on
         restarted = False
-        if step.action == "stop":
+        if step.action in faults.STARTS_ON_REVERT:
             if kind == "apply":
                 self.down.add(service)
             else:
@@ -301,7 +301,7 @@ class Run:
                 if service in scenario_mod.LOGIT_SERVICES:
                     self.pending_ready[service] = {"since": _now(), "step": step.id,
                                                    "why": "unpause"}
-        elif step.action == "restart" and kind == "apply":
+        elif step.action in faults.STARTS_ON_APPLY and kind == "apply":
             restarted = True
         if restarted:
             info = self.docker.inspect(self.ids[service]) or {}

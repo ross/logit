@@ -14,12 +14,18 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   packets, and a drop there would read as a fault the step didn't ask for.
 - `docker network connect` drops a container's aliases, so a partition records them before the
   disconnect and passes each back with `--alias`.
+- A `kill` is `docker kill -s KILL`: the process gets no shutdown signal, so it writes no final
+  `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line, and the container
+  exits with `KILL_EXIT_CODE`. Its revert is a `docker start`, as a `stop`'s is. The container is
+  never recreated, so its filesystem, a disk spool under `/tmp` included, survives the kill.
 """
 
 from dataclasses import dataclass, field
 
 NETEM_LIMIT = "100000"
 STOP_TIMEOUT_S = 30
+# 128 + SIGKILL: the exit code Docker records for a container a `kill` ended.
+KILL_EXIT_CODE = 137
 
 
 @dataclass
@@ -93,6 +99,10 @@ def stop_revert(ctx, step):
     return _record(ctx.docker.run(["start", ctx.ids[step.on]]))
 
 
+def kill_apply(ctx, step):
+    return _record(ctx.docker.run(["kill", "-s", "KILL", ctx.ids[step.on]]))
+
+
 def restart_apply(ctx, step):
     return _record(ctx.docker.run(
         ["restart", "-t", str(STOP_TIMEOUT_S), ctx.ids[step.on]], timeout=STOP_TIMEOUT_S + 15,
@@ -160,6 +170,12 @@ ACTIONS = {
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
         affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
     ),
+    "kill": Action(
+        apply=kill_apply,
+        revert=stop_revert,
+        affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
+        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+    ),
     "restart": Action(
         apply=restart_apply,
         revert=restart_revert,
@@ -176,5 +192,7 @@ ACTIONS = {
 
 # Actions after whose apply or revert a `logit` service has started again and must report ready.
 STARTS_ON_APPLY = ("restart",)
-STARTS_ON_REVERT = ("stop",)
+STARTS_ON_REVERT = ("stop", "kill")
 RESUMES_ON_REVERT = ("pause",)
+# Actions whose apply ends a container's process, each with the exit code Docker records for it.
+EXIT_CODES = {"stop": 0, "restart": 0, "kill": KILL_EXIT_CODE}

@@ -20,11 +20,14 @@ LOGIT_SERVICES = ("logit", "generator")
 
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
-ACTION_NAMES = ("netem", "pause", "stop", "restart", "partition")
+ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition")
+# Actions that only make sense against a `logit` process: a `kill` exists to end one with no
+# shutdown, and the watchdog judges its exit code only for `logit` services.
+LOGIT_ONLY_ACTIONS = ("kill",)
 
 # Faults during which a container's network namespace is gone or unusable for a one-shot
 # `docker run --network container:<id>`.
-NAMESPACE_FAULTS = ("stop", "pause", "partition", "restart")
+NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart")
 
 TOP_LEVEL_KEYS = {
     "name", "description", "duration", "warmup", "cooldown", "recovery_bound", "cycle",
@@ -59,6 +62,8 @@ METRIC_KINDS = {
     "logit.component.receive.datagrams": "gauge",
     "logit.component.receive.utilization": "gauge",
     "logit.component.retrying": "gauge",
+    "logit.component.buffer.disk.replayed": "sum",
+    "logit.component.buffer.disk.segments": "gauge",
 }
 _EXPECT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _STEP_ID = re.compile(r"^c(\d+)s(\d+)$")
@@ -375,6 +380,8 @@ def validate(scenario, duration=None, seed=None):
             problems.append(f"{where}: unknown action `{spec.action}`{hint}")
         if spec.on not in SERVICES:
             problems.append(f"{where}: unknown service `{spec.on}`")
+        elif spec.action in LOGIT_ONLY_ACTIONS and spec.on not in LOGIT_SERVICES:
+            problems.append(f"{where}: {spec.action} is for {' or '.join(LOGIT_SERVICES)} only")
         if spec.for_ <= 0:
             problems.append(f"{where}: `for` must be longer than 0s")
         if spec.action == "netem":
@@ -391,9 +398,9 @@ def validate(scenario, duration=None, seed=None):
                 f"{format_duration(scenario.cycle)} cycle"
             )
 
-    # Two faults on one container may not overlap. A netem overlapping a stop, pause, restart,
-    # or partition of its container gets its own message: the qdisc is lost with the namespace,
-    # and a one-shot netem container needs a running target.
+    # Two faults on one container may not overlap. A netem overlapping a stop, kill, pause,
+    # restart, or partition of its container gets its own message: the qdisc is lost with the
+    # namespace, and a one-shot netem container needs a running target.
     by_service = {}
     for spec in scenario.steps:
         by_service.setdefault(spec.on, []).append(spec)

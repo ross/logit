@@ -16,7 +16,10 @@ SKIP every ledger row. For `[[expect]]`, it covers every validation rule and eac
 against a synthetic run: the window's open start, `through` reaching past the revert, a drain
 with no point, a gauge's value in force at the window's start and never across a SUT life,
 attribute filters, a step index across cycles, a step the schedule lacks, and a step whose apply
-failed.
+failed. For a `kill`, it covers its validation rules, the watchdog around it (exit code 137 only
+inside a scheduled kill, its start, its readiness probe, and the stdout gap it leaves), and a
+three-life run whose middle life ends by a kill: its egress band at both edges, a D with no
+stderr part, and the final life's sink identity counting a spool's replayed batches.
 """
 
 import copy
@@ -26,7 +29,7 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import checks, driver, scenario, telemetry, vm
+from . import checks, driver, faults, scenario, telemetry, vm
 
 _FAILURES = []
 _PASSED = [0]
@@ -88,6 +91,30 @@ def _rules(root):
         raw["step"].append({"at": "6m40s", "action": "netem", "on": "victoria-metrics",
                             "args": "delay 10ms", "for": "10s"})
 
+    def netem_in_kill(raw):
+        raw["step"].append({"at": "11m10s", "action": "kill", "on": "generator", "for": "20s"})
+        raw["step"].append({"at": "11m20s", "action": "netem", "on": "generator",
+                            "args": "delay 10ms", "for": "5s"})
+
+    def kill_vm(raw):
+        raw["step"].append({"at": "11m10s", "action": "kill", "on": "victoria-metrics",
+                            "for": "20s"})
+
+    def kill_generator(raw):
+        raw["step"].append({"at": "11m10s", "action": "kill", "on": "generator", "for": "20s"})
+
+    _refused(path, mutate(netem_in_kill), "netem on generator during its kill",
+             "netem during a kill")
+    _refused(path, mutate(kill_vm), "kill is for logit or generator only",
+             "a kill on victoria-metrics")
+    try:
+        loaded = scenario.from_dict(mutate(kill_generator), path)
+        expect(loaded.steps[-1].action == "kill", "a kill on the generator loads")
+    except scenario.ScenarioError as err:
+        expect(False, f"a kill on the generator is refused: {err.problems}")
+    expect(set(faults.ACTIONS) == set(scenario.ACTION_NAMES),
+           f"faults.ACTIONS and scenario.ACTION_NAMES name the same actions, got "
+           f"{sorted(faults.ACTIONS)} vs {sorted(scenario.ACTION_NAMES)}")
     _refused(path, mutate(drop_for), "every fault needs `for`", "a step without for")
     _refused(path, mutate(overlap), "two faults overlap on generator", "overlapping faults")
     _refused(path, mutate(netem_in_stop), "netem on victoria-metrics during its stop",
@@ -96,7 +123,7 @@ def _rules(root):
              "cooldown under recovery_bound")
     _refused(path, mutate(lambda r: r["step"][0].update(at="12m")), "after the 13m cycle",
              "a step past its cycle")
-    _refused(path, mutate(lambda r: r["step"][0].update(action="kill")), "unknown action",
+    _refused(path, mutate(lambda r: r["step"][0].update(action="explode")), "unknown action",
              "an unknown action")
     _refused(path, mutate(lambda r: r["step"][0].update(action="clear")),
              "reverts are scheduled", "a revert written as a step")
@@ -894,6 +921,218 @@ def _gauge_lives():
     expect(value == 1, f"the value in force inside one life still counts, got {value}")
 
 
+def _kill_watchdog():
+    """The watchdog around a `kill` of the SUT applied at +60 and reverted (started) by +90: its
+    exit code, its start, its readiness probe, and the stdout gap it leaves."""
+    kill = [_action("apply", "c0s1", "kill", "logit", 60, 60.1),
+            _action("revert", "c0s1", "kill", "logit", 89, 90)]
+    start, end = _phase("start", 0, t0=T0), [_phase("end_begin", 400), _phase("end_end", 450)]
+
+    def run(tmp, name, steps=kill, code=137, ready=True, stdout=()):
+        timeline = [start] + steps + ([_ready("c0s1", "logit", 91)] if ready else []) + end
+        run_dir = _run_dir(tmp, name, timeline, stdout)
+        first, second = _stamp(T0 - 5), _stamp(T0 + 89.5)
+        watchdog = []
+        for offset in range(0, 400, 5):
+            for svc in ("logit", "generator"):
+                exited = svc == "logit" and 60 < offset < 90
+                watchdog.append({
+                    "t": T0 + offset, "svc": svc, "status": "exited" if exited else "running",
+                    "exit_code": code if exited else 0, "health": "healthy",
+                    "started_at": second if svc == "logit" and offset >= 90 else first,
+                    "finished_at": _stamp(T0 + 60.05) if svc == "logit" and offset > 60 else "",
+                    "restart_count": 0})
+        (run_dir / "watchdog.jsonl").write_text("".join(json.dumps(r) + "\n" for r in watchdog))
+        (run_dir / "inspect").mkdir()
+        for svc, started, finished in (("logit", second, T0 + 460), ("generator", first,
+                                                                      T0 + 401)):
+            (run_dir / "inspect" / f"{svc}.json").write_text(json.dumps({"State": {
+                "Status": "exited", "ExitCode": 0, "OOMKilled": False, "StartedAt": started,
+                "FinishedAt": _stamp(finished)}}))
+        return run_dir
+
+    with tempfile.TemporaryDirectory() as tmp:
+        clean = run(tmp, "kill-clean")
+        for check in (checks.check_exit, checks.check_restarts, checks.check_timeline):
+            result = _status(clean, check)
+            expect(result.status == checks.PASS,
+                   f"{check.__name__} PASSes a scheduled kill and its start, got {result}")
+        result = _status(clean, checks.check_exit)
+        expect("1 kill(s)" in result.detail, f"exit names the kill, got {result}")
+        wrong_code = run(tmp, "kill-code-1", code=1)
+        result = _status(wrong_code, checks.check_exit)
+        expect(result.status == checks.FAIL and "which leaves 137" in result.detail,
+               f"exit FAILs an exit inside a kill with a code other than 137, got {result}")
+        stop = [dict(record, action="stop") for record in kill]
+        stopped = run(tmp, "stop-137", steps=stop)
+        result = _status(stopped, checks.check_exit)
+        expect(result.status == checks.FAIL and "which leaves 0" in result.detail,
+               f"exit FAILs code 137 inside a scheduled stop, got {result}")
+        unprobed = run(tmp, "kill-unprobed", ready=False)
+        result = _status(unprobed, checks.check_timeline)
+        expect(result.status == checks.FAIL and "no readiness probe" in result.detail,
+               f"timeline FAILs a kill's start with no ready record, got {result}")
+        quiet = [line for line in _sut_stdout(400)
+                 if not 60 < (telemetry.parse_rfc3339(json.loads(line)["timestamp"]) - T0) < 90]
+        gap = run(tmp, "kill-gap", stdout=quiet)
+        result = _status(gap, checks.check_progress)
+        expect(not any("went quiet" in line for line in result.lines),
+               f"progress doesn't flag the stdout gap a kill leaves, got {result}")
+
+
+# The kill fixture's SUT config: a small R (100 + 67 x 10 = 770), so the band's high side is
+# testable against a 200-lines-per-second run.
+KILL_SUT_CONFIG = "receive: { max_datagrams: 100, batch_max_events: 10 }\n"
+# Life 0 ends at a stop over +101..+131; life 1 at a kill over +203..+213; life 2 is final.
+KILL_STOP = (101, 131)
+KILL_KILL = (203, 213)
+
+
+def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3):
+    """A three-life run for the ledger: life 1 ends by a kill. The generator and the SUT move
+    `PER_DRAIN` lines per 5 s drain (200/s), and the export samples every 10 s. Lives 0 and 2
+    balance. Life 1's W − D − B − V is `kill_gap`, Ab − V alone, the window the kill discarded;
+    its band is [−1,000, 2,770]: 200/s x the 5 s drain interval below, R 770 + 200/s x the
+    10 s window above. `stray_drop` puts a listener shutdown-drop line inside life 1, which a
+    killed life can't write. Life 2's sink opens a spool holding `replayed` batches life 1
+    queued, and delivers them in its first drain."""
+    gen = []
+    for offset in range(5, 301, 5):
+        stamp = _stamp(T0 + offset)
+        gen.append(_line(stamp, "logit.process.uptime", "gauge", float(offset)))
+        for metric in ("logit.output.messages", "logit.output.datagrams"):
+            gen.append(_line(stamp, metric, "sum", PER_DRAIN, component="out"))
+        gen.append(_line(stamp, "logit.component.events.sent", "sum", PER_DRAIN,
+                         component="load"))
+        gen.append(_line(stamp, "logit.component.batches.sent", "sum", PER_DRAIN // 100,
+                         component="load"))
+        gen.append(_line(stamp, "logit.component.buffer.batches", "gauge", 0, component="out"))
+
+    lives = [(0, -1, range(5, KILL_STOP[0], 5)),
+             (1, KILL_STOP[1], range(135, KILL_KILL[0], 5)),
+             (2, KILL_KILL[1], range(215, 321, 5))]
+    sut = []
+    absorbed = {}
+    for life, start, offsets in lives:
+        for offset in offsets:
+            stamp = _stamp(T0 + offset)
+            sut.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
+            w = PER_DRAIN if offset <= 300 else 0
+            absorbed[life] = absorbed.get(life, 0) + w
+            for metric, value, comp in (("logit.input.datagrams", w, "in"),
+                                        ("logit.component.events.sent", w, "in"),
+                                        ("logit.component.events.received", w, "window"),
+                                        ("logit.transform.metrics.absorbed", w, "window"),
+                                        ("logit.component.batches.received", 1, "sink"),
+                                        ("logit.component.batches.delivered",
+                                         1 + (replayed if offset == 215 else 0), "sink")):
+                sut.append(_line(stamp, metric, "sum", value, component=comp))
+            if offset == 215 and replayed:
+                sut.append(_line(stamp, "logit.component.buffer.disk.replayed", "sum", replayed,
+                                 component="sink"))
+            for metric, comp in (("logit.component.buffer.batches", "sink"),
+                                 ("logit.component.buffer.utilization", "sink"),
+                                 ("logit.component.receive.utilization", "in"),
+                                 ("logit.component.retrying", "sink")):
+                sut.append(_line(stamp, metric, "gauge", 0, component=comp))
+
+    timeline = [_phase("start", 0, t0=T0),
+                _action("apply", "c0s1", "stop", "logit", KILL_STOP[0], affects_udp_ingress=True),
+                _action("revert", "c0s1", "stop", "logit", KILL_STOP[1] - 1, KILL_STOP[1],
+                        affects_udp_ingress=True),
+                _ready("c0s1", "logit", KILL_STOP[1] + 1),
+                _action("apply", "c0s2", "kill", "logit", KILL_KILL[0], KILL_KILL[0] + 0.1,
+                        affects_udp_ingress=True),
+                _action("revert", "c0s2", "kill", "logit", KILL_KILL[1] - 1, KILL_KILL[1],
+                        affects_udp_ingress=True),
+                _ready("c0s2", "logit", KILL_KILL[1] + 1),
+                _phase("end_begin", 300), _phase("end_end", 330)]
+    run_dir = _run_dir(tmp, name, timeline, sut, ledger=LEDGER,
+                       configs={"sut": "logit-sut.yaml"})
+    (run_dir / "configs").mkdir()
+    (run_dir / "configs" / "logit-sut.yaml").write_text(KILL_SUT_CONFIG)
+    (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
+
+    def log(offset, level, message, **fields):
+        return json.dumps({"timestamp": _stamp(T0 + offset), "level": level,
+                           "message": message, "target": "logit", **fields})
+
+    stderr = [log(0, "INFO", "ready"), log(KILL_STOP[0] + 0.6, "INFO", "drain complete"),
+              log(321, "INFO", "drain complete")]
+    if stray_drop:
+        stderr.append(log(150, "WARN", "20 datagram(s) still in the receive queue when this "
+                          "listener was stopped at its shutdown grace, undecoded",
+                          component="in"))
+    (run_dir / "logs" / "logit.stderr").write_text("\n".join(stderr) + "\n")
+
+    # Life 1's samples carry its own timestamps: a spool replayed by life 2 delivers them late,
+    # and the export still places them by time.
+    totals = {0: absorbed[0], 1: absorbed[1] - kill_gap, 2: absorbed[2]}
+    stamps = {0: range(10, 101, 10), 1: range(140, 201, 10), 2: range(220, 321, 10)}
+    export = []
+    for index in range(2):
+        values, timestamps = [], []
+        for life in (0, 1, 2):
+            share = totals[life] // 2 if index == 0 else totals[life] - totals[life] // 2
+            n = len(stamps[life])
+            values += [share * (i + 1) // n for i in range(n)]
+            timestamps += [int((T0 + s) * 1000) for s in stamps[life]]
+        export.append({"metric": {"__name__": f"x_{index}_total"}, "values": values,
+                       "timestamps": timestamps})
+    (run_dir / "vm-export.jsonl").write_text("".join(json.dumps(s) + "\n" for s in export))
+    return run_dir
+
+
+def _kill_ledger():
+    rows = ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.aggregate", "ledger.egress",
+            "ledger.summary", "identity.sink", "recovery")
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            return {r.id: r for r in checks.run_all(_kill_run(tmp, name, **kwargs))}
+
+        clean = results("kill-clean")
+        for row in rows:
+            expect(clean[row].status == checks.PASS,
+                   f"{row} PASSes the three-life fixture with a killed life, got {clean[row]}")
+        led = checks.Ledger(checks.RunData(Path(tmp) / "kill-clean"))
+        expect(led.killed == [1] and led.R == 770, f"life 1 is the killed one and R is 770, got "
+                                                    f"{led.killed} {led.R}")
+        egress = clean["ledger.egress"].detail
+        expect("life 1 (killed): W − D − B − V 1,500 = residual 0 + Ab − V 1,500, within band"
+               in egress and "band [-1,000, 2,770]: ingest 200/s" in egress
+               and "D has no stderr part" in egress,
+               f"egress reports the killed life's gap inside its band, got {egress}")
+        expect("life 2 (final): Ab 18,000 − V 18,000 = 0, ok" in egress,
+               f"the final life stays exact, got {egress}")
+
+        edge_high = results("kill-high-edge", kill_gap=2770)
+        expect(edge_high["ledger.egress"].status == checks.PASS,
+               f"a killed life's gap of R + one window of ingest passes, got "
+               f"{edge_high['ledger.egress']}")
+        over = results("kill-over", kill_gap=2771)
+        expect(over["ledger.egress"].status == checks.FAIL
+               and "life 1 (killed): W − D − B − V 2,771" in over["ledger.egress"].detail
+               and "uncounted" in over["ledger.egress"].detail,
+               f"egress FAILs a killed life's gap above its band as uncounted, got "
+               f"{over['ledger.egress']}")
+        low = results("kill-low-edge", kill_gap=-1000)
+        expect(low["ledger.egress"].status == checks.PASS,
+               f"a killed life's V may exceed W − D − B by one drain interval of ingest, got "
+               f"{low['ledger.egress']}")
+        under = results("kill-under", kill_gap=-1001)
+        expect(under["ledger.egress"].status == checks.FAIL,
+               f"egress FAILs a killed life's gap below its band, got {under['ledger.egress']}")
+
+        expect("received 21 + replayed 3 vs delivered 24" in clean["identity.sink"].detail,
+               f"identity.sink counts a spool's replayed batches as received, got "
+               f"{clean['identity.sink']}")
+        stray = results("kill-stray-drop", stray_drop=True)
+        stray_led = checks.Ledger(checks.RunData(Path(tmp) / "kill-stray-drop"))
+        expect(1 not in stray_led.D_log and stray["ledger.intake"].status == checks.PASS,
+               f"a killed life's D takes nothing from stderr, got {stray_led.D_log} "
+               f"{stray['ledger.intake']}")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -912,7 +1151,8 @@ def run(root, quiet=False):
     _FAILURES.clear()
     _PASSED[0] = 0
     for part in (_durations, _rules, _expect_rules, _expand, _ndjson, _stderr, _slope, _checks,
-                 _vm_resets, _ledger_checks, _expect_checks, _gauge_lives, _shipped):
+                 _vm_resets, _ledger_checks, _kill_watchdog, _kill_ledger, _expect_checks,
+                 _gauge_lives, _shipped):
         try:
             part(root) if part in (_rules, _expect_rules, _expand, _shipped) else part()
         except Exception as err:  # report the part that broke, then keep going

@@ -18,11 +18,19 @@ import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import collect, telemetry, vm
+from . import collect, faults, telemetry, vm
 from .scenario import EXPECT_REDUCERS, LOGIT_SERVICES, SERVICES
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
+
+
+def is_start(record):
+    """Whether a timeline record started a container again: a revert of a `stop` or `kill`, or a
+    `restart`'s apply. Each start of a `logit` service begins a new process life."""
+    event, action = record.get("event"), record.get("action")
+    return ((event == "revert" and action in faults.STARTS_ON_REVERT)
+            or (event == "apply" and action in faults.STARTS_ON_APPLY))
 
 # The self-log lines a sink writes while it can't deliver, expected inside a fault window:
 # `retrying` (ERROR, keyed), `send_failed` (WARN, keyed), and `degraded` (WARN, the message, no
@@ -287,8 +295,8 @@ def check_timeline(data):
     starts = 0
     for record in actions:
         event, action = record["event"], record.get("action")
-        if not ((event == "revert" and action in ("stop", "pause"))
-                or (event == "apply" and action == "restart")):
+        if not (is_start(record) or (event == "revert"
+                                     and action in faults.RESUMES_ON_REVERT)):
             continue
         if record.get("on") not in LOGIT_SERVICES or record.get("early"):
             continue
@@ -304,18 +312,24 @@ def check_timeline(data):
 
 
 def check_exit(data):
+    """Every exit of a `logit` service falls inside a scheduled stop, restart, or kill, with the
+    code that action leaves (0, or 137 for a kill), or in the end sequence with 0; the final
+    state is exited; and nothing was OOM-killed."""
     if not data.inspect:
         return Result("exit", SKIP, "no inspect/ files")
     lines = []
     status = PASS
+    # {service: [(start, end, action, expected exit code)]}
     stop_windows = {}
     for record in data.timeline:
-        if record.get("event") in ("apply", "revert") and record.get("action") in ("stop",
-                                                                                     "restart"):
-            if record["event"] == "apply" and not record.get("rc"):
-                stop_windows.setdefault(record["on"], []).append(
-                    (record["started_at"] - 1, record["finished_at"] + 1))
+        action = record.get("action")
+        if (record.get("event") == "apply" and action in faults.EXIT_CODES
+                and not record.get("rc")):
+            stop_windows.setdefault(record["on"], []).append(
+                (record["started_at"] - 1, record["finished_at"] + 1, action,
+                 faults.EXIT_CODES[action]))
     end_begin = data.phases.get("end_begin", {}).get("t")
+    kills = 0
     exits = 0
     for service in LOGIT_SERVICES:
         seen = {}
@@ -328,17 +342,23 @@ def check_exit(data):
         for finished, code in sorted(seen.items(), key=lambda item: item[0] or ""):
             exits += 1
             t = parse_docker_time(finished)
-            scheduled = t is not None and (
-                data.in_window(t, stop_windows.get(service, []))
-                or (end_begin is not None and t >= end_begin)
-            )
-            if not scheduled:
+            window = None if t is None else next(
+                (w for w in stop_windows.get(service, []) if w[0] <= t <= w[1]), None)
+            if window is not None:
+                _, _, action, want = window
+            elif t is not None and end_begin is not None and t >= end_begin:
+                action, want = "end sequence", 0
+            else:
                 status = FAIL
                 lines.append(f"{service} exited at {data.offset(t)} with code {code}, outside "
                              "every scheduled stop")
-            elif code != 0:
+                continue
+            if code != want:
                 status = FAIL
-                lines.append(f"{service} exited at {data.offset(t)} with code {code}")
+                lines.append(f"{service} exited at {data.offset(t)} with code {code}, inside a "
+                             f"scheduled {action}, which leaves {want}")
+            elif action == "kill":
+                kills += 1
         if final.get("Status") != "exited":
             status = FAIL
             lines.append(f"{service} final state is {final.get('Status')}, not exited")
@@ -349,6 +369,9 @@ def check_exit(data):
             lines.append(f"{service} was OOM-killed")
     if status == PASS:
         detail = f"{exits} exit(s) of the logit services, each a scheduled stop with code 0"
+        if kills:
+            detail = (f"{exits} exit(s) of the logit services, each a scheduled stop with code 0 "
+                      f"or a scheduled kill with code {faults.KILL_EXIT_CODE} ({kills} kill(s))")
     else:
         detail = lines[0]
     return Result("exit", status, detail, lines)
@@ -359,8 +382,7 @@ def check_restarts(data):
         return Result("restarts", SKIP, "no watchdog.jsonl")
     starts = {}
     for record in data.timeline:
-        event, action = record.get("event"), record.get("action")
-        if (event == "revert" and action == "stop") or (event == "apply" and action == "restart"):
+        if is_start(record):
             starts.setdefault(record["on"], []).append(
                 (record["started_at"] - 1, record["finished_at"] + 2))
     lines = []
@@ -501,7 +523,8 @@ def check_progress(data):
         if len(drains) < 3:
             continue
         interval = statistics.median(b - a for a, b in zip(drains, drains[1:]))
-        held = data.windows(on=service, actions=("stop", "pause", "restart"), extend=False)
+        held = data.windows(on=service, actions=("stop", "kill", "pause", "restart"),
+                            extend=False)
         for a, b in zip(drains, drains[1:]):
             if b - a > DRAIN_GAP_INTERVALS * interval and not any(
                 s <= b and e >= a for s, e in held
@@ -701,6 +724,7 @@ class Ledger:
         self.gen = data.telemetry.get("generator")
         # Reasons every row that reads the SUT's telemetry SKIPs.
         self.problems = []
+        self.killed = []
         if self.sut is None:
             self.problems.append("no SUT telemetry")
             self.lives = []
@@ -712,15 +736,15 @@ class Ledger:
         self.life_starts = self.sut.life_starts
         self.lives = list(range(len(self.life_starts))) or [0]
         self.final = self.lives[-1]
-        # Each start of the SUT container begins a life: a stop's revert, an end-sequence early
-        # one included, and a restart's apply. An unpause doesn't. A life under `internal`'s
+        # Each start of the SUT container begins a life: a stop's or a kill's revert, an
+        # end-sequence early one included, and a restart's apply. An unpause doesn't. A life
+        # ended by a kill writes no shutdown drain, so its last drain is an ordinary one, and the
+        # next life's first uptime is lower. A life under `internal`'s
         # interval leaves at most its shutdown uptime point, so the next life's first uptime isn't
         # lower and the two merge; the ledger isn't judged over merged windows.
         expected = 1 + sum(
             1 for record in data.timeline
-            if record.get("on") == "logit" and not record.get("rc")
-            and ((record.get("event") == "revert" and record.get("action") == "stop")
-                 or (record.get("event") == "apply" and record.get("action") == "restart")))
+            if record.get("on") == "logit" and not record.get("rc") and is_start(record))
         if len(self.lives) != expected:
             self.problems.append(
                 f"SUT telemetry shows {len(self.lives)} life/lives where logit.process.uptime "
@@ -738,8 +762,16 @@ class Ledger:
         self.Ab = sut.counter_by_life("logit.transform.metrics.absorbed",
                                       component=self.aggregate)
 
+        # The lives a scheduled `kill` ended: the life in force when the kill was applied.
+        self.killed = sorted({
+            vm.life_at(self.life_starts, record["started_at"])
+            for record in data.timeline
+            if record.get("event") == "apply" and record.get("action") == "kill"
+            and record.get("on") == "logit" and not record.get("rc")})
+
         # Shutdown drops and `drain complete` land after the final drain, so they come from
-        # stderr, each credited to the life its timestamp falls in.
+        # stderr, each credited to the life its timestamp falls in. A killed life writes neither,
+        # so its D has no stderr part.
         self.D_log = {}
         self.batches_dropped = {}
         self.drain_completes = {}
@@ -748,6 +780,8 @@ class Ledger:
                 continue
             life = vm.life_at(self.life_starts, entry.ts)
             match = SHUTDOWN_DROP_RE.match(entry.message)
+            if match and life in self.killed:
+                continue
             if match and entry.component == listener:
                 self.D_log[life] = self.D_log.get(life, 0) + int(match.group(1))
             elif entry.message == "drain complete":
@@ -814,15 +848,49 @@ class Ledger:
         """W − D − B − Ab: what a life read but didn't absorb by its last drain."""
         return self.get("W", life) - self.D(life) - self.get("B", life) - self.get("Ab", life)
 
+    def kill_band(self, life):
+        """`(low, high, text)`: the gap a killed life's W − D − B − V may show with nothing
+        lost, from its ingest rate over its last drain interval.
+
+        A kill writes no final drain, so the reads after the life's last drain are in no
+        counter, and an `aggregate` flush between that drain and the kill can carry them into V:
+        V can exceed W − D − B by up to one drain interval of ingest, the low side. The kill
+        also discards `aggregate`'s unflushed window, whose events Ab counts and V never
+        holds, on top of the residual that can be in flight at a drain: the high side is R plus
+        one aggregate window of ingest, the window being the export's sample spacing."""
+        drains = self.sut.life_drains(life)
+        gaps = [b - a for a, b in zip(drains, drains[1:])]
+        interval = statistics.median(gaps) if gaps else 0.0
+        last_w = next((v for ts, v, point_life in reversed(self.sut.counter_points(
+            "logit.input.datagrams", component=self.listener))
+            if point_life == life and drains and ts == drains[-1]), 0)
+        rate = last_w / gaps[-1] if gaps and gaps[-1] > 0 else 0.0
+        window = vm.sample_spacing_s(self.series) or 0.0
+        low = -round(rate * interval)
+        high = self.R + round(rate * window)
+        text = (f"band [{_n(low)}, {_n(high)}]: ingest {rate:,.0f}/s over the last drain "
+                f"interval, x {interval:g}s drain interval below; R + {window:g}s aggregate "
+                "window above")
+        return low, high, text
+
     def egress(self, life):
-        """`(status, verdict, gap)` for one life's egress: `ok`, `counted`, or `uncounted`.
+        """`(status, verdict, gap)` for one life's egress: `ok`, `counted`, `within band`, or
+        `uncounted`.
 
         The final life's gap is Ab − V. An earlier life's is W − D − B − V, the residual plus
         Ab − V, because the close-time window delivers what that life read but hadn't absorbed
-        by its last drain into V."""
+        by its last drain into V. A killed life has no close-time window and no `drain
+        complete`: its gap passes inside `kill_band`, and anything outside it is uncounted."""
         gap = self.get("Ab", life) - self.get("V", life)
         if life != self.final:
             gap += self.residual(life)
+        if life in self.killed and life != self.final:
+            low, high, _ = self.kill_band(life)
+            if gap == 0:
+                return PASS, "ok", gap
+            if low <= gap <= high:
+                return PASS, "within band", gap
+            return FAIL, "uncounted", gap
         dropped = self.batches_dropped.get(life, 0)
         if gap == 0:
             return PASS, "ok", gap
@@ -964,7 +1032,8 @@ def check_ledger_wire(data):
 
 
 def _per_life_lines(led):
-    return [f"life {life}{' (final)' if life == led.final else ''}: {led.symbols(life)}"
+    return [f"life {life}{' (final)' if life == led.final else ''}"
+            f"{' (killed)' if life in led.killed else ''}: {led.symbols(life)}"
             for life in led.lives]
 
 
@@ -1027,8 +1096,8 @@ def check_ledger_aggregate(data):
 def check_ledger_egress(data):
     """The egress gap per life, Ab − V for the final life and W − D − B − V for an earlier one:
     0 passes; a positive gap with that life's `drain complete` `batches_dropped` above 0 is
-    counted, never reconciled; any other gap is uncounted loss. An export with no series can't
-    pass."""
+    counted, never reconciled; a killed life's gap passes inside `Ledger.kill_band`; any other
+    gap is uncounted loss. An export with no series can't pass."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.egress", led)
     if skipped:
@@ -1045,9 +1114,13 @@ def check_ledger_egress(data):
             part = (f"life {life} (final): Ab {_n(led.get('Ab', life))} − V "
                     f"{_n(led.get('V', life))} = {_n(gap)}, {verdict}")
         else:
-            part = (f"life {life}: W − D − B − V {_n(gap)} = residual {_n(led.residual(life))} "
-                    f"+ Ab − V {_n(ab_v)}, {verdict}")
-        if gap > 0:
+            killed = " (killed)" if life in led.killed else ""
+            part = (f"life {life}{killed}: W − D − B − V {_n(gap)} = residual "
+                    f"{_n(led.residual(life))} + Ab − V {_n(ab_v)}, {verdict}")
+        if life in led.killed and life != led.final:
+            _, _, band = led.kill_band(life)
+            part += f" ({band}; D has no stderr part: a SIGKILL logs no shutdown drops)"
+        elif gap > 0:
             part += f" (drain complete batches_dropped {_n(dropped)})"
         parts.append(part)
     if not led.series:
@@ -1064,7 +1137,9 @@ def check_ledger_egress(data):
         lines.insert(0, f"{len(wrong)} series with resets other than {lives - 1}: {sample}; "
                         "their segments are credited by timestamp")
     for life in led.lives:
-        if life != led.final and led.drain_completes.get(life, 0) == 0:
+        if life in led.killed and life != led.final:
+            lines.append(f"life {life} was killed: no final drain and no drain complete line")
+        elif life != led.final and led.drain_completes.get(life, 0) == 0:
             lines.append(f"life {life} has no drain complete line")
     detail = "; ".join(parts) + f" ({led.R_text})"
     if wrong:
@@ -1101,8 +1176,9 @@ def check_ledger_summary(data):
 
 
 def check_identity_sink(data):
-    """At the final life's last drain before its shutdown drain: batches.received ==
-    delivered + dropped (every reason) + buffer.batches, one batch in flight allowed."""
+    """At the final life's last drain before its shutdown drain: batches.received +
+    buffer.disk.replayed == delivered + dropped (every reason) + buffer.batches, one batch in
+    flight allowed."""
     led = _ledger(data)
     skipped = _skip_without_sut("identity.sink", led)
     if skipped:
@@ -1118,13 +1194,17 @@ def check_identity_sink(data):
                    if point_life == life and ts <= at)
 
     received = upto("logit.component.batches.received")
+    # A disk spool opens holding what an earlier process queued: those batches are delivered
+    # in this life but were received in another, and `buffer.disk.replayed` counts them.
+    replayed = upto("logit.component.buffer.disk.replayed")
     delivered = upto("logit.component.batches.delivered")
     dropped = upto("logit.component.batches.dropped")
     queued = next((v for ts, v, point_life in reversed(sut.gauge_series(
         "logit.component.buffer.batches", component=sink)) if point_life == life and ts <= at), 0)
-    gap = received - delivered - dropped - queued
-    detail = (f"final life {life} at {data.offset(at)}: received {_n(received)} vs delivered "
-              f"{_n(delivered)} + dropped {_n(dropped)} + buffer.batches {_n(queued)}, "
+    gap = received + replayed - delivered - dropped - queued
+    replay = f" + replayed {_n(replayed)}" if replayed else ""
+    detail = (f"final life {life} at {data.offset(at)}: received {_n(received)}{replay} vs "
+              f"delivered {_n(delivered)} + dropped {_n(dropped)} + buffer.batches {_n(queued)}, "
               f"gap {_n(gap)} (one batch in flight allowed)")
     return Result("identity.sink", PASS if 0 <= gap <= 1 else FAIL, detail)
 
