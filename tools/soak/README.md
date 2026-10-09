@@ -171,7 +171,9 @@ resent series point overwrites the stored one, and a resent log is stored again
 
 1. `script/soak` runs the self-test, builds `logit:soak` from `Dockerfile` and
    `logit-soak-netem:local` from `netem/` (set `SOAK_SKIP_IMAGE=1` to reuse both), and validates
-   the scenario's configs in `logit:soak`.
+   the scenario's configs in `logit:soak`. `SOAK_SKIP_IMAGE=1` reuses whatever `logit:soak` is on
+   the daemon, whichever tree built it; `provenance.txt` records the image id, so check it before
+   reading a run as evidence about a changed binary.
 2. The driver refuses to start if the compose project already has containers, then brings the
    stack up with `docker compose up --wait`, which waits on each `logit` service's `logit ready`
    health check. For an external target it brings up no `victoria-metrics`.
