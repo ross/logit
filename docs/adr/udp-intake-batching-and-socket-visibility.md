@@ -1,6 +1,6 @@
 ---
 created: 2026-09-18
-updated: 2026-10-07
+updated: 2026-10-08
 ---
 
 # UDP intake batching and socket visibility
@@ -528,6 +528,10 @@ no `consume_budget`/`yield_now` every N batches — because there is nothing in 
 one to fix, and an unmotivated yield in the hottest loop in the read path is a cost with no benefit
 behind it.
 
+*(Amended 2026-10-08: a backlog drain, which these steady-flood runs never produced, needed one
+yield. See "Amendment: a backlog drain starves the reader, and the one yield it needed" at the end
+of this record.)*
+
 What the batched read *did* move is peak RSS on the two large-datagram scenarios: `udp-statsd-packed`
 went from a tight 44.4-47.5 MiB across five repeats to 50.4-62.3 MiB. That is not the slab — the
 sweep holds RSS flat across a sixteenfold change in slab size — it is simply more datagram bytes in
@@ -777,6 +781,8 @@ ahead of evidence this same plan is about to produce.
   `run_until_shutdown`'s two-arm select, the `&mut self.decoder` borrow and `Fanout` ownership.
   Recorded in `docs/known-gaps/intake.md` next to the `SO_REUSEPORT` entry rather than designed
   here.
+  *(Amended 2026-10-08: the sharing had one measurable cost, a backlog decoded in one poll, now
+  closed. See "Amendment: a backlog drain starves the reader, and the one yield it needed".)*
 
 ## As built
 
@@ -1193,3 +1199,93 @@ That `wait_for` and `Sleep::poll_elapsed` both spend the task's budget is why
 [ADR `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md)'s
 decision 6 wraps every grace arm in `tokio::task::unconstrained`. The `sample_while` doc comment in
 `crates/logit-inputs/src/udp.rs` repeats the wrong fact; `drain/w3` will correct it.
+
+## Amendment: a backlog drain starves the reader, and the one yield it needed (2026-10-08)
+
+"The coop-budget question a batched read raises" argues fairness from the ratio of the two arms'
+budget spending, and says `decode_loop` spends about two units per pop batch. It doesn't, while the
+queue holds datagrams. `BoundedQueue::pop_many` on a non-empty queue completes on its first poll
+under a std mutex and spends no budget: it awaits its `Notify` only when the queue is empty. The
+flush-deadline `timeout` polls `pop_many` first, so its `Sleep` isn't polled either. The only
+coop-aware await left in the decode arm is `emit`'s `Fanout::send`, once per `batch_max_events`
+(1,000) events, and it spends budget only when a downstream inbox is full.
+
+So when a deep queue meets an open downstream, the decode arm pops and decodes the whole backlog in
+one poll. Within one poll a `select!` arm runs until it returns `Pending`, so `read_loop`, the other
+arm of `UdpListener::drive`'s `select!`, isn't polled meanwhile, and `recvmmsg` isn't called. The
+steady-flood measurements above never produce this regime, because their queue never gets deep.
+
+### What the soak harness measured
+
+`script/soak`'s `udp-flood-sink-stop` scenario, run `20261008T231010Z`, stops the destination of a
+`statsd_in -> aggregate -> prometheus_out` chain for 60 s under a flood of 20,000 one-line
+datagrams/s. `statsd_in` ran the default `receive:` block (a 10,000-datagram queue, `drop_oldest`,
+`read_batch: 64`) on the kernel-default 212,992-byte `SO_RCVBUF`.
+
+- Through the 60 s stall, the listener read with zero kernel drops. The queue filled and evicted
+  under `drop_oldest`, counted, as designed.
+- The chain unblocked 8 s after the destination returned, which is the sink's retry backoff.
+- In the one 5 s sample window where the queue went from full to empty, `logit.input.kernel.drops`
+  counted 79 datagrams.
+
+Draining a full queue in one poll means about 10 `emit`s and several milliseconds of decoding with
+no read. The kernel charges each datagram's `skb` truesize, hundreds of bytes of overhead on top of its
+payload, against `SO_RCVBUF`, so at 20,000 datagrams/s a 212,992-byte buffer holds on the order of
+10 ms of one-line datagrams: 79 drops is a read gap a few milliseconds longer than that.
+
+### The decision: `decode_loop` yields after a run of full pops
+
+After decoding a popped batch, `decode_loop` counts it when the pop returned `pop_batch` datagrams,
+and after `YIELD_EVERY_FULL_POPS` (16) consecutive full pops calls `tokio::task::yield_now()`.
+That bounds the reader's gap to 16 pop batches of decoding (1,024 datagrams at the default
+`read_batch`, about a millisecond of one-line datagrams) however deep the queue is.
+
+- **A full pop, not every pop.** A pop that returns fewer than `pop_batch` datagrams emptied the
+  queue, so the next `pop_many` parks on its `Notify`, a real yield, and the run restarts at zero.
+  In the steady state, where the decoder keeps up, no pop fills and the counter never moves.
+- **Sixteen, not one.** Yielding on every full pop polls the socket so often under a flood of
+  small datagrams that each `recvmmsg` returns fewer of them, and the extra syscalls cost CPU per
+  event (the table below: +11% on `udp-statsd-small` at one, within noise at sixteen). The bound
+  only has to be far inside the socket buffer's worth of arrivals, which at the measured rate is
+  about 10 ms.
+- **Per pop, not per `emit`.** Yielding at `emit` bounds the gap at `batch_max_events` datagrams,
+  which depends on the batching config rather than on the reader, and a backlog decoded straight
+  into an open downstream reaches `emit` only once per 1,000 events.
+- **`yield_now`, not `consume_budget`.** The budget is per task, shared by both arms, and a
+  flooded read arm spends it to zero (128 successful `recvmmsg` calls). A budget-based yield would
+  stall decode on every poll where the read arm went first, and starve decode instead of read.
+- **Cancellation.** At the yield, the popped batch is fully decoded and its `CountedDrain` is
+  empty, so a grace-backstop drop there loses only the accumulator's events, the uncounted gap
+  `docs/design/pipeline-graph.md`'s "Cancellation points" already names for `decode_loop`. A
+  `yield_now` isn't a `select!` or a `timeout`, so it adds no row to that table.
+
+`a_decode_burst_through_a_deep_queue_yields_after_a_run_of_full_pops` pins it deterministically:
+one hand-driven poll of `decode_loop` over 2,048 queued datagrams leaves 1,024. Without the yield,
+it leaves 0. `a_partial_pop_does_not_yield` pins the condition: one poll over 10 datagrams leaves 0.
+
+### What the fix measured
+
+The same scenario on the same box with the fix: `logit.input.kernel.drops` stayed at 0 through the
+whole run, the `no-kernel-drops` row passed, and every other row read as before, at the every-pop
+cadence (run `20261009T003527Z`) and at sixteen (run `20261009T141302Z`, with a second soak
+scenario loading the box at the same time). A rerun of the unfixed build in the same session,
+`20261009T002922Z`, reproduced the 79.
+
+### Steady-state cost
+
+Laptop numbers (16 physical cores, the box otherwise idle but for a second `logit` soak), the
+stashed `main` binary against the fix at three cadences, interleaved, five repeats each, `--pin-sender
+0,1 --pin-child 2,3`. This box clears the VM-tuned rates with no kernel drops on any side, so the
+drop column says nothing here and the comparison is CPU per event and the mean `recvmmsg` fill.
+Provisional until the perf VM re-measures it.
+
+| Scenario | `main` µs/event | yield every full pop | every 4th | every 16th |
+|---|---|---|---|---|
+| `udp-statsd` | 0.512-0.522 (fill 12.8-14.1) | 0.516, 0.518 (13.4-13.8) | 0.515, 0.516 (12.1-14.5) | 0.515, 0.515 (11.4-13.4) |
+| `udp-statsd-small` | 1.069-1.185 (fill 2.5-3.0) | 1.184, 1.192 (2.3-2.4) | 1.148, 1.268 (2.1-2.4) | 1.085, 1.126 (2.5-3.0) |
+| `udp-statsd-packed` | 0.532, 0.537 (fill 5.7-6.0) | 0.529, 0.532 (5.4-5.6) | not run | not run |
+
+`main`'s own spread on `udp-statsd-small` across the session (1.069 to 1.185) is wider than the
+difference at sixteen, so that cadence is "within noise" on this box, not "zero". Every-pop's +11%
+on the same scenario, with its fill dropping from 2.9 to 2.3, is the cost of polling the socket too
+often: more `recvmmsg` calls per event.

@@ -1819,6 +1819,13 @@ impl ReceiveBufferSampler {
     }
 }
 
+/// How many consecutive full pops [`decode_loop`] decodes before it yields the task to
+/// `read_loop`. Bounds the reader's gap through a backlog to this many pop batches of decoding;
+/// a shorter cadence polls the socket so often that each `recvmmsg` returns fewer datagrams, which
+/// costs syscalls per event under a flood of small datagrams (ADR
+/// `udp-intake-batching-and-socket-visibility`'s backlog-drain amendment has the numbers).
+const YIELD_EVERY_FULL_POPS: usize = 16;
+
 /// Pops datagrams from `queue`, decodes and accumulates them into batches, and sends each
 /// completed batch through `sink`, independent of how fast `read_loop` fills `queue`. Uses
 /// [`ReceiveQueue::pop_many`], not `peek`/`commit`: a datagram that fails to decode is diagnosed
@@ -1838,6 +1845,14 @@ impl ReceiveBufferSampler {
 ///
 /// Owns `sink` (the `Fanout`): dropping this future closes every downstream inbox, the shutdown
 /// cascade in `docs/adr/service-lifecycle-and-output-retry.md`.
+///
+/// **Why it yields after a run of full pops.** Nothing else in the loop returns to the scheduler
+/// while the queue holds datagrams and downstream has room, so a backlog left by a stalled
+/// downstream would decode in one poll, for milliseconds in which `read_loop` never calls
+/// `recvmmsg` and the kernel's receive buffer overflows. A pop shorter than `pop_batch` emptied
+/// the queue and the next `pop_many` parks anyway, so a decoder that keeps up never reaches the
+/// yield; [`YIELD_EVERY_FULL_POPS`] says why the cadence is coarser than every full pop. ADR
+/// `udp-intake-batching-and-socket-visibility`'s backlog-drain amendment has the measurements.
 ///
 /// Flushes the accumulator's final contents (`FlushReason::Shutdown`) only once `pop_many` reports
 /// closed-and-empty (a return of `0`), after `read_loop` can push nothing new: the same "flush only
@@ -1862,6 +1877,8 @@ async fn decode_loop<D: Decoder + Send>(
     let remainder_diag = diag.clone();
     // Untouched with `peer` off: no datagram carries a sender.
     let mut peers = PeerCache::default();
+    // Consecutive pops that filled `pop_batch`; see the yield at the end of the loop.
+    let mut full_pops = 0usize;
     let has_interval = !batching.flush_interval.is_zero();
     let mut next_flush =
         has_interval.then(|| tokio::time::Instant::now() + batching.flush_interval);
@@ -1951,6 +1968,21 @@ async fn decode_loop<D: Decoder + Send>(
                     diag.warn_throttled("bad_datagram", err);
                 }
             }
+        }
+
+        // A full pop means more is likely queued, and `pop_many` on a non-empty queue spends no
+        // coop budget, so without this a deep backlog decodes in one poll while `read_loop`, the
+        // other arm of `UdpListener::drive`'s `select!`, goes unpolled. `yield_now`, not
+        // `consume_budget`: the read arm spends the shared budget to zero on a flood. A partial
+        // pop emptied the queue, so the next `pop_many` parks and the run of full pops restarts.
+        if count == batching.pop_batch {
+            full_pops += 1;
+            if full_pops >= YIELD_EVERY_FULL_POPS {
+                full_pops = 0;
+                tokio::task::yield_now().await;
+            }
+        } else {
+            full_pops = 0;
         }
     }
 }
@@ -3882,6 +3914,73 @@ mod tests {
         let sixty_four = deliver_burst(64, &payloads, &registry).await;
         assert_eq!(one, payloads, "read_batch: 1 must deliver the whole burst in order");
         assert_eq!(sixty_four, one, "the batch size must not be observable in the event stream");
+    }
+
+    /// Builds a receive queue holding `depth` small datagrams, polls a `decode_loop` over it once
+    /// by hand, and returns the depth left. The queue and the loop take the default config but
+    /// for `batch_max_events`, raised past any depth used here so no `emit` runs and nothing but
+    /// the loop's own yield, or `pop_many` on an empty queue, can return `Pending`.
+    async fn depth_after_one_decode_poll(depth: usize) -> usize {
+        use std::task::Poll;
+
+        let config =
+            UdpListenerConfig { batch_max_events: 1 << 20, ..UdpListenerConfig::default() };
+        let queue: Arc<ReceiveQueue> = Arc::new(BoundedQueue::with_metrics(
+            config.queue_config(),
+            &RECEIVE_QUEUE_METRICS,
+            Telemetry::default(),
+        ));
+        let mut datagrams: Vec<Datagram> = (0..depth)
+            .map(|i| Datagram {
+                bytes: Bytes::from(format!("msg-{i}")),
+                received_at: i as i64,
+                peer: None,
+            })
+            .collect();
+        queue.push_many(&mut datagrams).await;
+
+        let (fanout, _rx) = recording_fanout(64);
+        let mut decoder = TestDecoder::new();
+        let decode = decode_loop(
+            &mut decoder,
+            Arc::clone(&queue),
+            fanout,
+            config.batching(),
+            Telemetry::default(),
+            Diagnostics::default(),
+        );
+        let mut decode = Box::pin(decode);
+        std::future::poll_fn(|cx| {
+            let _ = decode.as_mut().poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+        // `take_all` is for when no other future of the queue is alive.
+        drop(decode);
+        queue.take_all().len()
+    }
+
+    /// A backlog twice `YIELD_EVERY_FULL_POPS` pop batches deep, with downstream open, decodes
+    /// `YIELD_EVERY_FULL_POPS` pop batches per poll, so `UdpListener::drive`'s read arm is polled
+    /// partway through the backlog instead of after all of it.
+    #[tokio::test]
+    async fn a_decode_burst_through_a_deep_queue_yields_after_a_run_of_full_pops() {
+        let pop_batch = UdpListenerConfig::default().read_batch;
+        let run = YIELD_EVERY_FULL_POPS * pop_batch;
+        let left = depth_after_one_decode_poll(2 * run).await;
+        assert_eq!(
+            left, run,
+            "one poll of decode_loop should take {YIELD_EVERY_FULL_POPS} pop batches of \
+             {pop_batch} off a deep queue"
+        );
+    }
+
+    /// A pop shorter than `pop_batch` doesn't yield: the loop goes straight back to `pop_many`,
+    /// which parks on the empty queue.
+    #[tokio::test]
+    async fn a_partial_pop_does_not_yield() {
+        let left = depth_after_one_decode_poll(10).await;
+        assert_eq!(left, 0, "one poll of decode_loop should drain a queue shallower than a pop");
     }
 
     /// Byte-exact across the legal size range in one batch: zero-length, small, and one at the
