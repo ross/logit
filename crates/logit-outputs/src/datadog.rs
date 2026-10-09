@@ -961,7 +961,8 @@ impl DatadogOutput {
                     self.diag.warn_throttled(
                         "oversize",
                         format_args!(
-                            "dropped one event on the {} route: it encodes to {raw_len} bytes                              ({wire_len} compressed), over the route's per-request limit",
+                            "dropped one event on the {} route: it encodes to {raw_len} bytes \
+                             ({wire_len} compressed), over the route's per-request limit",
                             route.name()
                         ),
                     );
