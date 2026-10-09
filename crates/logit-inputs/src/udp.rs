@@ -3916,48 +3916,68 @@ mod tests {
         assert_eq!(sixty_four, one, "the batch size must not be observable in the event stream");
     }
 
-    /// Builds a receive queue holding `depth` small datagrams, polls a `decode_loop` over it once
-    /// by hand, and returns the depth left. The queue and the loop take the default config but
-    /// for `batch_max_events`, raised past any depth used here so no `emit` runs and nothing but
-    /// the loop's own yield, or `pop_many` on an empty queue, can return `Pending`.
-    async fn depth_after_one_decode_poll(depth: usize) -> usize {
-        use std::task::Poll;
+    /// A `decode_loop` over a receive queue, polled by hand. The queue and the loop take the
+    /// default config but for `batch_max_events`, raised past any depth used here so no `emit`
+    /// runs and nothing but the loop's own yield, or `pop_many` on an empty queue, can return
+    /// `Pending`.
+    struct HandPolledDecode {
+        queue: Arc<ReceiveQueue>,
+        decode: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+        next_datagram: usize,
+    }
 
-        let config =
-            UdpListenerConfig { batch_max_events: 1 << 20, ..UdpListenerConfig::default() };
-        let queue: Arc<ReceiveQueue> = Arc::new(BoundedQueue::with_metrics(
-            config.queue_config(),
-            &RECEIVE_QUEUE_METRICS,
-            Telemetry::default(),
-        ));
-        let mut datagrams: Vec<Datagram> = (0..depth)
-            .map(|i| Datagram {
-                bytes: Bytes::from(format!("msg-{i}")),
-                received_at: i as i64,
-                peer: None,
+    impl HandPolledDecode {
+        fn new() -> Self {
+            let config =
+                UdpListenerConfig { batch_max_events: 1 << 20, ..UdpListenerConfig::default() };
+            let queue: Arc<ReceiveQueue> = Arc::new(BoundedQueue::with_metrics(
+                config.queue_config(),
+                &RECEIVE_QUEUE_METRICS,
+                Telemetry::default(),
+            ));
+            let (fanout, rx) = recording_fanout(64);
+            // Never read: the loop only has to find room, which the 64-batch channel gives it.
+            std::mem::forget(rx);
+            let decoder = Box::leak(Box::new(TestDecoder::new()));
+            let decode = Box::pin(decode_loop(
+                decoder,
+                Arc::clone(&queue),
+                fanout,
+                config.batching(),
+                Telemetry::default(),
+                Diagnostics::default(),
+            ));
+            Self { queue, decode, next_datagram: 0 }
+        }
+
+        /// Queues `count` small datagrams.
+        async fn push(&mut self, count: usize) {
+            let mut datagrams: Vec<Datagram> = (0..count)
+                .map(|i| Datagram {
+                    bytes: Bytes::from(format!("msg-{}", self.next_datagram + i)),
+                    received_at: (self.next_datagram + i) as i64,
+                    peer: None,
+                })
+                .collect();
+            self.next_datagram += count;
+            self.queue.push_many(&mut datagrams).await;
+        }
+
+        /// Polls the loop once.
+        async fn poll_once(&mut self) {
+            std::future::poll_fn(|cx| {
+                let _ = self.decode.as_mut().poll(cx);
+                std::task::Poll::Ready(())
             })
-            .collect();
-        queue.push_many(&mut datagrams).await;
+            .await;
+        }
 
-        let (fanout, _rx) = recording_fanout(64);
-        let mut decoder = TestDecoder::new();
-        let decode = decode_loop(
-            &mut decoder,
-            Arc::clone(&queue),
-            fanout,
-            config.batching(),
-            Telemetry::default(),
-            Diagnostics::default(),
-        );
-        let mut decode = Box::pin(decode);
-        std::future::poll_fn(|cx| {
-            let _ = decode.as_mut().poll(cx);
-            Poll::Ready(())
-        })
-        .await;
-        // `take_all` is for when no other future of the queue is alive.
-        drop(decode);
-        queue.take_all().len()
+        /// Drops the loop and returns how many datagrams it left queued.
+        fn finish(self) -> usize {
+            // `take_all` is for when no other future of the queue is alive.
+            drop(self.decode);
+            self.queue.take_all().len()
+        }
     }
 
     /// A backlog twice `YIELD_EVERY_FULL_POPS` pop batches deep, with downstream open, decodes
@@ -3967,20 +3987,36 @@ mod tests {
     async fn a_decode_burst_through_a_deep_queue_yields_after_a_run_of_full_pops() {
         let pop_batch = UdpListenerConfig::default().read_batch;
         let run = YIELD_EVERY_FULL_POPS * pop_batch;
-        let left = depth_after_one_decode_poll(2 * run).await;
+        let mut decode = HandPolledDecode::new();
+        decode.push(2 * run).await;
+        decode.poll_once().await;
         assert_eq!(
-            left, run,
+            decode.finish(),
+            run,
             "one poll of decode_loop should take {YIELD_EVERY_FULL_POPS} pop batches of \
              {pop_batch} off a deep queue"
         );
     }
 
-    /// A pop shorter than `pop_batch` doesn't yield: the loop goes straight back to `pop_many`,
-    /// which parks on the empty queue.
+    /// A pop shorter than `pop_batch` emptied the queue, so it doesn't yield and it restarts the
+    /// run of full pops. One poll over fifteen full pops and a partial one drains the queue and
+    /// parks; the next poll then decodes a whole run of sixteen full pops before it yields. A
+    /// counter the partial pop didn't reset would yield after the first of them and leave
+    /// fifteen batches queued.
     #[tokio::test]
-    async fn a_partial_pop_does_not_yield() {
-        let left = depth_after_one_decode_poll(10).await;
-        assert_eq!(left, 0, "one poll of decode_loop should drain a queue shallower than a pop");
+    async fn a_partial_pop_restarts_the_run_of_full_pops() {
+        let pop_batch = UdpListenerConfig::default().read_batch;
+        let run = YIELD_EVERY_FULL_POPS * pop_batch;
+        let mut decode = HandPolledDecode::new();
+        decode.push(run - pop_batch + 10).await;
+        decode.poll_once().await;
+        decode.push(run).await;
+        decode.poll_once().await;
+        assert_eq!(
+            decode.finish(),
+            0,
+            "a run of full pops after a partial pop should start from zero and be decoded whole"
+        );
     }
 
     /// Byte-exact across the legal size range in one batch: zero-length, small, and one at the

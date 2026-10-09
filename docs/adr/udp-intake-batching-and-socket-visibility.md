@@ -1,6 +1,6 @@
 ---
 created: 2026-09-18
-updated: 2026-10-08
+updated: 2026-10-09
 ---
 
 # UDP intake batching and socket visibility
@@ -528,7 +528,7 @@ no `consume_budget`/`yield_now` every N batches — because there is nothing in 
 one to fix, and an unmotivated yield in the hottest loop in the read path is a cost with no benefit
 behind it.
 
-*(Amended 2026-10-08: a backlog drain, which these steady-flood runs never produced, needed one
+*(Amended 2026-10-09: a backlog drain, which these steady-flood runs never produced, needed one
 yield. See "Amendment: a backlog drain starves the reader, and the one yield it needed" at the end
 of this record.)*
 
@@ -781,7 +781,7 @@ ahead of evidence this same plan is about to produce.
   `run_until_shutdown`'s two-arm select, the `&mut self.decoder` borrow and `Fanout` ownership.
   Recorded in `docs/known-gaps/intake.md` next to the `SO_REUSEPORT` entry rather than designed
   here.
-  *(Amended 2026-10-08: the sharing had one measurable cost, a backlog decoded in one poll, now
+  *(Amended 2026-10-09: the sharing had one measurable cost, a backlog decoded in one poll, now
   closed. See "Amendment: a backlog drain starves the reader, and the one yield it needed".)*
 
 ## As built
@@ -1200,7 +1200,7 @@ That `wait_for` and `Sleep::poll_elapsed` both spend the task's budget is why
 decision 6 wraps every grace arm in `tokio::task::unconstrained`. The `sample_while` doc comment in
 `crates/logit-inputs/src/udp.rs` repeats the wrong fact; `drain/w3` will correct it.
 
-## Amendment: a backlog drain starves the reader, and the one yield it needed (2026-10-08)
+## Amendment: a backlog drain starves the reader, and the one yield it needed (2026-10-09)
 
 "The coop-budget question a batched read raises" argues fairness from the ratio of the two arms'
 budget spending, and says `decode_loop` spends about two units per pop batch. It doesn't, while the
@@ -1208,7 +1208,8 @@ queue holds datagrams. `BoundedQueue::pop_many` on a non-empty queue completes o
 under a std mutex and spends no budget: it awaits its `Notify` only when the queue is empty. The
 flush-deadline `timeout` polls `pop_many` first, so its `Sleep` isn't polled either. The only
 coop-aware await left in the decode arm is `emit`'s `Fanout::send`, once per `batch_max_events`
-(1,000) events, and it spends budget only when a downstream inbox is full.
+(1,000) events: `Edge::offer` spends one unit per consumer on every send, about 10 for a full
+queue against a budget of 128, and parks only when an inbox is full.
 
 So when a deep queue meets an open downstream, the decode arm pops and decodes the whole backlog in
 one poll. Within one poll a `select!` arm runs until it returns `Pending`, so `read_loop`, the other
@@ -1261,7 +1262,9 @@ That bounds the reader's gap to 16 pop batches of decoding (1,024 datagrams at t
 
 `a_decode_burst_through_a_deep_queue_yields_after_a_run_of_full_pops` pins it deterministically:
 one hand-driven poll of `decode_loop` over 2,048 queued datagrams leaves 1,024. Without the yield,
-it leaves 0. `a_partial_pop_does_not_yield` pins the condition: one poll over 10 datagrams leaves 0.
+it leaves 0. `a_partial_pop_restarts_the_run_of_full_pops` pins the reset: a poll over fifteen full
+pops and a partial one, then a poll over a whole run, leaves 0, where a counter the partial pop
+didn't reset would yield after one more full pop and leave fifteen batches.
 
 ### What the fix measured
 
