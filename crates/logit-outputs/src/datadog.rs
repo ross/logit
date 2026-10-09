@@ -76,10 +76,11 @@
 //!
 //! The send time is read once per batch, in `observe_batch`, and every attempt at the batch
 //! measures from it: staleness isn't monotonic in the clock (a point too far ahead becomes fresh),
-//! so a clock read per attempt could drop a point on one attempt and send it on the next. An `Ok`
-//! clears it, and the next `observe_batch` replaces it. A `send` with no `observe_batch` reads the
-//! clock itself only when no earlier batch left a time behind: after a batch whose last attempt
-//! failed, it reuses that batch's time (`docs/known-gaps/datadog.md`).
+//! so a clock read per attempt could drop a point on one attempt and send it on the next. A final
+//! result (`Ok`, or a fault `write_loop` won't retry under the sink's posture) clears it, and the
+//! next `observe_batch` replaces it. A `send` with no `observe_batch` reads the clock itself only
+//! when no earlier batch left a time behind: after a batch whose last attempt failed with a fault
+//! `write_loop` would retry, it reuses that batch's time (`docs/known-gaps/datadog.md`).
 //!
 //! A retryable fault retries until the batch is delivered or shutdown cuts it, bounded by the
 //! sink's `buffer:`. Staleness is judged against the batch's one send time, so a batch held
@@ -154,12 +155,36 @@
 //!
 //! ## Faults, retries, and duplicate safety
 //!
-//! **One `send` is one attempt per request, and each request's verdict stands on its own**
-//! ([`Outcomes`]; `docs/adr/delivery-semantics.md`'s "Amendment: per-request verdicts
-//! (2026-10-04)"). A request Datadog rejects is counted and the send goes on to the next request;
-//! a refused key, a `Clean` failure, or an `Ambiguous` one stops the send, and `write_loop` retries
-//! the whole batch, re-sending any request that had already succeeded. The send succeeds when any
-//! request was accepted, and fails with the first rejection when every request was rejected.
+//! **One `send`, several requests, retried per request.** A batch leaves as one or more requests
+//! per route, a route cut into requests by [`split_encode`], sent in route order. Each request's
+//! verdict stands on its own ([`Outcomes`]; `docs/adr/delivery-semantics.md`'s "Amendment:
+//! per-request verdicts (2026-10-04)"):
+//! - An accepted request is remembered for the batch, and a retry of the batch doesn't resend it.
+//! - A `Rejected` request counts its entries dropped (below), is remembered too, and the send goes
+//!   on to the next request.
+//! - A refused key, a `Clean` failure, or an `Ambiguous` one stops the send with that request's
+//!   own class, and the runtime retries or drops the batch on it: a retry sends only the requests
+//!   not yet remembered.
+//!
+//! A send succeeds when any request of the batch was accepted, on this attempt or an earlier one,
+//! and fails `Rejected` only when every request sent was rejected. A request is named by its place
+//! in the attempt's send order, which is the same on every attempt because the plan and the cuts
+//! depend only on the batch and the send time `observe_batch` fixed
+//! ([`DatadogOutput::attempt`]). The memory lives beside the batch accounting
+//! ([`crate::accounting::BatchAccounting::settle`]): `observe_batch` clears it for each new batch,
+//! so it covers the retries of one batch and nothing else. A caller that never calls
+//! `observe_batch` gets no memory, and each `send` sends every request. A disk-buffered batch
+//! replayed after a restart is a new batch and sends every request again.
+//!
+//! The posture decides what a stop costs, and the accepted requests are never resent under either:
+//! - `Refused` and `Clean` hold the batch under both postures, and each retry sends the
+//!   remaining requests.
+//! - `Ambiguous` under `at_least_once` retries the remaining requests; the failed one may arrive
+//!   twice.
+//! - `Ambiguous` under `at_most_once` drops the batch. The sink counts the entries of the failed
+//!   request, of the rest of its route's unsent requests, and of every later route as
+//!   `logit.output.records.dropped{route, reason="ambiguous_at_most_once"}`, from the posture the
+//!   runtime hands it ([`Output::observe_posture`]); the runtime counts the batch.
 //!
 //! Datadog documents its intake statuses by HTTP code, the same on every route, with a free-text
 //! body; no documented body code changes a status's meaning, so the status decides the class.
@@ -192,20 +217,15 @@
 //! | `429` | `Ambiguous` | "Too Many Requests, request should be retried after some time", with `X-RateLimit-*` headers this sink doesn't read | [send logs][logs-api], [rate limits][rate-limits] |
 //! | any `5xx`, `501` included | `Ambiguous` | "request should be retried after some time"; may have been applied | [send logs][logs-api] |
 //! | any other `3xx` or `4xx` | `Rejected` | about this request; redirects are off ([`crate::http::build_client`]) | [Agent retry guide][agent-retry] |
-//! | connect failure, before any request of this `send` was accepted | `Clean` | nothing left the process | -- |
-//! | connect failure after one was | `Ambiguous` | Datadog holds part of the batch ([`crate::http::after_delivery`]) | -- |
+//! | connect failure | `Clean` | nothing of this request left the process; a retry skips the requests already accepted | -- |
 //! | any other transport error, timeout included | `Ambiguous` | the request may have been applied | -- |
 //!
-//! `Clean` and `Refused` mean Datadog holds nothing of the batch, so once a request was accepted a
-//! connect failure or a refusal on a later one is `Ambiguous` ([`crate::http::after_delivery`]):
-//! a route answered `Refused` after another route was accepted retries the whole batch under
-//! `at_least_once`, the accepted routes included, and drops it under `at_most_once`. That costs a
-//! resend of the accepted routes on every retry, and is kept because a refusal on one route holds
-//! for every batch: the routes share one org-wide key, so a `401` or `403` refuses them all, and a
-//! `404` names a route the configured base will refuse next time too. Reading such a route as
+//! A refusal holds for every batch: the routes share one org-wide key, so a `401` or `403` refuses
+//! them all, and a `404` names a route the configured base will refuse next time too. So a route
+//! answered `Refused` after another route was accepted stays `Refused` and holds the batch under
+//! both postures, and each retry sends the refused route's requests alone. Reading such a route as
 //! `Rejected` instead would drop its records from every batch until the operator fixed the config,
-//! the loss `Refused` exists to prevent. Under `at_least_once` a resent series point overwrites
-//! and a resent log is stored again ("Delivery posture", below).
+//! the loss `Refused` exists to prevent.
 //!
 //! [logs-api]: https://docs.datadoghq.com/api/latest/logs/#send-logs
 //! [rate-limits]: https://docs.datadoghq.com/api/latest/rate-limits/
@@ -215,14 +235,14 @@
 //! Redirects aren't followed ([`crate::http::build_client`] says why).
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
-//! retries an `Ambiguous` attempt, and a batch spans several requests, so a retry re-sends the
-//! ones that succeeded. A trial org was sent two resends: a resent series point was stored once,
-//! the last write winning at its `(series, timestamp)`, and an identical log was stored twice.
-//! The upstream `aggregate` `temporality: cumulative` remedy doesn't apply here: the series route
-//! skips a cumulative `Sum`, since a Datadog `count` carries a per-interval value. Distribution
-//! points, sketches, and APM stats have no remedy and are assumed to add on a resend, and events,
-//! checks, and traces to be stored again, until measured. `buffer.delivery: at_most_once` drops
-//! the batch instead.
+//! retries an `Ambiguous` attempt, which resends the request that drew the ambiguous answer and
+//! may store it twice; a disk-buffered batch replayed after a restart resends every request. A
+//! trial org was sent two resends: a resent series point was stored once, the last write winning
+//! at its `(series, timestamp)`, and an identical log was stored twice. The upstream `aggregate`
+//! `temporality: cumulative` remedy doesn't apply here: the series route skips a cumulative `Sum`,
+//! since a Datadog `count` carries a per-interval value. Distribution points, sketches, and APM
+//! stats have no remedy and are assumed to add on a resend, and events, checks, and traces to be
+//! stored again, until measured. `buffer.delivery: at_most_once` drops the batch instead.
 //!
 //! ## Telemetry
 //!
@@ -233,7 +253,7 @@
 //! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; not for a refused connection |
 //! | `logit.output.records{route}` | entries in a request Datadog accepted, less those its series `202` body names |
 //! | `logit.output.records.rejected{route}` | series a `202` body names as dropped; the series route only |
-//! | `logit.output.records.dropped{route, reason}` | `stale`, `too_many_tags`, `oversize`, `needs_agent_processing`, `not_datadog_origin`, `rejected`, as above |
+//! | `logit.output.records.dropped{route, reason}` | `stale`, `too_many_tags`, `oversize`, `needs_agent_processing`, `not_datadog_origin`, `rejected`, as above; `ambiguous_at_most_once`, the entries an at-most-once drop loses, which for a route the attempt never reached is the plan's count, an upper bound that includes entries its encode would have skipped or dropped `oversize` |
 //!
 //! Plus everything [`DatadogEncoder`] counts itself (`logit.output.metrics.skipped`, including
 //! `unsupported_kind`-style skips by `metric_kind`; `metrics.degraded`; `tags.dropped`;
@@ -245,7 +265,8 @@
 //! encoder's counters and diagnostics, through handles gated by the sink's `BatchAccounting`. The
 //! plan is unit 0 and each route its own unit, so a route an earlier attempt never reached counts
 //! on the attempt that first encodes it. The transport counters, `records.rejected`, a `413`'s
-//! `oversize`, and a rejected request's `rejected` count per attempt.
+//! `oversize`, and a rejected request's `rejected` count per request sent: a settled request isn't
+//! resent, so each counts once per batch for it, and a retry counts only the requests it sends.
 
 use crate::accounting::BatchAccounting;
 use crate::http::classify_status;
@@ -260,7 +281,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use logit_core::interner::resolve;
 use logit_core::{redact, Diagnostics, EventBatch, MetricKind, Symbol, Telemetry};
-use logit_pipeline::{BatchContext, Fault, Output, SeqId};
+use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::datadog::events::EventFormat;
 use logit_proto::datadog::series::metric_tag_count;
 use logit_proto::datadog::{
@@ -500,6 +521,11 @@ struct Item {
     weight: usize,
 }
 
+/// The entries `items` weigh on their route.
+fn weight(items: &[Item]) -> usize {
+    items.iter().map(|item| item.weight).sum()
+}
+
 /// The events of `batch` named by `items`: the batch itself when that is every event, else a
 /// copy sharing its resource and scope. `items` is in ascending index order with no repeats.
 fn sub_batch<'a>(batch: &'a EventBatch, items: &[Item]) -> Cow<'a, EventBatch> {
@@ -664,7 +690,8 @@ pub struct DatadogOutput {
     telemetry: Telemetry,
     accounting: BatchAccounting,
     /// The send time of the batch `observe_batch` last armed, read by every attempt at it so each
-    /// reaches the same stale verdict; cleared by an `Ok`, replaced by the next `observe_batch`.
+    /// reaches the same stale verdict; cleared by a final result
+    /// ([`BatchAccounting::is_final`]), replaced by the next `observe_batch`.
     /// `None` reads the clock per `send`.
     batch_now: Option<i64>,
     /// [`now_nanos`], or a test's scripted clock.
@@ -881,22 +908,30 @@ impl DatadogOutput {
     /// One attempt at send time `now`: the plan, then each route's requests in turn. The plan is
     /// unit 0 of the batch accounting and route `r`'s `split_encode` unit `1 + r as u32`, each
     /// counting encode-side only on the batch's first encode of it. A route is encoded only once
-    /// the routes before it were sent or rejected, so a route an earlier attempt never reached
-    /// counts on the attempt that first encodes it.
+    /// the routes before it were settled, so a route an earlier attempt never reached counts on the
+    /// attempt that first encodes it.
+    ///
+    /// Requests are numbered `0, 1, 2, …` in send order across routes, one per `split_encode`
+    /// chunk, and a request the destination settled for this batch (accepted or rejected) is
+    /// encoded again but not resent. The number names the same request on every attempt only
+    /// because the plan and the cuts are pure functions of the batch and the send time
+    /// `observe_batch` fixed: anything that makes either depend on per-attempt state breaks the
+    /// memory.
     ///
     /// Each request's result is folded by [`Outcomes`]: a rejected request (counted by
-    /// [`DatadogOutput::post`]) lets the attempt go on; a refused key, a `Clean` failure, or an
-    /// `Ambiguous` one ends it. Once a request was accepted, a failure that would be `Clean` is
-    /// `Ambiguous` ([`crate::http::after_delivery`]). That wraps `post`'s result rather than living
-    /// in it, so `post`'s `requests{class}` and `request.bytes` follow the request's own fault: a
-    /// refused connection counts no bytes whatever came before it.
+    /// [`DatadogOutput::post`]) is remembered and the attempt goes on; a refused key, a `Clean`
+    /// failure, or an `Ambiguous` one ends it with its own fault. Under `at_most_once` an
+    /// `Ambiguous` stop drops the batch, so this request's entries, the rest of its route's
+    /// unsettled requests, and every later route's planned entries are counted
+    /// `records.dropped{reason="ambiguous_at_most_once"}`.
     async fn attempt(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
         let (first, mut plan) = self.accounting.encode(0, || plan(batch, now));
         if first {
             self.count_plan_drops(&plan);
         }
         let gate = self.accounting.gate().clone();
-        let mut outcomes = Outcomes::new();
+        let mut outcomes = Outcomes::new(self.accounting.any_accepted());
+        let mut next_request: u32 = 0;
         for route in ROUTES {
             let items = std::mem::take(&mut plan.routes[route as usize]);
             if items.is_empty() {
@@ -933,20 +968,51 @@ impl DatadogOutput {
                     );
                 }
             }
-            for (chunk, encoded) in split.requests {
-                let entries = chunk.iter().map(|item| item.weight).sum();
+            let mut requests = split.requests.into_iter();
+            while let Some((chunk, encoded)) = requests.next() {
+                let request = next_request;
+                next_request += 1;
+                if self.accounting.settled(request) {
+                    continue;
+                }
+                let entries = weight(&chunk);
                 // `post` counts and diagnoses a rejection itself.
-                outcomes.note(self.post(route, encoded, entries).await, |_| {})?;
+                let result = self.post(route, encoded, entries).await;
+                let accepted = result.is_ok();
+                if let Err(err) = outcomes.note(result, |_| {}) {
+                    if self.accounting.posture() == DeliveryPosture::AtMostOnce
+                        && logit_pipeline::classify(&err) == Fault::Ambiguous
+                    {
+                        let mut lost = entries;
+                        for (rest, _) in requests {
+                            let request = next_request;
+                            next_request += 1;
+                            if !self.accounting.settled(request) {
+                                lost += weight(&rest);
+                            }
+                        }
+                        self.dropped(route, "ambiguous_at_most_once", lost);
+                        // A later route's planned weight is an upper bound: it includes entries
+                        // its encode would have skipped or dropped `oversize`.
+                        for &later in &ROUTES[route as usize + 1..] {
+                            let planned = weight(&plan.routes[later as usize]);
+                            self.dropped(later, "ambiguous_at_most_once", planned);
+                        }
+                    }
+                    return Err(err);
+                }
+                self.accounting.settle(request, accepted);
             }
         }
         outcomes.finish()
     }
 
-    /// One attempt at send time `now` ([`DatadogOutput::attempt`]). An `Ok` clears the batch's
-    /// send time and disarms the batch accounting, a batch that sent nothing included.
+    /// One attempt at send time `now` ([`DatadogOutput::attempt`]). A final result (`Ok`, or a
+    /// fault `write_loop` won't retry) clears the batch's send time and disarms the batch
+    /// accounting, a batch that sent nothing included.
     async fn send_at(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
         let result = self.attempt(batch, now).await;
-        if result.is_ok() {
+        if self.accounting.is_final(&result) {
             self.batch_now = None;
         }
         self.accounting.finish(result)
@@ -1126,17 +1192,27 @@ fn series_errors(body: &[u8]) -> Vec<&[u8]> {
 
 #[async_trait::async_trait]
 impl Output for DatadogOutput {
-    /// Arms this sink's batch accounting (`crate::accounting`) and fixes the batch's send time,
-    /// so every attempt at it reaches the same stale verdict (module doc's "What is never sent").
+    /// Arms this sink's batch accounting (`crate::accounting`), which clears the requests the
+    /// destination settled for the last batch, and fixes the batch's send time, so every attempt
+    /// at it reaches the same stale verdict and cuts the same requests (module doc's "What is
+    /// never sent").
     fn observe_batch(&mut self, _ctx: BatchContext, _seq: SeqId) {
         self.accounting.observe();
         self.batch_now = Some((self.clock)());
     }
 
-    /// One or more requests per route the batch needs, sequentially; a rejected request is counted
-    /// and the rest go on, and a refused key or a `Clean` or `Ambiguous` failure stops the send
+    /// Records the posture, which decides whether an `Ambiguous` stop counts
+    /// `ambiguous_at_most_once` and is final, disarming the batch accounting and clearing the
+    /// batch's send time.
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        self.accounting.observe_posture(posture);
+    }
+
+    /// One or more requests per route the batch needs, sequentially, skipping those the
+    /// destination settled on an earlier attempt at the batch; a rejected request is counted and
+    /// the rest go on, and a refused key or a `Clean` or `Ambiguous` failure stops the send
     /// (module doc's "Faults, retries, and duplicate safety"). The send time is the one the last
-    /// `observe_batch` fixed until an `Ok` clears it, else the clock's.
+    /// `observe_batch` fixed until a final result clears it, else the clock's.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let now = self.batch_now.unwrap_or_else(|| (self.clock)());
         self.send_at(batch, now).await
@@ -1730,24 +1806,32 @@ mod tests {
         }
     }
 
-    /// A route refused after another was accepted retries the whole batch: `Ambiguous`, so
-    /// `at_least_once` resends and `at_most_once` drops, never a `Clean`-style resend under both.
+    /// A route refused after another was accepted keeps its own class, `Refused`, so the batch
+    /// holds under both postures, and each retry sends only the refused route.
     #[tokio::test]
-    async fn a_refused_route_after_an_accepted_route_is_ambiguous() {
+    async fn a_refused_route_after_an_accepted_route_is_refused_and_retries_only_itself() {
         for status in [403, 404] {
             let (addr, log) = intake(move |path| {
                 (if path == "/api/v2/series" { 202 } else { status }, String::new())
             })
             .await;
             let b = batch(vec![gauge(NOW), log_event(NOW, "after")]);
-            let err = sink(addr).send_at(&b, NOW).await.unwrap_err();
-            assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{status}: {err:#}");
-            assert_eq!(paths(&log), ["/api/v2/series", "/api/v2/logs"], "{status}");
+            let mut out = sink(addr).with_clock(|| NOW);
+            out.observe_batch(BatchContext::default(), SeqId { id: [0; 16], seq: 1 });
+            for _ in 0..2 {
+                let err = out.send(&b).await.unwrap_err();
+                assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{status}: {err:#}");
+            }
+            assert_eq!(
+                paths(&log),
+                ["/api/v2/series", "/api/v2/logs", "/api/v2/logs"],
+                "{status}: the retry sends the refused route alone"
+            );
         }
     }
 
     /// A logs `202` is success, and an `Ambiguous` route aborts the ones after it: the retry
-    /// resends the whole batch anyway.
+    /// sends them.
     #[tokio::test]
     async fn an_ambiguous_route_aborts_the_rest_of_the_batch() {
         let (addr, log) =
@@ -1829,14 +1913,20 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
     }
 
-    /// Once a route's request was accepted, a connect failure on the next is ambiguous: a
-    /// `Clean` retry would resend the accepted series.
+    /// A connect failure after an accepted request keeps its own class, `Clean`: the retry
+    /// resends only the logs request, so the accepted series isn't sent twice. Both attempts'
+    /// errors name the logs URL, which only a retry that skipped the series request reaches.
     #[tokio::test]
-    async fn a_connect_failure_after_an_accepted_request_is_ambiguous() {
+    async fn a_connect_failure_after_an_accepted_request_is_clean_and_retries_only_itself() {
         let (addr, log) = crate::test_support::answers_once(202, Vec::new()).await;
         let b = batch(vec![gauge(NOW), log_event(NOW, "after")]);
-        let err = sink(addr).send_at(&b, NOW).await.unwrap_err();
-        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        let mut out = sink(addr).with_clock(|| NOW);
+        out.observe_batch(BatchContext::default(), SeqId { id: [0; 16], seq: 1 });
+        for attempt in 0..2 {
+            let err = out.send(&b).await.unwrap_err();
+            assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{attempt}: {err:#}");
+            assert!(format!("{err:#}").contains("/api/v2/logs"), "{attempt}: {err:#}");
+        }
         assert_eq!(crate::test_support::recorded_paths(&log.lock().unwrap()), ["/api/v2/series"]);
     }
 
@@ -2001,16 +2091,26 @@ mod tests {
     /// A key can be split by the read limit itself, not only by the snippet cut, leaving a
     /// fragment `redacted_snippet`'s whole-key match can't catch. Its remnant strip bounds what
     /// such a fragment can leak to fewer than 4 bytes.
+    ///
+    /// A split fragment reaches the snippet only when the body opens with whitespace: the snippet
+    /// is cut from the trimmed body, so trimming shifts the read limit's cut inside it. Without
+    /// that, a key the read splits starts past the snippet's 256 bytes.
     #[tokio::test]
     async fn a_key_split_by_the_read_limit_leaks_no_more_than_a_few_bytes() {
-        let start = error_read_bytes(KEY) - 3;
-        let prefix = "x".repeat(start);
-        let body = format!("{prefix}{KEY}");
+        // `read_body_prefix` reads 4 bytes past `error_read_bytes`, so the read keeps the key's
+        // first 7 bytes, and the trimmed body (filler plus fragment) fits in the snippet whole.
+        let indent = " ".repeat(KEY.len() + 8);
+        let filler = "x".repeat(error_read_bytes(KEY) + 4 - 7 - indent.len());
+        let body = format!("{indent}{filler}{KEY}");
 
         let (addr, _log) = intake(move |_| (500, body.clone())).await;
         let err = sink(addr).send_at(&batch(vec![gauge(NOW)]), NOW).await.unwrap_err();
+        // The message also names the request URL, whose ephemeral port can hold a run of KEY's
+        // digits (`34563` holds `3456`), so only the response snippet after it is checked.
         let message = format!("{err:#}");
-        assert!(!contains_key_run_longer_than(&message, KEY, 3), "{message}");
+        let (_, snippet) = message.split_once("): ").expect("a response snippet");
+        assert!(snippet.starts_with(&filler), "{message}");
+        assert!(!contains_key_run_longer_than(snippet, KEY, 3), "{message}");
     }
 
     /// Whether `text` contains a contiguous run of more than `max_run` bytes that is itself a
@@ -2208,11 +2308,13 @@ mod tests {
         }
     }
 
-    /// The logs route fails after the series route was sent: the retry re-sends both, and every
-    /// route's encode-side counts, `plan`'s drops, and the codec diagnostic read as after one
-    /// attempt, the logs route's included, which attempt 1 encoded before its request failed.
+    /// The logs route fails after the series route was accepted: the retry sends the logs request
+    /// alone, so the series route's requests, records, and bytes read as after one attempt, and
+    /// nothing is counted dropped. Every route's encode-side counts, `plan`'s drops, and the codec
+    /// diagnostic read as after one attempt too, the logs route's included, which attempt 1
+    /// encoded before its request failed.
     #[tokio::test]
-    async fn a_route_failing_after_another_was_sent_counts_every_routes_encode_side_once() {
+    async fn a_route_failing_after_another_was_accepted_resends_only_itself() {
         let batches = || vec![encode_side_batch()];
         let (single, one) =
             run_dd(|p, _| accepted(p), batches(), at_least_once(), instrumented).await;
@@ -2220,15 +2322,18 @@ mod tests {
         let (retried, log) = run_dd(script, batches(), at_least_once(), instrumented).await;
 
         assert_eq!(recorded_paths(&one), [SERIES, LOGS]);
-        assert_eq!(recorded_paths(&log), [SERIES, LOGS, SERIES, LOGS], "two attempts");
-        assert_eq!(sum_of(&retried, REQUESTS, &[("route", "series"), ("class", "2xx")]), 2.0);
+        assert_eq!(recorded_paths(&log), [SERIES, LOGS, LOGS], "the retry sends logs alone");
+        assert_eq!(sum_of(&retried, REQUESTS, &[("route", "series"), ("class", "2xx")]), 1.0);
         assert_eq!(sum_of(&retried, REQUESTS, &[("route", "logs"), ("class", "5xx")]), 1.0);
         assert_eq!(sum_of(&retried, REQUESTS, &[("route", "logs"), ("class", "2xx")]), 1.0);
         let series_records = sum_of(&single, RECORDS, &[("route", "series")]);
-        assert_eq!(sum_of(&retried, RECORDS, &[("route", "series")]), 2.0 * series_records);
+        assert!(series_records > 0.0);
+        assert_eq!(sum_of(&retried, RECORDS, &[("route", "series")]), series_records);
         assert_eq!(sum_of(&retried, RECORDS, &[("route", "logs")]), 1.0);
         let bytes = sum_of(&single, REQUEST_BYTES, &[("route", "series")]);
-        assert_eq!(sum_of(&retried, REQUEST_BYTES, &[("route", "series")]), 2.0 * bytes);
+        assert_eq!(sum_of(&retried, REQUEST_BYTES, &[("route", "series")]), bytes);
+        let ambiguous = [("reason", "ambiguous_at_most_once")];
+        assert_eq!(sum_of(&retried, RECORDS_DROPPED, &ambiguous), 0.0);
         for path in [SERIES, LOGS] {
             assert_resent_unchanged(&one, &log, path);
         }
@@ -2409,14 +2514,11 @@ mod tests {
         assert_a_batch_after_a_dropped_one_reads_the_clock_again(rejected, fast_retry()).await;
     }
 
-    /// Pins a documented corner (`docs/known-gaps/datadog.md`): after a batch whose last attempt
-    /// failed, a `send` with no `observe_batch` reuses that batch's send time and finds the gate
-    /// armed. The failed batch fixed `NOW`, so the direct send's point 11 min ahead is stale there
-    /// and dropped (it would be fresh at the clock's next reading, `NOW + 2 min`), and its `stale`
-    /// drop is muted, since the failed batch already encoded the plan's unit. Its `Ok` clears both,
-    /// so the next direct send reads the clock and sends the same point.
+    /// A rejected batch is final, so a `send` after it with no `observe_batch` reads the clock
+    /// and counts live: the point 11 min past `NOW` is fresh at the clock's second reading,
+    /// `NOW + 2 min`, and the stale point beside it counts its `stale` drop.
     #[tokio::test]
-    async fn a_direct_send_after_a_failed_batch_reuses_its_send_time_and_armed_gate() {
+    async fn a_direct_send_after_a_rejected_batch_reads_the_clock_and_counts() {
         let (clock, reads) = stepping_clock(NOW);
         let rejected_first = |p: &str, k| {
             if p == SERIES && k == 0 {
@@ -2433,6 +2535,39 @@ mod tests {
             sums_through_write_loop(&mut output, &mut probe, "datadog_out", batches, fast_retry())
                 .await;
         assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+
+        let ahead = NOW + 11 * MINUTE;
+        output.send(&batch(vec![gauge(ahead), gauge(NOW - 2 * HOUR)])).await.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "the direct send reads the clock");
+        assert_eq!(series_points(&log.lock().unwrap()), [vec![NOW], vec![ahead]]);
+        let sums: Sums =
+            probe.poll().sums().map(|(n, t, v)| ((n.to_string(), t.to_vec()), v)).collect();
+        assert_eq!(sum_of(&sums, RECORDS_DROPPED, &[("reason", "stale")]), 1.0, "and counts");
+    }
+
+    /// Pins a documented corner (`docs/known-gaps/datadog.md`): after a batch whose last attempt
+    /// failed with a fault `write_loop` would retry, a `send` with no `observe_batch` reuses that
+    /// batch's send time and finds the gate armed. The failed batch fixed `NOW`, so the direct
+    /// send's point 11 min ahead is stale there and dropped (it would be fresh at the clock's next
+    /// reading, `NOW + 2 min`), and its `stale` drop is muted, since the failed batch already
+    /// encoded the plan's unit. Its `Ok` clears both, so the next direct send reads the clock and
+    /// sends the same point.
+    #[tokio::test]
+    async fn a_direct_send_after_a_retryable_failure_reuses_its_send_time_and_armed_gate() {
+        let (clock, reads) = stepping_clock(NOW);
+        let busy_first = |p: &str, k| {
+            if p == SERIES && k == 0 {
+                Reply::Answer(503, Vec::new())
+            } else {
+                accepted(p)
+            }
+        };
+        let (addr, log) = per_path_recorder(busy_first).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(addr, &probe).with_clock(clock);
+        output.observe_batch(BatchContext::default(), SeqId { id: [0; 16], seq: 1 });
+        let err = output.send(&batch(vec![gauge(NOW)])).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
 
         let ahead = NOW + 11 * MINUTE;
         output.send(&batch(vec![gauge(ahead)])).await.unwrap();
@@ -2555,7 +2690,7 @@ mod tests {
         b.events.push(log_event(NOW, &"x".repeat(2_000)));
         sums_through_write_loop(&mut output, &mut probe, "datadog_out", vec![b], at_least_once())
             .await;
-        assert_eq!(recorded_paths(&log.lock().unwrap()), [SERIES, LOGS, SERIES, LOGS]);
+        assert_eq!(recorded_paths(&log.lock().unwrap()), [SERIES, LOGS, LOGS]);
         assert_eq!(output.diag.occurrences("oversized_sketch"), 1);
         assert_eq!(output.diag.occurrences("oversize"), 1);
     }
@@ -2579,12 +2714,12 @@ mod tests {
         assert_eq!(sum_of(&sums, "logit.component.diagnostics", &rejected), 1.0);
     }
 
-    /// The series route is rejected on both attempts and the logs route is busy on the first:
-    /// each attempt's rejection is that attempt's verdict and counts again, the logs route, which
-    /// attempt 1 reached past the rejection, counts its encode side once, and the batch is
-    /// delivered on attempt 2.
+    /// The series route is rejected and the logs route is busy on the first attempt: the
+    /// rejected request is remembered, so the retry sends logs alone and the rejection counts and
+    /// diagnoses once. The logs route, which attempt 1 reached past the rejection, counts its
+    /// encode side once, and the batch is delivered on attempt 2.
     #[tokio::test]
-    async fn a_rejection_answered_on_a_retry_is_counted_again() {
+    async fn a_rejected_request_is_not_resent_and_counts_once() {
         let batches = || vec![encode_side_batch()];
         let (single, _) =
             run_dd(|p, _| accepted(p), batches(), at_least_once(), instrumented).await;
@@ -2594,14 +2729,14 @@ mod tests {
         };
         let (retried, log) = run_dd(script, batches(), at_least_once(), instrumented).await;
 
-        assert_eq!(recorded_paths(&log), [SERIES, LOGS, SERIES, LOGS], "two attempts");
+        assert_eq!(recorded_paths(&log), [SERIES, LOGS, LOGS], "the retry sends logs alone");
         assert_eq!(sum_of(&retried, "logit.component.batches.delivered", &[]), 1.0);
         let series_records = sum_of(&single, RECORDS, &[("route", "series")]);
         assert!(series_records > 0.0);
         let rejected = [("route", "series"), ("reason", "rejected")];
-        assert_eq!(sum_of(&retried, RECORDS_DROPPED, &rejected), 2.0 * series_records);
+        assert_eq!(sum_of(&retried, RECORDS_DROPPED, &rejected), series_records);
         let diagnosed = [("key", "request_rejected")];
-        assert_eq!(sum_of(&retried, "logit.component.diagnostics", &diagnosed), 2.0);
+        assert_eq!(sum_of(&retried, "logit.component.diagnostics", &diagnosed), 1.0);
         let per_attempt = [
             PER_ATTEMPT[0],
             PER_ATTEMPT[1],
@@ -2609,6 +2744,131 @@ mod tests {
             ("logit.component.diagnostics", &[("key", "request_rejected")][..]),
         ];
         assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &per_attempt);
+    }
+
+    // ---- per-request retry memory --------------------------------------------------------------
+
+    /// One entry per request, so each log is its own request on the logs route.
+    const ONE_PER_REQUEST: Caps = Caps { entries: 1, ..Caps::UNBOUNDED };
+
+    /// `n` logs, each its own message, so each request's body differs from the others'.
+    fn numbered_logs(n: usize) -> Vec<Event> {
+        (0..n).map(|i| log_event(NOW, &format!("log {i}"))).collect()
+    }
+
+    /// A sink on `probe`'s handles that sends one entry per request.
+    fn one_per_request(addr: SocketAddr, probe: &TelemetryProbe) -> DatadogOutput {
+        instrumented(addr, probe).with_caps(ONE_PER_REQUEST)
+    }
+
+    /// A `503` on the second of three logs requests: the retry resends that request alone and
+    /// then sends the third, so the logs bodies read first, second, second, third.
+    #[tokio::test]
+    async fn a_retry_resends_only_the_failed_chunk_of_a_route() {
+        let script = |p: &str, k| if p == LOGS && k == 1 { busy_once(p, 0) } else { accepted(p) };
+        let b = batch(numbered_logs(3));
+        let (sums, log) = run_dd(script, vec![b], at_least_once(), one_per_request).await;
+        let sent = bodies(&log, LOGS);
+        assert_eq!(sent.len(), 4, "three requests and one resend");
+        assert_eq!(sent[1], sent[2], "the retry resends the failed request");
+        assert!(sent[0] != sent[1] && sent[1] != sent[3] && sent[0] != sent[3]);
+        assert_eq!(sum_of(&sums, RECORDS, &[("route", "logs")]), 3.0);
+        assert_eq!(sum_of(&sums, RECORDS_DROPPED, &[]), 0.0);
+    }
+
+    /// A request index past the first 64-bit word of the accounting's memory: a `503` on the
+    /// 67th of 70 logs requests resends that request alone.
+    #[tokio::test]
+    async fn a_retry_past_the_sixty_fourth_request_resends_only_the_failed_one() {
+        let script = |p: &str, k| if p == LOGS && k == 66 { busy_once(p, 0) } else { accepted(p) };
+        let b = batch(numbered_logs(70));
+        let (sums, log) = run_dd(script, vec![b], at_least_once(), one_per_request).await;
+        let sent = bodies(&log, LOGS);
+        assert_eq!(sent.len(), 71, "70 requests and one resend");
+        assert_eq!(sent[66], sent[67], "the retry resends the failed request");
+        assert_eq!(sum_of(&sums, RECORDS, &[("route", "logs")]), 70.0);
+    }
+
+    /// A batch whose every request is rejected, across two attempts, is dropped `rejected`; one
+    /// whose series request was accepted on the first attempt is delivered, though the only
+    /// request of the second is rejected.
+    #[tokio::test]
+    async fn rejections_across_attempts_drop_the_batch_unless_a_request_was_accepted() {
+        for (series, dropped) in [(400, 1.0), (200, 0.0)] {
+            let script = move |p: &str, k| match (p, k) {
+                (SERIES, _) => Reply::Answer(series, Vec::new()),
+                (_, 0) => Reply::Answer(503, Vec::new()),
+                _ => Reply::Answer(400, Vec::new()),
+            };
+            let b = batch(vec![gauge(NOW), log_event(NOW, "after")]);
+            let (sums, log) = run_dd(script, vec![b], at_least_once(), instrumented).await;
+            assert_eq!(recorded_paths(&log), [SERIES, LOGS, LOGS], "series {series}");
+            let rejected = [("reason", "rejected")];
+            let batches_dropped = sum_of(&sums, "logit.component.batches.dropped", &rejected);
+            assert_eq!(batches_dropped, dropped, "series {series}");
+            let delivered = sum_of(&sums, "logit.component.batches.delivered", &[]);
+            assert_eq!(delivered, 1.0 - dropped, "series {series}");
+        }
+    }
+
+    /// Under `at_most_once` an `Ambiguous` stop drops the batch and counts
+    /// `ambiguous_at_most_once` for the failed request, the rest of its route, and every later
+    /// route, and nothing for a request already accepted. Under `at_least_once` the same script
+    /// is retried and delivered, counting nothing.
+    #[tokio::test]
+    async fn an_ambiguous_stop_at_most_once_counts_what_was_not_accepted() {
+        // (failing path, its failing request, series counted, logs counted)
+        let cases = [(SERIES, 1, 1.0, 3.0), (LOGS, 1, 0.0, 2.0)];
+        for (path, request, series, logs) in cases {
+            let script = move |p: &str, k| {
+                if p == path && k == request {
+                    Reply::Answer(503, Vec::new())
+                } else {
+                    accepted(p)
+                }
+            };
+            let events = || {
+                let mut events = vec![gauge(NOW), gauge(NOW)];
+                events.extend(numbered_logs(3));
+                vec![batch(events)]
+            };
+            let (sums, _) = run_dd(script, events(), at_most_once(), one_per_request).await;
+            let counted = |route| {
+                let tags = [("route", route), ("reason", "ambiguous_at_most_once")];
+                sum_of(&sums, RECORDS_DROPPED, &tags)
+            };
+            assert_eq!(counted("series"), series, "{path}");
+            assert_eq!(counted("logs"), logs, "{path}");
+            assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0, "{path}");
+
+            let (sums, _) = run_dd(script, events(), at_least_once(), one_per_request).await;
+            let ambiguous = [("reason", "ambiguous_at_most_once")];
+            assert_eq!(sum_of(&sums, RECORDS_DROPPED, &ambiguous), 0.0, "{path}");
+            assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0, "{path}");
+        }
+    }
+
+    /// The memory is per batch: a second batch after a retried one sends every request again.
+    #[tokio::test]
+    async fn a_new_batch_resends_every_request() {
+        let script = |p: &str, k| if p == LOGS { busy_once(p, k) } else { accepted(p) };
+        let b = || batch(vec![gauge(NOW), log_event(NOW, "after")]);
+        let (_, log) = run_dd(script, vec![b(), b()], at_least_once(), instrumented).await;
+        assert_eq!(recorded_paths(&log), [SERIES, LOGS, LOGS, SERIES, LOGS]);
+    }
+
+    /// With no `observe_batch` nothing is remembered: each direct send is a new batch and sends
+    /// every request.
+    #[tokio::test]
+    async fn direct_sends_with_no_observe_batch_resend_every_request() {
+        let (addr, log) =
+            per_path_recorder(|p, k| if p == LOGS { busy_once(p, k) } else { accepted(p) }).await;
+        let mut out = sink(addr).with_clock(|| NOW);
+        let b = batch(vec![gauge(NOW), log_event(NOW, "after")]);
+        let err = out.send(&b).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+        out.send(&b).await.unwrap();
+        assert_eq!(recorded_paths(&log.lock().unwrap()), [SERIES, LOGS, SERIES, LOGS]);
     }
 
     // ---- request.bytes -----------------------------------------------------------------------

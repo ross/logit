@@ -155,7 +155,7 @@ pub use crate::tls::TlsClientSettings;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use logit_core::{redact, Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::{BatchContext, Fault, Output, SeqId};
+use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::splunk::response::{
     encode_ack_request, parse_ack_reply, parse_reply, HecReply, HecStatus, SPLUNK_CLOUD_BODY_CAP,
 };
@@ -923,8 +923,13 @@ impl Output for SplunkHecOutput {
         self.accounting.observe();
     }
 
-    /// One attempt ([`SplunkHecOutput::attempt`]). An `Ok` disarms the batch accounting on every
-    /// path, a batch that sent nothing included.
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        self.accounting.observe_posture(posture);
+    }
+
+    /// One attempt ([`SplunkHecOutput::attempt`]). A final result (`Ok`, or a fault
+    /// `write_loop` won't retry) disarms the batch accounting on every path, a batch that sent
+    /// nothing included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)

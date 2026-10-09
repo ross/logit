@@ -571,15 +571,17 @@ destination may receive the batch twice. `statsd_out` is the one exception and d
 destination, so the resend adds to it. Set `buffer.delivery: at_most_once` on any other sink to
 drop a batch on its first ambiguous failure instead of risking a duplicate
 ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 5). A sink that sends one batch as
-several requests (`datadog_out`, `datadog_trace_out`, `splunk_hec_out`) reports a retryable
-failure as ambiguous once any of them was accepted, so `at_least_once` resends the accepted
-requests with the rest and `at_most_once` drops the rest (item 9). `otlp_out` instead remembers
-which signals of a batch were accepted and retries only the others: it reports the failed
-signal's own class, never resends an accepted signal within a run (a `buffer.disk:` batch
-replayed after a restart sends every signal again), and under `at_most_once` counts the records
-of the signals it drops as `records.dropped{signal, reason="ambiguous_at_most_once"}`
+several requests remembers which of them the destination accepted and retries only the others.
+`otlp_out` keys that by signal, `datadog_out` and `datadog_trace_out` by request. Each reports the
+failed request's own class and never resends an accepted request within a run, but may resend the
+request that drew an ambiguous answer, which can land twice. A `buffer.disk:` batch replayed after
+a restart sends every request again. Under `at_most_once` they count the records of the requests
+they drop as `records.dropped{signal or route, reason="ambiguous_at_most_once"}`
 ([ADR `sink-fault-classes`](adr/sink-fault-classes.md), "Amendment: `otlp_out` retries per signal
-(2026-10-05)"). A request whose answer is `Rejected` (a `400` or a `413`, for example) is counted
+(2026-10-05)" and "Amendment: the Datadog sinks retry per request (2026-10-09)"). Only
+`splunk_hec_out` still reports a retryable failure as ambiguous once any request was accepted, so
+`at_least_once` resends the accepted requests with the rest and `at_most_once` drops the rest
+(item 9). A request whose answer is `Rejected` (a `400` or a `413`, for example) is counted
 and skipped, except at `splunk_hec_out`, and the send succeeds if any request was accepted.
 
 A resend is harmless where the destination overwrites on identity: a sample at its
@@ -2698,20 +2700,24 @@ event too large to send alone is dropped and counted `records.dropped{reason="ov
 
 **Delivery.** One batch goes out over up to eight routes, each as one or more requests (one per
 event, and a route over its size cap is split), sent one after another. A `408`, `429`, or `5xx`
-answer or a timeout stops the rest, and the whole batch is retried or dropped as one. A `401` or
+answer or a timeout stops the rest, and the batch is retried or dropped on it. The sink remembers
+which requests Datadog accepted or rejected, and a retry sends only the rest. A `401` or
 `403` (a rejected API key), or a `404`, `405`, or `407` (the configured base, or a proxy in front
-of it, refusing every batch), also stops the rest, and the sink holds the batch and retries it (`refused`).
+of it, refusing every batch), also stops the rest, and the sink holds the batch and retries it (`refused`),
+under either posture.
 A `413` counts the request's entries `oversize`, and any
 other `4xx` or `3xx` counts them `records.dropped{reason="rejected"}`; neither is retried, and the
 send goes on to the next request. A series `202` whose body names series Datadog dropped (a point
 too far in the future, say) counts each `records.rejected{route="series"}` and isn't retried.
 The send is delivered if any request was accepted, and fails
-as `rejected`, and is dropped, only when none was. A retry re-sends the requests that succeeded, so the default posture, `at_least_once`,
-can deliver a resend. A trial org stored a resent series point once, the last write winning at
+as `rejected`, and is dropped, only when none was. The default posture, `at_least_once`, can still
+deliver a resend: of the request that drew the ambiguous answer, and of every request of a
+`buffer.disk:` batch replayed after a crash. A trial org stored a resent series point once, the last write winning at
 its `(series, timestamp)`, and an identical log twice. Assume every other route (distribution
 points, sketches, events, checks, traces, stats) stores a resend again: none was measured.
 Distribution points, sketches, and stats add on a resend and have no upstream remedy. Set
-`buffer: {delivery: at_most_once}` to drop the batch on a `5xx` instead.
+`buffer: {delivery: at_most_once}` to drop the batch on a `5xx` instead; it counts the entries it
+drops as `records.dropped{reason="ambiguous_at_most_once"}`.
 
 **Pointing it at another `logit`.** `endpoints:` replaces each derived host with a base URL, which
 is how to send through a proxy, or to relay into another `logit`'s `datadog_in`:
@@ -2801,17 +2807,18 @@ Agent's `max_request_bytes`. A trace too large to send alone is dropped and coun
 `logit.output.records.dropped{reason="oversize"}`.
 
 **Delivery.** Traces go first, then stats. A request that fails with a retryable error stops the
-rest, and the batch is retried or dropped as one. A `413` counts `oversize`, and a `400` or any
+rest, and the batch is retried or dropped on it. The sink remembers which requests the Agent
+accepted or rejected, and a retry sends only the rest. A `413` counts `oversize`, and a `400` or any
 other `4xx` the sink reads as `rejected` counts `records.dropped{reason="rejected"}` and goes on
 to the next request; the send is delivered if either request was accepted. `408`, `5xx`, and
 timeouts are retryable under `at_least_once`. A refused connection, a missing socket file, or an
-overwhelmed Agent's `429` is retried under every posture before any request of the batch was
-accepted, and after one is retryable like a timeout. A `401`, `403`, `404`, `405`, `407`, or
+overwhelmed Agent's `429` is retried under every posture. A `401`, `403`, `404`, `405`, `407`, or
 `415` means the Agent doesn't serve this `version:` as configured, or something else answered in
 its place: the sink holds the batch and retries it (`refused`). The sink's module doc has the
 table.
-An Agent dedupes nothing, so under the default `at_least_once` posture a resend stores its spans
-twice and adds its stats; `buffer: {delivery: at_most_once}` drops the batch on a `5xx` instead. A
+An Agent dedupes nothing, so under the default `at_least_once` posture a resend (of the request
+that drew the ambiguous answer, or of a batch replayed from `buffer.disk:` after a crash) stores
+its spans twice and adds its stats; `buffer: {delivery: at_most_once}` drops the batch on a `5xx` instead. A
 `buffer:` here is also what keeps
 `datadog_trace_in` from answering tracers `503` while the Agent is unreachable.
 
