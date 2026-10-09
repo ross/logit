@@ -16,10 +16,10 @@
 //! ## Grammar and round-trip contract
 //!
 //! `<name>:<value>|<type>[|@<sample-rate>][|#<tag>[:<value>],...][|c:<container-id>][|e:<external-data>][|card:<cardinality>][|T<unix-seconds>]`
-//! is the grammar `logit_inputs::statsd` parses. When `@` and `|T` appear is under "Sample rate:
+//! is the grammar `logit_proto::statsd` parses. When `@` and `|T` appear is under "Sample rate:
 //! never for a counter, real for `Samples`" and "`\|c:<container-id>` and `\|T<timestamp>`" below.
 //! Every sanitization rule exists because `StatsdDecoder::parse_line` would otherwise misparse the
-//! result; that module's grammar doc has the decoder side of each.
+//! result; `logit_proto::statsd`'s grammar doc has the decoder side of each.
 //!
 //! ## Dialects
 //!
