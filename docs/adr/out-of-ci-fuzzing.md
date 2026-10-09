@@ -95,9 +95,8 @@ and never by `fuzz-tmin`. The two native batch targets and `statsd` use it to ru
 (`-fork=1 -ignore_ooms=0`). The process-wide interner never evicts, so a long-lived fuzz process
 accumulates every dictionary string, metric name, and tag key it decodes until the arena outgrows
 the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a
-child fatal. Fork
-mode was checked in the image: it stops at `-max_total_time`, merges new inputs into
-`fuzz/corpus/<target>`, and writes a child's crash to `fuzz/artifacts/<target>/`.
+child fatal. Fork mode was checked in the image: it stops at `-max_total_time`, merges new inputs
+into `fuzz/corpus/<target>`, and writes a child's crash to `fuzz/artifacts/<target>/`.
 
 ### The image
 
