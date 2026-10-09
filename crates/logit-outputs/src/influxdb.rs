@@ -55,7 +55,7 @@ use logit_core::interner::resolve;
 use logit_core::{
     DdSketch, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
 };
-use logit_pipeline::{BatchContext, SeqId};
+use logit_pipeline::{BatchContext, DeliveryPosture, SeqId};
 use logit_proto::{CodecError, Encoder};
 use std::collections::HashMap;
 // `write!` into a `String`: formats straight into the output buffer, no `String` per number
@@ -207,8 +207,13 @@ impl Output for InfluxDbOutput {
         self.accounting.observe();
     }
 
-    /// One attempt ([`InfluxDbOutput::attempt`]). An `Ok` disarms the batch accounting on every
-    /// path, a batch that encoded to nothing included.
+    fn observe_posture(&mut self, posture: DeliveryPosture) {
+        self.accounting.observe_posture(posture);
+    }
+
+    /// One attempt ([`InfluxDbOutput::attempt`]). A final result (`Ok`, or a fault
+    /// `write_loop` won't retry) disarms the batch accounting on every path, a batch that encoded
+    /// to nothing included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
