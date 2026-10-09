@@ -84,13 +84,16 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # packet any transport hands the decoder, above UDP's 65,507-byte payload. Its worst input,
 # `a:1:1:…|c`, is one 864-byte `Event` per two bytes, and a second line's append doubles `out` past
 # the first line's exact fit: a measured 54 MiB `Vec`, which
-# `crates/logit-proto/tests/robustness.rs`'s statsd section pins under 56. `extra args` go to
-# `fuzz` only, never to `fuzz-tmin`.
+# `crates/logit-proto/tests/robustness.rs`'s statsd section pins under 56. `syslog`'s worst
+# input, `<0>` lines filling 64 KiB, is one 864-byte `Event` per four bytes, and the target's
+# marker event takes `out` one past 16,384 events, so it doubles to a measured 27 MiB `Vec`, which
+# the syslog section pins under 32. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
 #
-# `native_batch`, `native_hop_batch`, and `statsd` run in fork mode: the process-wide interner
-# never evicts, so a long-lived fuzz process accumulates every dictionary string, metric name, and
-# tag key it decodes until the arena outgrows the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a
-# child fatal, as it is outside fork mode.
+# `native_batch`, `native_hop_batch`, `statsd`, and `syslog` run in fork mode: the process-wide
+# interner never evicts, so a long-lived fuzz process accumulates every dictionary string, metric
+# name, tag key, SD-ID, and PARAM-NAME it decodes until the arena outgrows the malloc limit, and
+# fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal, as it
+# is outside fork mode.
 FUZZ_TARGETS=(
     "native_frame|262144|65|"
     "native_batch|65536|64|-fork=1 -ignore_ooms=0"
@@ -108,6 +111,7 @@ FUZZ_TARGETS=(
     "forwarded|4096|16|"
     "stream_framing|65546|16|"
     "statsd|65536|56|-fork=1 -ignore_ooms=0"
+    "syslog|65536|32|-fork=1 -ignore_ooms=0"
 )
 
 # The sanitizer builds' RUSTFLAGS differ from miri's and careful's, so they get their own volume

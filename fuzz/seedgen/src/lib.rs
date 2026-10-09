@@ -3,9 +3,9 @@
 //!
 //! A target that takes a selector byte gets it prepended, matching the target's own doc: the
 //! OTLP targets' signal (`0` logs, `1` metrics, `2` traces), `prom_decompress`'s encoding,
-//! `prom_remote_write`'s version, and `stream_framing`'s four bytes of mode, bound, and
-//! chunking. [`generate`] is deterministic, so a rerun rewrites the same bytes and leaves
-//! `git status` clean.
+//! `prom_remote_write`'s version, `stream_framing`'s four bytes of mode, bound, and chunking,
+//! and `syslog`'s line splitting (`1` on, `0` off). [`generate`] is deterministic, so a rerun
+//! rewrites the same bytes and leaves `git status` clean.
 
 use bytes::{Bytes, BytesMut};
 use logit_core::interner::intern;
@@ -241,6 +241,10 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
 
     for (name, bytes) in statsd_seeds(testdata)? {
         add("statsd", name, bytes);
+    }
+
+    for (name, bytes) in syslog_seeds(testdata)? {
+        add("syslog", name, bytes);
     }
 
     let mut skipped = Vec::new();
@@ -499,6 +503,55 @@ fn statsd_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     Ok(out)
 }
 
+/// Every recorded syslog capture under line splitting and as one frame without it, and
+/// constructed lines for the shapes `crates/logit-proto/src/syslog/mod.rs` names: STRUCTURED-DATA
+/// with repeated PARAM-NAMEs, each escape, and SD-NAMEs at and past 32 bytes; nil and empty
+/// fields; a BOM; RFC 3164 with and without a tag and PID; PRI at and past its bounds; digit-led
+/// MSGs against the dialect sniff; and the leniencies.
+fn syslog_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    const SPLIT: u8 = 1;
+    const FRAMED: u8 = 0;
+    let mut out = Vec::new();
+    let mut paths: Vec<_> = std::fs::read_dir(testdata.join("interop/syslog"))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "raw"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let capture = std::fs::read(&path)?;
+        out.push((format!("{stem}-split"), prefixed(SPLIT, &capture)));
+        out.push((format!("{stem}-framed"), prefixed(FRAMED, &capture)));
+    }
+
+    let id_32 = "i".repeat(32);
+    let id_33 = "i".repeat(33);
+    let constructed: Vec<(&str, u8, Vec<u8>)> = vec![
+        ("sd-repeated-params", SPLIT, br#"<134>1 2003-10-11T22:14:15.003Z host app 42 ID1 [rep@1 k="a" k="b" j="c" k="d"][two@1 k="e"] msg"#.to_vec()),
+        ("sd-escapes", SPLIT, br#"<134>1 - - - - - [esc@1 q="a\"b" b="x\]y" s="c\\d" o="e\nf"] msg"#.to_vec()),
+        ("sd-unescaped-bracket", SPLIT, br#"<134>1 - - - - - [a@1 k="a]b"] msg"#.to_vec()),
+        ("sd-name-32", SPLIT, format!(r#"<134>1 - - - - - [{id_32} {id_32}="v"] msg"#).into_bytes()),
+        ("sd-name-33", SPLIT, format!(r#"<134>1 - - - - - [{id_33} k="v"] msg"#).into_bytes()),
+        ("nil-fields", SPLIT, b"<134>1 - - - - - - nil fields".to_vec()),
+        ("empty-fields", SPLIT, br#"<134>1  host  - - [a@1 k="v"]msg"#.to_vec()),
+        ("nil-sd-no-space", SPLIT, b"<134>1 - - - - - -msg".to_vec()),
+        ("bom", SPLIT, b"<165>1 2003-10-11T22:14:15.003Z host app - - - \xEF\xBB\xBFbom message".to_vec()),
+        ("non-utf8-msg", SPLIT, b"<134>1 - host app 7 - - \xff\xfe binary".to_vec()),
+        ("rfc3164-tag-pid", SPLIT, b"<13>Oct 11 22:14:15 host app[123]: with a pid".to_vec()),
+        ("rfc3164-tag", SPLIT, b"<13>Oct  1 22:14:15 host app: with a tag".to_vec()),
+        ("rfc3164-no-tag", SPLIT, b"<13>Oct 11 22:14:15 a message with no tag".to_vec()),
+        ("rfc3164-str-pid", SPLIT, b"<13>app[worker-1]: str pid\n<13>app[007]: padded pid".to_vec()),
+        ("pri-bounds", SPLIT, b"<0>pri zero\n<191>pri max\n<192>past the max\n<00>leading zero".to_vec()),
+        ("digit-led", SPLIT, b"<13>4 requests failed\n<14>1 worker died\n<13>10 workers started".to_vec()),
+        ("crlf-lines", SPLIT, b"<13>a\r\n\r\n<13>b\r\r\n<13>c".to_vec()),
+        ("framed-multiline", FRAMED, b"<13>line one\nline two\r\n".to_vec()),
+    ];
+    for (name, selector, datagram) in constructed {
+        out.push((format!("constructed-{name}"), prefixed(selector, &datagram)));
+    }
+    Ok(out)
+}
+
 fn prefixed(selector: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + body.len());
     out.push(selector);
@@ -573,6 +626,7 @@ mod tests {
                 "sketch_merge",
                 "statsd",
                 "stream_framing",
+                "syslog",
             ]
         );
     }
