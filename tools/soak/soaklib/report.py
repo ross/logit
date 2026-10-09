@@ -20,18 +20,19 @@ def _header(run_dir):
         resolved = json.loads((Path(run_dir) / "scenario.resolved.json").read_text())
     except (OSError, ValueError):
         resolved = {}
-    return resolved.get("name", "?"), resolved.get("duration")
+    return resolved.get("name", "?"), resolved.get("duration"), resolved.get("seed")
 
 
 def write(run_dir, results):
     run_dir = Path(run_dir)
-    name, duration = _header(run_dir)
+    name, duration, seed = _header(run_dir)
     overall = worst([result.status for result in results])
+    scheduled = "" if duration is None else f", {duration:g}s scheduled"
+    seeded = "" if seed is None else f", random schedule seed {seed}"
     lines = [
         f"# soak: {name}",
         "",
-        f"Run `{run_dir.name}`, {duration:g}s scheduled. Overall: **{overall}**."
-        if duration is not None else f"Run `{run_dir.name}`. Overall: **{overall}**.",
+        f"Run `{run_dir.name}`{scheduled}{seeded}. Overall: **{overall}**.",
         "",
         markdown_table(results),
         "",
@@ -46,6 +47,7 @@ def write(run_dir, results):
     (run_dir / "results.json").write_text(json.dumps({
         "scenario": name,
         "run": run_dir.name,
+        "seed": seed,
         "overall": overall,
         "failed": overall == FAIL,
         "checks": [result.to_json() for result in results],

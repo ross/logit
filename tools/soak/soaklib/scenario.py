@@ -3,12 +3,24 @@
 The schema and the validation rules are docs/plans/soak-harness.md's "The scenario schema";
 `validate()` is their canonical copy in code, and the self-test exercises every rule.
 
-Times in a scenario are durations (`"90s"`, `"6m30s"`, `"1h"`). Step offsets (`at`) are relative
-to the start of each cycle, and cycles start after `warmup`. `expand(duration)` repeats the cycle
-while it fits before `cooldown`; a last cycle that doesn't fit whole keeps only the steps whose
-fault ends before `cooldown` starts, so a short `--duration` still runs the schedule's head.
+Times in a scenario are durations (`"90s"`, `"6m30s"`, `"1h"`). A scenario's schedule is either
+fixed or random:
+
+- Fixed: `cycle` and `[[step]]` tables. Step offsets (`at`) are relative to the start of each
+  cycle, and cycles start after `warmup`. `expand(duration)` repeats the cycle while it fits
+  before `cooldown`; a last cycle that doesn't fit whole keeps only the steps whose fault ends
+  before `cooldown` starts, so a short `--duration` still runs the schedule's head.
+- Random: a `[random]` table. `expand(duration, seed)` draws one fault at a time from
+  `random.Random(seed)`: a gap, a fault template by weight, its `for`, and for netem one of its
+  `args`. Faults never overlap, and each is preceded by a gap of at least `gap.min`, which
+  `validate()` holds at `recovery_bound + 2 x progress_window` or more, so every fault's recovery
+  is followed by judged steady state. The first fault whose end would pass the start of
+  `cooldown` ends the schedule, so a shorter run's schedule is a prefix of a longer one's for the
+  same seed. Draws use `Random.random()` only, whose sequence for an integer seed is stable
+  across Python versions; `randrange()` and `choices()` are not promised to be.
 """
 
+import random
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -32,9 +44,12 @@ NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart")
 
 TOP_LEVEL_KEYS = {
     "name", "description", "duration", "warmup", "cooldown", "recovery_bound", "cycle",
-    "configs", "ledger", "thresholds", "step", "expect",
+    "configs", "ledger", "thresholds", "step", "expect", "random",
 }
 STEP_KEYS = {"at", "action", "on", "args", "for"}
+RANDOM_KEYS = {"seed", "gap", "fault"}
+RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
+RANGE_KEYS = {"min", "max"}
 CONFIG_KEYS = {"sut", "generator"}
 LEDGER_KEYS = {
     "vm_selector", "generator_input", "generator_sink", "sut_listener", "sut_aggregate",
@@ -136,13 +151,46 @@ class StepSpec:
 
 
 @dataclass
+class FaultTemplate:
+    """One `[[random.fault]]`: an allowed fault, its weight, the range its `for` is drawn from,
+    and, for netem, the `args` it picks from. Times in seconds."""
+
+    index: int
+    weight: float
+    action: str
+    on: str
+    args: list
+    for_min: float
+    for_max: float
+
+    def to_json(self):
+        return {"weight": self.weight, "action": self.action, "on": self.on,
+                "args": list(self.args), "for": {"min": self.for_min, "max": self.for_max}}
+
+
+@dataclass
+class RandomSpec:
+    """The `[random]` table: the default seed, the gap range in seconds, and the templates."""
+
+    seed: int
+    gap_min: float
+    gap_max: float
+    faults: list
+
+    def to_json(self):
+        return {"seed": self.seed, "gap": {"min": self.gap_min, "max": self.gap_max},
+                "fault": [template.to_json() for template in self.faults]}
+
+
+@dataclass
 class Step:
     """One fault occurrence in an expanded schedule. `start` and `end` are seconds after the
-    stack came up (the timeline's zero): `warmup + cycle * n + at`, and `start + for`."""
+    stack came up (the timeline's zero): `warmup + cycle * n + at`, and `start + for`. A random
+    schedule's step has id `r<n>`, `cycle` None, and `spec_index` its template's index."""
 
     id: str
     spec_index: int
-    cycle: int
+    cycle: object
     action: str
     on: str
     args: str
@@ -197,6 +245,7 @@ class Scenario:
     thresholds: dict
     steps: list = field(default_factory=list)
     expectations: list = field(default_factory=list)
+    random: object = None
 
     @property
     def directory(self):
@@ -205,8 +254,19 @@ class Scenario:
     def config_path(self, role):
         return (self.directory / self.configs[role]).resolve()
 
-    def to_json(self, duration=None):
+    def seed_for(self, seed=None):
+        """The seed a run uses: `seed` (from `--seed`) when given, else the `[random]` table's;
+        None for a fixed schedule."""
+        if self.random is None:
+            return None
+        return self.random.seed if seed is None else seed
+
+    def to_json(self, duration=None, seed=None):
+        """The resolved scenario a run records: its schedule expanded for `duration` and, for a
+        random schedule, the seed it was drawn with, so `check` re-scores the run offline and
+        `--seed` reproduces it."""
         duration = self.duration if duration is None else duration
+        seed = self.seed_for(seed)
         return {
             "name": self.name,
             "description": self.description,
@@ -215,7 +275,9 @@ class Scenario:
             "warmup": self.warmup,
             "cooldown": self.cooldown,
             "recovery_bound": self.recovery_bound,
-            "cycle": self.cycle,
+            "cycle": None if self.random is not None else self.cycle,
+            "seed": seed,
+            "random": None if self.random is None else self.random.to_json(),
             "configs": dict(self.configs),
             "ledger": dict(self.ledger),
             "thresholds": {
@@ -223,7 +285,7 @@ class Scenario:
                 "rss_growth_mib_per_hour": self.thresholds["rss_growth_mib_per_hour"],
                 "fd_growth": self.thresholds["fd_growth"],
             },
-            "steps": [step.to_json() for step in expand(self, duration)],
+            "steps": [step.to_json() for step in expand(self, duration, seed)],
             "expect": [e.to_json() for e in self.expectations],
         }
 
@@ -267,7 +329,21 @@ def from_dict(raw, path):
     warmup = dur(raw, "warmup", "scenario")
     cooldown = dur(raw, "cooldown", "scenario")
     recovery_bound = dur(raw, "recovery_bound", "scenario")
-    cycle = dur(raw, "cycle", "scenario")
+    # A schedule is fixed (`cycle` and `[[step]]`) or random (`[random]`), never both.
+    random_spec = None
+    cycle = 0.0
+    if "random" in raw:
+        for key in ("cycle", "step"):
+            if key in raw:
+                problems.append(f"`{key}` is for a fixed schedule; a scenario has either "
+                                "[random] or `cycle` with [[step]] tables, not both")
+        if "expect" in raw:
+            problems.append("[[expect]] names a step, and a [random] schedule's steps change "
+                            "with the seed; the watchdog, ledger, and recovery rows judge a "
+                            "random schedule")
+        random_spec = _parse_random(raw["random"], problems, dur)
+    else:
+        cycle = dur(raw, "cycle", "scenario")
 
     configs = raw.get("configs", {})
     ledger = raw.get("ledger", {})
@@ -348,6 +424,7 @@ def from_dict(raw, path):
         path=path, name=name, description=description, duration=duration, warmup=warmup,
         cooldown=cooldown, recovery_bound=recovery_bound, cycle=cycle, configs=configs,
         ledger=ledger, thresholds=thresholds, steps=steps, expectations=expectations,
+        random=random_spec,
     )
     if problems:
         raise ScenarioError(problems)
@@ -355,21 +432,85 @@ def from_dict(raw, path):
     return scenario
 
 
+def _parse_random(table, problems, dur):
+    """The `[random]` table as a `RandomSpec`, appending to `problems` what can't be parsed.
+    Ranges and weights are checked against the schedule's rules in `validate()`."""
+    if not isinstance(table, dict):
+        problems.append("`random` must be a table, written [random]")
+        return None
+    for key in sorted(set(table) - RANDOM_KEYS):
+        problems.append(f"random: unknown key `{key}`")
+    seed = table.get("seed")
+    if seed is None:
+        problems.append("random: missing `seed`")
+        seed = 0
+    elif not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+        problems.append(f"random.seed must be an integer 0 or more, got {seed!r}")
+        seed = 0
+
+    def span(raw, where):
+        if not isinstance(raw, dict):
+            problems.append(f"{where} must be a table such as {{ min = \"30s\", max = \"2m\" }}")
+            return 0.0, 0.0
+        for key in sorted(set(raw) - RANGE_KEYS):
+            problems.append(f"{where}: unknown key `{key}`")
+        return dur(raw, "min", where), dur(raw, "max", where)
+
+    if "gap" not in table:
+        problems.append("random: missing `gap`")
+        gap_min = gap_max = 0.0
+    else:
+        gap_min, gap_max = span(table["gap"], "random.gap")
+    raw_faults = table.get("fault")
+    if not isinstance(raw_faults, list) or not raw_faults:
+        problems.append("random: needs at least one [[random.fault]] table")
+        raw_faults = []
+    templates = []
+    for index, raw in enumerate(raw_faults):
+        where = f"random.fault {index + 1}"
+        if not isinstance(raw, dict):
+            problems.append(f"{where}: must be a table")
+            continue
+        for key in sorted(set(raw) - RANDOM_FAULT_KEYS):
+            problems.append(f"{where}: unknown key `{key}`")
+        for key in ("weight", "action", "on", "for"):
+            if key not in raw:
+                problems.append(f"{where}: missing `{key}`")
+        weight = raw.get("weight", 0)
+        if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+            problems.append(f"{where}: `weight` must be a number")
+            weight = 0
+        args = raw.get("args", [])
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            problems.append(f"{where}: `args` must be an array of netem specs, one picked per "
+                            "occurrence")
+            args = []
+        for_min, for_max = span(raw["for"], f"{where}.for") if "for" in raw else (0.0, 0.0)
+        templates.append(FaultTemplate(
+            index=index, weight=float(weight), action=raw.get("action", ""),
+            on=raw.get("on", ""), args=list(args), for_min=for_min, for_max=for_max,
+        ))
+    return RandomSpec(seed=seed, gap_min=gap_min, gap_max=gap_max, faults=templates)
+
+
 def validate(scenario, duration=None, seed=None):
     """Raises `ScenarioError` listing every rule `scenario` breaks for a run of `duration`
-    seconds (the scenario's own when None)."""
+    seconds (the scenario's own when None), drawn with `seed` (from `--seed`) for a random
+    schedule."""
     problems = []
-    if seed is not None:
+    if seed is not None and scenario.random is None:
         problems.append(
-            "--seed is refused until W4 adds a [random] table "
-            "(docs/plans/soak-harness.md, \"Workstreams\")"
+            f"--seed applies to a [random] schedule only; {scenario.name or 'this scenario'} "
+            "runs fixed [[step]] tables, which a seed can't change"
         )
+    elif seed is not None and (not isinstance(seed, int) or seed < 0):
+        problems.append(f"--seed must be an integer 0 or more, got {seed!r}")
     if scenario.cooldown < scenario.recovery_bound:
         problems.append(
             f"cooldown {format_duration(scenario.cooldown)} is shorter than recovery_bound "
             f"{format_duration(scenario.recovery_bound)}"
         )
-    if scenario.cycle <= 0:
+    if scenario.random is None and scenario.cycle <= 0:
         problems.append("cycle must be longer than 0s")
     if scenario.thresholds.get("progress_window", 0) <= 0:
         problems.append("thresholds.progress_window must be longer than 0s")
@@ -444,8 +585,128 @@ def validate(scenario, duration=None, seed=None):
             f"cycle: warmup + cycle ends at {format_duration(scenario.warmup + scenario.cycle)}, "
             f"after cooldown starts at {format_duration(quiet_end)}"
         )
+    if scenario.random is not None:
+        template_problems = _random_problems(scenario, duration)
+        problems += template_problems
+        if not template_problems and not problems:
+            # The generated schedules, at the scenario's own duration and the run's, meet every
+            # rule above by construction; checking them keeps that a tested fact.
+            for length in sorted({scenario.duration, run_duration}):
+                steps = expand(scenario, length, scenario.seed_for(seed))
+                problems += _schedule_problems(scenario, steps, length)
     if problems:
         raise ScenarioError(problems)
+
+
+def _random_problems(scenario, duration):
+    """Every rule a `[random]` table breaks. `gap.min` must cover a fault's recovery and two
+    progress windows, so each fault is followed by steady state the checks judge, and `cooldown`
+    must cover it too, for the last fault."""
+    spec = scenario.random
+    problems = []
+    window = scenario.thresholds.get("progress_window", 0) or 0
+    floor = scenario.recovery_bound + 2 * window
+    if spec.gap_min > spec.gap_max:
+        problems.append(f"random.gap.min {format_duration(spec.gap_min)} is above max "
+                        f"{format_duration(spec.gap_max)}")
+    if spec.gap_min < floor:
+        problems.append(
+            f"random.gap.min {format_duration(spec.gap_min)} is under recovery_bound "
+            f"{format_duration(scenario.recovery_bound)} + 2 x progress_window "
+            f"{format_duration(window)} = {format_duration(floor)}, so a fault's recovery could "
+            "run into the next fault with no steady state judged between them")
+    if scenario.cooldown < spec.gap_min:
+        problems.append(
+            f"cooldown {format_duration(scenario.cooldown)} is shorter than random.gap.min "
+            f"{format_duration(spec.gap_min)}, so the last fault could leave no steady state "
+            "judged after its recovery")
+    for template in spec.faults:
+        where = f"random.fault {template.index + 1} ({template.action or '?'} on " \
+                f"{template.on or '?'})"
+        if template.weight <= 0:
+            problems.append(f"{where}: `weight` must be above 0")
+        if template.action not in ACTION_NAMES:
+            problems.append(f"{where}: unknown action `{template.action}`")
+        if template.on not in SERVICES:
+            problems.append(f"{where}: unknown service `{template.on}`")
+        elif template.action in SUT_ONLY_ACTIONS and template.on != "logit":
+            problems.append(f"{where}: {template.action} is for logit only")
+        if template.for_min <= 0:
+            problems.append(f"{where}: `for.min` must be longer than 0s")
+        if template.for_min > template.for_max:
+            problems.append(f"{where}: `for.min` {format_duration(template.for_min)} is above "
+                            f"`for.max` {format_duration(template.for_max)}")
+        if template.action == "netem":
+            if not template.args:
+                problems.append(f"{where}: netem needs `args`, the specs it picks from")
+            for args in template.args:
+                words = args.split()
+                if not words:
+                    problems.append(f"{where}: an empty netem spec")
+                elif words[0] in ("clear", "del", "delete"):
+                    problems.append(f"{where}: netem clear is a fault's revert, never a fault")
+        elif template.args:
+            problems.append(f"{where}: `args` is for netem only")
+    if duration is None and spec.faults:
+        longest = max(template.for_max for template in spec.faults)
+        quiet_end = scenario.duration - scenario.cooldown
+        if scenario.warmup + spec.gap_max + longest > quiet_end:
+            problems.append(
+                f"the scenario's own duration {format_duration(scenario.duration)} doesn't "
+                f"fit every draw of one fault: warmup + gap.max + the longest for.max ends at "
+                f"{format_duration(scenario.warmup + spec.gap_max + longest)}, after cooldown "
+                f"starts at {format_duration(quiet_end)}")
+    return problems
+
+
+def _schedule_problems(scenario, steps, duration):
+    """Every rule an expanded schedule breaks: known actions and services, a kill on the SUT
+    only, each fault inside warmup's end and cooldown's start, no two faults overlapping on one
+    container, no netem during a namespace fault, and, for a random schedule, no two faults
+    overlapping anywhere, each after a gap of at least `gap.min`."""
+    problems = []
+    quiet_end = duration - scenario.cooldown
+    for step in steps:
+        where = f"step {step.id} ({step.action} on {step.on})"
+        if step.action not in ACTION_NAMES:
+            problems.append(f"{where}: unknown action")
+        if step.on not in SERVICES:
+            problems.append(f"{where}: unknown service")
+        elif step.action in SUT_ONLY_ACTIONS and step.on != "logit":
+            problems.append(f"{where}: {step.action} is for logit only")
+        if step.end <= step.start:
+            problems.append(f"{where}: ends at or before its start")
+        if step.start < scenario.warmup:
+            problems.append(f"{where}: starts inside warmup")
+        if step.end > quiet_end:
+            problems.append(f"{where}: ends inside cooldown")
+    ordered = sorted(steps, key=lambda s: s.start)
+    for i, first in enumerate(ordered):
+        for second in ordered[i + 1:]:
+            if second.start >= first.end:
+                break
+            if first.on != second.on:
+                continue
+            pair = {first.action, second.action}
+            if "netem" in pair and pair & set(NAMESPACE_FAULTS):
+                problems.append(f"steps {first.id} and {second.id}: netem on {first.on} during "
+                                f"its {(pair - {'netem'}).pop()}")
+            else:
+                problems.append(f"steps {first.id} and {second.id}: two faults overlap on "
+                                f"{first.on}")
+    if scenario.random is not None:
+        previous_end = scenario.warmup
+        for step in ordered:
+            gap = step.start - previous_end
+            if gap < 0:
+                problems.append(f"step {step.id}: starts before the previous fault ends; a "
+                                "random schedule runs one fault at a time")
+            elif gap < scenario.random.gap_min:
+                problems.append(f"step {step.id}: starts {format_duration(gap)} after the "
+                                "previous fault's end or warmup, under random.gap.min "
+                                f"{format_duration(scenario.random.gap_min)}")
+            previous_end = max(previous_end, step.end)
+    return problems
 
 
 def _expect_problems(scenario, duration):
@@ -501,11 +762,14 @@ def _expect_problems(scenario, duration):
     return problems
 
 
-def expand(scenario, duration=None):
+def expand(scenario, duration=None, seed=None):
     """The fault occurrences a run of `duration` seconds performs, in start order. No fault
-    ends after `duration - cooldown`."""
+    ends after `duration - cooldown`. A random schedule is drawn with `seed`, the `[random]`
+    table's when None; a fixed one ignores it."""
     duration = scenario.duration if duration is None else duration
     quiet_end = duration - scenario.cooldown
+    if scenario.random is not None:
+        return _expand_random(scenario, quiet_end, scenario.seed_for(seed))
     steps = []
     cycle = 0
     while scenario.cycle > 0:
@@ -523,6 +787,49 @@ def expand(scenario, duration=None):
         cycle += 1
     steps.sort(key=lambda s: (s.start, s.spec_index))
     return steps
+
+
+def _draw(rng, low, high):
+    """A whole number of seconds in [low, high], from one `rng.random()`; the driver ticks once
+    a second, so a fraction would only move the step to the next tick."""
+    return min(high, max(low, float(round(low + (high - low) * rng.random()))))
+
+
+def _expand_random(scenario, quiet_end, seed):
+    """One fault at a time from the end of warmup: a gap, a template by weight, its `for`, and
+    for netem one of its `args`, in that order per fault, until a fault would end after
+    `quiet_end`."""
+    spec = scenario.random
+    templates = [t for t in spec.faults if t.weight > 0]
+    total = sum(t.weight for t in templates)
+    if not templates or total <= 0:
+        return []
+    rng = random.Random(seed)
+    steps = []
+    t = scenario.warmup
+    while True:
+        gap = _draw(rng, spec.gap_min, spec.gap_max)
+        pick = rng.random() * total
+        template = templates[-1]
+        for candidate in templates:
+            pick -= candidate.weight
+            if pick < 0:
+                template = candidate
+                break
+        length = _draw(rng, template.for_min, template.for_max)
+        args = ""
+        if template.args:
+            args = template.args[min(len(template.args) - 1,
+                                     int(rng.random() * len(template.args)))]
+        start = t + gap
+        end = start + length
+        if end > quiet_end or length <= 0:
+            return steps
+        steps.append(Step(
+            id=f"r{len(steps) + 1}", spec_index=template.index, cycle=None,
+            action=template.action, on=template.on, args=args, start=start, end=end,
+        ))
+        t = end
 
 
 def shipped(root):

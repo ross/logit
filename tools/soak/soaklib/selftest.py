@@ -22,7 +22,16 @@ it leaves), and a three-life run whose middle life ends by a kill: its egress ba
 edges, with and without a residual, a surplus below it and a lost last window above it, a D
 with no stderr part, the final life's sink identity counting a spool's replayed batches,
 `ledger.windows` against lost middle, tail, and head windows, and `ledger.replay` against a
-short replay. `ledger.wire` counts a steady run's surplus as 0.
+short replay. `ledger.wire` counts a steady run's surplus as 0, and `ledger.windows` excuses a
+gap across a pause or partition that silences the SUT, but not a window lost beside one.
+
+For a `[random]` schedule, it covers every validation rule, a pinned head of the shipped
+scenario's schedule (so a seed keeps reproducing a recorded run), determinism, and, for 12 seeds
+at five durations up to 24 hours, that every drawn schedule passes `validate()`, honors its gap
+and `for` ranges, leaves two progress windows after each recovery, and is a prefix of a longer
+run's; the schedule rules against hand-built schedules; and where the seed is recorded. It also
+covers the chunked log capture against a fake `docker logs` with out-of-order and late lines
+and a failed chunk, the polls' absolute deadlines, and a hung daemon ending an inspect round.
 """
 
 import copy
@@ -32,7 +41,7 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import checks, driver, faults, scenario, telemetry, vm
+from . import checks, collect, docker, driver, faults, report, scenario, telemetry, vm
 
 _FAILURES = []
 _PASSED = [0]
@@ -153,7 +162,8 @@ def _rules(root):
              "a misspelled key")
     _refused(path, mutate(lambda r: r["ledger"].pop("vm_selector")),
              "ledger: missing `vm_selector`", "a missing ledger key")
-    _refused(path, copy.deepcopy(base), "W4", "--seed", seed=7)
+    _refused(path, copy.deepcopy(base), "--seed applies to a [random] schedule only",
+             "--seed on a fixed schedule", seed=7)
     _refused(path, copy.deepcopy(base), "leaves no time", "a duration inside warmup+cooldown",
              duration=150)
 
@@ -249,6 +259,335 @@ def _line(ts, name, kind, value, component="self", attrs=None, **fields):
     attributes = {"component": component, "kind": "x", "role": "sink", **(attrs or {})}
     return json.dumps({"timestamp": ts, "metrics": [metric], "attributes": attributes},
                       separators=(",", ":"))
+
+
+def _random_base(root):
+    path = root / "scenarios" / "random-faults" / "scenario.toml"
+    return path, tomllib.loads(path.read_text())
+
+
+# The first three faults the shipped random-faults scenario draws with its own seed. A change
+# here means a seed no longer reproduces the schedule an earlier run recorded.
+RANDOM_HEAD = [("r1", "kill", "logit", "", 260.0, 314.0),
+               ("r2", "netem", "logit", "delay 1s", 451.0, 591.0),
+               ("r3", "kill", "logit", "", 810.0, 839.0)]
+
+
+def _random(root):
+    path, base = _random_base(root)
+    loaded = scenario.load(path)
+    spec = loaded.random
+    templates = {t.index: t for t in spec.faults}
+    head = [(s.id, s.action, s.on, s.args, s.start, s.end) for s in scenario.expand(loaded)[:3]]
+    expect(head == RANDOM_HEAD, f"the scenario's own seed draws the recorded head, got {head}")
+    first = [s.to_json() for s in scenario.expand(loaded, 8 * 3600, 5)]
+    again = [s.to_json() for s in scenario.expand(loaded, 8 * 3600, 5)]
+    expect(first == again and first, "the same seed draws the same schedule")
+    drawn = {json.dumps([s.to_json() for s in scenario.expand(loaded, 3600, seed)])
+             for seed in range(12)}
+    expect(len(drawn) == 12, f"12 seeds draw 12 different schedules, got {len(drawn)}")
+    window = loaded.thresholds["progress_window"]
+    for seed in range(12):
+        long = scenario.expand(loaded, 24 * 3600, seed)
+        for duration in (600, 1200, 3600, 8 * 3600, 24 * 3600):
+            where = f"seed {seed} at {scenario.format_duration(duration)}"
+            try:
+                scenario.validate(loaded, duration=duration, seed=seed)
+            except scenario.ScenarioError as err:
+                expect(False, f"{where}: validate() refused a generated schedule: {err}")
+            steps = scenario.expand(loaded, duration, seed)
+            problems = scenario._schedule_problems(loaded, steps, duration)
+            expect(not problems, f"{where}: the schedule breaks {problems}")
+            expect([s.to_json() for s in steps] == [s.to_json() for s in long[:len(steps)]],
+                   f"{where}: a shorter run's schedule is a prefix of a longer one's")
+            expect([s.id for s in steps] == [f"r{i + 1}" for i in range(len(steps))],
+                   f"{where}: steps are r1, r2, ... in order")
+            previous = loaded.warmup
+            busy = 0.0
+            # One expectation per schedule and rule, each naming the first step that breaks it.
+            broken = {}
+            for step in steps:
+                template = templates[step.spec_index]
+                gap = step.start - previous
+                length = step.end - step.start
+                for rule, holds in (
+                    ("its gap is outside random.gap", spec.gap_min <= gap <= spec.gap_max),
+                    ("it follows a recovery with under two progress windows of steady state",
+                     gap - loaded.recovery_bound >= 2 * window),
+                    ("it isn't a draw of its template",
+                     template.for_min <= length <= template.for_max
+                     and (step.action, step.on) == (template.action, template.on)
+                     and (step.args in template.args if template.args else step.args == "")),
+                    ("it ends inside cooldown", step.end <= duration - loaded.cooldown),
+                ):
+                    if not holds:
+                        broken.setdefault(rule, step)
+                busy += length + loaded.recovery_bound
+                previous = step.end
+            expect(not broken, f"{where}: " + "; ".join(
+                f"{step.id} ({step.action} on {step.on}, {step.start:g}s to {step.end:g}s): "
+                f"{rule}" for rule, step in broken.items()))
+            if duration >= 8 * 3600:
+                share = 1 - busy / (duration - loaded.warmup)
+                expect(share >= 0.25, f"{where}: steady state is {share:.0%} of the run after "
+                                      "warmup, under the 25% gap.min guarantees")
+
+    resolved = loaded.to_json(3600, 42)
+    expect(resolved["seed"] == 42 and resolved["cycle"] is None
+           and resolved["random"]["seed"] == spec.seed
+           and resolved["steps"] == [s.to_json() for s in scenario.expand(loaded, 3600, 42)],
+           "scenario.resolved.json records the seed used and the schedule it drew")
+    expect(loaded.to_json(3600)["seed"] == spec.seed,
+           "with no --seed, the resolved seed is the scenario's own")
+    statsd = scenario.load(root / "scenarios" / "statsd-vm" / "scenario.toml")
+    expect(statsd.to_json()["seed"] is None and statsd.to_json()["random"] is None,
+           "a fixed schedule records no seed")
+    run = driver.Run(root, loaded, 3600, None, False, "/nonexistent", [], "logit:soak")
+    expect(run.seed == spec.seed and run.seed_source == "scenario.toml"
+           and run.steps == scenario.expand(loaded, 3600),
+           f"the driver draws with the scenario's seed by default, got {run.seed}")
+    run = driver.Run(root, loaded, 3600, 7, False, "/nonexistent", [], "logit:soak")
+    expect(run.seed == 7 and run.seed_source == "--seed"
+           and run.steps == scenario.expand(loaded, 3600, 7),
+           f"--seed overrides the scenario's seed, got {run.seed}")
+    try:
+        scenario.validate(loaded, seed=7)
+        expect(True, "")
+    except scenario.ScenarioError as err:
+        expect(False, f"--seed on a [random] schedule is refused: {err}")
+
+    def mutate(edit):
+        raw = copy.deepcopy(base)
+        edit(raw)
+        return raw
+
+    def fault(raw, **changes):
+        raw["random"]["fault"][0].update(changes)
+
+    def lifecycle(raw, **changes):
+        # The first template that isn't netem.
+        next(f for f in raw["random"]["fault"] if f["action"] != "netem").update(changes)
+
+    _refused(path, mutate(lambda r: r.update(cycle="13m")), "not both", "[random] with a cycle")
+    _refused(path, mutate(lambda r: r.update(step=[{"at": "0s", "action": "pause",
+                                                    "on": "logit", "for": "10s"}])),
+             "not both", "[random] with [[step]] tables")
+    _refused(path, mutate(lambda r: r.update(expect=[dict(VALID_EXPECT)])),
+             "[[expect]] names a step", "[[expect]] beside [random]")
+    _refused(path, mutate(lambda r: r["random"]["gap"].update(min="104s")),
+             "random.gap.min 1m44s is under recovery_bound", "a gap under recovery + 2 windows")
+    _refused(path, mutate(lambda r: r.update(cooldown="110s")),
+             "shorter than random.gap.min", "a cooldown under gap.min")
+    _refused(path, mutate(lambda r: r["random"]["gap"].update(max="110s")),
+             "random.gap.min 2m is above max", "gap.min above gap.max")
+    _refused(path, mutate(lambda r: fault(r, **{"for": {"min": "3m", "max": "1m"}})),
+             "`for.min` 3m is above `for.max` 1m", "for.min above for.max")
+    _refused(path, mutate(lambda r: fault(r, **{"for": {"min": "0s", "max": "1m"}})),
+             "`for.min` must be longer than 0s", "a zero for.min")
+    _refused(path, mutate(lambda r: fault(r, weight=0)), "`weight` must be above 0",
+             "a zero weight")
+    _refused(path, mutate(lambda r: fault(r, weight="3")), "`weight` must be a number",
+             "a string weight")
+    _refused(path, mutate(lambda r: fault(r, action="explode")), "unknown action",
+             "an unknown random action")
+    _refused(path, mutate(lambda r: fault(r, on="influxdb")),
+             "random.fault 1 (netem on influxdb): unknown service",
+             "an unknown random service")
+    _refused(path, mutate(lambda r: lifecycle(r, action="kill", on="generator")),
+             "random.fault 3 (kill on generator): kill is for logit only",
+             "a random kill on the generator")
+    _refused(path, mutate(lambda r: fault(r, args=[])), "netem needs `args`",
+             "netem with no args")
+    _refused(path, mutate(lambda r: fault(r, args=["clear"])), "netem clear is a fault's revert",
+             "netem clear as a random spec")
+    _refused(path, mutate(lambda r: fault(r, args="loss 1%")), "`args` must be an array",
+             "netem args as a string")
+    _refused(path, mutate(lambda r: lifecycle(r, args=["loss 1%"])), "`args` is for netem only",
+             "args on a random lifecycle fault")
+    _refused(path, mutate(lambda r: r["random"].update(sede=1)), "random: unknown key `sede`",
+             "a misspelled [random] key")
+    _refused(path, mutate(lambda r: fault(r, fro="1m")), "unknown key `fro`",
+             "a misspelled [[random.fault]] key")
+    _refused(path, mutate(lambda r: r["random"].pop("seed")), "random: missing `seed`",
+             "a [random] table with no seed")
+    _refused(path, mutate(lambda r: r["random"].update(seed=-1)), "integer 0 or more",
+             "a negative seed")
+    _refused(path, mutate(lambda r: r["random"].update(seed="7")), "integer 0 or more",
+             "a string seed")
+    _refused(path, mutate(lambda r: r["random"].update(fault=[])), "at least one",
+             "a [random] table with no fault")
+    _refused(path, mutate(lambda r: r["random"].pop("gap")), "random: missing `gap`",
+             "a [random] table with no gap")
+    _refused(path, mutate(lambda r: r.update(duration="8m")), "doesn't fit every draw",
+             "an own duration one draw can overrun")
+    _refused(path, copy.deepcopy(base), "--seed must be an integer 0 or more",
+             "a negative --seed", seed=-3)
+
+    # The schedule rules, against hand-built schedules no draw produces.
+    def step(n, action, on, start, end, args=""):
+        return scenario.Step(id=f"r{n}", spec_index=0, cycle=None, action=action, on=on,
+                             args=args, start=start, end=end)
+
+    for steps, needle, what in (
+        ([step(1, "stop", "logit", 300, 400), step(2, "pause", "generator", 350, 380)],
+         "starts before the previous fault ends",
+         "faults overlapping across containers"),
+        ([step(1, "stop", "logit", 300, 400), step(2, "netem", "logit", 350, 380, "loss 1%")],
+         "netem on logit during its stop", "netem inside a stop"),
+        ([step(1, "stop", "logit", 300, 400), step(2, "pause", "logit", 450, 480)],
+         "under random.gap.min", "a gap under gap.min"),
+        ([step(1, "stop", "logit", 100, 200)], "under random.gap.min",
+         "a first fault too soon after warmup"),
+        ([step(1, "pause", "logit", 30, 200)], "starts inside warmup", "a fault in warmup"),
+        ([step(1, "pause", "logit", 3000, 3550)], "ends inside cooldown", "a fault in cooldown"),
+        ([step(1, "kill", "generator", 300, 330)], "kill is for logit only",
+         "a kill on the generator"),
+    ):
+        problems = scenario._schedule_problems(loaded, steps, 3600)
+        expect(any(needle in problem for problem in problems),
+               f"{what}: expected a problem containing {needle!r}, got {problems}")
+
+
+class _FakeLogs:
+    """A container log for `LogCapture`, read as moby's json-file reader does: `--since` skips
+    lines before it only until the first line at or after it, and `--until` stops at the first
+    line after it. `fail_next` makes the next call write its first line and return 1."""
+
+    def __init__(self):
+        self.lines = []
+        self.calls = []
+        self.fail_next = False
+
+    def logs_to(self, container, stdout_path, stderr_path, since=None, until=None,
+                timeout=0):
+        self.calls.append((since, until))
+        since_ns = None if since is None else _ns(since)
+        until_ns = None if until is None else _ns(until)
+        chosen = []
+        for ts, stream, text in self.lines:
+            if since_ns is not None:
+                if ts < since_ns:
+                    continue
+                since_ns = None
+            if until_ns is not None and ts > until_ns:
+                break
+            chosen.append((stream, text))
+        failing, self.fail_next = self.fail_next, False
+        if failing:
+            chosen = chosen[:1]
+        with open(stdout_path, "w") as out, open(stderr_path, "w") as err:
+            for stream, text in chosen:
+                (out if stream == "stdout" else err).write(text + "\n")
+        return docker.Result(1 if failing else 0, "", "timed out" if failing else "")
+
+
+def _ns(text):
+    """An RFC 3339 timestamp with nine fractional digits -> epoch nanoseconds."""
+    base, frac = text[:-1].split(".")
+    return int(telemetry.parse_rfc3339(base + "Z")) * 1_000_000_000 + int(frac)
+
+
+def _log_capture():
+    ns = 1_800_000_000 * 1_000_000_000
+    expect(collect.rfc3339_ns(ns + 123_456_789) == "2027-01-15T08:00:00.123456789Z"
+           and _ns(collect.rfc3339_ns(ns + 7)) == ns + 7,
+           f"rfc3339_ns writes nine digits, got {collect.rfc3339_ns(ns + 123_456_789)}")
+    second = 1_000_000_000
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = _FakeLogs()
+        capture = collect.LogCapture(Path(tmp), fake)
+        written = []
+
+        def add(offset_s, stream, text):
+            fake.lines.append((ns + int(offset_s * second), stream, text))
+            written.append((stream, text))
+
+        add(1, "stdout", "a")
+        add(2, "stderr", "b")
+        add(9, "stdout", "c")
+        # stderr's copier timestamped this before "c" and wrote it after: out of order.
+        add(8.5, "stderr", "d")
+        add(14, "stdout", "e")
+        expect(capture.chunk({"logit": "id1"}, now_ns=ns + 15 * second),
+               "the first chunk succeeds")
+        expect(fake.calls[-1] == (None, collect.rfc3339_ns(ns + 10 * second)),
+               f"the first chunk reads from the start until 5 s ago, got {fake.calls[-1]}")
+        # Written after the first chunk with a timestamp inside it, behind a line past it: the
+        # next chunk starts at that later line, by position, so it isn't skipped.
+        add(9.5, "stdout", "f")
+        add(16, "stderr", "g")
+        expect(capture.chunk({"logit": "id1"}, now_ns=ns + 21 * second),
+               "the second chunk succeeds")
+        expect(fake.calls[-1][0] == collect.rfc3339_ns(ns + 10 * second + 1),
+               f"the next chunk starts 1 ns after the last one's until, got {fake.calls[-1]}")
+        add(30, "stdout", "h")
+        fake.fail_next = True
+        expect(not capture.chunk({"logit": "id1", "generator": "id2"},
+                                 now_ns=ns + 40 * second),
+               "a failed chunk fails the round")
+        expect(len(fake.calls) == 3, f"a failed chunk stops the round, got {fake.calls}")
+        failed_since = fake.calls[-1][0]
+        add(41, "stderr", "i")
+        expect(capture.chunk({"logit": "id1"}, final=True), "the final chunk succeeds")
+        expect(fake.calls[-1] == (failed_since, None),
+               f"a failed chunk leaves the cursor, and the final chunk reads to the end, got "
+               f"{fake.calls[-1]} after {failed_since}")
+        capture.close()
+        logs = Path(tmp) / "logs"
+        got_out = (logs / "logit.stdout").read_text().split()
+        got_err = (logs / "logit.stderr").read_text().split()
+        want_out = [t for stream, t in written if stream == "stdout"]
+        want_err = [t for stream, t in written if stream == "stderr"]
+        expect(got_out == want_out and got_err == want_err,
+               f"chunks partition the log with no line lost or repeated, got {got_out} "
+               f"{got_err}, want {want_out} {want_err}")
+        records = collect.read_jsonl(Path(tmp) / "log-chunks.jsonl")
+        expect(len(records) == len(fake.calls) and [r["rc"] for r in records] == [0, 0, 1, 0],
+               f"every chunk is recorded in log-chunks.jsonl, got {records}")
+        expect(not list(logs.glob(".*.chunk")), "no temporary chunk file is left behind")
+
+
+class _HungDocker:
+    """`inspect` that takes `POLL_TIMEOUT_S` on a fake clock and fails, as a hung daemon's
+    does."""
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.calls = 0
+
+    def inspect(self, container, timeout=0):
+        self.calls += 1
+        self.clock[0] += timeout
+        return None
+
+
+class _Records(list):
+    def write(self, record):
+        self.append(record)
+
+
+def _hung_inspect(root):
+    loaded = scenario.load(root / "scenarios" / "statsd-vm" / "scenario.toml")
+    run = driver.Run(root, loaded, 600, None, False, "/nonexistent", [], "logit:soak")
+    clock = [1000.0]
+    real_now = driver._now
+    driver._now = lambda: clock[0]
+    try:
+        run.ids = {"logit": "a", "generator": "b", "victoria-metrics": "c"}
+        run.docker = _HungDocker(clock)
+        run.watchdog = _Records()
+        run.t0 = 0.0
+        run.inspect_all()
+    finally:
+        driver._now = real_now
+    expect(run.docker.calls == 1 and len(run.watchdog) == 1,
+           f"a timed-out inspect ends the round, got {run.docker.calls} call(s)")
+
+
+def _deadlines():
+    expect(driver._next_multiple(4.99, 5) == 5 and driver._next_multiple(5.0, 5) == 10
+           and driver._next_multiple(17.3, 5) == 20 and driver._next_multiple(899.9, 300) == 900,
+           "a poll's next deadline is the next multiple of its period")
 
 
 def _ndjson():
@@ -1016,7 +1355,7 @@ KILL_KILL = (203, 213)
 
 
 def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=None, drop=(),
-              every_window=True, kill_residual=0):
+              every_window=True, kill_residual=0, silence=None):
     """A three-life run for the ledger: life 1 ends by a kill. The generator and the SUT move
     `PER_DRAIN` lines per 5 s drain (200/s), and the export samples every 10 s. Lives 0 and 2
     balance. Life 1's Ab − V is `kill_gap`, the window the kill discarded; its band is
@@ -1026,7 +1365,8 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
     batches (default `replayed`), and life 2's sink opens a spool holding `replayed` of them and
     delivers them in its first drain. `drop` deletes the export's samples at those offsets from
     every series; `every_window` sets `[ledger] vm_every_window`. `kill_residual` lines are read
-    in the drain before life 1's last and never absorbed."""
+    in the drain before life 1's last and never absorbed. `silence` is `(service, action)` of a
+    fault over +240..+270 in life 2."""
     queued = replayed if queued is None else queued
     gen = []
     for offset in range(5, 301, 5):
@@ -1080,8 +1420,12 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
                         affects_udp_ingress=True),
                 _action("revert", "c0s2", "kill", "logit", KILL_KILL[1] - 1, KILL_KILL[1],
                         affects_udp_ingress=True),
-                _ready("c0s2", "logit", KILL_KILL[1] + 1),
-                _phase("end_begin", 300), _phase("end_end", 330)]
+                _ready("c0s2", "logit", KILL_KILL[1] + 1)]
+    if silence is not None:
+        on, action = silence
+        timeline += [_action("apply", "c0s3", action, on, 240, 240.2),
+                     _action("revert", "c0s3", action, on, 269.8, 270)]
+    timeline += [_phase("end_begin", 300), _phase("end_end", 330)]
     ledger = {**LEDGER, "vm_every_window": True} if every_window else LEDGER
     run_dir = _run_dir(tmp, name, timeline, sut, ledger=ledger,
                        configs={"sut": "logit-sut.yaml"})
@@ -1205,6 +1549,24 @@ def _kill_ledger():
                and "life 2's first sample at +240s, 27s after the life started"
                in head["ledger.windows"].detail,
                f"windows FAILs a later life's late first sample, got {head['ledger.windows']}")
+        paused = results("windows-pause", drop=(250, 260, 270), silence=("logit", "pause"))
+        expect(paused["ledger.windows"].status == checks.PASS
+               and "2 excused" in paused["ledger.windows"].detail,
+               f"windows excuses a gap across a pause of the SUT, got {paused['ledger.windows']}")
+        parted = results("windows-partition", drop=(250, 260, 270),
+                         silence=("generator", "partition"))
+        expect(parted["ledger.windows"].status == checks.PASS,
+               f"windows excuses a gap across a partition of the generator, got "
+               f"{parted['ledger.windows']}")
+        beside = results("windows-pause-and-lost", drop=(230, 240, 250, 260, 270),
+                         silence=("logit", "pause"))
+        expect(beside["ledger.windows"].status == checks.FAIL
+               and "life 2 gap 60s from +220s to +280s" in beside["ledger.windows"].detail,
+               f"windows FAILs a window lost beside a pause, got {beside['ledger.windows']}")
+        netem = results("windows-netem", drop=(250, 260, 270), silence=("logit", "netem"))
+        expect(netem["ledger.windows"].status == checks.FAIL,
+               f"windows doesn't excuse a gap across a fault that leaves the SUT writing "
+               f"windows, got {netem['ledger.windows']}")
         unset = results("kill-windows-unset", every_window=False)
         expect(unset["ledger.windows"].status == checks.SKIP,
                f"windows SKIPs without vm_every_window, got {unset['ledger.windows']}")
@@ -1239,6 +1601,24 @@ def _kill_ledger():
                f"{stray['ledger.intake']}")
 
 
+def _report():
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp)
+        rows = [checks.Result("run", checks.PASS, "ok")]
+        (run_dir / "scenario.resolved.json").write_text(json.dumps(
+            {"name": "random-faults", "duration": 3600.0, "seed": 42}))
+        report.write(run_dir, rows)
+        text = (run_dir / "results.md").read_text()
+        expect(", 3600s scheduled, random schedule seed 42." in text
+               and json.loads((run_dir / "results.json").read_text())["seed"] == 42,
+               f"results.md and results.json carry the seed, got {text[:200]}")
+        (run_dir / "scenario.resolved.json").write_text(json.dumps(
+            {"name": "statsd-vm", "duration": 960.0, "seed": None}))
+        report.write(run_dir, rows)
+        expect("seed" not in (run_dir / "results.md").read_text().splitlines()[2],
+               "a fixed schedule's header names no seed")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -1256,11 +1636,12 @@ def run(root, quiet=False):
     root = Path(root)
     _FAILURES.clear()
     _PASSED[0] = 0
-    for part in (_durations, _rules, _expect_rules, _expand, _ndjson, _stderr, _slope, _checks,
-                 _vm_resets, _ledger_checks, _kill_watchdog, _kill_ledger, _expect_checks,
-                 _gauge_lives, _shipped):
+    for part in (_durations, _rules, _expect_rules, _expand, _random, _log_capture, _deadlines,
+                 _hung_inspect, _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks, _kill_watchdog,
+                 _kill_ledger, _expect_checks, _gauge_lives, _report, _shipped):
         try:
-            part(root) if part in (_rules, _expect_rules, _expand, _shipped) else part()
+            takes_root = (_rules, _expect_rules, _expand, _random, _hung_inspect, _shipped)
+            part(root) if part in takes_root else part()
         except Exception as err:  # report the part that broke, then keep going
             _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")
     if _FAILURES:

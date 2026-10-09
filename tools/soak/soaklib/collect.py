@@ -8,6 +8,7 @@ can be re-scored offline from its directory alone.
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -68,7 +69,8 @@ def _meminfo_total():
     return "unknown"
 
 
-def provenance(run_dir, root, docker, images, scenario_name, duration, seed, argv):
+def provenance(run_dir, root, docker, images, scenario_name, duration, seed, argv,
+               seed_source=None):
     """Writes `provenance.txt`: what ran, on what, from which tree."""
     sha = _command(["git", "-C", str(root), "rev-parse", "HEAD"]) or "unknown"
     dirty = _command(["git", "-C", str(root), "status", "--porcelain"])
@@ -79,7 +81,8 @@ def provenance(run_dir, root, docker, images, scenario_name, duration, seed, arg
         f"captured: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
         f"scenario: {scenario_name}",
         f"duration: {duration:g}s",
-        f"seed: {seed if seed is not None else 'none'}",
+        f"seed: {seed} (from {seed_source})" if seed is not None
+        else "seed: none (a fixed schedule)",
         f"argv: {' '.join(argv)}",
         f"repo: {sha} ({dirty_count} modified path(s))",
         f"docker: {server or 'unknown'}",
@@ -98,14 +101,101 @@ def provenance(run_dir, root, docker, images, scenario_name, duration, seed, arg
     (Path(run_dir) / "provenance.txt").write_text("\n".join(lines) + "\n")
 
 
-def service_logs(run_dir, docker, ids):
-    """`logs/<svc>.stdout` and `.stderr`, kept apart, for every service with a container."""
-    logs = Path(run_dir) / "logs"
-    logs.mkdir(exist_ok=True)
+# A chunk's `--until` trails the wall clock by this much, so a line the daemon timestamped
+# before it has been written to the log file by the time the chunk reads it.
+LOG_LAG_NS = 5 * 1_000_000_000
+LOG_CHUNK_TIMEOUT_S = 60.0
+
+
+def rfc3339_ns(ns):
+    """Epoch nanoseconds -> RFC 3339 UTC with nine fractional digits, which `docker logs
+    --since`/`--until` parse without rounding."""
+    seconds, frac = divmod(int(ns), 1_000_000_000)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + f".{frac:09d}Z"
+
+
+class LogCapture:
+    """Appends each service's `docker logs` to `logs/<svc>.stdout` and `.stderr` in chunks
+    during a run, so an hours-long run never reads a whole log at once and the daemon's
+    rotated `json-file` logs (compose.yaml's `logging` options) never drop a line before it is
+    captured.
+
+    Boundaries, from the daemon's `json-file` reader (moby's `loggerutils` forwarder): `--since`
+    skips lines timestamped before it only until the first line at or after it, then passes
+    every later line in file order; `--until` stops at the first line timestamped after it. A
+    chunk's next `--since` is its `--until` plus 1 ns, so the next chunk starts at the line the
+    previous one stopped at, and consecutive chunks partition the file by position: no line is
+    read twice or skipped, even where stdout's and stderr's timestamps interleave out of order.
+    The one loss is a line written to the file more than `LOG_LAG_NS` after its timestamp,
+    behind the next chunk's start; the daemon writes a line as it reads it from the container.
+
+    One cursor per container id: a container stopped and started keeps its id and one log
+    across lives. A chunk goes to temporary files and is appended only when `docker logs`
+    returned 0, so a failed or timed-out chunk is retried whole from the same cursor next time.
+    Each chunk is recorded in `log-chunks.jsonl`."""
+
+    def __init__(self, run_dir, docker):
+        self.logs = Path(run_dir) / "logs"
+        self.logs.mkdir(exist_ok=True)
+        self.docker = docker
+        self.cursors = {}
+        self.record = Jsonl(Path(run_dir) / "log-chunks.jsonl")
+
+    def chunk(self, ids, final=False, now_ns=None, timeout=LOG_CHUNK_TIMEOUT_S):
+        """One chunk per service in `ids`, up to `LOG_LAG_NS` before `now_ns`, or everything
+        left when `final`. Stops the round at the first failed call and returns False, so a
+        hung daemon costs one timeout per round."""
+        now_ns = time.time_ns() if now_ns is None else now_ns
+        for service, container in ids.items():
+            since = self.cursors.get(container)
+            until = None if final else now_ns - LOG_LAG_NS
+            if until is not None and since is not None and until < since:
+                continue
+            out = self.logs / f".{service}.stdout.chunk"
+            err = self.logs / f".{service}.stderr.chunk"
+            started = time.time()
+            result = self.docker.logs_to(
+                container, out, err,
+                since=None if since is None else rfc3339_ns(since),
+                until=None if until is None else rfc3339_ns(until),
+                timeout=timeout)
+            entry = {"svc": service, "id": container, "since_ns": since, "until_ns": until,
+                     "final": final, "rc": result.rc, "t": started,
+                     "elapsed_s": round(time.time() - started, 3)}
+            if result.ok:
+                sizes = {}
+                for chunk_path, stream in ((out, "stdout"), (err, "stderr")):
+                    with open(chunk_path, "rb") as src, \
+                            open(self.logs / f"{service}.{stream}", "ab") as dst:
+                        shutil.copyfileobj(src, dst)
+                    sizes[stream] = chunk_path.stat().st_size
+                entry.update(stdout_bytes=sizes["stdout"], stderr_bytes=sizes["stderr"])
+                if until is not None:
+                    self.cursors[container] = until + 1
+            else:
+                entry["stderr"] = result.stderr.strip()[-500:]
+            for chunk_path in (out, err):
+                chunk_path.unlink(missing_ok=True)
+            self.record.write(entry)
+            if not result.ok:
+                return False
+        return True
+
+    def close(self):
+        self.record.close()
+
+
+def service_logs(run_dir, docker, ids, capture=None):
+    """`logs/<svc>.stdout` and `.stderr`, kept apart, for every service with a container: the
+    tail after `capture`'s last chunk, or the whole log with no capture."""
+    own = capture is None
+    capture = capture or LogCapture(run_dir, docker)
     results = {}
     for service, container in ids.items():
-        result = docker.logs_to(container, logs / f"{service}.stdout", logs / f"{service}.stderr")
-        results[service] = result.rc
+        ok = capture.chunk({service: container}, final=True, timeout=300.0)
+        results[service] = 0 if ok else 1
+    if own:
+        capture.close()
     return results
 
 

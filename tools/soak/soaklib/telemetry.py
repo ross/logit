@@ -7,15 +7,22 @@ file among its readers: one event per line, `timestamp` RFC 3339 UTC with nine f
 (`component`, `kind`, `role`). A `sum` from `internal` is a delta per drain.
 
 A container stopped and started keeps one log, so its stdout spans several process lives.
-`lives()` splits them where `logit.process.uptime` (seconds since `internal` started) decreases,
-and each point belongs to the newest life that started at or before its timestamp. Counters are
-summed per life; gauges are series.
+`assign_lives()` splits them where `logit.process.uptime` (seconds since `internal` started)
+decreases, and each point belongs to the newest life that started at or before its timestamp.
+Counters are summed per life; gauges are series.
+
+An hours-long run holds hundreds of thousands of points, and the checks query them thousands of
+times, so `Telemetry` indexes points by name and caches each (name, attributes) selection in
+timestamp order; `counter_in` bisects it. Points sharing a line share one attributes dict, and
+identical attribute sets are interned to one, which keeps an 8-hour run's points in a few
+hundred MB.
 
 stderr is mostly JSON objects with `timestamp`, `level`, `target`, `component`, `key`, and
 `message` at the top level (`docs/deploying.md`, "Self-logging"). A Rust panic message is raw
 text (`thread '<name>' panicked at <file>:<line>:<col>:`), so stderr is classified line by line.
 """
 
+import bisect
 import json
 import re
 from dataclasses import dataclass, field
@@ -42,7 +49,7 @@ def parse_rfc3339(text):
     return seconds
 
 
-@dataclass
+@dataclass(slots=True)
 class Point:
     ts: float
     name: str
@@ -60,10 +67,41 @@ class Telemetry:
     life_starts: list = field(default_factory=list)
     # Distinct drain timestamps, from the uptime points: one per `internal` tick.
     drains: list = field(default_factory=list)
+    # Caches built on first use: points by name, each selection in timestamp order with its
+    # timestamps, and each life's drains. `assign_lives()` clears them.
+    _by_name: dict = field(default_factory=dict, repr=False)
+    _selections: dict = field(default_factory=dict, repr=False)
+    _life_drains: dict = field(default_factory=dict, repr=False)
+
+    def _clear(self):
+        self._by_name.clear()
+        self._selections.clear()
+        self._life_drains.clear()
+
+    def _selection(self, name, attrs):
+        """`(points, timestamps)` of `name` whose attributes match `attrs`, in timestamp order
+        (file order among equal timestamps)."""
+        if self._by_name.get(None) != len(self.points):
+            # Points were added since the index was built.
+            self._clear()
+        key = (name, tuple(sorted(attrs.items())))
+        cached = self._selections.get(key)
+        if cached is None:
+            if not self._by_name:
+                self._by_name[None] = len(self.points)
+                for point in self.points:
+                    self._by_name.setdefault(point.name, []).append(point)
+                for key_name, points in self._by_name.items():
+                    if key_name is not None:
+                        points.sort(key=lambda p: p.ts)
+            chosen = [p for p in self._by_name.get(name, ())
+                      if all(p.attributes.get(k) == v for k, v in attrs.items())]
+            cached = (chosen, [p.ts for p in chosen])
+            self._selections[key] = cached
+        return cached
 
     def matching(self, name, **attrs):
-        return [p for p in self.points if p.name == name
-                and all(p.attributes.get(k) == v for k, v in attrs.items())]
+        return list(self._selection(name, attrs)[0])
 
     def counter_by_life(self, name, **attrs):
         """{life: summed delta} for a `sum` metric."""
@@ -75,8 +113,10 @@ class Telemetry:
 
     def counter_in(self, name, start, end, **attrs):
         """A `sum` metric's points summed over drains in [start, end)."""
-        return sum(p.value for p in self.matching(name, **attrs)
-                   if start <= p.ts < end and isinstance(p.value, (int, float)))
+        points, stamps = self._selection(name, attrs)
+        low = bisect.bisect_left(stamps, start)
+        high = bisect.bisect_left(stamps, end)
+        return sum(p.value for p in points[low:high] if isinstance(p.value, (int, float)))
 
     def counter_points(self, name, **attrs):
         """[(ts, summed delta, life)] for a `sum` metric, one entry per drain, in timestamp
@@ -90,7 +130,10 @@ class Telemetry:
 
     def life_drains(self, life):
         """The drain timestamps of one process life, in order."""
-        return sorted({p.ts for p in self.points if p.name == UPTIME and p.life == life})
+        if life not in self._life_drains:
+            self._life_drains[life] = sorted({p.ts for p in self._selection(UPTIME, {})[0]
+                                              if p.life == life})
+        return list(self._life_drains[life])
 
     def gauge_series(self, name, **attrs):
         """[(ts, value, life)] for a gauge, in timestamp order."""
@@ -103,17 +146,29 @@ class Telemetry:
 def parse_ndjson(lines):
     """`Telemetry` from NDJSON lines (any iterable of str)."""
     telemetry = Telemetry()
+    # Every line of one drain carries the same timestamp, and a run repeats a few dozen
+    # attribute sets, so both are parsed or kept once.
+    stamps = {}
+    interned = {}
     for line in lines:
         line = line.strip()
         if not line:
             continue
         try:
             event = json.loads(line)
-            ts = parse_rfc3339(event["timestamp"])
+            text = event["timestamp"]
+            ts = stamps.get(text) if isinstance(text, str) else None
+            if ts is None:
+                ts = parse_rfc3339(text)
+                stamps[text] = ts
         except (ValueError, KeyError, TypeError):
             telemetry.bad_lines += 1
             continue
         attributes = event.get("attributes") or {}
+        try:
+            attributes = interned.setdefault(tuple(sorted(attributes.items())), attributes)
+        except TypeError:
+            pass  # an unhashable value: keep this line's own dict
         for metric in event.get("metrics") or []:
             telemetry.points.append(Point(
                 ts=ts,
@@ -148,13 +203,16 @@ def assign_lives(telemetry):
         previous = uptime
     telemetry.life_starts = starts
     telemetry.drains = sorted({ts for ts, _ in uptimes})
+    # A drain's timestamp can precede `ts - uptime` by the uptime's rounding, so a point
+    # belongs to the newest life that started at most 1 s after it.
+    shifted = [start - 1.0 for start in starts]
+    ordered = all(a <= b for a, b in zip(shifted, shifted[1:]))
     for point in telemetry.points:
-        life = 0
-        for index, start in enumerate(starts):
-            # A drain's timestamp can precede `ts - uptime` by the uptime's rounding.
-            if point.ts >= start - 1.0:
-                life = index
-        point.life = life
+        if ordered:
+            point.life = max(0, bisect.bisect_right(shifted, point.ts) - 1)
+        else:
+            point.life = max((i for i, s in enumerate(shifted) if point.ts >= s), default=0)
+    telemetry._clear()
 
 
 @dataclass

@@ -82,9 +82,9 @@ class Docker:
         result = self.compose("ps", "-a", "-q")
         return result.stdout.split() if result.ok else []
 
-    def inspect(self, container):
+    def inspect(self, container, timeout=DEFAULT_TIMEOUT):
         """`docker inspect` of one container as a dict, or None."""
-        result = self.run(["inspect", container])
+        result = self.run(["inspect", container], timeout=timeout)
         if not result.ok:
             return None
         try:
@@ -92,11 +92,18 @@ class Docker:
         except (ValueError, IndexError):
             return None
 
-    def logs_to(self, container, stdout_path, stderr_path, timeout=300.0):
-        """`docker logs` with the container's stdout and stderr kept apart. They span every life
-        of a container that was stopped and started but never recreated."""
+    def logs_to(self, container, stdout_path, stderr_path, since=None, until=None,
+                timeout=300.0):
+        """`docker logs` with the container's stdout and stderr kept apart, overwriting both
+        files. They span every life of a container that was stopped and started but never
+        recreated. `since` and `until` are passed through as RFC 3339 timestamps."""
+        args = ["logs"]
+        if since is not None:
+            args += ["--since", since]
+        if until is not None:
+            args += ["--until", until]
         with open(stdout_path, "w") as out, open(stderr_path, "w") as err:
-            return self.run(["logs", container], timeout=timeout, stdout=out, stderr=err)
+            return self.run(args + [container], timeout=timeout, stdout=out, stderr=err)
 
     def exec_(self, container, argv, timeout=DEFAULT_TIMEOUT):
         return self.run(["exec", container, *argv], timeout=timeout)
@@ -111,12 +118,12 @@ class Docker:
         value = result.stdout.strip()
         return value if result.ok and value else None
 
-    def stats(self, containers):
+    def stats(self, containers, timeout=DEFAULT_TIMEOUT):
         """One `docker stats --no-stream` sample per container, as dicts."""
         if not containers:
             return []
         result = self.run(["stats", "--no-stream", "--no-trunc", "--format", "{{json .}}",
-                           *containers])
+                           *containers], timeout=timeout)
         samples = []
         for line in result.stdout.splitlines():
             try:

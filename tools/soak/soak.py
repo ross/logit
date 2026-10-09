@@ -62,8 +62,13 @@ def cmd_list(args):
         except scenario.ScenarioError as err:
             print(f"{path.parent.name}\tINVALID: {err}")
             continue
+        if loaded.random is not None:
+            schedule = (f"random, seed {loaded.random.seed}, "
+                        f"{len(scenario.expand(loaded))} fault(s)")
+        else:
+            schedule = f"{len(loaded.steps)} step(s)"
         print(f"{loaded.name}\t{scenario.format_duration(loaded.duration)}\t"
-              f"{len(loaded.steps)} step(s)\t{loaded.description}")
+              f"{schedule}\t{loaded.description}")
     return 0
 
 
@@ -89,7 +94,9 @@ def main(argv=None):
     run = sub.add_parser("run", help="run a scenario and score it")
     run.add_argument("scenario", help="a name under tools/soak/scenarios/, or a path")
     run.add_argument("--duration", help="override the scenario's duration, such as 20m")
-    run.add_argument("--seed", type=int, help="recorded; refused until W4's random schedules")
+    run.add_argument("--seed", type=int,
+                     help="draw a [random] scenario's schedule with this seed instead of its "
+                          "own; refused for a fixed schedule")
     run.add_argument("--keep", action="store_true", help="leave the compose project up")
     run.add_argument("--out", help="where run directories go (default perf/results/soak)")
     run.set_defaults(func=cmd_run)

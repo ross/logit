@@ -16,7 +16,13 @@ x-logit: &logit
   image: ${SOAK_IMAGE:-logit:soak}
   # A crash must stay observable: nothing restarts a container but the driver's own steps.
   restart: "no"
-  logging: { driver: json-file }
+  # Rotated so an hours-long run bounds the daemon's disk: at the observed 6.4 KB/s of
+  # telemetry a 20 MB file lasts about 50 minutes, so the four full files a rotation keeps hold
+  # about 3.5 hours, and the driver captures a chunk every 5 minutes. tools/soak/README.md's
+  # "Long runs" has the arithmetic.
+  logging: &logging
+    driver: json-file
+    options: { max-size: "20m", max-file: "5", compress: "true" }
   # stdout carries the `internal` NDJSON, stderr the JSON self-log; the driver collects them apart
   # with `docker logs`.
   entrypoint: ["logit", "--log-format", "json", "run", "/config.yaml"]
@@ -28,6 +34,7 @@ services:
     command:
       - -retentionPeriod=100y
     ports: ["127.0.0.1::8428"]
+    logging: *logging
 
   logit:
     <<: *logit

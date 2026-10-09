@@ -12,6 +12,7 @@ warmup where the check says so, and everything from the end sequence on.
 telemetry whose process lives disagree with the timeline.
 """
 
+import bisect
 import json
 import re
 import statistics
@@ -685,6 +686,10 @@ SHUTDOWN_DROP_RE = re.compile(
 # `recovery`'s limits for the gauges and the ingest rate, against the warmup baseline.
 RECOVERED_UTILIZATION = 0.05
 RECOVERED_RATE_SHARE = 0.95
+# `(service, action)` faults during which the SUT writes no `aggregate` window: `ledger.windows`
+# excuses a gap across one.
+WINDOWLESS_FAULTS = {("logit", "pause"), ("logit", "partition"), ("generator", "pause"),
+                     ("generator", "stop"), ("generator", "partition")}
 
 
 def _int(value):
@@ -968,14 +973,18 @@ def _wire_buckets(data, led):
                 cum += value
                 anchors.append((ts, cum))
     anchors.sort(key=lambda item: item[0])
+    anchor_ts = [t for t, _ in anchors]
 
     def g_at(t):
         if not anchors or t <= anchors[0][0]:
             return 0.0
-        for (t1, c1), (t2, c2) in zip(anchors, anchors[1:]):
-            if t1 <= t <= t2:
-                return c1 if t2 == t1 else c1 + (c2 - c1) * (t - t1) / (t2 - t1)
-        return anchors[-1][1]
+        # The first anchor pair (t1, t2) with t1 <= t <= t2: t2 is the first anchor at or
+        # after t, and t is past the first anchor, so index >= 1.
+        index = bisect.bisect_left(anchor_ts, t)
+        if index >= len(anchors):
+            return anchors[-1][1]
+        (t1, c1), (t2, c2) = anchors[index - 1], anchors[index]
+        return c1 if t2 == t1 else c1 + (c2 - c1) * (t - t1) / (t2 - t1)
 
     counts = {}
     for name in ("logit.input.datagrams", "logit.input.kernel.drops"):
@@ -1278,6 +1287,14 @@ def check_ledger_windows(data):
     if not led.series:
         return Result("ledger.windows", FAIL, "no series in vm-export.jsonl match vm_selector")
     max_gap, tail_bound, head_bound = 1.5 * interval, 1.1 * interval, 2 * interval
+    # Faults during which the SUT writes no window by design: a paused process flushes nothing,
+    # and with the SUT or the generator partitioned no line arrives, and `aggregate` emits a
+    # series only in a window that updated it. A gap spanning one is excused when it starts
+    # within `max_gap` before the fault and ends within `head_bound` after it, as a new life's
+    # first sample does, so a window lost beside the fault still FAILs.
+    silent = [(f.start, f.end, f"{f.step} {f.action} on {f.on}") for f in data.faults
+              if (f.on, f.action) in WINDOWLESS_FAULTS]
+    excused = []
     problems = []
     widest = 0.0
     for one in led.series:
@@ -1292,6 +1309,13 @@ def check_ledger_windows(data):
                 problems.append(f"{name}: no sample in life {life}")
                 continue
             for a, b in zip(stamps, stamps[1:]):
+                if b - a > max_gap:
+                    cover = next((label for start, end, label in silent
+                                  if start - a <= max_gap and b - end <= head_bound
+                                  and a < end and b > start), None)
+                    if cover is not None:
+                        excused.append(f"{name}: life {life} gap {b - a:g}s across {cover}")
+                        continue
                 widest = max(widest, b - a)
                 if b - a > max_gap:
                     problems.append(f"{name}: life {life} gap {b - a:g}s from "
@@ -1310,13 +1334,17 @@ def check_ledger_windows(data):
     rules = (f"gaps <= {max_gap:g}s (1.5 x the {interval:g}s aggregate interval), a killed life's "
              f"last sample within {tail_bound:g}s (1.1 x) of the kill, a later life's first "
              f"within {head_bound:g}s (2 x) of its start")
+    if silent:
+        rules += (f"; a gap across a pause or partition that silences the SUT excused when it "
+                  f"starts within {max_gap:g}s before the fault and ends within {head_bound:g}s "
+                  f"after it, {len(excused)} excused")
     if problems:
         return Result("ledger.windows", FAIL,
                       f"missing windows, {len(problems)} finding(s), first: {problems[0]} "
-                      f"({rules})", problems)
+                      f"({rules})", problems + excused)
     return Result("ledger.windows", PASS,
                   f"{len(led.series)} series x {len(led.lives)} life/lives, widest gap "
-                  f"{widest:g}s ({rules})")
+                  f"{widest:g}s ({rules})", excused)
 
 
 def check_ledger_replay(data):

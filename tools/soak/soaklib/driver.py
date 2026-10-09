@@ -7,7 +7,14 @@ needs at the code:
 - The loop is single-threaded. A slow action (a `docker stop` waits up to its `-t`) delays the
   tick, and the timeline records when each action started and finished, not only when it was
   planned.
-- Every subprocess has a timeout (docker.py); none can hang the loop.
+- Every deadline is absolute, from the timeline's zero: the tick, each poll's next multiple of
+  its period, and each step's offset. A late tick or a slow poll delays what follows it and
+  never shifts a later deadline, so nothing drifts over hours.
+- Every subprocess has a timeout (docker.py); none can hang the loop. The polls use shorter
+  ones than actions do, and a poll round stops at its first timeout, so a hung daemon costs
+  each poll one timeout per round rather than one per container.
+- Logs are captured in chunks every `LOG_CHUNK_EVERY_S` (collect.py's `LogCapture` has the
+  boundary rules), and collection at the end fetches only the tail.
 - A `logit` container leaving `running`, or changing `StartedAt`, with no step behind it ends the
   schedule at once (fail fast). The end sequence, collection, and scoring still run.
 - `docker exec` into a paused container blocks, so readiness is never probed while a step holds
@@ -41,6 +48,10 @@ ADMIN = "http://127.0.0.1:9600"
 
 INSPECT_EVERY_S = 5
 SLOW_POLL_EVERY_S = 30
+# Well inside the rotation window compose.yaml's `logging` options leave at the observed line
+# rates; tools/soak/README.md's "Long runs" has the arithmetic.
+LOG_CHUNK_EVERY_S = 300
+POLL_TIMEOUT_S = 15
 READY_BOUND_S = 60
 FRESHNESS_LOOKBACK_S = 120
 QUIET_BOUND_S = 90
@@ -50,6 +61,12 @@ SUT_STOP_T = 60
 
 class Abort(Exception):
     pass
+
+
+def _next_multiple(offset, period):
+    """The first multiple of `period` after `offset`: a poll's next deadline. A poll that ran
+    late skips the deadlines it missed instead of running them back to back."""
+    return (int(offset // period) + 1) * period
 
 
 def _now():
@@ -84,11 +101,14 @@ class Run:
         self.root = Path(root)
         self.scenario = scenario
         self.duration = duration
-        self.seed = seed
+        # The seed a random schedule is drawn with: --seed, else the scenario's own.
+        self.seed = scenario.seed_for(seed)
+        self.seed_source = None if self.seed is None else ("--seed" if seed is not None
+                                                            else "scenario.toml")
         self.keep = keep
         self.argv = argv
         self.image = image
-        self.steps = scenario_mod.expand(scenario, duration)
+        self.steps = scenario_mod.expand(scenario, duration, self.seed)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         self.run_dir = Path(out_dir) / stamp
         self.project = f"soak-{scenario.name}"
@@ -120,8 +140,7 @@ class Run:
         for role in sorted(self.scenario.configs):
             shutil.copy(self.scenario.config_path(role),
                         self.run_dir / "configs" / self.scenario.configs[role])
-        resolved = self.scenario.to_json(self.duration)
-        resolved["seed"] = self.seed
+        resolved = self.scenario.to_json(self.duration, self.seed)
         (self.run_dir / "scenario.resolved.json").write_text(
             json.dumps(resolved, indent=2, sort_keys=True) + "\n"
         )
@@ -131,6 +150,7 @@ class Run:
         self.watchdog = collect.Jsonl(self.run_dir / "watchdog.jsonl")
         self.stats = collect.Jsonl(self.run_dir / "stats.ndjson")
         self.freshness = collect.Jsonl(self.run_dir / "vm-freshness.jsonl")
+        self.capture = collect.LogCapture(self.run_dir, self.docker)
 
     def say(self, text):
         offset = "" if self.t0 is None else f"[{scenario_mod.format_duration(_now() - self.t0)}] "
@@ -157,7 +177,7 @@ class Run:
             return 1
         collect.provenance(self.run_dir, self.root.parent.parent, self.docker,
                            [self.image, NETEM_IMAGE, VM_IMAGE], self.scenario.name,
-                           self.duration, self.seed, self.argv)
+                           self.duration, self.seed, self.argv, self.seed_source)
         self.say(f"run directory {self.run_dir}")
         ended = None
         for signum in (signal.SIGTERM, signal.SIGHUP):
@@ -207,8 +227,9 @@ class Run:
             self.started_at[service] = (info.get("State") or {}).get("StartedAt")
         self.t0 = _now()
         self.phase("start", t0=self.t0, ids=dict(self.ids))
+        seed = "" if self.seed is None else f", seed {self.seed}"
         self.say(f"stack up; {len(self.steps)} fault(s) over "
-                 f"{scenario_mod.format_duration(self.duration)}")
+                 f"{scenario_mod.format_duration(self.duration)}{seed}")
 
     def refresh_ids(self):
         for service in scenario_mod.SERVICES:
@@ -229,6 +250,7 @@ class Run:
         queue.sort(key=lambda item: (item[0], item[1]))
         next_inspect = 0.0
         next_slow = 0.0
+        next_chunk = LOG_CHUNK_EVERY_S
         tick = 0
         while True:
             now = _now()
@@ -240,16 +262,19 @@ class Run:
                 self.act(kind, step)
             self.poll_ready()
             if offset >= next_inspect:
-                next_inspect = offset + INSPECT_EVERY_S
+                next_inspect = _next_multiple(offset, INSPECT_EVERY_S)
                 self.inspect_all()
                 if self.fail_fast:
                     self.phase("fail_fast", reason=self.fail_fast)
                     self.say(f"fail fast: {self.fail_fast}")
                     return
             if offset >= next_slow:
-                next_slow = offset + SLOW_POLL_EVERY_S
+                next_slow = _next_multiple(offset, SLOW_POLL_EVERY_S)
                 self.sample_stats()
                 self.sample_freshness()
+            if offset >= next_chunk:
+                next_chunk = _next_multiple(offset, LOG_CHUNK_EVERY_S)
+                self.capture.chunk(self.ids)
             tick += 1
             delay = self.t0 + tick - _now()
             if delay > 0:
@@ -336,10 +361,13 @@ class Run:
     def inspect_all(self):
         now = _now()
         for service, container in self.ids.items():
-            info = self.docker.inspect(container)
+            info = self.docker.inspect(container, timeout=POLL_TIMEOUT_S)
             if info is None:
                 self.watchdog.write({"t": now, "offset": self.offset(now), "svc": service,
                                      "error": "inspect failed"})
+                if _now() - now >= POLL_TIMEOUT_S:
+                    # A timeout means the daemon isn't answering; the next round retries.
+                    return
                 continue
             state = info.get("State") or {}
             health = state.get("Health") or {}
@@ -374,7 +402,7 @@ class Run:
     def sample_stats(self):
         running = [c for s, c in self.ids.items() if s not in self.down and s not in self.paused]
         now = _now()
-        for sample in self.docker.stats(running):
+        for sample in self.docker.stats(running, timeout=POLL_TIMEOUT_S):
             service = next((s for s, c in self.ids.items() if c.startswith(sample.get("ID", "-"))
                             or sample.get("ID", "-").startswith(c)), sample.get("Name"))
             self.stats.write({"t": now, "offset": self.offset(now), "svc": service, **sample})
@@ -466,7 +494,7 @@ class Run:
         try:
             self.refresh_ids()
             if self.ids:
-                collect.service_logs(self.run_dir, self.docker, self.ids)
+                collect.service_logs(self.run_dir, self.docker, self.ids, self.capture)
                 collect.service_inspect(self.run_dir, self.docker, self.ids)
             self.phase("collected")
         except KeyboardInterrupt:
@@ -477,7 +505,8 @@ class Run:
             else:
                 result = self.docker.compose("down", "-v", "--remove-orphans", timeout=180)
                 self.phase("down", rc=result.rc)
-            for jsonl in (self.timeline, self.watchdog, self.stats, self.freshness):
+            for jsonl in (self.timeline, self.watchdog, self.stats, self.freshness,
+                          self.capture):
                 jsonl.close()
 
 
