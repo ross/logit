@@ -17,7 +17,7 @@
 //! and spans (ADR `multi-payload-events`), but OTLP is three services, so `send` issues one request
 //! per non-empty signal [`logit_proto::SignalEncoder::encode_signals`] returns, sequentially, in
 //! the order logs, traces, metrics. Each request's verdict stands on its own
-//! ([`crate::http::Outcomes::resuming`]):
+//! ([`crate::http::Outcomes`]):
 //! - An accepted signal is remembered for the batch, and a retry of the batch doesn't resend it.
 //! - A `Rejected` signal counts its records as
 //!   `logit.output.records.dropped{signal, reason="rejected"}`, warns (throttled,
@@ -498,10 +498,10 @@ impl OtlpOutput {
     }
 
     /// One request per signal the destination hasn't settled for this batch, no retry in the
-    /// sink (`docs/adr/buffered-sink-delivery.md`), each verdict folded by
-    /// [`Outcomes::resuming`]. An accepted signal is remembered and skipped on a retry of the same
-    /// batch; a rejected one is counted `logit.output.records.dropped{signal, reason="rejected"}`
-    /// by its record count, remembered, and the next signal is sent. A `Clean`, `Refused`, or
+    /// sink (`docs/adr/buffered-sink-delivery.md`), each verdict folded by [`Outcomes`]. An
+    /// accepted signal is remembered and skipped on a retry of the same batch; a rejected one is
+    /// counted `logit.output.records.dropped{signal, reason="rejected"}` by its record count,
+    /// remembered, and the next signal is sent. A `Clean`, `Refused`, or
     /// `Ambiguous` failure stops the attempt with its own fault, and `write_loop` retries only the
     /// signals not yet settled. Under `at_most_once`, an `Ambiguous` stop drops the batch, so the
     /// records of the failed signal and every signal not yet settled are counted
@@ -512,7 +512,7 @@ impl OtlpOutput {
     /// rejected records is only rejected again.
     async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let (_, payloads) = self.accounting.encode(0, || self.encoder.encode_signals(batch));
-        let mut outcomes = Outcomes::resuming(self.accounting.any_accepted());
+        let mut outcomes = Outcomes::new(self.accounting.any_accepted());
         let mut payloads = payloads?.into_iter();
         while let Some(payload) = payloads.next() {
             let (signal, records) = (payload.signal, payload.records);

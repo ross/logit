@@ -20,8 +20,8 @@
 
 use logit_core::CountGate;
 
-/// The per-batch state behind a sink's [`CountGate`]. A unit is a bit index below 32: `0` for a
-/// sink that encodes a batch in one piece.
+/// The per-batch state behind a sink's [`CountGate`]. An encode unit is a bit index below 32: `0`
+/// for a sink that encodes a batch in one piece. A request index has no bound.
 #[derive(Debug, Default)]
 pub(crate) struct BatchAccounting {
     gate: CountGate,
@@ -30,12 +30,45 @@ pub(crate) struct BatchAccounting {
     armed: bool,
     /// Units already encoded for the armed batch.
     counted: u32,
-    /// Requests of the armed batch the destination accepted, as bits; a request's bit index is
-    /// the sink's own numbering, separate from the encode units.
-    accepted: u32,
-    /// Requests of the armed batch the destination rejected, as bits; their records are counted
-    /// dropped, and a resend would be rejected again.
-    rejected: u32,
+    /// Requests of the armed batch the destination accepted; a request's index is the sink's own
+    /// numbering, separate from the encode units.
+    accepted: RequestBits,
+    /// Requests of the armed batch the destination rejected; their records are counted dropped,
+    /// and a resend would be rejected again.
+    rejected: RequestBits,
+}
+
+/// A growable set of request indexes. A `datadog_out` route cut by body size has no bound on its
+/// request count, so a fixed-width word can't hold them.
+#[derive(Debug, Default)]
+struct RequestBits(Vec<u64>);
+
+impl RequestBits {
+    fn set(&mut self, index: u32) {
+        let (word, bit) = Self::locate(index);
+        if self.0.len() <= word {
+            self.0.resize(word + 1, 0);
+        }
+        self.0[word] |= bit;
+    }
+
+    fn get(&self, index: u32) -> bool {
+        let (word, bit) = Self::locate(index);
+        self.0.get(word).is_some_and(|w| w & bit != 0)
+    }
+
+    fn any(&self) -> bool {
+        self.0.iter().any(|&w| w != 0)
+    }
+
+    /// Empties the set, keeping its allocation for the next batch.
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn locate(index: u32) -> (usize, u64) {
+        ((index / u64::BITS) as usize, 1 << (index % u64::BITS))
+    }
 }
 
 impl BatchAccounting {
@@ -48,29 +81,28 @@ impl BatchAccounting {
     pub(crate) fn observe(&mut self) {
         self.armed = true;
         self.counted = 0;
-        self.accepted = 0;
-        self.rejected = 0;
+        self.accepted.clear();
+        self.rejected.clear();
     }
 
     /// Records the destination's verdict on `request` of the armed batch: accepted, or rejected.
     /// Unarmed, it records nothing.
     pub(crate) fn settle(&mut self, request: u32, accepted: bool) {
-        debug_assert!(request < u32::BITS, "request {request} is past the bitset");
         if self.armed {
             let bits = if accepted { &mut self.accepted } else { &mut self.rejected };
-            *bits |= 1 << request;
+            bits.set(request);
         }
     }
 
     /// Whether the destination already settled `request` of the armed batch, so a retry skips
     /// it.
     pub(crate) fn settled(&self, request: u32) -> bool {
-        self.armed && (self.accepted | self.rejected) & (1 << request) != 0
+        self.armed && (self.accepted.get(request) || self.rejected.get(request))
     }
 
     /// Whether the destination accepted any request of the armed batch on an earlier attempt.
     pub(crate) fn any_accepted(&self) -> bool {
-        self.armed && self.accepted != 0
+        self.armed && self.accepted.any()
     }
 
     /// Runs one encode of `unit` with the gate muted when it repeats, and returns whether it was
@@ -175,6 +207,22 @@ mod tests {
         assert!(accounting.any_accepted());
         accounting.observe();
         assert!(!accounting.settled(0) && !accounting.settled(2), "observe clears the verdicts");
+        assert!(!accounting.any_accepted());
+    }
+
+    /// A request index past one 64-bit word is remembered, and `observe` clears it.
+    #[test]
+    fn a_request_past_the_first_word_is_settled_and_cleared() {
+        let mut accounting = BatchAccounting::default();
+        accounting.observe();
+        accounting.settle(70, false);
+        assert!(accounting.settled(70));
+        assert!(!accounting.settled(6) && !accounting.settled(69) && !accounting.settled(200));
+        assert!(!accounting.any_accepted(), "a rejection is not an acceptance");
+        accounting.settle(130, true);
+        assert!(accounting.settled(130) && accounting.any_accepted());
+        accounting.observe();
+        assert!(!accounting.settled(70) && !accounting.settled(130));
         assert!(!accounting.any_accepted());
     }
 

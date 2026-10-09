@@ -896,7 +896,7 @@ impl DatadogOutput {
             self.count_plan_drops(&plan);
         }
         let gate = self.accounting.gate().clone();
-        let mut outcomes = Outcomes::new();
+        let mut outcomes = Outcomes::new(self.accounting.any_accepted());
         for route in ROUTES {
             let items = std::mem::take(&mut plan.routes[route as usize]);
             if items.is_empty() {

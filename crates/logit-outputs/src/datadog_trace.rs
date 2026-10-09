@@ -819,7 +819,7 @@ impl DatadogTraceOutput {
     /// One attempt: traces, then stats, every request's verdict folded into `outcomes`
     /// ([`DatadogTraceOutput::post`]).
     async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let mut outcomes = Outcomes::new();
+        let mut outcomes = Outcomes::new(self.accounting.any_accepted());
         self.send_traces(batch, &mut outcomes).await?;
         self.send_stats(batch, &mut outcomes).await?;
         outcomes.finish()
