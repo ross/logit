@@ -1,0 +1,179 @@
+# A generated statsd stream into `logit` and out to Datadog's intake over the internet, under
+# network and lifecycle faults on the SUT. Nothing queries Datadog: the ledger ends at the sink's
+# own telemetry (`ledger.sent`), and a 2xx answer is the end of the evidence. The run needs
+# DD_API_KEY in perf/results/soak-external.env (tools/soak/README.md's "External targets").
+#
+# The sink is `at_least_once`, so a batch Datadog accepted but the sink didn't hear back about is
+# sent again after a partition or a timeout. That is harmless here: a resent series point
+# overwrites the stored one at its (series, timestamp). A resent log would be stored twice, but
+# this scenario sends only series (docs/known-gaps/datadog.md).
+#
+# The schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "statsd-datadog"
+description = "generator -> statsd_in (UDP) -> aggregate 10s delta -> datadog_out (disk spool) -> Datadog, no backend query"
+duration = "14m"          # warmup + one cycle + cooldown
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "12m"             # the last fault's recovery (11m15s) + one progress window and slack
+
+[target]
+kind = "external"
+name = "datadog"
+env = ["DD_API_KEY"]
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no VictoriaMetrics query
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+sut_aggregate = "window"
+sut_sink = "datadog"
+wire_loss_outside_faults = 0.0
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# Each fault is on the SUT, whose only network is the compose bridge, so netem and a partition
+# shape or cut its egress to the internet; the generator's statsd reaches it unimpaired except
+# during the partition, pause, and kill. Each fault is followed by at least 90 s: its 45 s
+# recovery and a 30 s progress window.
+[[step]]
+at = "0s"
+action = "netem"
+on = "logit"
+args = "delay 300ms 100ms"
+for = "90s"
+
+[[step]]
+at = "3m"
+action = "netem"
+on = "logit"
+args = "loss 20%"
+for = "60s"
+
+# No route to the intake: every request fails to connect, and the sink holds and retries.
+[[step]]
+at = "5m30s"
+action = "partition"
+on = "logit"
+for = "60s"
+
+[[step]]
+at = "8m"
+action = "pause"
+on = "logit"
+for = "30s"
+
+# The disk spool replays what the killed process had queued; ledger.replay ties the count to
+# the killed life's last-drain buffer.batches. With the intake reachable the queue is often
+# empty at the kill, so no expectation asks for a replay above 0.
+[[step]]
+at = "10m"
+action = "kill"
+on = "logit"
+for = "30s"
+
+# The sink never drops a batch: `block` holds the queue through every fault, and Datadog
+# accepted what it was sent.
+[[expect]]
+name = "no-drop-delay"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "datadog"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-drop-loss"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "datadog"
+step = "c0s2"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-drop-partition"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "datadog"
+step = "c0s3"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-drop-pause"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "datadog"
+step = "c0s4"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-drop-kill"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "datadog"
+step = "c0s5"
+window = "through"
+reduce = "delta"
+max = 0
+
+# The partition is the fault that makes the sink retry for certain. `retrying` is exported only
+# once a sink first retries, so a row after the netem steps, which TCP can absorb, would fail on
+# a gauge never set; `recovery` judges `retrying` after every fault.
+[[expect]]
+name = "retrying-clears"
+service = "logit"
+metric = "logit.component.retrying"
+component = "datadog"
+step = "c0s3"
+window = "after"
+reduce = "last"
+max = 0
+
+# A held batch is sent when the fault ends, well inside the series route's 1 h window, so
+# datadog_out drops nothing as stale before sending.
+[[expect]]
+name = "no-stale-partition"
+service = "logit"
+metric = "logit.output.records.dropped"
+attrs = { component = "datadog", reason = "stale" }
+step = "c0s3"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-stale-kill"
+service = "logit"
+metric = "logit.output.records.dropped"
+attrs = { component = "datadog", reason = "stale" }
+step = "c0s5"
+window = "through"
+reduce = "delta"
+max = 0
+
+# A torn spool tail is the other way a kill loses records: the restarted process truncates none.
+[[expect]]
+name = "no-torn-tail"
+service = "logit"
+metric = "logit.component.buffer.disk.truncated"
+component = "datadog"
+step = "c0s5"
+window = "through"
+reduce = "delta"
+max = 0

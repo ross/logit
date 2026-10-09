@@ -10,6 +10,9 @@
 #
 #   SOAK_SKIP_IMAGE=1   reuse the existing logit:soak and logit-soak-netem:local images
 #   SOAK_OUT=<dir>      where run directories go (default perf/results/soak)
+#   SOAK_EXTERNAL_ENV=<f>  an external-target scenario's env file: the variables its [target]
+#                       table lists, such as DD_API_KEY (default perf/results/soak-external.env);
+#                       it must be git-ignored. See tools/soak/README.md's "External targets".
 
 set -euo pipefail
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
@@ -41,6 +44,27 @@ scenario_dir="${TOOLS_DIR}/scenarios/${scenario}"
 
 python3 "${TOOLS_DIR}/soak.py" self-test
 
+# An external target reads its credentials from an env file the driver passes to compose as a
+# second `--env-file`; nothing else needs one.
+validate_env=()
+if [ "$(python3 "${TOOLS_DIR}/soak.py" target "${scenario}")" = external ]; then
+    EXTERNAL_ENV="${SOAK_EXTERNAL_ENV:-${ROOT}/perf/results/soak-external.env}"
+    if [ ! -f "${EXTERNAL_ENV}" ]; then
+        echo "soak: ${scenario} has an external target and needs ${EXTERNAL_ENV} (set SOAK_EXTERNAL_ENV)" >&2
+        exit 1
+    fi
+    EXTERNAL_ENV="$(readlink -f -- "${EXTERNAL_ENV}")"
+    # The file holds credentials, so it must be one git would never commit.
+    if ! git -C "${ROOT}" check-ignore -q "${EXTERNAL_ENV}"; then
+        echo "soak: ${EXTERNAL_ENV} is not git-ignored; keep credentials under perf/results/" >&2
+        exit 1
+    fi
+    # Names each variable the file doesn't set, never a value.
+    python3 "${TOOLS_DIR}/soak.py" target "${scenario}" --env-file "${EXTERNAL_ENV}"
+    export SOAK_EXTERNAL_ENV="${EXTERNAL_ENV}"
+    validate_env=(--env-file "${EXTERNAL_ENV}")
+fi
+
 # The driver runs every docker command as `sudo -n` so an expired ticket fails instead of
 # prompting mid-run; this primes the ticket.
 ${DOCKER} version >/dev/null
@@ -60,7 +84,7 @@ else
 fi
 
 for config in "${scenario_dir}"/logit-*.yaml; do
-    ${DOCKER} run --rm -v "${config}:/config.yaml:ro,z" "${IMAGE}" validate /config.yaml >/dev/null || {
+    ${DOCKER} run --rm "${validate_env[@]}" -v "${config}:/config.yaml:ro,z" "${IMAGE}" validate /config.yaml >/dev/null || {
         echo "soak: ${config} failed 'logit validate'" >&2
         exit 1
     }

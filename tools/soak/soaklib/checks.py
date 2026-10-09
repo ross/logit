@@ -10,6 +10,10 @@ warmup where the check says so, and everything from the end sequence on.
 
 `SKIP` means a check had nothing it could judge, such as a run with no telemetry, or SUT
 telemetry whose process lives disagree with the timeline.
+
+A run against an external target (`[target] kind = "external"`) has no backend query, so every
+row that reads V or the freshness samples SKIPs or leaves them out, and `ledger.sent` ends the
+ledger at the sink's own telemetry instead. A local run's `ledger.sent` SKIPs.
 """
 
 import bisect
@@ -20,7 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import collect, faults, telemetry, vm
-from .scenario import EXPECT_REDUCERS, LOGIT_SERVICES, SERVICES, parse_duration
+from .scenario import (EXPECT_REDUCERS, EXTERNAL_TARGET, LOCAL_TARGET, LOGIT_SERVICES,
+                       SERVICES, parse_duration)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
@@ -143,6 +148,10 @@ class RunData:
         self.thresholds = self.resolved.get("thresholds", {})
         self.ledger = self.resolved.get("ledger", {})
         self.duration = float(self.resolved.get("duration", 0))
+        # A run recorded before targets existed has none: the local target.
+        self.target = self.resolved.get("target") or {"kind": LOCAL_TARGET,
+                                                      "name": LOCAL_TARGET}
+        self.external = self.target.get("kind") == EXTERNAL_TARGET
 
         phases = {r["phase"]: r for r in self.timeline if r.get("event") == "phase"}
         self.phases = phases
@@ -550,8 +559,10 @@ def check_progress(data):
     if share is not None and share < COVERAGE_MIN_SHARE:
         status = worst([status, WARN])
         lines.append(f"delivery windows cover little of the run: {coverage}")
+    fresh = (f"no freshness samples ({NO_BACKEND})" if data.external else
+             f"{fresh_judged} freshness sample(s) under {FRESHNESS_MAX_AGE_S}s")
     detail = (f"{judged} {window:.0f}s window(s) with deliveries outside fault windows; "
-              f"{fresh_judged} freshness sample(s) under {FRESHNESS_MAX_AGE_S}s; {coverage}")
+              f"{fresh}; {coverage}")
     return Result("progress", status, detail if status == PASS else lines[0], lines)
 
 
@@ -686,6 +697,16 @@ SHUTDOWN_DROP_RE = re.compile(
 # `recovery`'s limits for the gauges and the ingest rate, against the warmup baseline.
 RECOVERED_UTILIZATION = 0.05
 RECOVERED_RATE_SHARE = 0.95
+# Why a row that reads V SKIPs on an external target.
+NO_BACKEND = "external target: no backend query"
+# `ledger.sent`'s reading of an external sink's telemetry (`datadog_out`'s module doc, "Faults,
+# retries, and duplicate safety" and "Telemetry"): the `records.dropped` reasons and the batch
+# drop reason that mean the destination refused the data, and the diagnostics quoting its
+# answer. Every other counted drop WARNs.
+REJECTED_RECORD_REASONS = ("rejected", "oversize")
+REJECTED_BATCH_REASONS = ("rejected",)
+REJECTION_KEYS = ("request_rejected", "series_rejected")
+_ANSWERED_RE = re.compile(r"answered (\d{3})")
 # `(service, action)` faults during which the SUT writes no `aggregate` window: `ledger.windows`
 # excuses a gap across one.
 WINDOWLESS_FAULTS = {("logit", "pause"), ("logit", "partition"), ("generator", "pause"),
@@ -713,7 +734,7 @@ def _yaml_int(text, key):
     return int(match.group(1)) if match else None
 
 
-def _component_duration(text, component, key):
+def component_duration(text, component, key):
     """A duration field of one component in a YAML text, block or flow style, in seconds, or
     None. The component's block is its `<component>:` line and every deeper-indented line after
     it."""
@@ -845,7 +866,7 @@ class Ledger:
         self.R = max_datagrams + RESIDUAL_BATCHES * batch_max
         self.R_text = f"R {_n(self.R)} = {_n(max_datagrams)} + {RESIDUAL_BATCHES} x {_n(batch_max)}"
         # The aggregate's configured window, in seconds, or None when the config doesn't say.
-        self.interval = _component_duration(text, self.aggregate or "", "interval")
+        self.interval = component_duration(text, self.aggregate or "", "interval")
 
     def _sut_config_text(self):
         """The SUT config: the run directory's copy, else the path `compose.env` names."""
@@ -1150,6 +1171,8 @@ def check_ledger_egress(data):
     `batches_dropped` above 0 is counted, never reconciled; a killed life's gap passes inside
     `Ledger.kill_band`; any other gap is uncounted loss, or a surplus below a killed life's
     band. An export with no series can't pass."""
+    if data.external:
+        return Result("ledger.egress", SKIP, f"{NO_BACKEND}; ledger.sent judges the sink")
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.egress", led)
     if skipped:
@@ -1204,7 +1227,8 @@ def check_ledger_egress(data):
 
 def check_ledger_summary(data):
     """The final life's uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), which must
-    be 0, with wire loss beside it by design. A counted egress term is shown and not judged."""
+    be 0, with wire loss beside it by design. A counted egress term is shown and not judged;
+    on an external target the Ab − V term SKIPs, and the row judges the other three."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.summary", led)
     if skipped:
@@ -1216,11 +1240,15 @@ def check_ledger_summary(data):
         ("E − A", g("E", life) - g("A", life)),
         ("A − Ab", g("A", life) - g("Ab", life)),
     ]
-    _, verdict, egress_gap = led.egress(life)
-    counted = verdict == "counted"
-    judged = sum(value for _, value in terms) + (0 if counted else egress_gap)
     shown = [f"{name} {_n(value)}" for name, value in terms]
-    shown.append(f"Ab − V {_n(egress_gap)}" + (" counted" if counted else ""))
+    if data.external:
+        judged = sum(value for _, value in terms)
+        shown.append(f"Ab − V SKIP ({NO_BACKEND})")
+    else:
+        _, verdict, egress_gap = led.egress(life)
+        counted = verdict == "counted"
+        judged = sum(value for _, value in terms) + (0 if counted else egress_gap)
+        shown.append(f"Ab − V {_n(egress_gap)}" + (" counted" if counted else ""))
     wire = ""
     if led.gen is not None:
         wire = (f"; wire G − (W + K) {_n(led.G - sum(led.W.values()) - sum(led.K.values()))} "
@@ -1274,6 +1302,8 @@ def check_ledger_windows(data):
     series only in a window that updated it, so an idle series has gaps by design. Under
     `temporality: cumulative` V reads only each life's last value, so a lost middle window
     changes no total and only this row sees it."""
+    if data.external:
+        return Result("ledger.windows", SKIP, NO_BACKEND)
     if data.ledger.get("vm_every_window") is not True:
         return Result("ledger.windows", SKIP, "not enabled ([ledger] vm_every_window)")
     led = _ledger(data)
@@ -1384,6 +1414,177 @@ def check_ledger_replay(data):
                      + ("" if ok else ", off by " + _n(replayed - queued)))
     return Result("ledger.replay", status,
                   "; ".join(parts) + " (one batch in flight allowed)")
+
+
+def _by_attr(tel, name, attr, **attrs):
+    """`{value of attr: summed delta}` for a `sum` metric over the whole run."""
+    sums = {}
+    for point in tel.matching(name, **attrs):
+        if isinstance(point.value, (int, float)):
+            key = point.attributes.get(attr, "?")
+            sums[key] = sums.get(key, 0) + point.value
+    return {key: value for key, value in sums.items() if value}
+
+
+def check_ledger_sent(data):
+    """For an external target, where the ledger ends at the sink's telemetry: `SENT` (a PASS
+    whose detail starts with the word) when every batch the sink received ended in an accepted
+    response. Per SUT life, at its last quiet drain (the final life's second-to-last, as for
+    `identity.sink`; an earlier life's last), `batches.received + buffer.disk.replayed ==
+    delivered + dropped + buffer.batches`, one batch in flight allowed. Over the run:
+
+    - FAIL: that identity off; a batch dropped `rejected`; records dropped `rejected` or
+      `oversize`, or named in a series `202` body (`records.rejected`), each with the status and
+      the sink's throttled `request_rejected`/`series_rejected` text from stderr; no request
+      answered `2xx`; no `logit.output.requests` at all.
+    - WARN: any other counted drop (a batch's `overflow_*` or `shutdown`, `drain complete`'s
+      `batches_dropped`, a record's `stale` or `too_many_tags`, an encoder's
+      `metrics.skipped`), and a request answered other than `2xx` (a `429`, a `5xx`, a
+      timeout's `network_error`) in a drain outside every fault window. Inside one it's the
+      fault's expected retry.
+
+    A `2xx` is the end of the evidence: nothing queries the destination for what it stored. A
+    local target SKIPs: `ledger.egress` judges its delivery against VictoriaMetrics."""
+    if not data.external:
+        return Result("ledger.sent", SKIP, "local target: ledger.egress judges delivery against "
+                      "VictoriaMetrics")
+    led = _ledger(data)
+    skipped = _skip_without_sut("ledger.sent", led)
+    if skipped:
+        return skipped
+    sut, sink = led.sut, led.sink
+    status = PASS
+    problems = []
+    lines = []
+
+    def flag(verdict, text):
+        nonlocal status
+        status = worst([status, verdict])
+        problems.append((verdict, text))
+
+    identities = []
+    # Flagged after the drops below, so a rejection, which explains a gap, leads the detail.
+    off_identity = []
+    for life in led.lives:
+        drains = sut.life_drains(life)
+        if not drains:
+            flag(FAIL, f"life {life} has no drain")
+            continue
+        at = drains[-2] if life == led.final and len(drains) >= 2 else drains[-1]
+
+        def upto(name):
+            return sum(v for ts, v, point_life in sut.counter_points(name, component=sink)
+                       if point_life == life and ts <= at)
+
+        received = upto("logit.component.batches.received")
+        replayed = upto("logit.component.buffer.disk.replayed")
+        delivered = upto("logit.component.batches.delivered")
+        dropped = upto("logit.component.batches.dropped")
+        queued = next((v for ts, v, point_life in reversed(sut.gauge_series(
+            "logit.component.buffer.batches", component=sink))
+            if point_life == life and ts <= at), 0)
+        gap = received + replayed - delivered - dropped - queued
+        replay = f" + replayed {_n(replayed)}" if replayed else ""
+        text = (f"life {life} at {data.offset(at)}: received {_n(received)}{replay} vs "
+                f"delivered {_n(delivered)} + dropped {_n(dropped)} + buffer.batches "
+                f"{_n(queued)}, gap {_n(gap)}")
+        identities.append(text)
+        lines.append(text)
+        if not 0 <= gap <= 1:
+            off_identity.append(f"{text}, outside [0, 1]")
+
+    rejections = [entry for entry in data.stderr.get("logit", [])
+                  if entry.kind == "json" and entry.key in REJECTION_KEYS
+                  and entry.component == sink]
+
+    def quoted():
+        if not rejections:
+            return "no request_rejected or series_rejected line on stderr"
+        first = rejections[0]
+        answered = _ANSWERED_RE.search(first.message)
+        status_text = (f"status {answered.group(1)}" if answered
+                       else "a 2xx whose body named dropped series")
+        return (f"{status_text}: {first.key} at {data.offset(first.ts)}: {first.message[:300]}")
+
+    batch_drops = _by_attr(sut, "logit.component.batches.dropped", "reason", component=sink)
+    for reason, value in sorted(batch_drops.items()):
+        if reason in REJECTED_BATCH_REASONS:
+            flag(FAIL, f"{_n(value)} batch(es) dropped {reason}, the destination refused them "
+                       f"({quoted()})")
+        else:
+            flag(WARN, f"{_n(value)} batch(es) dropped {reason}, counted")
+    shutdown = sum(led.batches_dropped.values())
+    if shutdown:
+        flag(WARN, f"drain complete reported {_n(shutdown)} batch(es) dropped at shutdown, "
+                   "counted across every node")
+    record_drops = _by_attr(sut, "logit.output.records.dropped", "reason", component=sink)
+    for reason, value in sorted(record_drops.items()):
+        if reason in REJECTED_RECORD_REASONS:
+            flag(FAIL, f"{_n(value)} record(s) dropped {reason}, the destination refused them "
+                       f"({quoted()})")
+        else:
+            flag(WARN, f"{_n(value)} record(s) dropped {reason} before sending, counted")
+    named = sum(sut.counter_by_life("logit.output.records.rejected", component=sink).values())
+    if named:
+        flag(FAIL, f"{_n(named)} record(s) named dropped in an accepted response's body "
+                   f"({quoted()})")
+    skipped_metrics = _by_attr(sut, "logit.output.metrics.skipped", "reason", component=sink)
+    skipped_metrics.update({f"metric_kind={k}": v for k, v in _by_attr(
+        sut, "logit.output.metrics.skipped", "metric_kind", component=sink).items()
+        if k != "?"})
+    skipped_metrics.pop("?", None)
+    total_skipped = sum(sut.counter_by_life("logit.output.metrics.skipped",
+                                            component=sink).values())
+    if total_skipped:
+        detail = ", ".join(f"{k} {_n(v)}" for k, v in sorted(skipped_metrics.items()))
+        flag(WARN, f"{_n(total_skipped)} metric(s) skipped by the encoder, never sent"
+                   + (f" ({detail})" if detail else ""))
+
+    for text in off_identity:
+        flag(FAIL, text)
+
+    requests = sut.matching("logit.output.requests", component=sink)
+    classes = {}
+    outside = {}
+    windows = data.windows()
+    drains = sut.drains
+    for point in requests:
+        if not isinstance(point.value, (int, float)) or not point.value:
+            continue
+        cls = point.attributes.get("class", "?")
+        classes[cls] = classes.get(cls, 0) + point.value
+        if cls == "2xx":
+            continue
+        # A drain's deltas cover the interval since the drain before it.
+        index = bisect.bisect_left(drains, point.ts)
+        previous = drains[index - 1] if index > 0 else point.ts
+        if not any(start < point.ts and end > previous for start, end in windows):
+            outside[cls] = outside.get(cls, 0) + point.value
+            lines.append(f"{_n(point.value)} request(s) answered {cls} in the drain at "
+                         f"{data.offset(point.ts)}, outside every fault window")
+    shown = ", ".join(f"{cls} {_n(value)}" for cls, value in sorted(classes.items()))
+    if not classes:
+        flag(FAIL, f"no logit.output.requests from {sink}: nothing shows a request was sent")
+    elif not classes.get("2xx"):
+        flag(FAIL, f"no request to {data.target.get('name')} answered 2xx ({shown})")
+    if outside:
+        flag(WARN, f"{_n(sum(outside.values()))} request(s) answered other than 2xx outside "
+                   "every fault window ("
+                   + ", ".join(f"{cls} {_n(v)}" for cls, v in sorted(outside.items())) + ")")
+    accepted = sum(sut.counter_by_life("logit.output.records", component=sink).values())
+    lines.insert(0, f"requests by class: {shown or 'none'}; records accepted {_n(accepted)}")
+    lines += [f"{entry.key} at {data.offset(entry.ts)}: {entry.message[:300]}"
+              for entry in rejections]
+
+    summary = (f"requests {shown or 'none'}; records accepted {_n(accepted)}; "
+               + "; ".join(identities) + f" (one batch in flight allowed); {NO_BACKEND}, so a "
+               "2xx is the end of the evidence")
+    if status == PASS:
+        return Result("ledger.sent", PASS, f"SENT to {data.target.get('name')}: every batch "
+                      f"received ended in an accepted response; {summary}", lines)
+    worst_first = sorted(problems, key=lambda item: -_ORDER[item[0]])
+    return Result("ledger.sent", status, f"{worst_first[0][1]}; {summary}",
+                  [text for _, text in worst_first] + lines)
 
 
 def _step_value(series, t, default=0.0):
@@ -1633,7 +1834,8 @@ CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_intake,
     check_ledger_edge, check_ledger_aggregate, check_ledger_egress, check_ledger_windows,
-    check_ledger_replay, check_ledger_summary, check_identity_sink, check_recovery, check_expect,
+    check_ledger_replay, check_ledger_summary, check_ledger_sent, check_identity_sink,
+    check_recovery, check_expect,
 )
 
 

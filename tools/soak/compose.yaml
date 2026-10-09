@@ -8,6 +8,14 @@
 #   SOAK_SUT_CONFIG        absolute path of the scenario's `logit` config for the service `logit`
 #   SOAK_GENERATOR_CONFIG  absolute path of the scenario's config for the service `generator`
 #
+# A scenario with an external target (`[target] kind = "external"`) gets a second `--env-file`,
+# `SOAK_EXTERNAL_ENV` (perf/results/soak-external.env by default), holding the variables its
+# `[target] env` lists. The `logit` service's `environment:` passes each variable scenario.py's
+# `EXTERNAL_ENV_PASSED` names, empty when unset.
+#
+# `victoria-metrics` is in the `local` profile, which the driver enables for a local-target
+# scenario only, so an external target's stack runs without it.
+#
 # No `container_name` and no `name:`, so a second scenario under another project can't collide
 # with this one. The one published port is VictoriaMetrics on an ephemeral loopback port, which
 # the driver reads with `compose port` after every start of that service.
@@ -31,6 +39,7 @@ x-logit: &logit
 services:
   victoria-metrics:
     image: victoriametrics/victoria-metrics:v1.152.0
+    profiles: [local]
     command:
       - -retentionPeriod=100y
     ports: ["127.0.0.1::8428"]
@@ -38,7 +47,11 @@ services:
 
   logit:
     <<: *logit
-    depends_on: [victoria-metrics]
+    # Not required: an external target's stack has no victoria-metrics service to wait for.
+    depends_on:
+      victoria-metrics: { condition: service_started, required: false }
+    environment:
+      DD_API_KEY: ${DD_API_KEY:-}
     volumes: ["${SOAK_SUT_CONFIG:?set by script/soak}:/config.yaml:ro,z"]
 
   generator:

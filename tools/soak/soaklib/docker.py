@@ -37,14 +37,25 @@ def docker_argv(env=None):
 
 
 class Docker:
-    """One compose project's view of the daemon. `project`, `compose_file`, and `env_file` are
+    """One compose project's view of the daemon. `project`, `compose_file`, each of
+    `env_files` in order (a later file overrides an earlier one), and each of `profiles` are
     passed to every `compose` call."""
 
-    def __init__(self, project, compose_file, env_file, prefix=None):
+    def __init__(self, project, compose_file, env_files, profiles=(), prefix=None):
         self.prefix = prefix if prefix is not None else docker_argv()
         self.project = project
         self.compose_file = str(compose_file)
-        self.env_file = str(env_file)
+        self.env_files = [str(path) for path in env_files]
+        self.profiles = list(profiles)
+
+    def compose_args(self):
+        """The global `compose` options every call passes, before the subcommand."""
+        args = ["compose", "--progress", "quiet", "-p", self.project, "-f", self.compose_file]
+        for path in self.env_files:
+            args += ["--env-file", path]
+        for profile in self.profiles:
+            args += ["--profile", profile]
+        return args
 
     def run(self, args, timeout=DEFAULT_TIMEOUT, stdout=None, stderr=None):
         """Runs `$DOCKER <args>`. With `stdout`/`stderr` file objects the output goes there
@@ -66,11 +77,7 @@ class Docker:
         return Result(proc.returncode, proc.stdout or "", proc.stderr or "")
 
     def compose(self, *args, timeout=DEFAULT_TIMEOUT):
-        return self.run(
-            ["compose", "--progress", "quiet", "-p", self.project, "-f", self.compose_file,
-             "--env-file", self.env_file, *args],
-            timeout=timeout,
-        )
+        return self.run([*self.compose_args(), *args], timeout=timeout)
 
     def container_id(self, service):
         """The service's container id, running or not, or None."""
@@ -104,6 +111,11 @@ class Docker:
             args += ["--until", until]
         with open(stdout_path, "w") as out, open(stderr_path, "w") as err:
             return self.run(args + [container], timeout=timeout, stdout=out, stderr=err)
+
+    def logs_tail(self, container, lines, timeout=DEFAULT_TIMEOUT):
+        """The last `lines` lines of a container's stdout as the result's `stdout`; its stderr
+        lines land in the result's `stderr`."""
+        return self.run(["logs", "--tail", str(lines), container], timeout=timeout)
 
     def exec_(self, container, argv, timeout=DEFAULT_TIMEOUT):
         return self.run(["exec", container, *argv], timeout=timeout)

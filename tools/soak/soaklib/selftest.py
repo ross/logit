@@ -35,6 +35,16 @@ run's; the schedule rules against hand-built schedules; and where the seed is re
 covers the chunked log capture against a fake `docker logs` with out-of-order and late lines
 and a failed chunk whose record keeps the CLI's error, the polls' absolute deadlines, a hung
 daemon ending an inspect round, and a SIGTERM or SIGHUP inherited as ignored staying ignored.
+
+For an external target, it covers every `[target]` validation rule and what such a target
+refuses (a VictoriaMetrics ledger key, a fault on `victoria-metrics`), that compose.yaml passes
+each variable a target may list and keeps `victoria-metrics` in the `local` profile, the env
+file check, the compose arguments and profile each kind of run gets, the end sequence's wait for
+the sink's queue to empty, and the checks over an external two-life run: `ledger.sent` reading
+SENT, a rejected batch and rejected records each FAILing with the status and the sink's text, a
+non-2xx answer inside and outside a fault window, counted drops and encoder skips WARNing, a
+batch neither delivered nor dropped, and no request telemetry; the rows that read V SKIP; and a
+local run's `ledger.sent` SKIPs.
 """
 
 import copy
@@ -885,7 +895,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 e1_short=0, a1_short=0, ab1_short=0, late_series=False, receive_util=0.0, slow_after_stop=False, rate_behind=0,
                 undelivered=0, empty_export=False, ab0_short=0, merged_lives=False,
                 empty_sut=False, buffer_batches=0, buffer_util=0.0, steady_surplus=0,
-                **resolved):
+                external=False, sut_extra=(), stderr_extra=(), **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
@@ -962,7 +972,14 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                         affects_udp_ingress=True),
                 _ready("c0s1", "logit", STOP[1] + 1),
                 _phase("end_begin", 300), _phase("end_end", 330)]
-    run_dir = _run_dir(tmp, name, timeline, sut, ledger=LEDGER, **resolved)
+    if external:
+        resolved.setdefault("target", {"kind": "external", "name": "datadog",
+                                       "env": ["DD_API_KEY"]})
+        ledger = {k: v for k, v in LEDGER.items() if k != "vm_selector"}
+    else:
+        ledger = LEDGER
+    run_dir = _run_dir(tmp, name, timeline, list(sut) + list(sut_extra), ledger=ledger,
+                       **resolved)
     if empty_sut:
         (run_dir / "logs" / "logit.stdout").write_text("")
     (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
@@ -986,6 +1003,8 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                               batches_dropped=dropped))
         else:
             stderr.append(log(offset, "INFO", "drain complete", duration="1ms"))
+    stderr += [log(offset, level, message, **fields)
+               for offset, level, message, fields in stderr_extra]
     (run_dir / "logs" / "logit.stderr").write_text("\n".join(stderr) + "\n")
 
     ab0 = totals[0]["E"]
@@ -1005,6 +1024,9 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             export.append({"metric": {"__name__": f"x_{index}_total"},
                            "values": [share // 2, share, other // 2, other],
                            "timestamps": [int((T0 + s) * 1000) for s in (50, 100, 200, 300)]})
+    if external:
+        # Nothing queries an external target, so the driver writes no export.
+        export = []
     (run_dir / "vm-export.jsonl").write_text("".join(json.dumps(s) + "\n" for s in export))
     return run_dir
 
@@ -1652,10 +1674,10 @@ def _kill_ledger():
         unset = results("kill-windows-unset", every_window=False)
         expect(unset["ledger.windows"].status == checks.SKIP,
                f"windows SKIPs without vm_every_window, got {unset['ledger.windows']}")
-        expect(checks._component_duration(KILL_SUT_CONFIG, "window", "interval") == 10.0
-               and checks._component_duration("components:\n  window: { type: aggregate, "
+        expect(checks.component_duration(KILL_SUT_CONFIG, "window", "interval") == 10.0
+               and checks.component_duration("components:\n  window: { type: aggregate, "
                                               "interval: 2m }\n", "window", "interval") == 120.0
-               and checks._component_duration(KILL_SUT_CONFIG, "in", "interval") is None,
+               and checks.component_duration(KILL_SUT_CONFIG, "in", "interval") is None,
                "the aggregate interval reads from a block or flow component, and only its own")
 
         expect(clean["ledger.replay"].status == checks.PASS
@@ -1681,6 +1703,320 @@ def _kill_ledger():
         expect(1 not in stray_led.D_log and stray["ledger.intake"].status == checks.PASS,
                f"a killed life's D takes nothing from stderr, got {stray_led.D_log} "
                f"{stray['ledger.intake']}")
+
+
+def _external_base(root):
+    path = root / "scenarios" / "statsd-datadog" / "scenario.toml"
+    return path, tomllib.loads(path.read_text())
+
+
+def _target_rules(root):
+    """The `[target]` table's validation rules, and what an external target refuses."""
+    path, base = _external_base(root)
+    vm_path, vm_base = _base(root)
+
+    def mutate(raw, edit):
+        raw = copy.deepcopy(raw)
+        edit(raw)
+        return raw
+
+    loaded = scenario.from_dict(copy.deepcopy(base), path)
+    expect(loaded.external and loaded.target == {"kind": "external", "name": "datadog",
+                                                 "env": ["DD_API_KEY"]},
+           f"statsd-datadog loads as an external target, got {loaded.target}")
+    resolved = loaded.to_json()
+    expect(resolved["target"]["kind"] == "external" and "vm_selector" not in resolved["ledger"],
+           f"the resolved scenario records the target, got {resolved['target']}")
+    local = scenario.from_dict(copy.deepcopy(vm_base), vm_path)
+    expect(not local.external and local.to_json()["target"]["kind"] == "victoria-metrics",
+           "a scenario with no [target] is the local target")
+
+    def table(**changes):
+        return lambda raw: raw["target"].update(changes)
+
+    cases = [
+        (base, table(kinds="external"), "target: unknown key `kinds`", "an unknown target key"),
+        (base, table(kind="splunk"), "target.kind must be", "an unknown target kind"),
+        (base, table(name="Data Dog"), "target.name must be lowercase", "a target name"),
+        (base, lambda raw: raw["target"].pop("name"), "target.name must be lowercase",
+         "an external target with no name"),
+        (base, table(env="DD_API_KEY"), "target.env must be an array", "a string env"),
+        (base, table(env=["dd-api-key"]), "isn't an environment variable name",
+         "a malformed variable name"),
+        (base, table(env=["DD_SITE"]), "compose.yaml doesn't pass DD_SITE",
+         "a variable compose.yaml doesn't pass"),
+        (base, table(env=["DD_API_KEY", "DD_API_KEY"]), "target.env repeats a variable",
+         "a repeated variable"),
+        (base, lambda raw: raw["ledger"].update(vm_selector="{x}"),
+         "ledger.vm_selector names a VictoriaMetrics query", "vm_selector on an external target"),
+        (base, lambda raw: raw["ledger"].update(vm_every_window=True),
+         "ledger.vm_every_window names a VictoriaMetrics query",
+         "vm_every_window on an external target"),
+        (base, lambda raw: raw["ledger"].pop("sut_sink"), "ledger: missing `sut_sink`",
+         "an external target still needs the sink id"),
+        (base, lambda raw: raw["step"].append({"at": "11m", "action": "stop",
+                                               "on": "victoria-metrics", "for": "20s"}),
+         "a fault on victoria-metrics, which an external target's stack doesn't run",
+         "a fault on victoria-metrics with an external target"),
+        (vm_base, lambda raw: raw.update(target={"kind": "victoria-metrics", "name": "vm"}),
+         "target.name is for an external target", "a name on the local target"),
+        (vm_base, lambda raw: raw.update(target="external"), "`target` must be a table",
+         "a target that isn't a table"),
+    ]
+    for raw, edit, needle, what in cases:
+        _refused(path if raw is base else vm_path, mutate(raw, edit), needle, what)
+
+    random_path, random_base = _random_base(root)
+
+    def external_random(raw):
+        raw["target"] = {"kind": "external", "name": "datadog", "env": ["DD_API_KEY"]}
+        del raw["ledger"]["vm_selector"]
+        raw["ledger"].pop("vm_every_window", None)
+        raw["random"]["fault"].append({"weight": 1, "action": "pause",
+                                       "on": "victoria-metrics",
+                                       "for": {"min": "30s", "max": "60s"}})
+
+    _refused(random_path, mutate(random_base, external_random),
+             "random.fault", "a random fault on victoria-metrics with an external target")
+
+    compose = (root / "compose.yaml").read_text()
+    for variable in scenario.EXTERNAL_ENV_PASSED:
+        expect(f"{variable}: ${{{variable}:-}}" in compose,
+               f"compose.yaml passes {variable} to the SUT, empty when unset")
+    expect("profiles: [local]" in compose.split("  logit:")[0],
+           "compose.yaml puts victoria-metrics in the local profile")
+    expect("required: false" in compose.split("  logit:")[1].split("  generator:")[0],
+           "the SUT's depends_on doesn't require victoria-metrics")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Path(tmp) / "external.env"
+        expect(scenario.missing_env(loaded, env) == ["DD_API_KEY"],
+               "a missing env file sets nothing")
+        env.write_text("# a comment\nDD_API_KEY=\nOTHER=1\n")
+        expect(scenario.missing_env(loaded, env) == ["DD_API_KEY"], "an empty value is missing")
+        env.write_text("DD_API_KEY=\nDD_API_KEY=abc\n")
+        expect(scenario.missing_env(loaded, env) == [], "the last line for a key wins")
+        expect(scenario.missing_env(local, Path(tmp) / "nothing") == [],
+               "a local target needs no env file")
+
+        argv = docker.Docker("p", "c.yaml", ["a.env", "b.env"], ["local"], prefix=["docker"])
+        expect(argv.compose_args() == ["compose", "--progress", "quiet", "-p", "p", "-f",
+                                       "c.yaml", "--env-file", "a.env", "--env-file", "b.env",
+                                       "--profile", "local"],
+               f"compose gets every env file in order and each profile, got "
+               f"{argv.compose_args()}")
+
+        run = driver.Run(root, loaded, loaded.duration, None, False, tmp, [], "logit:soak",
+                         env)
+        run.prepare()
+        expect(run.docker.profiles == [] and run.docker.env_files[-1] == str(env),
+               f"an external run has no local profile and passes its env file last, got "
+               f"{run.docker.profiles} {run.docker.env_files}")
+        expect("DD_API_KEY" not in (run.run_dir / "compose.env").read_text()
+               and json.loads((run.run_dir / "scenario.resolved.json").read_text())
+               ["target"]["name"] == "datadog",
+               "compose.env holds no credential, and the resolved scenario names the target")
+        for jsonl in (run.timeline, run.watchdog, run.stats, run.freshness, run.capture):
+            jsonl.close()
+        vm_run = driver.Run(root, local, local.duration, None, False, Path(tmp) / "vm", [],
+                            "logit:soak")
+        vm_run.prepare()
+        expect(vm_run.docker.profiles == ["local"] and len(vm_run.docker.env_files) == 1,
+               f"a local run enables the local profile, got {vm_run.docker.profiles}")
+        for jsonl in (vm_run.timeline, vm_run.watchdog, vm_run.stats, vm_run.freshness,
+                      vm_run.capture):
+            jsonl.close()
+        env.write_text("DD_API_KEY=\n")
+        try:
+            driver.run(root, path, None, None, False, Path(tmp) / "refused", [], "logit:soak",
+                       env)
+            expect(False, "a run with DD_API_KEY empty started")
+        except scenario.ScenarioError as err:
+            expect("doesn't set DD_API_KEY" in str(err) and "abc" not in str(err),
+                   f"a run names the missing variable, got {err}")
+
+
+class _TailDocker:
+    """`logs_tail` returning the SUT stdout `lines(now)` builds, on a fake clock."""
+
+    def __init__(self, clock, lines):
+        self.clock = clock
+        self.lines = lines
+        self.calls = 0
+
+    def logs_tail(self, container, lines, timeout=0):
+        self.calls += 1
+        return docker.Result(0, "\n".join(self.lines(self.clock[0])) + "\n", "")
+
+
+def _sink_drain(root):
+    """The external end sequence's wait: two aggregate windows after the generator stops, then
+    the sink's `buffer.batches` 0 and `retrying` 0 or never set, at the newest drain."""
+    loaded = scenario.load(root / "scenarios" / "statsd-datadog" / "scenario.toml")
+    expect(driver.Run(root, loaded, 600, None, False, "/nonexistent", [],
+                      "logit:soak").aggregate_interval() == 10.0,
+           "the wait reads the SUT config's aggregate interval")
+
+    def drains(queued, retrying=None):
+        def lines(now):
+            out = []
+            for t in range(int(now) - 30, int(now) + 1, 5):
+                stamp = _stamp(t)
+                out.append(_line(stamp, "logit.process.uptime", "gauge", float(t - 900)))
+                out.append(_line(stamp, "logit.component.buffer.batches", "gauge", queued(t),
+                                 component="datadog"))
+                if retrying is not None:
+                    out.append(_line(stamp, "logit.component.retrying", "gauge", retrying(t),
+                                     component="datadog"))
+            return out
+        return lines
+
+    def wait(lines):
+        run = driver.Run(root, loaded, 600, None, False, "/nonexistent", [], "logit:soak")
+        clock = [1000.0]
+        real_now, real_sleep, real_print = driver._now, driver.time.sleep, driver._print
+        driver._now = lambda: clock[0]
+        driver._print = lambda text, stream=None: None
+        driver.time.sleep = lambda s: clock.__setitem__(0, clock[0] + s)
+        try:
+            run.ids = {"logit": "a"}
+            run.docker = _TailDocker(clock, lines)
+            run.timeline = _Records()
+            run.t0 = 900.0
+            run.wait_sink_drained()
+        finally:
+            driver._now, driver.time.sleep, driver._print = real_now, real_sleep, real_print
+        return run.timeline[-1]
+
+    record = wait(drains(lambda t: 0))
+    expect(record["phase"] == "sink_drained" and record["held"] and record["waited_s"] >= 20,
+           f"an empty queue holds once two windows pass, got {record}")
+    record = wait(drains(lambda t: 1 if t < 1040 else 0, lambda t: 1 if t < 1030 else 0))
+    expect(record["held"] and record["waited_s"] >= 40,
+           f"the wait outlasts a queue still sending, got {record}")
+    record = wait(drains(lambda t: 1))
+    expect(not record["held"] and record["buffer_batches"] == 1,
+           f"a queue that never empties ends the wait at its bound, got {record}")
+    record = wait(drains(lambda t: 0, lambda t: 1))
+    expect(not record["held"] and record["retrying"] == 1,
+           f"a sink still retrying never counts as drained, got {record}")
+
+
+def _datadog_lines(rejected_at=None, retry_at=(), stale=0, skipped=0, records=True,
+                   batch=True):
+    """`datadog_out` telemetry for the ledger fixture's SUT drains: one request answered 2xx
+    and 100 records accepted per drain, plus what each keyword adds. A rejection at
+    `rejected_at` drops its records (`records`) and its batch (`batch`): a request rejected
+    while another of the batch's was accepted drops records only."""
+    drains = [o for o in range(5, STOP[0], 5)] + [o for o in range(135, 321, 5)]
+    lines = []
+    for offset in drains:
+        stamp = _stamp(T0 + offset)
+        lines.append(_line(stamp, "logit.output.requests", "sum", 1, component="sink",
+                           attrs={"route": "series", "class": "2xx"}))
+        lines.append(_line(stamp, "logit.output.records", "sum", 100, component="sink",
+                           attrs={"route": "series"}))
+    for offset in retry_at:
+        lines.append(_line(_stamp(T0 + offset), "logit.output.requests", "sum", 2,
+                           component="sink", attrs={"route": "series", "class": "5xx"}))
+    if rejected_at is not None:
+        stamp = _stamp(T0 + rejected_at)
+        lines.append(_line(stamp, "logit.output.requests", "sum", 1, component="sink",
+                           attrs={"route": "series", "class": "4xx"}))
+        if records:
+            lines.append(_line(stamp, "logit.output.records.dropped", "sum", 100,
+                               component="sink", attrs={"route": "series", "reason": "rejected"}))
+        if batch:
+            lines.append(_line(stamp, "logit.component.batches.dropped", "sum", 1,
+                               component="sink", attrs={"reason": "rejected"}))
+            lines.append(_line(stamp, "logit.component.batches.received", "sum", 1,
+                               component="sink"))
+    if stale:
+        lines.append(_line(_stamp(T0 + 250), "logit.output.records.dropped", "sum", stale,
+                           component="sink", attrs={"route": "series", "reason": "stale"}))
+    if skipped:
+        lines.append(_line(_stamp(T0 + 250), "logit.output.metrics.skipped", "sum", skipped,
+                           component="sink", attrs={"metric_kind": "cumulative_sum"}))
+    return lines
+
+
+def _external_checks():
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            run_dir = _ledger_run(tmp, name, external=True, **kwargs)
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        clean = results("external-clean", sut_extra=_datadog_lines())
+        sent = clean["ledger.sent"]
+        expect(sent.status == checks.PASS and sent.detail.startswith("SENT to datadog")
+               and "a 2xx is the end of the evidence" in sent.detail,
+               f"ledger.sent reads SENT for a clean external run, got {sent}")
+        for check_id in ("ledger.egress", "ledger.windows"):
+            expect(clean[check_id].status == checks.SKIP
+                   and checks.NO_BACKEND in clean[check_id].detail,
+                   f"{check_id} SKIPs on an external target, got {clean[check_id]}")
+        summary = clean["ledger.summary"]
+        expect(summary.status == checks.PASS and f"Ab − V SKIP ({checks.NO_BACKEND})"
+               in summary.detail, f"ledger.summary SKIPs its V term, got {summary}")
+        expect("no freshness samples" in clean["progress"].detail,
+               f"progress names no freshness samples, got {clean['progress'].detail}")
+        for check_id in ("ledger.intake", "ledger.edge", "ledger.aggregate", "identity.sink"):
+            expect(clean[check_id].status == checks.PASS,
+                   f"{check_id} judges an external run as a local one, got {clean[check_id]}")
+
+        # The final life's first drain after the stop (+135) is inside its fault window.
+        inside = results("external-retry-inside", sut_extra=_datadog_lines(retry_at=(135,)))
+        expect(inside["ledger.sent"].status == checks.PASS,
+               f"a 5xx inside a fault window is the fault's retry, got {inside['ledger.sent']}")
+        outside = results("external-retry-outside",
+                          sut_extra=_datadog_lines(retry_at=(250, 260)))
+        expect(outside["ledger.sent"].status == checks.WARN
+               and "4 request(s) answered other than 2xx outside every fault window (5xx 4)"
+               in outside["ledger.sent"].detail,
+               f"5xx outside every fault window WARNs with the count, got "
+               f"{outside['ledger.sent']}")
+
+        rejection = (250, "WARN", "https://api.datadoghq.com/api/v2/series answered 400 Bad "
+                     "Request, 100 record(s) dropped: {\"errors\":[\"Invalid\"]} (x1, further "
+                     "occurrences suppressed)", {"component": "sink", "key": "request_rejected"})
+        rejected = results("external-rejected", sut_extra=_datadog_lines(rejected_at=250),
+                           stderr_extra=[rejection])
+        row = rejected["ledger.sent"]
+        expect(row.status == checks.FAIL and "status 400" in row.detail
+               and "dropped rejected" in row.detail and "answered 400 Bad Request" in row.detail,
+               f"a rejected batch FAILs with the status and the sink's text, got {row}")
+        for name, kwargs, needle in (
+                ("external-rejected-records", dict(batch=False), "100 record(s) dropped rejected"),
+                ("external-rejected-batch", dict(records=False), "1 batch(es) dropped rejected")):
+            row = results(name, sut_extra=_datadog_lines(rejected_at=250, **kwargs),
+                          stderr_extra=[rejection])["ledger.sent"]
+            expect(row.status == checks.FAIL and needle in row.detail
+                   and "status 400" in row.detail,
+                   f"{needle} alone FAILs with the status, got {row}")
+        unquoted = results("external-rejected-no-line",
+                           sut_extra=_datadog_lines(rejected_at=250))
+        expect(unquoted["ledger.sent"].status == checks.FAIL
+               and "no request_rejected or series_rejected line" in
+               unquoted["ledger.sent"].detail,
+               f"a rejection with no stderr line still FAILs, got {unquoted['ledger.sent']}")
+        stale = results("external-stale", sut_extra=_datadog_lines(stale=7, skipped=3))
+        expect(stale["ledger.sent"].status == checks.WARN
+               and "7 record(s) dropped stale" in " ".join(stale["ledger.sent"].lines)
+               and "3 metric(s) skipped" in " ".join(stale["ledger.sent"].lines),
+               f"a counted pre-send drop and an encoder skip WARN, got {stale['ledger.sent']}")
+        short = results("external-undelivered", sut_extra=_datadog_lines(), undelivered=1)
+        expect(short["ledger.sent"].status == checks.FAIL
+               and "outside [0, 1]" in short["ledger.sent"].detail,
+               f"a batch neither delivered nor dropped FAILs, got {short['ledger.sent']}")
+        silent = results("external-no-requests")
+        expect(silent["ledger.sent"].status == checks.FAIL
+               and "no logit.output.requests" in silent["ledger.sent"].detail,
+               f"no request telemetry FAILs, got {silent['ledger.sent']}")
+
+        local = {r.id: r for r in checks.run_all(_ledger_run(tmp, "local-sent"))}
+        expect(local["ledger.sent"].status == checks.SKIP
+               and local["ledger.egress"].status == checks.PASS,
+               f"a local run SKIPs ledger.sent and judges egress, got {local['ledger.sent']}")
 
 
 def _report():
@@ -1721,10 +2057,11 @@ def run(root, quiet=False):
     for part in (_durations, _rules, _expect_rules, _expand, _random, _log_capture, _signals,
                  _deadlines,
                  _hung_inspect, _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks, _kill_watchdog,
-                 _kill_ledger, _expect_checks, _gauge_lives, _report, _shipped):
+                 _kill_ledger, _expect_checks, _gauge_lives, _target_rules, _sink_drain,
+                 _external_checks, _report, _shipped):
         try:
             takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
-                          _shipped)
+                          _target_rules, _sink_drain, _shipped)
             part(root) if part in takes_root else part()
         except Exception as err:  # report the part that broke, then keep going
             _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")

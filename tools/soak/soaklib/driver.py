@@ -25,10 +25,14 @@ needs at the code:
   ignored stays ignored, so `nohup` keeps a run alive past a closed terminal.
 - After a SIGHUP the terminal can be gone, so output goes through `_print`, which drops it
   rather than fail the run: the run directory holds everything.
+- An external target (`[target] kind = "external"`) runs without the `local` compose profile,
+  so with no `victoria-metrics`, and passes `SOAK_EXTERNAL_ENV` as a second `--env-file`. Nothing
+  queries the destination: no readiness, freshness, flush, or export. The end sequence waits for
+  the SUT sink's queue to empty instead of for the stored total to hold.
 
 Every time in `timeline.jsonl`, `watchdog.jsonl`, `stats.ndjson`, and `vm-freshness.jsonl` is
 epoch seconds (`t`, `started_at`, `finished_at`), with `offset` measured from the timeline's zero:
-the moment the stack was up and VictoriaMetrics answered `/health`.
+the moment the stack was up and, for a local target, VictoriaMetrics answered `/health`.
 """
 
 import json
@@ -40,7 +44,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import checks, collect, faults, report, scenario as scenario_mod, vm
+from . import checks, collect, faults, report, scenario as scenario_mod, telemetry, vm
 from .docker import Docker
 
 NETEM_IMAGE = "logit-soak-netem:local"
@@ -58,6 +62,15 @@ FRESHNESS_LOOKBACK_S = 120
 QUIET_BOUND_S = 90
 GENERATOR_STOP_T = 30
 SUT_STOP_T = 60
+# An external target's end sequence: how long to wait for the SUT sink's queue to empty, over a
+# sink's default `retry_max_delay` (10 s) several times, and how much of the SUT's stdout each
+# poll reads, several drains of `internal` lines.
+SINK_DRAIN_BOUND_S = 120
+SINK_DRAIN_TAIL_LINES = 400
+# The aggregate window assumed when the SUT config names none.
+DEFAULT_AGGREGATE_INTERVAL_S = 10.0
+# The compose profile holding `victoria-metrics`, enabled for a local target only.
+LOCAL_PROFILE = "local"
 
 
 class Abort(Exception):
@@ -107,9 +120,14 @@ def exit_code(results, ended=None):
 
 
 class Run:
-    def __init__(self, root, scenario, duration, seed, keep, out_dir, argv, image):
+    def __init__(self, root, scenario, duration, seed, keep, out_dir, argv, image,
+                 external_env=None):
         self.root = Path(root)
         self.scenario = scenario
+        self.external = scenario.external
+        # The external target's env file, passed to compose after compose.env; never copied
+        # into the run directory, since it holds credentials.
+        self.external_env = external_env
         self.duration = duration
         # The seed a random schedule is drawn with: --seed, else the scenario's own.
         self.seed = scenario.seed_for(seed)
@@ -154,7 +172,9 @@ class Run:
         (self.run_dir / "scenario.resolved.json").write_text(
             json.dumps(resolved, indent=2, sort_keys=True) + "\n"
         )
-        self.docker = Docker(self.project, self.root / "compose.yaml", env_file)
+        env_files = [env_file] + ([self.external_env] if self.external else [])
+        profiles = [] if self.external else [LOCAL_PROFILE]
+        self.docker = Docker(self.project, self.root / "compose.yaml", env_files, profiles)
         self.ctx = faults.Context(docker=self.docker, ids=self.ids, netem_image=NETEM_IMAGE)
         self.timeline = collect.Jsonl(self.run_dir / "timeline.jsonl")
         self.watchdog = collect.Jsonl(self.run_dir / "watchdog.jsonl")
@@ -185,8 +205,9 @@ class Run:
                    f"  {' '.join(self.docker.prefix)} compose -p {self.project} "
                    f"-f {self.docker.compose_file} down -v")
             return 1
+        images = [self.image, NETEM_IMAGE] + ([] if self.external else [VM_IMAGE])
         collect.provenance(self.run_dir, self.root.parent.parent, self.docker,
-                           [self.image, NETEM_IMAGE, VM_IMAGE], self.scenario.name,
+                           images, self.scenario.name,
                            self.duration, self.seed, self.argv, self.seed_source)
         self.say(f"run directory {self.run_dir}")
         ended = None
@@ -224,13 +245,14 @@ class Run:
         self.phase("up_end", rc=result.rc, stderr=result.stderr.strip()[-2000:])
         if not result.ok:
             raise Abort(f"compose up failed: {result.stderr.strip()[-500:]}")
-        self.refresh_vm_base()
-        deadline = _now() + 60
-        while not (self.vm_base and vm.healthy(self.vm_base)):
-            if _now() > deadline:
-                raise Abort("VictoriaMetrics never answered /health")
-            time.sleep(1)
+        if not self.external:
             self.refresh_vm_base()
+            deadline = _now() + 60
+            while not (self.vm_base and vm.healthy(self.vm_base)):
+                if _now() > deadline:
+                    raise Abort("VictoriaMetrics never answered /health")
+                time.sleep(1)
+                self.refresh_vm_base()
         for service in scenario_mod.LOGIT_SERVICES:
             info = self.docker.inspect(self.ids[service]) or {}
             self.started_at[service] = (info.get("State") or {}).get("StartedAt")
@@ -280,7 +302,8 @@ class Run:
             if offset >= next_slow:
                 next_slow = _next_multiple(offset, SLOW_POLL_EVERY_S)
                 self.sample_stats()
-                self.sample_freshness()
+                if not self.external:
+                    self.sample_freshness()
             if offset >= next_chunk:
                 next_chunk = _next_multiple(offset, LOG_CHUNK_EVERY_S)
                 self.capture.chunk(self.ids)
@@ -444,7 +467,10 @@ class Run:
                                  timeout=GENERATOR_STOP_T + 15)
         self.phase("generator_stopped", rc=result.rc, stderr=result.stderr.strip())
 
-        self.wait_quiet()
+        if self.external:
+            self.wait_sink_drained()
+        else:
+            self.wait_quiet()
 
         result = self.docker.run(["stop", "-t", str(SUT_STOP_T), self.ids["logit"]],
                                  timeout=SUT_STOP_T + 15)
@@ -452,6 +478,9 @@ class Run:
         self.phase("sut_stopped", rc=result.rc, stderr=result.stderr.strip(),
                    exit_code=(info.get("State") or {}).get("ExitCode"))
 
+        if self.external:
+            self.phase("end_end")
+            return
         self.refresh_vm_base()
         export_path = self.run_dir / "vm-export.jsonl"
         try:
@@ -499,6 +528,52 @@ class Run:
         self.phase("quiet", held=False, total=last_total, hold_s=hold_s, polls=polls,
                    bound_s=QUIET_BOUND_S)
 
+    def aggregate_interval(self):
+        """The SUT config's `aggregate` window in seconds, or `DEFAULT_AGGREGATE_INTERVAL_S`."""
+        try:
+            text = self.scenario.config_path("sut").read_text()
+        except OSError:
+            text = ""
+        interval = checks.component_duration(
+            text, self.scenario.ledger.get("sut_aggregate", ""), "interval")
+        return interval or DEFAULT_AGGREGATE_INTERVAL_S
+
+    def wait_sink_drained(self):
+        """For an external target, which nothing queries: waits until a SUT drain at least two
+        aggregate windows after the generator stopped shows the sink's `buffer.batches` at 0
+        and its `retrying` at 0 or never set, bounded at `SINK_DRAIN_BOUND_S`. Two windows let
+        `aggregate` flush the last lines the generator sent; the sink's queue then empties once
+        its last send is accepted. Reads the newest `SINK_DRAIN_TAIL_LINES` of the SUT's
+        stdout, which a run in progress hasn't collected yet."""
+        sink = self.scenario.ledger["sut_sink"]
+        stopped = _now()
+        hold_s = 2 * self.aggregate_interval()
+        deadline = stopped + SINK_DRAIN_BOUND_S
+        polls = 0
+        state = {}
+        while _now() < deadline:
+            polls += 1
+            result = self.docker.logs_tail(self.ids["logit"], SINK_DRAIN_TAIL_LINES,
+                                           timeout=POLL_TIMEOUT_S)
+            tel = telemetry.parse_ndjson(result.stdout.splitlines())
+            newest = max(tel.drains, default=None)
+            queued = tel.gauge_series("logit.component.buffer.batches", component=sink)
+            retrying = tel.gauge_series("logit.component.retrying", component=sink)
+            state = {
+                "newest_drain": newest,
+                "buffer_batches": queued[-1][1] if queued else None,
+                "retrying": retrying[-1][1] if retrying else None,
+            }
+            if (newest is not None and newest >= stopped + hold_s
+                    and state["buffer_batches"] == 0 and not state["retrying"]):
+                self.phase("sink_drained", held=True, hold_s=hold_s, polls=polls,
+                           waited_s=round(_now() - stopped, 3), **state)
+                return
+            time.sleep(2)
+        self.phase("sink_drained", held=False, hold_s=hold_s, polls=polls,
+                   bound_s=SINK_DRAIN_BOUND_S, **state)
+        self.say(f"the {sink} queue didn't empty within {SINK_DRAIN_BOUND_S}s: {state}")
+
     def teardown(self):
         try:
             self.refresh_ids()
@@ -519,10 +594,17 @@ class Run:
                 jsonl.close()
 
 
-def run(root, scenario_path, duration, seed, keep, out_dir, argv, image):
+def run(root, scenario_path, duration, seed, keep, out_dir, argv, image, external_env=None):
     scenario = scenario_mod.load(scenario_path)
     duration = scenario.duration if duration is None else duration
     scenario_mod.validate(scenario, duration=duration, seed=seed)
-    run = Run(root, scenario, duration, seed, keep, out_dir, argv, image)
+    if scenario.external:
+        # script/soak checks this before it validates the configs; a direct run checks it here.
+        missing = scenario_mod.missing_env(scenario, external_env)
+        if missing:
+            raise scenario_mod.ScenarioError([
+                f"external target {scenario.target['name']}: {external_env} doesn't set "
+                f"{', '.join(missing)} (set SOAK_EXTERNAL_ENV to another file)"])
+    run = Run(root, scenario, duration, seed, keep, out_dir, argv, image, external_env)
     run.prepare()
     return run.execute()

@@ -6,8 +6,9 @@ so run it through that script; `list`, `check`, and `self-test` need no Docker a
 directly. Standard library only, Python 3.11 or later. See README.md here.
 
 Environment: `DOCKER` (the command prefix, `sudo docker` by default), `SOAK_OUT` (where run
-directories go, default `perf/results/soak`), and `SOAK_IMAGE` (the `logit` image tag,
-`logit:soak`).
+directories go, default `perf/results/soak`), `SOAK_IMAGE` (the `logit` image tag,
+`logit:soak`), and `SOAK_EXTERNAL_ENV` (the env file an external target's variables come from,
+default `perf/results/soak-external.env`).
 """
 
 import argparse
@@ -24,6 +25,11 @@ sys.path.insert(0, str(TOOLS))
 from soaklib import checks, driver, report, scenario, selftest  # noqa: E402
 
 ROOT = TOOLS.parent.parent
+DEFAULT_EXTERNAL_ENV = ROOT / "perf/results/soak-external.env"
+
+
+def external_env():
+    return Path(os.environ.get("SOAK_EXTERNAL_ENV") or DEFAULT_EXTERNAL_ENV).resolve()
 
 
 def scenario_path(name):
@@ -48,7 +54,7 @@ def cmd_run(args):
         out = Path(args.out or os.environ.get("SOAK_OUT") or ROOT / "perf/results/soak")
         return driver.run(
             TOOLS, scenario_path(args.scenario), duration, args.seed, args.keep, out.resolve(),
-            sys.argv, os.environ.get("SOAK_IMAGE", "logit:soak"),
+            sys.argv, os.environ.get("SOAK_IMAGE", "logit:soak"), external_env(),
         )
     except (ValueError, scenario.ScenarioError) as err:
         print(f"soak: {err}", file=sys.stderr)
@@ -83,6 +89,25 @@ def cmd_check(args):
     return driver.exit_code(results)
 
 
+def cmd_target(args):
+    """Prints the scenario's target kind, for script/soak. With `--env-file`, exits 1 naming each
+    `[target] env` variable the file doesn't set or sets empty, never a value."""
+    try:
+        loaded = scenario.load(scenario_path(args.scenario))
+    except scenario.ScenarioError as err:
+        print(f"soak: {err}", file=sys.stderr)
+        return 2
+    if args.env_file is None:
+        print(loaded.target["kind"])
+        return 0
+    missing = scenario.missing_env(loaded, args.env_file)
+    if missing:
+        print(f"soak: external target {loaded.target['name']}: {args.env_file} doesn't set "
+              f"{', '.join(missing)}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_self_test(args):
     return selftest.run(TOOLS)
 
@@ -106,6 +131,12 @@ def main(argv=None):
     check = sub.add_parser("check", help="re-score a run directory offline")
     check.add_argument("run_dir")
     check.set_defaults(func=cmd_check)
+
+    target = sub.add_parser("target", help="print a scenario's target kind; with --env-file, "
+                                           "check that the file sets its variables")
+    target.add_argument("scenario")
+    target.add_argument("--env-file", help="the external target's env file to check")
+    target.set_defaults(func=cmd_target)
 
     sub.add_parser("self-test", help="test the driver's pure parts").set_defaults(
         func=cmd_self_test)

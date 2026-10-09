@@ -18,6 +18,12 @@ fixed or random:
   `cooldown` ends the schedule, so a shorter run's schedule is a prefix of a longer one's for the
   same seed. Draws use `Random.random()` only, whose sequence for an integer seed is stable
   across Python versions; `randrange()` and `choices()` are not promised to be.
+
+A scenario's target is where the SUT's sink delivers. The default is the local
+`victoria-metrics` service, which the checks query for V. A `[target]` table with
+`kind = "external"` names a destination outside the stack, such as Datadog, which nothing
+queries: the stack runs without `victoria-metrics`, faults on it are refused, and the ledger
+ends at the sink's own telemetry (docs/plans/soak-harness.md's "External targets").
 """
 
 import random
@@ -44,8 +50,20 @@ NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart")
 
 TOP_LEVEL_KEYS = {
     "name", "description", "duration", "warmup", "cooldown", "recovery_bound", "cycle",
-    "configs", "ledger", "thresholds", "step", "expect", "random",
+    "configs", "ledger", "thresholds", "step", "expect", "random", "target",
 }
+# The local target, the default, and the kind with no backend query.
+LOCAL_TARGET = "victoria-metrics"
+EXTERNAL_TARGET = "external"
+TARGET_KEYS = {"kind", "name", "env"}
+# The variables compose.yaml passes into the SUT's environment for an external target. A
+# `[target] env` entry outside this list would reach no container, so `validate()` refuses it;
+# the self-test checks that compose.yaml passes each one.
+EXTERNAL_ENV_PASSED = ("DD_API_KEY",)
+# The ledger keys that name a VictoriaMetrics query, which an external target has none of.
+VM_LEDGER_KEYS = {"vm_selector", "vm_every_window"}
+_TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 STEP_KEYS = {"at", "action", "on", "args", "for"}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
@@ -82,6 +100,9 @@ METRIC_KINDS = {
     "logit.component.buffer.disk.replayed": "sum",
     "logit.component.buffer.disk.segments": "gauge",
     "logit.component.buffer.disk.truncated": "sum",
+    "logit.output.requests": "sum",
+    "logit.output.records": "sum",
+    "logit.output.records.dropped": "sum",
 }
 _EXPECT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _STEP_ID = re.compile(r"^c(\d+)s(\d+)$")
@@ -246,6 +267,13 @@ class Scenario:
     steps: list = field(default_factory=list)
     expectations: list = field(default_factory=list)
     random: object = None
+    # `{kind, name, env}`; kind `victoria-metrics` (the default) or `external`.
+    target: dict = field(default_factory=lambda: {"kind": LOCAL_TARGET, "name": LOCAL_TARGET,
+                                                  "env": []})
+
+    @property
+    def external(self):
+        return self.target.get("kind") == EXTERNAL_TARGET
 
     @property
     def directory(self):
@@ -279,6 +307,8 @@ class Scenario:
             "seed": seed,
             "random": None if self.random is None else self.random.to_json(),
             "configs": dict(self.configs),
+            "target": {"kind": self.target["kind"], "name": self.target["name"],
+                       "env": list(self.target["env"])},
             "ledger": dict(self.ledger),
             "thresholds": {
                 "progress_window": self.thresholds["progress_window"],
@@ -345,12 +375,22 @@ def from_dict(raw, path):
     else:
         cycle = dur(raw, "cycle", "scenario")
 
+    target = _parse_target(raw.get("target", {}), problems)
+    external = target["kind"] == EXTERNAL_TARGET
     configs = raw.get("configs", {})
     ledger = raw.get("ledger", {})
     thresholds = dict(raw.get("thresholds", {}))
+    # An external target has no VictoriaMetrics to query, so the keys naming one are refused
+    # with their own message rather than ignored.
+    ledger_keys = LEDGER_KEYS - VM_LEDGER_KEYS if external else LEDGER_KEYS
+    ledger_optional = OPTIONAL_LEDGER_KEYS | (VM_LEDGER_KEYS if external else set())
+    if external and isinstance(ledger, dict):
+        for key in sorted(VM_LEDGER_KEYS & set(ledger)):
+            problems.append(f"ledger.{key} names a VictoriaMetrics query, and an external "
+                            "target has no backend query")
     for table, keys, optional, where in (
         (configs, CONFIG_KEYS, set(), "configs"),
-        (ledger, LEDGER_KEYS, OPTIONAL_LEDGER_KEYS, "ledger"),
+        (ledger, ledger_keys, ledger_optional, "ledger"),
         (thresholds, THRESHOLD_KEYS, set(), "thresholds"),
     ):
         if not isinstance(table, dict):
@@ -424,12 +464,80 @@ def from_dict(raw, path):
         path=path, name=name, description=description, duration=duration, warmup=warmup,
         cooldown=cooldown, recovery_bound=recovery_bound, cycle=cycle, configs=configs,
         ledger=ledger, thresholds=thresholds, steps=steps, expectations=expectations,
-        random=random_spec,
+        random=random_spec, target=target,
     )
     if problems:
         raise ScenarioError(problems)
     validate(scenario)
     return scenario
+
+
+def _parse_target(table, problems):
+    """The `[target]` table as `{kind, name, env}`, appending to `problems` what breaks its
+    rules: an unknown key or kind; for an external target, a `name` that isn't a slug or an
+    `env` that isn't a list of distinct variable names compose.yaml passes; and for the local
+    target, any `name` or `env`."""
+    local = {"kind": LOCAL_TARGET, "name": LOCAL_TARGET, "env": []}
+    if not isinstance(table, dict):
+        problems.append("`target` must be a table, written [target]")
+        return local
+    for key in sorted(set(table) - TARGET_KEYS):
+        problems.append(f"target: unknown key `{key}`")
+    kind = table.get("kind", LOCAL_TARGET)
+    if kind not in (LOCAL_TARGET, EXTERNAL_TARGET):
+        problems.append(f"target.kind must be {LOCAL_TARGET!r} or {EXTERNAL_TARGET!r}, got "
+                        f"{kind!r}")
+        return local
+    if kind == LOCAL_TARGET:
+        for key in sorted({"name", "env"} & set(table)):
+            problems.append(f"target.{key} is for an external target; the local target is "
+                            f"{LOCAL_TARGET}")
+        return local
+    name = table.get("name")
+    if not isinstance(name, str) or not _TARGET_NAME.match(name):
+        problems.append("target.name must be lowercase letters, digits, `_`, or `-`, such as "
+                        "\"datadog\"")
+        name = EXTERNAL_TARGET
+    env = table.get("env", [])
+    if not isinstance(env, list) or not all(isinstance(v, str) for v in env):
+        problems.append("target.env must be an array of environment variable names")
+        env = []
+    for variable in env:
+        if not _ENV_NAME.match(variable):
+            problems.append(f"target.env: {variable!r} isn't an environment variable name")
+        elif variable not in EXTERNAL_ENV_PASSED:
+            problems.append(f"target.env: compose.yaml doesn't pass {variable} to the SUT; it "
+                            f"passes {', '.join(EXTERNAL_ENV_PASSED)}")
+    if len(set(env)) != len(env):
+        problems.append("target.env repeats a variable")
+    return {"kind": kind, "name": name, "env": list(env)}
+
+
+def read_env_file(path):
+    """`{name: value}` from a `KEY=VALUE` env file, the last line for a key winning, skipping
+    blank lines and `#` comments. Values are taken as written, quotes included, as
+    `docker run --env-file` takes them. Raises `OSError` when the file can't be read."""
+    values = {}
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value
+    return values
+
+
+def missing_env(scenario, env_file):
+    """The `[target] env` variables `env_file` doesn't set, or sets empty, in the scenario's
+    order; every one when the file can't be read. Returns names only, so no caller can print a
+    value."""
+    if not scenario.external or not scenario.target["env"]:
+        return []
+    try:
+        values = read_env_file(env_file)
+    except OSError:
+        return list(scenario.target["env"])
+    return [name for name in scenario.target["env"] if not values.get(name, "").strip()]
 
 
 def _parse_random(table, problems, dur):
@@ -516,6 +624,15 @@ def validate(scenario, duration=None, seed=None):
         problems.append("thresholds.progress_window must be longer than 0s")
     if not isinstance(scenario.ledger.get("vm_every_window", False), bool):
         problems.append("ledger.vm_every_window must be true or false")
+    if scenario.external:
+        # An external target's stack runs without the victoria-metrics service.
+        held = [f"step {spec.index + 1}" for spec in scenario.steps if spec.on == LOCAL_TARGET]
+        if scenario.random is not None:
+            held += [f"random.fault {t.index + 1}" for t in scenario.random.faults
+                     if t.on == LOCAL_TARGET]
+        for where in held:
+            problems.append(f"{where}: a fault on {LOCAL_TARGET}, which an external target's "
+                            "stack doesn't run")
 
     for spec in scenario.steps:
         where = f"step {spec.index + 1} ({spec.action or '?'} on {spec.on or '?'})"
