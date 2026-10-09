@@ -91,10 +91,11 @@ the largest allocation a valid input of `max_len` bytes can need. For the native
 MiB, because a legitimate 64 MiB lz4 frame allocates its full `uncompressed_len`.
 
 The fourth `FUZZ_TARGETS` column holds extra libFuzzer arguments for one target, passed by `fuzz`
-and never by `fuzz-tmin`. The two native batch targets and `statsd` use it to run in fork mode (`-fork=1
--ignore_ooms=0`). The process-wide interner never evicts, so a long-lived fuzz process
-accumulates every dictionary string it decodes until the arena outgrows the malloc limit, and
-fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal. Fork
+and never by `fuzz-tmin`. The two native batch targets and `statsd` use it to run in fork mode
+(`-fork=1 -ignore_ooms=0`). The process-wide interner never evicts, so a long-lived fuzz process
+accumulates every dictionary string, metric name, and tag key it decodes until the arena outgrows
+the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a
+child fatal. Fork
 mode was checked in the image: it stops at `-max_total_time`, merges new inputs into
 `fuzz/corpus/<target>`, and writes a child's crash to `fuzz/artifacts/<target>/`.
 
