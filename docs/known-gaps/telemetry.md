@@ -109,14 +109,13 @@ Entry format and the other areas: [the known-gaps index](README.md).
   counters count once per batch, but these repeat on every attempt that gets the same answer:
   Splunk's code 6 (`records.dropped{reason="invalid_event"}`) and Splunk Cloud's oversize answer,
   a datagram refused with `EMSGSIZE`, and the packer's skip of an entry over the datagram cap
-  (`oversize_datagram`). `otlp_out`'s verdict counters don't repeat: a retry never resends a
-  signal the destination already settled.
+  (`oversize_datagram`). The verdict counters of `otlp_out`, `datadog_out`, and `datadog_trace_out` don't repeat: a
+  retry never resends a signal or request the destination already settled.
   [internal-telemetry.md](../design/internal-telemetry.md)'s class table lists them.
   - **Consequence:** on a sink that retries, these counters read high by the number of attempts
-    that met the verdict, and the batch's own retries account for the growth. The Datadog sinks'
-    `records.dropped{reason="rejected"}` count a rejected request again on
-    every retry of a batch held on a later request, and a hold has no end but success or
-    shutdown, so that re-count is unbounded for as long as the hold lasts.
+    that met the verdict, and the batch's own retries account for the growth. A hold has no end
+    but success or shutdown, so a Splunk verdict re-counted on every retry is unbounded for as
+    long as the hold lasts.
   - **Why it stays:** each attempt got its own answer, and a retry might get a different one, so
     counting once would need the sink to remember what an earlier attempt learned
     ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
