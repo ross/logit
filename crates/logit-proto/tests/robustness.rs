@@ -1,17 +1,19 @@
 //! Mutation testing over every decoder that reads untrusted bytes off a socket:
 //! [`frame::read_frame`], [`native::decode_batch`], each `native::control::*::decode`,
 //! `collectd::CollectdDecoder` (UDP datagrams are easy to spoof), `graphite::GraphiteDecoder`
-//! in both protocols, and `prometheus::compression::decompress_bounded`, which inflates every
-//! remote-write body `prometheus_in` receives. Pickle is the highest-risk parser in the repo: a format built for arbitrary
-//! object construction, read from a socket. A network-facing decoder must pass this suite
-//! (`docs/plans/native-transport.md`). The OTLP section pins the limits OTLP decoding relies on
-//! instead of caps of its own: each parser's nesting limit, timestamp saturation, and OTLP/JSON's
-//! peak memory per input byte.
+//! in both protocols, `prometheus::compression::decompress_bounded`, which inflates every
+//! remote-write body `prometheus_in` receives, and `framing::Framer`, which frames every TCP and
+//! Unix-stream listener's bytes in all five modes. Pickle is the highest-risk parser in the repo:
+//! a format built for arbitrary object construction, read from a socket. A network-facing decoder
+//! must pass this suite (`docs/plans/native-transport.md`). The OTLP section pins the limits OTLP
+//! decoding relies on instead of caps of its own: each parser's nesting limit, timestamp
+//! saturation, and OTLP/JSON's peak memory per input byte. The framing section also pins the
+//! drain state's single `drained` count and the table of what a FIN and an RST count.
 //!
 //! For each decoder: every single-byte truncation of a valid input, thousands of seeded bit flips,
 //! length fields inflated past the input, and, for `decode_batch`, `Value` nesting past the depth
-//! cap. The decoder must never panic, and never size an allocation from an attacker-declared
-//! length before bounding it (a peak-allocation counter checks the huge-count cases). Truncation
+//! cap. The decoder must never panic, and never size an allocation from a corrupt declared length
+//! before bounding it (a peak-allocation counter checks the huge-count cases). Truncation
 //! contracts differ by decoder: see [`assert_every_truncation_never_panics`] and
 //! [`assert_every_truncation_fails_cleanly`].
 //!
@@ -21,6 +23,7 @@
 use bytes::{Bytes, BytesMut};
 use logit_core::{AttrMap, Event, EventBatch, LogRecord, Provenance, Resource, Severity, Value};
 use logit_proto::frame::{self, Compression};
+use logit_proto::framing::{FrameError, Framer, FramingMode, Oversize, MAX_FRAME_BYTES};
 use logit_proto::graphite::{GraphiteDecoder, Protocol};
 use logit_proto::native::control::{self, Ack, AckStatus, Hello, HelloAck, Reject};
 use logit_proto::native::varint::{read_uvarint, write_uvarint};
@@ -1333,6 +1336,206 @@ fn otlp_json_peak_memory_per_input_byte_is_documented() {
             "{case}: {len}-byte body peaked at {peak} live bytes, {ratio:.1} per input byte, \
              over the documented ceiling of {ceiling}"
         );
+    }
+}
+
+// -- framing ------------------------------------------------------------------------------------
+//
+// The stream `Framer`, driven as `logit_inputs::tcp`'s driver drives it: push, then `next_frame`
+// until `Ok(None)` or a fatal error, then `finish` on a FIN or `abandon` on any other end.
+
+/// rsyslog's RFC 6587 non-transparent stream (`testdata/interop/syslog/README.md`).
+const RSYSLOG_TCP: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../testdata/interop/syslog/rsyslog-tcp-000.raw"
+));
+
+/// The `datadog` Python client's stream Unix socket: little-endian length-prefixed packets
+/// (`testdata/interop/datadog/README.md`).
+const DOGSTATSD_UNIX_STREAM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../testdata/interop/datadog/dogstatsd-unix-stream-000.raw"
+));
+
+const DRAIN: FramingMode = FramingMode::Lines { oversize: Oversize::DrainToNextLine };
+const FATAL_LINES: FramingMode = FramingMode::Lines { oversize: Oversize::Fatal };
+
+/// Pushes `bytes` and drains: every frame, then the first error if it was fatal. Non-fatal
+/// errors are collected and the drain goes on, as the driver's does.
+fn drain_push(framer: &mut Framer, bytes: &[u8]) -> (Vec<Bytes>, Vec<FrameError>) {
+    framer.push(bytes);
+    let (mut frames, mut errors) = (Vec::new(), Vec::new());
+    loop {
+        match framer.next_frame() {
+            Ok(Some(frame)) => frames.push(frame),
+            Ok(None) => return (frames, errors),
+            Err(err) => {
+                let fatal = err.is_fatal();
+                errors.push(err);
+                if fatal {
+                    return (frames, errors);
+                }
+            }
+        }
+    }
+}
+
+/// Every mode's valid stream with its length prefix where it has one, for the bit-flip sweep.
+fn framing_cases() -> Vec<(FramingMode, Vec<u8>)> {
+    let mut pickle = (GRAPHITE_PICKLE.len() as u32).to_be_bytes().to_vec();
+    pickle.extend_from_slice(GRAPHITE_PICKLE);
+    vec![
+        (FramingMode::Rfc6587Auto, RSYSLOG_TCP.to_vec()),
+        (
+            FramingMode::Rfc6587Auto,
+            format!("{} {}", RSYSLOG_TCP.len(), "x".repeat(RSYSLOG_TCP.len())).into_bytes(),
+        ),
+        (DRAIN, GRAPHITE_PLAINTEXT.to_vec()),
+        (FATAL_LINES, GRAPHITE_PLAINTEXT.to_vec()),
+        (FramingMode::LengthPrefixed, pickle),
+        (FramingMode::LengthPrefixedLe, DOGSTATSD_UNIX_STREAM.to_vec()),
+    ]
+}
+
+/// Every prefix of the stream, closed by a FIN: a short syslog frame, or none, never a panic.
+#[test]
+fn framer_survives_every_truncation_of_the_rsyslog_stream_then_finish() {
+    for len in 0..=RSYSLOG_TCP.len() {
+        let closed = std::panic::catch_unwind(|| {
+            let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
+            let (frames, errors) = drain_push(&mut framer, &RSYSLOG_TCP[..len]);
+            assert!(errors.is_empty(), "a prefix of an LF-framed stream frames cleanly");
+            let last = framer.finish().expect("an LF-framed remainder is a final message");
+            assert_eq!(framer.buffered(), 0);
+            frames.len() + usize::from(last.is_some())
+        });
+        let count = closed.unwrap_or_else(|_| panic!("a {len}-byte prefix panicked"));
+        assert!(count <= 1, "a {len}-byte prefix of one message framed {count}");
+    }
+}
+
+/// A flipped bit can change the framing a stream latches, a count, or a prefix; whatever it
+/// does, push, drain, and close never panic, under every mode and split across two pushes.
+#[test]
+fn framer_survives_seeded_bit_flips_in_every_mode() {
+    let mut rng = Lcg::new(0xF4A3_E5EE_D000_0001);
+    for (mode, valid) in framing_cases() {
+        for _ in 0..1500 {
+            let mut mutated = valid.clone();
+            let byte_idx = rng.next_usize(mutated.len());
+            let bit = rng.next_usize(8);
+            mutated[byte_idx] ^= 1 << bit;
+            let split = rng.next_usize(mutated.len() + 1);
+            let bound = [64, 4096, MAX_FRAME_BYTES][rng.next_usize(3)];
+            let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut framer = Framer::new(mode, bound);
+                let (_, errors) = drain_push(&mut framer, &mutated[..split]);
+                if errors.iter().any(FrameError::is_fatal) {
+                    return;
+                }
+                let (_, errors) = drain_push(&mut framer, &mutated[split..]);
+                if !errors.iter().any(FrameError::is_fatal) {
+                    let _ = framer.finish();
+                }
+            }))
+            .is_err();
+            assert!(!panicked, "{mode:?}: a flip at byte {byte_idx} bit {bit} panicked");
+        }
+    }
+}
+
+/// A corrupt length prefix of `u32::MAX` is refused before anything is sized from it: one fatal
+/// `Oversize`, and the peak is the framer's own read buffer.
+#[test]
+fn a_corrupt_u32_max_length_prefix_is_a_fatal_oversize_without_a_large_allocation() {
+    for mode in [FramingMode::LengthPrefixed, FramingMode::LengthPrefixedLe] {
+        let mut err = None;
+        let peak = peak_live_bytes(|| {
+            let mut framer = Framer::new(mode, MAX_FRAME_BYTES);
+            framer.push(&[0xFF, 0xFF, 0xFF, 0xFF, b'x']);
+            err = framer.next_frame().err();
+        });
+        let err = err.expect("a declared length past the bound is an error");
+        assert!(matches!(err, FrameError::Oversize(_)), "{mode:?}: {err:?}");
+        assert!(err.is_fatal(), "{mode:?}: a length-framed stream has no resync point");
+        assert!(peak < 64 * 1024, "{mode:?}: peaked at {peak} live bytes");
+    }
+}
+
+/// A sender that writes only keepalive newlines produces no frame and costs nothing at a close;
+/// each `next_frame` call over a megabyte of them returns.
+#[test]
+fn an_all_newline_keepalive_stream_yields_no_frames_and_terminates() {
+    let newlines = vec![b'\n'; 1 << 20];
+    for mode in [FramingMode::Rfc6587Auto, DRAIN, FATAL_LINES] {
+        let mut framer = Framer::new(mode, 64);
+        let (frames, errors) = drain_push(&mut framer, &newlines);
+        assert!(frames.is_empty() && errors.is_empty(), "{mode:?}: {frames:?} {errors:?}");
+        assert_eq!(framer.buffered(), 0, "{mode:?}: every newline is consumed");
+        assert_eq!(framer.finish(), Ok(None), "{mode:?}");
+    }
+}
+
+/// The drain state lasts until the line's `LF`, however many pushes that takes, holds nothing
+/// meanwhile, counts the line once as `drained`, and lets the next line frame.
+#[test]
+fn the_drain_latch_holds_across_many_pushes_and_counts_once() {
+    let mut framer = Framer::new(DRAIN, 64);
+    let mut errors = Vec::new();
+    let (frames, first) = drain_push(&mut framer, &[b'x'; 65]);
+    assert!(frames.is_empty());
+    errors.extend(first);
+    for _ in 0..1000 {
+        let (frames, more) = drain_push(&mut framer, &[b'y'; 4096]);
+        assert!(frames.is_empty(), "the abandoned line never frames");
+        errors.extend(more);
+        assert_eq!(framer.buffered(), 0, "a drain holds nothing between pushes");
+    }
+    let (frames, more) = drain_push(&mut framer, b"\nvalid line\n");
+    errors.extend(more);
+    assert_eq!(frames, vec![Bytes::from_static(b"valid line")]);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(matches!(errors[0], FrameError::Drained(_)), "{:?}", errors[0]);
+    assert_eq!(errors[0].reason(), "drained");
+}
+
+/// The same bytes ended by a FIN (`finish`) and by an RST, shutdown, or idle close (`abandon`):
+/// the `frames.dropped` reason each counts, or the frame a FIN delivers.
+#[test]
+fn a_fin_and_an_rst_agree_about_every_remainder() {
+    enum Fin {
+        Nothing,
+        Truncated,
+        Delivers(&'static [u8]),
+    }
+    let cases: [(FramingMode, &[u8], Fin, Option<&str>); 12] = [
+        (FramingMode::Rfc6587Auto, b"<13>a\n", Fin::Nothing, None),
+        (FramingMode::Rfc6587Auto, b"<13>a\n<13>b", Fin::Delivers(b"<13>b"), Some("truncated")),
+        (FramingMode::Rfc6587Auto, b"<13>a\n<13>b\r", Fin::Delivers(b"<13>b"), Some("truncated")),
+        (FramingMode::Rfc6587Auto, b"<13>a\n\r", Fin::Nothing, None),
+        (FramingMode::Rfc6587Auto, b"9 <13>", Fin::Truncated, Some("truncated")),
+        (DRAIN, b"a 1 2\n \t\r", Fin::Nothing, None),
+        (DRAIN, b"a 1 2\nb 1", Fin::Truncated, Some("truncated")),
+        (DRAIN, &[b'x'; 100], Fin::Nothing, None),
+        (FATAL_LINES, b"a 1 2\n\r\n\r", Fin::Nothing, None),
+        (FramingMode::LengthPrefixed, &[0, 0, 0, 1, b'h'], Fin::Nothing, None),
+        (FramingMode::LengthPrefixed, &[0, 0, 0, 2, b'h'], Fin::Truncated, Some("truncated")),
+        (FramingMode::LengthPrefixedLe, &[2, 0], Fin::Truncated, Some("truncated")),
+    ];
+    for (mode, wire, fin, rst) in cases {
+        let label = format!("{mode:?} {:?}", String::from_utf8_lossy(wire));
+        let mut by_fin = Framer::new(mode, 64);
+        let mut by_rst = Framer::new(mode, 64);
+        let (_, errors) = drain_push(&mut by_fin, wire);
+        assert!(!errors.iter().any(FrameError::is_fatal), "{label}: {errors:?}");
+        drain_push(&mut by_rst, wire);
+        match (fin, by_fin.finish()) {
+            (Fin::Nothing, Ok(None)) => {}
+            (Fin::Truncated, Err(FrameError::Truncated(_))) => {}
+            (Fin::Delivers(want), Ok(Some(frame))) => assert_eq!(&frame[..], want, "{label}"),
+            (_, got) => panic!("{label}: a FIN gave {got:?}"),
+        }
+        assert_eq!(by_rst.abandon().as_ref().map(FrameError::reason), rst, "{label}");
     }
 }
 
