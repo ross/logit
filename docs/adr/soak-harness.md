@@ -80,9 +80,10 @@ Four facts about the running system shape the design:
   interface and exits. The qdisc outlives the `tc` process.
 - A root qdisc shapes the target container's egress only. Netem on the `logit` under test impairs
   its sends to the backend, not the traffic arriving at it.
-- Lifecycle faults are `pause`, `stop`, `restart`, and a network `partition` (disconnect, then
+- Lifecycle faults are `pause`, `stop`, `restart`, a network `partition` (disconnect, then
   reconnect with the service aliases recorded before the disconnect, because a reconnect drops
-  them).
+  them), and a `kill` of the SUT with SIGKILL. A `kill` tests what the process left on disk,
+  such as a disk spool, because nothing in the process runs after the signal.
 - Every fault has a duration, so its revert is scheduled with it.
 
 **The load source is a second `logit`: `generate_in` into `statsd_out` over UDP, one line per
