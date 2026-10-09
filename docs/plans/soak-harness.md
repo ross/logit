@@ -392,6 +392,7 @@ ticket with `${DOCKER} version` first.
      than 5 s after its timestamp, behind the next chunk's start, would be lost; the daemon
      writes each line as it reads it. A chunk is written to temporary files and appended only
      when `docker logs` returns 0, so a failed chunk is retried whole from the same cursor.
+     A failed chunk's record keeps the tail of the CLI's error from its temporary stderr file.
      The cursor is per container id, which a stop and start keep.
    - **Fail fast:** a `logit` container leaving `running`, or a `StartedAt` change, with no step
      behind it ends the timeline at once. The end sequence and collection still run.
@@ -403,7 +404,9 @@ ticket with `${DOCKER} version` first.
    `.stdout` and `.stderr`, and `inspect/<svc>.json`.
    Then `compose down -v --remove-orphans`, unless `--keep`. A `try`/`finally` makes SIGINT still
    collect, and the driver routes SIGTERM and SIGHUP into SIGINT's `KeyboardInterrupt`, because
-   Python's default for both ends the process without running `finally`.
+   Python's default for both ends the process without running `finally`. A signal the driver
+   inherited as ignored stays ignored, so `nohup` keeps a run alive when bash resends SIGHUP to
+   its jobs as the terminal closes.
 6. Score with `checks.run_all(run_dir)` into `results.md` and `results.json`, whose header
    names the seed of a random schedule. Exit 1 on any FAIL
    or an aborted or errored run, and 130 when interrupted.
@@ -566,9 +569,14 @@ The rows:
   about a second ahead of the signal. A gap across a fault that silences the SUT is excused
   (W4): a `pause` of `logit` flushes nothing, and a `partition` of `logit`, or a `pause`, `stop`,
   or `partition` of the generator, stops lines arriving, and `aggregate` writes a series only
-  in a window that updated it. The gap is excused only when it starts within 1.5 × the interval
-  before the fault and ends within 2 × the interval after it, the bound a new life's first
-  sample gets, so a window lost beside the fault still FAILs.
+  in a window that updated it. The gap is excused only when it starts within 1.1 × the interval
+  before the fault, where the last window before it closes, and ends within 1.1 × the interval
+  after it: the first window to close after the fault can hold no line, and the next one closes
+  an interval later. A generator `stop` gets 2 × the interval after it, the bound a new life's
+  first sample gets, because the restarted generator sends its first line only after it
+  starts. A window lost beside the fault FAILs once it moves the gap's end past its bound; one
+  lost inside that bound is excused. A recorded `statsd-vm` run's margins were 1.6 s before a
+  pause and 10.1 s after a partition at a 10 s interval.
 - `ledger.replay`, for each killed life followed by another, else SKIP: the next life's
   first-drain `buffer.disk.replayed` equals the killed life's `buffer.batches` at its last
   drain, one batch in flight allowed. `identity.sink` balances on whatever `replayed` reports,
@@ -1171,12 +1179,14 @@ What W4 measured without a run:
   passes `self-test` validation and the shipped-config test, and a run of it, every row PASS, is
   recorded under "Findings", with a negative control: the same scenario without the spool, whose
   killed life's `ledger.egress` FAILs as uncounted and whose `ledger.replay` FAILs.
-- **W4**: the self-test passes, and each new rule fails it when reverted (46 rules: every
+- **W4**: the self-test passes, and each new rule fails it when reverted (51 rules: every
   `[random]` validation and schedule rule, the draw order, the seed's recording, the
-  `ledger.windows` excusal, the chunk boundaries and failure handling, and the poll deadlines
-  and round timeouts). `random-faults` passes `self-test` validation, the shipped-config test,
+  `ledger.windows` excusal and its bounds before and after the fault, the chunk boundaries and
+  failure handling, the poll deadlines and round timeouts, and an inherited SIGHUP ignore kept
+  for `nohup`). `random-faults` passes `self-test` validation, the shipped-config test,
   and `logit validate` in `logit:soak`. Re-scoring the recorded W1b, W2, and W3 runs gives the
   same rows, every detail included. `check` on a synthetic 8-hour run directory finishes in
-  seconds. A 1-hour `random-faults` run and an 8-hour one are recorded under "Findings".
+  seconds. W4 is done once a 1-hour `random-faults` run and an 8-hour one are recorded under
+  "Findings"; neither has been made yet.
 - **W5**: each new scenario passes `self-test` validation and the shipped-config test, and a
   run of it is recorded under "Findings".

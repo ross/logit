@@ -114,8 +114,9 @@ appends `limit 100000` to `args` unless they set a `limit`, so netem's own queue
 5. It collects the rest of each service's stdout and stderr separately with `docker logs`, and
    its final `docker inspect`, then tears the project down (`down -v --remove-orphans`) unless `--keep`.
    This step runs on every exit but SIGKILL: SIGINT (Ctrl-C), SIGTERM, and SIGHUP each stop the
-   schedule and reach it. After a SIGHUP the driver drops its terminal output and carries on,
-   because the run directory has everything.
+   schedule and reach it, unless the driver started with that signal ignored, as `nohup` leaves
+   SIGHUP. After a SIGHUP the driver drops its terminal output and carries on, because the run
+   directory has everything.
 6. It scores the run. The script exits 1 on any `FAIL`, including a run the driver aborted or
    hit an error in, and 130 when SIGINT, SIGTERM, or SIGHUP interrupted it, whose `run` row
    FAILs too. `check` on that directory exits 1: only the live run knows it was interrupted.
@@ -130,7 +131,7 @@ A run writes `perf/results/soak/<UTC stamp>/` (gitignored, or under `SOAK_OUT`):
 | `stats.ndjson`, `vm-freshness.jsonl` | the 30-second `docker stats` and VictoriaMetrics freshness samples |
 | `vm-export.jsonl` | VictoriaMetrics' `/api/v1/export` of the scenario's `vm_selector` at the end |
 | `logs/<service>.stdout`, `.stderr` | each service's output across every life of its container |
-| `log-chunks.jsonl` | one record per `docker logs` call: its `--since`, `--until`, exit code, and bytes |
+| `log-chunks.jsonl` | one record per `docker logs` call: its `--since`, `--until`, exit code, and bytes, or the end of its error when it failed |
 | `inspect/<service>.json` | each container's final `docker inspect` |
 | `provenance.txt`, `compose.env`, `scenario.toml`, `scenario.resolved.json`, `configs/` | what ran, on what host, from which commit, the seed of a random schedule, the expanded schedule, and a copy of each `logit` config |
 
@@ -154,7 +155,7 @@ rule only holds in steady state. The plan's "The checks" has the full rules.
 | `ledger.intake` | the final SUT life's datagrams read minus dropped differ from the events sent plus bad lines; or an earlier life's read-but-unabsorbed residual (W − D − B − Ab) falls outside [0, R], R being the receive queue plus 67 batches |
 | `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listener's events sent differ from those `aggregate` received, or those it received from those it absorbed |
 | `ledger.egress` | the final SUT life's absorbed increments minus VictoriaMetrics' reset-aware total (Ab − V), or a stopped earlier life's datagrams read minus dropped, bad lines, and that total (W − D − B − V), is nonzero, other than a positive gap that life's `drain complete` line counts in `batches_dropped`; a killed life's Ab − V falls outside its band (below, a surplus: the residual plus one drain interval of ingest; above, uncounted: one aggregate interval plus one drain interval of ingest), with the residual the kill lost reported beside it; or the export matched no series. A series without one segment per SUT life `WARN`s |
-| `ledger.windows` | under `[ledger] vm_every_window = true` only: a series in a SUT life has two samples more than 1.5 aggregate intervals apart, a killed life's last sample is more than 1.1 intervals before the kill, or a later life's first is more than 2 intervals after its start. The interval comes from the SUT config. A gap across a `pause` or `partition` of `logit`, or a `pause`, `stop`, or `partition` of the generator, is excused when it starts within 1.5 intervals before the fault and ends within 2 after it: the SUT writes no window then |
+| `ledger.windows` | under `[ledger] vm_every_window = true` only: a series in a SUT life has two samples more than 1.5 aggregate intervals apart, a killed life's last sample is more than 1.1 intervals before the kill, or a later life's first is more than 2 intervals after its start. The interval comes from the SUT config. A gap across a `pause` or `partition` of `logit`, or a `pause`, `stop`, or `partition` of the generator, is excused when it starts within 1.1 intervals before the fault and ends within 1.1 after it (2 after a generator `stop`, which sends again only once it starts): the SUT writes no window then |
 | `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight |
 | `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0; a counted egress term is shown and not judged |
 | `identity.sink` | at the final life's last drain before shutdown, the sink's batches received, plus those a disk spool replayed at open, differ from delivered + dropped + queued by more than one batch in flight |
@@ -240,10 +241,11 @@ tmux new -s soak 'script/soak run random-faults --duration 8h 2>&1 | tee soak-8h
 ```
 
 `nohup script/soak run random-faults --duration 8h > soak-8h.log 2>&1 &` works too when
-`$DOCKER` needs no password (`DOCKER=docker`, or `sudo` without one). The driver runs every docker
-command as `sudo -n`, which fails instead of prompting, and with no terminal there's nothing to
-prompt on; `tmux` keeps the terminal the ticket was primed on. Follow a run with
-`tail -f perf/results/soak/<stamp>/timeline.jsonl`.
+`$DOCKER` needs no password (`DOCKER=docker`, or `sudo` without one). Bash resends SIGHUP to its
+jobs when the terminal closes, and the driver keeps the ignore `nohup` set, so the run carries
+on. The driver runs every docker command as `sudo -n`, which fails instead of prompting, and with
+no terminal there's nothing to prompt on; `tmux` keeps the terminal the ticket was primed on.
+Follow a run with `tail -f perf/results/soak/<stamp>/timeline.jsonl`.
 
 What an 8-hour run costs, from the recorded runs' rates:
 
