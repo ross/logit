@@ -853,6 +853,7 @@ table, and collectd's binary framing gives this listener nothing further only it
 | `encrypted_packet_dropped` | A `SecurityLevel Encrypt` datagram. This codec holds no keys. |
 | `types_db_mismatch` | The configured `types_db` defines the list's type with a different data-source count or kinds than arrived, so its records fall back to index naming. |
 | `notification_dropped` | A `0x0100`/`0x0101` notification with an out-of-set severity, an empty message, or no host set: the notification counterpart of `incomplete_identity`. |
+| `record_name_cut` | A value list whose Plugin or Type is past 127 bytes, cut to 127 in its record name; the `collectd.*` attributes keep every byte. |
 
 A type simply *missing* from `types_db` is deliberately not reported, because that's routine, not a
 misconfiguration.

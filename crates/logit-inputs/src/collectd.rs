@@ -51,7 +51,7 @@
 //!
 //! Every one is throttled (`logit.component.diagnostics{key}`,
 //! `docs/design/internal-telemetry.md`). The decoder's keys (`bad_part`, `incomplete_identity`,
-//! `encrypted_packet_dropped`, `types_db_mismatch`, `notification_dropped`) are in
+//! `encrypted_packet_dropped`, `types_db_mismatch`, `notification_dropped`, `record_name_cut`) are in
 //! [`logit_proto::collectd`]'s mapping table. The driver adds `bad_datagram`: a datagram that
 //! failed with nothing salvaged, which a malformed first part causes.
 //!
