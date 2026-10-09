@@ -6,10 +6,13 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 - **A UDP listener's read and decode loops share one task.** `read_loop` and `decode_loop`
   (`crates/logit-inputs/src/udp.rs`) run under `UdpListener::drive`'s one two-arm `select!`, so
-  they interleave, yielding to each other on the coop budget, but never run on two cores at once.
-  The sharing costs nothing measurable
+  they interleave, yielding to each other on the coop budget and on `decode_loop`'s full-pop yield,
+  but never run on two cores at once.
+  The one measured cost of the sharing, a backlog left by a stalled downstream decoding in one
+  poll while the reader goes unpolled, is closed by `decode_loop` yielding after a run of full pops
   ([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)'s
-  "The coop-budget question a batched read raises").
+  "Amendment: a backlog drain starves the reader"). What a split would still buy is in the table
+  below.
 
   A report-only experiment that spawned `decode_loop` onto its own task, pinned to cores 2, 3, 14,
   and 15 (two fast physical cores plus their SMT siblings), found headroom in splitting them.
