@@ -265,9 +265,9 @@ impl PickleReader {
     /// order. Returns how many items were skipped for being the wrong shape.
     ///
     /// A wrong-shaped *item* is skipped. A disallowed opcode, a declared length past the input, a
-    /// string that isn't UTF-8, a bound, or a payload that doesn't leave exactly one list on the
-    /// stack fails the whole frame with [`CodecError::Malformed`], and so does a non-empty list
-    /// item inside a list grown by `APPEND`/`APPENDS` (`append_range`'s tail rule).
+    /// string that isn't UTF-8, a bound, or a payload that leaves anything but a single list on
+    /// the stack fails the whole frame with [`CodecError::Malformed`], and so does a non-empty
+    /// list item inside a list grown by `APPEND`/`APPENDS` (`append_range`'s tail rule).
     ///
     /// `path` borrows `input`, so the caller can make it a zero-copy [`bytes::Bytes`] slice.
     pub fn read_datapoints<'a>(

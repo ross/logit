@@ -8,8 +8,8 @@
 //!   (`crates/logit-proto/src/graphite/decode.rs`'s `decode_plaintext`);
 //! - the model: each piece is one event or none, and it's the event `shared::graphite`'s
 //!   `expected_event` builds from the piece's three whitespace-separated fields, after one
-//!   trailing `\r` comes off: the path, the tags, the value's bits, and the timestamp read
-//!   exactly, `-1` as `received_at`;
+//!   trailing `\r` comes off: the path, the tags, the value's bits, and the timestamp
+//!   at its exact reading, `-1` as `received_at`;
 //! - shape and zero-copy: every event has one finite `Gauge` and `Str` tags that slice the
 //!   datagram (`shared::graphite`'s `check_event`);
 //! - the second-generation fixed point in both protocols (`shared::graphite`'s
