@@ -333,6 +333,20 @@ impl CollectdDecoder {
         let type_bytes = &bytes[type_.clone()];
         let plugin_name = &plugin_bytes[..plugin_bytes.len().min(MAX_NAME_SEGMENT_BYTES)];
         let type_name = &type_bytes[..type_bytes.len().min(MAX_NAME_SEGMENT_BYTES)];
+        if plugin_name.len() < plugin_bytes.len() || type_name.len() < type_bytes.len() {
+            // Two Plugins or Types sharing their first 127 bytes now share a name, and a sink
+            // that drops `collectd.*` attributes (`graphite_out`) writes them as one series.
+            self.diag.warn_throttled(
+                "record_name_cut",
+                format_args!(
+                    "collectd: a {}-byte plugin or {}-byte type is past collectd's 127-byte \
+                     limit; cutting it to 127 bytes in the record name, the collectd.* \
+                     attributes keep it whole",
+                    plugin_bytes.len(),
+                    type_bytes.len()
+                ),
+            );
+        }
         // One `types.db` lookup per Values part, not per data source. It borrows `self.types_db`
         // alongside `self.name`/`self.diag` (disjoint fields), so nothing is cloned per list.
         let data_sources =
@@ -811,19 +825,26 @@ pub(crate) mod tests {
     }
 
     /// A Plugin or Type past collectd's 127 bytes is cut to 127 in the record name, which is
-    /// interned once per data source, and kept whole in its attribute.
+    /// interned once per data source, kept whole in its attribute, and reported once per list
+    /// under `record_name_cut`; a name at the limit isn't.
     #[test]
     fn a_long_plugin_or_type_is_cut_in_the_record_name_and_kept_in_the_attribute() {
         let plugin = vec![b'p'; 4000];
         let type_ = "t".repeat(126) + "é";
-        let events = decode(
-            PacketBuilder::new()
-                .string(part::TYPE_HOST, b"web-1")
-                .string(part::TYPE_PLUGIN, &plugin)
-                .string(part::TYPE_TYPE, type_.as_bytes())
-                .values(&[gauge(0.1), gauge(0.2)])
-                .build(),
-        );
+        let mut decoder = decoder().with_diagnostics(logit_core::Diagnostics::new("collectd_in"));
+        let mut events = Vec::new();
+        let datagram = PacketBuilder::new()
+            .string(part::TYPE_HOST, b"web-1")
+            .string(part::TYPE_PLUGIN, &plugin)
+            .string(part::TYPE_TYPE, type_.as_bytes())
+            .values(&[gauge(0.1), gauge(0.2)])
+            .string(part::TYPE_PLUGIN, &plugin[..127])
+            .string(part::TYPE_TYPE, b"t")
+            .values(&[gauge(0.3)])
+            .build();
+        decoder.decode_into(datagram, RECEIVED_AT, &mut events).unwrap();
+        assert_eq!(decoder.diag().occurrences("record_name_cut"), 1, "only the cut list");
+        assert_eq!(resolve(events[1].metrics[0].name), format!("{}.t", "p".repeat(127)));
         let names: Vec<&str> =
             events[0].metrics.iter().map(|record| resolve(record.name)).collect();
         let cut = format!("{}.{}\u{fffd}", "p".repeat(127), "t".repeat(126));

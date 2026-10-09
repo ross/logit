@@ -48,7 +48,7 @@
 //! | Values with an empty host, plugin or type | list skipped, nothing pushed | `incomplete_identity` (collectd's own receiver rejects the same list with `-EINVAL`) |
 //! | TimeHR (2⁻³⁰ s) / Time (s) / neither | `Event::timestamp` = [`cdtime_to_nanos`] / `s * 1e9` / `received_at` | -- (collectd rejects a `time == 0` list; this codec observes rather than rejects, so a timeless list is stamped with receipt time like every other `logit` input) |
 //! | IntervalHR / Interval | `collectd.interval` = `F64` seconds (`cdtime / 2³⁰`, exact); `0` → absent | -- |
-//! | record name, no `types_db` configured or the list's type not in it | `<plugin>.<type>` for a one-data-source list, `<plugin>.<type>.<i>` (0-based) otherwise, `<plugin>` and `<type>` each cut to their first 127 bytes, the longest collectd's own receiver takes (a sequence the cut splits becomes U+FFFD) | -- (a type missing from `types.db` is routine, not a misconfiguration) |
+//! | record name, no `types_db` configured or the list's type not in it | `<plugin>.<type>` for a one-data-source list, `<plugin>.<type>.<i>` (0-based) otherwise | -- (a type missing from `types.db` is routine, not a misconfiguration) |
 //! | record name, the list's type resolved in [`types_db`] with a matching data-source count **and** kinds | `<plugin>.<type>` for a one-data-source type (the lone data source, conventionally `value`, is omitted -- collectd's own `write_graphite` default), `<plugin>.<type>.<ds_name>` otherwise | -- |
 //! | record name, the type resolved but its count or kinds disagree with the wire | index naming, as above | `types_db_mismatch` -- the configured file is not the one the sender is running against, and naming from it would label a real measurement wrongly |
 //! | a part whose `len` is `< 4`, runs past the datagram, a string part with no NUL terminator, a numeric part not 12 bytes, a Values part where `len != 6 + 9 * count`, `count == 0`, `count > `[`MAX_VALUES_PER_LIST`], or an unknown data-source type byte | the rest of the datagram is abandoned; events already decoded from it are **kept** | `bad_part` when something was already decoded, else `CodecError::Malformed` (the listener's own `bad_datagram`) |
@@ -57,6 +57,13 @@
 //! | `0x0101` Severity | sets sticky severity (raw `u64`); reset per datagram like every other sticky field | -- |
 //! | `0x0100` Message | dispatches a **notification**: one [`logit_core::Event::log`] built from the current sticky host/plugin/plugin_instance/type/type_instance/time/severity -- see "Notifications" below | `notification_dropped` when severity, host or the message itself fails validation |
 //! | any other part type | skipped by length | -- |
+//!
+//! In every record name, `<plugin>` and `<type>` are each cut to their first 127 bytes, the
+//! longest string collectd's own receiver takes, and a UTF-8 sequence the cut splits becomes
+//! U+FFFD; the `collectd.*` attributes keep every byte. A list whose name is cut reports
+//! `record_name_cut`. A sink that drops `collectd.*` attributes, such as `graphite_out`, writes two
+//! Plugins or Types that share their first 127 bytes as one series (ADR `collectd-binary-relay`'s
+//! record-name amendment).
 //!
 //! ## Notifications: `0x0100`/`0x0101`
 //!
@@ -254,8 +261,9 @@ pub const NOTIF_MAX_MSG_LEN: usize = 256;
 /// uncapped, and a fresh Plugin part plus a one-value list mints a new interned name for ~21 wire
 /// bytes. That is the same wire-chosen-name exposure `statsd_in` has, accepted on
 /// `docs/design/memory.md` §4's "listeners are private" premise. A name carries at most 127
-/// bytes of each of `<plugin>` and `<type>`, so one Values part mints at most 64 names of under
-/// 300 bytes, however long its Plugin and Type parts are.
+/// wire bytes of each of `<plugin>` and `<type>` (up to three times that once invalid UTF-8
+/// becomes U+FFFD), so one Values part mints at most 64 names of under 800 bytes, however long
+/// its Plugin and Type parts are.
 pub const MAX_VALUES_PER_LIST: usize = 64;
 
 /// The wire Host. See this module doc's well-known-attribute table.

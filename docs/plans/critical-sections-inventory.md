@@ -5798,11 +5798,11 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Priority:** P1 — already fixed and tested, but memo-key handling is exactly the class of subtle wire-driven-allocation bug worth a dedicated regression/fuzz check to keep fixed.
 - **Verified (untrusted/w9):** reviewed @bde61109, no code change. The robustness test asserts a byte
   bound: the 9-byte frame's decode peaks under 4,096 live bytes, where the memo the key names
-  would be about 8 MB. It's renamed from `..._hostile_memo_key` to `..._corrupt_memo_key` under
-  ADR `deployment-threat-model`. `MEMOIZE` takes `self.memo.len()` as its key, so it always
+  would be about 8 MB. `MEMOIZE` takes `self.memo.len()` as its key, so it always
   passes the ordinal check. The memo key is now in the fuzz corpus: the CPython seeds memoize every
-  string and tuple, `written-300` reaches `LONG_BINPUT` past key 255, and the target's built
-  payloads memoize each well-shaped item and repeat it through `BINGET` or `LONG_BINGET`. The
+  string and tuple, and the target's built payloads memoize each well-shaped item
+  (`Builder::memoize`, `LONG_BINPUT` from key 256) and repeat it through `BINGET` or
+  `LONG_BINGET`. The
   campaign under CODEC-01 ran with no crash, the 32 MiB malloc limit standing for the memo's bound.
 
 ### CODEC-03 — Carbon plaintext/pickle decode entry point and timestamp arithmetic
@@ -6096,9 +6096,13 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   the fuzz target's fork children did that until the interner's own arena tripped a 64 MiB malloc
   limit. Each segment of the name is now cut to its first 127 bytes, the longest string
   collectd's own receiver takes, and the `collectd.*` attributes keep every byte, so the relay is
-  unchanged (`collectd_out` never reads the name).
-  `a_long_plugin_or_type_is_cut_in_the_record_name_and_kept_in_the_attribute` pins it and fails
-  with the cut reverted. The `.expect()` arithmetic,
+  unchanged (`collectd_out` never reads the name). Two Plugins or Types sharing their first 127
+  bytes then share a name, which `graphite_out`, dropping `collectd.*` attributes, writes as one
+  carbon path; a throttled `record_name_cut` diagnostic reports each cut list, and ADR
+  `collectd-binary-relay`'s record-name amendment and a `docs/known-gaps/mappings.md`
+  `decode (collectd)` row record the merge.
+  `a_long_plugin_or_type_is_cut_in_the_record_name_and_kept_in_the_attribute` pins the cut and
+  the diagnostic, and fails with the cut reverted. The `.expect()` arithmetic,
   re-derived: once `len == 6 + 9 * count`, the payload is `2 + 9 * count` bytes, the type vector
   `payload[2..2 + count]` fits, and value `index < count` ends at `2 + count + 8 * (index + 1)`,
   at most the payload's length, so `try_into` always gets eight bytes; every type byte passed
