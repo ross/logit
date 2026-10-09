@@ -99,9 +99,9 @@ limit, and fork mode restarts the process.
 `-ignore_ooms=0` keeps an out-of-memory in a child fatal. Fork mode was checked in the image: it
 stops at `-max_total_time`, merges new inputs into `fuzz/corpus/<target>`, and writes a child's
 crash to `fuzz/artifacts/<target>/`. Its first step merges the corpus and the seeds, and that
-merge drops an input that crashes rather than reporting it: `untrusted/w9`'s `collectd` run with
-`MAX_VALUES_PER_LIST`'s check widened by one ran 120 seconds clean in fork mode, while the same
-binary outside fork mode crashed on the committed seed that crosses the cap. So a fork-mode
+merge drops an input that crashes rather than reporting it. With `MAX_VALUES_PER_LIST`'s check
+widened by one, `collectd` ran 120 seconds clean in fork mode, while the same binary outside fork
+mode crashed on the committed seed that crosses the cap. So a fork-mode
 target's `regress-*` seed is checked by its `robustness.rs` test or a run without `-fork`, not by
 `fuzz`.
 

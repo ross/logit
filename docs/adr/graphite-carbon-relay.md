@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-07
+updated: 2026-10-09
 ---
 
 # Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch
@@ -57,25 +57,8 @@ arbitrary Python object. See "Pickle opcode subset" below.
 **Decode (wire → model).** One line or one pickle datapoint decodes to one `Event` carrying one
 `MetricRecord`.
 
-| Wire | Model | Counter / diag |
-|---|---|---|
-| one line / one pickle datapoint | one `Event`, one `MetricRecord` | — |
-| `path` (before first `;`) | `name = intern(path)`, `Gauge(v)` | — |
-| `;name=value` | event attribute `Value::Str`, zero-copy `Bytes` slice | — |
-| repeated tag key | last wins | `logit.input.tags.normalized{reason="duplicate_key"}` |
-| finite value (`3`, `-1.5`, `1e5`, pickle `"3.14"` string) | `Gauge(v)` | — |
-| NaN / ±inf | line skipped | `logit.input.metrics.skipped{reason="non_finite_value"}` + diag |
-| `timestamp == -1` | `received_at` | — |
-| `timestamp > 0` (int or fractional) | `(ts * 1e9) as i64` | — |
-| other `timestamp <= 0` | skipped | `{reason="bad_timestamp"}` + diag |
-| not exactly 3 whitespace-separated fields; non-UTF-8; empty path | skipped | `{reason="bad_line"}` + diag |
-| malformed tag (`;` without `=`, empty name or value) | whole line skipped (carbon raises too) | `{reason="bad_tag"}` + diag |
-| empty / whitespace-only line | skipped, uncounted | — |
-| line > `max_line_bytes` (TCP) | drain to next `\n`, next line still decodes | `{reason="oversize_line"}` + diag |
-| pickle frame > `max_frame_bytes` | connection closed (no resync in a length-framed stream) | diag `oversize_frame` |
-| disallowed opcode / depth / item cap | `CodecError::Malformed`, whole frame dropped | diag `bad_pickle` |
-| pickle item not `(str, (num, num))` | that datapoint skipped, rest of frame decodes | `{reason="bad_shape"}` |
-| `Resource` / `Scope` | shared default / `None` | — |
+The decode table, every skip and its counter, lives in `crates/logit-proto/src/graphite/mod.rs`'s
+"Decode: wire → model" section, the canonical copy this ADR doesn't repeat.
 
 **Encode (model → wire)** is the inverse, plus rules for model kinds Carbon's wire can't carry
 natively. Prefix `logit.output.metrics.skipped{reason=…}` unless noted; kind drops use
