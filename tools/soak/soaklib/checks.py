@@ -1432,8 +1432,8 @@ def check_ledger_sent(data):
     """For an external target, where the ledger ends at the sink's telemetry: `SENT` (a PASS
     whose detail starts with the word) when every batch the sink received ended in an accepted
     response, judged per SUT life by the sink's batch identity and over the run by its drops,
-    refusals, and request classes. A local target SKIPs. The plan's "Pass/fail" section
-    (`docs/plans/soak-harness.md`) lists each FAIL and WARN."""
+    refusals, and request classes. A local target SKIPs. `docs/plans/soak-harness.md`, "8.
+    External targets (W5)", lists each FAIL and WARN."""
     if not data.external:
         return Result("ledger.sent", SKIP, "local target: ledger.egress judges delivery against "
                       "VictoriaMetrics")

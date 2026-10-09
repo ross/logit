@@ -704,19 +704,26 @@ query", `ledger.summary` shows its Ab − V term as SKIP and judges the other th
 `progress` reports no freshness samples. `ledger.replay` reads only telemetry, so it stays, as
 do `ledger.wire`, `ledger.intake`, `ledger.edge`, `ledger.aggregate`, `identity.sink`,
 `recovery`, and `self_log`, whose sink fault keys (`retrying`, `send_failed`, `degraded`) are
-the runtime's, not a sink's own; `datadog_out`'s `request_rejected`, `series_rejected`,
-`api_key_rejected`, and `request_refused` are WARN lines, which `self_log` doesn't judge.
-`ledger.sent` ends the ledger at the sink, from `datadog_out`'s telemetry
-(`crates/logit-outputs/src/datadog.rs`, "Telemetry"):
+the runtime's, not a sink's own; `datadog_out`'s diagnostics are WARN lines, which `self_log`
+doesn't judge. `ledger.sent` ends the ledger at the sink. It reads `datadog_out`'s telemetry and
+diagnostics as the sink's module doc describes them (`crates/logit-outputs/src/datadog.rs`,
+"Faults, retries, and duplicate safety", whose response-class table maps each answer to a class
+and a diagnostic, and "Telemetry"). This list is the canonical copy of its verdicts:
 
 - Per SUT life, at its last quiet drain (the final life's second-to-last, an earlier life's
   last), `batches.received + buffer.disk.replayed == delivered + dropped (every reason) +
   buffer.batches`, one batch in flight allowed. Off: FAIL.
+- The final life's `buffer.batches` above 0 at that drain, or the last `sink_drained` phase in
+  `timeline.jsonl` with `held` false: FAIL, naming the batches left unsent. The identity
+  balances a queued batch, so it can't catch one the run ended with.
 - A batch dropped `rejected`, records dropped `rejected` or `oversize`, or records a series
   `202` body names (`logit.output.records.rejected`): FAIL, with the status and the first
-  `request_rejected` or `series_rejected` line from stderr. Under per-request verdicts a
-  rejected request drops its records and the batch survives when another request was accepted,
-  so both counters are read.
+  stderr line with the key that explains it, `request_rejected` for a drop and
+  `series_rejected` for a `202` body. Under per-request verdicts a rejected request drops its
+  records and the batch survives when another request was accepted, so both counters are read.
+- An `api_key_rejected` or `request_refused` line from the sink on stderr: FAIL, quoting the
+  first. The sink reads that answer as `Refused` and holds its queue with no exit, so the run
+  can't deliver until the key or the endpoint is fixed.
 - No `logit.output.requests` point, or none of class `2xx`: FAIL.
 - Any other counted drop (a batch's `overflow_*` or `shutdown` reason, `drain complete`'s
   `batches_dropped`, a record's `stale`, `too_many_tags`, or other pre-send reason, the

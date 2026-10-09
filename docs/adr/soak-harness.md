@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-08
+updated: 2026-10-09
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -113,6 +113,8 @@ datagram.**
   so the total is summed reset-aware: the first value, plus each non-negative step, plus the new
   value after each decrease or SUT restart, since a restart whose first total isn't below the
   last one shows no decrease. `series_retention` is raised so a fault never evicts a series.
+  An external target, such as Datadog, has no backend query: the ledger ends at the sink's
+  telemetry, and a `2xx` is the end of the evidence.
 - Loss the system can't count by design is reported and never fails a run: UDP loss between the
   generator and the SUT, the kernel queue at socket close, and a cancelled generator send, each
   linked to its entry in [`docs/known-gaps/intake.md`](../known-gaps/intake.md). The exception is

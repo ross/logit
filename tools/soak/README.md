@@ -130,7 +130,9 @@ script/soak run statsd-datadog
   because it holds credentials; everything under `perf/results/` is ignored.
 - The script refuses to start when the file doesn't set a listed variable or sets it empty,
   and names the variable, never its value. It passes the file to `logit validate` and to
-  compose as a second `--env-file`; the run directory never holds a copy.
+  compose as a second `--env-file`; the run directory never holds a copy. Each
+  `inspect/<svc>.json` has every `Config.Env` value replaced by `<redacted>`, because the SUT's
+  environment carries the key.
 - A variable reaches the SUT only when `compose.yaml` passes it in the `logit` service's
   `environment:`. Today that's `DD_API_KEY`, and the scenario check refuses any other name in
   `env`.
@@ -151,19 +153,11 @@ What changes for an external target:
 - `ledger.egress` and `ledger.windows` SKIP, and `ledger.summary` shows its Ab − V term as SKIP
   and judges the other three. `ledger.wire`, `ledger.intake`, `ledger.edge`,
   `ledger.aggregate`, `ledger.replay`, and `identity.sink` judge the run as they do a local one.
-- `ledger.sent` ends the ledger at the sink's own telemetry. Its row is a `PASS` whose detail
-  starts with `SENT` when every batch the sink received ended in an accepted response: per SUT
-  life, batches received plus replayed equal delivered plus dropped plus queued, nothing was
-  dropped, and some request answered `2xx`. A batch or records the destination rejected (a
-  response the sink's response-class table reads as `Rejected`, such as a `400` or a `413`, or
-  series named in a `202` body) FAIL, with the status and
-  the sink's `request_rejected` or `series_rejected` text from stderr. A `429`, `5xx`, or
-  timeout inside a fault window is the fault's expected retry; outside every fault window it
-  `WARN`s with the count, because the destination has a floor of errors of its own. Any other
-  counted drop, such as `stale` or an encoder's skip, `WARN`s. A wrong key or site answers
-  `403`, which the sink reads as `Refused`: it holds the queue and retries without end, so the
-  run shows a sink that never delivers in `progress` and `recovery`, and no `2xx` in
-  `ledger.sent`.
+- `ledger.sent` ends the ledger at the sink's own telemetry, and reads a `PASS` whose detail
+  starts with `SENT` when every batch the sink received ended in an accepted response. A batch
+  left unsent, a drop or refusal the sink logged, or no `2xx` FAILs it; the plan's
+  [External targets](../../docs/plans/soak-harness.md#8-external-targets-w5) section lists
+  every verdict.
 
 `SENT` is the end of the evidence. A `2xx` means the intake took the request for processing;
 nothing queries the destination for what it stored, so the harness can't see a point the intake
@@ -238,7 +232,7 @@ rule only holds in steady state. The plan's "The checks" has the full rules.
 | `ledger.windows` | under `[ledger] vm_every_window = true` only, and SKIPs on an external target: a series in a SUT life has two samples more than 1.5 aggregate intervals apart, a killed life's last sample is more than 1.1 intervals before the kill, or a later life's first is more than 2 intervals after its start. The interval comes from the SUT config. A gap across a `pause` or `partition` of `logit`, or a `pause`, `stop`, or `partition` of the generator, is excused when it starts within 1.1 intervals before the fault and ends within 1.1 after it (2 after a generator `stop`, which sends again only once it starts): the SUT writes no window then |
 | `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight |
 | `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0; a counted egress term is shown and not judged, and on an external target the Ab − V term SKIPs |
-| `ledger.sent` | an external target only, else SKIP: a SUT life's sink batches received plus replayed differ from delivered plus dropped plus queued by more than one in flight, the destination rejected a batch or records, or no request answered `2xx`; see [External targets](#external-targets). Other counted drops, and non-`2xx` answers outside every fault window, `WARN`; a clean run's detail starts with `SENT` |
+| `ledger.sent` | an external target only, else SKIP: a batch the sink received didn't end in an accepted response; a clean run's detail starts with `SENT`. See [External targets](#external-targets) |
 | `identity.sink` | at the final life's last drain before shutdown, the sink's batches received, plus those a disk spool replayed at open, differ from delivered + dropped + queued by more than one batch in flight |
 | `recovery` | within `recovery_bound` of a fault's end, no drain interval clear of other faults shows the sink not retrying, its buffer under 5% full or holding at most one batch, the listener's receive queue under 5% full, and ingest at 95% of the warmup rate; a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN`, and so does a run where no fault had an eligible interval |
 | `expect.<name>` | a scenario's own `[[expect]]` bound doesn't hold; see [Expectations](#expectations) |
