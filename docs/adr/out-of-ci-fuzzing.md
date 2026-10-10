@@ -97,10 +97,10 @@ and `message_kv` use it to run in fork mode (`-fork=1 -ignore_ooms=0`). The proc
 interner never evicts, so a long-lived fuzz process accumulates every dictionary string, metric
 name, tag key, SD-ID, PARAM-NAME, carbon path, Prometheus exemplar label name and family name,
 and log-message key it decodes until the arena outgrows the malloc limit, and fork mode restarts
-the process. A fork child still runs for up to 300 seconds, and a key in `message_logfmt` or
-`message_kv` runs up to the whole 64 KiB message: in fork mode `message_kv` took the arena past
-its 16 MiB limit inside 90 seconds. So those two skip an input that could hold a key over 32
-bytes; a key's length changes nothing in either scan.
+the process. A key in `message_logfmt` or `message_kv` can run the whole 64 KiB message, and
+long distinct keys grow the never-evicting arena past the 16 MiB limit within one fork child, so
+those two targets skip an input that could hold a key over 32 bytes; a key's length changes
+nothing in either scan.
 `-ignore_ooms=0` keeps an out-of-memory in a child fatal. Fork mode was checked in the image: it
 stops at `-max_total_time`, merges new inputs into `fuzz/corpus/<target>`, and writes a child's
 crash to `fuzz/artifacts/<target>/`. Its first step merges the corpus and the seeds, and that

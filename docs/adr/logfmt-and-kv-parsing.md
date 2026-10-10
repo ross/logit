@@ -33,13 +33,12 @@ delimiters vs. configurable ones) that a shared config surface would need per-mo
 with no shared behavior to actually unify.
 
 **`logfmt`'s grammar is fixed and requires no config beyond `bare_keys`:** whitespace-delimited
-`key=value` tokens (a closing `"` also ends a token, as go-logfmt reads `a="x"b=1`;
-`crates/logit-proto/src/message/logfmt.rs`'s module doc holds the token boundaries), `"`-quoted
-values with backslash escapes (`\\`, `\"`, `\n`, `\r`, `\t` -- anything else, including
-`\uXXXX`/`\xNN`, is preserved verbatim, backslash included), first `=` wins (`a=b=c` -> `a` ->
-`"b=c"`). An unterminated quote fails the *whole line* (token boundaries become unknowable past
-that point) with a throttled `parse_failure` diagnostic and the event
-passed through untouched, exactly `json`'s posture toward a malformed object. A keyless `=`
+`key=value` tokens (`crates/logit-proto/src/message/logfmt.rs`'s module doc holds the token
+boundaries), `"`-quoted values with backslash escapes (`\\`, `\"`, `\n`, `\r`, `\t` -- anything
+else, including `\uXXXX`/`\xNN`, is preserved verbatim, backslash included), first `=` wins
+(`a=b=c` -> `a` -> `"b=c"`). An unterminated quote fails the *whole line* (token boundaries become
+unknowable past that point) with a throttled `parse_failure` diagnostic and the event passed
+through untouched, exactly `json`'s posture toward a malformed object. A keyless `=`
 (`=1 a=2`) only skips that one token and resynchronizes at the next whitespace -- the rest of the
 line still parses. This asymmetry is intentional: an unterminated quote corrupts everything after
 it, a keyless token corrupts nothing but itself.
@@ -70,12 +69,10 @@ matching `logfmt`'s own first-`=`-wins rule). Whitespace around each key and val
 unconditionally** (not a `trim: bool` flag) -- this is what lets `pair_sep: ","` work uniformly on
 both `a=1,b=2` and `a=1, b=2` without an operator needing to think about it, and there's no grammar
 reason a `kv` user would ever want literal leading/trailing whitespace preserved around a key or
-value it can't quote anyway. An empty segment (`a=1&&b=2`) is skipped with no diagnostic and
-counted in `pairs.skipped`; a segment with no `kv_sep` at all follows the same `bare_keys` rule as
-`logfmt`; a segment whose key is empty after trimming is skipped and counted. If no segment
-produces a pair, because none contains `kv_sep` or every one that does has an empty key, the whole
-line fails like `logfmt`'s `NoPairs` case. `crates/logit-proto/src/message/logfmt.rs`'s module doc
-holds these segment rules.
+value it can't quote anyway. An empty or keyless segment adds nothing, a bareword follows
+`logfmt`'s `bare_keys` rule, and a line where no segment produces a `key<kv_sep>value` pair fails
+like `logfmt`'s `NoPairs` case;
+`crates/logit-proto/src/message/logfmt.rs`'s module doc holds the segment rules.
 
 **Both are rejected at graph-validation time when `kv`'s separators can only ever misbehave**
 (new rule 30, `crates/logit-pipeline/src/graph.rs`): an empty `pair_sep` or `kv_sep`, identical
