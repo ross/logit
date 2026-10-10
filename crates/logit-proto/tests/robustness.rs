@@ -3771,7 +3771,11 @@ fn csv_worst_case_message_stays_under_the_fuzz_malloc_limit() {
     largest_under_message_limit("delimiters", || {
         let fields = csv_fields(&row, b',').unwrap();
         assert_eq!(fields.len(), MESSAGE_BYTES + 1);
-        let reference: Vec<Vec<u8>> = fields.iter().map(|f| f.to_vec()).collect();
+        // One push per field, as the target's `reference` builds its reading.
+        let mut reference: Vec<Vec<u8>> = Vec::new();
+        for f in &fields {
+            reference.push(f.to_vec());
+        }
         assert_eq!(reference.len(), fields.len());
     });
 }

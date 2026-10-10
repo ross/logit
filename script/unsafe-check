@@ -102,7 +102,7 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # `message_*` targets' `max_len` is a selector byte and a 64 KiB message, past the 65,507-byte
 # datagram and `MAX_FRAME_BYTES` line most messages arrive in; each worst message grows one `Vec`
 # by doubling, measured in the robustness suite's log-message section under 16: `message_json`'s
-# `{"a":[0,0,…]}` at 1.25 MiB, `message_csv`'s 65,537 empty fields at 2 MiB, `message_logfmt`'s
+# `{"a":[0,0,…]}` at 1.25 MiB, `message_csv`'s 65,537 empty fields at 3 MiB, `message_logfmt`'s
 # one-byte barewords at 1.5 MiB, and `message_kv`'s at 2 MiB. `message_csv` needs no fork mode
 # because the split interns nothing. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
 #
