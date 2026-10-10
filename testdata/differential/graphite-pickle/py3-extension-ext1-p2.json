@@ -1,0 +1,36 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "ValueError",
+   "message": "unregistered extension code 200"
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py3-extension-ext1-p2",
+ "cpython": {
+  "error": "ValueError",
+  "message": "unregistered extension code 200"
+ },
+ "description": "The decimal.Decimal class as copyreg extension code 200.",
+ "exercises": [
+  "EXT1"
+ ],
+ "logit": {
+  "opcode": "0x82",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "EXT1",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

@@ -1,0 +1,62 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "value.2p127-minus-1",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x47e0000000000000",
+     "repr": "1.7014118346046923e+38"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-value-2p127-minus-1-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "value.2p127-minus-1",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "int": "170141183460469231731687303715884105727"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "The value 170141183460469231731687303715884105727.",
+ "exercises": [
+  "LONG1"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "LONG1",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

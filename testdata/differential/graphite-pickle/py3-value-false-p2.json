@@ -1,0 +1,61 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "value.false",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x0000000000000000",
+     "repr": "0.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-value-false-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "value.false",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       false
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "The value False, which float() reads as 0.0.",
+ "divergence": "carbon's float() reads this value; the reader reads only numbers and numeric strings Rust's f64 parse takes (docs/known-gaps/mappings.md: decode (Graphite), a value carbon's float() coerces)",
+ "exercises": [
+  "NEWFALSE"
+ ],
+ "logit": {
+  "datapoints": [],
+  "skipped": 1,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "NEWFALSE",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

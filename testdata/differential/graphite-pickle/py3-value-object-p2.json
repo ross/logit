@@ -1,0 +1,60 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "UnpicklingError",
+   "message": "Attempting to unpickle unsafe module __main__"
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py3-value-object-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "reject.object",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "object": "__main__.Sample",
+        "repr": "Sample(v=1)"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "An instance of a class.",
+ "exercises": [
+  "GLOBAL",
+  "NEWOBJ",
+  "BUILD"
+ ],
+ "logit": {
+  "opcode": "0x63",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BININT1",
+  "BINPUT",
+  "BINUNICODE",
+  "BUILD",
+  "EMPTY_DICT",
+  "EMPTY_LIST",
+  "EMPTY_TUPLE",
+  "GLOBAL",
+  "NEWOBJ",
+  "PROTO",
+  "SETITEM",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

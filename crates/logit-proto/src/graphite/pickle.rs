@@ -22,7 +22,7 @@
 //! | memo | `BINPUT` `0x71`, `LONG_BINPUT` `0x72`, `MEMOIZE` `0x94`, `BINGET` `0x68`, `LONG_BINGET` `0x6a` (keys bounded by [`super::MAX_PICKLE_ITEMS`]) |
 //! | containers | `MARK` `0x28`, `EMPTY_LIST` `0x5d`, `LIST` `0x6c`, `APPEND` `0x61`, `APPENDS` `0x65`, `EMPTY_TUPLE` `0x29`, `TUPLE` `0x74`, `TUPLE1` `0x85`, `TUPLE2` `0x86`, `TUPLE3` `0x87` |
 //! | strings | `BINUNICODE` `0x58`, `SHORT_BINUNICODE` `0x8c`, `BINUNICODE8` `0x8d`, `BINSTRING` `0x54`, `SHORT_BINSTRING` `0x55`, `BINBYTES` `0x42`, `SHORT_BINBYTES` `0x43`, `BINBYTES8` `0x8e` -- every one UTF-8 validated |
-//! | numbers | `BININT` `0x4a`, `BININT1` `0x4b`, `BININT2` `0x4d`, `LONG1` `0x8a`, `LONG4` `0x8b` (magnitude ≤ 8 bytes), `BINFLOAT` `0x47` |
+//! | numbers | `BININT` `0x4a`, `BININT1` `0x4b`, `BININT2` `0x4d`, `LONG1` `0x8a`, `LONG4` `0x8b` (magnitude ≤ 16 bytes), `BINFLOAT` `0x47` |
 //! | inert | `NONE` `0x4e`, `NEWTRUE` `0x88`, `NEWFALSE` `0x89` |
 //! | text (protocol 0) | `INT` `0x49`, `LONG` `0x4c`, `FLOAT` `0x46`, `STRING` `0x53`, `UNICODE` `0x56`, `PUT` `0x70`, `GET` `0x67` -- each argument runs to the next `\n` ("Protocol 0") |
 //!
@@ -49,7 +49,7 @@
 //! reads it, except where a bullet names a spelling this reader fails and CPython takes; no
 //! surveyed sender writes one:
 //!
-//! - `INT` and `LONG`: an optional sign and decimal digits that fit an `i64`. CPython's
+//! - `INT` and `LONG`: an optional sign and decimal digits that fit an `i128`. CPython's
 //!   `int(x, 0)` also takes `0x`/`0o`/`0b`, `_`, and surrounding whitespace, and its C loader
 //!   reads `INT 010` as octal 8; this reader fails all of them, and a leading zero before a
 //!   non-zero digit. `I00` and `I01` are `False` and `True`. `LONG`'s trailing `L` is optional,
@@ -84,8 +84,9 @@
 //!   after the first), so one corrupt `LONG_BINPUT` can't grow the memo to the size its key names.
 //!   The `1` is Python 2's `cPickle`, which numbers its memo from 1 in every protocol (the ADR
 //!   amendment's "Memo keys");
-//! - `LONG1`/`LONG4` accept a magnitude of at most 8 bytes, and `INT`/`LONG` an `i64`: carbon's
-//!   timestamps are seconds;
+//! - `LONG1`/`LONG4` accept a magnitude of at most 16 bytes, and `INT`/`LONG` an `i128`. An
+//!   integer past `i64` reads as the nearest `f64`, as carbon's `float()` reads it, so a `u64`
+//!   counter decodes; a larger one, which only hand-built code writes, fails the frame;
 //! - the stack must hold **exactly one** value at `STOP`, and it must be a list.
 //!
 //! ## Reusable state
@@ -146,8 +147,9 @@ const OP_FRAME: u8 = 0x95;
 /// The highest `PROTO` version this reader accepts; nothing above 5 exists.
 const MAX_PROTO_VERSION: u8 = 5;
 
-/// The most bytes a `LONG1`/`LONG4` magnitude may carry (this module's "Bounds" section).
-const MAX_LONG_BYTES: usize = 8;
+/// The most bytes a `LONG1`/`LONG4` magnitude may carry: an `i128` (this module's "Bounds"
+/// section).
+const MAX_LONG_BYTES: usize = 16;
 
 // -- writer -------------------------------------------------------------------------------------
 
@@ -237,7 +239,7 @@ fn write_int(out: &mut Vec<u8>, v: i64) {
     // trailing sign-extension byte only while the byte below still carries the sign in its high
     // bit, so a positive value keeps the `0x00` that stops it reading as negative.
     let sign: u8 = if v < 0 { 0xff } else { 0x00 };
-    let mut len = MAX_LONG_BYTES;
+    let mut len = bytes.len();
     while len > 1 {
         let top = bytes[len - 1];
         let below_is_negative = bytes[len - 2] & 0x80 != 0;
@@ -475,7 +477,7 @@ impl PickleReader {
                     at += 1;
                     let v = read_long(input, at, n)?;
                     at += n;
-                    self.push(PValue::Int(v))?;
+                    self.push(integer(v))?;
                 }
                 OP_LONG4 => {
                     let n = i32::from_le_bytes(slice(input, at, 4)?.try_into().unwrap());
@@ -484,7 +486,7 @@ impl PickleReader {
                         .map_err(|_| malformed("pickle LONG4 declares a negative length"))?;
                     let v = read_long(input, at, n)?;
                     at += n;
-                    self.push(PValue::Int(v))?;
+                    self.push(integer(v))?;
                 }
                 OP_BINFLOAT => {
                     let v = f64::from_be_bytes(slice(input, at, 8)?.try_into().unwrap());
@@ -577,14 +579,14 @@ impl PickleReader {
                     let value = match line(input, &mut at)? {
                         b"00" => PValue::Bool(false),
                         b"01" => PValue::Bool(true),
-                        arg => PValue::Int(parse_decimal(arg, "INT")?),
+                        arg => integer(parse_decimal(arg, "INT")?),
                     };
                     self.push(value)?;
                 }
                 OP_LONG => {
                     let arg = line(input, &mut at)?;
                     let digits = arg.strip_suffix(b"L").unwrap_or(arg);
-                    self.push(PValue::Int(parse_decimal(digits, "LONG")?))?;
+                    self.push(integer(parse_decimal(digits, "LONG")?))?;
                 }
                 OP_FLOAT => {
                     let value = parse_float(line(input, &mut at)?)?;
@@ -846,9 +848,9 @@ fn line<'a>(input: &'a [u8], at: &mut usize) -> Result<&'a [u8], CodecError> {
     Ok(&rest[..n])
 }
 
-/// `INT`'s or `LONG`'s argument: an optional sign and decimal digits that fit an `i64`
+/// `INT`'s or `LONG`'s argument: an optional sign and decimal digits that fit an `i128`
 /// ("Protocol 0" says which spellings CPython takes that this rejects).
-fn parse_decimal(arg: &[u8], op: &str) -> Result<i64, CodecError> {
+fn parse_decimal(arg: &[u8], op: &str) -> Result<i128, CodecError> {
     let digits = arg.strip_prefix(b"-").or_else(|| arg.strip_prefix(b"+")).unwrap_or(arg);
     let decimal = !digits.is_empty() && digits.iter().all(u8::is_ascii_digit);
     // CPython's C loader reads `INT 010` with `strtol` base 0, as octal 8.
@@ -858,8 +860,8 @@ fn parse_decimal(arg: &[u8], op: &str) -> Result<i64, CodecError> {
     }
     std::str::from_utf8(arg)
         .ok()
-        .and_then(|text| text.parse::<i64>().ok())
-        .ok_or_else(|| malformed(format!("pickle {op} argument does not fit an i64")))
+        .and_then(|text| text.parse::<i128>().ok())
+        .ok_or_else(|| malformed(format!("pickle {op} argument does not fit an i128")))
 }
 
 /// `FLOAT`'s argument: a Python float `repr`, including `nan` and `inf`.
@@ -1022,8 +1024,18 @@ fn hex_value(d: u8) -> Option<u8> {
     (d as char).to_digit(16).map(|v| v as u8)
 }
 
+/// An integer as the stack holds it: an `i64` where it fits, else the nearest `f64`, which is
+/// what carbon's `float()` makes of it. `as` rounds an `i128` to nearest, ties to even, as
+/// CPython's `float(int)` does.
+fn integer(v: i128) -> PValue {
+    match i64::try_from(v) {
+        Ok(v) => PValue::Int(v),
+        Err(_) => PValue::Float(v as f64),
+    }
+}
+
 /// A `LONG1`/`LONG4` magnitude: little-endian two's complement, at most [`MAX_LONG_BYTES`] bytes.
-fn read_long(input: &[u8], at: usize, n: usize) -> Result<i64, CodecError> {
+fn read_long(input: &[u8], at: usize, n: usize) -> Result<i128, CodecError> {
     if n > MAX_LONG_BYTES {
         return Err(malformed(format!(
             "pickle long of {n} byte(s) exceeds the {MAX_LONG_BYTES}-byte magnitude cap"
@@ -1035,9 +1047,9 @@ fn read_long(input: &[u8], at: usize, n: usize) -> Result<i64, CodecError> {
         return Ok(0);
     }
     let negative = bytes[n - 1] & 0x80 != 0;
-    let mut buf = if negative { [0xffu8; 8] } else { [0u8; 8] };
+    let mut buf = if negative { [0xffu8; MAX_LONG_BYTES] } else { [0u8; MAX_LONG_BYTES] };
     buf[..n].copy_from_slice(bytes);
-    Ok(i64::from_le_bytes(buf))
+    Ok(i128::from_le_bytes(buf))
 }
 
 fn malformed(msg: impl Into<String>) -> CodecError {
@@ -1533,8 +1545,8 @@ mod tests {
             assert!(err.to_string().contains(want), "{path_op:?}: {err}");
         }
         for (number_ops, want) in [
-            (&b"I99999999999999999999\nF1\n"[..], "does not fit"),
-            (b"L9223372036854775808L\nF1\n", "does not fit"),
+            (&b"I999999999999999999999999999999999999999\nF1\n"[..], "does not fit"),
+            (b"L170141183460469231731687303715884105728L\nF1\n", "does not fit"),
             (b"I010\nF1\n", "not a decimal"),
             (b"I0x10\nF1\n", "not a decimal"),
             (b"I1_000\nF1\n", "not a decimal"),
@@ -1685,11 +1697,11 @@ mod tests {
     }
 
     #[test]
-    fn a_long_magnitude_past_eight_bytes_is_rejected() {
-        let mut payload = vec![OP_PROTO, 2, OP_LONG1, 9];
-        payload.extend_from_slice(&[0u8; 9]);
+    fn a_long_magnitude_past_sixteen_bytes_is_rejected() {
+        let mut payload = vec![OP_PROTO, 2, OP_LONG1, 17];
+        payload.extend_from_slice(&[0u8; 17]);
         payload.push(OP_STOP);
-        let err = read(&payload).expect_err("a 9-byte long must be rejected");
+        let err = read(&payload).expect_err("a 17-byte long must be rejected");
         assert!(err.to_string().contains("magnitude cap"), "{err}");
     }
 

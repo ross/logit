@@ -1,0 +1,61 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "UnpicklingError",
+   "message": "Attempting to unpickle unsafe module __main__"
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py3-value-object-kw-p4",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "reject.object",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "object": "__main__.Keyword",
+        "repr": "Keyword(v=3)"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "An instance whose __getnewargs_ex__ passes keyword arguments.",
+ "exercises": [
+  "STACK_GLOBAL",
+  "NEWOBJ_EX"
+ ],
+ "logit": {
+  "opcode": "0x93",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINGET",
+  "BININT",
+  "BININT1",
+  "BUILD",
+  "EMPTY_DICT",
+  "EMPTY_LIST",
+  "EMPTY_TUPLE",
+  "FRAME",
+  "MEMOIZE",
+  "NEWOBJ_EX",
+  "PROTO",
+  "SETITEM",
+  "SHORT_BINUNICODE",
+  "STACK_GLOBAL",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 4
+}

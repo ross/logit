@@ -1,0 +1,56 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "UnpicklingError",
+   "message": "Attempting to unpickle unsafe module __main__"
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py2-value-oldstyle-p0",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "py2.old",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "object": "__main__.Old",
+        "repr": "Old([('v', 1)])"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "An old-style class instance: INST.",
+ "exercises": [
+  "INST",
+  "BUILD"
+ ],
+ "logit": {
+  "opcode": "0x69",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BUILD",
+  "DICT",
+  "INST",
+  "INT",
+  "LIST",
+  "MARK",
+  "PUT",
+  "SETITEM",
+  "STOP",
+  "STRING",
+  "TUPLE"
+ ],
+ "producer": "python2",
+ "protocol": 0
+}

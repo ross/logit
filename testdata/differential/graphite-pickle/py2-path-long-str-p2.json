@@ -1,0 +1,63 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "py2.long.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py2-path-long-str-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "py2.long.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "The long str path at protocol 2.",
+ "exercises": [
+  "BINSTRING"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINFLOAT",
+  "BININT",
+  "BINPUT",
+  "BINSTRING",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "python2",
+ "protocol": 2
+}

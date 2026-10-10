@@ -1,0 +1,85 @@
+#!/bin/bash
+# Usage: script/differential <corpus> [--check]
+#   Corpora: pickle (testdata/differential/graphite-pickle/, from tools/differential/pickle/)
+#
+# Regenerates a differential corpus under testdata/differential/: generated cases, each committed
+# beside a reference implementation's reading of it, which tests read with no reference installed
+# (ADR `out-of-ci-fuzzing`'s "Seeds and differential corpora"). Review `git diff --stat
+# testdata/differential/` and commit.
+#
+# --check regenerates into a temporary directory outside the repository and fails, exit 1, if the
+# result differs from the committed files: a stale corpus, or a generator that isn't deterministic.
+#
+# Runs on the host and drives docker, like script/record-fixtures. Every image is pinned by tag and
+# digest, so a rerun writes the same bytes. Not part of script/cibuild.
+
+set -euo pipefail
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+# CPython 3.12.15, the version testdata/interop/graphite/README.md records for the CPython pickle
+# captures, and Python 2.7.18, the last Python 2, for the cPickle senders.
+PY3_IMAGE="python:3.12.15-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1"
+PY2_IMAGE="python:2.7.18-slim@sha256:6c1ffdff499e29ea663e6e67c9b6b9a3b401d554d2c9f061f9a45344e3992363"
+
+usage() {
+    sed -n '2,3p' "$0" >&2
+    exit 2
+}
+
+# generate_pickle <out_dir>: writes the carbon pickle corpus into <out_dir>. gen_py2.py writes the
+# Python 2 payloads into a scratch directory; gen_cases.py reads them, pickle.rs's opcode lists,
+# and testdata/interop/graphite/, and writes every case. Neither container has a network.
+# `-P -s` keeps the script's directory and the user site off `sys.path` and, unlike `-I`, honors
+# PYTHONHASHSEED.
+generate_pickle() {
+    local out="$1" scratch
+    scratch="$(mktemp -d)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '${scratch}'" RETURN
+    local gen="${ROOT}/tools/differential/pickle"
+    local user
+    user="$(id -u):$(id -g)"
+
+    ${DOCKER} run --rm --network none --user "${user}" -e PYTHONHASHSEED=0 \
+        -v "${gen}:/gen:ro,z" -v "${scratch}:/work:z" \
+        "${PY2_IMAGE}" python2 /gen/gen_py2.py /work/py2.json
+    ${DOCKER} run --rm --network none --user "${user}" -e PYTHONHASHSEED=0 \
+        -v "${gen}:/gen:ro,z" -v "${scratch}:/work:ro,z" \
+        -v "${ROOT}/crates/logit-proto/src/graphite/pickle.rs:/src/pickle.rs:ro,z" \
+        -v "${ROOT}/testdata/interop/graphite:/interop:ro,z" \
+        -v "${out}:/out:z" \
+        "${PY3_IMAGE}" python3 -P -s /gen/gen_cases.py --py2 /work/py2.json \
+            --allowlist /src/pickle.rs --interop /interop --out /out
+}
+
+[ $# -ge 1 ] || usage
+corpus="$1"
+shift
+check=0
+case "${1:-}" in
+    --check) check=1 ;;
+    "") ;;
+    *) usage ;;
+esac
+
+case "${corpus}" in
+    pickle) committed="${ROOT}/testdata/differential/graphite-pickle" ;;
+    *) usage ;;
+esac
+
+if [ "${check}" = 1 ]; then
+    out="$(mktemp -d)"
+    trap 'rm -rf "${out}"' EXIT
+    "generate_${corpus}" "${out}"
+    if diff -r -x README.md "${committed}" "${out}"; then
+        echo "differential: ${committed#"${ROOT}/"} is current"
+    else
+        echo "differential: ${committed#"${ROOT}/"} is stale; run script/differential ${corpus}" >&2
+        exit 1
+    fi
+else
+    mkdir -p "${committed}"
+    find "${committed}" -maxdepth 1 -type f ! -name README.md -delete
+    "generate_${corpus}" "${committed}"
+fi

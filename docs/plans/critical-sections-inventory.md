@@ -294,7 +294,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [WIRE-17](#wire-17--prometheus_in--written--logitinputsamples-reconciliation) | P1 | `prometheus_in` `-Written` / `logit.input.samples` reconciliation | `crates/logit-inputs/src/prometheus.rs` (`write_response`'s `-Written` counting, `with_written_headers`) | unreviewed |
 | [WIRE-18](#wire-18--prometheus_out-exposition-registry-upsert-type-conflict-expiry-sweep-one-pass-cap) | P1 | `prometheus_out` exposition registry: upsert, type conflict, expiry sweep, one-pass cap | `crates/logit-outputs/src/prometheus.rs` (`Registry`, `ExposeOutput::send`) | unreviewed |
 | [WIRE-19](#wire-19--prometheus_out-exposition-http-server-two-deadlines-and-synchronous-render--gzip-on-the-runtime) | P1 | `prometheus_out` exposition HTTP server: two deadlines, and synchronous render + gzip on the runtime | `crates/logit-outputs/src/prometheus.rs` (`serve`, `handle`, `response_timeout`) | unreviewed |
-| [CODEC-01](#codec-01--hand-rolled-restricted-pickle-stack-machine-reader-opcode-allowlist) | P1 | Hand-rolled restricted pickle stack-machine reader (opcode allowlist) | `crates/logit-proto/src/graphite/pickle.rs` (`PickleReader::parse`, `PickleReader::read_datapoints`) | reviewed @bde61109 (docs and tests, no code change) |
+| [CODEC-01](#codec-01--hand-rolled-restricted-pickle-stack-machine-reader-opcode-allowlist) | P1 | Hand-rolled restricted pickle stack-machine reader (opcode allowlist) | `crates/logit-proto/src/graphite/pickle.rs` (`PickleReader::parse`, `PickleReader::read_datapoints`) | findings → untrusted/w12 |
 | [CODEC-02](#codec-02--historical-pickle-memo-growth-dos-fixed-regression-sensitive) | P1 | Historical pickle memo-growth DoS (fixed, regression-sensitive) | `crates/logit-proto/src/graphite/pickle.rs` (`PickleReader::memo_put`) | reviewed @bde61109 (docs and tests, no code change) |
 | [CODEC-03](#codec-03--carbon-plaintextpickle-decode-entry-point-and-timestamp-arithmetic) | P1 | Carbon plaintext/pickle decode entry point and timestamp arithmetic | `crates/logit-proto/src/graphite/decode.rs` (`GraphiteDecoder::decode_into`, `resolve_timestamp`) | reviewed @bde61109 (docs and tests, no code change) |
 | [CODEC-05](#codec-05--dogstatsdstatsd-line-decoder--per-line-dispatch-and-event-text-unescaping) | P1 | DogStatsD/statsd line decoder — per-line dispatch and event-text unescaping | `crates/logit-proto/src/statsd/decode.rs` (`StatsdDecoder::decode_into`, `unescape_event_text`) | findings → untrusted/w7 |
@@ -5748,7 +5748,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   - every opcode not in the allowlist is rejected, including every object-construction opcode (`GLOBAL`/`STACK_GLOBAL`/`REDUCE`/`BUILD`/`INST`/`OBJ`/`NEWOBJ*`/`EXT*`/`PERSID`)
   - every declared length (`BINUNICODE`/`BINUNICODE8`/`BINBYTES8`/`SHORT_BIN*`/`FRAME`) is checked against remaining input *before* anything is sliced or sized from it (`slice()` in pickle.rs is the single choke point — confirm no length check anywhere bypasses it)
   - `BINSTRING`'s signed 32-bit length rejects negative rather than sign-extending (`parse`'s `OP_BINSTRING` arm)
-  - `LONG1`/`LONG4` magnitude capped at 8 bytes (`MAX_LONG_BYTES`) regardless of declared `n`
+  - `LONG1`/`LONG4` magnitude capped at 16 bytes (`MAX_LONG_BYTES`, an `i128`) regardless of declared `n`
   - stack size (`MAX_PICKLE_ITEMS`), open-`MARK` depth (`MAX_PICKLE_DEPTH`), and each arena (`tuples`, `lists`) independently bounded — all four caps checked *before* the corresponding `Vec` grows, not after
   - `PickleReader::datapoint`'s two-level-deep-only traversal genuinely cannot be driven deeper by any accepted opcode sequence — no recursion exists anywhere in `parse`'s opcode loop; the only nesting mechanism is the stack + `APPEND`/`APPENDS`/`TUPLE*` opcodes, none of which recurse
   - final-state check: exactly one stack value at `STOP`, and it must be a `List`
@@ -5784,6 +5784,21 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   built-frame oracle in its first seconds. Under the malloc limit the caps hold: the worst 64 KiB
   payload, one memoized datapoint repeated by two-byte `BINGET`s, allocates at most a 27 MiB
   `Vec`, pinned under the target's 32 MiB limit.
+- **Verified (untrusted/w12):** the carbon pickle differential corpus,
+  `testdata/differential/graphite-pickle/` (`script/differential pickle`), holds 115 payloads
+  CPython 3.12.15 and Python 2.7.18 wrote across protocols 0 to 5, each with CPython's reading,
+  carbon 1.1.10's receiver's reading, and the reader's declared verdict, plus readings of the five
+  recorded pickle captures; `crates/logit-proto/tests/graphite_pickle_differential.rs` checks all
+  120 with no Python installed, and the generator fails unless every accepted opcode the doc lists
+  appears in a case that reads and every rejected one in a case that fails (`BINUNICODE8`,
+  `BINBYTES8`, `LONG4`, and `DUP` excepted, each with its reason). It found 37 cases where the
+  reader's verdict differed from carbon's. Five were one finding, fixed: an integer CPython writes
+  as a 9- to 16-byte `LONG1` or a text `LONG` past `i64`, such as a `u64` counter at 2^63, failed
+  the frame where carbon stores the nearest `f64`. It now reads as that `f64` (ADR
+  `graphite-carbon-relay`'s integer amendment); with the fix reverted, the five cases fail. The
+  other 32 are recorded, each case naming its row, under `docs/known-gaps/mappings.md`'s
+  `decode (Graphite)` rows. The 115 payloads are `graphite_pickle` seeds
+  (`diff-<case>`).
 
 ### CODEC-02 — Historical pickle memo-growth DoS (fixed, regression-sensitive)
 - **Location:** `crates/logit-proto/src/graphite/pickle.rs` (`PickleReader::memo_put`); fix commit `e821381 fix(proto): bound pickle memo growth by opcodes consumed`
@@ -5841,6 +5856,15 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   `round()` removed, a run crashed on the model oracle in its first second. The worst 64 KiB
   datagram, `a 1 1` lines, allocates at most a 13.5 MiB `Vec`, pinned under the target's 16 MiB
   limit.
+- **Verified (untrusted/w12), no code change:** the carbon pickle differential corpus (CODEC-01's
+  Verified bullet) runs every case that reads through the pickle-mode `GraphiteDecoder`: each datapoint
+  becomes the module doc's event or the skip its decode table names, the skip counts equal each
+  case's declared `decoder_skips`, and a datapoint whose fate differs from carbon's
+  `metricReceived` must say why. Six do, both kinds recorded: a timestamp of `0`, `-5`, or `-1.5`
+  is `bad_timestamp`, where carbon stores the first two and reads `-1.5` as receipt time
+  (`int(-1.5) == -1`; a new `decode (Graphite)` row), and an infinite value is
+  `non_finite_value`, where carbon drops only NaN (the existing `encode (Graphite)` non-finite
+  row).
 
 ### CODEC-04 — Carbon plaintext/pickle encoder: tag sanitization, multi-value expansion, frame packing
 - **Location:** `crates/logit-proto/src/graphite/encode.rs` (`encode_record`, `multi`, `expand`); `encode.rs` (`Sink::emit`/`close_frame`/`payload_len` — pickle frame packing and the 4-byte length-prefix patch); `encode.rs` (`sanitize_into` and the three `is_forbidden_in_*` predicates); output glue `crates/logit-outputs/src/graphite.rs` (thin transport wrapper, no extra codec logic)

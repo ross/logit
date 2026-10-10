@@ -1,0 +1,47 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": []
+ },
+ "case": "py3-value-none-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "value.none",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       null
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "A None value, which float() refuses.",
+ "exercises": [
+  "NONE"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 1,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "NONE",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

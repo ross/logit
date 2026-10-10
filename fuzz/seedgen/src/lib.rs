@@ -1,5 +1,6 @@
-//! Builds the committed starting seeds under `fuzz/seeds/<target>/` from `testdata/interop/` and
-//! encoder round trips, so every fuzz target starts from inputs its decoder accepts.
+//! Builds the committed starting seeds under `fuzz/seeds/<target>/` from `testdata/interop/`,
+//! `testdata/differential/`, and encoder round trips, so every fuzz target starts from inputs its
+//! decoder accepts.
 //!
 //! A target that takes a selector byte gets it prepended, matching the target's own doc: the
 //! OTLP targets' signal (`0` logs, `1` metrics, `2` traces), `prom_decompress`'s encoding,
@@ -650,7 +651,8 @@ const CPYTHON_MEMOIZED: &[u8] = &[
 
 /// Under mode `0`: the five recorded pickle captures with their length prefix stripped (protocols
 /// 0, 2, and 5 from CPython 3, Python 2's `cPickle` protocol 0, and Dropwizard's
-/// `PickledGraphite`), a CPython dump with memoized repeats and a `LONG1`, `write_datapoints`
+/// `PickledGraphite`), every payload in `testdata/differential/graphite-pickle/` as
+/// `diff-<case>`, a CPython dump with memoized repeats and a `LONG1`, `write_datapoints`
 /// output, and hand-assembled payloads in the shapes other producers write (og-rek's
 /// `MARK … LIST`, one `APPEND` per item, protocol 1's `MARK … TUPLE`, a stray `None`, a
 /// numeric-string value, the memo key past 255 a batch of more than 256 datapoints reaches, a
@@ -680,6 +682,17 @@ fn graphite_pickle_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8
         }
     }
     out.push(("cpython-memoized".to_string(), prefixed(PAYLOAD, CPYTHON_MEMOIZED)));
+
+    // Every case of the carbon pickle differential corpus, accepted and rejected alike.
+    let mut cases: Vec<_> = std::fs::read_dir(testdata.join("differential/graphite-pickle"))?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<Result<_, _>>()?;
+    cases.retain(|path| path.extension().is_some_and(|ext| ext == "pkl"));
+    cases.sort();
+    for path in cases {
+        let stem = path.file_stem().and_then(|s| s.to_str()).expect("a UTF-8 case name");
+        out.push((format!("diff-{stem}"), prefixed(PAYLOAD, &std::fs::read(&path)?)));
+    }
 
     let written: [(&str, Vec<(&str, i64, f64)>); 4] = [
         ("one", vec![("sys.cpu;host=web-1", 1_700_000_000, 0.5)]),

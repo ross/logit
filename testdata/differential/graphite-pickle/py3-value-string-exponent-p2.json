@@ -1,0 +1,59 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "value.string-exponent",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x40f86a0000000000",
+     "repr": "100000.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-value-string-exponent-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "value.string-exponent",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       "1e5"
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "The value '1e5'.",
+ "exercises": [
+  "BINUNICODE"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

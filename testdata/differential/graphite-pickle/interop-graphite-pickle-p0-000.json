@@ -1,0 +1,144 @@
+{
+ "carbon": {
+  "items": 4,
+  "outcome": "ok",
+  "received": [
+   [
+    "logit-fixture.pickle.int_value",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x4045000000000000",
+     "repr": "42.0"
+    },
+    "store"
+   ],
+   [
+    "logit-fixture.pickle.float_value",
+    {
+     "f64": "0x41d954fc40600000",
+     "repr": "1700000001.5"
+    },
+    {
+     "f64": "0x4029800000000000",
+     "repr": "12.75"
+    },
+    "store"
+   ],
+   [
+    "logit-fixture.pickle.negative_value",
+    {
+     "f64": "0x41d954fc40800000",
+     "repr": "1700000002.0"
+    },
+    {
+     "f64": "0xc031800000000000",
+     "repr": "-17.5"
+    },
+    "store"
+   ],
+   [
+    "logit-fixture.pickle.large_value",
+    {
+     "f64": "0x41d954fc40c00000",
+     "repr": "1700000003.0"
+    },
+    {
+     "f64": "0x4132d68700000000",
+     "repr": "1234567.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "interop-graphite-pickle-p0-000",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "logit-fixture.pickle.int_value",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "int": "42"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "tuple": [
+     "logit-fixture.pickle.float_value",
+     {
+      "tuple": [
+       {
+        "f64": "0x41d954fc40600000",
+        "repr": "1700000001.5"
+       },
+       {
+        "f64": "0x4029800000000000",
+        "repr": "12.75"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "tuple": [
+     "logit-fixture.pickle.negative_value",
+     {
+      "tuple": [
+       {
+        "int": "1700000002"
+       },
+       {
+        "f64": "0xc031800000000000",
+        "repr": "-17.5"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "tuple": [
+     "logit-fixture.pickle.large_value",
+     {
+      "tuple": [
+       {
+        "int": "1700000003"
+       },
+       {
+        "f64": "0x4132d68700000000",
+        "repr": "1234567.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "testdata/interop/graphite/graphite-pickle-p0-000.raw's one frame, its 4-byte big-endian length prefix (281) stripped.",
+ "length_prefix": 281,
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "FLOAT",
+  "INT",
+  "LIST",
+  "MARK",
+  "PUT",
+  "STOP",
+  "TUPLE",
+  "UNICODE"
+ ],
+ "source": "interop/graphite/graphite-pickle-p0-000.raw"
+}

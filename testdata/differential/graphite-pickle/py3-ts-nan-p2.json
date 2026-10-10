@@ -1,0 +1,85 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "ValueError",
+   "message": "cannot convert float NaN to integer"
+  },
+  "items": 1,
+  "outcome": "raised",
+  "received": [
+   [
+    "ts.nan",
+    {
+     "f64": "0x7ff8000000000000",
+     "repr": "nan"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    {
+     "raises": "ValueError"
+    }
+   ]
+  ]
+ },
+ "case": "py3-ts-nan-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "ts.nan",
+     {
+      "tuple": [
+       {
+        "f64": "0x7ff8000000000000",
+        "repr": "nan"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "decoder_skips": {
+  "bad_timestamp": 1
+ },
+ "description": "The timestamp nan.",
+ "divergence": "carbon's metricReceived calls int() on the timestamp, which raises on NaN and infinity and closes the connection; the reader yields the datapoint, and the decoder counts it bad_timestamp (docs/known-gaps/mappings.md: decode (Graphite), a frame carbon fails that the reader keeps)",
+ "exercises": [
+  "BINFLOAT"
+ ],
+ "logit": {
+  "datapoints": [
+   [
+    "ts.nan",
+    {
+     "f64": "0x7ff8000000000000",
+     "repr": "nan"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    }
+   ]
+  ],
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINFLOAT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}
