@@ -1,0 +1,8 @@
+app.checkout_api.web_07.us_east_1.http.api.v1.orders.200.count:1|c
+app.checkout_api.web_07.us_east_1.http.api.v1.orders.duration:0.050000|ms
+app.checkout_api.web_07.us_east_1.cache.lookups:1|c|@0.1
+app.checkout_api.web_07.us_east_1.render.calls:1|c|@0.5
+app.checkout_api.web_07.us_east_1.db.select_user.duration:0.333136|ms
+app.checkout_api.web_07.us_east_1.worker.email.depth:234|g
+app.checkout_api.web_07.us_east_1.worker.webhooks.depth:110|g
+app.checkout_api.web_07.us_east_1.worker.reindex.depth:90|g

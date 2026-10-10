@@ -239,6 +239,10 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         add("stream_framing", name, bytes);
     }
 
+    for (name, bytes) in statsd_seeds(testdata)? {
+        add("statsd", name, bytes);
+    }
+
     let mut skipped = Vec::new();
     for (target, files) in seeds.iter_mut() {
         files.retain(|name, bytes| {
@@ -439,6 +443,62 @@ fn stream_framing_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>
     Ok(out)
 }
 
+/// Every recorded statsd datagram, the `datadog` client's Unix datagrams and its buffered stream
+/// connection's packets with their length prefixes stripped, and constructed lines for each shape
+/// the grammar names. The unbuffered stream connection is left out: its nine packets are the same
+/// nine calls as the Unix datagrams (`testdata/interop/datadog/README.md`).
+fn statsd_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let raw_files = |dir: &str, prefix: &str| -> std::io::Result<Vec<std::path::PathBuf>> {
+        let mut paths: Vec<_> = std::fs::read_dir(testdata.join("interop").join(dir))?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "raw"))
+            .filter(|path| {
+                path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(prefix))
+            })
+            .collect();
+        paths.sort();
+        Ok(paths)
+    };
+    for path in
+        raw_files("statsd", "statsd-")?.into_iter().chain(raw_files("datadog", "dogstatsd-unix-0")?)
+    {
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        out.push((stem, std::fs::read(&path)?));
+    }
+
+    let stream = std::fs::read(testdata.join("interop/datadog/dogstatsd-unix-stream-001.raw"))?;
+    let mut rest = &stream[..];
+    let mut packet = 0;
+    while let Some((prefix, body)) = rest.split_first_chunk::<4>() {
+        let len = u32::from_le_bytes(*prefix) as usize;
+        let (frame, tail) = body.split_at(len.min(body.len()));
+        out.push((format!("dogstatsd-unix-stream-001-{packet}"), frame.to_vec()));
+        rest = tail;
+        packet += 1;
+    }
+
+    for (name, datagram) in [
+        ("event-escapes", &b"_e{5,14}:title|one\\ntwo\\n\\n|t:warning|p:low|#env:a\n"[..]),
+        ("event-every-field", b"_e{2,4}:hi|body|d:1700000000|h:web|p:normal|t:error|k:agg|s:src|#a,b:1|c:cid|e:ext|card:low"),
+        ("event-trailing-space", b"_e{1,3}:t|a  "),
+        ("service-check", b"_sc|db.ok|2|d:1700000000|h:db|#env:a|m:slow upstream|c:cid|card:high"),
+        ("multi-value-timer", b"latency:1:2:3|ms|@0.5|#route:/a"),
+        ("multi-value-counter", b"hits:1:2:-3|c|@0.25"),
+        ("gauge-deltas", b"load:+1|g\nload:-2|g\nload:3|g"),
+        ("set", b"users:alice:bob:alice|s|#team:a,team:b,team:a"),
+        ("timestamp", b"hits:1|c|T1700000000\nhits:1|c|T9223372036"),
+        ("origin-fields", b"hits:1|c|c:ci-0123|e:it-false,cn-app|card:orchestrator"),
+        ("tags", b"hits:1|c|#urgent,urgent:1,env:prod|#env:dev"),
+        ("sample-rate", b"latency:12|h|@0.001\nsize:4|d|@1"),
+        ("float-extremes", b"big:1.7e308|c|@0.99\nmax:-1.7976931348623157e308|g\nlat:1e-300:4.9e-324|ms"),
+        ("mixed-lines", b"a:1|c\r\n  b:2|g  \n\nbad line\n_total.count:1|c\n"),
+    ] {
+        out.push((format!("constructed-{name}"), datagram.to_vec()));
+    }
+    Ok(out)
+}
+
 fn prefixed(selector: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + body.len());
     out.push(selector);
@@ -511,6 +571,7 @@ mod tests {
                 "proxy_header",
                 "sketch_bytes",
                 "sketch_merge",
+                "statsd",
                 "stream_framing",
             ]
         );

@@ -51,7 +51,8 @@
 //! receipt time `decode_into`'s `received_at` supplies, and stamps
 //! `statsd.timestamp: Value::U64(secs)`, the raw wire value. The carrier is what survives a stage
 //! that rebuilds `Event::timestamp` (`aggregate`'s flush), and it tells a wire timestamp from a
-//! receipt-time one. A non-digit or overflowing `|T` rejects only that line as `bad_line`. Both
+//! receipt-time one. A `|T` that isn't an unsigned integer (the form is under the rejection
+//! rules below), or whose nanoseconds overflow `i64`, rejects only that line as `bad_line`. Both
 //! attributes are protocol-namespaced carriers (`docs/adr/lossless-transit.md`). Every other
 //! unrecognized `|` segment is accepted and ignored, for forward compatibility.
 //!
@@ -64,8 +65,15 @@
 //!
 //! A line is rejected as `bad_line` when it has no `:` or an empty name, no `|<type>`, an unknown
 //! type, a `c`/`g`/`ms`/`h`/`d` value that doesn't parse or isn't finite (`NaN`/`inf` parse as
-//! `f64`; `s` members are opaque and never parsed), or an `@rate` that doesn't parse, isn't
-//! finite, or is outside `(0, 1]` (checked even on a `g`/`s` line, which ignores the rate).
+//! `f64`; `s` members are opaque and never parsed), a `c` value whose extrapolation overflows to
+//! infinity (`1e308|c|@0.1`), or an `@rate` that doesn't parse, isn't finite, or is outside
+//! `(0, 1]` (checked even on a `g`/`s` line, which ignores the rate).
+//!
+//! The integer fields, `|T`, an event's `d:` and `{TITLE_LEN,TEXT_LEN}`, and a service check's
+//! `STATUS`, parse as Rust's unsigned integers do: decimal digits, with an optional leading `+`
+//! and any number of leading zeros. No recorded client writes either, and both name the same
+//! number as the bare digits, so accepting them loses nothing. `statsd_out` writes the bare
+//! digits.
 //!
 //! ## DogStatsD tags
 //!

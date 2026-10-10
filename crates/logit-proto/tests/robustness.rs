@@ -8,7 +8,10 @@
 //! must pass this suite (`docs/plans/native-transport.md`). The OTLP section pins the limits OTLP
 //! decoding relies on instead of caps of its own: each parser's nesting limit, timestamp
 //! saturation, and OTLP/JSON's peak memory per input byte. The framing section also pins the
-//! drain state's single `drained` count and the table of what a FIN and an RST count.
+//! drain state's single `drained` count and the table of what a FIN and an RST count. The statsd
+//! section runs `statsd::StatsdDecoder` over every recorded datagram, and pins event-text
+//! unescaping against `str::replace`, the last `|T` second whose nanoseconds fit an `i64`, and
+//! the largest allocation a 64 KiB datagram makes.
 //!
 //! For each decoder: every single-byte truncation of a valid input, thousands of seeded bit flips,
 //! length fields inflated past the input, and, for `decode_batch`, `Value` nesting past the depth
@@ -35,6 +38,7 @@ use logit_proto::otlp::generated::opentelemetry::proto::resource::v1 as otlp_res
 use logit_proto::otlp::generated::opentelemetry::proto::trace::v1 as otlp_trace;
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{self, DecompressError, Encoding};
+use logit_proto::statsd::StatsdDecoder;
 use logit_proto::{
     CodecError, Decoder, Encoder, Signal, SignalDecoder, SignalEncoder, SignalPayload,
 };
@@ -53,16 +57,19 @@ struct CountingAlloc;
 thread_local! {
     static LIVE: Cell<i64> = const { Cell::new(0) };
     static PEAK: Cell<i64> = const { Cell::new(0) };
+    static LARGEST: Cell<i64> = const { Cell::new(0) };
 }
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record(layout.size() as i64);
+        record_size(layout.size());
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         record(layout.size() as i64);
+        record_size(layout.size());
         unsafe { System.alloc_zeroed(layout) }
     }
 
@@ -73,6 +80,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         record(new_size as i64 - layout.size() as i64);
+        record_size(new_size);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -89,6 +97,11 @@ fn record(delta: i64) {
     });
 }
 
+/// The largest single allocation, the size libFuzzer's `-malloc_limit_mb` checks.
+fn record_size(size: usize) {
+    LARGEST.with(|largest| largest.set(largest.get().max(size as i64)));
+}
+
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
 
@@ -99,6 +112,13 @@ fn peak_live_bytes(f: impl FnOnce()) -> i64 {
     PEAK.with(|peak| peak.set(0));
     f();
     PEAK.with(|peak| peak.get())
+}
+
+/// Runs `f`, returning its peak live bytes and its largest single allocation.
+fn peak_and_largest_allocation(f: impl FnOnce()) -> (i64, i64) {
+    LARGEST.with(|largest| largest.set(0));
+    let peak = peak_live_bytes(f);
+    (peak, LARGEST.with(|largest| largest.get()))
 }
 
 // -- seeded LCG -------------------------------------------------------------------------------
@@ -1536,6 +1556,166 @@ fn a_fin_and_an_rst_agree_about_every_remainder() {
             (_, got) => panic!("{label}: a FIN gave {got:?}"),
         }
         assert_eq!(by_rst.abandon().as_ref().map(FrameError::reason), rst, "{label}");
+    }
+}
+
+// -- statsd -------------------------------------------------------------------------------------
+//
+// `StatsdDecoder::decode_into` over one datagram, as `statsd_in` hands it one. A bad line is a
+// throttled `bad_line` diagnostic, never an error, so a rejected line shows as a missing event.
+
+/// Every recorded statsd datagram: `testdata/interop/statsd/` and the `datadog` client's Unix
+/// datagrams (each directory's `README.md` has the provenance).
+fn statsd_datagrams() -> Vec<(String, Vec<u8>)> {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/interop");
+    let mut out = Vec::new();
+    for (dir, prefix) in [("statsd", "statsd-"), ("datadog", "dogstatsd-unix-0")] {
+        let mut paths: Vec<_> = std::fs::read_dir(format!("{root}/{dir}"))
+            .expect("the recorded corpus is checked in")
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.starts_with(prefix) && name.ends_with(".raw")
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            out.push((name, std::fs::read(&path).unwrap()));
+        }
+    }
+    assert!(out.len() >= 60, "expected the whole recorded corpus, got {}", out.len());
+    out
+}
+
+fn statsd_decode(datagram: &[u8]) -> Result<Vec<Event>, CodecError> {
+    let mut out = Vec::new();
+    StatsdDecoder::new(Arc::new(Resource::default())).decode_into(
+        Bytes::copy_from_slice(datagram),
+        0,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+#[test]
+fn statsd_survives_every_single_byte_truncation_of_every_recorded_datagram() {
+    for (name, datagram) in statsd_datagrams() {
+        let survived = std::panic::catch_unwind(|| {
+            assert_every_truncation_never_panics(&datagram, |bytes| statsd_decode(bytes).is_err())
+        });
+        assert!(survived.is_ok(), "{name}");
+    }
+}
+
+#[test]
+fn statsd_survives_seeded_bit_flips_over_every_recorded_datagram() {
+    for (name, datagram) in statsd_datagrams() {
+        let survived = std::panic::catch_unwind(|| {
+            assert_bit_flips_never_panic(&datagram, 300, |bytes| statsd_decode(bytes).is_err())
+        });
+        assert!(survived.is_ok(), "{name}");
+    }
+}
+
+/// An event's text unescaped against `str::replace` as the oracle. `unescape_event_text` sizes
+/// its buffer as `raw.len() - escapes` and `debug_assert`s it filled that, which runs here: a
+/// count off by one either way panics in this test. Text with nothing to unescape stays a slice
+/// of the datagram.
+#[test]
+fn statsd_event_text_unescapes_as_str_replace_does() {
+    let mut texts: Vec<String> = (0..=64).map(|n| "\\n".repeat(n)).collect();
+    texts.extend(
+        [
+            "",
+            "\\",
+            "a\\",
+            "\\\\n",
+            "\\\\\\n",
+            "\\nn",
+            "n\\",
+            "\\n\\",
+            "a\\nb\\nc",
+            "é\\nü\\n",
+            "\\n|t:error",
+            "\\N\\r\\t",
+        ]
+        .map(String::from),
+    );
+    for text in texts {
+        let datagram = format!("_e{{1,{}}}:t|{text}", text.len());
+        let bytes = Bytes::from(datagram.clone());
+        let mut out = Vec::new();
+        StatsdDecoder::new(Arc::new(Resource::default()))
+            .decode_into(bytes.clone(), 0, &mut out)
+            .unwrap();
+        assert_eq!(out.len(), 1, "{datagram:?} decodes to one event");
+        let Value::Str(message) = &out[0].log.as_ref().unwrap().message else {
+            panic!("{datagram:?}: the message is a Str");
+        };
+        assert_eq!(&message[..], text.replace("\\n", "\n").as_bytes(), "{datagram:?}");
+        assert_eq!(
+            logit_core::subslice::within(&bytes, message),
+            !text.contains("\\n"),
+            "{datagram:?}: a slice if and only if nothing was unescaped"
+        );
+    }
+}
+
+/// `|T` seconds become nanoseconds through `checked_mul` and `i64::try_from`: `9223372036` is the
+/// last second whose nanoseconds fit an `i64`, `9223372037` the first that doesn't, and
+/// `18446744074` the first whose `u64` multiplication overflows. Each rejection drops only its
+/// line, and an event's and a service check's `d:` share the parse.
+#[test]
+fn statsd_wire_seconds_reject_past_the_last_representable_second() {
+    let events = statsd_decode(b"a:1|c|T9223372036").unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].timestamp, 9_223_372_036_000_000_000);
+    for secs in ["9223372037", "18446744073", "18446744074", "18446744073709551616"] {
+        for line in [
+            format!("a:1|c|T{secs}"),
+            format!("_e{{1,1}}:t|x|d:{secs}"),
+            format!("_sc|check|0|d:{secs}"),
+        ] {
+            let events = statsd_decode(format!("{line}\nb:1|c").as_bytes()).unwrap();
+            assert_eq!(events.len(), 1, "{line}: only the other line decodes");
+            assert_eq!(events[0].timestamp, 0, "{line}");
+        }
+    }
+}
+
+/// The input that makes the most events per byte, `a:1:1:…|c` filling the frame bound: one
+/// 864-byte `Event` per two wire bytes. Two lines can be worse than one, because the second
+/// line's append doubles `out`'s capacity past the first line's exact fit. The largest single
+/// allocation is what `script/unsafe-check`'s `statsd` malloc limit sits above.
+#[test]
+fn statsd_worst_case_datagram_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 56 << 20;
+    let one_line = {
+        let mut line = b"a:1".to_vec();
+        while line.len() + 4 <= MAX_FRAME_BYTES {
+            line.extend_from_slice(b":1");
+        }
+        line.extend_from_slice(b"|c");
+        line
+    };
+    let two_lines = {
+        let mut line = one_line[..one_line.len() - 8].to_vec();
+        line.extend_from_slice(b"|c\na:1|c");
+        line
+    };
+    for (name, datagram) in [("one line", one_line), ("two lines", two_lines)] {
+        assert!(datagram.len() <= MAX_FRAME_BYTES, "{name}");
+        let mut events = 0;
+        let (peak, largest) = peak_and_largest_allocation(|| {
+            events = statsd_decode(&datagram).unwrap().len();
+        });
+        eprintln!(
+            "{name}: {} bytes, {events} events, peak {peak}, largest {largest}",
+            datagram.len()
+        );
+        assert!(events * 2 + 8 >= datagram.len(), "{name}: about one event per two bytes");
+        assert!(largest < MALLOC_LIMIT, "{name}: largest allocation {largest}");
     }
 }
 
