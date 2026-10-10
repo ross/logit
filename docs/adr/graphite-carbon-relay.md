@@ -502,8 +502,8 @@ producer's source on 2026-10-09 found:
 
 | Producer | Pickle protocol | What it writes per datapoint |
 |---|---|---|
-| Dropwizard Metrics [`PickledGraphite`](https://github.com/dropwizard/metrics/blob/v4.2.25/metrics-graphite/src/main/java/com/codahale/metrics/graphite/PickledGraphite.java) (3.2.6 and 4.2.25) | 0, written by hand | `(S'<name>'\n(L<ts>L\nS'<value>'\ntta` inside `(l` … `.`, with no memo. The name is never escaped and can hold raw UTF-8 bytes. The value is a quoted `%2.2f` string, possibly `NaN` or `Infinity`. JVM services reach it through `metrics-reporter-config`'s `pickled` reporter, Cassandra's pluggable reporter, or direct wiring. |
-| Diamond [`GraphitePickleHandler`](https://github.com/python-diamond/Diamond/blob/master/src/diamond/handler/graphitepickle.py) | the interpreter default: 0 on Python 2 (`cPickle.dumps(batch)`), 3 or higher on Python 3 | Python 2 writes `(S'<path>'\np1\n(I<ts>\nF<value>\ntp2\ntp3\na`: a `PUT` memo, and `L` for a timestamp on a 32-bit platform |
+| Dropwizard Metrics [`PickledGraphite`](https://github.com/dropwizard/metrics/blob/v4.2.25/metrics-graphite/src/main/java/com/codahale/metrics/graphite/PickledGraphite.java) (3.2.6 and 4.2.25) | 0, written by hand | `(S'<name>'\n(L<ts>L\nS'<value>'\ntta` inside `(l` … `.`, with no memo. The name is never escaped and can hold raw UTF-8 bytes. The value is a quoted string: `%2.2f` for a floating-point gauge, a plain integer such as `S'42'` for a counter, or `S'NaN'`, which the decoder skips and counts as a non-finite value, as carbon drops it. JVM services reach it through `metrics-reporter-config`'s `pickled` reporter, Cassandra's pluggable reporter, or direct wiring. |
+| Diamond [`GraphitePickleHandler`](https://github.com/python-diamond/Diamond/blob/master/src/diamond/handler/graphitepickle.py) | the interpreter default: 0 on Python 2 (`cPickle.dumps(batch)`), 3 or higher on Python 3 | Python 2 writes `(S'<path>'\np1\n(I<ts>\nF<value>\ntp2\ntp3\na`: a `PUT` memo. A timestamp passes 2^31 only after 2038, and only then does a 32-bit Python 2 write it as a `long`, `L…L` |
 | [graphitesend](https://github.com/daniellawrence/graphitesend/blob/master/graphitesend/graphitesend.py) | the interpreter default (0 on Python 2) | the same as Diamond |
 | [og-rek](https://github.com/kisielk/og-rek/blob/master/encode.go) (Go) | 2 by default, 0 with a zero-value config | `I`, `F` (`%g`), and `S`, with no memo |
 | carbon's own [client](https://github.com/graphite-project/carbon/blob/master/lib/carbon/client.py) | 2 (`pickle.dumps(datapoints, protocol=2)`) | binary opcodes only |
@@ -548,8 +548,9 @@ Each textual opcode's argument runs to the next `\n` in the remaining input. A m
 - **`LONG`**: decimal with an optional trailing `L`, as CPython's loader treats it, read into an
   `i64`. An overflow is `Malformed`.
 - **`INT` and `LONG` leading zeros**: a multi-digit literal with a leading zero followed by a
-  non-zero digit, such as `010`, is `Malformed`, because Python 2's `strtol` with base 0 reads it as
-  octal. An all-zero spelling such as `00` is accepted.
+  non-zero digit, such as `010`, is `Malformed`. CPython's C `load_int`, on both Python 2 and
+  Python 3, parses with `strtol` and base 0, which reads such a literal as octal, so no decimal
+  reading of it would match what CPython decodes. An all-zero spelling such as `00` is accepted.
 - **`FLOAT`**: Rust's `f64` parse, which accepts `nan`, `inf`, and exponent forms such as `1e+06`.
   A literal `nan` or `inf` reaches the decoder's existing `non_finite_value` skip, as carbon drops a
   NaN. An out-of-range literal such as `F1e999` is `Malformed` rather than infinity, matching
