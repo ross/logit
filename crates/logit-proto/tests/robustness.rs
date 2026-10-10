@@ -3143,9 +3143,9 @@ fn prometheus_text_histogram_reconstruction() {
     }
 }
 
-/// A histogram whose only bucket is `-Inf` gains a `+Inf` one: `Point::Histogram`'s buckets end
-/// at `+Inf` (`crates/logit-proto/src/prometheus/mod.rs`), and a check for a *finite* last bound
-/// stepped over `-Inf`. The `prom_text` target found it.
+/// A histogram whose only bucket is `-Inf` gains a `+Inf` one, on decode and on encode:
+/// `Point::Histogram`'s buckets end at `+Inf` (`crates/logit-proto/src/prometheus/mod.rs`), and a
+/// last bound of `-Inf` isn't one.
 #[test]
 fn prometheus_text_a_neg_inf_only_histogram_gains_a_pos_inf_bucket() {
     let body = "# TYPE h histogram\nh_bucket{le=\"-Inf\"} 3\n";
@@ -3180,9 +3180,8 @@ fn prometheus_text_a_neg_inf_only_histogram_gains_a_pos_inf_bucket() {
     assert_eq!(buckets.as_slice(), [(f64::NEG_INFINITY, 3), (f64::INFINITY, 3)]);
 }
 
-/// A line naming `le` or `quantile` twice is a `duplicate_label`, as any repeated label is. Taking
-/// the first as the bound left the second as a series label, which the writer then wrote beside the
-/// generated one. The `prom_text` target's oracle found it.
+/// A line naming `le` or `quantile` twice is a `duplicate_label`, as any repeated label is,
+/// rather than a bound plus a series label of the same name.
 #[test]
 fn prometheus_text_a_repeated_le_or_quantile_is_a_duplicate_label() {
     for body in [
@@ -3200,9 +3199,8 @@ fn prometheus_text_a_repeated_le_or_quantile_is_a_duplicate_label() {
 }
 
 /// The writer orders families by the name their `# TYPE` line carries, writes one family per
-/// name, counting the other's series, and writes nothing for a family with no line to write.
-/// Each broke `write(parse(write(parse(x)))) == write(parse(x))`, and the `prom_text` target found
-/// each.
+/// name, counting the other's series, and writes nothing for a family with no line to write, so
+/// `write(parse(write(parse(x)))) == write(parse(x))`.
 #[test]
 fn prometheus_text_writes_a_fixed_point() {
     let cases: [(&str, &str, u64); 3] = [
@@ -3355,8 +3353,8 @@ fn assert_remote_write_fixed_point(body: &[u8], version: remote_write::Version) 
 }
 
 /// 1.0 metadata names a counter after its value sample, `_total` included: the model name gains
-/// `_total` on decode whatever the metadata said, so naming it `foo` here made the next encode
-/// name it `foo_total`. The `prom_remote_write` target found it.
+/// `_total` on decode whatever the metadata says, so any other name would differ on the next
+/// encode.
 #[test]
 fn remote_write_1_0_metadata_names_a_counter_with_its_total_suffix() {
     let groups = [vec![remote_write_counter("foo", 1_000_000_000, 1.0, Vec::new())]];
@@ -3368,8 +3366,7 @@ fn remote_write_1_0_metadata_names_a_counter_with_its_total_suffix() {
 }
 
 /// An exemplar lands on a reading, never on a stale marker: the encoder drops an exemplar it finds
-/// on a stale series, so placing one there lost it on the next hop. The `prom_remote_write` target
-/// found it.
+/// on a stale series, so one placed there would be lost on the next hop.
 #[test]
 fn remote_write_an_exemplar_is_never_placed_on_a_stale_marker() {
     let label = |name: &str, value: &str| pb1::Label { name: name.into(), value: value.into() };
@@ -3404,8 +3401,8 @@ fn remote_write_an_exemplar_is_never_placed_on_a_stale_marker() {
 }
 
 /// Every series of a family carries one help and unit, the first the groups offer: decode applies
-/// a family's description to all its series, so a series written without one came back with it.
-/// The `prom_remote_write` target found it.
+/// a family's description to all its series, so a series written without it would decode with
+/// it.
 #[test]
 fn remote_write_every_series_of_a_family_carries_one_description() {
     let gauge = |value: &str, help: Option<&str>| {
@@ -3433,9 +3430,8 @@ fn remote_write_every_series_of_a_family_carries_one_description() {
     assert_remote_write_fixed_point(&body, remote_write::Version::V2);
 }
 
-/// A series merged from several groups writes its exemplars in timestamp order: decode places each
-/// by its own timestamp, so group order came back as a different order. The
-/// `prom_remote_write` target found it.
+/// A series merged from several groups writes its exemplars in timestamp order, the order decode
+/// places them by.
 #[test]
 fn remote_write_a_series_exemplars_are_written_in_timestamp_order() {
     let groups = [
