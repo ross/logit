@@ -8,8 +8,9 @@ import java.util.concurrent.TimeUnit;
 /**
  * Reports a fixed registry once through Dropwizard's `GraphiteReporter` and `PickledGraphite`,
  * so the capture holds one real protocol-0 frame. A fixed clock pins every datapoint's timestamp
- * to 1700000000; `GraphiteReporter` sends a registry's metrics in name order and formats each
- * value with `%2.2f`, so the frame is the same on every run.
+ * to 1700000000. `GraphiteReporter` sends gauges, then counters, each sorted by name, and formats
+ * a gauge's `Double` with `%2.2f` and a counter's count as a plain integer, so the frame is the
+ * same on every run.
  *
  * `interop_fixture_dropwizard_decodes` in crates/logit-inputs/src/graphite/mod.rs asserts on these
  * exact names and values; change them together.

@@ -10,7 +10,8 @@ Diamond writes: protocol 0, a `PUT` memo numbered from 1 (cPickle's numbering, n
 `STRING` paths in Python 2 `repr` form, and a `GET` when one path object repeats.
 
 `DATAPOINTS` holds a UTF-8 path, which cPickle escapes as `\\xc3\\xa9`, and a `long` timestamp,
-written `L1700000003L`, as Diamond's `int` timestamp is on a 32-bit platform.
+written `L1700000003L`. Diamond's timestamp is written that way only when it is a Python `long`,
+which on a 32-bit platform means past 2038; the script's `long` literal exercises `LONG` today.
 `interop_fixture_pickle_python_2_decodes` in `crates/logit-inputs/src/graphite/mod.rs` asserts on
 these exact paths and values; change them together.
 
