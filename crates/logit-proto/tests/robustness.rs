@@ -3763,8 +3763,8 @@ fn json_worst_case_message_stays_under_the_fuzz_malloc_limit() {
     }
 }
 
-/// `message_csv`'s worst message, 64 KiB of delimiters: 65,537 empty fields, whose offsets, the
-/// unescaped fields, and the target's reference reading each grow by doubling.
+/// `message_csv`'s worst message, 64 KiB of delimiters: 65,537 empty fields, whose offsets and
+/// the target's reference reading grow by doubling, the reading to the largest allocation.
 #[test]
 fn csv_worst_case_message_stays_under_the_fuzz_malloc_limit() {
     let row = vec![b','; MESSAGE_BYTES];
