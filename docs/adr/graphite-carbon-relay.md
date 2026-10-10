@@ -561,9 +561,9 @@ Each textual opcode's argument runs to the next `\n` in the remaining input. A m
 - **`INT`**: decimal `i64` with an optional sign. CPython's loader calls `int(x, 0)`, which also
   takes `0x`, `0o`, `0b`, and `_` separators. No surveyed sender writes any of them, so the reader
   rejects them as `Malformed`. An overflow is `Malformed`, matching `LONG1`/`LONG4`'s 8-byte cap.
-  (Amended 2026-10-09: both read an `i128`; see the next amendment.)
 - **`LONG`**: decimal with an optional trailing `L`, as CPython's loader treats it, read into an
-  `i64`. An overflow is `Malformed`.
+  `i64`. An overflow is `Malformed`. (Amended 2026-10-09: `INT` and `LONG` both read an `i128`;
+  see "Amendment: an integer past `i64` reads as the nearest `f64`".)
 - **`INT` and `LONG` leading zeros**: a multi-digit literal with a leading zero followed by a
   non-zero digit, such as `010`, is `Malformed`. CPython's C `load_int`, on both Python 2 and
   Python 3, parses with `strtol` and base 0, which reads such a literal as octal, so no decimal
@@ -620,10 +620,11 @@ Python reads it into.
 
 - `LONG1` and `LONG4` take a magnitude of at most 16 bytes, an `i128`, and the text `INT` and
   `LONG` take any decimal that fits an `i128`.
-- A value that fits an `i64` stays an integer. A larger one becomes the nearest `f64`, rounded to
+- A value that fits an `i64` stays an integer. A larger one, below 2^127, becomes the nearest
+  `f64`, rounded to
   nearest with ties to even, which is how CPython's `float(int)` rounds.
-- A magnitude past 16 bytes still fails the frame. Only hand-built code writes an integer past
-  2^127, and `docs/known-gaps/mappings.md` records it with the corpus's other
+- A magnitude past 16 bytes still fails the frame. Only hand-built code writes an integer of
+  magnitude 2^127 or more, and `docs/known-gaps/mappings.md` records it with the corpus's other
   `decode (Graphite)` divergences.
 
 The bound still costs nothing: every magnitude is read from a slice already validated against the

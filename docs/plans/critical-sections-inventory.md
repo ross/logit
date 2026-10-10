@@ -5748,7 +5748,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   - every opcode not in the allowlist is rejected, including every object-construction opcode (`GLOBAL`/`STACK_GLOBAL`/`REDUCE`/`BUILD`/`INST`/`OBJ`/`NEWOBJ*`/`EXT*`/`PERSID`)
   - every declared length (`BINUNICODE`/`BINUNICODE8`/`BINBYTES8`/`SHORT_BIN*`/`FRAME`) is checked against remaining input *before* anything is sliced or sized from it (`slice()` in pickle.rs is the single choke point — confirm no length check anywhere bypasses it)
   - `BINSTRING`'s signed 32-bit length rejects negative rather than sign-extending (`parse`'s `OP_BINSTRING` arm)
-  - `LONG1`/`LONG4` magnitude capped at 16 bytes (`MAX_LONG_BYTES`, an `i128`; 8 before untrusted/w12) regardless of declared `n`
+  - `LONG1`/`LONG4` magnitude capped at 16 bytes (`MAX_LONG_BYTES`, an `i128`) regardless of declared `n`
   - stack size (`MAX_PICKLE_ITEMS`), open-`MARK` depth (`MAX_PICKLE_DEPTH`), and each arena (`tuples`, `lists`) independently bounded — all four caps checked *before* the corresponding `Vec` grows, not after
   - `PickleReader::datapoint`'s two-level-deep-only traversal genuinely cannot be driven deeper by any accepted opcode sequence — no recursion exists anywhere in `parse`'s opcode loop; the only nesting mechanism is the stack + `APPEND`/`APPENDS`/`TUPLE*` opcodes, none of which recurse
   - final-state check: exactly one stack value at `STOP`, and it must be a `List`
@@ -5796,12 +5796,8 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   as a 9- to 16-byte `LONG1` or a text `LONG` past `i64`, such as a `u64` counter at 2^63, failed
   the frame where carbon stores the nearest `f64`. It now reads as that `f64` (ADR
   `graphite-carbon-relay`'s integer amendment); with the fix reverted, the five cases fail. The
-  other 32 are recorded under `docs/known-gaps/mappings.md`'s `decode (Graphite)` rows: values
-  carbon's `float()` coerces (a bool, padded, `_`-separated, or full-width numeric strings, an
-  integer past 2^127; 12 cases), lone-surrogate paths (2), shapes carbon iterates (a tuple, dict,
-  set, or frozenset batch, a recursive tuple, a `bytearray` value; 9), list-shaped datapoints, the
-  existing row (4), and frames carbon's receiver fails that the reader keeps (a Python 3 `bytes`
-  path, a NaN or infinite timestamp; 5). The 115 payloads are `graphite_pickle` seeds
+  other 32 are recorded, each case naming its row, under `docs/known-gaps/mappings.md`'s
+  `decode (Graphite)` rows. The 115 payloads are `graphite_pickle` seeds
   (`diff-<case>`).
 
 ### CODEC-02 — Historical pickle memo-growth DoS (fixed, regression-sensitive)
@@ -5861,7 +5857,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   datagram, `a 1 1` lines, allocates at most a 13.5 MiB `Vec`, pinned under the target's 16 MiB
   limit.
 - **Verified (untrusted/w12), no code change:** the carbon pickle differential corpus (CODEC-01's
-  w12 line) runs every case that reads through the pickle-mode `GraphiteDecoder`: each datapoint
+  Verified bullet) runs every case that reads through the pickle-mode `GraphiteDecoder`: each datapoint
   becomes the module doc's event or the skip its decode table names, the skip counts equal each
   case's declared `decoder_skips`, and a datapoint whose fate differs from carbon's
   `metricReceived` must say why. Six do, both kinds recorded: a timestamp of `0`, `-5`, or `-1.5`
