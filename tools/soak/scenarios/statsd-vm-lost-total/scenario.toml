@@ -1,0 +1,44 @@
+# A negative control for the loss ledger: the SUT stops while VictoriaMetrics is down, so the
+# batches holding its first life's last totals drop at shutdown. That life's `ledger.egress` must
+# report a positive gap as counted, beside `drain complete`'s `batches_dropped`, and the summary
+# row's other terms must stay 0. The schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "statsd-vm-lost-total"
+description = "statsd-vm with a SUT stop inside a VictoriaMetrics stop: a life's last totals lost at shutdown, counted"
+duration = "5m"           # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"
+cycle = "3m"
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+sut_aggregate = "window"
+sut_sink = "victoria_metrics"
+wire_loss_outside_faults = 0.0
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+# The SUT's stop starts and ends inside VictoriaMetrics' stop, so its sink is retrying at the
+# signal and its second life starts with nowhere to deliver.
+[[step]]
+at = "0s"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+[[step]]
+at = "30s"
+action = "stop"
+on = "logit"
+for = "30s"
