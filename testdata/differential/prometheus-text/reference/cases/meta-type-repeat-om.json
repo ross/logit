@@ -1,0 +1,28 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "m",
+   "value": "gauge"
+  },
+  {
+   "kind": "type",
+   "name": "m",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "m",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xd985c3c5",
+  "len": 40,
+  "path": "differential/prometheus-text/cases/meta-type-repeat-om.om"
+ },
+ "parser": "openmetrics"
+}

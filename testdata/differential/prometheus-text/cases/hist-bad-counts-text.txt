@@ -1,0 +1,6 @@
+# TYPE h histogram
+h_bucket{le="1"} NaN
+h_bucket{le="2"} -1
+h_bucket{le="+Inf"} 3
+h_sum 9
+h_count +Inf

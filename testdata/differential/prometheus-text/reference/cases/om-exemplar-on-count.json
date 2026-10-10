@@ -1,0 +1,43 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "h",
+   "value": "histogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4000000000000000"
+  },
+  {
+   "exemplar": {
+    "labels": [
+     [
+      "a",
+      "b"
+     ]
+    ],
+    "value": "0x3ff0000000000000"
+   },
+   "kind": "series",
+   "labels": [],
+   "name": "h_count",
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x25bb6b34",
+  "len": 69,
+  "path": "differential/prometheus-text/cases/om-exemplar-on-count.om"
+ },
+ "parser": "openmetrics"
+}

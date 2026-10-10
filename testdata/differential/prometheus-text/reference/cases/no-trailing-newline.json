@@ -1,0 +1,29 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "b"
+    ]
+   ],
+   "name": "g",
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xf76588eb",
+  "len": 14,
+  "path": "differential/prometheus-text/cases/no-trailing-newline.txt"
+ },
+ "parser": "prom"
+}

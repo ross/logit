@@ -1,0 +1,32 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "g",
+   "value": "gauge"
+  },
+  {
+   "exemplar": {
+    "labels": [
+     [
+      "a",
+      "b"
+     ]
+    ],
+    "value": "0x3ff0000000000000"
+   },
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x1124a44b",
+  "len": 37,
+  "path": "differential/prometheus-text/cases/om-exemplar-on-gauge.om"
+ },
+ "parser": "openmetrics"
+}

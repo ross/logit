@@ -1,0 +1,22 @@
+{
+ "divergence": "two label pairs with no comma between them: Prometheus's text 0.0.4 parser takes the comma as optional, this decoder skips the line (docs/known-gaps/mappings.md: A line Prometheus's text parser keeps that this decoder skips)",
+ "divergent": [
+  [
+   "e",
+   [
+    [
+     "a",
+     "1"
+    ],
+    [
+     "b",
+     "2"
+    ]
+   ]
+  ]
+ ],
+ "result": "ok",
+ "skips": {
+  "malformed_line": 1
+ }
+}

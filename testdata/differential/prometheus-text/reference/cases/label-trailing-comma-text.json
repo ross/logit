@@ -1,0 +1,23 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "1"
+    ]
+   ],
+   "name": "e",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xc33acf3c",
+  "len": 12,
+  "path": "differential/prometheus-text/cases/label-trailing-comma-text.txt"
+ },
+ "parser": "prom"
+}

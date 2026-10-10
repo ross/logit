@@ -1,0 +1,28 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "help",
+   "name": "m",
+   "value": "a\\b\nc\"d\\te"
+  },
+  {
+   "kind": "type",
+   "name": "m",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "m",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xb1d32981",
+  "len": 48,
+  "path": "differential/prometheus-text/cases/meta-help-escapes-om.om"
+ },
+ "parser": "openmetrics"
+}

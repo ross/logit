@@ -1,0 +1,23 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "z\n"
+    ]
+   ],
+   "name": "e",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x09aae594",
+  "len": 13,
+  "path": "differential/prometheus-text/cases/esc-newline-text.txt"
+ },
+ "parser": "prom"
+}

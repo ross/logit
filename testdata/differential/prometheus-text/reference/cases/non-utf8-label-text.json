@@ -1,0 +1,21 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": {
+  "after_entry": 1,
+  "message": "invalid UTF-8 label value: \"\\\"\\xff\\\"\""
+ },
+ "input": {
+  "crc32c": "0x8b13c219",
+  "len": 19,
+  "path": "differential/prometheus-text/cases/non-utf8-label-text.txt"
+ },
+ "parser": "prom"
+}

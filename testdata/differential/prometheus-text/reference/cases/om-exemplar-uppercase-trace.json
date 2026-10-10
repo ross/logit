@@ -1,0 +1,32 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "r",
+   "value": "counter"
+  },
+  {
+   "exemplar": {
+    "labels": [
+     [
+      "trace_id",
+      "0123456789ABCDEF0123456789ABCDEF"
+     ]
+    ],
+    "value": "0x3fe0000000000000"
+   },
+   "kind": "series",
+   "labels": [],
+   "name": "r_total",
+   "value": "0x4008000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x4da90770",
+  "len": 85,
+  "path": "differential/prometheus-text/cases/om-exemplar-uppercase-trace.om"
+ },
+ "parser": "openmetrics"
+}

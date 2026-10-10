@@ -1,0 +1,14 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [],
+ "error": {
+  "after_entry": 0,
+  "message": "expected next entry after timestamp, got \".\" (\"INVALID\") while parsing: \"g 1 1.\""
+ },
+ "input": {
+  "crc32c": "0x0ae8ac3d",
+  "len": 10,
+  "path": "differential/prometheus-text/cases/ts-text-float.txt"
+ },
+ "parser": "prom"
+}

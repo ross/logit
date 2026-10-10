@@ -2,7 +2,7 @@
 
 This directory holds real wire traffic, captured once from real third-party producers and
 committed. The producers are syslog senders, collectd, OTel SDKs, carbon senders, Prometheus,
-vmagent, statsd/DogStatsD clients, a Datadog Agent, a dd-trace tracer, and four Splunk HEC
+node_exporter, a `prometheus_client` app, vmagent, statsd/DogStatsD clients, a Datadog Agent, a dd-trace tracer, and four Splunk HEC
 clients. The fixtures check `logit`'s decoders against what those producers put on the wire:
 
 - `crates/logit-proto/src/syslog/`
@@ -11,6 +11,8 @@ clients. The fixtures check `logit`'s decoders against what those producers put 
 - `crates/logit-proto/src/otlp/`
 - `crates/logit-proto/src/graphite/`
 - `crates/logit-proto/src/prometheus/remote_write.rs`
+- `crates/logit-proto/src/prometheus/text.rs`, through the Prometheus text differential corpus
+  ([`../differential/prometheus-text/`](../differential/prometheus-text/README.md))
 - `crates/logit-proto/src/datadog/`, `crates/logit-inputs/src/datadog.rs`, and
   `crates/logit-inputs/src/datadog_trace.rs`
 - `crates/logit-proto/src/splunk/` and `crates/logit-inputs/src/splunk.rs`
@@ -55,6 +57,11 @@ testdata/interop/
                           headers -- which is what carries the `Content-Type` and
                           `X-Prometheus-Remote-Write-Version` the wire version is read from, and
                           the `Content-Encoding` that says which decompressor the body needs
+  prometheus-scrape/README.md -- provenance table for prometheus-scrape/*.body
+  prometheus-scrape/*.body    -- scrape response bodies node_exporter and a prometheus_client app
+                                 served, byte for byte, one file per response
+  prometheus-scrape/*.headers -- one sidecar per body, holding the response's Content-Type, which
+                                 picks the dialect
   statsd/README.md     -- provenance table for statsd/*.raw
   statsd/*.raw         -- raw captured UDP datagrams from two real statsd clients (Datadog's
                           `datadog` package and the plain-statsd `statsd` package), each in a
@@ -84,8 +91,9 @@ The Prometheus, Datadog, and Splunk HTTP corpora (`prometheus/*.bin`, `datadog/*
 sender won't send another request until it gets a response; for a tracer, which reads its
 Agent's answers, and a HEC client, which reads Splunk's, it replies with a configured document
 instead. The OTLP corpus
-(`otlp/*.json`) is the Collector's own re-emitted output. Each subdirectory's README has the
-details.
+(`otlp/*.json`) is the Collector's own re-emitted output. The scrape corpus
+(`prometheus-scrape/*.body`) is the other direction: curl pulls each body from the exporter, as a
+scraper does. Each subdirectory's README has the details.
 
 ## Regenerating
 
@@ -95,7 +103,7 @@ explains how to add one.
 Recording is a **deliberate, reviewed act**, not part of `script/cibuild`, like `script/protogen`
 and `testdata/tls/regen.sh`. It pulls real third-party images from Docker Hub and ghcr.io, and runs
 them against the internet-facing package mirrors those images use: the `rsyslog`, `collectd`, and
-`graphite` producers each run a fresh `apt-get install`, the `statsd` and `datadog` producers a
+`graphite` producers each run a fresh `apt-get install`, the `statsd`, `datadog`, and `prometheus-scrape` producers a
 fresh `pip install`, and the `splunk` producer a fresh Maven build. CI shouldn't repeat that non-determinism on every push.
 
 To regenerate:
@@ -125,6 +133,9 @@ messages per construct is the right size. Keep fixtures to these rough sizes:
 - **Datadog:** under 40 KB for the whole corpus. A zstd request body is small; a trace body isn't,
   since one Flask request is about ten spans, so trace captures serve few requests.
 - **Splunk:** under 20 KB for the whole corpus: one request per client format or metric type.
+- **Prometheus scrape:** about 150 KB at most for the whole corpus, since a scrape body is a whole
+  exporter's output and can't be trimmed; shrink it by dropping a collector. As of 2026-10-09 its
+  three bodies total about 31 KB.
 - **Whole directory:** well under 100 KB total. As of 2026-09-25, the fixtures, excluding READMEs,
   total about 92 KB.
 
@@ -157,3 +168,6 @@ None of them asserts a measured value, which differs on every run.
 `crates/logit-proto/tests/prometheus_remote_write_interop.rs`,
 `crates/logit-proto/tests/datadog_interop.rs`, and `crates/logit-proto/tests/splunk_interop.rs`
 follow the same rule for the Prometheus, Datadog, and Splunk corpora.
+`crates/logit-proto/tests/prometheus_text_differential.rs` compares each `prometheus-scrape/` body's
+decode with Prometheus's own reading of the same bytes, committed under
+`../differential/prometheus-text/reference/`, rather than with values written into the test.

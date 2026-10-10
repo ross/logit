@@ -1,0 +1,28 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "m",
+   "value": "gauge"
+  },
+  {
+   "kind": "help",
+   "name": "m",
+   "value": "A gauge."
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "m",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x9b444f96",
+  "len": 37,
+  "path": "differential/prometheus-text/cases/meta-tabs.txt"
+ },
+ "parser": "prom"
+}

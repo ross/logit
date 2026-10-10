@@ -1,0 +1,6 @@
+{
+ "result": "ok",
+ "skips": {
+  "malformed_metadata": 1
+ }
+}

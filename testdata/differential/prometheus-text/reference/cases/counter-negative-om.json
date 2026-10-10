@@ -1,0 +1,34 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "c",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "c_total",
+   "value": "0xbff0000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "d",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "d_total",
+   "value": "0x7ff8000000000001"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xa70d0a7f",
+  "len": 63,
+  "path": "differential/prometheus-text/cases/counter-negative-om.om"
+ },
+ "parser": "openmetrics"
+}

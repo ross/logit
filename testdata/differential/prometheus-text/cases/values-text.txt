@@ -1,0 +1,16 @@
+# TYPE g gauge
+g{v="nan"} NaN
+g{v="nan-lower"} nan
+g{v="pinf"} +Inf
+g{v="inf"} Inf
+g{v="ninf"} -Inf
+g{v="infinity"} Infinity
+g{v="negzero"} -0
+g{v="max"} 1.7976931348623157e308
+g{v="e308"} 1e308
+g{v="subnormal"} 5e-324
+g{v="plus"} +5
+g{v="dot"} .5
+g{v="trail"} 5.
+g{v="lead0"} 007
+g{v="exp"} 1E+3

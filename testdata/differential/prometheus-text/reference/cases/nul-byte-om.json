@@ -1,0 +1,35 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "x\u0000y"
+    ]
+   ],
+   "name": "m",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "n",
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x91c7d14a",
+  "len": 27,
+  "path": "differential/prometheus-text/cases/nul-byte-om.om"
+ },
+ "parser": "openmetrics"
+}

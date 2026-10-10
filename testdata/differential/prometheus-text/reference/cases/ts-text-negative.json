@@ -1,0 +1,14 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [],
+ "error": {
+  "after_entry": 0,
+  "message": "expected timestamp or new record, got \"-\" (\"INVALID\") while parsing: \"g 1 -\""
+ },
+ "input": {
+  "crc32c": "0xa9dea565",
+  "len": 20,
+  "path": "differential/prometheus-text/cases/ts-text-negative.txt"
+ },
+ "parser": "prom"
+}

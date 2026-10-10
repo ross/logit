@@ -1,0 +1,182 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "g",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "nan"
+    ]
+   ],
+   "name": "g",
+   "value": "0x7ff8000000000001"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "nan-lower"
+    ]
+   ],
+   "name": "g",
+   "value": "0x7ff8000000000001"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "pinf"
+    ]
+   ],
+   "name": "g",
+   "value": "0x7ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "inf"
+    ]
+   ],
+   "name": "g",
+   "value": "0x7ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "ninf"
+    ]
+   ],
+   "name": "g",
+   "value": "0xfff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "infinity"
+    ]
+   ],
+   "name": "g",
+   "value": "0x7ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "negzero"
+    ]
+   ],
+   "name": "g",
+   "value": "0x8000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "max"
+    ]
+   ],
+   "name": "g",
+   "value": "0x7fefffffffffffff"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "e308"
+    ]
+   ],
+   "name": "g",
+   "value": "0x7fe1ccf385ebc8a0"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "subnormal"
+    ]
+   ],
+   "name": "g",
+   "value": "0x0000000000000001"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "plus"
+    ]
+   ],
+   "name": "g",
+   "value": "0x4014000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "dot"
+    ]
+   ],
+   "name": "g",
+   "value": "0x3fe0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "trail"
+    ]
+   ],
+   "name": "g",
+   "value": "0x4014000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "lead0"
+    ]
+   ],
+   "name": "g",
+   "value": "0x401c000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "exp"
+    ]
+   ],
+   "name": "g",
+   "value": "0x408f400000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x74528501",
+  "len": 303,
+  "path": "differential/prometheus-text/cases/values-om.om"
+ },
+ "parser": "openmetrics"
+}

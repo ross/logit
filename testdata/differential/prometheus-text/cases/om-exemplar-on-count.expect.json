@@ -1,0 +1,13 @@
+{
+ "degraded": {
+  "exemplar_dropped": 1
+ },
+ "divergence": "an exemplar on a `_count` line, which OpenMetrics forbids: dropped and counted `exemplar_dropped`, where Prometheus stores it (docs/known-gaps/mappings.md: An OpenMetrics exemplar on a line other than)",
+ "divergent": [
+  [
+   "h_count",
+   []
+  ]
+ ],
+ "result": "ok"
+}

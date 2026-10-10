@@ -1,0 +1,23 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "x\\"
+    ]
+   ],
+   "name": "e",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xc22a85ca",
+  "len": 19,
+  "path": "differential/prometheus-text/cases/esc-backslash-om.om"
+ },
+ "parser": "openmetrics"
+}

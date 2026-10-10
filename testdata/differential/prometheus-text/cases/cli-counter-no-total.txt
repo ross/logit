@@ -1,0 +1,4 @@
+# HELP requests Total requests served.
+# TYPE requests counter
+requests{method="get"} 5 1395066363000
+requests{method="post"} 2

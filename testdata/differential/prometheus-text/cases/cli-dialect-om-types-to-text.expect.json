@@ -1,0 +1,13 @@
+{
+ "divergence": "`http_requests_created` carries no labels, so it names a series with no value sample of its own: skipped `incomplete_series`, where Prometheus stores it (docs/known-gaps/mappings.md: A line Prometheus's text parser keeps that this decoder skips)",
+ "divergent": [
+  [
+   "http_requests_created",
+   []
+  ]
+ ],
+ "result": "ok",
+ "skips": {
+  "incomplete_series": 1
+ }
+}

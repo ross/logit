@@ -1,0 +1,8 @@
+# TYPE q summary
+q{quantile="0.5"} 1
+q{quantile="0.99"} 2
+q{quantile="5"} 3
+q{quantile="-Inf"} 4
+q_sum 10
+q_count 4
+# EOF

@@ -1,0 +1,5 @@
+h_bucket{le="1"} 1
+# TYPE h histogram
+h_bucket{le="+Inf"} 2
+h_count 2
+# EOF

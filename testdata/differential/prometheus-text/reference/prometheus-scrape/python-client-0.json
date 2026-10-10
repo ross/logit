@@ -1,0 +1,744 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=underscores",
+ "entries": [
+  {
+   "kind": "help",
+   "name": "python_gc_objects_collected",
+   "value": "Objects collected during gc"
+  },
+  {
+   "kind": "type",
+   "name": "python_gc_objects_collected",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "generation",
+     "0"
+    ]
+   ],
+   "name": "python_gc_objects_collected_total",
+   "value": "0x4070000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "generation",
+     "1"
+    ]
+   ],
+   "name": "python_gc_objects_collected_total",
+   "value": "0x4018000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "generation",
+     "2"
+    ]
+   ],
+   "name": "python_gc_objects_collected_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "python_gc_objects_uncollectable",
+   "value": "Uncollectable objects found during GC"
+  },
+  {
+   "kind": "type",
+   "name": "python_gc_objects_uncollectable",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "generation",
+     "0"
+    ]
+   ],
+   "name": "python_gc_objects_uncollectable_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "generation",
+     "1"
+    ]
+   ],
+   "name": "python_gc_objects_uncollectable_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "generation",
+     "2"
+    ]
+   ],
+   "name": "python_gc_objects_uncollectable_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "python_gc_collections",
+   "value": "Number of times this generation was collected"
+  },
+  {
+   "kind": "type",
+   "name": "python_gc_collections",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "generation",
+     "0"
+    ]
+   ],
+   "name": "python_gc_collections_total",
+   "value": "0x4042000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "generation",
+     "1"
+    ]
+   ],
+   "name": "python_gc_collections_total",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "generation",
+     "2"
+    ]
+   ],
+   "name": "python_gc_collections_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "python_info",
+   "value": "Python platform information"
+  },
+  {
+   "kind": "type",
+   "name": "python_info",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "implementation",
+     "CPython"
+    ],
+    [
+     "major",
+     "3"
+    ],
+    [
+     "minor",
+     "12"
+    ],
+    [
+     "patchlevel",
+     "15"
+    ],
+    [
+     "version",
+     "3.12.15"
+    ]
+   ],
+   "name": "python_info",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "process_virtual_memory_bytes",
+   "value": "Virtual memory size in bytes."
+  },
+  {
+   "kind": "type",
+   "name": "process_virtual_memory_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_virtual_memory_bytes",
+   "value": "0x41a63f8000000000"
+  },
+  {
+   "kind": "help",
+   "name": "process_resident_memory_bytes",
+   "value": "Resident memory size in bytes."
+  },
+  {
+   "kind": "type",
+   "name": "process_resident_memory_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_resident_memory_bytes",
+   "value": "0x417a820000000000"
+  },
+  {
+   "kind": "help",
+   "name": "process_start_time_seconds",
+   "value": "Start time of the process since unix epoch in seconds."
+  },
+  {
+   "kind": "type",
+   "name": "process_start_time_seconds",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_start_time_seconds",
+   "value": "0x41dab26bbbceb852"
+  },
+  {
+   "kind": "help",
+   "name": "process_cpu_seconds",
+   "value": "Total user and system CPU time spent in seconds."
+  },
+  {
+   "kind": "type",
+   "name": "process_cpu_seconds",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_cpu_seconds_total",
+   "value": "0x3fb70a3d70a3d70b"
+  },
+  {
+   "kind": "help",
+   "name": "process_open_fds",
+   "value": "Number of open file descriptors."
+  },
+  {
+   "kind": "type",
+   "name": "process_open_fds",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_open_fds",
+   "value": "0x4018000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "process_max_fds",
+   "value": "Maximum number of open file descriptors."
+  },
+  {
+   "kind": "type",
+   "name": "process_max_fds",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_max_fds",
+   "value": "0x4090000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "app_requests",
+   "value": "Requests served."
+  },
+  {
+   "kind": "type",
+   "name": "app_requests",
+   "value": "counter"
+  },
+  {
+   "exemplar": {
+    "labels": [
+     [
+      "span_id",
+      "00f067aa0ba902b7"
+     ],
+     [
+      "trace_id",
+      "4bf92f3577b34da6a3ce929d0e0e4736"
+     ]
+    ],
+    "ts_ms": 1791602417744,
+    "value": "0x4008000000000000"
+   },
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "GET"
+    ],
+    [
+     "path",
+     "/"
+    ]
+   ],
+   "name": "app_requests_total",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "GET"
+    ],
+    [
+     "path",
+     "/"
+    ]
+   ],
+   "name": "app_requests_created",
+   "value": "0x41dab26bbc6fa92c"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "POST"
+    ],
+    [
+     "path",
+     "a \"quoted\" \\path\nwith a newline"
+    ]
+   ],
+   "name": "app_requests_total",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "POST"
+    ],
+    [
+     "path",
+     "a \"quoted\" \\path\nwith a newline"
+    ]
+   ],
+   "name": "app_requests_created",
+   "value": "0x41dab26bbc6fa986"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "GET"
+    ],
+    [
+     "path",
+     "/café/日本"
+    ]
+   ],
+   "name": "app_requests_total",
+   "value": "0x4004000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "GET"
+    ],
+    [
+     "path",
+     "/café/日本"
+    ]
+   ],
+   "name": "app_requests_created",
+   "value": "0x41dab26bbc6fa9ab"
+  },
+  {
+   "kind": "help",
+   "name": "app_temperature_celsius",
+   "value": "Sensor reading."
+  },
+  {
+   "kind": "type",
+   "name": "app_temperature_celsius",
+   "value": "gauge"
+  },
+  {
+   "kind": "unit",
+   "name": "app_temperature_celsius",
+   "value": "celsius"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "sensor",
+     "nan"
+    ]
+   ],
+   "name": "app_temperature_celsius",
+   "value": "0x7ff8000000000001"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "sensor",
+     "pos_inf"
+    ]
+   ],
+   "name": "app_temperature_celsius",
+   "value": "0x7ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "sensor",
+     "neg_inf"
+    ]
+   ],
+   "name": "app_temperature_celsius",
+   "value": "0xfff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "sensor",
+     "neg_zero"
+    ]
+   ],
+   "name": "app_temperature_celsius",
+   "value": "0x8000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "sensor",
+     "max"
+    ]
+   ],
+   "name": "app_temperature_celsius",
+   "value": "0x7fefffffffffffff"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "sensor",
+     "min_subnormal"
+    ]
+   ],
+   "name": "app_temperature_celsius",
+   "value": "0x0000000000000001"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "sensor",
+     "plain"
+    ]
+   ],
+   "name": "app_temperature_celsius",
+   "value": "0x4035800000000000"
+  },
+  {
+   "kind": "help",
+   "name": "app_latency_seconds",
+   "value": "Request latency."
+  },
+  {
+   "kind": "type",
+   "name": "app_latency_seconds",
+   "value": "histogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "0.005"
+    ]
+   ],
+   "name": "app_latency_seconds_bucket",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "exemplar": {
+    "labels": [
+     [
+      "span_id",
+      "00f067aa0ba902b7"
+     ],
+     [
+      "trace_id",
+      "4bf92f3577b34da6a3ce929d0e0e4736"
+     ]
+    ],
+    "ts_ms": 1791602417744,
+    "value": "0x3fb47ae147ae147b"
+   },
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "0.1"
+    ]
+   ],
+   "name": "app_latency_seconds_bucket",
+   "value": "0x4010000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1.0"
+    ]
+   ],
+   "name": "app_latency_seconds_bucket",
+   "value": "0x4014000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "2.5"
+    ]
+   ],
+   "name": "app_latency_seconds_bucket",
+   "value": "0x4014000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "app_latency_seconds_bucket",
+   "value": "0x4018000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "app_latency_seconds_count",
+   "value": "0x4018000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "app_latency_seconds_sum",
+   "value": "0x4013883126e978d5"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "app_latency_seconds_created",
+   "value": "0x41dab26bbc6faaf6"
+  },
+  {
+   "kind": "help",
+   "name": "app_payload_bytes",
+   "value": "Request payload size."
+  },
+  {
+   "kind": "type",
+   "name": "app_payload_bytes",
+   "value": "summary"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "app_payload_bytes_count",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "app_payload_bytes_sum",
+   "value": "0x40b2780000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "app_payload_bytes_created",
+   "value": "0x41dab26bbc6fabb8"
+  },
+  {
+   "kind": "help",
+   "name": "app_build",
+   "value": "Build information."
+  },
+  {
+   "kind": "type",
+   "name": "app_build",
+   "value": "info"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "revision",
+     "abc123"
+    ],
+    [
+     "version",
+     "1.2.3"
+    ]
+   ],
+   "name": "app_build_info",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "app_state",
+   "value": "Lifecycle state."
+  },
+  {
+   "kind": "type",
+   "name": "app_state",
+   "value": "stateset"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "app_state",
+     "starting"
+    ]
+   ],
+   "name": "app_state",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "app_state",
+     "running"
+    ]
+   ],
+   "name": "app_state",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "app_state",
+     "stopped"
+    ]
+   ],
+   "name": "app_state",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "app_queue_wait_seconds",
+   "value": "Time jobs now queued have waited."
+  },
+  {
+   "kind": "type",
+   "name": "app_queue_wait_seconds",
+   "value": "gaugehistogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "0.5"
+    ]
+   ],
+   "name": "app_queue_wait_seconds_bucket",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1.0"
+    ]
+   ],
+   "name": "app_queue_wait_seconds_bucket",
+   "value": "0x4014000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "app_queue_wait_seconds_bucket",
+   "value": "0x4018000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "app_queue_wait_seconds_gcount",
+   "value": "0x4018000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "app_queue_wait_seconds_gsum",
+   "value": "0x4011000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "app_legacy_ratio",
+   "value": "A value with no declared type."
+  },
+  {
+   "kind": "type",
+   "name": "app_legacy_ratio",
+   "value": "unknown"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "app_legacy_ratio",
+   "value": "0x3fe8000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xf787cd3e",
+  "len": 4305,
+  "path": "interop/prometheus-scrape/python-client-0.body"
+ },
+ "parser": "openmetrics"
+}

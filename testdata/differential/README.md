@@ -1,14 +1,16 @@
 # Differential corpora
 
-This directory holds generated test cases, each committed beside a reference implementation's
-reading of it. A test runs `logit`'s decoder over each case and compares its verdict with the
+This directory holds test cases, each committed beside a reference implementation's reading of
+it. A test runs `logit`'s decoder over each case and compares its verdict with the
 reading, so the decoder is checked against the software it has to agree with, with none of that
 software installed at test time.
 
 It differs from [`../interop/`](../interop/README.md) in three ways:
 
-- **Generated, not captured.** A generator script builds every case from fixed literals, so a
-  case can be a shape no recorded sender happened to produce.
+- **Generated or hand-built, not captured.** A generator script builds every case from fixed
+  literals, or a case is a hand-built body committed as an input, so a case can be a shape no
+  recorded sender happened to produce. A corpus can also read recorded captures under
+  `../interop/` in place, beside its own cases.
 - **Deterministic.** The generator runs in images pinned by tag and digest and writes the same
   bytes on every run, so a regenerated corpus that differs from the committed one is a finding.
 - **It carries a reference reading.** Each case's JSON file holds what the reference made of the
@@ -25,6 +27,7 @@ starting seed.
 | Directory | Decoder | Reference | Test |
 |---|---|---|---|
 | [`graphite-pickle/`](graphite-pickle/README.md) | `crates/logit-proto/src/graphite/pickle.rs`, carbon's pickle reader | CPython 3.12's and Python 2.7's `pickle`, and carbon 1.1.10's pickle receiver | `crates/logit-proto/tests/graphite_pickle_differential.rs` |
+| [`prometheus-text/`](prometheus-text/README.md) | `crates/logit-proto/src/prometheus/text.rs` and `assemble.rs`, the text 0.0.4 and OpenMetrics decoder | Prometheus 3.14.0's `model/textparse`, over hand-built bodies and `../interop/prometheus-scrape/`'s recorded ones | `crates/logit-proto/tests/prometheus_text_differential.rs` |
 
 ## Regenerating and checking
 
@@ -42,6 +45,7 @@ A generator self-checks before it writes anything: each corpus's README says wha
 
 ## Size
 
-The tree is about 260 KB, most of it JSON readings. The `graphite-pickle` payloads total about
+The tree is about 480 KB, most of it JSON readings. The `graphite-pickle` payloads total about
 80 KB, 68 KB of them in the one case that has to pass 64 KiB to get two `FRAME`s; the rest are a
-few hundred bytes each.
+few hundred bytes each. `prometheus-text` is about 220 KB: 40 KB of cases and 180 KB of readings,
+49 KB of them the recorded node_exporter body's.

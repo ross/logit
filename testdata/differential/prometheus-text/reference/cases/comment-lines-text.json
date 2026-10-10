@@ -1,0 +1,18 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x772a89a3",
+  "len": 26,
+  "path": "differential/prometheus-text/cases/comment-lines-text.txt"
+ },
+ "parser": "prom"
+}

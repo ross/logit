@@ -1,0 +1,18 @@
+{
+ "divergence": "a timestamp past 2262 overflows an `i64` of nanoseconds: skipped `malformed_line` (docs/known-gaps/mappings.md: A sample value or timestamp the model can't hold)",
+ "divergent": [
+  [
+   "g",
+   [
+    [
+     "a",
+     "1"
+    ]
+   ]
+  ]
+ ],
+ "result": "ok",
+ "skips": {
+  "malformed_line": 1
+ }
+}

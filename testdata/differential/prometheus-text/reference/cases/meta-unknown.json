@@ -1,0 +1,23 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "u",
+   "value": "unknown"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "u",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xf9904cc7",
+  "len": 27,
+  "path": "differential/prometheus-text/cases/meta-unknown.om"
+ },
+ "parser": "openmetrics"
+}

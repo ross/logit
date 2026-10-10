@@ -1,0 +1,22 @@
+{
+ "divergence": "a quoted UTF-8 metric name: skipped `malformed_line` (docs/known-gaps/mappings.md: Prometheus 3's quoted UTF-8 names)",
+ "divergent": [
+  [
+   "a.b",
+   []
+  ],
+  [
+   "a.b",
+   [
+    [
+     "x",
+     "y"
+    ]
+   ]
+  ]
+ ],
+ "result": "ok",
+ "skips": {
+  "malformed_line": 2
+ }
+}

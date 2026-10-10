@@ -1,0 +1,26 @@
+{
+ "content_type": "application/openmetrics-text; version",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "g",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x86ec5e3f",
+  "len": 25,
+  "path": "differential/prometheus-text/cases/ct-om-bad-param.om"
+ },
+ "parser": {
+  "error": "cannot parse Content-Type \"application/openmetrics-text; version\" and no fallback_scrape_protocol for target\nmime: invalid media parameter",
+  "fallback": "prom"
+ }
+}

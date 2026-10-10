@@ -1,0 +1,34 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "\\t"
+    ]
+   ],
+   "name": "e",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "\\é"
+    ]
+   ],
+   "name": "e",
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x35ebdff6",
+  "len": 31,
+  "path": "differential/prometheus-text/cases/esc-undefined-om.om"
+ },
+ "parser": "openmetrics"
+}

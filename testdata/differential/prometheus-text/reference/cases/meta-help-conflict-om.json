@@ -1,0 +1,33 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "help",
+   "name": "m",
+   "value": "one"
+  },
+  {
+   "kind": "help",
+   "name": "m",
+   "value": "two"
+  },
+  {
+   "kind": "type",
+   "name": "m",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "m",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x47b52e01",
+  "len": 51,
+  "path": "differential/prometheus-text/cases/meta-help-conflict-om.om"
+ },
+ "parser": "openmetrics"
+}

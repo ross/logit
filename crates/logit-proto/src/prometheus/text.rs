@@ -82,10 +82,12 @@
 //! One further skip reason (`non_monotonic_buckets`, with `empty_histogram` for a bucket-less
 //! histogram) comes from the model mapping in [`super::families_to_events`] rather than from
 //! parsing: a bucket list that decreases is only *detectable* as the cumulative → per-bucket
-//! conversion runs, and that conversion is dialect-independent. One *degradation* is
+//! conversion runs, and that conversion is dialect-independent. Two *degradations* are
 //! counted here: `logit.input.metrics.degraded{reason="histogram_count_mismatch"}`, when a
 //! histogram's `_count`/`_gcount` line disagrees with its `+Inf` bucket -- the `+Inf` line wins,
-//! since the model holds one total, not two.
+//! since the model holds one total, not two -- and `{reason="exemplar_dropped"}`, an OpenMetrics
+//! exemplar on a line other than a value sample or a `_bucket` (a `_count`, say), which
+//! OpenMetrics forbids and the model has nowhere to keep.
 //!
 //! **Leniencies**, each a place a strict reading of either spec would fail the body and this parser
 //! does not, because a scraper's job is to keep what it can:
@@ -102,7 +104,14 @@
 //!   bucket -- see [`super`]'s normalization list;
 //! - buckets and quantiles are sorted on parse; both formats require increasing order anyway;
 //! - a quantile outside `[0, 1]` is kept, as Prometheus's own parsers keep it: the assembler checks
-//!   that a quantile is a number, not its range.
+//!   that a quantile is a number, not its range;
+//! - each of these fails a whole scrape in Prometheus's parsers, in at least one dialect, and is
+//!   read here: a `\r` before a line's `\n`, spaces or tabs before a line, a tab or a run of spaces
+//!   between OpenMetrics fields, blank lines and plain comments in OpenMetrics, blank lines after
+//!   `# EOF`, an empty OpenMetrics `# HELP`, an OpenMetrics-only `# TYPE` keyword in text 0.0.4, a
+//!   `# UNIT` that isn't the family name's suffix, a text 0.0.4 timestamp with a sign or a
+//!   fraction, a value past `f64`'s range (read as an infinity), and a signed `NaN`. The Prometheus
+//!   text differential corpus (`testdata/differential/prometheus-text/`) holds a case for each.
 //!
 //! ## Writing is deterministic
 //!
@@ -154,13 +163,16 @@ impl Dialect {
         }
     }
 
-    /// The dialect a scrape response's `Content-Type` selects: OpenMetrics only when it says so,
-    /// text 0.0.4 for everything else (including a missing or unrecognized type) -- the same
-    /// default Prometheus applies.
+    /// The dialect a scrape response's `Content-Type` selects: OpenMetrics only when its media
+    /// type, the part before any `;`, is `application/openmetrics-text` in any case; text 0.0.4
+    /// for everything else, including a missing or unrecognized type, which is what Prometheus
+    /// reads under `fallback_scrape_protocol: PrometheusText0.0.4`. The media type is compared
+    /// whole, so `application/openmetrics-textual` is text 0.0.4, as it is to Prometheus. The
+    /// parameters aren't read: a malformed one makes Prometheus fall back to text 0.0.4 and this
+    /// keep OpenMetrics (`docs/known-gaps/mappings.md`).
     pub fn from_content_type(value: &str) -> Dialect {
-        const OM: &[u8] = b"application/openmetrics-text";
-        let bytes = value.trim_start().as_bytes();
-        if bytes.len() >= OM.len() && bytes[..OM.len()].eq_ignore_ascii_case(OM) {
+        let media_type = value.split(';').next().unwrap_or("").trim_matches([' ', '\t']);
+        if media_type.eq_ignore_ascii_case("application/openmetrics-text") {
             Dialect::OpenMetrics1_0
         } else {
             Dialect::Text0_0_4
@@ -1897,6 +1909,15 @@ mod tests {
         );
         assert_eq!(Dialect::from_content_type("text/plain; version=0.0.4"), Dialect::Text0_0_4);
         assert_eq!(Dialect::from_content_type(""), Dialect::Text0_0_4, "missing type -> text");
+        assert_eq!(
+            Dialect::from_content_type("application/openmetrics-textual; version=1.0.0"),
+            Dialect::Text0_0_4,
+            "the media type is compared whole"
+        );
+        assert_eq!(
+            Dialect::from_content_type(" application/openmetrics-text ;version=1.0.0"),
+            Dialect::OpenMetrics1_0
+        );
         assert!(Dialect::Text0_0_4.content_type().starts_with("text/plain"));
         assert!(Dialect::OpenMetrics1_0.content_type().starts_with("application/openmetrics-text"));
     }

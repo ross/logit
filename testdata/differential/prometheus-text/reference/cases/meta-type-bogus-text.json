@@ -1,0 +1,14 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [],
+ "error": {
+  "after_entry": 0,
+  "message": "invalid metric type \"bogus\""
+ },
+ "input": {
+  "crc32c": "0xf093e597",
+  "len": 19,
+  "path": "differential/prometheus-text/cases/meta-type-bogus-text.txt"
+ },
+ "parser": "prom"
+}

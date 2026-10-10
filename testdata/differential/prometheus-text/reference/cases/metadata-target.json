@@ -1,0 +1,161 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "help",
+   "name": "prometheus_build_info",
+   "value": "A metric with a constant '1' value labeled by version, revision, branch, goversion from which prometheus was built, and the goos and goarch for the build."
+  },
+  {
+   "kind": "type",
+   "name": "prometheus_build_info",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "branch",
+     "HEAD"
+    ],
+    [
+     "goarch",
+     "amd64"
+    ],
+    [
+     "goos",
+     "linux"
+    ],
+    [
+     "goversion",
+     "go1.26.6"
+    ],
+    [
+     "revision",
+     "d7598b7141418fa35be2b5ec5d0fefb634199610"
+    ],
+    [
+     "tags",
+     "netgo,builtinassets"
+    ],
+    [
+     "version",
+     "3.14.0"
+    ]
+   ],
+   "name": "prometheus_build_info",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "prometheus_tsdb_wal_page_flushes_total",
+   "value": "Total number of page flushes."
+  },
+  {
+   "kind": "type",
+   "name": "prometheus_tsdb_wal_page_flushes_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "prometheus_tsdb_wal_page_flushes_total",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "prometheus_tsdb_compaction_duration_seconds",
+   "value": "Duration of compaction runs"
+  },
+  {
+   "kind": "type",
+   "name": "prometheus_tsdb_compaction_duration_seconds",
+   "value": "histogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1.0"
+    ]
+   ],
+   "name": "prometheus_tsdb_compaction_duration_seconds_bucket",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "prometheus_tsdb_compaction_duration_seconds_bucket",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "prometheus_tsdb_compaction_duration_seconds_sum",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "prometheus_tsdb_compaction_duration_seconds_count",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_gc_duration_seconds",
+   "value": "A summary of the wall-time pause (stop-the-world) duration in garbage collection cycles."
+  },
+  {
+   "kind": "type",
+   "name": "go_gc_duration_seconds",
+   "value": "summary"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.0"
+    ]
+   ],
+   "name": "go_gc_duration_seconds",
+   "value": "0x3f0ce13fd40909c8"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "1.0"
+    ]
+   ],
+   "name": "go_gc_duration_seconds",
+   "value": "0x3f33d71e1aae6844"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_gc_duration_seconds_sum",
+   "value": "0x3f5aa7adfbc8b02a"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_gc_duration_seconds_count",
+   "value": "0x4031000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x20b81e2d",
+  "len": 2657,
+  "path": "differential/prometheus-text/cases/metadata-target.txt"
+ },
+ "parser": "prom"
+}

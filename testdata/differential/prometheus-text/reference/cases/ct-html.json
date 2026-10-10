@@ -1,0 +1,26 @@
+{
+ "content_type": "text/html; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "g",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xc501c940",
+  "len": 19,
+  "path": "differential/prometheus-text/cases/ct-html.txt"
+ },
+ "parser": {
+  "error": "received unsupported Content-Type \"text/html; charset=utf-8\" and no fallback_scrape_protocol specified for target",
+  "fallback": "prom"
+ }
+}
