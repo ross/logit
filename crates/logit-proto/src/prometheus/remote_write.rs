@@ -58,7 +58,7 @@
 //! | `Sample.value`, `Sample.timestamp` (ms) | the point's value, and the group it lands in |
 //! | a sample whose value is the stale NaN ([`super::STALE_NAN_BITS`]) | [`Point::Stale`] for that series in that group |
 //! | `Sample.start_timestamp` (2.0, ms, `0` = unset) | [`Series::created`] |
-//! | `Exemplar` | the shared exemplar mapping ([`assemble::exemplar_from_labels`]): `trace_id`/`span_id` → [`logit_core::TraceRef`], the rest → `filtered_attributes`. Attached in a pass of its own, once every series' samples are grouped, to the group where *that series* has a sample at the exemplar's own timestamp -- else the latest group where it has one at all. Never to a group where it has none: see [`Decoded::exemplars`] |
+//! | `Exemplar` | the shared exemplar mapping ([`assemble::exemplar_from_labels`]): `trace_id`/`span_id` → [`logit_core::TraceRef`], the rest → `filtered_attributes`. Attached in a pass of its own, once every series' samples are grouped, to the group where *that series* has a reading at the exemplar's own timestamp -- else the latest group where it has one at all. Never to a group where it has none, a stale marker included: see [`Decoded::exemplars`] |
 //! | `histograms[]` (native histograms) | **skipped**, counted `logit.input.metrics.skipped{reason="native_histogram"}` and reported in [`Decoded::histograms_skipped`] -- `docs/known-gaps/prometheus.md`'s native-histogram row |
 //!
 //! Everything else is the assembler's, unchanged: suffix routing, `le`/`quantile` stripping, the
@@ -89,8 +89,10 @@
 //!   report nothing written, which reads to a sender as "accepted". A truly empty body -- zero
 //!   bytes, which is what an empty 1.0 `WriteRequest` encodes to -- is a valid empty request and
 //!   decodes to no groups;
-//! - 2.0: `symbols[0]` is not the empty string, a `labels_refs` list has an odd length, or any
-//!   symbol reference is out of range. A bad index means the whole table is being read wrongly.
+//! - 2.0: `symbols[0]` is not the empty string, a `labels_refs` list has an odd length, or a
+//!   symbol reference the decode reads is out of range. A bad index means the whole table is being
+//!   read wrongly. The decode reads every series' labels, and the metadata and exemplars of each
+//!   series whose labels are valid; a series skipped as `invalid_labels` has neither read.
 //!
 //! Anything wrong with *one series* is a counted skip instead, because a request from a real sender
 //! is worth keeping the rest of:
@@ -98,7 +100,7 @@
 //! | Reason | What it counts |
 //! |---|---|
 //! | `invalid_labels` | a series with no `__name__`, an empty label name or value, or a repeated label name -- all of which both specs forbid a sender from producing. A label set out of byte order is sorted, not skipped: both specs forbid that too, but vmagent sends it and Prometheus's and VictoriaMetrics's own receivers accept it |
-//! | `native_histogram` | one entry of a `histograms[]` list (above) |
+//! | `native_histogram` | one entry of a `histograms[]` list (above), on a series whose labels are valid; a series skipped as `invalid_labels` counts once, there |
 //! | `duplicate_type` / `duplicate_metadata` | a second metadata entry naming a *different* type, help or unit for one family. A sender repeating what it already said is not counted, which matters here because 2.0 repeats a family's `Metadata` on every one of its wire series |
 //!
 //! And one *degradation*, `logit.input.metrics.degraded{reason="exemplar_dropped"}`: an exemplar
@@ -138,6 +140,7 @@
 //! | an exemplar on a family with no `_total`/`_bucket` series (a gauge, an `info`, a `stateset`, a summary), or one whose value is `NaN` and so falls in no bucket | dropped, `logit.output.metrics.degraded{reason="exemplar_dropped"}` -- the same rule and the same counter the OpenMetrics writer uses |
 //! | a family with an empty name | **skipped**, `logit.output.metrics.skipped{reason="invalid_labels"}`; `__name__` may not be empty |
 //! | two readings of one series whose nanosecond timestamps truncate to the same millisecond | the **later** reading wins and the earlier is dropped, `logit.output.metrics.degraded{reason="sub_ms_collapsed"}` per dropped reading. One label set may not carry two samples at one timestamp -- Prometheus and Mimir answer `400 duplicate sample for timestamp` and the sender treats that as permanent, so emitting both would cost the whole request rather than the one reading |
+//! | a counter's family name in 1.0's `MetricMetadata` | its value sample's name, `_total` included, whatever the model name: decode gives a counter that name either way, so this keeps a re-encode a fixed point |
 //! | [`Series::created`], **version 1.0 only** | dropped, uncounted. 1.0 has no field for it at all; this is the operator's choice of wire version, listed with the permitted normalizations below the way text 0.0.4's `_created` drop is |
 //!
 //! ## Permitted normalizations
@@ -160,10 +163,13 @@
 //! - 1.0 drops `Series::created` (above);
 //! - an exemplar belongs to a `TimeSeries`, not to a sample, in *both* versions -- so a request
 //!   carrying several timestamps for one series cannot say which sample an exemplar came from.
-//!   Decode assigns each one to the group where that series has a sample at the exemplar's own
+//!   Decode assigns each one to the group where that series has a reading at the exemplar's own
 //!   timestamp, and to the latest group where it has one at all otherwise;
 //! - a histogram's exemplars come back in *bucket-label* order (`le` sorted as a string, so `+Inf`
-//!   first), not in the order the model held them.
+//!   first), not in the order the model held them, and each wire series' exemplars are written in
+//!   timestamp order;
+//! - a family's help and unit are the first its groups carry, written on every one of its series:
+//!   decode applies a family's description to all of its series, whichever one carried it.
 //!
 //! [`Assembler`]: assemble::Assembler
 //! [`CodecError::Malformed`]: crate::CodecError::Malformed
@@ -423,12 +429,15 @@ struct Routed<'a> {
     /// Empty unless the series carries something that has to be placed relative to its samples --
     /// an exemplar, or 2.0 help/unit from an untyped series. Tracking it unconditionally would cost
     /// one `Vec<i64>` per series for a request that mostly has neither.
+    ///
+    /// A group where the series is a stale marker isn't in it: an exemplar is an example of a
+    /// reading, and a stale series has none, so the encoder drops an exemplar it finds there.
     groups: Vec<i64>,
 }
 
 impl Routed<'_> {
     /// The group an exemplar at `timestamp_nanos` belongs to: the group where *this series* has a
-    /// sample at that instant, else the latest group where it has one at all.
+    /// reading at that instant, else the latest group where it has one at all.
     ///
     /// An exemplar hangs off a `TimeSeries` rather than off a sample in both versions, so a request
     /// carrying several timestamps for one series cannot say which sample an exemplar came from:
@@ -685,12 +694,16 @@ fn decode_v1(
         let description = described.get(name);
         let track = !series.exemplars.is_empty() || description.is_some();
         let mut touched = Vec::new();
+        let mut stale = Vec::new();
         for sample in &series.samples {
             let timestamp = ms_to_nanos(sample.timestamp);
             if push_sample(groups.at(timestamp), name, &labels, sample.value, timestamp, decoder) {
                 decoded.samples += 1;
                 if track {
                     touched.push(timestamp);
+                    if is_stale_nan(sample.value) {
+                        stale.push(timestamp);
+                    }
                 }
             }
         }
@@ -707,6 +720,8 @@ fn decode_v1(
                 }
             }
         }
+        stale.sort_unstable();
+        touched.retain(|timestamp| stale.binary_search(timestamp).is_err());
         routed.push(Some(Routed { name, labels, groups: touched }));
     }
 
@@ -899,6 +914,7 @@ fn decode_v2(
         };
         let track = !series.exemplars.is_empty() || described.is_some();
         let mut touched = Vec::new();
+        let mut stale = Vec::new();
         for sample in &series.samples {
             let timestamp = ms_to_nanos(sample.timestamp);
             let assembler = groups.at(timestamp);
@@ -906,6 +922,9 @@ fn decode_v2(
                 decoded.samples += 1;
                 if track {
                     touched.push(timestamp);
+                    if is_stale_nan(sample.value) {
+                        stale.push(timestamp);
+                    }
                 }
             }
             if sample.start_timestamp != 0 {
@@ -930,6 +949,8 @@ fn decode_v2(
                 }
             }
         }
+        stale.sort_unstable();
+        touched.retain(|timestamp| stale.binary_search(timestamp).is_err());
         routed.push(Some(Routed { name, labels, groups: touched }));
     }
 
@@ -998,6 +1019,20 @@ pub fn encode_counted(
 ) -> (Vec<u8>, u64) {
     let mut built: BTreeMap<Vec<(String, String)>, SeriesOut> = BTreeMap::new();
     let mut flat = Vec::new();
+    // One help and one unit per family name, the first each group order offers, so every series
+    // of a family carries the same pair. Decode reads a family's description off whichever of its
+    // series declares one and applies it family-wide, so series disagreeing here would decode to
+    // a request whose re-encode differs. One group holds each family name once (the assembler
+    // keys families by name), so the table is built only for several, and a one-group encode
+    // allocates nothing for it.
+    let mut described: HashMap<&str, (Option<&str>, Option<&str>)> = HashMap::new();
+    if groups.len() > 1 {
+        for family in groups.iter().flatten() {
+            let entry = described.entry(family.name.as_str()).or_default();
+            entry.0 = entry.0.or(family.help.as_deref());
+            entry.1 = entry.1.or(family.unit.as_deref());
+        }
+    }
     for families in groups {
         for family in families {
             for series in &family.series {
@@ -1013,13 +1048,19 @@ pub fn encode_counted(
                     else {
                         continue;
                     };
-                    let out = built.entry(labels).or_insert_with(|| SeriesOut {
-                        family: family.name.clone(),
-                        kind: family.kind,
-                        help: family.help.clone().unwrap_or_default(),
-                        unit: family.unit.clone().unwrap_or_default(),
-                        samples: Vec::new(),
-                        exemplars: Vec::new(),
+                    let out = built.entry(labels).or_insert_with(|| {
+                        let (help, unit) = described
+                            .get(family.name.as_str())
+                            .copied()
+                            .unwrap_or((family.help.as_deref(), family.unit.as_deref()));
+                        SeriesOut {
+                            family: metadata_family_name(family),
+                            kind: family.kind,
+                            help: help.unwrap_or_default().to_string(),
+                            unit: unit.unwrap_or_default().to_string(),
+                            samples: Vec::new(),
+                            exemplars: Vec::new(),
+                        }
                     });
                     out.samples.push(SampleOut {
                         value: sample.value,
@@ -1036,6 +1077,10 @@ pub fn encode_counted(
         // two samples that truncate to the same millisecond keep the order their groups gave them
         // -- which is what makes "keep the last" below mean "the latest reading wins".
         out.samples.sort_by_key(|sample| sample.timestamp_ms);
+        // Exemplars too, stably: decode places an exemplar by its timestamp, not by the group it
+        // was written from, so a series merged from several groups would otherwise come back in
+        // a different order and the body wouldn't be a fixed point.
+        out.exemplars.sort_by_key(|exemplar| exemplar.timestamp_ms);
         // One label set may not carry two samples at one timestamp: Prometheus and Mimir answer
         // `400 duplicate sample for timestamp`, which the sender classifies as rejected and the
         // whole batch is dropped -- so a pair of readings a microsecond apart would cost every
@@ -1070,6 +1115,7 @@ pub fn encode_counted(
 /// One series on its way out: the family facts both versions' metadata needs, plus the samples and
 /// exemplars merged across every group this label set appeared in.
 struct SeriesOut {
+    /// The name 1.0's `MetricMetadata` gives the family ([`metadata_family_name`]).
     family: String,
     kind: FamilyType,
     help: String,
@@ -1109,6 +1155,17 @@ fn primary_sample_name(family: &MetricFamily) -> Cow<'_, str> {
         }
         FamilyType::Info => Cow::Owned(format!("{}_info", family.name)),
         _ => Cow::Borrowed(family.name.as_str()),
+    }
+}
+
+/// The family name 1.0's `MetricMetadata` carries: the model name, except that a counter is
+/// named after its value sample, `_total` included. A counter's model name gains `_total` on
+/// decode whatever the metadata said, so naming it `foo` here would decode as `foo_total` and the
+/// next encode would name it that: the body wouldn't be a fixed point.
+fn metadata_family_name(family: &MetricFamily) -> String {
+    match family.kind {
+        FamilyType::Counter => primary_sample_name(family).into_owned(),
+        _ => family.name.clone(),
     }
 }
 
