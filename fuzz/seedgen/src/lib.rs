@@ -641,17 +641,26 @@ const CPYTHON_MEMOIZED: &[u8] = &[
     0x2e,
 ];
 
-/// Under mode `0`: the two recorded pickle captures with their length prefix stripped, a CPython
-/// dump with memoized repeats and a `LONG1`, `write_datapoints` output, and hand-assembled
-/// payloads in the shapes other producers write (og-rek's `MARK … LIST`, one `APPEND` per item,
-/// protocol 1's `MARK … TUPLE`, a stray `None`, a numeric-string value, the memo key past 255 a
-/// batch of more than 256 datapoints reaches, and a list-shaped datapoint). Under mode `1`: build
-/// specs covering every item kind under each of the three outer-list shapes.
+/// Under mode `0`: the five recorded pickle captures with their length prefix stripped (protocols
+/// 0, 2, and 5 from CPython 3, Python 2's `cPickle` protocol 0, and Dropwizard's
+/// `PickledGraphite`), a CPython dump with memoized repeats and a `LONG1`, `write_datapoints`
+/// output, and hand-assembled payloads in the shapes other producers write (og-rek's
+/// `MARK … LIST`, one `APPEND` per item, protocol 1's `MARK … TUPLE`, a stray `None`, a
+/// numeric-string value, the memo key past 255 a batch of more than 256 datapoints reaches, a
+/// list-shaped datapoint, and protocol-0 strings with every escape the reader decodes). Under
+/// mode `1`: build specs covering every item kind under each of the three outer-list shapes, in
+/// both spellings.
 fn graphite_pickle_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     const PAYLOAD: u8 = 0;
     const BUILD: u8 = 1;
     let mut out = Vec::new();
-    for stem in ["graphite-pickle-p2-000", "graphite-pickle-p5-000"] {
+    for stem in [
+        "graphite-dropwizard-000",
+        "graphite-pickle-p0-000",
+        "graphite-pickle-p2-000",
+        "graphite-pickle-p5-000",
+        "graphite-pickle-py2-000",
+    ] {
         let capture = std::fs::read(testdata.join(format!("interop/graphite/{stem}.raw")))?;
         let mut rest = &capture[..];
         let mut frame = 0;
@@ -719,10 +728,27 @@ fn graphite_pickle_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8
     list_shaped.extend_from_slice(&[0x65, 0x65, 0x65, 0x2e]);
     out.push(("list-shaped-datapoint".to_string(), prefixed(PAYLOAD, &list_shaped)));
 
+    // Protocol 0: every `STRING` escape, `UNICODE`'s `\u`/`\U`/Latin-1, a `LONG` without its `L`,
+    // `I01`, `F nan`, and a `GET` of a path memoized at cPickle's key 1.
+    let escapes: &[u8] =
+        b"(lp1\n(S'a\\\\b\\'c\\\"d\\a\\b\\f\\n\\r\\t\\v\\x41\\101\\q;k=\\x76'\np2\n\
+        (I1700000000\nF0.5\ntp3\ntp4\na(V\\u0071\\U0001f600\xe9\\x\np5\n(L1700000001\nFnan\nttp6\na\
+        (g2\n(I01\nS'2.5'\nttp7\na.";
+    out.push(("protocol-0-escapes".to_string(), prefixed(PAYLOAD, escapes)));
+
     // A build spec's first byte picks the outer list (`0` `APPENDS`, `1` `LIST`, `2` one `APPEND`
     // per item); each byte after it is one item, `byte % 7` its kind and `byte / 7` its number.
-    let every_kind: Vec<u8> = (0..14).collect();
-    for (outer, name) in [(0u8, "appends"), (1, "list"), (2, "append-each")] {
+    // Bit 7 of the first byte spells the payload in protocol 0's text opcodes, and bit 6 numbers
+    // the memo from 1, as Python 2's `cPickle` does; `n` up to 3 covers each escape spelling.
+    let every_kind: Vec<u8> = (0..28).collect();
+    for (outer, name) in [
+        (0u8, "appends"),
+        (1, "list"),
+        (2, "append-each"),
+        (0x80, "text-appends"),
+        (0x81, "text-list"),
+        (0xc2, "text-append-each-cpickle-memo"),
+    ] {
         let spec = [&[outer][..], &every_kind].concat();
         out.push((format!("build-{name}-every-kind"), prefixed(BUILD, &spec)));
         // Alternating a new tuple (kind 0) and a memo repeat of an earlier one (kind 2).

@@ -92,7 +92,8 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # which the graphite section pins under 16. `graphite_pickle`'s is its mode byte and a 64 KiB
 # payload, past which carbon's 1 MiB frame bound reaches no new reader state: its worst input,
 # one memoized datapoint repeated by two-byte `BINGET`s, is a measured 27 MiB `Vec`, pinned under
-# 32. `collectd`'s is its two cut bytes and a 65,507-byte UDP payload; its worst input, one-byte
+# 32; protocol 0's densest repeat, the three-byte `g0\n`, makes fewer events, and its decoded
+# strings' scratch is at most twice the payload. `collectd`'s is its two cut bytes and a 65,507-byte UDP payload; its worst input, one-byte
 # notification messages six bytes apart, is a measured 13.5 MiB `Vec`, pinned under 16 in the
 # collectd section. `prom_text`'s is its dialect byte and a body one byte short of 64 KiB; its
 # worst input, distinct one- to three-character names on `aa 1` lines, is one family of one

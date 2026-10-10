@@ -834,26 +834,81 @@ fn graphite_pickle_never_allocates_from_a_corrupt_memo_key() {
     assert!(peak < 4096, "peak live bytes {peak} suggests the memo key sized the memo");
 }
 
-/// Every opcode byte off the allowlist is refused, checked exhaustively.
+/// Every opcode byte off the allowlist is refused, checked exhaustively, by the allowlist's own
+/// message rather than a short read or a bad argument.
 #[test]
 fn graphite_pickle_rejects_every_opcode_outside_the_allowlist() {
     const PERMITTED: &[u8] = &[
-        0x28, 0x29, 0x2e, 0x42, 0x43, 0x47, 0x4a, 0x4b, 0x4d, 0x4e, 0x54, 0x55, 0x58, 0x5d, 0x61,
-        0x65, 0x68, 0x6a, 0x6c, 0x71, 0x72, 0x74, 0x80, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b,
-        0x8c, 0x8d, 0x8e, 0x94, 0x95,
+        0x28, 0x29, 0x2e, 0x42, 0x43, 0x46, 0x47, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x53, 0x54,
+        0x55, 0x56, 0x58, 0x5d, 0x61, 0x65, 0x67, 0x68, 0x6a, 0x6c, 0x70, 0x71, 0x72, 0x74, 0x80,
+        0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x94, 0x95,
     ];
+    assert_eq!(PERMITTED.len(), 42, "the allowlist the module doc's table names");
     for opcode in 0u8..=255 {
         if PERMITTED.contains(&opcode) {
             continue;
         }
-        // Trailing operand bytes, so a refusal is the allowlist, not a short read.
+        // Trailing operand bytes and a newline, so a refusal is the allowlist, not a short read
+        // or a protocol-0 argument with no end.
         let mut corrupt = vec![0x80u8, 0x02, opcode];
-        corrupt.extend_from_slice(&[0u8; 16]);
+        corrupt.extend_from_slice(&[b'0'; 16]);
+        corrupt.push(b'\n');
         corrupt.push(0x2e);
-        assert!(
-            decode_graphite(&Bytes::from(corrupt), Protocol::Pickle),
-            "opcode {opcode:#04x} must not be accepted"
+        let err = pickle_decode(&corrupt).expect_err("an opcode off the allowlist must fail");
+        assert_eq!(
+            err.to_string(),
+            format!("malformed input: pickle opcode {opcode:#04x} is not permitted"),
         );
+    }
+}
+
+/// A protocol-0 argument has no declared length: one with no `\n` behind it runs to the end of
+/// the frame and fails there, allocating nothing.
+#[test]
+fn graphite_pickle_rejects_an_unterminated_protocol_0_argument_without_allocating() {
+    for &opcode in b"ILFSVpg" {
+        let mut corrupt = vec![b'(', b'l', opcode, b'\''];
+        corrupt.extend(std::iter::repeat_n(b'\\', 1 << 16));
+        let err = pickle_decode(&corrupt).expect_err("an unterminated argument must fail");
+        assert!(err.to_string().contains("no terminating newline"), "{err}");
+        let peak = peak_live_bytes(|| {
+            let _ = pickle_decode(&corrupt);
+        });
+        // `pickle_decode` copies the frame into a `Bytes`; nothing else may be sized from it.
+        let bound = (corrupt.len() + 4096) as i64;
+        assert!(peak < bound, "peak live bytes {peak} for opcode {opcode:#04x}");
+    }
+}
+
+/// The scratch holds decoded protocol-0 strings and is at most twice the frame: a `UNICODE` of
+/// Latin-1 bytes at 0x80 or above doubles, and every other decode shrinks or keeps its size.
+#[test]
+fn graphite_pickle_protocol_0_scratch_stays_within_twice_the_frame() {
+    const PATH_BYTES: usize = 1 << 16;
+    let latin1 = {
+        let mut frame = b"(l(V".to_vec();
+        frame.extend(std::iter::repeat_n(0xe9u8, PATH_BYTES));
+        frame.extend_from_slice(b"\n(I1\nF1\ntta.");
+        frame
+    };
+    let escaped = {
+        let mut frame = b"(l(S'".to_vec();
+        frame.extend(b"\\x41".iter().copied().cycle().take(PATH_BYTES));
+        frame.extend_from_slice(b"'\n(I1\nF1\ntta.");
+        frame
+    };
+    for (name, frame, path_len) in
+        [("UNICODE", &latin1, 2 * PATH_BYTES), ("STRING", &escaped, PATH_BYTES / 4)]
+    {
+        let mut reader = logit_proto::graphite::pickle::PickleReader::new();
+        let mut paths = Vec::new();
+        let peak = peak_live_bytes(|| {
+            reader.read_datapoints(frame, |path, _, _| paths.push(path.len())).unwrap();
+        });
+        assert_eq!(paths, [path_len], "{name}");
+        // The scratch `Vec` doubles as it grows, so its capacity can reach twice what it holds.
+        let bound = (2 * 2 * frame.len() + 4096) as i64;
+        assert!(peak <= bound, "{name}: peak live bytes {peak}");
     }
 }
 
@@ -1070,6 +1125,23 @@ fn graphite_pickle_worst_case_payload_stays_under_the_fuzz_malloc_limit() {
     eprintln!("{} bytes, {events} events, peak {peak}, largest {largest}", payload.len());
     assert_eq!(events, (payload.len() - 20) / 2 + 1, "one event per BINGET, and the first");
     assert!(largest < MALLOC_LIMIT, "largest allocation {largest}");
+
+    // Protocol 0's densest spelling, `g0\n`, is three bytes per event, so it makes fewer.
+    let mut payload = b"(l(S'a'\np0\n(I1\nI1\nttp0\na(".to_vec();
+    while payload.len() + 4 <= 1 << 16 {
+        payload.extend_from_slice(b"g0\n");
+    }
+    payload.extend_from_slice(b"e.");
+    let mut p0_events = 0;
+    let (_, p0_largest) = peak_and_largest_allocation(|| {
+        let mut out = vec![Event::empty(-1, AttrMap::new())];
+        let mut decoder =
+            GraphiteDecoder::new(Arc::new(Resource::default())).with_protocol(Protocol::Pickle);
+        decoder.decode_into(Bytes::from(payload.clone()), 0, &mut out).unwrap();
+        p0_events = out.len() - 1;
+    });
+    assert!(p0_events < events, "protocol 0: {p0_events} events");
+    assert!(p0_largest <= largest, "protocol 0: largest allocation {p0_largest}");
 }
 
 /// The plaintext counterpart: `a 1 1`, the shortest line that decodes, and its `LF`, filling a
