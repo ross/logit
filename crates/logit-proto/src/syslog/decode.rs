@@ -167,6 +167,19 @@ fn is_printusascii(b: &[u8]) -> bool {
     b.iter().all(|&c| is_printusascii_byte(c))
 }
 
+/// A PROCID or `tag[pid]` token as a `u64` when it is canonical decimal: ASCII digits with no
+/// leading zero, or `0` (`super`'s module doc, `syslog.pid`). `u64::from_str` alone would also take
+/// `+5` and `007`, which `syslog_out` would then write as `5` and `7`.
+fn canonical_pid(token: &[u8]) -> Option<u64> {
+    let canonical = !token.is_empty()
+        && token.iter().all(u8::is_ascii_digit)
+        && (token.len() == 1 || token[0] != b'0');
+    if !canonical {
+        return None;
+    }
+    std::str::from_utf8(token).ok()?.parse().ok()
+}
+
 /// The `syslog.*` carrier keys, interned once per process so each line pays a sorted
 /// `insert_sym`, not an interner hash and shard lock. A `LazyLock` rather than a decoder field
 /// (as collectd's `AttrKeys` is) because the parsers are free functions; `KEYS.x` is one acquire
@@ -254,13 +267,12 @@ fn parse_line(
                 keys,
             ) {
                 Ok(event) => Ok(event),
-                // Version `1` is the only one real senders emit, so its failure is malformed RFC
-                // 5424. Any other digit failing is likely a tag-less RFC 3164 MSG starting with a
-                // digit and a space, so reparse as RFC 3164, which never fails.
-                Err(err) if version == '1' => Err(err),
+                // Whatever the version, a line that doesn't parse as RFC 5424 is most likely a
+                // tag-less RFC 3164 MSG starting with a digit and a space (`<14>1 worker died`),
+                // and rejecting it would drop it, so reparse it as RFC 3164, which never fails and
+                // keeps the whole remainder as MSG. Reported, so a malformed RFC 5424 sender or a
+                // future version still shows.
                 Err(err) => {
-                    // Reported so a future RFC 5424 version past `1` doesn't get reparsed as RFC
-                    // 3164 unnoticed.
                     diag.warn_throttled(
                         "sniff_fallback",
                         format_args!(
@@ -323,11 +335,9 @@ fn is_tag_shaped(token: &[u8]) -> bool {
         if pid.is_empty() {
             return false;
         }
-        // Numeric fitting `u64`, or PRINTUSASCII without `]` so the bracket still balances
-        // (`super`'s module doc, `syslog.pid`).
-        let numeric_fits_u64 = pid.iter().all(|b| b.is_ascii_digit())
-            && std::str::from_utf8(pid).is_ok_and(|s| s.parse::<u64>().is_ok());
-        if !numeric_fits_u64 && !pid.iter().all(|&b| is_printusascii_byte(b) && b != b']') {
+        // PRINTUSASCII without `]`, so the bracket still balances (`super`'s module doc,
+        // `syslog.pid`). Every decimal PID is in that class.
+        if !pid.iter().all(|&b| is_printusascii_byte(b) && b != b']') {
             return false;
         }
         &body[..open]
@@ -397,9 +407,9 @@ fn parse_3164(
             let name = &tag_body[..open];
             let pid_bytes = &tag_body[open + 1..tag_body.len() - 1];
             attrs.insert_sym(KEYS.tag, Value::Str(subslice::share(line, name)));
-            match std::str::from_utf8(pid_bytes).ok().and_then(|s| s.parse::<u64>().ok()) {
+            match canonical_pid(pid_bytes) {
                 Some(n) => attrs.insert_sym(KEYS.pid, Value::U64(n)),
-                // `is_tag_shaped` guarantees a non-`u64` PID is PRINTUSASCII, so valid UTF-8.
+                // `is_tag_shaped` guarantees the PID is PRINTUSASCII, so valid UTF-8.
                 None => attrs.insert_sym(KEYS.pid, Value::Str(subslice::share(line, pid_bytes))),
             }
         } else {
@@ -462,7 +472,7 @@ fn message_value(line: &Bytes, msg: &[u8], strip_bom: bool) -> Value {
 }
 
 /// One STRUCTURED-DATA grammar violation. `offset` is relative to [`parse_structured_data`]'s
-/// input; the caller adds its base for the `bad_line` message.
+/// input; the caller adds its base for the `sniff_fallback` message.
 #[derive(Debug)]
 struct SdError {
     offset: usize,
@@ -578,10 +588,14 @@ fn parse_structured_data(s: &[u8], keys: &mut KeyCache) -> Result<(Option<Value>
         let id_bytes = parse_sd_name(s, &mut pos)?;
         let id = std::str::from_utf8(id_bytes)
             .expect("parse_sd_name only accepts PRINTUSASCII, always valid UTF-8");
-        // `AttrMap::get`, not an intern: the element may still be rejected, and the sniff
-        // routes RFC 3164 lines containing `[token` through here before falling back. Interning
-        // now would keep producer-controlled text for the process's life, outside
-        // `docs/design/memory.md` §4's accepted exposure; it happens at the insert below.
+        // `AttrMap::get`, not an intern, so a line rejected before its first PARAM or
+        // SD-ELEMENT completes interns nothing; the sniff routes RFC 3164 lines containing
+        // `[token` through here before falling back. A completed PARAM's name and a closed
+        // element's SD-ID are interned as they complete, before the rest of the line is
+        // validated, so a line rejected later has interned those. That is the interner exposure
+        // `docs/design/memory.md`'s "Interning: the bargain, and its bounds" accepts, under ADR
+        // `deployment-threat-model`: a sender writing a malformed line writes it with the same
+        // names each time.
         if sd.get(id).is_some() {
             return Err(SdError::new(elem_start, format!("duplicate SD-ID {id:?}")));
         }
@@ -663,8 +677,9 @@ fn parse_5424(
     let mut attrs = AttrMap::new();
     attrs.insert_sym(KEYS.facility, Value::U64(facility as u64));
     attrs.insert_sym(KEYS.severity, Value::U64(severity_num as u64));
-    // Nil is an explicit `Value::Null`; unparseable rejects the line like a bad PRI; parseable but
-    // out of `i64`-nanosecond range keeps the event without the attribute (`super`'s module doc).
+    // Nil or empty is an explicit `Value::Null`; unparseable fails the RFC 5424 parse, so the line
+    // falls back to RFC 3164; parseable but out of `i64`-nanosecond range keeps the event without
+    // the attribute (`super`'s module doc).
     match nil_or(ts_field) {
         None => {
             attrs.insert_sym(KEYS.timestamp, Value::Null);
@@ -707,11 +722,11 @@ fn parse_5424(
                 String::from_utf8_lossy(pid)
             )));
         }
-        match std::str::from_utf8(pid).expect("validated PRINTUSASCII above").parse::<u64>() {
-            Ok(n) => {
+        match canonical_pid(pid) {
+            Some(n) => {
                 attrs.insert_sym(KEYS.pid, Value::U64(n));
             }
-            Err(_) => {
+            None => {
                 attrs.insert_sym(KEYS.pid, Value::Str(subslice::share(line, pid)));
             }
         }
@@ -794,6 +809,30 @@ mod tests {
 
     fn message_str(event: &Event) -> &str {
         message_val(event).as_str().unwrap()
+    }
+
+    /// Decodes `line`, which sniffs as RFC 5424 and fails that parse, asserting it falls back to
+    /// RFC 3164 with a `sniff_fallback`: one event whose MSG is everything after PRI, with no
+    /// RFC 5424 field stamped (`super`'s module doc, "Dialect disambiguation").
+    fn falls_back(line: &str) -> Event {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog", "input");
+        let diag = Diagnostics::new("syslog_in").with_telemetry(telemetry);
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default())).with_diagnostics(diag);
+        let batch = decoder.decode(Bytes::from(line.to_string())).expect("decode should succeed");
+        let event = only_event(batch.events);
+        let after_pri = &line[line.find('>').unwrap() + 1..];
+        assert_eq!(message_str(&event), after_pri, "{line}: the whole remainder is MSG");
+        for key in ["syslog.timestamp", "syslog.msgid", "syslog.sd"] {
+            assert!(event.attributes.get(key).is_none(), "{line}: {key} is not stamped");
+        }
+        let keys: Vec<_> = registry
+            .drain(0)
+            .iter()
+            .filter_map(|e| e.attributes.get("key").and_then(Value::as_str).map(String::from))
+            .collect();
+        assert_eq!(keys, ["sniff_fallback"], "{line}");
+        event
     }
 
     fn parse_err(line: &str) -> CodecError {
@@ -958,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn rfc5424_invalid_timestamp_is_rejected_rather_than_treated_as_absent() {
+    fn rfc5424_invalid_timestamp_falls_back_rather_than_being_treated_as_absent() {
         for ts in [
             "2024-02-31T00:00:00Z",      // February has no 31st day
             "2023-02-29T00:00:00Z",      // 2023 is not a leap year
@@ -970,11 +1009,7 @@ mod tests {
             // `logit_core::time` RFC 3339 parser accepts up to 9, a harmless leniency.
             "2024-01-01T00:00:00.1234567890Z",
         ] {
-            let line = format!("<134>1 {ts} - - - - - msg");
-            assert!(
-                matches!(parse_err(&line), CodecError::Malformed(_)),
-                "expected timestamp {ts:?} to be rejected"
-            );
+            falls_back(&format!("<134>1 {ts} - - - - - msg"));
         }
     }
 
@@ -1352,27 +1387,35 @@ mod tests {
     }
 
     #[test]
-    fn structured_data_33_char_sd_name_is_rejected() {
+    fn structured_data_33_char_sd_name_falls_back() {
+        // Past RFC 5424's 32-byte limit, so the line isn't RFC 5424.
         let id = "a".repeat(33);
-        let line = format!(r#"<134>1 - - - - - [{id} k="v"] msg"#);
-        assert!(
-            matches!(parse_err(&line), CodecError::Malformed(_)),
-            "a 33-byte SD-NAME exceeds RFC 5424's 32-byte limit and must be rejected"
-        );
+        falls_back(&format!(r#"<134>1 - - - - - [{id} k="v"] msg"#));
     }
 
     #[test]
-    fn structured_data_duplicate_sd_id_is_rejected() {
-        let line = r#"<134>1 - - - - - [ex@32473 k="v"][ex@32473 j="w"] msg"#;
-        assert!(matches!(parse_err(line), CodecError::Malformed(_)));
+    fn structured_data_duplicate_sd_id_falls_back() {
+        falls_back(r#"<134>1 - - - - - [ex@32473 k="v"][ex@32473 j="w"] msg"#);
     }
 
-    /// A line rejected inside `parse_structured_data` interns nothing, whether it is an RFC 3164
-    /// line routed there by the sniff or a version-`1` line with a malformed SD-ELEMENT
-    /// (`docs/design/memory.md` §4). `nextest` runs each test in its own process, so
-    /// `interner::len()` reflects only this test.
+    /// The tag-less RFC 3164 line Python's `SysLogHandler` sends for a message starting `1 `:
+    /// version `1` gets the same fallback as every other version.
     #[test]
-    fn a_line_rejected_inside_structured_data_interns_nothing() {
+    fn a_tag_less_rfc3164_msg_starting_1_space_falls_back_to_rfc3164() {
+        let event = falls_back("<14>1 worker died");
+        assert_eq!(event.attributes.get("syslog.severity"), Some(&Value::U64(6)));
+        assert!(event.attributes.get("syslog.tag").is_none());
+        assert!(event.attributes.get("syslog.hostname").is_none());
+        falls_back("<13>1 2 3 msg");
+    }
+
+    /// A line whose STRUCTURED-DATA fails before its first PARAM or SD-ELEMENT completes interns
+    /// nothing, whatever its version, and falls back to RFC 3164 with its whole MSG. A line that
+    /// fails later has interned the names it completed: the exposure `parse_structured_data`'s
+    /// comment accepts. `nextest` runs each test in its own process, so `interner::len()`
+    /// reflects only this test.
+    #[test]
+    fn a_line_whose_structured_data_fails_interns_only_the_names_it_completed() {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
         // Warm-up: initializes `KEYS` before the window opens.
         drop(
@@ -1392,22 +1435,60 @@ mod tests {
             "the line falls back to RFC 3164 and keeps its whole MSG"
         );
 
-        // A genuine version-`1` line whose SD-ELEMENT is malformed: rejected, no event at all.
-        let rejected = Bytes::from_static(b"<134>1 - - - - - [badelem@1 msg");
-        let events = decoder.decode(rejected).expect("decode should succeed").events;
-        assert!(events.is_empty(), "a malformed SD-ELEMENT rejects the whole line");
+        // A version-`1` line whose SD-ELEMENT is malformed: it falls back the same way.
+        let malformed = Bytes::from_static(b"<134>1 - - - - - [badelem@1 msg");
+        let events = decoder.decode(malformed).expect("decode should succeed").events;
+        assert_eq!(message_str(&only_event(events)), "1 - - - - - [badelem@1 msg");
 
         assert_eq!(
             logit_core::interner::len(),
             before,
-            "an SD-ID from a line that never validated must not reach the interner"
+            "nothing on a line that fails before a PARAM completes reaches the interner"
+        );
+
+        // One complete PARAM and one closed element, then a malformed second element: the line
+        // falls back, and the completed PARAM-NAME and SD-ID are interned.
+        let late = Bytes::from_static(b"<134>1 - - - - - [first@1 done=\"v\"][second@1 broken");
+        let events = decoder.decode(late).expect("decode should succeed").events;
+        assert!(only_event(events).attributes.get("syslog.sd").is_none());
+        assert_eq!(
+            logit_core::interner::len(),
+            before + 2,
+            "`done` and `first@1` completed before the failure, and nothing else did"
         );
     }
 
+    /// `syslog.pid` is `U64` only for canonical decimal, so a PID `u64::from_str` would rewrite
+    /// (`+5`, `007`) stays the `Str` the sender wrote and relays unchanged.
     #[test]
-    fn structured_data_unterminated_element_is_rejected() {
-        let line = r#"<134>1 - - - - - [ex@32473 k="v""#;
-        assert!(matches!(parse_err(line), CodecError::Malformed(_)));
+    fn a_non_canonical_numeric_pid_stays_a_str() {
+        for (line, pid) in [
+            ("<134>1 - - - +5 - - msg", "+5"),
+            ("<134>1 - - - 007 - - msg", "007"),
+            ("<13>app[+5]: msg", "+5"),
+            ("<13>app[007]: msg", "007"),
+        ] {
+            let event = only_event(decode(line));
+            assert_eq!(
+                event.attributes.get("syslog.pid").and_then(Value::as_str),
+                Some(pid),
+                "{line}"
+            );
+        }
+        for (line, pid) in [
+            ("<134>1 - - - 0 - - msg", 0),
+            ("<134>1 - - - 18446744073709551615 - - msg", u64::MAX),
+            ("<13>app[0]: msg", 0),
+            ("<13>app[42]: msg", 42),
+        ] {
+            let event = only_event(decode(line));
+            assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(pid)), "{line}");
+        }
+    }
+
+    #[test]
+    fn structured_data_unterminated_element_falls_back() {
+        falls_back(r#"<134>1 - - - - - [ex@32473 k="v""#);
     }
 
     #[test]

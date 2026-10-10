@@ -11,7 +11,12 @@
 //! drain state's single `drained` count and the table of what a FIN and an RST count. The statsd
 //! section runs `statsd::StatsdDecoder` over every recorded datagram, and pins event-text
 //! unescaping against `str::replace`, the last `|T` second whose nanoseconds fit an `i64`, and
-//! the largest allocation a 64 KiB datagram makes.
+//! the largest allocation a 64 KiB datagram makes. The syslog section runs
+//! `syslog::SyslogDecoder` over every recorded capture with line splitting on and off, and pins
+//! the 32-byte SD-NAME bound, repeated PARAM-NAMEs folding into one array, a PARAM-VALUE cut off at
+//! the end of the input, the PRI range, the RFC 3164 timestamp's 15 bytes, a digit-led RFC 3164
+//! MSG against the dialect sniff, a 64 KiB line of distinct SD-NAMEs, and the largest allocation
+//! a 64 KiB datagram makes.
 //!
 //! For each decoder: every single-byte truncation of a valid input, thousands of seeded bit flips,
 //! length fields inflated past the input, and, for `decode_batch`, `Value` nesting past the depth
@@ -39,6 +44,7 @@ use logit_proto::otlp::generated::opentelemetry::proto::trace::v1 as otlp_trace;
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{self, DecompressError, Encoding};
 use logit_proto::statsd::StatsdDecoder;
+use logit_proto::syslog::SyslogDecoder;
 use logit_proto::{
     CodecError, Decoder, Encoder, Signal, SignalDecoder, SignalEncoder, SignalPayload,
 };
@@ -1717,6 +1723,285 @@ fn statsd_worst_case_datagram_stays_under_the_fuzz_malloc_limit() {
         assert!(events * 2 + 8 >= datagram.len(), "{name}: about one event per two bytes");
         assert!(largest < MALLOC_LIMIT, "{name}: largest allocation {largest}");
     }
+}
+
+// -- syslog -------------------------------------------------------------------------------------
+//
+// `SyslogDecoder::decode_into` over one datagram, as `syslog_in`'s UDP arm hands it one, or over
+// one frame with line splitting off, as its TCP arm does. A bad line is a throttled `bad_line`
+// diagnostic, never an error, so a rejected line shows as a missing event.
+
+/// Every recorded syslog capture in `testdata/interop/syslog/` (its `README.md` has the
+/// provenance). `rsyslog-tcp-000.raw` is a TCP stream of one LF-terminated message, which line
+/// splitting reads as one datagram.
+fn syslog_captures() -> Vec<(String, Vec<u8>)> {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/interop/syslog");
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .expect("the recorded corpus is checked in")
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "raw"))
+        .collect();
+    paths.sort();
+    let out: Vec<_> = paths
+        .into_iter()
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, std::fs::read(&path).unwrap())
+        })
+        .collect();
+    assert_eq!(out.len(), 7, "expected the whole recorded corpus");
+    out
+}
+
+fn syslog_decoder(line_splitting: bool) -> SyslogDecoder {
+    SyslogDecoder::new(Arc::new(Resource::default())).with_line_splitting(line_splitting)
+}
+
+fn syslog_decode(input: &[u8]) -> Vec<Event> {
+    let mut out = Vec::new();
+    syslog_decoder(true)
+        .decode_into(Bytes::copy_from_slice(input), 0, &mut out)
+        .expect("syslog decoding never fails a datagram");
+    out
+}
+
+/// The one event `line` decodes to, or a panic naming the line.
+fn syslog_event(line: &[u8]) -> Event {
+    let mut events = syslog_decode(line);
+    assert_eq!(events.len(), 1, "{:?} decodes to one event", String::from_utf8_lossy(line));
+    events.pop().unwrap()
+}
+
+fn syslog_message(event: &Event) -> &str {
+    event.log.as_ref().unwrap().message.as_str().expect("a UTF-8 message")
+}
+
+#[test]
+fn syslog_survives_every_single_byte_truncation_of_every_capture() {
+    for (name, capture) in syslog_captures() {
+        for splitting in [true, false] {
+            let survived = std::panic::catch_unwind(|| {
+                assert_every_truncation_never_panics(&capture, |bytes| {
+                    let mut out = Vec::new();
+                    syslog_decoder(splitting).decode_into(bytes.clone(), 0, &mut out).is_err()
+                })
+            });
+            assert!(survived.is_ok(), "{name}, line splitting {splitting}");
+        }
+    }
+}
+
+#[test]
+fn syslog_survives_seeded_bit_flips_over_every_capture() {
+    for (name, capture) in syslog_captures() {
+        for splitting in [true, false] {
+            let survived = std::panic::catch_unwind(|| {
+                assert_bit_flips_never_panic(&capture, 300, |bytes| {
+                    let mut out = Vec::new();
+                    syslog_decoder(splitting).decode_into(bytes.clone(), 0, &mut out).is_err()
+                })
+            });
+            assert!(survived.is_ok(), "{name}, line splitting {splitting}");
+        }
+    }
+}
+
+/// RFC 5424 §6.3.3 caps an SD-NAME at 32 bytes, for an SD-ID and a PARAM-NAME alike. A line past
+/// it isn't RFC 5424, so it falls back to RFC 3164 with its whole MSG and no `syslog.sd`.
+#[test]
+fn syslog_sd_names_are_accepted_at_32_bytes_and_fall_back_at_33() {
+    let (at, past) = ("i".repeat(32), "i".repeat(33));
+    for (id, param) in [(&at, &at), (&past, &at), (&at, &past)] {
+        let line = format!(r#"<134>1 - - - - - [{id} {param}="v"] msg"#);
+        let event = syslog_event(line.as_bytes());
+        let fits = id.len() <= 32 && param.len() <= 32;
+        let label = format!("SD-ID {} and PARAM-NAME {}", id.len(), param.len());
+        assert_eq!(event.attributes.get("syslog.sd").is_some(), fits, "{label}");
+        let message = if fits { "msg" } else { &line[5..] };
+        assert_eq!(syslog_message(&event), message, "{label}");
+    }
+}
+
+/// A PARAM-NAME repeated a thousand times in one element, in a line under 64 KiB, folds into one
+/// `Value::Array` in wire order.
+#[test]
+fn syslog_a_thousand_repeated_param_names_fold_into_one_array_in_order() {
+    let mut line = b"<134>1 - - - - - [rep@1".to_vec();
+    for i in 0..1000 {
+        line.extend_from_slice(format!(r#" k="{i}""#).as_bytes());
+    }
+    line.extend_from_slice(b"] msg");
+    assert!(line.len() <= MAX_FRAME_BYTES);
+    let event = syslog_event(&line);
+    let Some(Value::Map(sd)) = event.attributes.get("syslog.sd") else {
+        panic!("syslog.sd is a Map");
+    };
+    let Some(Value::Map(params)) = sd.get("rep@1") else { panic!("rep@1 is a Map") };
+    assert_eq!(params.len(), 1, "one PARAM-NAME");
+    let Some(Value::Array(values)) = params.get("k") else { panic!("k is an Array") };
+    let expected: Vec<Value> = (0..1000).map(|i| Value::str(i.to_string())).collect();
+    assert_eq!(values, &expected);
+    assert_eq!(syslog_message(&event), "msg");
+}
+
+/// A PARAM-VALUE cut off at the end of the input, in its body or right after a backslash, fails
+/// the RFC 5424 parse under either mode, never a panic or an index past the end, and the line
+/// falls back to RFC 3164 with its whole MSG.
+#[test]
+fn syslog_a_param_value_cut_off_at_the_end_of_the_input_falls_back() {
+    for line in [
+        &br#"<134>1 - - - - - [a@1 k="abc"#[..],
+        br#"<134>1 - - - - - [a@1 k="abc\"#,
+        br#"<134>1 - - - - - [a@1 k=""#,
+        br#"<134>1 - - - - - [a@1 k="\"#,
+    ] {
+        for splitting in [true, false] {
+            let mut out = Vec::new();
+            syslog_decoder(splitting).decode_into(Bytes::from_static(line), 0, &mut out).unwrap();
+            assert_eq!(out.len(), 1, "{:?}", String::from_utf8_lossy(line));
+            assert!(out[0].attributes.get("syslog.sd").is_none());
+            assert_eq!(syslog_message(&out[0]).as_bytes(), &line[5..]);
+        }
+    }
+}
+
+/// PRI is `0` to `191` with no leading zero (`crates/logit-proto/src/syslog/mod.rs`'s
+/// "Mapping").
+#[test]
+fn syslog_pri_accepts_0_and_191_and_rejects_192_and_00() {
+    for (pri, facility, severity) in [("0", 0, 0), ("191", 23, 7)] {
+        let event = syslog_event(format!("<{pri}>msg").as_bytes());
+        assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(facility)), "{pri}");
+        assert_eq!(event.attributes.get("syslog.severity"), Some(&Value::U64(severity)), "{pri}");
+    }
+    for pri in ["192", "00", "000", "0191"] {
+        assert!(syslog_decode(format!("<{pri}>msg").as_bytes()).is_empty(), "{pri}");
+    }
+}
+
+/// The RFC 3164 timestamp is 15 bytes: one byte short is MSG text, and 15 with nothing after it
+/// is a timestamp and an empty MSG.
+#[test]
+fn syslog_rfc3164_timestamp_needs_all_15_bytes() {
+    let event = syslog_event(b"<13>Oct 11 22:14:1");
+    assert!(event.attributes.get("syslog.timestamp").is_none());
+    assert_eq!(syslog_message(&event), "Oct 11 22:14:1");
+
+    let event = syslog_event(b"<13>Oct 11 22:14:15");
+    assert_eq!(
+        event.attributes.get("syslog.timestamp").and_then(Value::as_str),
+        Some("Oct 11 22:14:15")
+    );
+    assert_eq!(syslog_message(&event), "");
+}
+
+/// A tag-less RFC 3164 MSG starting with a digit and a space, against the dialect sniff
+/// (`crates/logit-proto/src/syslog/mod.rs`'s "Dialect disambiguation"): any digit, `1` included,
+/// falls back to RFC 3164 with a `sniff_fallback`, and two digits never sniff.
+#[test]
+fn syslog_a_digit_led_rfc3164_msg_against_the_dialect_sniff() {
+    let registry = logit_core::Registry::new();
+    let telemetry = registry.telemetry_for("syslog_in", "syslog", "input");
+    let diag = logit_core::Diagnostics::new("syslog_in").with_telemetry(telemetry);
+    let mut decoder = syslog_decoder(true).with_diagnostics(diag);
+    let mut decode_with_diag = |line: &'static [u8]| {
+        let mut out = Vec::new();
+        decoder.decode_into(Bytes::from_static(line), 0, &mut out).unwrap();
+        let keys: Vec<String> = registry
+            .drain(0)
+            .iter()
+            .filter_map(|e| e.attributes.get("key").and_then(Value::as_str).map(String::from))
+            .collect();
+        (out, keys)
+    };
+
+    for line in [
+        &b"<13>4 requests failed"[..],
+        b"<13>0 a b c",
+        b"<13>9 lives",
+        b"<14>1 worker died",
+        b"<13>1 2 3 msg",
+    ] {
+        let (events, keys) = decode_with_diag(line);
+        assert_eq!(events.len(), 1, "{:?}", String::from_utf8_lossy(line));
+        assert_eq!(syslog_message(&events[0]), std::str::from_utf8(&line[4..]).unwrap());
+        assert_eq!(keys, ["sniff_fallback"], "{:?}", String::from_utf8_lossy(line));
+    }
+
+    let (events, keys) = decode_with_diag(b"<13>10 workers started");
+    assert_eq!(syslog_message(&events[0]), "10 workers started");
+    assert!(keys.is_empty(), "a two-digit token never sniffs as RFC 5424: {keys:?}");
+}
+
+/// The input that makes the most events per byte: `<0>`, the shortest accepted line, and its `LF`,
+/// filling a 64 KiB datagram, decoded into an `out` that already holds one event, as the fuzz
+/// target's marker does. That is one 864-byte `Event` per four bytes, 16,384 of them, and the
+/// marker pushes the count one past a power of two, so `out` doubles once more: a measured 27 MiB
+/// `Vec` of 32,768 events. The largest single allocation is what `script/unsafe-check`'s `syslog`
+/// malloc limit sits above.
+#[test]
+fn syslog_worst_case_datagram_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 32 << 20;
+    let mut datagram = b"<0>\n".repeat(MAX_FRAME_BYTES / 4);
+    datagram.pop();
+    assert!(datagram.len() < MAX_FRAME_BYTES);
+    let mut events = 0;
+    let (peak, largest) = peak_and_largest_allocation(|| {
+        let mut out = vec![Event::empty(-1, AttrMap::new())];
+        syslog_decoder(true).decode_into(Bytes::from(datagram.clone()), 0, &mut out).unwrap();
+        events = out.len() - 1;
+    });
+    eprintln!("{} bytes, {events} events, peak {peak}, largest {largest}", datagram.len());
+    assert_eq!(events, MAX_FRAME_BYTES / 4, "one event per `<0>` line");
+    assert!(largest < MALLOC_LIMIT, "largest allocation {largest}");
+}
+
+/// A 64 KiB line of distinct SD-NAMEs, in the order that costs `AttrMap` the most: each name
+/// interned before the line in reverse, so every insert into the sorted map lands at its front.
+/// The parse is one forward pass, but that fold is quadratic in the name count; the frame cap
+/// bounds it, and no count cap is added (`docs/known-gaps/syslog.md`). This pins the result, not
+/// the time, which the test prints: about 10 ms for the PARAMs and 17 ms for the SD-IDs in a
+/// release build, against 3 ms for the PARAMs in first-seen order.
+#[test]
+fn syslog_a_64_kib_line_of_distinct_sd_names_decodes_whole() {
+    let time = |line: &[u8]| {
+        let start = std::time::Instant::now();
+        let event = syslog_event(line);
+        eprintln!("{} bytes in {:?}", line.len(), start.elapsed());
+        event
+    };
+    let sd_of = |event: &Event| match event.attributes.get("syslog.sd") {
+        Some(Value::Map(sd)) => sd.as_ref().clone(),
+        other => panic!("syslog.sd is a Map: {other:?}"),
+    };
+
+    let mut line = b"<134>1 - - - - - [d@1".to_vec();
+    let mut names = Vec::new();
+    while line.len() + 16 < MAX_FRAME_BYTES {
+        let name = format!("p{:x}", names.len());
+        line.extend_from_slice(format!(r#" {name}="""#).as_bytes());
+        names.push(name);
+    }
+    line.extend_from_slice(b"] m");
+    for name in names.iter().rev() {
+        logit_core::interner::intern(name);
+    }
+    let sd = sd_of(&time(&line));
+    let Some(Value::Map(params)) = sd.get("d@1") else { panic!("d@1 is a Map") };
+    assert_eq!(params.len(), names.len(), "every PARAM-NAME is kept");
+
+    let mut line = b"<134>1 - - - - - ".to_vec();
+    let mut ids = Vec::new();
+    while line.len() + 16 < MAX_FRAME_BYTES {
+        let id = format!("s{:x}", ids.len());
+        line.extend_from_slice(format!("[{id}]").as_bytes());
+        ids.push(id);
+    }
+    line.extend_from_slice(b" m");
+    for id in ids.iter().rev() {
+        logit_core::interner::intern(id);
+    }
+    assert_eq!(sd_of(&time(&line)).len(), ids.len(), "every SD-ID is kept");
 }
 
 // -- native decode: canonical varints, trailing bytes, the decode budget -----------------------

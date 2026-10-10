@@ -56,3 +56,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
     ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)), so a `0x0A` inside
     an octet-counted MSG survives end to end. The HAProxy CBOR entry records why the decoder that
     would consume such a payload was measured and not built.
+- **Non-goal: no cap on STRUCTURED-DATA elements or PARAMs per line.** `parse_structured_data`
+  (`crates/logit-proto/src/syslog/decode.rs`) reads the line in one forward pass that never
+  recurses or backtracks, and the line is bounded by the frame cap (`MAX_FRAME_BYTES`, 64 KiB) or
+  the UDP datagram. Folding names into `AttrMap`'s sorted map is quadratic in the number of
+  distinct names when they arrive in an order the interner hasn't seen: a 64 KiB line of about
+  10,000 distinct SD-IDs costs about 17 ms in a release build. No real sender writes thousands of
+  elements or PARAMs on one line, so a count cap would only stop crafted input, and it isn't added,
+  per [ADR `deployment-threat-model`](../adr/deployment-threat-model.md). Pinned by
+  `crates/logit-proto/tests/robustness.rs`'s syslog section.

@@ -1,12 +1,13 @@
 ---
 created: 2026-09-11
-updated: 2026-10-04
+updated: 2026-10-09
 ---
 
 # RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission
 
 ## Status
-Accepted
+Accepted. Amended 2026-10-09: a line whose RFC 5424 parse fails, STRUCTURED-DATA included, is
+read as RFC 3164 instead of dropped (see the amendment at the end).
 
 ## Context
 
@@ -66,14 +67,19 @@ has:
   legitimate literal backslash as the start of an escape it doesn't recognize.
   `PARAM-VALUE` is then required to be valid UTF-8 once unescaped (it's defined as
   `UTF-8-STRING`).
-- **Duplicate `SD-ID` rejects the line.** An `SD-ID` repeated within one message has no defined
-  merge between the two elements sharing it, so this parser rejects the whole line rather than
-  silently picking one (last-wins or first-wins would both be a guess the RFC doesn't license).
-- **Any other grammar violation rejects the whole line** — a missing `=`, a missing opening or
-  closing quote, an unterminated element, an SD-NAME outside 1..=32 PRINTUSASCII-minus-`=SP]"` —
-  with a `bad_line` diagnostic naming what was violated and its byte offset. This is the same
-  strictness every other malformed RFC 5424 field on the line already gets (a bad PRI, a bad
-  TIMESTAMP): STRUCTURED-DATA is not a special, more-tolerant case.
+- **Duplicate `SD-ID` fails the line's RFC 5424 parse.** An `SD-ID` repeated within one message
+  has no defined merge between the two elements sharing it, so this parser fails the whole RFC
+  5424 parse rather than silently picking one (last-wins or first-wins would both be a guess the
+  RFC doesn't license).
+- **Any other grammar violation fails the whole RFC 5424 parse** — a missing `=`, a missing
+  opening or closing quote, an unterminated element, an SD-NAME outside 1..=32
+  PRINTUSASCII-minus-`=SP]"`. This is the same strictness every other malformed RFC 5424 field on
+  the line already gets (a bad TIMESTAMP): STRUCTURED-DATA is not a special, more-tolerant case.
+  A line that fails the RFC 5424 parse is read as RFC 3164 instead, its whole remainder after PRI
+  kept as MSG and no `syslog.sd` stamped, with a `sniff_fallback` diagnostic naming what was
+  violated and its byte offset (`crates/logit-proto/src/syslog/mod.rs`'s "Dialect
+  disambiguation"). The exceptions are the leniencies that lose nothing, such as an unescaped `]`
+  inside a quoted PARAM-VALUE, which that module doc's "Leniencies" lists.
 
 ### Emit rules (`crates/logit-outputs/src/syslog.rs`'s `write_structured_data`, `write_sd_element`, `write_sd_param`, `push_sd_escaped`)
 
@@ -108,11 +114,11 @@ has:
   **SD-ID collision.** RFC 5424's grammar permits `@` inside an ordinary `SD-ID`, so a peer that
   happens to use the same PEN-qualified id `syslog_out` was configured with would otherwise make
   the sink emit two SD-ELEMENTs sharing one SD-ID, which §6.3.1 forbids and which `syslog_in`
-  rejects outright. The encoder guards against it: when `structured_data.sd_id` already appears as
-  a key of the event's own `syslog.sd`, the opt-in element is skipped for that event, counted under
-  `dropped_sd_id_collision`, and reported through the throttled `invalid_structured_data` diagnostic
-  naming the collision. The origin's element wins because it is real data; the opt-in element is
-  a convenience the operator can rename.
+  reads as RFC 3164, losing the structure. The encoder guards against it: when
+  `structured_data.sd_id` already appears as a key of the event's own `syslog.sd`, the opt-in
+  element is skipped for that event, counted under `dropped_sd_id_collision`, and reported through
+  the throttled `invalid_structured_data` diagnostic naming the collision. The origin's element
+  wins because it is real data; the opt-in element is a convenience the operator can rename.
 
 ### Timestamp precedence
 
@@ -132,8 +138,9 @@ before an event reaches `syslog_out`.
 
 ### `syslog.pid`
 
-`Value::U64` when PROCID (5424) or a `tag[pid]` bracket (3164) parses as one; `Value::Str` of the
-raw token otherwise. RFC 5424's PROCID is free-form PRINTUSASCII, not necessarily numeric, and this
+`Value::U64` when PROCID (5424) or a `tag[pid]` bracket (3164) is canonical decimal that fits a
+`u64` (no sign, no leading zero); `Value::Str` of the raw token otherwise, so `+5` and `007` relay
+as written. RFC 5424's PROCID is free-form PRINTUSASCII, not necessarily numeric, and this
 project now keeps a non-numeric one rather than dropping it. `resolve_pid` mirrors this on encode
 ([`Pid::U64`]/[`Pid::Str`]): a `Pid::Str` is sanitized and capped at 128 bytes (5424's own PROCID
 maximum) on 5424 output, and rendered as `tag[pid]` after the same cap on 3164 output (3164 defines
@@ -172,12 +179,13 @@ at all.
   normalized attributes). Already rejected in [ADR `lossless-transit`](lossless-transit.md)'s own
   Alternatives: it goes stale the instant a transform touches the event, doubles memory for every
   event carrying it, and answers "what bytes arrived" rather than "does the information survive."
-- **Lenient SD parsing that tolerates grammar errors** (skip a malformed element rather than
-  reject the line, or accept an SD-NAME outside the 32-byte limit). Rejected on two grounds:
-  consistency with every other RFC 5424 field this dialect already parses strictly (a bad PRI or
-  TIMESTAMP rejects the line, not just the field), and a lenient parse can't be inverted exactly —
-  `syslog_out` would have no faithful way to re-emit whatever was tolerated, breaking the
-  byte-faithful relay this convention exists to enable.
+- **Lenient SD parsing that tolerates grammar errors**: skip a malformed element and keep the
+  rest of the line as RFC 5424, or accept an SD-NAME outside the 32-byte limit. Still rejected
+  on two grounds: consistency with every other RFC 5424 field this dialect parses strictly (a
+  bad TIMESTAMP fails the whole RFC 5424 parse, not only the field), and a lenient parse can't
+  be inverted, so `syslog_out` would have no faithful way to re-emit whatever was
+  tolerated, breaking the byte-faithful relay this convention exists to enable. The amendment's
+  fallback isn't this: it keeps no partial `syslog.sd`, and reads the whole line as RFC 3164.
 - **Shipping a default private enterprise number** (e.g. RFC 5424's own `32473` example) for the
   opt-in `structured_data` element. Rejected: `32473` was never assigned to this project — silently
   minting SD-ELEMENTs under it would misrepresent their origin to any receiver that looks the PEN
@@ -230,3 +238,24 @@ at all.
   `crates/logit-cli/src/pipeline.rs`'s `SyslogOut` arm is the sole place a config `sd_id` crosses
   into `SyslogEncoder::with_structured_data` and its `anyhow::Result` becomes a config-time error;
   `schema/logit.schema.json` regenerated.
+
+## Amendment (2026-10-09): a failed RFC 5424 parse falls back to RFC 3164
+
+**Decision.** A line that sniffs as RFC 5424 but doesn't parse as one is read as RFC 3164: its
+whole remainder after PRI becomes MSG, unless the RFC 3164 header rule finds a tag in it, and no
+`syslog.sd` is stamped. A throttled `sniff_fallback` diagnostic names the broken rule and its
+byte offset. Only a malformed PRI rejects a line, as `bad_line`.
+
+**Why.** [ADR `deployment-threat-model`](deployment-threat-model.md) requires a real sender's
+line to survive. Python's `SysLogHandler` writes no tag or timestamp, so a message beginning with
+`1 ` arrives as `<14>1 worker died`, which matches the RFC 5424 sniff, fails the parse, and was
+dropped. Telling that line apart from a malformed RFC 5424 line isn't possible from its bytes.
+Either way the line failed the parse and was lost, so keeping it as RFC 3164 costs nothing, and
+the diagnostic still surfaces a malformed RFC 5424 sender.
+
+**What "strict" means now.** The STRUCTURED-DATA grammar under "Parse rules" is as strict as
+before, and a violation still means no `syslog.sd`. What changes is the consequence: a violation
+changes the line's dialect instead of dropping it.
+
+`crates/logit-proto/src/syslog/mod.rs`'s "Dialect disambiguation" holds the rule, and its
+"Leniencies" lists the departures from the grammar that are accepted as RFC 5424.
