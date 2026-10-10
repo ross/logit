@@ -1169,7 +1169,9 @@ The drawn schedule (offsets in seconds from the start; `r8` reverted 1.2 s late 
 | r14 | 3222 | netem | logit | `delay 1s` | 111 s |
 
 The rows of `results.md` (the `ledger.egress` detail trimmed to its per-life verdicts and bands,
-which are identical in shape for every killed life):
+which are identical in shape for every killed life; `ledger.windows` re-scored by the idle rule
+the 8-hour run below led to, where the first scoring excused the same gap, across `r12`, by a
+time bound around the fault):
 
 | Check | Status | Detail |
 |---|---|---|
@@ -1187,7 +1189,7 @@ which are identical in shape for every killed life):
 | `ledger.edge` | PASS | final life 5: E 1,144,200 == A 1,144,200 (listener to aggregate) |
 | `ledger.aggregate` | PASS | final life 5: Ab 1,144,200 == A 1,144,200 (every event absorbed) |
 | `ledger.egress` | PASS | life 0 (killed): Ab 528,800 − V 528,800 = 0, ok (band [-10,000, 30,001]); life 1 (killed): Ab 1,060,900 − V 1,050,900 = 10,000, within band (band [-9,999, 29,997]); life 2: W − D − B − V 0 = residual 0 + Ab − V 0, ok; life 3 (killed): Ab 929,900 − V 929,900 = 0, ok (band [-10,001, 30,002]); life 4 (killed): Ab 2,942,809 − V 2,942,809 = 0, ok (band [-10,002, 30,006]); life 5 (final): Ab 1,144,200 − V 1,144,200 = 0, ok |
-| `ledger.windows` | PASS | 100 series x 6 life/lives, widest gap 10.002s (gaps <= 15s (1.5 x the 10s aggregate interval), a killed life's last sample within 11s (1.1 x) of the kill, a later life's first within 20s (2 x) of its start; a gap across a fault that silences the SUT excused when it starts within 11s before the fault and ends within 11s after it (20s after a generator stop), 100 excused) |
+| `ledger.windows` | PASS | 100 series x 6 life/lives, widest gap 10.002s (gaps <= 15s (1.5 x the 10s aggregate interval) or idle, with no window batches.sent from a + 7.5s to b - 2.5s (5s drains); a killed life's last sample within 11s (1.1 x) of the kill, a later life's first within 20s (2 x) of its start; 1 idle gap(s) excused: life 4 +2866s to +2906s (40.001s, 100 series), window sent 0 batch(es) over 6 drain(s) from +2874s to +2904s) |
 | `ledger.replay` | PASS | life 1's first drain replayed 0 vs killed life 0's last-drain buffer.batches 1; life 2's first drain replayed 0 vs killed life 1's last-drain buffer.batches 0; life 4's first drain replayed 0 vs killed life 3's last-drain buffer.batches 1; life 5's first drain replayed 0 vs killed life 4's last-drain buffer.batches 1 (one batch in flight allowed) |
 | `ledger.summary` | PASS | final life 5: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V 0; wire G − (W + K) 44,769 over the run, by design |
 | `identity.sink` | PASS | final life 5 at +3623s: received 55 vs delivered 55 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
@@ -1215,8 +1217,85 @@ What the run showed:
 - **The health sampler took 790 samples**, all healthy outside fault windows, and the slowest
   readiness after a start was 0.1 s.
 
-This run is the 1-hour smoke. W4 isn't done until the 8-hour run (`--duration 8h`, 113 faults for
-seed 20261009) is recorded here, per "Verification".
+Run `20261009T154710Z` (2026-10-09), the 8-hour run: `SOAK_SKIP_IMAGE=1 script/soak run
+random-faults --duration 8h`, seed 20261009 (113 faults), from `soak/w4` at `5de4999f` on
+`logit:soak` `sha256:549cfaa6d1ee`,
+built `--no-cache` from the merged tree with #596, and VictoriaMetrics v1.152.0. The run
+directory is 239 MB. The host was shared for part of the run with a 14-minute `statsd-datadog`
+run and with cargo test containers. Overall PASS after a re-score: the first scoring FAILed
+`ledger.windows` on one gap, a harness finding described below, and every other row passed both
+times.
+
+The rows of the re-scored `results.md` (`rss_slope`, `ledger.intake`, `ledger.egress`, and
+`ledger.replay` trimmed to their ranges and counts):
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 226 apply/revert action(s) returned 0; 38 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 31 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (16 kill(s)) |
+| `restarts` | PASS | 44 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 95 sink fault line(s) inside fault windows, 0 outside, 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 6182 health sample(s) healthy outside fault windows; 38 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 458 30s window(s) with deliveries outside fault windows; 535 freshness sample(s) under 30s; 13710s of 28740s after warmup judged (48%; WARN under 5%) |
+| `rss_slope` | PASS | MiB/h per service/life: logit/0 to logit/29 from -13.4 to +36.4, generator/0 +1.0 (limit 64); logit 14835s of 28740s after warmup judged (52%; WARN under 5%); generator 14830s of 28740s after warmup judged (52%; WARN under 5%) |
+| `fd_slope` | PASS | warmup median -> end: logit 15->15, generator 11->11 (limit +8) |
+| `ledger.wire` | PASS | G 56,517,865 = W 55,362,360 + K 937,342 + wire 218,163 (by design: 227,626 in UDP-affecting windows, -9,542 steady, 79 at the end; steady loss judged 871, each run at 0 or more, against limit 15,300); the generator's counted drop_newest loss, not in G: 1,094,500 event(s) in 10,945 batch(es) |
+| `ledger.intake` | PASS | final life 29: W − D 538,400 vs E + B 538,400; lives 0 to 28: W − D − B − Ab 0 within [0, R] (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.edge` | PASS | final life 29: E 538,400 == A 538,400 (listener to aggregate) |
+| `ledger.aggregate` | PASS | final life 29: Ab 538,400 == A 538,400 (every event absorbed) |
+| `ledger.egress` | PASS | 16 killed lives: Ab − V 0, ok (10 lives) or 10,000, within band (6 lives: 1, 10, 12, 17, 20, 25), each band about [-10,000, 30,000]; 13 stopped lives: W − D − B − V 0 = residual 0 + Ab − V 0, ok; life 29 (final): Ab 538,400 − V 538,400 = 0, ok |
+| `ledger.windows` | PASS | 100 series x 30 life/lives, widest gap 10.002s (gaps <= 15s (1.5 x the 10s aggregate interval) or idle, with no window batches.sent from a + 7.5s to b - 2.5s (5s drains); a killed life's last sample within 11s (1.1 x) of the kill, a later life's first within 20s (2 x) of its start; 23 idle gap(s) excused: life 4 +2866s to +2906s (40s, 100 series), window sent 0 batch(es) over 6 drain(s) from +2874s to +2904s; life 7 +4773s to +4793s (20s, 100 series), window sent 0 batch(es) over 2 drain(s) from +4781s to +4791s; life 7 +4923s to +4964s (40.885s, 100 series), window sent 0 batch(es) over 0 drain(s) from +4931s to +4962s; 20 more in the lines) |
+| `ledger.replay` | PASS | 16 killed lives each followed by another: the next life's first drain replayed 0 vs the killed life's last-drain buffer.batches 0 or 1 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 29: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V 0; wire G − (W + K) 218,163 over the run, by design |
+| `identity.sink` | PASS | final life 29 at +28829s: received 24 vs delivered 24 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `recovery` | PASS | 113 of 113 fault(s) judged, each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `expect` | SKIP | the scenario has no [[expect]] tables |
+
+What the run showed:
+
+- **The SUT ran 30 lives**: 16 ended by a `kill`, 13 by a `stop`, and the final one. All 226
+  actions returned 0, the health sampler took 6,182 samples, all healthy outside fault windows,
+  and the slowest readiness after a start or unpause was 0.1 s.
+- **Steady-state coverage was 48% of the post-warmup time for `progress`** (458 windows with
+  deliveries) **and 52% for the RSS slopes**, the same shares as the 1-hour run.
+- **RSS slopes were −13.4 to +36.4 MiB/h per life** (limit 64), and the generator's was
+  +1.0 MiB/h over the whole run. File descriptors stayed
+  flat: `logit` 15 to 15, the generator 11 to 11.
+- **Wire loss was 218,163, all inside UDP-affecting windows.** Those windows lost 227,626, the
+  steady buckets summed to −9,542, clamped to 0 per bucket (judged 871 against a limit of
+  15,300), and 79 fell at the end. The kernel counted 937,342 drops (K), during pauses of the
+  SUT, and the generator counted 1,094,500 `drop_newest` events in 10,945 batches while the SUT
+  was down. Both are counted loss. The final life's uncounted loss was 0.
+- **The ledger balanced in every life.** Every earlier life's residual was 0. Ten killed lives
+  balanced to 0 and six were 10,000 short, one unflushed 10 s window at 2,000/s, inside the band.
+- **`ledger.replay` replayed 0 at every one of the 16 restarts after a kill**, against 0 or 1
+  queued batches at each kill: the sink was idle at each kill, as in the 1-hour run.
+- **`recovery` judged all 113 faults**, and each recovered within the 45 s `recovery_bound`.
+- **The sink dropped nothing in the whole run.** During the partition `r43` it held one
+  `Ambiguous` batch and delivered it at 18:45:40 when the partition ended. `vm-export.jsonl` holds
+  the +10675 s sample twice with the same value, because the timed-out first POST landed too:
+  a harmless at-least-once duplicate under `temporality: cumulative`.
+
+One finding, in the harness: the first scoring FAILed `ledger.windows`, because all 100 series
+lacked the windows at about +10685 s and +10695 s in life 10. Fault `r43` was a 23 s
+`partition` of `logit`, from +10671.00 s to +10694.08 s. The generator's `statsd_out` couldn't
+resolve `logit:8125` until +10698.39 s, 4.31 s after the revert. Across the run's six `logit`
+partitions this resume lag ran 0.94 to 4.53 s; it's inferred to be Docker's embedded DNS
+re-registering the alias after `network connect`. The SUT's listener saw no datagram from
+18:45:22 to 18:45:37, and the `window` aggregate reported `series.active` 0 and sent no batch at
+those flushes. It then absorbed the 58,100-datagram backlog at 18:45:42 and emitted the +10705 s
+window with the full count, so the totals went from 43,820 to 44,620 over four windows, 200 per
+window. VictoriaMetrics logged nothing from 18:30 to 18:49. No window was lost: the gap ended
+11.084 s after the revert, past the 11 s bound the excusal then allowed after a silencing fault.
+Widening that bound would also have excused a window lost right after a fault, so the
+excusal now reads the aggregate's own `batches.sent` instead of fault windows (see
+`ledger.windows` under "The checks"). Re-scored, the row passes with 23 idle gaps excused, each
+across a `pause` or `partition` of `logit` or a `partition` of the generator, `r43`'s among them:
+"life 10 +10675s to +10705s (30s, 100 series), window sent 0 batch(es) over 4 drain(s) from
++10683s to +10703s". The 1-hour run and the W1b, W2, and W3 runs keep their statuses.
+
+The 8-hour run meets W4's gate in "Verification".
 
 What W4 measured without a run:
 
@@ -1273,12 +1352,13 @@ What W4 measured without a run:
   killed life's `ledger.egress` FAILs as uncounted and whose `ledger.replay` FAILs.
 - **W4**: the self-test passes, and each new rule fails it when reverted (51 rules: every
   `[random]` validation and schedule rule, the draw order, the seed's recording, the
-  `ledger.windows` excusal and its bounds before and after the fault, the chunk boundaries and
-  failure handling, the poll deadlines and round timeouts, and an inherited SIGHUP ignore kept
-  for `nohup`). `random-faults` passes `self-test` validation, the shipped-config test,
+  `ledger.windows` idle excusal, on time and one drain late, across a pause with no drains,
+  and past 11 s after a partition, against a batch sent inside the span, the chunk boundaries
+  and failure handling, the poll deadlines and round timeouts, and an inherited SIGHUP ignore
+  kept for `nohup`). `random-faults` passes `self-test` validation, the shipped-config test,
   and `logit validate` in `logit:soak`. Re-scoring the recorded W1b, W2, and W3 runs gives the
-  same rows, every detail included. `check` on a synthetic 8-hour run directory finishes in
-  seconds. W4 is done once a 1-hour `random-faults` run and an 8-hour one are recorded under
-  "Findings"; neither has been made yet.
+  same statuses; only `ledger.windows`' statement of its rules changes. `check` on a synthetic
+  8-hour run directory finishes in seconds. Met: the 1-hour run `20261009T135848Z` and the
+  8-hour run `20261009T154710Z` are recorded under "Findings", both Overall PASS.
 - **W5**: each new scenario passes `self-test` validation and the shipped-config test, and a
   run of it is recorded under "Findings".
