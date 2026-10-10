@@ -6209,8 +6209,9 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   timestamp order); and a family's series written from several groups each took their own
   group's help and unit, which decode then applies family-wide (each now takes the first the
   groups carry). The decompress gate's single entry point: `prometheus_in`'s receiver calls
-  `compression::decompress_bounded` and nothing else, and the one other `decompress_vec` in a crate
-  is `prometheus_out`'s test receiver, under `#[cfg(test)]`; a Snappy length over the cap is
+  `compression::decompress_bounded` and nothing else, and the only other `decompress_vec` calls
+  are test code under `#[cfg(test)]` (`prometheus_out`'s test receiver and `generated`'s
+  `snap_block_round_trip`); a Snappy length over the cap is
   refused with under 64 KiB live, a length at the cap over a short body allocates at most the cap
   and fails, and a varint past 32 bits is malformed on the header. `symbol` and `resolve_refs` are
   hard `Malformed`: the target builds 2.0 requests and checks the verdict against the doc's rule on

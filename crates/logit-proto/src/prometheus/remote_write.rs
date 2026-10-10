@@ -104,8 +104,8 @@
 //! | `duplicate_type` / `duplicate_metadata` | a second metadata entry naming a *different* type, help or unit for one family. A sender repeating what it already said is not counted, which matters here because 2.0 repeats a family's `Metadata` on every one of its wire series |
 //!
 //! And one *degradation*, `logit.input.metrics.degraded{reason="exemplar_dropped"}`: an exemplar
-//! with no reading to be an example of -- its series has no sample anywhere in the request, or the
-//! series was itself skipped above. The two counters are not additive: a series with bad labels and
+//! with no reading to be an example of -- its series has no reading anywhere in the request (a
+//! stale marker is not one), or the series was itself skipped above. The two counters are not additive: a series with bad labels and
 //! three exemplars raises one `invalid_labels` **and** three `exemplar_dropped`, because they
 //! answer different questions (how many series went, and how much of what the sender sent was not
 //! stored).
@@ -285,8 +285,9 @@ pub struct Decoded {
     pub samples: u64,
     /// Exemplars stored, for `X-Prometheus-Remote-Write-Exemplars-Written`. Every exemplar this
     /// codec could not place is counted `logit.input.metrics.degraded{reason="exemplar_dropped"}`
-    /// instead -- whether its series carried no sample this codec kept, or the series was skipped
-    /// as `invalid_labels` -- so the difference from what was sent is in one counter.
+    /// instead -- whether its series carried no reading this codec kept (a stale marker is not
+    /// one), or the series was skipped as `invalid_labels` -- so the difference from what was sent
+    /// is in one counter.
     pub exemplars: u64,
     /// Native-histogram entries skipped, each also counted
     /// `logit.input.metrics.skipped{reason="native_histogram"}`.
@@ -526,8 +527,8 @@ fn merge_declaration(
 
 /// Attaches one exemplar to the group [`Routed::group_for`] chooses, counting
 /// `logit.input.metrics.degraded{reason="exemplar_dropped"}` when there is nowhere to put it --
-/// a series whose every sample this codec stepped over, or one that carried exemplars and no
-/// samples at all. Returns whether it was stored, which is what
+/// a series with no reading this codec kept (a stale marker is not one), or one that carried
+/// exemplars and no samples at all. Returns whether it was stored, which is what
 /// `X-Prometheus-Remote-Write-Exemplars-Written` reports.
 fn attach_exemplar(
     groups: &mut Groups<'_>,
