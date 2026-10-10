@@ -709,10 +709,6 @@ REJECTED_BATCH_REASONS = ("rejected",)
 REJECTION_KEYS = ("request_rejected", "series_rejected", "oversize")
 REFUSAL_KEYS = ("api_key_rejected", "request_refused")
 _ANSWERED_RE = re.compile(r"answered (\d{3})")
-# `(service, action)` faults during which the SUT writes no `aggregate` window: `ledger.windows`
-# excuses a gap across one.
-WINDOWLESS_FAULTS = {("logit", "pause"), ("logit", "partition"), ("generator", "pause"),
-                     ("generator", "stop"), ("generator", "partition")}
 
 
 def _int(value):
@@ -1296,12 +1292,13 @@ def check_identity_sink(data):
 
 def check_ledger_windows(data):
     """Opt-in, under `[ledger] vm_every_window`: every series has a sample for every
-    `aggregate` window of every SUT life. Per life and series, consecutive samples are at most
-    1.5 x the configured interval apart; a killed life's last sample is at most 1.1 x the
-    interval before the kill, because the kill discards only the window in progress, and 10%
-    covers a flush's own lateness; and a later life's first sample is at most 2 x the interval
-    after the life starts, the first window plus startup. Opt-in because `aggregate` emits a
-    series only in a window that updated it, so an idle series has gaps by design. Under
+    `aggregate` window the SUT emitted. Per life and series, consecutive samples are at most
+    1.5 x the configured interval apart, unless the SUT's `aggregate` sent no batch in the span
+    the missing windows would have been flushed in; a killed life's last sample is at most
+    1.1 x the interval before the kill, because the kill discards only the window in progress,
+    and 10% covers a flush's own lateness; and a later life's first sample is at most 2 x the
+    interval after the life starts, the first window plus startup. Opt-in because `aggregate`
+    emits a series only in a window that updated it, so an idle series has gaps by design. Under
     `temporality: cumulative` V reads only each life's last value, so a lost middle window
     changes no total and only this row sees it."""
     if data.external:
@@ -1319,20 +1316,31 @@ def check_ledger_windows(data):
     if not led.series:
         return Result("ledger.windows", FAIL, "no series in vm-export.jsonl match vm_selector")
     max_gap, tail_bound, head_bound = 1.5 * interval, 1.1 * interval, 2 * interval
-    # Faults during which the SUT writes no window by design: a paused process flushes nothing,
-    # and with the SUT or the generator partitioned or stopped no line arrives, and `aggregate`
-    # emits a series only in a window that updated it. A gap spanning one is excused when it
-    # starts within `tail_bound` before the fault, where the last window before it closes, and
-    # ends within `tail_bound` after it: the first window to close after the fault can hold no
-    # line, and the next one closes an interval later. A restarted generator sends its first
-    # line only after it starts, so a generator stop gets `head_bound` after it, as a new life's
-    # first sample does; that allowance is assumed, since no shipped scenario stops the
-    # generator. A lost window beside the fault FAILs once it moves the gap's start or end past
-    # its bound; one lost inside that bound is excused.
-    silent = [(f.start, f.end, head_bound if (f.on, f.action) == ("generator", "stop")
-               else tail_bound, f"{f.step} {f.action} on {f.on}") for f in data.faults
-              if (f.on, f.action) in WINDOWLESS_FAULTS]
-    excused = []
+    # A gap (a, b] is idle when `aggregate` sent no batch in the span its missing windows would
+    # have been flushed in: an idle flush sends nothing, so no window existed to store. A flush
+    # at f is reported by the drain at f + d, d from about 0 to one drain period p, since the
+    # two timers share a phase and either may fire first at a shared tick. The windows missing
+    # from (a, b] flush at a + k x interval, 0 < k < (b - a) / interval, so their drains fall
+    # in [a + interval, b - interval + p]; a's own drain falls in [a, a + p] and b's in
+    # [b, b + p]. Counting over [a + (interval + p) / 2, b - (interval - p) / 2) splits both
+    # separations in half, a margin of (interval - p) / 2 on each side for timer jitter, and
+    # needs p < interval. A paused SUT writes no drain and flushes nothing, so a gap across a
+    # pause counts 0 over no drains and is idle: no window closed, so none was lost.
+    gaps = [b - a for a, b in zip(led.sut.drains, led.sut.drains[1:]) if b > a]
+    period = round(statistics.median(gaps), 1) if gaps else None
+    sent = [ts for ts, value, _ in led.sut.counter_points("logit.component.batches.sent",
+                                                         component=led.aggregate) if value]
+    drains = led.sut.drains
+    idle_rule = period is not None and period < interval
+
+    def flushes(a, b):
+        """(batches sent, drains, span start, span end) over the span between a and b."""
+        lo, hi = a + (interval + period) / 2, b - (interval - period) / 2
+        n_sent = sum(1 for ts in sent if lo <= ts < hi)
+        n_drains = bisect.bisect_left(drains, hi) - bisect.bisect_left(drains, lo)
+        return n_sent, n_drains, lo, hi
+
+    idle = {}
     problems = []
     widest = 0.0
     for one in led.series:
@@ -1347,17 +1355,22 @@ def check_ledger_windows(data):
                 problems.append(f"{name}: no sample in life {life}")
                 continue
             for a, b in zip(stamps, stamps[1:]):
-                if b - a > max_gap:
-                    cover = next((label for start, end, after, label in silent
-                                  if start - a <= tail_bound and b - end <= after
-                                  and a < end and b > start), None)
-                    if cover is not None:
-                        excused.append(f"{name}: life {life} gap {b - a:g}s across {cover}")
-                        continue
+                if b - a <= max_gap:
+                    widest = max(widest, b - a)
+                    continue
+                gap = f"life {life} gap {b - a:g}s from {data.offset(a)} to {data.offset(b)}"
+                if not idle_rule:
+                    widest = max(widest, b - a)
+                    problems.append(f"{name}: {gap}")
+                    continue
+                n_sent, n_drains, lo, hi = flushes(a, b)
+                span = (f"{led.aggregate} sent {n_sent} batch(es) over {n_drains} drain(s) "
+                        f"from {data.offset(lo)} to {data.offset(hi)}")
+                if n_sent == 0:
+                    idle.setdefault((life, a, b), [0, span])[0] += 1
+                    continue
                 widest = max(widest, b - a)
-                if b - a > max_gap:
-                    problems.append(f"{name}: life {life} gap {b - a:g}s from "
-                                    f"{data.offset(a)} to {data.offset(b)}")
+                problems.append(f"{name}: {gap}, windows emitted but not stored: {span}")
             if life in led.killed_at and life != led.final:
                 kill = led.killed_at[life]
                 if stamps[-1] < kill - tail_bound:
@@ -1369,13 +1382,25 @@ def check_ledger_windows(data):
                                 f"{data.offset(stamps[0])}, "
                                 f"{stamps[0] - led.life_starts[life]:g}s after the life started "
                                 f"at {data.offset(led.life_starts[life])}")
-    rules = (f"gaps <= {max_gap:g}s (1.5 x the {interval:g}s aggregate interval), a killed life's "
-             f"last sample within {tail_bound:g}s (1.1 x) of the kill, a later life's first "
-             f"within {head_bound:g}s (2 x) of its start")
-    if silent:
-        rules += (f"; a gap across a fault that silences the SUT excused when it starts "
-                  f"within {tail_bound:g}s before the fault and ends within {tail_bound:g}s "
-                  f"after it ({head_bound:g}s after a generator stop), {len(excused)} excused")
+    if idle_rule:
+        rules = (f"gaps <= {max_gap:g}s (1.5 x the {interval:g}s aggregate interval) or idle, "
+                 f"with no {led.aggregate} batches.sent from a + {(interval + period) / 2:g}s to "
+                 f"b - {(interval - period) / 2:g}s ({period:g}s drains); a killed life's last "
+                 f"sample within {tail_bound:g}s (1.1 x) of the kill, a later life's first "
+                 f"within {head_bound:g}s (2 x) of its start")
+    else:
+        rules = (f"gaps <= {max_gap:g}s (1.5 x the {interval:g}s aggregate interval), no idle "
+                 f"excusal because the drain period {period}s isn't under the interval; a killed "
+                 f"life's last sample within {tail_bound:g}s (1.1 x) of the kill, a later life's "
+                 f"first within {head_bound:g}s (2 x) of its start")
+    # One line per distinct idle gap: every series flushes at the same instants, so a gap
+    # usually spans them all.
+    excused = [f"idle gap excused: life {life} {data.offset(a)} to {data.offset(b)} ({b - a:g}s, "
+               f"{count} series), {span}" for (life, a, b), (count, span) in sorted(idle.items())]
+    if excused:
+        shown = "; ".join(line.removeprefix("idle gap excused: ") for line in excused[:3])
+        more = f"; {len(excused) - 3} more in the lines" if len(excused) > 3 else ""
+        rules += f"; {len(excused)} idle gap(s) excused: {shown}{more}"
     if problems:
         return Result("ledger.windows", FAIL,
                       f"missing windows, {len(problems)} finding(s), first: {problems[0]} "
