@@ -1,0 +1,7 @@
+# TYPE req counter
+req_total{a="1"} 3 1605281325.5
+req_created{a="1"} 1605281325.123
+# TYPE lat summary
+lat_count 2
+lat_created 1.605281325e9
+# EOF

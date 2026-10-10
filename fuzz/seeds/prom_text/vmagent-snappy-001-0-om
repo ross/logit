@@ -1,0 +1,33 @@
+# TYPE go_gc_duration_seconds unknown
+go_gc_duration_seconds{instance="metatarget:9100",job="vmagent",monitor="logit-fixture",quantile="0"} 0.000055084 1790280252.188
+go_gc_duration_seconds{instance="metatarget:9100",job="vmagent",monitor="logit-fixture",quantile="1"} 0.000302739 1790280252.188
+# TYPE go_gc_duration_seconds_count unknown
+go_gc_duration_seconds_count{instance="metatarget:9100",job="vmagent",monitor="logit-fixture"} 17 1790280252.188
+# TYPE go_gc_duration_seconds_sum unknown
+go_gc_duration_seconds_sum{instance="metatarget:9100",job="vmagent",monitor="logit-fixture"} 0.001626892 1790280252.188
+# TYPE prometheus_build_info unknown
+prometheus_build_info{branch="HEAD",goarch="amd64",goos="linux",goversion="go1.26.6",instance="metatarget:9100",job="vmagent",monitor="logit-fixture",revision="d7598b7141418fa35be2b5ec5d0fefb634199610",tags="netgo,builtinassets",version="3.14.0"} 1 1790280252.188
+# TYPE prometheus_tsdb_compaction_duration_seconds_bucket unknown
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="metatarget:9100",job="vmagent",le="+Inf",monitor="logit-fixture"} 0 1790280252.188
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="metatarget:9100",job="vmagent",le="1",monitor="logit-fixture"} 0 1790280252.188
+# TYPE prometheus_tsdb_compaction_duration_seconds_count unknown
+prometheus_tsdb_compaction_duration_seconds_count{instance="metatarget:9100",job="vmagent",monitor="logit-fixture"} 0 1790280252.188
+# TYPE prometheus_tsdb_compaction_duration_seconds_sum unknown
+prometheus_tsdb_compaction_duration_seconds_sum{instance="metatarget:9100",job="vmagent",monitor="logit-fixture"} 0 1790280252.188
+# TYPE prometheus_tsdb_wal_page_flushes_total unknown
+prometheus_tsdb_wal_page_flushes_total{instance="metatarget:9100",job="vmagent",monitor="logit-fixture"} 3 1790280252.188
+# TYPE scrape_duration_seconds unknown
+scrape_duration_seconds{instance="metatarget:9100",job="vmagent",monitor="logit-fixture"} 0.005 1790280252.188
+# TYPE scrape_response_size_bytes unknown
+scrape_response_size_bytes{instance="metatarget:9100",job="vmagent",monitor="logit-fixture"} 2657 1790280252.188
+# TYPE scrape_samples_post_metric_relabeling unknown
+scrape_samples_post_metric_relabeling{instance="metatarget:9100",job="vmagent",monitor="logit-fixture"} 10 1790280252.188
+# TYPE scrape_samples_scraped unknown
+scrape_samples_scraped{instance="metatarget:9100",job="vmagent",monitor="logit-fixture"} 10 1790280252.188
+# TYPE scrape_series_added unknown
+scrape_series_added{instance="metatarget:9100",job="vmagent",monitor="logit-fixture"} 10 1790280252.188
+# TYPE scrape_timeout_seconds unknown
+scrape_timeout_seconds{instance="metatarget:9100",job="vmagent",monitor="logit-fixture"} 5 1790280252.188
+# TYPE up unknown
+up{instance="metatarget:9100",job="vmagent",monitor="logit-fixture"} 1 1790280252.188
+# EOF

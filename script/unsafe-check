@@ -94,12 +94,17 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # one memoized datapoint repeated by two-byte `BINGET`s, is a measured 27 MiB `Vec`, pinned under
 # 32. `collectd`'s is its two cut bytes and a 65,507-byte UDP payload; its worst input, one-byte
 # notification messages six bytes apart, is a measured 13.5 MiB `Vec`, pinned under 16 in the
-# collectd section. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
+# collectd section. `prom_text`'s is its dialect byte and a body one byte short of 64 KiB; its
+# worst input, distinct one- to three-character names on `aa 1` lines, is one family of one
+# series per five or six bytes, and the target's model mapping makes one 864-byte `Event` of
+# each: a measured 13.5 MiB `Vec`, pinned under 16 in the prometheus text section. `extra args`
+# go to `fuzz` only, never to `fuzz-tmin`.
 #
 # `native_batch`, `native_hop_batch`, `statsd`, `syslog`, `graphite_plaintext`,
-# `graphite_pickle`, and `collectd` run in fork mode: the process-wide interner never evicts, so a
-# long-lived fuzz process accumulates every dictionary string, metric name, tag key, SD-ID,
-# PARAM-NAME, and carbon path it decodes until the arena outgrows the malloc limit, and fork mode
+# `graphite_pickle`, `collectd`, `prom_text`, and `prom_remote_write` run in fork mode: the
+# process-wide interner never evicts, so a long-lived fuzz process accumulates every dictionary
+# string, metric name, tag key, SD-ID, PARAM-NAME, carbon path, and Prometheus exemplar label
+# name and family name it decodes until the arena outgrows the malloc limit, and fork mode
 # restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal, as it
 # is outside fork mode.
 FUZZ_TARGETS=(
@@ -114,7 +119,8 @@ FUZZ_TARGETS=(
     "otlp_json|65536|64|"
     "otlp_grpc|65536|16|"
     "prom_decompress|65536|16|"
-    "prom_remote_write|65536|64|"
+    "prom_remote_write|65536|64|-fork=1 -ignore_ooms=0"
+    "prom_text|65536|16|-fork=1 -ignore_ooms=0"
     "proxy_header|65552|16|"
     "forwarded|4096|16|"
     "stream_framing|65546|16|"

@@ -17,6 +17,7 @@ libfuzzer-sys = "0.4"
 bytes = "1"
 logit-core = { path = "../crates/logit-core" }
 logit-proto = { path = "../crates/logit-proto" }
+prost = "0.14"
 
 # Symbols in a crash's stack trace.
 [profile.release]
@@ -102,6 +103,13 @@ bench = false
 [[bin]]
 name = "prom_remote_write"
 path = "fuzz_targets/prom_remote_write.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "prom_text"
+path = "fuzz_targets/prom_text.rs"
 test = false
 doc = false
 bench = false

@@ -3,7 +3,7 @@
 //!
 //! A target that takes a selector byte gets it prepended, matching the target's own doc: the
 //! OTLP targets' signal (`0` logs, `1` metrics, `2` traces), `prom_decompress`'s encoding,
-//! `prom_remote_write`'s version, `stream_framing`'s four bytes of mode, bound, and chunking,
+//! `prom_remote_write`'s version and mode, `prom_text`'s dialect, `stream_framing`'s four bytes of mode, bound, and chunking,
 //! `syslog`'s line splitting (`1` on, `0` off), `graphite_pickle`'s mode (`0` a payload, `1` a
 //! build spec), and `collectd`'s two-byte cut position. [`generate`] is deterministic, so a rerun
 //! rewrites the same bytes and leaves `git status` clean.
@@ -27,7 +27,9 @@ use logit_proto::native::varint::write_uvarint;
 use logit_proto::native::{encode_batch, encode_hop_batch, SeqId, CODEC_BATCH, CODEC_HOP_BATCH};
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{decompress_bounded, Encoding};
-use logit_proto::prometheus::remote_write::Version;
+use logit_proto::prometheus::remote_write::{self, Version};
+use logit_proto::prometheus::text::{self, Dialect};
+use logit_proto::prometheus::PrometheusDecoder;
 use logit_proto::proxy::V2_SIGNATURE;
 use logit_proto::{FramedEncoder, MessageBuf, Signal, SignalEncoder, SignalPayload};
 use std::collections::BTreeMap;
@@ -44,6 +46,10 @@ pub type Seeds = BTreeMap<&'static str, BTreeMap<String, Vec<u8>>>;
 
 const SIGNALS: [(Signal, &str, u8); 3] =
     [(Signal::Logs, "logs", 0), (Signal::Metrics, "metrics", 1), (Signal::Traces, "traces", 2)];
+
+/// `prom_text`'s dialect selectors.
+const DIALECTS: [(Dialect, &str, u8); 2] =
+    [(Dialect::Text0_0_4, "text", 0), (Dialect::OpenMetrics1_0, "om", 1)];
 
 /// Every seed, keyed by target. `testdata` is the repository's `testdata/` directory. Seeds over
 /// [`MAX_SEED_BYTES`] are dropped and named in the second return value.
@@ -234,7 +240,24 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
             Version::V1 => 0,
             Version::V2 => 1,
         };
-        add("prom_remote_write", stem, prefixed(version_selector, &decompressed));
+        add("prom_remote_write", stem.clone(), prefixed(version_selector, &decompressed));
+        let decoded = remote_write::decode(&decompressed, version, &mut PrometheusDecoder::new())
+            .map_err(|e| std::io::Error::other(format!("{stem}: {e}")))?;
+        for (i, families) in decoded.groups.iter().enumerate().take(3) {
+            for (dialect, label, selector) in DIALECTS {
+                let mut body = Vec::new();
+                text::write(families, dialect, &mut body);
+                add("prom_text", format!("{stem}-{i}-{label}"), prefixed(selector, &body));
+            }
+        }
+    }
+
+    for (name, bytes) in prom_text_seeds(testdata)? {
+        add("prom_text", name, bytes);
+    }
+
+    for (name, bytes) in prom_remote_write_built_seeds() {
+        add("prom_remote_write", name, bytes);
     }
 
     for (name, bytes) in proxy_headers() {
@@ -852,6 +875,130 @@ fn collectd_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     Ok(out)
 }
 
+/// `logit-cli`'s exposition fixtures, by their dialect suffix, and the scrape target the recorded
+/// metadata capture points at, then hand-written bodies for what neither has: OpenMetrics
+/// `_created`, `# EOF` misplaced and missing, a histogram missing `+Inf`, fractional and
+/// non-finite counts, exemplars, `info` and `stateset`, quantiles outside `[0, 1]`, every escape
+/// at the end of a label value, and a text 0.0.4 `# EOF`, which is a comment.
+fn prom_text_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let fixtures = testdata.join("../crates/logit-cli/tests/fixtures/prometheus");
+    let mut paths: Vec<_> = std::fs::read_dir(&fixtures)?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "in"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let selector = if stem.ends_with(".om") { 1 } else { 0 };
+        out.push((format!("cli-{stem}"), prefixed(selector, &std::fs::read(&path)?)));
+    }
+    let target = testdata.join("../tools/record-fixtures/prometheus-metadata-target.prom");
+    out.push(("metadata-target".to_string(), prefixed(0, &std::fs::read(target)?)));
+
+    let om: [(&str, &str); 9] = [
+        (
+            "created",
+            "# TYPE req counter\nreq_total{a=\"1\"} 3 1605281325.5\nreq_created{a=\"1\"} 1605281325.123\n\
+             # TYPE lat summary\nlat_count 2\nlat_created 1.605281325e9\n# EOF\n",
+        ),
+        ("eof-missing", "# TYPE g gauge\ng 1\n"),
+        ("eof-then-content", "g 1\n# EOF\ng 2\n"),
+        ("eof-then-blank", "g 1\n# EOF\n\n \t\r\n"),
+        (
+            "histogram-no-inf",
+            "# TYPE h histogram\nh_bucket{le=\"1\"} 2\nh_bucket{le=\"5\"} 4\nh_count 6\nh_sum 9\n# EOF\n",
+        ),
+        (
+            "fractional-counts",
+            "# TYPE h gaugehistogram\nh_bucket{le=\"1\"} 0.5\nh_bucket{le=\"+Inf\"} 2.5\nh_gcount 2.49\n\
+             h_gsum 1\n# TYPE c histogram\nc_bucket{le=\"1\"} NaN\nc_bucket{le=\"2\"} -1\n\
+             c_bucket{le=\"+Inf\"} 1e19\nc_count +Inf\n# EOF\n",
+        ),
+        (
+            "exemplars",
+            "# TYPE r counter\nr_total 3 # {trace_id=\"0123456789abcdef0123456789abcdef\",\
+             span_id=\"fedcba9876543210\"} 0.5 1605281325.5\n# TYPE h histogram\n\
+             h_bucket{le=\"0.1\"} 1 # {slow=\"no\"} 0.05\nh_bucket{le=\"+Inf\"} 2 # {} 7\n# EOF\n",
+        ),
+        (
+            "info-and-stateset",
+            "# TYPE build info\nbuild_info{version=\"1.2.3\"} 1\n# TYPE s stateset\n\
+             s{s=\"a\"} 0\ns{s=\"b\"} 1\n# TYPE u unknown\n# UNIT u_seconds seconds\nu 1\n# EOF\n",
+        ),
+        (
+            "quantiles",
+            "# TYPE q summary\nq{quantile=\"0.5\"} 1\nq{quantile=\"5\"} 2\nq{quantile=\"-Inf\"} 3\n\
+             q{quantile=\"NaN\"} 4\nq_sum 1\nq_count 3\n# EOF\n",
+        ),
+    ];
+    for (name, body) in om {
+        out.push((format!("om-{name}"), prefixed(1, body.as_bytes())));
+    }
+    let text: [(&str, &str); 2] = [
+        (
+            "escapes",
+            "e{a=\"x\\\\\",b=\"y\\\"\",c=\"z\\n\",d=\"\\t\"} 1\nf{a=\"open\\\"} 1\nf{a=\"cut\\\n",
+        ),
+        ("eof-is-a-comment", "g 1\n# EOF\ng{a=\"b\"} 2\n# HELP g A gauge.\n"),
+    ];
+    for (name, body) in text {
+        out.push((format!("text-{name}"), prefixed(0, body.as_bytes())));
+    }
+    Ok(out)
+}
+
+/// `prom_remote_write`'s build-mode inputs (selector bit 1), in the byte order the target's
+/// `Build` reads them. Each 2.0 request has the four symbols `"", "__name__", "foo", "a"` (k = 4)
+/// and one series named `foo`, with a reference at k - 1, at k, or at `u32::MAX`, an odd
+/// `labels_refs`, and a non-empty `symbols[0]`; the 1.0 ones carry a valid and an invalid series,
+/// and metadata.
+fn prom_remote_write_built_seeds() -> Vec<(String, Vec<u8>)> {
+    // Indices into the target's `STRINGS`.
+    const EMPTY: u8 = 0;
+    const NAME: u8 = 1;
+    const FOO: u8 = 2;
+    const A: u8 = 12;
+    const HELP: u8 = 13;
+    const GAUGE: u8 = 2;
+    // k, the four symbols, then a byte that empties `symbols[0]` unless it's a multiple of 8.
+    let symbols = |first: u8, keep_first: u8| vec![4, first, NAME, FOO, A, keep_first];
+    // One series: its references, one sample of 1.0 at 0 ms, no native histogram, no exemplar,
+    // then the metadata selector, type, help reference, and unit reference.
+    let series = |refs: &[u8], help: u8| {
+        let mut out = vec![1, refs.len() as u8];
+        out.extend_from_slice(refs);
+        out.extend_from_slice(&[1, 0, 0, 0, 1, 0, 1, GAUGE, help, 0]);
+        out
+    };
+    let v2 = |first: u8, keep_first: u8, refs: &[u8], help: u8| {
+        let mut out = vec![0b11];
+        out.extend(symbols(first, keep_first));
+        out.extend(series(refs, help));
+        out
+    };
+    let v1 = {
+        let mut out = vec![0b10, 2];
+        // `__name__="foo",a="a"`, a sample of 2.5 at 0 ms, an exemplar `{a="a"} 1.0` at 0 ms, and
+        // no native histogram.
+        out.extend_from_slice(&[2, NAME, FOO, A, A, 1, 3, 0, 0, 1, 1, A, A, 0, 0, 1]);
+        // An empty `__name__`, no samples or exemplars, and a native histogram, which an invalid
+        // series doesn't count.
+        out.extend_from_slice(&[1, NAME, EMPTY, 0, 0, 0]);
+        // One metadata entry: `foo` is a gauge, with help.
+        out.extend_from_slice(&[1, GAUGE, FOO, HELP, EMPTY]);
+        out
+    };
+    vec![
+        ("built-v2-ref-k-minus-1".to_string(), v2(EMPTY, 1, &[1, 2], 3)),
+        ("built-v2-ref-k".to_string(), v2(EMPTY, 1, &[1, 2], 4)),
+        ("built-v2-ref-u32-max".to_string(), v2(EMPTY, 1, &[1, 255], 0)),
+        ("built-v2-odd-refs".to_string(), v2(EMPTY, 1, &[1, 2, 3], 0)),
+        ("built-v2-symbol0-not-empty".to_string(), v2(A, 8, &[1, 2], 0)),
+        ("built-v1".to_string(), v1),
+    ]
+}
+
 fn prefixed(selector: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + body.len());
     out.push(selector);
@@ -924,6 +1071,7 @@ mod tests {
                 "otlp_proto",
                 "prom_decompress",
                 "prom_remote_write",
+                "prom_text",
                 "proxy_header",
                 "sketch_bytes",
                 "sketch_merge",
