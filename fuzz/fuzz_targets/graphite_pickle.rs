@@ -302,7 +302,10 @@ fuzz_target!(|data: &[u8]| {
                 assert_eq!(got.2.to_bits(), want.2.to_bits(), "built: a value changed");
             }
             for (borrowed, copied) in borrowed.iter().zip(copied) {
-                assert_eq!(*borrowed, !copied, "built: only a path spelled to need decoding is decoded");
+                assert_eq!(
+                    *borrowed, !copied,
+                    "built: only a path spelled to need decoding is decoded"
+                );
             }
         }
         (Some(Verdict::Fails), Ok(_)) => panic!("built: a frame the tail rule fails read"),

@@ -268,8 +268,9 @@ enum PValue {
         start: u32,
         len: u32,
     },
-    /// A UTF-8-validated range into [`PickleReader::scratch`]: a protocol-0 string whose escapes
-    /// were decoded.
+    /// A UTF-8-validated range into [`PickleReader::scratch`]: a protocol-0 string the reader
+    /// decoded (a `STRING` with a backslash, or a `UNICODE` with a non-ASCII byte or a `\u`/`\U`
+    /// escape).
     Scratch {
         start: u32,
         len: u32,
