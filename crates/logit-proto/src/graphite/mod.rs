@@ -61,7 +61,7 @@
 //! | `Resource` / `Scope` | the decoder's own shared default / `None` | -- |
 //!
 //! Framing is the listener's job: the two oversize rows are counted and diagnosed by the shared TCP
-//! driver's `Framer` (`crates/logit-inputs/src/tcp.rs`), not by [`GraphiteDecoder`]. Every other
+//! driver's [`Framer`](crate::framing::Framer), not by [`GraphiteDecoder`]. Every other
 //! row is emitted here.
 //!
 //! ## Encode: model → wire

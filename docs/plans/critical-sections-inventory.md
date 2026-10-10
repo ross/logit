@@ -224,7 +224,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-03](#net-03--udp-decode_loop-pop_many-batching-interval-flush-deadline-race-and-final-flush-ordering) | P0 | UDP `decode_loop`: `pop_many` batching, interval-flush deadline race, and final flush ordering | `crates/logit-inputs/src/udp.rs` (`decode_loop`) | findings → #406 |
 | [NET-06](#net-06--boundedqueuepush_many-batched-admission-control-the-pre-wait-notify-and-cancellation) | P0 | `BoundedQueue::push_many`: batched admission control, the pre-wait notify, and cancellation | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::push_many`) | findings → #403 |
 | [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | reviewed @510291b1 |
-| [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-inputs/src/tcp.rs` (`Framer`) | in-progress (untrusted/w6) |
+| [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-proto/src/framing.rs` (`Framer`) | in-progress (untrusted/w6) |
 | [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | findings → #443, #445, #447 |
 | [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | findings → #444, #447 |
 | [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`) | findings → #445, #447 |
@@ -841,11 +841,11 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
 ---
 
 ### NET-08 — TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix
-- **Location:** `crates/logit-inputs/src/tcp.rs` — `struct Framer`, `Framer::new`,
+- **Location:** `crates/logit-proto/src/framing.rs` — `struct Framer`, `Framer::new`,
   `Framer::push` (the latch), `next_frame`, `finish`, `oversize_policy`, `next_line`,
   `next_length_prefixed`, `next_octet_counted`, `strip_cr`. Supporting types: `FramingMode`,
   `Oversize`, `Framing`, `FrameError`. Constants: `MAX_FRAME_BYTES`, `READ_BUFFER_BYTES`,
-  `LENGTH_PREFIX_BYTES` with its cross-crate assert.
+  `LENGTH_PREFIX_BYTES` with its assert against `graphite::pickle`'s.
 - **What it does:** A pure, socket-free byte-stream framer. Under `Rfc6587Auto` it latches
   octet-counting vs. LF framing from the connection's very first byte and never re-evaluates. Under
   `Lines` it scans for `LF` with an incremental `scanned` cursor (so a long line is not rescanned
@@ -903,7 +903,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   - *Low confidence, 32-bit only:* `u32::from_be_bytes(prefix) as usize` in `next_length_prefixed` is
     lossless on 64-bit but the comparison against `max_frame_bytes: usize` would behave differently on a 32-bit
     target. No such target ships today.
-- **Existing coverage:** `tcp.rs` framer tests (~20 tests: latch, split pushes, embedded
+- **Existing coverage:** `crates/logit-proto/src/framing.rs`'s framer tests (~20 tests: latch, split pushes, embedded
   newline, CR stripping, empty lines, oversize under both policies, drain-to-next-line, ten-digit
   and leading-zero counts, length-prefix assembly and over-bound), plus the recorded-interop replay
   `interop_fixture_rsyslog_tcp_non_transparent_frame`. ADRs: `syslog-tcp-ingress-and-tls`,

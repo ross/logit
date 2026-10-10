@@ -20,7 +20,7 @@
 //! **non-transparent** (LF-delimited), since such a frame always starts with `<`. A final
 //! LF-framed message with no terminator is emitted on a clean close, as RFC 6587 §3.4.2 permits;
 //! after an abrupt close or a shutdown it is counted `truncated`. A frame past the driver's 64 KiB
-//! [`MAX_FRAME_BYTES`](crate::tcp::MAX_FRAME_BYTES) closes the connection, counted
+//! [`MAX_FRAME_BYTES`](logit_proto::framing::MAX_FRAME_BYTES) closes the connection, counted
 //! `logit.input.frames.dropped{reason="oversize"}`, under either framing, since octet counting has
 //! no resync point; an octet-counted frame cut short by a close is
 //! `logit.input.frames.dropped{reason="truncated"}`. As in `statsd_in`, only `receive:`'s
@@ -417,9 +417,9 @@ impl SyslogDecoder {
     /// it as one message (`docs/adr/syslog-tcp-ingress-and-tls.md`).
     ///
     /// Off is for a transport that already delimits messages, [`SyslogInput::tcp`]'s RFC 6587
-    /// [`crate::tcp::Framer`]. Splitting there would be wrong: an octet-counted MSG may contain
-    /// `\n`, and re-splitting would turn one multiline message into half-messages, most of them
-    /// missing a PRI and dropped as `bad_line`.
+    /// [`logit_proto::framing::Framer`]. Splitting there would be wrong: an octet-counted MSG may
+    /// contain `\n`, and re-splitting would turn one multiline message into half-messages, most of
+    /// them missing a PRI and dropped as `bad_line`.
     pub fn with_line_splitting(mut self, line_splitting: bool) -> Self {
         self.line_splitting = line_splitting;
         self
@@ -459,7 +459,7 @@ impl Decoder for SyslogDecoder {
         if !self.line_splitting {
             // One framed message. An octet-counted MSG-LEN may cover a trailing `\r\n`; strip one
             // `\n`, then one `\r` behind it, so it decodes as the same line over UDP would (the
-            // splitting arm and `crate::tcp::Framer`'s LF framing strip the same).
+            // splitting arm and `logit_proto::framing::Framer`'s LF framing strip the same).
             //
             // The `\r` comes off **only** when an `\n` did. An LF-framed frame arrives
             // terminator-free, so a `\r` still at its end is payload (`...msg\r\r\n`) that UDP

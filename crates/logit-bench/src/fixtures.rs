@@ -323,7 +323,7 @@ pub fn graphite_tagged_datagram() -> Bytes {
 ///
 /// Unframed, because that's what [`GraphiteDecoder`] is handed. Carbon's framing (a big-endian
 /// `u32` payload length, Twisted's `Int32StringReceiver`) belongs to the listener, which strips it
-/// before calling `decode_into` (`crates/logit-inputs/src/tcp.rs`'s `Framer`).
+/// before calling `decode_into` (`logit_proto::framing::Framer`).
 ///
 /// The opcodes are hand-written rather than produced by
 /// `logit_proto::graphite::pickle::write_datapoints`, for [`collectd_part_header`]'s reason.
