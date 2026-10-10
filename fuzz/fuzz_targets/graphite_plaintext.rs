@@ -63,7 +63,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(whole, pieces, "lines: the datagram and its lines one at a time disagree");
 
     for event in &whole[1..] {
-        graphite::check_event(&datagram, event);
+        graphite::check_event(&datagram, event, true);
     }
     graphite::assert_second_generation_fixed_point(whole.split_off(1));
 });

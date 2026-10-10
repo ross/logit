@@ -13,7 +13,9 @@
 //!
 //! Every tag value is a zero-copy [`Bytes::slice`] of the input (`docs/design/memory.md` §2),
 //! including on the pickle path, because [`super::pickle::PickleReader`] yields `&str`s borrowed
-//! from the same buffer.
+//! from the same buffer. The exception is a protocol-0 path the reader decoded into its scratch (a
+//! `STRING` with a backslash, or a `UNICODE` with a non-ASCII byte or a `\u`/`\U` escape):
+//! `subslice::share` copies that path's tag values.
 
 use super::pickle::PickleReader;
 use super::Protocol;
