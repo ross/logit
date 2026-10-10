@@ -553,7 +553,10 @@ impl PickleReader {
                     self.memo_put(key)?;
                 }
                 OP_MEMOIZE => {
-                    let key = self.memo.len();
+                    // CPython keys `MEMOIZE` by the count of filled slots, and `memo_put` can
+                    // leave only slot 0 unfilled.
+                    let key =
+                        self.memo.len() - usize::from(matches!(self.memo.first(), Some(None)));
                     self.memo_put(key)?;
                 }
                 OP_BINGET => {
@@ -1382,6 +1385,23 @@ mod tests {
         }
         let (points, _) = read(b"(lp1\n.").expect("key 1 on an empty memo is cPickle's first");
         assert!(points.is_empty());
+    }
+
+    /// After a first `PUT 1` or `BINPUT 1` skips slot 0, `MEMOIZE` keys by filled slots, as
+    /// CPython does, so it writes slot 1 and a later `GET 1` reads `c.d`. CPython 3.14.7's
+    /// `pickle.loads` reads both payloads as `a.b`, `c.d`, `c.d`. Hand-assembled: no pickler
+    /// writes `MEMOIZE` after a skipped slot.
+    #[test]
+    fn memoize_after_a_skipped_slot_0_keys_by_filled_slots() {
+        for payload in [
+            &b"\x80\x04]((\x8c\x03a.bp1\nK1K2\x86t(\x8c\x03c.d\x94K1K2\x86t(g1\nK1K2\x86te."[..],
+            b"\x80\x04]((\x8c\x03a.bq\x01K1K2\x86t(\x8c\x03c.d\x94K1K2\x86t(h\x01K1K2\x86te.",
+        ] {
+            let (points, skipped) = read(payload).expect("the payload must decode");
+            assert_eq!(skipped, 0);
+            let paths: Vec<&str> = points.iter().map(|p| p.0.as_str()).collect();
+            assert_eq!(paths, ["a.b", "c.d", "c.d"], "{payload:?}");
+        }
     }
 
     #[test]
