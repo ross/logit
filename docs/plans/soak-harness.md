@@ -34,7 +34,7 @@ Non-goals:
   them.
 
 Stream key **`soak`**: branches `soak/w0`, `soak/w1a`, `soak/w1b`, then `soak/w2` through
-`soak/w5`, a linear stack. PR stack only: nothing is merged by this workstream; Ross directs
+`soak/w12`, a linear stack. PR stack only: nothing is merged by this workstream; Ross directs
 merging.
 
 Settled with Ross (2026-10-08): faults are an iproute2 image with `NET_ADMIN` applying `tc netem`
@@ -774,6 +774,124 @@ replay above 0: `ledger.replay` ties the replay to the killed life's last `buffe
 toxiproxy and TCP-level faults it alone can express; per-peer `tc filter` and `ifb` ingress
 shaping until a scenario needs them (W2 at the earliest); a checker container; any CI job.
 
+### 10. Next scenarios
+
+Every shipped scenario drives one path, `statsd_in` over UDP into one `aggregate` and one sink,
+on §3's three services, and `[ledger]` names one component per hop. The scenarios below widen
+that, in landing order. Each states what it proves, its faults, its rows, and the harness support
+it needs; §2's validation, §5's end sequence, and §6's checks hold unless an item says otherwise.
+
+**Cheap now.** Each is a scenario directory on the three services plus a small check extension.
+
+1. **Lua in the path.** `statsd_in → lua → aggregate → prometheus_out`, the script rewriting
+   each event and emitting a rollup from `flush()`. No run has driven `run_lua`, or seen `/readyz`
+   read `stalled`, the one not-ready answer for a node that hasn't exited
+   ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Admin endpoint, readiness, and
+   release image"). Variants ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)):
+   a busy loop after N events reads `stalled`, then `ok` (the sandbox has no clock, so the loop
+   is an iteration count sized past the 10 s `stall_after`); a VM over `max_memory` exits 2 with
+   `memory_limit_exceeded` ([`docs/deploying.md`](../deploying.md), "Probes and exit codes"); an
+   error on every Nth event counts `logit.component.errors{reason="process"}`. Faults: §2's
+   sink-leg schedule. Rows: a script hop in the ledger (received equals emitted plus
+   `script_drop` drops plus errors; A counts `flush()`'s events); `ready` judges the stall.
+   Needs: `[ledger] sut_script`; a no-op `mark` action with `for`, whose window excuses the stall
+   for `progress` and `ready` and names a step for `[[expect]]`; readiness scored from the status
+   word `logit ready` prints, which `watchdog.jsonl`'s `health_log` already holds though only
+   `Health.Status` is judged; and an expected exit (code and self-log key) for `exit` and
+   `self_log`.
+2. **Two sinks of one kind, failing independently.** `aggregate` fans out to two
+   `prometheus_out`, each with its own VictoriaMetrics; faults on one leg, then both overlapping;
+   then the same split through `route` and two `target`s
+   ([ADR `target-components`](../adr/target-components.md)). A held branch slows the other only
+   through its inbox: under `block` its buffer then its inbox fill, the shared send waits, and
+   `logit.component.inbox.full` counts under the held consumer; under `drop_oldest` the other
+   keeps delivering. Faults: `stop` and netem on one backend, then both. Rows: `ledger.egress`,
+   `ledger.windows`, `identity.sink`, and `recovery` per sink; an `[[expect]]` on the healthy
+   sink's `batches.delivered` during the outage. Needs: a scenario compose override the driver
+   merges with `-f`, the service list read from the merged file, and `[ledger]` listing sinks,
+   each with its own V.
+3. **Fan-in.** Two generators of different kinds into one `aggregate` and sink: statsd, plus
+   `lines_in` with `kv_metrics` or remote-write into `prometheus_in`. Proves series merging and
+   per-source loss attribution. Faults: netem, `partition`, and `stop` on each generator in turn.
+   Rows: `ledger.wire` per source in its own unit, `ledger.intake` per listener. A remote-write
+   leg carries cumulative totals, so it keeps its own series and balances as V does. Needs: item
+   2's override, and `[ledger]` listing generators, G summed where the units meet.
+4. **A full spool.** A small `buffer.disk.max_bytes` through a long `victoria-metrics` stop.
+   Reaching `max_bytes` is `overflow`'s case (`drop_oldest` counts `overflow_oldest`);
+   `batches.dropped{reason="disk_full"}` counts only an `ENOSPC` write
+   ([ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md), "Decision"). Rows:
+   `[[expect]]` on the drop reason, `ledger.egress` counted, then `progress` and `recovery`.
+   Needs: nothing for `max_bytes`; for `ENOSPC`, a size-capped tmpfs at the spool path from item
+   2's override, and no `kill`, because Docker discards a tmpfs when its container stops.
+5. **A slow destination.** Netem `delay` on `victoria-metrics`, or `rate` on `logit`, past the
+   sink's `timeout:`, so a request VictoriaMetrics applied still times out: `prometheus_out`'s
+   `Ambiguous` transport-error row (module doc, "Faults, retries and duplicate safety"). The
+   retry rewrites the totals, which `temporality: cumulative` overwrites. Rows: `[[expect]]` on
+   `requests{class="network_error"}` and `retries`, `ledger.egress` at 0, and `progress` telling
+   a slow drain from a hang. Needs: nothing new.
+6. **High cardinality over hours.** A second `generate_in` with an unbounded `{seq}` in the metric
+   name, at a low rate. The interner never frees
+   ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Event model and interner"), so
+   `rss_slope` should FAIL: the harness sees the documented growth and pins its rate. A short
+   `series_retention` keeps `aggregate`'s state from masking it. Rows: `rss_slope` and the slope
+   of `logit.process.interner.strings`. Needs: an expected verdict per row (`rss_slope` FAIL
+   scores PASS) and a gauge `slope` reducer.
+
+**Medium.** Each adds a service, a topology, or a tool.
+
+7. **The native hop.** Generator → SUT A (`statsd_in → logit_out`, `buffer.disk:`) → SUT B
+   (`logit_in → aggregate → prometheus_out`). Raw events cross the hop, so a forwarded resend is a
+   surplus at B, not an overwrite in V. Proves [ADR `delivery-semantics`](../adr/delivery-semantics.md),
+   "7. The native hop is effectively-once", and the resume in
+   [ADR `native-hop-named-acks`](../adr/native-hop-named-acks.md), "4. The handshake carries
+   identities out and marks back". Faults on A or the link judge zero surplus; a restart of B
+   forgets its marks, so its resend is judged within the send window. Rows: the ledger one hop
+   longer, `ledger.replay` on A. Needs: a second SUT service, with `kill` on it.
+8. **TCP ingress.** `syslog_in` or `lines_in` over TCP, or `statsd_in` with `transport: tcp`, from
+   the generator's TCP sinks. A stalled SUT backs up into the sender
+   ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md), "No receive queue on
+   TCP -- the connection itself is the backpressure"), so a `pause` is the generator's counted
+   overflow, and a `partition` is a reset losing what sat in the socket buffers, uncounted on both
+   sides. Rows: `ledger.wire` judged zero outside resets, and idle closes
+   ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)) under `[[expect]]`.
+   Needs: per-line wire counters in place of datagram ones.
+9. **File tailing.** `tail_in` or `docker_in` behind a rotating writer, with `pause` and `kill` on
+   the SUT. Proves checkpoint resume
+   ([ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md),
+   "Checkpoints: optional, written on an interval, only when dirty"). A replay is at-least-once
+   (ADR `delivery-semantics`, "10. A replaying input is at-least-once up to the in-memory
+   queues"), so a killed life is judged zero loss and a surplus up to one checkpoint interval.
+   Needs: a volume the writer and SUT share (the generator's `file_out` can write, G its count)
+   and that surplus band.
+10. **Deterministic destination errors.** A scripted HTTP stand-in answering `429`, `5xx`, `400`,
+    and `413` on cue and recording what it accepts, so every row of a sink's response-class table
+    ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "Each sink attributes from
+    everything its destination gives it") runs under load, and a Datadog-shaped one makes
+    `ledger.sent` testable without a real org. It's a destination, not a proxy, so the non-goal
+    in "Context" holds; toxiproxy (§9) adds TCP-level faults, not statuses. Rows: `ledger.egress`
+    against its record, `[[expect]]` per class. Needs: the stand-in, a cue the driver sets per
+    step, and V read from its record. This is the one tooling investment the roadmap recommends.
+
+**Operational.**
+
+11. **Rolling overlap.** Two SUTs on `reuse_port` with `shutdown.delay`, swapped mid-run
+    ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md),
+    "What an overlap means for the data"). Rows: zero uncounted loss; wire loss at the swap within
+    the old socket's queue at close. Needs: a namespace-holder service both SUTs join, because a
+    SUT owning the namespace takes the port with it when it stops; and a per-instance attribute
+    with V summed across instances, because two processes writing one cumulative series overwrite
+    each other.
+12. **SIGHUP and TLS reload.** A TLS listener and sink, signalled and rotated during faults
+    ([ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md), "Trigger: a content poll,
+    and SIGHUP"). SIGHUP also reopens `stdio_out`, the harness's telemetry stream. Rows:
+    `[[expect]]` on `logit.tls.reloads{outcome="reloaded"}` and `logit.tls.certificate.not_after`,
+    the ledger at zero across reconnects, and no telemetry gap. Needs: a `signal` action and a
+    certificate-rotation action writing into a mounted directory.
+
+**The first PR is items 1 and 2 together.** Both touch code the harness has never driven, and
+item 2 forces the compose override, the service list, and the per-sink ledger that items 3, 7,
+and 11 need.
+
 ## Workstreams
 
 | # | Branch | PR title | Size | Depends on |
@@ -785,6 +903,13 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
 | W3 | `soak/w3` | `soak/w3: disk-spool kill -9 replay soak` | M | W2 |
 | W4 | `soak/w4` | `soak/w4: seeded random schedules and hours-long soaks` | M | W3 |
 | W5 | `soak/w5` | `soak/w5: an external Datadog target for soaks` | M | W4 |
+| W6 | `soak/w6` | `soak/w6: the soak harness's next scenarios` | S | W5 |
+| W7 | `soak/w7` | `soak/w7: Lua-in-the-path and two-sink fan-out soaks` | M | W6 |
+| W8 | `soak/w8` | `soak/w8: fan-in, full-spool, slow-destination, and cardinality soaks` | M | W7 |
+| W9 | `soak/w9` | `soak/w9: a scripted HTTP destination for every response class` | M | W8 |
+| W10 | `soak/w10` | `soak/w10: a native-hop soak between two logit processes` | M | W9 |
+| W11 | `soak/w11` | `soak/w11: TCP-ingress and file-tailing soaks` | M | W10 |
+| W12 | `soak/w12` | `soak/w12: rolling-overlap, SIGHUP, and TLS-reload soaks` | M | W11 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -833,8 +958,19 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
   for the sink's queue, `ledger.sent`, the SKIPs of the rows that read V, and the
   `statsd-datadog` scenario ("External targets"); self-test fixtures for every `[target]` rule,
   the wait, and `ledger.sent`'s verdicts.
+- **W6**: §10, "Next scenarios", and these rows. Documentation only.
+- **W7**: §10's items 1 and 2: the `mark` action, readiness scored from `health_log`, expected
+  exits, `[ledger] sut_script`, the scenario compose override, the merged service list, and the
+  per-sink ledger, with a scenario per variant.
+- **W8**: items 3 to 6: a ledger over several generators, the tmpfs spool, expected verdicts,
+  and the gauge `slope` reducer.
+- **W9**: item 10, the scripted destination, and `ledger.sent` run against it.
+- **W10**: item 7, a second SUT service and the ledger one hop longer.
+- **W11**: items 8 and 9, per-line wire counters, a shared volume, and the replay surplus band.
+- **W12**: items 11 and 12, the namespace-holder service, per-instance totals, and the `signal`
+  and certificate-rotation actions.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5, linear. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7 → W8 → W9 → W10 → W11 → W12, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
@@ -1485,3 +1621,4 @@ What the run showed:
   `victoria-metrics` and the external shape without it. Re-scoring the recorded W3 run gives the
   same rows, every detail included, plus a `ledger.sent` SKIP. W5 is done once a run of
   `statsd-datadog` is recorded under "Findings".
+- **W6** is documentation only: `crates/logit-cli/tests/doc_links.rs` passes.
