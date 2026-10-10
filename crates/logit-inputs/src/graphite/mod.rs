@@ -1392,4 +1392,60 @@ mod tests {
     fn interop_fixture_pickle_protocol_5_decodes() {
         assert_pickle_fixture_decodes("graphite-pickle-p5-000.raw");
     }
+
+    /// The same `DATAPOINTS` in CPython 3's protocol 0: `UNICODE`, `INT`, `FLOAT`, and `PUT`.
+    #[test]
+    fn interop_fixture_pickle_protocol_0_decodes() {
+        assert_pickle_fixture_decodes("graphite-pickle-p0-000.raw");
+    }
+
+    /// Every event as `(path, timestamp, value)`, for a fixture whose values are all `Gauge`s.
+    fn interop_points(events: &[Event]) -> Vec<(&str, i64, f64)> {
+        events
+            .iter()
+            .map(|e| {
+                assert_eq!(e.metrics.len(), 1, "one pickle datapoint is one event with one metric");
+                let MetricKind::Gauge(value) = e.metrics[0].kind else {
+                    panic!("carbon's wire has no type, got {:?}", e.metrics[0].kind)
+                };
+                (resolve(e.metrics[0].name), e.timestamp, value)
+            })
+            .collect()
+    }
+
+    /// Diamond's `cPickle.dumps(batch)` on Python 2.7.18
+    /// (`tools/record-fixtures/python2_diamond_pickle_producer.py`): protocol 0 with a memo
+    /// numbered from 1, a `\x`-escaped UTF-8 path, a repeated path through `GET`, and a `LONG`.
+    #[test]
+    fn interop_fixture_pickle_python_2_decodes() {
+        let (events, registry) = decode_interop_pickle("graphite-pickle-py2-000.raw");
+        assert_eq!(interop_diagnostic_keys(&registry), Vec::<String>::new());
+        assert_eq!(
+            interop_points(&events),
+            vec![
+                ("logit-fixture.diamond.cpu.total.user", 1_700_000_000_000_000_000, 12.5),
+                ("logit-fixture.diamond.loadavg.01", 1_700_000_000_000_000_000, 0.25),
+                ("logit-fixture.diamond.caf\u{e9}.count", 1_700_000_001_000_000_000, 3.0),
+                ("logit-fixture.diamond.cpu.total.user", 1_700_000_002_000_000_000, -1.0),
+                ("logit-fixture.diamond.uptime", 1_700_000_003_000_000_000, 7.0),
+            ]
+        );
+    }
+
+    /// Dropwizard Metrics 4.2.25's `GraphiteReporter` over `PickledGraphite`
+    /// (`tools/record-fixtures/dropwizard-graphite/`): hand-written protocol 0, every value a
+    /// quoted `STRING`, and a raw UTF-8 name. The `NaN` gauge is skipped as carbon drops it.
+    #[test]
+    fn interop_fixture_dropwizard_decodes() {
+        let (events, registry) = decode_interop_pickle("graphite-dropwizard-000.raw");
+        assert_eq!(interop_diagnostic_keys(&registry), vec!["non_finite_value".to_string()]);
+        assert_eq!(
+            interop_points(&events),
+            vec![
+                ("logit-fixture.dropwizard.heap.used", 1_700_000_000_000_000_000, 12.5),
+                ("logit-fixture.dropwizard.caf\u{e9}.visits.count", 1_700_000_000_000_000_000, 3.0),
+                ("logit-fixture.dropwizard.requests.count", 1_700_000_000_000_000_000, 42.0),
+            ]
+        );
+    }
 }
