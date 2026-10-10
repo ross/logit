@@ -45,7 +45,7 @@
 //! Protocol 0 is the text pickle. Dropwizard Metrics' `PickledGraphite` writes it by hand, and
 //! Python 2 senders (Diamond, graphitesend) write it through `cPickle.dumps`'s default.
 //! [ADR `graphite-carbon-relay`](../../../../docs/adr/graphite-carbon-relay.md)'s "Amendment: the
-//! reader accepts pickle protocol 0" has the survey. Each argument is read as CPython's loader
+//! reader accepts pickle protocol 0" has the survey, and its "Bounds" the rules below. Each argument is read as CPython's loader
 //! reads it, except where a bullet names a spelling this reader fails and CPython takes; no
 //! surveyed sender writes one:
 //!
@@ -82,7 +82,8 @@
 //!   stack, each arena, and the memo independently. A memo key must also be ordinal
 //!   (`key <= max(memo.len(), 1)`, at most one new slot per `PUT`/`BINPUT`/`LONG_BINPUT`/`MEMOIZE`
 //!   after the first), so one corrupt `LONG_BINPUT` can't grow the memo to the size its key names.
-//!   The `1` is Python 2's `cPickle`, which numbers its memo from 1 in every protocol;
+//!   The `1` is Python 2's `cPickle`, which numbers its memo from 1 in every protocol (the ADR
+//!   amendment's "Memo keys");
 //! - `LONG1`/`LONG4` accept a magnitude of at most 8 bytes, and `INT`/`LONG` an `i64`: carbon's
 //!   timestamps are seconds;
 //! - the stack must hold **exactly one** value at `STOP`, and it must be a list.
