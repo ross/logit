@@ -236,9 +236,14 @@ Each message is a 4-byte **big-endian** length prefix (Twisted's `Int32StringRec
 followed by exactly that many bytes of a pickled `[(path, (timestamp, value)), ...]`: a flat list
 of `(str, (number, number))` tuples, one per datapoint, in no particular grouping.
 
-- Real senders (`carbon-relay`'s own pickle client, collectd's `write_graphite` plugin in
-  `Protocol Pickle` mode) emit protocol 2 or `-1`, which resolves to the sender's highest available
-  protocol. Nothing in the field emits protocol 0 or 1 for this payload shape.
+- Real senders write three pickle protocols. Carbon's own relay client and og-rek's default
+  write protocol 2. A Python 3 sender that calls `pickle.dumps` with no protocol writes 3 or higher.
+  Dropwizard Metrics' `PickledGraphite` writes protocol 0 by hand, and Python 2 senders (Diamond's
+  `GraphitePickleHandler`, graphitesend) write protocol 0 as the interpreter's default.
+  [ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)'s "Amendment: the reader accepts
+  pickle protocol 0" has the per-producer survey and its sources.
+- collectd's `write_graphite` and Spark's `GraphiteSink` write plaintext only; neither has a pickle
+  mode.
 - Carbon's receiver treats `timestamp <= 0` specially: `-1` means "now", so the point gets receipt
   time instead of being rejected. Otherwise `pickle.dumps`'s float/int formatting passes straight
   through.
