@@ -1,0 +1,21 @@
+# The system under test in `script/soak`'s statsd-vm-lost-total control: statsd-vm's pipeline with
+# a 1 s sink shutdown grace, so a stop while VictoriaMetrics is down drops the queued batches that
+# hold that life's last totals, and `drain complete` reports them.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    buffer: { shutdown_grace: 1s }  # drop what's queued at a stop instead of waiting it out
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
