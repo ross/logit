@@ -508,7 +508,8 @@ impl Registry {
     /// Renders through [`text::write_with`], not [`text::write`], so the writer's drops
     /// (`degraded{reason="exemplar_dropped"|"unit_not_suffix"}`, and
     /// `skipped{reason="name_collision"}` for two families with one `# TYPE` name) count on the
-    /// encoder `send` uses. Post-sanitization family-name collisions are that encoder's to skip and count too.
+    /// encoder `send` uses. Post-sanitization family-name collisions are that encoder's to skip and
+    /// count too.
     fn render(&self, dialect: Dialect, encoder: &mut PrometheusEncoder) -> Vec<u8> {
         let mut out = Vec::new();
         text::write_with(&self.families(), dialect, &mut out, encoder);

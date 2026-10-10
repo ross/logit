@@ -264,8 +264,9 @@ equality modulo:
   dropped; an empty or all-unrepresentable array still drops the label entirely and counts
   `labels.dropped{reason="unrepresentable"}` as before.
 - **Two families whose `# TYPE` names coincide write once.** A text 0.0.4 counter `foo` beside a
-  gauge `foo_total`, or counters `foo` and `foo_total`, both write `# TYPE foo_total`, and
-  `prometheus_out`'s registry can hold both, since it keys families by sanitized model name. A
+  gauge `foo_total` both write `# TYPE foo_total`, as counters `foo` and `foo_total` do in either
+  dialect (`# TYPE foo` in OpenMetrics), and `prometheus_out`'s registry can hold both, since it
+  keys families by sanitized model name. A
   second `# TYPE` line for a name makes Prometheus reject the whole scrape, so the family whose
   model name sorts first is written and each series of the other is counted
   `logit.output.metrics.skipped{reason="name_collision"}`.

@@ -95,8 +95,8 @@ and never by `fuzz-tmin`. The two native batch targets, `statsd`, `syslog`, the 
 targets, `collectd`, and the two Prometheus decode targets use it to run in fork mode
 (`-fork=1 -ignore_ooms=0`). The process-wide interner never evicts, so a long-lived fuzz process
 accumulates every dictionary string, metric name, tag key, SD-ID, PARAM-NAME, carbon path, and
-Prometheus exemplar label name and family name it decodes until the arena outgrows the malloc limit, and fork mode
-restarts the process.
+Prometheus exemplar label name and family name it decodes until the arena outgrows the malloc
+limit, and fork mode restarts the process.
 `-ignore_ooms=0` keeps an out-of-memory in a child fatal. Fork mode was checked in the image: it
 stops at `-max_total_time`, merges new inputs into `fuzz/corpus/<target>`, and writes a child's
 crash to `fuzz/artifacts/<target>/`. Its first step merges the corpus and the seeds, and that

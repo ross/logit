@@ -105,9 +105,10 @@
 //!
 //! And one *degradation*, `logit.input.metrics.degraded{reason="exemplar_dropped"}`: an exemplar
 //! with no reading to be an example of -- its series has no reading anywhere in the request (a
-//! stale marker is not one), or the series was itself skipped above. The two counters are not additive: a series with bad labels and
-//! three exemplars raises one `invalid_labels` **and** three `exemplar_dropped`, because they
-//! answer different questions (how many series went, and how much of what the sender sent was not
+//! stale marker is not one), or the series was itself skipped above. The two counters are not
+//! additive: a series with bad labels and three exemplars raises one `invalid_labels` **and**
+//! three `exemplar_dropped`, because they answer different questions (how many series went, and
+//! how much of what the sender sent was not
 //! stored).
 //!
 //! ## Encode: families → protobuf
