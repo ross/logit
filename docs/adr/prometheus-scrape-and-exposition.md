@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-09
+updated: 2026-10-10
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -74,6 +74,11 @@ The two dialects disagree on timestamp units, which the codec (not this ADR) has
 right in both directions: OpenMetrics timestamps and the `_created` series are **float seconds**;
 text `0.0.4` timestamps are **integer milliseconds**. A value crossing from one dialect to the
 other on a relay converts, it never reinterprets the same digits under the other unit.
+
+The Prometheus text differential corpus ([`testdata/differential/prometheus-text/`](../../testdata/differential/prometheus-text/README.md))
+is the conformance evidence for the decode side: it checks both dialects against Prometheus
+3.14.0's own parser over hand-built bodies and real exporters' scrape bodies, and
+`docs/known-gaps/mappings.md`'s `decode (Prometheus)` rows record where the two differ.
 
 ### Model mapping
 
