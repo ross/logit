@@ -508,9 +508,14 @@ impl<'a> Assembler<'a> {
                 series.timestamp = Some(ts);
             }
         }
-        if matches!(slot.role, Role::Primary | Role::Bucket) {
-            if let Some(exemplar) = exemplar {
+        // OpenMetrics allows an exemplar on a `_total` or `_bucket` line only, and the model keeps
+        // one per value-bearing sample; one riding a `_sum`, `_count`, or `_created` line has no
+        // home, so it is counted rather than lost silently.
+        if let Some(exemplar) = exemplar {
+            if matches!(slot.role, Role::Primary | Role::Bucket) {
                 series.exemplars.push(exemplar);
+            } else {
+                decoder.degraded("exemplar_dropped");
             }
         }
         true
