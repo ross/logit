@@ -1296,15 +1296,15 @@ def check_ledger_windows(data):
     # pause counts 0 over no drains and is idle: no window closed, so none was lost.
     gaps = [b - a for a, b in zip(led.sut.drains, led.sut.drains[1:]) if b > a]
     period = round(statistics.median(gaps), 1) if gaps else None
-    sent = [ts for ts, value, _ in led.sut.counter_points("logit.component.batches.sent",
-                                                         component=led.aggregate) if value]
+    sent = [(ts, value) for ts, value, _ in led.sut.counter_points(
+        "logit.component.batches.sent", component=led.aggregate) if value]
     drains = led.sut.drains
     idle_rule = period is not None and period < interval
 
     def flushes(a, b):
         """(batches sent, drains, span start, span end) over the span between a and b."""
         lo, hi = a + (interval + period) / 2, b - (interval - period) / 2
-        n_sent = sum(1 for ts in sent if lo <= ts < hi)
+        n_sent = sum(value for ts, value in sent if lo <= ts < hi)
         n_drains = bisect.bisect_left(drains, hi) - bisect.bisect_left(drains, lo)
         return n_sent, n_drains, lo, hi
 
