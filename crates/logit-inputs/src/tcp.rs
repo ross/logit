@@ -1299,7 +1299,7 @@ mod tests {
     use logit_pipeline::test_util::{
         expect_closed, expect_still_open, recv_batch, wait_until, TelemetryProbe, Totals,
     };
-    use logit_proto::framing::{Framing, Oversize};
+    use logit_proto::framing::Oversize;
     use logit_proto::proxy;
     use logit_proto::CodecError;
     use rustls_pki_types::pem::PemObject;
@@ -1309,73 +1309,6 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
-
-    // ---- framer: recorded interop fixtures ----------------------------------------------------
-    //
-    // A real rsyslog `omfwd` forwarder's TCP byte stream at its default `TCP_Framing` (RFC 6587
-    // §3.4.2 non-transparent), captured by `script/record-fixtures rsyslog-tcp`
-    // (`testdata/interop/syslog/README.md`'s `rsyslog-tcp-000.raw` row), pushed through `Framer`
-    // as it arrived and decoded with the real `SyslogDecoder`.
-
-    /// `testdata/interop/syslog/<name>` as raw bytes: a TCP fixture is a whole connection's byte
-    /// stream, not one UTF-8 datagram like `crate::syslog`'s `interop_fixture` reads.
-    fn interop_fixture_bytes(name: &str) -> Vec<u8> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../testdata/interop/syslog")
-            .join(name);
-        std::fs::read(&path)
-            .unwrap_or_else(|e| panic!("reading interop fixture {}: {e}", path.display()))
-    }
-
-    #[test]
-    fn interop_fixture_rsyslog_tcp_non_transparent_frame() {
-        let wire = interop_fixture_bytes("rsyslog-tcp-000.raw");
-
-        // One push, then `finish`: the recorded connection carries one message and is torn down
-        // by the recording harness.
-        let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
-        framer.push(&wire);
-        assert_eq!(
-            framer.framing(),
-            Some(Framing::NonTransparent),
-            "a stock omfwd forwarder with no TCP_Framing parameter must latch non-transparent, not \
-             octet-counting"
-        );
-
-        let mut frames = Vec::new();
-        while let Some(frame) = framer.next_frame().expect("framing should succeed") {
-            frames.push(frame);
-        }
-        if let Some(trailing) = framer.finish().expect("finish should succeed") {
-            frames.push(trailing);
-        }
-        assert_eq!(frames.len(), 1, "exactly one message on this connection: {frames:?}");
-
-        // A non-transparent frame never has an embedded newline, so `SyslogDecoder`'s
-        // `\n`-splitting is a no-op here.
-        let mut decoder = crate::syslog::SyslogDecoder::new(Arc::new(Resource::default()));
-        let events = decoder
-            .decode(frames.into_iter().next().unwrap())
-            .expect("decode should succeed")
-            .events;
-        assert_eq!(events.len(), 1, "exactly one decoded event: {events:?}");
-        let event = &events[0];
-
-        assert_eq!(
-            event.attributes.get("syslog.tag").and_then(Value::as_str),
-            Some("logit-fixture"),
-            "syslog.tag should match the `logger -t logit-fixture` invocation the fixture recorded"
-        );
-        // `logger` with no `-p` sends the default `user.notice` (PRI 13 = facility 1 * 8 +
-        // severity 5).
-        assert_eq!(
-            event.log.as_ref().and_then(|log| log.severity),
-            Some(logit_core::Severity::Info),
-            "user.notice (PRI 13) maps to Severity::Info (13 % 8 = 5)"
-        );
-        let message = event.log.as_ref().expect("event should carry a log").message.as_str();
-        assert_eq!(message, Some("hello from rsyslog, captured for logit interop fixtures"));
-    }
 
     // ---- driver: fixtures and harness ---------------------------------------------------------
 

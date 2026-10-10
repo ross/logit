@@ -27,7 +27,6 @@ use logit_core::{
     Resource, Samples, Scope, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Value,
 };
 use logit_inputs::generate::{GenerateInput, GenerateMetricKind};
-use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
 use logit_proto::collectd::types_db::TEST_TYPES_DB;
 use logit_proto::collectd::{CollectdDecoder, TypesDb};
@@ -35,6 +34,7 @@ use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::graphite::{GraphiteDecoder, Protocol as GraphiteProtocol};
 use logit_proto::prometheus::{PrometheusDecoder, PrometheusEncoder};
 use logit_proto::statsd::StatsdDecoder;
+use logit_proto::syslog::SyslogDecoder;
 use logit_proto::Decoder;
 use logit_transforms::{
     AggregateTemporality, Aggregator, Arrays, CsvParser, Distributions, Fields, Flatten,
@@ -55,8 +55,8 @@ use std::time::Duration;
 /// `fixtures/nginx/`, which `compose.yaml`'s `nginx` service runs, still has to stay real.
 /// `perf/scenarios/json-parse.yaml`'s template is still this line's JSON body.
 ///
-/// It exercises `syslog.rs`'s two-token header rule for a hostname-less line, and its body's
-/// `": "` defeats a naive "scan for the first colon-space" parse.
+/// It exercises `logit_proto::syslog`'s two-token header rule for a hostname-less line, and its
+/// body's `": "` defeats a naive "scan for the first colon-space" parse.
 pub const NGINX_SYSLOG_LINE: &str = concat!(
     "<190>Aug 31 06:52:01 nginx_access: ",
     r#"{"host":"static.local","request_method":"GET","status":200,"#,
@@ -1192,12 +1192,13 @@ pub fn sum_metric_event_with_spilled_attributes() -> Event {
 /// RFC 3164, with the header shape of RFC 3164 §5.4's example (`<34>` = facility `auth`(4),
 /// severity `crit`(2)), carrying an sshd authentication failure as rsyslog would forward it, with
 /// **both** hostname and `tag[pid]:`. Unlike [`NGINX_SYSLOG_LINE`]'s `nohostname` shape, this
-/// takes `parse_3164`'s other header branch (as `syslog.rs`'s
+/// takes `parse_3164`'s other header branch (as `logit_proto::syslog`'s
 /// `rfc3164_with_hostname_decodes_message_severity_and_attributes` test does) and yields six
 /// attributes (`syslog.facility`/`severity`/`timestamp`/`hostname`/`tag`/`pid`), inside the
 /// measured syslog range (`docs/design/data-shapes.md` §6).
 ///
-/// Hand-written: no live syslogd was captured. It's derived from `syslog.rs`'s decoder and tests.
+/// Hand-written: no live syslogd was captured. It's derived from `logit_proto::syslog`'s decoder
+/// and tests.
 pub const SSHD_SYSLOG_LINE: &str = "<34>Aug 31 06:52:01 auth-edge-3 sshd[8843]: Failed password \
      for invalid user admin from 203.0.113.7 port 54321 ssh2";
 

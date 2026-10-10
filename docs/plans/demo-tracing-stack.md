@@ -210,8 +210,8 @@ to HAProxy's trace regardless.
   `pages/logging_formatter.py` reads them for the access log's `trace_id`/`span_id`/`trace_flags`
   fields (that log line still goes through `logit`, over syslog, same as every other tier);
   `pages/syslog_handler.py` disables `SysLogHandler`'s default trailing-NUL byte, which
-  `crates/logit-inputs/src/syslog.rs`'s headerless-message path otherwise decodes fine (RFC 3164
-  header omitted entirely — no need to hand-roll one).
+  `crates/logit-proto/src/syslog/decode.rs`'s headerless-message path otherwise decodes fine (RFC
+  3164 header omitted entirely — no need to hand-roll one).
 - `demo/logit.yaml` (edit) — no `otlp_in` component at all; `tempo_out` keeps its original single
   source (`trace_only`, `logit`'s own internal spans only). Renamed the app tier's
   `service.name` to `demo-app` and updated the four dashboard panels that hardcoded `demo-hello`.

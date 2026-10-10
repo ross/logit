@@ -53,7 +53,7 @@ marker (`-`) produces no `syslog.sd` attribute at all — never an empty map —
 data" and "an empty element" (which the grammar doesn't allow anyway) stay distinguishable from
 "the attribute wasn't looked at."
 
-### Parse rules (`crates/logit-inputs/src/syslog.rs`'s `parse_structured_data`, `parse_sd_name`, `parse_param_value`)
+### Parse rules (`crates/logit-proto/src/syslog/decode.rs`'s `parse_structured_data`, `parse_sd_name`, `parse_param_value`)
 
 Faithful to RFC 5424 §6.3, with the same strictness the rest of this dialect's parsing already
 has:

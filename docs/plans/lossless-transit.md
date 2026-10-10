@@ -239,19 +239,19 @@ test through real sockets.
 
 **W5 outcome ([ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)):**
 landed as designed. `parse_structured_data`/`parse_sd_name`/`parse_param_value`
-(`crates/logit-inputs/src/syslog.rs`) replace `skip_structured_data` with a real, quote-aware RFC
-5424 §6.3 parser into `syslog.sd`; `write_structured_data`/`write_sd_element`/`write_sd_param`
+(`crates/logit-proto/src/syslog/decode.rs`) replace `skip_structured_data` with a real, quote-aware
+RFC 5424 §6.3 parser into `syslog.sd`; `write_structured_data`/`write_sd_element`/`write_sd_param`
 (`crates/logit-outputs/src/syslog.rs`) are its exact encoder inverse, plus the opt-in
 `structured_data: { sd_id }` element for non-`syslog.*` attributes. `syslog.pid` is `Value::Str`
 when PROCID/the 3164 bracket isn't numeric; a nil 5424 TIMESTAMP stamps `syslog.timestamp` as
 `Value::Null`; a non-UTF-8 MSG decodes to `Value::Bytes` instead of rejecting the line.
 `syslog_out`'s TIMESTAMP now follows the precedence table in the new ADR instead of always being
 `event.timestamp`. Unit coverage for the new parse/encode paths lands directly in
-`crates/logit-inputs/src/syslog.rs`/`crates/logit-outputs/src/syslog.rs`'s own `#[cfg(test)]`
-modules; the `crates/logit-cli/tests/syslog_round_trip.rs` integration coverage this assessment
-named as missing (5424-in/5424-out and 3164-in/3164-out over real UDP sockets, plus a
-`decode(encode(decode(x))) == decode(x)` proptest) is this workstream's Phase B, tracked separately
-from this Phase C docs pass.
+`crates/logit-proto/src/syslog/decode.rs`/`crates/logit-outputs/src/syslog.rs`'s own
+`#[cfg(test)]` modules; the `crates/logit-cli/tests/syslog_round_trip.rs` integration coverage
+this assessment named as missing (5424-in/5424-out and 3164-in/3164-out over real UDP sockets,
+plus a `decode(encode(decode(x))) == decode(x)` proptest) is this workstream's Phase B, tracked
+separately from this Phase C docs pass.
 
 ### Native `logit_in -> logit_out`
 

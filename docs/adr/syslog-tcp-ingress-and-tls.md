@@ -169,8 +169,8 @@ cost entirely; `logit.input.connections.rejected{reason="limit"}` is still count
 
 ### The framer sits under the decoder, and the decoder stops re-splitting on `\n`
 
-`SyslogDecoder::decode_into` (`crates/logit-inputs/src/syslog.rs`) currently splits its input on
-`\n` because a UDP datagram can carry more than one line-delimited message. On the TCP arm, the
+`SyslogDecoder::decode_into` (`crates/logit-proto/src/syslog/decode.rs`) currently splits its input
+on `\n` because a UDP datagram can carry more than one line-delimited message. On the TCP arm, the
 framer above has already delimited one message per frame -- including an octet-counted MSG, which
 may legally *contain* an embedded newline as ordinary message content, not a delimiter. Re-splitting
 on `\n` inside the decoder would shred such a message into multiple spurious events. `SyslogDecoder`

@@ -47,8 +47,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** `transport: tcp` with `tls:`.
 - **A binary syslog MSG with a `0x0A` byte is split on UDP.** A non-UTF-8 MSG decodes to a
   `Value::Bytes` message, but on `syslog_in`'s UDP transport `SyslogDecoder::decode_into`
-  (`crates/logit-inputs/src/syslog.rs`) splits on `\n` before parsing, which cuts a binary payload
-  at any `0x0A` byte (see the HAProxy "CBOR" entry under
+  (`crates/logit-proto/src/syslog/decode.rs`) splits on `\n` before parsing, which cuts a binary
+  payload at any `0x0A` byte (see the HAProxy "CBOR" entry under
   [HTTP access logs](transforms.md#http-access-logs-nginx-haproxy-and-http_access)).
   - **Workaround:** `transport: tcp`. `SyslogInput::tcp` turns line splitting off
     (`SyslogDecoder::with_line_splitting(false)`), and `logit-inputs::tcp::TcpListener`'s
