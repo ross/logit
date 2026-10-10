@@ -10,6 +10,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger](soak-harness.md) | 2026-10-08 | 2026-10-08 |
 | [Enabling plan: sender addresses on the HTTP listeners — `peer:`, `proxy_protocol:`, and `forwarded:`](http-listener-peer-address.md) | 2026-10-05 | 2026-10-05 |
 | [Research note: live reload, socket handover, and what each deployment world needs](live-reload-and-socket-handover.md) | 2026-10-05 | 2026-10-05 |
 | [Enabling plan: sink fault model — a bad batch drops, a non-functional destination holds, the process never exits](sink-fault-model.md) | 2026-10-04 | 2026-10-05 |

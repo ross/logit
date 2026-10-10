@@ -1,0 +1,37 @@
+# The system under test in `script/soak`'s statsd-datadog scenario: statsd over UDP, a 10 s delta
+# aggregate, and `datadog_out` posting series straight to Datadog's intake. Its `internal`
+# telemetry goes to stdout as NDJSON for the harness to read; `script/soak` runs it with
+# `--log-format json` and the API key from its external env file.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    interval: 10s
+    # Delta, the statsd shape: each window's increment goes out as a Datadog `count`. The series
+    # route skips a cumulative `Sum` (crates/logit-outputs/src/datadog.rs, "Delivery posture"),
+    # so `temporality: cumulative` would send nothing.
+    temporality: delta
+  host:
+    type: set
+    sources: [window]
+    # datadog_out has no host field: it reads `host.name` from the resource, and a count's
+    # interval in seconds from `datadog.interval`, the window above.
+    resource:
+      host.name: logit-soak
+    attributes:
+      datadog.interval: 10
+  datadog:
+    type: datadog_out
+    sources: [host]
+    api_key: !env DD_API_KEY
+    # The default site, Datadog's US1. For an org on another site, set `site:` here, such as
+    # `site: datadoghq.eu`; the key must belong to that site, or every request answers 403.
+    # buffer: a disk spool, so a kill replays what the killed process had queued. The driver
+    # kills and starts this container but never recreates it, so a directory in its own
+    # filesystem survives the kill with no volume. The memory bounds stay at their defaults
+    # (block, at_least_once, retry_max_delay 10s), as `disk:` requires.
+    buffer: { disk: { path: /tmp/soak-spool } }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

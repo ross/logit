@@ -1,0 +1,106 @@
+# A UDP flood into `statsd_in` while VictoriaMetrics is stopped for 60 s, with a two-batch
+# blocking sink queue and a 500 ms aggregate window so the stop backs up to the listener, and
+# the receive queue at its defaults: the listener evicts and counts the oldest datagrams and
+# keeps reading its socket, so the kernel drops nothing. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "udp-flood-sink-stop"
+description = "a 20,000 lines/s statsd flood with a 60s VictoriaMetrics stop backing up to a default receive queue: the listener evicts and keeps reading, the kernel drops nothing"
+duration = "5m"           # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"
+cycle = "3m"              # the stop, its recovery, and two progress windows of steady state
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+sut_aggregate = "window"
+sut_sink = "victoria_metrics"
+wire_loss_outside_faults = 0.0
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+[[step]]
+at = "0s"
+action = "stop"
+on = "victoria-metrics"
+for = "60s"
+
+# The stop reaches the listener: `aggregate`'s inbox fills, and the receive queue evicts its
+# oldest datagrams and counts them.
+[[expect]]
+name = "aggregate-inbox-full"
+service = "logit"
+metric = "logit.component.inbox.full"
+component = "window"
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "listener-evicts"
+service = "logit"
+metric = "logit.component.datagrams.dropped"
+component = "statsd"
+attrs = { reason = "overflow_oldest" }
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1
+
+# Every drain during the stop reads datagrams, and the stop's total is at least 90% of 60 s at
+# the generator's rate.
+[[expect]]
+name = "intake-keeps-reading"
+service = "logit"
+metric = "logit.input.datagrams"
+component = "statsd"
+step = "c0s1"
+window = "during"
+reduce = "min_delta"
+min = 1
+
+[[expect]]
+name = "intake-keeps-pace"
+service = "logit"
+metric = "logit.input.datagrams"
+component = "statsd"
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1080000
+
+# The chain stays blocked until the sink's next retry after the revert, up to its
+# `retry_max_delay` later, so a bound that must hold for the whole episode reads `through`.
+[[expect]]
+name = "no-kernel-drops"
+service = "logit"
+metric = "logit.input.kernel.drops"
+component = "statsd"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+# A drain sharing its tick with `aggregate`'s flush sees the batch pushed on that tick, so a
+# drained queue reads at most 1.
+[[expect]]
+name = "sink-queue-drains"
+service = "logit"
+metric = "logit.component.buffer.batches"
+component = "victoria_metrics"
+step = "c0s1"
+window = "after"
+reduce = "last"
+max = 1
