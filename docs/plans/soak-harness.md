@@ -1578,5 +1578,5 @@ What the run showed:
   passes `self-test` validation, the shipped-config test, and `logit validate` in `logit:soak`
   with a placeholder key. `docker compose config` renders the local shape with
   `victoria-metrics` and the external shape without it. Re-scoring the recorded W3 run gives the
-  same rows, every detail included, plus a `ledger.sent` SKIP. W5 is done once a run of
-  `statsd-datadog` is recorded under "Findings".
+  same rows, every detail included, plus a `ledger.sent` SKIP. Met: the `statsd-datadog` run
+  `20261009T155153Z` is recorded under "Findings", Overall PASS.
