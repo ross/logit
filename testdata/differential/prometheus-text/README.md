@@ -27,10 +27,10 @@ current, run `script/differential prom-text --check`. See [`../README.md`](../RE
 | Prometheus's parser | the Go module `github.com/prometheus/prometheus v0.314.0` (Prometheus 3.14.0, the release whose `prompb` is vendored under `crates/logit-proto/proto/prometheus/` and that recorded `../../interop/prometheus/`), commit `d7598b7141418fa35be2b5ec5d0fefb634199610`, through `tools/differential/prom-text/go.mod` and `go.sum` |
 | the Go toolchain | `golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61` (Go 1.27.2), run with `GOTOOLCHAIN=local` and `GOFLAGS=-mod=readonly` |
 
-`tools/differential/prom-text/main.go` calls `textparse.New(body, contentType, nil,
-textparse.ParserOptions{})`, the scrape loop's own call with every option at the scrape loop's
-default: no fallback protocol, `_created` series kept as series, no type-and-unit labels, and no
-conversion of classic histograms. `StartTimestamp` isn't called, since it reads ahead and changes
+`tools/differential/prom-text/main.go` calls `textparse.New(body, contentType,
+labels.NewSymbolTable(), textparse.ParserOptions{})`, the scrape loop's own call with every option
+at the scrape loop's default: no fallback protocol, `_created` series kept as series, no
+type-and-unit labels, and no conversion of classic histograms. `StartTimestamp` isn't called, since it reads ahead and changes
 whether later `_created` lines are skipped. Where `New` returns no parser, which fails a scrape,
 the reading records the error and goes on with the parser
 `fallback_scrape_protocol: PrometheusText0.0.4` selects.

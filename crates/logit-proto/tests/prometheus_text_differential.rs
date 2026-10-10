@@ -34,8 +34,9 @@
 //!   for a series and timestamp;
 //! - a `+Inf` bucket only logit has, where Prometheus read none, and a `_count` only logit has, the
 //!   `+Inf` total restated: `text.rs`'s "Leniencies";
-//! - a histogram `_count` that differs from Prometheus's only where `histogram_count_mismatch` was
-//!   counted: the `+Inf` bucket wins (`text.rs`'s skip table);
+//! - a histogram `_count` that differs from Prometheus's, for a series whose own `_count` line
+//!   Prometheus read as disagreeing with its `+Inf` (else highest) bucket, which is the series
+//!   `histogram_count_mismatch` counts: the bucket wins (`text.rs`'s skip table);
 //! - a bucket, `_count`, or `_gcount` value Prometheus reads as a fraction equals logit's `u64`
 //!   count when it rounds to it (`assemble.rs`'s `count_value`);
 //! - `untyped` equals `unknown`: Prometheus's text parser reads `# TYPE x untyped` as
@@ -154,7 +155,12 @@ fn corpus() -> Vec<Body> {
     let readings = bodies.iter().filter(|b| b.expect.is_some()).count();
     assert_eq!(readings, case_bodies, "every case has a reading and every reading a case");
     assert!(case_bodies >= 100, "{case_bodies} cases; is the corpus there?");
-    assert!(bodies.len() > case_bodies, "no recorded bodies");
+    let recorded = sorted_files(&testdata().join("interop/prometheus-scrape"))
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "body"))
+        .count();
+    assert!(recorded > 0, "no recorded bodies");
+    assert_eq!(bodies.len() - case_bodies, recorded, "every recorded body has a reading");
     bodies
 }
 
@@ -395,6 +401,37 @@ fn exemplar_labels(exemplar: &Exemplar) -> Vec<(String, String)> {
     labels
 }
 
+/// Whether Prometheus's own `_count`/`_gcount` line `id` disagrees with the total its own bucket
+/// lines give that series, both read as `assemble.rs`'s `count_value` rounds them: the `+Inf`
+/// bucket, or, with none, the highest bucket, which is what `finish_series` takes as the total.
+/// Only such a series may count `histogram_count_mismatch`, so only its `_count` is excused.
+fn count_disagrees(go: &[(Identity, &Json)], id: &Identity, entry: &Json) -> bool {
+    let base = id.0.strip_suffix("_gcount").or_else(|| id.0.strip_suffix("_count"));
+    let Some(base) = base else { return false };
+    let bucket = format!("{base}_bucket");
+    let mut totals: Vec<(f64, f64)> = go
+        .iter()
+        .filter(|((name, labels), _)| {
+            *name == bucket
+                && labels.iter().filter(|(k, _)| k != "le").eq(id.1.iter())
+                && labels.iter().any(|(k, _)| k == "le")
+        })
+        .filter_map(|((_, labels), e)| {
+            let (_, le) = labels.iter().find(|(k, _)| k == "le")?;
+            let bound = f64::from_bits(u64::from_str_radix(le.strip_prefix("f64:")?, 16).ok()?);
+            Some((bound, counted(bits(&e["value"]))?))
+        })
+        .collect();
+    totals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let Some(&(_, total)) = totals.last() else { return false };
+    counted(bits(&entry["value"])).is_some_and(|count| count != total)
+}
+
+/// A count line's value as `assemble.rs`'s `count_value` reads it, or `None` for one it skips.
+fn counted(value: f64) -> Option<f64> {
+    (value.is_finite() && value >= 0.0).then(|| value.round())
+}
+
 /// Whether logit's line reads as Prometheus's series entry, or why not.
 fn compare(go: &Json, logit: &Line, dialect: Dialect, count_mismatch: bool) -> Result<(), String> {
     let value = bits(&go["value"]);
@@ -519,6 +556,12 @@ fn check(body: &Body) {
         "{name}: degraded"
     );
     let go_ok = body.reading["error"].is_null();
+    if decoded.result.is_err() || !dialect_agrees {
+        assert!(
+            divergent(expect).is_empty(),
+            "{name}: no series is compared here, so `divergent` must be empty"
+        );
+    }
     let Ok(families) = decoded.result else {
         assert_eq!(go_ok, divergence, "{name}: `divergence` iff Prometheus read what logit failed");
         return;
@@ -541,18 +584,19 @@ fn check(body: &Body) {
     for (id, line) in lines {
         assert!(ours.insert(id.clone(), line).is_none(), "{name}: logit has {id:?} twice");
     }
-    let count_mismatch = decoded.degraded.contains_key("histogram_count_mismatch");
+    let go = go_series(&body.reading);
     let mut differs = Vec::new();
     let mut matched = std::collections::HashSet::new();
-    for (id, entry) in go_series(&body.reading) {
-        match ours.get(&id) {
+    for (id, entry) in &go {
+        match ours.get(id) {
             Some(line) => {
+                let count_mismatch = line.role == Role::Total && count_disagrees(&go, id, entry);
                 if let Err(why) = compare(entry, line, dialect, count_mismatch) {
                     differs.push((id.clone(), why));
                 }
-                matched.insert(id);
+                matched.insert(id.clone());
             }
-            None => differs.push((id, "absent from logit".to_string())),
+            None => differs.push((id.clone(), "absent from logit".to_string())),
         }
     }
     let differing: Vec<Identity> = differs.iter().map(|(id, _)| id.clone()).collect();

@@ -1039,16 +1039,19 @@ client, with no socket of its own.
   `assemble::Assembler`: `malformed_line`, `malformed_metadata`, `duplicate_label`,
   `duplicate_series`, `duplicate_type`, `duplicate_metadata`, `unknown_suffix`,
   `incomplete_series`, `empty_histogram`, `non_monotonic_buckets`, plus
-  `degraded{reason="histogram_count_mismatch"}`.
+  `degraded{reason="histogram_count_mismatch"}` and `degraded{reason="exemplar_dropped"}`, the
+  second for an OpenMetrics exemplar on a `_sum`, `_count`, `_created`, or quantile line, where
+  the model has nowhere to keep it.
 - **`skipped{reason="invalid_labels"}`** (remote-write): a series with no `__name__`, an empty label
   name or value, or a label set that isn't strictly ascending by byte order. Both specs forbid a
   sender from producing these, and none is worth failing the whole request over.
 - **`skipped{reason="native_histogram"}`** (remote-write): one `histograms[]` entry. See
   `docs/known-gaps/mappings.md`; this is also why a 2.0 response's `Histograms-Written` is always
   `0`.
-- **`degraded{reason="exemplar_dropped"}`** (remote-write): an exemplar whose series has no sample
-  anywhere in the request, or whose series was itself skipped. This reason is also an encoder
-  reason on the output side. It's not additive with `invalid_labels`: a series with bad labels and
+- **`degraded{reason="exemplar_dropped"}`** (both modes): in scrape mode, an OpenMetrics exemplar
+  on a line other than a value sample or a `_bucket` (the text assembler reason above); in
+  remote-write, an exemplar whose series has no sample anywhere in the request, or whose series
+  was itself skipped. This reason is also an encoder reason on the output side. It's not additive with `invalid_labels`: a series with bad labels and
   three exemplars raises one `invalid_labels` and three `exemplar_dropped`, because they answer
   different questions.
 - **`degraded{reason="seed_mismatch"}`** (metadata cache): a *remembered* type would have made the
