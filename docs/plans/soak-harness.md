@@ -1494,7 +1494,7 @@ The rows of the re-scored `results.md` (`rss_slope`, `ledger.intake`, `ledger.eg
 | `rss_slope` | PASS | MiB/h per service/life: logit/0 to logit/29 from -13.4 to +36.4, generator/0 +1.0 (limit 64); logit 14835s of 28740s after warmup judged (52%; WARN under 5%); generator 14830s of 28740s after warmup judged (52%; WARN under 5%) |
 | `fd_slope` | PASS | warmup median -> end: logit 15->15, generator 11->11 (limit +8) |
 | `ledger.wire` | PASS | G 56,517,865 = W 55,362,360 + K 937,342 + wire 218,163 (by design: 227,626 in UDP-affecting windows, -9,542 steady, 79 at the end; steady loss judged 871, each run at 0 or more, against limit 15,300); the generator's counted drop_newest loss, not in G: 1,094,500 event(s) in 10,945 batch(es) |
-| `ledger.intake` | PASS | final life 29: W − D 538,400 vs E + B 538,400; lives 0 to 28: W − D − B − Ab 0 within [0, R] (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.intake` | PASS | final life 29: W − D 538,400 vs E + B 538,400; lives 0 to 28: W − D − B − Ab 0 (life 19: 100) within [0, R] (R 77,000 = 10,000 + 67 x 1,000) |
 | `ledger.edge` | PASS | final life 29: E 538,400 == A 538,400 (listener to aggregate) |
 | `ledger.aggregate` | PASS | final life 29: Ab 538,400 == A 538,400 (every event absorbed) |
 | `ledger.egress` | PASS | 16 killed lives: Ab − V 0, ok (10 lives) or 10,000, within band (6 lives: 1, 10, 12, 17, 20, 25), each band about [-10,000, 30,000]; 13 stopped lives: W − D − B − V 0 = residual 0 + Ab − V 0, ok; life 29 (final): Ab 538,400 − V 538,400 = 0, ok |
@@ -1520,8 +1520,9 @@ What the run showed:
   15,300), and 79 fell at the end. The kernel counted 937,342 drops (K), during pauses of the
   SUT, and the generator counted 1,094,500 `drop_newest` events in 10,945 batches while the SUT
   was down. Both are counted loss. The final life's uncounted loss was 0.
-- **The ledger balanced in every life.** Every earlier life's residual was 0. Ten killed lives
-  balanced to 0 and six were 10,000 short, one unflushed 10 s window at 2,000/s, inside the band.
+- **The ledger balanced in every life.** Every earlier life's residual was 0, except killed
+  life 19's 100, inside [0, R]. Ten killed lives balanced to 0 and six were 10,000 short, one
+  unflushed 10 s window at 2,000/s, inside the band.
 - **`ledger.replay` replayed 0 at every one of the 16 restarts after a kill**, against 0 or 1
   queued batches at each kill: the sink was idle at each kill, as in the 1-hour run.
 - **`recovery` judged all 113 faults**, and each recovered within the 45 s `recovery_bound`.
