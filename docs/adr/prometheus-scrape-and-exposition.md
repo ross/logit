@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-03
+updated: 2026-10-09
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -263,6 +263,16 @@ equality modulo:
   `logit.output.labels.normalized{reason="multi_value"}` once per attribute rather than silently
   dropped; an empty or all-unrepresentable array still drops the label entirely and counts
   `labels.dropped{reason="unrepresentable"}` as before.
+- **Two families whose `# TYPE` names coincide write once.** A text 0.0.4 counter `foo` beside a
+  gauge `foo_total`, or counters `foo` and `foo_total`, both write `# TYPE foo_total`, and
+  `prometheus_out`'s registry can hold both, since it keys families by sanitized model name. A
+  second `# TYPE` line for a name makes Prometheus reject the whole scrape, so the family whose
+  model name sorts first is written and each series of the other is counted
+  `logit.output.metrics.skipped{reason="name_collision"}`.
+- **A family with no line to write loses its `# HELP` and `# TYPE` lines too.** That's a family
+  whose every series is stale, or a text 0.0.4 summary holding only `_created`. Metadata with no
+  sample after it would parse back as no family at all, so writing it would make the output
+  differ from its own re-render.
 - The three synthetic families `prometheus_in` always adds (`up`, `scrape_duration_seconds`,
   `scrape_samples_scraped` — see "Synthetic scrape metrics" below) are excluded from the
   round-trip fixed-point comparison by name, not asserted equal at all: `scrape_duration_seconds`

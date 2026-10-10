@@ -91,7 +91,7 @@
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.dropped{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is dropped -- `logit.output.labels.dropped{reason="reserved"}` |
 //! | two names sanitizing onto one wire name | the family whose *model* name sorts first is exposed, the rest are **skipped** -- `logit.output.metrics.skipped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug |
 //! | `unit` / `description` | `# UNIT` (OM only, and only when `_<unit>` suffixes the family name and the unit is `[a-zA-Z0-9_]+` -- the OpenMetrics spec requires it and Prometheus's parser fails the entire body otherwise; dropped counted `logit.output.metrics.degraded{reason="unit_not_suffix"}`) / `# HELP` |
-//! | two families whose `# TYPE` lines carry one name (a counter `foo` and a gauge `foo_total`, written as text 0.0.4) | the one whose model name sorts first is written, each series of the other **skipped** -- `logit.output.metrics.skipped{reason="name_collision"}`, for the reason the row above gives ([`text`]'s "Writing is deterministic") |
+//! | two families whose `# TYPE` lines carry one name | one is written, the other's series **skipped**, `logit.output.metrics.skipped{reason="name_collision"}` -- see the normalization list below |
 //! | two records, one name, different family types | the first record's type wins, the rest are **skipped**, `logit.output.metrics.skipped{reason="type_conflict"}` -- one name cannot carry two `# TYPE` lines |
 //! | `EventBatch::scope`, `Resource::schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
 //!
@@ -128,6 +128,13 @@
 //! - `_created`, `# UNIT` and exemplars dropped when the *output* dialect is text 0.0.4, and the
 //!   OpenMetrics-only family types rendered as their nearest text 0.0.4 shape (see [`text`]);
 //! - `# EOF` present per dialect; blank lines, non-`HELP`/`TYPE`/`UNIT` comments dropped;
+//! - two families whose `# TYPE` names coincide (a text 0.0.4 counter `foo` beside a gauge
+//!   `foo_total`, or counters `foo` and `foo_total`) write once: the one whose model name sorts
+//!   first, with each series of the other counted
+//!   `logit.output.metrics.skipped{reason="name_collision"}`, since a second `# TYPE` line for a
+//!   name makes Prometheus reject the whole scrape;
+//! - a family with no line to write (every series stale, or a text 0.0.4 summary holding only
+//!   `_created`) loses its `# HELP` and `# TYPE` lines too;
 //! - a histogram's `+Inf` bucket is authoritative for the total: a `_count` line that disagrees is
 //!   ignored rather than kept as a second, conflicting total the model has nowhere to put;
 //! - a histogram exemplar sits on the bucket its own *value* falls in, which for a conforming
