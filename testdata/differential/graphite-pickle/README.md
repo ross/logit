@@ -20,7 +20,9 @@ To regenerate, run `script/differential pickle`; to check the committed files ar
 `script/differential pickle` prints both interpreters' versions and `pickle.HIGHEST_PROTOCOL` on
 every run. The generator is `tools/differential/pickle/gen_py2.py` (Python 2 syntax, run first)
 and `tools/differential/pickle/gen_cases.py` (Python 3, stdlib only, run with
-`PYTHONHASHSEED=0` so a set pickles in one order). Neither container has a network.
+`PYTHONHASHSEED=0` in the environment and `python3 -P -s`, not `-I`, which would ignore it; the
+generator fails unless hash randomization is off, so a set pickles in one order). Neither container
+has a network.
 
 ## Files
 
@@ -58,8 +60,8 @@ Each JSON file is `json.dump(sort_keys=True, indent=1)`:
 - `divergence`: present if and only if `logit` differs from `carbon`, naming why and the
   `docs/known-gaps/mappings.md` row that records it.
 - `decoder_skips`: the `logit.input.metrics.skipped` reasons the pickle decoder counts, besides
-  `bad_shape`; `decoder_divergence`: present if and only if a datapoint's fate in the decoder differs
-  from its carbon `fate`.
+  `bad_shape`; `decoder_divergence`: present if and only if the reader agrees with carbon and a
+  datapoint's fate in the decoder differs from its carbon `fate`.
 - `exercises` and `opcodes`: the opcodes the case claims, and every opcode it contains.
 
 ## What the generator checks

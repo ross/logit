@@ -39,7 +39,7 @@
   ]
  },
  "description": "A batch that is a tuple.",
- "divergence": "carbon iterates any container and float()s any value it can; the reader takes a list batch and has no opcode for this shape (docs/known-gaps/mappings.md: decode (Graphite), a shape carbon iterates)",
+ "divergence": "carbon iterates any container; the reader takes only a list at STOP (docs/known-gaps/mappings.md: decode (Graphite), a shape carbon iterates)",
  "exercises": [
   "TUPLE1"
  ],

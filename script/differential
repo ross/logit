@@ -30,6 +30,8 @@ usage() {
 # generate_pickle <out_dir>: writes the carbon pickle corpus into <out_dir>. gen_py2.py writes the
 # Python 2 payloads into a scratch directory; gen_cases.py reads them, pickle.rs's opcode lists,
 # and testdata/interop/graphite/, and writes every case. Neither container has a network.
+# `-P -s` keeps the script's directory and the user site off `sys.path` and, unlike `-I`, honors
+# PYTHONHASHSEED.
 generate_pickle() {
     local out="$1" scratch
     scratch="$(mktemp -d)"
@@ -47,7 +49,7 @@ generate_pickle() {
         -v "${ROOT}/crates/logit-proto/src/graphite/pickle.rs:/src/pickle.rs:ro,z" \
         -v "${ROOT}/testdata/interop/graphite:/interop:ro,z" \
         -v "${out}:/out:z" \
-        "${PY3_IMAGE}" python3 -I /gen/gen_cases.py --py2 /work/py2.json \
+        "${PY3_IMAGE}" python3 -P -s /gen/gen_cases.py --py2 /work/py2.json \
             --allowlist /src/pickle.rs --interop /interop --out /out
 }
 

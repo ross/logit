@@ -20,7 +20,7 @@ when a rejected case's first unlisted opcode isn't the one it declares, or when 
 an opcode `pickle.rs`'s module doc lists ("Accepted opcodes" and the rejection paragraph after
 it) and isn't in `ACCEPT_UNREACHABLE` or `REJECT_UNREACHABLE`.
 
-Usage: python3 -I gen_cases.py --py2 py2.json --allowlist pickle.rs --interop <dir> --out <dir>
+Usage: PYTHONHASHSEED=0 python3 -P -s gen_cases.py --py2 py2.json --allowlist pickle.rs --interop <dir> --out <dir>
 """
 
 import argparse
@@ -322,6 +322,8 @@ GAP_SURROGATE = ("carbon keeps a str with a lone surrogate; a logit name is UTF-
 GAP_CONTAINER = ("carbon iterates any container and float()s any value it can; the reader takes "
                  "a list batch and has no opcode for this shape (docs/known-gaps/mappings.md: "
                  "decode (Graphite), a shape carbon iterates)")
+GAP_TUPLE_BATCH = ("carbon iterates any container; the reader takes only a list at STOP "
+                   "(docs/known-gaps/mappings.md: decode (Graphite), a shape carbon iterates)")
 GAP_LIST_ITEM = ("carbon unpacks any two-element sequence; the reader fails a non-empty list item "
                  "in a list grown by APPEND/APPENDS (docs/known-gaps/mappings.md: decode "
                  "(Graphite), a list-shaped pickle datapoint)")
@@ -523,7 +525,7 @@ def py3_cases():
         malformed(message="cannot extend"),
         "A tuple datapoint whose (timestamp, value) is a list.", divergence=GAP_LIST_ITEM)
     py3("py3-tuple-batch-p2", (("tuple.a", (TS, 1.0)),), 2, ["TUPLE1"],
-        malformed(message="not a list"), "A batch that is a tuple.", divergence=GAP_CONTAINER)
+        malformed(message="not a list"), "A batch that is a tuple.", divergence=GAP_TUPLE_BATCH)
     py3("py3-tuple-shapes-p2",
         [("shape.ok", (TS, 1.0)), ("shape.one",), ("shape.three", (TS, 1.0), 3),
          ("shape.inner3", (TS, 1.0, 2.0)), (), ("shape.big", (TS, 1.0), 3, 4)],
@@ -760,8 +762,10 @@ def main():
     args = ap.parse_args()
     print("gen_cases: Python %s, pickle.HIGHEST_PROTOCOL=%d"
           % (sys.version.split()[0], pickle.HIGHEST_PROTOCOL))
-    if os.environ.get("PYTHONHASHSEED") != "0":
-        raise SystemExit("gen_cases: run with PYTHONHASHSEED=0, so a set pickles in one order")
+    if sys.flags.hash_randomization:
+        raise SystemExit(
+            "gen_cases: run with PYTHONHASHSEED=0 and without -E/-I, so a set pickles in one order"
+        )
 
     accepted, rejected = allowlist(args.allowlist)
     with open(args.py2, encoding="utf-8") as f:
