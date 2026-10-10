@@ -23,9 +23,9 @@ edges, with and without a residual, a surplus below it and a lost last window ab
 with no stderr part, the final life's sink identity counting a spool's replayed batches,
 `ledger.windows` against lost middle, tail, and head windows, and `ledger.replay` against a
 short replay. `ledger.wire` counts a steady run's surplus as 0, and `ledger.windows` excuses a
-gap across a fault that silences the SUT, but not one starting or ending past its bound on
-either side, the one window lost right before or right after the fault included, and gives a
-generator stop its own longer bound after it.
+gap the aggregate sent no batch in, with the flushes reported on time or one drain late,
+across a pause with no drains, and past 11 s after a partition, but FAILs one it sent a batch
+in, the one window lost right before or right after a fault included.
 
 For a `[random]` schedule, it covers every validation rule, a pinned head of the shipped
 scenario's schedule (so a seed keeps reproducing a recorded run), determinism, and, for 12 seeds
@@ -1391,7 +1391,8 @@ KILL_KILL = (203, 213)
 
 
 def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=None, drop=(),
-              every_window=True, kill_residual=0, silence=None):
+              every_window=True, kill_residual=0, silence=None, idle=(), extra_sent=(),
+              late_report=False, no_drains=None):
     """A three-life run for the ledger: life 1 ends by a kill. The generator and the SUT move
     `PER_DRAIN` lines per 5 s drain (200/s), and the export samples every 10 s. Lives 0 and 2
     balance. Life 1's Ab − V is `kill_gap`, the window the kill discarded; its band is
@@ -1400,10 +1401,14 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
     line inside life 1, which a killed life can't write. Life 1's last drain shows `queued`
     batches (default `replayed`), and life 2's sink opens a spool holding `replayed` of them and
     delivers them in its first drain. `drop` deletes the export's samples at those offsets from
-    every series; `every_window` sets `[ledger] vm_every_window`. `kill_residual` lines are read
-    in the drain before life 1's last and never absorbed. `silence` is `(service, action)` of a
-    fault over +240..+270 in life 2, or `(service, action, start, end)` of one over those
-    offsets."""
+    every series, a window the aggregate flushed but the store lost; `idle` deletes those
+    samples and the aggregate's flush of them, a window it never emitted. The aggregate reports
+    each flush's batch in the drain at the flush's offset, or the next drain under
+    `late_report`, and one more batch in each drain at the offsets in `extra_sent`. `no_drains`
+    is a `(start, end)` span with no SUT drain, as a pause leaves. `every_window` sets `[ledger]
+    vm_every_window`. `kill_residual` lines are read in the drain before life 1's last and never
+    absorbed. `silence` is `(service, action)` of a fault over +240..+270 in life 2, or
+    `(service, action, start, end)` of one over those offsets."""
     queued = replayed if queued is None else queued
     gen = []
     for offset in range(5, 301, 5):
@@ -1422,9 +1427,17 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
              (2, KILL_KILL[1], range(215, 321, 5))]
     sut = []
     absorbed = {}
+    flushed = [s for s in (*range(10, 101, 10), *range(140, 201, 10), *range(220, 321, 10))
+               if s not in idle]
+    reported = [s + 5 if late_report else s for s in flushed] + list(extra_sent)
     for life, start, offsets in lives:
         for offset in offsets:
+            if no_drains is not None and no_drains[0] < offset < no_drains[1]:
+                continue
             stamp = _stamp(T0 + offset)
+            if offset in reported:
+                sut.append(_line(stamp, "logit.component.batches.sent", "sum",
+                                 reported.count(offset), component="window"))
             sut.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
             w = PER_DRAIN if offset <= 300 else 0
             absorbed[life] = absorbed.get(life, 0) + w
@@ -1493,7 +1506,7 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
             share = totals[life] // 2 if index == 0 else totals[life] - totals[life] // 2
             n = len(stamps[life])
             for i, s in enumerate(stamps[life]):
-                if s not in drop:
+                if s not in drop and s not in idle:
                     values.append(share * (i + 1) // n)
                     timestamps.append(int((T0 + s) * 1000))
         export.append({"metric": {"__name__": f"x_{index}_total"}, "values": values,
@@ -1586,69 +1599,63 @@ def _kill_ledger():
                and "life 2's first sample at +240s, 27s after the life started"
                in head["ledger.windows"].detail,
                f"windows FAILs a later life's late first sample, got {head['ledger.windows']}")
-        paused = results("windows-pause", drop=(250, 260, 270), silence=("logit", "pause"))
-        expect(paused["ledger.windows"].status == checks.PASS
-               and "2 excused" in paused["ledger.windows"].detail,
-               f"windows excuses a gap across a pause of the SUT, got {paused['ledger.windows']}")
-        parted = results("windows-partition", drop=(250, 260, 270),
-                         silence=("generator", "partition"))
-        expect(parted["ledger.windows"].status == checks.PASS,
-               f"windows excuses a gap across a partition of the generator, got "
-               f"{parted['ledger.windows']}")
-        beside = results("windows-pause-and-lost", drop=(230, 240, 250, 260, 270),
-                         silence=("logit", "pause"))
-        expect(beside["ledger.windows"].status == checks.FAIL
-               and "life 2 gap 60s from +220s to +280s" in beside["ledger.windows"].detail,
-               f"windows FAILs a window lost beside a pause, got {beside['ledger.windows']}")
-        # A pause over +245..+265 between the 10 s samples: the last one before it at +240, the
-        # first after it at +270, each 5 s from the fault; the bound on both sides is 11 s.
+        # The aggregate flushes every 10 s; its batch is reported in the drain at the flush.
+        # Between samples at +240 and +270 it counts drains from +247.5 to +267.5.
+        idle = results("windows-idle", idle=(250, 260))
+        expect(idle["ledger.windows"].status == checks.PASS
+               and "1 idle gap(s) excused: life 2 +240s to +270s (30s, 2 series), window sent 0 "
+               "batch(es) over 4 drain(s) from +248s to +268s" in idle["ledger.windows"].detail,
+               f"windows excuses a gap the aggregate flushed nothing in, got "
+               f"{idle['ledger.windows']}")
+        emitted = results("windows-idle-sent", idle=(250, 260), extra_sent=(255,))
+        expect(emitted["ledger.windows"].status == checks.FAIL
+               and "x_0_total: life 2 gap 30s from +240s to +270s, windows emitted but not "
+               "stored: window sent 1 batch(es)" in emitted["ledger.windows"].detail,
+               f"windows FAILs a gap the aggregate sent a batch in, got "
+               f"{emitted['ledger.windows']}")
+        # A flush reported one drain late puts +240's batch at +245 and +270's at +275, both
+        # outside the span.
+        idle_late = results("windows-idle-late", idle=(250, 260), late_report=True)
+        lost_late = results("windows-lost-late", drop=(250, 260), late_report=True)
+        expect(idle_late["ledger.windows"].status == checks.PASS
+               and lost_late["ledger.windows"].status == checks.FAIL,
+               f"windows counts neither sample's own flush when the drain reports it one drain "
+               f"late, got {idle_late['ledger.windows']} {lost_late['ledger.windows']}")
+        # The r43 shape: a partition of the SUT over +247..+258.92, the first sample after it
+        # 11.08 s after the revert, and no flush between.
+        r43 = results("windows-r43", idle=(250, 260),
+                      silence=("logit", "partition", 247, 258.92))
+        expect(r43["ledger.windows"].status == checks.PASS
+               and "1 idle gap(s) excused" in r43["ledger.windows"].detail,
+               f"windows excuses an idle gap ending 11.08 s after a partition, got "
+               f"{r43['ledger.windows']}")
         pause = ("logit", "pause", 245, 265)
-        inside = results("windows-inside", drop=(250, 260), silence=pause)
-        expect(inside["ledger.windows"].status == checks.PASS
-               and "2 excused" in inside["ledger.windows"].detail,
-               f"windows excuses the two windows inside a pause, got {inside['ledger.windows']}")
-        before = results("windows-lost-before", drop=(240, 250, 260), silence=pause)
+        before = results("windows-lost-before", drop=(240,), idle=(250, 260), silence=pause)
         expect(before["ledger.windows"].status == checks.FAIL
                and "life 2 gap 40s from +230s to +270s" in before["ledger.windows"].detail,
-               f"windows FAILs the one window lost right before a pause, got "
+               f"windows FAILs a window the aggregate flushed right before a pause, got "
                f"{before['ledger.windows']}")
-        after = results("windows-lost-after", drop=(250, 260, 270), silence=pause)
+        after = results("windows-lost-after", drop=(270,), idle=(250, 260), silence=pause)
         expect(after["ledger.windows"].status == checks.FAIL
                and "life 2 gap 40s from +240s to +280s" in after["ledger.windows"].detail,
-               f"windows FAILs the one window lost right after a pause, got "
+               f"windows FAILs a window the aggregate flushed right after a pause, got "
                f"{after['ledger.windows']}")
-        edge_after = results("windows-edge-after", drop=(250, 260),
-                             silence=("logit", "pause", 249.1, 259.1))
-        past_after = results("windows-past-after", drop=(250, 260),
-                             silence=("logit", "pause", 248.9, 258.9))
-        expect(edge_after["ledger.windows"].status == checks.PASS
-               and past_after["ledger.windows"].status == checks.FAIL,
-               f"windows excuses a gap ending 10.9 s after a pause and FAILs one ending 11.1 s "
-               f"after it, got {edge_after['ledger.windows']} {past_after['ledger.windows']}")
-        edge_before = results("windows-edge-before", drop=(250, 260),
-                              silence=("logit", "pause", 250.9, 260.9))
-        past_before = results("windows-past-before", drop=(250, 260),
-                              silence=("logit", "pause", 251.1, 261.1))
-        expect(edge_before["ledger.windows"].status == checks.PASS
-               and past_before["ledger.windows"].status == checks.FAIL,
-               f"windows excuses a gap starting 10.9 s before a pause and FAILs one starting "
-               f"11.1 s before it, got {edge_before['ledger.windows']} "
-               f"{past_before['ledger.windows']}")
-        restart = ("generator", "stop", 245, 265)
-        started = results("windows-generator-stop", drop=(250, 260, 270), silence=restart)
-        expect(started["ledger.windows"].status == checks.PASS
-               and "2 excused" in started["ledger.windows"].detail,
-               f"windows gives a generator stop 2 x the interval after it, got "
-               f"{started['ledger.windows']}")
-        late = results("windows-generator-stop-late", drop=(250, 260, 270, 280, 290),
-                       silence=("generator", "stop", 245, 279))
-        expect(late["ledger.windows"].status == checks.FAIL,
-               f"windows FAILs a gap ending past 2 x the interval after a generator stop, got "
-               f"{late['ledger.windows']}")
+        # A paused SUT writes no drain and flushes nothing.
+        paused = results("windows-pause-no-drains", idle=(250, 260, 270), no_drains=(242, 277),
+                         silence=("logit", "pause", 242, 277))
+        expect(paused["ledger.windows"].status == checks.PASS
+               and "window sent 0 batch(es) over 0 drain(s)" in paused["ledger.windows"].detail,
+               f"windows excuses a gap across a pause with no drains, got "
+               f"{paused['ledger.windows']}")
+        stopped = results("windows-generator-stop", idle=(250, 260, 270, 280, 290),
+                          silence=("generator", "stop", 245, 285))
+        expect(stopped["ledger.windows"].status == checks.PASS
+               and "life 2 +240s to +300s (60s, 2 series)" in stopped["ledger.windows"].detail,
+               f"windows excuses an idle gap of any length, got {stopped['ledger.windows']}")
         netem = results("windows-netem", drop=(250, 260, 270), silence=("logit", "netem"))
         expect(netem["ledger.windows"].status == checks.FAIL,
-               f"windows doesn't excuse a gap across a fault that leaves the SUT writing "
-               f"windows, got {netem['ledger.windows']}")
+               f"windows FAILs windows the aggregate flushed whatever fault is running, got "
+               f"{netem['ledger.windows']}")
         unset = results("kill-windows-unset", every_window=False)
         expect(unset["ledger.windows"].status == checks.SKIP,
                f"windows SKIPs without vm_every_window, got {unset['ledger.windows']}")

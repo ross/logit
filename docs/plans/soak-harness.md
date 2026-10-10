@@ -261,8 +261,9 @@ life's counters is lost, so that life's egress is judged within a band, not for 
 life a hop is judged in").
 
 **`vm_every_window` (W3)**, an optional `[ledger]` key, turns on `ledger.windows`: every series
-has a sample in every `aggregate` window of every SUT life. Set it only when every series is
-written in every window, because `aggregate` emits a series only in a window that updated it.
+has a sample in every `aggregate` window of every SUT life that `aggregate` emitted. Set it only
+when every series is written in every window, because `aggregate` emits a series only in a
+window that updated it, and the row excuses a gap only when the whole component was idle.
 
 The expected rate is never configured. It is measured from the generator's own `events.sent`
 over the warmup.
@@ -558,26 +559,39 @@ The rows:
   delivered total, which no log line states. A killed life's gap passes inside its band (see
   "Which life a hop is judged in"). Any other gap is **uncounted loss, FAIL**.
 - `ledger.windows`, only under `[ledger] vm_every_window = true`, else SKIP: per SUT life and
-  series, consecutive samples are at most 1.5 × the SUT config's `aggregate` interval apart; a
-  killed life's last sample is at most 1.1 × the interval before the kill, because the kill
-  discards only the window in progress and 10% covers a flush's own lateness; and a later
-  life's first sample is at most 2 × the interval after the life starts, the first window plus
-  startup. A series with no sample in a life FAILs too. Each FAIL names the series and the gap.
-  The interval comes from the config, never the median spacing, which moves once half the
-  windows are missing. A last window lost to a kill that lands within 0.1 × the interval of the
-  life's last flush passes, and the kill time is the `docker kill` call's start, which can run
-  about a second ahead of the signal. A gap across a fault that silences the SUT is excused
-  (W4): a `pause` of `logit` flushes nothing, and a `partition` of `logit`, or a `pause`, `stop`,
-  or `partition` of the generator, stops lines arriving, and `aggregate` writes a series only
-  in a window that updated it. The gap is excused only when it starts within 1.1 × the interval
-  before the fault, where the last window before it closes, and ends within 1.1 × the interval
-  after it: the first window to close after the fault can hold no line, and the next one closes
-  an interval later. A generator `stop` gets 2 × the interval after it, the bound a new life's
-  first sample gets, because the restarted generator sends its first line only after it
-  starts; that allowance is assumed, since no shipped scenario stops the generator. A window
-  lost beside the fault FAILs once it moves the gap's start or end past its bound; one lost
-  inside that bound is excused. A recorded `statsd-vm` run's margins were 1.6 s before a
-  pause and 10.1 s after a partition at a 10 s interval.
+  series, consecutive samples are at most 1.5 × the SUT config's `aggregate` interval apart,
+  unless the gap is idle; a killed life's last sample is at most 1.1 × the interval before the
+  kill, because the kill discards only the window in progress and 10% covers a flush's own
+  lateness; and a later life's first sample is at most 2 × the interval after the life starts,
+  the first window plus startup. A series with no sample in a life FAILs too. Each FAIL names
+  the series and the gap. The interval comes from the config, never the median spacing, which
+  moves once half the windows are missing. A last window lost to a kill that lands within
+  0.1 × the interval of the life's last flush passes, and the kill time is the `docker kill`
+  call's start, which can run about a second ahead of the signal.
+
+  A gap is idle, and excused, when the `aggregate` the `[ledger] sut_aggregate` id names sent
+  no batch in the span its missing windows would have been flushed in. An idle flush sends
+  nothing, because `aggregate` emits a series only in a window that updated it, so no window
+  existed to store. The row counts `logit.component.batches.sent`, one per send and none for an
+  idle flush; `aggregate` emits no `flush.events`. The span follows from the drain cadence. A
+  flush at f is reported by the drain at f + d, where d runs from about 0 to one drain period
+  p (the median spacing of the SUT's drains), because the `internal` and `aggregate` timers
+  share a phase and either can fire first at a shared tick; in recorded runs d is within
+  0.13 s of 0 or of p. For a gap between samples at a and b, the missing windows flush at
+  a + k × interval for 0 < k < (b − a) / interval, so their drains fall in
+  [a + interval, b − interval + p]; a's own drain falls in [a, a + p] and b's in [b, b + p].
+  The row counts over [a + (interval + p) / 2, b − (interval − p) / 2), which splits both
+  separations in half and leaves a margin of (interval − p) / 2 on each side for timer jitter:
+  at a 10 s interval and 5 s drains, [a + 7.5 s, b − 2.5 s). The rule needs p under the
+  interval, and with p at or above it no gap is excused. When the count is above 0, windows
+  were emitted but are missing from the store, and the gap FAILs with the count. The rule
+  doesn't read fault windows: an idle gap is legitimate anywhere, and a window lost beside a
+  fault FAILs because its flush is counted. A paused SUT writes no drain and flushes nothing,
+  so a gap across a pause counts 0 over no drains and is excused; no window closed during the
+  pause, so none could be lost. The count is per component, not per series, so a series idle
+  while others flush FAILs; set `vm_every_window` only where every series is written in every
+  window. The detail names each excused gap with its offsets, its series count, and the
+  batches and drains counted.
 - `ledger.replay`, for each killed life followed by another, else SKIP: the next life's
   first-drain `buffer.disk.replayed` equals the killed life's `buffer.batches` at its last
   drain, one batch in flight allowed. `identity.sink` balances on whatever `replayed` reports,
@@ -710,7 +724,7 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
 - **W4**: seeded random schedules (a `[random]` table and `--seed`; "The scenario schema"),
   hours-long runs (chunked `docker logs --since/--until`, rotated `json-file` logs, absolute
   poll deadlines, bounded poll timeouts; "The driver loop and end sequence"), `check` fast
-  enough for an 8-hour run, `ledger.windows` excusing gaps across faults that silence the SUT,
+  enough for an 8-hour run, `ledger.windows` excusing a gap in which `aggregate` sent no batch,
   and the `random-faults` scenario. The perf VM is dropped: long runs happen on the development
   host, which has 32 cores, 125 GB of RAM, 716 GB of free disk, and Docker's default `json-file`
   log driver with no daemon-level rotation, so compose sets each container's rotation.
