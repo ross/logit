@@ -850,9 +850,11 @@ sequence, and §6's checks hold unless an item says otherwise.
    ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Event model and interner"), so
    `rss_slope` should FAIL: the harness sees the documented growth and pins its rate. A short
    `series_retention` keeps `aggregate`'s state from masking it. Rows: `rss_slope` and the slope
-   of `logit.process.interner.strings`. The generator interns every name too, so its RSS grows
-   beside the SUT's; both rows read the SUT's telemetry stream, never the generator's. Needs:
-   an expected verdict per row (`rss_slope` FAIL scores PASS) and a gauge `slope` reducer.
+   of `logit.process.interner.strings` on `logit`. The generator interns every name too, so
+   its RSS grows beside the SUT's, and `rss_slope` folds both services into one verdict; the row
+   has to judge each service on its own before a FAIL says anything about the SUT. Needs: an
+   expected verdict per row and per service (`rss_slope` FAIL on `logit` scores PASS, the
+   generator's judged apart) and a gauge `slope` reducer.
 
 **Medium.** Each adds a service, a topology, or a tool.
 
@@ -879,11 +881,13 @@ sequence, and §6's checks hold unless an item says otherwise.
    (ADR `delivery-semantics`, "10. A replaying input is at-least-once up to the in-memory
    queues"): a checkpoint advances once lines reach the downstream inboxes, so a kill loses the
    checkpointed lines still in memory (the inboxes, `aggregate`'s open window, and the sink's
-   memory queue) and replays the lines since the last checkpoint. A killed life is therefore
-   judged with §6's killed-life band ("Which life a hop is judged in"), plus a surplus band of
-   up to one checkpoint interval of lines on top. A `buffer.disk:` on the sink removes only the
-   sink-queue part of the loss. Needs: a volume the writer and SUT share (the generator's
-   `file_out` can write, G its count) and that surplus band.
+   memory queue) and replays the lines since the last checkpoint. The sink runs with
+   `buffer.disk:`, as `spool-kill-replay` does, so the sink's queue survives and §6's killed-life
+   band ("Which life a hop is judged in"), which covers `aggregate`'s window and not a sink
+   queue, applies as written, with the lines the tailer read standing in for W. A killed life is
+   judged with that band plus a surplus band of up to one checkpoint interval of lines on top.
+   Needs: a volume the writer and SUT share (the generator's `file_out` can write, G its count),
+   the tail-side W, and that surplus band.
 10. **Deterministic destination errors.** A scripted HTTP stand-in answering `429`, `5xx`, `400`,
     and `413` on cue and recording what it accepts, so every row of a sink's response-class table
     ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "Each sink attributes from
