@@ -792,8 +792,9 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
 
 Every shipped scenario drives one path, `statsd_in` over UDP into one `aggregate` and one sink,
 on §3's three services, and `[ledger]` names one component per hop. The scenarios below widen
-that, in landing order. Each states what it proves, its faults, its rows, and the harness support
-it needs; §2's validation, §5's end sequence, and §6's checks hold unless an item says otherwise.
+that, grouped by cost; the Workstreams table gives the landing order. Each states what it
+proves, its faults, its rows, and the harness support it needs; §2's validation, §5's end
+sequence, and §6's checks hold unless an item says otherwise.
 
 **Cheap now.** Each is a scenario directory on the three services plus a small check extension.
 
@@ -805,8 +806,8 @@ it needs; §2's validation, §5's end sequence, and §6's checks hold unless an 
    a busy loop after N events reads `stalled`, then `ok` (the sandbox has no clock, so the loop
    is an iteration count sized past the 10 s `stall_after`); a VM over `max_memory` exits 2 with
    `memory_limit_exceeded` ([`docs/deploying.md`](../deploying.md), "Probes and exit codes"); an
-   error on every Nth event counts `logit.component.errors{reason="process"}`. Faults: §2's
-   sink-leg schedule. Rows: a script hop in the ledger (received equals emitted plus
+   error on every Nth event counts `logit.component.errors{reason="process"}`. Faults: the
+   `statsd-vm` schedule in §2. Rows: a script hop in the ledger (received equals emitted plus
    `script_drop` drops plus errors; A counts `flush()`'s events); `ready` judges the stall.
    Needs: `[ledger] sut_script`; a no-op `mark` action with `for`, whose window excuses the stall
    for `progress` and `ready` and names a step for `[[expect]]`; readiness scored from the status
@@ -839,17 +840,19 @@ it needs; §2's validation, §5's end sequence, and §6's checks hold unless an 
    2's override, and no `kill`, because Docker discards a tmpfs when its container stops.
 5. **A slow destination.** Netem `delay` on `victoria-metrics`, or `rate` on `logit`, past the
    sink's `timeout:`, so a request VictoriaMetrics applied still times out: `prometheus_out`'s
-   `Ambiguous` transport-error row (module doc, "Faults, retries and duplicate safety"). The
-   retry rewrites the totals, which `temporality: cumulative` overwrites. Rows: `[[expect]]` on
-   `requests{class="network_error"}` and `retries`, `ledger.egress` at 0, and `progress` telling
-   a slow drain from a hang. Needs: nothing new.
-6. **High cardinality over hours.** A second `generate_in` with an unbounded `{seq}` in the metric
-   name, at a low rate. The interner never frees
+   `Ambiguous` transport-error row (module doc, "Faults, retries and duplicate safety (sender
+   mode)"). The retry rewrites the totals, which `temporality: cumulative` overwrites. Rows:
+   `[[expect]]` on `requests{class="network_error"}` and `retries`, `ledger.egress` at 0, and
+   `progress` telling a slow drain from a hang. Needs: nothing new.
+6. **High cardinality over hours.** A second `generate_in` with `{seq%N}` in the metric name,
+   N past any count the run reaches, at a low rate (`generate_in` rejects a bare `{seq}` in an
+   interned field). The interner never frees
    ([`docs/known-gaps/runtime.md`](../known-gaps/runtime.md), "Event model and interner"), so
    `rss_slope` should FAIL: the harness sees the documented growth and pins its rate. A short
    `series_retention` keeps `aggregate`'s state from masking it. Rows: `rss_slope` and the slope
-   of `logit.process.interner.strings`. Needs: an expected verdict per row (`rss_slope` FAIL
-   scores PASS) and a gauge `slope` reducer.
+   of `logit.process.interner.strings`. The generator interns every name too, so its RSS grows
+   beside the SUT's; both rows read the SUT's telemetry stream, never the generator's. Needs:
+   an expected verdict per row (`rss_slope` FAIL scores PASS) and a gauge `slope` reducer.
 
 **Medium.** Each adds a service, a topology, or a tool.
 
@@ -874,9 +877,13 @@ it needs; §2's validation, §5's end sequence, and §6's checks hold unless an 
    ([ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md),
    "Checkpoints: optional, written on an interval, only when dirty"). A replay is at-least-once
    (ADR `delivery-semantics`, "10. A replaying input is at-least-once up to the in-memory
-   queues"), so a killed life is judged zero loss and a surplus up to one checkpoint interval.
-   Needs: a volume the writer and SUT share (the generator's `file_out` can write, G its count)
-   and that surplus band.
+   queues"): a checkpoint advances once lines reach the downstream inboxes, so a kill loses the
+   checkpointed lines still in memory (the inboxes, `aggregate`'s open window, and the sink's
+   memory queue) and replays the lines since the last checkpoint. A killed life is therefore
+   judged with §6's killed-life band ("Which life a hop is judged in"), plus a surplus band of
+   up to one checkpoint interval of lines on top. A `buffer.disk:` on the sink removes only the
+   sink-queue part of the loss. Needs: a volume the writer and SUT share (the generator's
+   `file_out` can write, G its count) and that surplus band.
 10. **Deterministic destination errors.** A scripted HTTP stand-in answering `429`, `5xx`, `400`,
     and `413` on cue and recording what it accepts, so every row of a sink's response-class table
     ([ADR `sink-fault-classes`](../adr/sink-fault-classes.md), "Each sink attributes from
@@ -897,10 +904,13 @@ it needs; §2's validation, §5's end sequence, and §6's checks hold unless an 
     each other.
 12. **SIGHUP and TLS reload.** A TLS listener and sink, signalled and rotated during faults
     ([ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md), "Trigger: a content poll,
-    and SIGHUP"). SIGHUP also reopens `stdio_out`, the harness's telemetry stream. Rows:
-    `[[expect]]` on `logit.tls.reloads{outcome="reloaded"}` and `logit.tls.certificate.not_after`,
-    the ledger at zero across reconnects, and no telemetry gap. Needs: a `signal` action and a
-    certificate-rotation action writing into a mounted directory.
+    and SIGHUP"). Rows: `[[expect]]` on `logit.tls.reloads{outcome="reloaded"}` and
+    `logit.tls.certificate.not_after`, and the ledger at zero across reconnects. The harness's
+    telemetry stream is a stdout `stdio_out`, which ignores SIGHUP, so it's expected to run
+    unaffected; a separate row covers the reopen with a SUT `file_out` on a mounted volume, whose
+    path a rename moves aside before the signal and whose next batch lands in a fresh file.
+    Needs: a `signal` action and a certificate-rotation action writing into a mounted
+    directory.
 
 **The first PR is items 1 and 2 together.** Both touch code the harness has never driven, and
 item 2 forces the compose override, the service list, and the per-sink ledger that items 3, 7,
