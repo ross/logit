@@ -98,15 +98,20 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # collectd section. `prom_text`'s is its dialect byte and a body one byte short of 64 KiB; its
 # worst input, distinct one- to three-character names on `aa 1` lines, is one family of one
 # series per five or six bytes, and the target's model mapping makes one 864-byte `Event` of
-# each: a measured 13.5 MiB `Vec`, pinned under 16 in the prometheus text section. `extra args`
-# go to `fuzz` only, never to `fuzz-tmin`.
+# each: a measured 13.5 MiB `Vec`, pinned under 16 in the prometheus text section. The four
+# `message_*` targets' `max_len` is a selector byte and a 64 KiB message, past the 65,507-byte
+# datagram and `MAX_FRAME_BYTES` line most messages arrive in; each worst message grows one `Vec`
+# by doubling, measured in the robustness suite's log-message section under 16: `message_json`'s
+# `{"a":[0,0,…]}` at 1.25 MiB, `message_csv`'s 65,537 empty fields at 2 MiB, `message_logfmt`'s
+# one-byte barewords at 1.5 MiB, and `message_kv`'s at 2 MiB. `message_csv` needs no fork mode
+# because the split interns nothing. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
 #
 # `native_batch`, `native_hop_batch`, `statsd`, `syslog`, `graphite_plaintext`,
-# `graphite_pickle`, `collectd`, `prom_text`, and `prom_remote_write` run in fork mode: the
-# process-wide interner never evicts, so a long-lived fuzz process accumulates every dictionary
-# string, metric name, tag key, SD-ID, PARAM-NAME, carbon path, and Prometheus exemplar label
-# name and family name it decodes until the arena outgrows the malloc limit, and fork mode
-# restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal, as it
+# `graphite_pickle`, `collectd`, `prom_text`, `prom_remote_write`, `message_json`,
+# `message_logfmt`, and `message_kv` run in fork mode: the process-wide interner never evicts, so
+# a long-lived fuzz process accumulates every dictionary string, metric name, tag key, SD-ID,
+# PARAM-NAME, carbon path, Prometheus exemplar label name and family name, and log-message key it
+# decodes until the arena outgrows the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal, as it
 # is outside fork mode.
 FUZZ_TARGETS=(
     "native_frame|262144|65|"
@@ -130,6 +135,10 @@ FUZZ_TARGETS=(
     "graphite_plaintext|65536|16|-fork=1 -ignore_ooms=0"
     "graphite_pickle|65537|32|-fork=1 -ignore_ooms=0"
     "collectd|65509|16|-fork=1 -ignore_ooms=0"
+    "message_json|65537|16|-fork=1 -ignore_ooms=0"
+    "message_csv|65537|16|"
+    "message_logfmt|65537|16|-fork=1 -ignore_ooms=0"
+    "message_kv|65537|16|-fork=1 -ignore_ooms=0"
 )
 
 # The sanitizer builds' RUSTFLAGS differ from miri's and careful's, so they get their own volume

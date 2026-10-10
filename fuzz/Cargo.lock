@@ -376,6 +376,7 @@ dependencies = [
  "logit-core",
  "logit-proto",
  "prost",
+ "serde_json",
 ]
 
 [[package]]

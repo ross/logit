@@ -5,7 +5,8 @@
 //! OTLP targets' signal (`0` logs, `1` metrics, `2` traces), `prom_decompress`'s encoding,
 //! `prom_remote_write`'s version and mode, `prom_text`'s dialect, `stream_framing`'s four bytes of mode, bound, and chunking,
 //! `syslog`'s line splitting (`1` on, `0` off), `graphite_pickle`'s mode (`0` a payload, `1` a
-//! build spec), and `collectd`'s two-byte cut position. [`generate`] is deterministic, so a rerun
+//! build spec), `collectd`'s two-byte cut position, and the four `message_*` targets' entry point,
+//! delimiter, `bare_keys`, or separator pair ([`message_seeds`]). [`generate`] is deterministic, so a rerun
 //! rewrites the same bytes and leaves `git status` clean.
 
 use bytes::{Bytes, BytesMut};
@@ -290,6 +291,12 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
 
     for (name, bytes) in collectd_seeds(testdata)? {
         add("collectd", name, bytes);
+    }
+
+    for (target, seeds) in message_seeds() {
+        for (name, bytes) in seeds {
+            add(target, name.to_string(), bytes);
+        }
     }
 
     let mut skipped = Vec::new();
@@ -1025,6 +1032,188 @@ fn prom_remote_write_built_seeds() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
+/// An nginx `access_json_full` line (`fixtures/nginx/nginx.conf`), as `escape=json` writes one.
+const NGINX_ACCESS_JSON: &str = concat!(
+    r#"{"time":"2026-09-07T06:52:01+00:00","remote_addr":"203.0.113.7","host":"shop.example.com","#,
+    r#""request_method":"GET","request_uri":"/api/v1/orders?id=42&sort=desc","status":200,"#,
+    r#""body_bytes_sent":612,"request_time":0.012,"upstream_response_time":"0.010","#,
+    r#""http_referer":"","http_user_agent":"Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0","#,
+    r#""http_x_forwarded_for":""}"#
+);
+
+/// The same format with what `escape=json` escapes: a quote and a backslash in the request URI,
+/// and an ESC byte as `\u001B`.
+const NGINX_ACCESS_JSON_ESCAPED: &str = concat!(
+    r#"{"time":"2026-09-07T06:52:02+00:00","remote_addr":"198.51.100.23","host":"shop.example.com","#,
+    r#""request_method":"GET","request_uri":"/search?q=\"a\\b\"","status":499,"#,
+    r#""body_bytes_sent":0,"request_time":0.000,"upstream_response_time":"","#,
+    r#""http_referer":"https://shop.example.com/","http_user_agent":"curl/8.5.0 \u001B[31m","#,
+    r#""http_x_forwarded_for":"203.0.113.7, 10.0.0.1"}"#
+);
+
+/// nginx's `access_semconv` format (`fixtures/nginx/nginx.conf`), the `http_access` input.
+const NGINX_ACCESS_SEMCONV: &str = concat!(
+    r#"{"http.request.method":"POST","url.original":"/api/v1/orders","url.scheme":"https","#,
+    r#""network.protocol.version":"HTTP/2.0","http.response.status_code":"201","#,
+    r#""http.response.body.size":57,"http.response.size":312,"http.request.size":1024,"#,
+    r#""http.request.duration_s":0.018,"server.address":"shop.example.com","#,
+    r#""client.address":"203.0.113.7","user_agent.original":"Mozilla/5.0","#,
+    r#""http.request.header.referer":"","user.name":"","upstream.address":"10.0.0.17:8080","#,
+    r#""upstream.status":"201","upstream.duration_s":"0.017"}"#
+);
+
+/// pino-http's completion record, two levels of nested objects
+/// (`crates/logit-bench/src/fixtures.rs`'s `PINO_HTTP_LOG_BODY`).
+const PINO_HTTP_JSON: &str = concat!(
+    r#"{"level":30,"time":1725091200123,"pid":4821,"hostname":"api-7c9f8d6b5-abcde","#,
+    r#""reqId":"req-8461","req":{"method":"POST","url":"/api/v1/orders","#,
+    r#""headers":{"host":"shop.example.com","content-type":"application/json"}},"#,
+    r#""res":{"statusCode":201,"headers":{"content-length":"57","vary":"Accept-Encoding"}},"#,
+    r#""responseTime":18,"msg":"request completed","tags":["a",["b",{}],[]]}"#
+);
+
+/// The delimiter selector `message_csv` reads for `delim`: its index among the delimiters graph
+/// rule 32 admits, in byte order.
+fn csv_selector(delim: u8) -> u8 {
+    (0u8..delim).filter(|b| !matches!(b, b'"' | b'\n' | b'\r')).count() as u8
+}
+
+/// `message_kv`'s separator table, in the target's order (`fuzz/fuzz_targets/message_kv.rs`).
+const KV_SEPARATORS: [(&str, &str); 9] = [
+    ("&", "="),
+    (" ", "="),
+    (",", "="),
+    (", ", ": "),
+    (";", "="),
+    ("\t", ":"),
+    (",", " "),
+    (" :: ", " -> "),
+    ("¦", "→"),
+];
+
+/// Constructed seeds for the four log-message targets: no recorded corpus holds these messages.
+/// `message_json`'s selector is `0` `parse_object` and `1` `parse_object_prefix`,
+/// `message_logfmt`'s is `bare_keys`, `message_csv`'s is [`csv_selector`], and `message_kv`'s is
+/// an index into [`KV_SEPARATORS`] shifted left one, `bare_keys` in the low bit.
+fn message_seeds() -> Vec<(&'static str, Vec<(&'static str, Vec<u8>)>)> {
+    let json = |prefix: bool, body: &str| prefixed(prefix as u8, body.as_bytes());
+    let json_seeds = vec![
+        ("nginx-access", json(false, NGINX_ACCESS_JSON)),
+        ("nginx-access-escaped", json(false, NGINX_ACCESS_JSON_ESCAPED)),
+        ("nginx-semconv", json(false, NGINX_ACCESS_SEMCONV)),
+        // The bare `000` `$status` writes for a request nginx never answered isn't valid JSON.
+        (
+            "nginx-status-000",
+            json(false, &NGINX_ACCESS_JSON.replace(r#""status":200"#, r#""status":000"#)),
+        ),
+        ("pino-nested", json(false, PINO_HTTP_JSON)),
+        (
+            "numbers",
+            json(
+                false,
+                r#"{"u":18446744073709551615,"u_over":18446744073709551616,"i":-9223372036854775808,"i_over":-9223372036854775809,"zero":0,"neg_zero":-0,"f":1.5e308,"small":4.9e-324,"e":1E-7,"frac":0.1}"#,
+            ),
+        ),
+        (
+            "escapes",
+            json(
+                false,
+                r#"{"s":"\"\\\/\b\f\n\r\t\u00e9\ud83d\ude00\u0000","esc\u0061ped key":"x","":""}"#,
+            ),
+        ),
+        (
+            "duplicate-keys",
+            json(false, r#"{"a":1,"a":"two","n":{"b":1,"b":{"c":null}},"a":[true]}"#),
+        ),
+        ("whitespace", json(false, " \t\r\n{ \"a\" : [ 1 , 2 ] , \"b\" : false }\n")),
+        ("empty-object", json(false, "{}")),
+        ("prefix-trailing-text", json(true, r#"{"level":"info","msg":"ok"} took=3ms"#)),
+        ("prefix-second-object", json(true, r#"{"a":1}{"b":2}"#)),
+        ("prefix-nginx", json(true, NGINX_ACCESS_JSON)),
+        ("top-level-array", json(false, "[1,2]")),
+        ("trailing-content", json(false, r#"{"a":1} x"#)),
+        ("unterminated", json(false, r#"{"a":"b"#)),
+    ];
+
+    let csv = |delim: u8, row: &str| prefixed(csv_selector(delim), row.as_bytes());
+    let csv_seeds = vec![
+        ("access", csv(b',', "10.0.0.1,2026-09-07T06:52:01Z,GET,\"/a,b\",200,612,0.012")),
+        (
+            "doubled-quotes",
+            csv(
+                b',',
+                r#"203.0.113.7,"GET /search?q=""a,b"" HTTP/1.1",200,"Mozilla/5.0 (""compatible"")""#,
+            ),
+        ),
+        ("header", csv(b',', "client,time,method,path,status,bytes,duration")),
+        ("empty-fields", csv(b',', ",,\"\",,")),
+        ("quote-in-unquoted", csv(b',', r#"he said "hi",b"#)),
+        ("tab", csv(b'\t', "203.0.113.7\t-\t\"GET / HTTP/1.1\"\t200")),
+        ("semicolon", csv(b';', "a;\"b;c\";\"\"\"\"")),
+        ("pipe", csv(b'|', "frontend|backend/srv1|0/0/1/2/3|200")),
+        ("unterminated", csv(b',', "a,\"b")),
+        ("trailing-after-quote", csv(b',', "\"a\"b,c")),
+        ("empty", csv(b',', "")),
+    ];
+
+    let logfmt = |bare: bool, line: &str| prefixed(bare as u8, line.as_bytes());
+    let logfmt_seeds = vec![
+        (
+            "go-kit",
+            logfmt(
+                false,
+                "level=info ts=2026-09-07T06:52:01Z caller=metrics.go:159 component=frontend \
+                 org_id=fake latency=fast duration=12.3ms status=200 msg=\"query stats\"",
+            ),
+        ),
+        ("escaped", logfmt(false, "level=info query=\"{job=\\\"nginx\\\"}\" status=200")),
+        (
+            "lua-example",
+            logfmt(
+                false,
+                "level=info msg=request method=GET path=/api/orders/42 status=200 dur=12ms \
+                 user=alice",
+            ),
+        ),
+        ("go-log-prefix", logfmt(false, "2026/09/07 12:00:00 level=info msg=started")),
+        ("barewords", logfmt(true, "debug cached level=info ready")),
+        ("no-space-after-quote", logfmt(false, "a=\"x\"b=1 c=\"y\"z")),
+        ("keyless", logfmt(false, "=1 a=2 == b=c=d")),
+        ("escapes", logfmt(false, "a=\"\\\\ \\\" \\n \\r \\t \\u00e9 \\x41\" b=\"\"")),
+        ("crlf-tabs", logfmt(false, "a=1\tb=2\r\nc= d")),
+        ("unterminated", logfmt(false, "a=1 b=\"open")),
+        ("trailing-backslash", logfmt(false, "a=\"x\\")),
+    ];
+
+    let kv = |index: usize, bare: bool, line: &str| {
+        debug_assert!(index < KV_SEPARATORS.len());
+        prefixed((index as u8) << 1 | bare as u8, line.as_bytes())
+    };
+    let kv_seeds = vec![
+        ("query", kv(0, false, "a=1&b=2&c=hello")),
+        ("query-empty-segments", kv(0, true, "a=1&&b=2&flag&=3&")),
+        ("space", kv(1, false, "a=1 b=2 c=hello")),
+        ("comma", kv(2, false, "a=1, b=2,c = hello")),
+        ("colon", kv(3, false, "level: info, msg: hello world, dur: 3ms")),
+        ("cookie", kv(4, true, "session=abc123; theme=dark; HttpOnly; lang=en")),
+        (
+            "ltsv",
+            kv(5, false, "host:127.0.0.1\tident:-\ttime:[07/Sep/2026:06:52:01 +0000]\tstatus:200"),
+        ),
+        ("value-after-space", kv(6, false, "a 1,b 2,c  three four")),
+        ("arrows", kv(7, false, "a -> 1 :: b -> 2 -> 3 :: c")),
+        ("non-ascii", kv(8, true, "a→1¦b→2¦c")),
+        ("no-pairs", kv(0, false, "=1&=2")),
+    ];
+
+    vec![
+        ("message_json", json_seeds),
+        ("message_csv", csv_seeds),
+        ("message_logfmt", logfmt_seeds),
+        ("message_kv", kv_seeds),
+    ]
+}
+
 fn prefixed(selector: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + body.len());
     out.push(selector);
@@ -1088,6 +1277,10 @@ mod tests {
                 "graphite_pickle",
                 "graphite_plaintext",
                 "hll_bytes",
+                "message_csv",
+                "message_json",
+                "message_kv",
+                "message_logfmt",
                 "native_batch",
                 "native_control",
                 "native_frame",

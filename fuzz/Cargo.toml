@@ -18,6 +18,7 @@ bytes = "1"
 logit-core = { path = "../crates/logit-core" }
 logit-proto = { path = "../crates/logit-proto" }
 prost = "0.14"
+serde_json = "1"
 
 # Symbols in a crash's stack trace.
 [profile.release]
@@ -166,6 +167,34 @@ bench = false
 [[bin]]
 name = "collectd"
 path = "fuzz_targets/collectd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_json"
+path = "fuzz_targets/message_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_csv"
+path = "fuzz_targets/message_csv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_logfmt"
+path = "fuzz_targets/message_logfmt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_kv"
+path = "fuzz_targets/message_kv.rs"
 test = false
 doc = false
 bench = false
