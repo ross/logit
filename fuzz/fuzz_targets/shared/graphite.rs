@@ -107,7 +107,7 @@ pub fn assert_matches(decoded: &Event, expected: &(Event, bool), what: &str) {
 /// The shape every decoded event has, whatever produced it: one finite `Gauge` with a path
 /// holding no `;`, and `Str` tags whose names hold no `;` or `=` and whose values hold no `;`,
 /// each non-empty. When `zero_copy`, every tag value is also a slice of `input`: it is, unless
-/// the pickle reader decoded the path field's escapes into its scratch.
+/// the pickle reader decoded the path field into its scratch.
 pub fn check_event(input: &Bytes, event: &Event, zero_copy: bool) {
     assert!(event.log.is_none() && event.span.is_none(), "model: graphite decodes a metric only");
     assert_eq!(event.metrics.len(), 1, "model: one record per datapoint");

@@ -317,8 +317,9 @@ impl PickleReader {
     /// the stack fails the whole frame with [`CodecError::Malformed`], and so does a non-empty
     /// list item inside a list grown by `APPEND`/`APPENDS` (`append_range`'s tail rule).
     ///
-    /// `path` borrows `input`, unless it is a protocol-0 string the sender escaped: then it
-    /// borrows the reader's scratch. `logit_core::subslice::share` tells the two apart, so a
+    /// `path` borrows `input`, unless it is a protocol-0 string the reader decoded ("Bounds": a
+    /// `STRING` with a backslash, or a `UNICODE` with a non-ASCII byte or a `\u`/`\U` escape):
+    /// then it borrows the reader's scratch. `logit_core::subslice::share` tells the two apart, so a
     /// caller still gets a zero-copy [`bytes::Bytes`] slice wherever one exists.
     pub fn read_datapoints(
         &mut self,

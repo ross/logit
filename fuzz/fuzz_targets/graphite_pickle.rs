@@ -13,8 +13,8 @@
 //! - built payloads, in protocol 2's binary spelling or protocol 0's text one: the reader yields
 //!   every well-shaped item in list order and counts every wrong-shaped one, and fails the frame
 //!   only where `append_range`'s tail rule says so: a non-empty list item inside an outer list
-//!   grown by `APPEND`/`APPENDS`. A built path the builder escaped is decoded, and one it didn't
-//!   borrows the payload;
+//!   grown by `APPEND`/`APPENDS`. A built path the reader must decode (escaped, or a `UNICODE`
+//!   with a Latin-1 byte) is decoded, and any other borrows the payload;
 //! - shape and zero-copy: every event has one finite `Gauge` and `Str` tags, which slice the
 //!   payload whenever the reader yielded its path from the payload (`shared::graphite`'s
 //!   `check_event`);
@@ -36,8 +36,9 @@ use logit_proto::Decoder;
 /// `(path, timestamp, value)` as the reader yields it.
 type Point = (String, f64, f64);
 
-/// What the reader must make of a built payload. `copied[i]` is whether the builder escaped
-/// `points[i]`'s path, so the reader decodes it rather than borrowing the payload.
+/// What the reader must make of a built payload. `copied[i]` is whether the builder spelled
+/// `points[i]`'s path so the reader must decode it (an escape, or a Latin-1 byte) rather than
+/// borrow the payload.
 enum Verdict {
     Reads { points: Vec<Point>, copied: Vec<bool>, skipped: usize },
     Fails,
@@ -64,7 +65,7 @@ struct Builder {
     text: bool,
     memo: usize,
     /// Memo keys of the well-shaped items written so far, what each one reads as, and whether
-    /// its path was escaped.
+    /// the reader must decode its path.
     good: Vec<(usize, Point, bool)>,
 }
 
@@ -192,7 +193,8 @@ fn build(spec: &[u8]) -> (Vec<u8>, Verdict) {
                     }
                     _ => (format!("q.{n};k={n}"), format!("q.{n};k={n}").into()),
                 };
-                let escaped = text && n % 3 != 0;
+                // `\u0071` and the raw Latin-1 byte both send the path to the scratch.
+                let decoded = text && n % 3 != 0;
                 let point = (path, seconds as f64, value.parse().unwrap());
                 b.op(0x28, &[]);
                 if text {
@@ -209,8 +211,8 @@ fn build(spec: &[u8]) -> (Vec<u8>, Verdict) {
                 }
                 b.op(0x74, &[0x74]);
                 points.push(point.clone());
-                copied.push(escaped);
-                b.memoize(point, escaped);
+                copied.push(decoded);
+                b.memoize(point, decoded);
             }
             // A repeat of an earlier well-shaped item, through the memo.
             2 if !b.good.is_empty() => {
@@ -300,7 +302,7 @@ fuzz_target!(|data: &[u8]| {
                 assert_eq!(got.2.to_bits(), want.2.to_bits(), "built: a value changed");
             }
             for (borrowed, copied) in borrowed.iter().zip(copied) {
-                assert_eq!(*borrowed, !copied, "built: only an escaped path is decoded");
+                assert_eq!(*borrowed, !copied, "built: only a path spelled to need decoding is decoded");
             }
         }
         (Some(Verdict::Fails), Ok(_)) => panic!("built: a frame the tail rule fails read"),
