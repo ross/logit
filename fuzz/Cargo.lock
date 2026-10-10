@@ -375,6 +375,7 @@ dependencies = [
  "libfuzzer-sys",
  "logit-core",
  "logit-proto",
+ "prost",
 ]
 
 [[package]]

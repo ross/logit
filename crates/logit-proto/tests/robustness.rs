@@ -19,7 +19,12 @@
 //! a 64 KiB datagram makes. The collectd section pins a Values count past the cap with its own
 //! matching length; the graphite section pins `resolve_timestamp`'s table against an exact
 //! reading, CPython's batched `APPENDS`, list-shaped pickle datapoints, and, in both, the largest
-//! allocation the worst 64 KiB input makes.
+//! allocation the worst 64 KiB input makes. The prometheus text section runs
+//! `prometheus::text::parse_with` over both dialects' fixtures and pins `count_value`'s table,
+//! `_created` on both sides of 2^63 nanoseconds, every escape at a label value's end, histogram
+//! reconstruction, the writer's fixed point, and the largest allocation the worst 64 KiB body
+//! makes; the remote-write section pins Snappy's length gate against a corrupt length and the
+//! encoder's fixed point.
 //!
 //! For each decoder: every single-byte truncation of a valid input, thousands of seeded bit flips,
 //! length fields inflated past the input, and, for `decode_batch`, `Value` nesting past the depth
@@ -32,7 +37,9 @@
 //! to flip. Iteration counts keep each decoder well under a second, since `script/test` runs this.
 
 use bytes::{Bytes, BytesMut};
-use logit_core::{AttrMap, Event, EventBatch, LogRecord, Provenance, Resource, Severity, Value};
+use logit_core::{
+    AttrMap, Event, EventBatch, Exemplar, LogRecord, Provenance, Resource, Severity, Value,
+};
 use logit_proto::frame::{self, Compression};
 use logit_proto::framing::{FrameError, Framer, FramingMode, Oversize, MAX_FRAME_BYTES};
 use logit_proto::graphite::{GraphiteDecoder, Protocol};
@@ -46,15 +53,28 @@ use logit_proto::otlp::generated::opentelemetry::proto::resource::v1 as otlp_res
 use logit_proto::otlp::generated::opentelemetry::proto::trace::v1 as otlp_trace;
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{self, DecompressError, Encoding};
+use logit_proto::prometheus::generated::io::prometheus::write::v2 as pb2;
+use logit_proto::prometheus::generated::prometheus as pb1;
+use logit_proto::prometheus::text::{self, Dialect};
+use logit_proto::prometheus::{
+    remote_write, FamilyType, MetricFamily, Point, PrometheusDecoder, PrometheusEncoder, Series,
+    STALE_NAN_BITS,
+};
 use logit_proto::statsd::StatsdDecoder;
 use logit_proto::syslog::SyslogDecoder;
 use logit_proto::{
     CodecError, Decoder, Encoder, Signal, SignalDecoder, SignalEncoder, SignalPayload,
 };
+use prost::Message;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+
+#[path = "support/prometheus_text.rs"]
+mod prometheus_fixtures;
+
+use prometheus_fixtures::{OPENMETRICS_FIXTURE, TEXT_FIXTURE};
 
 // -- a tiny, self-contained peak-allocation counter -----------------------------------------
 //
@@ -2937,3 +2957,582 @@ const RATIO_EXPONENTIAL_BUCKET: f64 = 8.0;
 const RATIO_SAMPLE: f64 = 2.0;
 const RATIO_HISTOGRAM_BUCKET: f64 = 1.8;
 const RATIO_SUMMARY_QUANTILE: f64 = 1.0;
+
+// -- prometheus text ----------------------------------------------------------------------------
+//
+// `prometheus::text::parse_with` and its assembler over the two `prometheus_fixed_point.rs`
+// fixtures, plus the float-to-integer guards, label-value escapes at a string's end, the histogram
+// reconstruction rules (`crates/logit-proto/src/prometheus/text.rs`'s "Leniencies"), and the
+// writer's fixed point.
+
+const PROMETHEUS_DIALECTS: [Dialect; 2] = [Dialect::Text0_0_4, Dialect::OpenMetrics1_0];
+
+fn prometheus_fixture(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Text0_0_4 => TEXT_FIXTURE,
+        Dialect::OpenMetrics1_0 => OPENMETRICS_FIXTURE,
+    }
+}
+
+/// Every `reason` a registry counted, with its count, sorted.
+type Reasons = Vec<(String, u64)>;
+
+type PrometheusParsed = (Result<Vec<MetricFamily>, CodecError>, Reasons);
+
+/// Lines after `# TYPE h histogram`, the buckets they make, and what they count.
+type HistogramCase = (&'static str, &'static [(f64, u64)], Reasons);
+
+/// A parse with telemetry, returning every `logit.input.metrics.{skipped,degraded}` reason and its
+/// count.
+fn prometheus_parse(body: &[u8], dialect: Dialect) -> PrometheusParsed {
+    let registry = logit_core::Registry::new();
+    let mut decoder = PrometheusDecoder::new().with_telemetry(registry.telemetry_for(
+        "prometheus_in",
+        "prometheus_in",
+        "source",
+    ));
+    let result = text::parse_with(body, dialect, &mut decoder);
+    (result, telemetry_reasons(&registry, "logit.input.metrics."))
+}
+
+/// Every `reason` the registry holds under a counter starting with `prefix`, with its count.
+fn telemetry_reasons(registry: &logit_core::Registry, prefix: &str) -> Reasons {
+    let mut reasons: Vec<(String, u64)> = registry
+        .drain(0)
+        .iter()
+        .filter_map(|event| {
+            let metric = event.metrics.first()?;
+            let name = logit_core::interner::resolve(metric.name);
+            let logit_core::MetricKind::Sum(sum) = &metric.kind else { return None };
+            let reason = event.attributes.get("reason").and_then(Value::as_str)?;
+            name.starts_with(prefix).then(|| (format!("{name}{{{reason}}}"), sum.value as u64))
+        })
+        .collect();
+    reasons.sort();
+    reasons
+}
+
+fn prometheus_written(families: &[MetricFamily], dialect: Dialect) -> String {
+    let mut out = Vec::new();
+    text::write(families, dialect, &mut out);
+    String::from_utf8(out).expect("the writer writes UTF-8")
+}
+
+/// A text 0.0.4 body never fails as a whole. An OpenMetrics prefix fails until it holds the
+/// `# EOF` line, its trailing `LF` aside.
+#[test]
+fn prometheus_text_survives_every_single_byte_truncation() {
+    for dialect in PROMETHEUS_DIALECTS {
+        let valid = prometheus_fixture(dialect).as_bytes();
+        let eof_line = valid.len() - 1;
+        for len in 0..valid.len() {
+            let (result, _) = prometheus_parse(&valid[..len], dialect);
+            let expect_ok = dialect == Dialect::Text0_0_4 || len >= eof_line;
+            assert_eq!(result.is_ok(), expect_ok, "{dialect:?}, a {len}-byte prefix: {result:?}");
+        }
+    }
+}
+
+/// A flip can break a line or the `# EOF`, never the parse: text 0.0.4 stays `Ok`, and an
+/// OpenMetrics `Err` is one of the two whole-body rejections.
+#[test]
+fn prometheus_text_survives_seeded_bit_flips() {
+    for dialect in PROMETHEUS_DIALECTS {
+        let valid = prometheus_fixture(dialect).as_bytes();
+        let mut rng = Lcg::new(0x5EED_5EED_5EED_5EEDu64);
+        for _ in 0..300 {
+            let mut mutated = valid.to_vec();
+            let (byte, bit) = (rng.next_usize(mutated.len()), rng.next_usize(8));
+            mutated[byte] ^= 1 << bit;
+            let result = std::panic::catch_unwind(|| prometheus_parse(&mutated, dialect).0)
+                .unwrap_or_else(|_| {
+                    panic!("{dialect:?}: a flip at byte {byte} bit {bit} panicked")
+                });
+            match result {
+                Ok(_) => {}
+                Err(CodecError::Malformed(reason)) if dialect == Dialect::OpenMetrics1_0 => {
+                    assert!(reason.contains("`# EOF`"), "{dialect:?}, byte {byte}: {reason}")
+                }
+                Err(other) => panic!("{dialect:?}, a flip at byte {byte} bit {bit}: {other}"),
+            }
+        }
+    }
+}
+
+/// `assemble.rs`'s `count_value` through a `+Inf` bucket: a finite, non-negative float rounds
+/// (half away from zero) and saturates at `u64::MAX`; anything else skips the line, which leaves
+/// the histogram with no bucket at all.
+#[test]
+fn prometheus_text_count_values_round_saturate_or_skip() {
+    let cases: [(&str, Option<u64>); 7] = [
+        ("18446744073709551615", Some(u64::MAX)),
+        ("1e19", Some(10_000_000_000_000_000_000)),
+        ("1e300", Some(u64::MAX)),
+        ("NaN", None),
+        ("-0.0", Some(0)),
+        ("-1.0", None),
+        ("0.5", Some(1)),
+    ];
+    for (value, expected) in cases {
+        let body = format!("# TYPE h histogram\nh_bucket{{le=\"+Inf\"}} {value}\n");
+        let (result, reasons) = prometheus_parse(body.as_bytes(), Dialect::Text0_0_4);
+        let families = result.unwrap();
+        match expected {
+            Some(count) => {
+                let Point::Histogram { buckets, count: total, .. } = &families[0].series[0].point
+                else {
+                    panic!("{value}: {families:?}")
+                };
+                assert_eq!((buckets.as_slice(), *total), (&[(f64::INFINITY, count)][..], count));
+                assert!(reasons.is_empty(), "{value}: {reasons:?}");
+            }
+            None => {
+                assert!(families.is_empty(), "{value}: {families:?}");
+                assert_eq!(
+                    reasons,
+                    [
+                        ("logit.input.metrics.skipped{incomplete_series}".to_string(), 1),
+                        ("logit.input.metrics.skipped{malformed_line}".to_string(), 1),
+                    ],
+                    "{value}"
+                );
+            }
+        }
+    }
+}
+
+/// `created_nanos`' `f64` arm, which a remote-write 1.0 `_created` sample reaches (it carries no
+/// source token), on both sides of 2^63 nanoseconds in both directions, and the text path's
+/// exponent fallback (`parse_scaled_decimal`), which has the same guard.
+#[test]
+fn prometheus_created_timestamps_on_both_sides_of_the_i64_range() {
+    use pb1::metric_metadata::MetricType;
+    // 9,223,372,036.854775808 seconds is 2^63 nanoseconds; the third case is the nearest `f64`.
+    let cases: [(f64, Option<i64>); 5] = [
+        (9_223_372_036.0, Some(9_223_372_036_000_000_000)),
+        (9_223_372_037.0, None),
+        (9_223_372_036.854_776, None),
+        (-9_223_372_036.0, Some(-9_223_372_036_000_000_000)),
+        (-9_223_372_037.0, None),
+    ];
+    let label = |name: &str, value: &str| pb1::Label { name: name.into(), value: value.into() };
+    for (seconds, expected) in cases {
+        let request = pb1::WriteRequest {
+            timeseries: ["foo_total", "foo_created"]
+                .into_iter()
+                .zip([1.0, seconds])
+                .map(|(name, value)| pb1::TimeSeries {
+                    labels: vec![label("__name__", name)],
+                    samples: vec![pb1::Sample { value, timestamp: 1000 }],
+                    ..Default::default()
+                })
+                .collect(),
+            metadata: vec![pb1::MetricMetadata {
+                r#type: MetricType::Counter as i32,
+                metric_family_name: "foo".into(),
+                ..Default::default()
+            }],
+        };
+        let decoded = remote_write::decode(
+            &request.encode_to_vec(),
+            remote_write::Version::V1,
+            &mut PrometheusDecoder::new(),
+        )
+        .unwrap();
+        assert_eq!(decoded.groups[0][0].series[0].created, expected, "{seconds} s");
+    }
+
+    for (text, expected) in [
+        ("9.223372036e9", Some(9_223_372_036_000_000_000)),
+        ("9.223372037e9", None),
+        ("-9.223372037e9", None),
+    ] {
+        let body = format!("# TYPE foo counter\nfoo_total 1\nfoo_created {text}\n# EOF\n");
+        let (result, _) = prometheus_parse(body.as_bytes(), Dialect::OpenMetrics1_0);
+        assert_eq!(result.unwrap()[0].series[0].created, expected, "{text}");
+    }
+}
+
+/// Every escape at the end of a label value: `\\` and `\"` close on the next quote, a lone `\`
+/// before the quote escapes it and leaves the value open, and a `\` ending the line has nothing to
+/// escape. The writer escapes `\`, `"`, and `LF` and nothing else, as both formats specify.
+#[test]
+fn prometheus_text_label_escapes_at_the_end_of_a_value() {
+    let closed = [
+        (r#"e{a="x\\"} 1"#, "x\\"),
+        (r#"e{a="x\""} 1"#, "x\""),
+        (r#"e{a="x\n"} 1"#, "x\n"),
+        (r#"e{a="x\t"} 1"#, "x\\t"),
+        (r#"e{a="\\\"\\"} 1"#, "\\\"\\"),
+    ];
+    for (line, value) in closed {
+        let (result, reasons) = prometheus_parse(line.as_bytes(), Dialect::Text0_0_4);
+        let families = result.unwrap();
+        assert_eq!(families[0].series[0].labels, [("a".to_string(), value.to_string())], "{line}");
+        assert!(reasons.is_empty(), "{line}: {reasons:?}");
+        let written = prometheus_written(&families, Dialect::Text0_0_4);
+        let escaped = value.replace('\\', r"\\").replace('"', r#"\""#).replace('\n', r"\n");
+        assert_eq!(written, format!("# TYPE e untyped\ne{{a=\"{escaped}\"}} 1\n"), "{line}");
+        let (again, _) = prometheus_parse(written.as_bytes(), Dialect::Text0_0_4);
+        assert_eq!(again.unwrap(), families, "{line}: the written form parses back");
+    }
+    for line in [r#"e{a="x\"} 1"#, r#"e{a="x\"#, r#"e{a="x\\\"} 1"#, r#"e{a="x"#] {
+        let (result, reasons) = prometheus_parse(line.as_bytes(), Dialect::Text0_0_4);
+        assert!(result.unwrap().is_empty(), "{line}");
+        assert_eq!(reasons, [("logit.input.metrics.skipped{malformed_line}".to_string(), 1)]);
+    }
+}
+
+/// Out-of-order buckets are sorted; a missing `+Inf` comes from `_count`, or from the highest
+/// bucket when `_count` is smaller or absent; a `_count` that disagrees with `+Inf` loses to it,
+/// degraded rather than skipped.
+#[test]
+fn prometheus_text_histogram_reconstruction() {
+    let degraded =
+        || vec![("logit.input.metrics.degraded{histogram_count_mismatch}".to_string(), 1)];
+    let cases: [HistogramCase; 5] = [
+        (
+            "h_bucket{le=\"5\"} 4\nh_bucket{le=\"1\"} 2\nh_bucket{le=\"+Inf\"} 6",
+            &[(1.0, 2), (5.0, 4), (f64::INFINITY, 6)],
+            vec![],
+        ),
+        ("h_bucket{le=\"1\"} 2\nh_count 7", &[(1.0, 2), (f64::INFINITY, 7)], vec![]),
+        ("h_bucket{le=\"1\"} 2\nh_count 1", &[(1.0, 2), (f64::INFINITY, 2)], degraded()),
+        ("h_bucket{le=\"1\"} 2", &[(1.0, 2), (f64::INFINITY, 2)], vec![]),
+        ("h_bucket{le=\"+Inf\"} 6\nh_count 5", &[(f64::INFINITY, 6)], degraded()),
+    ];
+    for (lines, buckets, reasons) in cases {
+        let body = format!("# TYPE h histogram\n{lines}\n");
+        let (result, got) = prometheus_parse(body.as_bytes(), Dialect::Text0_0_4);
+        let families = result.unwrap();
+        let Point::Histogram { buckets: got_buckets, count, .. } = &families[0].series[0].point
+        else {
+            panic!("{lines}: {families:?}")
+        };
+        assert_eq!(got_buckets.as_slice(), buckets, "{lines}");
+        assert_eq!(*count, buckets[buckets.len() - 1].1, "{lines}: the count is the +Inf bucket");
+        assert_eq!(got, reasons, "{lines}");
+    }
+}
+
+/// A histogram whose only bucket is `-Inf` gains a `+Inf` one, on decode and on encode:
+/// `Point::Histogram`'s buckets end at `+Inf` (`crates/logit-proto/src/prometheus/mod.rs`), and a
+/// last bound of `-Inf` isn't one.
+#[test]
+fn prometheus_text_a_neg_inf_only_histogram_gains_a_pos_inf_bucket() {
+    let body = "# TYPE h histogram\nh_bucket{le=\"-Inf\"} 3\n";
+    let families = prometheus_parse(body.as_bytes(), Dialect::Text0_0_4).0.unwrap();
+    let Point::Histogram { buckets, count, .. } = &families[0].series[0].point else {
+        panic!("{families:?}")
+    };
+    assert_eq!(buckets.as_slice(), [(f64::NEG_INFINITY, 3), (f64::INFINITY, 3)]);
+    assert_eq!(*count, 3);
+
+    // The encode side's `cumulative_counts`, from a model histogram no decode produced.
+    let histogram = logit_core::Histogram {
+        buckets: vec![(f64::NEG_INFINITY, 3)],
+        temporality: logit_core::Temporality::Cumulative,
+        sum: None,
+        min: None,
+        max: None,
+    };
+    let record = logit_core::MetricRecord::new(
+        logit_core::interner::intern("h"),
+        logit_core::MetricKind::Histogram(histogram),
+    );
+    let event = Event::metric(0, AttrMap::new(), record);
+    let resource = Resource::default();
+    let families = logit_proto::prometheus::events_to_families(
+        std::iter::once((&resource, &event)),
+        &mut PrometheusEncoder::new(),
+    );
+    let Point::Histogram { buckets, .. } = &families[0].series[0].point else {
+        panic!("{families:?}")
+    };
+    assert_eq!(buckets.as_slice(), [(f64::NEG_INFINITY, 3), (f64::INFINITY, 3)]);
+}
+
+/// A line naming `le` or `quantile` twice is a `duplicate_label`, as any repeated label is,
+/// rather than a bound plus a series label of the same name.
+#[test]
+fn prometheus_text_a_repeated_le_or_quantile_is_a_duplicate_label() {
+    for body in [
+        "# TYPE h histogram\nh_bucket{le=\"1\",le=\"2\"} 1\n",
+        "# TYPE s summary\ns{quantile=\"0.5\",quantile=\"0.9\"} 1\n",
+    ] {
+        let (result, reasons) = prometheus_parse(body.as_bytes(), Dialect::Text0_0_4);
+        assert!(result.unwrap().is_empty(), "{body}");
+        assert_eq!(
+            reasons,
+            [("logit.input.metrics.skipped{duplicate_label}".to_string(), 1)],
+            "{body}"
+        );
+    }
+}
+
+/// The writer orders families by the name their `# TYPE` line carries, writes one family per
+/// name, counting the other's series, and writes nothing for a family with no line to write, so
+/// `write(parse(write(parse(x)))) == write(parse(x))`.
+#[test]
+fn prometheus_text_writes_a_fixed_point() {
+    let cases: [(&str, &str, u64); 3] = [
+        (
+            "# TYPE build info\nbuild_info 1\nbuildUinfo 1\n",
+            "# TYPE buildUinfo untyped\nbuildUinfo 1\n# TYPE build_info gauge\nbuild_info 1\n",
+            0,
+        ),
+        (
+            "# TYPE foo counter\nfoo 1\n# TYPE foo_total gauge\nfoo_total 2\n",
+            "# TYPE foo_total counter\nfoo_total 1\n",
+            1,
+        ),
+        ("# TYPE s summary\ns_created 1605281325\n", "", 0),
+    ];
+    for (body, expected, collisions) in cases {
+        let families = prometheus_parse(body.as_bytes(), Dialect::Text0_0_4).0.unwrap();
+        let registry = logit_core::Registry::new();
+        let mut encoder = logit_proto::prometheus::PrometheusEncoder::new()
+            .with_telemetry(registry.telemetry_for("prometheus_out", "prometheus_out", "sink"));
+        let mut out = Vec::new();
+        text::write_with(&families, Dialect::Text0_0_4, &mut out, &mut encoder);
+        let written = String::from_utf8(out).unwrap();
+        assert_eq!(written, expected, "{body}");
+        let counted = telemetry_reasons(&registry, "logit.output.metrics.skipped");
+        let expected_counts: Vec<(String, u64)> = (collisions > 0)
+            .then(|| ("logit.output.metrics.skipped{name_collision}".to_string(), collisions))
+            .into_iter()
+            .collect();
+        assert_eq!(counted, expected_counts, "{body}");
+        let (again, reasons) = prometheus_parse(written.as_bytes(), Dialect::Text0_0_4);
+        assert!(reasons.is_empty(), "{body}: {reasons:?}");
+        assert_eq!(prometheus_written(&again.unwrap(), Dialect::Text0_0_4), written, "{body}");
+    }
+}
+
+/// The input that allocates the most for `prom_text`'s run: distinct one- to three-character
+/// metric names, `aa 1` lines filling 64 KiB, each its own family of one series. Parsing,
+/// writing, and the target's `families_to_events_with` over them, whose `Vec<Event>` doubles past
+/// the 10,922 events to 16,384: the largest allocation is what `script/unsafe-check`'s
+/// `prom_text` malloc limit sits above.
+#[test]
+fn prometheus_text_worst_case_body_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 16 << 20;
+    let first = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_:";
+    let rest = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_:";
+    let names = first
+        .iter()
+        .map(|&a| vec![a])
+        .chain(first.iter().flat_map(|&a| rest.iter().map(move |&b| vec![a, b])));
+    let names =
+        names.chain(first.iter().flat_map(|&a| {
+            rest.iter().flat_map(move |&b| rest.iter().map(move |&c| vec![a, b, c]))
+        }));
+    let mut body = Vec::new();
+    for name in names {
+        if body.len() + name.len() + 3 > MAX_FRAME_BYTES - 1 {
+            break;
+        }
+        body.extend_from_slice(&name);
+        body.extend_from_slice(b" 1\n");
+    }
+    let mut series = 0;
+    let (peak, largest) = peak_and_largest_allocation(|| {
+        let families = text::parse(&body, Dialect::Text0_0_4).unwrap();
+        let mut out = Vec::new();
+        text::write(&families, Dialect::Text0_0_4, &mut out);
+        let events = logit_proto::prometheus::families_to_events_with(
+            &families,
+            0,
+            &mut PrometheusDecoder::new(),
+            &mut |_, _| {},
+        );
+        series = events.len();
+    });
+    eprintln!("{} bytes, {series} series, peak {peak}, largest {largest}", body.len());
+    assert_eq!(series, body.iter().filter(|&&b| b == b'\n').count(), "one series per line");
+    assert!(largest < MALLOC_LIMIT, "largest allocation {largest}");
+}
+
+// -- prometheus remote-write --------------------------------------------------------------------
+//
+// The Snappy length gate and the encoder's fixed point. The 2.0 symbol-table rules are pinned in
+// `prometheus_remote_write_fixed_point.rs` (`version_2_symbol_table_errors_fail_the_whole_request`)
+// and checked over built requests by the `prom_remote_write` fuzz target.
+
+/// Snappy's block header is a varint of the decompressed length. Declared over the cap, it's
+/// refused before anything is allocated; declared at the cap over a body too short for it, the
+/// decoder allocates the declared length, at most the cap, and then fails; a varint past 32 bits
+/// is malformed on the header.
+#[test]
+fn snappy_never_allocates_past_the_cap_from_a_corrupt_length() {
+    let varint = |len: u64| {
+        let mut out = BytesMut::new();
+        write_uvarint(&mut out, len);
+        out.to_vec()
+    };
+    let body = [0x00, 0x00, 0x00, 0x00];
+    let cases: [(Vec<u8>, &str, i64); 4] = [
+        ([varint(u32::MAX as u64), body.to_vec()].concat(), "too large", 64 * 1024),
+        ([varint(REMOTE_WRITE_CAP as u64 + 1), body.to_vec()].concat(), "too large", 64 * 1024),
+        (
+            [varint(REMOTE_WRITE_CAP as u64), body.to_vec()].concat(),
+            "malformed",
+            REMOTE_WRITE_CAP as i64 + 64 * 1024,
+        ),
+        ([varint(u64::MAX), body.to_vec()].concat(), "malformed", 64 * 1024),
+    ];
+    for (input, expected, bound) in cases {
+        let mut result = None;
+        let peak = peak_live_bytes(|| {
+            result =
+                Some(compression::decompress_bounded(Encoding::Snappy, &input, REMOTE_WRITE_CAP));
+        });
+        let kind = match result {
+            Some(Err(DecompressError::TooLarge { .. })) => "too large",
+            Some(Err(DecompressError::Malformed { .. })) => "malformed",
+            other => panic!("{input:02x?}: {other:?}"),
+        };
+        assert_eq!(kind, expected, "{input:02x?}");
+        assert!(peak < bound, "{input:02x?}: peak live bytes {peak}, bound {bound}");
+    }
+}
+
+fn remote_write_counter(
+    name: &str,
+    timestamp: i64,
+    value: f64,
+    exemplars: Vec<Exemplar>,
+) -> MetricFamily {
+    let mut family = MetricFamily::new(name, FamilyType::Counter);
+    family.series.push(Series {
+        labels: Vec::new(),
+        point: Point::Counter(value),
+        timestamp: Some(timestamp),
+        created: None,
+        exemplars,
+    });
+    family
+}
+
+fn remote_write_exemplar(timestamp: i64) -> Exemplar {
+    Exemplar { timestamp, value: 1.0, trace: None, filtered_attributes: AttrMap::new() }
+}
+
+fn assert_remote_write_fixed_point(body: &[u8], version: remote_write::Version) {
+    let decoded = remote_write::decode(body, version, &mut PrometheusDecoder::new()).unwrap();
+    let again = remote_write::encode(&decoded.groups, version, &mut PrometheusEncoder::new());
+    assert_eq!(again, body, "{version:?}: encode(decode(B)) != B");
+}
+
+/// 1.0 metadata names a counter after its value sample, `_total` included: the model name gains
+/// `_total` on decode whatever the metadata says, so any other name would differ on the next
+/// encode.
+#[test]
+fn remote_write_1_0_metadata_names_a_counter_with_its_total_suffix() {
+    let groups = [vec![remote_write_counter("foo", 1_000_000_000, 1.0, Vec::new())]];
+    let body =
+        remote_write::encode(&groups, remote_write::Version::V1, &mut PrometheusEncoder::new());
+    let request = pb1::WriteRequest::decode(body.as_slice()).unwrap();
+    assert_eq!(request.metadata[0].metric_family_name, "foo_total");
+    assert_remote_write_fixed_point(&body, remote_write::Version::V1);
+}
+
+/// An exemplar lands on a reading, never on a stale marker: the encoder drops an exemplar it finds
+/// on a stale series, so one placed there would be lost on the next hop.
+#[test]
+fn remote_write_an_exemplar_is_never_placed_on_a_stale_marker() {
+    let label = |name: &str, value: &str| pb1::Label { name: name.into(), value: value.into() };
+    let request = pb1::WriteRequest {
+        timeseries: vec![pb1::TimeSeries {
+            labels: vec![label("__name__", "foo_total")],
+            samples: vec![
+                pb1::Sample { value: f64::from_bits(STALE_NAN_BITS), timestamp: 0 },
+                pb1::Sample { value: 1.0, timestamp: 1000 },
+            ],
+            exemplars: vec![pb1::Exemplar { labels: Vec::new(), value: 1.0, timestamp: 0 }],
+            histograms: Vec::new(),
+        }],
+        metadata: Vec::new(),
+    };
+    let decoded = remote_write::decode(
+        &request.encode_to_vec(),
+        remote_write::Version::V1,
+        &mut PrometheusDecoder::new(),
+    )
+    .unwrap();
+    let exemplars: Vec<usize> =
+        decoded.groups.iter().map(|g| g[0].series[0].exemplars.len()).collect();
+    assert_eq!(exemplars, [0, 1], "on the 1000 ms reading, not the stale marker at 0 ms");
+    assert_eq!(decoded.exemplars, 1);
+    let body = remote_write::encode(
+        &decoded.groups,
+        remote_write::Version::V1,
+        &mut PrometheusEncoder::new(),
+    );
+    assert_remote_write_fixed_point(&body, remote_write::Version::V1);
+}
+
+/// Every series of a family carries one help and unit, the first the groups offer: decode applies
+/// a family's description to all its series, so a series written without it would decode with
+/// it.
+#[test]
+fn remote_write_every_series_of_a_family_carries_one_description() {
+    let gauge = |value: &str, help: Option<&str>| {
+        let mut family = MetricFamily::new("g", FamilyType::Gauge);
+        family.help = help.map(String::from);
+        family.series.push(Series {
+            labels: vec![("a".to_string(), value.to_string())],
+            point: Point::Gauge(1.0),
+            timestamp: Some(if help.is_some() { 1_000_000_000 } else { 0 }),
+            created: None,
+            exemplars: Vec::new(),
+        });
+        family
+    };
+    let groups = [vec![gauge("1", None)], vec![gauge("2", Some("A gauge."))]];
+    let body =
+        remote_write::encode(&groups, remote_write::Version::V2, &mut PrometheusEncoder::new());
+    let request = pb2::Request::decode(body.as_slice()).unwrap();
+    let helps: Vec<&str> = request
+        .timeseries
+        .iter()
+        .map(|series| request.symbols[series.metadata.unwrap().help_ref as usize].as_str())
+        .collect();
+    assert_eq!(helps, ["A gauge.", "A gauge."]);
+    assert_remote_write_fixed_point(&body, remote_write::Version::V2);
+}
+
+/// A series merged from several groups writes its exemplars in timestamp order, the order decode
+/// places them by.
+#[test]
+fn remote_write_a_series_exemplars_are_written_in_timestamp_order() {
+    let groups = [
+        vec![remote_write_counter("foo_total", 0, 1.0, vec![remote_write_exemplar(2_000_000_000)])],
+        vec![remote_write_counter(
+            "foo_total",
+            1_000_000_000,
+            2.0,
+            vec![remote_write_exemplar(1_000_000_000)],
+        )],
+    ];
+    for version in [remote_write::Version::V1, remote_write::Version::V2] {
+        let body = remote_write::encode(&groups, version, &mut PrometheusEncoder::new());
+        let timestamps: Vec<i64> = match version {
+            remote_write::Version::V1 => {
+                pb1::WriteRequest::decode(body.as_slice()).unwrap().timeseries[0]
+                    .exemplars
+                    .iter()
+                    .map(|e| e.timestamp)
+                    .collect()
+            }
+            remote_write::Version::V2 => pb2::Request::decode(body.as_slice()).unwrap().timeseries
+                [0]
+            .exemplars
+            .iter()
+            .map(|e| e.timestamp)
+            .collect(),
+        };
+        assert_eq!(timestamps, [1000, 2000], "{version:?}");
+        assert_remote_write_fixed_point(&body, version);
+    }
+}

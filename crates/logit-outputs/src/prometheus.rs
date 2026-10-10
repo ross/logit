@@ -375,8 +375,8 @@ struct StoredFamily {
     series: BTreeMap<LabelKey, Stored>,
 }
 
-/// What a scrape renders. `BTreeMap` at both levels, so iteration is already [`text::write`]'s
-/// canonical order (families by name, series by label set).
+/// What a scrape renders. `BTreeMap` at both levels, so families iterate by name and series by
+/// label set; [`text::write`] orders families by their `# TYPE` name when it renders them.
 #[derive(Debug, Default)]
 struct Registry {
     families: BTreeMap<String, StoredFamily>,
@@ -506,8 +506,10 @@ impl Registry {
     }
 
     /// Renders through [`text::write_with`], not [`text::write`], so the writer's drops
-    /// (`degraded{reason="exemplar_dropped"|"unit_not_suffix"}`) count on the encoder `send`
-    /// uses. Post-sanitization family-name collisions are that encoder's to skip and count too.
+    /// (`degraded{reason="exemplar_dropped"|"unit_not_suffix"}`, and
+    /// `skipped{reason="name_collision"}` for two families with one `# TYPE` name) count on the
+    /// encoder `send` uses. Post-sanitization family-name collisions are that encoder's to skip and
+    /// count too.
     fn render(&self, dialect: Dialect, encoder: &mut PrometheusEncoder) -> Vec<u8> {
         let mut out = Vec::new();
         text::write_with(&self.families(), dialect, &mut out, encoder);

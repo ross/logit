@@ -300,8 +300,8 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CODEC-05](#codec-05--dogstatsdstatsd-line-decoder--per-line-dispatch-and-event-text-unescaping) | P1 | DogStatsD/statsd line decoder — per-line dispatch and event-text unescaping | `crates/logit-proto/src/statsd/decode.rs` (`StatsdDecoder::decode_into`, `unescape_event_text`) | findings → untrusted/w7 |
 | [CODEC-07](#codec-07--rfc-31645424-syslog-parser--pritimestamp-framing-and-dialect-sniffing) | P1 | RFC 3164/5424 syslog parser — PRI/TIMESTAMP framing and dialect sniffing | `crates/logit-proto/src/syslog/decode.rs` (`parse_line`, `parse_3164_timestamp`) | findings → untrusted/w8 |
 | [CODEC-10](#codec-10--collectd-binary-decoder--tlv-part-framing-and-the-values-part-lengthcount-gate) | P1 | collectd binary decoder — TLV part framing and the Values-part length/count gate | `crates/logit-proto/src/collectd/part.rs` (`read_part`) | findings → untrusted/w9 |
-| [CODEC-12](#codec-12--prometheus-textopenmetrics-decoder--line-grammar-family-assembler-and-cumulative-bucket-reconstruction) | P1 | Prometheus text/OpenMetrics decoder — line grammar, family assembler, and cumulative-bucket reconstruction | `crates/logit-proto/src/prometheus/text.rs` (`parse_with`, `Parser`, `parse_sample`) | in-progress (untrusted/w10) |
-| [CODEC-13](#codec-13--prometheus-remote-write-decoder--snappy-decompression-bomb-guard-and-the-20-symbol-table-indirection) | P1 | Prometheus remote-write decoder — Snappy decompression-bomb guard and the 2.0 symbol-table indirection | `crates/logit-proto/src/prometheus/compression.rs` (`decompress_bounded`, the Snappy `decompress_len` gate), `crates/logit-proto/src/prometheus/remote_write.rs` | in-progress (untrusted/w10) |
+| [CODEC-12](#codec-12--prometheus-textopenmetrics-decoder--line-grammar-family-assembler-and-cumulative-bucket-reconstruction) | P1 | Prometheus text/OpenMetrics decoder — line grammar, family assembler, and cumulative-bucket reconstruction | `crates/logit-proto/src/prometheus/text.rs` (`parse_with`, `Parser`, `parse_sample`) | findings → untrusted/w10 |
+| [CODEC-13](#codec-13--prometheus-remote-write-decoder--snappy-decompression-bomb-guard-and-the-20-symbol-table-indirection) | P1 | Prometheus remote-write decoder — Snappy decompression-bomb guard and the 2.0 symbol-table indirection | `crates/logit-proto/src/prometheus/compression.rs` (`decompress_bounded`, the Snappy `decompress_len` gate), `crates/logit-proto/src/prometheus/remote_write.rs` | findings → untrusted/w10 |
 | [CODEC-14](#codec-14--influxdb-line-protocol-encoder--collision-avoiding-timestamp-allocator-and-fieldtag-escaping) | P1 | InfluxDB line-protocol encoder — collision-avoiding timestamp allocator and field/tag escaping | `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp`) | unreviewed |
 | [CODEC-17](#codec-17--otlp-decode--unguarded-u64-as-i64-timestamp-cast-on-every-wire-timestamp-field-logstracesmetrics) | P1 | OTLP decode — unguarded `u64 as i64` timestamp cast on every wire timestamp field (logs/traces/metrics) | `crates/logit-proto/src/otlp/logs.rs` (`decode_log_record`) | findings → #366 |
 | [CORE-01](#core-01--process-wide-symbol-interner-unbounded-growth-and-per-call-shard-contention) | P1 | Process-wide symbol interner: unbounded growth and per-call shard contention | `crates/logit-core/src/interner.rs` (`INTERNER`, `intern`, `resolve`, `lookup`) | unreviewed |
@@ -6154,10 +6154,39 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   - `finish_series`'s synthesized `+Inf` bucket can't be fooled by a producer sending a *finite* bucket claiming to be `+Inf`-labeled some other way, and the `histogram_count_mismatch` degradation (not a hard failure) is the only consequence of a producer's `_count` disagreeing with the reconstructed total — never a silently wrong total.
   - Label-set validation (empty name/value, non-ascending byte order — referenced from the remote-write doc as shared assembler logic) applies identically to the text-format path, not just remote-write.
 - **Observed concerns (unverified):** none spotted — every float-to-integer cast found in `assemble.rs` was preceded by an explicit finiteness/range guard, matching the pattern seen everywhere else in this survey. Did not exhaustively read `parse_labels`' escape-unescaping loop byte-by-byte in this pass — worth a follow-up specifically on backslash-escape handling for label values (`\\`, `\"`, `\n`) at a string's exact end.
-- **Existing coverage:** `crates/logit-proto/src/prometheus/text.rs`'s own unit tests and `mod.rs`'s; `crates/logit-proto/tests/prometheus_fixed_point.rs` (round-trip tests). **No dedicated section in `crates/logit-proto/tests/robustness.rs`** (that file's own module doc only names `native`, `control`, `collectd`, and `graphite` as covered — prometheus is not mentioned). Governed by ADR `prometheus-scrape-and-exposition`.
-- **Suggested verification approach:** a proptest generating adversarial exposition bodies (mixed dialects, missing `+Inf` buckets, fractional bucket counts, out-of-order `le` values, huge/negative/NaN sample values) checked against `finish_series` for panics and correct total reconstruction; a differential test against Prometheus's own `expfmt` Go parser for a shared corpus (the interop-style approach `prometheus_remote_write_interop.rs` already uses for remote-write).
-- **Priority:** P1 — untrusted text input with real float-edge-case handling, well-guarded by inspection, but (like statsd/syslog) has no dedicated entry in the project's own robustness/fuzz harness despite that harness explicitly existing for "every decoder that will read untrusted bytes off a socket."
-
+- **Existing coverage:** `crates/logit-proto/src/prometheus/text.rs`'s own unit tests and `mod.rs`'s; `crates/logit-proto/tests/prometheus_fixed_point.rs` (round-trip tests); the `prom_text` fuzz target and `crates/logit-proto/tests/robustness.rs`'s prometheus text section (untrusted/w10). Governed by ADR `prometheus-scrape-and-exposition`.
+- **Suggested verification approach:** a differential corpus against Prometheus's own `textparse`, the interop-style approach `prometheus_remote_write_interop.rs` uses for remote-write (untrusted/w13). The adversarial-body checks are done (untrusted/w10).
+- **Priority:** P1 — untrusted text input with real float-edge-case handling, well-guarded by inspection, but (like statsd/syslog) has no dedicated entry in the project's own robustness/fuzz harness despite that harness explicitly existing for "every decoder that will read untrusted bytes off a socket" (it has both since untrusted/w10).
+- **Verified (untrusted/w10):** findings, five of them, each a fixed point the `prom_text` target's
+  canonical-text or histogram oracle broke, each fixed, pinned in `robustness.rs`'s prometheus
+  text section, and shown failing with its fix reverted: a histogram whose only bucket was `-Inf`
+  had no `+Inf` bucket, since `finish_series` (and the encode side's `cumulative_counts`) appended
+  one only after a *finite* last bound; the writer sorted families by model name rather than by
+  the `# TYPE` name it writes, so an `info` `build` (written `build_info`) and `buildUinfo` came
+  back reordered; two families writing one `# TYPE` name (a text 0.0.4 counter `foo` and a gauge
+  `foo_total`) were both written, which Prometheus rejects whole, so the first by model name is
+  written and the other's series counted `skipped{reason="name_collision"}`; a family with no
+  line to write (a text 0.0.4 summary holding only `_created`) kept its `# TYPE` line; and a line
+  naming `le` or `quantile` twice kept the second as a series label, which the writer then wrote
+  beside the generated one, so it's now a `duplicate_label`. None changes how a real exporter's
+  body reads. The escape loop: `parse_quoted` reads `\\`, `\"`, and `\n`, keeps any other escape
+  literal, and returns `None` for a `\` with nothing after it, so `\"` where the closing quote
+  should be leaves the value open and a `\` ending the line has nothing to escape: either line is
+  a `malformed_line`, never an out-of-bounds read; the writer
+  escapes `\`, `"`, and `LF` alone, pinned with every case. The skip/reject split: `parse_with`
+  returns `Err` from two places, `Parser::line` (content after an OpenMetrics `# EOF`) and
+  `Parser::finish` (no `# EOF`), and every other path is a counted skip; the target checks the
+  verdict and the message against the doc's table on every input. The float guards: `count_value`
+  casts only a finite, non-negative value, so the worst is saturation at `u64::MAX` (`1e300` and
+  `2^64` read as `u64::MAX`, `0.5` as `1`, `-0.0` as `0`, `NaN` and `-1` skip the line), and the
+  target checks that writing `+Inf` or `-Inf` over every such value changes no histogram or
+  summary; `created_nanos`' `f64` arm, reached by a remote-write 1.0 `_created` sample, and
+  `parse_scaled_decimal`'s exponent fallback refuse `|nanos| >= 2^63` as an `f64`, and every
+  `f64` under it rounds to at most `2^63 - 1024`, so the cast can't overflow (pinned on both sides
+  of 2^63 in both directions). A quantile outside `[0, 1]` is kept, as Prometheus's own parsers
+  keep it, and `text.rs`'s "Leniencies" now say so. Doc fixes in `text.rs`: the skip table names
+  the assembler's `malformed_line` cases, `malformed_metadata` no longer counts an empty `# HELP`,
+  and a missing `+Inf` takes the larger of `_count` and the highest bucket. A 600-second campaign (fork mode, debug assertions on) ran 985,741 inputs in 603 seconds, about 1,630 exec/s (each input parses and writes three times), to a 2,740-input corpus with no crash. With the `-Inf` fix reverted, the target crashed on its committed `regress-neg-inf-only-histogram` seed outside fork mode (ADR `out-of-ci-fuzzing`). The worst 64 KiB body, distinct one- to three-character names on `aa 1` lines, allocates at most a 13.5 MiB `Vec` of events in the target, pinned under its 16 MiB limit; `assemble.rs` interns exemplar label names (`exemplar_from_labels`), and the target's model mapping interns family names, so the target runs in fork mode.
 ### CODEC-13 — Prometheus remote-write decoder — Snappy decompression-bomb guard and the 2.0 symbol-table indirection
 - **Location:** `crates/logit-proto/src/prometheus/compression.rs` (`decompress_bounded`, the Snappy `decompress_len` gate), `crates/logit-proto/src/prometheus/remote_write.rs` (`symbol`/`resolve_refs`/`decode_v2`'s `symbols[0]` invariant check)
 - **What it does:** Before ever inflating a Snappy-compressed remote-write POST body, `prometheus_in` reads the decompressed length out of the Snappy block header (`snap::raw::decompress_len`) and rejects the request if that declared length exceeds `MAX_REQUEST_BYTES`, *before* calling `decompress_vec` — a textbook compression-bomb defense. Once decompressed and protobuf-decoded (by `prost`, not hand-rolled), remote-write 2.0's request-wide string-interning table (`symbols[]`, referenced by index from every label) is resolved via bounds-checked `symbols.get(reference as usize)`, with `symbols[0] == ""` and even-length `labels_refs` both explicitly validated as structural invariants that reject the whole request (not a per-series skip) when violated.
@@ -6168,9 +6197,29 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   - The empty-body-vs-wrong-message-type disambiguation (same module-doc section — a 1.0 body posted with a 2.0 `Content-Type` decodes to a syntactically-valid-but-empty `Request`) is actually caught, not silently accepted as "zero series, 204 OK" (the doc explicitly says this was a real bug class the check exists to close).
   - `reference as usize` (in `symbol`) can't wrap or misbehave for a `reference` read from protobuf as some smaller unsigned type — confirm the protobuf field's declared type and that no sign-extension or truncation is possible on 32-bit-index platforms.
 - **Observed concerns (unverified):** none spotted — the decompression-bomb guard is exactly the right shape and explicitly comments on why (the module doc of `crates/logit-proto/src/prometheus/compression.rs`, whose `decompress_snappy` makes the `snap::raw::decompress_len` call). Lower confidence than the rest of this survey on the protobuf-message-shape parsing itself, since that's `prost`-generated/handled and wasn't re-audited here (out of scope per the task's "skip generated" guidance, though `remote_write.rs`'s hand-written post-decode validation *was* reviewed).
-- **Existing coverage:** `crates/logit-proto/tests/prometheus_remote_write_fixed_point.rs` and `crates/logit-proto/tests/prometheus_remote_write_interop.rs` (the latter explicitly decompressing real Snappy bodies). No dedicated compression-bomb regression test was located in this pass (i.e., a test asserting peak-allocation stays bounded for a hostile declared-length, mirroring collectd's/graphite's robustness-suite pattern) — worth confirming one exists under a different name, or adding one. Governed by ADR `prometheus-remote-write`.
-- **Suggested verification approach:** a targeted test constructing a Snappy block whose header declares a length just over `MAX_REQUEST_BYTES` (and one just under, plus one at `usize::MAX`-adjacent boundary values) verified to reject without ever calling `decompress_vec`, ideally with a peak-allocation counter like `robustness.rs`'s `CountingAlloc`; a symbol-table fuzz target feeding a valid-shaped but adversarially-indexed `labels_refs`.
-- **Priority:** P1 — the compression-bomb gate is correctly implemented and is exactly the kind of check that's easy to silently regress (e.g. someone "simplifying" to a single `decompress_vec` call during a refactor); worth a dedicated regression test given how much damage a silent regression here would do (unbounded memory from a single small HTTP request).
+- **Existing coverage:** `crates/logit-proto/tests/prometheus_remote_write_fixed_point.rs` and `crates/logit-proto/tests/prometheus_remote_write_interop.rs` (the latter decompressing real Snappy bodies); `crates/logit-proto/tests/robustness.rs`'s decompression tests and its remote-write section's Snappy length-gate test with a peak-allocation bound; the `prom_decompress` fuzz target, and `prom_remote_write` with a structured mode over the symbol table (untrusted/w10). Governed by ADR `prometheus-remote-write`.
+- **Suggested verification approach:** done (untrusted/w10): the Snappy declared-length cases under a peak-allocation counter, and a fuzz target building valid-shaped requests with references in range, at `k`, and at `u32::MAX`.
+- **Priority:** P1 — the compression-bomb gate is correctly implemented and is exactly the kind of check that's easy to silently regress (e.g. someone "simplifying" to a single `decompress_vec` call during a refactor); worth a dedicated regression test given how much damage a silent regression here would do (unbounded memory from a single small HTTP request); one has landed (untrusted/w10).
+- **Verified (untrusted/w10):** findings, four of them, each a fixed point the `prom_remote_write`
+  target's `encode(decode(B1)) == B1` oracle broke, fixed, pinned in `robustness.rs`'s
+  remote-write section, and shown failing with its fix reverted: 1.0 metadata named a counter by
+  its model name, which decode then gave `_total`, so the next encode named it differently (it now
+  names the value sample); decode placed an exemplar on a group where its series was a stale
+  marker, where the encoder drops it (an exemplar now lands on a reading); and a series merged from
+  several groups wrote its exemplars in group order, which decode doesn't keep (they're now in
+  timestamp order); and a family's series written from several groups each took their own
+  group's help and unit, which decode then applies family-wide (each now takes the first the
+  groups carry). The decompress gate's single entry point: `prometheus_in`'s receiver calls
+  `compression::decompress_bounded` and nothing else, and the only other `decompress_vec` calls are test code (`prometheus_out`'s `#[cfg(test)]` receiver, `generated`'s `snap_block_round_trip`, and `tests/prometheus_remote_write_interop.rs`'s receiver). `symbol` and `resolve_refs` are
+  hard `Malformed`: the target builds 2.0 requests and checks the verdict against the doc's rule on
+  every one, which showed the rule covers the references the decode reads, every series' labels
+  and the metadata and exemplars of a series whose labels are valid, and the doc now says so. The
+  empty-body check: a non-empty body decoding to a request with nothing in it is `Malformed` in
+  both versions, pinned by `a_body_of_the_other_version_is_malformed_rather_than_an_empty_request`.
+  `reference as usize`: the field is a protobuf `uint32`, prost's `u32`, and the cast
+  zero-extends on every target with a `usize` of 32 bits or more, so it can't wrap; `0` returns
+  before the lookup. `native_histogram` counts only a valid series' histograms, and the doc now
+  says so. A 600-second campaign (fork mode, debug assertions on) ran 5,894,219 inputs in 603 seconds, about 9,770 exec/s, to a 2,563-input corpus with no crash. Outside fork mode, the target crashed on its committed seeds with the stale-marker fix reverted (`regress-exemplar-on-stale`), and with `symbol` made to return `Ok(None)` for an out-of-range reference (`built-v2-ref-k`). The row keeps its 64 MiB limit and moves to fork mode, since exemplar label names intern.
 
 ---
 

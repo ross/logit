@@ -1,0 +1,11 @@
+# TYPE h gaugehistogram
+h_bucket{le="1"} 0.5
+h_bucket{le="+Inf"} 2.5
+h_gcount 2.49
+h_gsum 1
+# TYPE c histogram
+c_bucket{le="1"} NaN
+c_bucket{le="2"} -1
+c_bucket{le="+Inf"} 1e19
+c_count +Inf
+# EOF

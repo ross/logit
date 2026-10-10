@@ -1,0 +1,35 @@
+# TYPE go_gc_duration_seconds unknown
+go_gc_duration_seconds{instance="localhost:9090",job="prometheus",monitor="logit-fixture",quantile="0.0"} 0.000054983 1789731085.468
+go_gc_duration_seconds{instance="localhost:9090",job="prometheus",monitor="logit-fixture",quantile="0.25"} 0.000062067 1789731085.468
+go_gc_duration_seconds{instance="localhost:9090",job="prometheus",monitor="logit-fixture",quantile="0.5"} 0.000067527 1789731085.468
+go_gc_duration_seconds{instance="localhost:9090",job="prometheus",monitor="logit-fixture",quantile="0.75"} 0.000084349 1789731085.468
+go_gc_duration_seconds{instance="localhost:9090",job="prometheus",monitor="logit-fixture",quantile="1.0"} 0.000225425 1789731085.468
+# TYPE go_gc_duration_seconds_count unknown
+go_gc_duration_seconds_count{instance="localhost:9090",job="prometheus",monitor="logit-fixture"} 15 1789731085.468
+# TYPE go_gc_duration_seconds_sum unknown
+go_gc_duration_seconds_sum{instance="localhost:9090",job="prometheus",monitor="logit-fixture"} 0.001198128 1789731085.468
+# TYPE prometheus_build_info unknown
+prometheus_build_info{branch="HEAD",goarch="amd64",goos="linux",goversion="go1.26.6",instance="localhost:9090",job="prometheus",monitor="logit-fixture",revision="d7598b7141418fa35be2b5ec5d0fefb634199610",tags="netgo,builtinassets",version="3.14.0"} 1 1789731085.468
+# TYPE prometheus_tsdb_compaction_duration_seconds_bucket unknown
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="+Inf",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="1.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="1024.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="128.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="16.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="2.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="2048.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="256.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="32.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="4.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="4096.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="512.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="64.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="8.0",monitor="logit-fixture"} 0 1789731085.468
+prometheus_tsdb_compaction_duration_seconds_bucket{instance="localhost:9090",job="prometheus",le="8192.0",monitor="logit-fixture"} 0 1789731085.468
+# TYPE prometheus_tsdb_compaction_duration_seconds_count unknown
+prometheus_tsdb_compaction_duration_seconds_count{instance="localhost:9090",job="prometheus",monitor="logit-fixture"} 0 1789731085.468
+# TYPE prometheus_tsdb_compaction_duration_seconds_sum unknown
+prometheus_tsdb_compaction_duration_seconds_sum{instance="localhost:9090",job="prometheus",monitor="logit-fixture"} 0 1789731085.468
+# TYPE prometheus_tsdb_wal_page_flushes_total unknown
+prometheus_tsdb_wal_page_flushes_total{instance="localhost:9090",job="prometheus",monitor="logit-fixture"} 0 1789731085.468
+# EOF
