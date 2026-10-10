@@ -239,7 +239,8 @@ of `(str, (number, number))` tuples, one per datapoint, in no particular groupin
 - Real senders write three pickle protocols. Carbon's own relay client and og-rek's default
   write protocol 2. A Python 3 sender that calls `pickle.dumps` with no protocol writes 3 or higher.
   Dropwizard Metrics' `PickledGraphite` writes protocol 0 by hand, and Python 2 senders (Diamond's
-  `GraphitePickleHandler`, graphitesend) write protocol 0 as the interpreter's default.
+  `GraphitePickleHandler`, graphitesend) write protocol 0 as the interpreter's default, often
+  through `cPickle`.
   [ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)'s "Amendment: the reader accepts
   pickle protocol 0" has the per-producer survey and its sources.
 - collectd's `write_graphite` and Spark's `GraphiteSink` write plaintext only; neither has a pickle
