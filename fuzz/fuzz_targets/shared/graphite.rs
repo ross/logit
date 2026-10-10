@@ -106,8 +106,9 @@ pub fn assert_matches(decoded: &Event, expected: &(Event, bool), what: &str) {
 
 /// The shape every decoded event has, whatever produced it: one finite `Gauge` with a path
 /// holding no `;`, and `Str` tags whose names hold no `;` or `=` and whose values hold no `;`,
-/// each a non-empty slice of `input`.
-pub fn check_event(input: &Bytes, event: &Event) {
+/// each non-empty. When `zero_copy`, every tag value is also a slice of `input`: it is, unless
+/// the pickle reader decoded the path field's escapes into its scratch.
+pub fn check_event(input: &Bytes, event: &Event, zero_copy: bool) {
     assert!(event.log.is_none() && event.span.is_none(), "model: graphite decodes a metric only");
     assert_eq!(event.metrics.len(), 1, "model: one record per datapoint");
     let record = &event.metrics[0];
@@ -125,7 +126,10 @@ pub fn check_event(input: &Bytes, event: &Event) {
         let Value::Str(bytes) = value else { panic!("model: a tag value is a Str: {value:?}") };
         let text = std::str::from_utf8(bytes).expect("model: a tag value is valid UTF-8");
         assert!(!text.is_empty() && !text.contains(';'), "model: tag value {text:?}");
-        assert!(subslice::within(input, bytes), "zero-copy: a tag value slices the input");
+        assert!(
+            !zero_copy || subslice::within(input, bytes),
+            "zero-copy: a tag value slices the input"
+        );
     }
 }
 
