@@ -1,10 +1,11 @@
 #!/bin/bash
 # Usage: script/validate
 # Runs `logit validate` over every shipped config: demo/logit.yaml, examples/*/logit.yaml,
-# fixtures/*.yaml, perf/scenarios/*.yaml, tools/shape-survey/configs/*.yaml, and tools/victoria-interop/logit-*.yaml
-# and tools/splunk-interop/logit-*.yaml (those directories' other YAML is compose and vmagent
-# config). Not part of script/cibuild;
-# script/test's `every_shipped_config_loads_and_validates` covers the same set.
+# fixtures/*.yaml, perf/scenarios/*.yaml, tools/shape-survey/configs/*.yaml,
+# tools/victoria-interop/logit-*.yaml, tools/splunk-interop/logit-*.yaml, and
+# tools/soak/scenarios/*/logit-*.yaml (those directories' other files are compose, vmagent, and
+# scenario config). Not part of script/cibuild; script/test's
+# `every_shipped_config_loads_and_validates` covers the same set.
 #
 # The `!env` variables the configs need (ADR `env-yaml-tag`) are defaulted here, not in
 # compose.yaml's `dev` service: `run()` bypasses compose in CI, so only an export here reaches both.
@@ -44,7 +45,7 @@ LOGIT_BIN="${CARGO_TARGET_DIR:-${ROOT}/target}/debug/logit"
 
 for config in demo/logit.yaml examples/*/logit.yaml fixtures/*.yaml perf/scenarios/*.yaml \
     tools/shape-survey/configs/*.yaml tools/victoria-interop/logit-*.yaml \
-    tools/splunk-interop/logit-*.yaml; do
+    tools/splunk-interop/logit-*.yaml tools/soak/scenarios/*/logit-*.yaml; do
     echo "-- ${config}"
     "${LOGIT_BIN}" validate "${config}"
 done

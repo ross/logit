@@ -478,8 +478,11 @@ timer, and waits as before. A `Fanout::send_with_deadline` that times out sends 
 send. The consumer's blocked timer, dropped by the timeout, records the time to cancel.
 
 A sink's own `buffer.overflow: drop_newest | drop_oldest` keeps its inbox draining, so such a sink
-shows `inbox.full` only briefly. A sink under the default `overflow: block` shows sustained
-`inbox.full` once its buffer fills (`buffer.utilization` at 1.0).
+shows `inbox.full` only briefly. A sink under the default `overflow: block` stops taking batches
+once its buffer fills (`buffer.utilization` at 1.0). Its 64-slot inbox then fills, and it counts
+one `inbox.full` per blocked send, not one per drain: the producer that found the inbox full
+waits in that send, and the wait shows in `inbox.blocked.duration`, recorded when the send
+completes.
 
 #### Receive and processing side: the node loops
 
