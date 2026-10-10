@@ -83,6 +83,10 @@ tools/soak/
     scenario.toml
     logit-sut.yaml
     logit-generator.yaml
+  scenarios/sink-outage-block/          # W2: each a short cycle with [[expect]] tables
+  scenarios/sink-outage-drop-oldest/
+  scenarios/udp-flood-sink-stop/
+  scenarios/udp-flood-sink-stop-block/
 ```
 
 Subcommands: `run <scenario> [--duration 20m] [--seed N] [--keep] [--out DIR]`, `list`,
@@ -193,6 +197,41 @@ for = "45s"
 
 The expected rate is never configured. It is measured from the generator's own `events.sent`
 over the warmup.
+
+**Expectations (W2).** The watchdog and the ledger judge every scenario alike. A scenario that
+asserts something of its own, such as a sink queue filling during an outage, adds `[[expect]]`
+tables, each scored as one `expect.<name>` row:
+
+```toml
+[[expect]]
+name = "sink-queue-fills"               # the row id: expect.sink-queue-fills
+service = "logit"                       # whose telemetry: logit or generator
+metric = "logit.component.buffer.batches"
+component = "victoria_metrics"          # optional; joins `attrs`
+attrs = { reason = "overflow_oldest" }  # optional attribute filters, all strings
+step = "c0s1"                           # an expanded step id, or a 1-based [[step]] index
+window = "during"                       # during | after | through
+reduce = "max"                          # delta | min_delta | max | min | last
+min = 2                                 # min, max, or both
+```
+
+| Field | Meaning |
+|---|---|
+| `step` | An expanded step id names one occurrence. An integer names that `[[step]]` table's occurrence in every cycle, and the row FAILs if any occurrence does |
+| `window` | `during` is the fault's span, from its apply starting to its revert finishing; `after` is the `recovery_bound` after it; `through` is both, from the apply starting to `recovery_bound` after the revert finishes. Each is open at its start, because a drain's deltas cover the interval before its timestamp. A bound that must hold for the whole episode, such as a loss counter that must stay 0, reads `through`: a chain blocked behind a sink stays blocked until the sink's next retry after the revert, up to its `retry_max_delay` later, so `during` misses the tail |
+| `reduce` | For a counter (`kind: sum`): `delta` sums the window's drains, and `min_delta` is the smallest single drain, a drain with no point counting 0, because a loss counter isn't emitted while it's 0. For a gauge: `max`, `min`, and `last` over the window's samples and the value in force at its start, because `internal` exports a gauge only in a drain after it was set. The value in force comes only from the SUT life whose drains cover the window's start, so a value an earlier process set doesn't carry into the next; a life that hasn't set the gauge yet leaves it unset. `last` is the value in force at the window's end |
+
+`validate()` refuses an unknown key, a missing field, a `name` that isn't lowercase letters,
+digits, `_`, or `-`, a repeated `name`, a `service` other than `logit` or `generator`, an
+unknown `window` or `reduce`, a reducer of the wrong kind for a metric whose kind it knows,
+no bound, a `min` above `max`, a bound that isn't a number, `component` set both alone and in
+`attrs`, a `component` that isn't a string, and a `step` that names no `[[step]]` table or, at the scenario's own duration, isn't
+in its schedule. A shorter `--duration` may drop the step; the row then SKIPs.
+
+When the run is scored, the row FAILs when the reduced value is outside its bounds, the window
+has no drain (a counter) or the gauge was never set by its end, the run's points for the metric
+are of the other kind, or the step was scheduled but its apply didn't return 0. A scenario with
+no `[[expect]]` gets one `expect` row that SKIPs.
 
 ### 3. Compose (W1a)
 
@@ -399,7 +438,8 @@ The rows:
   allowing one batch in flight. Checked there, not at exit, because the sink's last delivery and
   its shutdown drops land after the final drain.
 - `recovery`: within `recovery_bound` of each fault's end, some SUT drain shows `retrying` at 0,
-  `buffer.utilization` and `receive.utilization` under 0.05, and an ingest rate over the drain
+  `buffer.utilization` under 0.05, or under 1.0 with `buffer.batches` at most 1 (one batch in a
+  2-batch queue is half of it, and one that fills its queue isn't drained), `receive.utilization` under 0.05, and an ingest rate over the drain
   interval ending there of at least 95% of the warmup baseline. Only intervals after the fault's
   end, inside one SUT life, and clear of every other fault are eligible, because a dense schedule
   often starts the next fault before `recovery_bound` runs out; a fault with no eligible interval
@@ -409,6 +449,8 @@ The rows:
 - `ledger.summary`, for the final life: uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V),
   which must be 0, with each term shown beside it and wire loss beside them as "by design". When
   `ledger.egress` is counted, its term is shown as counted and the row judges the other three.
+- `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
+  window around one step; see "The scenario schema".
 
 ### 7. The first scenario's configs (W1a)
 
@@ -495,11 +537,13 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
   fixtures for a VictoriaMetrics export with resets and a stderr log with shutdown drops; the
   `statsd-vm-lost-total` control scenario; a 16-minute run and both negative controls recorded
   under "Findings".
-- **W2**: sink-outage variants, the verification
-  [`buffered-sink-delivery.md`](buffered-sink-delivery.md) describes (a 90 s stop under `block`,
-  then `drop_oldest` with a small `max_batches`), and a UDP flood with the sink stopped,
-  [`decoupled-listener-io.md`](decoupled-listener-io.md)'s deferred soak. Per-peer `tc filter`
-  if a scenario needs it.
+- **W2**: `[[expect]]` tables in the scenario schema and the `expect` check that scores them
+  (§2), with self-test fixtures for every validation rule and reducer; `recovery` accepts a sink
+  queue holding one batch. Four scenarios: `sink-outage-block` and `sink-outage-drop-oldest`, the
+  verification [`buffered-sink-delivery.md`](buffered-sink-delivery.md) describes (a 90 s stop
+  under `block`, then `drop_oldest` with a small `max_batches`), and `udp-flood-sink-stop` and
+  `udp-flood-sink-stop-block`, [`decoupled-listener-io.md`](decoupled-listener-io.md)'s deferred
+  soak. A run of each is recorded under "Findings". No scenario needed per-peer `tc filter`.
 - **W3**: disk-spool `kill -9` replay, from [`durable-sink-buffer.md`](durable-sink-buffer.md): a
   `kill` action, a named volume for `buffer.disk.path`, SIGKILL lives in the ledger (the last
   5 s or less of telemetry is lost), and `buffer.disk.replayed` above 0 once, then 0.
@@ -654,6 +698,174 @@ Two negative controls:
   uncounted"), `ledger.summary` FAILed on the same 492,400, `progress` FAILed on the empty
   freshness samples, and the script exited 1.
 
+### W2: sink outages and UDP floods (2026-10-08)
+
+Each scenario's recorded run below is from `soak/w2` with the review fixes (committed as
+`a8af054d`; the `udp-flood-sink-stop` run started before that commit, with the same changes
+uncommitted), one at a time at its own duration, on W1a's images and host (`logit:soak`
+`sha256:78a95c90bb4a`; no Rust changed). Every watchdog row (`run` through `fd_slope`),
+`identity.sink`, and `recovery` PASSed in all four runs. The ledger and expectation rows follow.
+Earlier attempts, cited below as evidence, ran from `65745897` with the W2 changes uncommitted.
+
+What the runs showed about `logit`:
+
+- **Under the default `receive.overflow: drop_oldest`, the kernel dropped 79 datagrams as a
+  blocked chain unblocked.** Run `20261008T231010Z`, `udp-flood-sink-stop`: the listener evicted
+  and counted 532,590 datagrams, 426,090 of them during the stop and 106,500 in the two drains
+  after the revert, and read 100,000 datagrams in every drain throughout, but
+  `logit.input.kernel.drops` read 79 in the drain at +128.4 s, 8 s after the revert, the drain in
+  which the receive queue went from full to empty and the chain unblocked; that drain read 99,921
+  datagrams. [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md) says the socket keeps
+  being read while the downstream is stalled, and through the stop it was: the drops came from
+  the unblock, not the stall. The loss is counted (K in `ledger.wire`, which PASSed). The first
+  run of this scenario, `20261008T223523Z` at a 10 s window, read 0, but its stop never reached
+  the listener, so it shows nothing about an unblock.
+
+  Resolved: the decode loop drained the backlog in one poll while the read loop went unpolled,
+  and PR #596 makes `decode_loop` yield after 16 consecutive full pops
+  ([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)'s
+  "Amendment: a backlog drain starves the reader, and the one yield it needed (2026-10-09)").
+  Four runs of this scenario against the fixed binary read 0 kernel drops with every row passing:
+  `20261009T003527Z` and `20261009T141302Z` from the fix's own branch, and `20261009T152642Z` and
+  `20261009T153202Z` from an image rebuilt with no cache from the merged `soak/w2` tree. An
+  intermediate run, `20261009T151548Z` (45 drops), ran an image the record can't tie to the fix,
+  so it isn't counted.
+- **A small `max_batches` doesn't make a 90 s outage reach the listener at 10 s windows.**
+  `aggregate` sends one batch per window, and the sink's inbox holds 64 batches
+  (`CHANNEL_CAPACITY` in `crates/logit-pipeline/src/runtime.rs`) between `aggregate` and the
+  sink's queue. Run `20261008T221446Z`, `sink-outage-block` with statsd-vm's 10 s window: the
+  queue reached its 2 batches 18 s into the stop, the sink took one more batch off its inbox and
+  then nothing until the revert, when it took 7 at once, and nothing upstream blocked:
+  `expect.aggregate-inbox-full` and `expect.listener-drops-counted` FAILed at 0, while every
+  ledger row PASSed. Run `20261008T223523Z`, `udp-flood-sink-stop` with the defaults: the sink's
+  queue peaked at 6 of 1,024 batches, no `inbox.full`, and `receive.utilization` 0 at every
+  drain, so its rows held whether or not the read loop was decoupled. Filling the 64-batch inbox
+  at one batch per 10 s takes over 10 minutes, so all four scenarios use a 500 ms window and a
+  2-batch sink queue. The default `max_batches: 1024` alone would take nearly three hours at
+  10 s.
+- **`inbox.full` counts once per blocked send, not continuously.** In each blocking run, the
+  sink's and `aggregate`'s `inbox.full` read 1 over the whole outage: the producer found the
+  inbox full once and then waited in that send, and the outage's length shows in
+  `inbox.blocked.duration`, recorded once that send completes. A second `inbox.full` lands in the
+  drain where the chain unblocks. [`internal-telemetry.md`](../design/internal-telemetry.md)'s
+  "Inbox side" now says so; it used to say a blocking sink "shows sustained `inbox.full` once
+  its buffer fills", and the expectations assert `delta >= 1`.
+- **A blocked chain stays blocked until the sink's next retry, not until the revert.** In
+  `udp-flood-sink-stop-block`, 119,075 of the 516,666 kernel drops landed in the two drains after
+  VictoriaMetrics started again, until the sink's backoff (`retry_max_delay`, 10 s) reached it
+  (205,000 of 602,465 in the earlier attempt `20261008T224118Z`). `sink-outage-block`'s listener
+  likewise counted 6,100 of its 92,100 `overflow_oldest` drops in the drain after the revert, and
+  `udp-flood-sink-stop`'s 106,500 of 532,590. This is the documented behavior, and it's why every
+  bound that must hold for the whole episode reads the `through` window.
+- **`drop_oldest` at the sink never stalled intake.** `sink-outage-drop-oldest`'s sink evicted
+  181 batches and kept taking batches off its inbox, so `aggregate`'s `inbox.full` read 0 over
+  the stop and its tail (`expect.aggregate-never-blocks`), with the same 500 ms window that
+  blocked `aggregate` about 40 s into the stop in `sink-outage-block`; the listener dropped nothing and its
+  receive queue stayed empty.
+- Everything else matched its documentation: `drop_oldest` at the listener counted every drop;
+  `block` at the listener evicted nothing, during the stop or after it, and moved the loss to
+  the kernel's counter; `block` at the sink dropped no batch; and every ledger balanced.
+
+What the runs showed about the harness:
+
+- With a 500 ms window and a 5 s `internal` interval, both timers tick in phase, so every drain
+  lands right after a push and `buffer.batches` reads 1 in steady state, warmup included. A
+  drained queue therefore reads at most 1, and each scenario's `sink-queue-drains` asserts
+  `last <= 1`. For the same reason `recovery` failed run `20261008T222147Z` on
+  `buffer.utilization 0.500`, one batch in a 2-batch queue, although the sink delivered 73
+  batches in the first drain after the revert and then the full arrival rate; `recovery` now
+  accepts a queue holding at most one batch that doesn't fill it.
+- A `during` window misses the tail of a blocked episode: in `20261008T224118Z` the listener
+  stayed blocked about 13 s past the revert, so `through` exists for the bounds that must stay 0.
+- `udp-flood-sink-stop` ran at the starting rate of 20,000 lines/s with no `rate_behind` and no
+  kernel drops in warmup, so the rate stayed there. Its wire gap was 0 over 6,123,400 lines (8
+  steady, −8 at the end, the interpolation's edges), so `wire_loss_outside_faults` stays 0.0 on
+  this host: the docker bridge lost nothing at this rate.
+
+**`sink-outage-block`**, run `20261008T232120Z` (5 minutes 30 seconds; 500 ms window; sink
+`buffer: {max_batches: 2}`; VictoriaMetrics stopped 90 s):
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.wire` | PASS | G 672,300 = W 672,300 + K 0 + wire 0 (by design: 0 in UDP-affecting windows, -40 steady, 40 at the end; steady limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 580,200 vs E + B 580,200 (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.egress` | PASS | life 0 (final): Ab 580,200 − V 580,200 = 0, ok (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V 0; wire G − (W + K) 0 over the run, by design |
+| `expect.sink-queue-fills` | PASS | max of logit.component.buffer.batches{component=victoria_metrics} on logit, during c0s1: c0s1 (+60s, +150s]: 2 (1 sample(s) and the value in force at its start), want >= 2 |
+| `expect.sink-inbox-full` | PASS | delta of logit.component.inbox.full{component=victoria_metrics} on logit, during c0s1: c0s1 (+60s, +150s]: 1 (over 18 drain(s)), want >= 1 |
+| `expect.aggregate-inbox-full` | PASS | delta of logit.component.inbox.full{component=window} on logit, during c0s1: c0s1 (+60s, +150s]: 1 (over 18 drain(s)), want >= 1 |
+| `expect.listener-drops-counted` | PASS | delta of logit.component.datagrams.dropped{component=statsd, reason=overflow_oldest} on logit, during c0s1: c0s1 (+60s, +150s]: 86,000 (over 18 drain(s)), want >= 1 |
+| `expect.no-kernel-drops` | PASS | delta of logit.input.kernel.drops{component=statsd} on logit, through c0s1: c0s1 (+60s, +195s]: 0 (over 27 drain(s)), want <= 0 |
+| `expect.sink-never-drops` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics} on logit, through c0s1: c0s1 (+60s, +195s]: 0 (over 27 drain(s)), want <= 0 |
+| `expect.sink-queue-drains` | PASS | last of logit.component.buffer.batches{component=victoria_metrics} on logit, after c0s1: c0s1 (+150s, +195s]: 1 (9 sample(s) and the value in force at its start), want <= 1 |
+| `expect.retrying-clears` | PASS | min of logit.component.retrying{component=victoria_metrics} on logit, after c0s1: c0s1 (+150s, +195s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
+
+The listener's receive queue filled about 45 s into the stop, after the sink's queue, its
+inbox, and `aggregate`'s inbox, and D is the 92,100 datagrams it dropped and counted. The edge
+and aggregate rows PASSed with 580,200 on each side.
+
+**`sink-outage-drop-oldest`**, run `20261008T231530Z` (5 minutes 30 seconds; 500 ms window; sink
+`buffer: {max_batches: 2, overflow: drop_oldest}`; VictoriaMetrics stopped 90 s):
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.wire` | PASS | G 672,300 = W 672,300 + K 0 + wire 0 (by design: 0 in UDP-affecting windows, -51 steady, 51 at the end; steady limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 672,300 vs E + B 672,300 (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.egress` | PASS | life 0 (final): Ab 672,300 − V 672,300 = 0, ok (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V 0; wire G − (W + K) 0 over the run, by design |
+| `identity.sink` | PASS | final life 0 at +333s: received 673 vs delivered 492 + dropped 181 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `expect.sink-evicts-oldest` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics, reason=overflow_oldest} on logit, during c0s1: c0s1 (+60s, +150s]: 175 (over 18 drain(s)), want >= 1 |
+| `expect.aggregate-never-blocks` | PASS | delta of logit.component.inbox.full{component=window} on logit, through c0s1: c0s1 (+60s, +195s]: 0 (over 27 drain(s)), want <= 0 |
+| `expect.listener-no-drops` | PASS | delta of logit.component.datagrams.dropped{component=statsd} on logit, through c0s1: c0s1 (+60s, +195s]: 0 (over 27 drain(s)), want <= 0 |
+| `expect.intake-never-stalls` | PASS | max of logit.component.receive.utilization{component=statsd} on logit, through c0s1: c0s1 (+60s, +195s]: 0 (27 sample(s) and the value in force at its start), want <= 0.05 |
+| `expect.sink-queue-drains` | PASS | last of logit.component.buffer.batches{component=victoria_metrics} on logit, after c0s1: c0s1 (+150s, +195s]: 1 (9 sample(s) and the value in force at its start), want <= 1 |
+
+The sink evicted 181 batches, 175 inside the stop and 6 in the drain after the revert, and Ab − V
+is 0: under `temporality: cumulative` each evicted total was superseded by a later one that
+reached VictoriaMetrics, and the batches delivered after the revert were the newest, so no
+series' last total was lost.
+
+**`udp-flood-sink-stop`**, run `20261008T231010Z` (5 minutes; 20,000 lines/s; 500 ms window;
+sink `buffer: {max_batches: 2}`; the receive queue at its defaults; VictoriaMetrics stopped
+60 s):
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.wire` | PASS | G 6,123,400 = W 6,123,321 + K 79 + wire 0 (by design: 0 in UDP-affecting windows, 8 steady, -8 at the end; steady limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 5,590,731 vs E + B 5,590,731 (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.egress` | PASS | life 0 (final): Ab 5,590,731 − V 5,590,731 = 0, ok (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V 0; wire G − (W + K) 0 over the run, by design |
+| `expect.aggregate-inbox-full` | PASS | delta of logit.component.inbox.full{component=window} on logit, during c0s1: c0s1 (+60s, +120s]: 1 (over 12 drain(s)), want >= 1 |
+| `expect.listener-evicts` | PASS | delta of logit.component.datagrams.dropped{component=statsd, reason=overflow_oldest} on logit, during c0s1: c0s1 (+60s, +120s]: 426,090 (over 12 drain(s)), want >= 1 |
+| `expect.intake-keeps-reading` | PASS | min_delta of logit.input.datagrams{component=statsd} on logit, during c0s1: c0s1 (+60s, +120s]: 100,000 (smallest of 12 drain(s)), want >= 1 |
+| `expect.intake-keeps-pace` | PASS | delta of logit.input.datagrams{component=statsd} on logit, during c0s1: c0s1 (+60s, +120s]: 1,200,000 (over 12 drain(s)), want >= 1.08e+06 |
+| `expect.no-kernel-drops` | FAIL | delta of logit.input.kernel.drops{component=statsd} on logit, through c0s1: c0s1 (+60s, +165s]: 79 (over 21 drain(s)), want <= 0, FAIL |
+| `expect.sink-queue-drains` | PASS | last of logit.component.buffer.batches{component=victoria_metrics} on logit, after c0s1: c0s1 (+120s, +165s]: 1 (8 sample(s) and the value in force at its start), want <= 1 |
+
+The receive queue filled about 38 s into the stop and evicted from then until the chain
+unblocked; `expect.no-kernel-drops` is the finding above.
+
+**`udp-flood-sink-stop-block`**, run `20261008T232711Z` (5 minutes; 20,000 lines/s;
+`receive: {overflow: block, max_datagrams: 10000}`; 500 ms window; sink
+`buffer: {max_batches: 2}`; VictoriaMetrics stopped 60 s):
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.wire` | PASS | G 6,123,300 = W 5,606,634 + K 516,666 + wire 0 (by design: 0 in UDP-affecting windows, 78 steady, -78 at the end; steady limit 100); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 0: W − D 5,606,634 vs E + B 5,606,634 (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.egress` | PASS | life 0 (final): Ab 5,606,634 − V 5,606,634 = 0, ok (R 77,000 = 10,000 + 67 x 1,000) |
+| `ledger.summary` | PASS | final life 0: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V 0; wire G − (W + K) 0 over the run, by design |
+| `expect.sink-queue-fills` | PASS | max of logit.component.buffer.batches{component=victoria_metrics} on logit, during c0s1: c0s1 (+60s, +120s]: 2 (1 sample(s) and the value in force at its start), want >= 2 |
+| `expect.kernel-drops` | PASS | delta of logit.input.kernel.drops{component=statsd} on logit, during c0s1: c0s1 (+60s, +120s]: 397,591 (over 12 drain(s)), want >= 1 |
+| `expect.block-never-evicts` | PASS | delta of logit.component.datagrams.dropped{component=statsd} on logit, through c0s1: c0s1 (+60s, +165s]: 0 (over 21 drain(s)), want <= 0 |
+| `expect.sink-queue-drains` | PASS | last of logit.component.buffer.batches{component=victoria_metrics} on logit, after c0s1: c0s1 (+120s, +165s]: 1 (8 sample(s) and the value in force at its start), want <= 1 |
+| `expect.retrying-clears` | PASS | min of logit.component.retrying{component=victoria_metrics} on logit, after c0s1: c0s1 (+120s, +165s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
+| `expect.receive-queue-empties` | PASS | min of logit.component.receive.utilization{component=statsd} on logit, after c0s1: c0s1 (+120s, +165s]: 0 (8 sample(s) and the value in force at its start), want <= 0.05 |
+
+The kernel started dropping about 40 s into the stop, once the sink's queue and inbox,
+`aggregate`'s inbox, and the receive queue had filled; from then on the listener read nothing
+until the chain unblocked. Every datagram the kernel took is in K, so the wire gap stayed 0.
+
 ## Verification
 
 - **W0** (this PR) is documentation only: `crates/logit-cli/tests/doc_links.rs` passes, and
@@ -677,5 +889,8 @@ Two negative controls:
       reports them, that life's `ledger.egress` reports a positive gap as counted, and its
       W − D − B − Ab stays within [0, R].
     - A wrong `vm_selector` FAILs `ledger.egress` rather than passing with nothing to compare.
-- **W2 through W5**: each new scenario passes `self-test` validation and the shipped-config test,
+- **W2**: the self-test passes, and each new expectation fails with its rule reverted. Each new
+  scenario passes `self-test` validation and the shipped-config test, and a run of it, every row
+  PASS, is recorded under "Findings".
+- **W3 through W5**: each new scenario passes `self-test` validation and the shipped-config test,
   and a run of it is recorded under "Findings".

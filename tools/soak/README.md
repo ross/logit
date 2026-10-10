@@ -49,6 +49,16 @@ VictoriaMetrics is down, with a 1 s sink `shutdown_grace`, so its first life's l
 shutdown. A correct ledger reports that life's `ledger.egress` gap as counted, never as a
 `FAIL`.
 
+Four scenarios of about 5 minutes each run one fault and assert its effect with `[[expect]]`
+tables (see [Expectations](#expectations)):
+
+| Scenario | Fault | What its expectations assert |
+|---|---|---|
+| `sink-outage-block` | VictoriaMetrics stopped 90 s; the sink's queue is 2 batches under `overflow: block` | the sink's queue fills, backpressure reaches the listener, whose receive queue drops the oldest datagrams and counts them while the kernel and the sink drop nothing, and the sink drains after |
+| `sink-outage-drop-oldest` | VictoriaMetrics stopped 90 s; the sink's queue is 2 batches under `overflow: drop_oldest` | the sink evicts and counts batches while `aggregate` never blocks, the listener drops nothing, and its receive queue stays under 5% full, and the sink drains after |
+| `udp-flood-sink-stop` | 20,000 lines/s; VictoriaMetrics stopped 60 s; a 2-batch blocking sink queue, the receive queue at its default | the stop backs up to the listener, which evicts and counts the oldest datagrams and reads datagrams in every drain of the stop, at 90% of the generator's rate, and the kernel drops nothing, including in the drain where the chain unblocks |
+| `udp-flood-sink-stop-block` | as `udp-flood-sink-stop`, with `receive: {overflow: block, max_datagrams: 10000}` | the stop backs up to the listener, the kernel drops, `logit` evicts nothing, and every queue drains after |
+
 ### Faults
 
 | Action | What it does | Revert |
@@ -122,12 +132,38 @@ rule only holds in steady state. The plan's "The checks" has the full rules.
 | `ledger.egress` | the final SUT life's absorbed increments minus VictoriaMetrics' reset-aware total (Ab − V), or an earlier life's datagrams read minus dropped, bad lines, and that total (W − D − B − V), is nonzero, other than a positive gap that life's `drain complete` line counts in `batches_dropped`; or the export matched no series. A series without one segment per SUT life `WARN`s |
 | `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0; a counted egress term is shown and not judged |
 | `identity.sink` | at the final life's last drain before shutdown, the sink's batches received differ from delivered + dropped + queued by more than one batch in flight |
-| `recovery` | within `recovery_bound` of a fault's end, no drain interval clear of other faults shows the sink not retrying, its buffer and the listener's receive queue under 5% full, and ingest at 95% of the warmup rate; a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN`, and so does a run where no fault had an eligible interval |
+| `recovery` | within `recovery_bound` of a fault's end, no drain interval clear of other faults shows the sink not retrying, its buffer under 5% full or holding at most one batch, the listener's receive queue under 5% full, and ingest at 95% of the warmup rate; a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN`, and so does a run where no fault had an eligible interval |
+| `expect.<name>` | a scenario's own `[[expect]]` bound doesn't hold; see [Expectations](#expectations) |
 
 The plan's "The ledger and identities" defines each symbol. Shutdown-time drops land after
 `internal`'s final drain, so the ledger reads them from stderr: the listener's `warn` lines into
 D, and `drain complete`'s `batches_dropped` beside `ledger.egress`. The per-hop rows are exact
 only for the final SUT life, because an earlier life stops under load.
+
+### Expectations
+
+A scenario's `[[expect]]` tables add one `expect.<name>` row each, judging one metric reduced
+over a window around one step. The plan's "The scenario schema" is the full reference.
+
+```toml
+[[expect]]
+name = "sink-queue-fills"
+service = "logit"                       # logit or generator
+metric = "logit.component.buffer.batches"
+component = "victoria_metrics"          # and any other attribute under attrs = { ... }
+step = "c0s1"                           # an expanded step id, or a [[step]] index for every cycle
+window = "during"                       # the fault's span; `after`, the recovery_bound after it; `through`, both
+reduce = "max"                          # counters: delta, min_delta; gauges: max, min, last
+min = 2                                 # min, max, or both
+```
+
+`min_delta` is the smallest single drain's delta, so `min = 1` asserts a counter rose in every
+drain of the window. A gauge reducer includes the value in force at the window's start, because
+`internal` exports a gauge only in a drain after it was set, taken from the SUT life running at
+that start only. A bound that must hold for the whole episode, such as a loss counter that must
+stay 0, uses `through`: a chain blocked behind a sink stays blocked until the sink's next retry,
+up to its `retry_max_delay` after the revert. A scenario with no `[[expect]]` gets one `expect`
+row that SKIPs.
 
 ## Cleanup and a shared daemon
 

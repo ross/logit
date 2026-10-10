@@ -28,7 +28,7 @@ NAMESPACE_FAULTS = ("stop", "pause", "partition", "restart")
 
 TOP_LEVEL_KEYS = {
     "name", "description", "duration", "warmup", "cooldown", "recovery_bound", "cycle",
-    "configs", "ledger", "thresholds", "step",
+    "configs", "ledger", "thresholds", "step", "expect",
 }
 STEP_KEYS = {"at", "action", "on", "args", "for"}
 CONFIG_KEYS = {"sut", "generator"}
@@ -37,6 +37,31 @@ LEDGER_KEYS = {
     "sut_sink", "wire_loss_outside_faults",
 }
 THRESHOLD_KEYS = {"progress_window", "rss_growth_mib_per_hour", "fd_growth"}
+EXPECT_KEYS = {"name", "service", "metric", "component", "attrs", "step", "window", "reduce",
+               "min", "max"}
+EXPECT_WINDOWS = ("during", "after", "through")
+# Each reducer reads one metric kind: a counter (`sum`, a delta per drain) or a gauge.
+EXPECT_REDUCERS = {"delta": "sum", "min_delta": "sum", "max": "gauge", "min": "gauge",
+                   "last": "gauge"}
+# Kinds of the metrics the shipped expectations name, so `validate()` refuses a reducer of the
+# wrong kind before a run. docs/design/internal-telemetry.md is the canonical list; a metric
+# missing here is checked against the kind its points carry when the run is scored.
+METRIC_KINDS = {
+    "logit.input.datagrams": "sum",
+    "logit.input.kernel.drops": "sum",
+    "logit.component.datagrams.dropped": "sum",
+    "logit.component.batches.dropped": "sum",
+    "logit.component.batches.delivered": "sum",
+    "logit.component.inbox.full": "sum",
+    "logit.component.retries": "sum",
+    "logit.component.buffer.batches": "gauge",
+    "logit.component.buffer.utilization": "gauge",
+    "logit.component.receive.datagrams": "gauge",
+    "logit.component.receive.utilization": "gauge",
+    "logit.component.retrying": "gauge",
+}
+_EXPECT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_STEP_ID = re.compile(r"^c(\d+)s(\d+)$")
 
 _DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)")
 _UNIT_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
@@ -125,6 +150,31 @@ class Step:
 
 
 @dataclass
+class Expectation:
+    """One `[[expect]]`: a bound on one metric, reduced over a window around a step.
+
+    `step` is an expanded step id (`"c0s1"`) or a 1-based `[[step]]` index (an int), which
+    names that step's occurrence in every cycle. `attrs` holds every attribute filter,
+    `component` included."""
+
+    index: int
+    name: str
+    service: str
+    metric: str
+    attrs: dict
+    step: object
+    window: str
+    reduce: str
+    min: object = None
+    max: object = None
+
+    def to_json(self):
+        return {"name": self.name, "service": self.service, "metric": self.metric,
+                "attrs": dict(self.attrs), "step": self.step, "window": self.window,
+                "reduce": self.reduce, "min": self.min, "max": self.max}
+
+
+@dataclass
 class Scenario:
     path: Path
     name: str
@@ -138,6 +188,7 @@ class Scenario:
     ledger: dict
     thresholds: dict
     steps: list = field(default_factory=list)
+    expectations: list = field(default_factory=list)
 
     @property
     def directory(self):
@@ -165,6 +216,7 @@ class Scenario:
                 "fd_growth": self.thresholds["fd_growth"],
             },
             "steps": [step.to_json() for step in expand(self, duration)],
+            "expect": [e.to_json() for e in self.expectations],
         }
 
 
@@ -250,10 +302,44 @@ def from_dict(raw, path):
         if "on" not in raw_step:
             problems.append(f"{where}: missing `on`")
 
+    expectations = []
+    raw_expect = raw.get("expect", [])
+    if not isinstance(raw_expect, list):
+        problems.append("`expect` must be an array of tables, written [[expect]]")
+        raw_expect = []
+    for index, raw_one in enumerate(raw_expect):
+        where = f"expect {index + 1}"
+        if not isinstance(raw_one, dict):
+            problems.append(f"{where}: must be a table")
+            continue
+        for key in sorted(set(raw_one) - EXPECT_KEYS):
+            problems.append(f"{where}: unknown key `{key}`")
+        for key in ("name", "service", "metric", "step", "window", "reduce"):
+            if key not in raw_one:
+                problems.append(f"{where}: missing `{key}`")
+        attrs = raw_one.get("attrs", {})
+        if not isinstance(attrs, dict) or not all(isinstance(v, str) for v in attrs.values()):
+            problems.append(f"{where}: `attrs` must be a table of strings")
+            attrs = {}
+        attrs = dict(attrs)
+        if "component" in raw_one:
+            if "component" in attrs:
+                problems.append(f"{where}: `component` is set both alone and in `attrs`")
+            elif not isinstance(raw_one["component"], str):
+                problems.append(f"{where}: `component` must be a string")
+            else:
+                attrs["component"] = raw_one["component"]
+        expectations.append(Expectation(
+            index=index, name=raw_one.get("name", ""), service=raw_one.get("service", ""),
+            metric=raw_one.get("metric", ""), attrs=attrs, step=raw_one.get("step", ""),
+            window=raw_one.get("window", ""), reduce=raw_one.get("reduce", ""),
+            min=raw_one.get("min"), max=raw_one.get("max"),
+        ))
+
     scenario = Scenario(
         path=path, name=name, description=description, duration=duration, warmup=warmup,
         cooldown=cooldown, recovery_bound=recovery_bound, cycle=cycle, configs=configs,
-        ledger=ledger, thresholds=thresholds, steps=steps,
+        ledger=ledger, thresholds=thresholds, steps=steps, expectations=expectations,
     )
     if problems:
         raise ScenarioError(problems)
@@ -328,6 +414,8 @@ def validate(scenario, duration=None, seed=None):
                             f"overlap on {service}"
                         )
 
+    problems += _expect_problems(scenario, duration)
+
     run_duration = scenario.duration if duration is None else duration
     quiet_end = run_duration - scenario.cooldown
     if quiet_end < scenario.warmup:
@@ -343,6 +431,59 @@ def validate(scenario, duration=None, seed=None):
         )
     if problems:
         raise ScenarioError(problems)
+
+
+def _expect_problems(scenario, duration):
+    """Every rule the `[[expect]]` tables break. A step id is checked against the scenario's
+    own schedule; a shorter `--duration` that drops the step leaves the expectation to SKIP."""
+    problems = []
+    names = set()
+    scheduled = {step.id for step in expand(scenario)} if scenario.cycle > 0 else set()
+    for exp in scenario.expectations:
+        where = f"expect {exp.index + 1} ({exp.name or '?'})"
+        if not isinstance(exp.name, str) or not _EXPECT_NAME.match(exp.name):
+            problems.append(f"{where}: `name` must be lowercase letters, digits, `_`, or `-`")
+        elif exp.name in names:
+            problems.append(f"{where}: `name` repeats another expectation's")
+        else:
+            names.add(exp.name)
+        if exp.service not in LOGIT_SERVICES:
+            problems.append(f"{where}: unknown service `{exp.service}`; telemetry comes from "
+                            f"{' or '.join(LOGIT_SERVICES)}")
+        if not isinstance(exp.metric, str) or not exp.metric:
+            problems.append(f"{where}: `metric` must name a metric")
+        if exp.window not in EXPECT_WINDOWS:
+            problems.append(f"{where}: unknown window `{exp.window}`; one of "
+                            f"{', '.join(EXPECT_WINDOWS)}")
+        kind = EXPECT_REDUCERS.get(exp.reduce) if isinstance(exp.reduce, str) else None
+        if kind is None:
+            problems.append(f"{where}: unknown reduce `{exp.reduce}`; one of "
+                            f"{', '.join(EXPECT_REDUCERS)}")
+        elif isinstance(exp.metric, str) and METRIC_KINDS.get(exp.metric, kind) != kind:
+            problems.append(f"{where}: reduce `{exp.reduce}` reads a {kind}, and {exp.metric} "
+                            f"is a {METRIC_KINDS[exp.metric]}")
+        bounds = [b for b in (exp.min, exp.max) if b is not None]
+        if not bounds:
+            problems.append(f"{where}: needs `min`, `max`, or both")
+        elif not all(isinstance(b, (int, float)) and not isinstance(b, bool) for b in bounds):
+            problems.append(f"{where}: `min` and `max` must be numbers")
+        elif len(bounds) == 2 and exp.min > exp.max:
+            problems.append(f"{where}: `min` {exp.min:g} is above `max` {exp.max:g}")
+        match = _STEP_ID.match(exp.step) if isinstance(exp.step, str) else None
+        if isinstance(exp.step, int) and not isinstance(exp.step, bool):
+            if not 1 <= exp.step <= len(scenario.steps):
+                problems.append(f"{where}: step index {exp.step} is outside the scenario's "
+                                f"{len(scenario.steps)} [[step]] table(s)")
+        elif match:
+            if not 1 <= int(match.group(2)) <= len(scenario.steps):
+                problems.append(f"{where}: step `{exp.step}` names no [[step]] table")
+            elif duration is None and exp.step not in scheduled:
+                problems.append(f"{where}: step `{exp.step}` isn't in the scenario's own "
+                                "schedule")
+        else:
+            problems.append(f"{where}: `step` must be a step id such as \"c0s1\" or a "
+                            "1-based [[step]] index")
+    return problems
 
 
 def expand(scenario, duration=None):

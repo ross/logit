@@ -10,8 +10,13 @@ ledger, it covers the reset-aware VictoriaMetrics total and its split per life, 
 and at a life start with none, and a two-life run whose final life balances and whose earlier
 life's residual reaches V, each rule broken in turn: shutdown drops on stderr, a counted and an
 uncounted egress gap, an earlier life's residual that never reaches V, an empty export, wire loss
-in and out of a fault window and at the end, the sink identity, and recovery. Empty SUT
-telemetry, and lives the timeline disagrees with, SKIP every ledger row.
+in and out of a fault window and at the end, the sink identity, and recovery, a two-batch sink
+queue holding one batch and a one-batch queue it fills included. Empty SUT telemetry, and lives the timeline disagrees with,
+SKIP every ledger row. For `[[expect]]`, it covers every validation rule and each reducer
+against a synthetic run: the window's open start, `through` reaching past the revert, a drain
+with no point, a gauge's value in force at the window's start and never across a SUT life,
+attribute filters, a step index across cycles, a step the schedule lacks, and a step whose apply
+failed.
 """
 
 import copy
@@ -110,6 +115,73 @@ def _rules(root):
     _refused(path, copy.deepcopy(base), "W4", "--seed", seed=7)
     _refused(path, copy.deepcopy(base), "leaves no time", "a duration inside warmup+cooldown",
              duration=150)
+
+
+VALID_EXPECT = {"name": "buffer-climbs", "service": "logit",
+                "metric": "logit.component.buffer.batches", "component": "victoria_metrics",
+                "step": "c0s4", "window": "during", "reduce": "max", "min": 2}
+
+
+def _expect_rules(root):
+    path, base = _base(root)
+
+    def with_expect(**changes):
+        raw = copy.deepcopy(base)
+        one = {**VALID_EXPECT, **changes}
+        raw["expect"] = [{k: v for k, v in one.items() if v is not None}]
+        return raw
+
+    loaded = scenario.from_dict(with_expect(attrs={"reason": "overflow_oldest"}), path)
+    exp = loaded.expectations[0]
+    expect(exp.attrs == {"component": "victoria_metrics", "reason": "overflow_oldest"},
+           f"`component` joins `attrs`, got {exp.attrs}")
+    resolved = loaded.to_json()
+    expect(resolved["expect"][0]["name"] == "buffer-climbs",
+           "the resolved scenario carries its expectations")
+    scenario.from_dict(with_expect(step=4, min=None, max=3), path)
+    expect(True, "a step index and a lone max are accepted")
+    scenario.from_dict(with_expect(window="through"), path)
+    expect(True, "the through window is accepted")
+
+    cases = [
+        (dict(windw="during"), "unknown key `windw`", "an unknown expect key"),
+        (dict(metric=None), "missing `metric`", "an expectation without a metric"),
+        (dict(service="victoria-metrics"), "unknown service `victoria-metrics`",
+         "an expectation on a service with no telemetry"),
+        (dict(window="before"), "unknown window `before`", "an unknown window"),
+        (dict(reduce="mean"), "unknown reduce `mean`", "an unknown reducer"),
+        (dict(reduce="delta"), "reads a sum, and logit.component.buffer.batches is a gauge",
+         "a counter reducer on a gauge"),
+        (dict(metric="logit.input.kernel.drops", reduce="max"),
+         "reads a gauge, and logit.input.kernel.drops is a sum", "a gauge reducer on a counter"),
+        (dict(min=None), "needs `min`, `max`, or both", "an expectation without bounds"),
+        (dict(max=1), "`min` 2 is above `max` 1", "min above max"),
+        (dict(min="2"), "must be numbers", "a bound that isn't a number"),
+        (dict(min=True), "must be numbers", "a boolean bound"),
+        (dict(step=8), "step index 8 is outside", "a step index past the [[step]] tables"),
+        (dict(step=0), "step index 0 is outside", "a step index of 0"),
+        (dict(step="c0s9"), "names no [[step]] table", "a step id naming no [[step]]"),
+        (dict(step="c3s1"), "isn't in the scenario's own schedule",
+         "a step id the schedule never reaches"),
+        (dict(step="first"), "must be a step id", "a malformed step"),
+        (dict(name="Buffer climbs"), "`name` must be lowercase", "a name that isn't a slug"),
+        (dict(attrs={"component": "x"}), "set both alone and in `attrs`",
+         "component set twice"),
+        (dict(attrs={"count": 2}), "`attrs` must be a table of strings", "a non-string attr"),
+        (dict(component=5), "`component` must be a string", "a non-string component"),
+        (dict(name=["a"]), "`name` must be lowercase", "a list-valued name"),
+        (dict(reduce=["max"]), "unknown reduce", "a list-valued reduce"),
+        (dict(metric=["x"]), "`metric` must name a metric", "a list-valued metric"),
+    ]
+    for changes, needle, what in cases:
+        _refused(path, with_expect(**changes), needle, what)
+    twice = copy.deepcopy(base)
+    twice["expect"] = [dict(VALID_EXPECT), dict(VALID_EXPECT)]
+    _refused(path, twice, "repeats another expectation's", "two expectations with one name")
+    # A shorter --duration that drops the step is accepted; the row SKIPs.
+    loaded = scenario.from_dict(with_expect(), path)
+    scenario.validate(loaded, duration=300)
+    expect(True, "a short --duration may drop an expectation's step")
 
 
 def _expand(root):
@@ -396,7 +468,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 life0_dropped=0, life1_dropped=0, steady_loss=0, fault_loss=0, end_extra=0,
                 e1_short=0, a1_short=0, ab1_short=0, late_series=False, receive_util=0.0, slow_after_stop=False, rate_behind=0,
                 undelivered=0, empty_export=False, ab0_short=0, merged_lives=False,
-                empty_sut=False, **resolved):
+                empty_sut=False, buffer_batches=0, buffer_util=0.0, **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
@@ -457,9 +529,10 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                                      0 if (life == 1 and offset in (200, 205) and undelivered)
                                      else 1, "sink")):
             sut.append(_line(stamp, metric, "sum", value, component=comp))
-        sut.append(_line(stamp, "logit.component.buffer.batches", "gauge", 0, component="sink"))
-        sut.append(_line(stamp, "logit.component.buffer.utilization", "gauge", 0.0,
-                         component="sink"))
+        sut.append(_line(stamp, "logit.component.buffer.batches", "gauge",
+                         buffer_batches if life == 1 else 0, component="sink"))
+        sut.append(_line(stamp, "logit.component.buffer.utilization", "gauge",
+                         buffer_util if life == 1 else 0.0, component="sink"))
         sut.append(_line(stamp, "logit.component.receive.utilization", "gauge",
                          receive_util if life == 1 else 0.0, component="in"))
         sut.append(_line(stamp, "logit.component.retrying", "gauge", 0, component="sink"))
@@ -654,6 +727,17 @@ def _ledger_checks():
                f"recovery WARNs when no fault has an eligible interval, got "
                f"{unjudged['recovery']}")
 
+        # A 2-batch sink queue holding the batch it sends reads 0.5 full.
+        small = results("recovery-small-queue", buffer_batches=1, buffer_util=0.5)
+        expect(small["recovery"].status == checks.PASS,
+               f"recovery PASSes a small queue holding one batch, got {small['recovery']}")
+        full = results("recovery-full-queue", buffer_batches=1, buffer_util=1.0)
+        expect(full["recovery"].status == checks.FAIL,
+               f"recovery FAILs a one-batch queue that one batch fills, got {full['recovery']}")
+        backed_up = results("recovery-backed-up", buffer_batches=2, buffer_util=0.5)
+        expect(backed_up["recovery"].status == checks.FAIL,
+               f"recovery FAILs a queue holding two batches over 5% full, got "
+               f"{backed_up['recovery']}")
         busy = results("recovery-busy", receive_util=0.5)
         expect(busy["recovery"].status == checks.FAIL,
                f"recovery FAILs a receive queue still full, got {busy['recovery']}")
@@ -664,6 +748,150 @@ def _ledger_checks():
         expect(behind["recovery"].status == checks.WARN,
                f"recovery WARNs a shortfall when the generator fell behind, got "
                f"{behind['recovery']}")
+
+
+def _expect_run(tmp, name, expectations, apply_rc=0, second_cycle=False):
+    """A run directory for `check_expect`: c0s1 held over [+100, +190] (and c1s1 over
+    [+300, +390] with `second_cycle`), and SUT drains every 5 s from +5 to +450.
+
+    - `logit.input.datagrams{component=in}`: 1,000 per drain, none at +150 and +155.
+    - `logit.component.datagrams.dropped{component=in}`: 10 per drain from +120 to +180 under
+      `reason=overflow_oldest`, and 7 at +140 under `reason=shutdown`.
+    - `logit.component.buffer.batches{component=sink}`: set to 5 at +50, 2 at +120, 0 at +200,
+      and 3 at +330. Nothing else sets it, as a gauge only drains after it's set.
+    - `logit.input.kernel.drops{component=in}`: 5 at +200, after the revert.
+    - `logit.component.inbox.full{component=window}` exported as a gauge, a kind mismatch."""
+    stdout = []
+    for offset in range(5, 451, 5):
+        stamp = _stamp(T0 + offset)
+        stdout.append(_line(stamp, "logit.process.uptime", "gauge", float(offset)))
+        if offset not in (150, 155):
+            stdout.append(_line(stamp, "logit.input.datagrams", "sum", 1000, component="in"))
+        if 120 <= offset <= 180:
+            stdout.append(_line(stamp, "logit.component.datagrams.dropped", "sum", 10,
+                                component="in", attrs={"reason": "overflow_oldest"}))
+        if offset == 140:
+            stdout.append(_line(stamp, "logit.component.datagrams.dropped", "sum", 7,
+                                component="in", attrs={"reason": "shutdown"}))
+        if offset in (50, 120, 200, 330):
+            value = {50: 5, 120: 2, 200: 0, 330: 3}[offset]
+            stdout.append(_line(stamp, "logit.component.buffer.batches", "gauge", value,
+                                component="sink"))
+        if offset == 200:
+            stdout.append(_line(stamp, "logit.input.kernel.drops", "sum", 5, component="in"))
+        stdout.append(_line(stamp, "logit.component.inbox.full", "gauge", 1, component="window"))
+    timeline = [_phase("start", 0, t0=T0),
+                _action("apply", "c0s1", "stop", "victoria-metrics", 100, rc=apply_rc),
+                _action("revert", "c0s1", "stop", "victoria-metrics", 189, 190)]
+    steps = [{"id": "c0s1", "spec_index": 0, "cycle": 0, "action": "stop",
+              "on": "victoria-metrics", "args": "", "start": 100, "end": 190}]
+    if second_cycle:
+        timeline += [_action("apply", "c1s1", "stop", "victoria-metrics", 300),
+                     _action("revert", "c1s1", "stop", "victoria-metrics", 389, 390)]
+        steps.append({**steps[0], "id": "c1s1", "cycle": 1, "start": 300, "end": 390})
+    timeline += [_phase("end_begin", 450), _phase("end_end", 480)]
+    return _run_dir(tmp, name, timeline, stdout, expect=expectations, steps=steps)
+
+
+def _expect_checks():
+    def exp(**fields):
+        base = {"name": "x", "service": "logit", "metric": "logit.input.datagrams",
+                "attrs": {"component": "in"}, "step": "c0s1", "window": "during",
+                "reduce": "delta", "min": None, "max": None}
+        return {**base, **fields}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        counter = 0
+
+        def rows(expectations, **kwargs):
+            nonlocal counter
+            counter += 1
+            run_dir = _expect_run(tmp, f"expect-{counter}", expectations, **kwargs)
+            return [r for r in checks.run_all(run_dir) if r.id.startswith("expect")]
+
+        def one(what, want, **fields):
+            result = rows([exp(**fields)])[0]
+            expect(result.status == want, f"{what}: want {want}, got {result}")
+            return result
+
+        none = rows([])
+        expect(len(none) == 1 and none[0].id == "expect" and none[0].status == checks.SKIP,
+               f"check_expect SKIPs a scenario with no expectations, got {none}")
+
+        # c0s1's during window (+100, +190] holds drains +105..+190: 18 drains, two missing.
+        result = one("delta sums the window's drains", checks.PASS, min=16000, max=16000)
+        expect(result.id == "expect.x", f"the row id is expect.<name>, got {result.id}")
+        one("delta under its min FAILs", checks.FAIL, min=16001)
+        one("min_delta counts a drain with no point as 0", checks.FAIL, reduce="min_delta",
+            min=1)
+        one("min_delta passes a counter that rose in every drain", checks.PASS,
+            reduce="min_delta", min=1000, window="after")
+        one("after reads the recovery_bound after the revert", checks.PASS, window="after",
+            min=9000, max=9000)
+        one("attrs filter on reason", checks.PASS, metric="logit.component.datagrams.dropped",
+            attrs={"component": "in", "reason": "overflow_oldest"}, min=130, max=130)
+        one("a loss counter never emitted in the window reads 0", checks.PASS,
+            metric="logit.input.kernel.drops", max=0)
+        # through is (+100, +235]: 27 drains, two missing.
+        one("through spans the fault and its recovery_bound", checks.PASS, window="through",
+            min=25000, max=25000)
+        one("through sees a counter that moves after the revert", checks.FAIL,
+            window="through", metric="logit.input.kernel.drops", max=0)
+        one("a counter that should stay 0 FAILs when it moved", checks.FAIL,
+            metric="logit.component.datagrams.dropped", max=0)
+
+        gauge = dict(metric="logit.component.buffer.batches", attrs={"component": "sink"})
+        one("max sees the value in force at the window's start", checks.PASS, reduce="max",
+            min=5, **gauge)
+        one("min of a gauge over the window", checks.PASS, reduce="min", min=2, max=2, **gauge)
+        one("min over its max FAILs", checks.FAIL, reduce="min", max=1, **gauge)
+        one("last is the value in force at the window's end", checks.PASS, reduce="last",
+            window="after", max=0, **gauge)
+        one("last above its max FAILs", checks.FAIL, reduce="last", max=1, **gauge)
+        one("a gauge never set FAILs", checks.FAIL, reduce="max", max=0,
+            metric="logit.component.retrying", attrs={"component": "sink"})
+        one("a reducer of the wrong kind for the run's points FAILs", checks.FAIL,
+            metric="logit.component.inbox.full", attrs={"component": "window"}, min=1)
+
+        one("a step the run's schedule doesn't have SKIPs", checks.SKIP, step="c1s1", min=0)
+        result = rows([exp(min=1)], apply_rc=1)[0]
+        expect(result.status == checks.FAIL and "never applied" in result.detail,
+               f"a scheduled step whose apply failed FAILs, got {result}")
+        # c0s1's max is 5 and c1s1's is 3.
+        result = rows([exp(step=1, reduce="max", min=4, **gauge)], second_cycle=True)[0]
+        expect(result.status == checks.FAIL and "c0s1" in result.detail
+               and "c1s1" in result.detail,
+               f"a step index judges every cycle's occurrence, got {result}")
+        result = rows([exp(name="a", min=1), exp(name="b", max=0)])
+        expect([(r.id, r.status) for r in result]
+               == [("expect.a", checks.PASS), ("expect.b", checks.FAIL)],
+               f"one row per expectation, got {result}")
+
+
+def _gauge_lives():
+    """A gauge a previous process set isn't in force in the next one. Life 0 drains every 5 s
+    from +5 to +100 and sets `retrying` to 1 at +100; life 1 starts at +130, drains from +135,
+    and sets it to 0 at +150."""
+    lines = []
+    for offset in list(range(5, 101, 5)) + list(range(135, 201, 5)):
+        stamp = _stamp(T0 + offset)
+        uptime = offset if offset <= 100 else offset - 130
+        lines.append(_line(stamp, "logit.process.uptime", "gauge", float(uptime)))
+        if offset in (100, 150):
+            lines.append(_line(stamp, "logit.component.retrying", "gauge",
+                               1 if offset == 100 else 0, component="sink"))
+    tel = telemetry.parse_ndjson(lines)
+    attrs = {"component": "sink"}
+    value, _ = checks.reduce_gauge(tel, "logit.component.retrying", attrs, T0 + 130, T0 + 175,
+                                   "max")
+    expect(value == 0, f"a window opening between lives ignores the earlier life's value, "
+                       f"got {value}")
+    value, _ = checks.reduce_gauge(tel, "logit.component.retrying", attrs, T0 + 137, T0 + 145,
+                                   "last")
+    expect(value is None, f"a gauge the covering life hasn't set yet is unset, got {value}")
+    value, _ = checks.reduce_gauge(tel, "logit.component.retrying", attrs, T0 + 100, T0 + 120,
+                                   "last")
+    expect(value == 1, f"the value in force inside one life still counts, got {value}")
 
 
 def _shipped(root):
@@ -683,10 +911,10 @@ def run(root, quiet=False):
     root = Path(root)
     _FAILURES.clear()
     _PASSED[0] = 0
-    for part in (_durations, _rules, _expand, _ndjson, _stderr, _slope, _checks, _vm_resets,
-                 _ledger_checks, _shipped):
+    for part in (_durations, _rules, _expect_rules, _expand, _ndjson, _stderr, _slope, _checks,
+                 _vm_resets, _ledger_checks, _expect_checks, _gauge_lives, _shipped):
         try:
-            part(root) if part in (_rules, _expand, _shipped) else part()
+            part(root) if part in (_rules, _expect_rules, _expand, _shipped) else part()
         except Exception as err:  # report the part that broke, then keep going
             _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")
     if _FAILURES:
