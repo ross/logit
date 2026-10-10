@@ -1,0 +1,94 @@
+# A 90 s VictoriaMetrics outage against a two-batch sink queue under `overflow: drop_oldest`:
+# the sink evicts and counts its oldest batches and keeps taking batches off its inbox, so
+# `aggregate` never blocks and intake never stalls, and the queue drains to empty once
+# VictoriaMetrics is back. The SUT's 500 ms aggregate window is what would fill the sink's
+# 64-batch inbox within the stop if the sink stopped taking batches. Under
+# `temporality: cumulative` a later total supersedes an evicted one, so the ledger's egress
+# should still balance. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "sink-outage-drop-oldest"
+description = "statsd-vm with 500ms windows and a 2-batch drop_oldest sink queue: a 90s VictoriaMetrics stop evicts batches at the sink and never blocks aggregate or intake"
+duration = "5m30s"        # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"
+cycle = "3m30s"           # the stop, its recovery, and two progress windows of steady state
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+sut_aggregate = "window"
+sut_sink = "victoria_metrics"
+wire_loss_outside_faults = 0.0
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+[[step]]
+at = "0s"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+[[expect]]
+name = "sink-evicts-oldest"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "victoria_metrics"
+attrs = { reason = "overflow_oldest" }
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1
+
+# The sink keeps draining its inbox, so nothing upstream blocks at any point of the episode.
+[[expect]]
+name = "aggregate-never-blocks"
+service = "logit"
+metric = "logit.component.inbox.full"
+component = "window"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "listener-no-drops"
+service = "logit"
+metric = "logit.component.datagrams.dropped"
+component = "statsd"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "intake-never-stalls"
+service = "logit"
+metric = "logit.component.receive.utilization"
+component = "statsd"
+step = "c0s1"
+window = "through"
+reduce = "max"
+max = 0.05
+
+# A drain sharing its tick with `aggregate`'s flush sees the batch pushed on that tick, so a
+# drained queue reads at most 1.
+[[expect]]
+name = "sink-queue-drains"
+service = "logit"
+metric = "logit.component.buffer.batches"
+component = "victoria_metrics"
+step = "c0s1"
+window = "after"
+reduce = "last"
+max = 1
