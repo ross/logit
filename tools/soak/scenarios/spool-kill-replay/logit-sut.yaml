@@ -1,0 +1,26 @@
+# The system under test in `script/soak`'s spool-kill-replay scenario: statsd-vm's SUT with its
+# sink on a disk spool, so the totals queued while VictoriaMetrics is down survive a SIGKILL and
+# are replayed by the next process. Its `internal` telemetry goes to stdout as NDJSON for the
+# harness to read; `script/soak` runs it with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    # The driver kills and starts this container but never recreates it, so a directory in its
+    # own filesystem survives the kill with no volume. /tmp is writable by the image's
+    # unprivileged `logit` user, and the spool creates the directory. The memory bounds stay
+    # at their defaults, as `disk:` requires.
+    buffer: { disk: { path: /tmp/soak-spool } }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
