@@ -44,7 +44,7 @@
 //! |---|---|---|
 //! | one line / one pickle datapoint | one `Event`, one `MetricRecord` | -- |
 //! | `path` (everything before the first `;`) | `name = intern(path)`, `Gauge(v)` | -- |
-//! | `;name=value` | event attribute, `Value::Str` over a zero-copy [`bytes::Bytes`] slice of the input | -- |
+//! | `;name=value` | event attribute, `Value::Str` over a zero-copy [`bytes::Bytes`] slice of the input; a copy when the path is a protocol-0 pickle string whose escapes were decoded | -- |
 //! | repeated tag key | last occurrence wins | `logit.input.tags.normalized{reason="duplicate_key"}` + diag `duplicate_tag_key` |
 //! | finite value (`3`, `-1.5`, `1e5`, or a pickle `"3.14"` string) | `Gauge(v)` | -- |
 //! | NaN / ±inf | line skipped | `logit.input.metrics.skipped{reason="non_finite_value"}` + diag `non_finite_value` |
@@ -56,7 +56,7 @@
 //! | empty / ASCII-whitespace-only line | skipped, **uncounted** (packet padding, a trailing `\n`); a line of Unicode whitespace is a `bad_line` | -- |
 //! | line longer than `max_line_bytes` (TCP) | the framer drops it and resynchronizes at the next `\n`; the line after it still decodes, and the connection stays up | `logit.input.frames.dropped{reason="oversize"}`, or `reason="drained"` when the line crossed the bound before its `\n` arrived, after which the connection discards input until its next `\n` + diag `framing_error` |
 //! | pickle frame longer than `max_frame_bytes` | the connection is closed -- there is no resync point in a length-framed stream | `logit.input.frames.dropped{reason="oversize"}` + diag `framing_error` |
-//! | a disallowed pickle opcode, a declared length past the payload, a string that isn't UTF-8, the depth/item caps, or a non-empty list item in a list grown by `APPEND`/`APPENDS` ([`pickle::PickleReader::read_datapoints`]) | `CodecError::Malformed`, the whole frame is dropped | diag `bad_pickle` |
+//! | a disallowed pickle opcode, a declared length past the payload, a protocol-0 argument the reader refuses ([`pickle`]'s "Protocol 0"), a string that isn't UTF-8 after any escapes are decoded, the depth/item caps, or a non-empty list item in a list grown by `APPEND`/`APPENDS` ([`pickle::PickleReader::read_datapoints`]) | `CodecError::Malformed`, the whole frame is dropped | diag `bad_pickle` |
 //! | any other pickle item that is not `(str, (num, num))` | **that datapoint** is skipped; the rest of the frame still decodes | `logit.input.metrics.skipped{reason="bad_shape"}` + diag `bad_shape` |
 //! | `Resource` / `Scope` | the decoder's own shared default / `None` | -- |
 //!
@@ -175,6 +175,9 @@
 //!     **named normalization, not a skip**: unlike `prometheus_out`, which skips a delta `Sum`
 //!     because exposition has a competing cumulative meaning, carbon's wire has no opinion on
 //!     either, so the number is carried faithfully and only the model's extra facts are lost.
+//! 13. A pickle sender's spelling (protocol version, opcode choice, memo use) leaves as
+//!     `graphite_out`'s protocol-2 writer spelling. A protocol-0, protocol-1, or protocol-5 sender
+//!     is re-spelled, and no decoded field changes.
 //!
 //! One more sits outside the numbering the ADR and plan share, because the listener adds it after
 //! decode rather than the codec: under `graphite_in`'s `peer:` or `proxy_protocol:`,

@@ -471,6 +471,20 @@ fn graphite_decode_a_100_datapoint_pickle_frame() {
     expect_allocs("graphite_in: decode a 100-datapoint pickle frame", stats, 1);
 }
 
+/// The same 100 datapoints at protocol 0, every path escaped: still one allocation. The reader's
+/// scratch, which holds the decoded paths, is a field cleared per frame like its arenas.
+#[test]
+fn graphite_decode_a_100_datapoint_protocol_0_pickle_frame() {
+    let mut decoder = fixtures::graphite_pickle_decoder();
+    let frame = fixtures::graphite_pickle_protocol_0_frame(100);
+    drop(decoder.decode(frame.clone())); // warm: interns 100 paths and grows the scratch
+
+    let (batch, stats) = measure(|| decoder.decode(frame.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 100);
+    assert_eq!(stats.reallocs, 5, "the events Vec grows 4 -> 8 -> ... -> 128");
+    expect_allocs("graphite_in: decode a 100-datapoint protocol-0 pickle frame", stats, 1);
+}
+
 /// One scrape through the two functions a scrape tick calls (`prometheus_in` has no `Decoder`;
 /// `docs/adr/prometheus-scrape-and-exposition.md`'s "No `logit_proto::Encoder`" section):
 /// `text::parse_with` (bytes -> families), then `families_to_events`. The fixture is

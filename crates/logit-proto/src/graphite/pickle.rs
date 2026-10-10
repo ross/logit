@@ -24,42 +24,74 @@
 //! | strings | `BINUNICODE` `0x58`, `SHORT_BINUNICODE` `0x8c`, `BINUNICODE8` `0x8d`, `BINSTRING` `0x54`, `SHORT_BINSTRING` `0x55`, `BINBYTES` `0x42`, `SHORT_BINBYTES` `0x43`, `BINBYTES8` `0x8e` -- every one UTF-8 validated |
 //! | numbers | `BININT` `0x4a`, `BININT1` `0x4b`, `BININT2` `0x4d`, `LONG1` `0x8a`, `LONG4` `0x8b` (magnitude ≤ 8 bytes), `BINFLOAT` `0x47` |
 //! | inert | `NONE` `0x4e`, `NEWTRUE` `0x88`, `NEWFALSE` `0x89` |
+//! | text (protocol 0) | `INT` `0x49`, `LONG` `0x4c`, `FLOAT` `0x46`, `STRING` `0x53`, `UNICODE` `0x56`, `PUT` `0x70`, `GET` `0x67` -- each argument runs to the next `\n` ("Protocol 0") |
 //!
 //! The three inert opcodes are accepted so a stray `None`/`True` in a sender's list costs **that
 //! datapoint**, not every datapoint in the frame. `0x8c`/`0x8d`/`0x8e` and `0x95` are
-//! protocol-4/5 opcodes that `pickle.dumps(..., protocol=-1)` emits on a modern CPython; protocol 2
-//! and `-1` are both senders to accept.
+//! protocol-4/5 opcodes that `pickle.dumps(..., protocol=-1)` emits on a modern CPython. A
+//! protocol-1 dump has no `PROTO` header, and every opcode it emits for a carbon payload is a
+//! binary one from the table. Every protocol, 0 through 5, decodes.
 //!
 //! Everything else is rejected, in particular: `GLOBAL` `0x63`, `STACK_GLOBAL` `0x93`, `REDUCE`
 //! `0x52`, `BUILD` `0x62`, `INST` `0x69`, `OBJ` `0x6f`, `NEWOBJ` `0x81`, `NEWOBJ_EX` `0x92`,
 //! `EXT1/2/4` `0x82`/`0x83`/`0x84`, `PERSID` `0x50`, `BINPERSID` `0x51`, `DUP` `0x32`, `POP`
 //! `0x30`, `POP_MARK` `0x31`, every dict and set opcode (`EMPTY_DICT` `0x7d`, `DICT` `0x64`,
 //! `SETITEM` `0x73`, `SETITEMS` `0x75`, `EMPTY_SET` `0x8f`, `FROZENSET` `0x91`, `ADDITEMS` `0x90`),
-//! `BYTEARRAY8` `0x96`, `NEXT_BUFFER` `0x97`, `READONLY_BUFFER` `0x98`, and every protocol-0
-//! textual opcode (`INT` `0x49`, `LONG` `0x4c`, `FLOAT` `0x46`, `STRING` `0x53`, `UNICODE` `0x56`,
-//! `PUT` `0x70`, `GET` `0x67`, ...). A protocol-0 dump therefore fails at its first value rather
-//! than being half-understood. A protocol-1 dump **decodes**: it has no `PROTO` header, but every
-//! opcode it emits for a carbon payload is a binary one from the table above.
+//! `BYTEARRAY8` `0x96`, `NEXT_BUFFER` `0x97`, and `READONLY_BUFFER` `0x98`. Python 3 writes a
+//! `bytes` value at protocol 0 as `GLOBAL _codecs encode` plus `REDUCE`, so that fails the frame.
+//!
+//! ## Protocol 0
+//!
+//! Protocol 0 is the text pickle. Dropwizard Metrics' `PickledGraphite` writes it by hand, and
+//! Python 2 senders (Diamond, graphitesend) write it through `cPickle.dumps`'s default.
+//! [ADR `graphite-carbon-relay`](../../../../docs/adr/graphite-carbon-relay.md)'s "Amendment: the
+//! reader accepts pickle protocol 0" has the survey. Each argument is read as CPython's loader
+//! reads it, except where a bullet names a spelling this reader fails and CPython takes; no
+//! surveyed sender writes one:
+//!
+//! - `INT` and `LONG`: an optional sign and decimal digits that fit an `i64`. CPython's
+//!   `int(x, 0)` also takes `0x`/`0o`/`0b`, `_`, and surrounding whitespace, and its C loader
+//!   reads `INT 010` as octal 8; this reader fails all of them, and a leading zero before a
+//!   non-zero digit. `I00` and `I01` are `False` and `True`. `LONG`'s trailing `L` is optional,
+//!   as it is for CPython.
+//! - `FLOAT`: Rust's `f64` parse, which takes `nan`, `inf`, and `1e+06`. A literal past `f64`'s
+//!   range, such as `1e999`, fails the frame, as CPython raises `OverflowError` on it.
+//! - `PUT` and `GET`: decimal digits only.
+//! - `STRING`: quoted with the same `'` or `"` at both ends, its escapes decoded as
+//!   `codecs.escape_decode` does (`\\ \' \" \a \b \f \n \r \t \v`, `\xHH` with two hex
+//!   digits, and `\ooo` with one to three octal digits). An unknown escape keeps its backslash; a
+//!   raw byte passes through, so Dropwizard's unescaped UTF-8 names decode.
+//! - `UNICODE`: raw-unicode-escape. Only `\uXXXX` and `\UXXXXXXXX` are escapes, and every other
+//!   byte is a Latin-1 code point. An escape naming a surrogate fails the frame, where CPython
+//!   builds a `str` it can't encode as UTF-8.
+//!
+//! A decoded string passes the same UTF-8 check a binary string does.
 //!
 //! ## Bounds
 //!
 //! - every declared length is validated against the **remaining input** before anything is sized
 //!   from it (all through [`slice()`]); `crates/logit-proto/tests/robustness.rs` measures this with
-//!   a peak-allocation counter;
-//! - no string is copied: a string value is a range into the caller's buffer, so a frame declaring
-//!   a gigabyte allocates nothing and fails the bound;
+//!   a peak-allocation counter. A protocol-0 argument has no declared length: it ends at the next
+//!   `\n`, and a missing one fails the frame;
+//! - a binary string, and a protocol-0 string with nothing to decode, is a range into the caller's
+//!   buffer, so a frame declaring a gigabyte allocates nothing and fails the bound. Any other
+//!   protocol-0 string is decoded into a per-frame scratch: a `STRING` never grows, and a
+//!   `UNICODE` at most doubles (a Latin-1 byte at `0x80` or above becomes two UTF-8 bytes), so a
+//!   frame's scratch is at most twice its input;
 //! - [`super::MAX_PICKLE_DEPTH`] bounds open `MARK`s, and [`super::MAX_PICKLE_ITEMS`] bounds the
 //!   stack, each arena, and the memo independently. A memo key must also be ordinal
-//!   (`key <= self.memo.len()`, one new slot per `BINPUT`/`LONG_BINPUT`/`MEMOIZE`), so one
-//!   corrupt `LONG_BINPUT` can't grow the memo to the size its key names;
-//! - `LONG1`/`LONG4` accept a magnitude of at most 8 bytes: carbon's timestamps are seconds;
+//!   (`key <= max(memo.len(), 1)`, at most one new slot per `PUT`/`BINPUT`/`LONG_BINPUT`/`MEMOIZE`
+//!   after the first), so one corrupt `LONG_BINPUT` can't grow the memo to the size its key names.
+//!   The `1` is Python 2's `cPickle`, which numbers its memo from 1 in every protocol;
+//! - `LONG1`/`LONG4` accept a magnitude of at most 8 bytes, and `INT`/`LONG` an `i64`: carbon's
+//!   timestamps are seconds;
 //! - the stack must hold **exactly one** value at `STOP`, and it must be a list.
 //!
 //! ## Reusable state
 //!
-//! [`PickleReader`]'s stack, arenas, and memo are fields cleared per frame, so a warm pickle
-//! decode allocates only the caller's `Vec<Event>` (`docs/design/memory.md` §2). That is why a
-//! tuple or list is an index range into an arena: a `Vec` per tuple would allocate twice per
+//! [`PickleReader`]'s stack, arenas, memo, and scratch are fields cleared per frame, so a warm
+//! pickle decode allocates only the caller's `Vec<Event>` (`docs/design/memory.md` §2). That is
+//! why a tuple or list is an index range into an arena: a `Vec` per tuple would allocate twice per
 //! datapoint.
 
 use super::{MAX_PICKLE_DEPTH, MAX_PICKLE_ITEMS};
@@ -72,20 +104,27 @@ const OP_EMPTY_TUPLE: u8 = 0x29;
 const OP_STOP: u8 = 0x2e;
 const OP_BINBYTES: u8 = 0x42;
 const OP_SHORT_BINBYTES: u8 = 0x43;
+const OP_FLOAT: u8 = 0x46;
 const OP_BINFLOAT: u8 = 0x47;
+const OP_INT: u8 = 0x49;
 const OP_BININT: u8 = 0x4a;
 const OP_BININT1: u8 = 0x4b;
+const OP_LONG: u8 = 0x4c;
 const OP_BININT2: u8 = 0x4d;
 const OP_NONE: u8 = 0x4e;
+const OP_STRING: u8 = 0x53;
 const OP_BINSTRING: u8 = 0x54;
 const OP_SHORT_BINSTRING: u8 = 0x55;
+const OP_UNICODE: u8 = 0x56;
 const OP_BINUNICODE: u8 = 0x58;
 const OP_EMPTY_LIST: u8 = 0x5d;
 const OP_APPEND: u8 = 0x61;
 const OP_APPENDS: u8 = 0x65;
+const OP_GET: u8 = 0x67;
 const OP_BINGET: u8 = 0x68;
 const OP_LONG_BINGET: u8 = 0x6a;
 const OP_LIST: u8 = 0x6c;
+const OP_PUT: u8 = 0x70;
 const OP_BINPUT: u8 = 0x71;
 const OP_LONG_BINPUT: u8 = 0x72;
 const OP_TUPLE: u8 = 0x74;
@@ -228,6 +267,12 @@ enum PValue {
         start: u32,
         len: u32,
     },
+    /// A UTF-8-validated range into [`PickleReader::scratch`]: a protocol-0 string whose escapes
+    /// were decoded.
+    Scratch {
+        start: u32,
+        len: u32,
+    },
     /// A range into [`PickleReader::tuples`].
     Tuple {
         start: u32,
@@ -251,6 +296,8 @@ pub struct PickleReader {
     /// Indexed by memo key, filled in key order (`memo_put` rejects a key past the end); a
     /// `BINGET` of an unset key fails.
     memo: Vec<Option<PValue>>,
+    /// Decoded protocol-0 strings, back to back; at most twice the frame's length ("Bounds").
+    scratch: Vec<u8>,
     /// Open `MARK` count, the depth [`MAX_PICKLE_DEPTH`] bounds.
     marks: usize,
 }
@@ -269,11 +316,13 @@ impl PickleReader {
     /// the stack fails the whole frame with [`CodecError::Malformed`], and so does a non-empty
     /// list item inside a list grown by `APPEND`/`APPENDS` (`append_range`'s tail rule).
     ///
-    /// `path` borrows `input`, so the caller can make it a zero-copy [`bytes::Bytes`] slice.
-    pub fn read_datapoints<'a>(
+    /// `path` borrows `input`, unless it is a protocol-0 string the sender escaped: then it
+    /// borrows the reader's scratch. `logit_core::subslice::share` tells the two apart, so a
+    /// caller still gets a zero-copy [`bytes::Bytes`] slice wherever one exists.
+    pub fn read_datapoints(
         &mut self,
-        input: &'a [u8],
-        mut on_datapoint: impl FnMut(&'a str, f64, f64),
+        input: &[u8],
+        mut on_datapoint: impl FnMut(&str, f64, f64),
     ) -> Result<usize, CodecError> {
         self.parse(input)?;
 
@@ -300,7 +349,7 @@ impl PickleReader {
     /// Pulls `(path, timestamp, value)` out of one list item, or `None` if it is not a
     /// `(str, (number, number))`. Looks exactly two levels down and never recurses, so crafted
     /// nesting can't make it recurse.
-    fn datapoint<'a>(&self, input: &'a [u8], item: PValue) -> Option<(&'a str, f64, f64)> {
+    fn datapoint<'a>(&'a self, input: &'a [u8], item: PValue) -> Option<(&'a str, f64, f64)> {
         let PValue::Tuple { start, len } = item else { return None };
         if len != 2 {
             return None;
@@ -317,23 +366,27 @@ impl PickleReader {
         Some((path, timestamp, value))
     }
 
-    fn as_str<'a>(&self, input: &'a [u8], value: PValue) -> Option<&'a str> {
-        let PValue::Str { start, len } = value else { return None };
+    fn as_str<'a>(&'a self, input: &'a [u8], value: PValue) -> Option<&'a str> {
+        let bytes = match value {
+            PValue::Str { start, len } => &input[start as usize..start as usize + len as usize],
+            PValue::Scratch { start, len } => {
+                &self.scratch[start as usize..start as usize + len as usize]
+            }
+            _ => return None,
+        };
         // Re-validated rather than trusted with `unsafe`; the cost is a scan of one path.
-        std::str::from_utf8(&input[start as usize..start as usize + len as usize]).ok()
+        std::str::from_utf8(bytes).ok()
     }
 
     /// A number, or a **numeric string**: Python producers often send `"3.14"`, and carbon
-    /// coerces with `float()`, as `str::parse::<f64>` does here.
+    /// coerces with `float()`, as `str::parse::<f64>` does here. Dropwizard's `PickledGraphite`
+    /// sends every value this way.
     fn as_f64(&self, input: &[u8], value: PValue) -> Option<f64> {
         match value {
             PValue::Int(v) => Some(v as f64),
             PValue::Float(v) => Some(v),
-            PValue::Str { start, len } => {
-                std::str::from_utf8(&input[start as usize..start as usize + len as usize])
-                    .ok()?
-                    .parse::<f64>()
-                    .ok()
+            PValue::Str { .. } | PValue::Scratch { .. } => {
+                self.as_str(input, value)?.parse::<f64>().ok()
             }
             PValue::Mark
             | PValue::None
@@ -349,12 +402,13 @@ impl PickleReader {
         self.tuples.clear();
         self.lists.clear();
         self.memo.clear();
+        self.scratch.clear();
         self.marks = 0;
 
-        // Ranges are `u32`; `max_frame_bytes` (at most 16 MiB) keeps a larger payload out, but
-        // one must not truncate a range if it got here.
-        if input.len() > u32::MAX as usize {
-            return Err(malformed("pickle payload is larger than 4 GiB"));
+        // Ranges are `u32`, and the scratch can reach twice the input; `max_frame_bytes` (at most
+        // 16 MiB) keeps a larger payload out, but one must not truncate a range if it got here.
+        if input.len() > (u32::MAX / 2) as usize {
+            return Err(malformed("pickle payload is larger than 2 GiB"));
         }
 
         let mut at = 0usize;
@@ -512,6 +566,43 @@ impl PickleReader {
                     self.memo_get(key)?;
                 }
 
+                // -- protocol 0: each argument runs to the next `\n` ("Protocol 0") --
+                OP_INT => {
+                    let value = match line(input, &mut at)? {
+                        b"00" => PValue::Bool(false),
+                        b"01" => PValue::Bool(true),
+                        arg => PValue::Int(parse_decimal(arg, "INT")?),
+                    };
+                    self.push(value)?;
+                }
+                OP_LONG => {
+                    let arg = line(input, &mut at)?;
+                    let digits = arg.strip_suffix(b"L").unwrap_or(arg);
+                    self.push(PValue::Int(parse_decimal(digits, "LONG")?))?;
+                }
+                OP_FLOAT => {
+                    let value = parse_float(line(input, &mut at)?)?;
+                    self.push(PValue::Float(value))?;
+                }
+                OP_STRING => {
+                    let start = at;
+                    let arg = line(input, &mut at)?;
+                    self.push_quoted_string(input, start, arg.len())?;
+                }
+                OP_UNICODE => {
+                    let start = at;
+                    let arg = line(input, &mut at)?;
+                    self.push_raw_unicode(input, start, arg.len())?;
+                }
+                OP_PUT => {
+                    let key = parse_memo_key(line(input, &mut at)?)?;
+                    self.memo_put(key)?;
+                }
+                OP_GET => {
+                    let key = parse_memo_key(line(input, &mut at)?)?;
+                    self.memo_get(key)?;
+                }
+
                 other => {
                     return Err(malformed(format!("pickle opcode {other:#04x} is not permitted")))
                 }
@@ -537,6 +628,51 @@ impl PickleReader {
             return Err(malformed("pickle string is not valid utf-8"));
         }
         self.push(PValue::Str { start: at as u32, len: n as u32 })
+    }
+
+    /// `STRING`'s argument, `input[start..start + n]`: a quoted string whose escapes decode as
+    /// Python's `codecs.escape_decode` decodes them. An argument with no backslash is pushed as a
+    /// range into `input`; any other is decoded into the scratch.
+    fn push_quoted_string(
+        &mut self,
+        input: &[u8],
+        start: usize,
+        n: usize,
+    ) -> Result<(), CodecError> {
+        let arg = &input[start..start + n];
+        let quoted = n >= 2 && arg[0] == arg[n - 1] && matches!(arg[0], b'\'' | b'"');
+        if !quoted {
+            return Err(malformed("pickle STRING argument is not quoted"));
+        }
+        let body = &arg[1..n - 1];
+        if !body.contains(&b'\\') {
+            return self.push_str(input, start + 1, n - 2);
+        }
+        let from = self.scratch.len();
+        decode_string_escape(body, &mut self.scratch)?;
+        self.push_scratch(from)
+    }
+
+    /// `UNICODE`'s argument, `input[start..start + n]`, decoded as Python's `raw_unicode_escape`
+    /// decodes it. An ASCII argument with no `\u`/`\U` escape decodes to itself, so it is pushed
+    /// as a range into `input`; any other is decoded into the scratch.
+    fn push_raw_unicode(&mut self, input: &[u8], start: usize, n: usize) -> Result<(), CodecError> {
+        let arg = &input[start..start + n];
+        if arg.is_ascii() && !has_unicode_escape(arg) {
+            return self.push_str(input, start, n);
+        }
+        let from = self.scratch.len();
+        decode_raw_unicode_escape(arg, &mut self.scratch)?;
+        self.push_scratch(from)
+    }
+
+    /// Validates `scratch[from..]` as UTF-8 and pushes it as one string.
+    fn push_scratch(&mut self, from: usize) -> Result<(), CodecError> {
+        if std::str::from_utf8(&self.scratch[from..]).is_err() {
+            return Err(malformed("pickle string is not valid utf-8"));
+        }
+        let len = self.scratch.len() - from;
+        self.push(PValue::Scratch { start: from as u32, len: len as u32 })
     }
 
     /// Pops the topmost `MARK`'s position, or fails. Decrements the open-mark depth.
@@ -624,7 +760,7 @@ impl PickleReader {
     /// `EMPTY_LIST MARK … APPENDS` shape gives, CPython's batches of 1,000 included. Interleaved
     /// open lists are rejected, which fails a list-shaped datapoint, `[path, [ts, value]]`, built
     /// inside a list still to be appended to: carbon's receiver accepts one, but no surveyed
-    /// producer writes one (`docs/known-gaps/mappings.md`'s `decode (Graphite)` rows). Supporting
+    /// producer writes one (`docs/known-gaps/mappings.md`'s `decode (Graphite)` row). Supporting
     /// them needs a per-list `Vec` or a compaction pass whose cost the frame's shape chooses.
     fn append_range(&mut self, target: usize, from: usize) -> Result<(), CodecError> {
         let PValue::List { start, len } = self.stack[target] else {
@@ -651,8 +787,9 @@ impl PickleReader {
         }
         // A memo key must be ordinal: CPython hands out keys sequentially, so a real stream only
         // overwrites a slot or appends the next. A key past that would size the memo from a
-        // corrupt index ("Bounds").
-        if key > self.memo.len() {
+        // corrupt index ("Bounds"). Python 2's `cPickle` numbers from 1 rather than 0, so slot 0
+        // may be skipped, and only slot 0.
+        if key > self.memo.len().max(1) {
             return Err(malformed(format!(
                 "pickle memo key {key} skips ahead of the {} entries written so far",
                 self.memo.len()
@@ -663,8 +800,9 @@ impl PickleReader {
         if matches!(value, PValue::Mark) {
             return Err(malformed("pickle memo put of a MARK"));
         }
-        if key == self.memo.len() {
-            self.memo.push(None);
+        // At most two new slots: the skipped slot 0 and `key` itself.
+        if key >= self.memo.len() {
+            self.memo.resize(key + 1, None);
         }
         self.memo[key] = Some(value);
         Ok(())
@@ -688,6 +826,194 @@ fn slice(input: &[u8], at: usize, n: usize) -> Result<&[u8], CodecError> {
     input
         .get(at..end)
         .ok_or_else(|| malformed(format!("pickle field of {n} byte(s) runs past the payload")))
+}
+
+/// A protocol-0 opcode's argument: `input[*at..]` up to the next `\n`, which `*at` moves past. A
+/// missing `\n` fails the frame, so an argument is never longer than the input.
+fn line<'a>(input: &'a [u8], at: &mut usize) -> Result<&'a [u8], CodecError> {
+    let rest = input.get(*at..).unwrap_or_default();
+    let n = rest
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or_else(|| malformed("pickle protocol-0 argument has no terminating newline"))?;
+    *at += n + 1;
+    Ok(&rest[..n])
+}
+
+/// `INT`'s or `LONG`'s argument: an optional sign and decimal digits that fit an `i64`
+/// ("Protocol 0" says which spellings CPython takes that this rejects).
+fn parse_decimal(arg: &[u8], op: &str) -> Result<i64, CodecError> {
+    let digits = arg.strip_prefix(b"-").or_else(|| arg.strip_prefix(b"+")).unwrap_or(arg);
+    let decimal = !digits.is_empty() && digits.iter().all(u8::is_ascii_digit);
+    // CPython's C loader reads `INT 010` with `strtol` base 0, as octal 8.
+    let octal_looking = digits.len() > 1 && digits[0] == b'0' && digits.iter().any(|&d| d != b'0');
+    if !decimal || octal_looking {
+        return Err(malformed(format!("pickle {op} argument is not a decimal integer")));
+    }
+    std::str::from_utf8(arg)
+        .ok()
+        .and_then(|text| text.parse::<i64>().ok())
+        .ok_or_else(|| malformed(format!("pickle {op} argument does not fit an i64")))
+}
+
+/// `FLOAT`'s argument: a Python float `repr`, including `nan` and `inf`.
+fn parse_float(arg: &[u8]) -> Result<f64, CodecError> {
+    let value = std::str::from_utf8(arg)
+        .ok()
+        .and_then(|text| text.parse::<f64>().ok())
+        .ok_or_else(|| malformed("pickle FLOAT argument is not a float"))?;
+    // CPython's loader raises `OverflowError` on a literal past `f64`'s range, such as `1e999`,
+    // where Rust's parse returns infinity. Only an `inf` spelling contains an `i`.
+    if value.is_infinite() && !arg.iter().any(|b| b.eq_ignore_ascii_case(&b'i')) {
+        return Err(malformed("pickle FLOAT argument is out of range"));
+    }
+    Ok(value)
+}
+
+/// `PUT`'s or `GET`'s argument: a decimal memo key, which `memo_put`/`memo_get` then bound.
+fn parse_memo_key(arg: &[u8]) -> Result<usize, CodecError> {
+    let decimal = !arg.is_empty() && arg.iter().all(u8::is_ascii_digit);
+    decimal
+        .then(|| std::str::from_utf8(arg).ok()?.parse::<usize>().ok())
+        .flatten()
+        .ok_or_else(|| malformed("pickle PUT/GET memo key is not a decimal integer"))
+}
+
+/// Decodes a `STRING` body (its quotes stripped) onto `out`, as CPython's
+/// `_PyBytes_DecodeEscape` does. The output is never longer than `body`.
+///
+/// An escape-newline can't occur, because the body ends at the first `\n`.
+fn decode_string_escape(body: &[u8], out: &mut Vec<u8>) -> Result<(), CodecError> {
+    let mut i = 0;
+    while i < body.len() {
+        let c = body[i];
+        i += 1;
+        if c != b'\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(&e) = body.get(i) else {
+            return Err(malformed("pickle STRING ends in a lone backslash"));
+        };
+        i += 1;
+        match e {
+            b'\\' | b'\'' | b'"' => out.push(e),
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'0'..=b'7' => {
+                // Up to three octal digits; CPython keeps the low byte of a value past `\377`.
+                let mut value = u32::from(e - b'0');
+                for _ in 0..2 {
+                    match body.get(i) {
+                        Some(&d @ b'0'..=b'7') => {
+                            value = value * 8 + u32::from(d - b'0');
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(value as u8);
+            }
+            b'x' => {
+                // Two hex digits, or CPython raises "invalid \x escape".
+                let hi = body.get(i).and_then(|&d| hex_value(d));
+                let lo = body.get(i + 1).and_then(|&d| hex_value(d));
+                let (Some(hi), Some(lo)) = (hi, lo) else {
+                    return Err(malformed("pickle STRING has an invalid \\x escape"));
+                };
+                out.push((hi << 4) | lo);
+                i += 2;
+            }
+            // An unknown escape keeps its backslash, and the byte after it is read as ordinary.
+            _ => {
+                out.push(b'\\');
+                i -= 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `arg` holds a `\u` or `\U` escape as raw-unicode-escape reads it: a backslash pairs
+/// with the byte after it, so `\\u` is a backslash pair and then a literal `u`.
+fn has_unicode_escape(arg: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < arg.len() {
+        if arg[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        if matches!(arg[i + 1], b'u' | b'U') {
+            return true;
+        }
+        i += 2;
+    }
+    false
+}
+
+/// Decodes a `UNICODE` argument onto `out` as UTF-8, as CPython's
+/// `_PyUnicode_DecodeRawUnicodeEscape` does. Only `\uXXXX` and `\UXXXXXXXX` are escapes; a
+/// backslash before any other byte stays, and every other byte is a Latin-1 code point. The
+/// output is at most twice `arg`: a byte at `0x80` or above becomes two UTF-8 bytes, and an
+/// escape of six or ten bytes becomes at most four.
+fn decode_raw_unicode_escape(arg: &[u8], out: &mut Vec<u8>) -> Result<(), CodecError> {
+    let mut i = 0;
+    while i < arg.len() {
+        let c = arg[i];
+        i += 1;
+        if c != b'\\' || i == arg.len() {
+            push_latin1(out, c);
+            continue;
+        }
+        let e = arg[i];
+        i += 1;
+        let width = match e {
+            b'u' => 4,
+            b'U' => 8,
+            _ => {
+                out.push(b'\\');
+                push_latin1(out, e);
+                continue;
+            }
+        };
+        let digits = arg
+            .get(i..i + width)
+            .ok_or_else(|| malformed("pickle UNICODE has a truncated \\u escape"))?;
+        let mut code = 0u32;
+        for &d in digits {
+            let d = hex_value(d)
+                .ok_or_else(|| malformed("pickle UNICODE has a non-hex digit in a \\u escape"))?;
+            code = (code << 4) | u32::from(d);
+        }
+        i += width;
+        // CPython decodes a lone surrogate into a `str` that can't be encoded as UTF-8; here
+        // it fails the frame, as a non-UTF-8 binary string does.
+        let ch = char::from_u32(code).ok_or_else(|| {
+            malformed(format!("pickle UNICODE escape {code:#x} is a surrogate or past U+10FFFF"))
+        })?;
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    }
+    Ok(())
+}
+
+/// Appends Latin-1 byte `c` as UTF-8: itself below `0x80`, two bytes from there.
+fn push_latin1(out: &mut Vec<u8>, c: u8) {
+    if c < 0x80 {
+        out.push(c);
+    } else {
+        out.push(0xc0 | (c >> 6));
+        out.push(0x80 | (c & 0x3f));
+    }
+}
+
+fn hex_value(d: u8) -> Option<u8> {
+    (d as char).to_digit(16).map(|v| v as u8)
 }
 
 /// A `LONG1`/`LONG4` magnitude: little-endian two's complement, at most [`MAX_LONG_BYTES`] bytes.
@@ -770,6 +1096,68 @@ mod tests {
         0x49, 0x31, 0x0a, 0x46, 0x31, 0x2e, 0x30, 0x0a, 0x74, 0x70, 0x32, 0x0a, 0x74, 0x70, 0x33,
         0x0a, 0x61, 0x2e,
     ];
+
+    /// Python 3.14.7: pickle.dumps([('sys.cpu', (1700000000, 0.5)),
+    /// ('café.€\\x', (2**40, float('nan'))), ('flag', (True, None))], protocol=0) --
+    /// `UNICODE` with a raw Latin-1 byte (0xe9) and `\u` escapes (`€`, and `\` for the
+    /// backslash), a `LONG` `L…L`, `F nan`, `I01`, and `NONE`.
+    const CPYTHON3_PROTOCOL_0_ESCAPED: &[u8] = &[
+        0x28, 0x6c, 0x70, 0x30, 0x0a, 0x28, 0x56, 0x73, 0x79, 0x73, 0x2e, 0x63, 0x70, 0x75, 0x0a,
+        0x70, 0x31, 0x0a, 0x28, 0x49, 0x31, 0x37, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+        0x0a, 0x46, 0x30, 0x2e, 0x35, 0x0a, 0x74, 0x70, 0x32, 0x0a, 0x74, 0x70, 0x33, 0x0a, 0x61,
+        0x28, 0x56, 0x63, 0x61, 0x66, 0xe9, 0x2e, 0x5c, 0x75, 0x32, 0x30, 0x61, 0x63, 0x5c, 0x75,
+        0x30, 0x30, 0x35, 0x63, 0x78, 0x0a, 0x70, 0x34, 0x0a, 0x28, 0x4c, 0x31, 0x30, 0x39, 0x39,
+        0x35, 0x31, 0x31, 0x36, 0x32, 0x37, 0x37, 0x37, 0x36, 0x4c, 0x0a, 0x46, 0x6e, 0x61, 0x6e,
+        0x0a, 0x74, 0x70, 0x35, 0x0a, 0x74, 0x70, 0x36, 0x0a, 0x61, 0x28, 0x56, 0x66, 0x6c, 0x61,
+        0x67, 0x0a, 0x70, 0x37, 0x0a, 0x28, 0x49, 0x30, 0x31, 0x0a, 0x4e, 0x74, 0x70, 0x38, 0x0a,
+        0x74, 0x70, 0x39, 0x0a, 0x61, 0x2e,
+    ];
+
+    /// Python 3.14.7: pickle.dumps([('a.b', b'x')], protocol=0) -- a `bytes` value at protocol 0
+    /// is `GLOBAL` 0x63 `_codecs encode` and `REDUCE` 0x52.
+    const CPYTHON3_PROTOCOL_0_BYTES: &[u8] = &[
+        0x28, 0x6c, 0x70, 0x30, 0x0a, 0x28, 0x56, 0x61, 0x2e, 0x62, 0x0a, 0x70, 0x31, 0x0a, 0x63,
+        0x5f, 0x63, 0x6f, 0x64, 0x65, 0x63, 0x73, 0x0a, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x65, 0x0a,
+        0x70, 0x32, 0x0a, 0x28, 0x56, 0x78, 0x0a, 0x70, 0x33, 0x0a, 0x56, 0x6c, 0x61, 0x74, 0x69,
+        0x6e, 0x31, 0x0a, 0x70, 0x34, 0x0a, 0x74, 0x70, 0x35, 0x0a, 0x52, 0x70, 0x36, 0x0a, 0x74,
+        0x70, 0x37, 0x0a, 0x61, 0x2e,
+    ];
+
+    /// Python 2.7.18 (`python:2.7-slim`), Diamond's `GraphitePickleHandler` call: p = 'sys.cpu';
+    /// cPickle.dumps([(p, (1700000000, 0.5)), ('caf\xc3\xa9.x', (1700000001L, float('nan'))),
+    /// (p, (1700000002, 1.5)), ('flag', (True, 1.0))]) -- `cPickle` numbers its memo from 1
+    /// (`lp1`), escapes a UTF-8 path as `\xc3\xa9`, reuses `p` through `GET` (`g2`), and writes a
+    /// `long` as `L…L` and `True` as `I01`.
+    const CPYTHON2_CPICKLE_PROTOCOL_0: &[u8] = &[
+        0x28, 0x6c, 0x70, 0x31, 0x0a, 0x28, 0x53, 0x27, 0x73, 0x79, 0x73, 0x2e, 0x63, 0x70, 0x75,
+        0x27, 0x0a, 0x70, 0x32, 0x0a, 0x28, 0x49, 0x31, 0x37, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+        0x30, 0x30, 0x0a, 0x46, 0x30, 0x2e, 0x35, 0x0a, 0x74, 0x70, 0x33, 0x0a, 0x74, 0x70, 0x34,
+        0x0a, 0x61, 0x28, 0x53, 0x27, 0x63, 0x61, 0x66, 0x5c, 0x78, 0x63, 0x33, 0x5c, 0x78, 0x61,
+        0x39, 0x2e, 0x78, 0x27, 0x0a, 0x70, 0x35, 0x0a, 0x28, 0x4c, 0x31, 0x37, 0x30, 0x30, 0x30,
+        0x30, 0x30, 0x30, 0x30, 0x31, 0x4c, 0x0a, 0x46, 0x6e, 0x61, 0x6e, 0x0a, 0x74, 0x74, 0x70,
+        0x36, 0x0a, 0x61, 0x28, 0x67, 0x32, 0x0a, 0x28, 0x49, 0x31, 0x37, 0x30, 0x30, 0x30, 0x30,
+        0x30, 0x30, 0x30, 0x32, 0x0a, 0x46, 0x31, 0x2e, 0x35, 0x0a, 0x74, 0x70, 0x37, 0x0a, 0x74,
+        0x70, 0x38, 0x0a, 0x61, 0x28, 0x53, 0x27, 0x66, 0x6c, 0x61, 0x67, 0x27, 0x0a, 0x70, 0x39,
+        0x0a, 0x28, 0x49, 0x30, 0x31, 0x0a, 0x46, 0x31, 0x0a, 0x74, 0x74, 0x70, 0x31, 0x30, 0x0a,
+        0x61, 0x2e,
+    ];
+
+    /// Python 2.7.18 (`python:2.7-slim`): cPickle.dumps([('sys.cpu', (1700000000, 0.5))], 2) --
+    /// binary, but its memo also starts at 1 (`BINPUT 1`), as carbon's own client writes it on
+    /// Python 2.
+    const CPYTHON2_CPICKLE_PROTOCOL_2: &[u8] = &[
+        0x80, 0x02, 0x5d, 0x71, 0x01, 0x55, 0x07, 0x73, 0x79, 0x73, 0x2e, 0x63, 0x70, 0x75, 0x71,
+        0x02, 0x4a, 0x00, 0xf1, 0x53, 0x65, 0x47, 0x3f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x86, 0x71, 0x03, 0x86, 0x71, 0x04, 0x61, 0x2e,
+    ];
+
+    /// Dropwizard Metrics 4.2.25 `PickledGraphite.pickleMetrics`'s spelling, written out by hand
+    /// from its source for two `send(name, value, timestamp)` calls: no memo, a `LONG` second, the
+    /// `%2.2f` value as a quoted `STRING`, and a name of raw UTF-8 (`é` is 0xc3 0xa9) that the
+    /// writer never escapes. `testdata/interop/graphite/graphite-dropwizard-000.raw` is a real
+    /// capture of the same shape.
+    const DROPWIZARD_PICKLED_GRAPHITE: &[u8] =
+        b"(l(S'jvm.heap.used'\n(L1700000000L\nS'12.50'\ntta(S'caf\xc3\xa9.count'\n(L1700000000L\nS'NaN'\ntta.";
 
     /// pickle.dumps([('a.b', (1, 1.0))], protocol=1) -- no `PROTO` header, `TUPLE` 0x74 rather
     /// than `TUPLE2`, but only binary opcodes.
@@ -918,6 +1306,262 @@ mod tests {
         assert_eq!(points, vec![point("sys.cpu;env=prod;host=web-1", 1_700_000_000.0, 0.5)]);
     }
 
+    // -- protocol 0 -------------------------------------------------------------------------------
+
+    /// `(path, timestamp, value)` with the floats compared by bits, so a NaN compares equal.
+    fn bits(points: &[Point]) -> Vec<(String, u64, u64)> {
+        points.iter().map(|(p, t, v)| (p.clone(), t.to_bits(), v.to_bits())).collect()
+    }
+
+    /// A frame of one datapoint whose path is the protocol-0 string opcode `path_op` (opcode,
+    /// argument, and `\n`), and the path the reader yields from it.
+    fn protocol_0_path(path_op: &[u8]) -> Result<String, CodecError> {
+        let mut payload = b"(l(".to_vec();
+        payload.extend_from_slice(path_op);
+        payload.extend_from_slice(b"(I1\nF2.5\ntta.");
+        let (points, skipped) = read(&payload)?;
+        assert_eq!(skipped, 0, "{payload:?}");
+        assert_eq!(points.len(), 1, "{payload:?}");
+        Ok(points[0].0.clone())
+    }
+
+    #[test]
+    fn a_cpython_protocol_0_dump_decodes() {
+        let (points, skipped) = read(CPYTHON_PROTOCOL_0).expect("protocol 0 must decode");
+        assert_eq!(skipped, 0);
+        assert_eq!(points, vec![point("a.b", 1.0, 1.0)]);
+    }
+
+    /// Python 3's protocol 0: `UNICODE` with Latin-1 and `\u` escapes, `LONG`, `F nan`, `I01`.
+    #[test]
+    fn a_cpython_3_protocol_0_dump_with_escapes_decodes() {
+        let (points, skipped) =
+            read(CPYTHON3_PROTOCOL_0_ESCAPED).expect("python 3 protocol 0 must decode");
+        assert_eq!(skipped, 1, "('flag', (True, None)) is the wrong shape");
+        assert_eq!(
+            bits(&points),
+            bits(&[
+                point("sys.cpu", 1_700_000_000.0, 0.5),
+                point("caf\u{e9}.\u{20ac}\\x", 1_099_511_627_776.0, f64::NAN),
+            ])
+        );
+    }
+
+    /// Diamond's call on Python 2: `cPickle`'s memo from 1, `\x` escapes, `GET`, `L…L`, `I01`.
+    #[test]
+    fn a_python_2_cpickle_protocol_0_dump_decodes() {
+        let (points, skipped) =
+            read(CPYTHON2_CPICKLE_PROTOCOL_0).expect("python 2 cPickle protocol 0 must decode");
+        assert_eq!(skipped, 1, "('flag', (True, 1.0)): a bool timestamp is the wrong shape");
+        assert_eq!(
+            bits(&points),
+            bits(&[
+                point("sys.cpu", 1_700_000_000.0, 0.5),
+                point("caf\u{e9}.x", 1_700_000_001.0, f64::NAN),
+                point("sys.cpu", 1_700_000_002.0, 1.5),
+            ])
+        );
+    }
+
+    /// Python 2's `cPickle` numbers its memo from 1 in the binary protocols too.
+    #[test]
+    fn a_python_2_cpickle_protocol_2_dump_decodes() {
+        let (points, skipped) =
+            read(CPYTHON2_CPICKLE_PROTOCOL_2).expect("python 2 cPickle protocol 2 must decode");
+        assert_eq!(skipped, 0);
+        assert_eq!(points, vec![point("sys.cpu", 1_700_000_000.0, 0.5)]);
+    }
+
+    /// Slot 0 is the one slot a memo may skip: key 2 on an empty memo still fails.
+    #[test]
+    fn a_memo_key_past_slot_1_on_an_empty_memo_is_rejected() {
+        for payload in [&[OP_PROTO, 2, OP_EMPTY_LIST, OP_BINPUT, 2, OP_STOP][..], b"(lp2\n."] {
+            let err = read(payload).expect_err("key 2 on an empty memo must fail");
+            assert!(err.to_string().contains("skips ahead"), "{err}");
+        }
+        let (points, _) = read(b"(lp1\n.").expect("key 1 on an empty memo is cPickle's first");
+        assert!(points.is_empty());
+    }
+
+    #[test]
+    fn a_dropwizard_pickled_graphite_payload_decodes() {
+        let (points, skipped) =
+            read(DROPWIZARD_PICKLED_GRAPHITE).expect("Dropwizard's spelling must decode");
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            bits(&points),
+            bits(&[
+                point("jvm.heap.used", 1_700_000_000.0, 12.5),
+                point("caf\u{e9}.count", 1_700_000_000.0, f64::NAN),
+            ])
+        );
+    }
+
+    /// A string with nothing to decode stays a range into the frame, as a binary string does.
+    #[test]
+    fn a_protocol_0_string_with_nothing_to_decode_borrows_the_frame() {
+        // One binding, so the frame and the range check name the same bytes.
+        let frame = DROPWIZARD_PICKLED_GRAPHITE;
+        let mut reader = PickleReader::new();
+        let mut within = Vec::new();
+        reader
+            .read_datapoints(frame, |path, _, _| {
+                within.push(frame.as_ptr_range().contains(&path.as_ptr()));
+            })
+            .expect("Dropwizard's spelling must decode");
+        assert_eq!(within, vec![true, true]);
+        assert!(reader.scratch.is_empty(), "nothing was decoded into the scratch");
+    }
+
+    /// `STRING` escapes, as `codecs.escape_decode` reads them.
+    #[test]
+    fn string_escapes_decode_as_python_decodes_them() {
+        for (arg, want) in [
+            (&b"S'a\\\\b'\n"[..], "a\\b"),
+            (b"S'it\\'s'\n", "it's"),
+            (b"S\"say \\\"hi\\\"\"\n", "say \"hi\""),
+            (b"S'\\a\\b\\f\\n\\r\\t\\v'\n", "\x07\x08\x0c\n\r\t\x0b"),
+            (b"S'\\x41\\x7a'\n", "Az"),
+            (b"S'\\101\\7\\0'\n", "A\x07\0"),
+            // A value past `\377` keeps its low byte: `\501` is 0x141, read as 0x41.
+            (b"S'\\501'\n", "A"),
+            // An octal escape takes at most three digits.
+            (b"S'\\1011'\n", "A1"),
+            // An unknown escape keeps its backslash.
+            (b"S'\\q\\8'\n", "\\q\\8"),
+            // Raw UTF-8, as Dropwizard writes a name, passes through.
+            (b"S'caf\xc3\xa9'\n", "caf\u{e9}"),
+            // Python 2's `repr` uses `"` for a string holding a `'`, and an unescaped quote
+            // inside is still part of the body.
+            (b"S\"it's\"\n", "it's"),
+            (b"S''\n", ""),
+        ] {
+            assert_eq!(protocol_0_path(arg).as_deref().ok(), Some(want), "{arg:?}");
+        }
+    }
+
+    /// `UNICODE` escapes, as `raw_unicode_escape` reads them.
+    #[test]
+    fn unicode_escapes_decode_as_python_decodes_them() {
+        for (arg, want) in [
+            (&b"Va\\u0041\n"[..], "aA"),
+            (b"V\\U0001f600\n", "\u{1f600}"),
+            (b"Vcaf\xe9\n", "caf\u{e9}"),
+            // Only `\u`/`\U` are escapes; a pair of backslashes leaves the `u` literal.
+            (b"V\\\\u0041\n", "\\\\u0041"),
+            (b"Va\\qb\\\n", "a\\qb\\"),
+            (b"V\\u005cx\n", "\\x"),
+        ] {
+            assert_eq!(protocol_0_path(arg).as_deref().ok(), Some(want), "{arg:?}");
+        }
+    }
+
+    #[test]
+    fn protocol_0_numbers_read_as_python_reads_them() {
+        for (number_ops, timestamp, value) in [
+            (&b"I-5\nF-2.5\n"[..], -5.0, -2.5),
+            (b"I+7\nF1e+06\n", 7.0, 1e6),
+            (b"I0\nFinf\n", 0.0, f64::INFINITY),
+            (b"L42L\nF.5\n", 42.0, 0.5),
+            (b"L42\nF-inf\n", 42.0, f64::NEG_INFINITY),
+            (b"L00L\nF1\n", 0.0, 1.0),
+            (b"L-9223372036854775808L\nF0\n", i64::MIN as f64, 0.0),
+        ] {
+            let mut payload = b"(l(S'a'\n(".to_vec();
+            payload.extend_from_slice(number_ops);
+            payload.extend_from_slice(b"tta.");
+            let (points, skipped) = read(&payload).expect("a protocol-0 number must decode");
+            assert_eq!(skipped, 0, "{payload:?}");
+            assert_eq!(bits(&points), bits(&[point("a", timestamp, value)]), "{payload:?}");
+        }
+    }
+
+    /// `I00`/`I01` are bools, which a carbon datapoint can't use, so the item is skipped.
+    #[test]
+    fn i00_and_i01_are_bools() {
+        for flag in [&b"I00\n"[..], b"I01\n"] {
+            let mut payload = b"(l(S'a'\n(".to_vec();
+            payload.extend_from_slice(flag);
+            payload.extend_from_slice(b"F1\ntta.");
+            let (points, skipped) = read(&payload).expect("a bool timestamp is a wrong shape");
+            assert_eq!((points.len(), skipped), (0, 1), "{payload:?}");
+        }
+    }
+
+    /// Every protocol-0 argument this reader refuses fails the frame, with the reason.
+    #[test]
+    fn malformed_protocol_0_arguments_fail_the_frame() {
+        for (path_op, want) in [
+            (&b"S'abc\n"[..], "not quoted"),
+            (b"S'abc\"\n", "not quoted"),
+            (b"S'\n", "not quoted"),
+            (b"Sabc\n", "not quoted"),
+            (b"S'\\x4'\n", "invalid \\x escape"),
+            (b"S'\\xzz'\n", "invalid \\x escape"),
+            (b"S'abc\\'\n", "lone backslash"),
+            (b"S'\xff'\n", "not valid utf-8"),
+            (b"S'\\xff'\n", "not valid utf-8"),
+            (b"V\\ud800\n", "surrogate"),
+            (b"V\\U00110000\n", "past U+10FFFF"),
+            (b"V\\u12\n", "truncated"),
+            (b"V\\u12zz\n", "non-hex"),
+        ] {
+            let err = protocol_0_path(path_op).expect_err("a malformed string must fail");
+            assert!(err.to_string().contains(want), "{path_op:?}: {err}");
+        }
+        for (number_ops, want) in [
+            (&b"I99999999999999999999\nF1\n"[..], "does not fit"),
+            (b"L9223372036854775808L\nF1\n", "does not fit"),
+            (b"I010\nF1\n", "not a decimal"),
+            (b"I0x10\nF1\n", "not a decimal"),
+            (b"I1_000\nF1\n", "not a decimal"),
+            (b"I 1\nF1\n", "not a decimal"),
+            (b"I\nF1\n", "not a decimal"),
+            (b"L\nF1\n", "not a decimal"),
+            (b"LL\nF1\n", "not a decimal"),
+            (b"I1\nF1e999\n", "out of range"),
+            (b"I1\nF1.0x\n", "not a float"),
+            (b"I1\nF1", "no terminating newline"),
+        ] {
+            let mut payload = b"(l(S'a'\n(".to_vec();
+            payload.extend_from_slice(number_ops);
+            payload.extend_from_slice(b"tta.");
+            let err = read(&payload).expect_err("a malformed number must fail");
+            assert!(err.to_string().contains(want), "{payload:?}: {err}");
+        }
+        for (memo_op, want) in [
+            (&b"p-1\n"[..], "not a decimal"),
+            (b"p\n", "not a decimal"),
+            (b"p99999999999999999999999\n", "not a decimal"),
+            (b"g5\n", "was never set"),
+        ] {
+            let mut payload = b"(l".to_vec();
+            payload.extend_from_slice(memo_op);
+            payload.push(OP_STOP);
+            let err = read(&payload).expect_err("a malformed memo key must fail");
+            assert!(err.to_string().contains(want), "{payload:?}: {err}");
+        }
+    }
+
+    /// A decoded `UNICODE` at most doubles: every byte at 0x80 or above becomes two UTF-8 bytes.
+    #[test]
+    fn the_scratch_never_exceeds_twice_the_frame() {
+        let mut payload = b"(l(V".to_vec();
+        payload.extend(std::iter::repeat_n(0xe9u8, 4096));
+        payload.extend_from_slice(b"\n(I1\nF1\ntta.");
+        let mut reader = PickleReader::new();
+        let mut paths = 0;
+        reader
+            .read_datapoints(&payload, |path, _, _| {
+                assert_eq!(path.chars().count(), 4096);
+                paths += 1;
+            })
+            .expect("a Latin-1 path must decode");
+        assert_eq!(paths, 1);
+        assert_eq!(reader.scratch.len(), 2 * 4096);
+        assert!(reader.scratch.len() <= 2 * payload.len());
+    }
+
     // -- rejected payloads ------------------------------------------------------------------------
 
     /// Every opcode that could make a general unpickler construct or call something is refused,
@@ -929,7 +1573,7 @@ mod tests {
             ("STACK_GLOBAL", CPYTHON_STACK_GLOBAL),
             ("dict", CPYTHON_DICT),
             ("set", CPYTHON_SET),
-            ("protocol 0", CPYTHON_PROTOCOL_0),
+            ("protocol-0 bytes", CPYTHON3_PROTOCOL_0_BYTES),
         ] {
             let err = read(payload).expect_err("{name} must be rejected");
             let message = err.to_string();
@@ -1151,6 +1795,11 @@ mod tests {
             CPYTHON_LONG1_TIMESTAMP,
             CPYTHON_WRONG_SHAPE,
             CPYTHON_GLOBAL,
+            CPYTHON_PROTOCOL_0,
+            CPYTHON3_PROTOCOL_0_ESCAPED,
+            CPYTHON2_CPICKLE_PROTOCOL_0,
+            CPYTHON2_CPICKLE_PROTOCOL_2,
+            DROPWIZARD_PICKLED_GRAPHITE,
         ] {
             for len in 0..payload.len() {
                 let truncated = &payload[..len];
@@ -1294,13 +1943,25 @@ mod tests {
             (0..64).map(|_| ("a.b.c.d", 1_700_000_000i64, 1.0f64)).collect::<Vec<_>>(),
         );
         let mut reader = PickleReader::new();
+        let caps = |r: &PickleReader| {
+            (
+                r.stack.capacity(),
+                r.tuples.capacity(),
+                r.lists.capacity(),
+                r.memo.capacity(),
+                r.scratch.capacity(),
+            )
+        };
         reader.read_datapoints(&payload, |_, _, _| {}).expect("first frame");
-        let caps = (reader.stack.capacity(), reader.tuples.capacity(), reader.lists.capacity());
+        let warm = caps(&reader);
         reader.read_datapoints(&payload, |_, _, _| {}).expect("second frame");
-        assert_eq!(
-            (reader.stack.capacity(), reader.tuples.capacity(), reader.lists.capacity()),
-            caps,
-            "a warm reader must not reallocate"
-        );
+        assert_eq!(caps(&reader), warm, "a warm reader must not reallocate");
+
+        // A protocol-0 frame whose escaped strings decode into the scratch.
+        reader.read_datapoints(CPYTHON2_CPICKLE_PROTOCOL_0, |_, _, _| {}).expect("first frame");
+        assert!(!reader.scratch.is_empty(), "the fixture must exercise the scratch");
+        let warm = caps(&reader);
+        reader.read_datapoints(CPYTHON2_CPICKLE_PROTOCOL_0, |_, _, _| {}).expect("second frame");
+        assert_eq!(caps(&reader), warm, "a warm reader must not reallocate its scratch");
     }
 }
