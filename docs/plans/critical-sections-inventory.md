@@ -316,8 +316,8 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-19](#core-19--the-lua-telemetry-global-script-strings-into-the-process-interner) | P1 | The Lua `telemetry` global: script strings into the process interner | `crates/logit-script/src/telemetry.rs` (`static_str`, `static_metric_name`, `install`) | reviewed @d80f616 |
 | [XFORM-01](#xform-01--aggregate-serieskey-identity-hashing-and-grouping) | P1 | Aggregate: SeriesKey identity, hashing, and grouping | `crates/logit-transforms/src/aggregate.rs` (`SeriesKey`, `hash_value`, `value_key_eq`) | findings → #402, #414, #415, #416 |
 | [XFORM-04](#xform-04--aggregate-cumulative-temporality-and-counter-reset-semantics) | P1 | Aggregate: cumulative temporality and counter-reset semantics | `crates/logit-transforms/src/aggregate.rs` (module doc, `SeriesState::first_seen`) | findings → #407 |
-| [XFORM-06](#xform-06--jsonrs-zero-copy-json-into-attributes-parsing) | P1 | json.rs: zero-copy JSON-into-attributes parsing | `crates/logit-transforms/src/json.rs` (`JsonParser::process`), `crates/logit-proto/src/message/json.rs` (`parse_object`, `borrowed_str_bytes`) | in-progress (untrusted/w11) |
-| [XFORM-08](#xform-08--logfmtrs--kv-parsing-hand-rolled-tokenizers) | P1 | logfmt.rs / kv parsing: hand-rolled tokenizers | `crates/logit-proto/src/message/logfmt.rs` (`scan_quoted`, `parse_logfmt`, `parse_kv`) | in-progress (untrusted/w11) |
+| [XFORM-06](#xform-06--jsonrs-zero-copy-json-into-attributes-parsing) | P1 | json.rs: zero-copy JSON-into-attributes parsing | `crates/logit-transforms/src/json.rs` (`JsonParser::process`), `crates/logit-proto/src/message/json.rs` (`parse_object`, `borrowed_str_bytes`) | reviewed @5566667e |
+| [XFORM-08](#xform-08--logfmtrs--kv-parsing-hand-rolled-tokenizers) | P1 | logfmt.rs / kv parsing: hand-rolled tokenizers | `crates/logit-proto/src/message/logfmt.rs` (`scan_quoted`, `parse_logfmt`, `parse_kv`) | reviewed @5566667e |
 | [XFORM-09](#xform-09--trace_contextrs-timing-resolution-and-skew-arithmetic) | P1 | trace_context.rs: timing resolution and skew arithmetic | `crates/logit-transforms/src/trace_context.rs` (`timing_nanos`, `f64_seconds_to_nanos`, `quantity`) | unreviewed |
 | [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/stream.rs` (`connect`, `handshake`) | findings → #451 |
 | [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | findings → #450 |
@@ -348,7 +348,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-14](#core-14--template-the-name-parser-and-per-event-renderer) | P2 | `template`: the `{name}` parser and per-event renderer | `crates/logit-core/src/template.rs` (`parse`, `Template::compile`, `Compiled::render`) | unreviewed |
 | [CORE-20](#core-20--countingalloc-the-dev-only-counting-global-allocator) | P2 | `CountingAlloc`: the dev-only counting global allocator | `crates/logit-bench/src/alloc.rs` (`CountingAlloc`, `measure`) | unreviewed |
 | [XFORM-05](#xform-05--aggregate-contributing-context-span-link-bookkeeping) | P2 | Aggregate: contributing-context span-link bookkeeping | `crates/logit-transforms/src/aggregate.rs` (`ContributingContexts`) | findings → #410 |
-| [XFORM-07](#xform-07--csvrs-hand-rolled-rfc-4180-row-splitter) | P2 | csv.rs: hand-rolled RFC 4180 row splitter | `crates/logit-proto/src/message/csv.rs` (`split_row`, `unescape`) | in-progress (untrusted/w11) |
+| [XFORM-07](#xform-07--csvrs-hand-rolled-rfc-4180-row-splitter) | P2 | csv.rs: hand-rolled RFC 4180 row splitter | `crates/logit-proto/src/message/csv.rs` (`split_row`, `unescape`) | reviewed @5566667e |
 | [XFORM-10](#xform-10--regexrs-capture-group-extraction) | P2 | regex.rs: capture-group extraction | `crates/logit-transforms/src/regex.rs` (`RegexParser::new`, `process`) | unreviewed |
 | [XFORM-11](#xform-11--small-filtermutate-transforms-combined) | P2 | Small filter/mutate transforms (combined) | `crates/logit-transforms/src/keep.rs` | unreviewed |
 | [SINK-10](#sink-10--build_client_config--insecure_skip_verify--shared-client-tls-construction) | P2 | `build_client_config` / `insecure_skip_verify` — shared client TLS construction | `crates/logit-outputs/src/tls.rs` (`build_client_config`) | unreviewed |
@@ -7128,7 +7128,7 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   `KeyCache` instead of allocating an owned `String` per key.
 - **Why sensitive:** hot-path, custom (nontrivial-3p-use(serde_json): drives the low-level
   `Deserializer`/`Visitor` API directly rather than the ordinary `Deserialize` derive path),
-  untrusted-input (this parses attacker/producer-controlled bytes).
+  untrusted-input (this parses producer-controlled bytes).
 - **Invariants to verify:**
   - `borrowed_str_bytes`'s pointer-range check must correctly detect every case
     where serde_json's `visit_borrowed_str` did *not* actually hand back a genuine sub-slice of
@@ -7146,10 +7146,10 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
     recursion limit (no `unbounded_depth` feature enabled, confirmed via `Cargo.toml`) -- verify
     this is still true after any dependency-feature change, since this module does not add its own
     depth guard.
-- **Observed concerns (unverified):** the pointer-range arithmetic in `borrowed_str_bytes` uses
+- **Observed concerns (unverified):** the pointer-range arithmetic in `borrowed_str_bytes` used
   plain `usize` pointer casts and addition (`base_start + base.len()`, `s_start + s.len()`) with no
-  overflow guard; on ordinary 64-bit targets with realistic buffer sizes this cannot overflow, but
-  it's worth an explicit sanity check that these are true "is-a-subslice" checks and not just
+  overflow guard, until #599 moved it into `logit_core::subslice::share`; on ordinary 64-bit
+  targets with realistic buffer sizes this cannot overflow, but it's worth an explicit sanity check that these are true "is-a-subslice" checks and not just
   "ranges happen to overlap numerically" (e.g. does it correctly reject a `s` that is a *different*
   live allocation whose address range happens to lie within `base`'s numeric range due to reuse?
   In practice two `Bytes` never coincide like this from one `serde_json::Deserializer::from_slice`
@@ -7158,8 +7158,32 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
 - **Existing coverage:** `crates/logit-transforms/src/json.rs`'s unit tests (the `#[cfg(test)]` module), plus
   `crates/logit-bench/tests/allocations.rs`'s `json_parse_one_event`/`json_parse_wide_json_event`/
   `json_parse_reordered_keys_event` (allocation-count pins, which indirectly also exercise the
-  zero-copy path -- a regression to copying would likely fail these). ADR:
+  zero-copy path -- a regression to copying would likely fail these); the `message_json` fuzz
+  target and `crates/logit-proto/tests/robustness.rs`'s log-message section (untrusted/w11). ADR:
   `json-parsing-into-attributes.md`.
+- **Verified (untrusted/w11):** reviewed, no code change. The pointer-range check is
+  `logit_core::subslice::share` since #599: one `wrapping_sub` offset tested against
+  `base.len() - sub.len()`, with no addition that can overflow, and a slice outside `base` (the
+  scratch copy serde_json makes for an escaped string) is copied; `subslice`'s module doc says why
+  a different live allocation can't pass, since two live allocations never overlap. The
+  `message_json` target checks every shared `Value::Str` sits between the two quotes of its own
+  string token and equals serde_json's reading of the same bytes, so a false share fails it. Both
+  `scratch.clear()` sites stay, each pinned by a `json.rs` test shown failing with it removed:
+  `a_failed_parse_leaves_scratch_empty` fails with the `Err` arm's clear gone, and
+  `a_malformed_event_leaves_nothing_for_the_next_one` with both gone (either one alone keeps the
+  next merge clean). `a_failure_partway_through_leaves_existing_attributes_untouched` pins the
+  all-or-nothing merge at the transform, the contract the core's "may hold a partial prefix" doc
+  hands it. Depth: no `unbounded_depth` anywhere in the build; serde_json admits 127 nested
+  containers and fails the 128th, pinned in both modes by
+  `json_nesting_stops_at_serde_jsons_recursion_limit`. The differential found one artifact of its
+  own reference, not of the parse: the workspace's `raw_value` feature makes `serde_json::Value`
+  read an object whose first key is `$serde_json::private::RawValue` as the JSON in its string,
+  so the target skips a parse holding that key, with a `regress-raw-value-token` seed. A
+  600-second campaign (fork mode, debug assertions on) ran 27,105,277 inputs, about
+  45,000 exec/s, to a 2,709-input corpus with no crash. With the parse's `U64` mapped
+  to `I64`, the target failed its differential on the committed seeds outside fork mode. The
+  worst 64 KiB message, `{"a":[0,0,…]}`, allocates at most a 1.25 MiB `Vec`, pinned under the
+  target's 16 MiB limit.
 - **Suggested verification approach:** a fuzz target over `parse_object`/`parse_object_prefix`
   feeding arbitrary bytes (checks: never panics, never produces a `Value::Str` that isn't valid
   UTF-8, never OOMs on deeply nested input); targeted review of `borrowed_str_bytes` against
@@ -7200,9 +7224,29 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   ever broke, `Vec::with_capacity`'s actual capacity would just be larger than needed --
   `Bytes::from` would then take the extra-allocation path the comment says it's trying to avoid,
   a perf regression, not a soundness issue).
-- **Existing coverage:** `csv.rs` unit tests for `split_row` (`split_handles_...` tests) plus
+- **Existing coverage:** `crates/logit-proto/src/message/csv.rs`'s unit tests for `split_row`
+  (`split_row_worked_examples` and two more) and `crates/logit-transforms/src/csv.rs`'s, plus
   `crates/logit-bench/tests/allocations.rs`'s `csv_parse_one_event` (zero-allocation pin) and its
-  escaped-field counterpart. ADR: `csv-positional-columns.md`.
+  escaped-field counterpart; the `message_csv` fuzz target and `robustness.rs`'s log-message
+  section (untrusted/w11). ADR: `csv-positional-columns.md`.
+- **Verified (untrusted/w11):** reviewed, no code change. The `u32` bound: `message/csv.rs`'s
+  module doc now states it. Every source's default bound keeps a message far under 4 GiB (a
+  65,507-byte datagram, `MAX_FRAME_BYTES` or a listener's `max_line_bytes` on a stream, `tail_in`'s
+  and `docker_in`'s 1 MiB `max_line_bytes`, the HTTP listeners' few-MiB body caps); an
+  operator-set `max_line_bytes` of 4 GiB or more is the one way past it, and nothing validates an
+  upper bound on it. The UTF-8 reasoning holds for every delimiter rule 32 admits: rule 32 checks
+  `is_ascii()` and refuses `"`, `\n`, and `\r`, an ASCII byte never occurs inside a multi-byte
+  sequence, and `unescape` deletes only ASCII `"`; the `message_csv` target picks each of the 125
+  admitted delimiters and checks every field of a valid UTF-8 row is valid UTF-8. The empty line
+  is total since #603 (`split_row` reads `line.get(i)`, one empty field), and the target's
+  independent state machine agrees on it. `unescape`'s length-then-fill runs under its
+  `debug_assert_eq!` on every fuzz input (cargo-fuzz builds with debug assertions) and in
+  `csv_unescape_sizes_runs_of_doubled_quotes`, which covers every run of 1 to 199 quotes. A
+  600-second campaign (no fork mode, debug assertions on) ran 10,073,706 inputs, about
+  16,800 exec/s, to a 196-input corpus with no crash. With the trailing delimiter's
+  empty field removed, the target failed its reference comparison on the committed seeds. The
+  worst 64 KiB message, 65,537 empty fields, allocates at most a 2 MiB `Vec`, pinned under the
+  target's 16 MiB limit.
 - **Suggested verification approach:** fuzz `split_row` directly (never panics, offsets always in
   bounds, field count matches actual delimiter count); confirm the `u32` offset ceiling against
   any documented/enforced max message size elsewhere in the pipeline.
@@ -7222,8 +7266,8 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
     the `j + 1 >= n` check in `scan_quoted`, but re-verify against an input ending in a lone
     trailing backslash inside quotes.
   - `find_bytes` is a byte-substring search (`.windows(needle.len())`); for
-    `kv`'s operator-configured `pair_sep`/`kv_sep` this is fine (bounded, non-adversarial needle
-    length), but confirm no path ever calls it with an attacker-influenced needle.
+    `kv`'s operator-configured `pair_sep`/`kv_sep` this is fine (a bounded needle from config),
+    but confirm no path ever calls it with a needle taken from the message.
   - `parse_kv`'s cursor always advances past each found separator, so the
     total work across one message is linear in message length, not quadratic -- worth a direct
     confirmation since `find_bytes` alone looks like it could be O(n) per call if misused in a loop
@@ -7234,16 +7278,45 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   - `is_blank`-vs-`NoPairs` distinction (`is_blank`, used in the `Transform::process` impls of both `logfmt` and `kv`) determines
     whether a "nothing parsed" outcome is silently ignored or surfaced as a throttled diagnostic --
     verify a message of pure barewords-with-`bare_keys`-off still correctly produces a *diagnosed*
-    `NoPairs`, not a silent skip (the module doc says a bareword-only line fails as `NoPairs` "the
-    same as it would with `bare_keys` off").
+    `NoPairs`, not a silent skip (a bareword-only line fails as `NoPairs` with `bare_keys` on or
+    off).
 - **Observed concerns (unverified):** none spotted that suggest a genuine quadratic blowup or an
   infinite loop; the resynchronization logic is subtle enough (three separate "value" arms in
   `parse_logfmt`, each advancing `i` differently) that a fuzz target would be higher-value here
   than more manual reading.
 - **Existing coverage:** `crates/logit-transforms/src/logfmt.rs` has a large test module covering quoting,
   escapes, unterminated quotes, bare keys, and `kv`'s three empty/bareword/no-separator segment
-  shapes; `crates/logit-bench/tests/allocations.rs` pins allocation counts for the escaped-value
-  case. ADR: `logfmt-and-kv-parsing.md`.
+  shapes, and a proptest against a regex reading of the grammar; `crates/logit-bench/tests/allocations.rs`
+  pins allocation counts for the escaped-value case; the `message_logfmt` and `message_kv` fuzz
+  targets and `robustness.rs`'s log-message section (untrusted/w11). ADR: `logfmt-and-kv-parsing.md`.
+- **Verified (untrusted/w11):** reviewed, no code change; five doc fixes. `scan_quoted` returns
+  `UnterminatedQuote` for a `\` with nothing after it, so `a="abc\`, `a="\`, `a="\"`, and
+  `a="x\\\` all fail at the opening quote, pinned by
+  `logfmt_a_lone_trailing_backslash_inside_quotes_is_an_unterminated_quote`. `find_bytes` only
+  ever gets `pair_sep` or `kv_sep`, both from config, and rule 30 rejects an empty one; its
+  `None` for an empty needle is now documented beside that invariant. Work is linear in the
+  message for a fixed separator: `parse_kv`'s cursor moves to `seg_end + pair_sep.len()` and each
+  search starts there, so the search costs at most `pair_sep.len()` comparisons per byte; `parse_logfmt`'s outer loop
+  consumes at least one byte per turn on every arm, and a line of 64 KiB of `=` finishes as
+  `NoPairs` with nothing pushed (`logfmt_a_line_of_only_equals_signs_is_no_pairs`); the fuzz
+  targets' `-timeout=10` would report a hang. The `NoPairs` rule: `is_blank` excuses only an
+  empty or whitespace line from the diagnostic, so a bareword-only line is diagnosed under either
+  `bare_keys`. The doc fixes, each a leniency that loses nothing, now in
+  `message/logfmt.rs`'s module doc and the ADR: a closing quote ends a logfmt token with no
+  whitespace after it (`a="x"b=1` is `a` and `b`), which is how go-logfmt's `ScanKeyval` reads
+  it; kv's `NoPairs` also covers a line whose every `kv_sep` segment has an empty key; kv's empty
+  segment is counted in `pairs.skipped` with no diagnostic; `unescape` is the one value that
+  allocates, while a key missing `KeyCache` allocates in the interner; and `find_bytes`'s empty
+  needle. Campaigns of 600 seconds (fork mode, debug
+  assertions on) ran 16,062,079 `message_logfmt` inputs (about 25,300 exec/s, a
+  449-input corpus) and 23,003,464 `message_kv` inputs (about 36,300 exec/s, a
+  527-input corpus) with no crash. Both targets skip an input that could hold a key over
+  32 bytes, because long distinct keys took the never-evicting interner's arena past the 16 MiB
+  malloc limit inside one fork child (ADR `out-of-ci-fuzzing`'s fork-mode paragraph). With
+  `unescape`'s `\\` arm removed, `message_logfmt` failed its round trip, and with trailing
+  whitespace left on a kv key or value, `message_kv` failed its differential, each on the
+  committed seeds outside fork mode. The worst 64 KiB messages, one-byte barewords, allocate at
+  most a 1.5 MiB (`logfmt`) and a 2 MiB (`kv`) `Vec`, pinned under the targets' 16 MiB limit.
 - **Suggested verification approach:** fuzz `parse_logfmt`/`parse_kv` directly (never panics, never
   infinite-loops, `i`/`cursor` always strictly non-decreasing and eventually reaches `n`); a
   proptest comparing output against a simple reference regex-based logfmt parser on generated
