@@ -1,8 +1,8 @@
 //! Datadog service checks: `POST /api/v1/check_run`, both directions. The mapping table is in the
 //! parent module's doc ("Logs, events, service checks").
 //!
-//! A check decodes to exactly the [`Event::metric`] `statsd_in`'s DogStatsD `_sc|...` parser
-//! builds (`crates/logit-inputs/src/statsd.rs`'s `parse_service_check`): a `Gauge(status)` named
+//! A check decodes to exactly the [`Event::metric`] `statsd_in`'s DogStatsD `_sc|...` parser builds
+//! (`crates/logit-proto/src/statsd/decode.rs`'s `parse_service_check`): a `Gauge(status)` named
 //! after the check, plus the same `statsd.service_check.*` attributes, so either one re-encodes on
 //! either route.
 
@@ -20,7 +20,7 @@ use logit_core::{AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource,
 use serde_json::Value as Json;
 use std::sync::LazyLock;
 
-/// `statsd_in`'s service-check attribute names (`crates/logit-inputs/src/statsd.rs`), reused
+/// `statsd_in`'s service-check attribute names (`crates/logit-proto/src/statsd/decode.rs`), reused
 /// verbatim.
 pub const ATTR_SERVICE_CHECK_NAME: &str = "statsd.service_check.name";
 pub const ATTR_SERVICE_CHECK_STATUS: &str = "statsd.service_check.status";

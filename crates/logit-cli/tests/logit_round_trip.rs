@@ -7,10 +7,10 @@
 use bytes::Bytes;
 use logit_core::{AttrMap, Event, EventBatch, Resource};
 use logit_inputs::logit::{LogitInput, TlsServerSettings};
-use logit_inputs::statsd::StatsdDecoder;
 use logit_outputs::logit::{LogitOutput, TlsClientSettings};
 use logit_pipeline::{classify, Fanout, Fault, Input, Output};
 use logit_proto::frame::Compression;
+use logit_proto::statsd::StatsdDecoder;
 use logit_proto::Decoder;
 use std::sync::Arc;
 use std::time::Duration;

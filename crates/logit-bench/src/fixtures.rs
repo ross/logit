@@ -27,7 +27,6 @@ use logit_core::{
     Resource, Samples, Scope, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Value,
 };
 use logit_inputs::generate::{GenerateInput, GenerateMetricKind};
-use logit_inputs::statsd::StatsdDecoder;
 use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
 use logit_proto::collectd::types_db::TEST_TYPES_DB;
@@ -35,6 +34,7 @@ use logit_proto::collectd::{CollectdDecoder, TypesDb};
 use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::graphite::{GraphiteDecoder, Protocol as GraphiteProtocol};
 use logit_proto::prometheus::{PrometheusDecoder, PrometheusEncoder};
+use logit_proto::statsd::StatsdDecoder;
 use logit_proto::Decoder;
 use logit_transforms::{
     AggregateTemporality, Aggregator, Arrays, CsvParser, Distributions, Fields, Flatten,
@@ -68,7 +68,7 @@ pub const NGINX_SYSLOG_LINE: &str = concat!(
 pub const STATSD_LINE: &str = "page.views:1|c|@0.5|#env:prod,region:us-east-1,service:web";
 
 /// The same shape as [`STATSD_LINE`], except one tag key (`team`) repeats, which `insert_tags`
-/// folds into a `Value::Array` in wire order (`crates/logit-inputs/src/statsd.rs`'s "DogStatsD
+/// folds into a `Value::Array` in wire order (`crates/logit-proto/src/statsd/mod.rs`'s "DogStatsD
 /// tags" section). The plain `env:prod` tag stays so the measurement is the repeated key's cost on
 /// top of an ordinary tagged counter.
 pub const STATSD_REPEATED_TAG_LINE: &str = "page.views:1|c|#env:prod,team:a,team:b";
@@ -94,7 +94,7 @@ pub const STATSD_SET_LINE: &str = "unique.users:abc123|s";
 
 /// A DogStatsD event (`_e{tlen,xlen}:title|text|...`) line whose `TEXT` has nothing to unescape,
 /// so `unescape_event_text` takes its zero-copy path. Datadog's documented example event, as
-/// `crates/logit-inputs/src/statsd.rs`'s `dogstatsd_docs_example_event_decodes` also uses.
+/// `crates/logit-proto/src/statsd/decode.rs`'s `dogstatsd_docs_example_event_decodes` also uses.
 pub const STATSD_EVENT_LINE: &str =
     "_e{21,36}:An exception occurred|Cannot parse CSV file from 10.0.0.17|t:warning|#err_type:bad_file";
 
@@ -104,8 +104,9 @@ pub const STATSD_EVENT_LINE: &str =
 pub const STATSD_EVENT_LINE_WITH_ESCAPED_NEWLINE: &str = "_e{5,12}:title|line1\\nline2";
 
 /// A DogStatsD service check (`_sc|name|status|...`) line, Datadog's documented example (as in
-/// `crates/logit-inputs/src/statsd.rs`'s `dogstatsd_docs_example_service_check_decodes`). Decodes
-/// to one [`logit_core::MetricKind::Gauge`] event plus the `statsd.service_check.*` carriers.
+/// `crates/logit-proto/src/statsd/decode.rs`'s `dogstatsd_docs_example_service_check_decodes`).
+/// Decodes to one [`logit_core::MetricKind::Gauge`] event plus the `statsd.service_check.*`
+/// carriers.
 pub const STATSD_SERVICE_CHECK_LINE: &str =
     "_sc|Redis connection|2|#env:dev|m:Redis connection timed out after 10s";
 

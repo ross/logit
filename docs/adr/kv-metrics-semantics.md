@@ -89,7 +89,7 @@ concrete consumer would need escaping rules for a literal dot in a real attribut
 complexity with no requirement driving it.
 
 **Distributions produce a raw, single-observation `MetricKind::Samples`**, exactly as
-`crates/logit-inputs/src/statsd.rs` does for its `ms`/`h`/`d` metric types since
+`crates/logit-proto/src/statsd/` does for its `ms`/`h`/`d` metric types since
 [lossless-transit](lossless-transit.md)'s W3 — the value rides verbatim (one `f64`, inline in
 `Samples`' own `SmallVec`, no allocation), left for `aggregate` to sketch and merge across events
 the same way statsd-sourced timings already are. This replaced the original single-sample

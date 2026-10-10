@@ -6,7 +6,7 @@ vmagent, statsd/DogStatsD clients, a Datadog Agent, a dd-trace tracer, and four 
 clients. The fixtures check `logit`'s decoders against what those producers put on the wire:
 
 - `crates/logit-inputs/src/syslog.rs`
-- `crates/logit-inputs/src/statsd.rs`
+- `crates/logit-proto/src/statsd/`
 - `crates/logit-proto/src/collectd/`
 - `crates/logit-proto/src/otlp/`
 - `crates/logit-proto/src/graphite/`
@@ -148,7 +148,7 @@ For the pattern, see the `interop_fixture_*` tests in these files:
   its `collectd.*` identity, and its interval.
 - `crates/logit-inputs/src/graphite/mod.rs`: they assert a decoded path prefix, that every kind is
   a bare `Gauge`, and the pickle fixtures' exact datapoints.
-- `crates/logit-inputs/src/statsd.rs`
+- `crates/logit-proto/src/statsd/decode.rs`
 
 None of them asserts a measured value, which differs on every run.
 `crates/logit-proto/tests/prometheus_remote_write_interop.rs`,

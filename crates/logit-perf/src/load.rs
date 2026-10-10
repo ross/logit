@@ -1639,7 +1639,7 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
-    /// Decodes `datagram` with a real [`logit_inputs::statsd::StatsdDecoder`], returning the
+    /// Decodes `datagram` with a real [`logit_proto::statsd::StatsdDecoder`], returning the
     /// events it produced and every diagnostic key it raised on the way.
     fn decode(datagram: &[u8]) -> (Vec<logit_core::Event>, Vec<String>) {
         use logit_core::telemetry::Registry;
@@ -1649,7 +1649,7 @@ mod tests {
 
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
-        let mut decoder = logit_inputs::statsd::StatsdDecoder::new(Arc::new(Resource::default()))
+        let mut decoder = logit_proto::statsd::StatsdDecoder::new(Arc::new(Resource::default()))
             .with_diagnostics(Diagnostics::new("statsd_in").with_telemetry(telemetry));
         let mut events = Vec::new();
         decoder

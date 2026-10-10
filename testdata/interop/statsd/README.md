@@ -78,12 +78,12 @@ instead.
 
 ## Tests that consume these fixtures
 
-The `interop_fixture_*` tests in `crates/logit-inputs/src/statsd.rs` read this corpus. They assert
-on decoded values rather than exact bytes, because a re-record does **not** reproduce these bytes. The
-workload's values come from a seeded `random.Random`, so the *shape* is stable. But the DogStatsD
-container ID changes with the container, and which lines land in which buffered datagram depends
-on flush timing. Every producer in this corpus has the same "real capture, not a golden file"
-property.
+The `interop_fixture_*` tests in `crates/logit-proto/src/statsd/decode.rs` read this corpus. They
+assert on decoded values rather than exact bytes, because a re-record does **not** reproduce these
+bytes. The workload's values come from a seeded `random.Random`, so the *shape* is stable. But the
+DogStatsD container ID changes with the container, and which lines land in which buffered datagram
+depends on flush timing. Every producer in this corpus has the same "real capture, not a golden
+file" property.
 
 ## What isn't covered here (yet)
 
