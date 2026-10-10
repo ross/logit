@@ -1,0 +1,62 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "tuple.a",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-tuple-batch-p2",
+ "cpython": {
+  "tuple": [
+   {
+    "tuple": [
+     "tuple.a",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "A batch that is a tuple.",
+ "divergence": "carbon iterates any container and float()s any value it can; the reader takes a list batch and has no opcode for this shape (docs/known-gaps/mappings.md: decode (Graphite), a shape carbon iterates)",
+ "exercises": [
+  "TUPLE1"
+ ],
+ "logit": {
+  "message": "not a list",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "BINFLOAT",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "PROTO",
+  "STOP",
+  "TUPLE1",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

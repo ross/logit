@@ -1,0 +1,63 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "ts.long",
+    {
+     "f64": "0x4270000000000000",
+     "repr": "1099511627776.0"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-ts-long-p0",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "ts.long",
+     {
+      "tuple": [
+       {
+        "int": "1099511627776"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "Protocol 0's LONG, which CPython writes for an int past i32.",
+ "exercises": [
+  "LONG"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "FLOAT",
+  "LIST",
+  "LONG",
+  "MARK",
+  "PUT",
+  "STOP",
+  "TUPLE",
+  "UNICODE"
+ ],
+ "producer": "cpython3",
+ "protocol": 0
+}

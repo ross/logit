@@ -1,0 +1,28 @@
+{
+ "carbon": {
+  "items": 0,
+  "outcome": "ok",
+  "received": []
+ },
+ "case": "py3-empty-p0",
+ "cpython": {
+  "list": []
+ },
+ "description": "An empty batch in protocol 0.",
+ "exercises": [
+  "LIST"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "LIST",
+  "MARK",
+  "PUT",
+  "STOP"
+ ],
+ "producer": "cpython3",
+ "protocol": 0
+}

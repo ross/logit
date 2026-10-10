@@ -1,0 +1,46 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": []
+ },
+ "case": "py3-value-string-hex-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "value.hex",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       "0x10"
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "The value as the string '0x10'.",
+ "exercises": [
+  "BINUNICODE"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 1,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

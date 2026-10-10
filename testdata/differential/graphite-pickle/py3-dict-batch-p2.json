@@ -1,0 +1,64 @@
+{
+ "carbon": {
+  "items": 2,
+  "outcome": "ok",
+  "received": []
+ },
+ "case": "py3-dict-batch-p2",
+ "cpython": {
+  "dict": [
+   [
+    "reject.a",
+    {
+     "tuple": [
+      {
+       "int": "1700000000"
+      },
+      {
+       "f64": "0x3ff0000000000000",
+       "repr": "1.0"
+      }
+     ]
+    }
+   ],
+   [
+    "reject.b",
+    {
+     "tuple": [
+      {
+       "int": "1700000000"
+      },
+      {
+       "f64": "0x4000000000000000",
+       "repr": "2.0"
+      }
+     ]
+    }
+   ]
+  ]
+ },
+ "description": "A dict batch.",
+ "divergence": "carbon iterates any container and float()s any value it can; the reader takes a list batch and has no opcode for this shape (docs/known-gaps/mappings.md: decode (Graphite), a shape carbon iterates)",
+ "exercises": [
+  "EMPTY_DICT",
+  "SETITEMS"
+ ],
+ "logit": {
+  "opcode": "0x7d",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "BINFLOAT",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_DICT",
+  "MARK",
+  "PROTO",
+  "SETITEMS",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

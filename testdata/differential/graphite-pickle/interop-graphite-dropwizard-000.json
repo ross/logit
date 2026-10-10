@@ -1,0 +1,81 @@
+{
+ "carbon": {
+  "items": 4,
+  "outcome": "ok",
+  "received": [
+   [
+    "logit-fixture.dropwizard.heap.used",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x4029000000000000",
+     "repr": "12.5"
+    },
+    "store"
+   ],
+   [
+    "logit-fixture.dropwizard.ratio.undefined",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x7ff8000000000000",
+     "repr": "nan"
+    },
+    "nan"
+   ],
+   [
+    "logit-fixture.dropwizard.café.visits.count",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x4008000000000000",
+     "repr": "3.0"
+    },
+    "store"
+   ],
+   [
+    "logit-fixture.dropwizard.requests.count",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x4045000000000000",
+     "repr": "42.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "interop-graphite-dropwizard-000",
+ "cpython": {
+  "error": "UnicodeDecodeError",
+  "message": "'ascii' codec can't decode byte 0xc3 in position 28: ordinal not in range(128)"
+ },
+ "decoder_skips": {
+  "non_finite_value": 1
+ },
+ "description": "testdata/interop/graphite/graphite-dropwizard-000.raw's one frame, its 4-byte big-endian length prefix (274) stripped.",
+ "length_prefix": 274,
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "LIST",
+  "LONG",
+  "MARK",
+  "STOP",
+  "STRING",
+  "TUPLE"
+ ],
+ "source": "interop/graphite/graphite-dropwizard-000.raw"
+}

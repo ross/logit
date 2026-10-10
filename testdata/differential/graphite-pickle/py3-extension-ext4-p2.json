@@ -1,0 +1,36 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "ValueError",
+   "message": "unregistered extension code 70000"
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py3-extension-ext4-p2",
+ "cpython": {
+  "error": "ValueError",
+  "message": "unregistered extension code 70000"
+ },
+ "description": "The decimal.Decimal class as copyreg extension code 70000.",
+ "exercises": [
+  "EXT4"
+ ],
+ "logit": {
+  "opcode": "0x84",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "EXT4",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

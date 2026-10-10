@@ -1,0 +1,58 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "UnpicklingError",
+   "message": "Attempting to unpickle unsafe module __main__"
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py2-value-oldstyle-p1",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "py2.old",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "object": "__main__.Old",
+        "repr": "Old([('v', 1)])"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "An old-style class instance at protocol 1: GLOBAL, then OBJ.",
+ "exercises": [
+  "OBJ",
+  "GLOBAL"
+ ],
+ "logit": {
+  "opcode": "0x63",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BININT1",
+  "BINPUT",
+  "BUILD",
+  "EMPTY_DICT",
+  "EMPTY_LIST",
+  "GLOBAL",
+  "MARK",
+  "OBJ",
+  "SETITEM",
+  "SHORT_BINSTRING",
+  "STOP",
+  "TUPLE"
+ ],
+ "producer": "python2",
+ "protocol": 1
+}

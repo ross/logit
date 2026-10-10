@@ -1,0 +1,37 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "UnpicklingError",
+   "message": "A load persistent id instruction was encountered, but no persistent_load function was specified."
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py3-persistent-id-p2",
+ "cpython": {
+  "error": "UnpicklingError",
+  "message": "A load persistent id instruction was encountered, but no persistent_load function was specified."
+ },
+ "description": "A path the pickler writes by persistent id.",
+ "exercises": [
+  "BINPERSID"
+ ],
+ "logit": {
+  "opcode": "0x51",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINFLOAT",
+  "BININT",
+  "BINPERSID",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

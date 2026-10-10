@@ -1,0 +1,69 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "AttributeError",
+   "message": "'bytes' object has no attribute 'encode'"
+  },
+  "items": 1,
+  "outcome": "raised",
+  "received": []
+ },
+ "case": "py3-path-bytes-p3",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     {
+      "bytes": "706174682e6279746573"
+     },
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "A bytes path at protocol 3, carbon's Python 2 str.",
+ "divergence": "carbon calls .encode on a path that isn't a str, which raises on Python 3 bytes and closes the connection; the reader reads bytes as UTF-8 text, as carbon on Python 2 did (docs/known-gaps/mappings.md: decode (Graphite), a frame carbon fails that the reader keeps)",
+ "exercises": [
+  "SHORT_BINBYTES"
+ ],
+ "logit": {
+  "datapoints": [
+   [
+    "path.bytes",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    }
+   ]
+  ],
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINFLOAT",
+  "BININT",
+  "BINPUT",
+  "EMPTY_LIST",
+  "PROTO",
+  "SHORT_BINBYTES",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 3
+}

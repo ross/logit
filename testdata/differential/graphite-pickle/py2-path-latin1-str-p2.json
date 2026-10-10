@@ -1,0 +1,36 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "UnicodeDecodeError",
+   "message": "'utf-8' codec can't decode byte 0xe9 in position 7: unexpected end of data"
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py2-path-latin1-str-p2",
+ "cpython": {
+  "error": "UnicodeDecodeError",
+  "message": "'ascii' codec can't decode byte 0xe9 in position 7: ordinal not in range(128)"
+ },
+ "description": "A Latin-1 str path at protocol 2.",
+ "exercises": [
+  "SHORT_BINSTRING"
+ ],
+ "logit": {
+  "message": "not valid utf-8",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINFLOAT",
+  "BININT",
+  "BINPUT",
+  "EMPTY_LIST",
+  "PROTO",
+  "SHORT_BINSTRING",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "python2",
+ "protocol": 2
+}

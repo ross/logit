@@ -128,6 +128,9 @@ messages per construct is the right size. Keep fixtures to these rough sizes:
 - **Whole directory:** well under 100 KB total. As of 2026-09-25, the fixtures, excluding READMEs,
   total about 92 KB.
 
+The sibling tree [`../differential/`](../differential/README.md) isn't counted here. It holds
+generated cases, not captures, and its README gives its own size.
+
 If a producer's natural output is bigger, such as a verbose OTLP payload with many spans, trim it
 at record time instead of committing everything the producer emits. `script/record-fixtures`'s
 OTLP producer does this with `--traces=3`/`--logs=3`/`--metrics=3` instead of an open-ended

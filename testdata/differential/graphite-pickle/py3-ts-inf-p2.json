@@ -1,0 +1,85 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "OverflowError",
+   "message": "cannot convert float infinity to integer"
+  },
+  "items": 1,
+  "outcome": "raised",
+  "received": [
+   [
+    "ts.inf",
+    {
+     "f64": "0x7ff0000000000000",
+     "repr": "inf"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    {
+     "raises": "OverflowError"
+    }
+   ]
+  ]
+ },
+ "case": "py3-ts-inf-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "ts.inf",
+     {
+      "tuple": [
+       {
+        "f64": "0x7ff0000000000000",
+        "repr": "inf"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "decoder_skips": {
+  "bad_timestamp": 1
+ },
+ "description": "The timestamp inf.",
+ "divergence": "carbon's metricReceived calls int() on the timestamp, which raises on NaN and infinity and closes the connection; the reader yields the datapoint, and the decoder counts it bad_timestamp (docs/known-gaps/mappings.md: decode (Graphite), a frame carbon fails that the reader keeps)",
+ "exercises": [
+  "BINFLOAT"
+ ],
+ "logit": {
+  "datapoints": [
+   [
+    "ts.inf",
+    {
+     "f64": "0x7ff0000000000000",
+     "repr": "inf"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    }
+   ]
+  ],
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINFLOAT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}
