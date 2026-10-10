@@ -95,11 +95,11 @@ last-write-wins, for free, via `AttrMap::insert_sym` overwriting in push order -
 separately, merge only on full success" shape, so a line that fails partway (an unterminated quote)
 never leaves `event.attributes` half-populated.
 
-**Allocation posture: a hand-rolled scanner that tracks its own byte offsets, not `syslog.rs`'s
-pointer-arithmetic `slice_of` or `json.rs`'s guarded `borrowed_str_bytes`.** Neither of those
-existing precedents' constraints apply here: `syslog.rs` needs pointer arithmetic because
-`str::split` hands back offset-less `&str`s, and `json.rs` needs a guarded reconstruction because
-`serde_json` may hand back an unescape scratch buffer outside the input buffer. This scanner never
+**Allocation posture: a hand-rolled scanner that tracks its own byte offsets, not the
+pointer-range `logit_core::subslice::share` that `syslog.rs` and `json.rs` use.** Neither of those
+existing precedents' constraints apply here: `syslog.rs` calls `share` because `str::split` hands
+back offset-less `&str`s, and `json.rs` calls it because `serde_json` may hand back an unescape
+scratch buffer outside the input buffer, which `share` copies. This scanner never
 loses its own indices, so every unquoted or escape-free-quoted value is a plain, infallible
 `raw.slice(a..b)` -- a `Bytes` refcount bump, not a copy. Every key is interned straight off the
 message's own byte slice (`&text[key_start..key_end]`), never through an owned `String` -- safe

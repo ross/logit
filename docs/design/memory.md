@@ -223,7 +223,7 @@ line.
 | `statsd_in` decode 1 distribution line (`ms`/`h`/`d`, unsampled) | **2** | same as `statsd_in` decode 1 line -- `ms`/`h`/`d` decode straight to `MetricKind::Samples` now (ADR `lossless-transit`'s W3), one value fits inline in `Samples`'s own `SmallVec`; no `DdSketch`/`bins` Vec is built at decode time any more |
 | `statsd_in` decode 1 sampled distribution line (`@0.1`) | **2** | same as unsampled -- the raw `sample_rate` now rides verbatim on the decoded `Samples`, with no decode-time extrapolation to allocate for |
 | `statsd_in` decode 1 set line (`s`) | **3** | 2 as above + 1 `Vec<Bytes>` for `MetricKind::SetMembers`'s members -- unlike `Samples`'s inline `SmallVec`, `SetMembers` has no small-size optimization |
-| `statsd_in` decode 1 DogStatsD event line (`_e{...}`, `TEXT` with nothing to unescape) | **2** | same as `statsd_in` decode 1 line -- `parse_event`'s `unescape_event_text` takes its zero-copy `slice_of` path, so an event costs nothing beyond the per-line/per-batch `Vec<Event>` pair every statsd line pays |
+| `statsd_in` decode 1 DogStatsD event line (`_e{...}`, `TEXT` with nothing to unescape) | **2** | same as `statsd_in` decode 1 line -- `parse_event`'s `unescape_event_text` takes its zero-copy `subslice::share` path, so an event costs nothing beyond the per-line/per-batch `Vec<Event>` pair every statsd line pays |
 | `statsd_in` decode 1 DogStatsD event line (`TEXT` with one `\n` escape) | **3** | 2 as above + 1 -- the decoded length is known up front (each two-byte escape becomes one byte), so `unescape_event_text` sizes its `Vec` exactly and `Bytes::from(Vec<u8>)` takes its `len == capacity` promotion path: one allocation, no realloc, no second eager control-block alloc of the kind a slack-capacity `String::replace` result would cost |
 | `statsd_in` decode 1 DogStatsD service check line (`_sc\|...`) | **2** | same as `statsd_in` decode 1 line -- every `statsd.service_check.*` carrier is a zero-copy datagram slice, same shape as an ordinary metric line's tags |
 | `statsd_in` decode 1 line with a repeated tag key | **4** | ADR `statsd-output`'s amendment -- 2 as `statsd_in` decode 1 line + 2: `insert_tags` builds the `Value::Array`'s `Vec` spine (`vec![existing, value]`), and `build_event`'s `attributes.clone()` -- run once even on a single-value line -- deep-copies that spine again for the `Event`. A scalar tag's share of that clone is a `Bytes` refcount bump; the `Array` is the one attribute shape whose clone allocates |
@@ -234,7 +234,7 @@ line.
 | `collectd_in` decode a 25-list datagram | **1** | + 3 reallocs (`Vec<Event>` growing 4 → 8 → 16 → 32); a collectd datagram has no header naming its value-list count, so `decode_into` cannot size the `Vec` up front |
 | `collectd_in` decode 1 three-data-source list, `types_db` resolving its names | **2** | **the same as without a `types.db`** -- the lookup is one `HashMap::get` per Values part returning a borrowed slice, and resolved names go into the same reused scratch `String` before interning |
 | `graphite_in` decode 1 plaintext line | **1** | just the `Vec<Event>`, same as `syslog_in`/`collectd_in` -- the path is interned, the value is an `f64` in the record, and one `Gauge` fits `MetricList`'s inline capacity |
-| `graphite_in` decode 1 tagged line (2 carbon tags) | **1** | **the same as untagged** -- every tag value is a zero-copy `Bytes::slice` of the datagram (`logit_proto::graphite::decode`'s `slice_of`, the trick `statsd_in`'s own `slice_of` plays) and two entries still fit `AttrMap`'s inline capacity |
+| `graphite_in` decode 1 tagged line (2 carbon tags) | **1** | **the same as untagged** -- every tag value is a zero-copy `Bytes::slice` of the datagram (`logit_core::subslice::share`, the helper `statsd_in` and `syslog_in` use too) and two entries still fit `AttrMap`'s inline capacity |
 | `graphite_in` `decode_into` into a warm buffer | **0** | ADR `decoupled-listener-io` -- nothing at all is left once the caller's `Vec<Event>` keeps its capacity, on the TCP path (the shared `logit-inputs/src/tcp.rs` driver's per-connection `scratch`) as much as the UDP one |
 | `graphite_in` decode a 25-line datagram | **1** | + 3 reallocs (`Vec<Event>` growing 4 → 8 → 16 → 32); a carbon datagram has no header naming its line count, so `decode_into` cannot size the `Vec` up front -- the same shape as `collectd_in`'s 25-list row |
 | `graphite_in` decode a 100-datapoint pickle frame | **1** | + 5 reallocs (4 → 8 → … → 128). The restricted pickle reader's stack, arenas and memo are decoder *fields*, cleared per frame rather than rebuilt (`logit_proto::graphite::pickle::PickleReader`), so walking a hundred datapoints through the stack machine allocates nothing of its own -- which is exactly why they are fields |
@@ -747,18 +747,18 @@ a field parsed out of a socket read buffer is a refcounted slice of that buffer,
 allocation. The datagram decoders keep that commitment (§2's decode rows); `statsd_in` broke it
 until §8 item 3 fixed it.
 
-`syslog_in` is the exemplar. `slice_of` rebuilds a `Bytes` for each extracted field by pointer
-arithmetic back into the datagram, so decoding a line costs exactly one allocation (the `Vec`)
+`syslog_in` is the exemplar. `logit_core::subslice::share` rebuilds a `Bytes` for each extracted
+field as a range-checked slice of the datagram, so decoding a line costs exactly one allocation (the `Vec`)
 however many fields it yields. `crates/logit-bench`'s `syslog_fields_share_the_datagram_allocation`
 asserts this structurally, not just by count. `json` continues it: `ValueSeed` deserializes straight
-into `Value` with no intermediate `serde_json::Value` tree, and `borrowed_str_bytes` keeps an
+into `Value` with no intermediate `serde_json::Value` tree, and the same `share` keeps an
 unescaped string a slice of the message buffer, copying only a string serde had to unescape.
 
 `statsd_in` used to build attribute values with `attributes.insert(k, v)` on a `&str`, which went
 through `impl From<&str> for Value` → `Value::str` → `Bytes::from(String)`, copying bytes already in
 the datagram; `build_event`'s `attributes.clone()` then promoted each to a shared `Bytes`, a second
-copy. That was six of the pre-fix eight allocations. It now uses `syslog.rs`'s `slice_of`
-reconstruction, asserted structurally by `crates/logit-bench`'s
+copy. That was six of the pre-fix eight allocations. It now uses the same
+`logit_core::subslice::share` reconstruction, asserted structurally by `crates/logit-bench`'s
 `statsd_tag_values_share_the_datagram_allocation` (which replaced
 `statsd_tag_values_are_copied_not_sliced`). The 2 remaining allocations are a `Vec<Event>` per line
 plus one for the batch: the same irreducible pair `syslog_in` has, split across two `Vec`s because
@@ -1384,7 +1384,7 @@ other docs cite items by number.
 2. ~~**Make `AttrMap::get` non-interning.**~~ **Done**: `AttrMap::get`/`remove` probe via
    `interner::lookup` instead of `intern`, closing both the CPU cost and the theoretical growth
    path (§4). It also added `interner::len()`, needed to test the fix.
-3. ~~**Give `statsd_in` the `slice_of` treatment.**~~ **Done**: 8 → 2 allocations per line (§2's
+3. ~~**Give `statsd_in` the zero-copy treatment.**~~ **Done**: 8 → 2 allocations per line (§2's
    zero-copy section). `statsd_in` keeps the same zero-copy promise `syslog_in` does.
 4. ~~**Trim `json`'s allocations.**~~ **Done, further than scoped**: 7 → 1 for the nginx shape,
    and 1 for a 28-field wide-JSON line too (§2). The plan was a checkpoint-and-rollback scheme over

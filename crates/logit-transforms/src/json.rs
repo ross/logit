@@ -4,6 +4,7 @@
 
 use bytes::Bytes;
 use logit_core::interner::KeyCache;
+use logit_core::subslice;
 use logit_core::{AttrMap, Diagnostics, Event, Resource, Symbol, Value};
 use logit_pipeline::Transform;
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
@@ -185,21 +186,10 @@ fn parse_object_prefix(
     TopLevelSeed { base: json, out, keys }.deserialize(&mut de)
 }
 
-/// Slices `base` for a `&str` serde_json borrowed from it (`Visitor::visit_borrowed_str`), so an
-/// unescaped string stays zero-copy (`docs/design/data-model.md`'s "Values" section).
-///
-/// Checks the pointer range and falls back to a copy rather than calling `Bytes::slice_ref`,
-/// which panics on a non-subset and would take down the transform node over one input.
+/// Slices `base`, the message being parsed, for a `&str` serde_json borrowed from it
+/// (`Visitor::visit_borrowed_str`), so an unescaped string stays zero-copy.
 fn borrowed_str_bytes(base: &Bytes, s: &str) -> Bytes {
-    let base_start = base.as_ptr() as usize;
-    let base_end = base_start + base.len();
-    let s_start = s.as_ptr() as usize;
-    let s_end = s_start + s.len();
-    if s_start >= base_start && s_end <= base_end {
-        base.slice((s_start - base_start)..(s_end - base_start))
-    } else {
-        Bytes::copy_from_slice(s.as_bytes())
-    }
+    subslice::share(base, s.as_bytes())
 }
 
 /// Deserializes a JSON value straight into a [`Value`], skipping a `serde_json::Value` tree and

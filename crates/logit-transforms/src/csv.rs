@@ -681,17 +681,15 @@ mod tests {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
         let mut event = log_event("hello,world");
-        let message_ptr_range = match message_of(&event) {
-            Value::Str(b) => (b.as_ptr() as usize, b.as_ptr() as usize + b.len()),
+        let message = match message_of(&event) {
+            Value::Str(b) => b.clone(),
             other => panic!("expected Str, got {other:?}"),
         };
         assert!(csv.process(&resource, &mut event), "always forwards");
         match attr(&event, "a") {
             Some(Value::Str(b)) => {
-                let start = b.as_ptr() as usize;
-                let end = start + b.len();
                 assert!(
-                    start >= message_ptr_range.0 && end <= message_ptr_range.1,
+                    logit_core::subslice::within(&message, b),
                     "field 'a' should be a slice of the original message buffer"
                 );
             }

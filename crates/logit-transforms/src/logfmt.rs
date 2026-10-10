@@ -472,6 +472,7 @@ impl Transform for Kv {
 mod tests {
     use super::*;
     use logit_core::interner::{intern as intern_for_test, resolve};
+    use logit_core::subslice::within;
     use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, SpanEvent, SpanKind};
     use logit_core::{Registry, SpanRecord, SpanStatus};
 
@@ -517,12 +518,6 @@ mod tests {
 
     fn attr<'a>(event: &'a Event, key: &str) -> Option<&'a Value> {
         event.attributes.get(key)
-    }
-
-    fn points_into(haystack: &Bytes, needle: &Bytes) -> bool {
-        let base = haystack.as_ptr() as usize;
-        let start = needle.as_ptr() as usize;
-        start >= base && start + needle.len() <= base + haystack.len()
     }
 
     // -----------------------------------------------------------------------------------------
@@ -773,11 +768,11 @@ mod tests {
         assert!(logfmt.process(&resource, &mut event), "log events pass through");
 
         let Some(Value::Str(msg)) = attr(&event, "msg") else { panic!("msg should be a Str") };
-        assert!(points_into(&message, msg), "escape-free quoted value should slice the message");
+        assert!(within(&message, msg), "escape-free quoted value should slice the message");
         let Some(Value::Str(status)) = attr(&event, "status") else {
             panic!("status should be a Str")
         };
-        assert!(points_into(&message, status), "unquoted value should slice the message");
+        assert!(within(&message, status), "unquoted value should slice the message");
     }
 
     // -----------------------------------------------------------------------------------------
@@ -915,7 +910,7 @@ mod tests {
         );
         assert!(kv.process(&resource, &mut event), "log events pass through");
         let Some(Value::Str(b)) = attr(&event, "b") else { panic!("b should be a Str") };
-        assert!(points_into(&message, b), "kv value should slice the message");
+        assert!(within(&message, b), "kv value should slice the message");
     }
 
     // -----------------------------------------------------------------------------------------
