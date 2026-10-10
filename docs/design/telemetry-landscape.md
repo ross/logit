@@ -243,6 +243,8 @@ of `(str, (number, number))` tuples, one per datapoint, in no particular groupin
   through `cPickle`.
   [ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)'s "Amendment: the reader accepts
   pickle protocol 0" has the per-producer survey and its sources.
+  Carbon's own receiver rejects a `bytes` path at protocols 0 to 2 by default; the same
+  amendment records the measurement.
 - collectd's `write_graphite` and Spark's `GraphiteSink` write plaintext only; neither has a pickle
   mode.
 - Carbon's receiver treats `timestamp <= 0` specially: `-1` means "now", so the point gets receipt

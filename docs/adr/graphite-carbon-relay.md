@@ -532,8 +532,18 @@ Seven opcodes join the allowlist, taking it from 35 opcodes to 42:
 Every object-construction opcode stays rejected: `GLOBAL` `c`, `INST` `i`, `OBJ` `o`, `REDUCE`
 `R`, `BUILD` `b`, `PERSID` `P`, every dict and set opcode, `DUP` `2`, `POP` `0`, and `POP_MARK`
 `1`, along with every binary opcode the Rejected list above names. Python 3 writes a `bytes` value at
-protocol 0 as `GLOBAL _codecs.encode` plus `REDUCE`, so that spelling stays rejected too. A carbon
-path is a `str`, so no surveyed sender writes it. The seven new opcodes are safe for the same reason
+protocols 0 to 2 as `GLOBAL _codecs.encode` plus `REDUCE`, so that spelling stays rejected too, under
+`bad_pickle`. A carbon path is a `str`, so no surveyed sender writes it. Measured on 2026-10-09
+against carbon 1.1.10, Twisted 26.4.0, and Python 3.11, calling
+`MetricPickleReceiver.stringReceived` directly, carbon rejects the same frame. Its default
+`SafeUnpickler` (`PICKLE_SAFE` in `lib/carbon/util.py` holds only `copy_reg._reconstructor` and
+`__builtin__.object`) raises `UnpicklingError` on `_codecs`, and `stringReceived` logs "invalid
+pickle" and ignores the payload. With `USE_INSECURE_UNPICKLER` set, the payload loads, then
+`metric.encode('utf-8')` in `lib/carbon/protocols.py` raises an uncaught `AttributeError` on a
+`bytes` path. Either way carbon delivers nothing, so keeping `GLOBAL` closed costs no real sender.
+At protocol 3 and above a `bytes` path is `BINBYTES`, which the reader accepts as UTF-8 and carbon
+1.1.10 on Python 3 fails with the same `AttributeError`, so there the reader is more tolerant than
+carbon. The seven new opcodes are safe for the same reason
 the binary ones are: each pushes a scalar or touches the memo, and none names, imports, or calls
 anything.
 
