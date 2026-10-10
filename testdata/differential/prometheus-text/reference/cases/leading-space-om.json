@@ -1,0 +1,14 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [],
+ "error": {
+  "after_entry": 0,
+  "message": "expected a valid start token, got \" \" (\"INVALID\") while parsing: \" \""
+ },
+ "input": {
+  "crc32c": "0x9f48c4cb",
+  "len": 12,
+  "path": "differential/prometheus-text/cases/leading-space-om.om"
+ },
+ "parser": "openmetrics"
+}

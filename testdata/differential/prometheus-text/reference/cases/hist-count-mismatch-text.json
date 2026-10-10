@@ -1,0 +1,51 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "h",
+   "value": "histogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1.0"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4010000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_sum",
+   "value": "0x4022000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_count",
+   "value": "0x4018000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xc97ab5c9",
+  "len": 78,
+  "path": "differential/prometheus-text/cases/hist-count-mismatch-text.txt"
+ },
+ "parser": "prom"
+}

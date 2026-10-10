@@ -1,0 +1,14 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [],
+ "error": {
+  "after_entry": 0,
+  "message": "invalid metric type \"gauge\\r\""
+ },
+ "input": {
+  "crc32c": "0x0bf7ec3c",
+  "len": 40,
+  "path": "differential/prometheus-text/cases/crlf-om.om"
+ },
+ "parser": "openmetrics"
+}

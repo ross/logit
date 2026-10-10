@@ -1,0 +1,5 @@
+# TYPE a gauge
+a 1
+# TYPE b gauge
+b 1
+a{x="2"} 2

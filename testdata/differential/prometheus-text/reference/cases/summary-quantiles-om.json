@@ -1,0 +1,73 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "q",
+   "value": "summary"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.5"
+    ]
+   ],
+   "name": "q",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.99"
+    ]
+   ],
+   "name": "q",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "5.0"
+    ]
+   ],
+   "name": "q",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "-Inf"
+    ]
+   ],
+   "name": "q",
+   "value": "0x4010000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "q_sum",
+   "value": "0x4024000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "q_count",
+   "value": "0x4010000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xf1a0a41f",
+  "len": 122,
+  "path": "differential/prometheus-text/cases/summary-quantiles-om.om"
+ },
+ "parser": "openmetrics"
+}

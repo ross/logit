@@ -1,0 +1,3 @@
+g{v="ok"} 1
+g{v="hex"} 0x1p-2
+g{v="after"} 2

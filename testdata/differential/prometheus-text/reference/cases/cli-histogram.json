@@ -1,0 +1,87 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "latency_seconds",
+   "value": "histogram"
+  },
+  {
+   "kind": "unit",
+   "name": "latency_seconds",
+   "value": "seconds"
+  },
+  {
+   "kind": "help",
+   "name": "latency_seconds",
+   "value": "Request latency."
+  },
+  {
+   "exemplar": {
+    "labels": [
+     [
+      "slow",
+      "no"
+     ]
+    ],
+    "value": "0x3fa999999999999a"
+   },
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "0.1"
+    ]
+   ],
+   "name": "latency_seconds_bucket",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1.0"
+    ]
+   ],
+   "name": "latency_seconds_bucket",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "latency_seconds_bucket",
+   "value": "0x4010000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "latency_seconds_sum",
+   "value": "0x4004000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "latency_seconds_count",
+   "value": "0x4010000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "latency_seconds_created",
+   "value": "0x41d7eba98b400000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x4564c1ee",
+  "len": 316,
+  "path": "differential/prometheus-text/cases/cli-histogram.om"
+ },
+ "parser": "openmetrics"
+}

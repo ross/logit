@@ -1,0 +1,14 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [],
+ "error": {
+  "after_entry": 0,
+  "message": "expected comma or brace close, got \" \" (\"INVALID\") while parsing: \"e{a=\\\"1\\\" \""
+ },
+ "input": {
+  "crc32c": "0xdbd3e496",
+  "len": 27,
+  "path": "differential/prometheus-text/cases/label-no-comma-om.om"
+ },
+ "parser": "openmetrics"
+}

@@ -1,6 +1,8 @@
 #!/bin/bash
 # Usage: script/differential <corpus> [--check]
 #   Corpora: pickle (testdata/differential/graphite-pickle/, from tools/differential/pickle/)
+#            prom-text (testdata/differential/prometheus-text/reference/, from
+#            tools/differential/prom-text/)
 #
 # Regenerates a differential corpus under testdata/differential/: generated cases, each committed
 # beside a reference implementation's reading of it, which tests read with no reference installed
@@ -22,8 +24,16 @@ source "${SCRIPT_PATH}/common.sh"
 PY3_IMAGE="python:3.12.15-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1"
 PY2_IMAGE="python:2.7.18-slim@sha256:6c1ffdff499e29ea663e6e67c9b6b9a3b401d554d2c9f061f9a45344e3992363"
 
+# Go 1.27.2, which builds the Prometheus 3.14.0 module tools/differential/prom-text/go.mod pins
+# (`github.com/prometheus/prometheus v0.314.0`, the release whose `prompb` is vendored under
+# crates/logit-proto/proto/prometheus/).
+GO_IMAGE="golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61"
+# The Go module and build caches: downloaded modules are untrusted data, so they live in a docker
+# volume rather than under the repository. `docker volume rm` it to start clean.
+GO_CACHE_VOLUME="logit-differential-go"
+
 usage() {
-    sed -n '2,3p' "$0" >&2
+    sed -n '2,5p' "$0" >&2
     exit 2
 }
 
@@ -53,6 +63,31 @@ generate_pickle() {
             --allowlist /src/pickle.rs --interop /interop --out /out
 }
 
+# generate_prom_text <out_dir>: writes Prometheus's reading of every hand-built case and every
+# recorded scrape body (testdata/interop/prometheus-scrape/) into <out_dir>/cases/ and
+# <out_dir>/prometheus-scrape/. The first container downloads the modules go.sum names, the only
+# step with a network; the second builds and runs the program with none, and with the module proxy
+# off, so it can only use what go.sum verified.
+generate_prom_text() {
+    local out="$1"
+    local gen="${ROOT}/tools/differential/prom-text"
+    local user
+    user="$(id -u):$(id -g)"
+    local env=(-e HOME=/tmp -e GOTOOLCHAIN=local -e GOFLAGS=-mod=readonly
+        -e GOPATH=/cache/gopath -e GOCACHE=/cache/build)
+
+    ${DOCKER} run --rm -v "${GO_CACHE_VOLUME}:/cache" "${GO_IMAGE}" chown "${user}" /cache
+    ${DOCKER} run --rm --user "${user}" "${env[@]}" -v "${GO_CACHE_VOLUME}:/cache" \
+        -v "${gen}:/gen:ro,z" -w /gen "${GO_IMAGE}" go mod download
+    ${DOCKER} run --rm --network none --user "${user}" "${env[@]}" -e GOPROXY=off \
+        -v "${GO_CACHE_VOLUME}:/cache" -v "${gen}:/gen:ro,z" \
+        -v "${ROOT}/testdata/differential/prometheus-text/cases:/cases:ro,z" \
+        -v "${ROOT}/testdata/interop/prometheus-scrape:/recorded:ro,z" \
+        -v "${out}:/out:z" -w /gen "${GO_IMAGE}" \
+        bash -c 'go build -o /cache/prom-text . && /cache/prom-text -cases /cases \
+            -recorded /recorded -out /out'
+}
+
 [ $# -ge 1 ] || usage
 corpus="$1"
 shift
@@ -65,13 +100,14 @@ esac
 
 case "${corpus}" in
     pickle) committed="${ROOT}/testdata/differential/graphite-pickle" ;;
+    prom-text) committed="${ROOT}/testdata/differential/prometheus-text/reference" ;;
     *) usage ;;
 esac
 
 if [ "${check}" = 1 ]; then
     out="$(mktemp -d)"
     trap 'rm -rf "${out}"' EXIT
-    "generate_${corpus}" "${out}"
+    "generate_${corpus//-/_}" "${out}"
     if diff -r -x README.md "${committed}" "${out}"; then
         echo "differential: ${committed#"${ROOT}/"} is current"
     else
@@ -80,6 +116,8 @@ if [ "${check}" = 1 ]; then
     fi
 else
     mkdir -p "${committed}"
-    find "${committed}" -maxdepth 1 -type f ! -name README.md -delete
-    "generate_${corpus}" "${committed}"
+    # Every file a generator writes, so a case it no longer writes doesn't linger. The pickle
+    # corpus is one flat directory; the prom-text readings sit under per-source subdirectories.
+    find "${committed}" -type f ! -name README.md -delete
+    "generate_${corpus//-/_}" "${committed}"
 fi

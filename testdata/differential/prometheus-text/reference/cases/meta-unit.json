@@ -1,0 +1,28 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "m_seconds",
+   "value": "gauge"
+  },
+  {
+   "kind": "unit",
+   "name": "m_seconds",
+   "value": "seconds"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "m_seconds",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x9633258c",
+  "len": 66,
+  "path": "differential/prometheus-text/cases/meta-unit.om"
+ },
+ "parser": "openmetrics"
+}

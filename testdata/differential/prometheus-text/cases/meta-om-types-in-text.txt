@@ -1,0 +1,2 @@
+# TYPE i info
+i_info{v="1"} 1

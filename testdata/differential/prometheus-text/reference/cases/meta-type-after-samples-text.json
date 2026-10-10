@@ -1,0 +1,45 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "h",
+   "value": "histogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_count",
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x33e78b84",
+  "len": 70,
+  "path": "differential/prometheus-text/cases/meta-type-after-samples-text.txt"
+ },
+ "parser": "prom"
+}

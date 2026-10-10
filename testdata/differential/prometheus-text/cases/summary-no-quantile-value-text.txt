@@ -1,0 +1,4 @@
+# TYPE q summary
+q{quantile="x"} 1
+q_sum 10
+q_count 4

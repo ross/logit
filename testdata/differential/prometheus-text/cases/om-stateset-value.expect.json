@@ -1,0 +1,15 @@
+{
+ "divergence": "a `stateset` sample of 2, which OpenMetrics doesn't allow: the model holds a bool, so it reads as 1 (docs/known-gaps/mappings.md: A sample value or timestamp the model can't hold)",
+ "divergent": [
+  [
+   "s",
+   [
+    [
+     "s",
+     "a"
+    ]
+   ]
+  ]
+ ],
+ "result": "ok"
+}

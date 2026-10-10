@@ -1,0 +1,6 @@
+{
+ "degraded": {
+  "histogram_count_mismatch": 1
+ },
+ "result": "ok"
+}

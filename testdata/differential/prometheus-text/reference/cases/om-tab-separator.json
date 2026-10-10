@@ -1,0 +1,14 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [],
+ "error": {
+  "after_entry": 0,
+  "message": "expected value after metric, got \"\\t\" (\"INVALID\") while parsing: \"g\\t\""
+ },
+ "input": {
+  "crc32c": "0x78dd4868",
+  "len": 10,
+  "path": "differential/prometheus-text/cases/om-tab-separator.om"
+ },
+ "parser": "openmetrics"
+}

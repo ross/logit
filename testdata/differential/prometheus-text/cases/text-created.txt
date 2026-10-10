@@ -1,0 +1,6 @@
+# TYPE c counter
+c_total 3
+c_created 1605281325.5
+# TYPE d_total counter
+d_total 1
+d_created 1605281325

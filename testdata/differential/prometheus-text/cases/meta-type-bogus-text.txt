@@ -1,0 +1,2 @@
+# TYPE m bogus
+m 1

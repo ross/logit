@@ -1,0 +1,26 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "ok"
+    ]
+   ],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": {
+  "after_entry": 1,
+  "message": "unsupported character in float while parsing: \"g{v=\\\"hex\\\"} 0x1p-2\""
+ },
+ "input": {
+  "crc32c": "0xdff3a2b9",
+  "len": 51,
+  "path": "differential/prometheus-text/cases/value-hex-om.om"
+ },
+ "parser": "openmetrics"
+}

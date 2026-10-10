@@ -1,0 +1,13 @@
+{
+ "divergence": "a `# TYPE h histogram` after a bare `h_bucket` line: the later bucket lines join the implicit `h_bucket` family the first opened, so `h` holds only `_count` and is skipped `incomplete_series` (docs/known-gaps/mappings.md: A line Prometheus's text parser keeps that this decoder skips)",
+ "divergent": [
+  [
+   "h_count",
+   []
+  ]
+ ],
+ "result": "ok",
+ "skips": {
+  "incomplete_series": 1
+ }
+}

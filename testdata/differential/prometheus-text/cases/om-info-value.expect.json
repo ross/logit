@@ -1,0 +1,15 @@
+{
+ "divergence": "an `info` sample of 2, which OpenMetrics doesn't allow: the model holds no value for an `info` sample, so it reads as 1 (docs/known-gaps/mappings.md: A sample value or timestamp the model can't hold)",
+ "divergent": [
+  [
+   "build_info",
+   [
+    [
+     "version",
+     "1.2.3"
+    ]
+   ]
+  ]
+ ],
+ "result": "ok"
+}

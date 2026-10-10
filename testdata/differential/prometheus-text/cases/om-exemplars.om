@@ -1,0 +1,8 @@
+# TYPE r counter
+r_total 3 # {trace_id="0123456789abcdef0123456789abcdef",span_id="fedcba9876543210"} 0.5 1605281325.5
+# TYPE h histogram
+h_bucket{le="0.1"} 1 # {slow="no"} 0.05
+h_bucket{le="+Inf"} 2 # {} 7
+h_count 2
+h_sum 7.05
+# EOF

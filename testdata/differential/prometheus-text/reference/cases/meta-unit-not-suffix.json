@@ -1,0 +1,20 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "m",
+   "value": "gauge"
+  }
+ ],
+ "error": {
+  "after_entry": 1,
+  "message": "unit \"seconds\" not a suffix of metric \"m\""
+ },
+ "input": {
+  "crc32c": "0x397c15c5",
+  "len": 42,
+  "path": "differential/prometheus-text/cases/meta-unit-not-suffix.om"
+ },
+ "parser": "openmetrics"
+}

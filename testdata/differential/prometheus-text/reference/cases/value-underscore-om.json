@@ -1,0 +1,26 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "ok"
+    ]
+   ],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": {
+  "after_entry": 1,
+  "message": "unsupported character in float while parsing: \"g{v=\\\"us\\\"} 1_000\""
+ },
+ "input": {
+  "crc32c": "0xa3ce9b65",
+  "len": 49,
+  "path": "differential/prometheus-text/cases/value-underscore-om.om"
+ },
+ "parser": "openmetrics"
+}

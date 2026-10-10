@@ -1,0 +1,6 @@
+# TYPE g gaugehistogram
+g_bucket{le="1"} 2
+g_bucket{le="+Inf"} 3
+g_gcount 3
+g_gsum 4
+# EOF

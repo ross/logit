@@ -1,0 +1,2 @@
+# TYPE u untyped
+u 1

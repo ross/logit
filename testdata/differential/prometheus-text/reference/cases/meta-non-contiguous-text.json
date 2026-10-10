@@ -1,0 +1,45 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "a",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "a",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "b",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "b",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "x",
+     "2"
+    ]
+   ],
+   "name": "a",
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xd8564831",
+  "len": 49,
+  "path": "differential/prometheus-text/cases/meta-non-contiguous-text.txt"
+ },
+ "parser": "prom"
+}

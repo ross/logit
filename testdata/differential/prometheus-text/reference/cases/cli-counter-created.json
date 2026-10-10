@@ -1,0 +1,56 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "requests",
+   "value": "counter"
+  },
+  {
+   "kind": "help",
+   "name": "requests",
+   "value": "Total requests served."
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "get"
+    ]
+   ],
+   "name": "requests_total",
+   "ts_ms": 1395066363500,
+   "value": "0x40900c0000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "get"
+    ]
+   ],
+   "name": "requests_created",
+   "value": "0x41d7eba98b47df3b"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "post"
+    ]
+   ],
+   "name": "requests_total",
+   "value": "0x4008000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x4667a94f",
+  "len": 194,
+  "path": "differential/prometheus-text/cases/cli-counter-created.om"
+ },
+ "parser": "openmetrics"
+}

@@ -1,0 +1,40 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "h",
+   "value": "histogram"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_bucket",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_count",
+   "value": "0x4008000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x40d8eddf",
+  "len": 62,
+  "path": "differential/prometheus-text/cases/hist-no-le-text.txt"
+ },
+ "parser": "prom"
+}

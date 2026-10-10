@@ -1,0 +1,36 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "1"
+    ]
+   ],
+   "name": "g",
+   "ts_ms": 9300000000000,
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "2"
+    ]
+   ],
+   "name": "g",
+   "ts_ms": 1605281325000,
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x855245cb",
+  "len": 50,
+  "path": "differential/prometheus-text/cases/ts-om-past-2262.om"
+ },
+ "parser": "openmetrics"
+}
