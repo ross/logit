@@ -316,8 +316,8 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-19](#core-19--the-lua-telemetry-global-script-strings-into-the-process-interner) | P1 | The Lua `telemetry` global: script strings into the process interner | `crates/logit-script/src/telemetry.rs` (`static_str`, `static_metric_name`, `install`) | reviewed @d80f616 |
 | [XFORM-01](#xform-01--aggregate-serieskey-identity-hashing-and-grouping) | P1 | Aggregate: SeriesKey identity, hashing, and grouping | `crates/logit-transforms/src/aggregate.rs` (`SeriesKey`, `hash_value`, `value_key_eq`) | findings → #402, #414, #415, #416 |
 | [XFORM-04](#xform-04--aggregate-cumulative-temporality-and-counter-reset-semantics) | P1 | Aggregate: cumulative temporality and counter-reset semantics | `crates/logit-transforms/src/aggregate.rs` (module doc, `SeriesState::first_seen`) | findings → #407 |
-| [XFORM-06](#xform-06--jsonrs-zero-copy-json-into-attributes-parsing) | P1 | json.rs: zero-copy JSON-into-attributes parsing | `crates/logit-transforms/src/json.rs` (`JsonParser::process`, `borrowed_str_bytes`) | in-progress (untrusted/w11) |
-| [XFORM-08](#xform-08--logfmtrs--kv-parsing-hand-rolled-tokenizers) | P1 | logfmt.rs / kv parsing: hand-rolled tokenizers | `crates/logit-transforms/src/logfmt.rs` (`scan_quoted`, `parse_logfmt`, `parse_kv`) | in-progress (untrusted/w11) |
+| [XFORM-06](#xform-06--jsonrs-zero-copy-json-into-attributes-parsing) | P1 | json.rs: zero-copy JSON-into-attributes parsing | `crates/logit-transforms/src/json.rs` (`JsonParser::process`), `crates/logit-proto/src/message/json.rs` (`parse_object`, `borrowed_str_bytes`) | in-progress (untrusted/w11) |
+| [XFORM-08](#xform-08--logfmtrs--kv-parsing-hand-rolled-tokenizers) | P1 | logfmt.rs / kv parsing: hand-rolled tokenizers | `crates/logit-proto/src/message/logfmt.rs` (`scan_quoted`, `parse_logfmt`, `parse_kv`) | in-progress (untrusted/w11) |
 | [XFORM-09](#xform-09--trace_contextrs-timing-resolution-and-skew-arithmetic) | P1 | trace_context.rs: timing resolution and skew arithmetic | `crates/logit-transforms/src/trace_context.rs` (`timing_nanos`, `f64_seconds_to_nanos`, `quantity`) | unreviewed |
 | [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/stream.rs` (`connect`, `handshake`) | findings → #451 |
 | [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | findings → #450 |
@@ -348,7 +348,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-14](#core-14--template-the-name-parser-and-per-event-renderer) | P2 | `template`: the `{name}` parser and per-event renderer | `crates/logit-core/src/template.rs` (`parse`, `Template::compile`, `Compiled::render`) | unreviewed |
 | [CORE-20](#core-20--countingalloc-the-dev-only-counting-global-allocator) | P2 | `CountingAlloc`: the dev-only counting global allocator | `crates/logit-bench/src/alloc.rs` (`CountingAlloc`, `measure`) | unreviewed |
 | [XFORM-05](#xform-05--aggregate-contributing-context-span-link-bookkeeping) | P2 | Aggregate: contributing-context span-link bookkeeping | `crates/logit-transforms/src/aggregate.rs` (`ContributingContexts`) | findings → #410 |
-| [XFORM-07](#xform-07--csvrs-hand-rolled-rfc-4180-row-splitter) | P2 | csv.rs: hand-rolled RFC 4180 row splitter | `crates/logit-transforms/src/csv.rs` (`split_row`, `unescape`) | in-progress (untrusted/w11) |
+| [XFORM-07](#xform-07--csvrs-hand-rolled-rfc-4180-row-splitter) | P2 | csv.rs: hand-rolled RFC 4180 row splitter | `crates/logit-proto/src/message/csv.rs` (`split_row`, `unescape`) | in-progress (untrusted/w11) |
 | [XFORM-10](#xform-10--regexrs-capture-group-extraction) | P2 | regex.rs: capture-group extraction | `crates/logit-transforms/src/regex.rs` (`RegexParser::new`, `process`) | unreviewed |
 | [XFORM-11](#xform-11--small-filtermutate-transforms-combined) | P2 | Small filter/mutate transforms (combined) | `crates/logit-transforms/src/keep.rs` | unreviewed |
 | [SINK-10](#sink-10--build_client_config--insecure_skip_verify--shared-client-tls-construction) | P2 | `build_client_config` / `insecure_skip_verify` — shared client TLS construction | `crates/logit-outputs/src/tls.rs` (`build_client_config`) | unreviewed |
@@ -6808,9 +6808,10 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
 `aggregation-window-semantics`'s "Cardinality-cap tie-break".
 
 ### XFORM-06 — json.rs: zero-copy JSON-into-attributes parsing
-- **Location:** `json.rs` (`JsonParser::process`), `json.rs` (`borrowed_str_bytes`),
-  `json.rs` (the custom `serde::de::Visitor`/`DeserializeSeed` impls, `TopLevelSeed` and below,
-  deserializing straight into `Value`/`Symbol` instead of via `serde_json::Value`)
+- **Location:** `crates/logit-transforms/src/json.rs` (`JsonParser::process`),
+  `crates/logit-proto/src/message/json.rs` (`borrowed_str_bytes`; the custom
+  `serde::de::Visitor`/`DeserializeSeed` impls, `TopLevelSeed` and below, deserializing straight
+  into `Value`/`Symbol` instead of via `serde_json::Value`)
 - **What it does:** Parses a log message as one JSON object directly into `event.attributes`,
   using a hand-rolled `Deserializer`-driven visitor (not `serde_json::from_slice::<Value>()`) so
   unescaped strings stay zero-copy slices of the original `Bytes` buffer and keys go through a
@@ -6844,7 +6845,7 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   In practice two `Bytes` never coincide like this from one `serde_json::Deserializer::from_slice`
   call, but this is exactly the kind of pointer-provenance reasoning that's easy to get subtly
   wrong and hard to catch by testing).
-- **Existing coverage:** `json.rs` unit tests (the `#[cfg(test)]` module), plus
+- **Existing coverage:** `crates/logit-transforms/src/json.rs`'s unit tests (the `#[cfg(test)]` module), plus
   `crates/logit-bench/tests/allocations.rs`'s `json_parse_one_event`/`json_parse_wide_json_event`/
   `json_parse_reordered_keys_event` (allocation-count pins, which indirectly also exercise the
   zero-copy path -- a regression to copying would likely fail these). ADR:
@@ -6859,7 +6860,7 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   guarantee blindly.
 
 ### XFORM-07 — csv.rs: hand-rolled RFC 4180 row splitter
-- **Location:** `csv.rs` (`split_row`, `unescape`)
+- **Location:** `crates/logit-proto/src/message/csv.rs` (`split_row`, `unescape`)
 - **What it does:** A hand-rolled (no `csv` crate dependency) single-pass byte scanner implementing
   RFC 4180 quoting (embedded newlines explicitly out of scope, per the ADR) to split one message
   line into `(start, end, needs_unescape)` byte-offset triples, then unescapes doubled `""` only
@@ -6872,9 +6873,8 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
     something upstream bounds a single log line to well under 4 GiB, since a longer line would
     silently truncate/wrap these offsets via the `as u32` casts in `split_row`'s `out.push`
     calls).
-  - `split_row`'s precondition "`!line.is_empty()`" (its doc comment) is enforced by the caller
-    (`process` returns early on an empty message) -- verify every call site still upholds this if
-    the function is ever reused elsewhere.
+  - `split_row` treats an empty `line` as one empty field (its doc comment, pinned by a test), and
+    `process` still returns early on an empty message, so the transform never reaches that case.
   - The single UTF-8 validity check on the whole message (`std::str::from_utf8(&raw)` in `process`) is claimed sufficient to
     guarantee every subsequently-sliced field is also valid UTF-8, reasoning that `delimiter`/`"`
     are single ASCII bytes and never fall inside a multi-byte sequence -- verify this reasoning
@@ -6900,8 +6900,8 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   `u32` truncation is the only latent numeric concern and is very unlikely to be reachable.
 
 ### XFORM-08 — logfmt.rs / kv parsing: hand-rolled tokenizers
-- **Location:** `logfmt.rs` (`scan_quoted`, `parse_logfmt`, `find_bytes`, `parse_kv_segment`,
-  `parse_kv`, `unescape`)
+- **Location:** `crates/logit-proto/src/message/logfmt.rs` (`scan_quoted`, `parse_logfmt`,
+  `find_bytes`, `parse_kv_segment`, `parse_kv`, `unescape`)
 - **What it does:** Two hand-rolled, allocation-minimal tokenizers over the same message buffer:
   `logfmt` (whitespace-delimited, `"`-quoted-with-backslash-escapes) and `kv` (configurable
   literal separators, no quoting). Both resynchronize past malformed spans (e.g. a leading `=`
@@ -6930,7 +6930,7 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   infinite loop; the resynchronization logic is subtle enough (three separate "value" arms in
   `parse_logfmt`, each advancing `i` differently) that a fuzz target would be higher-value here
   than more manual reading.
-- **Existing coverage:** `logfmt.rs` has a large test module covering quoting,
+- **Existing coverage:** `crates/logit-transforms/src/logfmt.rs` has a large test module covering quoting,
   escapes, unterminated quotes, bare keys, and `kv`'s three empty/bareword/no-separator segment
   shapes; `crates/logit-bench/tests/allocations.rs` pins allocation counts for the escaped-value
   case. ADR: `logfmt-and-kv-parsing.md`.

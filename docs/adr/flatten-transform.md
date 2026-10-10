@@ -12,7 +12,7 @@ Accepted
 
 `Value::Map(Box<AttrMap>)` and `Value::Array(Vec<Value>)` are first-class, and four things in this
 codebase produce nesting today: the `json` transform (which merges only the *top* level, so one
-level down stays a `Value::Map` — `crates/logit-transforms/src/json.rs`), OTLP's `KvlistValue`
+level down stays a `Value::Map` — `crates/logit-proto/src/message/json.rs`), OTLP's `KvlistValue`
 decode (`crates/logit-proto/src/otlp/common.rs`), `syslog_in`'s deliberately two-level `syslog.sd`
 map ([ADR `syslog-structured-data-convention`](syslog-structured-data-convention.md)), and Lua
 (`crates/logit-script/src/value.rs`, which round-trips a `Value::Map`/`Array` to and from a real

@@ -956,7 +956,7 @@ crates/
   logit-core        internal event model: Event, Value, Resource, metric kinds, interner, self-telemetry
   logit-config      YAML config types + generated JSON Schema
   logit-script      LuaJIT embedding (mlua), the Event proxy
-  logit-proto       codec traits, native wire format, output buffering, statsd (statsd_in's decoder), syslog (syslog_in's decoder)
+  logit-proto       codec traits, native wire format, output buffering, statsd (statsd_in's decoder), syslog (syslog_in's decoder), message (the json, csv, logfmt, and kv parse cores the transforms wrap)
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target; the listener), syslog (the listener), graphite, lines (lines_in), collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), splunk (splunk_hec_out), logit (logit_out), null_out (load-test discard sink)

@@ -48,7 +48,8 @@ listener in `logit-inputs` or a transform in `logit-transforms` holds only:
 
 - its I/O: sockets, TLS, files, and the read loop;
 - its policy: which framing to use, `json`'s `invalid_utf8` retry, and what a failure costs;
-- its diagnostics and telemetry;
+- its diagnostics and telemetry, except a counter a parse core takes a `Telemetry` for
+  (`logfmt` and `kv` count their pairs inside the parse);
 - its `Input` or `Transform` impl.
 
 It calls the `logit-proto` parser for everything else.

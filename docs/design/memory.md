@@ -252,7 +252,7 @@ line.
 | `regex` parse 1 event (sshd shape, 3 captures onto 6 existing `syslog.*` attrs) | **1** | spills past `AttrMap`'s 8-entry inline capacity |
 | `regex` no match, 1 event | **0** | nothing written, nothing allocated |
 | `csv` parse + merge (7-column access line, one quoted-but-unescaped field) | **0** | interned columns, `insert_sym`, `Bytes::slice` throughout -- fits `AttrMap`'s inline capacity |
-| `csv` parse + merge (one doubled-quote field) | **1** | `unescape`'s own copy -- the only path in `csv` that allocates (`crates/logit-transforms/src/csv.rs`) |
+| `csv` parse + merge (one doubled-quote field) | **1** | `unescape`'s own copy -- the only path in `csv` that allocates (`crates/logit-proto/src/message/csv.rs`) |
 | `csv` parse + merge (16-column wide row) | **1** | `AttrMap` inline-capacity spill only -- every field itself is still a zero-copy slice |
 | `kv_metrics` derive 4 metrics | **1** | the `MetricList` spill, grown once via `reserve`; was 3 while each distribution sketched per event -- they are raw inline `MetricKind::Samples` now ([ADR `kv-metrics-semantics`](../adr/kv-metrics-semantics.md)) |
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
@@ -992,7 +992,7 @@ practice that means:
   `build_event`), which are client-controlled and where putting an id in the name is a well-worn
   anti-pattern: `user.<id>.logins`, `deploys.<sha>`, `orders.<order_id>.latency`. One such client is
   enough.
-- Secondarily, **JSON object keys** from log bodies (`json.rs`) when a producer puts data in key
+- Secondarily, **JSON object keys** from log bodies (`logit_proto::message::json`) when a producer puts data in key
   position (`{"req_a1b2c3": {...}}`), and **DogStatsD tag keys** for the same reason. Both are
   schema-shaped in normal use and unbounded only when abused.
 

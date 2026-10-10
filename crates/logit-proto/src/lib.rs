@@ -14,6 +14,7 @@ pub mod frame;
 pub mod framing;
 pub mod graphite;
 pub mod json;
+pub mod message;
 pub mod msgbuf;
 pub mod msgpack;
 pub mod multi_value;

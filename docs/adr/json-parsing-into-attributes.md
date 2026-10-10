@@ -65,7 +65,7 @@ what makes a line like `2026-08-29 INFO {"a":1} took=3ms` parse at all. The two 
 differ on trailing-content strictness, not just on where they start.
 
 **Values are decoded directly into `logit_core::Value`**, via a `serde::de::DeserializeSeed`/
-`Visitor` pair (`crates/logit-transforms/src/json.rs`), rather than through an intermediate
+`Visitor` pair (`crates/logit-proto/src/message/json.rs`), rather than through an intermediate
 `serde_json::Value` tree and a separate conversion. Two reasons: one fewer allocation-and-walk per
 line, and it lets an *unescaped* JSON string decode as a zero-copy `Bytes` slice of the original
 message buffer rather than a fresh allocation — the "`bytes::Bytes` everywhere strings and blobs

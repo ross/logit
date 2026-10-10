@@ -25,8 +25,8 @@ lz4_flex.workspace = true
 crc32c.workspace = true
 # OTLP/JSON decoding (src/otlp/json) -- both already resolve in Cargo.lock at these exact versions
 # via other workspace members (serde_json transitively through several crates, base64 through
-# reqwest/rustls), so neither adds a new crate version to the dependency graph. No `serde` here:
-# the JSON walk is plain functions over `serde_json::Value`, not `Deserialize` derives -- see
+# reqwest/rustls), so neither adds a new crate version to the dependency graph. OTLP/JSON uses no
+# `serde` derives: the JSON walk is plain functions over `serde_json::Value` -- see
 # ADR `otlp-json-decoding` for why (short version: derives can't express OTLP's hex-vs-base64 or
 # string-or-number dialect rules without fighting the derive, and this crate's generated `prost`
 # types are never hand-edited -- ADR `committed-pregenerated-otlp-protobuf`).
@@ -41,6 +41,9 @@ crc32c.workspace = true
 # `arbitrary_precision`, which would change every `serde_json::Number` in the workspace.
 serde_json = { workspace = true, features = ["float_roundtrip", "raw_value"] }
 base64.workspace = true
+# `message::json` drives the `serde::de` traits directly (a `DeserializeSeed` per value, no derive),
+# so a parsed string can stay a zero-copy slice of the message.
+serde.workspace = true
 # Prometheus remote-write's two body encodings, Snappy block format and zstd, both through
 # prometheus/compression.rs, which the remote-write sink and receiver share.
 snap.workspace = true
