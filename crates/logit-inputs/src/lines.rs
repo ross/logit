@@ -23,10 +23,11 @@
 //! `max_line_bytes` as the bound. The framer strips one `CR` before each `LF` and hands
 //! [`LinesDecoder`] one line at a time. A line past the bound is dropped, counted once as
 //! `logit.input.frames.dropped{reason="oversize"}`, and the connection resynchronizes at the next
-//! `LF`. An unterminated final line at a close is dropped and counted `reason="truncated"`, the
-//! driver's rule for every line-framed listener: a sender that stopped mid-line never finished it.
-//! Never [`FramingMode::Rfc6587Auto`], which would read a line opening with a digit as an octet
-//! count.
+//! `LF`; `reason="drained"` in place of `oversize` when the line crossed the bound before its `LF`
+//! arrived, so the connection discards input until its next one. An unterminated final line at a
+//! close is dropped and counted `reason="truncated"`, the driver's rule for every line-framed
+//! listener: a sender that stopped mid-line never finished it. Never
+//! [`FramingMode::Rfc6587Auto`], which would read a line opening with a digit as an octet count.
 //!
 //! **`udp` and `unix`**: the driver hands [`LinesDecoder`] a whole datagram, which it splits on
 //! `LF` itself. A datagram's end also ends its last line, so an unterminated tail is emitted. The

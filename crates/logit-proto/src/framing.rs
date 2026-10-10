@@ -9,6 +9,18 @@
 //! or DogStatsD's 4-byte little-endian one (`statsd_in`'s `transport: unix_stream`; ADR
 //! `datadog-agent-and-intake-relay`, decision 12).
 //!
+//! **What a connection holds.** Between pushes, after `next_frame` returns `Ok(None)`, the buffer
+//! holds at most `max_frame_bytes` under LF framing, `max_frame_bytes + 10` under octet counting
+//! (nine count digits and the SP), and `max_frame_bytes + 4` under a length prefix; a drain in
+//! progress holds nothing. The line bound is checked after a push, not during it, so the peak
+//! inside a push is that plus one push: `max_frame_bytes + READ_BUFFER_BYTES` under LF framing,
+//! since the driver pushes at most [`READ_BUFFER_BYTES`] at a time.
+//!
+//! **FIN and RST agree.** A connection's remainder is decided by [`Framer::finish`] on a clean EOF
+//! and by [`Framer::abandon`] on every other end, and the two count the same bytes the same way.
+//! The one exception is `Rfc6587Auto`'s LF framing, where a FIN delivers a remainder with
+//! content as a final message.
+//!
 //! The sockets, the first-byte and idle deadlines, and what a [`FrameError`] costs a connection
 //! are the driver's: `crates/logit-inputs/src/tcp.rs`'s module doc.
 
@@ -19,7 +31,8 @@ use bytes::{Bytes, BytesMut};
 /// calls it.
 ///
 /// Not configurable on `syslog_in` or `statsd_in`. `graphite_in` overrides it with its own
-/// `max_line_bytes`/`max_frame_bytes`, which carbon's receivers expose. It is *not* tied to
+/// `max_line_bytes`/`max_frame_bytes`, which carbon's receivers expose, and `lines_in` with its
+/// `max_line_bytes`, which defaults to this value. It is *not* tied to
 /// `syslog_out`'s `max_message_bytes` (8192): that is a sender-side knob an operator may raise,
 /// and a receiver ceiling tracking it would need re-tuning in lockstep with every sender. 64 KiB
 /// matches the practical per-message ceiling the UDP driver's 65507-byte read buffer already
@@ -53,7 +66,8 @@ pub enum FramingMode {
     /// life (`docs/adr/syslog-tcp-ingress-and-tls.md`). `syslog_in`'s mode, and nothing else's.
     Rfc6587Auto,
     /// LF-delimited lines only, never octet counting, whatever the first byte is. `graphite_in`
-    /// plaintext and `statsd_in`.
+    /// plaintext, `statsd_in`'s `tcp`, and `lines_in`'s `tcp` and `unix_stream`, each under
+    /// [`Oversize::DrainToNextLine`].
     Lines {
         /// What a line past the frame bound does.
         oversize: Oversize,
@@ -71,10 +85,13 @@ pub enum FramingMode {
 /// What [`FramingMode::Lines`] does with a line past the frame bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Oversize {
-    /// Close the connection, as RFC 6587 framing does: a line past the ceiling can only get
-    /// longer, and under octet counting there is no resync point.
+    /// Close the connection: a line past the ceiling can only get longer. The policy
+    /// `Rfc6587Auto`'s LF framing always applies (`syslog_in`). No shipped listener configures
+    /// `Lines { oversize: Fatal }`; it stays for a line protocol that prefers a close to a resync.
     Fatal,
-    /// Skip that one line and resynchronize at the next `LF`, counting the skip **once**. Carbon's
+    /// Skip that one line and resynchronize at the next `LF`, counting the skip **once**: as
+    /// [`FrameError::Drained`] if the line crossed the bound with no `LF` buffered, so the framer
+    /// discards input until one arrives, else as [`FrameError::OversizeSkipped`]. Carbon's
     /// behaviour (`docs/adr/graphite-carbon-relay.md`): one pathological datapoint must not cost a
     /// busy relay's whole connection, and an LF-delimited stream has an unambiguous resync point.
     DrainToNextLine,
@@ -120,10 +137,10 @@ impl Framing {
 
 /// Why [`Framer`] could not produce the next frame.
 ///
-/// All but [`FrameError::OversizeSkipped`] are fatal *to the connection*
-/// ([`FrameError::is_fatal`]), so the driver counts, diagnoses, and closes: an untrusted octet
-/// count leaves no way to find the next frame, a declared length past the ceiling has nothing
-/// buffered after it, and a line past the ceiling would only get longer.
+/// All but [`FrameError::OversizeSkipped`] and [`FrameError::Drained`] are fatal *to the
+/// connection* ([`FrameError::is_fatal`]), so the driver counts, diagnoses, and closes: a corrupt
+/// octet count leaves no way to find the next frame, a declared length past the ceiling has
+/// nothing buffered after it, and a line past the ceiling would only get longer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
     /// A frame larger than this listener's frame bound -- a declared octet count or length prefix
@@ -137,29 +154,39 @@ pub enum FrameError {
     /// length promised are missing; under [`FramingMode::Lines`], a non-whitespace remainder has
     /// no `LF`. Nothing was wrong with what the peer sent; it stopped. See [`Framer::finish`].
     Truncated(String),
-    /// One line past the frame bound under [`Oversize::DrainToNextLine`]: dropped, counted, and
-    /// resynchronized at the next `LF`. The one **non-fatal** variant: the connection stays open
-    /// and the next line still decodes.
+    /// One line past the frame bound under [`Oversize::DrainToNextLine`] whose `LF` was already
+    /// buffered, or that the peer closed on: dropped and counted, and the next line frames with
+    /// no drain state. **Non-fatal**: the connection stays open and the next line still decodes.
     OversizeSkipped(String),
+    /// One line that crossed the frame bound under [`Oversize::DrainToNextLine`] with no `LF`
+    /// buffered: dropped and counted once, and the framer then discards every byte up to and
+    /// including the connection's next `LF`. **Non-fatal**, like `OversizeSkipped`, but its own
+    /// reason: a connection that never sends another `LF` (a binary protocol pointed at a line
+    /// port) discards input for its whole life, and this is what tells it apart from one long
+    /// line that ended.
+    Drained(String),
 }
 
 impl FrameError {
     /// The `reason` tag on `logit.input.frames.dropped`
     /// (`docs/design/internal-telemetry.md`'s "Naming" section). `OversizeSkipped` shares
     /// `oversize` with its fatal sibling: the operator cares that a frame was too big, and
-    /// `is_fatal` says whether the connection survived.
+    /// `is_fatal` says whether the connection survived. `Drained` is `drained`.
     pub fn reason(&self) -> &'static str {
         match self {
             FrameError::Oversize(_) | FrameError::OversizeSkipped(_) => "oversize",
+            FrameError::Drained(_) => "drained",
             FrameError::Malformed(_) => "malformed",
             FrameError::Truncated(_) => "truncated",
         }
     }
 
-    /// Whether this error ends the connection. Only [`FrameError::OversizeSkipped`] does not:
-    /// every other variant leaves the framer with no trustworthy resync point.
+    /// Whether this error ends the connection. [`FrameError::OversizeSkipped`] and
+    /// [`FrameError::Drained`] do not, because each leaves the framer resynchronized (the
+    /// terminator consumed, or the drain state latched); every other variant leaves it with no
+    /// trustworthy resync point.
     pub fn is_fatal(&self) -> bool {
-        !matches!(self, FrameError::OversizeSkipped(_))
+        !matches!(self, FrameError::OversizeSkipped(_) | FrameError::Drained(_))
     }
 }
 
@@ -169,7 +196,8 @@ impl std::fmt::Display for FrameError {
             FrameError::Oversize(detail)
             | FrameError::Malformed(detail)
             | FrameError::Truncated(detail)
-            | FrameError::OversizeSkipped(detail) => f.write_str(detail),
+            | FrameError::OversizeSkipped(detail)
+            | FrameError::Drained(detail) => f.write_str(detail),
         }
     }
 }
@@ -186,7 +214,7 @@ pub struct Framer {
     mode: FramingMode,
     /// The largest single frame this connection will assemble. Per listener, not a constant:
     /// `syslog_in`/`statsd_in` take [`MAX_FRAME_BYTES`], a `graphite_in` takes its operator-facing
-    /// `max_line_bytes`/`max_frame_bytes`.
+    /// `max_line_bytes`/`max_frame_bytes`, and a `lines_in` its `max_line_bytes`.
     max_frame_bytes: usize,
     /// `None` only under [`FramingMode::Rfc6587Auto`] before the first byte arrives (the latch
     /// rule is on [`Framing`]). Both explicit modes set it at construction.
@@ -198,7 +226,8 @@ pub struct Framer {
     scanned: usize,
     /// Set when a line passed the bound with no `LF` under [`Oversize::DrainToNextLine`]:
     /// everything up to and including the next `LF` belongs to that abandoned line and is
-    /// discarded uncounted (the skip was counted once, when the bound was crossed).
+    /// discarded uncounted (the line was counted once, as [`FrameError::Drained`], when the bound
+    /// was crossed).
     draining: bool,
     /// Whether this connection has ever produced a byte: the first-byte deadline's predicate
     /// ([`Self::first_byte_seen`]).
@@ -244,12 +273,32 @@ impl Framer {
         self.seen_bytes
     }
 
-    /// Bytes held but not yet formed into a frame. Read by the stream driver's
-    /// `report_buffered_tail` (`crates/logit-inputs/src/tcp.rs`) on the paths
-    /// that end a connection without reaching [`Framer::finish`] (a peer RST mid-message, or
-    /// shutdown), so a discarded partial frame is still counted.
+    /// Bytes held but not yet formed into a frame, bounded as this module's doc says. What a
+    /// connection that ends here loses is [`Framer::abandon`]'s to decide, not this count's: a
+    /// blank remainder holds bytes and loses nothing.
     pub fn buffered(&self) -> usize {
         self.buf.len()
+    }
+
+    /// What a connection that ends without a clean EOF loses: a peer RST mid-message, a shutdown,
+    /// or an idle close. The stream driver's `report_buffered_tail`
+    /// (`crates/logit-inputs/src/tcp.rs`) counts the returned error. Discards the remainder.
+    ///
+    /// Agrees with [`Framer::finish`] over the same bytes: `None` for an empty or blank remainder
+    /// ([`Self::remainder_is_blank`]) and for a drain's tail, [`FrameError::Truncated`] otherwise.
+    /// The one difference is `Rfc6587Auto`'s LF framing, where `finish` delivers a remainder with
+    /// content as a final message and this counts it `truncated`: no FIN means the sender never
+    /// said it was done.
+    pub fn abandon(&mut self) -> Option<FrameError> {
+        let held = self.buf.len();
+        let lost = held > 0 && !self.draining && !self.remainder_is_blank();
+        self.buf.clear();
+        self.scanned = 0;
+        lost.then(|| {
+            FrameError::Truncated(format!(
+                "the connection ended abruptly with {held} byte(s) of an incomplete frame buffered"
+            ))
+        })
     }
 
     /// Appends whatever came off the socket. Under [`FramingMode::Rfc6587Auto`] only, latches
@@ -311,9 +360,9 @@ impl Framer {
     ///
     /// So under every framing a clean FIN and an abrupt RST agree about the same bytes: the
     /// stream driver's `ReadStep::Eof` arm routes this `Err` through `report_frame_error`, and
-    /// its `report_buffered_tail` reports the RST case identically
-    /// (`crates/logit-inputs/src/tcp.rs`). The one case with no counter
-    /// either way is a drain in progress, whose bytes were counted when the bound was crossed.
+    /// its `report_buffered_tail` reports the RST case through [`Framer::abandon`], which shares
+    /// this method's blank-remainder rule (`crates/logit-inputs/src/tcp.rs`). Neither counts a
+    /// drain in progress, whose line was counted `drained` when it crossed the bound.
     pub fn finish(&mut self) -> Result<Option<Bytes>, FrameError> {
         if self.buf.is_empty() {
             return Ok(None);
@@ -362,17 +411,18 @@ impl Framer {
                         )),
                     });
                 }
+                let blank = self.remainder_is_blank();
                 let line = self.buf.split_to(self.buf.len()).freeze();
                 self.scanned = 0;
-                let line = strip_cr(line);
-                if line.is_empty() {
+                if blank {
                     return Ok(None);
                 }
+                let line = strip_cr(line);
                 match self.mode {
                     // RFC 6587 §3.4.2 can't distinguish "the sender finished and closed" from
                     // "the sender died mid-message", and permits a final message with no
-                    // terminator, so this is an ordinary message. (`LengthPrefixed` never gets
-                    // here: its framing is never `NonTransparent`.)
+                    // terminator, so this is an ordinary message. (Neither length-prefixed mode
+                    // gets here: its framing is never `NonTransparent`.)
                     FramingMode::Rfc6587Auto
                     | FramingMode::LengthPrefixed
                     | FramingMode::LengthPrefixedLe => Ok(Some(line)),
@@ -380,22 +430,31 @@ impl Framer {
                     // without one is a truncated frame, not a short message; carbon's own
                     // receiver discards it. Emitting it would turn a sender dying mid-line into a
                     // datapoint with a truncated path or timestamp, and would make a clean FIN
-                    // disagree with an RST, which `report_buffered_tail` counts `truncated`.
-                    FramingMode::Lines { .. } => {
-                        // Whitespace only (trailing padding, a bare `CR`, a keepalive): nothing
-                        // was lost, so nothing is counted, as `next_frame` does for an empty line.
-                        if line.iter().all(|b| b.is_ascii_whitespace()) {
-                            return Ok(None);
-                        }
-                        Err(FrameError::Truncated(format!(
-                            "the peer closed with a {}-byte unterminated line buffered; a \
-                             line-framed stream's LF is its only completeness signal, so the \
-                             remainder is dropped",
-                            line.len()
-                        )))
-                    }
+                    // disagree with an RST, which `abandon` counts `truncated`.
+                    FramingMode::Lines { .. } => Err(FrameError::Truncated(format!(
+                        "the peer closed with a {}-byte unterminated line buffered; a \
+                         line-framed stream's LF is its only completeness signal, so the \
+                         remainder is dropped",
+                        line.len()
+                    ))),
                 }
             }
+        }
+    }
+
+    /// Whether the buffered remainder carries no message, so a connection ending on it lost
+    /// nothing and neither [`Framer::finish`] nor [`Framer::abandon`] counts it. Under
+    /// [`FramingMode::Lines`] that is whitespace only (trailing padding, a bare `CR`), as
+    /// `next_frame` skips an empty line; under `Rfc6587Auto`'s LF framing, nothing left once one
+    /// `CR` is stripped, since a whitespace remainder there is a final message `finish` delivers.
+    /// Under a declared length, only an empty buffer.
+    fn remainder_is_blank(&self) -> bool {
+        match (self.framing, self.mode) {
+            (Some(Framing::NonTransparent), FramingMode::Lines { .. }) => {
+                self.buf.iter().all(u8::is_ascii_whitespace)
+            }
+            (Some(Framing::NonTransparent), _) => matches!(&self.buf[..], b"" | b"\r"),
+            _ => self.buf.is_empty(),
         }
     }
 
@@ -447,9 +506,9 @@ impl Framer {
                         self.buf.clear();
                         self.scanned = 0;
                         self.draining = true;
-                        FrameError::OversizeSkipped(format!(
+                        FrameError::Drained(format!(
                             "a line reached {held} bytes with no LF, over the {bound}-byte bound; \
-                             skipping it and draining to the next newline"
+                             skipping it, and this connection discards input until its next LF"
                         ))
                     }
                 });
@@ -482,8 +541,9 @@ impl Framer {
     /// A 4-byte payload length, then that many payload bytes: big-endian for Twisted's
     /// `Int32StringReceiver` ([`FramingMode::LengthPrefixed`]), little-endian for DogStatsD's
     /// stream socket ([`FramingMode::LengthPrefixedLe`]); `read_len` is the byte order. The prefix
-    /// is validated and stripped here, so the decoder gets one unframed payload, which
-    /// `GraphiteDecoder`'s pickle path expects (framing is the listener's job).
+    /// is validated and stripped here, so the decoder gets one unframed payload: `GraphiteDecoder`'s
+    /// pickle path expects one pickle, and `StatsdDecoder` one packet of lines, as it gets from a
+    /// datagram (framing is the listener's job).
     ///
     /// A declared length past the bound is [`FrameError::Oversize`] and fatal: unlike an
     /// LF-delimited stream there is no resync point to skip to. A short buffer is `Ok(None)`.
@@ -872,7 +932,7 @@ mod tests {
         // Past the bound with no terminator: abandon the line and discard until its `LF`.
         framer.push(&[b'x'; 40]);
         let err = framer.next_frame().expect_err("40 bytes with no LF is past the 16-byte bound");
-        assert_eq!(err.reason(), "oversize", "{err}");
+        assert_eq!(err.reason(), "drained", "{err}");
         assert!(!err.is_fatal(), "a line protocol resynchronizes at the next LF: {err}");
         assert_eq!(framer.next_frame(), Ok(None), "still draining, nothing to hand over");
 
@@ -891,6 +951,41 @@ mod tests {
         assert_eq!(err.reason(), "oversize", "{err}");
         assert!(!err.is_fatal(), "{err}");
         assert_eq!(push_and_drain(&mut terminated, b""), vec!["survivor"]);
+    }
+
+    /// Only a line that enters the drain state counts `drained`; a line whose `LF` is buffered, a
+    /// remainder the peer closed on, and `Oversize::Fatal` keep `oversize`.
+    #[test]
+    fn only_a_line_that_enters_the_drain_state_counts_drained() {
+        let drain = FramingMode::Lines { oversize: Oversize::DrainToNextLine };
+
+        let mut crossing = Framer::new(drain, 16);
+        let err = push_and_expect_error(&mut crossing, &[b'x'; 17]);
+        assert_eq!(err, FrameError::Drained(err.to_string()));
+        assert_eq!(err.reason(), "drained");
+        assert!(!err.is_fatal(), "{err}");
+        assert!(err.to_string().contains("discards input until its next LF"), "{err}");
+        // Many more pushes without an `LF` are the same dropped line: nothing more is counted.
+        for _ in 0..64 {
+            assert_eq!(push_and_drain(&mut crossing, &[b'y'; 100]), Vec::<String>::new());
+            assert_eq!(crossing.buffered(), 0, "the drain holds nothing");
+        }
+        assert_eq!(push_and_drain(&mut crossing, b"tail\nnext\n"), vec!["next"]);
+
+        let mut terminated = Framer::new(drain, 16);
+        let err = push_and_expect_error(&mut terminated, b"0123456789abcdefg\n");
+        assert_eq!(err.reason(), "oversize", "the LF was buffered, so no drain: {err}");
+        assert!(!err.is_fatal(), "{err}");
+
+        let mut closed = Framer::new(drain, 16);
+        closed.push(&[b'x'; 17]);
+        let err = closed.finish().expect_err("a remainder over the bound at EOF is dropped");
+        assert_eq!(err.reason(), "oversize", "a closed connection drains nothing: {err}");
+
+        let mut fatal = Framer::new(FramingMode::Lines { oversize: Oversize::Fatal }, 16);
+        let err = push_and_expect_error(&mut fatal, &[b'x'; 17]);
+        assert_eq!(err.reason(), "oversize", "{err}");
+        assert!(err.is_fatal(), "{err}");
     }
 
     /// Under `Lines` an unterminated remainder at a clean EOF is truncated, unlike under
@@ -924,6 +1019,63 @@ mod tests {
             syslog.finish().expect("RFC 6587 permits a terminator-less final message"),
             Some(Bytes::from_static(b"<13>no terminator"))
         );
+    }
+
+    /// A remainder that carries no message: whitespace under `Lines`, a lone `CR` under
+    /// `Rfc6587Auto`'s LF framing. [`Framer::finish`] drops it uncounted, so an RST over the same
+    /// bytes must count nothing either.
+    #[test]
+    fn a_blank_remainder_is_counted_by_neither_a_fin_nor_an_rst() {
+        let drain = FramingMode::Lines { oversize: Oversize::DrainToNextLine };
+        let fatal = FramingMode::Lines { oversize: Oversize::Fatal };
+        let cases: [(FramingMode, &[u8]); 4] = [
+            (drain, b"a.b 1 17000\n \t"),
+            (fatal, b"a.b 1 17000\n\r"),
+            (drain, b"a.b 1 17000\r\n\r\r "),
+            (FramingMode::Rfc6587Auto, b"<13>a\n\r"),
+        ];
+        for (mode, wire) in cases {
+            let label = format!("{mode:?} {:?}", String::from_utf8_lossy(wire));
+            let mut fin = Framer::new(mode, MAX_FRAME_BYTES);
+            let mut rst = Framer::new(mode, MAX_FRAME_BYTES);
+            assert_eq!(push_and_drain(&mut fin, wire).len(), 1, "{label}");
+            assert_eq!(push_and_drain(&mut rst, wire).len(), 1, "{label}");
+            assert!(rst.buffered() > 0, "the case leaves its remainder buffered: {label}");
+            assert_eq!(fin.finish(), Ok(None), "a FIN drops the blank remainder: {label}");
+            assert_eq!(rst.abandon(), None, "and an RST over the same bytes agrees: {label}");
+            assert_eq!(rst.buffered(), 0, "the remainder is discarded either way: {label}");
+        }
+    }
+
+    /// The FIN/RST rule for a remainder that does carry bytes: both count it `truncated`, except
+    /// `Rfc6587Auto`'s LF framing, where a FIN delivers it as RFC 6587 §3.4.2 permits.
+    #[test]
+    fn a_remainder_with_content_is_truncated_by_an_rst_under_every_framing() {
+        let cases: [(FramingMode, &[u8], bool); 6] = [
+            (FramingMode::Rfc6587Auto, b"<13>a\n<13>half", true),
+            (FramingMode::Rfc6587Auto, b"<13>a\n ", true),
+            (FramingMode::Rfc6587Auto, b"9 <13>", false),
+            (FramingMode::Lines { oversize: Oversize::DrainToNextLine }, b"a.b 1", false),
+            (FramingMode::LengthPrefixed, &[0, 0, 0, 9, b'h'], false),
+            (FramingMode::LengthPrefixedLe, &[9, 0], false),
+        ];
+        for (mode, wire, fin_delivers) in cases {
+            let label = format!("{mode:?} {:?}", String::from_utf8_lossy(wire));
+            let mut fin = Framer::new(mode, MAX_FRAME_BYTES);
+            let mut rst = Framer::new(mode, MAX_FRAME_BYTES);
+            push_and_drain(&mut fin, wire);
+            push_and_drain(&mut rst, wire);
+            let rst = rst.abandon().unwrap_or_else(|| panic!("an RST counts: {label}"));
+            assert_eq!(rst.reason(), "truncated", "{label}");
+            match fin.finish() {
+                Ok(Some(_)) => assert!(fin_delivers, "only auto LF delivers on a FIN: {label}"),
+                Err(err) => {
+                    assert!(!fin_delivers, "{label}");
+                    assert_eq!(err.reason(), "truncated", "a FIN agrees: {label}");
+                }
+                Ok(None) => panic!("a FIN over a remainder with content counts it: {label}"),
+            }
+        }
     }
 
     #[test]

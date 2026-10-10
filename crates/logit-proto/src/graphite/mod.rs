@@ -54,7 +54,7 @@
 //! | not exactly 3 whitespace-separated fields; an unparseable value; non-UTF-8 bytes; an empty path | skipped | `logit.input.metrics.skipped{reason="bad_line"}` + diag `bad_line` |
 //! | malformed tag (a `;` segment with no `=`, an empty name, or an empty value) | the **whole line** is skipped -- carbon's own `TaggedSeries.parse` raises rather than dropping the one tag | `logit.input.metrics.skipped{reason="bad_tag"}` + diag `bad_tag` |
 //! | empty / whitespace-only line | skipped, **uncounted** (packet padding, a trailing `\n`) | -- |
-//! | line longer than `max_line_bytes` (TCP) | the framer drops it and resynchronizes at the next `\n`; the line after it still decodes, and the connection stays up | `logit.input.frames.dropped{reason="oversize"}` + diag `framing_error` |
+//! | line longer than `max_line_bytes` (TCP) | the framer drops it and resynchronizes at the next `\n`; the line after it still decodes, and the connection stays up | `logit.input.frames.dropped{reason="oversize"}`, or `reason="drained"` when the line crossed the bound before its `\n` arrived, after which the connection discards input until its next `\n` + diag `framing_error` |
 //! | pickle frame longer than `max_frame_bytes` | the connection is closed -- there is no resync point in a length-framed stream | `logit.input.frames.dropped{reason="oversize"}` + diag `framing_error` |
 //! | a disallowed pickle opcode, or the depth/item caps | `CodecError::Malformed`, the whole frame is dropped | diag `bad_pickle` |
 //! | a pickle item that is not `(str, (num, num))` | **that datapoint** is skipped; the rest of the frame still decodes | `logit.input.metrics.skipped{reason="bad_shape"}` + diag `bad_shape` |

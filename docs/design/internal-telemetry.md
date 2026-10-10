@@ -720,7 +720,7 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 | `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
 | `logit.input.connections.closed{reason="idle"}` | count | an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. A close at shutdown is not counted: there is no `reason="shutdown"`, because the runtime would record it after `internal`'s final drain |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
-| `logit.input.frames.dropped{reason="oversize"\|"malformed"\|"truncated"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses |
+| `logit.input.frames.dropped{reason="oversize"\|"drained"\|"malformed"\|"truncated"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses. `drained` is a line-framed listener's line that crossed its bound before its `LF` arrived: counted once, after which the connection discards input until its next `LF` |
 
 The driver's `Diagnostics` keys: `framing_error` (any `frames.dropped` reason), `bad_frame` (a
 decoder that rejects a whole frame), `connection_error` (I/O, a TLS handshake that failed or
@@ -776,11 +776,14 @@ table with no per-listener code.
 `syslog_in`/`graphite_in` does, and records that driver's stream set in place of the datagram
 pair, with nothing statsd-specific: `logit.input.accept_queue.depth` / `.utilization`, the
 connection metrics, `logit.input.frames` / `logit.input.frame.bytes` (one *frame* is one
-LF-delimited statsd line), and `logit.input.frames.dropped{reason}`. Only two reasons can occur:
+LF-delimited statsd line), and `logit.input.frames.dropped{reason}`. Only three reasons can occur:
 
 - **`oversize`:** a line past the driver's 64 KiB bound. Dropped and counted once; the connection
   stays open and the next line still decodes. A statsd listener frames `Lines{DrainToNextLine}` and
   never RFC 6587's octet counting, because a statsd line may legally begin with a digit.
+- **`drained`:** an `oversize` line that crossed the bound before its `LF` arrived, counted in its
+  place. The connection then discards input until its next `LF`, so a sender that never sends one
+  shows as one `drained` and no further frames.
 - **`truncated`:** a partial line left buffered when a connection ends: abruptly, on shutdown
   mid-message, **or on a clean close with the final line unterminated**. That last case is where
   statsd parts company with `syslog_in`: RFC 6587 §3.4.2 explicitly permits a terminator-less final
@@ -877,7 +880,7 @@ misconfiguration.
   **both** protocols, where one frame is one plaintext line or one pickle payload, counted at the
   size the decoder was handed (a pickle frame's 4-byte length prefix is stripped first, so the
   count is the payload, not the wire framing).
-  `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}` and
+  `logit.input.frames.dropped{reason="oversize"|"drained"|"malformed"|"truncated"}` and
   `logit.component.receive.flushed{reason}` from the per-connection `BatchAccumulator` (the same
   layer-2 point a datagram listener's shared `decode_loop` records) complete the set. There's no
   receive queue on this transport, because TCP's own flow control is the backpressure, so none of
@@ -886,8 +889,10 @@ misconfiguration.
 Both TCP framing failures land on `frames.dropped{reason="oversize"}`. They differ in whether the
 connection survives: a plaintext line past `max_line_bytes` is dropped and the reader
 resynchronizes at the next newline, while a pickle frame declaring more than `max_frame_bytes`
-closes the connection, because a length-framed stream has no resync point. Neither is
-`metrics.skipped`: one vocabulary per driver.
+closes the connection, because a length-framed stream has no resync point. A plaintext line that
+crossed `max_line_bytes` before its newline arrived counts `reason="drained"` instead, because the
+connection then discards input until its next newline. None is `metrics.skipped`: one vocabulary
+per driver.
 
 The codec adds its own counters under both transports:
 `logit.input.metrics.skipped{reason="bad_line"|"bad_tag"|"bad_timestamp"|"non_finite_value"|
@@ -914,12 +919,14 @@ it reports depends on its `transport:`:
 - **`udp` and `unix`:** the datagram set `statsd_in` records, from the shared `UdpListener`.
 - **`tcp` and `unix_stream`:** the stream set from the shared `TcpListener`: the connection
   metrics, `logit.input.frames` / `.frame.bytes` (one frame is one LF-delimited line), and
-  `logit.input.frames.dropped{reason="oversize"|"truncated"}`.
+  `logit.input.frames.dropped{reason="oversize"|"drained"|"truncated"}`.
 
 The stream framer enforces `max_line_bytes` on `tcp` and `unix_stream`, and the decoder enforces
 it on `udp` and `unix`. Both count a dropped line as `logit.input.frames.dropped{reason="oversize"}`,
 so the series means the same on every transport. On a datagram transport it's the only series of
-that name, and the rest of the datagram still decodes.
+that name, and the rest of the datagram still decodes. On a stream transport, a line that crossed
+the bound before its `LF` arrived counts `reason="drained"` in place of `oversize`, because the
+connection then discards input until its next `LF`.
 
 `Diagnostics` keys: `bound`, the driver's keys, and the datagram decoder's throttled
 `oversize_line`.

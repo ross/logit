@@ -224,7 +224,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-03](#net-03--udp-decode_loop-pop_many-batching-interval-flush-deadline-race-and-final-flush-ordering) | P0 | UDP `decode_loop`: `pop_many` batching, interval-flush deadline race, and final flush ordering | `crates/logit-inputs/src/udp.rs` (`decode_loop`) | findings → #406 |
 | [NET-06](#net-06--boundedqueuepush_many-batched-admission-control-the-pre-wait-notify-and-cancellation) | P0 | `BoundedQueue::push_many`: batched admission control, the pre-wait notify, and cancellation | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::push_many`) | findings → #403 |
 | [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | reviewed @510291b1 |
-| [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-proto/src/framing.rs` (`Framer`) | in-progress (untrusted/w6) |
+| [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-proto/src/framing.rs` (`Framer`) | findings → untrusted/w6 |
 | [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | findings → #443, #445, #447 |
 | [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | findings → #444, #447 |
 | [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`) | findings → #445, #447 |
@@ -842,7 +842,8 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
 
 ### NET-08 — TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix
 - **Location:** `crates/logit-proto/src/framing.rs` — `struct Framer`, `Framer::new`,
-  `Framer::push` (the latch), `next_frame`, `finish`, `oversize_policy`, `next_line`,
+  `Framer::push` (the latch), `next_frame`, `finish`, `abandon` (with the private
+  `remainder_is_blank` they share), `oversize_policy`, `next_line`,
   `next_length_prefixed`, `next_octet_counted`, `strip_cr`. Supporting types: `FramingMode`,
   `Oversize`, `Framing`, `FrameError`. Constants: `MAX_FRAME_BYTES`, `READ_BUFFER_BYTES`,
   `LENGTH_PREFIX_BYTES` with its assert against `graphite::pickle`'s.
@@ -885,7 +886,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   - **`finish()` and `report_buffered_tail` agree**: identical buffered bytes followed by FIN vs.
     RST produce the same counter, except the one documented case (`Rfc6587Auto` LF arm emits the
     remainder as a real final message).
-  - **`OversizeSkipped` is the only non-fatal variant** (`FrameError::is_fatal`) and the framer is genuinely
+  - **`OversizeSkipped` and `Drained` are the only non-fatal variants** (`FrameError::is_fatal`) and the framer is genuinely
     resynchronized when it is returned (the drain latch or the consumed terminator).
   - Leading-zero octet counts, zero counts, and non-digit-before-SP are all rejected rather than
     silently reinterpreted (`next_octet_counted`'s digit/SP loop, `digits == 0` check, and
@@ -907,7 +908,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   newline, CR stripping, empty lines, oversize under both policies, drain-to-next-line, ten-digit
   and leading-zero counts, length-prefix assembly and over-bound), plus the recorded-interop replay
   `interop_fixture_rsyslog_tcp_non_transparent_frame`. ADRs: `syslog-tcp-ingress-and-tls`,
-  `graphite-carbon-relay`, `idle-connection-timeout`.
+  `graphite-carbon-relay`, `idle-connection-timeout`. Since `untrusted/w6`: the `stream_framing` fuzz target (six oracles), `crates/logit-proto/tests/robustness.rs`'s "framing" section, and the FIN/RST agreement tests in `framing.rs` and `tcp.rs`.
 - **Suggested verification approach:** **a fuzz target** — `Framer` is pure, synchronous, and takes
   arbitrary bytes, which makes it the single best fuzzing candidate in this area (drive
   `push`/`next_frame`/`finish` over `cargo-fuzz` or `arbitrary`-driven proptest with randomized
@@ -916,6 +917,35 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   frame sequence). Add a differential proptest asserting FIN and RST agree.
 - **Priority:** P0 — the only untrusted-input parser on the stream path, entirely hand-rolled, and a
   framing mistake silently corrupts every downstream message rather than failing.
+- **Verified (untrusted/w6):** findings. The FIN/RST invariant didn't hold for a remainder that
+  carries no message: `finish` dropped a whitespace-only `Lines` remainder, and a lone `CR` under
+  `Rfc6587Auto`'s LF framing, uncounted, while `report_buffered_tail` counted any buffered byte
+  `truncated` on an RST, a shutdown, or an idle close. `Framer::abandon` now decides every
+  non-FIN end and shares `finish`'s blank-remainder rule, pinned by unit tests in `framing.rs`
+  and a listener idle-close test, each shown failing with the fix reverted. Checked with a new
+  `stream_framing` fuzz target over all five modes, with a fuzz-chosen bound and push sizes
+  (empty pushes included), and six oracles: one push and the chunked pushes give the same
+  outcomes; the buffer stays within the bound plus the framing's header between pushes; every
+  frame and skipped line consumes bytes; a reference splitter agrees under `Lines` and both
+  length prefixes; the auto latch holds; and `finish` and `abandon` agree. A 600-second campaign
+  (`script/unsafe-check fuzz stream_framing`, debug assertions on) ran 4,204,174 inputs at
+  about 6,995 exec/s to a 349-input, 721 KB corpus with no crash.
+  `crates/logit-proto/tests/robustness.rs` gains a framing section: every truncation of the
+  rsyslog stream, bit flips in every mode, a corrupt `u32::MAX` prefix refused
+  under 64 KiB of peak, an all-newline stream, the drain latch over a thousand pushes, and the
+  FIN/RST table. The other invariants held: digit and length caps, no index panic or overflow,
+  progress on an all-`\n` stream, the latch, `scanned` resets, and resync on a non-fatal error.
+  The observed concerns:
+  - *Bound slack:* real, and documented in `framing.rs`'s "What a connection holds": the peak
+    under `Lines` is `max_line_bytes + READ_BUFFER_BYTES`, not `- 1`, because a line of the bound
+    with no `LF` is held and the next read is appended before the check.
+  - *Post-drain discard:* the drain state now has an observable. The line that enters it counts
+    `frames.dropped{reason="drained"}` in place of `oversize`, and its `framing_error`
+    diagnostic says the connection discards input until its next `LF`, so a sender that never
+    sends one (a binary protocol pointed at a line port) is visible.
+  - *32-bit:* a platform note, no shipped target. `u32 as usize` is lossless on any `usize` of 32
+    bits or more, and `LENGTH_PREFIX_BYTES + payload_len` is computed only after `payload_len`
+    is checked against the bound.
 
 ---
 

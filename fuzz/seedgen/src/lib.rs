@@ -2,9 +2,10 @@
 //! encoder round trips, so every fuzz target starts from inputs its decoder accepts.
 //!
 //! A target that takes a selector byte gets it prepended, matching the target's own doc: the
-//! OTLP targets' signal (`0` logs, `1` metrics, `2` traces), `prom_decompress`'s encoding, and
-//! `prom_remote_write`'s version. [`generate`] is deterministic, so a rerun rewrites the same
-//! bytes and leaves `git status` clean.
+//! OTLP targets' signal (`0` logs, `1` metrics, `2` traces), `prom_decompress`'s encoding,
+//! `prom_remote_write`'s version, and `stream_framing`'s four bytes of mode, bound, and
+//! chunking. [`generate`] is deterministic, so a rerun rewrites the same bytes and leaves
+//! `git status` clean.
 
 use bytes::{Bytes, BytesMut};
 use logit_core::interner::intern;
@@ -234,6 +235,10 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         add("forwarded", name.to_string(), bytes);
     }
 
+    for (name, bytes) in stream_framing_seeds(testdata)? {
+        add("stream_framing", name, bytes);
+    }
+
     let mut skipped = Vec::new();
     for (target, files) in seeds.iter_mut() {
         files.retain(|name, bytes| {
@@ -326,6 +331,114 @@ fn forwarding_headers() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
+/// `stream_framing`'s selector bytes (`fuzz/fuzz_targets/stream_framing.rs`).
+const FRAMING_AUTO: u8 = 0;
+const FRAMING_LINES_DRAIN: u8 = 1;
+const FRAMING_LINES_FATAL: u8 = 2;
+const FRAMING_PREFIX_BE: u8 = 3;
+const FRAMING_PREFIX_LE: u8 = 4;
+/// The bound selector that means `MAX_FRAME_BYTES`; any other value `v` means `1 + v % 4096`.
+const BOUND_MAX: u16 = u16::MAX;
+
+/// A `stream_framing` input: mode, bound, chunking seed, then the stream.
+fn framing_seed(mode: u8, bound: u16, chunking: u8, stream: &[u8]) -> Vec<u8> {
+    let [hi, lo] = bound.to_be_bytes();
+    let mut out = vec![mode, hi, lo, chunking];
+    out.extend_from_slice(stream);
+    out
+}
+
+/// Recorded streams under the framing their listener uses, the UDP syslog captures wrapped in
+/// RFC 6587 octet counts, and the framing edge cases: keepalive newlines, a zero and a padded
+/// count, ten count digits, and a `u32::MAX` length prefix.
+fn stream_framing_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let read = |path: &str| std::fs::read(testdata.join("interop").join(path));
+    let mut out = Vec::new();
+
+    let rsyslog = read("syslog/rsyslog-tcp-000.raw")?;
+    for chunking in [0, 7] {
+        let seed = framing_seed(FRAMING_AUTO, BOUND_MAX, chunking, &rsyslog);
+        out.push((format!("auto-rsyslog-tcp-{chunking}"), seed));
+    }
+
+    let mut datagrams: Vec<_> = std::fs::read_dir(testdata.join("interop/syslog"))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "raw"))
+        .filter(|path| !path.file_name().is_some_and(|name| name == "rsyslog-tcp-000.raw"))
+        .collect();
+    datagrams.sort();
+    let mut all_counted = Vec::new();
+    for path in &datagrams {
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let msg = std::fs::read(path)?;
+        let mut counted = format!("{} ", msg.len()).into_bytes();
+        counted.extend_from_slice(&msg);
+        all_counted.extend_from_slice(&counted);
+        out.push((
+            format!("auto-octet-{stem}"),
+            framing_seed(FRAMING_AUTO, BOUND_MAX, 3, &counted),
+        ));
+    }
+    out.push((
+        "auto-octet-all".to_string(),
+        framing_seed(FRAMING_AUTO, BOUND_MAX, 11, &all_counted),
+    ));
+
+    let mut line_streams = vec![("graphite".to_string(), read("graphite/write-graphite-000.raw")?)];
+    let mut statsd: Vec<_> = std::fs::read_dir(testdata.join("interop/statsd"))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("statsd-plain-"))
+        })
+        .collect();
+    statsd.sort();
+    for path in statsd {
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        line_streams.push((stem, std::fs::read(&path)?));
+    }
+    // A bound of 64 is shorter than some recorded lines, so both oversize paths are reachable.
+    for (stem, stream) in &line_streams {
+        for (mode, label) in [(FRAMING_LINES_DRAIN, "drain"), (FRAMING_LINES_FATAL, "fatal")] {
+            out.push((format!("lines-{label}-{stem}"), framing_seed(mode, 63, 5, stream)));
+        }
+    }
+
+    for capture in ["graphite-pickle-p2-000", "graphite-pickle-p5-000"] {
+        let stream = read(&format!("graphite/{capture}.raw"))?;
+        out.push((format!("be-{capture}"), framing_seed(FRAMING_PREFIX_BE, BOUND_MAX, 1, &stream)));
+    }
+    for capture in ["dogstatsd-unix-stream-000", "dogstatsd-unix-stream-001"] {
+        let stream = read(&format!("datadog/{capture}.raw"))?;
+        out.push((format!("le-{capture}"), framing_seed(FRAMING_PREFIX_LE, BOUND_MAX, 1, &stream)));
+    }
+
+    let newlines = vec![b'\n'; 4096];
+    for (mode, label) in
+        [(FRAMING_AUTO, "auto"), (FRAMING_LINES_DRAIN, "drain"), (FRAMING_LINES_FATAL, "fatal")]
+    {
+        out.push((format!("{label}-all-newlines"), framing_seed(mode, BOUND_MAX, 2, &newlines)));
+    }
+    for (name, stream) in [
+        ("auto-zero-count", &b"0 x"[..]),
+        ("auto-padded-count", b"012 x"),
+        ("auto-ten-digit-count", b"1234567890 x"),
+    ] {
+        out.push((name.to_string(), framing_seed(FRAMING_AUTO, BOUND_MAX, 0, stream)));
+    }
+    let huge = [0xFF, 0xFF, 0xFF, 0xFF, b'x'];
+    out.push((
+        "be-u32-max-prefix".to_string(),
+        framing_seed(FRAMING_PREFIX_BE, BOUND_MAX, 0, &huge),
+    ));
+    out.push((
+        "le-u32-max-prefix".to_string(),
+        framing_seed(FRAMING_PREFIX_LE, BOUND_MAX, 0, &huge),
+    ));
+    Ok(out)
+}
+
 fn prefixed(selector: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + body.len());
     out.push(selector);
@@ -398,6 +511,7 @@ mod tests {
                 "proxy_header",
                 "sketch_bytes",
                 "sketch_merge",
+                "stream_framing",
             ]
         );
     }
