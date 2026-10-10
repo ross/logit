@@ -180,7 +180,8 @@ protocol 0".)
 ×2; then `APPENDS`(0x65) `STOP`(0x2e).
 
 **Reader accepts**: framing `PROTO` `FRAME`(0x95, length validated) `STOP`; memo `BINPUT` 0x71,
-`LONG_BINPUT` 0x72, `MEMOIZE` 0x94, `BINGET` 0x68, `LONG_BINGET` 0x6a (bounded); containers `MARK`,
+`LONG_BINPUT` 0x72, `MEMOIZE` 0x94, `BINGET` 0x68, `LONG_BINGET` 0x6a (bounded; amended
+2026-10-09, see "Memo keys" in the protocol-0 amendment below); containers `MARK`,
 `EMPTY_LIST`, `LIST` 0x6c, `APPEND` 0x61, `APPENDS`, `EMPTY_TUPLE` 0x29, `TUPLE` 0x74,
 `TUPLE1/2/3` 0x85-0x87; strings `BINUNICODE` 0x58, `SHORT_BINUNICODE` 0x8c, `BINUNICODE8` 0x8d,
 `BINSTRING` 0x54, `SHORT_BINSTRING` 0x55, `BINBYTES` 0x42, `SHORT_BINBYTES` 0x43, `BINBYTES8` 0x8e
@@ -492,6 +493,7 @@ canonical table.
 The pickle reader accepts protocol 0, carbon's text pickle, because real senders write it. This is
 the allowlist widening that "Pickle opcode subset" above says needs its own ADR decision. It adds
 seven textual opcodes, none of which imports or calls anything, and the allowlist stays closed.
+It also relaxes the memo key rule so Python 2 `cPickle` senders decode in every protocol.
 
 ### Evidence
 
@@ -520,7 +522,7 @@ Seven opcodes join the allowlist, taking it from 35 opcodes to 42:
 | Opcode | Byte | Argument | Pushes or does |
 |---|---|---|---|
 | `INT` | `0x49` (`I`) | a decimal line | an integer; `I00` and `I01` are `False` and `True`, as CPython reads them |
-| `LONG` | `0x4c` (`L`) | a decimal line with a trailing `L` | an integer |
+| `LONG` | `0x4c` (`L`) | a decimal line with an optional trailing `L` | an integer |
 | `FLOAT` | `0x46` (`F`) | a float `repr` line | a float |
 | `STRING` | `0x53` (`S`) | a quoted line | a string |
 | `UNICODE` | `0x56` (`V`) | a raw-unicode-escape line | a string |
@@ -543,15 +545,21 @@ Each textual opcode's argument runs to the next `\n` in the remaining input. A m
 - **`INT`**: decimal `i64` with an optional sign. CPython's loader calls `int(x, 0)`, which also
   takes `0x`, `0o`, `0b`, and `_` separators. No surveyed sender writes any of them, so the reader
   rejects them as `Malformed`. An overflow is `Malformed`, matching `LONG1`/`LONG4`'s 8-byte cap.
-- **`LONG`**: decimal with a trailing `L`, read into an `i64`. An overflow is `Malformed`.
+- **`LONG`**: decimal with an optional trailing `L`, as CPython's loader treats it, read into an
+  `i64`. An overflow is `Malformed`.
+- **`INT` and `LONG` leading zeros**: a multi-digit literal with a leading zero followed by a
+  non-zero digit, such as `010`, is `Malformed`, because Python 2's `strtol` with base 0 reads it as
+  octal. An all-zero spelling such as `00` is accepted.
 - **`FLOAT`**: Rust's `f64` parse, which accepts `nan`, `inf`, and exponent forms such as `1e+06`.
-  A non-finite value reaches the decoder's existing `non_finite_value` skip, as carbon drops a NaN.
-- **`PUT` and `GET`**: the key is decimal and goes through the existing memo rules unchanged: an
-  ordinal key and `MAX_PICKLE_ITEMS`.
+  A literal `nan` or `inf` reaches the decoder's existing `non_finite_value` skip, as carbon drops a
+  NaN. An out-of-range literal such as `F1e999` is `Malformed` rather than infinity, matching
+  CPython's `OverflowError`.
+- **`PUT` and `GET`**: the key is decimal and follows the memo key rule under "Memo keys" below,
+  capped by `MAX_PICKLE_ITEMS`.
 - **`STRING`**: the argument starts and ends with the same quote, `'` or `"`, or the frame is
   `Malformed`. With no backslash inside, the string stays a zero-copy range into the frame, as a
   binary string is. Otherwise it's decoded by Python's string-escape rules (`\\`, `\'`, `\"`, `\a`,
-  `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, `\xHH`, `\ooo`, and backslash-newline) into a reader-owned
+  `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, `\xHH`, and `\ooo`) into a reader-owned
   scratch buffer that's cleared per frame. A decoded string is never longer than its source. An
   unknown escape keeps its backslash, as Python does, and a raw byte passes through, so Dropwizard's
   unescaped UTF-8 names decode.
@@ -565,6 +573,16 @@ The UTF-8 check is unchanged: a decoded `STRING` or `UNICODE` passes the same ch
 string does, and a failure drops the frame as `bad_pickle`, which is what carbon does. The scratch
 buffer is reader state like the stack, arenas, and memo, so a warm decode keeps its allocation
 count.
+
+### Memo keys
+
+Python 2's `cPickle` numbers memo keys from 1, not 0. On `python:2.7-slim` (2.7.18) it writes
+`(lp1\n(S'sys.cpu'\np2\n…` at protocol 0 and `\x80\x02]q\x01…` at protocol 2. The reader's
+original rule, `key <= memo.len()`, rejected every Python 2 `cPickle` sender, in binary protocols
+as well as protocol 0, and that includes carbon's own client running on Python 2. The rule is now
+`key <= max(memo.len(), 1)`: one skipped slot 0, then one new slot per `PUT`, `BINPUT`,
+`LONG_BINPUT`, or `MEMOIZE`, still capped by `MAX_PICKLE_ITEMS`. A corrupt key still can't grow
+the memo to the size it names.
 
 ### Egress
 

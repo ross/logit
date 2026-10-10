@@ -209,7 +209,8 @@ pub struct EncodeStats {
 ×2; then `APPENDS`(0x65) `STOP`(0x2e).
 
 **Reader accepts**: framing `PROTO` `FRAME`(0x95, length validated) `STOP`; memo `BINPUT` 0x71,
-`LONG_BINPUT` 0x72, `MEMOIZE` 0x94, `BINGET` 0x68, `LONG_BINGET` 0x6a (bounded); containers
+`LONG_BINPUT` 0x72, `MEMOIZE` 0x94, `BINGET` 0x68, `LONG_BINGET` 0x6a (bounded; amended
+2026-10-09, see the ADR's protocol-0 amendment, "Memo keys"); containers
 `MARK`, `EMPTY_LIST`, `LIST` 0x6c, `APPEND` 0x61, `APPENDS`, `EMPTY_TUPLE` 0x29, `TUPLE` 0x74,
 `TUPLE1/2/3` 0x85-0x87; strings `BINUNICODE` 0x58, `SHORT_BINUNICODE` 0x8c, `BINUNICODE8` 0x8d,
 `BINSTRING` 0x54, `SHORT_BINSTRING` 0x55, `BINBYTES` 0x42, `SHORT_BINBYTES` 0x43, `BINBYTES8` 0x8e
