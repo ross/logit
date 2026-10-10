@@ -24,7 +24,10 @@
 //! `_created` on both sides of 2^63 nanoseconds, every escape at a label value's end, histogram
 //! reconstruction, the writer's fixed point, and the largest allocation the worst 64 KiB body
 //! makes; the remote-write section pins Snappy's length gate against a corrupt length and the
-//! encoder's fixed point.
+//! encoder's fixed point. The log-message section covers `message::{json,csv,logfmt}`: the JSON
+//! nesting limit the parse inherits from serde_json, truncation and bit flips of an nginx line,
+//! the logfmt and csv quote scanners at a line's end, and the largest allocation each
+//! `message_*` fuzz target's worst 64 KiB message makes.
 //!
 //! For each decoder: every single-byte truncation of a valid input, thousands of seeded bit flips,
 //! length fields inflated past the input, and, for `decode_batch`, `Value` nesting past the depth
@@ -3535,4 +3538,282 @@ fn remote_write_a_series_exemplars_are_written_in_timestamp_order() {
         assert_eq!(timestamps, [1000, 2000], "{version:?}");
         assert_remote_write_fixed_point(&body, version);
     }
+}
+
+// -- log messages: json, csv, logfmt, kv --------------------------------------------------------
+//
+// The parse cores in `logit_proto::message`. The JSON nesting limit is serde_json's default
+// recursion limit, which the core relies on in place of a depth cap of its own; the rest pins
+// truncation, the escape scanners at a line's end, and the largest allocation each `message_*`
+// fuzz target's worst 64 KiB input makes.
+
+/// An nginx `access_json_full` line (`fixtures/nginx/nginx.conf`).
+const NGINX_ACCESS_JSON: &str = concat!(
+    r#"{"time":"2026-09-07T06:52:01+00:00","remote_addr":"203.0.113.7","host":"shop.example.com","#,
+    r#""request_method":"GET","request_uri":"/search?q=\"a\\b\"","status":200,"#,
+    r#""body_bytes_sent":612,"request_time":0.012,"upstream_response_time":"0.010","#,
+    r#""http_referer":"","http_user_agent":"curl/8.5.0 \u001B[31m","#,
+    r#""http_x_forwarded_for":"203.0.113.7, 10.0.0.1"}"#
+);
+
+/// The 64 KiB message each `message_*` fuzz target's `max_len` admits behind its selector byte.
+const MESSAGE_BYTES: usize = 65_536;
+
+/// The malloc limit `script/unsafe-check` gives the four `message_*` targets.
+const MESSAGE_MALLOC_LIMIT: i64 = 16 << 20;
+
+fn json_parse(body: &[u8], prefix: bool) -> Result<Vec<(logit_core::Symbol, Value)>, String> {
+    let body = Bytes::copy_from_slice(body);
+    let mut out = Vec::new();
+    let mut keys = logit_core::interner::KeyCache::new();
+    let result = if prefix {
+        logit_proto::message::json::parse_object_prefix(&body, &mut out, &mut keys)
+    } else {
+        logit_proto::message::json::parse_object(&body, &mut out, &mut keys)
+    };
+    result.map(|()| out).map_err(|e| e.to_string())
+}
+
+/// `depth` containers, the top-level object included: `{"a":[[…]]}`.
+fn json_nested(depth: usize) -> String {
+    format!("{{\"a\":{}{}}}", "[".repeat(depth - 1), "]".repeat(depth - 1))
+}
+
+/// serde_json's default recursion limit admits 127 nested containers and fails the 128th, so a
+/// build that turned on its `unbounded_depth` feature would fail here first.
+#[test]
+fn json_nesting_stops_at_serde_jsons_recursion_limit() {
+    for prefix in [false, true] {
+        assert!(json_parse(json_nested(127).as_bytes(), prefix).is_ok(), "127, prefix {prefix}");
+        let err = json_parse(json_nested(128).as_bytes(), prefix).unwrap_err();
+        assert!(err.starts_with("recursion limit exceeded"), "128, prefix {prefix}: {err}");
+    }
+    let objects = |depth| format!("{}1{}", "{\"a\":".repeat(depth), "}".repeat(depth));
+    assert!(json_parse(objects(127).as_bytes(), false).is_ok(), "127 objects");
+    let err = json_parse(objects(128).as_bytes(), false).unwrap_err();
+    assert!(err.starts_with("recursion limit exceeded"), "128 objects: {err}");
+}
+
+/// No proper prefix of an object parses, in either mode, and none panics.
+#[test]
+fn json_survives_every_single_byte_truncation_of_an_nginx_line() {
+    let valid = NGINX_ACCESS_JSON.as_bytes();
+    assert_eq!(json_parse(valid, false).unwrap().len(), 12);
+    for len in 0..valid.len() {
+        for prefix in [false, true] {
+            let result = std::panic::catch_unwind(|| json_parse(&valid[..len], prefix));
+            let result = result.unwrap_or_else(|_| panic!("a {len}-byte prefix panicked"));
+            assert!(result.is_err(), "a {len}-byte prefix parsed, prefix {prefix}");
+        }
+    }
+}
+
+/// A flipped bit never panics, and every string that parses is valid UTF-8 and matches
+/// serde_json's own reading of the same bytes.
+#[test]
+fn json_survives_bit_flips_of_an_nginx_line() {
+    let valid = NGINX_ACCESS_JSON.as_bytes();
+    let mut rng = Lcg::new(0x5EED_5EED_5EED_5EEDu64);
+    for _ in 0..4000 {
+        let mut mutated = valid.to_vec();
+        let byte_idx = rng.next_usize(mutated.len());
+        mutated[byte_idx] ^= 1 << rng.next_usize(8);
+        let result = std::panic::catch_unwind(|| json_parse(&mutated, false))
+            .unwrap_or_else(|_| panic!("a bit flip at byte {byte_idx} panicked"));
+        let reference = serde_json::from_slice::<serde_json::Value>(&mutated);
+        let (Ok(pairs), Ok(serde_json::Value::Object(reference))) = (&result, &reference) else {
+            assert!(
+                result.is_err() && !matches!(reference, Ok(serde_json::Value::Object(_))),
+                "a bit flip at byte {byte_idx}: {result:?} against {reference:?}"
+            );
+            continue;
+        };
+        for (key, value) in pairs {
+            let key = logit_core::interner::resolve(*key);
+            if let Value::Str(s) = value {
+                let s = std::str::from_utf8(s).expect("a Value::Str is valid UTF-8");
+                // A flip can only duplicate a key by renaming one, and the later value wins.
+                if pairs.iter().filter(|(k, _)| logit_core::interner::resolve(*k) == key).count()
+                    == 1
+                {
+                    assert_eq!(reference[key].as_str(), Some(s), "byte {byte_idx}, key {key}");
+                }
+            }
+        }
+    }
+}
+
+fn logfmt_parse(
+    line: &str,
+    bare_keys: bool,
+) -> (Result<(), logit_proto::message::logfmt::ParseError>, Vec<(logit_core::Symbol, Value)>) {
+    let raw = Bytes::copy_from_slice(line.as_bytes());
+    let text = std::str::from_utf8(&raw).unwrap();
+    let mut out = Vec::new();
+    let mut keys = logit_core::interner::KeyCache::new();
+    let telemetry = logit_core::Telemetry::default();
+    let result = logit_proto::message::logfmt::parse_logfmt(
+        &raw, text, bare_keys, &mut out, &mut keys, &telemetry,
+    );
+    (result, out)
+}
+
+/// A line of nothing but `=` is a keyless token, skipped to the end, and nothing else: the scan
+/// finishes with no pair and no bareword.
+#[test]
+fn logfmt_a_line_of_only_equals_signs_is_no_pairs() {
+    use logit_proto::message::logfmt::ParseError;
+    for bare_keys in [false, true] {
+        let line = "=".repeat(MESSAGE_BYTES);
+        let (result, out) = logfmt_parse(&line, bare_keys);
+        assert!(matches!(result, Err(ParseError::NoPairs)), "bare_keys {bare_keys}");
+        assert!(out.is_empty());
+        let (result, out) = logfmt_parse("= == === a=1", bare_keys);
+        assert!(result.is_ok());
+        assert_eq!(out, [(logit_core::interner::intern("a"), Value::str("1"))]);
+    }
+}
+
+/// A `\` as a quoted value's last byte has nothing to escape, so the quote never closes.
+#[test]
+fn logfmt_a_lone_trailing_backslash_inside_quotes_is_an_unterminated_quote() {
+    use logit_proto::message::logfmt::ParseError;
+    for line in ["a=\"abc\\", "a=\"\\", "a=\"\\\"", "a=\"x\\\\\\"] {
+        let (result, _) = logfmt_parse(line, false);
+        assert!(matches!(result, Err(ParseError::UnterminatedQuote(2))), "{line:?}");
+    }
+    let (result, out) = logfmt_parse("a=\"x\\\\\"", false);
+    assert!(result.is_ok());
+    assert_eq!(out, [(logit_core::interner::intern("a"), Value::str("x\\"))]);
+}
+
+fn csv_fields(row: &[u8], delim: u8) -> Result<Vec<Bytes>, logit_proto::message::csv::RowError> {
+    let row = Bytes::copy_from_slice(row);
+    let mut offsets = Vec::new();
+    logit_proto::message::csv::split_row(&row, delim, &mut offsets)?;
+    Ok(offsets
+        .iter()
+        .map(|&(start, end, needs_unescape)| {
+            let field = row.slice(start as usize..end as usize);
+            if needs_unescape {
+                logit_proto::message::csv::unescape(&field)
+            } else {
+                field
+            }
+        })
+        .collect())
+}
+
+/// A row of `n` quotes: an even `n` is one quoted field of `(n - 2) / 2` literal quotes, an odd
+/// one never closes. Each unescape runs under `unescape`'s `debug_assert_eq!` that its first pass
+/// sized the output to the byte, live in a test build.
+#[test]
+fn csv_unescape_sizes_runs_of_doubled_quotes() {
+    use logit_proto::message::csv::RowError;
+    for n in 1..200 {
+        let row = vec![b'"'; n];
+        match csv_fields(&row, b',') {
+            Ok(fields) => {
+                assert_eq!(n % 2, 0, "{n} quotes parsed");
+                assert_eq!(fields, [Bytes::from(vec![b'"'; (n - 2) / 2])], "{n} quotes");
+            }
+            Err(err) => {
+                assert_eq!(n % 2, 1, "{n} quotes: {err}");
+                assert_eq!(err, RowError::UnterminatedQuote);
+            }
+        }
+    }
+    let fields = csv_fields(br##""a""b""","""c","""""##, b',').unwrap();
+    assert_eq!(fields, [&b"a\"b\""[..], b"\"c", b"\""]);
+}
+
+/// Runs `f` and returns its largest single allocation, failing past the targets' malloc limit.
+fn largest_under_message_limit(name: &str, f: impl FnOnce()) -> i64 {
+    let (peak, largest) = peak_and_largest_allocation(f);
+    eprintln!("{name}: peak {peak}, largest {largest}");
+    assert!(largest < MESSAGE_MALLOC_LIMIT, "{name}: largest allocation {largest}");
+    largest
+}
+
+/// The largest allocations a 64 KiB message makes in `message_json`: `[0,0,…]` and a run of
+/// one-pair objects, through the core and through `serde_json::Value`, which the target also
+/// parses. Each grows a `Vec` by doubling.
+#[test]
+fn json_worst_case_message_stays_under_the_fuzz_malloc_limit() {
+    let body = |open: &str, item: &str, close: &str| {
+        let mut body = open.to_string();
+        while body.len() + item.len() + close.len() <= MESSAGE_BYTES {
+            body.push_str(item);
+        }
+        body.pop();
+        body.push_str(close);
+        body
+    };
+    let cases = [
+        ("one array of zeros", body("{\"a\":[", "0,", "]}")),
+        ("top-level pairs", body("{", "\"a\":0,", "}")),
+        ("nested pairs", body("{\"a\":{", "\"a\":0,", "}}")),
+    ];
+    for (name, body) in &cases {
+        assert!(body.len() <= MESSAGE_BYTES);
+        largest_under_message_limit(name, || {
+            json_parse(body.as_bytes(), false).unwrap();
+            serde_json::from_slice::<serde_json::Value>(body.as_bytes()).unwrap();
+        });
+    }
+}
+
+/// `message_csv`'s worst message, 64 KiB of delimiters: 65,537 empty fields, whose offsets and
+/// the target's reference reading grow by doubling, the reading to the largest allocation.
+#[test]
+fn csv_worst_case_message_stays_under_the_fuzz_malloc_limit() {
+    let row = vec![b','; MESSAGE_BYTES];
+    largest_under_message_limit("delimiters", || {
+        let fields = csv_fields(&row, b',').unwrap();
+        assert_eq!(fields.len(), MESSAGE_BYTES + 1);
+        // One push per field, as the target's `reference` builds its reading.
+        let mut reference: Vec<Vec<u8>> = Vec::new();
+        for f in &fields {
+            reference.push(f.to_vec());
+        }
+        assert_eq!(reference.len(), fields.len());
+    });
+}
+
+/// `message_logfmt`'s and `message_kv`'s worst messages: one-byte barewords two bytes apart, the
+/// most pairs per byte, under `bare_keys`; `out`, the target's rendered line, and its reparse
+/// grow by doubling.
+#[test]
+fn logfmt_and_kv_worst_case_messages_stay_under_the_fuzz_malloc_limit() {
+    let barewords = "a ".repeat(MESSAGE_BYTES / 2 - 2);
+    largest_under_message_limit("logfmt barewords", || {
+        let (result, out) = logfmt_parse(&format!("{barewords}b=1"), true);
+        assert!(result.is_ok());
+        assert_eq!(out.len(), MESSAGE_BYTES / 2 - 1);
+        let (result, again) = logfmt_parse(&format!("{barewords}b=\"1\""), true);
+        assert!(result.is_ok());
+        assert_eq!(again, out);
+    });
+
+    let line = "a&".repeat(MESSAGE_BYTES / 2);
+    largest_under_message_limit("kv barewords", || {
+        let raw = Bytes::copy_from_slice(line.as_bytes());
+        let text = std::str::from_utf8(&raw).unwrap();
+        let mut out = Vec::new();
+        let mut keys = logit_core::interner::KeyCache::new();
+        let result = logit_proto::message::logfmt::parse_kv(
+            &raw,
+            text,
+            "&",
+            "=",
+            true,
+            &mut out,
+            &mut keys,
+            &logit_core::Telemetry::default(),
+        );
+        assert!(result.is_err(), "barewords alone are NoPairs");
+        assert_eq!(out.len(), MESSAGE_BYTES / 2);
+        let reference: Vec<(&str, &str)> = text.split('&').map(|s| (s, s)).collect();
+        assert_eq!(reference.len(), out.len() + 1);
+    });
 }

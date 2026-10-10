@@ -59,8 +59,8 @@ impl Transform for CsvParser {
     /// - no log, or a message that isn't `Str`/`Bytes`: nothing to parse;
     /// - an empty message: no diagnostic, counted as
     ///   `logit.transform.rows.skipped{reason="empty"}`;
-    /// - invalid UTF-8, the header line, bad quoting, or the wrong field count: a throttled
-    ///   `invalid_utf8`/`header_row`/`parse_failure`/`field_count` diagnostic.
+    /// - invalid UTF-8, the header line, bad quoting or a row past 4 GiB, or the wrong field
+    ///   count: a throttled `invalid_utf8`/`header_row`/`parse_failure`/`field_count` diagnostic.
     fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         let Some(log) = &event.log else { return true };
         let raw = match &log.message {

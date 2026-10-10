@@ -8,6 +8,25 @@
 //! `Value::Bool(true)` for an opted-in bareword, never a number. Each parser counts
 //! `logit.transform.pairs.parsed` and `logit.transform.pairs.skipped` per pair on the
 //! [`Telemetry`] it's given.
+//!
+//! `logfmt`'s token boundaries, where the ADR's "whitespace-delimited" leaves them open:
+//!
+//! - A closing `"` ends a token, whitespace or not: `a="x"b=1` is `a` and `b`, and `a="x"y` is
+//!   `a` and the bareword `y`. go-logfmt's decoder (`github.com/go-logfmt/logfmt`, `decode.go`'s
+//!   `ScanKeyval`) reads both lines the same way: it returns after the closing quote and starts
+//!   the next key at the next non-whitespace byte.
+//! - A key is any run of bytes other than whitespace and `=`, so it can hold a `"`; an unquoted
+//!   value is any run of non-whitespace bytes, so it can hold `=` and `"`.
+//!
+//! `kv`'s segment rules:
+//!
+//! - A segment that's empty or blank (`a=1&&b=2`, or a trailing `pair_sep`), a segment whose key
+//!   is empty after trimming (`=1`), and a bareword with `bare_keys` off each add nothing and
+//!   count one `pairs.skipped`; none of them gets a diagnostic.
+//! - [`ParseError::NoPairs`] means no segment produced a `key<kv_sep>value` pair, so a line whose
+//!   every `kv_sep` segment has an empty key (`=1&=2`) fails like a line with no `kv_sep`.
+//! - Both separators are non-empty: graph rule 30 rejects an empty one, which would split between
+//!   every byte. The byte search here returns no match for an empty needle rather than looping.
 
 use bytes::Bytes;
 use logit_core::interner::KeyCache;
@@ -48,8 +67,9 @@ impl fmt::Display for ParseError {
 /// Resolves the five escapes `logfmt` understands; any other escape is kept verbatim, backslash
 /// included.
 ///
-/// The only allocating path in the parse; every other value is a [`bytes::Bytes::slice`] of the
-/// message. `shrink_to_fit` matters: any escape makes `out` shorter than its capacity, and
+/// The only value that allocates; every other value is a [`bytes::Bytes::slice`] of the message.
+/// The other allocations in a parse are `out` growing and a key missing the [`KeyCache`], which
+/// interns it. `shrink_to_fit` matters: any escape makes `out` shorter than its capacity, and
 /// `Bytes::from(Vec<u8>)` then allocates a separate `Shared` block eagerly. Shrinking turns that
 /// into a `realloc`, which `crates/logit-bench/tests/allocations.rs` doesn't count as an `alloc`.
 fn unescape(bytes: &[u8]) -> Bytes {
@@ -81,7 +101,7 @@ fn unescape(bytes: &[u8]) -> Bytes {
 /// Scans a `"`-quoted value starting at `s[i] == b'"'`.
 ///
 /// Returns the content's `(start, end)` range (quotes excluded), whether it has a backslash
-/// escape, and the index just past the closing `"`. Escapes are skipped two bytes at a time and
+/// escape, and the index after the closing `"`. Escapes are skipped two bytes at a time and
 /// left for [`unescape`].
 fn scan_quoted(s: &[u8], i: usize) -> Result<(usize, usize, bool, usize), ParseError> {
     let n = s.len();
@@ -188,7 +208,8 @@ pub fn parse_logfmt(
 /// Finds `needle`'s first occurrence in `haystack` at or after byte offset `from`.
 ///
 /// A plain byte search: a valid UTF-8 needle found in valid UTF-8 always lands on a char boundary
-/// (self-synchronization), so no boundary check is needed.
+/// (self-synchronization), so no boundary check is needed. An empty `needle` finds nothing; graph
+/// rule 30 keeps both of `kv`'s separators non-empty.
 fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() || from > haystack.len() {
         return None;

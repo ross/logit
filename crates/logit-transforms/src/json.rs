@@ -592,6 +592,45 @@ mod tests {
         assert_eq!(parser.keys.len(), 2);
     }
 
+    /// The `Err` arm's clear: a failed parse holds no pair past `process`, so no partial value's
+    /// `Bytes` keeps the failed message's buffer alive.
+    #[test]
+    fn a_failed_parse_leaves_scratch_empty() {
+        let mut parser = JsonParser::new(false);
+        let resource = default_resource();
+        let mut bad = log_event(r#"{"a":"x","b":1,"c":"#);
+        assert!(parser.process(&resource, &mut bad), "log events pass through");
+        assert!(parser.scratch.is_empty(), "{} stale pairs", parser.scratch.len());
+    }
+
+    /// A malformed event's partial pairs never reach the next event's merge.
+    #[test]
+    fn a_malformed_event_leaves_nothing_for_the_next_one() {
+        let mut parser = JsonParser::new(false);
+        let resource = default_resource();
+        let mut bad = log_event(r#"{"stale":"x","b":1,"c":"#);
+        assert!(parser.process(&resource, &mut bad), "log events pass through");
+
+        let mut good = log_event(r#"{"c":2}"#);
+        assert!(parser.process(&resource, &mut good), "log events pass through");
+        let keys: Vec<&str> = good.attributes.iter().map(|(k, _)| resolve(k)).collect();
+        assert_eq!(keys, ["c"]);
+    }
+
+    /// A failure after some pairs parsed leaves an event's own attributes as they were: the
+    /// all-or-nothing merge, at the transform rather than in the parse core.
+    #[test]
+    fn a_failure_partway_through_leaves_existing_attributes_untouched() {
+        let mut parser = JsonParser::new(true);
+        let resource = default_resource();
+        let mut event = log_event(r#"INFO {"a":1,"keep":"new","b":[1,2,"#);
+        event.attributes.insert("keep", Value::str("old"));
+        event.attributes.insert("other", Value::U64(7));
+        let before = event.attributes.clone();
+        assert!(parser.process(&resource, &mut event), "log events pass through");
+        assert_eq!(event.attributes, before);
+    }
+
     #[test]
     fn an_empty_object_parses_and_inserts_nothing() {
         let mut parser = JsonParser::new(false);
