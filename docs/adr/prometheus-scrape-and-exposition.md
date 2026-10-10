@@ -234,7 +234,8 @@ Per [ADR `lossless-transit`](lossless-transit.md), the following count as normal
 for `prometheus_in -> prometheus_out`, and are what the round-trip fixed-point test asserts
 equality modulo:
 
-- Family/series reordering: families sorted by name, series within a family sorted by label set.
+- Family/series reordering: families sorted by the name on their `# TYPE` line, series within a
+  family sorted by label set.
 - Label reordering within a series, sorted by **rendered** (post-sanitization) name — see "Names
   and sanitization" above for the collision tie-break this implies.
 - Float formatting: shortest round-trip representation (`1.0` renders as `1`).

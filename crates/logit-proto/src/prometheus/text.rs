@@ -70,12 +70,12 @@
 //!
 //! | Reason | What it counts |
 //! |---|---|
-//! | `malformed_line` | a sample line this grammar rejects: a bad name, an unterminated label set, an unparsable value or timestamp, non-UTF-8 bytes, or Prometheus 3's quoted UTF-8 name syntax (`{"my.dotted.metric"} 1`), which this codec does not implement (`docs/known-gaps/mappings.md`) |
-//! | `malformed_metadata` | a `# HELP`/`# TYPE`/`# UNIT` line with a bad name, a missing field (a bare `# TYPE` included), or an unrecognized type keyword -- the family stays untyped rather than the body failing. Fields are separated by a run of spaces or tabs, either way |
+//! | `malformed_line` | a line this grammar rejects: non-UTF-8 bytes, a bad name, an unterminated label set, an unparsable value or timestamp, or Prometheus 3's quoted UTF-8 name syntax (`{"my.dotted.metric"} 1`), which this codec does not implement (`docs/known-gaps/mappings.md`). And a sample the assembler can't read: a bucket or quantile line with no numeric `le`/`quantile`, a bucket, `_count`, or `_gcount` whose value is `NaN`, infinite, or negative, or a `_created` that isn't an instant |
+//! | `malformed_metadata` | a `# HELP`/`# TYPE`/`# UNIT` line with a missing or bad name, a `# TYPE` with no type keyword or an unrecognized one -- the family stays untyped rather than the body failing. A `# HELP` or `# UNIT` with nothing after the name is an absent one, not malformed. Fields are separated by a run of spaces or tabs, either way |
 //! | `duplicate_type` | a second, conflicting `# TYPE` for one family; the first wins |
 //! | `duplicate_metadata` | a second `# HELP`/`# UNIT` for one family *disagreeing with the first*; the first wins. A producer repeating itself verbatim is neither counted nor an error, the same rule `duplicate_type` has always had |
 //! | `duplicate_series` | one sample repeated: the same label set twice for a family's primary/`_sum`/`_count`/`_created` sample, or the same `le`/`quantile` twice. Both formats require "a unique combination of a metric name and labels"; the first wins |
-//! | `duplicate_label` | one line naming the same label twice -- an invalid label set, so the whole sample goes |
+//! | `duplicate_label` | one line naming the same label twice, `le` or `quantile` included -- an invalid label set, so the whole sample goes |
 //! | `unknown_suffix` | a sample whose name is a **declared** family's name plus a suffix that type has no meaning for (`foo_sum` under `# TYPE foo counter`). An *implicit* family never claims a suffix: with no `# TYPE` anywhere, `foo` and `foo_sum` are two untyped families and neither sample is lost |
 //! | `incomplete_series` | a series with no value at all for its type: a counter with only a `_created`, a histogram with no buckets |
 //!
@@ -98,15 +98,25 @@
 //! - families need not be contiguous (OpenMetrics requires it; this parser groups by name);
 //! - `# UNIT` and `_created` are accepted in text 0.0.4, where they are not part of the format;
 //! - a `_count`/`_gcount` that disagrees with the `+Inf` bucket loses to it (counted, above), and a
-//!   histogram missing its `+Inf` bucket gains one from `_count` (or from its highest bucket) -- see
-//!   [`super`]'s normalization list;
-//! - buckets and quantiles are sorted on parse; both formats require increasing order anyway.
+//!   histogram missing its `+Inf` bucket gains one holding the larger of `_count` and its highest
+//!   bucket -- see [`super`]'s normalization list;
+//! - buckets and quantiles are sorted on parse; both formats require increasing order anyway;
+//! - a quantile outside `[0, 1]` is kept, as Prometheus's own parsers keep it: the assembler checks
+//!   that a quantile is a number, not its range.
 //!
 //! ## Writing is deterministic
 //!
-//! Families sorted by name, series by label set, labels by name, the generated `le`/`quantile`
-//! label written last. [`write`]/[`write_with`] never fail and never allocate per line (reused
-//! scratch `String`s for number formatting).
+//! Families sorted by the name their `# TYPE` line carries, series by label set, labels by name,
+//! the generated `le`/`quantile` label written last. [`write`]/[`write_with`] never fail and never
+//! allocate per line (reused scratch `String`s for number formatting). Parsing the output and
+//! writing it again gives the same bytes, which takes two more rules:
+//!
+//! - two families whose `# TYPE` lines would carry one name (a text 0.0.4 counter `foo` and a gauge
+//!   `foo_total`) can't both be written, since a second `# TYPE` line for a name makes Prometheus
+//!   reject the scrape: the one whose model name sorts first is written, and each series of the
+//!   other is counted `logit.output.metrics.skipped{reason="name_collision"}`;
+//! - a family with no line to write (every series stale, or a summary holding only a `_created`
+//!   in text 0.0.4) loses its metadata lines too.
 //!
 //! One exemplar per `_total`/`_bucket` line, as OpenMetrics requires ("a bucket MUST NOT have more
 //! than one exemplar"), each placed on the bucket **its own value falls in** -- for a conforming
@@ -176,8 +186,8 @@ impl Dialect {
 // -------------------------------------------------------------------------------------------------
 
 /// Parses a scrape body into families, canonically ordered (families by name, series by label set,
-/// labels by name) -- the same order [`write`] emits and [`super::events_to_families`] produces, so
-/// the three compose without a normalization pass in between.
+/// labels by name) -- the order [`super::events_to_families`] produces, so the two compose without
+/// a normalization pass in between. [`write`] orders families by their `# TYPE` name instead.
 ///
 /// Counters go nowhere: this is the no-telemetry convenience over [`parse_with`], for a caller with
 /// no component attached (a test, a benchmark). Production callers hold a [`PrometheusDecoder`].
@@ -556,7 +566,8 @@ pub fn write(families: &[MetricFamily], dialect: Dialect, out: &mut Vec<u8>) {
 }
 
 /// [`write`], counting what it has to drop on `encoder`'s telemetry:
-/// `logit.output.metrics.degraded{reason="unit_not_suffix"|"exemplar_dropped"}`. Text 0.0.4's
+/// `logit.output.metrics.degraded{reason="unit_not_suffix"|"exemplar_dropped"}` and
+/// `logit.output.metrics.skipped{reason="stale"|"name_collision"}`. Text 0.0.4's
 /// wholesale exemplar and `_created`/`# UNIT` drops are *not* counted -- those are the operator's
 /// dialect choice, listed with the permitted normalizations rather than as lossy mappings.
 pub fn write_with(
@@ -565,8 +576,13 @@ pub fn write_with(
     out: &mut Vec<u8>,
     encoder: &mut PrometheusEncoder,
 ) {
-    let mut order: Vec<&MetricFamily> = families.iter().collect();
-    order.sort_by(|a, b| a.name.cmp(&b.name));
+    // Sorted by the name each family's `# TYPE` line carries, which differs from the model name
+    // for a counter and a text 0.0.4 `info`: sorting by the model name puts `build` (an `info`,
+    // written `build_info`) before `buildUinfo`, and parsing that output back sorts them the other
+    // way round, so the output would not be a fixed point.
+    let mut order: Vec<(TypeName<'_>, &MetricFamily)> =
+        families.iter().map(|family| (TypeName::of(family, dialect), family)).collect();
+    order.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
     let mut writer = Writer {
         out,
         dialect,
@@ -577,7 +593,23 @@ pub fn write_with(
         base: String::new(),
         used: Vec::new(),
     };
-    for family in order {
+    let mut previous: Option<TypeName<'_>> = None;
+    for (base, family) in order {
+        // Two families with one `# TYPE` name (a text 0.0.4 counter `foo` and a gauge
+        // `foo_total`) can't both be written: a second `# TYPE` line for one name makes Prometheus
+        // reject the whole scrape. The one whose model name sorts first is written, as
+        // `events_to_families` resolves a sanitized-name collision, and each series of the other
+        // is counted.
+        if previous.is_some_and(|previous| previous == base) {
+            for _ in &family.series {
+                writer.encoder.skipped_reason("name_collision");
+            }
+            continue;
+        }
+        writer.base.clear();
+        writer.base.push_str(base.0);
+        writer.base.push_str(base.1);
+        previous = Some(base);
         writer.family(family);
     }
     if dialect.is_openmetrics() {
@@ -600,31 +632,10 @@ struct Writer<'a> {
 }
 
 impl Writer<'_> {
+    /// Writes one family; `self.base` already holds its `# TYPE` name ([`TypeName`]).
     fn family(&mut self, family: &MetricFamily) {
         let om = self.dialect.is_openmetrics();
-        self.base.clear();
-        match (family.kind, om) {
-            // A counter's value sample always ends in `_total`; only the family name differs.
-            // OpenMetrics names the family without the suffix, text 0.0.4 with it.
-            (FamilyType::Counter, true) => {
-                // A counter named exactly `_total` is legal (`_` is a valid leading character), and
-                // stripping the suffix there would leave a nameless `# TYPE  counter` line.
-                let stripped = family.name.strip_suffix("_total").filter(|s| !s.is_empty());
-                self.base.push_str(stripped.unwrap_or(&family.name));
-            }
-            (FamilyType::Counter, false) => {
-                self.base.push_str(&family.name);
-                if !family.name.ends_with("_total") {
-                    self.base.push_str("_total");
-                }
-            }
-            // Text 0.0.4 has no `info` type, so the family is named after the sample it renders as.
-            (FamilyType::Info, false) => {
-                self.base.push_str(&family.name);
-                self.base.push_str("_info");
-            }
-            _ => self.base.push_str(&family.name),
-        }
+        let start = self.out.len();
         let keyword = type_keyword(family.kind, self.dialect);
         // Prometheus's own output puts `# HELP` first; the OpenMetrics spec's examples put `# TYPE`
         // first, then `# UNIT`, then `# HELP`.
@@ -647,10 +658,17 @@ impl Writer<'_> {
             push_metadata(self.out, "TYPE", &self.base, keyword);
         }
 
+        let metadata_end = self.out.len();
         let mut series: Vec<&Series> = family.series.iter().collect();
         series.sort_by(|a, b| a.labels.cmp(&b.labels));
         for s in series {
             self.series(family.kind, s);
+        }
+        // A family none of whose series writes a line (every one stale, or a summary with only a
+        // `_created` in text 0.0.4) loses its metadata too: a parse of that output has no family to
+        // give it to, so the bytes wouldn't be a fixed point.
+        if self.out.len() == metadata_end {
+            self.out.truncate(start);
         }
     }
 
@@ -894,6 +912,56 @@ impl Writer<'_> {
             }
         }
         None
+    }
+}
+
+/// The name a family's `# TYPE` line carries in `dialect`, which is not always the model name
+/// ([`super`]'s "Family naming" table): a prefix of the model name and a suffix, so the writer
+/// orders and compares names without building them.
+#[derive(Clone, Copy)]
+struct TypeName<'a>(&'a str, &'static str);
+
+impl<'a> TypeName<'a> {
+    fn of(family: &'a MetricFamily, dialect: Dialect) -> Self {
+        let name = family.name.as_str();
+        match (family.kind, dialect.is_openmetrics()) {
+            // A counter's value sample always ends in `_total`; only the family name differs.
+            // OpenMetrics names the family without the suffix, text 0.0.4 with it.
+            (FamilyType::Counter, true) => {
+                // A counter named `_total` is legal (`_` is a valid leading character), and
+                // stripping the suffix there would leave a nameless `# TYPE  counter` line.
+                TypeName(name.strip_suffix("_total").filter(|s| !s.is_empty()).unwrap_or(name), "")
+            }
+            (FamilyType::Counter, false) if !name.ends_with("_total") => TypeName(name, "_total"),
+            // Text 0.0.4 has no `info` type, so the family is named after the sample it renders
+            // as.
+            (FamilyType::Info, false) => TypeName(name, "_info"),
+            _ => TypeName(name, ""),
+        }
+    }
+
+    fn bytes(self) -> impl Iterator<Item = u8> + 'a {
+        self.0.bytes().chain(self.1.bytes())
+    }
+}
+
+impl PartialEq for TypeName<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes().eq(other.bytes())
+    }
+}
+
+impl Eq for TypeName<'_> {}
+
+impl PartialOrd for TypeName<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TypeName<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.bytes().cmp(other.bytes())
     }
 }
 

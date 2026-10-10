@@ -20,7 +20,7 @@
 //! | any other sample name | a fresh family of the assembler's *implicit* type -- [`FamilyType::Untyped`] for text 0.0.4, [`FamilyType::Unknown`] for OpenMetrics and remote-write |
 //! | `le`/`quantile` | part of the [`Point`], not of the series identity: stripped from the label set before it becomes the series key |
 //! | a second value for one (family, label set, role) | `skipped{reason="duplicate_series"}`, first wins ([`replace_once`]) |
-//! | a label set naming one label twice | `skipped{reason="duplicate_label"}` -- an invalid label set, so the whole sample goes |
+//! | a label set naming one label twice, `le` or `quantile` included | `skipped{reason="duplicate_label"}` -- an invalid label set, so the whole sample goes |
 //! | a series whose samples don't add up to its type's value (a counter with only a `_created`, a histogram with no buckets) | `skipped{reason="incomplete_series"}` at [`Assembler::finish`] |
 //!
 //! Declarations ([`Assembler::declare_type`]/[`Assembler::declare_help`]/[`Assembler::declare_unit`])
@@ -606,6 +606,13 @@ impl<'a> Assembler<'a> {
         decoder: &mut PrometheusDecoder,
     ) -> Option<Slot> {
         let (family, role, total_suffix) = self.route(name, &labels, decoder)?;
+        // Checked before `le`/`quantile` come out, so a line naming one of them twice is a
+        // duplicate too, not a bound plus a series label of the same name.
+        labels.sort_by(|a, b| a.0.cmp(&b.0));
+        if labels.windows(2).any(|w| w[0].0 == w[1].0) {
+            decoder.skipped("duplicate_label");
+            return None;
+        }
         // `le`/`quantile` are part of the point, not the series identity: strip them out before the
         // label set becomes the series key.
         let extra = match role {
@@ -625,11 +632,6 @@ impl<'a> Assembler<'a> {
             },
             _ => None,
         };
-        labels.sort_by(|a, b| a.0.cmp(&b.0));
-        if labels.windows(2).any(|w| w[0].0 == w[1].0) {
-            decoder.skipped("duplicate_label");
-            return None;
-        }
 
         if total_suffix {
             self.families[family].total_suffix = true;
@@ -960,7 +962,7 @@ fn finish_series(
             // Every conforming producer sends a `+Inf` bucket; when one is missing the total has to
             // come from somewhere, and `_count` (else the highest bucket) is that somewhere.
             let highest = buckets.last().map(|(_, c)| *c).unwrap_or(0);
-            if buckets.last().map(|(b, _)| b.is_finite()).unwrap_or(true) {
+            if buckets.last().is_none_or(|(b, _)| *b != f64::INFINITY) {
                 buckets.push((f64::INFINITY, count.unwrap_or(highest).max(highest)));
             }
             let total = buckets.last().map(|(_, c)| *c).unwrap_or(0);
