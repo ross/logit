@@ -92,7 +92,7 @@ impl DsValue {
     }
 
     /// Whether `ds_type` is one of the four types this protocol defines. The decoder checks the
-    /// whole type vector before reading a value or allocating, so a hostile `count` can't make it
+    /// whole type vector before reading a value or allocating, so a corrupt `count` can't make it
     /// allocate.
     pub fn is_known_type(ds_type: u8) -> bool {
         matches!(ds_type, DS_COUNTER | DS_GAUGE | DS_DERIVE | DS_ABSOLUTE)
@@ -118,7 +118,7 @@ pub enum PartError {
     /// advance the cursor.
     #[error("part declares a length of {len}, below the {HEADER_LEN}-byte header")]
     ShortPart { len: usize },
-    /// A declared length past the end of the datagram: a truncated packet, or a hostile length.
+    /// A declared length past the end of the datagram: a truncated packet, or a corrupt length.
     #[error("part declares {len} bytes, only {remaining} remain")]
     Overlong { len: usize, remaining: usize },
 }

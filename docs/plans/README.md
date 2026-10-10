@@ -37,7 +37,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 | [Enabling plan: `Event.new(t)` — constructing events from Lua](lua-event-constructor.md) | 2026-09-15 | 2026-09-15 |
 | [Enabling plan: TLS and TCP ingress for `syslog_in`/`syslog_out`](syslog-tls.md) | 2026-09-13 | 2026-09-14 |
 | [Enabling plan: `target` components and routers](target-components.md) | 2026-09-13 | 2026-09-13 |
-| [Enabling plan: `graphite_in`/`graphite_out` — a lossless Graphite/Carbon relay](graphite-carbon-relay.md) | 2026-09-13 | 2026-09-13 |
+| [Enabling plan: `graphite_in`/`graphite_out` — a lossless Graphite/Carbon relay](graphite-carbon-relay.md) | 2026-09-13 | 2026-10-09 |
 | [Enabling plan: a load-test harness for the real `logit` binary](load-test-harness.md) | 2026-09-12 | 2026-10-02 |
 | [Enabling plan: `collectd_in`/`collectd_out` — a lossless collectd binary-protocol relay](collectd-binary-relay.md) | 2026-09-12 | 2026-09-12 |
 | [Enabling plan: Prometheus scrape ingestion and exposition](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-09-12 |

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-09-29
+updated: 2026-10-09
 ---
 
 # Enabling plan: `graphite_in`/`graphite_out` — a lossless Graphite/Carbon relay
@@ -33,7 +33,8 @@ Settled with Ross (2026-09-13), recorded in full in the ADR:
    (protocol-2 subset) and **restricted reader** accepting what real senders emit
    (`pickle.dumps(..., protocol=2)` and `protocol=-1`: `FRAME`, `SHORT_BINUNICODE`, `MEMOIZE`),
    rejecting everything else (no `GLOBAL`/`STACK_GLOBAL`/`REDUCE`/`BUILD`; bounded depth, memo,
-   items; lengths validated before allocation).
+   items; lengths validated before allocation). The ADR's "Amendment: the reader accepts pickle protocol 0" widens
+   this to protocol 0's textual opcodes.
 3. **Multi-value kinds are a `graphite_out` switch: `multi_value: skip | expand`** (name from the
    landscape matrix row "Multi-value point"). `skip` (default): `logit.output.metrics.skipped
    {metric_kind=…}`. `expand`: dotted sub-paths per the table below, counted
@@ -117,25 +118,7 @@ Codec holds its own `Telemetry`/`Diagnostics` and emits every counter itself (co
 
 #### Decode: wire → model
 
-| Wire | Model | Counter / diag |
-|---|---|---|
-| one line / one pickle datapoint | one `Event`, one `MetricRecord` | — |
-| `path` (before first `;`) | `name = intern(path)`, `Gauge(v)` | — |
-| `;name=value` | event attribute `Value::Str`, zero-copy `Bytes` slice | — |
-| repeated tag key | last wins | `logit.input.tags.normalized{reason="duplicate_key"}` |
-| finite value (`3`, `-1.5`, `1e5`, pickle `"3.14"` string) | `Gauge(v)` | — |
-| NaN / ±inf | line skipped | `logit.input.metrics.skipped{reason="non_finite_value"}` + diag |
-| `timestamp == -1` | `received_at` | — |
-| `timestamp > 0` (int or fractional) | `(ts * 1e9) as i64` | — |
-| other `timestamp <= 0` | skipped | `{reason="bad_timestamp"}` + diag |
-| not exactly 3 whitespace-separated fields; non-UTF-8; empty path | skipped | `{reason="bad_line"}` + diag |
-| malformed tag (`;` without `=`, empty name or value) | whole line skipped (carbon raises too) | `{reason="bad_tag"}` + diag |
-| empty / whitespace-only line | skipped, uncounted | — |
-| line > `max_line_bytes` (TCP) | drain to next `\n`, next line still decodes | `{reason="oversize_line"}` + diag |
-| pickle frame > `max_frame_bytes` | connection closed (no resync in a length-framed stream) | diag `oversize_frame` |
-| disallowed opcode / depth / item cap | `CodecError::Malformed`, whole frame dropped | diag `bad_pickle` |
-| pickle item not `(str, (num, num))` | that datapoint skipped, rest of frame decodes | `{reason="bad_shape"}` |
-| `Resource` / `Scope` | shared default / `None` | — |
+`crates/logit-proto/src/graphite/mod.rs`'s "Decode: wire → model" section is the canonical table.
 
 #### Encode: model → wire
 
@@ -226,7 +209,8 @@ pub struct EncodeStats {
 ×2; then `APPENDS`(0x65) `STOP`(0x2e).
 
 **Reader accepts**: framing `PROTO` `FRAME`(0x95, length validated) `STOP`; memo `BINPUT` 0x71,
-`LONG_BINPUT` 0x72, `MEMOIZE` 0x94, `BINGET` 0x68, `LONG_BINGET` 0x6a (bounded); containers
+`LONG_BINPUT` 0x72, `MEMOIZE` 0x94, `BINGET` 0x68, `LONG_BINGET` 0x6a (bounded; amended
+2026-10-09, see the ADR's protocol-0 amendment, "Memo keys"); containers
 `MARK`, `EMPTY_LIST`, `LIST` 0x6c, `APPEND` 0x61, `APPENDS`, `EMPTY_TUPLE` 0x29, `TUPLE` 0x74,
 `TUPLE1/2/3` 0x85-0x87; strings `BINUNICODE` 0x58, `SHORT_BINUNICODE` 0x8c, `BINUNICODE8` 0x8d,
 `BINSTRING` 0x54, `SHORT_BINSTRING` 0x55, `BINBYTES` 0x42, `SHORT_BINBYTES` 0x43, `BINBYTES8` 0x8e
@@ -237,7 +221,8 @@ pub struct EncodeStats {
 **Rejected** with `CodecError::Malformed("pickle opcode 0x.. is not permitted")`: `GLOBAL`,
 `STACK_GLOBAL`, `REDUCE`, `BUILD`, `INST`, `OBJ`, `NEWOBJ`, `NEWOBJ_EX`, `EXT1/2/4`, `PERSID`,
 `BINPERSID`, `DUP`, `POP`, `POP_MARK`, all dict/set opcodes, `BYTEARRAY8`/`NEXT_BUFFER`/
-`READONLY_BUFFER`, and every protocol-0 textual opcode. Bounds: `MAX_PICKLE_DEPTH`,
+`READONLY_BUFFER`, and every protocol-0 textual opcode (superseded: the ADR's "Amendment: the
+reader accepts pickle protocol 0" accepts seven of them). Bounds: `MAX_PICKLE_DEPTH`,
 `MAX_PICKLE_ITEMS` on memo and top-level list, every length validated against remaining input
 before allocating (`frame::read_frame` discipline, `crates/logit-proto/tests/robustness.rs`).
 Stack and memo are struct fields cleared per frame (warm decode allocates only the caller's
@@ -376,6 +361,8 @@ _tags/_multi_value` beside `statsd_format` (`:1014`).
 10. Sanitizer substitutions / empty-tag drops / collision drops (all counted).
 11. `tags: drop` drops the tag set (counted).
 12. `Sum` temporality and monotonicity dropped — a normalization, not a skip.
+13. A pickle sender's spelling (protocol version, opcode choice, memo use) leaves as `graphite_out`'s
+    protocol-2 writer spelling. Added by the ADR's protocol-0 amendment.
 
 ## Workstreams
 
@@ -420,7 +407,7 @@ resource; tag value slices input; pickle frame → one event per datapoint; nume
 wrong-shape item skipped, rest decodes. `pickle.rs` tests with CPython byte literals carrying
 provenance comments (exact `pickle.dumps` call): protocol 2 and 5 dumps decode; memoized repeated
 path via `BINGET`; `LONG1` timestamp past 2038; `GLOBAL`/`STACK_GLOBAL`/`REDUCE`/`BUILD`/dict/
-protocol-0 rejected; depth and item caps; truncation doesn't panic; writer emits only the ten
+protocol-0 rejected (superseded by the ADR's protocol-0 amendment); depth and item caps; truncation doesn't panic; writer emits only the ten
 permitted opcodes; write→read round-trips; CPython dump and our writer decode identically.
 `encode.rs` tests: gauge → one line; cumulative and delta sums bare; tags sorted; `tags: drop`
 counts every tag; array → last element counted; unrepresentable dropped; forbidden path byte
@@ -502,6 +489,9 @@ docker run -d --name graphite -p 2003:2003 -p 2004:2004 -p 8080:80 graphiteapp/g
   bounds + pre-validated lengths; `robustness.rs` and the rejection tests are the gate.
 - **Real-sender pickle variance**: CPython picks `BININT1/2`/`BININT`/`LONG1` by magnitude and
   protocol; tested against protocol 2 and -1 captures only; protocol 0/1 rejected outright.
+  (Superseded: protocol 1 decodes, since its carbon payloads use only allowlisted binary opcodes,
+  and [ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)'s "Amendment: the reader
+  accepts pickle protocol 0" accepts protocol 0 after a producer survey found real senders.)
 - **The TCP listener has no in-tree driver to copy**: connection lifetime, per-connection batch
   assembly, backpressure, shutdown drain are new; the socket-test list is sized accordingly.
 - **No `graphite.*` namespace** means a rename transform silently changes the wire path (unlike

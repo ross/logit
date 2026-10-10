@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-07
+updated: 2026-10-09
 ---
 
 # Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch
@@ -50,32 +50,16 @@ default 1 MiB — Carbon's own `Int32StringReceiver.MAX_LENGTH`).
 The pickle writer emits a hand-rolled protocol-2 subset (no crate dependency — see Alternatives);
 the reader is a **restricted** decoder accepting only what real senders emit
 (`pickle.dumps(..., protocol=2)` and `protocol=-1`), rejecting every opcode that could construct an
-arbitrary Python object. See "Pickle opcode subset" below.
+arbitrary Python object. See "Pickle opcode subset" below. (Amended 2026-10-09: the reader also
+accepts protocol 0. See "Amendment: the reader accepts pickle protocol 0".)
 
 ### Model mapping
 
 **Decode (wire → model).** One line or one pickle datapoint decodes to one `Event` carrying one
 `MetricRecord`.
 
-| Wire | Model | Counter / diag |
-|---|---|---|
-| one line / one pickle datapoint | one `Event`, one `MetricRecord` | — |
-| `path` (before first `;`) | `name = intern(path)`, `Gauge(v)` | — |
-| `;name=value` | event attribute `Value::Str`, zero-copy `Bytes` slice | — |
-| repeated tag key | last wins | `logit.input.tags.normalized{reason="duplicate_key"}` |
-| finite value (`3`, `-1.5`, `1e5`, pickle `"3.14"` string) | `Gauge(v)` | — |
-| NaN / ±inf | line skipped | `logit.input.metrics.skipped{reason="non_finite_value"}` + diag |
-| `timestamp == -1` | `received_at` | — |
-| `timestamp > 0` (int or fractional) | `(ts * 1e9) as i64` | — |
-| other `timestamp <= 0` | skipped | `{reason="bad_timestamp"}` + diag |
-| not exactly 3 whitespace-separated fields; non-UTF-8; empty path | skipped | `{reason="bad_line"}` + diag |
-| malformed tag (`;` without `=`, empty name or value) | whole line skipped (carbon raises too) | `{reason="bad_tag"}` + diag |
-| empty / whitespace-only line | skipped, uncounted | — |
-| line > `max_line_bytes` (TCP) | drain to next `\n`, next line still decodes | `{reason="oversize_line"}` + diag |
-| pickle frame > `max_frame_bytes` | connection closed (no resync in a length-framed stream) | diag `oversize_frame` |
-| disallowed opcode / depth / item cap | `CodecError::Malformed`, whole frame dropped | diag `bad_pickle` |
-| pickle item not `(str, (num, num))` | that datapoint skipped, rest of frame decodes | `{reason="bad_shape"}` |
-| `Resource` / `Scope` | shared default / `None` | — |
+The decode table, every skip and its counter, lives in `crates/logit-proto/src/graphite/mod.rs`'s
+"Decode: wire → model" section, the canonical copy this ADR doesn't repeat.
 
 **Encode (model → wire)** is the inverse, plus rules for model kinds Carbon's wire can't carry
 natively. Prefix `logit.output.metrics.skipped{reason=…}` unless noted; kind drops use
@@ -186,7 +170,9 @@ Pickle's own purpose is arbitrary Python object construction, which makes an unr
 remote-code-construction primitive fed straight from a socket. `graphite_in`'s pickle reader instead
 accepts a **fixed allowlist** of opcodes — exactly what CPython's own `pickle.dumps(obj, protocol=2)`
 (and `protocol=-1`, which resolves to the highest available protocol) emits for a list of
-`(str, (number, number))` tuples — and rejects everything else outright.
+`(str, (number, number))` tuples — and rejects everything else outright. (Amended 2026-10-09: the
+allowlist also takes protocol 0's seven textual opcodes. See "Amendment: the reader accepts pickle
+protocol 0".)
 
 **Writer** (protocol 2, no memo): `PROTO`(0x80,2) `EMPTY_LIST`(0x5d) `MARK`(0x28); per datapoint
 `BINUNICODE`(0x58, LE u32 len + UTF-8 — not `SHORT_BINSTRING`, which is `bytes` on py3),
@@ -194,7 +180,8 @@ accepts a **fixed allowlist** of opcodes — exactly what CPython's own `pickle.
 ×2; then `APPENDS`(0x65) `STOP`(0x2e).
 
 **Reader accepts**: framing `PROTO` `FRAME`(0x95, length validated) `STOP`; memo `BINPUT` 0x71,
-`LONG_BINPUT` 0x72, `MEMOIZE` 0x94, `BINGET` 0x68, `LONG_BINGET` 0x6a (bounded); containers `MARK`,
+`LONG_BINPUT` 0x72, `MEMOIZE` 0x94, `BINGET` 0x68, `LONG_BINGET` 0x6a (bounded; amended
+2026-10-09, see "Memo keys" in the protocol-0 amendment below); containers `MARK`,
 `EMPTY_LIST`, `LIST` 0x6c, `APPEND` 0x61, `APPENDS`, `EMPTY_TUPLE` 0x29, `TUPLE` 0x74,
 `TUPLE1/2/3` 0x85-0x87; strings `BINUNICODE` 0x58, `SHORT_BINUNICODE` 0x8c, `BINUNICODE8` 0x8d,
 `BINSTRING` 0x54, `SHORT_BINSTRING` 0x55, `BINBYTES` 0x42, `SHORT_BINBYTES` 0x43, `BINBYTES8` 0x8e
@@ -205,7 +192,8 @@ accepts a **fixed allowlist** of opcodes — exactly what CPython's own `pickle.
 **Rejected** with `CodecError::Malformed("pickle opcode 0x.. is not permitted")`: `GLOBAL`,
 `STACK_GLOBAL`, `REDUCE`, `BUILD`, `INST`, `OBJ`, `NEWOBJ`, `NEWOBJ_EX`, `EXT1/2/4`, `PERSID`,
 `BINPERSID`, `DUP`, `POP`, `POP_MARK`, every dict/set opcode, `BYTEARRAY8`/`NEXT_BUFFER`/
-`READONLY_BUFFER`, and every protocol-0 textual opcode. `GLOBAL`/`STACK_GLOBAL`/`REDUCE`/`BUILD` are
+`READONLY_BUFFER`, and every protocol-0 textual opcode (amended 2026-10-09: seven of them are now
+accepted, see below). `GLOBAL`/`STACK_GLOBAL`/`REDUCE`/`BUILD` are
 specifically the opcodes that let a pickle stream construct and invoke an arbitrary callable — the
 reason this format is unsafe to parse unrestricted at all. Bounds: `MAX_PICKLE_DEPTH` (16),
 `MAX_PICKLE_ITEMS` (500,000) on the memo and the top-level list, and every length-prefixed value
@@ -216,7 +204,8 @@ reason this format is unsafe to parse unrestricted at all. Bounds: `MAX_PICKLE_D
 extend as real-world producers turn up edge cases; it is the complete set this codec ever accepts.
 Widening it — even to a seemingly-inert opcode — is reviewed as a security decision against this
 ADR, not folded into a routine codec PR, because the allowlist's safety property is that it is
-closed, not merely generous.
+closed, not merely generous. "Amendment: the reader accepts pickle protocol 0" below is the one
+widening made under this rule.
 
 ### `graphite_in`'s TCP listener: no `ReceiveQueue`, and no shared driver yet
 
@@ -315,6 +304,9 @@ hand after the fact; this pair starts with one list, not two):
 10. Sanitizer substitutions / empty-tag drops / collision drops (all counted).
 11. `tags: drop` drops the tag set (counted).
 12. `Sum` temporality and monotonicity dropped — a normalization, not a skip.
+13. A pickle sender's spelling (protocol version, opcode choice, memo use) leaves as `graphite_out`'s
+    protocol-2 writer spelling. Added 2026-10-09; see "Amendment: the reader accepts pickle
+    protocol 0".
 
 ## Alternatives considered
 
@@ -495,3 +487,118 @@ renamed `expand_wire_output_is_pinned_for_every_kind_in_both_protocols` in
 [ADR `statsd-out-multi-value-expansion`](statsd-out-multi-value-expansion.md)'s amendment records
 the same change from `statsd_out`'s side, and `logit_proto::multi_value`'s module doc is the
 canonical table.
+
+## Amendment: the reader accepts pickle protocol 0 (2026-10-09)
+
+The pickle reader accepts protocol 0, carbon's text pickle, because real senders write it. This is
+the allowlist widening that "Pickle opcode subset" above says needs its own ADR decision. It adds
+seven textual opcodes, none of which imports or calls anything, and the allowlist stays closed.
+It also relaxes the memo key rule so Python 2 `cPickle` senders decode in every protocol.
+
+### Evidence
+
+The Decision section's claim that real senders write protocol 2 or `-1` was wrong. A survey of each
+producer's source on 2026-10-09 found:
+
+| Producer | Pickle protocol | What it writes per datapoint |
+|---|---|---|
+| Dropwizard Metrics [`PickledGraphite`](https://github.com/dropwizard/metrics/blob/v4.2.25/metrics-graphite/src/main/java/com/codahale/metrics/graphite/PickledGraphite.java) (3.2.6 and 4.2.25) | 0, written by hand | `(S'<name>'\n(L<ts>L\nS'<value>'\ntta` inside `(l` … `.`, with no memo. The name is never escaped and can hold raw UTF-8 bytes. The value is a quoted string: `%2.2f` for a floating-point gauge, a plain integer such as `S'42'` for a counter, or `S'NaN'`, which the decoder skips and counts as a non-finite value, as carbon drops it. JVM services reach it through `metrics-reporter-config`'s `pickled` reporter, Cassandra's pluggable reporter, or direct wiring. |
+| Diamond [`GraphitePickleHandler`](https://github.com/python-diamond/Diamond/blob/master/src/diamond/handler/graphitepickle.py) | the interpreter default: 0 on Python 2 (`cPickle.dumps(batch)`), 3 or higher on Python 3 | Python 2 writes `(S'<path>'\np1\n(I<ts>\nF<value>\ntp2\ntp3\na`: a `PUT` memo. A timestamp passes 2^31 only after 2038, and only then does a 32-bit Python 2 write it as a `long`, `L…L` |
+| [graphitesend](https://github.com/daniellawrence/graphitesend/blob/master/graphitesend/graphitesend.py) | the interpreter default (0 on Python 2) | the same as Diamond |
+| [og-rek](https://github.com/kisielk/og-rek/blob/master/encode.go) (Go) | 2 by default, 0 with a zero-value config | `I`, `F` (`%g`), and `S`, with no memo |
+| carbon's own [client](https://github.com/graphite-project/carbon/blob/master/lib/carbon/client.py) | 2 (`pickle.dumps(datapoints, protocol=2)`) | binary opcodes only |
+| collectd [`write_graphite`](https://github.com/collectd/collectd/blob/collectd-5.12.0/src/write_graphite.c) (5.12.0) | no pickle; plaintext only, over `tcp` or `udp` | — |
+| Spark [`GraphiteSink`](https://github.com/apache/spark/blob/v3.5.1/core/src/main/scala/org/apache/spark/metrics/sink/GraphiteSink.scala) (3.5.1) | no pickle; plaintext only, over `tcp` or `udp` | — |
+
+Carbon's own receiver ([`protocols.py`](https://github.com/graphite-project/carbon/blob/master/lib/carbon/protocols.py)'s
+`MetricPickleReceiver`) unpickles with `encoding='utf-8'`, calls `float()` on both the timestamp
+and the value, and skips a datapoint that fails. A `STRING` that isn't valid UTF-8 fails the whole
+payload there.
+
+### Opcodes added
+
+Seven opcodes join the allowlist, taking it from 35 opcodes to 42:
+
+| Opcode | Byte | Argument | Pushes or does |
+|---|---|---|---|
+| `INT` | `0x49` (`I`) | a decimal line | an integer; `I00` and `I01` are `False` and `True`, as CPython reads them |
+| `LONG` | `0x4c` (`L`) | a decimal line with an optional trailing `L` | an integer |
+| `FLOAT` | `0x46` (`F`) | a float `repr` line | a float |
+| `STRING` | `0x53` (`S`) | a quoted line | a string |
+| `UNICODE` | `0x56` (`V`) | a raw-unicode-escape line | a string |
+| `PUT` | `0x70` (`p`) | a decimal memo key line | stores the stack top in the memo |
+| `GET` | `0x67` (`g`) | a decimal memo key line | pushes a memo entry |
+
+Every object-construction opcode stays rejected: `GLOBAL` `c`, `INST` `i`, `OBJ` `o`, `REDUCE`
+`R`, `BUILD` `b`, `PERSID` `P`, every dict and set opcode, `DUP` `2`, `POP` `0`, and `POP_MARK`
+`1`, along with every binary opcode the Rejected list above names. Python 3 writes a `bytes` value at
+protocols 0 to 2 as `GLOBAL _codecs.encode` plus `REDUCE`, so that spelling stays rejected too, under
+`bad_pickle`. A carbon path is a `str`, so no surveyed sender writes it. Measured on 2026-10-09
+against carbon 1.1.10, Twisted 26.4.0, and Python 3.11, calling
+`MetricPickleReceiver.stringReceived` directly, carbon rejects the same frame. Its default
+`SafeUnpickler` (`PICKLE_SAFE` in `lib/carbon/util.py` holds only `copy_reg._reconstructor` and
+`__builtin__.object`) raises `UnpicklingError` on `_codecs`, and `stringReceived` logs "invalid
+pickle" and ignores the payload. With `USE_INSECURE_UNPICKLER` set, the payload loads, then
+`metric.encode('utf-8')` in `lib/carbon/protocols.py` raises an uncaught `AttributeError` on a
+`bytes` path. Either way carbon delivers nothing, so keeping `GLOBAL` closed costs no real sender.
+At protocol 3 and above a `bytes` path is `BINBYTES`, which the reader accepts as UTF-8 and carbon
+1.1.10 on Python 3 fails with the same `AttributeError`, so there the reader is more tolerant than
+carbon. The seven new opcodes are safe for the same reason
+the binary ones are: each pushes a scalar or touches the memo, and none names, imports, or calls
+anything.
+
+### Bounds
+
+Each textual opcode's argument runs to the next `\n` in the remaining input. A missing `\n` is
+`Malformed`, so every argument is bounded by the frame and none is sized from a declared length.
+
+- **`INT`**: decimal `i64` with an optional sign. CPython's loader calls `int(x, 0)`, which also
+  takes `0x`, `0o`, `0b`, and `_` separators. No surveyed sender writes any of them, so the reader
+  rejects them as `Malformed`. An overflow is `Malformed`, matching `LONG1`/`LONG4`'s 8-byte cap.
+- **`LONG`**: decimal with an optional trailing `L`, as CPython's loader treats it, read into an
+  `i64`. An overflow is `Malformed`.
+- **`INT` and `LONG` leading zeros**: a multi-digit literal with a leading zero followed by a
+  non-zero digit, such as `010`, is `Malformed`. CPython's C `load_int`, on both Python 2 and
+  Python 3, parses with `strtol` and base 0, which reads such a literal as octal, so no decimal
+  reading of it would match what CPython decodes. An all-zero spelling such as `00` is accepted.
+- **`FLOAT`**: Rust's `f64` parse, which accepts `nan`, `inf`, and exponent forms such as `1e+06`.
+  A literal `nan` or `inf` reaches the decoder's existing `non_finite_value` skip, as carbon drops a
+  NaN. An out-of-range literal such as `F1e999` is `Malformed` rather than infinity, matching
+  CPython's `OverflowError`.
+- **`PUT` and `GET`**: the key is decimal and follows the memo key rule under "Memo keys" below,
+  capped by `MAX_PICKLE_ITEMS`.
+- **`STRING`**: the argument starts and ends with the same quote, `'` or `"`, or the frame is
+  `Malformed`. With no backslash inside, the string stays a zero-copy range into the frame, as a
+  binary string is. Otherwise it's decoded by Python's string-escape rules (`\\`, `\'`, `\"`, `\a`,
+  `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, `\xHH`, and `\ooo`) into a reader-owned
+  scratch buffer that's cleared per frame. A decoded string is never longer than its source. An
+  unknown escape keeps its backslash, as Python does, and a raw byte passes through, so Dropwizard's
+  unescaped UTF-8 names decode.
+- **`UNICODE`**: raw-unicode-escape. `\uXXXX` and `\UXXXXXXXX` become UTF-8, and a surrogate or a
+  value past U+10FFFF is `Malformed`. Every other byte is Latin-1, so a byte at or above `0x80`
+  becomes two UTF-8 bytes. An argument that is pure ASCII with no `\u` or `\U` stays zero-copy;
+  any other goes to the same scratch buffer. That buffer grows to at most twice the argument, so a
+  frame's scratch is bounded by twice `max_frame_bytes`.
+
+The UTF-8 check is unchanged: a decoded `STRING` or `UNICODE` passes the same check every binary
+string does, and a failure drops the frame as `bad_pickle`, which is what carbon does. The scratch
+buffer is reader state like the stack, arenas, and memo, so a warm decode keeps its allocation
+count.
+
+### Memo keys
+
+Python 2's `cPickle` numbers memo keys from 1, not 0. On `python:2.7-slim` (2.7.18) it writes
+`(lp1\n(S'sys.cpu'\np2\n…` at protocol 0 and `\x80\x02]q\x01…` at protocol 2. The reader's
+original rule, `key <= memo.len()`, rejected every Python 2 `cPickle` sender, in binary protocols
+as well as protocol 0, and that includes carbon's own client running on Python 2. The rule is now
+`key <= max(memo.len(), 1)`: one skipped slot 0, then one new slot per `PUT`, `BINPUT`,
+`LONG_BINPUT`, or `MEMOIZE`, still capped by `MAX_PICKLE_ITEMS`. A corrupt key still can't grow
+the memo to the size it names.
+
+### Egress
+
+`graphite_out` still writes protocol 2. A protocol-0 sender relayed through `graphite_in ->
+graphite_out` leaves in protocol 2's spelling, which changes the encoding and no decoded field.
+The normalization list had no row for that, and protocol 1 and `-1` senders were already re-spelled
+the same way, so the list gains normalization 13 above. `crates/logit-proto/src/graphite/mod.rs`'s
+module doc gains the same row with the reader change, keeping the three copies' numbering in step.

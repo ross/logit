@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: script/record-fixtures [producer ...]
-#   Producers: logger, python-syslog-handler, rsyslog, rsyslog-tcp, collectd, otlp, graphite,
-#              prometheus, vmagent, statsd, datadog (= datadog-agent, datadog-tracer,
+#   Producers: logger, python-syslog-handler, rsyslog, rsyslog-tcp, collectd, otlp, graphite (also
+#              graphite-p0, graphite-py2, graphite-dropwizard, one capture each), prometheus, vmagent, statsd, datadog (= datadog-agent, datadog-tracer,
 #              datadog-dogstatsd-unix), splunk (= splunk-otel, splunk-docker, splunk-sc4s,
 #              splunk-java, then check_splunk_capture.py)
 #   With no arguments, records every producer in `all` below.
@@ -27,6 +27,8 @@ PROM_CFG_DIR="" # set by record_prometheus, removed by cleanup()
 DD_CONF_DIR=""  # set by record_datadog_agent, removed by cleanup()
 # The Datadog producers' shared `/var/run/datadog`: the Agent's sockets, or the capture's.
 DD_VOLUME="logit-record-fixtures-dd-run"
+# The JDK and Maven the Java producers (`graphite`'s Dropwizard capture, `splunk-java`) build in.
+MAVEN_IMAGE="maven:3.9.16-eclipse-temurin-17"
 
 # ---- shared plumbing ---------------------------------------------------------------------------
 
@@ -228,10 +230,16 @@ record_otlp() {
 # `interop_fixture_write_graphite_plaintext_decodes` (crates/logit-inputs/src/graphite/mod.rs)
 # decodes it as one buffer. The 90s timeout covers the apt-get install.
 #
-# Pickle comes from python_graphite_pickle_producer.py, a stdlib-only sender, at `protocol=2` and
-# `protocol=-1` (highest available: 5 on python:3.12-slim), one capture each so a test can name the
-# opcodes it checks. `python3 --version` prints beside the script's `pickle.HIGHEST_PROTOCOL` line
-# for testdata/interop/graphite/README.md's provenance table.
+# Pickle comes from three senders, one capture each so a test can name the opcodes it checks:
+# - python_graphite_pickle_producer.py, a stdlib-only sender, at `protocol=0`, `protocol=2`, and
+#   `protocol=-1` (highest available: 5 on python:3.12-slim). `python3 --version` prints beside the
+#   script's `pickle.HIGHEST_PROTOCOL` line for testdata/interop/graphite/README.md's provenance
+#   table.
+# - python2_diamond_pickle_producer.py on python:2.7-slim: Diamond's `cPickle.dumps(batch)` call,
+#   protocol 0 with cPickle's memo numbering.
+# - Dropwizard Metrics' `GraphiteReporter` over `PickledGraphite` (tools/record-fixtures/
+#   dropwizard-graphite/), built in `MAVEN_IMAGE`. The 600s timeout covers the first run's
+#   dependency download.
 record_graphite() {
     echo "== recording: collectd write_graphite plugin (plaintext TCP, debian:bookworm-slim) =="
     local out="${OUT_ROOT}/graphite"
@@ -259,6 +267,46 @@ record_graphite() {
         -v "${TOOLS_DIR}/python_graphite_pickle_producer.py:/producer/run.py:ro,z" \
         -w /producer python:3.12-slim \
         bash -c "python3 --version && python3 run.py --host capture --port 2004 --protocol -1"
+    finish_capture
+
+    record_graphite_p0
+    record_graphite_py2
+    record_graphite_dropwizard
+}
+
+record_graphite_p0() {
+    local out="${OUT_ROOT}/graphite"
+    echo "== recording: stdlib pickle producer (protocol 0) =="
+    start_capture tcp 2004 "${out}" graphite-pickle-p0 1
+    ${DOCKER} run --rm --network "${NET}" \
+        -v "${TOOLS_DIR}/python_graphite_pickle_producer.py:/producer/run.py:ro,z" \
+        -w /producer python:3.12-slim \
+        bash -c "python3 --version && python3 run.py --host capture --port 2004 --protocol 0"
+    finish_capture
+}
+
+record_graphite_py2() {
+    local out="${OUT_ROOT}/graphite"
+    echo "== recording: Diamond's cPickle.dumps(batch) on Python 2 (python:2.7-slim) =="
+    start_capture tcp 2004 "${out}" graphite-pickle-py2 1
+    ${DOCKER} run --rm --network "${NET}" \
+        -v "${TOOLS_DIR}/python2_diamond_pickle_producer.py:/producer/run.py:ro,z" \
+        -w /producer python:2.7-slim \
+        python2 run.py capture 2004
+    finish_capture
+}
+
+record_graphite_dropwizard() {
+    local out="${OUT_ROOT}/graphite"
+    echo "== recording: Dropwizard Metrics PickledGraphite (${MAVEN_IMAGE}) =="
+    start_capture tcp 2004 "${out}" graphite-dropwizard 1 600
+    ${DOCKER} run --rm --network "${NET}" \
+        -v "${TOOLS_DIR}/dropwizard-graphite:/src:ro,z" "${MAVEN_IMAGE}" \
+        bash -c "cp -r /src /build && cd /build && java -version 2>&1 | head -1 \
+            && mvn -q -B package dependency:copy-dependencies -DskipTests \
+            && ls target/dependency | grep -E 'metrics' \
+            && java -cp 'target/classes:target/dependency/*' Main capture 2004" \
+        2>&1 | sed 's/^/  [java] /'
     finish_capture
 }
 
@@ -681,7 +729,6 @@ SPLUNK_TELEMETRYGEN_IMAGE="ghcr.io/open-telemetry/opentelemetry-collector-contri
 SPLUNK_DIND_IMAGE="docker:29.8.1-dind"
 SPLUNK_ALPINE_IMAGE="alpine:3.22"
 SPLUNK_SC4S_IMAGE="ghcr.io/splunk/splunk-connect-for-syslog/container3:3.40.0"
-SPLUNK_MAVEN_IMAGE="maven:3.9.16-eclipse-temurin-17"
 
 # splunk_capture <prefix> <timeout> [raw_capture.py args...]: start_capture on port 8088, named
 # by path, with Splunk's success body on every data route and its health body on both health
@@ -856,11 +903,11 @@ for line in open('/lines.txt').read().splitlines():
 # asynchronously, so the two `/event` appenders' requests interleave in no fixed order. The 600 s
 # timeout covers the first run's Maven downloads.
 record_splunk_java() {
-    echo "== recording: splunk-library-javalogging Logback appender (${SPLUNK_MAVEN_IMAGE}) =="
+    echo "== recording: splunk-library-javalogging Logback appender (${MAVEN_IMAGE}) =="
     splunk_capture java 600 --max-per-path 1 \
         --require /services/collector/event/1.0=6 --require /services/collector/raw=3
     ${DOCKER} run --rm --name splunk-java --network "${NET}" --hostname splunk-java-fixture \
-        -v "${TOOLS_DIR}/splunk-java:/src:ro,z" "${SPLUNK_MAVEN_IMAGE}" \
+        -v "${TOOLS_DIR}/splunk-java:/src:ro,z" "${MAVEN_IMAGE}" \
         bash -c "cp -r /src /build && cd /build && java -version 2>&1 | head -1 \
             && mvn -q -B package dependency:copy-dependencies -DskipTests \
             && ls target/dependency | grep -E 'splunk|logback|okhttp' \
@@ -912,6 +959,9 @@ for p in "${producers[@]}"; do
     collectd) record_collectd ;;
     otlp) record_otlp ;;
     graphite) record_graphite ;;
+    graphite-p0) record_graphite_p0 ;;
+    graphite-py2) record_graphite_py2 ;;
+    graphite-dropwizard) record_graphite_dropwizard ;;
     prometheus) record_prometheus ;;
     vmagent) record_vmagent ;;
     statsd) record_statsd ;;

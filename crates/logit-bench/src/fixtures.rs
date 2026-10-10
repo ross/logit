@@ -359,6 +359,30 @@ pub fn graphite_pickle_frame(datapoints: usize) -> Bytes {
     Bytes::from(out)
 }
 
+/// [`graphite_pickle_frame`]'s datapoints at protocol 0, spelled as Python 2.7.18's
+/// `cPickle.dumps(batch)` spells them (Diamond's call; `testdata/interop/graphite/
+/// graphite-pickle-py2-000.raw` is a real capture): `(lp1`, then per datapoint
+/// `(S'<path>'\np<k>\n(I<ts>\nF0.5\ntp<k+1>\ntp<k+2>\na`, then `.`.
+///
+/// Each path holds a `\x2d` escape for its `-`, so every string takes the reader's escape-decoding
+/// path into its scratch rather than the zero-copy one. cPickle writes `\x..` for a non-ASCII byte,
+/// not for `-`; the escape here exercises the same decode with an ASCII path.
+pub fn graphite_pickle_protocol_0_frame(datapoints: usize) -> Bytes {
+    let mut out = b"(lp1\n".to_vec();
+    let mut memo = 2;
+    for index in 0..datapoints {
+        let datapoint = format!(
+            "(S'servers.web\\x2d1.cpu.core{index}'\np{memo}\n(I1700000000\nF0.5\ntp{}\ntp{}\na",
+            memo + 1,
+            memo + 2
+        );
+        out.extend_from_slice(datapoint.as_bytes());
+        memo += 3;
+    }
+    out.push(b'.');
+    Bytes::from(out)
+}
+
 /// `skip_to_brace` off, matching `fixtures/nginx-to-influxdb.yaml`: the syslog decoder has already
 /// stripped the header, so the whole message is the JSON body.
 pub fn json_parser() -> JsonParser {

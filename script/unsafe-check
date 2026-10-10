@@ -87,12 +87,21 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # `crates/logit-proto/tests/robustness.rs`'s statsd section pins under 56. `syslog`'s worst
 # input, `<0>` lines filling 64 KiB, is one 864-byte `Event` per four bytes, and the target's
 # marker event takes `out` one past 16,384 events, so it doubles to a measured 27 MiB `Vec`, which
-# the syslog section pins under 32. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
+# the syslog section pins under 32. `graphite_plaintext`'s `max_len` is `statsd`'s; its worst
+# input, `a 1 1` lines filling 64 KiB, is one `Event` per six bytes, a measured 13.5 MiB `Vec`,
+# which the graphite section pins under 16. `graphite_pickle`'s is its mode byte and a 64 KiB
+# payload, past which carbon's 1 MiB frame bound reaches no new reader state: its worst input,
+# one memoized datapoint repeated by two-byte `BINGET`s, is a measured 27 MiB `Vec`, pinned under
+# 32; protocol 0's densest repeat, the three-byte `g0\n`, makes fewer events, and its decoded
+# strings' scratch is at most twice the payload. `collectd`'s is its two cut bytes and a 65,507-byte UDP payload; its worst input, one-byte
+# notification messages six bytes apart, is a measured 13.5 MiB `Vec`, pinned under 16 in the
+# collectd section. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
 #
-# `native_batch`, `native_hop_batch`, `statsd`, and `syslog` run in fork mode: the process-wide
-# interner never evicts, so a long-lived fuzz process accumulates every dictionary string, metric
-# name, tag key, SD-ID, and PARAM-NAME it decodes until the arena outgrows the malloc limit, and
-# fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal, as it
+# `native_batch`, `native_hop_batch`, `statsd`, `syslog`, `graphite_plaintext`,
+# `graphite_pickle`, and `collectd` run in fork mode: the process-wide interner never evicts, so a
+# long-lived fuzz process accumulates every dictionary string, metric name, tag key, SD-ID,
+# PARAM-NAME, and carbon path it decodes until the arena outgrows the malloc limit, and fork mode
+# restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal, as it
 # is outside fork mode.
 FUZZ_TARGETS=(
     "native_frame|262144|65|"
@@ -112,6 +121,9 @@ FUZZ_TARGETS=(
     "stream_framing|65546|16|"
     "statsd|65536|56|-fork=1 -ignore_ooms=0"
     "syslog|65536|32|-fork=1 -ignore_ooms=0"
+    "graphite_plaintext|65536|16|-fork=1 -ignore_ooms=0"
+    "graphite_pickle|65537|32|-fork=1 -ignore_ooms=0"
+    "collectd|65509|16|-fork=1 -ignore_ooms=0"
 )
 
 # The sanitizer builds' RUSTFLAGS differ from miri's and careful's, so they get their own volume

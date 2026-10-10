@@ -9,7 +9,7 @@
 
 use super::part::{self, DsValue, PartError, PartHeader};
 use super::types_db::{DataSource, TypesDb};
-use super::{cdtime_to_nanos, CDTIME_ONE_SECOND, MAX_VALUES_PER_LIST};
+use super::{cdtime_to_nanos, CDTIME_ONE_SECOND, DATA_MAX_NAME_LEN, MAX_VALUES_PER_LIST};
 use crate::{CodecError, Decoder};
 use bytes::Bytes;
 use logit_core::interner::{intern, Symbol};
@@ -20,6 +20,12 @@ use logit_core::{
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::sync::Arc;
+
+/// The most bytes of a Plugin or Type a record name carries: [`DATA_MAX_NAME_LEN`] minus the
+/// NUL, the longest string collectd's own receiver takes. A list interns one name per data
+/// source in the never-evicting interner, so a longer part would be copied there up to
+/// [`MAX_VALUES_PER_LIST`] times; the `collectd.*` attribute keeps every byte.
+const MAX_NAME_SEGMENT_BYTES: usize = DATA_MAX_NAME_LEN - 1;
 
 /// Decodes collectd binary-protocol datagrams, with no socket, so framing, stickiness, and
 /// malformed-input tests run against it directly.
@@ -260,8 +266,9 @@ impl CollectdDecoder {
     /// wire order.
     ///
     /// **Every length and type check happens before any allocation.** The declared data-source
-    /// count is attacker-controlled (up to 65535), and sizing anything from it before checking it
-    /// against the part's length is the bug `crates/logit-proto/tests/robustness.rs` catches.
+    /// count comes off the wire (up to 65535, whatever a corrupt or misconfigured sender writes),
+    /// and sizing anything from it before checking it against the part's length is the bug
+    /// `crates/logit-proto/tests/robustness.rs` catches.
     fn decode_values(
         &mut self,
         bytes: &Bytes,
@@ -324,6 +331,22 @@ impl CollectdDecoder {
 
         let plugin_bytes = &bytes[plugin.clone()];
         let type_bytes = &bytes[type_.clone()];
+        let plugin_name = &plugin_bytes[..plugin_bytes.len().min(MAX_NAME_SEGMENT_BYTES)];
+        let type_name = &type_bytes[..type_bytes.len().min(MAX_NAME_SEGMENT_BYTES)];
+        if plugin_name.len() < plugin_bytes.len() || type_name.len() < type_bytes.len() {
+            // Two Plugins or Types sharing their first 127 bytes now share a name, and a sink
+            // that drops `collectd.*` attributes (`graphite_out`) writes them as one series.
+            self.diag.warn_throttled(
+                "record_name_cut",
+                format_args!(
+                    "collectd: a {}-byte plugin or {}-byte type is past collectd's 127-byte \
+                     limit; cutting it to 127 bytes in the record name, the collectd.* \
+                     attributes keep it whole",
+                    plugin_bytes.len(),
+                    type_bytes.len()
+                ),
+            );
+        }
         // One `types.db` lookup per Values part, not per data source. It borrows `self.types_db`
         // alongside `self.name`/`self.diag` (disjoint fields), so nothing is cloned per list.
         let data_sources =
@@ -338,9 +361,9 @@ impl CollectdDecoder {
                 .expect("every data-source type byte was validated above");
 
             self.name.clear();
-            push_lossy(&mut self.name, plugin_bytes);
+            push_lossy(&mut self.name, plugin_name);
             self.name.push('.');
-            push_lossy(&mut self.name, type_bytes);
+            push_lossy(&mut self.name, type_name);
             // A single-data-source list is `<plugin>.<type>` either way, as collectd's
             // `write_graphite` omits the lone data source's name (conventionally `value`).
             match data_sources {
@@ -799,6 +822,39 @@ pub(crate) mod tests {
         let names: Vec<&str> =
             events[0].metrics.iter().map(|record| resolve(record.name)).collect();
         assert_eq!(names, vec!["load.load.0", "load.load.1", "load.load.2"]);
+    }
+
+    /// A Plugin or Type past collectd's 127 bytes is cut to 127 in the record name, which is
+    /// interned once per data source, kept whole in its attribute, and reported once per list
+    /// under `record_name_cut`; a name at the limit isn't.
+    #[test]
+    fn a_long_plugin_or_type_is_cut_in_the_record_name_and_kept_in_the_attribute() {
+        let plugin = vec![b'p'; 4000];
+        let type_ = "t".repeat(126) + "é";
+        let mut decoder = decoder().with_diagnostics(logit_core::Diagnostics::new("collectd_in"));
+        let mut events = Vec::new();
+        let datagram = PacketBuilder::new()
+            .string(part::TYPE_HOST, b"web-1")
+            .string(part::TYPE_PLUGIN, &plugin)
+            .string(part::TYPE_TYPE, type_.as_bytes())
+            .values(&[gauge(0.1), gauge(0.2)])
+            .string(part::TYPE_PLUGIN, &plugin[..127])
+            .string(part::TYPE_TYPE, b"t")
+            .values(&[gauge(0.3)])
+            .build();
+        decoder.decode_into(datagram, RECEIVED_AT, &mut events).unwrap();
+        assert_eq!(decoder.diag().occurrences("record_name_cut"), 1, "only the cut list");
+        assert_eq!(resolve(events[1].metrics[0].name), format!("{}.t", "p".repeat(127)));
+        let names: Vec<&str> =
+            events[0].metrics.iter().map(|record| resolve(record.name)).collect();
+        let cut = format!("{}.{}\u{fffd}", "p".repeat(127), "t".repeat(126));
+        assert_eq!(names, vec![format!("{cut}.0"), format!("{cut}.1")]);
+        assert_eq!(
+            events[0].attributes.get(ATTR_PLUGIN).and_then(|v| v.as_str()).map(str::len),
+            Some(4000),
+            "the attribute keeps every byte"
+        );
+        assert_eq!(events[0].attributes.get(ATTR_TYPE).and_then(|v| v.as_str()), Some(&*type_));
     }
 
     #[test]

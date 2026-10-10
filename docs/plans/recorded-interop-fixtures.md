@@ -150,7 +150,10 @@ Two things about this one differ from every producer above it, both worth naming
 
 The follow-on list below is otherwise unchanged. `testdata/interop/graphite/README.md`'s own "what
 isn't covered here (yet)" section carries what this pair doesn't capture (tagged plaintext, UDP
-plaintext, a real carbon/Twisted pickle sender, reconnection, protocol 0/1 pickle).
+plaintext, a real carbon/Twisted pickle sender, reconnection, protocol 1 pickle). Protocol 0 was
+later captured from CPython 3, Python 2's `cPickle`, and Dropwizard Metrics' `PickledGraphite`, once
+the reader accepted it (ADR `graphite-carbon-relay`'s "Amendment: the reader accepts pickle
+protocol 0").
 
 ## 1. How captures are recorded, reproducibly
 
