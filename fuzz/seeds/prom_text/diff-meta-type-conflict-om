@@ -1,0 +1,4 @@
+# TYPE m gauge
+# TYPE m counter
+m 1
+# EOF

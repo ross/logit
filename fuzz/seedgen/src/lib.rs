@@ -925,7 +925,9 @@ fn collectd_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
 /// metadata capture points at, then hand-written bodies for what neither has: OpenMetrics
 /// `_created`, `# EOF` misplaced and missing, a histogram missing `+Inf`, fractional and
 /// non-finite counts, exemplars, `info` and `stateset`, quantiles outside `[0, 1]`, every escape
-/// at the end of a label value, and a text 0.0.4 `# EOF`, which is a comment.
+/// at the end of a label value, and a text 0.0.4 `# EOF`, which is a comment. Last, every body of
+/// the Prometheus text differential corpus, its hand-built cases and the recorded scrape bodies,
+/// as `diff-<stem>`, under the dialect its `Content-Type` sidecar selects.
 fn prom_text_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     let mut out = Vec::new();
     let fixtures = testdata.join("../crates/logit-cli/tests/fixtures/prometheus");
@@ -990,6 +992,32 @@ fn prom_text_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     ];
     for (name, body) in text {
         out.push((format!("text-{name}"), prefixed(0, body.as_bytes())));
+    }
+    for dir in ["differential/prometheus-text/cases", "interop/prometheus-scrape"] {
+        let mut bodies: Vec<_> = std::fs::read_dir(testdata.join(dir))?
+            .map(|entry| entry.map(|e| e.path()))
+            .collect::<Result<_, _>>()?;
+        bodies.retain(|path| {
+            path.extension().is_some_and(|ext| ext == "txt" || ext == "om" || ext == "body")
+        });
+        bodies.sort();
+        for path in bodies {
+            let file = path.file_name().and_then(|s| s.to_str()).expect("a UTF-8 body name");
+            let stem = &file[..file.rfind('.').expect("an extension")];
+            let headers = std::fs::read_to_string(path.with_file_name(format!("{stem}.headers")))?;
+            let content_type = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-type").then(|| value.trim())
+                })
+                .unwrap_or("");
+            let selector = match Dialect::from_content_type(content_type) {
+                Dialect::Text0_0_4 => 0,
+                Dialect::OpenMetrics1_0 => 1,
+            };
+            out.push((format!("diff-{stem}"), prefixed(selector, &std::fs::read(&path)?)));
+        }
     }
     Ok(out)
 }
