@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-09-25
+updated: 2026-10-09
 ---
 
 # Untrusted-input bounds: one set of rules for every decoder and listener a peer can reach
@@ -215,3 +215,7 @@ Each of these needs crafted input, and none has a free defense. Each is recorded
   backpressure, not idleness ([ADR `idle-connection-timeout`](idle-connection-timeout.md)).
 - A new decoder or listener of peer bytes is held to these rules in review, and gets a fuzz target
   ([ADR `out-of-ci-fuzzing`](out-of-ci-fuzzing.md)).
+- A decoder with an external reference implementation, such as CPython's `pickle` for the carbon
+  pickle reader, also gets a differential corpus under `testdata/differential/`: generated cases
+  with the reference's reading committed beside them
+  ([ADR `out-of-ci-fuzzing`](out-of-ci-fuzzing.md)'s "untrusted-input parsers" amendment).

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-09-25
+updated: 2026-10-09
 ---
 
 # Out-of-CI fuzzing: a `cargo-fuzz` workspace in the unsafe-check image, with every crash landed as a stable test
@@ -54,20 +54,9 @@ the decoder.
 ### Targets
 
 The canonical target table lives only in `script/unsafe-check`'s `FUZZ_TARGETS` array, one
-`<target>|<max_len>|<malloc_limit_mb>` entry per target. Nothing else lists them. In prose, the
-targets cover:
-
-- the native frame envelope, read in a loop with `resync` the way the disk spool reads it;
-- native batch decode, for both batch codecs (v1 and v2 with its provenance trailer);
-- native control messages (`Hello`, `HelloAck`, `Ack`, `Reject`);
-- `DdSketch` bytes (decode, then a `to_bytes` fixed-point oracle) and `DdSketch` merge (two decoded
-  halves merged, then `quantile` and `to_bytes`);
-- `HyperLogLog` bytes (decode, `estimate`, `insert`, `merge`, `to_bytes`, and drop, since the
-  drop is where a wrong allocation `Layout` would surface);
-- OTLP protobuf, OTLP/JSON, and gRPC framing followed by protobuf decode, with the first input
-  byte choosing the signal;
-- Prometheus remote-write decompression (oracle: output never exceeds the cap) and remote-write
-  decode, with the first byte choosing 1.0 or 2.0.
+`<target>|<max_len>|<malloc_limit_mb>|<extra args>` entry per target, where the fourth column
+holds extra libFuzzer arguments (see "The driver"). Nothing else lists them. What each target
+covers is described in prose under the "untrusted-input parsers" amendment below.
 
 ### Seeds, corpus, and artifacts
 
@@ -101,7 +90,7 @@ allocation past the limit is a crash. The limit is set slightly above
 the largest allocation a valid input of `max_len` bytes can need. For the native frame that is 65
 MiB, because a legitimate 64 MiB lz4 frame allocates its full `uncompressed_len`.
 
-A fourth `FUZZ_TARGETS` column holds extra libFuzzer arguments for one target, passed by `fuzz`
+The fourth `FUZZ_TARGETS` column holds extra libFuzzer arguments for one target, passed by `fuzz`
 and never by `fuzz-tmin`. The two native batch targets use it to run in fork mode (`-fork=1
 -ignore_ooms=0`). The process-wide interner never evicts, so a long-lived fuzz process
 accumulates every dictionary string it decodes until the arena outgrows the malloc limit, and
@@ -160,7 +149,7 @@ harness, not by CI.
   nightly, carries `clang`, and has a driver script. A second image would repeat all of that and
   drift from it. Only the target volume needs to be separate.
 - **Structured targets through `arbitrary`.** Rejected for these targets. Every decoder here takes
-  bytes from a peer, so raw bytes are the input space an attacker controls. `arbitrary`-derived
+  bytes from a peer, so raw bytes are the input space a peer writes. `arbitrary`-derived
   inputs start from well-typed values and reach the decoders only through an encoder, which skips
   the malformed inputs the fuzzer exists to find. A later target for an encoder-side invariant can
   use it.
@@ -292,3 +281,101 @@ Two things the campaign turned up about the harness, not the decoders:
 After the campaign, both `native_batch_*` targets' `malloc_limit_mb` rose from 16 to 64, because
 a valid batch of more than 16,384 empty events regrows `decode_batch_body`'s events `Vec` past
 16 MiB (about 56 MiB at `max_len`), and none of the campaign's inputs reached that count.
+
+## Amendment (2026-10-09): untrusted-input parsers
+
+The inventory's cluster 9, "Untrusted-input parsers", gives every hand-rolled parser of producer
+bytes a target. Most of those parsers live outside `logit-core` and `logit-proto` today, so
+[ADR `parsers-live-in-logit-proto`](parsers-live-in-logit-proto.md) moves them behind the seam
+this ADR's "The `fuzz/` crate" requires first. This amendment records what changes in the
+harness. It holds the prose description of every target, which "Targets" points at; the
+campaign tables under "Running it" keep the names each campaign ran under.
+
+### Targets
+
+`script/unsafe-check`'s `FUZZ_TARGETS` stays the one canonical table. In prose, the existing
+targets cover:
+
+- `native_frame`: the native frame envelope, read in a loop with `resync` the way the disk spool
+  reads it;
+- `native_batch` and `native_hop_batch`: the two native payload shapes, a bare batch and a hop
+  batch with its sender pair and provenance trailer, both under the default decode budget;
+- `native_control`: the native control messages;
+- `sketch_bytes`, `sketch_merge`, and `hll_bytes`: `DdSketch` bytes (decode, then a `to_bytes`
+  fixed-point oracle), `DdSketch` merge (two decoded halves merged, then `quantile` and
+  `to_bytes`), and `HyperLogLog` bytes (decode, `estimate`, `insert`, `merge`, `to_bytes`, and
+  drop, where a wrong allocation `Layout` would surface);
+- `otlp_proto`, `otlp_json`, and `otlp_grpc`: OTLP protobuf, OTLP/JSON, and gRPC framing followed
+  by protobuf decode, with the first input byte choosing the signal;
+- `prom_decompress` and `prom_remote_write`: remote-write decompression (oracle: output never
+  exceeds the cap) and decode, with the first byte choosing 1.0 or 2.0;
+- `proxy_header`: the start of a stream through `logit_proto::proxy::parse`;
+- `forwarded`: one forwarding header's value through `logit_proto::forwarded::parse`.
+
+Cluster 9 adds one target per moved or already-movable parser:
+
+- `stream_framing`: the TCP stream `Framer`, in every framing mode;
+- `statsd` and `syslog`: the two line decoders;
+- `graphite_plaintext`, `graphite_pickle`, and `collectd`: the carbon and collectd decoders, each
+  with a second-generation encode/decode fixed point;
+- `prom_text`: the Prometheus text and OpenMetrics decoder;
+- `message_json`, `message_csv`, `message_logfmt`, and `message_kv`: the log-message tokenizers.
+
+`prom_remote_write` also gains a structured mode, which builds a request from its input so the
+symbol-table rules are reachable, and a fixed-point oracle on every input.
+
+### Seeds and differential corpora
+
+`seedgen` also reads `testdata/interop/{statsd,syslog,graphite,collectd}/`, and every corpus
+under `testdata/differential/`. A differential corpus differs from `testdata/interop/`, which
+holds captured bytes that don't reproduce: it's generated, deterministic, and carries a reference
+implementation's reading of each case beside the case's bytes. `script/differential <corpus>`
+regenerates one, and `script/differential <corpus> --check` regenerates it into a temporary
+directory and fails if it differs from the committed files. No test needs the reference
+implementation installed; tests read the committed reading.
+
+### The `fuzz/` crate
+
+- The seam list under "The `fuzz/` crate" grows by the moves ADR `parsers-live-in-logit-proto`
+  names: `logit_proto::framing`, `logit_proto::statsd`, `logit_proto::syslog`, and
+  `logit_proto::message::{json,csv,logfmt}`.
+- The fuzz crate gains two third-party dependencies, `serde_json` (the reference reading for
+  `message_json`) and `prost` (to build a structured remote-write request). Both are already in
+  `fuzz/Cargo.lock` through the path dependencies, so neither adds a crate version.
+
+### Crash to regression test
+
+A crash's regression test lands in the `tests/robustness.rs` of the crate that owns the decoder,
+whichever crate that is. After the moves that is `logit-proto` for every cluster 9 parser, but
+the rule follows the code, not a list of two files.
+
+### Debug assertions under fuzzing
+
+The driver runs `cargo fuzz run` without `-O`. Without it, the pinned cargo-fuzz 0.13.2 adds
+`-Cdebug-assertions` to the build's `RUSTFLAGS` (`src/project.rs`), and its `-a` help reads
+"Build artifacts with debug assertions and overflow checks enabled (default if not -O)". rustc's
+overflow checks follow debug assertions unless set separately. So every `debug_assert!` in a
+parser fires under fuzzing, and integer overflow panics, in dependencies too: the `hll_bytes`
+finding under "First campaign" is an overflow panic inside `cardinality-estimator`. Don't add
+`-O` to the driver, because it turns both off.
+
+### The `Framer`'s drain state gets an observable
+
+Under `Oversize::DrainToNextLine`, a line that crosses the bound with no `LF` buffered is counted
+once, as `logit.input.frames.dropped{reason="oversize"}`, and the `Framer` then discards every
+byte until the next `LF`. A connection that never sends one, such as a binary protocol pointed at
+a line port, keeps sending bytes into that discard for its whole life, and nothing distinguishes
+it from a single long line that ended. That is reachable by accident, so it gets a free
+observable rather than a `docs/known-gaps/` entry:
+
+- A line that enters the drain state counts `logit.input.frames.dropped{reason="drained"}` in
+  place of `reason="oversize"`, so each dropped line still counts once. A line whose `LF` is
+  already buffered, and every other framing mode's oversize, keeps `reason="oversize"`.
+- The throttled `framing_error` diagnostic for that line says the connection discards input until
+  its next `LF`.
+
+`docs/design/internal-telemetry.md`'s "Layer 3: what only a component knows" table holds the
+canonical `frames.dropped` reasons. `untrusted/w6`, the branch that adds the `stream_framing`
+target, adds `drained` there, to the reason lists in that doc's `statsd_in`, `graphite_in`, and
+`lines_in` sections (the listeners that frame with `DrainToNextLine`), and to those listeners'
+module docs.
