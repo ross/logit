@@ -46,8 +46,9 @@ public class Main {
                 .convertDurationsTo(TimeUnit.MILLISECONDS)
                 .filter(MetricFilter.ALL)
                 .build(graphite);
+        // One report, which connects, sends one frame, and closes. Not `reporter.close()`: that
+        // reports once more, on a second connection.
         reporter.report();
-        reporter.close();
         System.out.println("dropwizard-graphite: reported " + registry.getMetrics().size()
                 + " metrics through PickledGraphite to " + host + ":" + port);
     }
