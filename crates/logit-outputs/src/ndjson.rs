@@ -55,8 +55,8 @@
 //!
 //! Readers that mirror this grammar: `tools/shape-survey/summarize.py`,
 //! `tools/shape-survey/check_interop.py`, `tools/shape-survey/producers/oteldemo.sh`'s Python,
-//! `tools/splunk-interop/check.py`, and `tools/victoria-interop/check.py`. A change here is
-//! mirrored there.
+//! `tools/splunk-interop/check.py`, `tools/victoria-interop/check.py`, and
+//! `tools/soak/soaklib/telemetry.py`. A change here is mirrored there.
 //!
 //! Everything writes straight into the caller's `String` with `push_str`/`write!`: no per-field
 //! `String`, no serde (`docs/design/memory.md`).
