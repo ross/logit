@@ -769,3 +769,102 @@ mod tests {
         }
     }
 }
+
+/// `logfmt` against a regex reading of the ADR's grammar on generated well-formed lines.
+#[cfg(test)]
+mod reference {
+    use super::*;
+    use logit_core::interner::resolve;
+    use proptest::prelude::*;
+
+    /// A key, then `=` and a quoted value (group 2) or an unquoted one (group 3), after the start
+    /// of the line or whitespace.
+    fn grammar() -> regex::Regex {
+        regex::Regex::new(
+            r#"(?:^|[ \t\r\n]+)([^ \t\r\n="]+)=(?:"((?:[^"\\]|\\.)*)"|([^ \t\r\n"]*))"#,
+        )
+        .unwrap()
+    }
+
+    fn unescape(quoted: &str) -> String {
+        let mut out = String::new();
+        let mut chars = quoted.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some(c @ ('\\' | '"')) => out.push(c),
+                Some(c) => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                None => out.push('\\'),
+            }
+        }
+        out
+    }
+
+    fn quoted_value() -> impl Strategy<Value = String> {
+        let piece = prop_oneof![
+            "[a-z0-9 =.:/{}-]{1,6}",
+            Just("\\\"".to_string()),
+            Just("\\\\".to_string()),
+            Just("\\n".to_string()),
+            Just("\\t".to_string()),
+            Just("\\u00e9".to_string()),
+            Just("é".to_string()),
+        ];
+        prop::collection::vec(piece, 0..5).prop_map(|p| format!("\"{}\"", p.concat()))
+    }
+
+    fn pair() -> impl Strategy<Value = String> {
+        let key = "[a-z_][a-z0-9_.]{0,8}";
+        let value = prop_oneof!["[a-z0-9=./:@-]{0,10}", quoted_value()];
+        (key, value).prop_map(|(k, v)| format!("{k}={v}"))
+    }
+
+    fn line() -> impl Strategy<Value = String> {
+        let sep = prop_oneof![Just(" "), Just("  "), Just("\t"), Just(" \t ")];
+        (prop::collection::vec((pair(), sep), 1..10), "[ \t]{0,2}").prop_map(|(pairs, lead)| {
+            let mut line = lead;
+            for (pair, sep) in pairs {
+                line.push_str(&pair);
+                line.push_str(sep);
+            }
+            line
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn logfmt_reads_a_well_formed_line_as_the_grammar_does(line in line()) {
+            let raw = Bytes::copy_from_slice(line.as_bytes());
+            let mut out = Vec::new();
+            let mut keys = KeyCache::new();
+            let parsed =
+                parse_logfmt(&raw, &line, false, &mut out, &mut keys, &Telemetry::default());
+            prop_assert!(parsed.is_ok(), "{line:?}");
+            let got: Vec<(String, String)> = out
+                .iter()
+                .map(|(k, v)| (resolve(*k).to_string(), v.as_str().unwrap().to_string()))
+                .collect();
+            let want: Vec<(String, String)> = grammar()
+                .captures_iter(&line)
+                .map(|c| {
+                    let value = match (c.get(2), c.get(3)) {
+                        (Some(quoted), _) => unescape(quoted.as_str()),
+                        (None, Some(bare)) => bare.as_str().to_string(),
+                        (None, None) => unreachable!("one alternative matches"),
+                    };
+                    (c[1].to_string(), value)
+                })
+                .collect();
+            prop_assert_eq!(got, want, "{:?}", line);
+        }
+    }
+}
