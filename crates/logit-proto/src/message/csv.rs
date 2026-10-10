@@ -4,6 +4,18 @@
 //! header-row and UTF-8 checks, field-count check, and diagnostics; the grammar is in
 //! [ADR `csv-positional-columns`](../../../../docs/adr/csv-positional-columns.md). A row is one
 //! message, so quoting never spans a record separator.
+//!
+//! Field offsets are `u32`, so a row over 4 GiB would wrap them. No source delivers one under
+//! its default bounds: a UDP datagram carries at most 65,507 bytes, a stream line stops at
+//! `framing::MAX_FRAME_BYTES` (64 KiB) or the listener's `max_line_bytes`, `tail_in` and
+//! `docker_in` drop a line past `max_line_bytes` (1 MiB by default), and the HTTP listeners cap a
+//! request body at a few MiB. Only an operator-set `max_line_bytes` of 4 GiB or more could admit
+//! such a row, and the listener holds the whole line in memory before it gets here.
+//!
+//! Every field of a valid UTF-8 row is valid UTF-8, which is why the transform checks the
+//! message once: graph rule 32 admits only an ASCII delimiter other than `"`, `\n`, and `\r`, an
+//! ASCII byte never occurs inside a multi-byte sequence, so no field boundary splits one, and
+//! [`unescape`] deletes only ASCII `"` bytes.
 
 use bytes::Bytes;
 
@@ -67,8 +79,9 @@ pub fn split_row(line: &Bytes, delim: u8, out: &mut Vec<(u32, u32, bool)>) -> Re
             }
             end = j; // exclusive: the closing quote's own index
             needs_unescape = esc;
-            next = j + 1; // index just past the closing quote
-                          // A closing quote must be followed by the delimiter or end-of-line.
+            next = j + 1; // the index after the closing quote
+
+            // A closing quote must be followed by the delimiter or end-of-line.
             if next < n && line[next] != delim {
                 return Err(RowError::TrailingAfterQuote);
             }
@@ -102,9 +115,9 @@ pub fn split_row(line: &Bytes, delim: u8, out: &mut Vec<(u32, u32, bool)>) -> Re
 
 /// Collapses each doubled `""` to one `"`: the only path in the `csv` transform that allocates.
 ///
-/// It allocates once because the first pass sizes the `Vec` exactly: `Bytes::from(Vec<u8>)`
-/// avoids a second allocation only when length equals capacity, and `field.len()` would
-/// overestimate.
+/// It allocates once because the first pass sizes the `Vec` to the output length:
+/// `Bytes::from(Vec<u8>)` avoids a second allocation only when length equals capacity, and
+/// `field.len()` would overestimate.
 #[inline]
 pub fn unescape(field: &Bytes) -> Bytes {
     let mut out_len = 0;
