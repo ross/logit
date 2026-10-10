@@ -186,7 +186,8 @@ protocol 0".)
 `TUPLE1/2/3` 0x85-0x87; strings `BINUNICODE` 0x58, `SHORT_BINUNICODE` 0x8c, `BINUNICODE8` 0x8d,
 `BINSTRING` 0x54, `SHORT_BINSTRING` 0x55, `BINBYTES` 0x42, `SHORT_BINBYTES` 0x43, `BINBYTES8` 0x8e
 (UTF-8 validated); numbers `BININT` 0x4a, `BININT1` 0x4b, `BININT2` 0x4d, `LONG1` 0x8a, `LONG4`
-0x8b (≤8-byte magnitude), `BINFLOAT` 0x47; inert `NONE` 0x4e, `NEWTRUE` 0x88, `NEWFALSE` 0x89
+0x8b (≤8-byte magnitude; amended 2026-10-09 to 16 bytes, see "Amendment: an integer past `i64`
+reads as the nearest `f64`"), `BINFLOAT` 0x47; inert `NONE` 0x4e, `NEWTRUE` 0x88, `NEWFALSE` 0x89
 (a stray one is a skipped datapoint, not a rejected frame).
 
 **Rejected** with `CodecError::Malformed("pickle opcode 0x.. is not permitted")`: `GLOBAL`,
@@ -363,6 +364,11 @@ hand after the fact; this pair starts with one list, not two):
   "Encode: events → families" table's `Distribution(sketch)` row in `prometheus/mod.rs`), left
   uncorrected by this effort and noted as a follow-up in this plan's
   W4b closeout; no shared `logit_inputs::tcp` driver yet, with the extraction trigger named above.
+- **The reader's conformance evidence is a differential corpus**:
+  `testdata/differential/graphite-pickle/` holds payloads CPython 3.12 and Python 2.7 wrote, each
+  with CPython's reading, carbon's receiver's reading, and the verdict the reader must give, and
+  `crates/logit-proto/tests/graphite_pickle_differential.rs` checks every one
+  ([`testdata/differential/README.md`](../../testdata/differential/README.md)).
 - **The pickle reader is a new, meaningful security surface**: a parser for a format whose purpose
   is arbitrary object construction, fed straight from a socket. Its safety rests entirely on the
   fixed opcode allowlist, bounded depth/memo/item counts, and every length validated against
@@ -555,6 +561,7 @@ Each textual opcode's argument runs to the next `\n` in the remaining input. A m
 - **`INT`**: decimal `i64` with an optional sign. CPython's loader calls `int(x, 0)`, which also
   takes `0x`, `0o`, `0b`, and `_` separators. No surveyed sender writes any of them, so the reader
   rejects them as `Malformed`. An overflow is `Malformed`, matching `LONG1`/`LONG4`'s 8-byte cap.
+  (Amended 2026-10-09: both read an `i128`; see the next amendment.)
 - **`LONG`**: decimal with an optional trailing `L`, as CPython's loader treats it, read into an
   `i64`. An overflow is `Malformed`.
 - **`INT` and `LONG` leading zeros**: a multi-digit literal with a leading zero followed by a
@@ -602,3 +609,22 @@ graphite_out` leaves in protocol 2's spelling, which changes the encoding and no
 The normalization list had no row for that, and protocol 1 and `-1` senders were already re-spelled
 the same way, so the list gains normalization 13 above. `crates/logit-proto/src/graphite/mod.rs`'s
 module doc gains the same row with the reader change, keeping the three copies' numbering in step.
+
+## Amendment: an integer past `i64` reads as the nearest `f64` (2026-10-09)
+
+The carbon pickle differential corpus (`testdata/differential/graphite-pickle/`) found that the
+reader failed a whole frame on an `int` CPython writes as a 9-byte `LONG1`, such as a `u64`
+counter at or past 2^63, where carbon's `float()` stores the nearest `f64`. A Python sender
+reaches one by passing on a `u64` counter, such as an SNMP `Counter64`, as the unbounded `int`
+Python reads it into.
+
+- `LONG1` and `LONG4` take a magnitude of at most 16 bytes, an `i128`, and the text `INT` and
+  `LONG` take any decimal that fits an `i128`.
+- A value that fits an `i64` stays an integer. A larger one becomes the nearest `f64`, rounded to
+  nearest with ties to even, which is how CPython's `float(int)` rounds.
+- A magnitude past 16 bytes still fails the frame. Only hand-built code writes an integer past
+  2^127, and `docs/known-gaps/mappings.md` records it with the corpus's other
+  `decode (Graphite)` divergences.
+
+The bound still costs nothing: every magnitude is read from a slice already validated against the
+input, so a larger cap moves no allocation. The allowlist is unchanged.

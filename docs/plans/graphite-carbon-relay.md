@@ -215,7 +215,7 @@ pub struct EncodeStats {
 `TUPLE1/2/3` 0x85-0x87; strings `BINUNICODE` 0x58, `SHORT_BINUNICODE` 0x8c, `BINUNICODE8` 0x8d,
 `BINSTRING` 0x54, `SHORT_BINSTRING` 0x55, `BINBYTES` 0x42, `SHORT_BINBYTES` 0x43, `BINBYTES8` 0x8e
 (UTF-8 validated); numbers `BININT` 0x4a, `BININT1` 0x4b, `BININT2` 0x4d, `LONG1` 0x8a, `LONG4`
-0x8b (≤8-byte magnitude), `BINFLOAT` 0x47; inert `NONE` 0x4e, `NEWTRUE` 0x88, `NEWFALSE` 0x89
+0x8b (≤8-byte magnitude, 16 bytes since the ADR's 2026-10-09 integer amendment), `BINFLOAT` 0x47; inert `NONE` 0x4e, `NEWTRUE` 0x88, `NEWFALSE` 0x89
 (a stray one = skipped datapoint, not a rejected frame).
 
 **Rejected** with `CodecError::Malformed("pickle opcode 0x.. is not permitted")`: `GLOBAL`,
