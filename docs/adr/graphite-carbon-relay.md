@@ -620,11 +620,10 @@ Python reads it into.
 
 - `LONG1` and `LONG4` take a magnitude of at most 16 bytes, an `i128`, and the text `INT` and
   `LONG` take any decimal that fits an `i128`.
-- A value that fits an `i64` stays an integer. A larger one, below 2^127, becomes the nearest
-  `f64`, rounded to
-  nearest with ties to even, which is how CPython's `float(int)` rounds.
-- A magnitude past 16 bytes still fails the frame. Only hand-built code writes an integer of
-  magnitude 2^127 or more, and `docs/known-gaps/mappings.md` records it with the corpus's other
+- A value that fits an `i64` stays an integer. A larger one that fits an `i128` becomes the
+  nearest `f64`, rounded to nearest with ties to even, which is how CPython's `float(int)` rounds.
+- A magnitude past 16 bytes still fails the frame. Only hand-built code writes an integer that
+  doesn't fit an `i128`, and `docs/known-gaps/mappings.md` records it with the corpus's other
   `decode (Graphite)` divergences.
 
 The bound still costs nothing: every magnitude is read from a slice already validated against the
