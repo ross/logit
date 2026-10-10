@@ -6212,11 +6212,11 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   the assembler's `malformed_line` cases, `malformed_metadata` no longer counts an empty `# HELP`,
   and a missing `+Inf` takes the larger of `_count` and the highest bucket. A 600-second campaign (fork mode, debug assertions on) ran 985,741 inputs in 603 seconds, about 1,630 exec/s (each input parses and writes three times), to a 2,740-input corpus with no crash. With the `-Inf` fix reverted, the target crashed on its committed `regress-neg-inf-only-histogram` seed outside fork mode (ADR `out-of-ci-fuzzing`). The worst 64 KiB body, distinct one- to three-character names on `aa 1` lines, allocates at most a 13.5 MiB `Vec` of events in the target, pinned under its 16 MiB limit; `assemble.rs` interns exemplar label names (`exemplar_from_labels`), and the target's model mapping interns family names, so the target runs in fork mode.
 - **Verified (untrusted/w13):** findings, two of them, fixed. The Prometheus text differential
-  corpus, `testdata/differential/prometheus-text/` (`script/differential prom-text`), holds 155
-  hand-built bodies (75 text 0.0.4, 80 OpenMetrics) and three scrape bodies recorded from
+  corpus, `testdata/differential/prometheus-text/` (`script/differential prom-text`), holds 157
+  hand-built bodies (76 text 0.0.4, 81 OpenMetrics) and three scrape bodies recorded from
   node_exporter 1.12.1 and prometheus_client 0.26.0 (`script/record-fixtures prometheus-scrape`),
   each beside Prometheus 3.14.0's `textparse.New` reading; `crates/logit-proto/tests/prometheus_text_differential.rs`
-  checks all 158 with no Go installed. The three recorded bodies read as Prometheus reads them,
+  checks all 160 with no Go installed. The three recorded bodies read as Prometheus reads them,
   with nothing skipped or degraded. Prometheus fails 37 of the cases whole; every series it read
   before the error is in `logit`'s output, and the shapes `logit` reads there are now listed in
   `text.rs`'s "Leniencies". The findings: `Dialect::from_content_type` matched
@@ -6228,7 +6228,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   new `decode (Prometheus)` rows in `docs/known-gaps/mappings.md`: Prometheus 3's quoted UTF-8
   names (6), values and timestamps the model can't hold (6), lines the grammar steps over that
   Prometheus's parser keeps (14), the exemplar on a `_count` (1), and a malformed `Content-Type`
-  parameter (1). No recorded body reaches one. The 158 bodies are `prom_text` seeds
+  parameter (1). No recorded body reaches one. The 160 bodies are `prom_text` seeds
   (`diff-<stem>`), and a 120-second `fuzz prom_text` run from them executed about 265,000 inputs
   with no crash.
 ### CODEC-13 — Prometheus remote-write decoder — Snappy decompression-bomb guard and the 2.0 symbol-table indirection

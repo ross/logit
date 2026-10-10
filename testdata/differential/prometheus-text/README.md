@@ -59,8 +59,9 @@ A name ends `-text` or `-om` when one shape is in both dialects. `cli-*` cases a
 in Prometheus's exposition format documentation (its `-no-weird` twin drops the one line Prometheus
 rejects), and `doc-openmetrics` the OpenMetrics specification's. The rest cover:
 
-- histograms: a missing `+Inf` bucket, buckets out of order, repeated, decreasing, spelled
-  `1`/`1.0`/`1e1`, a `_count` that disagrees, counts that are `NaN`, negative, or fractional;
+- histograms: a missing `+Inf` bucket, alone and beside a `_count` above the highest bucket,
+  buckets out of order, repeated, decreasing, spelled `1`/`1.0`/`1e1`, a `_count` that disagrees,
+  counts that are `NaN`, negative, or fractional;
 - summaries: quantiles outside `[0, 1]`, one that isn't a number;
 - values: `NaN`, the infinities, `-0`, the largest and the smallest subnormal `f64`, one past the
   range, hex floats, `_`, signed `NaN`, negative counters;

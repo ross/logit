@@ -35,8 +35,9 @@
 //! - a `+Inf` bucket only logit has, where Prometheus read none, and a `_count` only logit has, the
 //!   `+Inf` total restated: `text.rs`'s "Leniencies";
 //! - a histogram `_count` that differs from Prometheus's, for a series whose own `_count` line
-//!   Prometheus read as disagreeing with its `+Inf` (else highest) bucket, which is the series
-//!   `histogram_count_mismatch` counts: the bucket wins (`text.rs`'s skip table);
+//!   Prometheus read as disagreeing with its `+Inf` bucket or, with none, as a count below the
+//!   highest bucket, which is the series `histogram_count_mismatch` counts: the bucket wins
+//!   (`text.rs`'s skip table);
 //! - a bucket, `_count`, or `_gcount` value Prometheus reads as a fraction equals logit's `u64`
 //!   count when it rounds to it (`assemble.rs`'s `count_value`);
 //! - `untyped` equals `unknown`: Prometheus's text parser reads `# TYPE x untyped` as
@@ -401,10 +402,11 @@ fn exemplar_labels(exemplar: &Exemplar) -> Vec<(String, String)> {
     labels
 }
 
-/// Whether Prometheus's own `_count`/`_gcount` line `id` disagrees with the total its own bucket
-/// lines give that series, both read as `assemble.rs`'s `count_value` rounds them: the `+Inf`
-/// bucket, or, with none, the highest bucket, which is what `finish_series` takes as the total.
-/// Only such a series may count `histogram_count_mismatch`, so only its `_count` is excused.
+/// Whether Prometheus's own `_count`/`_gcount` line `id` disagrees with that series' own bucket
+/// lines the way `finish_series` counts `histogram_count_mismatch`, every count read as
+/// `assemble.rs`'s `count_value` rounds it: a count other than the `+Inf` bucket's, or, with no
+/// `+Inf` bucket, a count below the highest bucket. With none, `finish_series` takes the larger
+/// of the two as the total, so a count above the highest bucket is the total and isn't excused.
 fn count_disagrees(go: &[(Identity, &Json)], id: &Identity, entry: &Json) -> bool {
     let base = id.0.strip_suffix("_gcount").or_else(|| id.0.strip_suffix("_count"));
     let Some(base) = base else { return false };
@@ -423,8 +425,14 @@ fn count_disagrees(go: &[(Identity, &Json)], id: &Identity, entry: &Json) -> boo
         })
         .collect();
     totals.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let Some(&(_, total)) = totals.last() else { return false };
-    counted(bits(&entry["value"])).is_some_and(|count| count != total)
+    let Some(&(bound, highest)) = totals.last() else { return false };
+    counted(bits(&entry["value"])).is_some_and(|count| {
+        if bound == f64::INFINITY {
+            count != highest
+        } else {
+            count < highest
+        }
+    })
 }
 
 /// A count line's value as `assemble.rs`'s `count_value` reads it, or `None` for one it skips.
