@@ -1,0 +1,98 @@
+# statsd-vm's stream under a seeded random schedule of network and lifecycle faults, one at a
+# time, each followed by a gap of steady state. Meant for hours: pass `--duration 8h`. The same
+# seed draws the same schedule, so `--seed N` reproduces a run. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "random-faults"
+description = "statsd-vm with a disk-spooled sink under a seeded random schedule of netem, pause, stop, kill, and partition faults"
+duration = "1h"           # a smoke run; --duration 8h for a long one
+warmup = "60s"
+cooldown = "120s"         # >= recovery_bound and >= random.gap.min
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+sut_aggregate = "window"
+sut_sink = "victoria_metrics"
+wire_loss_outside_faults = 0.0
+# Every series is written about 200 times a window, so each has a sample in every window, and a
+# spooled window lost to a kill shows as a gap.
+vm_every_window = true
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+[random]
+seed = 20261009           # --seed overrides
+# The quiet time between one fault's end and the next's start. The minimum covers
+# recovery_bound + 2 x progress_window (105s), so every fault's recovery is followed by at least
+# two judged progress windows.
+gap = { min = "2m", max = "4m" }
+
+# netem on the SUT shapes its remote-write; TCP absorbs delay and loss, and a rate limit queues.
+[[random.fault]]
+weight = 3
+action = "netem"
+on = "logit"
+args = ["delay 200ms 50ms", "loss 30%", "delay 1s", "rate 1mbit"]
+for = { min = "60s", max = "3m" }
+
+# netem on the generator shapes the UDP into the SUT: loss there is wire loss by design.
+[[random.fault]]
+weight = 3
+action = "netem"
+on = "generator"
+args = ["delay 200ms 50ms", "loss 10%", "delay 1s", "rate 2mbit"]
+for = { min = "30s", max = "2m" }
+
+[[random.fault]]
+weight = 2
+action = "stop"
+on = "victoria-metrics"
+for = { min = "30s", max = "150s" }
+
+[[random.fault]]
+weight = 1
+action = "partition"
+on = "victoria-metrics"
+for = { min = "20s", max = "2m" }
+
+[[random.fault]]
+weight = 2
+action = "pause"
+on = "logit"
+for = { min = "20s", max = "90s" }
+
+[[random.fault]]
+weight = 2
+action = "stop"
+on = "logit"
+for = { min = "20s", max = "90s" }
+
+# The spool keeps what the killed process queued; ledger.replay and ledger.windows judge it.
+[[random.fault]]
+weight = 2
+action = "kill"
+on = "logit"
+for = { min = "20s", max = "60s" }
+
+[[random.fault]]
+weight = 1
+action = "partition"
+on = "logit"
+for = { min = "20s", max = "2m" }
+
+[[random.fault]]
+weight = 1
+action = "partition"
+on = "generator"
+for = { min = "20s", max = "60s" }

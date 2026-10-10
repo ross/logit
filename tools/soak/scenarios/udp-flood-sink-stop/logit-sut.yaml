@@ -1,0 +1,25 @@
+# The system under test in `script/soak`'s udp-flood-sink-stop scenario: statsd-vm's SUT with a
+# two-batch blocking sink queue and a 500 ms aggregate window, so a 60 s VictoriaMetrics outage
+# backs up through the sink's 64-batch inbox and `aggregate` to the listener, whose receive
+# queue is at its defaults. Its `internal` telemetry goes to stdout as NDJSON for the harness to
+# read.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    # One batch per window: at 10 s, filling the sink's 64-batch inbox would take over 10
+    # minutes.
+    interval: 500ms
+    temporality: cumulative
+    series_retention: 7200          # an hour of windows: a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    buffer: { max_batches: 2 }      # overflow: block, the default
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
