@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-09-26
+updated: 2026-10-11
 ---
 
 # Shutdown accounting and cancellation safety: every shutdown loss counted, and one table of cancellation points
@@ -265,6 +265,8 @@ was missing was executable evidence under real concurrency, and the shutdown acc
   drain the instant the signal fires, and every one of those counts is recorded later, at the
   grace backstop or during the drain. They reach a test `Registry`, but not an exported pipeline.
   The self-log `diag.warn` is what an operator sees, and `docs/known-gaps/` records the gap.
+  [Superseded by the amendment "internal drains last (2026-10-11)" below: decisions 10 to 16
+  move `internal`'s final drain after the data nodes' and log what is still undrained.]
 - Out of this stream's scope, recorded for the sink cluster: `stdio_out`/`file_out` write in
   place with `write_all`, so when a send is cancelled mid-write and `flush()` then completes it,
   the file can hold a torn line or native frame.
@@ -559,3 +561,89 @@ wire so the peer resends. Four uncounted losses the audit found are now in `docs
 
 Site comments that restated a row now point at the table, and the runtime, `Input`, and `tcp.rs`
 module docs point at it once. No behavior changes.
+
+## Amendment: internal drains last (2026-10-11)
+
+`internal` is an ordinary input, so it does its final drain the moment the shutdown signal fires.
+Every count recorded afterward stays in the registry and never reaches an exported pipeline:
+
+- decision 4's UDP `datagrams.dropped` and `bytes.dropped{reason="shutdown"}`;
+- the drops a sink or Lua node counts during its drain, as `batches.dropped{reason="shutdown"}`
+  through `count_shutdown_drop`;
+- the final drain's own `logit.internal.*` counts.
+
+Operators and the soak ledger read those counts from stderr. The Consequences bullet about
+`internal` above recorded this as a gap. These decisions close it, continuing the numbering above.
+
+Terms. Reachability follows each node's consumers and router or Lua `targets`, including a target's
+own consumers. `internal`'s **pipeline** is every node reachable from it. The pipeline is
+**dedicated** when no node in it is reachable from another input. A shared sink, such as one
+`otlp_out` carrying both data and `internal`'s output, makes it **mixed**.
+
+10. **Only a dedicated pipeline is staged.** It is the recommended setup, and the only one where
+    `internal`'s output is treated specially and always emits its last counts. With a mixed
+    pipeline, or no `internal`, shutdown runs as it does today.
+11. **A dedicated pipeline shuts down in two stages.** Stage one is the shutdown signal. Every node
+    outside the pipeline takes it as every node does today: inputs stop, the close-time flush
+    cascade runs, and a sink's `write_loop` grace and a Lua node's wedge rule count from it. The
+    runtime sends a second signal once stage one has fired and every node outside the pipeline has
+    exited, finished or failed. `internal` and the pipeline's sinks and Lua nodes take only that
+    second signal. Until then `internal` keeps draining on its interval, so a long data drain is
+    still exported tick by tick. On the second signal it drains once more and returns, and the
+    pipeline cascades as today.
+12. **Stage-two graces count from stage two.** `internal`'s 5 s grace (`ReceiveConfig::default()`),
+    each pipeline sink's `write_loop` grace, and each pipeline Lua node's wedge rule start at the
+    second signal, so a long data drain can't consume them. A pipeline sink idling on an empty queue
+    would otherwise reach its grace before `internal`'s final batch arrives, because `write_loop`'s
+    grace runs whether or not the queue is open.
+13. **Every wait stays bounded.** Transforms and routers take no signal, and a Lua thread parked on
+    a full inbox isn't busy, so each is bounded by the nodes below it, and in the end by a sink's
+    grace. A dedicated pipeline is closed in both directions: no outside node feeds a pipeline node,
+    or that node would be reachable from another input, and every node a pipeline node feeds is in
+    the pipeline. So stage one involves no pipeline node and is bounded as it is today. In stage
+    two, `internal`'s output closes within its stage-two grace, and every node below it is bounded
+    by the sinks below it, each counting its grace from stage two.
+14. **Mixed pipelines stay as they are, with a warning.** Staging a mixed pipeline would need
+    `internal` to split its output and keep shared nodes on stage one, or a shared node would hold
+    data past its sink's grace and lose its close-time flush. That machinery isn't worth it for a
+    setup the docs recommend against. A mixed pipeline resolves with a startup and `logit validate`
+    warning naming a shared node, and the operator docs recommend a dedicated pipeline and say why:
+    point `internal` at its own sinks, on the same backend when needed, such as a second `otlp_out`
+    to the same endpoint. Nothing enforces it, because a mixed pipeline is valid and loses only
+    shutdown-time telemetry.
+15. **The first-error and no-signal paths are unchanged.** A node failure sends the shutdown signal,
+    stage one runs, and stage two follows. A run with no shutdown signal (`run` passes `pending()`)
+    never reaches stage two.
+16. **The CLI logs what is left.** After every node has exited, it drains the registry once more and
+    writes each leftover metric point to the self-log as one structured line,
+    `telemetry left undrained at exit`, with the fields `component`, `metric`, `tags`, and `value`,
+    or `count` and `sum` for a timing. The level is `warn` for a nonzero `*.dropped` metric whose
+    `reason` isn't one the config asked for (`absorbed`, `unrouted`, `script_drop`), and that
+    isn't `keep` and `remove`'s reason-less `logit.transform.attributes.dropped`; `debug`
+    otherwise: even a dedicated pipeline leaves its own nodes' counts for its last batch, and those
+    would otherwise print on every clean exit. It does this on exit 0 and exit 2 alike. That
+    covers a mixed pipeline's residual and the final drain's own counts. Spans and captured logs
+    aren't repeated, because the logs already went to stderr.
+
+Because a dedicated pipeline exports what a listener counts while it stops, the HTTP listeners
+count each connection their shutdown close sequence ends as
+`logit.input.connections.closed{reason="shutdown"}`. That supersedes decision 8 of [ADR
+`idle-connection-timeout`](idle-connection-timeout.md)'s shutdown amendment. The TCP driver and
+`logit_in` don't count a shutdown close.
+
+Not covered: SIGKILL and out-of-memory kills give no drain at all. Only a shorter `interval` narrows
+that loss.
+
+Alternatives considered:
+
+- **Persist leftovers to a state file and replay them on the next start.** They arrive late or
+  never, it needs a state directory, and it is awkward for cumulative counters. It stays in reserve
+  if mixed pipelines prove common.
+- **A dedicated exporter inside `internal` that bypasses the graph.** It reverses [ADR
+  `internal-telemetry-as-pipeline-events`](internal-telemetry-as-pipeline-events.md).
+- **Stage a mixed pipeline too**, with `internal` splitting its output into dedicated and shared
+  edges. The mixed case has several hang and loss modes to design around: a shared sink or
+  transform held past its grace, and `internal`'s send to shared edges blocked behind a full
+  dedicated edge. The dedicated case alone is simple and covers the recommended setup.
+- **Require a dedicated pipeline through a validation rule.** Rejected: a mixed pipeline is valid,
+  and the loss is limited to shutdown-time telemetry.

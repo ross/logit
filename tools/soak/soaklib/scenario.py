@@ -19,16 +19,25 @@ fixed or random:
   same seed. Draws use `Random.random()` only, whose sequence for an integer seed is stable
   across Python versions; `randrange()` and `choices()` are not promised to be.
 
-A scenario's target is where the SUT's sink delivers. The default is the local
-`victoria-metrics` service, which the checks query for V. A `[target]` table with
-`kind = "external"` names a destination outside the stack, such as Datadog, which nothing
-queries: the stack runs without `victoria-metrics`, faults on it are refused, and the ledger
-ends at the sink's own telemetry (docs/plans/soak-harness.md's "External targets"). A
+A scenario's target is where the SUT's sinks deliver. The default is local: each
+`[[ledger.sink]]` names the `backend` service the checks query for its V. A `[target]` table
+with `kind = "external"` names a destination outside the stack, such as Datadog, which nothing
+queries: the stack runs without the `local` profile's backends, a sink names no backend, and the
+ledger ends at each sink's own telemetry (docs/plans/soak-harness.md's "External targets"). A
 `[target]` table with `kind = "kafka"` runs a local Kafka broker, the `kafka` service, in place of
-`victoria-metrics`: faults on `kafka` are allowed for that target only, and the ledger's V is the
-topic it names, read back at the end (docs/plans/soak-harness.md's "Kafka targets").
+the `local` profile's backends: its one sink names no backend, faults on `kafka` are allowed for
+that target only, and the ledger's V is the topic it names, read back at the end
+(docs/plans/soak-harness.md's "Kafka targets").
+
+Services are known by role, from each compose service's `soak.role` label: `sut` (the `logit`
+under test), `generator`, `backend`, or `broker` (a Kafka target's broker). A scenario may add
+services with a `compose` override file, so the role map comes from the merged compose config,
+which only the driver can read (`docker compose config`). `load()` checks what needs no service
+list; `service_problems()` checks the rest against a role map: the driver's in `prepare()`
+before the stack starts, and `base_roles()` in `list` and the self-test.
 """
 
+import json
 import os
 import random
 import re
@@ -38,25 +47,49 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# The services compose.yaml defines, and the two that run `logit`.
-SERVICES = ("logit", "generator", "victoria-metrics", "kafka")
-LOGIT_SERVICES = ("logit", "generator")
+# The compose label naming a service's role, and the roles. A `sut` and a `generator` run
+# `logit`; a `backend` stores what a sink delivers and answers the checks' queries; a `broker`
+# is a Kafka target's broker, which the driver reads the topic back from.
+ROLE_LABEL = "soak.role"
+SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE = "sut", "generator", "backend", "broker"
+ROLES = (SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE)
+LOGIT_ROLES = (SUT_ROLE, GENERATOR_ROLE)
+# The service each `logit` role runs as. One SUT and one generator, under these names.
+SUT_SERVICE, GENERATOR_SERVICE = "logit", "generator"
+# The role map compose.yaml's labels give with the `local` profile, for what can't run
+# `docker compose config`: `list` and the self-test, which pins it to compose.yaml.
+BASE_ROLES = {"logit": SUT_ROLE, "generator": GENERATOR_ROLE, "victoria-metrics": BACKEND_ROLE}
+# What the `kafka` profile adds to the role map in place of the `local` profile's backends.
+KAFKA_ROLES = {"kafka": BROKER_ROLE}
 
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
-ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition")
-# Actions allowed on the SUT only. A `kill` exists to end a `logit` process with no shutdown;
-# on the generator, the lines it sent after its last telemetry drain reach the SUT with no G
-# behind them, and `ledger.wire` would net them against real loss.
-SUT_ONLY_ACTIONS = ("kill",)
+ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "mark", "exit")
+# Actions allowed on the SUT only, each with the reason. A `kill` exists to end a `logit` process
+# with no shutdown; on the generator, the lines it sent after its last telemetry drain reach the
+# SUT with no G behind them, and `ledger.wire` would net them against real loss. An `exit`
+# names a self-exit the SUT's own config causes, which the generator's config never does.
+SUT_ONLY_ACTIONS = {
+    "kill": ("on the generator, the lines it sent after its last telemetry drain reach the SUT "
+             "with no G behind them, so ledger.wire would net them against real loss"),
+    "exit": "an expected exit is one the SUT's own config causes",
+}
+# Actions that name an expected event rather than cause one: their apply and revert make no
+# Docker call (an `exit`'s revert starts the container the event ended), so a `[random]`
+# schedule, which draws faults, can't hold them.
+EXPECTED_EVENT_ACTIONS = ("mark", "exit")
+# The `/readyz` words a `mark`'s `ready` may name: every answer but `ok`
+# (crates/logit-cli/src/admin.rs, `readyz_wire`).
+READY_WORDS = ("starting", "stalled", "draining", "degraded")
 
 # Faults during which a container's network namespace is gone or unusable for a one-shot
-# `docker run --network container:<id>`.
-NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart")
+# `docker run --network container:<id>`. An `exit` can end the process at any point in its
+# window.
+NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart", "exit")
 
 TOP_LEVEL_KEYS = {
     "name", "description", "duration", "warmup", "cooldown", "recovery_bound", "cycle",
-    "configs", "ledger", "thresholds", "step", "expect", "random", "target",
+    "configs", "ledger", "thresholds", "step", "expect", "random", "target", "compose",
 }
 # The local target, the default; the kind with no backend query; and the local Kafka broker,
 # whose kind is also its service name.
@@ -73,20 +106,27 @@ _TOPIC_NAME = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
 # the self-test checks that compose.yaml passes each one.
 EXTERNAL_ENV_PASSED = ("DD_API_KEY",)
 # The ledger keys that name a VictoriaMetrics query, which only the local target has.
-VM_LEDGER_KEYS = {"vm_selector", "vm_every_window"}
+VM_LEDGER_KEYS = {"vm_every_window"}
 _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PRIVATE_ENV_PREFIX = "soak-env-"
-STEP_KEYS = {"at", "action", "on", "args", "for"}
+STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key"}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
 RANGE_KEYS = {"min", "max"}
 CONFIG_KEYS = {"sut", "generator"}
 LEDGER_KEYS = {
-    "vm_selector", "generator_input", "generator_sink", "sut_listener", "sut_aggregate",
-    "sut_sink", "wire_loss_outside_faults",
+    "generator_input", "generator_sink", "sut_listener", "sut_aggregate", "sink",
+    "wire_loss_outside_faults",
 }
-OPTIONAL_LEDGER_KEYS = {"vm_every_window"}
+OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script", "split"}
+# How the SUT's sinks share `aggregate`'s output: `copy`, each sink a full copy by fan-out, or
+# `route`, each sink fed by one `target` a `route` fills, so the sinks' V add up to it.
+SPLITS = ("copy", "route")
+# A `[[ledger.sink]]`: the sink's component id, the backend service it delivers to and the
+# selector V is read with (both local only), and under `split = "route"` the `target` feeding it.
+SINK_KEYS = {"id", "backend", "vm_selector", "target"}
+_COMPONENT_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 THRESHOLD_KEYS = {"progress_window", "rss_growth_mib_per_hour", "fd_growth"}
 EXPECT_KEYS = {"name", "service", "metric", "component", "attrs", "step", "window", "reduce",
                "min", "max"}
@@ -116,6 +156,12 @@ METRIC_KINDS = {
     "logit.output.requests": "sum",
     "logit.output.records": "sum",
     "logit.output.records.dropped": "sum",
+    "logit.component.diagnostics": "sum",
+    "logit.component.errors": "sum",
+    "logit.component.events.dropped": "sum",
+    "logit.component.flush.events": "sum",
+    "logit.script.events.emitted": "sum",
+    "logit.script.vm.memory": "gauge",
 }
 _EXPECT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _STEP_ID = re.compile(r"^c(\d+)s(\d+)$")
@@ -182,6 +228,10 @@ class StepSpec:
     on: str
     args: str
     for_: float
+    # A `mark`'s `ready` word, and an `exit`'s `code` and `key`; None elsewhere.
+    ready: object = None
+    code: object = None
+    key: object = None
 
 
 @dataclass
@@ -230,12 +280,21 @@ class Step:
     args: str
     start: float
     end: float
+    ready: object = None
+    code: object = None
+    key: object = None
+
+    def expected(self):
+        """The `ready`, `code`, and `key` fields this step sets, for its JSON and its timeline
+        records."""
+        return {name: value for name, value in (("ready", self.ready), ("code", self.code),
+                                                ("key", self.key)) if value is not None}
 
     def to_json(self):
         return {
             "id": self.id, "spec_index": self.spec_index, "cycle": self.cycle,
             "action": self.action, "on": self.on, "args": self.args,
-            "start": self.start, "end": self.end,
+            "start": self.start, "end": self.end, **self.expected(),
         }
 
 
@@ -284,6 +343,8 @@ class Scenario:
     # default), `external`, or `kafka`.
     target: dict = field(default_factory=lambda: {"kind": LOCAL_TARGET, "name": LOCAL_TARGET,
                                                   "env": []})
+    # The compose override file beside scenario.toml, or None.
+    compose: object = None
 
     @property
     def external(self):
@@ -295,14 +356,21 @@ class Scenario:
 
     @property
     def has_vm(self):
-        """Whether the stack runs `victoria-metrics`, which only the local target does."""
+        """Whether the stack runs the `local` profile's backends, which only the local target
+        does."""
         return self.target.get("kind") == LOCAL_TARGET
 
     @property
-    def services(self):
-        """The services this scenario's stack runs."""
-        return tuple(s for s in SERVICES
-                     if (s != LOCAL_TARGET or self.has_vm) and (s != KAFKA_TARGET or self.kafka))
+    def sinks(self):
+        """The `[[ledger.sink]]` tables, in order."""
+        return list(self.ledger.get("sink") or [])
+
+    @property
+    def split(self):
+        return self.ledger.get("split", "copy")
+
+    def compose_path(self):
+        return None if self.compose is None else (self.directory / self.compose).resolve()
 
     @property
     def directory(self):
@@ -318,10 +386,10 @@ class Scenario:
             return None
         return self.random.seed if seed is None else seed
 
-    def to_json(self, duration=None, seed=None):
-        """The resolved scenario a run records: its schedule expanded for `duration` and, for a
-        random schedule, the seed it was drawn with, so `check` re-scores the run offline and
-        `--seed` reproduces it."""
+    def to_json(self, duration=None, seed=None, services=None):
+        """The resolved scenario a run records: its schedule expanded for `duration`, for a
+        random schedule the seed it was drawn with, and `services`, the role map the run
+        resolved, so `check` re-scores the run offline and `--seed` reproduces it."""
         duration = self.duration if duration is None else duration
         seed = self.seed_for(seed)
         return {
@@ -336,8 +404,11 @@ class Scenario:
             "seed": seed,
             "random": None if self.random is None else self.random.to_json(),
             "configs": dict(self.configs),
+            "compose": self.compose,
+            "services": dict(services or {}),
             "target": target_json(self.target),
-            "ledger": dict(self.ledger),
+            "ledger": {**self.ledger, "split": self.split,
+                       "sink": [dict(sink) for sink in self.sinks]},
             "thresholds": {
                 "progress_window": self.thresholds["progress_window"],
                 "rss_growth_mib_per_hour": self.thresholds["rss_growth_mib_per_hour"],
@@ -433,6 +504,16 @@ def from_dict(raw, path):
     for role in CONFIG_KEYS & set(configs):
         if not (path.parent / configs[role]).is_file():
             problems.append(f"configs.{role}: {configs[role]} not found beside {path.name}")
+    compose = raw.get("compose")
+    if compose is not None:
+        if not isinstance(compose, str) or not compose or "/" in compose:
+            problems.append("`compose` must name an override file beside scenario.toml, such "
+                            "as \"compose.override.yaml\"")
+            compose = None
+        elif not (path.parent / compose).is_file():
+            problems.append(f"compose: {compose} not found beside {path.name}")
+    if isinstance(ledger, dict):
+        problems += _sink_problems(ledger, target["kind"])
 
     steps = []
     for index, raw_step in enumerate(raw.get("step", [])):
@@ -446,6 +527,7 @@ def from_dict(raw, path):
             on=raw_step.get("on", ""),
             args=raw_step.get("args", ""),
             for_=dur(raw_step, "for", where) if "for" in raw_step else 0.0,
+            ready=raw_step.get("ready"), code=raw_step.get("code"), key=raw_step.get("key"),
         ))
         if "for" not in raw_step:
             problems.append(f"{where}: every fault needs `for`, so its revert is scheduled with it")
@@ -492,7 +574,7 @@ def from_dict(raw, path):
         path=path, name=name, description=description, duration=duration, warmup=warmup,
         cooldown=cooldown, recovery_bound=recovery_bound, cycle=cycle, configs=configs,
         ledger=ledger, thresholds=thresholds, steps=steps, expectations=expectations,
-        random=random_spec, target=target,
+        random=random_spec, target=target, compose=compose,
     )
     if problems:
         raise ScenarioError(problems)
@@ -506,6 +588,63 @@ def target_json(target):
     if "topic" in target:
         out["topic"] = target["topic"]
     return out
+
+
+def _sink_problems(ledger, kind):
+    """What the `[[ledger.sink]]` tables and `[ledger] split` break: at least one sink, each a
+    table of known keys with a distinct component `id`; for a local target a `backend` and a
+    `vm_selector` on every sink, and for an external or Kafka one neither; for a Kafka target
+    one sink only, the `kafka_out` whose topic is V; and under `split = "route"` at least two
+    sinks, each with a distinct `target`, which `copy` refuses. Whether `backend` names a
+    backend service needs the role map: `service_problems()`."""
+    problems = []
+    no_backend = kind != LOCAL_TARGET
+    split = ledger.get("split", "copy")
+    if split not in SPLITS:
+        problems.append(f"ledger.split must be one of {', '.join(SPLITS)}, got {split!r}")
+    sinks = ledger.get("sink")
+    if "sink" not in ledger:
+        return problems
+    if not isinstance(sinks, list) or not sinks or not all(isinstance(t, dict) for t in sinks):
+        return problems + ["ledger.sink must be one or more tables, written [[ledger.sink]]"]
+    if kind == KAFKA_TARGET and len(sinks) != 1:
+        problems.append("a kafka target has one [[ledger.sink]], the kafka_out whose topic the "
+                        "ledger reads back")
+    ids, targets = [], []
+    for index, sink in enumerate(sinks):
+        where = f"ledger.sink {index + 1}"
+        for key in sorted(set(sink) - SINK_KEYS):
+            problems.append(f"{where}: unknown key `{key}`")
+        sink_id = sink.get("id")
+        if not isinstance(sink_id, str) or not _COMPONENT_ID.match(sink_id):
+            problems.append(f"{where}: `id` must name the SUT sink's component id")
+        elif sink_id in ids:
+            problems.append(f"{where}: `id` {sink_id!r} repeats another sink's")
+        else:
+            ids.append(sink_id)
+        if no_backend:
+            for key in sorted({"backend", "vm_selector"} & set(sink)):
+                problems.append(f"{where}: `{key}` names a backend query, and the {kind} "
+                                "target has no backend")
+        else:
+            for key in ("backend", "vm_selector"):
+                if not isinstance(sink.get(key), str) or not sink.get(key):
+                    problems.append(f"{where}: missing `{key}`; a local sink names the backend "
+                                    "service it delivers to and the selector its V is read with")
+        target = sink.get("target")
+        if split == "route":
+            if not isinstance(target, str) or not _COMPONENT_ID.match(target):
+                problems.append(f"{where}: under split = \"route\" a sink needs `target`, the "
+                                "id of the target that feeds it")
+            elif target in targets:
+                problems.append(f"{where}: `target` {target!r} repeats another sink's")
+            else:
+                targets.append(target)
+        elif target is not None:
+            problems.append(f"{where}: `target` is for split = \"route\"")
+    if split == "route" and len(sinks) < 2:
+        problems.append("ledger.split = \"route\" needs two or more [[ledger.sink]] tables")
+    return problems
 
 
 def _parse_target(table, problems):
@@ -755,19 +894,9 @@ def validate(scenario, duration=None, seed=None):
         problems.append("thresholds.progress_window must be longer than 0s")
     if not isinstance(scenario.ledger.get("vm_every_window", False), bool):
         problems.append("ledger.vm_every_window must be true or false")
-    # A target's stack runs only its own backend service: `victoria-metrics` for the local
-    # target, `kafka` for a Kafka one, neither for an external one.
-    for service in (LOCAL_TARGET, KAFKA_TARGET):
-        if service in scenario.services:
-            continue
-        held = [f"step {spec.index + 1}" for spec in scenario.steps if spec.on == service]
-        if scenario.random is not None:
-            held += [f"random.fault {t.index + 1}" for t in scenario.random.faults
-                     if t.on == service]
-        for where in held:
-            problems.append(f"{where}: a fault on {service}, which the {scenario.target['kind']} "
-                            "target's stack doesn't run")
-
+    script = scenario.ledger.get("sut_script")
+    if script is not None and (not isinstance(script, str) or not script):
+        problems.append("ledger.sut_script must name the SUT's lua component")
     for spec in scenario.steps:
         where = f"step {spec.index + 1} ({spec.action or '?'} on {spec.on or '?'})"
         if spec.action not in ACTION_NAMES:
@@ -775,13 +904,7 @@ def validate(scenario, duration=None, seed=None):
             if spec.action in ("clear", "unpause", "start", "connect"):
                 hint = "; reverts are scheduled from a fault's `for`, never written as steps"
             problems.append(f"{where}: unknown action `{spec.action}`{hint}")
-        if spec.on not in SERVICES:
-            problems.append(f"{where}: unknown service `{spec.on}`")
-        elif spec.action in SUT_ONLY_ACTIONS and spec.on != "logit":
-            problems.append(
-                f"{where}: {spec.action} is for logit only: on the generator, the lines it sent "
-                "after its last telemetry drain reach the SUT with no G behind them, so "
-                "ledger.wire would net them against real loss")
+        problems += _expected_event_problems(spec, where)
         if spec.for_ <= 0:
             problems.append(f"{where}: `for` must be longer than 0s")
         if spec.action == "netem":
@@ -849,6 +972,36 @@ def validate(scenario, duration=None, seed=None):
         raise ScenarioError(problems)
 
 
+def _expected_event_problems(spec, where):
+    """What a step breaks of the `mark` and `exit` rules: `ready` on a `mark` only, one of
+    `READY_WORDS`; `code` and `key` required on an `exit` and refused elsewhere."""
+    problems = []
+    if spec.ready is not None:
+        if spec.action != "mark":
+            problems.append(f"{where}: `ready` is for mark only")
+        elif spec.ready not in READY_WORDS:
+            problems.append(f"{where}: `ready` must be one of {', '.join(READY_WORDS)}, got "
+                            f"{spec.ready!r}")
+    if spec.action == "exit":
+        if spec.code is None:
+            problems.append(f"{where}: exit needs `code`, the exit code the SUT leaves")
+        elif (not isinstance(spec.code, int) or isinstance(spec.code, bool)
+              or not 0 <= spec.code <= 255):
+            problems.append(f"{where}: `code` must be an integer from 0 to 255, got "
+                            f"{spec.code!r}")
+        if spec.key is None:
+            problems.append(f"{where}: exit needs `key`, the self-log key of the ERROR line "
+                            "that explains it")
+        elif not isinstance(spec.key, str) or not spec.key:
+            problems.append(f"{where}: `key` must be a self-log key such as "
+                            "\"memory_limit_exceeded\"")
+    else:
+        for name in ("code", "key"):
+            if getattr(spec, name) is not None:
+                problems.append(f"{where}: `{name}` is for exit only")
+    return problems
+
+
 def _random_problems(scenario, duration):
     """Every rule a `[random]` table breaks. `gap.min` must cover a fault's recovery and two
     progress windows, so each fault is followed by steady state the checks judge, and `cooldown`
@@ -878,10 +1031,9 @@ def _random_problems(scenario, duration):
             problems.append(f"{where}: `weight` must be above 0")
         if template.action not in ACTION_NAMES:
             problems.append(f"{where}: unknown action `{template.action}`")
-        if template.on not in SERVICES:
-            problems.append(f"{where}: unknown service `{template.on}`")
-        elif template.action in SUT_ONLY_ACTIONS and template.on != "logit":
-            problems.append(f"{where}: {template.action} is for logit only")
+        if template.action in EXPECTED_EVENT_ACTIONS:
+            problems.append(f"{where}: {template.action} names an expected event at a fixed "
+                            "time, and a [random] schedule draws faults; write it as a [[step]]")
         if template.for_min <= 0:
             problems.append(f"{where}: `for.min` must be longer than 0s")
         if template.for_min > template.for_max:
@@ -911,20 +1063,16 @@ def _random_problems(scenario, duration):
 
 
 def _schedule_problems(scenario, steps, duration):
-    """Every rule an expanded schedule breaks: known actions and services, a kill on the SUT
-    only, each fault inside warmup's end and cooldown's start, no two faults overlapping on one
-    container, no netem during a namespace fault, and, for a random schedule, no two faults
-    overlapping anywhere, each after a gap of at least `gap.min`."""
+    """Every rule an expanded schedule breaks: known actions, each fault inside warmup's end
+    and cooldown's start, no two faults overlapping on one container, no netem during a
+    namespace fault, and, for a random schedule, no two faults overlapping anywhere, each after
+    a gap of at least `gap.min`. `service_problems()` checks the services."""
     problems = []
     quiet_end = duration - scenario.cooldown
     for step in steps:
         where = f"step {step.id} ({step.action} on {step.on})"
         if step.action not in ACTION_NAMES:
             problems.append(f"{where}: unknown action")
-        if step.on not in SERVICES:
-            problems.append(f"{where}: unknown service")
-        elif step.action in SUT_ONLY_ACTIONS and step.on != "logit":
-            problems.append(f"{where}: {step.action} is for logit only")
         if step.end <= step.start:
             problems.append(f"{where}: ends at or before its start")
         if step.start < scenario.warmup:
@@ -974,9 +1122,6 @@ def _expect_problems(scenario, duration):
             problems.append(f"{where}: `name` repeats another expectation's")
         else:
             names.add(exp.name)
-        if exp.service not in LOGIT_SERVICES:
-            problems.append(f"{where}: unknown service `{exp.service}`; telemetry comes from "
-                            f"{' or '.join(LOGIT_SERVICES)}")
         if not isinstance(exp.metric, str) or not exp.metric:
             problems.append(f"{where}: `metric` must name a metric")
         if exp.window not in EXPECT_WINDOWS:
@@ -1013,6 +1158,102 @@ def _expect_problems(scenario, duration):
     return problems
 
 
+def roles_from_config(text):
+    """`{service: role}` from `docker compose config --format json`'s output, a service with no
+    `soak.role` label mapped to None. Raises `ValueError` for output that isn't that JSON."""
+    services = json.loads(text).get("services")
+    if not isinstance(services, dict):
+        raise ValueError("no `services` in the compose config")
+    return {name: ((spec or {}).get("labels") or {}).get(ROLE_LABEL)
+            for name, spec in services.items()}
+
+
+def base_roles(scenario):
+    """`BASE_ROLES` as the driver would resolve it for `scenario` with no override: without the
+    backends, which the `local` profile holds, for any target but the local one, and with
+    `KAFKA_ROLES`, which the `kafka` profile holds, for a Kafka target."""
+    roles = {name: role for name, role in BASE_ROLES.items()
+             if scenario.has_vm or role != BACKEND_ROLE}
+    if scenario.kafka:
+        roles.update(KAFKA_ROLES)
+    return roles
+
+
+def logit_services(roles):
+    """The services that run `logit`, the SUT and the generator, sorted."""
+    return sorted(name for name, role in roles.items() if role in LOGIT_ROLES)
+
+
+def backends(roles):
+    return sorted(name for name, role in roles.items() if role == BACKEND_ROLE)
+
+
+def role_problems(roles):
+    """What a role map breaks: every service labeled with a known role, and one SUT and one
+    generator, under the names `SUT_SERVICE` and `GENERATOR_SERVICE`."""
+    problems = []
+    for name, role in sorted(roles.items()):
+        if role not in ROLES:
+            problems.append(f"compose service {name}: label {ROLE_LABEL} must be one of "
+                            f"{', '.join(ROLES)}, got {role!r}")
+    for role, name in ((SUT_ROLE, SUT_SERVICE), (GENERATOR_ROLE, GENERATOR_SERVICE)):
+        holders = sorted(n for n, r in roles.items() if r == role)
+        if holders != [name]:
+            problems.append(f"the stack needs one {role} service, {name}, and has "
+                            f"{', '.join(holders) or 'none'}")
+    return problems
+
+
+def service_problems(scenario, roles):
+    """Every rule that needs the stack's services, against `roles` (`{service: role}`): the
+    role map's own rules; each step's and random fault's `on` a service of the stack, with a
+    `kill` or an `exit` on the SUT only; each `[[expect]]` service one that runs `logit`; for a
+    Kafka target, the broker `kafka`; and each local sink's `backend` a backend service."""
+    problems = role_problems(roles)
+    no_backend = ("; an external target's stack runs no backend" if scenario.external else
+                  "; a kafka target's stack runs the broker and no backend" if scenario.kafka
+                  else "")
+
+    def on_problems(on, action, where, reason=True):
+        if on not in roles:
+            return [f"{where}: unknown service `{on}`{no_backend}"]
+        if action in SUT_ONLY_ACTIONS and roles[on] != SUT_ROLE:
+            why = f": {SUT_ONLY_ACTIONS[action]}" if reason else ""
+            return [f"{where}: {action} is for logit only{why}"]
+        return []
+
+    for spec in scenario.steps:
+        problems += on_problems(spec.on, spec.action,
+                                f"step {spec.index + 1} ({spec.action or '?'} on {spec.on or '?'})")
+    if scenario.random is not None:
+        for template in scenario.random.faults:
+            problems += on_problems(template.on, template.action,
+                                    f"random.fault {template.index + 1} ({template.action or '?'} "
+                                    f"on {template.on or '?'})", reason=False)
+    runs = logit_services(roles)
+    for exp in scenario.expectations:
+        if exp.service not in runs:
+            problems.append(f"expect {exp.index + 1} ({exp.name or '?'}): unknown service "
+                            f"`{exp.service}`; telemetry comes from {' or '.join(runs)}")
+    if scenario.kafka and roles.get(KAFKA_TARGET) != BROKER_ROLE:
+        problems.append(f"a kafka target reads its topic from the {BROKER_ROLE} service "
+                        f"`{KAFKA_TARGET}`, which the stack doesn't run")
+    for index, sink in enumerate(scenario.sinks):
+        backend = sink.get("backend")
+        if backend is not None and roles.get(backend) != BACKEND_ROLE:
+            problems.append(f"ledger.sink {index + 1} ({sink.get('id')}): backend `{backend}` "
+                            f"isn't a backend service; the stack's are "
+                            f"{', '.join(backends(roles)) or 'none'}")
+    return problems
+
+
+def check_services(scenario, roles):
+    """Raises `ScenarioError` listing every `service_problems()` rule broken."""
+    problems = service_problems(scenario, roles)
+    if problems:
+        raise ScenarioError(problems)
+
+
 def expand(scenario, duration=None, seed=None):
     """The fault occurrences a run of `duration` seconds performs, in start order. No fault
     ends after `duration - cooldown`. A random schedule is drawn with `seed`, the `[random]`
@@ -1034,6 +1275,7 @@ def expand(scenario, duration=None, seed=None):
                 steps.append(Step(
                     id=f"c{cycle}s{spec.index + 1}", spec_index=spec.index, cycle=cycle,
                     action=spec.action, on=spec.on, args=spec.args, start=start, end=end,
+                    ready=spec.ready, code=spec.code, key=spec.key,
                 ))
         cycle += 1
     steps.sort(key=lambda s: (s.start, s.spec_index))

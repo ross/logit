@@ -1989,8 +1989,8 @@ async fn decode_loop<D: Decoder + Send>(
 
 /// [`decode_loop`]'s popped batch: a `CountedDrain` that also logs, when dropped with datagrams
 /// never yielded, how many it counted. The telemetry count is the drain's; this adds the self-log
-/// line, since `internal`'s final drain has already run by the time the grace backstop drops the
-/// loop.
+/// line, since only a dedicated `internal` pipeline exports the count: with a mixed one,
+/// `internal`'s final drain has already run by the time the grace backstop drops the loop.
 struct Undecoded<'a> {
     drain: CountedDrain<'a, Datagram>,
     /// Datagrams not yet yielded.

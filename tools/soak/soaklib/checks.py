@@ -13,15 +13,22 @@ telemetry whose process lives disagree with the timeline.
 
 A run against an external target (`[target] kind = "external"`) has no backend query, so every
 row that reads V or the freshness samples SKIPs or leaves them out, and `ledger.sent` ends the
-ledger at the sink's own telemetry instead. A local run's `ledger.sent` SKIPs.
+ledger at the sinks' own telemetry instead. A local run's `ledger.sent` SKIPs.
 
 A run against a Kafka target (`[target] kind = "kafka"`) has no VictoriaMetrics: the freshness
 samples and `ledger.windows` SKIP, `ledger.sent` judges the sink as for an external target, and
 V comes from the topic's distinct records, read back by the driver and deduplicated on their
 raw bytes (topic.py), so `ledger.egress` and `ledger.summary` judge Ab − V against it, and a
-surplus FAILs as on any target. `ledger.topic` judges the topic's distinct record count against
-the records the sink saw accepted, and its duplicate copies per life against `EPOCH_BUMP_REASONS`;
-it SKIPs for every other target.
+surplus FAILs as on any target. A Kafka target has one sink, whose V the topic is.
+`ledger.topic` judges the topic's distinct record count against the records the sink saw
+accepted, and its duplicate copies per life against `EPOCH_BUMP_REASONS`; it SKIPs for every
+other target.
+
+The ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`, `identity.sink`,
+`recovery`, `ledger.egress`, `ledger.windows`, `ledger.replay`, `ledger.sent`) keeps its id,
+reports one line per sink, and takes the worst status. Under `split = "copy"` each sink holds a
+full copy of `aggregate`'s output, so each sink's V is judged alone; under `split = "route"` the
+sinks' V add up to it, so the egress gap is judged on their sum.
 """
 
 import bisect
@@ -33,16 +40,19 @@ from pathlib import Path
 
 from . import collect, faults, telemetry, topic, vm
 from .scenario import (EXPECT_REDUCERS, EXTERNAL_TARGET, KAFKA_TARGET, LOCAL_TARGET,
-                       LOGIT_SERVICES, SERVICES, parse_duration)
+                       LOGIT_ROLES, parse_duration)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
 
 
 def is_start(record):
-    """Whether a timeline record started a container again: a revert of a `stop` or `kill`, or a
-    `restart`'s apply. Each start of a `logit` service begins a new process life."""
+    """Whether a timeline record started a container again: a revert of a `stop` or `kill`, a
+    revert of an `exit` that found the container exited, or a `restart`'s apply. Each start of
+    a `logit` service begins a new process life."""
     event, action = record.get("event"), record.get("action")
+    if event == "revert" and action == "exit":
+        return bool(record.get("started"))
     return ((event == "revert" and action in faults.STARTS_ON_REVERT)
             or (event == "apply" and action in faults.STARTS_ON_APPLY))
 
@@ -132,6 +142,10 @@ class Fault:
     end: float
     affects_udp_ingress: bool
     affects_egress: bool
+    # A `mark`'s `ready` word, and an `exit`'s `code` and `key`; None elsewhere.
+    ready: object = None
+    code: object = None
+    key: object = None
 
 
 class RunData:
@@ -147,14 +161,24 @@ class RunData:
         self.watchdog = collect.read_jsonl(self.run_dir / "watchdog.jsonl")
         self.stats = collect.read_jsonl(self.run_dir / "stats.ndjson")
         self.freshness = collect.read_jsonl(self.run_dir / "vm-freshness.jsonl")
-        try:
-            self.vm_series = vm.parse_export((self.run_dir / "vm-export.jsonl").read_text())
-        except OSError:
-            self.vm_series = []
         self.recovery_bound = float(self.resolved.get("recovery_bound", 0))
         self.warmup = float(self.resolved.get("warmup", 0))
         self.thresholds = self.resolved.get("thresholds", {})
         self.ledger = self.resolved.get("ledger", {})
+        self.sinks = [sink["id"] for sink in self.ledger.get("sink") or []]
+        self.split = self.ledger.get("split", "copy")
+        # `{service: role}` as the driver resolved it from compose.
+        self.services = self.resolved.get("services") or {}
+        self.logit_services = sorted(name for name, role in self.services.items()
+                                     if role in LOGIT_ROLES)
+        # `{sink: series}`, each from `vm-export/<sink>.jsonl`.
+        self.vm_series = {}
+        for sink in self.sinks:
+            try:
+                self.vm_series[sink] = vm.parse_export(
+                    (self.run_dir / "vm-export" / f"{sink}.jsonl").read_text())
+            except OSError:
+                self.vm_series[sink] = []
         self.duration = float(self.resolved.get("duration", 0))
         # A run directory with no target is a local one.
         self.target = self.resolved.get("target") or {"kind": LOCAL_TARGET,
@@ -192,12 +216,12 @@ class RunData:
         self.telemetry = {}
         self.stderr = {}
         self.inspect = {}
-        for service in SERVICES:
+        for service in sorted(self.services):
             stdout = self.run_dir / "logs" / f"{service}.stdout"
-            if service in LOGIT_SERVICES and stdout.exists():
+            if service in self.logit_services and stdout.exists():
                 self.telemetry[service] = telemetry.read_ndjson(stdout)
             stderr = self.run_dir / "logs" / f"{service}.stderr"
-            if service in LOGIT_SERVICES and stderr.exists():
+            if service in self.logit_services and stderr.exists():
                 self.stderr[service] = telemetry.read_stderr(stderr)
             try:
                 self.inspect[service] = json.loads(
@@ -212,10 +236,17 @@ class RunData:
             start=apply["started_at"], end=end,
             affects_udp_ingress=apply.get("affects_udp_ingress", False),
             affects_egress=apply.get("affects_egress", False),
+            ready=apply.get("ready"), code=apply.get("code"), key=apply.get("key"),
         )
 
     def offset(self, t):
         return "?" if t is None or self.t0 is None else f"{t - self.t0:+.0f}s"
+
+    def exit_windows(self, service="logit"):
+        """[(start, end, fault)] of each `exit` step on `service`, its span widened by 1 s on
+        each side, as a `stop`'s is for `exit`."""
+        return [(f.start - 1, f.end + 1, f) for f in self.faults
+                if f.action == "exit" and f.on == service]
 
     def windows(self, on=None, actions=None, extend=True):
         """[(start, end)] of fault windows, optionally only `on` one service or for some
@@ -323,7 +354,7 @@ def check_timeline(data):
         if not (is_start(record) or (event == "revert"
                                      and action in faults.RESUMES_ON_REVERT)):
             continue
-        if record.get("on") not in LOGIT_SERVICES or record.get("early"):
+        if record.get("on") not in data.logit_services or record.get("early"):
             continue
         starts += 1
         if (record["on"], record.get("step")) not in probed:
@@ -338,13 +369,14 @@ def check_timeline(data):
 
 def check_exit(data):
     """Every exit of a `logit` service falls inside a scheduled stop, restart, or kill, with the
-    code that action leaves (0, or 137 for a kill), or in the end sequence with 0; the final
-    state is exited; and nothing was OOM-killed."""
+    code that action leaves (0, or 137 for a kill), inside an `exit` step with the code the step
+    names, or in the end sequence with 0; every `exit` step saw its exit; the final state is
+    exited; and nothing was OOM-killed."""
     if not data.inspect:
         return Result("exit", SKIP, "no inspect/ files")
     lines = []
     status = PASS
-    # {service: [(start, end, action, expected exit code)]}
+    # {service: [(start, end, action, expected exit code, step)]}
     stop_windows = {}
     for record in data.timeline:
         action = record.get("action")
@@ -352,11 +384,17 @@ def check_exit(data):
                 and not record.get("rc")):
             stop_windows.setdefault(record["on"], []).append(
                 (record["started_at"] - 1, record["finished_at"] + 1, action,
-                 faults.EXIT_CODES[action]))
+                 faults.EXIT_CODES[action], record.get("step")))
+    for service in data.logit_services:
+        for start, end, fault in data.exit_windows(service):
+            stop_windows.setdefault(service, []).append(
+                (start, end, "exit", fault.code, fault.step))
     end_begin = data.phases.get("end_begin", {}).get("t")
     kills = 0
     exits = 0
-    for service in LOGIT_SERVICES:
+    expected = 0
+    seen_steps = set()
+    for service in data.logit_services:
         seen = {}
         for record in data.watchdog:
             if record.get("svc") == service and record.get("status") == "exited":
@@ -370,9 +408,9 @@ def check_exit(data):
             window = None if t is None else next(
                 (w for w in stop_windows.get(service, []) if w[0] <= t <= w[1]), None)
             if window is not None:
-                _, _, action, want = window
+                _, _, action, want, step = window
             elif t is not None and end_begin is not None and t >= end_begin:
-                action, want = "end sequence", 0
+                action, want, step = "end sequence", 0, None
             else:
                 status = FAIL
                 lines.append(f"{service} exited at {data.offset(t)} with code {code}, outside "
@@ -382,12 +420,25 @@ def check_exit(data):
                 status = FAIL
                 lines.append(f"{service} exited at {data.offset(t)} with code {code}, inside a "
                              f"scheduled {action}, which leaves {want}")
-            elif action == "kill":
+                continue
+            if action == "kill":
                 kills += 1
+            elif action == "exit":
+                expected += 1
+                seen_steps.add(step)
+                lines.append(f"{service} exited at {data.offset(t)} with code {code}, inside "
+                             f"expected exit {step}")
         if final.get("Status") != "exited":
             status = FAIL
             lines.append(f"{service} final state is {final.get('Status')}, not exited")
-    for service in SERVICES:
+    for service in data.logit_services:
+        for start, end, fault in data.exit_windows(service):
+            if fault.step not in seen_steps:
+                status = FAIL
+                lines.append(f"expected exit did not happen: {service} has no exit with code "
+                             f"{fault.code} in {fault.step}'s window [{data.offset(start)}, "
+                             f"{data.offset(end)}]")
+    for service in sorted(data.services):
         state = (data.inspect.get(service) or {}).get("State") or {}
         if state.get("OOMKilled"):
             status = FAIL
@@ -395,10 +446,12 @@ def check_exit(data):
     if status == PASS:
         detail = f"{exits} exit(s) of the logit services, each a scheduled stop with code 0"
         if kills:
-            detail = (f"{exits} exit(s) of the logit services, each a scheduled stop with code 0 "
-                      f"or a scheduled kill with code {faults.KILL_EXIT_CODE} ({kills} kill(s))")
+            detail += f" or a scheduled kill with code {faults.KILL_EXIT_CODE} ({kills} kill(s))"
+        if expected:
+            detail += (f" or an expected exit with its step's code ({expected}: "
+                       + ", ".join(line for line in lines if "expected exit" in line) + ")")
     else:
-        detail = lines[0]
+        detail = next(line for line in lines if "inside expected exit" not in line)
     return Result("exit", status, detail, lines)
 
 
@@ -413,7 +466,7 @@ def check_restarts(data):
     lines = []
     status = PASS
     changes = 0
-    for service in SERVICES:
+    for service in sorted(data.services):
         seq = []
         for record in data.watchdog:
             if record.get("svc") == service and record.get("started_at"):
@@ -438,14 +491,37 @@ def check_restarts(data):
 
 
 def check_self_log(data):
+    """FAILs a panic, a nonzero `exiting` line, or an ERROR line, except the sink fault lines
+    inside a fault window, and, inside an `exit` step's window, the `exiting` line with the
+    step's code and an ERROR line keyed with its `key`. Each `exit` step must show both, or the
+    expected exit didn't happen as named. The `Error: ` text line `main` prints as it returns
+    the failure, right after that `exiting` line, has no timestamp and is excused by its place.
+    """
     if not data.stderr:
         return Result("self_log", SKIP, "no logs/*.stderr")
     windows = data.windows()
     status = PASS
     lines = []
-    counts = {"error": 0, "fault_key_inside": 0, "fault_key_outside": 0, "text": 0}
+    counts = {"error": 0, "fault_key_inside": 0, "fault_key_outside": 0, "text": 0,
+              "expected": 0}
+    # {step: {"exiting", "key"}} for each `exit` step: which of its two lines appeared.
+    found = {}
+    exit_windows = {service: data.exit_windows(service) for service in data.stderr}
+
+    def expected_exit(service, entry, matches):
+        """The `exit` step whose window holds `entry` and whose fields `matches` accepts."""
+        if entry.ts is None:
+            return None
+        return next((fault for start, end, fault in exit_windows.get(service, [])
+                     if start <= entry.ts <= end and matches(fault)), None)
+
     for service, entries in data.stderr.items():
+        after_expected_exit = False
         for entry in entries:
+            follows, after_expected_exit = after_expected_exit, False
+            if follows and entry.kind == "text" and entry.raw.startswith("Error: "):
+                counts["expected"] += 1
+                continue
             if entry.kind == "panic":
                 status = FAIL
                 lines.append(f"{service}: panic: {entry.raw[:200]}")
@@ -457,10 +533,18 @@ def check_self_log(data):
                 continue
             if entry.message == "exiting":
                 code = entry.fields.get("code")
-                if code not in (0, "0", None):
-                    status = FAIL
-                    lines.append(f"{service}: exiting with code {code} at {data.offset(entry.ts)}"
-                                 f": {entry.fields.get('reason', '')}")
+                if code in (0, "0", None):
+                    continue
+                fault = expected_exit(service, entry,
+                                      lambda f, code=code: str(f.code) == str(code))
+                if fault is not None:
+                    counts["expected"] += 1
+                    found.setdefault(fault.step, set()).add("exiting")
+                    after_expected_exit = True
+                    continue
+                status = FAIL
+                lines.append(f"{service}: exiting with code {code} at {data.offset(entry.ts)}"
+                             f": {entry.fields.get('reason', '')}")
                 continue
             if entry.key == "thread_panicked":
                 status = FAIL
@@ -477,33 +561,112 @@ def check_self_log(data):
                                  f"{entry.message[:160]}")
                 continue
             if entry.level == "ERROR":
+                fault = expected_exit(service, entry, lambda f: entry.key and f.key == entry.key)
+                if fault is not None:
+                    counts["expected"] += 1
+                    found.setdefault(fault.step, set()).add("key")
+                    continue
                 counts["error"] += 1
                 status = FAIL
                 lines.append(f"{service}: ERROR at {data.offset(entry.ts)}: "
                              f"key={entry.key or '-'} {entry.message[:160]}")
+    for service, windows_of in exit_windows.items():
+        for _, _, fault in windows_of:
+            have = found.get(fault.step, set())
+            missing = [label for what, label in (
+                ("exiting", f"exiting line with code {fault.code}"),
+                ("key", f"ERROR line keyed {fault.key}")) if what not in have]
+            if missing:
+                status = FAIL
+                lines.insert(0, f"expected exit did not happen: {service} logged no "
+                                f"{' and no '.join(missing)} in {fault.step}'s window")
     summary = (f"{counts['fault_key_inside']} sink fault line(s) inside fault windows, "
-               f"{counts['fault_key_outside']} outside, {counts['error']} other ERROR, "
-               f"{counts['text']} non-JSON")
+               f"{counts['fault_key_outside']} outside, {counts['expected']} expected-exit "
+               f"line(s), {counts['error']} other ERROR, {counts['text']} non-JSON")
     return Result("self_log", status, summary if status == PASS else f"{lines[0]} ({summary})",
                   lines)
 
 
+def readiness_word(output):
+    """The status word in a `logit ready` output: `ok` on success, else the word before ` (` in
+    `stalled (503 Service Unavailable)`; the first word of any other output, such as a failed
+    connection's, or None for none."""
+    words = (output or "").split()
+    return words[0] if words else None
+
+
+def health_samples(data):
+    """[(t, service, word)] from each `logit` service's `health_log`: the image HEALTHCHECK's
+    `logit ready`, timed at its `Start`, one per `Start`, since the watchdog records the newest
+    entry every 5 s and the check runs every 10 s."""
+    samples = {}
+    for record in data.watchdog:
+        entry = record.get("health_log")
+        service = record.get("svc")
+        if service not in data.logit_services or not isinstance(entry, dict):
+            continue
+        t = parse_docker_time(entry.get("Start"))
+        if t is not None:
+            samples[(service, entry.get("Start"))] = (t, service,
+                                                      readiness_word(entry.get("Output")))
+    return sorted(samples.values(), key=lambda sample: sample[0])
+
+
 def check_ready(data):
+    """Readiness, from the status word `logit ready` reports in each `health_log` sample: `ok` in
+    every sample outside fault windows; at least one sample reading a `mark`'s `ready` word
+    inside that mark; and `degraded`, which means a node has exited, only inside an `exit` step.
+    A run whose watchdog recorded no `health_log` is judged on `Health.Status` instead. Every
+    start or unpause of a `logit` service is ready within `READY_WITHIN_S`."""
     if not data.watchdog:
         return Result("ready", SKIP, "no watchdog.jsonl")
     status = PASS
     lines = []
     judged = 0
-    for record in data.watchdog:
-        if record.get("svc") not in LOGIT_SERVICES or record.get("status") != "running":
-            continue
-        if not data.steady(record.get("t")):
-            continue
-        judged += 1
-        if record.get("health") != "healthy":
+    samples = health_samples(data)
+    marks = [f for f in data.faults if f.action == "mark" and f.ready]
+    # One line per mark whose word was read, for the detail.
+    seen = []
+    if samples:
+        for t, service, word in samples:
+            if word == "degraded" and not data.in_window(
+                    t, [(start, end) for start, end, _ in data.exit_windows(service)]):
+                status = FAIL
+                lines.append(f"{service} read degraded at {data.offset(t)}, outside every "
+                             "exit step: a node exited that no step expected")
+            elif data.steady(t):
+                judged += 1
+                if word != "ok":
+                    status = FAIL
+                    lines.append(f"{service} read {word} at {data.offset(t)}, outside every "
+                                 "fault window")
+        for mark in marks:
+            hits = [t for t, service, word in samples
+                    if service == mark.on and word == mark.ready and mark.start <= t <= mark.end]
+            if hits:
+                seen.append(f"{mark.step}: {mark.on} read {mark.ready} {len(hits)} time(s), "
+                            f"first at {data.offset(hits[0])}")
+            else:
+                status = FAIL
+                lines.insert(0, f"{mark.step}: {mark.on} never read {mark.ready} between "
+                                f"{data.offset(mark.start)} and {data.offset(mark.end)}")
+        source = f"{judged} readiness sample(s) read ok outside fault windows"
+    else:
+        for record in data.watchdog:
+            if record.get("svc") not in data.logit_services or record.get("status") != "running":
+                continue
+            if not data.steady(record.get("t")):
+                continue
+            judged += 1
+            if record.get("health") != "healthy":
+                status = FAIL
+                lines.append(f"{record['svc']} health {record.get('health')} at "
+                             f"{data.offset(record['t'])}, outside every fault window")
+        for mark in marks:
             status = FAIL
-            lines.append(f"{record['svc']} health {record.get('health')} at "
-                         f"{data.offset(record['t'])}, outside every fault window")
+            lines.insert(0, f"{mark.step}: no health_log samples, so {mark.ready} can't be "
+                            "judged")
+        source = f"{judged} health sample(s) healthy outside fault windows (no health_log)"
     readies = [r for r in data.timeline if r.get("event") == "ready"]
     for record in readies:
         if not record.get("ok") or record.get("ready_s", 0) > READY_WITHIN_S:
@@ -512,35 +675,40 @@ def check_ready(data):
                          f"{'ready' if record.get('ok') else 'not ready'} after "
                          f"{record.get('ready_s')}s")
     slowest = max((r.get("ready_s", 0) for r in readies), default=None)
-    detail = (f"{judged} health sample(s) healthy outside fault windows; {len(readies)} "
-              "start(s) or unpause(s) ready in time"
+    detail = (f"{source}; {len(readies)} start(s) or unpause(s) ready in time"
               + (f", slowest ready {slowest:.1f}s" if slowest is not None else ""))
-    return Result("ready", status, detail if status == PASS else lines[0], lines)
+    if seen:
+        detail += "; " + "; ".join(seen)
+    return Result("ready", status, detail if status == PASS else lines[0], lines + seen)
 
 
 def check_progress(data):
+    """Every progress window outside fault windows has a delivery from every sink, each
+    logit's stdout keeps its drain cadence, and each sink's newest stored sample stays fresh."""
     sut = data.telemetry.get("logit")
     if sut is None or data.t0 is None:
         return Result("progress", SKIP, "no SUT telemetry or no timeline start")
-    sink = data.ledger.get("sut_sink")
     window = float(data.thresholds.get("progress_window", 30))
     status = PASS
     lines = []
     judged = 0
     judged_after_warmup_s = 0.0
+    stalled = {sink: 0 for sink in data.sinks}
     for start, end in data.quiet_intervals(data.t0 + window):
         t = start
         while t + window <= end:
             judged += 1
             if t >= data.t0 + data.warmup:
                 judged_after_warmup_s += window
-            delivered = sut.counter_in("logit.component.batches.delivered", t, t + window,
-                                       component=sink)
-            if delivered <= 0:
-                verdict, why = classify_stall(sut, sink, t, t + window)
-                status = worst([status, verdict])
-                lines.append(f"no {sink} deliveries in [{data.offset(t)}, "
-                             f"{data.offset(t + window)}): {why}")
+            for sink in data.sinks:
+                delivered = sut.counter_in("logit.component.batches.delivered", t, t + window,
+                                           component=sink)
+                if delivered <= 0:
+                    stalled[sink] += 1
+                    verdict, why = classify_stall(sut, sink, t, t + window)
+                    status = worst([status, verdict])
+                    lines.append(f"no {sink} deliveries in [{data.offset(t)}, "
+                                 f"{data.offset(t + window)}): {why}")
             t += window
 
     for service, tel in data.telemetry.items():
@@ -548,7 +716,7 @@ def check_progress(data):
         if len(drains) < 3:
             continue
         interval = statistics.median(b - a for a, b in zip(drains, drains[1:]))
-        held = data.windows(on=service, actions=("stop", "kill", "pause", "restart"),
+        held = data.windows(on=service, actions=("stop", "kill", "pause", "restart", "exit"),
                             extend=False)
         for a, b in zip(drains, drains[1:]):
             if b - a > DRAIN_GAP_INTERVALS * interval and not any(
@@ -558,26 +726,34 @@ def check_progress(data):
                 lines.append(f"{service} stdout went quiet for {b - a:.0f}s from "
                              f"{data.offset(a)} (internal interval {interval:.0f}s)")
 
-    fresh_judged = 0
+    fresh_judged = {sink: 0 for sink in data.sinks}
     for record in data.freshness:
         t = record.get("t")
+        sink = record.get("sink")
         if record.get("skipped") or t is None or t < data.t0 + window or not data.steady(t):
             continue
-        fresh_judged += 1
+        fresh_judged[sink] = fresh_judged.get(sink, 0) + 1
         age = record.get("age_s")
         if record.get("error") or age is None or age >= FRESHNESS_MAX_AGE_S:
             status = FAIL
-            why = (record.get("error") or ("no sample matches vm_selector" if age is None
+            why = (record.get("error") or ("no sample matches its vm_selector" if age is None
                                            else f"newest sample {age}s old"))
-            lines.append(f"VictoriaMetrics freshness at {data.offset(t)}: {why}")
+            lines.append(f"{sink} freshness on {record.get('backend')} at {data.offset(t)}: "
+                         f"{why}")
     share, coverage = data.coverage(judged_after_warmup_s)
     if share is not None and share < COVERAGE_MIN_SHARE:
         status = worst([status, WARN])
         lines.append(f"delivery windows cover little of the run: {coverage}")
-    fresh = (f"no freshness samples ({no_vm_reason(data)})" if not data.has_vm else
-             f"{fresh_judged} freshness sample(s) under {FRESHNESS_MAX_AGE_S}s")
-    detail = (f"{judged} {window:.0f}s window(s) with deliveries outside fault windows; "
-              f"{fresh}; {coverage}")
+    per_sink = []
+    for sink in data.sinks:
+        fresh = ("no freshness samples" if not data.has_vm else
+                 f"{fresh_judged.get(sink, 0)} freshness sample(s)")
+        per_sink.append(f"{sink}: deliveries in {judged - stalled[sink]} of {judged}, {fresh}")
+    lines += per_sink
+    backend = (f" ({no_vm_reason(data)})" if not data.has_vm else
+               f", each freshness sample under {FRESHNESS_MAX_AGE_S}s")
+    detail = (f"{judged} {window:.0f}s window(s) outside fault windows, judged per sink"
+              f"{backend}: {'; '.join(per_sink)}; {coverage}")
     return Result("progress", status, detail if status == PASS else lines[0], lines)
 
 
@@ -622,7 +798,7 @@ def check_rss_slope(data):
     lines = []
     judged = []
     coverage = []
-    for service in LOGIT_SERVICES:
+    for service in data.logit_services:
         by_life, source = _rss_points(data, service)
         judged_s = 0.0
         for life, points in sorted(by_life.items()):
@@ -659,7 +835,7 @@ def check_fd_slope(data):
     summaries = []
     if data.t0 is None:
         return Result("fd_slope", SKIP, "no timeline start")
-    for service in LOGIT_SERVICES:
+    for service in data.logit_services:
         tel = data.telemetry.get(service)
         if tel is None:
             continue
@@ -703,9 +879,12 @@ DEFAULT_BATCH_MAX_EVENTS = 1000
 # shutdown signal: the accumulator, the batch the listener holds while its send waits on a full
 # inbox, `aggregate`'s 64-slot inbox, and the batch `aggregate` has taken but not yet absorbed.
 RESIDUAL_BATCHES = 67
+# What a `lua` node between the listener and `aggregate` adds to that: its own 64-slot inbox and
+# the batch it has taken off it but not yet sent.
+SCRIPT_RESIDUAL_BATCHES = 65
 # The UDP listener's `warn` lines for datagrams it counted as `datagrams.dropped{reason=
-# "shutdown"}` after `internal`'s final drain (`crates/logit-inputs/src/udp.rs`: `ReadHalf`,
-# `ResidualOnDrop`, and `Undecoded`).
+# "shutdown"}` (`crates/logit-inputs/src/udp.rs`: `ReadHalf`, `ResidualOnDrop`, and `Undecoded`).
+# Telemetry carries the same count, so these only cross-check it.
 SHUTDOWN_DROP_RE = re.compile(
     r"^(\d+) datagram\(s\) (?:still in the receive queue|read off the socket but never queued"
     r"|taken off the receive queue but not decoded)")
@@ -719,6 +898,7 @@ NO_VM_KAFKA = "kafka target: no VictoriaMetrics"
 
 def no_vm_reason(data):
     return NO_VM_KAFKA if data.kafka else NO_BACKEND
+
 
 # `ledger.sent`'s reading of an external sink's telemetry (`datadog_out`'s module doc, "Faults,
 # retries, and duplicate safety" and "Telemetry"): the `records.dropped` reasons and the batch
@@ -790,14 +970,25 @@ def component_duration(text, component, key):
 
 class Ledger:
     """The ledger's symbols per SUT process life, read once from a run's telemetry, stderr, and
-    VictoriaMetrics export. Lives are the SUT's; the generator's G is one number for the run."""
+    VictoriaMetrics exports. Lives are the SUT's; the generator's G is one number for the run.
+    V is per sink: `V[sink]`, each from its own export."""
 
     def __init__(self, data):
         cfg = data.ledger
         self.data = data
         self.listener = cfg.get("sut_listener")
         self.aggregate = cfg.get("sut_aggregate")
-        self.sink = cfg.get("sut_sink")
+        self.sinks = list(data.sinks)
+        self.split = data.split
+        # Under `route`, the `target` feeding each sink.
+        self.targets = {sink["id"]: sink.get("target") for sink in cfg.get("sink") or []}
+        # The `lua` component between the listener and `aggregate`, or None.
+        self.script = cfg.get("sut_script")
+        # How the egress rows write the increments `aggregate` absorbed from the listener's
+        # events: with a script, its `flush()` events are absorbed too, and V excludes them.
+        self.ab_text = "Ab − L_flush" if self.script else "Ab"
+        self.residual_text = ("W − D − B − X − (L_drop + L_err) − (Ab − L_flush)" if self.script
+                              else "W − D − B − X − Ab")
         self.gen_input = cfg.get("generator_input")
         self.gen_sink = cfg.get("generator_sink")
         self.sut = data.telemetry.get("logit")
@@ -833,14 +1024,35 @@ class Ledger:
         sut, listener = self.sut, self.listener
         self.W = sut.counter_by_life("logit.input.datagrams", component=listener)
         self.K = sut.counter_by_life("logit.input.kernel.drops", component=listener)
+        # D, every reason. Every SUT config gives `internal` a dedicated pipeline, so its final
+        # drain runs after every data node has exited and carries the shutdown drops too.
         self.D_tel = sut.counter_by_life("logit.component.datagrams.dropped", component=listener)
+        self.D_shutdown = sut.counter_by_life("logit.component.datagrams.dropped",
+                                              component=listener, reason="shutdown")
+        # Batches any data node dropped for shutdown, the sink's and a Lua node's alike.
+        self.shutdown_batches = sut.counter_by_life("logit.component.batches.dropped",
+                                                    reason="shutdown")
         self.B = sut.counter_by_life("logit.component.diagnostics", component=listener,
                                      key="bad_line")
         self.E = sut.counter_by_life("logit.component.events.sent", component=listener)
+        # Events the listener counted as sent and then dropped, every reason: a batch sent into
+        # the inbox of a node that has failed is `closed_consumer`.
+        self.X = sut.counter_by_life("logit.component.events.dropped", component=listener)
         self.A = sut.counter_by_life("logit.component.events.received",
                                      component=self.aggregate)
         self.Ab = sut.counter_by_life("logit.transform.metrics.absorbed",
                                       component=self.aggregate)
+        if self.script:
+            script = self.script
+            self.L_in = sut.counter_by_life("logit.component.events.received", component=script)
+            # Counts events: an `emit_many` outcome adds one per event it returns.
+            self.L_emit = sut.counter_by_life("logit.script.events.emitted", component=script)
+            self.L_drop = sut.counter_by_life("logit.component.events.dropped", component=script,
+                                              reason="script_drop")
+            self.L_err = sut.counter_by_life("logit.component.errors", component=script,
+                                             reason="process")
+            self.L_flush = sut.counter_by_life("logit.component.flush.events", component=script)
+            self.L_sent = sut.counter_by_life("logit.component.events.sent", component=script)
 
         # The lives a scheduled `kill` ended, each the life in force when the kill was applied,
         # with the time it was.
@@ -851,9 +1063,10 @@ class Ledger:
             and record.get("on") == "logit" and not record.get("rc")}
         self.killed = sorted(self.killed_at)
 
-        # Shutdown drops and `drain complete` land after the final drain, so they come from
-        # stderr, each credited to the life its timestamp falls in. A killed life writes neither,
-        # so its D has no stderr part.
+        # The stderr copies of the shutdown counts, each credited to the life its timestamp falls
+        # in, read only to cross-check telemetry (`datagram_mismatch`, `batch_mismatch`). `drain
+        # complete` also counts the `internal` pipeline's own shutdown drops, which no drain can
+        # export. A killed life writes neither.
         self.D_log = {}
         self.batches_dropped = {}
         self.drain_completes = {}
@@ -871,19 +1084,36 @@ class Ledger:
                 self.batches_dropped[life] = (self.batches_dropped.get(life, 0)
                                               + _int(entry.fields.get("batches_dropped")))
 
+        # Per sink: its series, V per life, the reset-aware total, the resets per series, and
+        # the series whose segments don't line up with the lives.
         self.series = data.vm_series
-        self.V, self.V_total, self.resets, self.mismatched = vm.totals_by_life(
-            self.series, self.life_starts)
-        # A Kafka target's V is the topic's distinct records' increments, credited to lives by
-        # record timestamp, with each extra copy credited the same way.
+        self.V, self.V_total, self.resets, self.mismatched = {}, {}, {}, {}
+        for sink in self.sinks:
+            (self.V[sink], self.V_total[sink], self.resets[sink],
+             self.mismatched[sink]) = vm.totals_by_life(self.series.get(sink, []),
+                                                        self.life_starts)
+        # A Kafka target's one sink has the topic for its V: the distinct records' increments,
+        # credited to lives by record timestamp, with each extra copy credited the same way.
         self.records = []
         self.unparsed = 0
         self.duplicates = {}
-        if data.kafka:
+        self.kafka_sink = self.sinks[0] if data.kafka and self.sinks else None
+        if self.kafka_sink is not None:
+            sink = self.kafka_sink
             self.records, self.unparsed, copies = topic.parse_records(data.topic_text or "")
-            self.V, self.V_total = topic.totals_by_life(self.records, self.life_starts)
+            self.V[sink], self.V_total[sink] = topic.totals_by_life(self.records,
+                                                                    self.life_starts)
             self.duplicates = topic.duplicates_by_life(copies, self.life_starts)
-            self.resets, self.mismatched = {}, []
+            self.resets[sink], self.mismatched[sink] = {}, []
+        # Per sink, what `edge` judges: the events it received, and under `route` the events
+        # its target sent; and the events `aggregate` sent, once per send whatever its fan-out.
+        self.S_in = {sink: sut.counter_by_life("logit.component.events.received",
+                                               component=sink) for sink in self.sinks}
+        self.T_sent = {sink: sut.counter_by_life("logit.component.events.sent",
+                                                 component=self.targets.get(sink))
+                       for sink in self.sinks if self.targets.get(sink)}
+        self.A_sent = sut.counter_by_life("logit.component.events.sent",
+                                          component=self.aggregate)
 
         if self.gen is not None:
             self.G = sum(self.gen.counter_by_life("logit.output.messages",
@@ -903,8 +1133,9 @@ class Ledger:
         text = self._sut_config_text()
         max_datagrams = _yaml_int(text, "max_datagrams") or DEFAULT_MAX_DATAGRAMS
         batch_max = _yaml_int(text, "batch_max_events") or DEFAULT_BATCH_MAX_EVENTS
-        self.R = max_datagrams + RESIDUAL_BATCHES * batch_max
-        self.R_text = f"R {_n(self.R)} = {_n(max_datagrams)} + {RESIDUAL_BATCHES} x {_n(batch_max)}"
+        batches = RESIDUAL_BATCHES + (SCRIPT_RESIDUAL_BATCHES if self.script else 0)
+        self.R = max_datagrams + batches * batch_max
+        self.R_text = f"R {_n(self.R)} = {_n(max_datagrams)} + {batches} x {_n(batch_max)}"
         # The aggregate's configured window, in seconds, or None when the config doesn't say.
         self.interval = component_duration(text, self.aggregate or "", "interval")
 
@@ -929,28 +1160,93 @@ class Ledger:
         return getattr(self, symbol).get(life, 0)
 
     def epoch_bumps(self, life):
-        """`{reason: records}` for the sink's `EPOCH_BUMP_REASONS` drops in one life."""
+        """`{reason: records}` for the Kafka sink's `EPOCH_BUMP_REASONS` drops in one life."""
         bumps = {}
         for reason in EPOCH_BUMP_REASONS:
-            value = self.sut.counter_by_life("logit.output.records.dropped", component=self.sink,
+            value = self.sut.counter_by_life("logit.output.records.dropped",
+                                             component=self.kafka_sink,
                                              reason=reason).get(life, 0)
             if value:
                 bumps[reason] = value
         return bumps
 
+    def v(self, life, sinks):
+        """V in `life` summed over `sinks`."""
+        return sum(self.V.get(sink, {}).get(life, 0) for sink in sinks)
+
+    def egress_groups(self):
+        """`[(label, sinks)]`, each judged as one egress: under `copy` each sink alone, under
+        `route` all of them, whose V add up to what `aggregate` absorbed."""
+        if self.split == "route":
+            return [(" + ".join(self.sinks), list(self.sinks))]
+        return [(sink, [sink]) for sink in self.sinks]
+
+    def v_text(self, life, sinks):
+        if len(sinks) == 1:
+            return f"V[{sinks[0]}] {_n(self.v(life, sinks))}"
+        parts = " + ".join(f"V[{sink}] {_n(self.v(life, [sink]))}" for sink in sinks)
+        return f"ΣV {_n(self.v(life, sinks))} ({parts})"
+
     def D(self, life):
-        return self.get("D_tel", life) + self.get("D_log", life)
+        return self.get("D_tel", life)
+
+    def datagram_mismatch(self, life):
+        """A detail when stderr's shutdown `warn` lines count more datagrams than telemetry's
+        `datagrams.dropped{reason="shutdown"}` for a life, else None. A killed life has neither.
+
+        Only stderr above telemetry is a disagreement. Under `receive: { overflow: block }`, a
+        `push_many` cancelled while blocked counts its datagrams as shutdown drops without
+        logging a line, so telemetry can exceed stderr on a correct ledger."""
+        logged, counted = self.get("D_log", life), self.get("D_shutdown", life)
+        if logged <= counted:
+            return None
+        return (f"life {life}: the listener's stderr shutdown lines count {_n(logged)} "
+                f"datagram(s), telemetry's datagrams.dropped{{reason=\"shutdown\"}} "
+                f"{_n(counted)}; D reads telemetry")
+
+    def batch_mismatch(self, life):
+        """A detail when `drain complete`'s `batches_dropped` and telemetry's
+        `batches.dropped{reason="shutdown"}` disagree for a life, else None. A killed life has
+        neither."""
+        if life in self.killed and life != self.final:
+            return None
+        logged, counted = self.batches_dropped.get(life, 0), self.get("shutdown_batches", life)
+        if logged == counted:
+            return None
+        return (f"life {life}: drain complete's batches_dropped {_n(logged)}, telemetry's "
+                f"batches.dropped{{reason=\"shutdown\"}} {_n(counted)}; a larger stderr count "
+                "is the internal pipeline's own drops, or a config whose internal pipeline isn't "
+                "dedicated")
 
     def symbols(self, life):
+        script = ""
+        if self.script:
+            script = "".join(f"{symbol} {_n(self.get(symbol, life))}, " for symbol in (
+                "L_in", "L_emit", "L_drop", "L_err", "L_flush", "L_sent"))
         return (f"W {_n(self.get('W', life))}, K {_n(self.get('K', life))}, D {_n(self.D(life))} "
-                f"({_n(self.get('D_tel', life))} telemetry + {_n(self.get('D_log', life))} "
-                f"stderr), B {_n(self.get('B', life))}, E {_n(self.get('E', life))}, "
+                f"({_n(self.get('D_shutdown', life))} at shutdown; stderr says "
+                f"{_n(self.get('D_log', life))}), B {_n(self.get('B', life))}, "
+                f"E {_n(self.get('E', life))}, X {_n(self.get('X', life))}, {script}"
                 f"A {_n(self.get('A', life))}, Ab {_n(self.get('Ab', life))}, "
-                f"V {_n(self.get('V', life))}")
+                + ", ".join(f"V[{sink}] {_n(self.v(life, [sink]))}" for sink in self.sinks))
+
+    def absorbed(self, life):
+        """The increments `aggregate` absorbed from the listener's events: Ab, less a script's
+        `flush()` events, each of which carries one metric whose series V excludes."""
+        return self.get("Ab", life) - (self.get("L_flush", life) if self.script else 0)
+
+    def script_dropped(self, life):
+        """The events a script dropped (`script_drop`) or failed on (`errors{process}`), both
+        counted, 0 with no script."""
+        if not self.script:
+            return 0
+        return self.get("L_drop", life) + self.get("L_err", life)
 
     def residual(self, life):
-        """W − D − B − Ab: what a life read but didn't absorb by its last drain."""
-        return self.get("W", life) - self.D(life) - self.get("B", life) - self.get("Ab", life)
+        """What a life read but neither absorbed nor dropped, counted, by its last drain:
+        W − D − B − X − Ab, and with a script W − D − B − X − (L_drop + L_err) − (Ab − L_flush)."""
+        return (self.get("W", life) - self.D(life) - self.get("B", life) - self.get("X", life)
+                - self.script_dropped(life) - self.absorbed(life))
 
     def kill_band(self, life):
         """`(low, high, text)`: the Ab − V a killed life may show with nothing lost, from its
@@ -972,7 +1268,8 @@ class Ledger:
         window = self.interval
         source = "configured"
         if window is None:
-            window = vm.sample_spacing_s(self.series) or 0.0
+            spaced = next((one for one in self.series.values() if one), [])
+            window = vm.sample_spacing_s(spaced) or 0.0
             source = "the export's sample spacing, the config naming none"
         residual = max(0, self.residual(life))
         low = -(residual + round(rate * interval))
@@ -984,20 +1281,27 @@ class Ledger:
                 f"kill plus one drain interval of queue growth after the last drain")
         return low, high, text
 
-    def egress(self, life):
-        """`(status, verdict, gap)` for one life's egress: `ok`, `counted`, `within band`,
-        `surplus`, or `uncounted`.
+    def egress(self, life, sinks):
+        """`(status, verdict, gap)` for one life's egress to `sinks`, whose V is summed (one
+        sink under `copy`, all under `route`): `ok`, `counted`, `within band`, `surplus`, or
+        `uncounted`.
 
-        The final life's gap is Ab − V. A stopped earlier life's is W − D − B − V, the residual
-        plus Ab − V, because the close-time window delivers what that life read but hadn't
-        absorbed by its last drain into V. A killed life has no close-time window and no `drain
-        complete`: its gap is Ab − V alone, judged inside `kill_band`; below the band it is a
-        surplus, above it uncounted loss. Its residual is what the kill lost from the receive
-        queue and inbox, by design, and is reported, not judged here.
+        A positive gap is counted when the life's telemetry has a batch dropped for shutdown at
+        a node that can explain it (`shutdown_credit`).
+
+        The final life's gap is Ab − V, and with a script Ab − L_flush − V, here and below. A
+        stopped earlier life's is W − D − B − X − V, less a script's counted drops, the residual
+        plus Ab − V, because `aggregate`'s close-time flush delivers what that life read but
+        hadn't absorbed by its last ordinary drain into V; the final drain runs after that
+        flush, so it exports the shutdown drops and the script's counted drops and errors. A
+        killed life has no close-time window and no shutdown drops: its gap is Ab − V alone,
+        judged inside `kill_band`; below the band it is a surplus, above it uncounted loss. Its
+        residual is what the kill lost from the receive queue and inbox, by design, and is
+        reported, not judged here.
 
         On a Kafka target, V counts each distinct record once, so a negative gap in a life that
         wasn't killed is a `surplus`, never a duplicate: increments V holds and Ab doesn't."""
-        gap = self.get("Ab", life) - self.get("V", life)
+        gap = self.absorbed(life) - self.v(life, sinks)
         if life in self.killed and life != self.final:
             low, high, _ = self.kill_band(life)
             if gap == 0:
@@ -1007,14 +1311,28 @@ class Ledger:
             return FAIL, ("surplus" if gap < low else "uncounted"), gap
         if life != self.final:
             gap += self.residual(life)
-        dropped = self.batches_dropped.get(life, 0)
         if gap == 0:
             return PASS, "ok", gap
-        if gap > 0 and dropped > 0:
+        if gap > 0 and self.shutdown_credit(life, sinks) > 0:
             return PASS, "counted", gap
         if gap < 0 and self.data.kafka:
             return FAIL, "surplus", gap
         return FAIL, "uncounted", gap
+
+    def other_sinks_shutdown(self, life, sinks):
+        """The batches the sinks outside `sinks` dropped for shutdown in `life`."""
+        return sum(self.sut.counter_by_life("logit.component.batches.dropped", component=sink,
+                                            reason="shutdown").get(life, 0)
+                   for sink in self.sinks if sink not in sinks)
+
+    def shutdown_credit(self, life, sinks):
+        """The batches dropped for shutdown in `life` that can explain a gap at `sinks`: every
+        node's, less those of the sinks outside the group. Under `copy` another sink's drop
+        loses nothing this sink was sent, while a drop upstream of the fan-out (the script,
+        `aggregate`) or at this sink can; under `route`, and with one sink, the group holds
+        every sink and the count is the life's whole."""
+        return (self.get("shutdown_batches", life)
+                - self.other_sinks_shutdown(life, sinks))
 
 
 def _ledger(data):
@@ -1165,8 +1483,9 @@ def _per_life_lines(led):
 
 
 def check_ledger_intake(data):
-    """The final life's W − D == E + B; each earlier life's W − D − B − Ab in [0, R], a sanity
-    bound. `ledger.egress` ties that residual to V."""
+    """The final life's W − D == E + B; each earlier life's residual (`Ledger.residual`) in
+    [0, R], a sanity bound. `ledger.egress` ties that residual to V. A life whose stderr
+    shutdown lines disagree with telemetry's shutdown drops WARNs."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.intake", led)
     if skipped:
@@ -1183,10 +1502,14 @@ def check_ledger_intake(data):
     for earlier in led.lives[:-1]:
         residual = led.residual(earlier)
         ok = 0 <= residual <= led.R
-        parts.append(f"life {earlier}: W − D − B − Ab {_n(residual)} "
+        parts.append(f"life {earlier}: {led.residual_text} {_n(residual)} "
                      f"{'within' if ok else 'outside'} [0, R]")
         if not ok:
             status = FAIL
+    mismatches = [m for m in map(led.datagram_mismatch, led.lives) if m]
+    if mismatches:
+        status = worst([status, WARN])
+        parts += mismatches
     detail = "; ".join(parts) + f" ({led.R_text})"
     return Result("ledger.intake", status, detail, lines)
 
@@ -1211,8 +1534,88 @@ def _final_equality(data, check_id, left, right, what):
 
 
 def check_ledger_edge(data):
-    """The final life's E == A, a single-consumer edge."""
-    return _final_equality(data, "ledger.edge", "E", "A", "listener to aggregate")
+    """The final life's edges, each `sent == received`: into `aggregate`, E == A, or with a
+    script L_sent == A, the edge from the script, since `ledger.script` judges the listener's;
+    and out to each sink, under `copy` `aggregate`'s events.sent == the sink's events.received
+    (a fan-out counts one send per batch, however many consumers it reaches), and under `route`
+    the sink's target's events.sent == the sink's events.received. Earlier lives are
+    reported."""
+    led = _ledger(data)
+    skipped = _skip_without_sut("ledger.edge", led)
+    if skipped:
+        return skipped
+    if led.script:
+        edges = [("L_sent", "A", led.L_sent, led.A, "script to aggregate")]
+    else:
+        edges = [("E", "A", led.E, led.A, "listener to aggregate")]
+    for sink in led.sinks:
+        received = led.S_in[sink]
+        if led.split == "route":
+            target = led.targets.get(sink)
+            edges.append((f"T_sent[{target}]", f"S_in[{sink}]", led.T_sent.get(sink, {}),
+                          received, f"target {target} to {sink}"))
+        else:
+            edges.append(("A_sent", f"S_in[{sink}]", led.A_sent, received,
+                          f"aggregate to {sink}"))
+    lines = []
+    parts = []
+    off = []
+    final = led.final
+    for left, right, lhs, rhs, what in edges:
+        for life in led.lives:
+            a, b = lhs.get(life, 0), rhs.get(life, 0)
+            lines.append(f"{what}, life {life}{' (final)' if life == final else ''}: {left} "
+                         f"{_n(a)}, {right} {_n(b)}, {left} − {right} {_n(a - b)}"
+                         + ("" if life == final else " (reported, not judged)"))
+        a, b = lhs.get(final, 0), rhs.get(final, 0)
+        if a != b:
+            off.append(f"{left} {_n(a)} != {right} {_n(b)}, off by {_n(a - b)} ({what})")
+        else:
+            parts.append(f"{left} {_n(a)} == {right} {_n(b)} ({what})")
+    if off:
+        return Result("ledger.edge", FAIL, f"final life {final}: " + "; ".join(off + parts),
+                      lines)
+    return Result("ledger.edge", PASS, f"final life {final}: " + "; ".join(parts), lines)
+
+
+def check_ledger_script(data):
+    """For a `[ledger] sut_script`, else SKIP, the final life's script hop: E == L_in (the
+    listener's edge), L_in == L_emit + L_drop + L_err (every event emitted, dropped, or failed
+    on), and L_sent == L_emit + L_flush (what it sent is what `process()` emitted plus what
+    `flush()` returned). Earlier lives are reported."""
+    if not data.ledger.get("sut_script"):
+        return Result("ledger.script", SKIP, "no [ledger] sut_script")
+    led = _ledger(data)
+    skipped = _skip_without_sut("ledger.script", led)
+    if skipped:
+        return skipped
+    g = led.get
+
+    def identities(life):
+        return [
+            ("E == L_in", g("E", life), g("L_in", life)),
+            ("L_in == L_emit + L_drop + L_err", g("L_in", life),
+             g("L_emit", life) + g("L_drop", life) + g("L_err", life)),
+            ("L_sent == L_emit + L_flush", g("L_sent", life),
+             g("L_emit", life) + g("L_flush", life)),
+        ]
+
+    lines = []
+    for life in led.lives:
+        shown = ", ".join(f"{name.split(' == ')[0]} {_n(a)} vs {_n(b)}"
+                          for name, a, b in identities(life))
+        lines.append(f"life {life}{' (final)' if life == led.final else ' (reported, not judged)'}"
+                     f": {shown}; {led.symbols(life)}")
+    life = led.final
+    off = [f"{name} off by {_n(a - b)} ({_n(a)} vs {_n(b)})"
+           for name, a, b in identities(life) if a != b]
+    summary = (f"final life {life}: E {_n(g('E', life))} == L_in {_n(g('L_in', life))} == L_emit "
+               f"{_n(g('L_emit', life))} + L_drop {_n(g('L_drop', life))} + L_err "
+               f"{_n(g('L_err', life))}; L_sent {_n(g('L_sent', life))} == L_emit + L_flush "
+               f"{_n(g('L_flush', life))}")
+    if off:
+        return Result("ledger.script", FAIL, f"final life {life}: {'; '.join(off)}", lines)
+    return Result("ledger.script", PASS, summary, lines)
 
 
 def check_ledger_aggregate(data):
@@ -1221,13 +1624,16 @@ def check_ledger_aggregate(data):
 
 
 def check_ledger_egress(data):
-    """The egress gap per life, Ab − V for the final life and a killed one, and W − D − B − V
-    for a stopped earlier one: 0 passes; a positive gap with that life's `drain complete`
-    `batches_dropped` above 0 is counted, never reconciled; a killed life's gap passes inside
+    """The egress gap per life and per egress group (`Ledger.egress_groups`: each sink under
+    `copy`, the sinks' summed V under `route`), Ab − V for the final life and a killed one, and
+    W − D − B − X − V for a stopped earlier one: 0 passes; a positive gap with a batch that
+    life's telemetry counts `batches.dropped{reason="shutdown"}` at a node that can explain it
+    (`Ledger.shutdown_credit`) is counted, never reconciled; a killed life's gap passes inside
     `Ledger.kill_band`; any other gap is uncounted loss, or a surplus below a killed life's
-    band or below 0 on a Kafka target. An export with no series can't pass."""
+    band or below 0 on a Kafka target. A sink whose export has no series, or a Kafka topic with
+    no records, can't pass."""
     if data.external:
-        return Result("ledger.egress", SKIP, f"{NO_BACKEND}; ledger.sent judges the sink")
+        return Result("ledger.egress", SKIP, f"{NO_BACKEND}; ledger.sent judges the sinks")
     if data.kafka and data.phases.get("kafka_read") is None:
         failed = data.phases.get("kafka_read_failed") or {}
         return Result("ledger.egress", FAIL, "the topic wasn't read back, so V is unknown: "
@@ -1238,137 +1644,194 @@ def check_ledger_egress(data):
     skipped = _skip_without_sut("ledger.egress", led)
     if skipped:
         return skipped
+    if not led.sinks:
+        return Result("ledger.egress", FAIL, "no [[ledger.sink]] to judge")
     status = PASS
     lines = []
-    parts = []
-    for life in led.lives:
-        verdict_status, verdict, gap = led.egress(life)
-        status = worst([status, verdict_status])
-        dropped = led.batches_dropped.get(life, 0)
-        ab_v = led.get("Ab", life) - led.get("V", life)
-        if life == led.final:
-            part = (f"life {life} (final): Ab {_n(led.get('Ab', life))} − V "
-                    f"{_n(led.get('V', life))} = {_n(gap)}, {verdict}")
-        elif life in led.killed:
-            _, _, band = led.kill_band(life)
-            part = (f"life {life} (killed): Ab {_n(led.get('Ab', life))} − V "
-                    f"{_n(led.get('V', life))} = {_n(gap)}, {verdict} ({band}); residual "
-                    f"W − D − B − Ab {_n(led.residual(life))} at its last drain, what the kill "
-                    "lost from the receive queue and inbox, by design, not judged here; D has "
-                    "no stderr part: a SIGKILL logs no shutdown drops")
-        else:
-            part = (f"life {life}: W − D − B − V {_n(gap)} = residual "
-                    f"{_n(led.residual(life))} + Ab − V {_n(ab_v)}, {verdict}")
-        if gap > 0 and not (life in led.killed and life != led.final):
-            part += f" (drain complete batches_dropped {_n(dropped)})"
-        parts.append(part)
-    lives = len(led.lives)
-    if data.kafka:
-        if not led.records:
+    groups = []
+    for label, sinks in led.egress_groups():
+        parts = []
+        for life in led.lives:
+            verdict_status, verdict, gap = led.egress(life, sinks)
+            status = worst([status, verdict_status])
+            ab_v = led.absorbed(life) - led.v(life, sinks)
+            flush = f" (L_flush {_n(led.get('L_flush', life))})" if led.script else ""
+            absorbed = (f"{led.ab_text} {_n(led.absorbed(life))}{flush} − "
+                        f"{led.v_text(life, sinks)}")
+            if life == led.final:
+                part = f"life {life} (final): {absorbed} = {_n(gap)}, {verdict}"
+            elif life in led.killed:
+                _, _, band = led.kill_band(life)
+                part = (f"life {life} (killed): {absorbed} = {_n(gap)}, {verdict} ({band}); "
+                        f"residual {led.residual_text} {_n(led.residual(life))} at its last "
+                        "drain, what the kill lost from the receive queue and inbox, by design, "
+                        "not judged here; D has no shutdown part: a SIGKILL counts no "
+                        "shutdown drops")
+            else:
+                whole = ("W − D − B − X − (L_drop + L_err) − V" if led.script
+                         else "W − D − B − X − V")
+                part = (f"life {life}: {whole} {_n(gap)} = residual "
+                        f"{_n(led.residual(life))} + {led.ab_text} − V {_n(ab_v)}, {verdict}")
+            if gap > 0 and not (life in led.killed and life != led.final):
+                others = ""
+                elsewhere = led.other_sinks_shutdown(life, sinks)
+                if elsewhere:
+                    others = f", not counting {_n(elsewhere)} at the other sinks"
+                part += (f" (batches dropped for shutdown "
+                         f"{_n(led.shutdown_credit(life, sinks))}{others})")
+            parts.append(part)
+        empty = [sink for sink in sinks if not led.series.get(sink) and sink != led.kafka_sink]
+        if led.kafka_sink in sinks:
+            if not led.records:
+                status = FAIL
+                parts.insert(0, f"no records in {topic.TOPIC_FILE}")
+            if led.unparsed:
+                status = FAIL
+                parts.insert(0, f"{_n(led.unparsed)} topic record(s) aren't JSON objects")
+        for sink in empty:
             status = FAIL
-            parts.insert(0, f"no records in {topic.TOPIC_FILE}")
-        if led.unparsed:
-            status = FAIL
-            parts.insert(0, f"{_n(led.unparsed)} topic record(s) aren't JSON objects")
-        copies = sum(led.duplicates.values())
-        lines.append(f"{_n(len(led.records) + copies)} topic record(s), {_n(len(led.records))} "
-                     f"distinct, {_n(copies)} duplicate copies; V {_n(led.V_total)} (the sum of "
-                     "the distinct records' delta sums)")
-        return Result("ledger.egress", status, "; ".join(parts) + f" ({led.R_text})", lines)
-    if not led.series:
-        status = FAIL
-        parts.insert(0, "no series in vm-export.jsonl match vm_selector "
-                        f"{data.ledger.get('vm_selector')!r}")
-    wrong = {name: n for name, n in led.resets.items() if n != lives - 1}
-    lines.append(f"{len(led.series)} series, reset-aware V {_n(led.V_total)}; resets per series "
-                 f"should be {lives - 1} (SUT lives − 1)")
-    if wrong:
+            selector = next((one.get("vm_selector") for one in data.ledger.get("sink") or []
+                             if one.get("id") == sink), None)
+            parts.insert(0, f"no series in vm-export/{sink}.jsonl match vm_selector "
+                            f"{selector!r}")
+        groups.append(f"{label}: " + "; ".join(parts))
+    lines += groups
+    mismatches = list(filter(None, map(led.batch_mismatch, led.lives)))
+    if mismatches:
         status = worst([status, WARN])
-        sample = ", ".join(f"{name} {n}" for name, n in list(wrong.items())[:5])
-        lines.insert(0, f"{len(wrong)} series with resets other than {lives - 1}: {sample}; "
-                        "their segments are credited by timestamp")
+    lives = len(led.lives)
+    wrong_total = 0
+    for sink in led.sinks:
+        if sink == led.kafka_sink:
+            copies = sum(led.duplicates.values())
+            lines.append(f"{sink}: {_n(len(led.records) + copies)} topic record(s), "
+                         f"{_n(len(led.records))} distinct, {_n(copies)} duplicate copies; V "
+                         f"{_n(led.V_total[sink])} (the sum of the distinct records' delta sums)")
+            continue
+        wrong = {name: n for name, n in led.resets[sink].items() if n != lives - 1}
+        lines.append(f"{sink}: {len(led.series.get(sink, []))} series, reset-aware V "
+                     f"{_n(led.V_total[sink])}; resets per series should be {lives - 1} (SUT "
+                     "lives − 1)")
+        if wrong:
+            wrong_total += len(wrong)
+            status = worst([status, WARN])
+            sample = ", ".join(f"{name} {n}" for name, n in list(wrong.items())[:5])
+            lines.insert(0, f"{sink}: {len(wrong)} series with resets other than {lives - 1}: "
+                            f"{sample}; their segments are credited by timestamp")
     for life in led.lives:
         if life in led.killed and life != led.final:
             lines.append(f"life {life} was killed: no final drain and no drain complete line")
         elif life != led.final and led.drain_completes.get(life, 0) == 0:
             lines.append(f"life {life} has no drain complete line")
-    detail = "; ".join(parts) + f" ({led.R_text})"
-    if wrong:
-        detail += f"; {len(wrong)} series' resets aren't SUT lives − 1"
+    split = f"split {led.split}"
+    detail = " | ".join(groups + mismatches) + f" ({split}; {led.R_text})"
+    if wrong_total:
+        detail += f"; {wrong_total} series' resets aren't SUT lives − 1"
     return Result("ledger.egress", status, detail, lines)
 
 
 def check_ledger_summary(data):
     """The final life's uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), which must
-    be 0, with wire loss beside it by design. A counted egress term is shown and not judged;
-    on an external target the Ab − V term SKIPs, and the row judges the other three. On a Kafka
-    target V counts the topic's distinct records, so a duplicate never enters the sum."""
+    be 0, with wire loss beside it by design. There is one Ab − V term per egress group, and
+    each must be 0 or counted on its own, so a surplus at one sink can't net out loss at
+    another. With a script, E − A becomes its four script terms (`check_ledger_script`'s three
+    identities and L_sent − A), the egress term is Ab − L_flush − V, and the script's drops and
+    errors are shown beside it, counted. A counted egress term is shown and not judged; on an external target the Ab − V term SKIPs, and the
+    row judges the others. On a Kafka target V counts the topic's distinct records, so a
+    duplicate never enters the sum."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.summary", led)
     if skipped:
         return skipped
     life = led.final
     g = led.get
-    terms = [
-        ("W − D − E − B", g("W", life) - led.D(life) - g("E", life) - g("B", life)),
-        ("E − A", g("E", life) - g("A", life)),
-        ("A − Ab", g("A", life) - g("Ab", life)),
-    ]
+    terms = [("W − D − E − B", g("W", life) - led.D(life) - g("E", life) - g("B", life))]
+    if led.script:
+        terms += [
+            ("E − L_in", g("E", life) - g("L_in", life)),
+            ("L_in − L_emit − L_drop − L_err",
+             g("L_in", life) - g("L_emit", life) - g("L_drop", life) - g("L_err", life)),
+            ("L_emit + L_flush − L_sent", g("L_emit", life) + g("L_flush", life)
+             - g("L_sent", life)),
+            ("L_sent − A", g("L_sent", life) - g("A", life)),
+        ]
+    else:
+        terms.append(("E − A", g("E", life) - g("A", life)))
+    terms.append(("A − Ab", g("A", life) - g("Ab", life)))
     shown = [f"{name} {_n(value)}" for name, value in terms]
+    uncounted_egress = False
     if data.external:
         judged = sum(value for _, value in terms)
-        shown.append(f"Ab − V SKIP ({NO_BACKEND})")
+        shown.append(f"{led.ab_text} − V SKIP ({NO_BACKEND})")
     else:
-        _, verdict, egress_gap = led.egress(life)
-        counted = verdict == "counted"
-        judged = sum(value for _, value in terms) + (0 if counted else egress_gap)
-        shown.append(f"Ab − V {_n(egress_gap)}" + (f" {verdict}" if counted else ""))
+        judged = sum(value for _, value in terms)
+        for _, sinks in led.egress_groups():
+            _, verdict, egress_gap = led.egress(life, sinks)
+            counted = verdict == "counted"
+            if not counted:
+                judged += egress_gap
+                uncounted_egress = uncounted_egress or egress_gap != 0
+            v = "ΣV" if len(sinks) > 1 else f"V[{sinks[0]}]"
+            shown.append(f"{led.ab_text} − {v} {_n(egress_gap)}"
+                         + (f" {verdict}" if counted else ""))
+    counted_script = ""
+    if led.script:
+        counted_script = (f"; the script's L_drop {_n(g('L_drop', life))} and L_err "
+                          f"{_n(g('L_err', life))}, counted")
     wire = ""
     if led.gen is not None:
         wire = (f"; wire G − (W + K) {_n(led.G - sum(led.W.values()) - sum(led.K.values()))} "
                 "over the run, by design")
-    status = PASS if judged == 0 else FAIL
-    detail = f"final life {life}: uncounted {_n(judged)} = " + " + ".join(shown) + wire
+    status = PASS if judged == 0 and not uncounted_egress else FAIL
+    detail = (f"final life {life}: uncounted {_n(judged)} = " + " + ".join(shown)
+              + counted_script + wire)
     return Result("ledger.summary", status, detail, _per_life_lines(led))
 
 
 def check_identity_sink(data):
-    """At the final life's last drain before its shutdown drain: batches.received +
-    buffer.disk.replayed == delivered + dropped (every reason) + buffer.batches, one batch in
-    flight allowed."""
+    """For each sink, at the final life's last drain before its shutdown drain:
+    batches.received + buffer.disk.replayed == delivered + dropped (every reason) +
+    buffer.batches, one batch in flight allowed."""
     led = _ledger(data)
     skipped = _skip_without_sut("identity.sink", led)
     if skipped:
         return skipped
-    sut, sink, life = led.sut, led.sink, led.final
+    sut, life = led.sut, led.final
     drains = [d for d in sut.life_drains(life)]
     if len(drains) < 2:
         return Result("identity.sink", SKIP, f"final life {life} has under two drains")
     at = drains[-2]
+    status = PASS
+    lines = []
+    for sink in led.sinks:
+        def upto(name, sink=sink):
+            return sum(v for ts, v, point_life in sut.counter_points(name, component=sink)
+                       if point_life == life and ts <= at)
 
-    def upto(name):
-        return sum(v for ts, v, point_life in sut.counter_points(name, component=sink)
-                   if point_life == life and ts <= at)
-
-    received = upto("logit.component.batches.received")
-    # A disk spool opens holding what an earlier process queued: those batches are delivered
-    # in this life but were received in another, and `buffer.disk.replayed` counts them.
-    replayed = upto("logit.component.buffer.disk.replayed")
-    delivered = upto("logit.component.batches.delivered")
-    dropped = upto("logit.component.batches.dropped")
-    queued = next((v for ts, v, point_life in reversed(sut.gauge_series(
-        "logit.component.buffer.batches", component=sink)) if point_life == life and ts <= at), 0)
-    gap = received + replayed - delivered - dropped - queued
-    replay = f" + replayed {_n(replayed)}" if replayed else ""
-    detail = (f"final life {life} at {data.offset(at)}: received {_n(received)}{replay} vs "
-              f"delivered {_n(delivered)} + dropped {_n(dropped)} + buffer.batches {_n(queued)}, "
-              f"gap {_n(gap)} (one batch in flight allowed)")
-    return Result("identity.sink", PASS if 0 <= gap <= 1 else FAIL, detail)
+        received = upto("logit.component.batches.received")
+        # A disk spool opens holding what an earlier process queued: those batches are
+        # delivered in this life but were received in another, and `buffer.disk.replayed`
+        # counts them.
+        replayed = upto("logit.component.buffer.disk.replayed")
+        delivered = upto("logit.component.batches.delivered")
+        dropped = upto("logit.component.batches.dropped")
+        queued = next((v for ts, v, point_life in reversed(sut.gauge_series(
+            "logit.component.buffer.batches", component=sink))
+            if point_life == life and ts <= at), 0)
+        gap = received + replayed - delivered - dropped - queued
+        replay = f" + replayed {_n(replayed)}" if replayed else ""
+        if not 0 <= gap <= 1:
+            status = FAIL
+        lines.append(f"{sink}: received {_n(received)}{replay} vs delivered {_n(delivered)} + "
+                     f"dropped {_n(dropped)} + buffer.batches {_n(queued)}, gap {_n(gap)}")
+    detail = (f"final life {life} at {data.offset(at)}: " + "; ".join(lines)
+              + " (one batch in flight allowed)")
+    return Result("identity.sink", status, detail, lines)
 
 
 def check_ledger_windows(data):
     """Opt-in, under `[ledger] vm_every_window`: every series has a sample for every
-    `aggregate` window the SUT emitted. Per life and series, consecutive samples are at most
+    `aggregate` window the SUT emitted, in every sink's export. Per life and series, consecutive samples are at most
     1.5 x the configured interval apart, unless the SUT's `aggregate` sent no batch in the span
     the missing windows would have been flushed in; a killed life's last sample is at most
     1.1 x the interval before the kill, because the kill discards only the window in progress,
@@ -1389,8 +1852,10 @@ def check_ledger_windows(data):
     if not interval:
         return Result("ledger.windows", FAIL, f"the SUT config names no interval for aggregate "
                       f"{led.aggregate!r}, so no window can be judged")
-    if not led.series:
-        return Result("ledger.windows", FAIL, "no series in vm-export.jsonl match vm_selector")
+    empty = [sink for sink in led.sinks if not led.series.get(sink)]
+    if empty:
+        return Result("ledger.windows", FAIL, "no series match vm_selector in "
+                      + ", ".join(f"vm-export/{sink}.jsonl" for sink in empty))
     max_gap, tail_bound, head_bound = 1.5 * interval, 1.1 * interval, 2 * interval
     # A gap (a, b] is idle when `aggregate` sent no batch in the span its missing windows would
     # have been flushed in: an idle flush sends nothing, so no window existed to store. A flush
@@ -1419,8 +1884,9 @@ def check_ledger_windows(data):
     idle = {}
     problems = []
     widest = 0.0
-    for one in led.series:
-        name = vm.series_name(one)
+    every = [(sink, one) for sink in led.sinks for one in led.series[sink]]
+    for sink, one in every:
+        name = f"{sink} {vm.series_name(one)}"
         by_life = {}
         for stamp in one.get("timestamps") or []:
             t = stamp / 1000
@@ -1482,12 +1948,13 @@ def check_ledger_windows(data):
                       f"missing windows, {len(problems)} finding(s), first: {problems[0]} "
                       f"({rules})", problems + excused)
     return Result("ledger.windows", PASS,
-                  f"{len(led.series)} series x {len(led.lives)} life/lives, widest gap "
+                  f"{len(every)} series over {len(led.sinks)} sink(s) x {len(led.lives)} "
+                  "life/lives, widest gap "
                   f"{widest:g}s ({rules})", excused)
 
 
 def check_ledger_replay(data):
-    """For each killed life followed by another: the next life's first-drain
+    """For each killed life followed by another, and each sink: the next life's first-drain
     `buffer.disk.replayed` equals the killed life's `buffer.batches` at its last drain, one
     batch in flight allowed. What a kill leaves queued comes back only through a disk spool's
     replay at open, so a short replay is lost windows `identity.sink` balances away."""
@@ -1498,10 +1965,10 @@ def check_ledger_replay(data):
     pairs = [life for life in led.killed if life + 1 in led.lives]
     if not pairs:
         return Result("ledger.replay", SKIP, "no killed life followed by another")
-    sut, sink = led.sut, led.sink
+    sut = led.sut
     status = PASS
     parts = []
-    for life in pairs:
+    for sink, life in [(sink, life) for sink in led.sinks for life in pairs]:
         drains = sut.life_drains(life)
         nxt = sut.life_drains(life + 1)
         queued = next((v for ts, v, point_life in reversed(sut.gauge_series(
@@ -1512,11 +1979,11 @@ def check_ledger_replay(data):
             if point_life == life + 1 and nxt and ts == nxt[0])
         ok = abs(replayed - queued) <= 1
         status = worst([status, PASS if ok else FAIL])
-        parts.append(f"life {life + 1}'s first drain replayed {_n(replayed)} vs killed life "
+        parts.append(f"{sink}: life {life + 1}'s first drain replayed {_n(replayed)} vs killed life "
                      f"{life}'s last-drain buffer.batches {_n(queued)}"
                      + ("" if ok else ", off by " + _n(replayed - queued)))
     return Result("ledger.replay", status,
-                  "; ".join(parts) + " (one batch in flight allowed)")
+                  "; ".join(parts) + " (one batch in flight allowed)", parts)
 
 
 def _by_attr(tel, name, attr, **attrs):
@@ -1530,42 +1997,73 @@ def _by_attr(tel, name, attr, **attrs):
 
 
 def check_ledger_sent(data):
-    """For an external target, where the ledger ends at the sink's telemetry: `SENT` (a PASS
-    whose detail starts with the word) when every batch the sink received ended in an accepted
-    response, judged per SUT life by the sink's batch identity and over the run by its drops,
-    refusals, and request classes. A local target SKIPs. `docs/plans/soak-harness.md`, "8.
-    External targets (W5)", lists each FAIL and WARN."""
+    """For an external target, where the ledger ends at the sinks' telemetry: `SENT` (a PASS
+    whose detail starts with the word) when every batch each sink received ended in an accepted
+    response, judged per sink and SUT life by the sink's batch identity and over the run by its
+    drops, refusals, and request classes. A Kafka target's sink is judged the same way, and its
+    ledger goes on to the topic. A local target SKIPs. `docs/plans/soak-harness.md`,
+    "8. External targets (W5)", lists each FAIL and WARN."""
     if data.has_vm:
         return Result("ledger.sent", SKIP, "local target: ledger.egress judges delivery against "
-                      "VictoriaMetrics")
-    # The request class an accepted answer carries: an HTTP sink's status class, or the class
-    # `kafka_out` counts a successful produce attempt under.
-    accepted_class = "ok" if data.kafka else "2xx"
+                      "the backends")
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.sent", led)
     if skipped:
         return skipped
-    sut, sink = led.sut, led.sink
     status = PASS
     problems = []
     lines = []
+    summaries = []
 
     def flag(verdict, text):
         nonlocal status
         status = worst([status, verdict])
         problems.append((verdict, text))
 
+    for mismatch in filter(None, map(led.batch_mismatch, led.lives)):
+        flag(WARN, mismatch)
+    drained = data.phases.get("sink_drained")
+    if drained and not drained.get("held"):
+        left = {sink: (one or {}).get("buffer_batches")
+                for sink, one in (drained.get("sinks") or {}).items()}
+        shown = ", ".join(f"{sink} {'unknown' if n is None else _n(n)}"
+                          for sink, n in sorted(left.items())) or "unknown"
+        flag(FAIL, f"a sink's queue never emptied after the generator stopped: sink_drained "
+                   f"held=false after {drained.get('bound_s')}s with buffer.batches {shown} "
+                   "left unsent")
+    for sink in led.sinks:
+        summaries.append(_sent_one(data, led, sink, flag, lines))
+    evidence = ("ledger.egress and ledger.topic read the topic back" if data.kafka else
+                f"{NO_BACKEND}, so a 2xx is the end of the evidence")
+    summary = "; ".join(summaries) + f" (one batch in flight allowed); {evidence}"
+    if status == PASS:
+        # `SENT` marks a ledger that ends at the sink; a Kafka target's goes on to the topic.
+        lead = "" if data.kafka else "SENT "
+        return Result("ledger.sent", PASS, f"{lead}to {data.target.get('name')}: every batch "
+                      f"received ended in an accepted response; {summary}", lines)
+    worst_first = sorted(problems, key=lambda item: -_ORDER[item[0]])
+    return Result("ledger.sent", status, f"{worst_first[0][1]}; {summary}",
+                  [text for _, text in worst_first] + lines)
+
+
+def _sent_one(data, led, sink, flag, lines):
+    """`ledger.sent`'s reading of one sink: flags each problem through `flag`, appends its
+    lines, and returns its summary."""
+    sut = led.sut
+    # The request class an accepted answer carries: an HTTP sink's status class, or the class
+    # `kafka_out` counts a successful produce attempt under.
+    accepted_class = "ok" if data.kafka else "2xx"
     identities = []
     # Flagged after the drops below, so a rejection, which explains a gap, leads the detail.
     off_identity = []
     for life in led.lives:
         drains = sut.life_drains(life)
         if not drains:
-            flag(FAIL, f"life {life} has no drain")
+            flag(FAIL, f"{sink}: life {life} has no drain")
             continue
         at = drains[-2] if life == led.final and len(drains) >= 2 else drains[-1]
 
-        def upto(name):
+        def upto(name, life=life, at=at):
             return sum(v for ts, v, point_life in sut.counter_points(name, component=sink)
                        if point_life == life and ts <= at)
 
@@ -1578,7 +2076,7 @@ def check_ledger_sent(data):
             if point_life == life and ts <= at), 0)
         gap = received + replayed - delivered - dropped - queued
         replay = f" + replayed {_n(replayed)}" if replayed else ""
-        text = (f"life {life} at {data.offset(at)}: received {_n(received)}{replay} vs "
+        text = (f"{sink} life {life} at {data.offset(at)}: received {_n(received)}{replay} vs "
                 f"delivered {_n(delivered)} + dropped {_n(dropped)} + buffer.batches "
                 f"{_n(queued)}, gap {_n(gap)}")
         identities.append(text)
@@ -1586,7 +2084,7 @@ def check_ledger_sent(data):
         if not 0 <= gap <= 1:
             off_identity.append(f"{text}, outside [0, 1]")
         if life == led.final and queued > 0:
-            off_identity.append(f"life {life}'s buffer.batches at its quiet drain at "
+            off_identity.append(f"{sink} life {life}'s buffer.batches at its quiet drain at "
                                 f"{data.offset(at)} is {_n(queued)}: {_n(queued)} batch(es) "
                                 "left unsent")
 
@@ -1613,30 +2111,27 @@ def check_ledger_sent(data):
     for key in REFUSAL_KEYS:
         count = sum(1 for entry in diagnostics if entry.key == key)
         if count:
-            flag(FAIL, f"the destination refused a request, so the sink held its queue: "
-                       f"{count} {key} line(s) ({quoted(key)})")
+            flag(FAIL, f"{sink}: the destination refused a request, so the sink held its "
+                       f"queue: {count} {key} line(s) ({quoted(key)})")
 
     batch_drops = _by_attr(sut, "logit.component.batches.dropped", "reason", component=sink)
     for reason, value in sorted(batch_drops.items()):
         if reason in REJECTED_BATCH_REASONS:
-            flag(FAIL, f"{_n(value)} batch(es) dropped {reason}, the destination refused them "
-                       f"({quoted('request_rejected')})")
+            flag(FAIL, f"{sink}: {_n(value)} batch(es) dropped {reason}, the destination "
+                       f"refused them ({quoted('request_rejected')})")
         else:
-            flag(WARN, f"{_n(value)} batch(es) dropped {reason}, counted")
-    shutdown = sum(led.batches_dropped.values())
-    if shutdown:
-        flag(WARN, f"drain complete reported {_n(shutdown)} batch(es) dropped at shutdown, "
-                   "counted across every node")
+            flag(WARN, f"{sink}: {_n(value)} batch(es) dropped {reason}, counted")
     record_drops = _by_attr(sut, "logit.output.records.dropped", "reason", component=sink)
     for reason, value in sorted(record_drops.items()):
         if reason in REJECTED_RECORD_REASONS:
-            flag(FAIL, f"{_n(value)} record(s) dropped {reason}, refused by the destination "
-                       f"or too large to send ({quoted('request_rejected', 'oversize')})")
+            flag(FAIL, f"{sink}: {_n(value)} record(s) dropped {reason}, refused by the "
+                       "destination or too large to send "
+                       f"({quoted('request_rejected', 'oversize')})")
         else:
-            flag(WARN, f"{_n(value)} record(s) dropped {reason} before sending, counted")
+            flag(WARN, f"{sink}: {_n(value)} record(s) dropped {reason} before sending, counted")
     named = sum(sut.counter_by_life("logit.output.records.rejected", component=sink).values())
     if named:
-        flag(FAIL, f"{_n(named)} record(s) named dropped in an accepted response's body "
+        flag(FAIL, f"{sink}: {_n(named)} record(s) named dropped in an accepted response's body "
                    f"({quoted('series_rejected')})")
     skipped_metrics = _by_attr(sut, "logit.output.metrics.skipped", "reason", component=sink)
     skipped_metrics.update({f"metric_kind={k}": v for k, v in _by_attr(
@@ -1647,17 +2142,11 @@ def check_ledger_sent(data):
                                             component=sink).values())
     if total_skipped:
         detail = ", ".join(f"{k} {_n(v)}" for k, v in sorted(skipped_metrics.items()))
-        flag(WARN, f"{_n(total_skipped)} metric(s) skipped by the encoder, never sent"
+        flag(WARN, f"{sink}: {_n(total_skipped)} metric(s) skipped by the encoder, never sent"
                    + (f" ({detail})" if detail else ""))
 
     for text in off_identity:
         flag(FAIL, text)
-    drained = data.phases.get("sink_drained")
-    if drained and not drained.get("held"):
-        left = drained.get("buffer_batches")
-        flag(FAIL, f"the sink's queue never emptied after the generator stopped: sink_drained "
-                   f"held=false after {drained.get('bound_s')}s with buffer.batches "
-                   f"{'unknown' if left is None else _n(left)} left unsent")
 
     requests = sut.matching("logit.output.requests", component=sink)
     classes = {}
@@ -1676,36 +2165,25 @@ def check_ledger_sent(data):
         previous = drains[index - 1] if index > 0 else point.ts
         if not any(start < point.ts and end > previous for start, end in windows):
             outside[cls] = outside.get(cls, 0) + point.value
-            lines.append(f"{_n(point.value)} request(s) answered {cls} in the drain at "
+            lines.append(f"{sink}: {_n(point.value)} request(s) answered {cls} in the drain at "
                          f"{data.offset(point.ts)}, outside every fault window")
     shown = ", ".join(f"{cls} {_n(value)}" for cls, value in sorted(classes.items()))
     if not classes:
         flag(FAIL, f"no logit.output.requests from {sink}: nothing shows a request was sent")
     elif not classes.get(accepted_class):
-        flag(FAIL, f"no request to {data.target.get('name')} answered {accepted_class} "
+        flag(FAIL, f"{sink}: no request to {data.target.get('name')} answered {accepted_class} "
                    f"({shown})")
     if outside:
-        flag(WARN, f"{_n(sum(outside.values()))} request(s) answered other than "
-                   f"{accepted_class} outside "
-                   "every fault window ("
+        flag(WARN, f"{sink}: {_n(sum(outside.values()))} request(s) answered other than "
+                   f"{accepted_class} outside every fault window ("
                    + ", ".join(f"{cls} {_n(v)}" for cls, v in sorted(outside.items())) + ")")
     accepted = sum(sut.counter_by_life("logit.output.records", component=sink).values())
-    lines.insert(0, f"requests by class: {shown or 'none'}; records accepted {_n(accepted)}")
-    lines += [f"{entry.key} at {data.offset(entry.ts)}: {entry.message[:300]}"
+    lines.insert(0, f"{sink}: requests by class: {shown or 'none'}; records accepted "
+                    f"{_n(accepted)}")
+    lines += [f"{sink}: {entry.key} at {data.offset(entry.ts)}: {entry.message[:300]}"
               for entry in diagnostics]
-
-    evidence = ("ledger.egress and ledger.topic read the topic back" if data.kafka else
-                f"{NO_BACKEND}, so a 2xx is the end of the evidence")
-    summary = (f"requests {shown or 'none'}; records accepted {_n(accepted)}; "
-               + "; ".join(identities) + f" (one batch in flight allowed); {evidence}")
-    if status == PASS:
-        # `SENT` marks a ledger that ends at the sink; a Kafka target's goes on to the topic.
-        lead = "" if data.kafka else "SENT "
-        return Result("ledger.sent", PASS, f"{lead}to {data.target.get('name')}: every batch "
-                      f"received ended in an accepted response; {summary}", lines)
-    worst_first = sorted(problems, key=lambda item: -_ORDER[item[0]])
-    return Result("ledger.sent", status, f"{worst_first[0][1]}; {summary}",
-                  [text for _, text in worst_first] + lines)
+    return (f"{sink}: requests {shown or 'none'}; records accepted {_n(accepted)}; "
+            + "; ".join(identities))
 
 
 def check_ledger_topic(data):
@@ -1736,7 +2214,7 @@ def check_ledger_topic(data):
         return skipped
     t_count = len(led.records)
     copies = sum(led.duplicates.values())
-    by_life = led.sut.counter_by_life("logit.output.records", component=led.sink)
+    by_life = led.sut.counter_by_life("logit.output.records", component=led.kafka_sink)
     accepted = sum(by_life.values())
     lines = [f"topic {data.target.get('topic')!r}: end offsets {read.get('offsets')}, "
              f"{_n(t_count + copies)} record(s) read back, {_n(t_count)} distinct",
@@ -1773,10 +2251,10 @@ def check_ledger_topic(data):
         problems.insert(0, "the broker acknowledged records it no longer holds")
     elif gap > 0:
         unsettled = sum(led.sut.counter_by_life("logit.output.records.dropped",
-                                                component=led.sink,
+                                                component=led.kafka_sink,
                                                 reason="ambiguous_at_most_once").values())
         batches = sum(led.sut.counter_by_life("logit.component.batches.dropped",
-                                              component=led.sink).values())
+                                              component=led.kafka_sink).values())
         if unsettled or batches:
             status = worst([status, WARN])
             problems.insert(0, f"records the sink never saw accepted, which an attempt it "
@@ -1802,12 +2280,13 @@ def _step_value(series, t, default=0.0):
 
 
 def check_recovery(data):
-    """Each fault has recovered when, at some SUT drain within `recovery_bound` of its end, the
-    sink's `retrying` is 0, its `buffer.utilization` is under 0.05 or its `buffer.batches` at
-    most 1, the listener's `receive.utilization` is under 0.05, and the ingest rate over the
-    drain interval ending there is at least 95% of the generator's warmup rate. A drain interval another fault overlaps, or that spans two SUT
-    lives, isn't eligible; a fault with no eligible interval is skipped and listed. A generator
-    `rate_behind` diagnostic turns a throughput shortfall into a WARN."""
+    """Each fault has recovered at each sink when, at some SUT drain within `recovery_bound` of
+    its end, that sink's `retrying` is 0, its `buffer.utilization` is under 0.05 or its
+    `buffer.batches` at most 1, the listener's `receive.utilization` is under 0.05, and the
+    ingest rate over the drain interval ending there is at least 95% of the generator's warmup
+    rate. A drain interval another fault overlaps, or that spans two SUT lives, isn't eligible;
+    a fault with no eligible interval is skipped and listed. A generator `rate_behind`
+    diagnostic turns a throughput shortfall into a WARN."""
     led = _ledger(data)
     skipped = _skip_without_sut("recovery", led)
     if skipped:
@@ -1825,9 +2304,9 @@ def check_recovery(data):
     baseline = sum(v for _, v in warm[1:]) / (warm[-1][0] - warm[0][0])
     behind = sum(v for _, v, _ in gen.counter_points("logit.component.diagnostics",
                                                      component=led.gen_input, key="rate_behind"))
-    retrying = sut.gauge_series("logit.component.retrying", component=led.sink)
-    buffer_util = sut.gauge_series("logit.component.buffer.utilization", component=led.sink)
-    buffer_batches = sut.gauge_series("logit.component.buffer.batches", component=led.sink)
+    gauges = {sink: {name: sut.gauge_series(f"logit.component.{name}", component=sink)
+                     for name in ("retrying", "buffer.utilization", "buffer.batches")}
+              for sink in led.sinks}
     receive_util = sut.gauge_series("logit.component.receive.utilization",
                                     component=led.listener)
     ingest = {ts: v for ts, v, _ in sut.counter_points("logit.input.datagrams",
@@ -1835,12 +2314,15 @@ def check_recovery(data):
     life_of = {p.ts: p.life for p in sut.points if p.name == telemetry.UPTIME}
     drains = sorted(life_of)
 
-    def assess(start, end):
-        """(problems, rate problem or None, rate, share) for the drain interval (start, end]."""
+    def assess(sink, start, end):
+        """(problems, rate problem or None, rate, share) for one sink over the drain interval
+        (start, end]."""
         problems = []
+        retrying = gauges[sink]["retrying"]
+        buffer_batches = gauges[sink]["buffer.batches"]
         if _step_value(retrying, end) != 0:
             problems.append(f"retrying {_step_value(retrying, end):g}")
-        for label, series in (("buffer.utilization", buffer_util),
+        for label, series in (("buffer.utilization", gauges[sink]["buffer.utilization"]),
                               ("receive.utilization", receive_util)):
             value = _step_value(series, end)
             # One batch in a small queue is a large share of it: a batch the sink holds
@@ -1873,30 +2355,33 @@ def check_recovery(data):
                          "of its end clear of other faults")
             continue
         judged += 1
-        last = None
-        for a, b in eligible:
-            problems, slow, rate, share = assess(a, b)
-            if not problems and slow is None:
-                lines.append(f"{name}: recovered at {data.offset(b)}, {b - fault.end:.0f}s "
-                             f"after its end, ingest {rate:,.0f}/s ({share:.0%})")
-                break
-            last = (b, problems, slow)
-        else:
-            b, problems, slow = last
-            verdict = FAIL if problems else (WARN if behind > 0 else FAIL)
-            if slow is not None:
-                problems.append(slow + (f", but the generator logged rate_behind {_n(behind)} "
-                                        "time(s)" if behind > 0 else ""))
-            status = worst([status, verdict])
-            lines.append(f"{name}: not recovered by {data.offset(b)}: {'; '.join(problems)}")
+        for sink in led.sinks:
+            last = None
+            for a, b in eligible:
+                problems, slow, rate, share = assess(sink, a, b)
+                if not problems and slow is None:
+                    lines.append(f"{name}: {sink} recovered at {data.offset(b)}, "
+                                 f"{b - fault.end:.0f}s after its end, ingest {rate:,.0f}/s "
+                                 f"({share:.0%})")
+                    break
+                last = (b, problems, slow)
+            else:
+                b, problems, slow = last
+                verdict = FAIL if problems else (WARN if behind > 0 else FAIL)
+                if slow is not None:
+                    problems.append(slow + (f", but the generator logged rate_behind "
+                                            f"{_n(behind)} time(s)" if behind > 0 else ""))
+                status = worst([status, verdict])
+                lines.append(f"{name}: {sink} not recovered by {data.offset(b)}: "
+                             f"{'; '.join(problems)}")
     if judged == 0:
         return Result("recovery", WARN, f"none of {len(data.faults)} fault(s) had an eligible "
                       f"drain interval within recovery_bound {data.recovery_bound:g}s of its "
                       "end", lines)
     failing = [line for line in lines if "not recovered" in line]
-    detail = (f"{judged} of {len(data.faults)} fault(s) judged, each recovered within "
-              f"recovery_bound {data.recovery_bound:g}s of its end; warmup rate "
-              f"{baseline:,.0f}/s")
+    detail = (f"{judged} of {len(data.faults)} fault(s) judged at {len(led.sinks)} sink(s), "
+              f"each recovered within recovery_bound {data.recovery_bound:g}s of its end; "
+              f"warmup rate {baseline:,.0f}/s")
     if failing:
         detail = f"{failing[0]}; {judged} of {len(data.faults)} fault(s) judged"
     return Result("recovery", status, detail, lines)
@@ -2037,10 +2522,9 @@ def check_expect(data):
 CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_intake,
-    check_ledger_edge, check_ledger_aggregate, check_ledger_egress, check_ledger_windows,
-    check_ledger_replay, check_ledger_summary, check_ledger_sent, check_ledger_topic,
-    check_identity_sink,
-    check_recovery, check_expect,
+    check_ledger_edge, check_ledger_script, check_ledger_aggregate, check_ledger_egress,
+    check_ledger_windows, check_ledger_replay, check_ledger_summary, check_ledger_sent,
+    check_ledger_topic, check_identity_sink, check_recovery, check_expect,
 )
 
 

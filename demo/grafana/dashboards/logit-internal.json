@@ -144,7 +144,7 @@
       "id": 5,
       "type": "timeseries",
       "title": "logit.output.requests (victoria_out, by class)",
-      "description": "victoria_out's (prometheus_out remote-write) own per-request outcome -- 2xx/4xx/5xx/network_error -- that run_output's single send.duration timer can't distinguish. Filtered on component, because loki_out and tempo_out count the same metric.",
+      "description": "victoria_out's (prometheus_out remote-write) own per-request outcome -- 2xx/4xx/5xx/network_error -- that run_output's single send.duration timer can't distinguish. Filtered on component, because the other sinks count the same metric.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
       "interval": "1m",
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
@@ -243,7 +243,7 @@
       "id": 11,
       "type": "table",
       "title": "Tempo: logit's own internal spans",
-      "description": "logit observing itself as *traces*, not just metrics (docs/adr/internal-span-emission-and-deterministic-sampling.md, docs/plans/otlp-end-to-end.md) -- one span per node-visit (listener send, transform process/flush, sink deliver), exported over OTLP/gRPC by demo/logit.yaml's `tempo_out`. Click a trace ID to open its waterfall and see the pipeline's real shape: a syslog_in root with json/scale/kv_metrics/keep/aggregate children, or an internal-only root for `self`'s own drain. Scoped to `{resource.service.name=\"logit\"}` -- as of docs/adr/trace-context-span-lifting.md, `tempo_out` also carries haproxy's/nginx's real access-line spans (see the panel below), so `{}` would now mix the two.\n\nThis is a `table` panel, not a `traces` panel: Grafana's `traces` panel type renders one trace's waterfall, not a searchable list of many -- the Tempo datasource's own response tells Grafana as much (`preferredVisualisationType: \"table\"`), and each row's Trace ID is already a link into the full trace view.",
+      "description": "logit observing itself as *traces*, not just metrics (docs/adr/internal-span-emission-and-deterministic-sampling.md, docs/plans/otlp-end-to-end.md) -- one span per node-visit (listener send, transform process/flush, sink deliver), exported over OTLP/gRPC by demo/logit.yaml's `self_tempo_out`. Click a trace ID to open its waterfall and see the pipeline's real shape: a syslog_in root with json/scale/kv_metrics/keep/aggregate children, or an internal-only root for `self`'s own drain. Scoped to `{resource.service.name=\"logit\"}` -- `self_tempo_out` and `tempo_out` write to the same Tempo, and `tempo_out` carries haproxy's/nginx's real access-line spans (see the panel below), so `{}` would mix the two.\n\nThis is a `table` panel, not a `traces` panel: Grafana's `traces` panel type renders one trace's waterfall, not a searchable list of many -- the Tempo datasource's own response tells Grafana as much (`preferredVisualisationType: \"table\"`), and each row's Trace ID is already a link into the full trace view.",
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 52 },
       "datasource": { "type": "tempo", "uid": "tempo" },
       "targets": [

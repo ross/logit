@@ -1,0 +1,38 @@
+# The system under test in `script/soak`'s route-split scenario: DogStatsD over UDP, a 10 s
+# cumulative aggregate, and a `route` on the `shard` tag into two targets, each feeding its own
+# remote-write sink and VictoriaMetrics. `aggregate` keeps the tag on each series, so each backend
+# holds one shard's series and the two together hold every one. Its `internal` telemetry goes to
+# stdout as NDJSON for the harness to read.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # DogStatsD tags become attributes
+  window:
+    type: aggregate
+    sources: [statsd]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  split:
+    type: route
+    sources: [window]
+    by: { attribute: shard }
+    routes: { "0": tier_a, "1": tier_b }   # nothing is unrouted: the generator sends 0 and 1
+  tier_a: { type: target }
+  tier_b: { type: target }
+  vm_a:
+    type: prometheus_out
+    sources: [tier_a]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  vm_b:
+    type: prometheus_out
+    sources: [tier_b]
+    endpoint: http://victoria-metrics-b:8428/api/v1/write
+    version: 1
+    compression: zstd
+    # Its 1024-batch queue holds every fault's windows, so `drop_oldest` never drops here; one
+    # blocking sink behind the listener keeps `logit validate` quiet.
+    buffer: { overflow: drop_oldest }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

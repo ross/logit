@@ -326,12 +326,16 @@ Two HAProxy rules matter more than the table:
 
 ### Trace ids
 
-**`logit` never mints a trace id.** A trace id has to come from the first hop that saw the
+**No `logit` transform mints a trace id.** A trace id has to come from the first hop that saw the
 request:
 
 - If a `traceparent` header arrived, log it verbatim under `traceparent`. `trace_context` takes the
   trace id, this line's parent span id, and the flags from it.
 - If none arrived, this server is the edge: mint a trace id here and log it as `trace.id`.
+
+A `lua` stage can mint one with `random.trace_id()` for a server that can't
+([docs/design/lua-api.md](design/lua-api.md)'s "Minting ids"), but no other hop sees an id minted
+there, so the request's backend spans land in a different trace.
 
 nginx already mints a per-request id (`$request_id`, 32 hex characters). This `map` uses it as a
 fallback while still reusing an inbound trace id:

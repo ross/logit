@@ -19,6 +19,7 @@ What a script can reach:
 | `Event.new(t)` | constructor | "Constructing events" |
 | `telemetry` | `count`/`gauge` | "Emitting telemetry from a script" |
 | `trace` | read (writes aren't enforced, but are overwritten each batch) | "Reading trace context" |
+| `random` | functions that mint ids | "Minting ids" |
 | `provenance` | read-only | "Reading provenance" |
 | `resource` | read/write, per batch | "Reading and writing `resource`" |
 | `scope` | read/write, per batch | "Reading and writing `scope`" |
@@ -371,6 +372,57 @@ track contributing contexts yourself inside `process()`, where they're readable.
 aggregate them for a script the way
 `docs/adr/trace-context-propagation-on-delivered.md`'s flush-side linking does for the native
 `aggregate` transform.
+
+## Minting ids
+
+A `random` global mints ids a script can put on an event: a fresh trace for a line that arrived
+with none, a span id for a span built with `Event.new`, or a request id on a log `flush()` makes.
+
+```lua
+function process(event)
+  if event.log and event.log.trace_id == nil then
+    event.log.trace_id = random.trace_id()
+    event.log.span_id = random.span_id()
+  end
+  event.attributes["request.id"] = random.uuid7(event.timestamp)
+  return event
+end
+```
+
+| Call | Returns |
+|---|---|
+| `random.trace_id()` | 32 lowercase hex characters, never all-zero |
+| `random.span_id()` | 16 lowercase hex characters, never all-zero |
+| `random.uuid()` | a UUID v4 as `8-4-4-4-12` lowercase hex |
+| `random.uuid7(ts)` | a UUID v7 (RFC 9562) whose 48-bit millisecond field is `ts / 1_000_000` |
+| `random.ulid(ts)` | a 26-character ULID (Crockford base32, uppercase) with the same millisecond field |
+| `random.hex(n)` | `n` random bytes as `2n` lowercase hex characters, `n` from 1 to 256 |
+
+`trace_id()` and `span_id()` return what `event.log.trace_id`/`span_id` and `Event.new`'s
+`span.trace_id`/`span_id` accept.
+
+**`ts` is a decimal-nanos string**, the form `event.timestamp` and `flush(now)` give ("Timestamps
+are strings" above). A script has no clock, so `uuid7` and `ulid` encode the time you pass:
+`event.timestamp` in `process()`, `now` in `flush()`. Two ids minted in one millisecond aren't
+ordered between themselves. A Lua number is rejected for the reason an `event.timestamp` write
+rejects one: a double is exact only to 2^53, and a unix-nanos value is past it.
+
+Errors are Lua runtime errors:
+
+- `random.uuid7: ts must be a string of decimal digits (a Lua number can't represent full nanosecond precision), got integer`
+  (and `got nil` for a missing `ts`)
+- `random.ulid: ts must be a string of decimal digits`
+- `random.uuid7: ts must not be negative, got -1000000`
+- `random.hex: n must be an integer from 1 to 256, got 0`
+
+**These ids are unique, not unpredictable.** They come from `logit`'s own id minter, a per-thread
+SplitMix64 (`logit_core::ids`), the one behind its internal trace ids. Don't use one as a secret
+or a token.
+
+**Each VM seeds `math.random` from the same minter when it's created**, because LuaJIT seeds it
+with one constant: without that, every worker's VM drew the same sequence. A script that calls
+`math.randomseed` gets the sequence it asks for. See
+[ADR `lua-random-ids`](../adr/lua-random-ids.md).
 
 ## Reading provenance
 
@@ -1218,7 +1270,7 @@ component id (`<unset>` for top-level code, which runs before the id is known).
 The sandbox is pinned by one test, `the_global_table_is_exactly_the_allowlist`
 (`crates/logit-script/src/lib.rs`), which holds the exact list. It builds a worker as the runtime
 does and requires `_G` to be Lua's base library, minus the removed loaders, environment functions,
-and `newproxy`, with `print` rerouted; the `math`, `string`, and `table` libraries; the six `logit`
+and `newproxy`, with `print` rerouted; the `math`, `string`, and `table` libraries; the seven `logit`
 globals this document describes, each a proxy or a table of Rust closures and none a route to the
 host; and the script's own `process`, and `flush` if it defines one. It also checks that the host
 and debugging libraries LuaJIT can load are absent. `collectgarbage` and `coroutine` stay: neither

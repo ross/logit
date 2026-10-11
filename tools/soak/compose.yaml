@@ -17,9 +17,14 @@
 # scenario only, so an external target's stack runs without it. `kafka` is in the `kafka`
 # profile, which the driver enables for a Kafka-target scenario only, in place of `local`.
 #
+# Every service carries a `soak.role` label, `sut`, `generator`, `backend`, or `broker` (the
+# Kafka target's broker), which is how the driver and the checks know it. A scenario's
+# `compose =` override file is merged onto this one (`-f compose.yaml -f <override>`) and labels
+# any service it adds, such as a second backend.
+#
 # No `container_name` and no `name:`, so a second scenario under another project can't collide
-# with this one. The one published port is VictoriaMetrics on an ephemeral loopback port, which
-# the driver reads with `compose port` after every start of that service.
+# with this one. The only published ports are the backends': each publishes its own ephemeral
+# loopback port, which the driver reads with `compose port` after every start of that backend.
 
 x-logit: &logit
   image: ${SOAK_IMAGE:-logit:soak}
@@ -41,6 +46,7 @@ services:
   victoria-metrics:
     image: victoriametrics/victoria-metrics:v1.152.0
     profiles: [local]
+    labels: { soak.role: backend }
     command:
       - -retentionPeriod=100y
     ports: ["127.0.0.1::8428"]
@@ -54,6 +60,7 @@ services:
   kafka:
     image: apache/kafka:4.2.0
     profiles: [kafka]
+    labels: { soak.role: broker }
     hostname: kafka
     restart: "no"
     environment:
@@ -82,6 +89,7 @@ services:
 
   logit:
     <<: *logit
+    labels: { soak.role: sut }
     # Neither is required: each is in a profile only one target's stack runs.
     depends_on:
       victoria-metrics: { condition: service_started, required: false }
@@ -92,6 +100,7 @@ services:
 
   generator:
     <<: *logit
+    labels: { soak.role: generator }
     depends_on:
       logit: { condition: service_healthy }
     volumes: ["${SOAK_GENERATOR_CONFIG:?set by script/soak}:/config.yaml:ro,z"]
