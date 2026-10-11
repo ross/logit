@@ -2344,6 +2344,16 @@ mod tests {
     }
 
     #[test]
+    fn the_status_class_derived_counter_counts_only_a_class_it_wrote() {
+        let (mut t, registry, _) =
+            instrumented(HttpAccessConfig { status_class: true, ..config() });
+        run(&mut t, &[("http.response.status_code", Value::I64(200))]);
+        run(&mut t, &[("http.response.status_code", Value::I64(503)), (STATUS_CLASS, s("x"))]);
+        let events = registry.drain(0);
+        assert_eq!(counter(&events, DERIVED, Some(("field", STATUS_CLASS))), 1.0);
+    }
+
+    #[test]
     fn status_class_is_off_by_default() {
         let event = run(&mut bare(), &[("http.response.status_code", Value::I64(200))]);
         assert_eq!(get(&event, "http.response.status_class"), None);
