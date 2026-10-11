@@ -29,9 +29,17 @@ pub enum Reading {
 }
 
 impl Leftover {
-    /// A nonzero `*.dropped` count is data the run lost; everything else is routine.
+    /// A nonzero `*.dropped` count whose `reason` the config didn't ask for is data the run lost;
+    /// everything else is routine. The intended reasons are an exclusion list, so a reason added
+    /// later warns until someone decides it is intended.
     fn is_loss(&self) -> bool {
-        matches!(self.reading, Reading::Value(v) if v != 0.0) && self.metric.ends_with(".dropped")
+        /// Drops a transform or router makes because the config says to: an aggregate or filter
+        /// absorbing an event, a route with no matching target, and a script returning no event.
+        const INTENDED: [&str; 3] = ["absorbed", "unrouted", "script_drop"];
+        let reason = self.tags.split(',').find_map(|pair| pair.strip_prefix("reason="));
+        matches!(self.reading, Reading::Value(v) if v != 0.0)
+            && self.metric.ends_with(".dropped")
+            && !reason.is_some_and(|r| INTENDED.contains(&r))
     }
 }
 
@@ -45,10 +53,10 @@ pub fn log_leftovers(registry: &Registry) {
             (Reading::Value(value), true) => tracing::warn!(
                 target: "logit", component, metric, tags, value, "telemetry left undrained at exit"
             ),
-            (Reading::Value(value), false) => tracing::info!(
+            (Reading::Value(value), false) => tracing::debug!(
                 target: "logit", component, metric, tags, value, "telemetry left undrained at exit"
             ),
-            (Reading::Distribution { count, sum }, _) => tracing::info!(
+            (Reading::Distribution { count, sum }, _) => tracing::debug!(
                 target: "logit", component, metric, tags, count, sum,
                 "telemetry left undrained at exit"
             ),
@@ -151,6 +159,22 @@ mod tests {
         assert!(!leftover("logit.component.batches.dropped", Reading::Value(0.0)).is_loss());
         assert!(!leftover("logit.component.batches.sent", Reading::Value(1.0)).is_loss());
         assert!(!leftover("x.dropped", Reading::Distribution { count: 1, sum: 1.0 }).is_loss());
+    }
+
+    #[test]
+    fn a_drop_the_config_asked_for_is_not_a_loss() {
+        let dropped = |reason: &str| Leftover {
+            component: "c".into(),
+            metric: "logit.component.events.dropped",
+            tags: format!("reason={reason}"),
+            reading: Reading::Value(3.0),
+        };
+        for intended in ["absorbed", "unrouted", "script_drop"] {
+            assert!(!dropped(intended).is_loss(), "{intended}");
+        }
+        for lost in ["shutdown", "rejected", "ambiguous_at_most_once", "a_new_reason"] {
+            assert!(dropped(lost).is_loss(), "{lost}");
+        }
     }
 
     #[test]

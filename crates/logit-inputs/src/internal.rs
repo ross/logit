@@ -108,7 +108,7 @@ impl Input for InternalInput {
     /// loop keeps ticking, so the final drain carries every count the rest of the drain recorded:
     /// a sink's or Lua node's drops for shutdown, and a UDP listener's shutdown remainders. With a
     /// mixed pipeline it fires with the process's shutdown signal, and those counts stay
-    /// undrained.
+    /// undrained, and the CLI logs them as `telemetry left undrained at exit`.
     ///
     /// **Why the final batch is delivered.** Downstream inboxes stay open while this future
     /// holds `sink`, so no downstream close-time flush starts until this returns

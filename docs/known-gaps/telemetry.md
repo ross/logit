@@ -100,10 +100,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   ([docs/deploying.md](../deploying.md)'s "Give `internal` a dedicated pipeline"). In a mixed
   pipeline the counts reach a test `Registry` but no `otlp_out` or `prometheus_out`. An operator
   sees them in the self-log instead: each UDP guard that counts a nonzero remainder logs a `warn`
-  naming the listener and the count, and `drain complete` logs the sinks' total.
+  naming the listener and the count, `drain complete` logs the sinks' total, and
+  `telemetry left undrained at exit` logs every remaining point.
 
   In both cases the final drain's own `logit.internal.*.emitted`/`drain.duration` are never
-  exported. They are recorded a tick behind, and no tick follows the final drain.
+  exported. They are recorded a tick behind, and no tick follows the final drain. Both cases log
+  them as `telemetry left undrained at exit`.
 - **A self-telemetry batch `internal` has drained is lost uncounted if the grace backstop drops it
   mid-send.** Each `tick` drains the registry, then awaits `Fanout::send`. A tick parked on a full
   downstream when shutdown fires keeps the `select!` from seeing the signal until the send
