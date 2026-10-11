@@ -1,4 +1,5 @@
-//! `kafka_out`: the `Output` that drives [`Producer`], one record per event.
+//! `kafka_out`: the `Output` that drives [`Producer`], with the records [`KafkaEncoder`] writes:
+//! one per event, or under `record: batch` as many events as fit in each.
 //!
 //! One `logit` batch becomes one [`Pending`]: [`KafkaEncoder`] writes every record, and
 //! [`Producer::prepare`] partitions them and cuts the partition batches once. The sink keeps that
@@ -8,7 +9,8 @@
 //! what W1 settled", item 1). It lets go of the `Pending` when a send is final (`Ok`, or a fault
 //! `write_loop` won't retry under the posture), and calls [`Producer::abandon`] on one dropped
 //! with a partition batch unsettled: when the send was final, or when `Output::observe_batch`
-//! starts another batch first, as after a shutdown cut. A caller that never calls
+//! starts another batch first, as after a shutdown cut. A batch that encodes to no record (every
+//! event skipped or dropped) succeeds without a request. A caller that never calls
 //! `observe_batch` gets a fresh `Pending` on every `send`. Under `at_most_once`, a `Refused`
 //! send first drops each partition batch left `Ambiguous`, so the retry doesn't resend it
 //! (`docs/adr/kafka-output.md`, "Amendment: what W2 settled", item 5).
@@ -22,10 +24,11 @@
 //! | `logit.output.requests{class}` | one per attempt, `class` its result (`crate::count_request`) |
 //! | `logit.output.batch.bytes` | the record values' bytes, before compression, once per batch |
 //! | `logit.output.records` | records the broker accepted |
-//! | `logit.output.records.dropped{reason}` | `oversize` (one record over `max_request_bytes`, never sent), `rejected` (a partition batch the broker rejected), `invalid_timestamp` or `invalid_record` (records the broker named), or `ambiguous_at_most_once` (records left unsettled when `at_most_once` drops an `Ambiguous` batch, or an `Ambiguous` partition batch beside a `Refused` one) |
+//! | `logit.output.records.dropped{reason}` | `oversize` (one record over `max_request_bytes`, or under `record: batch` one event whose value alone is over it, never sent), `rejected` (a partition batch the broker rejected), `invalid_timestamp` or `invalid_record` (records the broker named), or `ambiguous_at_most_once` (records left unsettled when `at_most_once` drops an `Ambiguous` batch, or an `Ambiguous` partition batch beside a `Refused` one) |
 //! | `logit.output.records.unkeyed` | records sent without a key because the configured key had no value on their event |
+//! | `logit.output.events.skipped{reason="no_log"}` | events `format: text` skipped for having no log record |
 //!
-//! `oversize` and `records.unkeyed` are encode-side, counted once per batch; the others follow
+//! `oversize`, `records.unkeyed`, and `events.skipped` are encode-side, counted once per batch; the others follow
 //! the broker's answer, which a retry never meets twice for one partition batch. Each drop but
 //! `ambiguous_at_most_once` raises a throttled diagnostic of the same name: `oversize` names the
 //! record count and the `max_request_bytes` cap, and `rejected`, `invalid_timestamp`, and
@@ -43,8 +46,8 @@ use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::{FramedEncoder, MessageBuf};
 
-use super::batch::ProducerRecord;
-use super::encode::{KafkaEncoder, RecordFormat, RecordKey, RecordMeta};
+use super::batch::{value_budget, ProducerRecord};
+use super::encode::{KafkaEncoder, RecordFormat, RecordKey, RecordMeta, RecordMode};
 use super::fault;
 use super::producer::{Acks, PartState, Pending, Producer, ProducerConfig, Settlement};
 use crate::accounting::BatchAccounting;
@@ -60,6 +63,7 @@ const BATCH_BYTES: &str = "logit.output.batch.bytes";
 const RECORDS: &str = "logit.output.records";
 const RECORDS_DROPPED: &str = "logit.output.records.dropped";
 const RECORDS_UNKEYED: &str = "logit.output.records.unkeyed";
+const EVENTS_SKIPPED: &str = "logit.output.events.skipped";
 
 /// Which replicas must have a batch before the broker answers. Mirrors `logit_config::KafkaAcks`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -88,6 +92,8 @@ pub struct KafkaSettings {
     pub topic: String,
     pub key: RecordKey,
     pub format: RecordFormat,
+    /// `None` takes the format's own default ([`RecordFormat::default_record`]).
+    pub record: Option<RecordMode>,
     pub compression: KafkaCompression,
     pub acks: KafkaAcks,
     pub idempotent: bool,
@@ -107,6 +113,7 @@ impl KafkaSettings {
             topic: topic.into(),
             key: RecordKey::None,
             format: RecordFormat::Json,
+            record: None,
             compression: KafkaCompression::None,
             acks: KafkaAcks::All,
             idempotent: true,
@@ -133,8 +140,14 @@ pub struct KafkaOutput {
 }
 
 impl KafkaOutput {
-    /// Fails on a broker entry that isn't a `host:port`, or idempotence without `acks: all`.
+    /// Fails on a broker entry that isn't a `host:port`, idempotence without `acks: all`, or a
+    /// key with `record: batch`, whose records have none.
     pub fn new(settings: KafkaSettings) -> anyhow::Result<Self> {
+        let record = settings.record.unwrap_or(settings.format.default_record());
+        anyhow::ensure!(
+            record == RecordMode::Event || settings.key == RecordKey::None,
+            "a kafka_out key needs 'record: event'; a batch record carries no key"
+        );
         let config = ProducerConfig {
             brokers: settings.brokers,
             topic: settings.topic,
@@ -161,10 +174,11 @@ impl KafkaOutput {
             .into_iter()
             .map(|(k, v)| (StrBytes::from_string(k), Some(Bytes::from(v))))
             .collect();
+        let budget = value_budget(settings.max_request_bytes, &headers);
         Ok(Self {
             producer: Producer::new(config.clone())?,
             config,
-            encoder: KafkaEncoder::new(&settings.key, settings.format),
+            encoder: KafkaEncoder::new(&settings.key, settings.format, record, budget),
             headers,
             messages: MessageBuf::default(),
             pending: None,
@@ -212,9 +226,10 @@ impl KafkaOutput {
         Ok(self)
     }
 
-    /// Encodes and partitions `batch` into a new [`Pending`]. The encode is unit 0 of the batch
-    /// accounting, so a repeat after a failed `prepare` counts nothing twice.
-    async fn prepare(&mut self, batch: &EventBatch) -> anyhow::Result<Pending> {
+    /// Encodes and partitions `batch` into a new [`Pending`], or `None` when it encodes to no
+    /// record. The encode is unit 0 of the batch accounting, so a repeat after a failed `prepare`
+    /// counts nothing twice.
+    async fn prepare(&mut self, batch: &EventBatch) -> anyhow::Result<Option<Pending>> {
         let mut messages = std::mem::take(&mut self.messages);
         let (first, stats) =
             self.accounting.encode(0, || self.encoder.encode_into(batch, &mut messages));
@@ -223,6 +238,14 @@ impl KafkaOutput {
             if stats.missing_key > 0 {
                 self.telemetry.count(RECORDS_UNKEYED, stats.missing_key as f64, &[]);
             }
+            if stats.no_log > 0 {
+                self.telemetry.count(EVENTS_SKIPPED, stats.no_log as f64, &[("reason", "no_log")]);
+            }
+            self.count_oversize(stats.oversize);
+        }
+        if messages.is_empty() {
+            self.messages = messages;
+            return Ok(None);
         }
         let records: Vec<ProducerRecord> = messages
             .iter_with()
@@ -235,21 +258,22 @@ impl KafkaOutput {
             .collect();
         self.messages = messages;
         let pending = self.producer.prepare(records).await?;
-        if pending.oversize > 0 {
-            self.telemetry.count(
-                RECORDS_DROPPED,
-                pending.oversize as f64,
-                &[("reason", "oversize")],
-            );
-            self.diag.warn_throttled(
-                "oversize",
-                format_args!(
-                    "dropped {} record(s) over 'max_request_bytes' ({})",
-                    pending.oversize, self.config.max_request_bytes
-                ),
-            );
+        self.count_oversize(pending.oversize);
+        Ok(Some(pending))
+    }
+
+    fn count_oversize(&mut self, n: usize) {
+        if n == 0 {
+            return;
         }
-        Ok(pending)
+        self.telemetry.count(RECORDS_DROPPED, n as f64, &[("reason", "oversize")]);
+        self.diag.warn_throttled(
+            "oversize",
+            format_args!(
+                "dropped {n} record(s) over 'max_request_bytes' ({})",
+                self.config.max_request_bytes
+            ),
+        );
     }
 
     async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
@@ -260,8 +284,10 @@ impl KafkaOutput {
             if batch.events.is_empty() {
                 return Ok(());
             }
-            let pending = self.prepare(batch).await?;
-            self.pending = Some(pending);
+            match self.prepare(batch).await? {
+                Some(pending) => self.pending = Some(pending),
+                None => return Ok(()),
+            }
         }
         let pending = self.pending.as_mut().expect("set above");
         let attempt = self.producer.attempt(pending).await;

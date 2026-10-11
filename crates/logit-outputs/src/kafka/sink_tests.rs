@@ -370,3 +370,124 @@ fn idempotence_without_acks_all_is_refused_at_construction() {
     };
     assert!(KafkaOutput::new(settings).is_err());
 }
+
+/// A metric event, which `format: text` has no body for.
+fn metric_event() -> Event {
+    Event::metric(
+        TS,
+        AttrMap::new(),
+        logit_core::MetricRecord::new(
+            logit_core::interner::intern("m"),
+            logit_core::MetricKind::Gauge(1.0),
+        ),
+    )
+}
+
+/// Under `record: batch`, one record holds the batch's events as NDJSON lines, unkeyed, stamped
+/// with its first event's timestamp, and counted once.
+#[tokio::test]
+async fn a_batch_record_carries_the_events_as_ndjson() {
+    let cluster = cluster(&[0, 0]).await;
+    let mut probe = TelemetryProbe::new();
+    let mut out =
+        sink(KafkaSettings { record: Some(RecordMode::Batch), ..settings(&cluster) }, &probe);
+    let input = batch((0..4).map(|i| event(&format!("k{i}"), &format!("m{i}"))).collect());
+    let sums = run(&mut out, &mut probe, vec![input.clone()], fast_retry()).await;
+
+    let state = cluster.state();
+    let records: Vec<_> = (0..2).flat_map(|p| state.partition(TOPIC, p).records()).collect();
+    assert_eq!(records.len(), 1, "one record for the batch");
+    let mut want = String::new();
+    crate::ndjson::render_ndjson(&mut want, &input);
+    assert_eq!(records[0].value.as_deref(), Some(want.as_bytes()));
+    assert_eq!(records[0].key, None);
+    assert_eq!(records[0].timestamp, TS / 1_000_000);
+    drop(state);
+    assert_eq!(sum(&sums, "logit.output.records", &[]), 1.0);
+}
+
+/// A key needs one event per record: a batch record, set or `native`'s default, refuses one.
+#[test]
+fn a_key_with_a_batch_record_is_refused() {
+    let base = KafkaSettings {
+        key: RecordKey::TraceId,
+        ..KafkaSettings::new(vec!["127.0.0.1:9".into()], TOPIC)
+    };
+    for settings in [
+        KafkaSettings { record: Some(RecordMode::Batch), ..base.clone() },
+        KafkaSettings { format: RecordFormat::Native, ..base.clone() },
+    ] {
+        let err = KafkaOutput::new(settings).err().expect("refused");
+        assert!(err.to_string().contains("'record: event'"), "{err}");
+    }
+    KafkaOutput::new(KafkaSettings {
+        format: RecordFormat::Native,
+        record: Some(RecordMode::Event),
+        ..base
+    })
+    .expect("native with record: event takes a key");
+}
+
+/// `format: text` skips an event with no log record and counts it; a batch with nothing left to
+/// send succeeds without a request.
+#[tokio::test]
+async fn text_skips_an_event_without_a_log_and_sends_nothing_for_none() {
+    let cluster = cluster(&[0]).await;
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink(KafkaSettings { format: RecordFormat::Text, ..settings(&cluster) }, &probe);
+    let metrics_only = batch(vec![metric_event(), metric_event()]);
+    let sums = run(&mut out, &mut probe, vec![metrics_only], fast_retry()).await;
+    assert!(cluster.state().requests.is_empty(), "no request for a batch with no record");
+    assert_eq!(sum(&sums, "logit.output.events.skipped", &[("reason", "no_log")]), 2.0);
+    assert_eq!(sum(&sums, "logit.output.requests", &[("class", "ok")]), 1.0);
+
+    let mixed = batch(vec![event("a", "first"), metric_event(), event("b", "second")]);
+    let sums = run(&mut out, &mut probe, vec![mixed], fast_retry()).await;
+    let values: Vec<_> = cluster
+        .state()
+        .partition(TOPIC, 0)
+        .records()
+        .iter()
+        .map(|r| r.value.clone().unwrap())
+        .collect();
+    assert_eq!(values, vec![Bytes::from_static(b"first"), Bytes::from_static(b"second")]);
+    assert_eq!(
+        sum(&sums, "logit.output.events.skipped", &[("reason", "no_log")]),
+        3.0,
+        "both runs"
+    );
+}
+
+/// Under `record: batch`, an event too large for a record alone is dropped and counted as
+/// `oversize`, and the rest of the batch goes out.
+#[tokio::test]
+async fn an_event_over_the_cap_alone_is_dropped_in_batch_mode() {
+    let cluster = cluster(&[0]).await;
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink(
+        KafkaSettings {
+            format: RecordFormat::Msgpack,
+            record: Some(RecordMode::Batch),
+            max_request_bytes: 600,
+            ..settings(&cluster)
+        },
+        &probe,
+    );
+    let input = batch(vec![event("a", "small"), event("b", &"x".repeat(600)), event("c", "small")]);
+    let sums = run(&mut out, &mut probe, vec![input], fast_retry()).await;
+
+    let state = cluster.state();
+    let records = state.partition(TOPIC, 0).records();
+    assert_eq!(records.len(), 1);
+    let value = records[0].value.clone().unwrap();
+    let mut reader = logit_proto::msgpack::Reader::new(&value);
+    let mut maps = 0;
+    while !reader.is_empty() {
+        reader.skip_value().unwrap();
+        maps += 1;
+    }
+    assert_eq!(maps, 2, "the two small events");
+    drop(state);
+    assert_eq!(sum(&sums, "logit.output.records.dropped", &[("reason", "oversize")]), 1.0);
+    assert!(sum(&sums, "logit.component.diagnostics", &[("key", "oversize")]) >= 1.0);
+}

@@ -47,6 +47,19 @@ impl ProducerRecord {
     }
 }
 
+/// The most bytes an unkeyed record's value may hold under `headers` and still pass the
+/// producer's `cap` check (`BATCH_OVERHEAD` plus [`ProducerRecord::size_upper_bound`]): that
+/// check solved for the value's length, which it counts byte for byte.
+pub(crate) fn value_budget(cap: usize, headers: &IndexMap<StrBytes, Option<Bytes>>) -> usize {
+    let empty = ProducerRecord {
+        key: None,
+        value: Some(Bytes::new()),
+        headers: headers.clone(),
+        timestamp: 0,
+    };
+    cap.saturating_sub(BATCH_OVERHEAD + empty.size_upper_bound())
+}
+
 /// The idempotent producer's fields a batch carries, or [`Stamp::NONE`] for a producer without
 /// idempotence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,5 +305,23 @@ mod tests {
             let encoded = encode(&records, Stamp::NONE, Compression::None).unwrap();
             assert!(encoded.len() <= bound, "{} > {bound}", encoded.len());
         }
+    }
+
+    /// A value of the budget's length passes the producer's cap check and one byte more doesn't.
+    #[test]
+    fn a_value_at_the_budget_fits_and_one_byte_more_does_not() {
+        let mut headers = IndexMap::new();
+        headers.insert(StrBytes::from_static_str("source"), Some(Bytes::from_static(b"logit")));
+        let cap = 1_000;
+        let budget = value_budget(cap, &headers);
+        let record = |len: usize| ProducerRecord {
+            key: None,
+            value: Some(Bytes::from(vec![b'x'; len])),
+            headers: headers.clone(),
+            timestamp: 0,
+        };
+        assert!(BATCH_OVERHEAD + record(budget).size_upper_bound() <= cap);
+        assert!(BATCH_OVERHEAD + record(budget + 1).size_upper_bound() > cap);
+        assert_eq!(value_budget(10, &headers), 0, "a cap under the overhead leaves no room");
     }
 }
