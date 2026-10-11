@@ -47,6 +47,18 @@ non-2xx answer inside and outside a fault window, counted drops and encoder skip
 batch neither delivered nor dropped, and no request telemetry; the rows that read V SKIP; and a
 local run's `ledger.sent` SKIPs.
 
+For `mark` and `exit` steps, it covers every validation rule (`ready` on a `mark` only and a
+known word, `code` and `key` required on an `exit` and refused elsewhere, an `exit` on the SUT
+only, no netem inside one, neither in a `[random]` schedule) and `[ledger] sut_script`; the
+driver around an `exit` (its revert starts only an exited container, and fail-fast accepts
+`exited` only inside its window); `ready` from `health_log`'s status word (`ok` in steady
+state, a mark's word inside it, `degraded` only inside an exit step, a sample timed at its
+`Start` and counted once, and the `Health.Status` fallback); the watchdog around an expected
+exit (its code, its start, the two self-log lines it needs and the `Error: ` line after them,
+and an exit that never came); and the ledger with a script between the listener and
+`aggregate`: `ledger.script`'s identities, the egress gap without the flush events, the wider
+residual band, and an earlier life ended by an expected exit.
+
 No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
 suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
 a slip in a part's own stand-ins included, gets rc 127 from `Docker.run`'s `OSError` instead of
@@ -190,6 +202,83 @@ def _rules(root):
              "--seed on a fixed schedule", seed=7)
     _refused(path, copy.deepcopy(base), "leaves no time", "a duration inside warmup+cooldown",
              duration=150)
+
+
+MARK = {"at": "11m10s", "action": "mark", "on": "logit", "for": "60s", "ready": "stalled"}
+EXIT = {"at": "11m10s", "action": "exit", "on": "logit", "for": "60s", "code": 2,
+        "key": "memory_limit_exceeded"}
+
+
+def _expected_event_rules(root):
+    """`mark` and `exit` steps, their fields, and `[ledger] sut_script`."""
+    path, base = _base(root)
+
+    def with_step(**fields):
+        raw = copy.deepcopy(base)
+        raw["step"].append({k: v for k, v in fields.items() if v is not None})
+        return raw
+
+    for fields, what in ((MARK, "a mark with a ready word"),
+                         ({**MARK, "ready": None}, "a mark with no ready word"),
+                         ({**MARK, "on": "victoria-metrics", "ready": None},
+                          "a mark on another service"),
+                         (EXIT, "an exit with a code and a key")):
+        try:
+            loaded = scenario.from_dict(with_step(**fields), path)
+            step = next(s for s in scenario.expand(loaded) if s.action == fields["action"])
+            expect(step.to_json().get("ready") == fields.get("ready")
+                   and step.to_json().get("code") == fields.get("code"),
+                   f"{what}: the expanded step carries its fields, got {step.to_json()}")
+        except scenario.ScenarioError as err:
+            expect(False, f"{what} is refused: {err.problems}")
+    expect(faults.ACTIONS["mark"].affects_udp_ingress(scenario.Step(
+        "c0s8", 7, 0, "mark", "logit", "", 0, 1)), "a mark on the SUT is UDP-affecting")
+    expect(not faults.ACTIONS["mark"].affects_udp_ingress(scenario.Step(
+        "c0s8", 7, 0, "mark", "victoria-metrics", "", 0, 1)),
+        "a mark on VictoriaMetrics isn't UDP-affecting")
+    expect("exit" in faults.STARTS_ON_REVERT and "exit" not in faults.EXIT_CODES,
+           "an exit's revert is a start, and its code comes from the step")
+
+    cases = [
+        ({**MARK, "ready": "ok"}, "`ready` must be one of", "a mark expecting ok"),
+        ({**MARK, "ready": "wedged"}, "`ready` must be one of", "an unknown ready word"),
+        ({**MARK, "action": "pause", "on": "generator"}, "`ready` is for mark only",
+         "ready on a pause"),
+        ({**MARK, "code": 2}, "`code` is for exit only", "code on a mark"),
+        ({**MARK, "key": "x"}, "`key` is for exit only", "key on a mark"),
+        ({**EXIT, "code": None}, "exit needs `code`", "an exit without code"),
+        ({**EXIT, "key": None}, "exit needs `key`", "an exit without key"),
+        ({**EXIT, "code": 256}, "`code` must be an integer from 0 to 255", "a code over 255"),
+        ({**EXIT, "code": "2"}, "`code` must be an integer", "a string code"),
+        ({**EXIT, "code": True}, "`code` must be an integer", "a boolean code"),
+        ({**EXIT, "key": ""}, "`key` must be a self-log key", "an empty key"),
+        ({**EXIT, "on": "generator"}, "exit is for logit only", "an exit on the generator"),
+        ({**EXIT, "ready": "degraded"}, "`ready` is for mark only", "ready on an exit"),
+    ]
+    for fields, needle, what in cases:
+        _refused(path, with_step(**fields), needle, what)
+    netem_in_exit = with_step(**EXIT)
+    netem_in_exit["step"].append({"at": "11m20s", "action": "netem", "on": "logit",
+                                  "args": "delay 10ms", "for": "5s"})
+    _refused(path, netem_in_exit, "netem on logit during its exit", "netem during an exit")
+    _refused(path, with_step(**{**MARK, "at": "10m50s"}), "two faults overlap on logit",
+             "a mark overlapping a fault on its container")
+    script = copy.deepcopy(base)
+    script["ledger"]["sut_script"] = ""
+    _refused(path, script, "ledger.sut_script must name", "an empty sut_script")
+    script["ledger"]["sut_script"] = "enrich"
+    try:
+        expect(scenario.from_dict(script, path).ledger["sut_script"] == "enrich",
+               "a sut_script loads")
+    except scenario.ScenarioError as err:
+        expect(False, f"a sut_script is refused: {err.problems}")
+
+    raw = tomllib.loads((root / "scenarios" / "random-faults" / "scenario.toml").read_text())
+    for action in ("mark", "exit"):
+        changed = copy.deepcopy(raw)
+        changed["random"]["fault"][0].update(action=action, on="logit", args=[])
+        _refused(root / "scenarios" / "random-faults" / "scenario.toml", changed,
+                 "write it as a [[step]]", f"`{action}` in a [random] schedule")
 
 
 VALID_EXPECT = {"name": "buffer-climbs", "service": "logit",
@@ -921,12 +1010,20 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 undelivered=0, empty_export=False, ab0_short=0, merged_lives=False,
                 empty_sut=False, buffer_batches=0, buffer_util=0.0, steady_surplus=0,
                 external=False, sut_extra=(), stderr_extra=(), timeline_extra=(),
-                **resolved):
+                script=None, l_in_short=0, l_err_unreported=0, l_sent_short=0,
+                sut_end="stop", **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
     them dropped on stderr over two of the listener's shutdown lines, and `v0_extra` reaching
-    VictoriaMetrics after its last drain, and life 1 balances."""
+    VictoriaMetrics after its last drain, and life 1 balances.
+
+    `script` puts a `lua` component, `lua`, between the listener and `window`: a dict of the
+    events it drops (`drop`), fails on (`err`), and returns from `flush()` (`flush`) per drain,
+    each flush event one metric `window` absorbs and V excludes. `l_in_short`,
+    `l_err_unreported`, and `l_sent_short` break its hop in life 1's drain at +200. `sut_end`
+    `"exit"` ends life 0 with an `exit` step (code 2) in place of the stop, its revert starting
+    the SUT."""
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -969,12 +1066,32 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             w += life0_extra
         if life == 1 and offset == 200:
             e -= e1_short
-        a = e - (a1_short if life == 1 and offset == 210 else 0)
+        flush = 0
+        if script is not None:
+            l_in = e - (l_in_short if life == 1 and offset == 200 else 0)
+            drop, err, flush = script["drop"], script["err"], script["flush"]
+            emit = l_in - drop - err
+            l_sent = emit + flush - (l_sent_short if life == 1 and offset == 200 else 0)
+            for metric, value, attrs in (
+                    ("logit.component.events.received", l_in, None),
+                    ("logit.script.events.emitted", emit, {"outcome": "emit"}),
+                    ("logit.component.events.dropped", drop, {"reason": "script_drop"}),
+                    ("logit.component.errors", err
+                     - (l_err_unreported if life == 1 and offset == 200 else 0),
+                     {"reason": "process"}),
+                    ("logit.component.flush.events", flush, None),
+                    ("logit.component.events.sent", l_sent, None)):
+                sut.append(_line(stamp, metric, "sum", value, component="lua", attrs=attrs))
+            e_into_window = l_sent
+        else:
+            e_into_window = e
+        a = e_into_window - (a1_short if life == 1 and offset == 210 else 0)
         ab = a - (ab1_short if life == 1 and offset == 220 else 0)
         if life == 0:
             ab -= ab0_short
         totals[life]["W"] += w
-        totals[life]["E"] += ab
+        # What V holds: every increment `window` absorbed but the script's flush events.
+        totals[life]["E"] += ab - flush
         for metric, value, comp in (("logit.input.datagrams", w, "in"),
                                     ("logit.component.events.sent", e, "in"),
                                     ("logit.component.events.received", a, "window"),
@@ -992,10 +1109,13 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                          receive_util if life == 1 else 0.0, component="in"))
         sut.append(_line(stamp, "logit.component.retrying", "gauge", 0, component="sink"))
 
+    end_fields = {"code": 2, "key": "memory_limit_exceeded"} if sut_end == "exit" else {}
     timeline = [_phase("start", 0, t0=T0),
-                _action("apply", "c0s1", "stop", "logit", STOP[0], affects_udp_ingress=True),
-                _action("revert", "c0s1", "stop", "logit", STOP[1] - 1, STOP[1],
-                        affects_udp_ingress=True),
+                _action("apply", "c0s1", sut_end, "logit", STOP[0], affects_udp_ingress=True,
+                        **end_fields),
+                _action("revert", "c0s1", sut_end, "logit", STOP[1] - 1, STOP[1],
+                        affects_udp_ingress=True, **end_fields,
+                        **({"started": True} if sut_end == "exit" else {})),
                 _ready("c0s1", "logit", STOP[1] + 1),
                 _phase("end_begin", 300), _phase("end_end", 330)] + list(timeline_extra)
     if external:
@@ -1003,7 +1123,9 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                                        "env": ["DD_API_KEY"]})
         ledger = {k: v for k, v in LEDGER.items() if k != "vm_selector"}
     else:
-        ledger = LEDGER
+        ledger = dict(LEDGER)
+    if script is not None:
+        ledger["sut_script"] = "lua"
     run_dir = _run_dir(tmp, name, timeline, list(sut) + list(sut_extra), ledger=ledger,
                        **resolved)
     if empty_sut:
@@ -1071,7 +1193,7 @@ def _ledger_checks():
         led = checks.Ledger(checks.RunData(Path(tmp) / "ledger-clean"))
         expect(led.D_log == {0: 20}, f"the listener's shutdown warn lines go into D, got "
                                      f"{led.D_log}")
-        expect(led.residual(0) == 30, f"life 0's W − D − B − Ab, got {led.residual(0)}")
+        expect(led.residual(0) == 30, f"life 0's W − D − B − X − Ab, got {led.residual(0)}")
         expect(led.R == 77000, f"R from the defaults, got {led.R}")
         expect("within [0, R]" in clean["ledger.intake"].detail,
                f"intake reports the earlier life's residual, got {clean['ledger.intake'].detail}")
@@ -1220,6 +1342,109 @@ def _ledger_checks():
         expect(behind["recovery"].status == checks.WARN,
                f"recovery WARNs a shortfall when the generator fell behind, got "
                f"{behind['recovery']}")
+
+
+def _script_ledger():
+    """The ledger with a `lua` component between the listener and `aggregate`: `ledger.script`'s
+    three identities, `ledger.edge` moving to the script's edge, the egress gap leaving out the
+    flush events V excludes, the residual band one inbox and one batch wider, and an earlier
+    life ended by an expected exit."""
+    per_drain = {"drop": 20, "err": 10, "flush": 1}
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            run_dir = _ledger_run(tmp, name, script=dict(per_drain), **kwargs)
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        clean = results("script-clean")
+        for check_id in ("ledger.intake", "ledger.edge", "ledger.script", "ledger.aggregate",
+                         "ledger.egress", "ledger.summary"):
+            expect(clean[check_id].status == checks.PASS,
+                   f"{check_id} PASSes the balanced script fixture, got {clean[check_id]}")
+        expect("script to aggregate" in clean["ledger.edge"].detail,
+               f"edge judges the script's edge, got {clean['ledger.edge']}")
+        expect("Ab − L_flush" in clean["ledger.egress"].detail
+               and "Ab − L_flush" in clean["ledger.summary"].detail
+               and "counted" in clean["ledger.summary"].detail,
+               f"egress and the summary name the flush term and the counted script drops, got "
+               f"{clean['ledger.egress']} / {clean['ledger.summary']}")
+        led = checks.Ledger(checks.RunData(Path(tmp) / "script-clean"))
+        expect(led.residual(0) == 30, f"life 0's residual less the script's drops and the "
+                                      f"flush events, got {led.residual(0)}")
+        expect(led.R == 142000, f"R grows by one inbox and one batch with a script, got {led.R}")
+
+        lost_edge = results("script-l-in", l_in_short=4)
+        expect(lost_edge["ledger.script"].status == checks.FAIL
+               and "E == L_in off by 4" in lost_edge["ledger.script"].detail,
+               f"ledger.script FAILs events lost between the listener and the script, got "
+               f"{lost_edge['ledger.script']}")
+        expect(lost_edge["ledger.summary"].status == checks.FAIL,
+               f"the summary FAILs a nonzero E − L_in, got {lost_edge['ledger.summary']}")
+        unaccounted = results("script-l-err", l_err_unreported=3)
+        expect(unaccounted["ledger.script"].status == checks.FAIL
+               and "L_in == L_emit + L_drop + L_err off by 3" in
+               unaccounted["ledger.script"].detail,
+               f"ledger.script FAILs events neither emitted, dropped, nor failed on, got "
+               f"{unaccounted['ledger.script']}")
+        unsent = results("script-l-sent", l_sent_short=6)
+        expect(unsent["ledger.script"].status == checks.FAIL
+               and "L_sent == L_emit + L_flush off by -6" in unsent["ledger.script"].detail,
+               f"ledger.script FAILs a send short of what it emitted, got "
+               f"{unsent['ledger.script']}")
+        expect(unsent["ledger.edge"].status == checks.PASS,
+               f"edge judges L_sent == A, which a short send keeps, got {unsent['ledger.edge']}")
+        edge = results("script-edge", a1_short=7)
+        expect(edge["ledger.edge"].status == checks.FAIL
+               and "L_sent" in edge["ledger.edge"].detail,
+               f"edge FAILs L_sent != A, got {edge['ledger.edge']}")
+
+        lost = results("script-final-uncounted", v1_short=40)
+        expect(lost["ledger.egress"].status == checks.FAIL
+               and lost["ledger.summary"].status == checks.FAIL,
+               f"egress and the summary FAIL a final-life gap with a script, got "
+               f"{lost['ledger.egress']} / {lost['ledger.summary']}")
+
+        # A residual between the plain R (77,000) and the script's (142,000).
+        wide = results("script-wide-residual", life0_extra=100030, v0_extra=100010)
+        expect(wide["ledger.intake"].status == checks.PASS
+               and wide["ledger.egress"].status == checks.PASS,
+               f"an earlier life's residual within the script's R passes, got "
+               f"{wide['ledger.intake']} / {wide['ledger.egress']}")
+
+        # Life 0 ends with an expected exit: two lives, its gap counted by drain complete.
+        exited = results("script-exit", sut_end="exit", v0_extra=-500, life0_dropped=3)
+        expect(not exited["ledger.egress"].detail.startswith("SUT telemetry shows")
+               and exited["ledger.egress"].status == checks.PASS
+               and "counted (drain complete batches_dropped 3)" in exited["ledger.egress"].detail,
+               f"an exit-ended life is a stopped earlier life with a counted gap, got "
+               f"{exited['ledger.egress']}")
+        expect(exited["ledger.script"].status == checks.PASS
+               and exited["ledger.summary"].status == checks.PASS,
+               f"the final life after an exit balances, got {exited['ledger.script']} / "
+               f"{exited['ledger.summary']}")
+        # The script node failed, and the listener's next batch went to its closed inbox,
+        # counted as `closed_consumer`: that life's gap is 0, not 100 uncounted.
+        closed = [_line(_stamp(T0 + 100), "logit.component.events.dropped", "sum", 100,
+                        component="in", attrs={"reason": "closed_consumer"})]
+        closed_run = results("script-exit-closed-consumer", sut_end="exit", sut_extra=closed,
+                             v0_extra=-70)
+        expect(closed_run["ledger.egress"].status == checks.PASS
+               and "W − D − B − X − (L_drop + L_err) − V 0" in closed_run["ledger.egress"].detail,
+               f"egress counts the listener's dropped events, got {closed_run['ledger.egress']}")
+        unexited = _ledger_run(tmp, "script-exit-unstarted", script=dict(per_drain),
+                               sut_end="exit")
+        timeline = collect.read_jsonl(unexited / "timeline.jsonl")
+        for record in timeline:
+            if record.get("event") == "revert":
+                record["started"] = False
+        (unexited / "timeline.jsonl").write_text("".join(json.dumps(r) + "\n" for r in timeline))
+        result = checks.check_ledger_egress(checks.RunData(unexited))
+        expect(result.status == checks.SKIP and "timeline starts the SUT into 1" in result.detail,
+               f"an exit revert that started nothing starts no life, got {result}")
+
+        none = _ledger_run(tmp, "script-none")
+        result = checks.check_ledger_script(checks.RunData(none))
+        expect(result.status == checks.SKIP, f"ledger.script SKIPs with no sut_script, got "
+                                             f"{result}")
 
 
 def _expect_run(tmp, name, expectations, apply_rc=0, second_cycle=False):
@@ -1425,6 +1650,271 @@ def _kill_watchdog():
                f"progress doesn't flag the stdout gap a kill leaves, got {result}")
 
 
+class _ExitDocker:
+    """A stand-in for an `exit` step's revert and the driver's start bookkeeping: `inspect`
+    answers `status` and `started`, and `run` records each command."""
+
+    def __init__(self, status):
+        self.status = status
+        self.calls = []
+
+    def inspect(self, container, timeout=None):
+        return {"State": {"Status": self.status, "StartedAt": "second"}}
+
+    def run(self, args, timeout=None):
+        self.calls.append(list(args))
+        return docker.Result(0, "", "")
+
+
+def _exit_driver():
+    """The driver around an `exit` step: its revert starts the container only when it has
+    exited, and the fail-fast check accepts `exited` only inside its window."""
+    step = scenario.Step("c0s1", 0, 0, "exit", "logit", "", 10.0, 20.0, code=2,
+                         key="memory_limit_exceeded")
+    for status, starts in (("exited", True), ("running", False)):
+        fake = _ExitDocker(status)
+        ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+        result = faults.ACTIONS["exit"].revert(ctx, step)
+        expect(result["rc"] == 0 and result["started"] is starts
+               and (fake.calls == [["start", "sut"]]) is starts,
+               f"an exit's revert on a {status} container starts it: {starts}, got {result} "
+               f"{fake.calls}")
+        expect(faults.ACTIONS["exit"].apply(ctx, step) == {"rc": 0, "stderr": ""}
+               and len(fake.calls) == int(starts), "an exit's apply makes no Docker call")
+
+    def fresh():
+        run = driver.Run.__new__(driver.Run)
+        run.down, run.paused, run.exiting = set(), set(), set()
+        run.pending_ready, run.fail_fast = {}, None
+        run.started_at = {"logit": "first"}
+        run.ids = {"logit": "sut"}
+        run.docker = _ExitDocker("running")
+        return run
+
+    exited = {"status": "exited", "exit_code": 2, "started_at": "first"}
+    run = fresh()
+    run.check_expected("logit", exited)
+    expect(run.fail_fast is not None, "an exit with no step behind it fails fast")
+    run = fresh()
+    run.after("apply", step, {"rc": 0})
+    run.check_expected("logit", exited)
+    run.check_expected("logit", {"status": "running", "exit_code": 0, "started_at": "first"})
+    expect(run.fail_fast is None, f"an exit step accepts exited and running, got "
+                                  f"{run.fail_fast}")
+    run.after("revert", step, {"rc": 0, "started": True})
+    expect(run.started_at["logit"] == "second" and "logit" in run.pending_ready
+           and not run.exiting, "a revert that started the SUT probes its readiness")
+    run.check_expected("logit", {**exited, "started_at": "second"})
+    expect(run.fail_fast is not None, "after the window, exited fails fast again")
+    run = fresh()
+    run.after("apply", step, {"rc": 0})
+    run.after("revert", step, {"rc": 0, "started": False})
+    expect(not run.pending_ready and run.started_at["logit"] == "first",
+           "a revert that started nothing probes nothing")
+
+
+def _health(offset, word, start=None):
+    """A `health_log` entry for a HEALTHCHECK that started at `start` (default `offset`)."""
+    output = "ok\n" if word == "ok" else f"{word} (503 Service Unavailable)\n"
+    started = _stamp(T0 + (offset if start is None else start))
+    return {"Start": started, "End": started, "ExitCode": 0 if word == "ok" else 1,
+            "Output": output}
+
+
+def _ready_words():
+    """`ready` from the status word in `health_log`: `ok` in steady time, a mark's word inside
+    it, `degraded` only inside an exit step, each sample timed at its `Start` and counted once,
+    and `Health.Status` when no `health_log` was recorded."""
+    mark = [_action("apply", "c0s1", "mark", "logit", 100, 100, ready="stalled"),
+            _action("revert", "c0s1", "mark", "logit", 160, 160, ready="stalled")]
+    exit_step = [_action("apply", "c0s1", "exit", "logit", 100, 100, code=2,
+                         key="memory_limit_exceeded"),
+                 _action("revert", "c0s1", "exit", "logit", 160, 161, code=2,
+                         key="memory_limit_exceeded", started=True),
+                 _ready("c0s1", "logit", 162)]
+    start, end = _phase("start", 0, t0=T0), [_phase("end_begin", 400), _phase("end_end", 450)]
+
+    def run(tmp, name, steps, words, health_log=True):
+        """`words(offset)` -> (word, start offset or None) for the SUT's sample at `offset`."""
+        run_dir = _run_dir(tmp, name, [start] + steps + end)
+        records = []
+        for offset in range(0, 400, 5):
+            word, started = words(offset)
+            for svc in ("logit", "generator"):
+                record = {"t": T0 + offset, "svc": svc, "status": "running",
+                          "health": "healthy" if svc != "logit" or word == "ok" else "unhealthy"}
+                if health_log:
+                    record["health_log"] = (_health(offset, word, started) if svc == "logit"
+                                            else _health(offset, "ok"))
+                records.append(record)
+        (run_dir / "watchdog.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+        return run_dir
+
+    def ok(offset):
+        return "ok", None
+
+    def stalled_in(low, high):
+        return lambda offset: ("stalled", None) if low <= offset <= high else ("ok", None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        result = _status(run(tmp, "ready-ok", [], ok), checks.check_ready)
+        expect(result.status == checks.PASS and "read ok" in result.detail,
+               f"ready PASSes ok samples, got {result}")
+        samples = checks.health_samples(checks.RunData(Path(tmp) / "ready-ok"))
+        expect(len(samples) == 160 and samples[0][2] == "ok",
+               f"one sample per service and Start, got {len(samples)}")
+
+        result = _status(run(tmp, "ready-mark", mark, stalled_in(120, 140)), checks.check_ready)
+        expect(result.status == checks.PASS and "c0s1: logit read stalled 5 time(s)"
+               in result.detail, f"ready PASSes a stall inside a mark that expects it, got "
+                                 f"{result}")
+        result = _status(run(tmp, "ready-mark-missing", mark, ok), checks.check_ready)
+        expect(result.status == checks.FAIL and "never read stalled" in result.detail,
+               f"ready FAILs a mark whose word never appears, got {result}")
+        result = _status(run(tmp, "ready-stall-steady", [], stalled_in(250, 260)),
+                         checks.check_ready)
+        expect(result.status == checks.FAIL and "read stalled at +250s" in result.detail,
+               f"ready FAILs a stall outside every fault window, got {result}")
+        # Recorded at +200 to +215, after the mark's window and its recovery, but started at
+        # +150, inside the mark: the HEALTHCHECK's own time decides.
+        late = run(tmp, "ready-late-record", mark,
+                   lambda o: ("stalled", 150) if 200 <= o <= 215 else ("ok", None))
+        result = _status(late, checks.check_ready)
+        expect(result.status == checks.PASS and "read stalled 1 time(s)" in result.detail,
+               f"ready times a sample at its Start and counts it once, got {result}")
+
+        degraded = lambda o: ("degraded", None) if 120 <= o <= 130 else ("ok", None)
+        result = _status(run(tmp, "ready-degraded-exit", exit_step, degraded),
+                         checks.check_ready)
+        expect(result.status == checks.PASS, f"ready accepts degraded inside an exit step, got "
+                                             f"{result}")
+        result = _status(run(tmp, "ready-degraded-mark", mark, lambda o: (
+            ("degraded", None) if 120 <= o <= 130 else ("stalled", None) if o == 140
+            else ("ok", None))), checks.check_ready)
+        expect(result.status == checks.FAIL and "degraded" in result.detail
+               and "outside every exit step" in result.detail,
+               f"ready FAILs degraded outside every exit step, even inside a mark, got {result}")
+
+        result = _status(run(tmp, "ready-fallback", [], stalled_in(250, 260), health_log=False),
+                         checks.check_ready)
+        expect(result.status == checks.FAIL and "health unhealthy" in result.detail,
+               f"ready falls back to Health.Status with no health_log, got {result}")
+        result = _status(run(tmp, "ready-fallback-mark", mark, ok, health_log=False),
+                         checks.check_ready)
+        expect(result.status == checks.FAIL and "can't be judged" in result.detail,
+               f"a mark's word can't pass with no health_log, got {result}")
+    expect(checks.readiness_word("stalled (503 Service Unavailable)") == "stalled"
+           and checks.readiness_word("ok\n") == "ok" and checks.readiness_word("") is None,
+           "readiness_word takes the status word")
+
+
+def _exit_watchdog():
+    """The watchdog around an `exit` step applied at +60 and reverted at +120: the SUT exits
+    by itself at +75 with code 2 and an ERROR line keyed `memory_limit_exceeded`, and the
+    revert starts it again."""
+    keyed = {"code": 2, "key": "memory_limit_exceeded"}
+    steps = [_action("apply", "c0s1", "exit", "logit", 60, 60, **keyed),
+             _action("revert", "c0s1", "exit", "logit", 119, 120, started=True, **keyed)]
+    start, end = _phase("start", 0, t0=T0), [_phase("end_begin", 400), _phase("end_end", 450)]
+
+    def log(offset, level, message, **fields):
+        return json.dumps({"timestamp": _stamp(T0 + offset), "level": level,
+                           "message": message, "target": "logit", **fields})
+
+    trip = [log(74.5, "ERROR", "Lua VM holds 70000000 bytes after 8 full collections",
+                key="memory_limit_exceeded", component="enrich"),
+            log(75, "ERROR", "exiting", code=2, reason="a node failed"),
+            "Error: component 'enrich': Lua VM holds 70000000 bytes after 8 full collections"]
+
+    def run(tmp, name, exits=True, code=2, at=75, stderr=trip, steps=steps, ready=True):
+        timeline = [start] + steps + ([_ready("c0s1", "logit", 122)] if ready else []) + end
+        run_dir = _run_dir(tmp, name, timeline)
+        first, second = _stamp(T0 - 5), _stamp(T0 + 119.5)
+        watchdog = []
+        for offset in range(0, 400, 5):
+            for svc in ("logit", "generator"):
+                down = svc == "logit" and exits and at < offset < 120
+                restarted = svc == "logit" and exits and offset >= 120
+                watchdog.append({
+                    "t": T0 + offset, "svc": svc, "status": "exited" if down else "running",
+                    "exit_code": code if down else 0, "health": "healthy",
+                    "started_at": second if restarted else first,
+                    "finished_at": _stamp(T0 + at) if svc == "logit" and exits and offset > at
+                    else "", "restart_count": 0})
+        (run_dir / "watchdog.jsonl").write_text("".join(json.dumps(r) + "\n" for r in watchdog))
+        (run_dir / "inspect").mkdir()
+        for svc, started in (("logit", second if exits else first), ("generator", first)):
+            (run_dir / "inspect" / f"{svc}.json").write_text(json.dumps({"State": {
+                "Status": "exited", "ExitCode": 0, "OOMKilled": False, "StartedAt": started,
+                "FinishedAt": _stamp(T0 + 450)}}))
+        (run_dir / "logs" / "logit.stderr").write_text("\n".join(
+            [log(0, "INFO", "ready")] + list(stderr)) + "\n")
+        return run_dir
+
+    with tempfile.TemporaryDirectory() as tmp:
+        clean = run(tmp, "exit-clean")
+        for check in (checks.check_exit, checks.check_restarts, checks.check_timeline,
+                      checks.check_self_log):
+            result = _status(clean, check)
+            expect(result.status == checks.PASS,
+                   f"{check.__name__} PASSes an expected exit and its start, got {result}")
+        result = _status(clean, checks.check_exit)
+        expect("inside expected exit c0s1" in result.detail, f"exit names the step, got {result}")
+        result = _status(clean, checks.check_self_log)
+        expect("3 expected-exit line(s)" in result.detail,
+               f"self_log counts the ERROR, exiting, and Error: lines, got {result}")
+        stray = run(tmp, "exit-stray-error-text", stderr=trip + [trip[2]])
+        result = _status(stray, checks.check_self_log)
+        expect(result.status == checks.WARN and "non-JSON" in result.detail,
+               f"self_log excuses only the Error: line right after an expected exiting line, "
+               f"got {result}")
+
+        unstarted = [steps[0], {**steps[1], "started": False}]
+        missing = run(tmp, "exit-missing", exits=False, stderr=(), steps=unstarted, ready=False)
+        for check in (checks.check_exit, checks.check_self_log):
+            result = _status(missing, check)
+            expect(result.status == checks.FAIL
+                   and "expected exit did not happen" in result.detail,
+                   f"{check.__name__} FAILs an exit step whose exit never came, got {result}")
+        result = _status(missing, checks.check_restarts)
+        expect(result.status == checks.PASS, f"restarts needs no start when the revert started "
+                                             f"nothing, got {result}")
+
+        wrong = run(tmp, "exit-code-1", code=1)
+        result = _status(wrong, checks.check_exit)
+        expect(result.status == checks.FAIL and "which leaves 2" in result.detail,
+               f"exit FAILs an exit with a code other than its step's, got {result}")
+        unkeyed = run(tmp, "exit-no-key", stderr=trip[1:])
+        result = _status(unkeyed, checks.check_self_log)
+        expect(result.status == checks.FAIL
+               and "no ERROR line keyed memory_limit_exceeded" in result.detail,
+               f"self_log FAILs an expected exit with no ERROR line keyed its key, got {result}")
+        other_code = run(tmp, "exit-line-code-3", stderr=[trip[0], log(75, "ERROR", "exiting",
+                                                                         code=3)])
+        result = _status(other_code, checks.check_self_log)
+        expect(result.status == checks.FAIL
+               and "exiting with code 3" in " ".join(result.lines),
+               f"self_log FAILs an exiting line with a code the step doesn't name, got {result}")
+        outside = run(tmp, "exit-line-outside", stderr=trip + [
+            log(300, "ERROR", "Lua VM holds", key="memory_limit_exceeded")])
+        result = _status(outside, checks.check_self_log)
+        expect(result.status == checks.FAIL and "+300s" in result.detail,
+               f"self_log FAILs the step's key outside its window, got {result}")
+        quiet = [line for line in _sut_stdout(400)
+                 if not 75 < (telemetry.parse_rfc3339(json.loads(line)["timestamp"]) - T0) < 120]
+        gap = run(tmp, "exit-gap")
+        (gap / "logs" / "logit.stdout").write_text("\n".join(quiet) + "\n")
+        result = _status(gap, checks.check_progress)
+        expect(not any("went quiet" in line for line in result.lines),
+               f"progress doesn't flag the stdout gap an expected exit leaves, got {result}")
+        early = run(tmp, "exit-before-window", at=50,
+                    stderr=[log(49.5, "ERROR", "x", key="memory_limit_exceeded"),
+                            log(50, "ERROR", "exiting", code=2)])
+        result = _status(early, checks.check_exit)
+        expect(result.status == checks.FAIL and "outside every scheduled stop" in result.detail,
+               f"exit FAILs an exit before its step's window, got {result}")
+
+
 # The kill fixture's SUT config: a small R (100 + 67 x 10 = 770), and the 10 s aggregate
 # interval the band and `ledger.windows` read.
 KILL_SUT_CONFIG = ("components:\n"
@@ -1580,7 +2070,7 @@ def _kill_ledger():
         egress = clean["ledger.egress"].detail
         expect("life 1 (killed): Ab 14,000 − V 12,500 = 1,500, within band" in egress
                and "band [-1,000, 3,000]: ingest 200/s" in egress
-               and "residual W − D − B − Ab 0 at its last drain" in egress
+               and "residual W − D − B − X − Ab 0 at its last drain" in egress
                and "D has no stderr part" in egress,
                f"egress reports the killed life's gap inside its band, got {egress}")
         expect("life 2 (final): Ab 18,000 − V 18,000 = 0, ok" in egress,
@@ -1609,7 +2099,7 @@ def _kill_ledger():
         detail = residual["ledger.egress"].detail
         expect(residual["ledger.egress"].status == checks.PASS
                and "Ab 14,000 − V 11,400 = 2,600, within band (band [-1,500, 3,000]" in detail
-               and "residual W − D − B − Ab 500 at its last drain" in detail,
+               and "residual W − D − B − X − Ab 500 at its last drain" in detail,
                f"a killed life's residual is reported beside Ab − V, never added to it, got "
                f"{residual['ledger.egress']}")
         residual_low = results("kill-residual-low", kill_residual=500, kill_gap=-1500)
@@ -2327,10 +2817,11 @@ def run(root, quiet=False):
                      _log_capture, _signals, _deadlines, _hung_inspect, _inspect_redacted,
                      _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks,
                      _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
-                     _sink_drain, _external_checks, _report, _shipped):
+                     _sink_drain, _external_checks, _report, _expected_event_rules,
+                     _exit_driver, _ready_words, _exit_watchdog, _script_ledger, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
-                              _target_rules, _sink_drain, _shipped)
+                              _target_rules, _sink_drain, _expected_event_rules, _shipped)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")

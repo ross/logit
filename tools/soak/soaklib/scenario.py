@@ -41,15 +41,28 @@ LOGIT_SERVICES = ("logit", "generator")
 
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
-ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition")
-# Actions allowed on the SUT only. A `kill` exists to end a `logit` process with no shutdown;
-# on the generator, the lines it sent after its last telemetry drain reach the SUT with no G
-# behind them, and `ledger.wire` would net them against real loss.
-SUT_ONLY_ACTIONS = ("kill",)
+ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "mark", "exit")
+# Actions allowed on the SUT only, each with the reason. A `kill` exists to end a `logit` process
+# with no shutdown; on the generator, the lines it sent after its last telemetry drain reach the
+# SUT with no G behind them, and `ledger.wire` would net them against real loss. An `exit`
+# names a self-exit the SUT's own config causes, which the generator's config never does.
+SUT_ONLY_ACTIONS = {
+    "kill": ("on the generator, the lines it sent after its last telemetry drain reach the SUT "
+             "with no G behind them, so ledger.wire would net them against real loss"),
+    "exit": "an expected exit is one the SUT's own config causes",
+}
+# Actions that name an expected event rather than cause one: their apply and revert make no
+# Docker call (an `exit`'s revert starts the container the event ended), so a `[random]`
+# schedule, which draws faults, can't hold them.
+EXPECTED_EVENT_ACTIONS = ("mark", "exit")
+# The `/readyz` words a `mark`'s `ready` may name: every answer but `ok`
+# (crates/logit-cli/src/admin.rs, `readyz_wire`).
+READY_WORDS = ("starting", "stalled", "draining", "degraded")
 
 # Faults during which a container's network namespace is gone or unusable for a one-shot
-# `docker run --network container:<id>`.
-NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart")
+# `docker run --network container:<id>`. An `exit` can end the process at any point in its
+# window.
+NAMESPACE_FAULTS = ("stop", "kill", "pause", "partition", "restart", "exit")
 
 TOP_LEVEL_KEYS = {
     "name", "description", "duration", "warmup", "cooldown", "recovery_bound", "cycle",
@@ -68,7 +81,7 @@ VM_LEDGER_KEYS = {"vm_selector", "vm_every_window"}
 _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PRIVATE_ENV_PREFIX = "soak-env-"
-STEP_KEYS = {"at", "action", "on", "args", "for"}
+STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key"}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
 RANGE_KEYS = {"min", "max"}
@@ -77,7 +90,7 @@ LEDGER_KEYS = {
     "vm_selector", "generator_input", "generator_sink", "sut_listener", "sut_aggregate",
     "sut_sink", "wire_loss_outside_faults",
 }
-OPTIONAL_LEDGER_KEYS = {"vm_every_window"}
+OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script"}
 THRESHOLD_KEYS = {"progress_window", "rss_growth_mib_per_hour", "fd_growth"}
 EXPECT_KEYS = {"name", "service", "metric", "component", "attrs", "step", "window", "reduce",
                "min", "max"}
@@ -107,6 +120,12 @@ METRIC_KINDS = {
     "logit.output.requests": "sum",
     "logit.output.records": "sum",
     "logit.output.records.dropped": "sum",
+    "logit.component.diagnostics": "sum",
+    "logit.component.errors": "sum",
+    "logit.component.events.dropped": "sum",
+    "logit.component.flush.events": "sum",
+    "logit.script.events.emitted": "sum",
+    "logit.script.vm.memory": "gauge",
 }
 _EXPECT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _STEP_ID = re.compile(r"^c(\d+)s(\d+)$")
@@ -173,6 +192,10 @@ class StepSpec:
     on: str
     args: str
     for_: float
+    # A `mark`'s `ready` word, and an `exit`'s `code` and `key`; None elsewhere.
+    ready: object = None
+    code: object = None
+    key: object = None
 
 
 @dataclass
@@ -221,12 +244,21 @@ class Step:
     args: str
     start: float
     end: float
+    ready: object = None
+    code: object = None
+    key: object = None
+
+    def expected(self):
+        """The `ready`, `code`, and `key` fields this step sets, for its JSON and its timeline
+        records."""
+        return {name: value for name, value in (("ready", self.ready), ("code", self.code),
+                                                ("key", self.key)) if value is not None}
 
     def to_json(self):
         return {
             "id": self.id, "spec_index": self.spec_index, "cycle": self.cycle,
             "action": self.action, "on": self.on, "args": self.args,
-            "start": self.start, "end": self.end,
+            "start": self.start, "end": self.end, **self.expected(),
         }
 
 
@@ -422,6 +454,7 @@ def from_dict(raw, path):
             on=raw_step.get("on", ""),
             args=raw_step.get("args", ""),
             for_=dur(raw_step, "for", where) if "for" in raw_step else 0.0,
+            ready=raw_step.get("ready"), code=raw_step.get("code"), key=raw_step.get("key"),
         ))
         if "for" not in raw_step:
             problems.append(f"{where}: every fault needs `for`, so its revert is scheduled with it")
@@ -702,6 +735,9 @@ def validate(scenario, duration=None, seed=None):
         problems.append("thresholds.progress_window must be longer than 0s")
     if not isinstance(scenario.ledger.get("vm_every_window", False), bool):
         problems.append("ledger.vm_every_window must be true or false")
+    script = scenario.ledger.get("sut_script")
+    if script is not None and (not isinstance(script, str) or not script):
+        problems.append("ledger.sut_script must name the SUT's lua component")
     if scenario.external:
         # An external target's stack runs without the victoria-metrics service.
         held = [f"step {spec.index + 1}" for spec in scenario.steps if spec.on == LOCAL_TARGET]
@@ -722,10 +758,9 @@ def validate(scenario, duration=None, seed=None):
         if spec.on not in SERVICES:
             problems.append(f"{where}: unknown service `{spec.on}`")
         elif spec.action in SUT_ONLY_ACTIONS and spec.on != "logit":
-            problems.append(
-                f"{where}: {spec.action} is for logit only: on the generator, the lines it sent "
-                "after its last telemetry drain reach the SUT with no G behind them, so "
-                "ledger.wire would net them against real loss")
+            problems.append(f"{where}: {spec.action} is for logit only: "
+                            f"{SUT_ONLY_ACTIONS[spec.action]}")
+        problems += _expected_event_problems(spec, where)
         if spec.for_ <= 0:
             problems.append(f"{where}: `for` must be longer than 0s")
         if spec.action == "netem":
@@ -793,6 +828,36 @@ def validate(scenario, duration=None, seed=None):
         raise ScenarioError(problems)
 
 
+def _expected_event_problems(spec, where):
+    """What a step breaks of the `mark` and `exit` rules: `ready` on a `mark` only, one of
+    `READY_WORDS`; `code` and `key` required on an `exit` and refused elsewhere."""
+    problems = []
+    if spec.ready is not None:
+        if spec.action != "mark":
+            problems.append(f"{where}: `ready` is for mark only")
+        elif spec.ready not in READY_WORDS:
+            problems.append(f"{where}: `ready` must be one of {', '.join(READY_WORDS)}, got "
+                            f"{spec.ready!r}")
+    if spec.action == "exit":
+        if spec.code is None:
+            problems.append(f"{where}: exit needs `code`, the exit code the SUT leaves")
+        elif (not isinstance(spec.code, int) or isinstance(spec.code, bool)
+              or not 0 <= spec.code <= 255):
+            problems.append(f"{where}: `code` must be an integer from 0 to 255, got "
+                            f"{spec.code!r}")
+        if spec.key is None:
+            problems.append(f"{where}: exit needs `key`, the self-log key of the ERROR line "
+                            "that explains it")
+        elif not isinstance(spec.key, str) or not spec.key:
+            problems.append(f"{where}: `key` must be a self-log key such as "
+                            "\"memory_limit_exceeded\"")
+    else:
+        for name in ("code", "key"):
+            if getattr(spec, name) is not None:
+                problems.append(f"{where}: `{name}` is for exit only")
+    return problems
+
+
 def _random_problems(scenario, duration):
     """Every rule a `[random]` table breaks. `gap.min` must cover a fault's recovery and two
     progress windows, so each fault is followed by steady state the checks judge, and `cooldown`
@@ -826,6 +891,9 @@ def _random_problems(scenario, duration):
             problems.append(f"{where}: unknown service `{template.on}`")
         elif template.action in SUT_ONLY_ACTIONS and template.on != "logit":
             problems.append(f"{where}: {template.action} is for logit only")
+        if template.action in EXPECTED_EVENT_ACTIONS:
+            problems.append(f"{where}: {template.action} names an expected event at a fixed "
+                            "time, and a [random] schedule draws faults; write it as a [[step]]")
         if template.for_min <= 0:
             problems.append(f"{where}: `for.min` must be longer than 0s")
         if template.for_min > template.for_max:
@@ -978,6 +1046,7 @@ def expand(scenario, duration=None, seed=None):
                 steps.append(Step(
                     id=f"c{cycle}s{spec.index + 1}", spec_index=spec.index, cycle=cycle,
                     action=spec.action, on=spec.on, args=spec.args, start=start, end=end,
+                    ready=spec.ready, code=spec.code, key=spec.key,
                 ))
         cycle += 1
     steps.sort(key=lambda s: (s.start, s.spec_index))

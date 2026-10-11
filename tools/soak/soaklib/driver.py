@@ -16,7 +16,9 @@ needs at the code:
 - Logs are captured in chunks every `LOG_CHUNK_EVERY_S` (collect.py's `LogCapture` has the
   boundary rules), and collection at the end fetches only the tail.
 - A `logit` container leaving `running`, or changing `StartedAt`, with no step behind it ends the
-  schedule at once (fail fast). The end sequence, collection, and scoring still run.
+  schedule at once (fail fast). The end sequence, collection, and scoring still run. Inside an
+  `exit` step the container may be `running` or `exited`; its revert starts it only if it
+  exited, and only then is it a start, with a readiness probe.
 - `docker exec` into a paused container blocks, so readiness is never probed while a step holds
   the container paused.
 - The `try`/`finally` around the run collects logs and tears the project down on every exit
@@ -150,6 +152,8 @@ class Run:
         self.active = {}
         self.down = set()
         self.paused = set()
+        # Services inside an `exit` step: running, or exited by the event it names.
+        self.exiting = set()
         self.pending_ready = {}
         self.started_at = {}
         self.fail_fast = None
@@ -338,6 +342,7 @@ class Run:
             "started_at": started, "offset": self.offset(started),
             "affects_udp_ingress": bool(action.affects_udp_ingress(step)),
             "affects_egress": bool(action.affects_egress(step)),
+            **step.expected(),
         }
         if early:
             record["early"] = True
@@ -345,7 +350,7 @@ class Run:
         record.update(result)
         record["finished_at"] = _now()
         self.timeline.write(record)
-        self.after(kind, step)
+        self.after(kind, step, result)
         show = f" -> {result['netem_show']}" if result.get("netem_show") else ""
         self.say(f"{kind} {step.id} {step.action} on {step.on} rc={result['rc']}{show}")
         if kind == "apply":
@@ -353,11 +358,17 @@ class Run:
         else:
             self.active.pop(step.id, None)
 
-    def after(self, kind, step):
+    def after(self, kind, step, result):
         """Keeps the expected-state sets in step with an action, and queues readiness probes."""
         service = step.on
         restarted = False
-        if step.action in faults.STARTS_ON_REVERT:
+        if step.action == "exit":
+            if kind == "apply":
+                self.exiting.add(service)
+            else:
+                self.exiting.discard(service)
+                restarted = bool(result.get("started"))
+        elif step.action in faults.STARTS_ON_REVERT:
             if kind == "apply":
                 self.down.add(service)
             else:
@@ -434,6 +445,8 @@ class Run:
         status = record["status"]
         if service in self.down:
             expected = ("exited",)
+        elif service in self.exiting:
+            expected = ("running", "exited")
         elif service in self.paused:
             expected = ("paused",)
         else:

@@ -18,6 +18,10 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line, and the container
   exits with `KILL_EXIT_CODE`. Its revert is a `docker start`, as a `stop`'s is. The container is
   never recreated, so its filesystem, a disk spool under `/tmp` included, survives the kill.
+- A `mark` and an `exit` name an event the SUT's own config causes, so neither apply makes a
+  Docker call. An `exit`'s revert starts the container only when it has exited, and its record
+  says whether it did (`started`): a revert that found the process still running starts no new
+  life, and the checks then FAIL the exit that never happened.
 """
 
 from dataclasses import dataclass, field
@@ -114,6 +118,18 @@ def restart_revert(ctx, step):
     return {"rc": 0, "stderr": ""}
 
 
+def no_op(ctx, step):
+    return {"rc": 0, "stderr": ""}
+
+
+def exit_revert(ctx, step):
+    info = ctx.docker.inspect(ctx.ids[step.on]) or {}
+    status = (info.get("State") or {}).get("Status")
+    if status != "exited":
+        return {"rc": 0, "stderr": "", "started": False, "status": status}
+    return _record(ctx.docker.run(["start", ctx.ids[step.on]]), started=True, status=status)
+
+
 def partition_apply(ctx, step):
     container = ctx.ids[step.on]
     info = ctx.docker.inspect(container) or {}
@@ -188,11 +204,26 @@ ACTIONS = {
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
         affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
     ),
+    # A mark on the SUT holds what it marks, such as a stalled script backing up into the UDP
+    # receive queue.
+    "mark": Action(
+        apply=no_op,
+        revert=no_op,
+        affects_udp_ingress=lambda step: step.on == "logit",
+        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+    ),
+    "exit": Action(
+        apply=no_op,
+        revert=exit_revert,
+        affects_udp_ingress=lambda step: True,
+        affects_egress=lambda step: True,
+    ),
 }
 
 # Actions after whose apply or revert a `logit` service has started again and must report ready.
 STARTS_ON_APPLY = ("restart",)
-STARTS_ON_REVERT = ("stop", "kill")
+STARTS_ON_REVERT = ("stop", "kill", "exit")
 RESUMES_ON_REVERT = ("pause",)
 # Actions whose apply ends a container's process, each with the exit code Docker records for it.
+# An `exit` step names its own code.
 EXIT_CODES = {"stop": 0, "restart": 0, "kill": KILL_EXIT_CODE}

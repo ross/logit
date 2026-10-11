@@ -32,9 +32,12 @@ _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
 
 
 def is_start(record):
-    """Whether a timeline record started a container again: a revert of a `stop` or `kill`, or a
-    `restart`'s apply. Each start of a `logit` service begins a new process life."""
+    """Whether a timeline record started a container again: a revert of a `stop` or `kill`, a
+    revert of an `exit` that found the container exited, or a `restart`'s apply. Each start of
+    a `logit` service begins a new process life."""
     event, action = record.get("event"), record.get("action")
+    if event == "revert" and action == "exit":
+        return bool(record.get("started"))
     return ((event == "revert" and action in faults.STARTS_ON_REVERT)
             or (event == "apply" and action in faults.STARTS_ON_APPLY))
 
@@ -124,6 +127,10 @@ class Fault:
     end: float
     affects_udp_ingress: bool
     affects_egress: bool
+    # A `mark`'s `ready` word, and an `exit`'s `code` and `key`; None elsewhere.
+    ready: object = None
+    code: object = None
+    key: object = None
 
 
 class RunData:
@@ -197,10 +204,17 @@ class RunData:
             start=apply["started_at"], end=end,
             affects_udp_ingress=apply.get("affects_udp_ingress", False),
             affects_egress=apply.get("affects_egress", False),
+            ready=apply.get("ready"), code=apply.get("code"), key=apply.get("key"),
         )
 
     def offset(self, t):
         return "?" if t is None or self.t0 is None else f"{t - self.t0:+.0f}s"
+
+    def exit_windows(self, service="logit"):
+        """[(start, end, fault)] of each `exit` step on `service`, its span widened by 1 s on
+        each side, as a `stop`'s is for `exit`."""
+        return [(f.start - 1, f.end + 1, f) for f in self.faults
+                if f.action == "exit" and f.on == service]
 
     def windows(self, on=None, actions=None, extend=True):
         """[(start, end)] of fault windows, optionally only `on` one service or for some
@@ -323,13 +337,14 @@ def check_timeline(data):
 
 def check_exit(data):
     """Every exit of a `logit` service falls inside a scheduled stop, restart, or kill, with the
-    code that action leaves (0, or 137 for a kill), or in the end sequence with 0; the final
-    state is exited; and nothing was OOM-killed."""
+    code that action leaves (0, or 137 for a kill), inside an `exit` step with the code the step
+    names, or in the end sequence with 0; every `exit` step saw its exit; the final state is
+    exited; and nothing was OOM-killed."""
     if not data.inspect:
         return Result("exit", SKIP, "no inspect/ files")
     lines = []
     status = PASS
-    # {service: [(start, end, action, expected exit code)]}
+    # {service: [(start, end, action, expected exit code, step)]}
     stop_windows = {}
     for record in data.timeline:
         action = record.get("action")
@@ -337,10 +352,16 @@ def check_exit(data):
                 and not record.get("rc")):
             stop_windows.setdefault(record["on"], []).append(
                 (record["started_at"] - 1, record["finished_at"] + 1, action,
-                 faults.EXIT_CODES[action]))
+                 faults.EXIT_CODES[action], record.get("step")))
+    for service in LOGIT_SERVICES:
+        for start, end, fault in data.exit_windows(service):
+            stop_windows.setdefault(service, []).append(
+                (start, end, "exit", fault.code, fault.step))
     end_begin = data.phases.get("end_begin", {}).get("t")
     kills = 0
     exits = 0
+    expected = 0
+    seen_steps = set()
     for service in LOGIT_SERVICES:
         seen = {}
         for record in data.watchdog:
@@ -355,9 +376,9 @@ def check_exit(data):
             window = None if t is None else next(
                 (w for w in stop_windows.get(service, []) if w[0] <= t <= w[1]), None)
             if window is not None:
-                _, _, action, want = window
+                _, _, action, want, step = window
             elif t is not None and end_begin is not None and t >= end_begin:
-                action, want = "end sequence", 0
+                action, want, step = "end sequence", 0, None
             else:
                 status = FAIL
                 lines.append(f"{service} exited at {data.offset(t)} with code {code}, outside "
@@ -367,11 +388,24 @@ def check_exit(data):
                 status = FAIL
                 lines.append(f"{service} exited at {data.offset(t)} with code {code}, inside a "
                              f"scheduled {action}, which leaves {want}")
-            elif action == "kill":
+                continue
+            if action == "kill":
                 kills += 1
+            elif action == "exit":
+                expected += 1
+                seen_steps.add(step)
+                lines.append(f"{service} exited at {data.offset(t)} with code {code}, inside "
+                             f"expected exit {step}")
         if final.get("Status") != "exited":
             status = FAIL
             lines.append(f"{service} final state is {final.get('Status')}, not exited")
+    for service in LOGIT_SERVICES:
+        for start, end, fault in data.exit_windows(service):
+            if fault.step not in seen_steps:
+                status = FAIL
+                lines.append(f"expected exit did not happen: {service} has no exit with code "
+                             f"{fault.code} in {fault.step}'s window [{data.offset(start)}, "
+                             f"{data.offset(end)}]")
     for service in SERVICES:
         state = (data.inspect.get(service) or {}).get("State") or {}
         if state.get("OOMKilled"):
@@ -380,10 +414,12 @@ def check_exit(data):
     if status == PASS:
         detail = f"{exits} exit(s) of the logit services, each a scheduled stop with code 0"
         if kills:
-            detail = (f"{exits} exit(s) of the logit services, each a scheduled stop with code 0 "
-                      f"or a scheduled kill with code {faults.KILL_EXIT_CODE} ({kills} kill(s))")
+            detail += f" or a scheduled kill with code {faults.KILL_EXIT_CODE} ({kills} kill(s))"
+        if expected:
+            detail += (f" or an expected exit with its step's code ({expected}: "
+                       + ", ".join(line for line in lines if "expected exit" in line) + ")")
     else:
-        detail = lines[0]
+        detail = next(line for line in lines if "inside expected exit" not in line)
     return Result("exit", status, detail, lines)
 
 
@@ -423,14 +459,37 @@ def check_restarts(data):
 
 
 def check_self_log(data):
+    """FAILs a panic, a nonzero `exiting` line, or an ERROR line, except the sink fault lines
+    inside a fault window, and, inside an `exit` step's window, the `exiting` line with the
+    step's code and an ERROR line keyed with its `key`. Each `exit` step must show both, or the
+    expected exit didn't happen as named. The `Error: ` text line `main` prints as it returns
+    the failure, right after that `exiting` line, has no timestamp and is excused by its place.
+    """
     if not data.stderr:
         return Result("self_log", SKIP, "no logs/*.stderr")
     windows = data.windows()
     status = PASS
     lines = []
-    counts = {"error": 0, "fault_key_inside": 0, "fault_key_outside": 0, "text": 0}
+    counts = {"error": 0, "fault_key_inside": 0, "fault_key_outside": 0, "text": 0,
+              "expected": 0}
+    # {step: {"exiting", "key"}} for each `exit` step: which of its two lines appeared.
+    found = {}
+    exit_windows = {service: data.exit_windows(service) for service in data.stderr}
+
+    def expected_exit(service, entry, matches):
+        """The `exit` step whose window holds `entry` and whose fields `matches` accepts."""
+        if entry.ts is None:
+            return None
+        return next((fault for start, end, fault in exit_windows.get(service, [])
+                     if start <= entry.ts <= end and matches(fault)), None)
+
     for service, entries in data.stderr.items():
+        after_expected_exit = False
         for entry in entries:
+            follows, after_expected_exit = after_expected_exit, False
+            if follows and entry.kind == "text" and entry.raw.startswith("Error: "):
+                counts["expected"] += 1
+                continue
             if entry.kind == "panic":
                 status = FAIL
                 lines.append(f"{service}: panic: {entry.raw[:200]}")
@@ -442,10 +501,18 @@ def check_self_log(data):
                 continue
             if entry.message == "exiting":
                 code = entry.fields.get("code")
-                if code not in (0, "0", None):
-                    status = FAIL
-                    lines.append(f"{service}: exiting with code {code} at {data.offset(entry.ts)}"
-                                 f": {entry.fields.get('reason', '')}")
+                if code in (0, "0", None):
+                    continue
+                fault = expected_exit(service, entry,
+                                      lambda f, code=code: str(f.code) == str(code))
+                if fault is not None:
+                    counts["expected"] += 1
+                    found.setdefault(fault.step, set()).add("exiting")
+                    after_expected_exit = True
+                    continue
+                status = FAIL
+                lines.append(f"{service}: exiting with code {code} at {data.offset(entry.ts)}"
+                             f": {entry.fields.get('reason', '')}")
                 continue
             if entry.key == "thread_panicked":
                 status = FAIL
@@ -462,33 +529,112 @@ def check_self_log(data):
                                  f"{entry.message[:160]}")
                 continue
             if entry.level == "ERROR":
+                fault = expected_exit(service, entry, lambda f: entry.key and f.key == entry.key)
+                if fault is not None:
+                    counts["expected"] += 1
+                    found.setdefault(fault.step, set()).add("key")
+                    continue
                 counts["error"] += 1
                 status = FAIL
                 lines.append(f"{service}: ERROR at {data.offset(entry.ts)}: "
                              f"key={entry.key or '-'} {entry.message[:160]}")
+    for service, windows_of in exit_windows.items():
+        for _, _, fault in windows_of:
+            have = found.get(fault.step, set())
+            missing = [label for what, label in (
+                ("exiting", f"exiting line with code {fault.code}"),
+                ("key", f"ERROR line keyed {fault.key}")) if what not in have]
+            if missing:
+                status = FAIL
+                lines.insert(0, f"expected exit did not happen: {service} logged no "
+                                f"{' and no '.join(missing)} in {fault.step}'s window")
     summary = (f"{counts['fault_key_inside']} sink fault line(s) inside fault windows, "
-               f"{counts['fault_key_outside']} outside, {counts['error']} other ERROR, "
-               f"{counts['text']} non-JSON")
+               f"{counts['fault_key_outside']} outside, {counts['expected']} expected-exit "
+               f"line(s), {counts['error']} other ERROR, {counts['text']} non-JSON")
     return Result("self_log", status, summary if status == PASS else f"{lines[0]} ({summary})",
                   lines)
 
 
+def readiness_word(output):
+    """The status word in a `logit ready` output: `ok` on success, else the word before ` (` in
+    `stalled (503 Service Unavailable)`; the first word of any other output, such as a failed
+    connection's, or None for none."""
+    words = (output or "").split()
+    return words[0] if words else None
+
+
+def health_samples(data):
+    """[(t, service, word)] from each `logit` service's `health_log`: the image HEALTHCHECK's
+    `logit ready`, timed at its `Start`, one per `Start`, since the watchdog records the newest
+    entry every 5 s and the check runs every 10 s."""
+    samples = {}
+    for record in data.watchdog:
+        entry = record.get("health_log")
+        service = record.get("svc")
+        if service not in LOGIT_SERVICES or not isinstance(entry, dict):
+            continue
+        t = parse_docker_time(entry.get("Start"))
+        if t is not None:
+            samples[(service, entry.get("Start"))] = (t, service,
+                                                      readiness_word(entry.get("Output")))
+    return sorted(samples.values(), key=lambda sample: sample[0])
+
+
 def check_ready(data):
+    """Readiness, from the status word `logit ready` reports in each `health_log` sample: `ok` in
+    every sample outside fault windows; at least one sample reading a `mark`'s `ready` word
+    inside that mark; and `degraded`, which means a node has exited, only inside an `exit` step.
+    A run whose watchdog recorded no `health_log` is judged on `Health.Status` instead. Every
+    start or unpause of a `logit` service is ready within `READY_WITHIN_S`."""
     if not data.watchdog:
         return Result("ready", SKIP, "no watchdog.jsonl")
     status = PASS
     lines = []
     judged = 0
-    for record in data.watchdog:
-        if record.get("svc") not in LOGIT_SERVICES or record.get("status") != "running":
-            continue
-        if not data.steady(record.get("t")):
-            continue
-        judged += 1
-        if record.get("health") != "healthy":
+    samples = health_samples(data)
+    marks = [f for f in data.faults if f.action == "mark" and f.ready]
+    # One line per mark whose word was read, for the detail.
+    seen = []
+    if samples:
+        for t, service, word in samples:
+            if word == "degraded" and not data.in_window(
+                    t, [(start, end) for start, end, _ in data.exit_windows(service)]):
+                status = FAIL
+                lines.append(f"{service} read degraded at {data.offset(t)}, outside every "
+                             "exit step: a node exited that no step expected")
+            elif data.steady(t):
+                judged += 1
+                if word != "ok":
+                    status = FAIL
+                    lines.append(f"{service} read {word} at {data.offset(t)}, outside every "
+                                 "fault window")
+        for mark in marks:
+            hits = [t for t, service, word in samples
+                    if service == mark.on and word == mark.ready and mark.start <= t <= mark.end]
+            if hits:
+                seen.append(f"{mark.step}: {mark.on} read {mark.ready} {len(hits)} time(s), "
+                            f"first at {data.offset(hits[0])}")
+            else:
+                status = FAIL
+                lines.insert(0, f"{mark.step}: {mark.on} never read {mark.ready} between "
+                                f"{data.offset(mark.start)} and {data.offset(mark.end)}")
+        source = f"{judged} readiness sample(s) read ok outside fault windows"
+    else:
+        for record in data.watchdog:
+            if record.get("svc") not in LOGIT_SERVICES or record.get("status") != "running":
+                continue
+            if not data.steady(record.get("t")):
+                continue
+            judged += 1
+            if record.get("health") != "healthy":
+                status = FAIL
+                lines.append(f"{record['svc']} health {record.get('health')} at "
+                             f"{data.offset(record['t'])}, outside every fault window")
+        for mark in marks:
             status = FAIL
-            lines.append(f"{record['svc']} health {record.get('health')} at "
-                         f"{data.offset(record['t'])}, outside every fault window")
+            lines.insert(0, f"{mark.step}: no health_log samples, so {mark.ready} can't be "
+                            "judged")
+        source = f"{judged} health sample(s) healthy outside fault windows (no health_log)"
     readies = [r for r in data.timeline if r.get("event") == "ready"]
     for record in readies:
         if not record.get("ok") or record.get("ready_s", 0) > READY_WITHIN_S:
@@ -497,10 +643,11 @@ def check_ready(data):
                          f"{'ready' if record.get('ok') else 'not ready'} after "
                          f"{record.get('ready_s')}s")
     slowest = max((r.get("ready_s", 0) for r in readies), default=None)
-    detail = (f"{judged} health sample(s) healthy outside fault windows; {len(readies)} "
-              "start(s) or unpause(s) ready in time"
+    detail = (f"{source}; {len(readies)} start(s) or unpause(s) ready in time"
               + (f", slowest ready {slowest:.1f}s" if slowest is not None else ""))
-    return Result("ready", status, detail if status == PASS else lines[0], lines)
+    if seen:
+        detail += "; " + "; ".join(seen)
+    return Result("ready", status, detail if status == PASS else lines[0], lines + seen)
 
 
 def check_progress(data):
@@ -533,7 +680,7 @@ def check_progress(data):
         if len(drains) < 3:
             continue
         interval = statistics.median(b - a for a, b in zip(drains, drains[1:]))
-        held = data.windows(on=service, actions=("stop", "kill", "pause", "restart"),
+        held = data.windows(on=service, actions=("stop", "kill", "pause", "restart", "exit"),
                             extend=False)
         for a, b in zip(drains, drains[1:]):
             if b - a > DRAIN_GAP_INTERVALS * interval and not any(
@@ -688,6 +835,9 @@ DEFAULT_BATCH_MAX_EVENTS = 1000
 # shutdown signal: the accumulator, the batch the listener holds while its send waits on a full
 # inbox, `aggregate`'s 64-slot inbox, and the batch `aggregate` has taken but not yet absorbed.
 RESIDUAL_BATCHES = 67
+# What a `lua` node between the listener and `aggregate` adds to that: its own 64-slot inbox and
+# the batch it has taken off it but not yet sent.
+SCRIPT_RESIDUAL_BATCHES = 65
 # The UDP listener's `warn` lines for datagrams it counted as `datagrams.dropped{reason=
 # "shutdown"}` after `internal`'s final drain (`crates/logit-inputs/src/udp.rs`: `ReadHalf`,
 # `ResidualOnDrop`, and `Undecoded`).
@@ -766,6 +916,13 @@ class Ledger:
         self.listener = cfg.get("sut_listener")
         self.aggregate = cfg.get("sut_aggregate")
         self.sink = cfg.get("sut_sink")
+        # The `lua` component between the listener and `aggregate`, or None.
+        self.script = cfg.get("sut_script")
+        # How the egress rows write the increments `aggregate` absorbed from the listener's
+        # events: with a script, its `flush()` events are absorbed too, and V excludes them.
+        self.ab_text = "Ab − L_flush" if self.script else "Ab"
+        self.residual_text = ("W − D − B − X − (L_drop + L_err) − (Ab − L_flush)" if self.script
+                              else "W − D − B − X − Ab")
         self.gen_input = cfg.get("generator_input")
         self.gen_sink = cfg.get("generator_sink")
         self.sut = data.telemetry.get("logit")
@@ -805,10 +962,24 @@ class Ledger:
         self.B = sut.counter_by_life("logit.component.diagnostics", component=listener,
                                      key="bad_line")
         self.E = sut.counter_by_life("logit.component.events.sent", component=listener)
+        # Events the listener counted as sent and then dropped, every reason: a batch sent into
+        # the inbox of a node that has failed is `closed_consumer`.
+        self.X = sut.counter_by_life("logit.component.events.dropped", component=listener)
         self.A = sut.counter_by_life("logit.component.events.received",
                                      component=self.aggregate)
         self.Ab = sut.counter_by_life("logit.transform.metrics.absorbed",
                                       component=self.aggregate)
+        if self.script:
+            script = self.script
+            self.L_in = sut.counter_by_life("logit.component.events.received", component=script)
+            # Counts events: an `emit_many` outcome adds one per event it returns.
+            self.L_emit = sut.counter_by_life("logit.script.events.emitted", component=script)
+            self.L_drop = sut.counter_by_life("logit.component.events.dropped", component=script,
+                                              reason="script_drop")
+            self.L_err = sut.counter_by_life("logit.component.errors", component=script,
+                                             reason="process")
+            self.L_flush = sut.counter_by_life("logit.component.flush.events", component=script)
+            self.L_sent = sut.counter_by_life("logit.component.events.sent", component=script)
 
         # The lives a scheduled `kill` ended, each the life in force when the kill was applied,
         # with the time it was.
@@ -861,8 +1032,9 @@ class Ledger:
         text = self._sut_config_text()
         max_datagrams = _yaml_int(text, "max_datagrams") or DEFAULT_MAX_DATAGRAMS
         batch_max = _yaml_int(text, "batch_max_events") or DEFAULT_BATCH_MAX_EVENTS
-        self.R = max_datagrams + RESIDUAL_BATCHES * batch_max
-        self.R_text = f"R {_n(self.R)} = {_n(max_datagrams)} + {RESIDUAL_BATCHES} x {_n(batch_max)}"
+        batches = RESIDUAL_BATCHES + (SCRIPT_RESIDUAL_BATCHES if self.script else 0)
+        self.R = max_datagrams + batches * batch_max
+        self.R_text = f"R {_n(self.R)} = {_n(max_datagrams)} + {batches} x {_n(batch_max)}"
         # The aggregate's configured window, in seconds, or None when the config doesn't say.
         self.interval = component_duration(text, self.aggregate or "", "interval")
 
@@ -890,15 +1062,34 @@ class Ledger:
         return self.get("D_tel", life) + self.get("D_log", life)
 
     def symbols(self, life):
+        script = ""
+        if self.script:
+            script = "".join(f"{symbol} {_n(self.get(symbol, life))}, " for symbol in (
+                "L_in", "L_emit", "L_drop", "L_err", "L_flush", "L_sent"))
         return (f"W {_n(self.get('W', life))}, K {_n(self.get('K', life))}, D {_n(self.D(life))} "
                 f"({_n(self.get('D_tel', life))} telemetry + {_n(self.get('D_log', life))} "
                 f"stderr), B {_n(self.get('B', life))}, E {_n(self.get('E', life))}, "
+                f"X {_n(self.get('X', life))}, {script}"
                 f"A {_n(self.get('A', life))}, Ab {_n(self.get('Ab', life))}, "
                 f"V {_n(self.get('V', life))}")
 
+    def absorbed(self, life):
+        """The increments `aggregate` absorbed from the listener's events: Ab, less a script's
+        `flush()` events, each of which carries one metric whose series V excludes."""
+        return self.get("Ab", life) - (self.get("L_flush", life) if self.script else 0)
+
+    def script_dropped(self, life):
+        """The events a script dropped (`script_drop`) or failed on (`errors{process}`), both
+        counted, 0 with no script."""
+        if not self.script:
+            return 0
+        return self.get("L_drop", life) + self.get("L_err", life)
+
     def residual(self, life):
-        """W − D − B − Ab: what a life read but didn't absorb by its last drain."""
-        return self.get("W", life) - self.D(life) - self.get("B", life) - self.get("Ab", life)
+        """What a life read but neither absorbed nor dropped, counted, by its last drain:
+        W − D − B − X − Ab, and with a script W − D − B − X − (L_drop + L_err) − (Ab − L_flush)."""
+        return (self.get("W", life) - self.D(life) - self.get("B", life) - self.get("X", life)
+                - self.script_dropped(life) - self.absorbed(life))
 
     def kill_band(self, life):
         """`(low, high, text)`: the Ab − V a killed life may show with nothing lost, from its
@@ -936,13 +1127,14 @@ class Ledger:
         """`(status, verdict, gap)` for one life's egress: `ok`, `counted`, `within band`,
         `surplus`, or `uncounted`.
 
-        The final life's gap is Ab − V. A stopped earlier life's is W − D − B − V, the residual
+        The final life's gap is Ab − V, and with a script Ab − L_flush − V, here and below. A
+        stopped earlier life's is W − D − B − X − V, less a script's counted drops, the residual
         plus Ab − V, because the close-time window delivers what that life read but hadn't
         absorbed by its last drain into V. A killed life has no close-time window and no `drain
         complete`: its gap is Ab − V alone, judged inside `kill_band`; below the band it is a
         surplus, above it uncounted loss. Its residual is what the kill lost from the receive
         queue and inbox, by design, and is reported, not judged here."""
-        gap = self.get("Ab", life) - self.get("V", life)
+        gap = self.absorbed(life) - self.get("V", life)
         if life in self.killed and life != self.final:
             low, high, _ = self.kill_band(life)
             if gap == 0:
@@ -1108,8 +1300,8 @@ def _per_life_lines(led):
 
 
 def check_ledger_intake(data):
-    """The final life's W − D == E + B; each earlier life's W − D − B − Ab in [0, R], a sanity
-    bound. `ledger.egress` ties that residual to V."""
+    """The final life's W − D == E + B; each earlier life's residual (`Ledger.residual`) in
+    [0, R], a sanity bound. `ledger.egress` ties that residual to V."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.intake", led)
     if skipped:
@@ -1126,7 +1318,7 @@ def check_ledger_intake(data):
     for earlier in led.lives[:-1]:
         residual = led.residual(earlier)
         ok = 0 <= residual <= led.R
-        parts.append(f"life {earlier}: W − D − B − Ab {_n(residual)} "
+        parts.append(f"life {earlier}: {led.residual_text} {_n(residual)} "
                      f"{'within' if ok else 'outside'} [0, R]")
         if not ok:
             status = FAIL
@@ -1154,8 +1346,51 @@ def _final_equality(data, check_id, left, right, what):
 
 
 def check_ledger_edge(data):
-    """The final life's E == A, a single-consumer edge."""
+    """The final life's E == A, a single-consumer edge; with a script, L_sent == A, the edge
+    from the script to `aggregate`, and `ledger.script` judges the listener's edge."""
+    if data.ledger.get("sut_script"):
+        return _final_equality(data, "ledger.edge", "L_sent", "A", "script to aggregate")
     return _final_equality(data, "ledger.edge", "E", "A", "listener to aggregate")
+
+
+def check_ledger_script(data):
+    """For a `[ledger] sut_script`, else SKIP, the final life's script hop: E == L_in (the
+    listener's edge), L_in == L_emit + L_drop + L_err (every event emitted, dropped, or failed
+    on), and L_sent == L_emit + L_flush (what it sent is what `process()` emitted plus what
+    `flush()` returned). Earlier lives are reported."""
+    if not data.ledger.get("sut_script"):
+        return Result("ledger.script", SKIP, "no [ledger] sut_script")
+    led = _ledger(data)
+    skipped = _skip_without_sut("ledger.script", led)
+    if skipped:
+        return skipped
+    g = led.get
+
+    def identities(life):
+        return [
+            ("E == L_in", g("E", life), g("L_in", life)),
+            ("L_in == L_emit + L_drop + L_err", g("L_in", life),
+             g("L_emit", life) + g("L_drop", life) + g("L_err", life)),
+            ("L_sent == L_emit + L_flush", g("L_sent", life),
+             g("L_emit", life) + g("L_flush", life)),
+        ]
+
+    lines = []
+    for life in led.lives:
+        shown = ", ".join(f"{name.split(' == ')[0]} {_n(a)} vs {_n(b)}"
+                          for name, a, b in identities(life))
+        lines.append(f"life {life}{' (final)' if life == led.final else ' (reported, not judged)'}"
+                     f": {shown}; {led.symbols(life)}")
+    life = led.final
+    off = [f"{name} off by {_n(a - b)} ({_n(a)} vs {_n(b)})"
+           for name, a, b in identities(life) if a != b]
+    summary = (f"final life {life}: E {_n(g('E', life))} == L_in {_n(g('L_in', life))} == L_emit "
+               f"{_n(g('L_emit', life))} + L_drop {_n(g('L_drop', life))} + L_err "
+               f"{_n(g('L_err', life))}; L_sent {_n(g('L_sent', life))} == L_emit + L_flush "
+               f"{_n(g('L_flush', life))}")
+    if off:
+        return Result("ledger.script", FAIL, f"final life {life}: {'; '.join(off)}", lines)
+    return Result("ledger.script", PASS, summary, lines)
 
 
 def check_ledger_aggregate(data):
@@ -1164,7 +1399,7 @@ def check_ledger_aggregate(data):
 
 
 def check_ledger_egress(data):
-    """The egress gap per life, Ab − V for the final life and a killed one, and W − D − B − V
+    """The egress gap per life, Ab − V for the final life and a killed one, and W − D − B − X − V
     for a stopped earlier one: 0 passes; a positive gap with that life's `drain complete`
     `batches_dropped` above 0 is counted, never reconciled; a killed life's gap passes inside
     `Ledger.kill_band`; any other gap is uncounted loss, or a surplus below a killed life's
@@ -1182,20 +1417,22 @@ def check_ledger_egress(data):
         verdict_status, verdict, gap = led.egress(life)
         status = worst([status, verdict_status])
         dropped = led.batches_dropped.get(life, 0)
-        ab_v = led.get("Ab", life) - led.get("V", life)
+        ab_v = led.absorbed(life) - led.get("V", life)
+        flush = f" (L_flush {_n(led.get('L_flush', life))})" if led.script else ""
+        absorbed = f"{led.ab_text} {_n(led.absorbed(life))}{flush} − V {_n(led.get('V', life))}"
         if life == led.final:
-            part = (f"life {life} (final): Ab {_n(led.get('Ab', life))} − V "
-                    f"{_n(led.get('V', life))} = {_n(gap)}, {verdict}")
+            part = f"life {life} (final): {absorbed} = {_n(gap)}, {verdict}"
         elif life in led.killed:
             _, _, band = led.kill_band(life)
-            part = (f"life {life} (killed): Ab {_n(led.get('Ab', life))} − V "
-                    f"{_n(led.get('V', life))} = {_n(gap)}, {verdict} ({band}); residual "
-                    f"W − D − B − Ab {_n(led.residual(life))} at its last drain, what the kill "
-                    "lost from the receive queue and inbox, by design, not judged here; D has "
-                    "no stderr part: a SIGKILL logs no shutdown drops")
+            part = (f"life {life} (killed): {absorbed} = {_n(gap)}, {verdict} ({band}); residual "
+                    f"{led.residual_text} {_n(led.residual(life))} at its last drain, what the "
+                    "kill lost from the receive queue and inbox, by design, not judged here; D "
+                    "has no stderr part: a SIGKILL logs no shutdown drops")
         else:
-            part = (f"life {life}: W − D − B − V {_n(gap)} = residual "
-                    f"{_n(led.residual(life))} + Ab − V {_n(ab_v)}, {verdict}")
+            whole = ("W − D − B − X − (L_drop + L_err) − V" if led.script
+                     else "W − D − B − X − V")
+            part = (f"life {life}: {whole} {_n(gap)} = residual "
+                    f"{_n(led.residual(life))} + {led.ab_text} − V {_n(ab_v)}, {verdict}")
         if gap > 0 and not (life in led.killed and life != led.final):
             part += f" (drain complete batches_dropped {_n(dropped)})"
         parts.append(part)
@@ -1225,34 +1462,50 @@ def check_ledger_egress(data):
 
 def check_ledger_summary(data):
     """The final life's uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), which must
-    be 0, with wire loss beside it by design. A counted egress term is shown and not judged;
-    on an external target the Ab − V term SKIPs, and the row judges the other three."""
+    be 0, with wire loss beside it by design. With a script, E − A becomes its four script terms
+    (`check_ledger_script`'s three identities and L_sent − A), the egress term is
+    Ab − L_flush − V, and the script's drops and errors are shown beside it, counted. A counted
+    egress term is shown and not judged; on an external target the Ab − V term SKIPs, and the
+    row judges the others."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.summary", led)
     if skipped:
         return skipped
     life = led.final
     g = led.get
-    terms = [
-        ("W − D − E − B", g("W", life) - led.D(life) - g("E", life) - g("B", life)),
-        ("E − A", g("E", life) - g("A", life)),
-        ("A − Ab", g("A", life) - g("Ab", life)),
-    ]
+    terms = [("W − D − E − B", g("W", life) - led.D(life) - g("E", life) - g("B", life))]
+    if led.script:
+        terms += [
+            ("E − L_in", g("E", life) - g("L_in", life)),
+            ("L_in − L_emit − L_drop − L_err",
+             g("L_in", life) - g("L_emit", life) - g("L_drop", life) - g("L_err", life)),
+            ("L_emit + L_flush − L_sent", g("L_emit", life) + g("L_flush", life)
+             - g("L_sent", life)),
+            ("L_sent − A", g("L_sent", life) - g("A", life)),
+        ]
+    else:
+        terms.append(("E − A", g("E", life) - g("A", life)))
+    terms.append(("A − Ab", g("A", life) - g("Ab", life)))
     shown = [f"{name} {_n(value)}" for name, value in terms]
     if data.external:
         judged = sum(value for _, value in terms)
-        shown.append(f"Ab − V SKIP ({NO_BACKEND})")
+        shown.append(f"{led.ab_text} − V SKIP ({NO_BACKEND})")
     else:
         _, verdict, egress_gap = led.egress(life)
         counted = verdict == "counted"
         judged = sum(value for _, value in terms) + (0 if counted else egress_gap)
-        shown.append(f"Ab − V {_n(egress_gap)}" + (" counted" if counted else ""))
+        shown.append(f"{led.ab_text} − V {_n(egress_gap)}" + (" counted" if counted else ""))
+    counted_script = ""
+    if led.script:
+        counted_script = (f"; the script's L_drop {_n(g('L_drop', life))} and L_err "
+                          f"{_n(g('L_err', life))}, counted")
     wire = ""
     if led.gen is not None:
         wire = (f"; wire G − (W + K) {_n(led.G - sum(led.W.values()) - sum(led.K.values()))} "
                 "over the run, by design")
     status = PASS if judged == 0 else FAIL
-    detail = f"final life {life}: uncounted {_n(judged)} = " + " + ".join(shown) + wire
+    detail = (f"final life {life}: uncounted {_n(judged)} = " + " + ".join(shown)
+              + counted_script + wire)
     return Result("ledger.summary", status, detail, _per_life_lines(led))
 
 
@@ -1868,9 +2121,9 @@ def check_expect(data):
 CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_intake,
-    check_ledger_edge, check_ledger_aggregate, check_ledger_egress, check_ledger_windows,
-    check_ledger_replay, check_ledger_summary, check_ledger_sent, check_identity_sink,
-    check_recovery, check_expect,
+    check_ledger_edge, check_ledger_script, check_ledger_aggregate, check_ledger_egress,
+    check_ledger_windows, check_ledger_replay, check_ledger_summary, check_ledger_sent,
+    check_identity_sink, check_recovery, check_expect,
 )
 
 
