@@ -279,6 +279,27 @@ async fn message_too_large_halves_the_batch_once() {
     assert_eq!((last.producer_epoch, last.base_sequence, last.records), (3, 0, 1));
 }
 
+/// A half of several records answered `MESSAGE_TOO_LARGE` again is rejected, not halved again:
+/// the split happens once per partition batch.
+#[tokio::test]
+async fn message_too_large_on_a_half_is_rejected_not_split_again() {
+    let cluster = cluster(1, &[0]).await;
+    let mut producer = Producer::new(config(&cluster)).unwrap();
+    cluster.script(Step::produce(None, Action::Error(code::MESSAGE_TOO_LARGE)));
+    cluster.script(Step::produce(None, Action::Error(code::MESSAGE_TOO_LARGE)));
+    let mut pending = prepare(&mut producer, keyed_for(0, 1, 4)).await;
+    assert_eq!(class(&producer.attempt(&mut pending).await), Some(Fault::Clean));
+    let attempt = producer.attempt(&mut pending).await;
+    assert_eq!(class(&attempt), Some(Fault::Clean), "the second half waits behind the first");
+    assert_eq!(pending.parts.len(), 2, "no second split");
+    assert_eq!(
+        (attempt.settled[0].records, &attempt.settled[0].settlement),
+        (2, &Settlement::Rejected { code: code::MESSAGE_TOO_LARGE })
+    );
+    assert_eq!(class(&producer.attempt(&mut pending).await), None);
+    assert_eq!(values_in(&cluster, 0).len(), 2);
+}
+
 #[tokio::test]
 async fn message_too_large_on_one_record_is_rejected() {
     let cluster = cluster(1, &[0]).await;
@@ -305,15 +326,18 @@ async fn named_records_are_dropped_and_the_rest_resent_once() {
         let last = received(&cluster).pop().unwrap();
         assert_eq!((last.producer_epoch, last.base_sequence), (1, 0));
 
-        // A rejection of the resend settles it.
+        // Records named again in the resend: the remainder is rejected whole, not trimmed and
+        // resent a second time.
         cluster.script(Step::produce(None, Action::RecordErrors(invalid, vec![0])));
         cluster.script(Step::produce(None, Action::RecordErrors(invalid, vec![0])));
-        send_expecting(
-            &mut producer,
-            keyed_for(0, 1, 2),
-            &[Some(Fault::Clean), Some(Fault::Rejected)],
-        )
-        .await;
+        let mut pending = prepare(&mut producer, keyed_for(0, 1, 3)).await;
+        assert_eq!(class(&producer.attempt(&mut pending).await), Some(Fault::Clean));
+        let attempt = producer.attempt(&mut pending).await;
+        assert_eq!(class(&attempt), Some(Fault::Rejected), "{:?}", attempt.result);
+        assert_eq!(
+            (attempt.settled[0].records, &attempt.settled[0].settlement),
+            (2, &Settlement::Rejected { code: invalid })
+        );
     }
 }
 
