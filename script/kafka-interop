@@ -263,6 +263,20 @@ for broker in "${BROKERS[@]}"; do
     done
 done
 
+# The codec each stored batch carries, for the codec legs. Kafka's segment files are in its own
+# batch format, so kafka-dump-log.sh reads them; Redpanda's aren't, so rpk prints each record's
+# batch attributes as the broker serves them on a fetch. Both brokers default
+# `compression.type` to `producer`, so a stored batch keeps the codec the sink sent.
+say "reading each codec topic's stored batch codec"
+for codec in none gzip snappy lz4 zstd; do
+    kafka_tool kafka-dump-log.sh \
+        --files "/tmp/kraft-combined-logs/codec-${codec}-0/00000000000000000000.log" \
+        >"${RUN_DIR}/readback/kafka/codec-${codec}.batches" 2>>"${RUN_DIR}/logs/readback.log" || true
+    ki_compose exec -T redpanda rpk topic consume "codec-${codec}" -X brokers=redpanda:9092 \
+        -o start -n 100 -f 'offset: %o compression: %a{compression}\n' \
+        >"${RUN_DIR}/readback/redpanda/codec-${codec}.batches" 2>>"${RUN_DIR}/logs/readback.log" || true
+done
+
 collect_logs
 say "checking the legs"
 status=0

@@ -2,7 +2,7 @@
 # `codec-none`, `codec-gzip`, `codec-snappy`, `codec-lz4`, and `codec-zstd`, one sink per
 # `compression`, each fed by its own generator. The script reads each topic back with
 # `kafka-console-consumer.sh` (the Java client) and with kcat (librdkafka), and `check.py` checks
-# both decoded every record.
+# both decoded every record and that the broker stored each topic's batches under its codec.
 admin: { bind: 127.0.0.1:9600 }
 
 components:

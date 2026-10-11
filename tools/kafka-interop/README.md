@@ -30,8 +30,8 @@ The legs, each run against both brokers:
 | Leg | Config | What it checks |
 |---|---|---|
 | `parity` | `logit-parity-*.yaml` | 200 events keyed by 50 `user` values land on the same partitions of a 6-partition topic as the same keys from `kafka-console-producer.sh` |
-| `codec-<c>` | `logit-codecs-*.yaml` | 100 events under each `compression` (`none`, `gzip`, `snappy`, `lz4`, `zstd`) decode in both the Java consumer and kcat, each event once |
-| `dedup` | `logit-dedup-*.yaml` | while the broker's packets to this leg are dropped, an idempotent sink's resend after an `Ambiguous` attempt stores no duplicate; a non-idempotent control sink beside it does |
+| `codec-<c>` | `logit-codecs-*.yaml` | 100 events under each `compression` (`none`, `gzip`, `snappy`, `lz4`, `zstd`) are stored under that codec, and decode in both the Java consumer and kcat, each event once |
+| `dedup` | `logit-dedup-*.yaml` | while the broker's packets to this leg are dropped, an idempotent sink's resend after an `Ambiguous` attempt stores no duplicate, and a non-idempotent control sink beside it stores at least one |
 | `tls`, `mtls`, `mtls-required` | `logit-tls-*.yaml` | 50 events over server TLS and over mutual TLS from the run's private CA; a sink with no client certificate stores nothing |
 | `timestamp` | `logit-timestamp-*.yaml` | in each batch of 10, the event stamped at 2100-01-01 is dropped and counted as `invalid_timestamp`, and the other nine land |
 
@@ -59,15 +59,30 @@ another sink in the same process.
    until a signal, so no leg ends on its own; the stop drains its sinks and writes its last
    telemetry.
 6. Reads every topic on both brokers back with `kafka-get-offsets.sh`,
-   `kafka-console-consumer.sh`, and kcat, then runs `check.py` with `python3 -I` in a
-   `python:3.12-slim` container. `check.py` reads only the run directory.
+   `kafka-console-consumer.sh`, and kcat. For each codec topic it also reads the codec each
+   stored batch carries: `kafka-dump-log.sh` over Kafka's segment file, and
+   `rpk topic consume -f '%a{compression}'` against Redpanda, whose segments aren't in Kafka's
+   file format, so rpk reports each record's batch codec as Redpanda serves it on a fetch. Both
+   brokers keep the producer's codec (`compression.type: producer`, the default). It then runs
+   `check.py` with `python3 -I` in a `python:3.12-slim` container. `check.py` reads only the
+   run directory.
 7. Clears the netem rules and tears the project down (`down -v --remove-orphans`) on every
    exit.
 
 A row is `PASS` (the leg did what the plan expects), `GAP` (the broker differs from Apache Kafka
-in a way [`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md) records), or `FAIL`. The
-`dedup` leg fails if the idempotent sink made no `Ambiguous` attempt, because then nothing was
-resent and the leg proves nothing. The script exits 1 on any `FAIL`.
+in a way [`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md) records), or `FAIL`. Only
+Redpanda's `timestamp` row can read `GAP`; Apache Kafka is the reference, so any other outcome
+there is a `FAIL`. The script exits 1 on any `FAIL`.
+
+Each leg fails when it can't prove what it checks:
+
+- A `codec-<c>` row fails if no stored batch codec was read, or if any stored batch carries a
+  codec other than `<c>`. Both consumers decode any codec, so the read-back alone can't show
+  that `compression:` reached the wire.
+- The `dedup` row fails if the idempotent sink made no `Ambiguous` attempt, or if the control
+  stored no duplicate or lost an event. Without an `Ambiguous` attempt nothing was resent; without
+  the control's duplicate, the fault never hit a batch the broker had appended, so the
+  idempotent sink's resends never reached the broker's duplicate check.
 
 A run writes `perf/results/kafka-interop/<timestamp>/` (gitignored, or under
 `KAFKA_INTEROP_OUT`):
@@ -78,6 +93,7 @@ A run writes `perf/results/kafka-interop/<timestamp>/` (gitignored, or under
 | `readback/<broker>/<topic>.java.tsv` | `kafka-console-consumer.sh` with the timestamp, partition, offset, and key printed |
 | `readback/<broker>/<topic>.kcat.tsv` | kcat's `%p\t%o\t%T\t%k\t%s` |
 | `readback/<broker>/<topic>.offsets` | `kafka-get-offsets.sh`, one `topic:partition:offset` per partition |
+| `readback/<broker>/codec-<c>.batches` | each codec topic's stored codec: `kafka-dump-log.sh` output for Kafka, one `offset: <o> compression: <c>` line per record for Redpanda |
 | `<leg>-<broker>-telemetry.log` | each leg's `internal` telemetry, `stdio_out` `format: json` |
 | `exits.txt`, `timeline.log`, `netem.log` | each leg's exit code, the run's phases, and the qdiscs and filters each netem step set |
 | `provenance.txt`, `logs/<service>.log`, `tls/` | image digests and versions, every service's log, and the run's certificates |

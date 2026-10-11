@@ -11,6 +11,10 @@ script has already written, under /out (the run directory):
                                         value
     readback/<broker>/<topic>.kcat.tsv  kcat -f '%p\\t%o\\t%T\\t%k\\t%s\\n'
     readback/<broker>/<topic>.offsets   kafka-get-offsets.sh: `<topic>:<partition>:<end offset>`
+    readback/kafka/codec-<c>.batches    kafka-dump-log.sh over the topic's first segment: one
+                                        `baseOffset: ... compresscodec: <c> ...` line per batch
+    readback/redpanda/codec-<c>.batches rpk topic consume -f 'offset: %o compression:
+                                        %a{compression}\n': each record's batch codec
     <leg>-<broker>-telemetry.log        each leg's `internal` telemetry, `stdio_out` `format: json`
     exits.txt                           `<service> <exit code>` per leg
 
@@ -21,6 +25,7 @@ a way docs/known-gaps/kafka.md records), or FAIL. Exits 1 on any FAIL.
 
 import json
 import pathlib
+import re
 import sys
 
 OUT = pathlib.Path("/out")
@@ -103,6 +108,28 @@ def end_offsets(broker, topic):
         if len(parts) == 3 and parts[2].isdigit():
             total += int(parts[2])
     return total
+
+
+_DUMP_CODEC = re.compile(r"\bcompresscodec: (\S+)")
+_RPK_CODEC = re.compile(r"^offset: \d+ compression: (\S+)$")
+
+
+def stored_codecs(broker, topic):
+    """The codec of each stored batch (Kafka) or of each record's batch (Redpanda), in order."""
+    path = OUT / "readback" / broker / f"{topic}.batches"
+    if not path.exists():
+        return []
+    codecs = []
+    for line in path.read_text(errors="replace").splitlines():
+        if broker == "kafka":
+            if line.startswith("baseOffset:"):
+                match = _DUMP_CODEC.search(line)
+                codecs.append(match.group(1) if match else "?")
+        else:
+            match = _RPK_CODEC.match(line.strip())
+            if match:
+                codecs.append(match.group(1))
+    return codecs
 
 
 # ---- telemetry ---------------------------------------------------------------------------------
@@ -194,7 +221,16 @@ def leg_codec(broker, codec):
             return "FAIL", (f"{reader} read {n} records ({len(seqs)} distinct), want "
                             f"{CODEC_EVENTS}; end offsets {held}")
         results.append(f"{reader} {n}")
-    return "PASS", f"{', '.join(results)} records, each event once; end offsets {held}"
+    stored = stored_codecs(broker, topic)
+    unit = "batch(es)" if broker == "kafka" else "record(s)"
+    wrong = sorted({c for c in stored if c != codec})
+    if not stored:
+        return "FAIL", f"no stored batch codec read for {topic}, so the codec is unproven"
+    if wrong:
+        return "FAIL", (f"{sum(c != codec for c in stored)} of {len(stored)} stored {unit} "
+                        f"carry {', '.join(wrong)}, not {codec}")
+    return "PASS", (f"{', '.join(results)} records, each event once; all {len(stored)} stored "
+                    f"{unit} carry {codec}; end offsets {held}")
 
 
 def leg_dedup(broker):
@@ -214,6 +250,13 @@ def leg_dedup(broker):
               f"requests {shown(idem)}; {control_text}")
     if not idem.get("ambiguous"):
         return "FAIL", f"no Ambiguous attempt, so nothing was resent and the leg proves nothing; {detail}"
+    # The control's duplicate is the proof that the fault hit a batch the broker had appended:
+    # without one, the idempotent sink's resends may never have reached the broker's dedup check.
+    if control_seqs != set(range(DEDUP_EVENTS)):
+        return "FAIL", f"the control lost {DEDUP_EVENTS - len(control_seqs)} event(s); {detail}"
+    if control_n <= len(control_seqs):
+        return "FAIL", (f"the control stored no duplicate, so the fault never hit an appended "
+                        f"batch and the leg proves nothing; {detail}")
     if seqs != set(range(DEDUP_EVENTS)):
         return "FAIL", f"{DEDUP_EVENTS - len(seqs)} event(s) missing; {detail}"
     if n != DEDUP_EVENTS:
@@ -256,19 +299,17 @@ def leg_timestamp(broker):
         return "PASS", detail
     rejected = telemetry_sum(events, "logit.output.records.dropped", component="timestamp",
                              reason="rejected")
-    if n == 0 and dropped == 0 and rejected == TIMESTAMP_EVENTS:
+    if broker == "redpanda" and n == 0 and dropped == 0 and rejected == TIMESTAMP_EVENTS:
         # docs/known-gaps/kafka.md: a broker that names no record in `record_errors` gets the
         # whole partition batch rejected, counted, under ADR `kafka-output` item 5.
         return "GAP", (f"the broker answered INVALID_TIMESTAMP naming no record, so every "
                        f"batch was rejected whole: records.dropped{{reason=rejected}} {rejected}; "
                        f"{detail}")
-    if seqs == set(range(TIMESTAMP_EVENTS)) and dropped == 0:
-        return "GAP", f"the broker stored the future-stamped records; {detail}"
     return "FAIL", detail
 
 
 LEGS = [("parity", "partition parity with kafka-console-producer.sh", leg_parity)]
-LEGS += [(f"codec-{c}", f"compression: {c}, read by Java and kcat",
+LEGS += [(f"codec-{c}", f"compression: {c} stored, read by Java and kcat",
           lambda b, c=c: leg_codec(b, c)) for c in CODECS]
 LEGS += [
     ("dedup", "idempotent resend under netem response loss", leg_dedup),
