@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-07
+updated: 2026-10-11
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -82,8 +82,8 @@ Only `Counter` (`|c`) and `Gauge`/`GaugeDelta` (`|g`) are encoded. `Distribution
 
 **This means a `statsd_in -> aggregate -> statsd_out` relay drops every timer metric today.**
 `ms`/`h`/`d` on the wire all decode to `MetricKind::Distribution`
-(`logit_inputs::statsd::build_event`), so the single most common statsd workload — timers — makes
-it through the input and the aggregator, then dies at this sink, loudly counted but dropped.
+(`build_event`, now in `logit_proto::statsd`), so the single most common statsd workload — timers —
+makes it through the input and the aggregator, then dies at this sink, loudly counted but dropped.
 Deferred rather than guessed at: the aggregator's `DdSketch` no longer holds the original samples
 it merged, so "how does a merged sketch become one or more statsd lines" is a real design
 question — emit one line per fixed quantile (losing the ability to compute an arbitrary
@@ -396,7 +396,8 @@ both new segments: `a_single_value_samples_metric_encodes_as_name_colon_value_pi
 fixed point (`mod fixed_point::decode_encode_decode_is_a_fixed_point`, 200 generated cases over
 `c`/`g`/`ms`/`h`/`d`/`s` lines with an optional rate/tags/container id/timestamp) pinning
 `decode(encode(decode(line))) == decode(line)` and `encode(decode(line))` as a fixed point of
-`encode . decode`. `crates/logit-inputs/src/statsd.rs` gained the matching decode-side coverage:
+`encode . decode`. `crates/logit-inputs/src/statsd.rs` (whose decoder and tests now live in
+`crates/logit-proto/src/statsd/decode.rs`) gained the matching decode-side coverage:
 `timer_becomes_a_single_sample_distribution`,
 `sampled_distribution_at_half_rate_preserves_the_rate_without_extrapolating`/
 `sampled_distribution_at_tenth_rate_preserves_the_rate_without_extrapolating`,
@@ -514,7 +515,8 @@ ordinary lines, right after the `_sc` line — only the first metric is claimed 
 
 ### Closing test enumeration
 
-`crates/logit-inputs/src/statsd.rs` gained: `dogstatsd_docs_example_event_decodes`,
+`crates/logit-inputs/src/statsd.rs` (now `crates/logit-proto/src/statsd/decode.rs`) gained:
+`dogstatsd_docs_example_event_decodes`,
 `dogstatsd_docs_example_service_check_decodes`, `event_with_every_optional_field_decodes`,
 `event_text_containing_pipe_colon_and_an_escaped_newline_decodes`,
 `event_title_length_running_past_the_line_is_rejected`,
@@ -649,7 +651,8 @@ that round-trips a multi-valued tag reproduces the exact token order the sender 
 
 ### Closing test enumeration
 
-`crates/logit-inputs/src/statsd.rs` gained: a repeated tag key folding into an `Array` in wire order
+`crates/logit-inputs/src/statsd.rs` (now `crates/logit-proto/src/statsd/decode.rs`) gained: a
+repeated tag key folding into an `Array` in wire order
 (`#team:a,team:b` -> `Array[Str("a"), Str("b")]`); an exact duplicate deduping instead of folding
 (`#team:a,team:a` -> `Str("a")`, no `Array`); a bare/valued mix folding in order in both directions
 (`#urgent,urgent:1` and `#urgent:1,urgent`); three occurrences folding into three elements; the same

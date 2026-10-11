@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-09-14
+updated: 2026-10-11
 ---
 
 # `syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS
@@ -296,7 +296,9 @@ a differently-shaped metric for the same event.
   comment and `SyslogTransport`'s (currently `syslog_out`-only) are rewritten to describe both
   directions. `schema/logit.schema.json` regenerated.
 - `crates/logit-inputs/src/tcp.rs` (new): the generic `TcpListener<D>` driver and its
-  `Framing`/framer, described above; `pub mod tcp;` in `crates/logit-inputs/src/lib.rs`.
+  `Framing`/framer, described above; `pub mod tcp;` in `crates/logit-inputs/src/lib.rs`. The
+  framer has since moved to `crates/logit-proto/src/framing.rs`, and the decoder to
+  `crates/logit-proto/src/syslog/`.
   `crates/logit-inputs/src/syslog.rs`: `SyslogInput::tcp`, `with_tls`, `with_line_splitting` wiring.
 - `crates/logit-outputs/src/syslog.rs`: `Conn::Tcp`'s boxed stream, `SyslogOutput::with_tls`,
   `logit.output.reconnects`. `crates/logit-outputs/src/tls.rs`: `AsyncStream` and `host_only`

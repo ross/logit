@@ -51,8 +51,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   payload at any `0x0A` byte (see the HAProxy "CBOR" entry under
   [HTTP access logs](transforms.md#http-access-logs-nginx-haproxy-and-http_access)).
   - **Workaround:** `transport: tcp`. `SyslogInput::tcp` turns line splitting off
-    (`SyslogDecoder::with_line_splitting(false)`), and `logit-inputs::tcp::TcpListener`'s
-    octet-counting `Framer` delimits by declared length
+    (`SyslogDecoder::with_line_splitting(false)`), and the octet-counting `Framer`
+    (`logit_proto::framing`) that `logit-inputs::tcp::TcpListener` drives delimits by declared
+    length
     ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)), so a `0x0A` inside
     an octet-counted MSG survives end to end. The HAProxy CBOR entry records why the decoder that
     would consume such a payload was measured and not built.

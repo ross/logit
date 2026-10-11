@@ -764,7 +764,7 @@ certificate's expiry) and `tls_reload_failed` (throttled, naming the file and wh
 
 ##### `statsd_in`
 
-`crates/logit-inputs/src/statsd.rs`.
+`crates/logit-inputs/src/statsd.rs`, with its decoder in `crates/logit-proto/src/statsd/`.
 
 **Under `transport: udp`:** `logit.input.datagrams`, `logit.input.datagram.bytes`, and
 `logit.input.reads`, the per-datagram and per-syscall detail `Fanout`'s per-batch view can't see.
@@ -812,7 +812,7 @@ component, not `statsd_in`'s.
 
 ##### `syslog_in`
 
-`crates/logit-inputs/src/syslog.rs`.
+`crates/logit-inputs/src/syslog.rs`, with its decoder in `crates/logit-proto/src/syslog/`.
 
 **Under `transport: udp`:** the same trio as `statsd_in`, `logit.input.datagrams`/
 `.datagram.bytes`/`.reads`.

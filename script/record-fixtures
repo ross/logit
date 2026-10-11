@@ -1,7 +1,8 @@
 #!/bin/bash
 # Usage: script/record-fixtures [producer ...]
 #   Producers: logger, python-syslog-handler, rsyslog, rsyslog-tcp, collectd, otlp, graphite (also
-#              graphite-p0, graphite-py2, graphite-dropwizard, one capture each), prometheus, prometheus-scrape, vmagent, statsd, datadog (= datadog-agent, datadog-tracer,
+#              graphite-p0, graphite-py2, graphite-dropwizard, one capture each), prometheus,
+#              prometheus-scrape, vmagent, statsd, datadog (= datadog-agent, datadog-tracer,
 #              datadog-dogstatsd-unix), splunk (= splunk-otel, splunk-docker, splunk-sc4s,
 #              splunk-java, then check_splunk_capture.py)
 #   With no arguments, records every producer in `all` below.
@@ -142,7 +143,7 @@ record_rsyslog() {
 # rsyslog over TCP: the same entrypoint with rsyslog-tcp.conf, whose `omfwd` sets no
 # `TCP_Framing`, so rsyslog sends its default RFC 6587 §3.4.2 non-transparent (LF-terminated)
 # framing. That stock default is what this fixture checks the auto-detecting `Framer`
-# (crates/logit-inputs/src/tcp.rs) against. One connection, so one file with one message.
+# (crates/logit-proto/src/framing.rs) against. One connection, so one file with one message.
 record_rsyslog_tcp() {
     echo "== recording: rsyslog (TCP, non-transparent framing) =="
     local out="${OUT_ROOT}/syslog"

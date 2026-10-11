@@ -1,6 +1,6 @@
 ---
 created: 2026-09-07
-updated: 2026-10-09
+updated: 2026-10-11
 ---
 
 # `logfmt` and `kv`: the de-facto key=value parsers, and why they stay two kinds
@@ -98,9 +98,10 @@ separately, merge only on full success" shape, so a line that fails partway (an 
 never leaves `event.attributes` half-populated.
 
 **Allocation posture: a hand-rolled scanner that tracks its own byte offsets, not the
-pointer-range `logit_core::subslice::share` that `syslog.rs` and `json.rs` use.** Neither of those
-existing precedents' constraints apply here: `syslog.rs` calls `share` because `str::split` hands
-back offset-less `&str`s, and `json.rs` calls it because `serde_json` may hand back an unescape
+pointer-range `logit_core::subslice::share` that `logit_proto::syslog` and
+`logit_proto::message::json` use.** Neither of those existing precedents' constraints apply here:
+the syslog decoder calls `share` because `str::split` hands back offset-less `&str`s, and the
+JSON parser calls it because `serde_json` may hand back an unescape
 scratch buffer outside the input buffer, which `share` copies. This scanner never
 loses its own indices, so every unquoted or escape-free-quoted value is a plain, infallible
 `raw.slice(a..b)` -- a `Bytes` refcount bump, not a copy. Every key is interned straight off the

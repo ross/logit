@@ -681,7 +681,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 |---|---|
 | `script/bootstrap` | Build the dev container image (run first, or after touching `Dockerfile.dev`) |
 | `script/test [args]` | `cargo nextest run --workspace` |
-| `script/lint` | `cargo clippy --workspace --all-targets -- -D warnings` |
+| `script/lint` | `cargo clippy --workspace --all-targets -- -D warnings`, then `cargo check` over `fuzz/`'s own workspace |
 | `script/format [--check]` | `cargo fmt --all` |
 | `script/check [test args]` | Routine format-check + lint + workspace tests, in one dev container |
 | `script/schema` | Regenerate `schema/logit.schema.json` — run after any `logit-config` type change, and commit the result |
@@ -968,7 +968,7 @@ crates/
   logit-core        internal event model: Event, Value, Resource, metric kinds, interner, self-telemetry
   logit-config      YAML config types + generated JSON Schema
   logit-script      LuaJIT embedding (mlua), the Event proxy
-  logit-proto       codec traits, native wire format, output buffering, statsd (statsd_in's decoder), syslog (syslog_in's decoder), message (the json, csv, logfmt, and kv parse cores the transforms wrap)
+  logit-proto       codec traits, native wire format, output buffering, framing (the stream `Framer` every TCP listener frames with), statsd (statsd_in's decoder), syslog (syslog_in's decoder), message (the json, csv, logfmt, and kv parse cores the transforms wrap)
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target; the listener), syslog (the listener), graphite, lines (lines_in), collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), splunk (splunk_hec_out), logit (logit_out), null_out (load-test discard sink)
@@ -992,7 +992,7 @@ where `script/perf run`/`attribute`/`flamegraph` write their (gitignored) output
 
 `testdata/differential/` holds those corpora: generated and deterministic, unlike `testdata/interop/`'s captures, each case's bytes beside a JSON file with the reference's reading and the verdict `logit` must give, and a `divergence` on every case where the two differ. `prometheus-text/` differs in its inputs: its `cases/` are hand-built and committed as inputs, its readings sit under `reference/`, and it reads `testdata/interop/prometheus-scrape/`'s recorded bodies in place. Its tests read it with `std::fs` and no reference installed, and `fuzz/seedgen` turns every case into a seed; [its README](testdata/differential/README.md) has the rest.
 
-`fuzz/` is the cargo-fuzz harness `script/unsafe-check fuzz` drives ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)), its own workspace outside the root one like `tools/protogen`, so `libfuzzer-sys` never enters the stable build: one target per file in `fuzz_targets/` (depending on `logit-core` and `logit-proto` only), `seedgen/` (a plain binary that writes `seeds/<target>/` deterministically from `testdata/interop/`, `testdata/differential/`, and encoder round trips), and the committed `seeds/`, where a `regress-*` file is a minimized crash input. `fuzz/corpus/`, `fuzz/artifacts/`, `fuzz/coverage/`, and `fuzz/target/` are gitignored; `script/format` covers the workspace, and clippy, `cargo-deny`, and `cargo-audit` don't.
+`fuzz/` is the cargo-fuzz harness `script/unsafe-check fuzz` drives ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)), its own workspace outside the root one like `tools/protogen`, so `libfuzzer-sys` never enters the stable build: one target per file in `fuzz_targets/`, 25 today, each also a row of `script/unsafe-check`'s `FUZZ_TARGETS` (depending on `logit-core` and `logit-proto` only), `seedgen/` (a plain binary that writes `seeds/<target>/` deterministically from `testdata/interop/{otlp,prometheus,prometheus-scrape,statsd,syslog,graphite,collectd,datadog}/`, every corpus under `testdata/differential/`, and encoder round trips), and the committed `seeds/`, where a `regress-*` file is a minimized crash input. `fuzz/corpus/`, `fuzz/artifacts/`, `fuzz/coverage/`, and `fuzz/target/` are gitignored; `script/format` covers the workspace and `script/lint` type-checks it on stable (`cargo check`), while clippy, `cargo-deny`, and `cargo-audit` don't.
 
 `perf/load/*.yaml` are the **sidecar load specs** for real-socket scenarios
 ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)):
