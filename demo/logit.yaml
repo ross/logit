@@ -102,6 +102,11 @@
 #                                    v                                                    |
 #                              windowed (aggregate)                                        |
 #                                    |                                                    |
+#                                    v                                                    v
+#                     victoria_out (prometheus_out)             browser_spans --> tempo_out (otlp_out, gRPC)
+#                                    |                          (browser_in, below)       |
+#                                    v                                                    v
+#                             VictoriaMetrics                                           Tempo
 #
 #   self (internal) --+-> self_logs (keep_signals: [logs]) ---> self_loki_out (otlp_out, HTTP) --> Loki
 #                     |
@@ -682,7 +687,7 @@ components:
   # event*, though: each drain is either a metric-only point or a span-only span event
   # (`crates/logit-core/src/telemetry.rs`'s `drain`). `trace_only` drops the metric-only ones
   # before `self_tempo_out` sees them. `has_signal` never mutates a forwarded event, so every
-  # span that reaches `self_tempo_out` arrives exactly as `self` produced it. See
+  # span that reaches `self_tempo_out` arrives as `self` produced it. See
   # `docs/adr/signal-filtering-components.md`.
   #
   # The gate is a noise filter, not a correctness requirement: it keeps the sink's input to the
