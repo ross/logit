@@ -1,0 +1,32 @@
+# The system under test in `script/soak`'s fanout-block scenario: a 500 ms aggregate fanned out to
+# two remote-write sinks, `vm_a` with the default 1024-batch queue under `overflow: drop_oldest`
+# and `vm_b` with a two-batch queue under `overflow: block`. A fan-out offers each batch to its
+# consumers in turn through one send, so once `vm_b`'s queue and 64-batch inbox are full,
+# `aggregate` waits on `vm_b` and `vm_a` gets nothing either. `vm_a`'s backend stays up, so its
+# queue never overflows, and one blocking sink keeps `logit validate` quiet. Its `internal` telemetry goes to stdout as NDJSON for the harness to read.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    # One batch per window: at 10 s, filling vm_b's 64-batch inbox would take over 10 minutes.
+    interval: 500ms
+    temporality: cumulative
+    series_retention: 7200          # an hour of windows: a fault must never evict a series
+  vm_a:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    buffer: { overflow: drop_oldest }   # 1024 batches, the default
+  vm_b:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics-b:8428/api/v1/write
+    version: 1
+    compression: zstd
+    buffer: { max_batches: 2 }      # overflow: block, the default
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
