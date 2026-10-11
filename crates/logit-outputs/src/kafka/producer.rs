@@ -204,6 +204,8 @@ pub(crate) struct Settled {
     pub(crate) partition: i32,
     pub(crate) records: usize,
     pub(crate) settlement: Settlement,
+    /// The broker's answer as text, for a diagnostic: its code's name and any message.
+    pub(crate) why: String,
 }
 
 /// One attempt's result: the send's verdict, and each settlement it reached, for the sink to
@@ -301,6 +303,7 @@ impl Producer {
     }
 
     /// The current identity, once `InitProducerId` answered.
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> Option<Identity> {
         self.identity
     }
@@ -495,6 +498,7 @@ impl Producer {
                     partition,
                     records: part.records.len(),
                     settlement: Settlement::Accepted { base_offset },
+                    why,
                 });
                 part.state = PartState::Accepted;
                 pending.accepted = true;
@@ -540,6 +544,7 @@ impl Producer {
                     partition,
                     records: named.len(),
                     settlement: Settlement::Dropped { code },
+                    why: why.clone(),
                 });
                 let rest: Vec<ProducerRecord> = std::mem::take(&mut part.records)
                     .into_iter()
@@ -575,6 +580,7 @@ impl Producer {
             partition: part.partition,
             records: part.records.len(),
             settlement: Settlement::Rejected { code },
+            why: why.clone(),
         });
         pending.first_rejection.get_or_insert(why);
         part.state = PartState::Rejected;

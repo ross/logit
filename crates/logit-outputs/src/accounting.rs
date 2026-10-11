@@ -120,6 +120,11 @@ impl BatchAccounting {
         self.rejected.clear();
     }
 
+    /// Whether `Output::observe_batch` armed the gate for a batch not yet final.
+    pub(crate) fn armed(&self) -> bool {
+        self.armed
+    }
+
     /// Records the destination's verdict on `request` of the armed batch: accepted, or rejected.
     /// Unarmed, it records nothing.
     pub(crate) fn settle(&mut self, request: u32, accepted: bool) {

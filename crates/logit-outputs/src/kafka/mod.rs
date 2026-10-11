@@ -1,6 +1,9 @@
-//! `kafka_out`'s producer core: a pure-Rust Kafka producer on `kafka-protocol`'s message codecs,
-//! with the Java producer 4.x's semantics and the divergences `docs/adr/kafka-output.md` names.
+//! `kafka_out`: a pure-Rust Kafka producer on `kafka-protocol`'s message codecs, with the Java
+//! producer 4.x's semantics and the divergences `docs/adr/kafka-output.md` names.
 //!
+//! - [`sink`] is the `Output`: one record per event, and one pending batch kept across
+//!   `write_loop`'s attempts at it.
+//! - [`encode`] writes each record's value, key, and timestamp.
 //! - [`producer`] partitions a batch, keeps the idempotent producer's identity and sequences,
 //!   and sends each attempt with a verdict per partition batch.
 //! - [`conn`] is one broker connection: framing, correlation ids, version negotiation, TLS.
@@ -54,10 +57,18 @@
 mod batch;
 mod compression;
 mod conn;
+mod encode;
 #[cfg(test)]
 mod fake_broker;
 mod fault;
 mod partitioner;
 mod producer;
+mod sink;
 #[cfg(test)]
 mod tests;
+
+pub use encode::{RecordFormat, RecordKey};
+pub use sink::{
+    KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings, TlsClientSettings,
+    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_TIMEOUT,
+};

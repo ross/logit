@@ -1,5 +1,6 @@
 //! `format: json` for `stdio_out`/`file_out`: one JSON object per event, one per line, for a
-//! program to read. This doc is the canonical grammar.
+//! program to read. `kafka_out`'s `format: json` sends each object as one record's value. This doc
+//! is the canonical grammar.
 //!
 //! Each line is one [`Event`] of an [`EventBatch`], in batch order, terminated by `\n`, with no
 //! pretty-printing and nothing between batches. Every populated field of the event model
@@ -109,7 +110,14 @@ impl<'a> Obj<'a> {
     }
 }
 
-fn render_event(out: &mut String, resource: &Resource, scope: Option<&Scope>, event: &Event) {
+/// Appends one event's object, without the newline: the line [`render_ndjson`] writes, which
+/// `kafka_out`'s `format: json` sends as a record's value.
+pub(crate) fn render_event(
+    out: &mut String,
+    resource: &Resource,
+    scope: Option<&Scope>,
+    event: &Event,
+) {
     let mut obj = Obj::open(out);
     push_timestamp(obj.key("timestamp"), event.timestamp);
     if let Some(log) = &event.log {

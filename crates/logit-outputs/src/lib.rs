@@ -14,10 +14,7 @@ pub mod graphite;
 mod http;
 pub mod human;
 pub mod influxdb;
-// The producer core has no caller outside its own tests until `kafka_out`'s `Output` impl
-// drives it (docs/plans/kafka-output.md).
-#[cfg_attr(not(test), allow(dead_code, unused_imports))]
-mod kafka;
+pub mod kafka;
 pub mod logit;
 pub mod ndjson;
 pub mod null;

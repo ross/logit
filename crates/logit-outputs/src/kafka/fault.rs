@@ -4,7 +4,9 @@
 use kafka_protocol::ResponseError;
 use logit_pipeline::Fault;
 
-/// Kafka error codes `kafka_out` reads by name.
+/// Kafka error codes `kafka_out` reads by name. A code that [`classify`] reaches through its
+/// default arm is named here for the tests that pin its row.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod code {
     pub(crate) const NONE: i16 = 0;
     pub(crate) const CORRUPT_MESSAGE: i16 = 2;
