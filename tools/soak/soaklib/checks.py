@@ -18,6 +18,7 @@ ledger at the sink's own telemetry instead. A local run's `ledger.sent` SKIPs.
 
 import bisect
 import json
+import math
 import re
 import statistics
 from dataclasses import dataclass, field
@@ -1130,7 +1131,9 @@ class Ledger:
         The final life's gap is Ab − V, and with a script Ab − L_flush − V, here and below. A
         stopped earlier life's is W − D − B − X − V, less a script's counted drops, the residual
         plus Ab − V, because the close-time window delivers what that life read but hadn't
-        absorbed by its last drain into V. A killed life has no close-time window and no `drain
+        absorbed by its last drain into V. With a script, that residual passes through it after
+        the last drain, which exports none of what it drops, so a positive gap up to
+        `script_band` passes. A killed life has no close-time window and no `drain
         complete`: its gap is Ab − V alone, judged inside `kill_band`; below the band it is a
         surplus, above it uncounted loss. Its residual is what the kill lost from the receive
         queue and inbox, by design, and is reported, not judged here."""
@@ -1149,7 +1152,22 @@ class Ledger:
             return PASS, "ok", gap
         if gap > 0 and dropped > 0:
             return PASS, "counted", gap
+        if self.script and life != self.final and 0 < gap <= self.script_band(life)[0]:
+            return PASS, "within script band", gap
         return FAIL, "uncounted", gap
+
+    def script_band(self, life):
+        """`(high, text)`: the gap a stopped earlier life may show because its script dropped or
+        failed on part of the residual after the last drain, which no drain exports: the
+        life's own share of dropped and failed events, (L_drop + L_err) / L_in, of the
+        residual, rounded up, plus 2, one per periodic rule of the shipped scripts landing on
+        an extra event."""
+        received = self.get("L_in", life)
+        share = self.script_dropped(life) / received if received else 0.0
+        residual = max(0, self.residual(life))
+        high = math.ceil(share * residual) + 2
+        return high, (f"script band [1, {_n(high)}]: the life's drop-and-error share {share:.2%} "
+                      f"of the residual {_n(residual)}, rounded up, plus 2")
 
 
 def _ledger(data):
@@ -1433,6 +1451,8 @@ def check_ledger_egress(data):
                      else "W − D − B − X − V")
             part = (f"life {life}: {whole} {_n(gap)} = residual "
                     f"{_n(led.residual(life))} + {led.ab_text} − V {_n(ab_v)}, {verdict}")
+            if verdict == "within script band":
+                part += f" ({led.script_band(life)[1]})"
         if gap > 0 and not (life in led.killed and life != led.final):
             part += f" (drain complete batches_dropped {_n(dropped)})"
         parts.append(part)

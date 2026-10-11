@@ -1403,6 +1403,17 @@ def _script_ledger():
                f"egress and the summary FAIL a final-life gap with a script, got "
                f"{lost['ledger.egress']} / {lost['ledger.summary']}")
 
+        # Life 0's script drops 3% of what it receives, so it may drop up to ceil(0.03 x 30) + 2
+        # of its 30-event residual after the last drain, where no drain counts them.
+        banded = results("script-band", v0_extra=27)
+        expect(banded["ledger.egress"].status == checks.PASS
+               and "within script band (script band [1, 3]" in banded["ledger.egress"].detail,
+               f"egress passes a stopped life's gap inside the script band, got "
+               f"{banded['ledger.egress']}")
+        over = results("script-band-over", v0_extra=26)
+        expect(over["ledger.egress"].status == checks.FAIL
+               and "uncounted" in over["ledger.egress"].detail,
+               f"egress FAILs a gap past the script band, got {over['ledger.egress']}")
         # A residual between the plain R (77,000) and the script's (142,000).
         wide = results("script-wide-residual", life0_extra=100030, v0_extra=100010)
         expect(wide["ledger.intake"].status == checks.PASS
