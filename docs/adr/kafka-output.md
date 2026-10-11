@@ -39,12 +39,18 @@ producer 4.x's defaults, and each place it departs from them is named below with
 ### 1. Client: `kafka-protocol`, pure Rust, no C
 
 - **Dependency.** `kafka-protocol = { version = "=0.18.0", default-features = false, features =
-  ["client", "broker", "gzip", "snappy"] }`. The version is pinned with `=` because a 0.x minor
-  release breaks the API. The crate is MIT or Apache-2.0, and it adds `crc` and `crc-catalog`
-  (same licenses) to the tree.
-- **Why the default features are off.** The crate's `lz4` feature pulls `lz4-sys` and its `zstd`
-  feature pulls `zstd-sys`, both C. `kafka_out` compresses lz4 and zstd through the crate's
-  custom-compression hook (`RecordBatchEncoder::encode_with_custom_compression`) instead:
+  ["client", "broker"] }`. The version is pinned with `=` because a 0.x minor release breaks the
+  API. The crate is MIT or Apache-2.0, and it adds `crc` and `crc-catalog` (same licenses) to the
+  tree.
+- **Compression goes through the crate's custom-compression hook, for all five codecs.** The
+  crate's `lz4` feature pulls `lz4-sys` and its `zstd` feature pulls `zstd-sys`, both C, and its
+  `snappy` feature writes xerial framing. `RecordBatchEncoder::encode_with_custom_compression`
+  calls the hook for every `Compression` value, and the crate's built-in codecs run only when no
+  hook is passed, so `kafka_out` compresses every codec itself and enables none of the crate's
+  codec features:
+  - `none` passes the records through;
+  - gzip through `flate2`;
+  - snappy as one raw block through `snap::raw` (item 2);
   - lz4 as an LZ4 frame through `lz4_flex`, with FLG `0x60` and BD `0x40` (version 1, independent
     blocks, no block or content checksum, no content size, 64 KB blocks), which is what both the
     Java client and librdkafka write;
@@ -54,7 +60,10 @@ producer 4.x's defaults, and each place it departs from them is named below with
   batch v2 (magic 2) with CRC-32C. It has no network client and no async runtime: the connection,
   the producer state, and the partitioners are `logit`'s own.
 - **The `broker` feature** decodes requests and encodes responses. It exists here so the tests
-  can run an in-process fake broker. No test depends on a running Kafka.
+  can run an in-process fake broker. No test depends on a running Kafka. The fake broker
+  decompresses through `RecordBatchDecoder`'s custom-decompression hook, with the same five
+  codecs, plus a xerial snappy reader for the Java corpus: a 16-byte header (the magic, a version, and a
+  compatible version), then raw blocks, each prefixed by a big-endian `u32` length.
 
 ### 2. Reference semantics: the Java producer 4.x
 
@@ -90,6 +99,11 @@ The named divergences:
 - **One produce request per broker per attempt.** Java keeps up to five requests in flight per
   connection. Pipelining through `Output::window` is a follow-up.
 - **No linger.** The batch `logit` hands the sink is the batch the producer sends.
+- **`MESSAGE_TOO_LARGE` halves a partition batch once.** Java cuts the batch into pieces of
+  `batch.size` (16,384) bytes, halves only a batch that is already a split, and re-enqueues the
+  pieces as new batches that can split and retry again. `logit` has no `batch.size` accumulator to
+  size pieces by, so `kafka_out` halves the partition batch, resends each half once, and reads a
+  second `MESSAGE_TOO_LARGE` as `Rejected` (item 7).
 - **No delivery timeout.** Java fails a batch after `delivery.timeout.ms` (120 s). `kafka_out`
   retries a retryable fault until it succeeds or shutdown cuts it, and `buffer:` bounds what queues
   behind it, as for every sink ([ADR `sink-fault-classes`](sink-fault-classes.md)).
@@ -141,14 +155,35 @@ keyed records land where a Java producer's records with the same key land.
 - **An idempotent producer** gets a producer id (PID) and epoch from `InitProducerId` and numbers
   each partition's batches with a sequence that advances by the record count and wraps from
   `Int32.MAX` to 0.
-- **A retry reuses the PID, the epoch, and each partition batch's base sequence verbatim**, as
-  Java's `RecordAccumulator.drain` does (it assigns a sequence only to a batch that has none). The
-  broker keeps the last five batches per PID per partition, so it deduplicates an `Ambiguous`
-  resend inside that window and answers with the original offsets.
+- **Within one epoch, a retry reuses the PID, the epoch, and each partition batch's base sequence
+  verbatim**, as Java's `RecordAccumulator.drain` does (it assigns a sequence only to a batch that
+  has none). The broker keeps the last five batches per PID per partition, so it deduplicates an
+  `Ambiguous` resend inside that window and answers with the original offsets.
+- **A partition batch that settles without being appended bumps the epoch.** The broker accepts a
+  partition's next batch only at the sequence after the last one it appended
+  (`ProducerAppendInfo.checkSequence`), so records numbered but never appended leave a gap, and
+  that partition's next batch would be answered `OUT_OF_ORDER_SEQUENCE_NUMBER`. The gap follows:
+  - a `Rejected` partition batch, whatever its code;
+  - the named-record drop and resend for `INVALID_TIMESTAMP` and `INVALID_RECORD` (item 5);
+  - the `MESSAGE_TOO_LARGE` split (item 7);
+  - a batch that `write_loop` drops after an `Ambiguous` attempt under `at_most_once`, which may
+    or may not have been appended.
+
+  Before that partition sends again, `kafka_out` sends `InitProducerId` with the current PID and
+  epoch (KIP-360), which keeps the PID and bumps the epoch, and every partition's sequence restarts
+  at 0 under it. The resend of the rest, the split halves, and every partition batch numbered behind
+  the failure take fresh consecutive sequences under the new epoch. Java does the same:
+  `TransactionManager.handleFailedBatch` requests an epoch bump for the partition, and the
+  `MESSAGE_TOO_LARGE` branch removes the batch from the in-flight set before it splits, so the
+  pieces take fresh sequences. With no gap inside an epoch, `OUT_OF_ORDER_SEQUENCE_NUMBER` means
+  only a real one: the broker lost its sequence state.
 - **Dedup is lost across a new epoch or a new PID.** A process restart mints a new PID.
-  `INVALID_PRODUCER_EPOCH` and `OUT_OF_ORDER_SEQUENCE_NUMBER` re-initialize the producer, and the
-  new epoch's sequences start at 0. A batch whose first attempt landed before one of these events
-  and whose retry was sent after it is stored twice.
+  `INVALID_PRODUCER_EPOCH` re-initializes the producer with a new PID, and an epoch bump (above, and
+  on `OUT_OF_ORDER_SEQUENCE_NUMBER`) keeps the PID under a new epoch. Either way the sequences start
+  at 0, and the broker can't match a resend against an append from before. A batch whose first
+  attempt landed before one of these events and whose retry was sent after it is stored twice. A
+  bump renumbers every unsettled partition batch, so it also costs dedup for one still waiting on an
+  `Ambiguous` answer, including the same partition's other batch in the same send, if it has one.
 - **The posture stays the runtime default, `at_least_once`** ([ADR
   `delivery-semantics`](delivery-semantics.md), item 5). The broker's dedup removes most
   duplicates, but not those above, so `kafka_out` doesn't claim effectively-once delivery.
@@ -157,15 +192,22 @@ keyed records land where a Java producer's records with the same key land.
   broker settled, in `BatchAccounting` (`crates/logit-outputs/src/accounting.rs`), as `otlp_out`
   and the Datadog sinks remember settled requests ([ADR
   `sink-fault-classes`](sink-fault-classes.md), "Amendment: the Datadog sinks retry per request
-  (2026-10-09)"). A retry resends only the unsettled partitions, with their original sequences.
+  (2026-10-09)"). A retry resends only the unsettled partitions, with their sequences from the
+  current epoch.
 - **What settles a partition.** A partition settles, and is never resent for that batch, when:
   - the broker accepted it (`NONE`, or `DUPLICATE_SEQUENCE_NUMBER` from an older broker);
-  - its records are `Rejected`, dropped and counted;
-  - its result is `Ambiguous` under `at_most_once`, dropped and counted.
+  - its records are `Rejected`, dropped and counted.
 - **The attempt's class covers only the unsettled partitions.** When any remain, the send returns
   the strongest of their classes, in the order `Refused`, `Ambiguous`, `Clean`. A partition held as
   `Refused` keeps the queue held, under both postures, and each retry resends the other unsettled
-  partitions without resending a settled one. When none remain, the send succeeds.
+  partitions without resending a settled one. Under `at_most_once`, an `Ambiguous` partition isn't
+  settled inside the sink: the send returns `Ambiguous`, and `write_loop` drops the batch and
+  counts it, as it does for `datadog_out`.
+- **When none remain, the send succeeds only if a partition was accepted**, on this attempt or an
+  earlier one (`BatchAccounting::any_accepted`). Otherwise it fails `Rejected` with the first
+  rejection's error, so `write_loop` drops and counts the batch as it does any rejected batch, as
+  [ADR `delivery-semantics`](delivery-semantics.md)'s "Amendment: per-request verdicts" sets for
+  `datadog_out`.
 
 ### 5. Fault classes
 
@@ -202,7 +244,7 @@ Broker error codes:
 | `INVALID_TIMESTAMP` | 32 | failed; `record_errors` names records from v8 | Drop the named records, resend the rest once | Item 6. |
 | `UNSUPPORTED_VERSION` | 35 | fatal | `Refused` | A protocol mismatch, the same for every batch. |
 | `POLICY_VIOLATION` | 44 | failed | `Rejected` | A broker-side policy refused this batch's content. |
-| `OUT_OF_ORDER_SEQUENCE_NUMBER` | 45 | retried, with an epoch bump in some cases | `Ambiguous`, producer re-initialized | The broker's sequence state no longer matches; an earlier attempt may have landed, and the new epoch loses dedup (item 4). |
+| `OUT_OF_ORDER_SEQUENCE_NUMBER` | 45 | retried, with an epoch bump in some cases | `Ambiguous`, epoch bumped | `kafka_out` leaves no gap inside an epoch (item 4), so the broker's sequence state no longer matches; an earlier attempt may have landed, and the new epoch loses dedup. |
 | `DUPLICATE_SEQUENCE_NUMBER` | 46 | success | Success | Current brokers answer `NONE` with the original offsets instead. |
 | `INVALID_PRODUCER_EPOCH` | 47 | failed | `Clean`, producer re-initialized | The broker refused the stale epoch before appending. |
 | `KAFKA_STORAGE_ERROR` | 56 | retried after a refresh | `Clean`, metadata refreshed | The replica's log directory failed; nothing was appended. |
@@ -211,14 +253,15 @@ Broker error codes:
 | `INVALID_RECORD` | 87 | failed; `record_errors` | Drop the named records, resend the rest once | As 32. |
 | `THROTTLING_QUOTA_EXCEEDED` | 89 | retried | `Clean` | Nothing was appended. Produce quotas otherwise slow a client through `throttle_time_ms`. |
 | `UNKNOWN_TOPIC_ID` | 100 | retried after a refresh | `Refused` after one metadata refresh | As 3. Produce v13 only, which `kafka_out` doesn't send (item 8). |
-| `INCONSISTENT_TOPIC_ID` | 103 | retried after a refresh | `Clean`, metadata refreshed | The topic was recreated under the same name. |
+| `INCONSISTENT_TOPIC_ID` | 103 | retried after a refresh | `Clean`, metadata refreshed | The topic was recreated under the same name. Produce v13 only, which `kafka_out` doesn't send (item 8). |
 | Any other code | — | — | `Rejected` | The runtime's default for an answer a sink can't attribute ([ADR `sink-fault-classes`](sink-fault-classes.md)). The diagnostic names the code. |
 
 Kafka has no `TOPIC_DELETED` error. A topic deleted under a running producer reads as code 3.
 
 **Records a broker names.** `INVALID_TIMESTAMP` and `INVALID_RECORD` carry `record_errors` from
 Produce v8 (KIP-467), naming the records at fault by index. `kafka_out` drops the named records,
-counted, and resends the rest of that partition batch once. This follows `splunk_hec_out`'s code 6,
+counted, bumps the epoch, and resends the rest of that partition batch once under fresh sequences
+(item 4). This follows `splunk_hec_out`'s code 6,
 which drops the one object HEC names and resends the rest once ([ADR
 `splunk-hec-relay`](splunk-hec-relay.md), decision 18). A second rejection of the resend, or a
 rejection that names no record, makes the partition batch `Rejected`.
@@ -241,7 +284,8 @@ counted, and delivers the rest of its batch (item 5). The past is unbounded by d
   over the cap is dropped at encode time and counted; it never reaches the broker.
 - **A send's records are cut into produce requests** that stay under the cap.
 - **`MESSAGE_TOO_LARGE`** on a partition batch with more than one record splits it in two and
-  resends both halves once, as Java does. On a single record it's `Rejected`.
+  resends both halves once (a divergence, item 2), under fresh sequences (item 4). On a single
+  record, or on a half, it's `Rejected`.
 - **`RECORD_LIST_TOO_LARGE`** is `Rejected` with no split, as in Java.
 
 ### 8. Protocol versions
@@ -338,12 +382,15 @@ Each format stays decodable, so a future `kafka_in` can round-trip it.
 
 ## Consequences
 
-- W1 adds `kafka-protocol`, `crc`, and `crc-catalog` to `Cargo.lock` and `deny.toml`'s review. It
-  enables `lz4_flex`'s frame support and widens `ruzstd`'s scope beyond Prometheus remote-write,
-  updating the `Cargo.toml` comments that scope them.
+- W1 adds `kafka-protocol`, `crc`, and `crc-catalog` to `Cargo.lock` and `deny.toml`'s review,
+  with none of `kafka-protocol`'s codec features, so no C codec enters the tree. It enables
+  `lz4_flex`'s frame support and widens the scope of `ruzstd`, `snap`, and `flate2`, already
+  direct dependencies of `logit-outputs`, beyond the components they serve today, updating the
+  `Cargo.toml` comments that scope them.
 - The `kafka_out` module doc carries the canonical fault-class table, each row backed by a
   fake-broker test, and this ADR's table stops being updated once it exists.
-- Duplicates are possible across a process restart and a producer re-initialization (item 4).
+- Duplicates are possible across a process restart, a producer re-initialization, and an epoch
+  bump, which follows every partition batch that settles without being appended (item 4).
   An operator who needs none must deduplicate downstream.
 - An event stamped more than an hour in the future doesn't reach a Kafka 4.x topic with the
   default broker config. It's dropped and counted (item 6).
