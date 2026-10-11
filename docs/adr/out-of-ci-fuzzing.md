@@ -143,12 +143,13 @@ lib test and joins `script/unsafe-check`'s `MIRI_TARGETS`, so Miri runs it.
 
 ### What `script/cibuild` doesn't cover
 
-`fuzz/` is outside the root workspace, so `script/lint`, `script/audit` (`cargo-deny` and
-`cargo-audit`), and `script/test` never build it. Nothing in `fuzz/` ships, and its only
+`fuzz/` is outside the root workspace, so clippy, `script/audit` (`cargo-deny` and
+`cargo-audit`), and `script/test` never reach it. Nothing in `fuzz/` ships, and its only
 dependency outside the root lock's set is `libfuzzer-sys`. `script/format` does reach it, with
-`cargo fmt --manifest-path fuzz/Cargo.toml`, so `rustfmt.toml` holds there too. A `fuzz/` crate
-that no longer compiles against a changed decoder API is found the next time someone runs the
-harness, not by CI.
+`cargo fmt --manifest-path fuzz/Cargo.toml`, so `rustfmt.toml` holds there too, and `script/lint`
+type-checks it on the stable toolchain, so a `fuzz/` crate that no longer compiles against a
+changed decoder API fails CI (the 2026-10-11 amendment). The sanitizer builds and the runs stay
+manual and nightly.
 
 ## Alternatives considered
 
@@ -174,8 +175,9 @@ harness, not by CI.
 - `docs/known-gaps/`'s "`cargo-fuzz` targets over the decoders" entry closes when the harness
   lands. ADR `out-of-ci-unsafe-verification`'s deferral of `cargo-fuzz` is superseded by its
   amendment of the same date.
-- A decoder change that breaks the `fuzz/` build isn't caught by CI. Run
-  `script/unsafe-check fuzz-seed` and a short `fuzz-all` after changing a decoder a target calls.
+- CI type-checks `fuzz/` but never runs a target, so a decoder change that breaks a target's
+  oracle passes CI. Run `script/unsafe-check fuzz-seed` and a short `fuzz-all` after changing a
+  decoder a target calls.
 - A new decoder of untrusted input should get a target: one `[[bin]]`, one `FUZZ_TARGETS` entry,
   and seeds from `seedgen`.
 - A target can only call code in `logit-core` or `logit-proto`. Parsing logic that lives in a
@@ -279,7 +281,8 @@ Two things the campaign turned up about the harness, not the decoders:
 
 - **The native batch targets didn't build.** The decode budget (#370) added a `DecodeBudget`
   argument to `decode_batch` and `decode_batch_v2`, and the two targets still passed one
-  argument. `fuzz/` is outside the cargo workspace, so `script/check` and CI never build it.
+  argument. `fuzz/` is outside the cargo workspace, and no check built it then; `script/lint`
+  now type-checks it (the 2026-10-11 amendment).
   Both targets now decode under `DecodeBudget::default()`, the budget `NativeDecoder` gives a
   frame under the default cap. "Consequences" already says so: run `fuzz-seed` and a short
   `fuzz-all` after changing a decoder a target calls.
@@ -296,9 +299,11 @@ a valid batch of more than 16,384 empty events regrows `decode_batch_body`'s eve
 
 ### Campaign at the untrusted-input stack tip (2026-10-11)
 
-Every target ran clean at the tip of the untrusted-input parser stack (`dc38374d`, the head of
-`untrusted/w13`, #621): the 11 cluster 9 targets for 1,800 seconds each and the 14 earlier ones
-for 600. `script/unsafe-check fuzz-seed` ran first and rewrote no committed seed, so every
+Every target ran clean at the tip of the untrusted-input parser stack: the 11 cluster 9 targets
+for 1,800 seconds each and the 14 earlier ones for 600. `stream_framing`, `statsd`, `syslog`, and
+`graphite_plaintext` ran binaries built at `dc38374d`, the head of `untrusted/w13` (#621). The
+other 21 ran binaries rebuilt from that tree plus a doc-comment-only change to `logit-core`, so
+every decoder they ran is the same code, and the result stands for `dc38374d`. `script/unsafe-check fuzz-seed` ran first and rewrote no committed seed, so every
 `regress-*` and `diff-*` seed is in the starting corpus. Image `logit-unsafe-check:local` with
 `nightly-2026-09-01` (`rustc 1.100.0-nightly (0dfb098f3 2026-08-31)`) and `cargo-fuzz` 0.13.2.
 
@@ -343,11 +348,12 @@ No target wrote an artifact: no crash, no out-of-memory against its `malloc_limi
 timeout, and no slow unit. Three things the campaign turned up about the harness, none about the
 decoders:
 
-- **Several targets can share one fuzz target volume once it's built.** Each `fuzz` call runs
-  `cargo fuzz run`, which rebuilds only when a source changed, so building every target first and
-  then starting four runs in parallel never had two runs compile at once. Give a concurrent
-  campaign its own volume (`UNSAFE_CHECK_FUZZ_TARGET_VOLUME`) so another checkout's build can't
-  replace the binaries mid-run.
+- **A campaign needs its own target volume and a checkout nobody edits while it runs.** Each
+  `fuzz` call runs `cargo fuzz run`, which rebuilds when a source in the checkout changed. A
+  change mid-campaign makes whichever run starts next rebuild, cargo's build-directory lock makes
+  every other starting run wait for it, and each later target relinks its binary against the
+  changed tree. Set `UNSAFE_CHECK_FUZZ_TARGET_VOLUME` so another checkout's build can't replace
+  the binaries either.
 - **A fork-mode run outlasts `-max_total_time` by up to 45 seconds**, the time its last
   child takes to finish and its corpus to merge, so a schedule should budget for it.
 - **`graphite_pickle` and `prom_text` are the slow targets**, at about 900 and 1,600 exec/s:
@@ -399,10 +405,13 @@ symbol-table rules are reachable, and a fixed-point oracle on every input.
 
 ### Seeds and differential corpora
 
-`seedgen` also reads `testdata/interop/{statsd,syslog,graphite,collectd,datadog,prometheus-scrape}/`, and every corpus
-under `testdata/differential/`. A differential corpus differs from `testdata/interop/`, which
-holds captured bytes that don't reproduce: it's generated, deterministic, and carries a reference
-implementation's reading of each case beside the case's bytes. `script/differential <corpus>`
+`seedgen` also reads `testdata/interop/{statsd,syslog,graphite,collectd,datadog,prometheus-scrape}/`,
+every corpus under `testdata/differential/`, every `*.in` exposition body under
+`crates/logit-cli/tests/fixtures/prometheus/`, and
+`tools/record-fixtures/prometheus-metadata-target.prom`. A differential corpus differs from
+`testdata/interop/`, which holds captured bytes that don't reproduce: it's generated,
+deterministic, and carries a reference implementation's reading of each case beside the case's
+bytes. `script/differential <corpus>`
 regenerates one, and `script/differential <corpus> --check` regenerates it into a temporary
 directory and fails if it differs from the committed files. No test needs the reference
 implementation installed; tests read the committed reading.
@@ -455,12 +464,12 @@ module docs.
 
 ## Amendment (2026-10-11): `script/lint` type-checks `fuzz/`
 
-`script/lint` ends with `cargo check --manifest-path fuzz/Cargo.toml --workspace --all-targets`,
-on the stable toolchain the dev and CI images carry. `libfuzzer-sys`'s build script compiles
-libFuzzer with the image's C++ compiler, and only `cargo fuzz build` and `cargo fuzz run` need
-nightly, so the check fits the stable build: it took about 7 seconds from an empty target
+After clippy, `script/lint` runs `cargo check --manifest-path fuzz/Cargo.toml --workspace
+--all-targets` on the stable toolchain the dev and CI images carry. `libfuzzer-sys`'s build script
+compiles libFuzzer with the image's C++ compiler, and only `cargo fuzz build` and `cargo fuzz run`
+need nightly, so the check fits the stable build: it took about 7 seconds from an empty target
 directory. A decoder signature change that breaks a target or `seedgen` now fails `script/check`
-and CI, where "What `script/cibuild` doesn't cover" left it to the next campaign's build.
+and CI, where before it showed only at the next campaign's build.
 
 The check doesn't build under the sanitizer, run a target, or lint `fuzz/`. A change to what a
 decoder accepts can still break a target's oracle with every check green, so the

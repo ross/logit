@@ -5795,11 +5795,13 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   built-frame oracle in its first seconds. Under the malloc limit the caps hold: the worst 64 KiB
   payload, one memoized datapoint repeated by two-byte `BINGET`s, allocates at most a 27 MiB
   `Vec`, pinned under the target's 32 MiB limit. Under ADR `deployment-threat-model`,
-  `MAX_PICKLE_DEPTH` (16, where a carbon payload reaches 2) and `MAX_PICKLE_ITEMS` stop only
-  crafted input; each is one branch, so both stay and nothing is added. A negative `BINSTRING`
-  length is reachable by a bit flip, and `usize::try_from` already refuses it as `Malformed`.
-  Interleaved open lists, which `append_range`'s tail rule refuses, are crafted-only, since no
-  surveyed producer builds a list inside a list grown by `APPEND`/`APPENDS`.
+  `MAX_PICKLE_DEPTH` (16 open `MARK`s, where a carbon batch reaches 3 at protocol 1: the
+  `APPENDS` batch mark and the outer and inner tuples, since protocol 1 has no `TUPLE2`) and
+  `MAX_PICKLE_ITEMS` stop only crafted input; each is one branch, so both stay and nothing is
+  added. A negative `BINSTRING` length is reachable by a bit flip, and `usize::try_from` already
+  refuses it as `Malformed`. A list-shaped datapoint inside a list grown by `APPEND`/`APPENDS`,
+  which `append_range`'s tail rule refuses, stays the `decode (Graphite)` known gap: carbon's
+  receiver accepts it, and no surveyed producer writes one.
 - **Verified (untrusted/w12, #620):** the carbon pickle differential corpus,
   `testdata/differential/graphite-pickle/` (`script/differential pickle`), holds 115 payloads
   CPython 3.12.15 and Python 2.7.18 wrote across protocols 0 to 5, each with CPython's reading,
@@ -5836,8 +5838,8 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   (`Builder::memoize`, `LONG_BINPUT` from key 256) and repeat it through `BINGET` or
   `LONG_BINGET`. The
   campaign under CODEC-01 ran with no crash, the 32 MiB malloc limit standing for the memo's bound.
-  A memo key that skips ahead is crafted-only: CPython numbers its memo slots in order, and Python
-  2's `cPickle` skips only slot 0, which `max(memo.len(), 1)` admits. The ordinal check is one
+  A memo key that skips ahead comes only from a corrupt key byte: CPython numbers its memo slots
+  in order, and Python 2's `cPickle` skips only slot 0, which `max(memo.len(), 1)` admits. The ordinal check is one
   branch, so it stays as the free defense ADR `deployment-threat-model` allows.
 
 ### CODEC-03 — Carbon plaintext/pickle decode entry point and timestamp arithmetic
