@@ -31,5 +31,8 @@ components:
     endpoint: http://victoria-metrics-b:8428/api/v1/write
     version: 1
     compression: zstd
+    # Its 1024-batch queue holds every fault's windows, so `drop_oldest` never drops here; one
+    # blocking sink behind the listener keeps `logit validate` quiet.
+    buffer: { overflow: drop_oldest }
   self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
   telemetry: { type: stdio_out, sources: [self], format: json }
