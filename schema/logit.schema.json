@@ -97,6 +97,73 @@
         }
       ]
     },
+    "BucketRange": {
+      "description": "One class in a `bucket` field's `ranges` list: at most one upper bound, and the class name.",
+      "type": "object",
+      "required": [
+        "value"
+      ],
+      "properties": {
+        "le": {
+          "description": "Matches a number at or below this bound. Can't be set together with `lt`.",
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "lt": {
+          "description": "Matches a number strictly below this bound. Can't be set together with `le`.",
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "value": {
+          "description": "The class written to `into` when this range matches. Must be non-empty. Two ranges may write the same class.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BucketSpec": {
+      "description": "One source field's classification, under `bucket`'s `attributes` map.",
+      "type": "object",
+      "required": [
+        "into",
+        "ranges"
+      ],
+      "properties": {
+        "into": {
+          "description": "The attribute the matched range's `value` is written to. Must be non-empty. Naming the source field itself replaces the number with its class in place.",
+          "type": "string"
+        },
+        "keep_source": {
+          "description": "Keep the source attribute after a class is written. Defaults to `true`. `false` removes it, unless `into` names the source field, where the class has already replaced it.",
+          "default": true,
+          "type": "boolean"
+        },
+        "other": {
+          "description": "What `into` becomes when the source value isn't a finite number, or is a number no range matches. Absent (the default) writes nothing in either case.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ranges": {
+          "description": "The classes, tested in order; the first range that matches wins. Must be non-empty. Every bound must be finite and larger than the bound before it. A range with no bound matches any number, and is allowed only as the last range.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BucketRange"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "BufferConfig": {
       "description": "Per-sink delivery buffer. Meaningful only on a sink; a non-default block on any other kind is rejected. Every field defaults, so the block is never required.",
       "type": "object",
@@ -1929,6 +1996,34 @@
               "type": "string",
               "enum": [
                 "keep_values"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Classifies a numeric attribute into a named class by range, so a number becomes a bounded string value that `has_attributes`, `drop_attributes`, and `route` can match: `http.request.duration_s` becomes `fast`, `ok`, or `slow` in `http.request.duration_class`. Integers, floats, and strings that parse as a finite number are classified. Never drops an event. An attribute the event doesn't carry is a silent no-op for that field, never a stamp. `attributes` must be non-empty.",
+          "type": "object",
+          "required": [
+            "attributes",
+            "type"
+          ],
+          "properties": {
+            "attributes": {
+              "description": "Applied per event, to `event.attributes`, keyed by the source field.",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/BucketSpec"
+              }
+            },
+            "buffer": true,
+            "receive": true,
+            "sources": true,
+            "targets": true,
+            "type": {
+              "type": "string",
+              "enum": [
+                "bucket"
               ]
             }
           },

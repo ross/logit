@@ -1022,6 +1022,27 @@ access_bounded:
 attribute: whatever survives `keep` sets both series cardinality and per-window memory. Keep
 `url.path`, `client.address`, and every `user_agent.original`-style free-text field out of it.
 
+To gate on a duration, classify it first. `bucket` writes a range's class into an attribute, so
+`has_attributes`, `drop_attributes`, or `route` can match it by equality
+([ADR `bucket-transform`](adr/bucket-transform.md)):
+
+```yaml
+access_latency:
+  type: bucket
+  sources: [access_http]
+  attributes:
+    http.request.duration_s:
+      into: http.request.duration_class
+      ranges:
+        - lt: 0.1
+          value: fast
+        - le: 1
+          value: ok
+        - value: slow
+```
+
+The class is a bounded value, so it's also safe to add to `keep`'s `fields` ahead of `aggregate`.
+
 ## Metrics
 
 `http_access` emits no metrics itself. It guarantees the attribute names that semconv's

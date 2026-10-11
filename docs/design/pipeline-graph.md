@@ -168,8 +168,8 @@ collide, so the rule stays predictable when a protocol gains its second side lat
 `syslog_out` (RFC 3164/5424 over UDP or TCP, `docs/adr/syslog-output.md`) did after `SyslogIn`.
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
-`has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`,
-`kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`, and any future
+`has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `bucket`,
+`logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`, and any future
 native transform — take no suffix, because a transform has only one direction.
 
 **`interval` is a per-kind field.** `lua`/`lua_file` carry an optional flush interval
@@ -214,7 +214,7 @@ literal argument string.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -401,6 +401,9 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `datadog_trace_in` without `bind`.
 81. An `admin.socket_mode` without `admin.socket`, an empty `admin.bind` or `admin.socket`, or an
     `admin.bind` that is a path.
+82. A `bucket` with no `attributes`, an empty field name, `into`, `ranges`, `value`, or `other`, a
+    range with both `lt` and `le`, a boundless range that isn't last, or a non-finite or
+    non-increasing bound.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

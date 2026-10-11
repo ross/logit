@@ -1521,6 +1521,16 @@ two fields on one component can clamp at very different rates. `.values.normaliz
 already-conforming case would make the rate unreadable. `field` is safe as a tag because the fields
 are config-declared. No `Diagnostics`: clamping to a fixed allow-list can't fail.
 
+##### `bucket`
+
+`crates/logit-transforms/src/bucket.rs`, [ADR `bucket-transform`](../adr/bucket-transform.md).
+
+`logit.transform.values.bucketed`/`.unmatched`, tagged `field`, in `keep_values`' shape: one
+`.bucketed` per present value a range classified, one `.unmatched` per present value that wasn't a
+finite number or that no range matched, whether or not `other` was written. An absent source
+counts as neither. `field` is safe as a tag because the fields are config-declared. No
+`Diagnostics`: a value that doesn't classify is steady-state data, not a failure.
+
 ##### `shape`
 
 `crates/logit-transforms/src/shape.rs`,

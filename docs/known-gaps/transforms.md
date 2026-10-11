@@ -11,6 +11,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - Equality-only filtering, such as splitting a `logit_in` fan-out back apart by an attribute an
     upstream `set` stamped: `has_attributes`/`drop_attributes`
     ([ADR `attribute-filtering-components`](../adr/attribute-filtering-components.md)).
+  - Numeric ranges, such as splitting out slow requests: `bucket` writes a range's class into an
+    attribute, and an equality component gates on it
+    ([ADR `bucket-transform`](../adr/bucket-transform.md)).
   - Destination selection (splitting one flow into named streams): `route` (equality on
     provenance/attribute/resource) and `target` components (ADR
     [`target-components`](../adr/target-components.md)); `lua` can also route with `event:to`.

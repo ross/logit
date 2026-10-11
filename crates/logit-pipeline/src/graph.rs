@@ -260,6 +260,10 @@
 //! 81. An `admin.socket_mode` without `admin.socket`; an empty `admin.bind` or `admin.socket`; or
 //!     an `admin.bind` starting with `/`, a path that belongs in `socket`
 //!     (`docs/adr/listener-port-sharing-and-shutdown-delay.md`).
+//! 82. A `bucket` with no `attributes`, an empty field name or `into`, an empty `ranges`, a range
+//!     with both `lt` and `le`, a boundless range that isn't last, a non-finite bound, bounds
+//!     that don't strictly increase, or an empty class `value` or `other`
+//!     (`docs/adr/bucket-transform.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -361,6 +365,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | HasProvenance { .. }
         | DropProvenance { .. }
         | KeepValues { .. }
+        | Bucket { .. }
         | Logfmt { .. }
         | Kv { .. }
         | Regex { .. }
@@ -429,6 +434,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         HasProvenance { .. } => "has_provenance",
         DropProvenance { .. } => "drop_provenance",
         KeepValues { .. } => "keep_values",
+        Bucket { .. } => "bucket",
         Logfmt { .. } => "logfmt",
         Kv { .. } => "kv",
         Regex { .. } => "regex",
@@ -531,6 +537,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::HasProvenance { .. }
             | ComponentKind::DropProvenance { .. }
             | ComponentKind::KeepValues { .. }
+            | ComponentKind::Bucket { .. }
             | ComponentKind::Logfmt { .. }
             | ComponentKind::Kv { .. }
             | ComponentKind::Regex { .. }
@@ -3761,6 +3768,73 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             "admin: 'bind' is a path, not a host:port -- serve the admin endpoint on a Unix socket \
              with 'socket:' instead"
         );
+    }
+
+    // Rule 82: `bucket` (`docs/adr/bucket-transform.md`). Ranges are tested first-match, so a
+    // boundless range before the end, or a bound no larger than the one before it, leaves every
+    // later range unreachable. Two ranges may share a class.
+    for (id, component) in &components {
+        let ComponentKind::Bucket { attributes } = &component.kind else { continue };
+        if attributes.is_empty() {
+            anyhow::bail!(
+                "component '{id}': a bucket with no 'attributes' configured can only ever be a \
+                 no-op"
+            );
+        }
+        for (field, spec) in attributes {
+            if field.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a bucket 'attributes' key must not be empty -- it could \
+                     never name a real attribute"
+                );
+            }
+            if spec.into.is_empty() {
+                anyhow::bail!("component '{id}': bucket '{field}' has an empty 'into'");
+            }
+            if spec.ranges.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': bucket '{field}' has an empty 'ranges' list -- it could \
+                     never write a class"
+                );
+            }
+            if spec.other.as_deref().is_some_and(str::is_empty) {
+                anyhow::bail!("component '{id}': bucket '{field}' has an empty 'other'");
+            }
+            let last = spec.ranges.len() - 1;
+            let mut previous: Option<f64> = None;
+            for (i, range) in spec.ranges.iter().enumerate() {
+                if range.value.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} has an empty 'value'"
+                    );
+                }
+                let bound = match (range.lt, range.le) {
+                    (Some(_), Some(_)) => anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} sets both 'lt' and 'le' -- \
+                         give one bound"
+                    ),
+                    (Some(bound), None) | (None, Some(bound)) => bound,
+                    (None, None) if i == last => continue,
+                    (None, None) => anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} has no bound but isn't the \
+                         last range -- a catch-all leaves every range after it unreachable"
+                    ),
+                };
+                if !bound.is_finite() {
+                    anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} has a non-finite bound"
+                    );
+                }
+                if previous.is_some_and(|previous| bound <= previous) {
+                    anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i}'s bound {bound} isn't \
+                         larger than the bound before it -- bounds must strictly increase, or a \
+                         range is unreachable"
+                    );
+                }
+                previous = Some(bound);
+            }
+        }
     }
 
     let mut resolved = HashMap::with_capacity(components.len());
@@ -13002,6 +13076,93 @@ mod tests {
         for window in [1, 32, 1024] {
             resolve(with_window(window))
                 .unwrap_or_else(|err| panic!("window {window} should resolve, got: {err}"));
+        }
+    }
+
+    // ---- rule 82: bucket ------------------------------------------------------------------
+
+    /// A `bucket` between a listener and a sink, its `attributes` given as JSON.
+    fn cfg_with_bucket(attributes: &str) -> Config {
+        let kind = listener_from_json(&format!(
+            r#"{{"type": "bucket", "sources": ["in"], "attributes": {attributes}}}"#
+        ));
+        cfg(vec![("in", vec![], listener()), ("b", vec!["in"], kind), ("out", vec!["b"], sink())])
+    }
+
+    #[test]
+    fn rule_82_accepts_every_range_shape() {
+        for attributes in [
+            r#"{"d": {"into": "c", "ranges": [{"lt": 0.1, "value": "fast"},
+                {"le": 1, "value": "ok"}, {"value": "slow"}], "other": "unknown"}}"#,
+            r#"{"d": {"into": "d", "ranges": [{"le": 0, "value": "none"}, {"value": "some"}],
+                "keep_source": false}}"#,
+            r#"{"d": {"into": "c", "ranges": [{"lt": 1000, "value": "a"},
+                {"lt": 2000, "value": "a"}]}}"#,
+            r#"{"d": {"into": "c", "ranges": [{"value": "any"}]}}"#,
+        ] {
+            resolve(cfg_with_bucket(attributes))
+                .unwrap_or_else(|err| panic!("{attributes} should resolve: {err}"));
+        }
+    }
+
+    #[test]
+    fn rule_82_rejects_each_malformed_bucket() {
+        for (attributes, expected) in [
+            (r#"{}"#, "no 'attributes'"),
+            (r#"{"": {"into": "c", "ranges": [{"value": "a"}]}}"#, "key must not be empty"),
+            (r#"{"d": {"into": "", "ranges": [{"value": "a"}]}}"#, "empty 'into'"),
+            (r#"{"d": {"into": "c", "ranges": []}}"#, "empty 'ranges'"),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"lt": 1, "le": 1, "value": "a"}]}}"#,
+                "both 'lt' and 'le'",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"value": "a"}, {"lt": 1, "value": "b"}]}}"#,
+                "isn't the last range",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"lt": 2, "value": "a"},
+                    {"le": 1, "value": "b"}]}}"#,
+                "strictly increase",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"lt": 1, "value": "a"},
+                    {"le": 1, "value": "b"}]}}"#,
+                "strictly increase",
+            ),
+            (r#"{"d": {"into": "c", "ranges": [{"lt": 1, "value": ""}]}}"#, "empty 'value'"),
+            (r#"{"d": {"into": "c", "ranges": [{"value": "a"}], "other": ""}}"#, "empty 'other'"),
+        ] {
+            let err = expect_err(cfg_with_bucket(attributes));
+            assert!(err.contains(expected), "{attributes}: expected '{expected}', got: {err}");
+        }
+    }
+
+    /// JSON can't spell a non-finite number, so this one is built directly.
+    #[test]
+    fn rule_82_rejects_a_non_finite_bound() {
+        for bound in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let kind = ComponentKind::Bucket {
+                attributes: std::collections::BTreeMap::from([(
+                    "d".to_string(),
+                    logit_config::BucketSpec {
+                        into: "c".to_string(),
+                        ranges: vec![logit_config::BucketRange {
+                            lt: Some(bound),
+                            le: None,
+                            value: "a".to_string(),
+                        }],
+                        other: None,
+                        keep_source: true,
+                    },
+                )]),
+            };
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("b", vec!["in"], kind),
+                ("out", vec!["b"], sink()),
+            ]));
+            assert!(err.contains("non-finite bound"), "{bound}: got: {err}");
         }
     }
 }

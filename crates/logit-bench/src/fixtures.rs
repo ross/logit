@@ -37,10 +37,10 @@ use logit_proto::graphite::{GraphiteDecoder, Protocol as GraphiteProtocol};
 use logit_proto::prometheus::{PrometheusDecoder, PrometheusEncoder};
 use logit_proto::Decoder;
 use logit_transforms::{
-    AggregateTemporality, Aggregator, Arrays, CsvParser, Distributions, Fields, Flatten,
-    HttpAccess, HttpAccessConfig, JsonParser, Keep, KeepValues, Kv, KvMetrics, Logfmt, MetricSpec,
-    Normalize, RegexParser, RouteRule, RouteSet, Sample, SampleField, SampleKey, SampleMissing,
-    SampleOverride, Set, Shape,
+    AggregateTemporality, Aggregator, Arrays, Bucket, BucketBound, BucketField, CsvParser,
+    Distributions, Fields, Flatten, HttpAccess, HttpAccessConfig, JsonParser, Keep, KeepValues, Kv,
+    KvMetrics, Logfmt, MetricSpec, Normalize, RegexParser, RouteRule, RouteSet, Sample,
+    SampleField, SampleKey, SampleMissing, SampleOverride, Set, Shape,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -551,6 +551,22 @@ pub fn keep_values() -> KeepValues {
             Some(Value::str("other")),
         )],
     )
+}
+
+/// A `bucket` classifying `nginx_event`'s `request_time` (`0.001`) into `request_time_class`
+/// (`tests/allocations.rs`'s `bucket_one_event`): `lt: 0.1` fast, `le: 1` ok, catch-all slow.
+pub fn bucket() -> Bucket {
+    Bucket::new(vec![BucketField {
+        field: "request_time".to_string(),
+        into: "request_time_class".to_string(),
+        ranges: vec![
+            (BucketBound::Lt(0.1), "fast".to_string()),
+            (BucketBound::Le(1.0), "ok".to_string()),
+            (BucketBound::Any, "slow".to_string()),
+        ],
+        other: Some("unknown".to_string()),
+        keep_source: true,
+    }])
 }
 
 /// [`nginx_event`] with `host` uppercased, so `keep_values`' `normalize: [lower]` step has work to

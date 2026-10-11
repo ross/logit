@@ -73,7 +73,8 @@ use logit_proto::graphite::{
     Tags as GraphiteWireTags,
 };
 use logit_transforms::{
-    AggregateTemporality as TransformTemporality, Aggregator, Arrays as TransformArrays, CsvParser,
+    AggregateTemporality as TransformTemporality, Aggregator, Arrays as TransformArrays,
+    Bucket as BucketTransform, BucketBound, BucketField, CsvParser,
     Distributions as TransformDistributions, DropAttributes as DropAttributesTransform,
     DropProvenance as DropProvenanceTransform, DropSignals as DropSignalsTransform,
     Fields as TransformFields, Flatten as FlattenTransform,
@@ -1032,6 +1033,9 @@ fn build_spec(
             KeepValuesTransform::new(to_allow_lists(resource), to_allow_lists(attributes))
                 .with_telemetry(telemetry.clone()),
         )),
+        Bucket { attributes } => NodeSpec::Transform(Box::new(
+            BucketTransform::new(to_bucket_fields(attributes)).with_telemetry(telemetry.clone()),
+        )),
         // `with_name(id)` becomes the `tap` tag, so two `shape` taps feeding one `aggregate` stay
         // distinct series (`docs/adr/shape-observer-component.md`).
         Shape { interval, resource, max_tracked_keys, max_tracked_keysets } => {
@@ -1942,6 +1946,34 @@ fn to_allow_lists(
             let allow = allow_list.allow.iter().map(to_set_value).collect();
             let other = allow_list.other.as_ref().map(to_set_value);
             (field.clone(), normalize, allow, other)
+        })
+        .collect()
+}
+
+/// `bucket`'s `BucketSpec` map into the `BucketField`s `Bucket::new` takes. Rule 82 has rejected a
+/// range with both `lt` and `le`.
+fn to_bucket_fields(
+    attributes: &std::collections::BTreeMap<String, logit_config::BucketSpec>,
+) -> Vec<BucketField> {
+    attributes
+        .iter()
+        .map(|(field, spec)| BucketField {
+            field: field.clone(),
+            into: spec.into.clone(),
+            ranges: spec
+                .ranges
+                .iter()
+                .map(|range| {
+                    let bound = match (range.lt, range.le) {
+                        (Some(bound), _) => BucketBound::Lt(bound),
+                        (None, Some(bound)) => BucketBound::Le(bound),
+                        (None, None) => BucketBound::Any,
+                    };
+                    (bound, range.value.clone())
+                })
+                .collect(),
+            other: spec.other.clone(),
+            keep_source: spec.keep_source,
         })
         .collect()
 }
@@ -4865,6 +4897,50 @@ mod tests {
             build_spec("keep_values", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
+    }
+
+    /// Runs the built transform: each range's bound kind and the class reach `Bucket::new`.
+    #[test]
+    fn build_spec_builds_a_working_bucket_transform() {
+        let kind: logit_config::Component = serde_json::from_str(
+            r#"{"type": "bucket", "sources": ["in"], "attributes": {"d": {"into": "c",
+                "ranges": [{"lt": 1, "value": "under"}, {"le": 1, "value": "one"},
+                           {"value": "over"}]}}}"#,
+        )
+        .unwrap();
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: kind.kind,
+        };
+        let NodeSpec::Transform(mut transform) =
+            build_spec("b", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("expected a Transform node");
+        };
+        let resource = Arc::new(logit_core::Resource::default());
+        for (value, class) in [(0.5, "under"), (1.0, "one"), (2.0, "over")] {
+            let mut attrs = logit_core::AttrMap::new();
+            attrs.insert("d", logit_core::Value::F64(value));
+            let mut event = logit_core::Event::log(
+                0,
+                attrs,
+                logit_core::LogRecord {
+                    message: logit_core::Value::str("msg"),
+                    severity: None,
+                    body_format: logit_core::BodyFormat::Raw,
+                    trace: None,
+                    event_name: None,
+                    observed_timestamp: 0,
+                    dropped_attributes_count: 0,
+                },
+            );
+            assert!(transform.process(&resource, &mut event));
+            assert_eq!(event.attributes.get("c"), Some(&logit_core::Value::str(class)), "{value}");
+        }
     }
 
     /// Runs the built transform: `FlattenFields`/`FlattenArrays` reach `Flatten::new`.

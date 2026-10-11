@@ -285,6 +285,42 @@ pub struct ValueAllowList {
     pub other: Option<SetValue>,
 }
 
+/// One source field's classification, under `bucket`'s `attributes` map.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BucketSpec {
+    /// The attribute the matched range's `value` is written to. Must be non-empty. Naming the
+    /// source field itself replaces the number with its class in place.
+    pub into: String,
+    /// The classes, tested in order; the first range that matches wins. Must be non-empty. Every
+    /// bound must be finite and larger than the bound before it. A range with no bound matches
+    /// any number, and is allowed only as the last range.
+    pub ranges: Vec<BucketRange>,
+    /// What `into` becomes when the source value isn't a finite number, or is a number no range
+    /// matches. Absent (the default) writes nothing in either case.
+    #[serde(default)]
+    pub other: Option<String>,
+    /// Keep the source attribute after a class is written. Defaults to `true`. `false` removes
+    /// it, unless `into` names the source field, where the class has already replaced it.
+    #[serde(default = "default_bucket_keep_source")]
+    pub keep_source: bool,
+}
+
+/// One class in a `bucket` field's `ranges` list: at most one upper bound, and the class name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BucketRange {
+    /// Matches a number strictly below this bound. Can't be set together with `le`.
+    #[serde(default)]
+    pub lt: Option<f64>,
+    /// Matches a number at or below this bound. Can't be set together with `lt`.
+    #[serde(default)]
+    pub le: Option<f64>,
+    /// The class written to `into` when this range matches. Must be non-empty. Two ranges may
+    /// write the same class.
+    pub value: String,
+}
+
 /// One entry of `http_access`'s `routes` list: either a `builtin` set, or a `match` regex with
 /// the literal `route` it assigns. Never both, and never a mix; `logit validate` names which half
 /// is missing or which key is extra. `match` is tested unanchored (unless the pattern anchors
@@ -2224,6 +2260,16 @@ pub enum ComponentKind {
         #[serde(default)]
         attributes: std::collections::BTreeMap<String, ValueAllowList>,
     },
+    /// Classifies a numeric attribute into a named class by range, so a number becomes a
+    /// bounded string value that `has_attributes`, `drop_attributes`, and `route` can match:
+    /// `http.request.duration_s` becomes `fast`, `ok`, or `slow` in
+    /// `http.request.duration_class`. Integers, floats, and strings that parse as a finite number
+    /// are classified. Never drops an event. An attribute the event doesn't carry is a silent
+    /// no-op for that field, never a stamp. `attributes` must be non-empty.
+    Bucket {
+        /// Applied per event, to `event.attributes`, keyed by the source field.
+        attributes: std::collections::BTreeMap<String, BucketSpec>,
+    },
     /// Forwards an event whose batch's `origin`/`previous` match a configured list: `origin` is
     /// the component that created the batch and `previous` the one that most recently handled
     /// it, not event data. Never mutates a forwarded event.
@@ -3531,6 +3577,11 @@ pub enum FlattenArrays {
     Index,
     /// Leave the array as a leaf, written back whole at its path.
     Skip,
+}
+
+/// `bucket`'s `keep_source` default: keep the source attribute.
+fn default_bucket_keep_source() -> bool {
+    true
 }
 
 /// `flatten`'s `attributes` default: every nested attribute.
@@ -5778,6 +5829,61 @@ mod tests {
         let step: NormalizeStep = serde_json::from_str(r#""lower""#).unwrap();
         assert_eq!(step, NormalizeStep::Lower);
         assert_eq!(serde_json::to_string(&NormalizeStep::Lower).unwrap(), r#""lower""#);
+    }
+
+    #[test]
+    fn bucket_component_deserializes_full_form() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "bucket", "sources": ["in"],
+                "attributes": {"duration_s": {"into": "duration_class",
+                    "ranges": [{"lt": 0.1, "value": "fast"}, {"le": 1, "value": "ok"},
+                               {"value": "slow"}],
+                    "other": "unknown", "keep_source": false}}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Bucket { attributes } => {
+                let spec = &attributes["duration_s"];
+                assert_eq!(spec.into, "duration_class");
+                assert_eq!(
+                    spec.ranges,
+                    vec![
+                        BucketRange { lt: Some(0.1), le: None, value: "fast".to_string() },
+                        BucketRange { lt: None, le: Some(1.0), value: "ok".to_string() },
+                        BucketRange { lt: None, le: None, value: "slow".to_string() },
+                    ]
+                );
+                assert_eq!(spec.other.as_deref(), Some("unknown"));
+                assert!(!spec.keep_source);
+            }
+            other => panic!("expected Bucket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bucket_other_defaults_to_none_and_keep_source_to_true() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "bucket", "sources": ["in"],
+                "attributes": {"d": {"into": "c", "ranges": [{"value": "any"}]}}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Bucket { attributes } => {
+                assert_eq!(attributes["d"].other, None);
+                assert!(attributes["d"].keep_source);
+            }
+            other => panic!("expected Bucket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bucket_rejects_an_unknown_range_key() {
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "bucket", "sources": ["in"],
+                "attributes": {"d": {"into": "c", "ranges": [{"ge": 1, "value": "big"}]}}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ge"), "got: {err}");
     }
 
     #[test]

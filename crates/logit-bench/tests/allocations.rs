@@ -1174,6 +1174,22 @@ fn keep_values_one_event_needs_lowering() {
     expect_allocs("keep_values: host needs lowering before it's allowed", stats, 1);
 }
 
+/// Zero: the class is a `Value` built once in `Bucket::new`, so writing it is a `Bytes` refcount
+/// bump, and `nginx_event`'s attributes have already spilled with room for one more key.
+#[test]
+fn bucket_one_event() {
+    let mut bucket = fixtures::bucket();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::nginx_event();
+    bucket.process(&resource, &mut warm);
+
+    let mut event = fixtures::nginx_event();
+    let (forwarded, stats) = measure(|| bucket.process(&resource, &mut event));
+    assert!(forwarded, "bucket forwards");
+    assert_eq!(event.attributes.get("request_time_class"), Some(&Value::str("fast")));
+    expect_allocs("bucket: classify request_time", stats, 0);
+}
+
 /// Zero: `nginx_event`'s attributes are all flat, so `flatten`'s phase-1 scan selects nothing and
 /// nothing is interned, removed, or reinserted (`docs/adr/flatten-transform.md`).
 #[test]

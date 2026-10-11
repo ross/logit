@@ -10,6 +10,7 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [`bucket`: a numeric-range classifier that writes a bounded attribute value](bucket-transform.md) | 2026-10-11 | 2026-10-11 |
 | [Run CI in an image prebaked from `Dockerfile.dev` and published to GHCR](ci-image-on-ghcr.md) | 2026-10-09 | 2026-10-09 |
 | [A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle](soak-harness.md) | 2026-10-08 | 2026-10-09 |
 | [`statsd_out` multi-value expansion: summarized kinds leave as dotted counter and gauge lines by default](statsd-out-multi-value-expansion.md) | 2026-10-07 | 2026-10-07 |
