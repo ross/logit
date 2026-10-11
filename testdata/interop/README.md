@@ -76,6 +76,9 @@ testdata/interop/
                           compressed as sent, one file per request
   splunk/*.headers     -- one sidecar per body: the method, the route with its query string (the
                           `/raw` envelope), and the compression
+  kafka/README.md      -- provenance for kafka/*: Java-client murmur2 partition vectors, record
+                          batches as a broker stored them (Java and kcat, five codecs), and the
+                          broker's ApiVersions ranges; not wire captures
 ```
 
 The capture methods differ on purpose. The `*.raw` corpora come from read-only UDP and TCP sinks.

@@ -1,0 +1,6 @@
+# apache/kafka:4.2.0 kafka-dump-log.sh --files <kafka-record-b-java-lz4-0/00000000000000000000.log> --print-data-log --deep-iteration
+Log starting offset: 0
+baseOffset: 0 lastOffset: 2 count: 3 baseSequence: 0 lastSequence: 2 producerId: 4 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1791739955584 size: 202 magic: 2 compresscodec: lz4 crc: 1836875165 isvalid: true
+| offset: 0 CreateTime: 1791739955552 keySize: 5 valueSize: 55 sequence: 0 headerKeys: [h1] key: key-1 payload: the quick brown fox jumps over the lazy dog, record one
+| offset: 1 CreateTime: 1791739955584 keySize: 5 valueSize: 55 sequence: 1 headerKeys: [h1] key: key-2 payload: the quick brown fox jumps over the lazy dog, record two
+| offset: 2 CreateTime: 1791739955584 keySize: 5 valueSize: 57 sequence: 2 headerKeys: [h1] key: key-3 payload: the quick brown fox jumps over the lazy dog, record three
