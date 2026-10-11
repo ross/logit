@@ -104,9 +104,13 @@ components:
         field: upstream.duration_s # empty on a non-proxied request -> silently skipped
         unit: s
 
+  # A debugging tap beside `influx_out`, so it drops its oldest batches rather than stall the
+  # metrics when nothing reads stdout. `span_tap` below does the same.
   tap:
     type: stdio_out
     sources: [nginx_metrics]
+    buffer:
+      overflow: drop_oldest
 
   # The span `nginx_trace` minted, isolated from the log+metrics event it rides in on:
   # `keep_signals` clears the other payload slots. Its own `stdio_out` keeps span lines apart from
@@ -119,6 +123,8 @@ components:
   span_tap:
     type: stdio_out
     sources: [nginx_spans]
+    buffer:
+      overflow: drop_oldest
 
   # `keep` before `aggregate`, not after: otherwise `aggregate` keys a series per request on every
   # syslog.* attribute (syslog.timestamp is unique per line) and on `url.path`/`client.address`.
