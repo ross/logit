@@ -739,7 +739,8 @@ topology, not a rare one, with these consequences:
   destination can head-of-line-block telemetry bound for an unrelated, healthy one. A sink isolates
   itself: `buffer.overflow: drop_newest | drop_oldest` keeps its inbox draining and counts what it
   drops, and `buffer.disk` defers the stall until the spool is full. The default `overflow: block`
-  keeps `tail_in`, TCP listeners, and the native hop lossless, because the sender waits. With every
+  keeps `tail_in`, TCP listeners, and the native hop lossless, because the sender waits. Rule 83
+  warns when one listener reaches two or more memory-only `block` sinks. With every
   sink set to drop, a transform, Lua node, or router backs up only when it is itself the
   bottleneck, which is a capacity matter. To find which branch is blocking, read
   `logit.component.inbox.full`, `inbox.blocked.duration`, and `inbox.batches` on the consumers

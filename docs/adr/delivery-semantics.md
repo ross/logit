@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-05
+updated: 2026-10-11
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -467,6 +467,31 @@ the consumer that blocks a fan-out is instrumented instead: `logit.component.inb
 (`docs/design/internal-telemetry.md`, "Inbox side: recorded under the consumer";
 `docs/design/pipeline-graph.md`, "Backpressure"). Propagating a closure as a shutdown signal
 stays open.
+
+## Amendment: warn on two or more memory-only blocking sinks behind one listener (2026-10-11)
+
+`block` stays the default `buffer.overflow`. Graph rule 83 adds a warning, not a rejection, when
+one listener reaches two or more sinks that use `overflow: block` with no `buffer.disk`, following
+both `sources` and router `targets` edges. The warning names the listeners and the sinks and
+nothing from their config. There's no opt-out.
+
+- **Why one blocking sink per source is fine.** That sink is the primary. When it stalls, intake
+  backs up behind it, which is what `block` is for: `tail_in`, the TCP listeners, and the native
+  hop stay lossless because the sender waits. A second memory-only blocking sink turns one
+  backend's outage into an outage of both, because the fan-out that feeds them parks on the full
+  one.
+- **Why a warning, not an error.** Two equal-priority destinations that should stall together
+  are a legitimate choice, and a config that is valid today keeps loading. An opt-out would be a
+  second setting to say what `drop_oldest` or `buffer.disk` already says.
+- **Why `buffer.disk` is exempt.** A spool absorbs the stall up to `disk.max_bytes`, which by
+  default is far longer than an in-memory buffer lasts. Past that bound a spool under `block`
+  backs up like memory; the operator sized it, so the rule doesn't second-guess it.
+- **Why `null_out` is exempt.** Its send never fails, so it never fills and never stalls a
+  sibling.
+- **Shipped configs follow the practice.** `every_shipped_config_loads_and_validates` asserts
+  that every config under `demo/`, `examples/`, `fixtures/`, `perf/scenarios/`, and the harness
+  directories resolves with no warnings, so an example an operator copies never models the shape
+  the warning flags.
 
 ## Amendment: per-request verdicts (2026-10-04)
 

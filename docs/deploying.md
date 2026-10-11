@@ -749,12 +749,21 @@ buffering:
 ### A slow or unreachable sink
 
 Under the default `overflow: block`, a sink whose buffer fills parks every branch that shares its
-upstream, including branches bound for healthy sinks. To keep one sink from stalling the others:
+upstream, including branches bound for healthy sinks. So give each source at most one sink that
+uses `overflow: block` with an in-memory buffer. That sink is the primary: when it stalls, intake
+backs up behind it by design. Give every other sink the source reaches one of these:
 
-- If the data matters and you need to ride out an outage, set `buffer.disk`. The stall waits until
-  the spool is full.
-- If the sink is best-effort, set `buffer.overflow: drop_newest` or `drop_oldest`. The sink keeps
-  draining and counts what it drops.
+- If the data matters and you need to ride out an outage, set `buffer.disk`. The spool absorbs the
+  stall until it reaches `disk.max_bytes`; after that, `overflow` applies as it does to a full
+  in-memory buffer, so under `block` a full spool backs up like memory.
+- If the sink is best-effort, such as a stdout display or a backend under evaluation, set
+  `buffer.overflow: drop_oldest` or `drop_newest`. The sink keeps draining and counts what it
+  drops.
+
+`logit validate` and `logit run` warn when a listener reaches two or more sinks that use
+`overflow: block` with no `buffer.disk`, naming the listener and the sinks. It's a warning, not an
+error, and there's no setting to silence it. A `buffer.disk` sink doesn't count, and neither does
+`null_out`, whose send never fails.
 
 To find the branch that is blocking, read these on the consumer, not the producer:
 `logit.component.inbox.full` (a send found the inbox full),
