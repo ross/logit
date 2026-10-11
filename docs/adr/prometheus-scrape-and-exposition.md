@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-03
+updated: 2026-10-10
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -62,8 +62,11 @@ compatibility" below for how the same two kinds grow into it later without a bre
 
 Both text exposition dialects are supported, on both kinds: Prometheus text format `0.0.4` and
 OpenMetrics `1.0`. `prometheus_in` parses whichever dialect a scraped target sent, determined from
-the response's own `Content-Type` header (`application/openmetrics-text` selects OpenMetrics;
-anything else, including a missing header, is treated as text `0.0.4`) — it does not send an
+the response's own `Content-Type` header (its media type, the part before any `;`, compared whole
+and case-insensitively: `application/openmetrics-text` selects OpenMetrics, and anything else,
+including a missing header, is treated as text `0.0.4`; the parameters aren't read, so a
+malformed one that makes Prometheus fall back to text `0.0.4` still selects OpenMetrics here, a
+divergence `docs/known-gaps/mappings.md` records) — it does not send an
 `Accept` header that forces one dialect, so it works against exporters that only understand the
 older format. `prometheus_out` negotiates the other direction: it inspects the scraping client's
 `Accept` header and serves OpenMetrics when the client asks for it, text `0.0.4` otherwise — the
@@ -74,6 +77,11 @@ The two dialects disagree on timestamp units, which the codec (not this ADR) has
 right in both directions: OpenMetrics timestamps and the `_created` series are **float seconds**;
 text `0.0.4` timestamps are **integer milliseconds**. A value crossing from one dialect to the
 other on a relay converts, it never reinterprets the same digits under the other unit.
+
+The Prometheus text differential corpus ([`testdata/differential/prometheus-text/`](../../testdata/differential/prometheus-text/README.md))
+is the conformance evidence for the decode side: it checks both dialects against Prometheus
+3.14.0's own parser over hand-built bodies and real exporters' scrape bodies, and
+`docs/known-gaps/mappings.md`'s `decode (Prometheus)` rows record where the two differ.
 
 ### Model mapping
 
@@ -234,7 +242,8 @@ Per [ADR `lossless-transit`](lossless-transit.md), the following count as normal
 for `prometheus_in -> prometheus_out`, and are what the round-trip fixed-point test asserts
 equality modulo:
 
-- Family/series reordering: families sorted by name, series within a family sorted by label set.
+- Family/series reordering: families sorted by the name on their `# TYPE` line, series within a
+  family sorted by label set.
 - Label reordering within a series, sorted by **rendered** (post-sanitization) name — see "Names
   and sanitization" above for the collision tie-break this implies.
 - Float formatting: shortest round-trip representation (`1.0` renders as `1`).
@@ -262,6 +271,17 @@ equality modulo:
   `logit.output.labels.normalized{reason="multi_value"}` once per attribute rather than silently
   dropped; an empty or all-unrepresentable array still drops the label entirely and counts
   `labels.dropped{reason="unrepresentable"}` as before.
+- **Two families whose `# TYPE` names coincide write once.** A text 0.0.4 counter `foo` beside a
+  gauge `foo_total` both write `# TYPE foo_total`, as counters `foo` and `foo_total` do in either
+  dialect (`# TYPE foo` in OpenMetrics), and `prometheus_out`'s registry can hold both, since it
+  keys families by sanitized model name. A
+  second `# TYPE` line for a name makes Prometheus reject the whole scrape, so the family whose
+  model name sorts first is written and each series of the other is counted
+  `logit.output.metrics.skipped{reason="name_collision"}`.
+- **A family with no line to write loses its `# HELP` and `# TYPE` lines too.** That's a family
+  whose every series is stale, or a text 0.0.4 summary holding only `_created`. Metadata with no
+  sample after it would parse back as no family at all, so writing it would make the output
+  differ from its own re-render.
 - The three synthetic families `prometheus_in` always adds (`up`, `scrape_duration_seconds`,
   `scrape_samples_scraped` — see "Synthetic scrape metrics" below) are excluded from the
   round-trip fixed-point comparison by name, not asserted equal at all: `scrape_duration_seconds`

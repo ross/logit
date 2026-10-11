@@ -1,0 +1,78 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "help",
+   "name": "http_requests_total",
+   "value": "The total number of HTTP requests."
+  },
+  {
+   "kind": "type",
+   "name": "http_requests_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "code",
+     "200"
+    ],
+    [
+     "method",
+     "post"
+    ]
+   ],
+   "name": "http_requests_total",
+   "ts_ms": 1395066363000,
+   "value": "0x40900c0000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "code",
+     "400"
+    ],
+    [
+     "method",
+     "post"
+    ]
+   ],
+   "name": "http_requests_total",
+   "ts_ms": 1395066363000,
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "error",
+     "Cannot find file:\n\"FILE.TXT\""
+    ],
+    [
+     "path",
+     "C:\\DIR\\FILE.TXT"
+    ]
+   ],
+   "name": "msdos_file_access_time_seconds",
+   "value": "0x41d5bace0ac00000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "metric_without_timestamp_and_labels",
+   "value": "0x4028f0a3d70a3d71"
+  }
+ ],
+ "error": {
+  "after_entry": 6,
+  "message": "expected timestamp or new record, got \"-\" (\"INVALID\") while parsing: \"something_weird{problem=\\\"division by zero\\\"} +Inf -\""
+ },
+ "input": {
+  "crc32c": "0xa8a64c50",
+  "len": 1588,
+  "path": "differential/prometheus-text/cases/doc-exposition-formats.txt"
+ },
+ "parser": "prom"
+}

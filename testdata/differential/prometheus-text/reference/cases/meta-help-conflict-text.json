@@ -1,0 +1,33 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "help",
+   "name": "m",
+   "value": "one"
+  },
+  {
+   "kind": "help",
+   "name": "m",
+   "value": "two"
+  },
+  {
+   "kind": "type",
+   "name": "m",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "m",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x5e36873f",
+  "len": 45,
+  "path": "differential/prometheus-text/cases/meta-help-conflict-text.txt"
+ },
+ "parser": "prom"
+}

@@ -53,15 +53,15 @@
 //!
 //! ## Framing
 //!
-//! Framing is the listener's job, not the decoder's: the driver's [`Framer`](crate::tcp::Framer)
-//! runs under a [`FramingMode`] chosen from `protocol:`. **Never [`FramingMode::Rfc6587Auto`]**: a
-//! carbon path may begin with a digit, which that mode would read as an RFC 6587 octet count and
-//! reframe the whole connection on.
+//! Framing is the listener's job, not the decoder's: the driver's
+//! [`Framer`](logit_proto::framing::Framer) runs under a [`FramingMode`] chosen from `protocol:`.
+//! **Never [`FramingMode::Rfc6587Auto`]**: a carbon path may begin with a digit, which that mode
+//! would read as an RFC 6587 octet count and reframe the whole connection on.
 //!
 //! | Protocol | Frame | Over the bound |
 //! |---|---|---|
 //! | plaintext, UDP | the datagram | nothing to bound: a datagram is already one read |
-//! | plaintext, TCP | [`FramingMode::Lines`] with [`Oversize::DrainToNextLine`]: one `\n`-delimited line (a trailing `\r` stripped) per `decode_into` | a line past `max_line_bytes` is dropped and counted **once** as `logit.input.frames.dropped{reason="oversize"}`; the connection stays open and the next line still decodes |
+//! | plaintext, TCP | [`FramingMode::Lines`] with [`Oversize::DrainToNextLine`]: one `\n`-delimited line (a trailing `\r` stripped) per `decode_into` | a line past `max_line_bytes` is dropped and counted **once** as `logit.input.frames.dropped{reason="oversize"}`, or `reason="drained"` if it crossed the bound before its `\n` arrived, so the connection discards input until its next `\n`; the connection stays open and the next line still decodes |
 //! | pickle, TCP | [`FramingMode::LengthPrefixed`]: a 4-byte big-endian length prefix then that many payload bytes, handed to `decode_into` unframed | a frame declaring more than `max_frame_bytes` **closes the connection** (`logit.input.frames.dropped{reason="oversize"}`, diagnostic `framing_error`): a length-framed stream has no resync point |
 //!
 //! A pickle payload that fails to decode (a disallowed opcode, a depth or item cap) drops that
@@ -70,10 +70,10 @@
 //! **A terminator-less line at EOF is dropped, not ingested.** Carbon's `\n` is the only signal a
 //! line is complete, so a sender that dies mid-line leaves a truncation. Without its newline,
 //! `svc.web01.cpu 42.5 17000` would parse cleanly and produce a gauge stamped 1970.
-//! [`FramingMode::Lines`] makes [`crate::tcp::Framer::finish`] return `Truncated` (counted
-//! `logit.input.frames.dropped{reason="truncated"}`), so a clean FIN and an abrupt RST agree about
-//! identical bytes. [`FramingMode::Rfc6587Auto`] does the opposite, because RFC 6587 §3.4.2 says a
-//! final syslog message needs no terminator.
+//! [`FramingMode::Lines`] makes [`logit_proto::framing::Framer::finish`] return `Truncated`
+//! (counted `logit.input.frames.dropped{reason="truncated"}`), so a clean FIN and an abrupt RST
+//! agree about identical bytes. [`FramingMode::Rfc6587Auto`] does the opposite, because RFC 6587
+//! §3.4.2 says a final syslog message needs no terminator.
 //!
 //! **One `decode_into` per line, not per read**, on carbon's hottest path: one `Arc` clone and one
 //! `absorb` per line. The ADR's "`graphite_in` TCP is now `logit_inputs::tcp`" section records the
@@ -116,11 +116,12 @@
 //! `logit.input.frames.dropped{reason}`, and `logit.component.receive.flushed{reason}`. The
 //! decoder's `logit.input.metrics.skipped{reason}` is reported under both.
 
-use crate::tcp::{FramingMode, Oversize, TcpListener, TcpListenerConfig, TlsServerSettings};
+use crate::tcp::{TcpListener, TcpListenerConfig, TlsServerSettings};
 use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use logit_core::{Diagnostics, Resource, Telemetry};
 use logit_pipeline::Fanout;
+use logit_proto::framing::{FramingMode, Oversize};
 use logit_proto::graphite::{
     GraphiteDecoder, Protocol, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_LINE_BYTES,
 };
@@ -720,16 +721,24 @@ mod tests {
         running.handle.abort();
     }
 
-    /// A line past `max_line_bytes` is counted once and the next line still decodes.
+    /// A line past `max_line_bytes` that crosses it with no `LF` is counted once as `drained`, and
+    /// the next line still decodes.
     #[tokio::test]
     async fn an_oversize_tcp_line_is_skipped_and_the_next_one_still_decodes() {
         let mut running =
             start(|input| input.with_max_line_bytes(64), Transport::Tcp, Protocol::Plaintext).await;
+        let mut probe = TelemetryProbe::with_registry(running.registry.clone());
         let mut stream = running.connect().await;
         let long_path = "x".repeat(200);
         stream.write_all(long_path.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The count proves the framer crossed the bound with no `LF` buffered, so the rest of
+        // the line lands in the drain.
+        probe
+            .wait_for("the line counted drained", |t| {
+                t.sum("logit.input.frames.dropped", &[("reason", "drained")]) >= 1.0
+            })
+            .await;
         stream.write_all(format!(" 1 {TIMESTAMP}\n").as_bytes()).await.unwrap();
         stream.write_all(line("after.oversize").as_bytes()).await.unwrap();
 
@@ -737,14 +746,14 @@ mod tests {
         assert_eq!(batch.events.len(), 1, "only the survivor is delivered");
         assert_eq!(resolve(batch.events[0].metrics[0].name), "after.oversize");
 
-        let drained = running.registry.drain(0);
         assert_eq!(
-            metric_sum(&drained, "logit.input.frames.dropped", Some(("reason", "oversize"))),
+            probe.sum("logit.input.frames.dropped", &[("reason", "drained")]),
             1.0,
             "counted once when the bound was crossed, not once per byte drained"
         );
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]), 0.0);
         assert_eq!(
-            metric_sum(&drained, "logit.component.diagnostics", Some(("key", "framing_error"))),
+            probe.sum("logit.component.diagnostics", &[("key", "framing_error")]),
             1.0,
             "and diagnosed on the driver's own framing key"
         );
@@ -1275,7 +1284,8 @@ mod tests {
     }
 
     /// Decodes every length-prefixed pickle frame a recorded connection holds, stripping each
-    /// prefix as `crate::tcp::Framer` does: the decoder expects one unframed payload per call.
+    /// prefix as `logit_proto::framing::Framer` does: the decoder expects one unframed payload per
+    /// call.
     fn decode_interop_pickle(name: &str) -> (Vec<Event>, Arc<Registry>) {
         let (mut decoder, registry) = interop_decoder(Protocol::Pickle);
         let raw = interop_fixture(name);
@@ -1381,5 +1391,61 @@ mod tests {
     #[test]
     fn interop_fixture_pickle_protocol_5_decodes() {
         assert_pickle_fixture_decodes("graphite-pickle-p5-000.raw");
+    }
+
+    /// The same `DATAPOINTS` in CPython 3's protocol 0: `UNICODE`, `INT`, `FLOAT`, and `PUT`.
+    #[test]
+    fn interop_fixture_pickle_protocol_0_decodes() {
+        assert_pickle_fixture_decodes("graphite-pickle-p0-000.raw");
+    }
+
+    /// Every event as `(path, timestamp, value)`, for a fixture whose values are all `Gauge`s.
+    fn interop_points(events: &[Event]) -> Vec<(&str, i64, f64)> {
+        events
+            .iter()
+            .map(|e| {
+                assert_eq!(e.metrics.len(), 1, "one pickle datapoint is one event with one metric");
+                let MetricKind::Gauge(value) = e.metrics[0].kind else {
+                    panic!("carbon's wire has no type, got {:?}", e.metrics[0].kind)
+                };
+                (resolve(e.metrics[0].name), e.timestamp, value)
+            })
+            .collect()
+    }
+
+    /// Diamond's `cPickle.dumps(batch)` on Python 2.7.18
+    /// (`tools/record-fixtures/python2_diamond_pickle_producer.py`): protocol 0 with a memo
+    /// numbered from 1, a `\x`-escaped UTF-8 path, a repeated path through `GET`, and a `LONG`.
+    #[test]
+    fn interop_fixture_pickle_python_2_decodes() {
+        let (events, registry) = decode_interop_pickle("graphite-pickle-py2-000.raw");
+        assert_eq!(interop_diagnostic_keys(&registry), Vec::<String>::new());
+        assert_eq!(
+            interop_points(&events),
+            vec![
+                ("logit-fixture.diamond.cpu.total.user", 1_700_000_000_000_000_000, 12.5),
+                ("logit-fixture.diamond.loadavg.01", 1_700_000_000_000_000_000, 0.25),
+                ("logit-fixture.diamond.caf\u{e9}.count", 1_700_000_001_000_000_000, 3.0),
+                ("logit-fixture.diamond.cpu.total.user", 1_700_000_002_000_000_000, -1.0),
+                ("logit-fixture.diamond.uptime", 1_700_000_003_000_000_000, 7.0),
+            ]
+        );
+    }
+
+    /// Dropwizard Metrics 4.2.25's `GraphiteReporter` over `PickledGraphite`
+    /// (`tools/record-fixtures/dropwizard-graphite/`): hand-written protocol 0, every value a
+    /// quoted `STRING`, and a raw UTF-8 name. The `NaN` gauge is skipped as carbon drops it.
+    #[test]
+    fn interop_fixture_dropwizard_decodes() {
+        let (events, registry) = decode_interop_pickle("graphite-dropwizard-000.raw");
+        assert_eq!(interop_diagnostic_keys(&registry), vec!["non_finite_value".to_string()]);
+        assert_eq!(
+            interop_points(&events),
+            vec![
+                ("logit-fixture.dropwizard.heap.used", 1_700_000_000_000_000_000, 12.5),
+                ("logit-fixture.dropwizard.caf\u{e9}.visits.count", 1_700_000_000_000_000_000, 3.0),
+                ("logit-fixture.dropwizard.requests.count", 1_700_000_000_000_000_000, 42.0),
+            ]
+        );
     }
 }

@@ -1,0 +1,22 @@
+{
+ "divergence": "one label named twice: skipped `duplicate_label`; Prometheus's parser reads it and its scrape loop then rejects the label set (docs/known-gaps/mappings.md: A line Prometheus's text parser keeps that this decoder skips)",
+ "divergent": [
+  [
+   "e",
+   [
+    [
+     "a",
+     "1"
+    ],
+    [
+     "a",
+     "2"
+    ]
+   ]
+  ]
+ ],
+ "result": "ok",
+ "skips": {
+  "duplicate_label": 1
+ }
+}

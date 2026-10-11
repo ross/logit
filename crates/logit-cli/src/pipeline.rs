@@ -1020,14 +1020,20 @@ fn build_spec(
         DropSignals { signals } => NodeSpec::Transform(Box::new(
             DropSignalsTransform::new(to_signal_set(signals)).with_telemetry(telemetry.clone()),
         )),
-        HasAttributes { resource, attributes } => NodeSpec::Transform(Box::new(
-            HasAttributesTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
-                .with_telemetry(telemetry.clone()),
-        )),
-        DropAttributes { resource, attributes } => NodeSpec::Transform(Box::new(
-            DropAttributesTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
-                .with_telemetry(telemetry.clone()),
-        )),
+        HasAttributes { resource, attributes, resource_present, attributes_present } => {
+            NodeSpec::Transform(Box::new(
+                HasAttributesTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
+                    .with_present(resource_present.clone(), attributes_present.clone())
+                    .with_telemetry(telemetry.clone()),
+            ))
+        }
+        DropAttributes { resource, attributes, resource_present, attributes_present } => {
+            NodeSpec::Transform(Box::new(
+                DropAttributesTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
+                    .with_present(resource_present.clone(), attributes_present.clone())
+                    .with_telemetry(telemetry.clone()),
+            ))
+        }
         KeepValues { resource, attributes } => NodeSpec::Transform(Box::new(
             KeepValuesTransform::new(to_allow_lists(resource), to_allow_lists(attributes))
                 .with_telemetry(telemetry.clone()),
@@ -4815,6 +4821,8 @@ mod tests {
                     "stream".to_string(),
                     logit_config::SetValue::Str("a".to_string()),
                 )]),
+                resource_present: Vec::new(),
+                attributes_present: Vec::new(),
             },
         };
         assert!(matches!(
@@ -4837,6 +4845,8 @@ mod tests {
                     logit_config::SetValue::Str("nginx".to_string()),
                 )]),
                 attributes: std::collections::BTreeMap::new(),
+                resource_present: Vec::new(),
+                attributes_present: Vec::new(),
             },
         };
         assert!(matches!(

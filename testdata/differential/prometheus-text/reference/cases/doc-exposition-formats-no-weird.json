@@ -1,0 +1,240 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "help",
+   "name": "http_requests_total",
+   "value": "The total number of HTTP requests."
+  },
+  {
+   "kind": "type",
+   "name": "http_requests_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "code",
+     "200"
+    ],
+    [
+     "method",
+     "post"
+    ]
+   ],
+   "name": "http_requests_total",
+   "ts_ms": 1395066363000,
+   "value": "0x40900c0000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "code",
+     "400"
+    ],
+    [
+     "method",
+     "post"
+    ]
+   ],
+   "name": "http_requests_total",
+   "ts_ms": 1395066363000,
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "error",
+     "Cannot find file:\n\"FILE.TXT\""
+    ],
+    [
+     "path",
+     "C:\\DIR\\FILE.TXT"
+    ]
+   ],
+   "name": "msdos_file_access_time_seconds",
+   "value": "0x41d5bace0ac00000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "metric_without_timestamp_and_labels",
+   "value": "0x4028f0a3d70a3d71"
+  },
+  {
+   "kind": "help",
+   "name": "http_request_duration_seconds",
+   "value": "A histogram of the request duration."
+  },
+  {
+   "kind": "type",
+   "name": "http_request_duration_seconds",
+   "value": "histogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "0.05"
+    ]
+   ],
+   "name": "http_request_duration_seconds_bucket",
+   "value": "0x40d77d8000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "0.1"
+    ]
+   ],
+   "name": "http_request_duration_seconds_bucket",
+   "value": "0x40e0548000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "0.2"
+    ]
+   ],
+   "name": "http_request_duration_seconds_bucket",
+   "value": "0x40f8828000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "0.5"
+    ]
+   ],
+   "name": "http_request_duration_seconds_bucket",
+   "value": "0x40ff96d000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1.0"
+    ]
+   ],
+   "name": "http_request_duration_seconds_bucket",
+   "value": "0x41005b2000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "http_request_duration_seconds_bucket",
+   "value": "0x41019e0000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "http_request_duration_seconds_sum",
+   "value": "0x40ea15e000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "http_request_duration_seconds_count",
+   "value": "0x41019e0000000000"
+  },
+  {
+   "kind": "help",
+   "name": "rpc_duration_seconds",
+   "value": "A summary of the RPC duration in seconds."
+  },
+  {
+   "kind": "type",
+   "name": "rpc_duration_seconds",
+   "value": "summary"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.01"
+    ]
+   ],
+   "name": "rpc_duration_seconds",
+   "value": "0x40a83c0000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.05"
+    ]
+   ],
+   "name": "rpc_duration_seconds",
+   "value": "0x40a9900000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.5"
+    ]
+   ],
+   "name": "rpc_duration_seconds",
+   "value": "0x40b2a50000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.9"
+    ]
+   ],
+   "name": "rpc_duration_seconds",
+   "value": "0x40c1948000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.99"
+    ]
+   ],
+   "name": "rpc_duration_seconds",
+   "value": "0x40f2b70000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "rpc_duration_seconds_sum",
+   "value": "0x4170bf3990000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "rpc_duration_seconds_count",
+   "value": "0x40a50a0000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xb9d10d6a",
+  "len": 1530,
+  "path": "differential/prometheus-text/cases/doc-exposition-formats-no-weird.txt"
+ },
+ "parser": "prom"
+}

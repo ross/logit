@@ -1,0 +1,107 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "g",
+   "value": "gaugehistogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1"
+    ]
+   ],
+   "name": "g_bucket",
+   "value": "0x3fe0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "g_bucket",
+   "value": "0x4004000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g_gcount",
+   "value": "0x4003eb851eb851ec"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g_gsum",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "h",
+   "value": "histogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1.0"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x3ff8000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_count",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_sum",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "s",
+   "value": "summary"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "s_count",
+   "value": "0x4004000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "s_sum",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x75600fd1",
+  "len": 219,
+  "path": "differential/prometheus-text/cases/om-fractional-counts.om"
+ },
+ "parser": "openmetrics"
+}

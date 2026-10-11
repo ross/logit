@@ -1,0 +1,1 @@
+{"time":"2026-09-07T06:52:01+00:00","remote_addr":"203.0.113.7","host":"shop.example.com","request_method":"GET","request_uri":"/api/v1/orders?id=42&sort=desc","status":200,"body_bytes_sent":612,"request_time":0.012,"upstream_response_time":"0.010","http_referer":"","http_user_agent":"Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0","http_x_forwarded_for":""}

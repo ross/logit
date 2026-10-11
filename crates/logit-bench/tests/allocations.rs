@@ -19,6 +19,7 @@
 
 use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
+use logit_core::subslice::within;
 use logit_core::{AttrMap, EventBatch, Registry, Resource, Telemetry, TraceRef, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::statsd::{Format as StatsdFormat, StatsdEncoder};
@@ -90,9 +91,9 @@ fn syslog_decode_100_lines() {
     assert_eq!(stats.reallocs, 5, "the events Vec grows 4 -> 8 -> 16 -> 32 -> 64 -> 128");
 }
 
-/// Two allocations for one line. Tag values are `slice_of` slices of the datagram, as in
-/// `syslog.rs`, so they cost nothing ([`statsd_tag_values_share_the_datagram_allocation`] pins
-/// that structurally).
+/// Two allocations for one line. Tag values are zero-copy slices of the datagram, as in
+/// `logit_proto::syslog`, so they cost nothing
+/// ([`statsd_tag_values_share_the_datagram_allocation`] pins that structurally).
 ///
 /// Syslog pays one `Vec<Event>` total; statsd pays two. The multi-value grammar (`name:1:2:3|c`)
 /// makes `parse_line` collect one line's events into its own `Vec` before `decode` appends them to
@@ -172,7 +173,7 @@ fn statsd_decode_one_set_line() {
 }
 
 /// A repeated DogStatsD tag key folds into a `Value::Array` at decode
-/// (`crates/logit-inputs/src/statsd.rs`'s "DogStatsD tags" section). Four allocations:
+/// (`crates/logit-proto/src/statsd/mod.rs`'s "DogStatsD tags" section). Four allocations:
 /// [`statsd_decode_one_line`]'s per-line/per-batch `Vec<Event>` pair, plus two for the `Array`.
 /// `insert_tags` builds its `Vec` spine (`vec![existing, value]`), and `build_event`'s
 /// `attributes.clone()`, run once even for a single-value line, deep-copies that spine. A scalar
@@ -214,7 +215,7 @@ fn statsd_decode_one_multi_value_counter_line_with_a_repeated_tag_key() {
 }
 
 /// A DogStatsD event (`_e{tlen,xlen}:title|text|...`) whose `TEXT` has no `\n` escape:
-/// `unescape_event_text` takes its zero-copy `slice_of` path, so the count is
+/// `unescape_event_text` takes its zero-copy path, so the count is
 /// [`statsd_decode_one_line`]'s per-line/per-batch `Vec<Event>` pair.
 #[test]
 fn statsd_decode_one_event_line() {
@@ -411,7 +412,7 @@ fn graphite_decode_one_plaintext_line() {
 }
 
 /// The same count with two carbon tags on the line: each tag value is a zero-copy datagram slice
-/// (`logit_proto::graphite::decode`'s `slice_of`), and two entries fit `AttrMap`'s inline capacity.
+/// (`logit_core::subslice::share`), and two entries fit `AttrMap`'s inline capacity.
 #[test]
 fn graphite_decode_one_tagged_line() {
     let mut decoder = fixtures::graphite_decoder();
@@ -468,6 +469,20 @@ fn graphite_decode_a_100_datapoint_pickle_frame() {
     assert_eq!(batch.events.len(), 100);
     assert_eq!(stats.reallocs, 5, "the events Vec grows 4 -> 8 -> ... -> 128");
     expect_allocs("graphite_in: decode a 100-datapoint pickle frame", stats, 1);
+}
+
+/// The same 100 datapoints at protocol 0, every path escaped: still one allocation. The reader's
+/// scratch, which holds the decoded paths, is a field cleared per frame like its arenas.
+#[test]
+fn graphite_decode_a_100_datapoint_protocol_0_pickle_frame() {
+    let mut decoder = fixtures::graphite_pickle_decoder();
+    let frame = fixtures::graphite_pickle_protocol_0_frame(100);
+    drop(decoder.decode(frame.clone())); // warm: interns 100 paths and grows the scratch
+
+    let (batch, stats) = measure(|| decoder.decode(frame.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 100);
+    assert_eq!(stats.reallocs, 5, "the events Vec grows 4 -> 8 -> ... -> 128");
+    expect_allocs("graphite_in: decode a 100-datapoint protocol-0 pickle frame", stats, 1);
 }
 
 /// One scrape through the two functions a scrape tick calls (`prometheus_in` has no `Decoder`;
@@ -1069,10 +1084,10 @@ fn logfmt_values_share_the_message_allocation() {
     let Some(Value::Str(status)) = event.attributes.get("status") else {
         panic!("status should be a Str")
     };
-    assert!(points_into(&message, status), "an unquoted value should slice the message");
+    assert!(within(&message, status), "an unquoted value should slice the message");
 
     let Some(Value::Str(msg)) = event.attributes.get("msg") else { panic!("msg should be a Str") };
-    assert!(points_into(&message, msg), "a quoted, escape-free value should slice the message");
+    assert!(within(&message, msg), "a quoted, escape-free value should slice the message");
 
     let mut escaped = fixtures::logfmt_parser();
     let escaped_message = bytes::Bytes::from_static(fixtures::LOGFMT_ESCAPED_LINE.as_bytes());
@@ -1094,7 +1109,7 @@ fn logfmt_values_share_the_message_allocation() {
         panic!("query should be a Str")
     };
     assert!(
-        !points_into(&escaped_message, query),
+        !within(&escaped_message, query),
         "an escaped value must not point into the message -- it was unescaped into a fresh String"
     );
 }
@@ -3699,15 +3714,15 @@ fn syslog_fields_share_the_datagram_allocation() {
     let Value::Str(message) = &event.log.as_ref().expect("a log").message else {
         panic!("the message should be a Str");
     };
-    assert!(points_into(&datagram, message), "log.message should slice the datagram, not copy it");
+    assert!(within(&datagram, message), "log.message should slice the datagram, not copy it");
 
     let tag = event.attributes.get("syslog.tag").expect("a tag");
     let Value::Str(tag) = tag else { panic!("the tag should be a Str") };
-    assert!(points_into(&datagram, tag), "syslog.tag should slice the datagram too");
+    assert!(within(&datagram, tag), "syslog.tag should slice the datagram too");
 }
 
 /// statsd's zero-copy claim, stated structurally: a DogStatsD tag value points into the datagram
-/// buffer, via `statsd.rs`'s `slice_of`.
+/// buffer, via `logit_core::subslice::share`.
 #[test]
 fn statsd_tag_values_share_the_datagram_allocation() {
     let datagram = fixtures::statsd_datagram(1);
@@ -3718,7 +3733,7 @@ fn statsd_tag_values_share_the_datagram_allocation() {
     let env = event.attributes.get("env").expect("the env tag");
     let Value::Str(env) = env else { panic!("the tag value should be a Str") };
     assert_eq!(env.as_ref(), b"prod");
-    assert!(points_into(&datagram, env), "env tag value should slice the datagram, not copy it");
+    assert!(within(&datagram, env), "env tag value should slice the datagram, not copy it");
 }
 
 /// A UDP listener copies each datagram out of the reusable 64 KB receive buffer with
@@ -3740,12 +3755,6 @@ fn datagram_copy_is_one_right_sized_allocation() {
          got {} bytes",
         stats.bytes
     );
-}
-
-fn points_into(haystack: &bytes::Bytes, needle: &bytes::Bytes) -> bool {
-    let base = haystack.as_ptr() as usize;
-    let start = needle.as_ptr() as usize;
-    start >= base && start + needle.len() <= base + haystack.len()
 }
 
 // ---------------------------------------------------------------------------------------------

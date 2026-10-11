@@ -1,0 +1,84 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "h",
+   "value": "histogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "0.5"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1.0"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1.0"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "10.0"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4010000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4018000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_sum",
+   "value": "0x4022000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_count",
+   "value": "0x4018000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x7a00213c",
+  "len": 141,
+  "path": "differential/prometheus-text/cases/hist-le-spellings-text.txt"
+ },
+ "parser": "prom"
+}

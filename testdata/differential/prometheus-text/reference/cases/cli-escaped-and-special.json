@@ -1,0 +1,54 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "weird",
+   "value": "unknown"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "note",
+     "line\nbreak \"quoted\""
+    ],
+    [
+     "path",
+     "C:\\tmp"
+    ]
+   ],
+   "name": "weird",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "problem",
+     "division by zero"
+    ]
+   ],
+   "name": "weird",
+   "value": "0x7ff0000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "nanvalue",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "nanvalue",
+   "value": "0x7ff8000000000001"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x59a6f810",
+  "len": 149,
+  "path": "differential/prometheus-text/cases/cli-escaped-and-special.txt"
+ },
+ "parser": "prom"
+}

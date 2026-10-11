@@ -1,0 +1,14 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [],
+ "error": {
+  "after_entry": 0,
+  "message": "strconv.ParseInt: parsing \"9223372036854775808\": value out of range while parsing: \"g 1 9223372036854775808\""
+ },
+ "input": {
+  "crc32c": "0xd6a1f47a",
+  "len": 24,
+  "path": "differential/prometheus-text/cases/ts-text-int64-overflow.txt"
+ },
+ "parser": "prom"
+}

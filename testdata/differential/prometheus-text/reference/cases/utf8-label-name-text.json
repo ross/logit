@@ -1,0 +1,29 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "x.y",
+     "1"
+    ]
+   ],
+   "name": "m",
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xe9b4c754",
+  "len": 19,
+  "path": "differential/prometheus-text/cases/utf8-label-name-text.txt"
+ },
+ "parser": "prom"
+}

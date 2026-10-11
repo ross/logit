@@ -1,6 +1,6 @@
 ---
 created: 2026-09-07
-updated: 2026-09-22
+updated: 2026-10-11
 ---
 
 # Routing by condition, sampling, throttling, dedup, and renaming are `lua` components
@@ -184,7 +184,9 @@ to resume.
   is exactly the central-collector shape this ADR's cost table is about, multiplied by branch
   count. The response was not the retired predicate grammar -- `has_attributes`/`drop_attributes`
   (`docs/adr/attribute-filtering-components.md`) are a bounded key/value equality matcher, not a
-  parser, and their config is deliberately no wider than `set`'s. This ADR's core holding is
+  parser, and their config is deliberately no wider than `set`'s. [Amended 2026-10-11: they also
+  take lists of keys that must be present, with any value, which `set` has no counterpart for;
+  see the "Amendment: key presence" in that ADR. A presence test adds no operator.] This ADR's core holding is
   unchanged and this is not its supersession: `logit` still ships no native predicate language, no
   `filter`/`where`, no operators, no boolean algebra beyond a plain conjunction. Anything needing an
   actual operator (`>=`, `contains`, cross-attribute comparison) still means writing `lua`, and the

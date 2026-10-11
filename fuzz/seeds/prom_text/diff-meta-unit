@@ -1,0 +1,4 @@
+# TYPE m_seconds gauge
+# UNIT m_seconds seconds
+m_seconds 1
+# EOF

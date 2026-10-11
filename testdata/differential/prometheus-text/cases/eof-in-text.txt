@@ -1,0 +1,4 @@
+g 1
+# EOF
+g{a="b"} 2
+# HELP g A gauge.

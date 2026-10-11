@@ -1,0 +1,6 @@
+# TYPE h histogram
+h_bucket{le="1"} 2
+h_bucket{le="5"} 4
+h_sum 9
+h_count 4
+# EOF

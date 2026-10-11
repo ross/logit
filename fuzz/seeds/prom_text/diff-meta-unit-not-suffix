@@ -1,0 +1,4 @@
+# TYPE m gauge
+# UNIT m seconds
+m 1
+# EOF
