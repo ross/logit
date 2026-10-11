@@ -3,7 +3,8 @@ the data path it affects.
 
 `ACTIONS` maps an action name to an `Action`. `apply` and `revert` take the driver's `Context`
 and the `scenario.Step`, and return a dict for `timeline.jsonl`: `rc`, `stderr`, and, for netem,
-`netem_show` (the target's root qdisc after the change).
+`netem_show` (the target's root qdisc after the change). The two predicates take the step and
+the run's role map (`{service: role}`), so they judge a service by its role, not its name.
 
 Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
 
@@ -25,6 +26,8 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
 """
 
 from dataclasses import dataclass, field
+
+from .scenario import BACKEND_ROLE, GENERATOR_ROLE, SUT_ROLE
 
 NETEM_LIMIT = "100000"
 STOP_TIMEOUT_S = 30
@@ -50,7 +53,7 @@ class Action:
     # Whether the fault can lose UDP between the generator and the SUT, which the ledger's wire
     # row judges only outside such windows.
     affects_udp_ingress: object
-    # Whether the fault can delay or fail the SUT's remote-write.
+    # Whether the fault can delay or fail a SUT sink's delivery to a backend.
     affects_egress: object
 
 
@@ -163,60 +166,76 @@ def partition_revert(ctx, step):
     return {"rc": rc, "stderr": "\n".join(errors), "networks": saved}
 
 
-def _lifecycle_on_sut_or_generator_partition(step):
-    return step.on == "logit" or (step.on == "generator" and step.action == "partition")
+def _on_sut(step, roles):
+    return roles.get(step.on) == SUT_ROLE
+
+
+def _on_generator(step, roles):
+    return roles.get(step.on) == GENERATOR_ROLE
+
+
+def _on_sut_or_backend(step, roles):
+    return roles.get(step.on) in (SUT_ROLE, BACKEND_ROLE)
+
+
+def _lifecycle_on_sut_or_generator_partition(step, roles):
+    return _on_sut(step, roles) or (_on_generator(step, roles) and step.action == "partition")
+
+
+def _always(step, roles):
+    return True
 
 
 ACTIONS = {
     "netem": Action(
         apply=netem_apply,
         revert=netem_revert,
-        affects_udp_ingress=lambda step: step.on == "generator",
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_udp_ingress=_on_generator,
+        affects_egress=_on_sut_or_backend,
     ),
     "pause": Action(
         apply=pause_apply,
         revert=pause_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_egress=_on_sut_or_backend,
     ),
     "stop": Action(
         apply=stop_apply,
         revert=stop_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_egress=_on_sut_or_backend,
     ),
     "kill": Action(
         apply=kill_apply,
         revert=stop_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_egress=_on_sut_or_backend,
     ),
     "restart": Action(
         apply=restart_apply,
         revert=restart_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_egress=_on_sut_or_backend,
     ),
     "partition": Action(
         apply=partition_apply,
         revert=partition_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_egress=_on_sut_or_backend,
     ),
     # A mark on the SUT holds what it marks, such as a stalled script backing up into the UDP
     # receive queue.
     "mark": Action(
         apply=no_op,
         revert=no_op,
-        affects_udp_ingress=lambda step: step.on == "logit",
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_udp_ingress=_on_sut,
+        affects_egress=_on_sut_or_backend,
     ),
     "exit": Action(
         apply=no_op,
         revert=exit_revert,
-        affects_udp_ingress=lambda step: True,
-        affects_egress=lambda step: True,
+        affects_udp_ingress=_always,
+        affects_egress=_always,
     ),
 }
 

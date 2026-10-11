@@ -59,6 +59,18 @@ and an exit that never came); and the ledger with a script between the listener 
 `aggregate`: `ledger.script`'s identities, the egress gap without the flush events, the wider
 residual band, and an earlier life ended by an expected exit.
 
+For service roles and several sinks, it covers compose.yaml's `soak.role` labels against
+`BASE_ROLES`, reading a role map from `docker compose config`'s JSON, every role-map rule, the
+rules that need the service list (a step or a sink on a service the stack lacks, a `kill` on a
+second backend, an `[[expect]]` on a backend), the fault predicates by role, and every
+`[[ledger.sink]]`, `split`, and `compose` rule; `prepare()` with an override and a given role
+map, with no role map and no daemon, and with a role map the scenario's services miss; a
+backend's port re-read alone after its revert, freshness per sink, and the end sequence's wait
+for every sink's total. Over two exports, under `copy` and `route`, it covers each per-sink row:
+a sink short or empty while the other balances, a surplus at one sink that can't net out loss
+at the other, the summed V under `route`, a reset on one backend only, a sink edge short of
+what was sent to it, and `identity.sink`, `recovery`, and `progress` naming the sink that broke.
+
 No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
 suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
 a slip in a part's own stand-ins included, gets rc 127 from `Docker.run`'s `OSError` instead of
@@ -68,6 +80,7 @@ running a command. A part that passes `prefix=` names its own fake and is unaffe
 import copy
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -109,10 +122,14 @@ def _base(root):
     return path, tomllib.loads(path.read_text())
 
 
-def _refused(path, raw, needle, what, seed=None, duration=None):
+def _refused(path, raw, needle, what, seed=None, duration=None, roles=None):
+    """Expects `raw` refused with a problem containing `needle`, by `load()`'s rules or by
+    `service_problems()` against `roles`, the base role map by default."""
     try:
         loaded = scenario.from_dict(raw, path)
         scenario.validate(loaded, duration=duration, seed=seed)
+        scenario.check_services(loaded, scenario.base_roles(loaded) if roles is None
+                                else roles)
     except scenario.ScenarioError as err:
         expect(any(needle in problem for problem in err.problems),
                f"{what}: expected a problem containing {needle!r}, got {err.problems}")
@@ -196,8 +213,8 @@ def _rules(root):
              "doesn't fit one whole cycle", "a duration shorter than one cycle")
     _refused(path, mutate(lambda r: r.update(durration="10m")), "unknown top-level key",
              "a misspelled key")
-    _refused(path, mutate(lambda r: r["ledger"].pop("vm_selector")),
-             "ledger: missing `vm_selector`", "a missing ledger key")
+    _refused(path, mutate(lambda r: r["ledger"].pop("sut_listener")),
+             "ledger: missing `sut_listener`", "a missing ledger key")
     _refused(path, copy.deepcopy(base), "--seed applies to a [random] schedule only",
              "--seed on a fixed schedule", seed=7)
     _refused(path, copy.deepcopy(base), "leaves no time", "a duration inside warmup+cooldown",
@@ -232,9 +249,10 @@ def _expected_event_rules(root):
         except scenario.ScenarioError as err:
             expect(False, f"{what} is refused: {err.problems}")
     expect(faults.ACTIONS["mark"].affects_udp_ingress(scenario.Step(
-        "c0s8", 7, 0, "mark", "logit", "", 0, 1)), "a mark on the SUT is UDP-affecting")
+        "c0s8", 7, 0, "mark", "logit", "", 0, 1), scenario.BASE_ROLES),
+        "a mark on the SUT is UDP-affecting")
     expect(not faults.ACTIONS["mark"].affects_udp_ingress(scenario.Step(
-        "c0s8", 7, 0, "mark", "victoria-metrics", "", 0, 1)),
+        "c0s8", 7, 0, "mark", "victoria-metrics", "", 0, 1), scenario.BASE_ROLES),
         "a mark on VictoriaMetrics isn't UDP-affecting")
     expect("exit" in faults.STARTS_ON_REVERT and "exit" not in faults.EXIT_CODES,
            "an exit's revert is a start, and its code comes from the step")
@@ -553,8 +571,6 @@ def _random(root):
          "a first fault too soon after warmup"),
         ([step(1, "pause", "logit", 30, 200)], "starts inside warmup", "a fault in warmup"),
         ([step(1, "pause", "logit", 3000, 3550)], "ends inside cooldown", "a fault in cooldown"),
-        ([step(1, "kill", "generator", 300, 330)], "kill is for logit only",
-         "a kill on the generator"),
     ):
         problems = scenario._schedule_problems(loaded, steps, 3600)
         expect(any(needle in problem for problem in problems),
@@ -821,7 +837,8 @@ def _slope():
 
 T0 = telemetry.parse_rfc3339("2026-10-08T12:00:00Z")
 RESOLVED = {"name": "fixture", "duration": 600.0, "warmup": 60.0, "cooldown": 120.0,
-            "recovery_bound": 45.0, "ledger": {"sut_sink": "sink"},
+            "recovery_bound": 45.0, "ledger": {"sink": [{"id": "sink"}], "split": "copy"},
+            "services": dict(scenario.BASE_ROLES),
             "thresholds": {"progress_window": 30.0, "fd_growth": 8,
                            "rss_growth_mib_per_hour": 64}}
 
@@ -996,9 +1013,10 @@ def _vm_resets():
            f"V credits each segment to its own life, got {by_life} {total} {mismatched}")
 
 
-LEDGER = {"vm_selector": "{__name__=~\"x_[0-9]+_total\"}", "generator_input": "load",
-          "generator_sink": "out", "sut_listener": "in", "sut_aggregate": "window",
-          "sut_sink": "sink", "wire_loss_outside_faults": 0.0}
+LEDGER = {"generator_input": "load", "generator_sink": "out", "sut_listener": "in",
+          "sut_aggregate": "window", "wire_loss_outside_faults": 0.0, "split": "copy",
+          "sink": [{"id": "sink", "backend": "victoria-metrics",
+                    "vm_selector": "{__name__=~\"x_[0-9]+_total\"}"}]}
 # The fixture's SUT stop: applied at +101, reverted by +131, so life 1 starts at +131.
 STOP = (101, 131)
 PER_DRAIN = 1000
@@ -1121,7 +1139,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
     if external:
         resolved.setdefault("target", {"kind": "external", "name": "datadog",
                                        "env": ["DD_API_KEY"]})
-        ledger = {k: v for k, v in LEDGER.items() if k != "vm_selector"}
+        ledger = {**LEDGER, "sink": [{"id": "sink"}]}
     else:
         ledger = dict(LEDGER)
     if script is not None:
@@ -1175,8 +1193,590 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
     if external:
         # Nothing queries an external target, so the driver writes no export.
         export = []
-    (run_dir / "vm-export.jsonl").write_text("".join(json.dumps(s) + "\n" for s in export))
+    _write_export(run_dir, "sink", export)
     return run_dir
+
+
+def _write_export(run_dir, sink, series):
+    """Writes one sink's export where the driver does: `vm-export/<sink>.jsonl`."""
+    (run_dir / "vm-export").mkdir(exist_ok=True)
+    (run_dir / "vm-export" / f"{sink}.jsonl").write_text(
+        "".join(json.dumps(one) + "\n" for one in series))
+
+
+# Two sinks, each to its own backend; under `route` each fed by its own target.
+TWO_SINKS = (("vm_a", "victoria-metrics", "tier_a"), ("vm_b", "victoria-metrics-b", "tier_b"))
+# What the multi-sink fixture's `window` sends per drain: 10 events, under `route` 5 to each target.
+AGGREGATE_SENT = 10
+
+
+def _sinks_run(tmp, name, split="copy", edit=None, export_edit=None, **kwargs):
+    """`_ledger_run`'s two-life run directory, rewritten for two sinks (`TWO_SINKS`): each line
+    the fixture's one sink wrote is written once per sink, `window` sends `AGGREGATE_SENT` events
+    per drain that each sink receives under `copy` and half of which each target sends and its
+    sink receives under `route`, and the export goes to each sink whole under `copy` and split
+    by series under `route` (`x_0_total` to `vm_a`, `x_1_total` to `vm_b`).
+
+    `edit(sink, record)` may change or drop (return None) each per-sink telemetry record, and
+    `export_edit(sink, series)` each sink's export."""
+    run_dir = _ledger_run(tmp, name, **kwargs)
+    sinks = [one for one, _, _ in TWO_SINKS]
+    out = []
+    for line in (run_dir / "logs" / "logit.stdout").read_text().splitlines():
+        record = json.loads(line)
+        attributes = record["attributes"]
+        if attributes["component"] != "sink":
+            out.append(line)
+            if record["metrics"][0]["name"] == "logit.process.uptime":
+                stamp = record["timestamp"]
+                out.append(_line(stamp, "logit.component.events.sent", "sum", AGGREGATE_SENT,
+                                 component="window"))
+                for sink, _, target in TWO_SINKS:
+                    share = AGGREGATE_SENT if split == "copy" else AGGREGATE_SENT // 2
+                    received = json.loads(_line(stamp, "logit.component.events.received", "sum",
+                                                share, component=sink))
+                    received = edit(sink, received) if edit else received
+                    if received is not None:
+                        out.append(json.dumps(received))
+                    if split == "route":
+                        out.append(_line(stamp, "logit.component.events.sent", "sum", share,
+                                         component=target))
+            continue
+        for sink in sinks:
+            copied = json.loads(line)
+            copied["attributes"]["component"] = sink
+            copied = edit(sink, copied) if edit else copied
+            if copied is not None:
+                out.append(json.dumps(copied))
+    (run_dir / "logs" / "logit.stdout").write_text("\n".join(out) + "\n")
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    resolved["services"] = {**scenario.BASE_ROLES, "victoria-metrics-b": "backend"}
+    selector = resolved["ledger"]["sink"][0].get("vm_selector")
+    resolved["ledger"]["split"] = split
+    resolved["ledger"]["sink"] = [
+        {"id": sink, "backend": backend, "vm_selector": selector,
+         **({"target": target} if split == "route" else {})}
+        for sink, backend, target in TWO_SINKS]
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    series = vm.parse_export((run_dir / "vm-export" / "sink.jsonl").read_text())
+    (run_dir / "vm-export" / "sink.jsonl").unlink()
+    for index, sink in enumerate(sinks):
+        mine = (copy.deepcopy(series) if split == "copy" else
+                [copy.deepcopy(one) for one in series
+                 if one["metric"]["__name__"] == f"x_{index}_total"])
+        _write_export(run_dir, sink, export_edit(sink, mine) if export_edit else mine)
+    return run_dir
+
+
+def _sink_ledger():
+    """The ledger with two sinks: under `copy` each sink's V judged alone against Ab, under
+    `route` their sum, and every per-sink row (`progress`, `identity.sink`, `recovery`,
+    `ledger.edge`, `ledger.egress`, `ledger.windows`) reporting one line per sink with the worst
+    status winning."""
+    rows = ("ledger.edge", "ledger.egress", "ledger.summary", "identity.sink", "recovery",
+            "progress")
+
+    def short_final(target, by):
+        """An `export_edit` taking `by` off `target`'s last value of each series."""
+        def edit(sink, series):
+            if sink == target:
+                for one in series:
+                    one["values"][-1] -= by
+            return series
+        return edit
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            return {r.id: r for r in checks.run_all(_sinks_run(tmp, name, **kwargs))}
+
+        for split in ("copy", "route"):
+            clean = results(f"sinks-{split}", split=split)
+            for row in rows:
+                expect(clean[row].status == checks.PASS,
+                       f"{row} PASSes the balanced two-sink {split} fixture, got {clean[row]}")
+            for sink, _, _ in TWO_SINKS:
+                for row in ("identity.sink", "recovery", "progress", "ledger.edge"):
+                    expect(sink in clean[row].detail or sink in " ".join(clean[row].lines),
+                           f"{row} reports {sink} under {split}, got {clean[row]}")
+        copied = results("sinks-copy-detail")
+        egress = copied["ledger.egress"].detail
+        expect("vm_a: life 0" in egress and "vm_b: life 0" in egress
+               and "V[vm_a]" in egress and "V[vm_b]" in egress and "split copy" in egress,
+               f"egress under copy judges each sink alone, got {egress}")
+        routed = results("sinks-route-detail", split="route")
+        egress = routed["ledger.egress"].detail
+        expect("vm_a + vm_b: life 0" in egress and "ΣV" in egress and "split route" in egress,
+               f"egress under route judges the summed V, got {egress}")
+        expect("T_sent[tier_a]" in routed["ledger.edge"].detail
+               and "S_in[vm_b]" in routed["ledger.edge"].detail,
+               f"edge under route judges each target against its sink, got "
+               f"{routed['ledger.edge']}")
+
+        # One sink short in the final life: under copy only that sink's line FAILs.
+        lost = results("sinks-copy-lost", export_edit=short_final("vm_b", 20))
+        egress = lost["ledger.egress"].detail
+        expect(lost["ledger.egress"].status == checks.FAIL
+               and "vm_b: " in egress and "V[vm_b] " in egress
+               and egress.split(" | ")[0].endswith("ok")
+               and "uncounted" in egress.split(" | ")[1],
+               f"copy FAILs the short sink alone, got {egress}")
+        expect(lost["ledger.summary"].status == checks.FAIL
+               and "Ab − V[vm_b] 40" in lost["ledger.summary"].detail,
+               f"the summary FAILs the short sink's term, got {lost['ledger.summary']}")
+        # A surplus at one sink and a matching loss at the other can't net out in the summary.
+        def opposite(sink, series):
+            for one in series:
+                one["values"][-1] += 20 if sink == "vm_a" else -20
+            return series
+        netted = results("sinks-copy-netted", export_edit=opposite)
+        expect(netted["ledger.summary"].status == checks.FAIL,
+               f"the summary FAILs opposite gaps at two sinks, got {netted['ledger.summary']}")
+        # Under copy, one sink holding the other's share is still a gap at each; under route
+        # the same total across both sinks balances.
+        moved = results("sinks-route-moved", split="route",
+                        export_edit=lambda sink, series: series)
+        expect(moved["ledger.egress"].status == checks.PASS,
+               f"route's summed V balances the two halves, got {moved['ledger.egress']}")
+        half = results("sinks-copy-half", split="copy",
+                       export_edit=lambda sink, series: [one for one in series
+                                                        if sink == "vm_a"
+                                                        or one["metric"]["__name__"] == "x_0_total"])
+        expect(half["ledger.egress"].status == checks.FAIL
+               and half["ledger.egress"].detail.split(" | ")[0].endswith("ok"),
+               f"copy FAILs a sink holding half the series, got {half['ledger.egress']}")
+        route_lost = results("sinks-route-lost", split="route",
+                             export_edit=short_final("vm_a", 20))
+        expect(route_lost["ledger.egress"].status == checks.FAIL
+               and "vm_a + vm_b: " in route_lost["ledger.egress"].detail
+               and "uncounted" in route_lost["ledger.egress"].detail,
+               f"route FAILs a summed V short at one sink, got {route_lost['ledger.egress']}")
+        empty = results("sinks-copy-empty",
+                        export_edit=lambda sink, series: [] if sink == "vm_b" else series)
+        expect(empty["ledger.egress"].status == checks.FAIL
+               and "no series in vm-export/vm_b.jsonl" in empty["ledger.egress"].detail
+               and "vm-export/vm_a.jsonl" not in empty["ledger.egress"].detail,
+               f"egress FAILs the sink whose export is empty, by name, got {empty['ledger.egress']}")
+
+        # A reset on one backend only: vm_b's series fall back inside the final life, so its
+        # resets aren't lives − 1, and egress WARNs naming vm_b and not vm_a.
+        def reset_b(sink, series):
+            if sink == "vm_b":
+                for one in series:
+                    one["values"] = one["values"][:3] + [1, one["values"][3]]
+                    one["timestamps"] = (one["timestamps"][:3] + [one["timestamps"][3] - 1000]
+                                         + one["timestamps"][3:])
+            return series
+        reset = results("sinks-copy-reset-b", export_edit=reset_b)
+        lines = " ".join(reset["ledger.egress"].lines)
+        expect(reset["ledger.egress"].status in (checks.WARN, checks.FAIL)
+               and "vm_b: 2 series with resets other than 1" in lines
+               and "vm_a: 2 series with resets" not in lines,
+               f"egress names the one backend whose series reset, got {reset['ledger.egress']}")
+
+        # Per-sink rows: the worst sink's status wins, and the line names it.
+        def undelivered_b(sink, record):
+            metric = record["metrics"][0]
+            if (sink == "vm_b" and metric["name"] == "logit.component.batches.delivered"
+                    and record["timestamp"] in (_stamp(T0 + 200), _stamp(T0 + 205))):
+                metric["value"] = 0
+            return record
+        stuck = results("sinks-identity-b", edit=undelivered_b)
+        expect(stuck["identity.sink"].status == checks.FAIL
+               and "vm_b: received" in stuck["identity.sink"].detail
+               and "gap 2" in stuck["identity.sink"].detail
+               and "gap 0" in stuck["identity.sink"].detail,
+               f"identity.sink FAILs the sink that lost batches, by name, got "
+               f"{stuck['identity.sink']}")
+
+        def busy_b(sink, record):
+            metric = record["metrics"][0]
+            if sink == "vm_b" and metric["name"] == "logit.component.buffer.utilization":
+                metric["value"] = 0.5
+            if sink == "vm_b" and metric["name"] == "logit.component.buffer.batches":
+                metric["value"] = 2
+            return record
+        busy = results("sinks-recovery-b", edit=busy_b)
+        lines = busy["recovery"].lines
+        expect(busy["recovery"].status == checks.FAIL
+               and any("vm_b not recovered" in line for line in lines)
+               and any("vm_a recovered" in line for line in lines),
+               f"recovery judges each sink, got {busy['recovery']}")
+
+        def silent_b(sink, record):
+            metric = record["metrics"][0]
+            if (sink == "vm_b" and metric["name"] == "logit.component.batches.delivered"
+                    and record["timestamp"] >= _stamp(T0 + 240)):
+                return None
+            return record
+        silent = results("sinks-progress-b", edit=silent_b)
+        expect(silent["progress"].status == checks.FAIL
+               and "no vm_b deliveries" in silent["progress"].detail,
+               f"progress FAILs the sink with no deliveries, by name, got {silent['progress']}")
+
+        def short_receipt(sink, record):
+            metric = record["metrics"][0]
+            if (sink == "vm_b" and metric["name"] == "logit.component.events.received"
+                    and record["timestamp"] == _stamp(T0 + 250)):
+                metric["value"] -= 3
+            return record
+        for split, needle in (("copy", "A_sent 380 != S_in[vm_b] 377"),
+                              ("route", "T_sent[tier_b] 190 != S_in[vm_b] 187")):
+            edge = results(f"sinks-edge-{split}", split=split, edit=short_receipt)["ledger.edge"]
+            expect(edge.status == checks.FAIL and needle in edge.detail,
+                   f"edge FAILs a sink receiving less than was sent to it under {split}, got "
+                   f"{edge}")
+
+
+def _declared_roles(text):
+    """`{service: role}` from a compose file's text: each service under `services:` at two
+    spaces, and the `soak.role` label in its block. For the shipped files only, which label each
+    service inline; the driver reads `docker compose config` instead."""
+    roles = {}
+    current = None
+    inside = False
+    for line in text.splitlines():
+        if line.startswith("services:"):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if line and not line.startswith(" "):
+            break
+        header = re.match(r"^  ([A-Za-z0-9_.-]+):\s*$", line)
+        if header:
+            current = header.group(1)
+            roles[current] = None
+            continue
+        label = re.search(r"soak\.role:\s*([a-z]+)", line)
+        if label and current is not None:
+            roles[current] = label.group(1)
+    return roles
+
+
+def _override_roles(loaded):
+    """The role map the driver would resolve for a shipped scenario: `base_roles()` with each
+    service its override labels."""
+    roles = scenario.base_roles(loaded)
+    if loaded.compose is not None:
+        roles.update(_declared_roles(loaded.compose_path().read_text()))
+    return roles
+
+
+def _roles(root):
+    """Service roles: compose.yaml's labels are `BASE_ROLES`; the role map's own rules; reading
+    `docker compose config`'s JSON; the rules that need the service list, against the base map
+    and an override's; and the fault predicates, which judge a service by its role."""
+    base = (root / "compose.yaml").read_text()
+    expect(_declared_roles(base) == scenario.BASE_ROLES,
+           f"compose.yaml labels each service as BASE_ROLES says, got {_declared_roles(base)}")
+    config = json.dumps({"name": "p", "services": {
+        "logit": {"labels": {"soak.role": "sut"}, "image": "x"},
+        "generator": {"labels": {"soak.role": "generator"}},
+        "victoria-metrics": {"labels": {"soak.role": "backend"}},
+        "victoria-metrics-b": {"labels": {"soak.role": "backend", "other": "1"}},
+        "nginx": {"image": "nginx"}}})
+    roles = scenario.roles_from_config(config)
+    expect(roles == {"logit": "sut", "generator": "generator", "victoria-metrics": "backend",
+                     "victoria-metrics-b": "backend", "nginx": None},
+           f"roles_from_config reads each service's soak.role label, got {roles}")
+    for junk in ("", "{}", "not json"):
+        try:
+            scenario.roles_from_config(junk)
+            expect(False, f"roles_from_config accepted {junk!r}")
+        except ValueError:
+            expect(True, "")
+    for bad, needle, what in (
+            ({**scenario.BASE_ROLES, "nginx": None}, "compose service nginx: label soak.role",
+             "an unlabeled service"),
+            ({**scenario.BASE_ROLES, "x": "sink"}, "must be one of sut, generator, backend",
+             "an unknown role"),
+            ({**scenario.BASE_ROLES, "logit-2": "sut"}, "one sut service, logit, and has logit, "
+             "logit-2", "two SUTs"),
+            ({"sut": "sut", "generator": "generator"}, "one sut service, logit, and has sut",
+             "a SUT under another name"),
+            ({"logit": "sut"}, "one generator service, generator, and has none",
+             "no generator")):
+        problems = scenario.role_problems(bad)
+        expect(any(needle in problem for problem in problems),
+               f"{what}: expected {needle!r}, got {problems}")
+    expect(scenario.role_problems(scenario.BASE_ROLES) == [], "BASE_ROLES breaks no role rule")
+
+    path, raw = _base(root)
+    copy_path = root / "scenarios" / "fanout-copy" / "scenario.toml"
+    two = scenario.load(copy_path)
+    with_b = _override_roles(two)
+    expect(with_b == {**scenario.BASE_ROLES, "victoria-metrics-b": "backend"},
+           f"fanout-copy's override adds a second backend, got {with_b}")
+    expect(scenario.service_problems(two, with_b) == [],
+           f"fanout-copy's steps and sinks hold with its override's roles, got "
+           f"{scenario.service_problems(two, with_b)}")
+    problems = scenario.service_problems(two, scenario.BASE_ROLES)
+    expect(any("unknown service `victoria-metrics-b`" in p for p in problems)
+           and any("backend `victoria-metrics-b` isn't a backend service" in p for p in problems),
+           f"without the override, a step and a sink on victoria-metrics-b are refused, got "
+           f"{problems}")
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    _refused(path, mutate(lambda r: r["ledger"]["sink"][0].update(backend="logit")),
+             "backend `logit` isn't a backend service", "a sink whose backend is the SUT")
+    _refused(path, mutate(lambda r: r["ledger"]["sink"][0].update(backend="vm")),
+             "backend `vm` isn't a backend service; the stack's are victoria-metrics",
+             "a sink whose backend isn't in the stack")
+    _refused(path, mutate(lambda r: r.update(expect=[{
+        "name": "x", "service": "victoria-metrics", "metric": "m", "step": 1,
+        "window": "during", "reduce": "delta", "min": 1}])),
+             "unknown service `victoria-metrics`; telemetry comes from generator or logit",
+             "an expectation on a backend")
+    _refused(path, mutate(lambda r: r["step"].append(
+        {"at": "11m10s", "action": "kill", "on": "victoria-metrics-b", "for": "20s"})),
+             "kill is for logit only", "a kill on a second backend",
+             roles={**scenario.BASE_ROLES, "victoria-metrics-b": "backend"})
+    _refused(path, raw, "one generator service", "a scenario run on a stack with no generator",
+             roles={"logit": "sut", "victoria-metrics": "backend"})
+
+    step = scenario.Step("c0s1", 0, 0, "stop", "victoria-metrics-b", "", 0, 1)
+    roles_b = {**scenario.BASE_ROLES, "victoria-metrics-b": "backend"}
+    for action in ("netem", "pause", "stop", "partition"):
+        step.action = action
+        expect(faults.ACTIONS[action].affects_egress(step, roles_b)
+               and not faults.ACTIONS[action].affects_udp_ingress(step, roles_b),
+               f"a {action} on a second backend affects egress only")
+    step.on, step.action = "generator", "netem"
+    expect(faults.ACTIONS["netem"].affects_udp_ingress(step, roles_b)
+           and not faults.ACTIONS["netem"].affects_egress(step, roles_b),
+           "a netem on the generator affects UDP ingress only")
+    step.on, step.action = "logit", "stop"
+    expect(faults.ACTIONS["stop"].affects_udp_ingress(step, roles_b)
+           and faults.ACTIONS["stop"].affects_egress(step, roles_b),
+           "a stop on the SUT affects both")
+
+
+def _sink_rules(root):
+    """`[[ledger.sink]]`, `[ledger] split`, and `compose`: every rule `load()` holds them to."""
+    path, raw = _base(root)
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    def sink(**changes):
+        return lambda r: r["ledger"]["sink"][0].update(changes)
+
+    def route(*sinks):
+        def edit(r):
+            r["ledger"]["split"] = "route"
+            r["ledger"]["sink"] = [dict(r["ledger"]["sink"][0], **one) for one in sinks]
+        return edit
+
+    loaded = scenario.load(path)
+    expect(loaded.sinks == [{"id": "victoria_metrics", "backend": "victoria-metrics",
+                             "vm_selector": '{__name__=~"soak_requests_[0-9]+_total"}'}]
+           and loaded.split == "copy" and loaded.to_json()["ledger"]["split"] == "copy",
+           f"statsd-vm has one sink and the default split, got {loaded.sinks} {loaded.split}")
+    cases = [
+        (lambda r: r["ledger"].pop("sink"), "ledger: missing `sink`", "no sink"),
+        (lambda r: r["ledger"].update(sink=[]), "ledger.sink must be one or more tables",
+         "an empty sink array"),
+        (lambda r: r["ledger"].update(sink="vm"), "ledger.sink must be one or more tables",
+         "a sink that isn't a table"),
+        (sink(sinks="x"), "ledger.sink 1: unknown key `sinks`", "an unknown sink key"),
+        (lambda r: r["ledger"]["sink"][0].pop("id"), "ledger.sink 1: `id` must name",
+         "a sink with no id"),
+        (sink(id="vm a"), "ledger.sink 1: `id` must name", "a sink id with a space"),
+        (lambda r: r["ledger"]["sink"].append(dict(r["ledger"]["sink"][0])),
+         "ledger.sink 2: `id` 'victoria_metrics' repeats", "a repeated sink id"),
+        (lambda r: r["ledger"]["sink"][0].pop("backend"), "ledger.sink 1: missing `backend`",
+         "a local sink with no backend"),
+        (lambda r: r["ledger"]["sink"][0].pop("vm_selector"),
+         "ledger.sink 1: missing `vm_selector`", "a local sink with no selector"),
+        (lambda r: r["ledger"].update(split="mirror"), "ledger.split must be one of copy, route",
+         "an unknown split"),
+        (sink(target="t"), "ledger.sink 1: `target` is for split = \"route\"",
+         "a target under copy"),
+        (route({"target": "t"}), "needs two or more [[ledger.sink]] tables",
+         "a route with one sink"),
+        (route({"target": "t"}, {"id": "b"}), "ledger.sink 2: under split = \"route\" a sink "
+         "needs `target`", "a routed sink with no target"),
+        (route({"target": "t"}, {"id": "b", "target": "t"}), "ledger.sink 2: `target` 't' "
+         "repeats", "two sinks fed by one target"),
+        (lambda r: r.update(compose=3), "`compose` must name an override file",
+         "a compose that isn't a string"),
+        (lambda r: r.update(compose="../compose.yaml"), "`compose` must name an override file",
+         "a compose outside the scenario's directory"),
+        (lambda r: r.update(compose="missing.yaml"), "compose: missing.yaml not found",
+         "a compose file that doesn't exist"),
+    ]
+    for edit, needle, what in cases:
+        _refused(path, mutate(edit), needle, what)
+    try:
+        routed = scenario.from_dict(mutate(route({"target": "t"}, {"id": "b", "target": "u"})),
+                                    path)
+        expect(routed.split == "route" and [s["target"] for s in routed.sinks] == ["t", "u"],
+               f"two routed sinks with distinct targets load, got {routed.sinks}")
+    except scenario.ScenarioError as err:
+        expect(False, f"two routed sinks are refused: {err.problems}")
+
+
+class _ConfigDocker:
+    """A `Docker` whose only call is `config_json`, answering `result`; any other call raises,
+    so a test using it can't start anything."""
+
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+
+    def config_json(self):
+        self.calls += 1
+        return self.result
+
+    def __getattr__(self, name):
+        raise AssertionError(f"_ConfigDocker.{name} called")
+
+
+def _driver_roles(root):
+    """`prepare()` with a compose override and a role map: the override is passed after the
+    base file and copied into the run, and the resolved scenario records it and the roles; a
+    run built without `roles=` asks compose, here a daemon that isn't there, and stops before
+    writing the resolved scenario; a role map missing the override's service fails the
+    scenario's checks there too. The driver's per-backend ports and the freshness poll per
+    sink follow."""
+    two = scenario.load(root / "scenarios" / "fanout-copy" / "scenario.toml")
+    roles = _override_roles(two)
+    with tempfile.TemporaryDirectory() as tmp:
+        argv = docker.Docker("p", ["c.yaml", "o.yaml"], ["a.env"], ["local"], prefix=["docker"])
+        expect(argv.compose_args() == ["compose", "--progress", "quiet", "-p", "p", "-f",
+                                       "c.yaml", "-f", "o.yaml", "--env-file", "a.env",
+                                       "--profile", "local"],
+               f"compose gets the base file, then the override, got {argv.compose_args()}")
+        run = driver.Run(root, two, two.duration, None, False, Path(tmp) / "given", [],
+                         "logit:soak", roles=roles)
+        run.prepare()
+        resolved = json.loads((run.run_dir / "scenario.resolved.json").read_text())
+        expect(run.docker.compose_files == [str(root / "compose.yaml"), str(two.compose_path())]
+               and (run.run_dir / "configs" / "compose.override.yaml").is_file()
+               and resolved["compose"] == "compose.override.yaml"
+               and resolved["services"] == roles
+               and [s["backend"] for s in resolved["ledger"]["sink"]]
+               == ["victoria-metrics", "victoria-metrics-b"],
+               f"prepare passes and copies the override and records it and the roles, got "
+               f"{run.docker.compose_files} {resolved.get('compose')} {resolved.get('services')}")
+        for jsonl in (run.timeline, run.watchdog, run.stats, run.freshness, run.capture):
+            jsonl.close()
+
+        asked = driver.Run(root, two, two.duration, None, False, Path(tmp) / "asked", [],
+                           "logit:soak")
+        try:
+            asked.prepare()
+            expect(False, "prepare() with no daemon resolved a role map")
+        except scenario.ScenarioError as err:
+            expect("docker compose config failed (rc 127)" in str(err)
+                   and not (asked.run_dir / "scenario.resolved.json").exists(),
+                   f"prepare() asks compose for the roles and stops when it can't, got {err}")
+        narrow = driver.Run(root, two, two.duration, None, False, Path(tmp) / "narrow", [],
+                            "logit:soak", roles=scenario.BASE_ROLES)
+        try:
+            narrow.prepare()
+            expect(False, "prepare() ran fanout-copy on a stack without victoria-metrics-b")
+        except scenario.ScenarioError as err:
+            expect("unknown service `victoria-metrics-b`" in str(err)
+                   and not (narrow.run_dir / "scenario.resolved.json").exists(),
+                   f"prepare() checks the scenario's services before anything starts, got {err}")
+
+        resolver = driver.Run(root, two, two.duration, None, False, "/nonexistent", [],
+                              "logit:soak")
+        resolver.docker = _ConfigDocker(docker.Result(0, config_text(roles), ""))
+        expect(resolver.resolve_roles() == roles and resolver.docker.calls == 1,
+               "resolve_roles reads the role map from compose config's JSON")
+        resolver.docker = _ConfigDocker(docker.Result(0, "Warning: x\n", ""))
+        try:
+            resolver.resolve_roles()
+            expect(False, "resolve_roles accepted output that isn't JSON")
+        except scenario.ScenarioError as err:
+            expect("docker compose config" in str(err), f"got {err}")
+
+    # Ports per backend: a revert on victoria-metrics-b re-reads its port only.
+    class Ports:
+        def __init__(self):
+            self.asked = []
+
+        def port(self, service, private):
+            self.asked.append((service, private))
+            return f"127.0.0.1:{9000 + len(self.asked)}"
+
+        def inspect(self, container, timeout=None):
+            return {"State": {"StartedAt": "x"}}
+
+    run = driver.Run(root, two, two.duration, None, False, "/nonexistent", [], "logit:soak",
+                     roles=roles)
+    run.docker = Ports()
+    run.ids = {name: name for name in roles}
+    step = scenario.Step("c0s1", 0, 0, "stop", "victoria-metrics-b", "", 0, 1)
+    run.after("apply", step, {"rc": 0})
+    run.after("revert", step, {"rc": 0})
+    expect(run.docker.asked == [("victoria-metrics-b", 8428)]
+           and run.vm_base == {"victoria-metrics-b": "http://127.0.0.1:9001"},
+           f"a revert on a backend re-reads that backend's port only, got {run.docker.asked}")
+
+    # Freshness: one record per sink, a held backend's skipped.
+    run.down = {"victoria-metrics-b"}
+    run.vm_base = {"victoria-metrics": "http://a", "victoria-metrics-b": "http://b"}
+    run.freshness = _Records()
+    run.t0 = 0.0
+    real = vm.freshness
+    vm.freshness = lambda base, selector, now, lookback: {"series": 1, "newest_ms": 1,
+                                                         "age_s": 1.0, "base": base}
+    try:
+        run.sample_freshness()
+    finally:
+        vm.freshness = real
+    by_sink = {record["sink"]: record for record in run.freshness}
+    expect(by_sink["vm_a"].get("base") == "http://a"
+           and by_sink["vm_b"].get("skipped") == "victoria-metrics-b held by a step",
+           f"freshness is sampled per sink, skipping a held backend, got {by_sink}")
+
+    # The end sequence's wait holds only once every sink's total holds.
+    totals = {"http://a": [10, 20, 20, 20, 20, 20, 20, 20],
+              "http://b": [5, 5, 5, 9, 9, 9, 9, 9]}
+    seen = {"http://a": 0, "http://b": 0}
+
+    def export(base, selector, start, end=None):
+        index = min(seen[base], len(totals[base]) - 1)
+        seen[base] += 1
+        return [{"metric": {"__name__": "x"}, "values": [totals[base][index]],
+                 "timestamps": [0]},
+                {"metric": {"__name__": "x"}, "values": [1, 2], "timestamps": [0, 2000]}]
+
+    clock = [1000.0]
+    reals = (vm.export, vm.force_flush, driver._now, driver.time.sleep)
+    vm.export, vm.force_flush = export, lambda base: None
+    driver._now = lambda: clock[0]
+    driver.time.sleep = lambda s: clock.__setitem__(0, clock[0] + s)
+    run.docker = Ports()
+    run.vm_base = {}
+    run.timeline = _Records()
+    real_refresh = run.refresh_vm_base
+    run.refresh_vm_base = lambda backend: run.vm_base.__setitem__(
+        backend, "http://a" if backend == "victoria-metrics" else "http://b")
+    try:
+        run.wait_quiet()
+    finally:
+        vm.export, vm.force_flush, driver._now, driver.time.sleep = reals
+        run.refresh_vm_base = real_refresh
+    quiet = run.timeline[-1]
+    expect(quiet["held"] and quiet["totals"] == {"vm_a": 22, "vm_b": 11}
+           and seen["http://b"] >= 5,
+           f"wait_quiet holds once both sinks' totals hold, got {quiet}")
+
+
+def config_text(roles):
+    """`docker compose config --format json`-shaped output for `roles`."""
+    return json.dumps({"services": {name: {"labels": {"soak.role": role}}
+                                    for name, role in roles.items()}})
 
 
 def _ledger_checks():
@@ -1261,7 +1861,7 @@ def _ledger_checks():
                f"the summary FAILs an uncounted Ab − V, got {final_lost['ledger.summary']}")
         final_counted = results("ledger-final-counted", v1_short=40, life1_dropped=1)
         expect(final_counted["ledger.summary"].status == checks.PASS
-               and "Ab − V 40 counted" in final_counted["ledger.summary"].detail,
+               and "Ab − V[sink] 40 counted" in final_counted["ledger.summary"].detail,
                f"the summary shows a counted egress term and judges the rest, got "
                f"{final_counted['ledger.summary']}")
         final_dup = results("ledger-final-negative", v1_short=-40)
@@ -1714,6 +2314,7 @@ def _exit_driver():
         run.pending_ready, run.fail_fast = {}, None
         run.started_at = {"logit": "first"}
         run.ids = {"logit": "sut"}
+        run.roles = dict(scenario.BASE_ROLES)
         run.docker = _ExitDocker("running")
         return run
 
@@ -2075,7 +2676,7 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
                     timestamps.append(int((T0 + s) * 1000))
         export.append({"metric": {"__name__": f"x_{index}_total"}, "values": values,
                        "timestamps": timestamps})
-    (run_dir / "vm-export.jsonl").write_text("".join(json.dumps(s) + "\n" for s in export))
+    _write_export(run_dir, "sink", export)
     return run_dir
 
 
@@ -2094,12 +2695,12 @@ def _kill_ledger():
         expect(led.killed == [1] and led.R == 770, f"life 1 is the killed one and R is 770, got "
                                                     f"{led.killed} {led.R}")
         egress = clean["ledger.egress"].detail
-        expect("life 1 (killed): Ab 14,000 − V 12,500 = 1,500, within band" in egress
+        expect("life 1 (killed): Ab 14,000 − V[sink] 12,500 = 1,500, within band" in egress
                and "band [-1,000, 3,000]: ingest 200/s" in egress
                and "residual W − D − B − X − Ab 0 at its last drain" in egress
                and "D has no stderr part" in egress,
                f"egress reports the killed life's gap inside its band, got {egress}")
-        expect("life 2 (final): Ab 18,000 − V 18,000 = 0, ok" in egress,
+        expect("life 2 (final): Ab 18,000 − V[sink] 18,000 = 0, ok" in egress,
                f"the final life stays exact, got {egress}")
 
         edge_high = results("kill-high-edge", kill_gap=3000)
@@ -2108,7 +2709,7 @@ def _kill_ledger():
                f"{edge_high['ledger.egress']}")
         over = results("kill-over", kill_gap=3001)
         expect(over["ledger.egress"].status == checks.FAIL
-               and "life 1 (killed): Ab 14,000 − V 10,999 = 3,001, uncounted"
+               and "life 1 (killed): Ab 14,000 − V[sink] 10,999 = 3,001, uncounted"
                in over["ledger.egress"].detail,
                f"egress FAILs a killed life's gap above its band as uncounted, got "
                f"{over['ledger.egress']}")
@@ -2124,7 +2725,7 @@ def _kill_ledger():
         residual = results("kill-residual", kill_residual=500, kill_gap=2600)
         detail = residual["ledger.egress"].detail
         expect(residual["ledger.egress"].status == checks.PASS
-               and "Ab 14,000 − V 11,400 = 2,600, within band (band [-1,500, 3,000]" in detail
+               and "Ab 14,000 − V[sink] 11,400 = 2,600, within band (band [-1,500, 3,000]" in detail
                and "residual W − D − B − X − Ab 500 at its last drain" in detail,
                f"a killed life's residual is reported beside Ab − V, never added to it, got "
                f"{residual['ledger.egress']}")
@@ -2144,7 +2745,7 @@ def _kill_ledger():
                f"{last['ledger.egress']} {last['ledger.windows']}")
 
         expect(clean["ledger.windows"].status == checks.PASS
-               and "2 series x 3 life/lives, widest gap 10s" in clean["ledger.windows"].detail,
+               and "2 series over 1 sink(s) x 3 life/lives, widest gap 10s" in clean["ledger.windows"].detail,
                f"windows PASSes a sample in every window, got {clean['ledger.windows']}")
         middle = results("kill-middle-windows", drop=(150, 160, 170, 180, 190))
         expect(middle["ledger.windows"].status == checks.FAIL
@@ -2274,7 +2875,8 @@ def _target_rules(root):
                                                  "env": ["DD_API_KEY"]},
            f"statsd-datadog loads as an external target, got {loaded.target}")
     resolved = loaded.to_json()
-    expect(resolved["target"]["kind"] == "external" and "vm_selector" not in resolved["ledger"],
+    expect(resolved["target"]["kind"] == "external"
+           and resolved["ledger"]["sink"] == [{"id": "datadog"}],
            f"the resolved scenario records the target, got {resolved['target']}")
     local = scenario.from_dict(copy.deepcopy(vm_base), vm_path)
     expect(not local.external and local.to_json()["target"]["kind"] == "victoria-metrics",
@@ -2296,16 +2898,18 @@ def _target_rules(root):
          "a variable compose.yaml doesn't pass"),
         (base, table(env=["DD_API_KEY", "DD_API_KEY"]), "target.env repeats a variable",
          "a repeated variable"),
-        (base, lambda raw: raw["ledger"].update(vm_selector="{x}"),
-         "ledger.vm_selector names a VictoriaMetrics query", "vm_selector on an external target"),
+        (base, lambda raw: raw["ledger"]["sink"][0].update(vm_selector="{x}"),
+         "`vm_selector` names a backend query", "vm_selector on an external target"),
+        (base, lambda raw: raw["ledger"]["sink"][0].update(backend="victoria-metrics"),
+         "`backend` names a backend query", "a backend on an external target"),
         (base, lambda raw: raw["ledger"].update(vm_every_window=True),
          "ledger.vm_every_window names a VictoriaMetrics query",
          "vm_every_window on an external target"),
-        (base, lambda raw: raw["ledger"].pop("sut_sink"), "ledger: missing `sut_sink`",
+        (base, lambda raw: raw["ledger"].pop("sink"), "ledger: missing `sink`",
          "an external target still needs the sink id"),
         (base, lambda raw: raw["step"].append({"at": "11m", "action": "stop",
                                                "on": "victoria-metrics", "for": "20s"}),
-         "a fault on victoria-metrics, which an external target's stack doesn't run",
+         "unknown service `victoria-metrics`; an external target's stack runs no backend",
          "a fault on victoria-metrics with an external target"),
         (vm_base, lambda raw: raw.update(target={"kind": "victoria-metrics", "name": "vm"}),
          "target.name is for an external target", "a name on the local target"),
@@ -2319,7 +2923,7 @@ def _target_rules(root):
 
     def external_random(raw):
         raw["target"] = {"kind": "external", "name": "datadog", "env": ["DD_API_KEY"]}
-        del raw["ledger"]["vm_selector"]
+        raw["ledger"]["sink"] = [{"id": "datadog"}]
         raw["ledger"].pop("vm_every_window", None)
         raw["random"]["fault"].append({"weight": 1, "action": "pause",
                                        "on": "victoria-metrics",
@@ -2376,7 +2980,7 @@ def _target_rules(root):
         expect(bystander.exists(), "remove_private_env leaves a directory it didn't make")
         env.write_text("export DD_API_KEY=abc\n")
 
-        argv = docker.Docker("p", "c.yaml", ["a.env", "b.env"], ["local"], prefix=["docker"])
+        argv = docker.Docker("p", ["c.yaml"], ["a.env", "b.env"], ["local"], prefix=["docker"])
         expect(argv.compose_args() == ["compose", "--progress", "quiet", "-p", "p", "-f",
                                        "c.yaml", "--env-file", "a.env", "--env-file", "b.env",
                                        "--profile", "local"],
@@ -2384,7 +2988,7 @@ def _target_rules(root):
                f"{argv.compose_args()}")
 
         run = driver.Run(root, loaded, loaded.duration, None, False, tmp, [], "logit:soak",
-                         env)
+                         env, roles=scenario.base_roles(loaded))
         run.prepare()
         private = run.private_env
         expect(run.docker.profiles == [] and private is not None
@@ -2409,7 +3013,7 @@ def _target_rules(root):
         expect(code == 1 and not private.exists() and not private.parent.exists(),
                "execute() removes the private env copy, an early return included")
         vm_run = driver.Run(root, local, local.duration, None, False, Path(tmp) / "vm", [],
-                            "logit:soak")
+                            "logit:soak", roles=scenario.BASE_ROLES)
         vm_run.prepare()
         expect(vm_run.docker.profiles == ["local"] and len(vm_run.docker.env_files) == 1,
                f"a local run enables the local profile, got {vm_run.docker.profiles}")
@@ -2503,7 +3107,7 @@ def _prepare_raises(root, path, env, tmp):
     order = []
 
     class Raising:
-        def __init__(self, project, compose_file, env_files, profiles=(), prefix=None):
+        def __init__(self, project, compose_files, env_files, profiles=(), prefix=None):
             order.append(("docker", Path(env_files[-1])))
             raise RuntimeError("no daemon")
 
@@ -2532,7 +3136,7 @@ class _BusyDocker:
     before it starts anything."""
 
     prefix = ["docker"]
-    compose_file = "compose.yaml"
+    compose_files = ["compose.yaml"]
 
     def project_containers(self):
         return ["leftover"]
@@ -2597,10 +3201,10 @@ def _sink_drain(root):
     expect(record["held"] and record["waited_s"] >= 40,
            f"the wait outlasts a queue still sending, got {record}")
     record = wait(drains(lambda t: 1))
-    expect(not record["held"] and record["buffer_batches"] == 1,
+    expect(not record["held"] and record["sinks"]["datadog"]["buffer_batches"] == 1,
            f"a queue that never empties ends the wait at its bound, got {record}")
     record = wait(drains(lambda t: 0, lambda t: 1))
-    expect(not record["held"] and record["retrying"] == 1,
+    expect(not record["held"] and record["sinks"]["datadog"]["retrying"] == 1,
            f"a sink still retrying never counts as drained, got {record}")
 
 
@@ -2738,13 +3342,14 @@ def _external_checks():
                f"batches still queued at the final life's quiet drain FAIL, got {queued}")
         undrained = results("external-undrained", sut_extra=_datadog_lines(), timeline_extra=[
             _phase("sink_drained", 320, held=False, hold_s=20, polls=60, bound_s=120,
-                   buffer_batches=2, retrying=1, newest_drain=T0 + 320)])["ledger.sent"]
+                   sinks={"sink": {"buffer_batches": 2, "retrying": 1}})])["ledger.sent"]
         expect(undrained.status == checks.FAIL and "held=false after 120s" in undrained.detail
-               and "buffer.batches 2 left unsent" in undrained.detail,
+               and "buffer.batches sink 2 left unsent" in undrained.detail,
                f"a sink_drained that never held FAILs with the count, got {undrained}")
         drained = results("external-drained", sut_extra=_datadog_lines(), timeline_extra=[
             _phase("sink_drained", 320, held=True, hold_s=20, polls=3, waited_s=24,
-                   buffer_batches=0, retrying=0, newest_drain=T0 + 320)])["ledger.sent"]
+                   newest_drain=T0 + 320,
+                   sinks={"sink": {"buffer_batches": 0, "retrying": 0}})])["ledger.sent"]
         expect(drained.status == checks.PASS and drained.detail.startswith("SENT"),
                f"a sink_drained that held reads SENT, got {drained}")
         no_2xx = results("external-no-2xx", sut_extra=_datadog_lines(cls="4xx"))["ledger.sent"]
@@ -2826,6 +3431,9 @@ def _shipped(root):
             loaded = scenario.load(path)
             expect(loaded.name == path.parent.name,
                    f"{path}: name {loaded.name!r} matches its directory")
+            # The services an override adds are read from its labels, as compose would merge
+            # them; `run` checks against compose's own answer before the stack starts.
+            scenario.check_services(loaded, _override_roles(loaded))
         except scenario.ScenarioError as err:
             expect(False, f"{path}: {err}")
 
@@ -2844,10 +3452,12 @@ def run(root, quiet=False):
                      _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks,
                      _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
                      _sink_drain, _external_checks, _report, _expected_event_rules,
-                     _exit_driver, _ready_words, _exit_watchdog, _script_ledger, _shipped):
+                     _exit_driver, _ready_words, _exit_watchdog, _script_ledger, _sink_ledger, _roles,
+                     _sink_rules, _driver_roles, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
-                              _target_rules, _sink_drain, _expected_event_rules, _shipped)
+                              _target_rules, _sink_drain, _expected_event_rules, _shipped,
+                              _roles, _sink_rules, _driver_roles)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")
