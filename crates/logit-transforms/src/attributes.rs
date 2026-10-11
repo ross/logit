@@ -1,7 +1,8 @@
 //! `has_attributes`/`drop_attributes`: filter events by an operator-configured key/value match
 //! against a batch's resource and/or an event's own attributes. See
-//! `docs/adr/attribute-filtering-components.md`. The config is `set`'s, field for field: whatever
-//! `set` can stamp, these can match.
+//! `docs/adr/attribute-filtering-components.md`. The `resource:`/`attributes:` maps are `set`'s:
+//! whatever `set` can stamp, these can match. The `_present` lists add key names that must exist
+//! with any value.
 //!
 //! **A map is a conjunction.** Every configured pair, within a map and across both `resource:` and
 //! `attributes:`, must match; under an any-of reading, a sibling branch sharing one pair would

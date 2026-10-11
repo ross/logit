@@ -66,7 +66,9 @@ attributes.rs`, implementing `logit_pipeline::Transform` the same way `has_signa
 values can fail).** Config is `ComponentKind::Set`'s config, field for field: a `resource:` map and
 an `attributes:` map, both `BTreeMap<String, SetValue>`. This matches on exactly what `set` can
 stamp, and nothing more -- the two components are designed to be inverses of each other across that
-boundary, not a general-purpose filter that happens to share a type.
+boundary, not a general-purpose filter that happens to share a type. [Amended 2026-10-11: the
+`attributes_present` and `resource_present` lists have no `set` counterpart; see "Amendment: key
+presence".]
 
 **A bounded key/value equality matcher is not a predicate language.** No operators: `=` is never
 spelled, because it is the only comparison the shape can mean. No boolean algebra: a map is a
@@ -85,7 +87,9 @@ string functions (`exists`/`contains`/`starts_with`/`ends_with`), and `not(...)`
 **The bound is structural, not a documentation promise: `has_attributes`' config is `set`'s
 config.** Whatever `set` can stamp is exactly what these two can match, field for field, literal
 type for literal type. This surface cannot grow on its own -- it can only grow if `set`'s does,
-which keeps the two review-linked rather than independently expandable.
+which keeps the two review-linked rather than independently expandable. [Amended 2026-10-11: this
+holds for the maps only; the presence lists have no `set` counterpart, see "Amendment: key
+presence".]
 
 **What stays Lua: everything with an actual operator in it** -- `>= 500`, `contains`,
 `starts_with`, real regex, comparing two attributes to each other, `or`, `not` over more than one
@@ -248,7 +252,7 @@ component.
   `drop_attributes`.
 - If a future config needs an actual operator (`>=`, `contains`, cross-attribute comparison) rather
   than equality, that is new evidence for `routing-by-condition-is-lua`'s own revisit trigger, not a
-  reason to grow this component past what `set` can stamp -- the retired predicate grammar sketch
+  reason to grow this component's maps past what `set` can stamp -- the retired predicate grammar sketch
   that ADR preserved is still where such a design would resume.
 
 ## Amendment: key presence (2026-10-11)
