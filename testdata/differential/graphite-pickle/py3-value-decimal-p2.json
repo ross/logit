@@ -1,0 +1,55 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "UnpicklingError",
+   "message": "Attempting to unpickle unsafe module decimal"
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py3-value-decimal-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "reject.decimal",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "object": "decimal.Decimal",
+        "repr": "Decimal('1.5')"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "A decimal.Decimal value.",
+ "exercises": [
+  "GLOBAL",
+  "REDUCE"
+ ],
+ "logit": {
+  "opcode": "0x63",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "GLOBAL",
+  "PROTO",
+  "REDUCE",
+  "STOP",
+  "TUPLE1",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

@@ -1,0 +1,14 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [],
+ "error": {
+  "after_entry": 0,
+  "message": "invalid metric type \"gauge\\r\""
+ },
+ "input": {
+  "crc32c": "0xf97f056a",
+  "len": 33,
+  "path": "differential/prometheus-text/cases/crlf-text.txt"
+ },
+ "parser": "prom"
+}

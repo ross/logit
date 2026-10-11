@@ -1,0 +1,63 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "ts.int",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-ts-int-p0",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "ts.int",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "Protocol 0's INT timestamp.",
+ "exercises": [
+  "INT"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "FLOAT",
+  "INT",
+  "LIST",
+  "MARK",
+  "PUT",
+  "STOP",
+  "TUPLE",
+  "UNICODE"
+ ],
+ "producer": "cpython3",
+ "protocol": 0
+}

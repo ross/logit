@@ -1,0 +1,96 @@
+# HELP python_gc_objects_collected_total Objects collected during gc
+# TYPE python_gc_objects_collected_total counter
+python_gc_objects_collected_total{generation="0"} 256.0
+python_gc_objects_collected_total{generation="1"} 6.0
+python_gc_objects_collected_total{generation="2"} 0.0
+# HELP python_gc_objects_uncollectable_total Uncollectable objects found during GC
+# TYPE python_gc_objects_uncollectable_total counter
+python_gc_objects_uncollectable_total{generation="0"} 0.0
+python_gc_objects_uncollectable_total{generation="1"} 0.0
+python_gc_objects_uncollectable_total{generation="2"} 0.0
+# HELP python_gc_collections_total Number of times this generation was collected
+# TYPE python_gc_collections_total counter
+python_gc_collections_total{generation="0"} 37.0
+python_gc_collections_total{generation="1"} 3.0
+python_gc_collections_total{generation="2"} 0.0
+# HELP python_info Python platform information
+# TYPE python_info gauge
+python_info{implementation="CPython",major="3",minor="12",patchlevel="15",version="3.12.15"} 1.0
+# HELP process_virtual_memory_bytes Virtual memory size in bytes.
+# TYPE process_virtual_memory_bytes gauge
+process_virtual_memory_bytes 1.86630144e+08
+# HELP process_resident_memory_bytes Resident memory size in bytes.
+# TYPE process_resident_memory_bytes gauge
+process_resident_memory_bytes 2.7795456e+07
+# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.
+# TYPE process_start_time_seconds gauge
+process_start_time_seconds 1.79160241523e+09
+# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.
+# TYPE process_cpu_seconds_total counter
+process_cpu_seconds_total 0.09000000000000001
+# HELP process_open_fds Number of open file descriptors.
+# TYPE process_open_fds gauge
+process_open_fds 6.0
+# HELP process_max_fds Maximum number of open file descriptors.
+# TYPE process_max_fds gauge
+process_max_fds 1024.0
+# HELP app_requests_total Requests served.
+# TYPE app_requests_total counter
+app_requests_total{method="GET",path="/"} 3.0
+app_requests_total{method="POST",path="a \"quoted\" \\path\nwith a newline"} 1.0
+app_requests_total{method="GET",path="/café/日本"} 2.5
+# HELP app_requests_created Requests served.
+# TYPE app_requests_created gauge
+app_requests_created{method="GET",path="/"} 1.7916024177447004e+09
+app_requests_created{method="POST",path="a \"quoted\" \\path\nwith a newline"} 1.791602417744722e+09
+app_requests_created{method="GET",path="/café/日本"} 1.7916024177447307e+09
+# HELP app_temperature_celsius Sensor reading.
+# TYPE app_temperature_celsius gauge
+app_temperature_celsius{sensor="nan"} NaN
+app_temperature_celsius{sensor="pos_inf"} +Inf
+app_temperature_celsius{sensor="neg_inf"} -Inf
+app_temperature_celsius{sensor="neg_zero"} -0.0
+app_temperature_celsius{sensor="max"} 1.7976931348623157e+308
+app_temperature_celsius{sensor="min_subnormal"} 5e-324
+app_temperature_celsius{sensor="plain"} 21.5
+# HELP app_latency_seconds Request latency.
+# TYPE app_latency_seconds histogram
+app_latency_seconds_bucket{le="0.005"} 1.0
+app_latency_seconds_bucket{le="0.1"} 4.0
+app_latency_seconds_bucket{le="1.0"} 5.0
+app_latency_seconds_bucket{le="2.5"} 5.0
+app_latency_seconds_bucket{le="+Inf"} 6.0
+app_latency_seconds_count 6.0
+app_latency_seconds_sum 4.883
+# HELP app_latency_seconds_created Request latency.
+# TYPE app_latency_seconds_created gauge
+app_latency_seconds_created 1.7916024177448096e+09
+# HELP app_payload_bytes Request payload size.
+# TYPE app_payload_bytes summary
+app_payload_bytes_count 3.0
+app_payload_bytes_sum 4728.0
+# HELP app_payload_bytes_created Request payload size.
+# TYPE app_payload_bytes_created gauge
+app_payload_bytes_created 1.7916024177448559e+09
+# HELP app_build_info Build information.
+# TYPE app_build_info gauge
+app_build_info{revision="abc123",version="1.2.3"} 1.0
+# HELP app_state Lifecycle state.
+# TYPE app_state gauge
+app_state{app_state="starting"} 0.0
+app_state{app_state="running"} 1.0
+app_state{app_state="stopped"} 0.0
+# HELP app_queue_wait_seconds Time jobs now queued have waited.
+# TYPE app_queue_wait_seconds histogram
+app_queue_wait_seconds_bucket{le="0.5"} 2.0
+app_queue_wait_seconds_bucket{le="1.0"} 5.0
+app_queue_wait_seconds_bucket{le="+Inf"} 6.0
+# HELP app_queue_wait_seconds_gcount Time jobs now queued have waited.
+# TYPE app_queue_wait_seconds_gcount gauge
+app_queue_wait_seconds_gcount 6.0
+# HELP app_queue_wait_seconds_gsum Time jobs now queued have waited.
+# TYPE app_queue_wait_seconds_gsum gauge
+app_queue_wait_seconds_gsum 4.25
+# HELP app_legacy_ratio A value with no declared type.
+# TYPE app_legacy_ratio untyped
+app_legacy_ratio 0.75

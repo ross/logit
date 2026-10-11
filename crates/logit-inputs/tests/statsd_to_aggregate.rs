@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 use logit_core::{MetricKind, Resource};
-use logit_inputs::statsd::StatsdDecoder;
+use logit_proto::statsd::StatsdDecoder;
 use logit_proto::Decoder;
 use logit_transforms::Aggregator;
 use std::sync::Arc;

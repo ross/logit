@@ -1,0 +1,55 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "UnpicklingError",
+   "message": "Attempting to unpickle unsafe module datetime"
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py3-value-datetime-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "reject.datetime",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "object": "datetime.datetime",
+        "repr": "datetime.datetime(2023, 11, 14, 22, 13, 20)"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "A datetime.datetime value.",
+ "exercises": [
+  "GLOBAL",
+  "REDUCE"
+ ],
+ "logit": {
+  "opcode": "0x63",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "GLOBAL",
+  "PROTO",
+  "REDUCE",
+  "STOP",
+  "TUPLE1",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

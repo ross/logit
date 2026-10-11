@@ -59,7 +59,7 @@
 //! 9. **A non-UTF-8 RFC 3164 HOSTNAME is dropped.** `parse_3164` never fails a line over its
 //!    HOSTNAME, because `parse_line`'s version-sniff fallback depends on that, so it skips the
 //!    `syslog.hostname` attribute and reports a throttled `hostname_not_utf8` diagnostic. Pinned by
-//!    a unit test in `logit_inputs::syslog`:
+//!    a unit test in `logit_proto::syslog`:
 //!    `a_non_utf8_rfc3164_hostname_is_skipped_with_a_throttled_diagnostic`.
 //!
 //! `mod tcp` and `mod tls` add no entry to this list: both transports share
@@ -69,10 +69,11 @@
 use bytes::Bytes;
 use logit_core::zoned::Zone;
 use logit_core::{Event, EventBatch, Value};
-use logit_inputs::syslog::{SyslogDecoder, SyslogInput};
+use logit_inputs::syslog::SyslogInput;
 use logit_outputs::syslog::{Format, SyslogEncoder, SyslogOutput};
 use logit_pipeline::test_util::{recv_batch, RECV_TIMEOUT};
 use logit_pipeline::{Delivered, Fanout, Input, Output, Transform};
+use logit_proto::syslog::SyslogDecoder;
 use logit_proto::Decoder;
 use logit_transforms::{TimestampFormat, TimestampResolver};
 use std::net::SocketAddr;
@@ -262,18 +263,20 @@ async fn rfc5424_non_utf8_message_relays_as_value_bytes_byte_for_byte() {
     }
 }
 
-/// A 33-byte SD-NAME breaks RFC 5424's 32-byte limit, so `syslog_in` rejects the whole line
-/// (`bad_line`). Decode-only: nothing reaches the sink.
+/// A 33-byte SD-NAME breaks RFC 5424's 32-byte limit, so the line isn't RFC 5424 and `syslog_in`
+/// reads it as RFC 3164, the whole remainder after PRI as its message and no `syslog.sd`, with a
+/// `sniff_fallback` diagnostic. Decode-only.
 #[tokio::test]
-async fn oversize_sd_name_is_rejected_by_the_decoder_and_never_reaches_the_sink() {
+async fn oversize_sd_name_falls_back_to_rfc3164_with_the_whole_line_as_its_message() {
     let raw = read_fixture("rfc5424-oversize-sd-name", "in");
     let mut decoder = SyslogDecoder::new(std::sync::Arc::new(logit_core::Resource::default()));
     let mut events = Vec::new();
     let result = decoder.decode_into(Bytes::copy_from_slice(&raw), 0, &mut events);
-    // A malformed line is skipped and reported through diagnostics, so the rejection shows up
-    // as zero events, not an `Err`.
     assert!(result.is_ok());
-    assert!(events.is_empty(), "a 33-byte SD-NAME must reject the whole line, producing no event");
+    assert_eq!(events.len(), 1, "the line is kept, as RFC 3164");
+    assert!(events[0].attributes.get("syslog.sd").is_none());
+    let message = events[0].log.as_ref().unwrap().message.as_str().unwrap();
+    assert_eq!(message.as_bytes(), &raw[5..], "everything after `<134>` is the message");
 }
 
 // ---- 3164 -> 3164, byte for byte ---------------------------------------------------------------

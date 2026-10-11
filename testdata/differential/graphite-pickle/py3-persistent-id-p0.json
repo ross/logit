@@ -1,0 +1,36 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "UnpicklingError",
+   "message": "A load persistent id instruction was encountered, but no persistent_load function was specified."
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py3-persistent-id-p0",
+ "cpython": {
+  "error": "UnpicklingError",
+  "message": "A load persistent id instruction was encountered, but no persistent_load function was specified."
+ },
+ "description": "A persistent id in protocol 0.",
+ "exercises": [
+  "PERSID"
+ ],
+ "logit": {
+  "opcode": "0x50",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "FLOAT",
+  "INT",
+  "LIST",
+  "MARK",
+  "PERSID",
+  "PUT",
+  "STOP",
+  "TUPLE"
+ ],
+ "producer": "cpython3",
+ "protocol": 0
+}

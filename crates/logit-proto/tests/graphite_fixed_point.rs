@@ -146,6 +146,27 @@ fn a_large_timestamp_is_a_fixed_point() {
     assert_fixed_point(batch(vec![datapoint("sys.cpu", 1.0, 2_147_483_653, &[])]));
 }
 
+/// Normalization 13: a protocol-0 sender's frame, with an escaped, tagged path, leaves in the
+/// pickle writer's protocol-2 spelling and decodes to the same events.
+#[test]
+fn a_protocol_0_sender_is_re_spelled_as_protocol_2_with_no_field_changed() {
+    // Python 2's `cPickle.dumps` spelling: a memo from 1, `\xc3\xa9` for `é`, `GET`, and `L…L`.
+    let protocol_0: &[u8] = b"(lp1\n(S'caf\\xc3\\xa9.x;env=prod'\np2\n(I1700000000\nF0.5\ntp3\n\
+        tp4\na(g2\n(L1700000001L\nF-2\ntp5\ntp6\na.";
+    let resource = Arc::new(Resource::default());
+    let decoded = decode_all(&[[&[0u8; 4][..], protocol_0].concat()], Protocol::Pickle, &resource);
+    assert_eq!(
+        decoded,
+        vec![
+            datapoint("caf\u{e9}.x", 0.5, 1_700_000_000, &[("env", "prod")]),
+            datapoint("caf\u{e9}.x", -2.0, 1_700_000_001, &[("env", "prod")]),
+        ]
+    );
+    let re_spelled = encode_at(&batch(decoded.clone()), Protocol::Pickle);
+    assert!(re_spelled.iter().all(|frame| frame[4..6] == [0x80, 0x02]), "protocol 2 on egress");
+    assert_eq!(decode_all(&re_spelled, Protocol::Pickle, &resource), decoded);
+}
+
 #[test]
 fn many_datapoints_are_a_fixed_point() {
     let events = (0..25)

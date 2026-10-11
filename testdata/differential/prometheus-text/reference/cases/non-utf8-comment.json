@@ -1,0 +1,18 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "m",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x05563eac",
+  "len": 18,
+  "path": "differential/prometheus-text/cases/non-utf8-comment.txt"
+ },
+ "parser": "prom"
+}

@@ -1,0 +1,81 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    {
+     "surrogates": [
+      112,
+      97,
+      116,
+      104,
+      46,
+      56448
+     ]
+    },
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-path-surrogate-p0",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     {
+      "surrogates": [
+       112,
+       97,
+       116,
+       104,
+       46,
+       56448
+      ]
+     },
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "The lone surrogate as protocol 0's \\udc80 escape.",
+ "divergence": "carbon keeps a str with a lone surrogate; a logit name is UTF-8, so the reader fails the frame (docs/known-gaps/mappings.md: decode (Graphite), a lone surrogate)",
+ "exercises": [
+  "UNICODE"
+ ],
+ "logit": {
+  "message": "is a surrogate",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "FLOAT",
+  "INT",
+  "LIST",
+  "MARK",
+  "PUT",
+  "STOP",
+  "TUPLE",
+  "UNICODE"
+ ],
+ "producer": "cpython3",
+ "protocol": 0
+}

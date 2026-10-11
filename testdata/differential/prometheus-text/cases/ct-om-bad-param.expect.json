@@ -1,0 +1,4 @@
+{
+ "divergence": "a `version` parameter with no value: Prometheus's `mime.ParseMediaType` fails and it falls back to text 0.0.4, this decoder reads the media type alone and picks OpenMetrics (docs/known-gaps/mappings.md: A `Content-Type` with a malformed parameter)",
+ "result": "ok"
+}

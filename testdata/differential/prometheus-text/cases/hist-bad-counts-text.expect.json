@@ -1,0 +1,31 @@
+{
+ "divergence": "a NaN or negative bucket count and an infinite `_count` have no `u64` reading: each line skipped `malformed_line` (docs/known-gaps/mappings.md: A sample value or timestamp the model can't hold)",
+ "divergent": [
+  [
+   "h_bucket",
+   [
+    [
+     "le",
+     "1.0"
+    ]
+   ]
+  ],
+  [
+   "h_bucket",
+   [
+    [
+     "le",
+     "2.0"
+    ]
+   ]
+  ],
+  [
+   "h_count",
+   []
+  ]
+ ],
+ "result": "ok",
+ "skips": {
+  "malformed_line": 3
+ }
+}

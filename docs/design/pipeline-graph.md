@@ -826,6 +826,10 @@ logit-core   logit-config   logit-script
                     logit-cli                        — CLI + the kind → impl registry
 ```
 
+Pure parsers of producer bytes, wire protocols and log-message text alike, belong in `logit-proto`
+below the impl crates, and a listener or transform wraps one
+([ADR `parsers-live-in-logit-proto`](../adr/parsers-live-in-logit-proto.md)).
+
 Not drawn above: `logit-transforms` also depends on `logit-config` directly, for `route`'s
 `RouteBy` type (`docs/adr/target-components.md`). An impl crate reading a config type it needs is
 unremarkable; only `logit-pipeline` is barred from depending on the impl crates.

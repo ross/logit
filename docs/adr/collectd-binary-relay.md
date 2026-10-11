@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-09-29
+updated: 2026-10-09
 ---
 
 # collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder
@@ -188,6 +188,26 @@ name):
 entries on a type conflict, matching collectd's own `TypesDB` directive semantics). collectd's own
 `types.db` file is GPL-licensed and is **never embedded or shipped** in this repo; a test fixture is
 a short, hand-written file in the same line format, never a copy of the real one.
+
+**Amendment (2026-10-09): a record name carries at most 127 bytes of its plugin and its type.**
+Decode cuts each of a record name's `<plugin>` and `<type>` segments to its first
+`DATA_MAX_NAME_LEN` − 1 (127) wire bytes, in every naming rule above. The `collectd.*` attributes
+keep every byte, and `collectd_out` never reads the name, so the like-protocol relay is unchanged.
+
+- **Why.** A Values part interns one name per data source, and the interner never evicts. Uncut,
+  a 60 KB Plugin part ahead of a 64-value list put 64 times its length into the interner for one
+  datagram. collectd's own receiver rejects a string past 127 bytes, so only a misconfigured
+  sender that isn't collectd reaches the cut.
+- **Consequence.** Two Plugins or two Types that share their first 127 bytes get the same record
+  name. `influxdb_out` and `prometheus_out` keep the `collectd.*` attributes as tags, so their
+  series stay apart and only the name changes. `graphite_out` skips `collectd.*` attributes
+  (`crates/logit-proto/src/graphite/encode.rs`'s `FOREIGN_CARRIER_PREFIXES`), so it writes the two
+  as one carbon path. `docs/known-gaps/mappings.md` has the `decode (collectd)` row.
+- **Observable.** A list whose name is cut reports a throttled `record_name_cut` diagnostic. It
+  costs one length comparison per list, and the merge it can cause is otherwise silent. There is no
+  counter, because the decoder holds no `Telemetry`, and nothing is dropped.
+
+`crates/logit-proto/src/collectd/mod.rs`'s decode table is the canonical statement of the rule.
 
 ### Time: cdtime ↔ nanoseconds
 

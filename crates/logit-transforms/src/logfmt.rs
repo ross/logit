@@ -1,48 +1,19 @@
 //! `logfmt` and `kv`: parse a log message as `key=value` pairs and merge them into the event's
 //! attributes, as `json` does for JSON. See `docs/adr/logfmt-and-kv-parsing.md`.
 //!
-//! `logfmt` is the de-facto convention (`level=info msg="hello world" dur=3ms`):
-//! whitespace-delimited pairs, `"`-quoted values with backslash escapes, no required config. `kv`
-//! is a literal splitter with required `pair_sep`/`kv_sep` and no quoting (`a=1&b=2`,
-//! `a: 1, b: 2`). They're two `ComponentKind`s sharing this module, not one kind with a mode flag.
-//!
-//! Both are stateless and always produce `Value::Str` (or `Value::Bool(true)` for an opted-in
-//! bareword), never a number; `scale`/`kv_metrics` downstream coerce through `crate::numeric`.
+//! `logfmt` is the de-facto convention (`level=info msg="hello world" dur=3ms`) with no required
+//! config; `kv` takes a required `pair_sep`/`kv_sep` (`a=1&b=2`, `a: 1, b: 2`). They're two
+//! `ComponentKind`s sharing this module, not one kind with a mode flag. The grammars, and the
+//! rule that a value is never a number, are `logit_proto::message::logfmt`'s; `scale`/`kv_metrics`
+//! downstream coerce through `crate::numeric`. This module holds the merge, the UTF-8 check, and
+//! the diagnostics.
 
 use bytes::Bytes;
 use logit_core::interner::KeyCache;
 use logit_core::{AttrMap, Diagnostics, Event, Resource, Symbol, Telemetry, Value};
 use logit_pipeline::Transform;
-use std::fmt;
+use logit_proto::message::logfmt::{is_blank, parse_kv, parse_logfmt, ParseError};
 use std::sync::Arc;
-
-const fn is_ws(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
-}
-
-/// `true` if `s` is empty or only [`is_ws`] bytes: nothing to parse, so `NoPairs` gets no
-/// `parse_failure` diagnostic.
-fn is_blank(s: &str) -> bool {
-    s.bytes().all(is_ws)
-}
-
-enum ParseError {
-    /// A `"` never closed (or its closing `"` was an escape target), at this byte offset.
-    UnterminatedQuote(usize),
-    /// Nothing in the line produced a `key<sep>value` pair; barewords don't count.
-    NoPairs,
-}
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ParseError::UnterminatedQuote(pos) => {
-                write!(f, "unterminated quote starting at byte {pos}")
-            }
-            ParseError::NoPairs => write!(f, "no key=value pairs found"),
-        }
-    }
-}
 
 /// Moves every pair out of `scratch` into `attrs` by `Symbol`.
 ///
@@ -51,265 +22,6 @@ fn merge_into(scratch: &mut Vec<(Symbol, Value)>, attrs: &mut AttrMap) {
     for (key, value) in scratch.drain(..) {
         attrs.insert_sym(key, value);
     }
-}
-
-/// Resolves the five escapes `logfmt` understands; any other escape is kept verbatim, backslash
-/// included.
-///
-/// The only allocating path in this module; every other value is a [`bytes::Bytes::slice`] of the
-/// message. `shrink_to_fit` matters: any escape makes `out` shorter than its capacity, and
-/// `Bytes::from(Vec<u8>)` then allocates a separate `Shared` block eagerly. Shrinking turns that
-/// into a `realloc`, which `crates/logit-bench/tests/allocations.rs` doesn't count as an `alloc`.
-fn unescape(bytes: &[u8]) -> Bytes {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'\\' => out.push(b'\\'),
-                b'"' => out.push(b'"'),
-                b'n' => out.push(b'\n'),
-                b'r' => out.push(b'\r'),
-                b't' => out.push(b'\t'),
-                other => {
-                    out.push(b'\\');
-                    out.push(other);
-                }
-            }
-            i += 2;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    out.shrink_to_fit();
-    Bytes::from(out)
-}
-
-/// Scans a `"`-quoted value starting at `s[i] == b'"'`.
-///
-/// Returns the content's `(start, end)` range (quotes excluded), whether it has a backslash
-/// escape, and the index just past the closing `"`. Escapes are skipped two bytes at a time and
-/// left for [`unescape`].
-fn scan_quoted(s: &[u8], i: usize) -> Result<(usize, usize, bool, usize), ParseError> {
-    let n = s.len();
-    let mut j = i + 1;
-    let mut has_escape = false;
-    while j < n {
-        match s[j] {
-            b'\\' => {
-                if j + 1 >= n {
-                    return Err(ParseError::UnterminatedQuote(i));
-                }
-                has_escape = true;
-                j += 2;
-            }
-            b'"' => return Ok((i + 1, j, has_escape, j + 1)),
-            _ => j += 1,
-        }
-    }
-    Err(ParseError::UnterminatedQuote(i))
-}
-
-/// Parses `text`, the whole message as validated UTF-8, as logfmt into `out`.
-///
-/// `raw` shares `text`'s bytes, so every value without an escape is a `raw.slice`, never a copy.
-/// Keys are sliced straight off `text`: every delimiter (whitespace, `=`, `"`) is one ASCII byte,
-/// so a slice always lands on a char boundary. They resolve through [`KeyCache`], one `memcmp`
-/// for a repeated key. The grammar is in `docs/adr/logfmt-and-kv-parsing.md`.
-fn parse_logfmt(
-    raw: &Bytes,
-    text: &str,
-    bare_keys: bool,
-    out: &mut Vec<(Symbol, Value)>,
-    keys: &mut KeyCache,
-    telemetry: &Telemetry,
-) -> Result<(), ParseError> {
-    let s = text.as_bytes();
-    let n = s.len();
-    let mut i = 0;
-    let mut saw_pair = false;
-
-    loop {
-        while i < n && is_ws(s[i]) {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
-
-        let key_start = i;
-        while i < n && !is_ws(s[i]) && s[i] != b'=' {
-            i += 1;
-        }
-        let key_end = i;
-
-        if key_end == key_start {
-            // No key (`=1 a=2`): resynchronize at the next whitespace.
-            while i < n && !is_ws(s[i]) {
-                i += 1;
-            }
-            telemetry.count("logit.transform.pairs.skipped", 1.0, &[]);
-            continue;
-        }
-
-        let value = if i < n && s[i] == b'=' {
-            i += 1;
-            saw_pair = true;
-            if i < n && s[i] == b'"' {
-                let (content_start, content_end, has_escape, next) = scan_quoted(s, i)?;
-                let value = if has_escape {
-                    Value::Str(unescape(&s[content_start..content_end]))
-                } else {
-                    Value::Str(raw.slice(content_start..content_end))
-                };
-                i = next;
-                value
-            } else {
-                let v_start = i;
-                while i < n && !is_ws(s[i]) {
-                    i += 1;
-                }
-                Value::Str(raw.slice(v_start..i))
-            }
-        } else if bare_keys {
-            // A bareword doesn't set `saw_pair`: a line of only barewords is still `NoPairs`.
-            Value::Bool(true)
-        } else {
-            telemetry.count("logit.transform.pairs.skipped", 1.0, &[]);
-            continue;
-        };
-
-        out.push((keys.get_or_intern(&text[key_start..key_end]), value));
-        telemetry.count("logit.transform.pairs.parsed", 1.0, &[]);
-    }
-
-    if !saw_pair {
-        return Err(ParseError::NoPairs);
-    }
-    Ok(())
-}
-
-/// Finds `needle`'s first occurrence in `haystack` at or after byte offset `from`.
-///
-/// A plain byte search: a valid UTF-8 needle found in valid UTF-8 always lands on a char boundary
-/// (self-synchronization), so no boundary check is needed.
-fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() || from > haystack.len() {
-        return None;
-    }
-    haystack[from..].windows(needle.len()).position(|w| w == needle).map(|i| from + i)
-}
-
-/// Trims [`is_ws`] bytes off both ends of `bytes[start..end]`, returning the trimmed range.
-fn trim_ws_range(bytes: &[u8], mut start: usize, mut end: usize) -> std::ops::Range<usize> {
-    while start < end && is_ws(bytes[start]) {
-        start += 1;
-    }
-    while end > start && is_ws(bytes[end - 1]) {
-        end -= 1;
-    }
-    start..end
-}
-
-/// Parses one `kv` segment, `text[seg_start..seg_end]`, into at most one pair on `out`.
-///
-/// A segment with an empty key, or with no `kv_sep` and either blank or `bare_keys` off, is
-/// skipped and counted as `pairs.skipped`.
-#[allow(clippy::too_many_arguments)]
-fn parse_kv_segment(
-    raw: &Bytes,
-    text: &str,
-    seg_start: usize,
-    seg_end: usize,
-    kv_sep_bytes: &[u8],
-    bare_keys: bool,
-    out: &mut Vec<(Symbol, Value)>,
-    keys: &mut KeyCache,
-    saw_pair: &mut bool,
-    telemetry: &Telemetry,
-) {
-    let bytes = text.as_bytes();
-    let segment = &bytes[seg_start..seg_end];
-
-    match find_bytes(segment, kv_sep_bytes, 0) {
-        Some(idx) => {
-            let key_range = trim_ws_range(segment, 0, idx);
-            if key_range.is_empty() {
-                telemetry.count("logit.transform.pairs.skipped", 1.0, &[]);
-                return;
-            }
-            let value_range = trim_ws_range(segment, idx + kv_sep_bytes.len(), segment.len());
-            let key = &text[(seg_start + key_range.start)..(seg_start + key_range.end)];
-            let value_abs = (seg_start + value_range.start)..(seg_start + value_range.end);
-            *saw_pair = true;
-            out.push((keys.get_or_intern(key), Value::Str(raw.slice(value_abs))));
-            telemetry.count("logit.transform.pairs.parsed", 1.0, &[]);
-        }
-        None => {
-            let key_range = trim_ws_range(segment, 0, segment.len());
-            if key_range.is_empty() {
-                // An empty segment (`a=1&&b=2`, or all whitespace).
-                telemetry.count("logit.transform.pairs.skipped", 1.0, &[]);
-                return;
-            }
-            if !bare_keys {
-                telemetry.count("logit.transform.pairs.skipped", 1.0, &[]);
-                return;
-            }
-            let key = &text[(seg_start + key_range.start)..(seg_start + key_range.end)];
-            out.push((keys.get_or_intern(key), Value::Bool(true)));
-            telemetry.count("logit.transform.pairs.parsed", 1.0, &[]);
-        }
-    }
-}
-
-/// Parses `text` as `kv`: `pair_sep`-separated segments, each split on its first `kv_sep`.
-///
-/// No quoting or escapes, so a value containing `pair_sep` isn't representable; that shape needs
-/// `logfmt`.
-#[allow(clippy::too_many_arguments)]
-fn parse_kv(
-    raw: &Bytes,
-    text: &str,
-    pair_sep: &str,
-    kv_sep: &str,
-    bare_keys: bool,
-    out: &mut Vec<(Symbol, Value)>,
-    keys: &mut KeyCache,
-    telemetry: &Telemetry,
-) -> Result<(), ParseError> {
-    let bytes = text.as_bytes();
-    let n = bytes.len();
-    let pair_sep_bytes = pair_sep.as_bytes();
-    let kv_sep_bytes = kv_sep.as_bytes();
-
-    let mut saw_pair = false;
-    let mut cursor = 0usize;
-    loop {
-        let seg_end = find_bytes(bytes, pair_sep_bytes, cursor).unwrap_or(n);
-        parse_kv_segment(
-            raw,
-            text,
-            cursor,
-            seg_end,
-            kv_sep_bytes,
-            bare_keys,
-            out,
-            keys,
-            &mut saw_pair,
-            telemetry,
-        );
-        if seg_end >= n {
-            break;
-        }
-        cursor = seg_end + pair_sep_bytes.len();
-    }
-
-    if !saw_pair {
-        return Err(ParseError::NoPairs);
-    }
-    Ok(())
 }
 
 /// The log message as a zero-copy `Bytes`, verified valid UTF-8.
@@ -472,6 +184,7 @@ impl Transform for Kv {
 mod tests {
     use super::*;
     use logit_core::interner::{intern as intern_for_test, resolve};
+    use logit_core::subslice::within;
     use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, SpanEvent, SpanKind};
     use logit_core::{Registry, SpanRecord, SpanStatus};
 
@@ -517,12 +230,6 @@ mod tests {
 
     fn attr<'a>(event: &'a Event, key: &str) -> Option<&'a Value> {
         event.attributes.get(key)
-    }
-
-    fn points_into(haystack: &Bytes, needle: &Bytes) -> bool {
-        let base = haystack.as_ptr() as usize;
-        let start = needle.as_ptr() as usize;
-        start >= base && start + needle.len() <= base + haystack.len()
     }
 
     // -----------------------------------------------------------------------------------------
@@ -773,11 +480,11 @@ mod tests {
         assert!(logfmt.process(&resource, &mut event), "log events pass through");
 
         let Some(Value::Str(msg)) = attr(&event, "msg") else { panic!("msg should be a Str") };
-        assert!(points_into(&message, msg), "escape-free quoted value should slice the message");
+        assert!(within(&message, msg), "escape-free quoted value should slice the message");
         let Some(Value::Str(status)) = attr(&event, "status") else {
             panic!("status should be a Str")
         };
-        assert!(points_into(&message, status), "unquoted value should slice the message");
+        assert!(within(&message, status), "unquoted value should slice the message");
     }
 
     // -----------------------------------------------------------------------------------------
@@ -915,7 +622,7 @@ mod tests {
         );
         assert!(kv.process(&resource, &mut event), "log events pass through");
         let Some(Value::Str(b)) = attr(&event, "b") else { panic!("b should be a Str") };
-        assert!(points_into(&message, b), "kv value should slice the message");
+        assert!(within(&message, b), "kv value should slice the message");
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1059,6 +766,105 @@ mod tests {
         match &events[0].metrics[0].kind {
             MetricKind::Sum(sum) => assert_eq!(sum.value, 1.0),
             other => panic!("expected Sum, got {other:?}"),
+        }
+    }
+}
+
+/// `logfmt` against a regex reading of the ADR's grammar on generated well-formed lines.
+#[cfg(test)]
+mod reference {
+    use super::*;
+    use logit_core::interner::resolve;
+    use proptest::prelude::*;
+
+    /// A key, then `=` and a quoted value (group 2) or an unquoted one (group 3), after the start
+    /// of the line or whitespace.
+    fn grammar() -> regex::Regex {
+        regex::Regex::new(
+            r#"(?:^|[ \t\r\n]+)([^ \t\r\n="]+)=(?:"((?:[^"\\]|\\.)*)"|([^ \t\r\n"]*))"#,
+        )
+        .unwrap()
+    }
+
+    fn unescape(quoted: &str) -> String {
+        let mut out = String::new();
+        let mut chars = quoted.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some(c @ ('\\' | '"')) => out.push(c),
+                Some(c) => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                None => out.push('\\'),
+            }
+        }
+        out
+    }
+
+    fn quoted_value() -> impl Strategy<Value = String> {
+        let piece = prop_oneof![
+            "[a-z0-9 =.:/{}-]{1,6}",
+            Just("\\\"".to_string()),
+            Just("\\\\".to_string()),
+            Just("\\n".to_string()),
+            Just("\\t".to_string()),
+            Just("\\u00e9".to_string()),
+            Just("é".to_string()),
+        ];
+        prop::collection::vec(piece, 0..5).prop_map(|p| format!("\"{}\"", p.concat()))
+    }
+
+    fn pair() -> impl Strategy<Value = String> {
+        let key = "[a-z_][a-z0-9_.]{0,8}";
+        let value = prop_oneof!["[a-z0-9=./:@-]{0,10}", quoted_value()];
+        (key, value).prop_map(|(k, v)| format!("{k}={v}"))
+    }
+
+    fn line() -> impl Strategy<Value = String> {
+        let sep = prop_oneof![Just(" "), Just("  "), Just("\t"), Just(" \t ")];
+        (prop::collection::vec((pair(), sep), 1..10), "[ \t]{0,2}").prop_map(|(pairs, lead)| {
+            let mut line = lead;
+            for (pair, sep) in pairs {
+                line.push_str(&pair);
+                line.push_str(sep);
+            }
+            line
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn logfmt_reads_a_well_formed_line_as_the_grammar_does(line in line()) {
+            let raw = Bytes::copy_from_slice(line.as_bytes());
+            let mut out = Vec::new();
+            let mut keys = KeyCache::new();
+            let parsed =
+                parse_logfmt(&raw, &line, false, &mut out, &mut keys, &Telemetry::default());
+            prop_assert!(parsed.is_ok(), "{line:?}");
+            let got: Vec<(String, String)> = out
+                .iter()
+                .map(|(k, v)| (resolve(*k).to_string(), v.as_str().unwrap().to_string()))
+                .collect();
+            let want: Vec<(String, String)> = grammar()
+                .captures_iter(&line)
+                .map(|c| {
+                    let value = match (c.get(2), c.get(3)) {
+                        (Some(quoted), _) => unescape(quoted.as_str()),
+                        (None, Some(bare)) => bare.as_str().to_string(),
+                        (None, None) => unreachable!("one alternative matches"),
+                    };
+                    (c[1].to_string(), value)
+                })
+                .collect();
+            prop_assert_eq!(got, want, "{:?}", line);
         }
     }
 }

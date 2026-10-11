@@ -2,7 +2,7 @@
 
 The base handler appends a trailing NUL byte to every UDP datagram by default (`append_nul = True`
 is a class attribute, not a constructor argument -- there's no way to disable it from
-`LOGGING`/`dictConfig` without subclassing). `crates/logit-inputs/src/syslog.rs` decodes each
+`LOGGING`/`dictConfig` without subclassing). `crates/logit-proto/src/syslog/` decodes each
 datagram as UTF-8 and hands the tail of the line to the `json` transform as-is; a trailing NUL
 survives both steps as a literal character after the JSON object's closing `}`, which
 `serde_json`'s parser rejects as trailing garbage (confirmed against the parser's source). See

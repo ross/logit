@@ -1,0 +1,63 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "reject.bytearray",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3ff8000000000000",
+     "repr": "1.5"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-value-bytearray-p5",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "reject.bytearray",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "bytearray": "312e35"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "A bytearray value at protocol 5.",
+ "divergence": "carbon iterates any container and float()s any value it can; the reader takes a list batch and has no opcode for this shape (docs/known-gaps/mappings.md: decode (Graphite), a shape carbon iterates)",
+ "exercises": [
+  "BYTEARRAY8"
+ ],
+ "logit": {
+  "opcode": "0x96",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BYTEARRAY8",
+  "EMPTY_LIST",
+  "FRAME",
+  "MEMOIZE",
+  "PROTO",
+  "SHORT_BINUNICODE",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 5
+}
