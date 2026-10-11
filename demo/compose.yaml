@@ -233,6 +233,10 @@ services:
     # Disables SELinux confinement for this one container rather than relabeling the bind mount
     # above (`:z` would do that, and is exactly what must NOT happen to the daemon's own state).
     security_opt: ["label=disable"]
+    # Docker's 10s default is shorter than the worst-case drain: up to 5s for the data sinks, then
+    # up to 5s more for `self`'s dedicated pipeline, which drains last. A SIGKILL before it ends
+    # loses the shutdown-time telemetry (`docs/deploying.md`'s "Signal and restart behavior").
+    stop_grace_period: 15s
     # `logit ready` (`docs/deploying.md`'s "Probes and exit codes", ADR `admin-readiness-endpoint`)
     # against demo/logit.yaml's own `admin: { bind: 0.0.0.0:9600 }`. It's the same probe
     # `Dockerfile`'s `HEALTHCHECK` runs, declared explicitly here so the `depends_on:

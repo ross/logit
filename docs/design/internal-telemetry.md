@@ -346,10 +346,12 @@ decisions 10 to 16):
    the pipeline cascades as usual.
 
 So the final drain carries the counts recorded during the data drain: a sink's or Lua node's
-`batches.dropped{reason="shutdown"}`, and a UDP listener's `datagrams.dropped{reason="shutdown"}`.
+`batches.dropped{reason="shutdown"}`, a UDP listener's `datagrams.dropped{reason="shutdown"}`, and an HTTP
+listener's `connections.closed{reason="shutdown"}`.
 `internal`'s grace and each pipeline sink's grace and Lua wedge rule count from the second signal,
 so a long data drain can't use them up. With a mixed pipeline (a sink or transform that also
-carries data) there's one stage, and those counts stay undrained. Either way, once every node has
+carries data) there's one stage, and those counts stay undrained; `graph::resolve` adds a warning
+naming `internal` and a shared node (validation rule 84). Either way, once every node has
 exited, `logit run` drains the registry one last time and logs each leftover metric point as a
 `telemetry left undrained at exit` line (`crates/logit-cli/src/undrained.rs`).
 
@@ -740,7 +742,7 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 | `logit.input.connections.rejected{reason="limit"}` | count | a connection closed at the connection cap, before any TLS handshake |
 | `logit.input.connections.rejected{reason="proxy_header"}` | count | a connection under `proxy_protocol: true` whose PROXY header was missing, malformed, cut short by the peer closing, or not complete within `handshake_timeout`; read before any TLS handshake |
 | `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
-| `logit.input.connections.closed{reason="idle"}` | count | an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. A close at shutdown is not counted: there is no `reason="shutdown"`, because `connections.closed` counts a policy close |
+| `logit.input.connections.closed{reason="idle"\|"shutdown"}` | count | `idle`: an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. `shutdown`: an HTTP listener (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver) closed an open connection at shutdown, one count per connection whose close sequence finished before `run_input`'s backstop. It lands after the shutdown signal, so only a dedicated `internal` pipeline exports it (see "With a dedicated pipeline, `internal` drains last"). The stream listeners and `logit_in` don't count a shutdown close |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
 | `logit.input.frames.dropped{reason="oversize"\|"drained"\|"malformed"\|"truncated"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses. `drained` is a line-framed listener's line that crossed its bound before its `LF` arrived: counted once, after which the connection discards input until its next `LF` |
 
@@ -962,7 +964,7 @@ connection then discards input until its next `LF`.
 `logit.input.connections.rejected{reason="limit"}` (the connection cap, `max_connections`, 1024
 by default, binding), `logit.input.connections.rejected{reason="proxy_header"}` (under
 `proxy_protocol: true`, a PROXY header that was missing, malformed, cut short, or late, read
-before any TLS accept), and `logit.input.connections.closed{reason="idle"}`. The first three are
+before any TLS accept), and `logit.input.connections.closed{reason="idle"|"shutdown"}`. The first three are
 the points `logit_in` and the shared TCP driver record, and the shared TCP driver alone records
 the `proxy_header` reason, for the same reason: this accept loop rejects at the
 cap rather than queueing behind a permit, so there's a refusal to count, and the gauge counts
@@ -1051,7 +1053,7 @@ loop and the same shared idle tracker (`crates/logit-inputs/src/http.rs`):
 `logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}`,
 `logit.input.connections.rejected{reason="proxy_header"}` (under `proxy_protocol: true`, a PROXY
 header that was missing, malformed, cut short, or late, read before any TLS accept), and
-`logit.input.connections.closed{reason="idle"}` (count). Scrape mode has none of them: it's a
+`logit.input.connections.closed{reason="idle"|"shutdown"}` (count). Scrape mode has none of them: it's a
 client, with no socket of its own.
 
 **The codec's counters**, on the decode side of both modes, are
@@ -1100,7 +1102,7 @@ TLS listener that close fails the TLS accept and is counted), `proxy_header` (bi
 **The connection metrics are `otlp_in`'s verbatim**, because this listener runs the same accept loop
 and the same shared idle tracker (`crates/logit-inputs/src/http.rs`): `logit.input.connections`
 (gauge), `logit.input.connections.rejected{reason="limit"}`,
-`logit.input.connections.closed{reason="idle"}`, and the accept-queue gauges. Under
+`logit.input.connections.closed{reason="idle"|"shutdown"}`, and the accept-queue gauges. Under
 `proxy_protocol: true`, `logit.input.connections.rejected{reason="proxy_header"}` counts a
 connection refused for its PROXY header, as on the shared TCP stream driver.
 
@@ -1156,7 +1158,7 @@ message text only, never a tag, and an API key never appears at all), `busy` (a 
 
 **The connection metrics are `datadog_in`'s, except the accept-queue gauges cover the TCP
 listener only.** `logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}`,
-and `logit.input.connections.closed{reason="idle"}` count the TCP listener and the Unix socket
+and `logit.input.connections.closed{reason="idle"|"shutdown"}` count the TCP listener and the Unix socket
 together, under one cap. The accept-queue gauges read the kernel's `TCP_INFO`, which a Unix socket
 has no counterpart for, so a `socket:`-only listener has none. Under `proxy_protocol: true`,
 `logit.input.connections.rejected{reason="proxy_header"}` counts a TCP connection refused for its
@@ -1199,7 +1201,7 @@ left out of the resource).
 
 **The connection metrics are `datadog_in`'s verbatim**, from the same accept loop and shared idle
 tracker: `logit.input.connections` (gauge, published by the same drop guard),
-`logit.input.connections.rejected{reason="limit"}`, `logit.input.connections.closed{reason="idle"}`,
+`logit.input.connections.rejected{reason="limit"}`, `logit.input.connections.closed{reason="idle"|"shutdown"}`,
 and the accept-queue gauges. Under `proxy_protocol: true`,
 `logit.input.connections.rejected{reason="proxy_header"}` counts a connection refused for its
 PROXY header, as on the shared TCP stream driver.

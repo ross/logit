@@ -133,8 +133,10 @@ error.
   controllers, and external load balancers, plus, for anything that routes on its own probe of
   `/readyz`, that probe's period times its failure threshold. Set
   `terminationGracePeriodSeconds` to at least the delay plus the largest `shutdown_grace` in the
-  config, plus a few seconds' margin, or the kubelet's SIGKILL cuts the drain short. The same
-  budget applies to Docker's `--stop-timeout` and systemd's `TimeoutStopSec=`.
+  config, plus a few seconds' margin, or the kubelet's SIGKILL cuts the drain short. With a
+  [dedicated `internal` pipeline](#give-internal-a-dedicated-pipeline), add its second stage:
+  the larger of `internal`'s fixed 5 s and its sinks' `buffer.shutdown_grace`. The same budget
+  applies to Docker's `stop_grace_period`/`--stop-timeout` and systemd's `TimeoutStopSec=`.
   [Overlapping two instances on one port](#overlapping-two-instances-on-one-port) puts the delay
   into a rolling-upgrade recipe, with a `preStop` hook as the fallback where the delay can't be
   used.
@@ -423,7 +425,8 @@ The config sets `reuse_port: true` on each listener, `admin.socket: /run/logit/a
 - **Don't declare `ports:` on the container.** Under `hostNetwork`, every container port is also a
   host port, and the scheduler won't place a second pod claiming the same host port on a node, so
   the surge pod stays `Pending` and the rollout stops.
-- **`terminationGracePeriodSeconds: 30` fits `delay: 10s` and the default 5 s grace.**
+- **`terminationGracePeriodSeconds: 30` fits `delay: 10s`, the default 5 s grace, and a
+  dedicated `internal` pipeline's 5 s second stage.**
   [Signal and restart behavior](#signal-and-restart-behavior) has the sizing rule.
 - **Give the `exec` probe a `timeoutSeconds` of at least 2.** The kubelet stops the probe at its
   timeout, and the default 1 s can be too short for the `logit ready` process to start and get an
@@ -592,7 +595,16 @@ a UDP listener's `datagrams.dropped{reason="shutdown"}`, and a sink's or Lua nod
 as one `otlp_out` fed by both, `internal` drains once when the shutdown signal arrives and
 shuts down with the data. Later counts then appear only in the self-log (`warn` lines, `drain complete`, and
 `telemetry left undrained at exit`), never in an exported pipeline. The final drain's own `logit.internal.*` counts
-are never exported in either case.
+are never exported in either case. `logit validate` and `logit run` warn about a mixed pipeline,
+naming `internal` and a node it shares.
+
+A dedicated pipeline makes exit take longer. After the data drain ends, `internal` gets its own
+5 s grace for its final send, and each of its sinks gets its `buffer.shutdown_grace` to deliver
+it, counted from that point. Budget for both in the orchestrator's kill deadline: Kubernetes'
+`terminationGracePeriodSeconds` defaults to 30 s, but Docker's `stop_grace_period`/`--stop-timeout`
+defaults to 10 s, which the default 5 s data drain plus a 5 s second stage already uses up. A
+SIGKILL that lands first loses the shutdown-time telemetry this pipeline exists to export.
+[Signal and restart behavior](#signal-and-restart-behavior) has the sizing rule.
 
 When the backend is the same, add a second sink that points at it. This config sends data and
 `internal`'s telemetry to one collector through two `otlp_out` sinks:

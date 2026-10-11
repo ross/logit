@@ -91,17 +91,19 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - the UDP listeners' `datagrams.dropped`/`bytes.dropped{reason="shutdown"}`
     ([ADR `shutdown-accounting-and-cancellation-safety`](../adr/shutdown-accounting-and-cancellation-safety.md),
     decision 4);
-  - the drops a sink or Lua node counts during the drain.
+  - the drops a sink or Lua node counts during the drain;
+  - the HTTP listeners' `connections.closed{reason="shutdown"}`.
 
   A dedicated pipeline closes this part of the gap: `internal` and its pipeline shut down after
   every other node and drain once more, so those counts are exported (the same ADR's "Amendment:
   internal drains last", decisions 10 to 16). Giving `internal` its own sinks, on the same backend
   when needed, is the recommended setup
-  ([docs/deploying.md](../deploying.md)'s "Give `internal` a dedicated pipeline"). In a mixed
-  pipeline the counts reach a test `Registry` but no `otlp_out` or `prometheus_out`. An operator
-  sees them in the self-log instead: each UDP guard that counts a nonzero remainder logs a `warn`
-  naming the listener and the count, `drain complete` logs the sinks' total, and
-  `telemetry left undrained at exit` logs every remaining point.
+  ([docs/deploying.md](../deploying.md)'s "Give `internal` a dedicated pipeline"), and
+  `logit validate` and `logit run` warn about a mixed one. In a mixed pipeline the counts reach a
+  test `Registry` but no `otlp_out` or `prometheus_out`. An operator sees them in the self-log
+  instead: each UDP guard that counts a nonzero remainder logs a `warn` naming the listener and
+  the count, `drain complete` logs the sinks' total, and `telemetry left undrained at exit` logs
+  every remaining point.
 
   In both cases the final drain's own `logit.internal.*.emitted`/`drain.duration` are never
   exported. They are recorded a tick behind, and no tick follows the final drain. Both cases log
