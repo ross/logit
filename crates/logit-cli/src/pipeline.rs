@@ -45,6 +45,9 @@ use logit_outputs::datadog_trace::{
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::graphite::{GraphiteOutput, Transport as GraphiteOutTransport};
 use logit_outputs::influxdb::InfluxDbOutput;
+use logit_outputs::kafka::{
+    KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings, RecordFormat, RecordKey,
+};
 use logit_outputs::logit::LogitOutput;
 use logit_outputs::null::NullOutput;
 use logit_outputs::otlp::{
@@ -1187,6 +1190,62 @@ fn build_spec(
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
                 .with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
+        KafkaOut {
+            brokers,
+            topic,
+            key,
+            format,
+            compression,
+            acks,
+            idempotent,
+            max_request_bytes,
+            timeout,
+            headers,
+            tls,
+        } => {
+            let settings = KafkaSettings {
+                brokers: brokers.clone(),
+                topic: topic.clone(),
+                key: match key {
+                    logit_config::KafkaKey::None => RecordKey::None,
+                    logit_config::KafkaKey::TraceId => RecordKey::TraceId,
+                    logit_config::KafkaKey::Attribute(name) => RecordKey::Attribute(name.clone()),
+                    logit_config::KafkaKey::Resource(name) => RecordKey::Resource(name.clone()),
+                },
+                format: match format {
+                    logit_config::KafkaFormat::Json => RecordFormat::Json,
+                },
+                compression: match compression {
+                    logit_config::KafkaCompression::None => KafkaCompression::None,
+                    logit_config::KafkaCompression::Gzip => KafkaCompression::Gzip,
+                    logit_config::KafkaCompression::Snappy => KafkaCompression::Snappy,
+                    logit_config::KafkaCompression::Lz4 => KafkaCompression::Lz4,
+                    logit_config::KafkaCompression::Zstd => KafkaCompression::Zstd,
+                },
+                acks: match acks {
+                    logit_config::KafkaAcks::All => KafkaAcks::All,
+                    logit_config::KafkaAcks::Leader => KafkaAcks::Leader,
+                    logit_config::KafkaAcks::None => KafkaAcks::None,
+                },
+                idempotent: *idempotent,
+                // Saturates on a 32-bit target: a cap past the address space is no cap.
+                max_request_bytes: usize::try_from(*max_request_bytes).unwrap_or(usize::MAX),
+                timeout: *timeout,
+                headers: headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                client_id: format!("logit-{id}"),
+            };
+            let mut output = KafkaOutput::new(settings)?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            if let Some(tls) = tls {
+                output = output.with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
+            }
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer, base_dir),

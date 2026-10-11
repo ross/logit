@@ -71,6 +71,27 @@ services:
     # running, not `logit run` listening, since UDP delivery is fire-and-forget.
     depends_on: [dev]
 
+  # A single-node KRaft broker for fixtures/kafka-out.yaml, the version
+  # testdata/interop/kafka/README.md records. It advertises `kafka:9092`, so only a client on the
+  # compose network can reach it; topics are created on first use.
+  kafka:
+    image: docker.io/apache/kafka:4.2.0
+    hostname: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+    networks: [logit]
+
 networks:
   logit: {}
 

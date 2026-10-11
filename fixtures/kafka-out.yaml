@@ -1,0 +1,42 @@
+# JSON log lines in, one Kafka record per event out: an application writing one JSON object per
+# line to a TCP socket, and `kafka_out` (docs/adr/kafka-output.md) producing each event to the
+# dev stack's broker (`compose.yaml`'s `kafka` service) as the JSON object `stdio_out`'s
+# `format: json` writes.
+#
+#   app (TCP lines) --> lines_in --> json --> kafka_out --> kafka:9092, topic logs
+#
+# Run it in the dev container on the compose network, then send a few lines and read them back:
+#
+#   printf '{"user":"ann","msg":"hello"}\n{"msg":"no user"}\n' | nc -q1 127.0.0.1 5170
+#   docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+#     --bootstrap-server kafka:9092 --topic logs --from-beginning \
+#     --property print.key=true --property print.headers=true --property print.partition=true
+#
+# `key: {attribute: user}` keys each record by its event's `user`, so every record of one user
+# lands on the partition the Java client picks for that key. An event without a `user` goes out
+# unkeyed, counted in `logit.output.records.unkeyed`.
+components:
+  lines_in:
+    type: lines_in
+    bind: 0.0.0.0:5170
+
+  parse:
+    type: json
+    sources: [lines_in]
+
+  kafka:
+    type: kafka_out
+    sources: [parse]
+    brokers: ["kafka:9092"]
+    # The dev broker creates a missing topic on first use; a production broker usually doesn't,
+    # and the sink holds its queue until an operator creates it.
+    topic: logs
+    key: {attribute: user}           # none (the default) | trace_id | {attribute: ..} | {resource: ..}
+    compression: zstd                # none (the default) | gzip | snappy | lz4 | zstd
+    headers:
+      source: logit
+    # acks: all                      # the default; idempotent: true needs it
+    # idempotent: true               # the default
+    # max_request_bytes: 1MiB        # the default; keep it under the topic's max.message.bytes
+    # timeout: 30s                   # the default
+    # tls: {}                        # turns TLS on; ca_file, cert_file, key_file as for logit_out
