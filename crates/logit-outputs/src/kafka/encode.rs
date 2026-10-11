@@ -820,6 +820,32 @@ mod tests {
         assert_eq!(native_events(&b2, &out).len(), 3);
     }
 
+    /// An event over the budget mid-batch ends a `native` record, because a frame can't skip an
+    /// event, while the in-order formats drop it and keep filling the open record.
+    #[test]
+    fn an_oversize_event_mid_batch_ends_a_native_record_but_not_a_json_one() {
+        let small = |i: i64| log_event(i * 1_000_000, Value::str("abcd"));
+        let big = log_event(9_000_000, Value::str("x".repeat(4096)));
+        let b = batch(AttrMap::new(), vec![small(0), small(1), big, small(2)]);
+        let abc = [b.events[0].clone(), b.events[1].clone(), b.events[3].clone()];
+        let groups = |format, budget| {
+            let (out, stats) = records(&mut encoder(format, RecordMode::Batch, budget), &b);
+            assert_eq!(stats.oversize, 1);
+            out.iter()
+                .map(|r| decoded(format, &b, std::slice::from_ref(r), RecordMode::Batch))
+                .collect::<Vec<_>>()
+        };
+        let objects = |events: &[Event]| events.iter().map(|e| ndjson(&b, e)).collect::<Vec<_>>();
+
+        let native_budget = native_frame(&b.resource, None, &abc).unwrap().len();
+        assert_eq!(
+            groups(RecordFormat::Native, native_budget),
+            vec![objects(&abc[..2]), objects(&abc[2..])],
+        );
+        let json_budget: usize = abc.iter().map(|e| ndjson(&b, e).len() + 1).sum();
+        assert_eq!(groups(RecordFormat::Json, json_budget), vec![objects(&abc)]);
+    }
+
     /// `record: event` keys each record in every format; a batch record never has one.
     #[test]
     fn every_format_keys_its_event_records() {
