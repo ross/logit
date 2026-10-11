@@ -453,3 +453,28 @@ differently. Where this section and an item above disagree, this section holds.
 
 The `kafka_out` module doc (`crates/logit-outputs/src/kafka/mod.rs`, "Response classes") now
 carries the canonical fault-class table, so item 5's table is no longer updated.
+
+## Amendment: what W2 settled (2026-10-11)
+
+Building the sink settled four points the decision above leaves open. Where this section and an
+item above disagree, this section holds.
+
+1. **`record:` waits for W3.** Item 11 gives every format a `record: event | batch` override.
+   `kafka_out` ships `format: json` with one record per event and no `record:` field. A batch
+   record needs its own timestamp and its own answer to a batch over `max_request_bytes`, which
+   W3 decides with the other formats.
+2. **A key's text follows `sample`'s canonical bytes** (`logit_core::sampling::hash_value`), which
+   item 3's table matches row for row. The one value that table leaves out, a `Timestamp`, is
+   its decimal nanoseconds, as `sample` hashes it, so one attribute keys a record and samples
+   an event the same way.
+3. **The sink lets go of a `Pending` when a send is final, and when `Output::observe_batch`
+   starts a batch while one is still held**, calling `Producer::abandon` either way. The second
+   case is a batch `write_loop` stopped retrying without a final send, as after a shutdown cut. A
+   caller that never calls `observe_batch` gets a fresh `Pending` on every `send`.
+4. **An event whose configured key has no value is counted in `logit.output.records.unkeyed`**,
+   not in `records.dropped`: the record is still sent.
+
+A Kafka 4.2 broker with `auto.create.topics.enable` answers the first `Metadata` request for a
+missing topic with `UNKNOWN_TOPIC_OR_PARTITION` while it creates the topic. The sink reads that
+as `Refused`, item 9's rule, and the retry after `write_loop`'s backoff finds the topic, so the
+first batch to a new topic logs one `retrying` error.

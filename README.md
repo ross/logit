@@ -103,7 +103,7 @@ DOT format. [examples/](examples) has complete starting configs, each with a ren
 | Aggregation and routing | `aggregate`, `route`, `target` |
 | Scripting | `lua`, `lua_file` |
 | Observation | `shape` |
-| Outputs | `influxdb_out`, `otlp_out`, `prometheus_out` (exposition or remote-write), `datadog_out` (Datadog's intake API), `datadog_trace_out` (a Datadog Agent's APM API), `splunk_hec_out` (Splunk's HTTP Event Collector), `statsd_out`, `syslog_out`, `collectd_out`, `graphite_out`, `logit_out`, `stdio_out`, `file_out`, `null_out` |
+| Outputs | `influxdb_out`, `otlp_out`, `prometheus_out` (exposition or remote-write), `datadog_out` (Datadog's intake API), `datadog_trace_out` (a Datadog Agent's APM API), `splunk_hec_out` (Splunk's HTTP Event Collector), `kafka_out` (a Kafka topic), `statsd_out`, `syslog_out`, `collectd_out`, `graphite_out`, `logit_out`, `stdio_out`, `file_out`, `null_out` |
 
 `logit_in` and `logit_out` speak `logit`'s own wire protocol, for forwarding between `logit` nodes.
 VictoriaMetrics, VictoriaLogs, and VictoriaTraces need no component of their own; see

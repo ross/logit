@@ -572,11 +572,13 @@ destination, so the resend adds to it. Set `buffer.delivery: at_most_once` on an
 drop a batch on its first ambiguous failure instead of risking a duplicate
 ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 5). A sink that sends one batch as
 several requests remembers which of them the destination accepted and retries only the others.
-`otlp_out` keys that by signal, `datadog_out` and `datadog_trace_out` by request. Each reports the
-failed request's own class and never resends an accepted request within a run, but may resend the
-request that drew an ambiguous answer, which can land twice. A `buffer.disk:` batch replayed after
-a restart sends every request again. Under `at_most_once` they count the records of the requests
-they drop as `records.dropped{signal or route, reason="ambiguous_at_most_once"}`
+`otlp_out` keys that by signal, `datadog_out` and `datadog_trace_out` by request, and `kafka_out`
+by partition batch. Each reports the failed request's own class and never resends an accepted
+request within a run, but may resend the request that drew an ambiguous answer, which can land
+twice. A `buffer.disk:` batch replayed after a restart sends every request again. Under
+`at_most_once` they count the records of the requests they drop as
+`records.dropped{reason="ambiguous_at_most_once"}`, tagged with the signal or route where they
+have one
 ([ADR `sink-fault-classes`](adr/sink-fault-classes.md), "Amendment: `otlp_out` retries per signal
 (2026-10-05)" and "Amendment: the Datadog sinks retry per request (2026-10-09)"). Only
 `splunk_hec_out` still reports a retryable failure as ambiguous once any request was accepted, so
@@ -680,6 +682,8 @@ evidence for every row:
   duplicate safety".
 - `splunk_hec_out`: Splunk's HEC codes, in [`splunk.rs`](../crates/logit-outputs/src/splunk.rs),
   "Faults, retries, and duplicate safety".
+- `kafka_out`: Kafka's produce error codes, per partition, in
+  [`kafka/mod.rs`](../crates/logit-outputs/src/kafka/mod.rs), "Response classes".
 - `logit_out`: the native hop's handshake, `Reject` codes, and ack wait, in
   [`logit.rs`](../crates/logit-outputs/src/logit.rs), "Response classes".
 - `syslog_out`, `statsd_out`, and `graphite_out` over a stream: the pooled-stream driver's I/O
@@ -3000,6 +3004,76 @@ settings on your stack. Against a token without it, each request counts as deliv
 `logit.output.records` for what Splunk accepted, `logit.output.records.dropped{reason}`, and
 `logit.output.acks{result}` under `ack: true`. `docs/design/internal-telemetry.md`'s
 `splunk_hec_out` section has every counter.
+
+## `kafka_out`: producing to Kafka
+
+`kafka_out` produces each event as one record to a Kafka topic, with the Java producer's defaults:
+`acks: all`, idempotence on, and keyed records on the partition a Java client picks for the same
+key. It speaks the Kafka protocol from Kafka 2.4 on; it's checked against Apache Kafka 4.2.
+[`fixtures/kafka-out.yaml`](../fixtures/kafka-out.yaml) sends JSON lines from a TCP socket into
+it.
+
+```yaml
+components:
+  kafka:
+    type: kafka_out
+    sources: [parse]
+    brokers: ["kafka-1:9092", "kafka-2:9092"]
+    topic: logs
+    key: {attribute: user}   # none (the default) | trace_id | {attribute: ..} | {resource: ..}
+    # compression: none      # the default; gzip | snappy | lz4 | zstd
+    # acks: all              # the default; idempotent: true needs it
+    # max_request_bytes: 1MiB
+    # headers: {source: logit}
+    # tls: {}                # turns TLS on
+```
+
+**Brokers.** `brokers:` is only where the sink bootstraps. It then connects to each partition's
+leader at the address the cluster advertises (`advertised.listeners`), so every advertised
+address must resolve and be reachable from `logit`, not only the bootstrap ones. A `tls:` block
+turns TLS on for every connection, checking each broker's certificate against the host it
+advertises; `cert_file` and `key_file` add a client certificate for mutual TLS. SASL isn't
+supported.
+
+**Records.** Each record's value is the event's JSON object, the one `stdio_out`'s `format: json`
+writes on a line ([`ndjson.rs`](../crates/logit-outputs/src/ndjson.rs) has the grammar). Its
+timestamp is the event's, as `CreateTime`, and every record carries the `headers:` map, in name
+order.
+
+**Keys and partitions.** `key: trace_id` keys a record by its trace id as 32 lowercase hex
+characters, as the OpenTelemetry Collector's Kafka exporter does, so both put one trace's records
+on one partition. `{attribute: NAME}` and `{resource: NAME}` key by that value as text. An event
+without the value is sent unkeyed and counted `logit.output.records.unkeyed`. Unkeyed records go
+to one partition per batch, picked at random among those with a leader.
+
+**Topics.** The topic must exist, or the broker must create it (`auto.create.topics.enable`).
+Against a broker that creates it, the first batch logs one `retrying` error for the topic while
+the broker creates it, then goes out. Against one that doesn't, the sink reports `refused` and
+holds its queue until an operator creates the topic.
+
+**Size.** `max_request_bytes` (1 MiB by default) caps one record and one produce request before
+compression. A record over it is dropped, counted `logit.output.records.dropped{reason="oversize"}`.
+Keep it at or below the topic's `max.message.bytes`: a batch the broker finds too large is split
+in two once, and a half still too large is dropped, counted `reason="rejected"`.
+
+**Timestamps.** Kafka 4.x rejects a record stamped more than an hour ahead of the broker's clock
+(`log.message.timestamp.after.max.ms`). The broker names it, and the sink drops it, counted
+`reason="invalid_timestamp"`, and delivers the rest of its batch. Fix the clock or the
+`timestamp` stage upstream; the record never reaches the topic.
+
+**Delivery.** A retry resends only the partitions the broker hasn't settled, under the same
+producer id and sequence numbers, so the broker discards a resend of a batch it already
+appended. That dedup doesn't survive a `logit` restart, which starts a new producer id, or a batch
+dropped part-way, after which the producer moves to a new epoch: a batch whose first attempt
+landed before either and whose retry went after is stored twice. Downstream consumers that need
+no duplicates must deduplicate. A broker that answers every batch the same way (authorization, an
+unsupported codec, a missing topic) is `refused`, and the sink holds its queue. The sink's module
+doc ([`kafka/mod.rs`](../crates/logit-outputs/src/kafka/mod.rs), "Response classes") has the
+table of every broker error it reads.
+
+**What to watch.** `logit.output.requests{class}`, `logit.output.records` for what Kafka
+accepted, `logit.output.records.dropped{reason}`, and `logit.output.records.unkeyed`.
+`docs/design/internal-telemetry.md`'s `kafka_out` section has every counter.
 
 ## Prometheus remote-write: receiving, sending, and picking a version
 
