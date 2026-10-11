@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-10-09
+updated: 2026-10-11
 ---
 
 # Verification plan: critical sections inventory
@@ -24,8 +24,8 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   will be wrong. A deep-dive session's first job is to refute or confirm them.
 - **Totals:** 135 entries — 42 P0, 62 P1, 31 P2. P0 = custom logic on the main data path where
   being wrong means silent loss/duplication/corruption, a crash, a hang, or a remote DoS.
-- **Progress (2026-09-29, at `sink/w8`'s head):** 67 of 135
-  entries done (38 P0, 25 P1, 4 P2): 63 with findings and four reviewed clean. The eight finished
+- **Progress (2026-10-11, at `untrusted/w14`'s head):** 80 of 135
+  entries done (39 P0, 35 P1, 6 P2): 72 with findings and eight reviewed clean. The nine finished
   clusters are the `libc` surface (#280–#283), durability (#322–#337), remote-reachable
   crash/DoS (#361, #366, #369–#372, #374, #377), which also closed leads 13 and 15 and
   re-reviewed CORE-05's stale entry, the Lua boundary (#383, #385, #386, #388, #391, #392),
@@ -34,11 +34,15 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   NET-06, RT-02..04, RT-07, TAIL-06, and TAIL-08 with findings and reviewed NET-07 and DISK-08
   clean, aggregate (#400, #402, #405, #407, #410), which closed XFORM-01..05 and CORE-07
   with findings, tail bookkeeping (#437, #440, #442–#445, #447), which closed TAIL-01..04,
-  TAIL-09..12 with findings, and the sink send path (#449–#456, #457), which also closed leads
-  12 and 14 and closed SINK-01..06, WIRE-08, WIRE-09, and RT-05 with findings. It also found two
-  defects the survey didn't name: bisection inflating codec counters on a single attempt in the
-  Datadog sinks (#456), and `PrometheusOutput` not forwarding `observe_batch` (#455). The rest of
-  the list is `unreviewed`. The index's **Status** column is the source of truth.
+  TAIL-09..12 with findings, the sink send path (#449–#456, #457), which also closed leads
+  12 and 14 and closed SINK-01..06, WIRE-08, WIRE-09, and RT-05 with findings, and the
+  untrusted-input parsers (#598–#603, #605, #606, #609, #612, #616, #619–#621, #TBD), which
+  closed NET-08, CODEC-01, CODEC-05, CODEC-07, CODEC-08, CODEC-10, CODEC-12, CODEC-13, and
+  XFORM-07 with findings and reviewed CODEC-02, CODEC-03, XFORM-06, and XFORM-08 clean. The sink
+  send path also found two defects the survey didn't name: bisection inflating codec counters on
+  a single attempt in the Datadog sinks (#456), and `PrometheusOutput` not forwarding
+  `observe_batch` (#455). The rest of the list is `unreviewed`. The index's **Status** column is
+  the source of truth.
 
 Two corrections to assumptions going in: `graphite/pickle.rs` and `logit-cli/src/pipeline.rs`
 contain **no** `unsafe` (grep hits were comments/tests). Production `unsafe` lives in exactly three
@@ -80,11 +84,14 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 
 Repo-wide gaps that cut across entries:
 
-- ~~**No `cargo-fuzz` target exists anywhere in the workspace.**~~ **Partly fixed (#371):**
-  `fuzz/` holds twelve cargo-fuzz targets over the native, sketch, HyperLogLog, OTLP, and
-  Prometheus remote-write decoders, run out of CI (ADR `out-of-ci-fuzzing`). statsd, syslog, the
-  Prometheus text parser, the TCP `Framer`, json/logfmt/csv tokenizers, disk-spool segments, and
-  tail checkpoints still have none (cluster 9).
+- ~~**No `cargo-fuzz` target exists anywhere in the workspace.**~~ **Partly fixed (#371, cluster
+  9):** `fuzz/` holds 25 cargo-fuzz targets, run out of CI (ADR `out-of-ci-fuzzing`), over the
+  native, sketch, HyperLogLog, OTLP, and Prometheus remote-write decoders, the PROXY and
+  forwarding headers, and, since cluster 9, the TCP `Framer`, statsd, syslog, carbon plaintext and
+  pickle, collectd, the Prometheus text parser, and the json, csv, logfmt, and kv tokenizers.
+  `script/lint` type-checks them on stable. ~~statsd, syslog, the Prometheus text parser, the TCP
+  `Framer`, json/logfmt/csv tokenizers,~~ Disk-spool segments and tail checkpoints still have
+  none.
 - **Cancellation is the least-tested axis.** ~~No test drops a future inside `write_all`, the UDP
   datagram loop, or a parked `store.push`.~~ **Partly fixed (clusters 3 and 6):** every production
   `select!` and `timeout` on a node's run path is a row of `docs/design/pipeline-graph.md`'s
@@ -146,9 +153,10 @@ Entries that share a mechanism and should be verified together, in suggested ord
 8. **Aggregate (done, #400, #402, #405, #407, #410)** — XFORM-01..05, CORE-07. Proptest against a naive
    reference aggregator, merge laws (associativity/commutativity) for every mergeable kind,
    cardinality-cap soak.
-9. **Untrusted-input parsers (in progress, untrusted/w0–w14)** — NET-08,
+9. **Untrusted-input parsers (done, #598–#603, #605, #606, #609, #612, #616, #619–#621, #TBD)** — NET-08,
    CODEC-01..03/05/07/08/10/12/13, XFORM-06/07/08. One fuzz target each; differential tests
-   against reference implementations to inform committed fixtures.
+   against reference implementations to inform committed fixtures: CPython `pickle` and
+   Prometheus `textparse`, committed under `testdata/differential/`.
 10. Everything else P1, then P2.
 
 ## How to use this list
@@ -186,9 +194,10 @@ Update the row in the same PR that lands the session's artifact. A `reviewed @<s
   the code. Past experience in this repo: a recorded real-client corpus found a Prometheus
   assembler bug that the proptests written alongside the code could not.
 - **Prefer executable verification to reading.** In rough order of value per hour:
-  - `cargo-fuzz` targets for every decoder of untrusted input (statsd, syslog, collectd, carbon
-    plaintext + pickle, Prometheus text + remote-write, OTLP/JSON, native frames, disk-spool
-    segments, tail checkpoints).
+  - `cargo-fuzz` targets for every decoder of untrusted input (~~statsd, syslog, collectd, carbon
+    plaintext + pickle, Prometheus text + remote-write, OTLP/JSON, native frames~~ covered:
+    `script/unsafe-check`'s `FUZZ_TARGETS` holds 25 targets; still open: disk-spool segments,
+    tail checkpoints).
   - A crash-injection harness for the disk spool, tail checkpoints, and file rotation: kill -9 at
     every write/fsync/rename boundary, restart, assert the no-loss / bounded-duplication contract.
   - Differential tests against the reference implementation (real collectd, carbon, Python
@@ -224,7 +233,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-03](#net-03--udp-decode_loop-pop_many-batching-interval-flush-deadline-race-and-final-flush-ordering) | P0 | UDP `decode_loop`: `pop_many` batching, interval-flush deadline race, and final flush ordering | `crates/logit-inputs/src/udp.rs` (`decode_loop`) | findings → #406 |
 | [NET-06](#net-06--boundedqueuepush_many-batched-admission-control-the-pre-wait-notify-and-cancellation) | P0 | `BoundedQueue::push_many`: batched admission control, the pre-wait notify, and cancellation | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::push_many`) | findings → #403 |
 | [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | reviewed @510291b1 |
-| [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-proto/src/framing.rs` (`Framer`) | findings → untrusted/w6 |
+| [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-proto/src/framing.rs` (`Framer`) | findings → #605 |
 | [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | findings → #443, #445, #447 |
 | [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | findings → #444, #447 |
 | [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`) | findings → #445, #447 |
@@ -294,14 +303,14 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [WIRE-17](#wire-17--prometheus_in--written--logitinputsamples-reconciliation) | P1 | `prometheus_in` `-Written` / `logit.input.samples` reconciliation | `crates/logit-inputs/src/prometheus.rs` (`write_response`'s `-Written` counting, `with_written_headers`) | unreviewed |
 | [WIRE-18](#wire-18--prometheus_out-exposition-registry-upsert-type-conflict-expiry-sweep-one-pass-cap) | P1 | `prometheus_out` exposition registry: upsert, type conflict, expiry sweep, one-pass cap | `crates/logit-outputs/src/prometheus.rs` (`Registry`, `ExposeOutput::send`) | unreviewed |
 | [WIRE-19](#wire-19--prometheus_out-exposition-http-server-two-deadlines-and-synchronous-render--gzip-on-the-runtime) | P1 | `prometheus_out` exposition HTTP server: two deadlines, and synchronous render + gzip on the runtime | `crates/logit-outputs/src/prometheus.rs` (`serve`, `handle`, `response_timeout`) | unreviewed |
-| [CODEC-01](#codec-01--hand-rolled-restricted-pickle-stack-machine-reader-opcode-allowlist) | P1 | Hand-rolled restricted pickle stack-machine reader (opcode allowlist) | `crates/logit-proto/src/graphite/pickle.rs` (`PickleReader::parse`, `PickleReader::read_datapoints`) | findings → untrusted/w12 |
+| [CODEC-01](#codec-01--hand-rolled-restricted-pickle-stack-machine-reader-opcode-allowlist) | P1 | Hand-rolled restricted pickle stack-machine reader (opcode allowlist) | `crates/logit-proto/src/graphite/pickle.rs` (`PickleReader::parse`, `PickleReader::read_datapoints`) | findings → #620 |
 | [CODEC-02](#codec-02--historical-pickle-memo-growth-dos-fixed-regression-sensitive) | P1 | Historical pickle memo-growth DoS (fixed, regression-sensitive) | `crates/logit-proto/src/graphite/pickle.rs` (`PickleReader::memo_put`) | reviewed @bde61109 (docs and tests, no code change) |
 | [CODEC-03](#codec-03--carbon-plaintextpickle-decode-entry-point-and-timestamp-arithmetic) | P1 | Carbon plaintext/pickle decode entry point and timestamp arithmetic | `crates/logit-proto/src/graphite/decode.rs` (`GraphiteDecoder::decode_into`, `resolve_timestamp`) | reviewed @bde61109 (docs and tests, no code change) |
-| [CODEC-05](#codec-05--dogstatsdstatsd-line-decoder--per-line-dispatch-and-event-text-unescaping) | P1 | DogStatsD/statsd line decoder — per-line dispatch and event-text unescaping | `crates/logit-proto/src/statsd/decode.rs` (`StatsdDecoder::decode_into`, `unescape_event_text`) | findings → untrusted/w7 |
-| [CODEC-07](#codec-07--rfc-31645424-syslog-parser--pritimestamp-framing-and-dialect-sniffing) | P1 | RFC 3164/5424 syslog parser — PRI/TIMESTAMP framing and dialect sniffing | `crates/logit-proto/src/syslog/decode.rs` (`parse_line`, `parse_3164_timestamp`) | findings → untrusted/w8 |
-| [CODEC-10](#codec-10--collectd-binary-decoder--tlv-part-framing-and-the-values-part-lengthcount-gate) | P1 | collectd binary decoder — TLV part framing and the Values-part length/count gate | `crates/logit-proto/src/collectd/part.rs` (`read_part`) | findings → untrusted/w9 |
-| [CODEC-12](#codec-12--prometheus-textopenmetrics-decoder--line-grammar-family-assembler-and-cumulative-bucket-reconstruction) | P1 | Prometheus text/OpenMetrics decoder — line grammar, family assembler, and cumulative-bucket reconstruction | `crates/logit-proto/src/prometheus/text.rs` (`parse_with`, `Parser`, `parse_sample`) | findings → untrusted/w13 |
-| [CODEC-13](#codec-13--prometheus-remote-write-decoder--snappy-decompression-bomb-guard-and-the-20-symbol-table-indirection) | P1 | Prometheus remote-write decoder — Snappy decompression-bomb guard and the 2.0 symbol-table indirection | `crates/logit-proto/src/prometheus/compression.rs` (`decompress_bounded`, the Snappy `decompress_len` gate), `crates/logit-proto/src/prometheus/remote_write.rs` | findings → untrusted/w10 |
+| [CODEC-05](#codec-05--dogstatsdstatsd-line-decoder--per-line-dispatch-and-event-text-unescaping) | P1 | DogStatsD/statsd line decoder — per-line dispatch and event-text unescaping | `crates/logit-proto/src/statsd/decode.rs` (`StatsdDecoder::decode_into`, `unescape_event_text`) | findings → #606 |
+| [CODEC-07](#codec-07--rfc-31645424-syslog-parser--pritimestamp-framing-and-dialect-sniffing) | P1 | RFC 3164/5424 syslog parser — PRI/TIMESTAMP framing and dialect sniffing | `crates/logit-proto/src/syslog/decode.rs` (`parse_line`, `parse_3164_timestamp`) | findings → #609 |
+| [CODEC-10](#codec-10--collectd-binary-decoder--tlv-part-framing-and-the-values-part-lengthcount-gate) | P1 | collectd binary decoder — TLV part framing and the Values-part length/count gate | `crates/logit-proto/src/collectd/part.rs` (`read_part`) | findings → #612 |
+| [CODEC-12](#codec-12--prometheus-textopenmetrics-decoder--line-grammar-family-assembler-and-cumulative-bucket-reconstruction) | P1 | Prometheus text/OpenMetrics decoder — line grammar, family assembler, and cumulative-bucket reconstruction | `crates/logit-proto/src/prometheus/text.rs` (`parse_with`, `Parser`, `parse_sample`) | findings → #616, #621 |
+| [CODEC-13](#codec-13--prometheus-remote-write-decoder--snappy-decompression-bomb-guard-and-the-20-symbol-table-indirection) | P1 | Prometheus remote-write decoder — Snappy decompression-bomb guard and the 2.0 symbol-table indirection | `crates/logit-proto/src/prometheus/compression.rs` (`decompress_bounded`, the Snappy `decompress_len` gate), `crates/logit-proto/src/prometheus/remote_write.rs` | findings → #616 |
 | [CODEC-14](#codec-14--influxdb-line-protocol-encoder--collision-avoiding-timestamp-allocator-and-fieldtag-escaping) | P1 | InfluxDB line-protocol encoder — collision-avoiding timestamp allocator and field/tag escaping | `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp`) | unreviewed |
 | [CODEC-17](#codec-17--otlp-decode--unguarded-u64-as-i64-timestamp-cast-on-every-wire-timestamp-field-logstracesmetrics) | P1 | OTLP decode — unguarded `u64 as i64` timestamp cast on every wire timestamp field (logs/traces/metrics) | `crates/logit-proto/src/otlp/logs.rs` (`decode_log_record`) | findings → #366 |
 | [CORE-01](#core-01--process-wide-symbol-interner-unbounded-growth-and-per-call-shard-contention) | P1 | Process-wide symbol interner: unbounded growth and per-call shard contention | `crates/logit-core/src/interner.rs` (`INTERNER`, `intern`, `resolve`, `lookup`) | unreviewed |
@@ -338,7 +347,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [WIRE-20](#wire-20--prometheus_out-remote-write-sender-timestamp-partition-one-post-per-batch-duplicate-safety) | P2 | `prometheus_out` remote-write sender: timestamp partition, one POST per batch, duplicate safety | `crates/logit-outputs/src/prometheus.rs` (`RemoteWriteOutput`) | unreviewed |
 | [CODEC-04](#codec-04--carbon-plaintextpickle-encoder-tag-sanitization-multi-value-expansion-frame-packing) | P2 | Carbon plaintext/pickle encoder: tag sanitization, multi-value expansion, frame packing | `crates/logit-proto/src/graphite/encode.rs` (`encode_record`, `Sink::emit`, `sanitize_into`) | unreviewed |
 | [CODEC-06](#codec-06--statsddogstatsd-encoder--service-check-status-coercion-and-multi-value-rendering) | P2 | statsd/DogStatsD encoder — service-check status coercion and multi-value rendering | `crates/logit-outputs/src/statsd.rs` (`render_service_check`) | unreviewed |
-| [CODEC-08](#codec-08--rfc-5424-structured-data-parser--bounded-loop-no-recursion-param-folding) | P2 | RFC 5424 STRUCTURED-DATA parser — bounded loop, no recursion, param folding | `crates/logit-proto/src/syslog/decode.rs` (`parse_sd_name`, `parse_structured_data`) | findings → untrusted/w8 |
+| [CODEC-08](#codec-08--rfc-5424-structured-data-parser--bounded-loop-no-recursion-param-folding) | P2 | RFC 5424 STRUCTURED-DATA parser — bounded loop, no recursion, param folding | `crates/logit-proto/src/syslog/decode.rs` (`parse_sd_name`, `parse_structured_data`) | findings → #609 |
 | [CODEC-09](#codec-09--syslog-encoder--structured-data-escaping-header-field-sanitization-and-oversizetruncation-handling) | P2 | syslog encoder — structured-data escaping, header-field sanitization, and oversize/truncation handling | `crates/logit-outputs/src/syslog.rs` (`encode_event`, `write_structured_data`) | unreviewed |
 | [CODEC-11](#codec-11--collectd-binary-encoder--identity-sanitizationtruncation-and-the-write_string_part-panic-contract) | P2 | collectd binary encoder — identity sanitization/truncation and the write_string_part panic contract | `crates/logit-proto/src/collectd/encode.rs` (`sanitize_raw`) | unreviewed |
 | [CODEC-15](#codec-15--messagebufm--reusable-framed-message-buffer-low-sensitivity) | P2 | `MessageBuf<M>` — reusable framed-message buffer (low sensitivity) | `crates/logit-proto/src/msgbuf.rs` (`MessageBuf`) | unreviewed |
@@ -348,7 +357,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-14](#core-14--template-the-name-parser-and-per-event-renderer) | P2 | `template`: the `{name}` parser and per-event renderer | `crates/logit-core/src/template.rs` (`parse`, `Template::compile`, `Compiled::render`) | unreviewed |
 | [CORE-20](#core-20--countingalloc-the-dev-only-counting-global-allocator) | P2 | `CountingAlloc`: the dev-only counting global allocator | `crates/logit-bench/src/alloc.rs` (`CountingAlloc`, `measure`) | unreviewed |
 | [XFORM-05](#xform-05--aggregate-contributing-context-span-link-bookkeeping) | P2 | Aggregate: contributing-context span-link bookkeeping | `crates/logit-transforms/src/aggregate.rs` (`ContributingContexts`) | findings → #410 |
-| [XFORM-07](#xform-07--csvrs-hand-rolled-rfc-4180-row-splitter) | P2 | csv.rs: hand-rolled RFC 4180 row splitter | `crates/logit-proto/src/message/csv.rs` (`split_row`, `unescape`) | findings → untrusted/w11 |
+| [XFORM-07](#xform-07--csvrs-hand-rolled-rfc-4180-row-splitter) | P2 | csv.rs: hand-rolled RFC 4180 row splitter | `crates/logit-proto/src/message/csv.rs` (`split_row`, `unescape`) | findings → #619 |
 | [XFORM-10](#xform-10--regexrs-capture-group-extraction) | P2 | regex.rs: capture-group extraction | `crates/logit-transforms/src/regex.rs` (`RegexParser::new`, `process`) | unreviewed |
 | [XFORM-11](#xform-11--small-filtermutate-transforms-combined) | P2 | Small filter/mutate transforms (combined) | `crates/logit-transforms/src/keep.rs` | unreviewed |
 | [SINK-10](#sink-10--build_client_config--insecure_skip_verify--shared-client-tls-construction) | P2 | `build_client_config` / `insecure_skip_verify` — shared client TLS construction | `crates/logit-outputs/src/tls.rs` (`build_client_config`) | unreviewed |
@@ -917,7 +926,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   frame sequence). Add a differential proptest asserting FIN and RST agree.
 - **Priority:** P0 — the only untrusted-input parser on the stream path, entirely hand-rolled, and a
   framing mistake silently corrupts every downstream message rather than failing.
-- **Verified (untrusted/w6):** findings. The FIN/RST invariant didn't hold for a remainder that
+- **Verified (untrusted/w6, #605):** findings. The FIN/RST invariant didn't hold for a remainder that
   carries no message: `finish` dropped a whitespace-only `Lines` remainder, and a lone `CR` under
   `Rfc6587Auto`'s LF framing, uncounted, while `report_buffered_tail` counted any buffered byte
   `truncated` on an RST, a shutdown, or an idle close. `Framer::abandon` now decides every
@@ -1465,7 +1474,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   `tcp.rs`'s module doc names one such divergence). They should be surveyed as a unit with this entry's
   accept-loop findings — in particular the fatal-`accept()`-error question, which likely applies to
   all three.
-- The codecs themselves (`StatsdDecoder::decode_into` in `statsd.rs`, `SyslogDecoder::decode_into`
+- The codecs themselves (`StatsdDecoder::decode_into` in `crates/logit-proto/src/statsd/decode.rs`, `SyslogDecoder::decode_into`
   in `crates/logit-proto/src/syslog/decode.rs`, `logit_proto::graphite`/`collectd`) are another agent's area, but note that
   `SyslogDecoder::decode_into` is documented as *infallible* — so the TCP driver's `bad_frame`
   counter is never reachable for `syslog_in`, and all syslog decode failures surface as the
@@ -5758,7 +5767,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Existing coverage:** Unusually strong. Unit tests in pickle.rs's `mod tests` use real CPython-generated fixtures (protocol 2, protocol 5/-1, memoized paths, LONG1 timestamps past 2038, numeric-string coercion, wrong-shaped items, explicit rejection tests for `GLOBAL`/`STACK_GLOBAL`/dict/set/`REDUCE`/`BUILD`, and Python 3's protocol-0 `bytes` spelling). `crates/logit-proto/tests/robustness.rs`'s graphite section explicitly calls this "the highest-risk parser in the repo" and runs single-byte-truncation-survival, seeded bit-flip fuzzing, inflated-string-length, 64-bit-length, and nesting-depth-cap tests with a peak-allocation counter. `crates/logit-proto/tests/graphite_fixed_point.rs` proptests round-trip (`plaintext_round_trips_every_generated_batch`, `pickle_round_trips_every_generated_batch`). The `graphite_pickle` fuzz target and the robustness section's batched-`APPENDS`, list-shaped-datapoint, and worst-case-allocation tests (untrusted/w9). ADR `graphite-carbon-relay.md`.
 - **Suggested verification approach:** port the existing bit-flip/truncation robustness tests to a real `cargo-fuzz` target run for CPU-hours instead of a fixed seed list, targeting `append_range`'s tail invariant and the memo ordinal-key check specifically (done, untrusted/w9: the `graphite_pickle` target). A differential test against real CPython `pickle.loads`/`dumps` (already informally done for fixture provenance) formalized as a corpus-based interop test would catch accepted-opcode semantic drift.
 - **Priority:** P1 — untrusted network input into fully custom parsing logic, but exceptionally well-bounded and already fuzz-adjacent-tested; no unsafe, no found P0.
-- **Verified (untrusted/w9):** reviewed @bde61109, no code change. `append_range`'s tail rule can't
+- **Verified (untrusted/w9, #612):** reviewed @bde61109, no code change. `append_range`'s tail rule can't
   corrupt another list's bounds: an append onto a list that isn't the arena's tail is refused
   before anything is written, so the failure is a clean frame reject. The rule does reject one
   shape a sender could write, a non-empty list item inside a list grown by `APPEND`/`APPENDS`,
@@ -5783,8 +5792,13 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   451-input, 104 KB corpus with no crash. With the tail check removed, a run crashed on the
   built-frame oracle in its first seconds. Under the malloc limit the caps hold: the worst 64 KiB
   payload, one memoized datapoint repeated by two-byte `BINGET`s, allocates at most a 27 MiB
-  `Vec`, pinned under the target's 32 MiB limit.
-- **Verified (untrusted/w12):** the carbon pickle differential corpus,
+  `Vec`, pinned under the target's 32 MiB limit. Under ADR `deployment-threat-model`,
+  `MAX_PICKLE_DEPTH` (16, where a carbon payload reaches 2) and `MAX_PICKLE_ITEMS` stop only
+  crafted input; each is one branch, so both stay and nothing is added. A negative `BINSTRING`
+  length is reachable by a bit flip, and `usize::try_from` already refuses it as `Malformed`.
+  Interleaved open lists, which `append_range`'s tail rule refuses, are crafted-only, since no
+  surveyed producer builds a list inside a list grown by `APPEND`/`APPENDS`.
+- **Verified (untrusted/w12, #620):** the carbon pickle differential corpus,
   `testdata/differential/graphite-pickle/` (`script/differential pickle`), holds 115 payloads
   CPython 3.12.15 and Python 2.7.18 wrote across protocols 0 to 5, each with CPython's reading,
   carbon 1.1.10's receiver's reading, and the reader's declared verdict, plus readings of the five
@@ -5812,7 +5826,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Existing coverage:** the `a_memo_key_that_skips_ahead_is_rejected` unit test in pickle.rs; `crates/logit-proto/tests/robustness.rs`'s `graphite_pickle_never_allocates_from_a_corrupt_memo_key`; the `graphite_pickle` fuzz target, whose seeds and built payloads carry `BINPUT`, `LONG_BINPUT`, `BINGET`, and `LONG_BINGET` (untrusted/w9).
 - **Suggested verification approach:** confirm the robustness test asserts an actual byte-level peak-allocation bound (not just "it errors"), and that this fix's ordinal-key invariant is included in the fuzz corpus above rather than only the one hand-written fixture (done, untrusted/w9).
 - **Priority:** P1 — already fixed and tested, but memo-key handling is exactly the class of subtle wire-driven-allocation bug worth a dedicated regression/fuzz check to keep fixed.
-- **Verified (untrusted/w9):** reviewed @bde61109, no code change. The robustness test asserts a byte
+- **Verified (untrusted/w9, #612):** reviewed @bde61109, no code change. The robustness test asserts a byte
   bound: the 9-byte frame's decode peaks under 4,096 live bytes, where the memo the key names
   would be about 8 MB. `MEMOIZE` takes `self.memo.len()` as its key, so it always
   passes the ordinal check. The memo key is now in the fuzz corpus: the CPython seeds memoize every
@@ -5820,6 +5834,9 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   (`Builder::memoize`, `LONG_BINPUT` from key 256) and repeat it through `BINGET` or
   `LONG_BINGET`. The
   campaign under CODEC-01 ran with no crash, the 32 MiB malloc limit standing for the memo's bound.
+  A memo key that skips ahead is crafted-only: CPython numbers its memo slots in order, and Python
+  2's `cPickle` skips only slot 0, which `max(memo.len(), 1)` admits. The ordinal check is one
+  branch, so it stays as the free defense ADR `deployment-threat-model` allows.
 
 ### CODEC-03 — Carbon plaintext/pickle decode entry point and timestamp arithmetic
 - **Location:** `crates/logit-proto/src/graphite/decode.rs` (`Decoder::decode_into`, `decode_plaintext`, `decode_line`, `decode_pickle`, `push_datapoint`); timestamp handling in `decode.rs` (`parse_timestamp`, `resolve_timestamp`)
@@ -5836,7 +5853,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Existing coverage:** `decode.rs`'s `#[cfg(test)] mod tests` (both protocols, the `-1` sentinel, a fractional timestamp, non-positive and unparseable timestamps, non-UTF-8 isolation, zero-copy tags); the `graphite_plaintext` and `graphite_pickle` fuzz targets and the robustness section's timestamp table (untrusted/w9). `crates/logit-proto/tests/robustness.rs` (`graphite_plaintext_survives_every_single_byte_truncation`, `graphite_plaintext_survives_seeded_bit_flips`: plaintext byte-truncation/bit-flip survival). `crates/logit-proto/tests/graphite_fixed_point.rs` round-trips including a large-timestamp fixed point (`a_large_timestamp_is_a_fixed_point`) and proptest generators. ADR `graphite-carbon-relay.md`; [`docs/known-gaps/mappings.md`](../known-gaps/mappings.md)'s `encode (Graphite)` rows document the deliberate lossy cases (multi-value skip, Sum temporality drop, non-finite drop, no metadata channel, 255-byte path limit) — not surprises, accepted normalizations.
 - **Suggested verification approach:** targeted code review of the timestamp split-arithmetic against a table of known-tricky `f64` values (sub-second fractions near precision boundaries, values near year-2038/2262 i64-nanosecond overflow); bias the existing proptest generators toward these boundary values (done, untrusted/w9: a table test and a fuzz oracle against the exact reading).
 - **Priority:** P1 — untrusted input parsing with real edge-case density (float sentinels, precision-sensitive arithmetic, lossless-roundtrip claims), heavily tested already.
-- **Verified (untrusted/w9):** reviewed @bde61109, no code change. The sentinel compare is
+- **Verified (untrusted/w9, #612):** reviewed @bde61109, no code change. The sentinel compare is
   `seconds == -1.0` on the parsed `f64`, so `-1`, `-1.0`, and `-1e0` are receipt time, and
   `-1.0000000000000002`, `-0.0`, and `0` are bad timestamps: the compare is on the value, not
   the spelling. The split arithmetic is pinned against an exact reading computed from the `f64`'s
@@ -5856,7 +5873,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   `round()` removed, a run crashed on the model oracle in its first second. The worst 64 KiB
   datagram, `a 1 1` lines, allocates at most a 13.5 MiB `Vec`, pinned under the target's 16 MiB
   limit.
-- **Verified (untrusted/w12), no code change:** the carbon pickle differential corpus (CODEC-01's
+- **Verified (untrusted/w12, #620), no code change:** the carbon pickle differential corpus (CODEC-01's
   Verified bullet) runs every case that reads through the pickle-mode `GraphiteDecoder`: each datapoint
   becomes the module doc's event or the skip its decode table names, the skip counts equal each
   case's declared `decoder_skips`, and a datapoint whose fate differs from carbon's
@@ -5899,7 +5916,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Existing coverage:** `crates/logit-proto/src/statsd/decode.rs`'s `#[cfg(test)] mod tests` (grammar, event/service-check parsing, tag folding). `crates/logit-inputs/tests/statsd_to_aggregate.rs` (integration through `aggregate`). ADR `statsd-output.md` (mirror), `lossless-transit.md`. Since `untrusted/w7`: the `statsd` fuzz target (four properties) and `crates/logit-proto/tests/robustness.rs`'s "statsd" section.
 - **Suggested verification approach:** a proptest specifically constructing adversarial `_e{...}` event bodies with runs of `\n` escapes (including odd/malformed patterns like a trailing lone backslash) to stress the capacity arithmetic; confirm `crates/logit-proto/tests/robustness.rs` coverage for statsd specifically (grep found graphite/collectd sections but this pass didn't confirm a statsd one).
 - **Priority:** P1 — v0.1's target protocol, untrusted input, custom grammar; no bug found but capacity arithmetic and pointer-reconstruction patterns deserve a fuzz pass given the DoS history in the sibling graphite codec.
-- **Verified (untrusted/w7):** findings. A finite counter value divided by a sample rate below 1
+- **Verified (untrusted/w7, #606):** findings. A finite counter value divided by a sample rate below 1
   could overflow: `hits:1e308|c|@0.1` decoded to a `Sum` of `inf`, which the decoder rejects as it does a literal `inf` counter. The
   counter arm now rejects the line as `bad_line`, pinned by a unit test in `decode.rs` shown
   failing with the fix reverted. Coverage can't tell one magnitude from another, so the fuzz
@@ -5962,7 +5979,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Existing coverage:** `crates/logit-proto/src/syslog/decode.rs`'s `#[cfg(test)] mod tests` (both dialects, RFC 5424 §6.5's four examples, line splitting off, and the recorded `testdata/interop/syslog/` corpus); `crates/logit-proto/tests/robustness.rs`'s syslog section and the `syslog` fuzz target (both untrusted/w8). ADR `syslog-output.md`, `syslog-tcp-ingress-and-tls.md`.
 - **Suggested verification approach:** confirm/add a `robustness.rs` syslog section (byte-truncation + bit-flip survival) if missing, given every sibling wire codec in this survey area has one; targeted fuzz on the PRI/dialect-sniff boundary (crafted lines starting with digit-sequences designed to bounce between the 3164/5424 paths).
 - **Priority:** P1 — untrusted input, fully custom dual-RFC grammar, no crate; code reads carefully guarded.
-- **Verified (untrusted/w8):** findings. A PROCID or `tag[pid]` bracket went through
+- **Verified (untrusted/w8, #609):** findings. A PROCID or `tag[pid]` bracket went through
   `u64::from_str`, which takes a leading `+` and leading zeros, so `+5` and `007` decoded as
   `U64(5)` and `U64(7)` and relayed as `5` and `7`. `syslog.pid` is now a `U64` only for
   canonical decimal, pinned by `a_non_canonical_numeric_pid_stays_a_str` in `decode.rs`, shown
@@ -6046,7 +6063,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Existing coverage:** `crates/logit-proto/src/syslog/decode.rs`'s test module (RFC 5424 §6.5's SD examples, each escape, a repeated PARAM-NAME, a dotted SD-ID, a 33-byte SD-NAME, a duplicate SD-ID, an unterminated element, and an unescaped `]`); `crates/logit-proto/tests/robustness.rs`'s syslog section and the `syslog` fuzz target (both untrusted/w8). ADR `log-record-trace-context.md`/`trace-context-span-lifting.md` touch adjacent `span:` handling; `lossless-transit.md` for the `syslog.sd` model addition.
 - **Suggested verification approach:** proptest generating adversarial SD blocks (deeply repeated PARAM-NAMEs, near-32-byte and over-32-byte names, unterminated quotes, backslash runs) checked against a real syslog-ng/rsyslog parse where feasible for a differential signal; confirm the upstream line-length cap is what actually bounds this parser's worst case, and consider whether an explicit max-SD-element or max-PARAM count would be cheap insurance independent of that external bound.
 - **Priority:** P2 — bounded, non-recursive, careful `.get()`-based indexing throughout; the only real question is whether it should have its own defense-in-depth cap rather than relying entirely on an external line-length bound.
-- **Verified (untrusted/w8):** findings, in docs and a test. Two claims were wrong. The
+- **Verified (untrusted/w8, #609):** findings, in docs and a test. Two claims were wrong. The
   SD-ELEMENT comment in `parse_structured_data` and
   `a_line_rejected_inside_structured_data_interns_nothing` said a rejected line interns nothing,
   but a PARAM-NAME is interned as its PARAM completes and an SD-ID as its element closes, before
@@ -6115,7 +6132,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Existing coverage:** **exceptionally strong** — `crates/logit-proto/tests/robustness.rs` runs `collectd_decode_survives_every_single_byte_truncation` (every prefix-truncation of a real packet), `collectd_decode_survives_seeded_bit_flips` (4000 seeded bit flips), and `collectd_decode_rejects_a_values_count_inflated_far_past_what_the_input_holds` — a hand-crafted part declaring 65535 data sources over 20 bytes, asserting both rejection *and* (via a custom `CountingAlloc` peak-allocation counter) that peak live bytes stays under 4 KiB, directly proving the count is checked before sizing. `crates/logit-proto/tests/collectd_fixed_point.rs` covers wire-level fixed-point round-trips including a proptest over a generated packet grammar. The `collectd` fuzz target and the robustness section's cap-boundary and worst-case-allocation tests (untrusted/w9). Governed by ADR `collectd-binary-relay`.
 - **Suggested verification approach:** given the strength of existing coverage, this is closer to a targeted-code-review item than a new-fuzz-target item — spot-check the `.expect()` arithmetic manually, and confirm the robustness suite also exercises a count that's valid-per-length-check but exceeds `MAX_VALUES_PER_LIST` (a boundary between the two distinct checks, `len != expected` and `count > MAX_VALUES_PER_LIST`) (done, untrusted/w9).
 - **Priority:** P1 — untrusted network input with real panic-adjacent arithmetic, but already has some of the best-targeted fuzz/mutation coverage in the codebase (bit-flip, truncation, and a corrupt-count allocation-DoS regression test all exist and pass); the residual risk was the interaction between the two count checks, exercised since untrusted/w9. (Supersedes a prior placeholder entry in this file that had marked collectd as unreviewed/P0-provisional — it has now been read line-by-line and does not warrant that priority.)
-- **Verified (untrusted/w9):** findings. A Values part interns one record name per
+- **Verified (untrusted/w9, #612):** findings. A Values part interns one record name per
   data source, `<plugin>.<type>.<i>`, so a corrupt Plugin or Type part of 60 KB behind a
   64-value list copied 64 times its length into the never-evicting interner for one datagram;
   the fuzz target's fork children did that until the interner's own arena tripped a 64 MiB malloc
@@ -6181,7 +6198,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Existing coverage:** `crates/logit-proto/src/prometheus/text.rs`'s own unit tests and `mod.rs`'s; `crates/logit-proto/tests/prometheus_fixed_point.rs` (round-trip tests); the `prom_text` fuzz target and `crates/logit-proto/tests/robustness.rs`'s prometheus text section (untrusted/w10). Governed by ADR `prometheus-scrape-and-exposition`.
 - **Suggested verification approach:** a differential corpus against Prometheus's own `textparse`, the interop-style approach `prometheus_remote_write_interop.rs` uses for remote-write (done, untrusted/w13). The corrupt-body checks are done (untrusted/w10).
 - **Priority:** P1 — untrusted text input with real float-edge-case handling, well-guarded by inspection, but (like statsd/syslog) has no dedicated entry in the project's own robustness/fuzz harness despite that harness explicitly existing for "every decoder that will read untrusted bytes off a socket" (it has both since untrusted/w10).
-- **Verified (untrusted/w10):** findings, five of them, each a fixed point the `prom_text` target's
+- **Verified (untrusted/w10, #616):** findings, five of them, each a fixed point the `prom_text` target's
   canonical-text or histogram oracle broke, each fixed, pinned in `robustness.rs`'s prometheus
   text section, and shown failing with its fix reverted: a histogram whose only bucket was `-Inf`
   had no `+Inf` bucket, since `finish_series` (and the encode side's `cumulative_counts`) appended
@@ -6211,7 +6228,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   keep it, and `text.rs`'s "Leniencies" now say so. Doc fixes in `text.rs`: the skip table names
   the assembler's `malformed_line` cases, `malformed_metadata` no longer counts an empty `# HELP`,
   and a missing `+Inf` takes the larger of `_count` and the highest bucket. A 600-second campaign (fork mode, debug assertions on) ran 985,741 inputs in 603 seconds, about 1,630 exec/s (each input parses and writes three times), to a 2,740-input corpus with no crash. With the `-Inf` fix reverted, the target crashed on its committed `regress-neg-inf-only-histogram` seed outside fork mode (ADR `out-of-ci-fuzzing`). The worst 64 KiB body, distinct one- to three-character names on `aa 1` lines, allocates at most a 13.5 MiB `Vec` of events in the target, pinned under its 16 MiB limit; `assemble.rs` interns exemplar label names (`exemplar_from_labels`), and the target's model mapping interns family names, so the target runs in fork mode.
-- **Verified (untrusted/w13):** findings, two of them, fixed. The Prometheus text differential
+- **Verified (untrusted/w13, #621):** findings, two of them, fixed. The Prometheus text differential
   corpus, `testdata/differential/prometheus-text/` (`script/differential prom-text`), holds 157
   hand-built bodies (76 text 0.0.4, 81 OpenMetrics) and three scrape bodies recorded from
   node_exporter 1.12.1 and prometheus_client 0.26.0 (`script/record-fixtures prometheus-scrape`),
@@ -6244,7 +6261,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Existing coverage:** `crates/logit-proto/tests/prometheus_remote_write_fixed_point.rs` and `crates/logit-proto/tests/prometheus_remote_write_interop.rs` (the latter decompressing real Snappy bodies); `crates/logit-proto/tests/robustness.rs`'s decompression tests and its remote-write section's Snappy length-gate test with a peak-allocation bound; the `prom_decompress` fuzz target, and `prom_remote_write` with a structured mode over the symbol table (untrusted/w10). Governed by ADR `prometheus-remote-write`.
 - **Suggested verification approach:** done (untrusted/w10): the Snappy declared-length cases under a peak-allocation counter, and a fuzz target building valid-shaped requests with references in range, at `k`, and at `u32::MAX`.
 - **Priority:** P1 — the compression-bomb gate is correctly implemented and is exactly the kind of check that's easy to silently regress (e.g. someone "simplifying" to a single `decompress_vec` call during a refactor); worth a dedicated regression test given how much damage a silent regression here would do (unbounded memory from a single small HTTP request); one has landed (untrusted/w10).
-- **Verified (untrusted/w10):** findings, four of them, each a fixed point the `prom_remote_write`
+- **Verified (untrusted/w10, #616):** findings, four of them, each a fixed point the `prom_remote_write`
   target's `encode(decode(B1)) == B1` oracle broke, fixed, pinned in `robustness.rs`'s
   remote-write section, and shown failing with its fix reverted: 1.0 metadata named a counter by
   its model name, which decode then gave `_total`, so the next encode named it differently (it now
@@ -6263,7 +6280,10 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   `reference as usize`: the field is a protobuf `uint32`, prost's `u32`, and the cast
   zero-extends on every target with a `usize` of 32 bits or more, so it can't wrap; `0` returns
   before the lookup. `native_histogram` counts only a valid series' histograms, and the doc now
-  says so. A 600-second campaign (fork mode, debug assertions on) ran 5,894,219 inputs in 603 seconds, about 9,770 exec/s, to a 2,563-input corpus with no crash. Outside fork mode, the target crashed on its committed seeds with the stale-marker fix reverted (`regress-exemplar-on-stale`), and with `symbol` made to return `Ok(None)` for an out-of-range reference (`built-v2-ref-k`). The row keeps its 64 MiB limit and moves to fork mode, since exemplar label names intern.
+  says so. Amplification past the cap is out of scope here: each body's declared Snappy length is
+  gated before it inflates, and many connections each inflating a small body to the cap at once
+  need crafted input, recorded as `docs/known-gaps/intake.md`'s "No per-listener in-flight byte
+  budget on the HTTP listeners" non-goal (ADR `untrusted-input-bounds`'s "Documented non-goals"). A 600-second campaign (fork mode, debug assertions on) ran 5,894,219 inputs in 603 seconds, about 9,770 exec/s, to a 2,563-input corpus with no crash. Outside fork mode, the target crashed on its committed seeds with the stale-marker fix reverted (`regress-exemplar-on-stale`), and with `symbol` made to return `Ok(None)` for an out-of-range reference (`built-v2-ref-k`). The row keeps its 64 MiB limit and moves to fork mode, since exemplar label names intern.
 
 ---
 
@@ -6360,7 +6380,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **The survey brief's `unsafe` claim for graphite/pickle.rs is incorrect** — verified via grep and git log; no `unsafe` exists or ever existed in that module, nor anywhere else in this survey's scope (`crates/logit-proto/src/{statsd,syslog,collectd,graphite,prometheus,otlp}`, `crates/logit-outputs/src/{statsd,syslog,collectd,graphite,influxdb,otlp,prometheus}.rs`) — confirmed by a repo-wide grep restricted to these paths. The only `unsafe` in the two crates that touch this survey's protocols at all lives in `crates/logit-inputs/src/tail/watch.rs` and `crates/logit-inputs/src/udp.rs`, both listener/socket glue explicitly out of this survey's scope.
 - **Repeated hand-rolled pattern worth tracking as one item, not many:** the raw-pointer-subtraction `slice_of` "reconstruct a zero-copy `Bytes` from a `&str`/byte-slice" trick appears near-identically in `statsd.rs`, `syslog.rs`, and `graphite/decode.rs` (each with its own independent implementation). It's sound today (every caller only ever slices a substring that was itself validated out of the original `Bytes`), but it's a single conceptual invariant spread across three files with no shared helper enforcing it — a future refactor in any one of them (e.g. introducing an owned/copied substring by mistake) would silently produce unsound pointer arithmetic with no compiler error. Worth one shared, tested utility rather than three independently-trusted copies, or at minimum one cross-file test that would catch a violation.
 - **collectd was independently read line-by-line in this pass** (superseding an earlier placeholder from a concurrent pass of this same file) and found to be **exceptionally well-guarded**, with dedicated robustness/fuzz coverage (truncation, bit-flip, and a hostile-count allocation-DoS regression test) matching or exceeding graphite's. Prometheus, OTLP, and InfluxDB/msgbuf entries below are likewise freshly read, not placeholders.
-- **Neither statsd nor syslog has a `crates/logit-proto/tests/robustness.rs` section** (confirmed by direct grep: only `native`, `control`, `graphite`, and (as of this pass) implicitly `collectd`-adjacent decoders are exercised there) — this is a genuine, real coverage gap for exactly the two protocols with the most attacker-facing custom parsing surface (DogStatsD's length-prefixed event grammar, syslog's STRUCTURED-DATA parser), not a false alarm. This is this survey's single strongest concrete recommendation: port `robustness.rs`'s truncation/bit-flip/hostile-length-counter harness to `StatsdDecoder`/`SyslogDecoder` before anything else in this list. Prometheus (text/OpenMetrics and remote-write) has no `robustness.rs` section either, per that entry's own grep — the harness's coverage stops at `native`/`control`/`graphite`/`collectd`, i.e. exactly the two oldest wire codecs plus the native format; every codec added since (statsd having predated the harness, syslog, prometheus, otlp) has none. This is a broader, repo-wide gap than any single codec entry captures on its own.
+- ~~**Neither statsd nor syslog has a `crates/logit-proto/tests/robustness.rs` section** (confirmed by direct grep: only `native`, `control`, `graphite`, and (as of this pass) implicitly `collectd`-adjacent decoders are exercised there) — this is a genuine, real coverage gap for exactly the two protocols with the most attacker-facing custom parsing surface (DogStatsD's length-prefixed event grammar, syslog's STRUCTURED-DATA parser), not a false alarm. This is this survey's single strongest concrete recommendation: port `robustness.rs`'s truncation/bit-flip/hostile-length-counter harness to `StatsdDecoder`/`SyslogDecoder` before anything else in this list. Prometheus (text/OpenMetrics and remote-write) has no `robustness.rs` section either, per that entry's own grep — the harness's coverage stops at `native`/`control`/`graphite`/`collectd`, i.e. exactly the two oldest wire codecs plus the native format; every codec added since (statsd having predated the harness, syslog, prometheus, otlp) has none. This is a broader, repo-wide gap than any single codec entry captures on its own.~~ **Fixed (#366, cluster 9):** `robustness.rs` now has an OTLP section (#366) and framing, statsd, syslog, Prometheus text, remote-write, and log-message sections (#605, #606, #609, #616, #619).
 - **Two genuinely new, previously-undocumented findings surfaced in this pass, both in OTLP:** (1) `any_value`'s JSON-decode recursion (`any_value` in `crates/logit-proto/src/otlp/json/mod.rs`) has no *local* depth bound, unlike the native wire format's `decode_batch` and graphite's `pickle` reader, both of which cap recursion/nesting explicitly — this one relies entirely on `serde_json`'s implicit limit as an unverified backstop, and is a live, provisional P0 pending a one-hour empirical check (send a deeply nested payload, see if it crashes); (2) every OTLP timestamp field's `u64 -> i64` decode cast (`logs.rs`/`metrics.rs`/`traces.rs`, ten-plus call sites) silently wraps to a negative timestamp for any wire value `>= 2^63`, with the *encode* side's `.max(0)` guard confirming the decode side's missing symmetric guard is an asymmetry rather than an intentional design (P1 — silent corruption, not a crash). Neither is in `docs/known-gaps/`. Both are worth a follow-up session's first attention precisely because they're concrete and testable in under an hour each, unlike most of this survey's "reads fine, wants more fuzzing" findings.
 
 
@@ -6531,7 +6551,7 @@ the telemetry buffers are `std::collections::HashMap`.
   - `weight()` ∈ `[1, MAX_WEIGHT]` for every `f64` input including `NaN`, `±inf`, `0.0`, `-0.0`, subnormals and `f64::MIN_POSITIVE`.
   - `sketch()` never drops a value regardless of `sample_rate`, and its count equals `values.len() * weight()`.
   - `SAMPLES_INLINE = 19` still keeps `size_of::<MetricKind>() == 176` (pinned).
-  - The `MAX_WEIGHT` clamp is applied consistently with `crates/logit-inputs/src/statsd.rs`'s own `MAX_SAMPLE_WEIGHT` (the doc says W3 folded one into the other — confirm there is now one constant, not two).
+  - The `MAX_WEIGHT` clamp is applied consistently with `crates/logit-inputs/src/statsd.rs`'s own `MAX_SAMPLE_WEIGHT` (the doc says W3 folded one into the other — confirm there is now one constant, not two). (No `MAX_SAMPLE_WEIGHT` remains in the workspace; the statsd decoder is `logit_proto::statsd`.)
 - **Observed concerns (unverified):** none spotted; the NaN reasoning is explicit and tested.
 - **Existing coverage:** `crates/logit-core/src/metric.rs`'s `tests` module (`samples_new_defaults_sample_rate_to_one`, `samples_weight_is_never_zero_and_is_clamped`, `sketch_of_a_nan_rate_samples_still_counts_every_value`, `sketch_weights_values_by_sample_rate`); `crates/logit-core/tests/type_sizes.rs` (`samples_inline_is_the_measured_constant`). Governed by [`docs/known-gaps/statsd.md`](../known-gaps/statsd.md) ("Sample-rate extrapolation"), `docs/adr/lossless-transit.md`.
 - **Suggested verification approach:** proptest `weight()` over arbitrary `f64` bit patterns.
@@ -7204,11 +7224,13 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   zero-copy path -- a regression to copying would likely fail these); the `message_json` fuzz
   target and `crates/logit-proto/tests/robustness.rs`'s log-message section (untrusted/w11). ADR:
   `json-parsing-into-attributes.md`.
-- **Verified (untrusted/w11):** reviewed, no code change. The pointer-range check is
+- **Verified (untrusted/w11, #619):** reviewed, no code change. The pointer-range check is
   `logit_core::subslice::share` since #599: one `wrapping_sub` offset tested against
   `base.len() - sub.len()`, with no addition that can overflow, and a slice outside `base` (the
   scratch copy serde_json makes for an escaped string) is copied; `subslice`'s module doc says why
-  a different live allocation can't pass, since two live allocations never overlap. The
+  a different live allocation can't pass, since two live allocations never overlap. That case
+  needs no input-side defense: no input, accidental or crafted, can make two live allocations
+  overlap. The
   `message_json` target checks every shared `Value::Str` sits between the two quotes of its own
   string token and equals serde_json's reading of the same bytes, so a false share fails it. Both
   `scratch.clear()` sites stay, each pinned by a `json.rs` test shown failing with it removed:
@@ -7272,7 +7294,7 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   `crates/logit-bench/tests/allocations.rs`'s `csv_parse_one_event` (zero-allocation pin) and its
   escaped-field counterpart; the `message_csv` fuzz target and `robustness.rs`'s log-message
   section (untrusted/w11). ADR: `csv-positional-columns.md`.
-- **Verified (untrusted/w11):** one finding, fixed. The `u32` offsets wrapped on a row past 4
+- **Verified (untrusted/w11, #619):** one finding, fixed. The `u32` offsets wrapped on a row past 4
   GiB, and a wrapped `start` above its `end` panicked in `raw.slice`. Every source's default
   bound keeps a message far under 4 GiB (a 65,507-byte datagram, `MAX_FRAME_BYTES` or a listener's
   `max_line_bytes` on a stream, `tail_in`'s and `docker_in`'s 1 MiB `max_line_bytes`, the HTTP
@@ -7280,7 +7302,8 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   `docker_in`, `lines_in`, `graphite_in`) or `splunk_hec_in`'s `max_request_bytes` past it, and
   nothing caps either. `split_row` now returns `RowError::RowTooLong` for a row over `u32::MAX`
   bytes before computing an offset, which the transform reports as its throttled
-  `parse_failure` and forwards the event unparsed. A 4 GiB row is too large for a test, so
+  `parse_failure` and forwards the event unparsed. That puts the overflow behind the one-branch
+  `row_fits` check rather than a non-goal, since a misconfigured bound reaches it. A 4 GiB row is too large for a test, so
   `row_fits_up_to_u32_max_bytes` pins the predicate at `u32::MAX` and `u32::MAX + 1`; the
   `csv_parse_*` allocation pins are unchanged. The UTF-8 reasoning holds for every delimiter rule 32 admits: rule 32 checks
   `is_ascii()` and refuses `"`, `\n`, and `\r`, an ASCII byte never occurs inside a multi-byte
@@ -7337,12 +7360,13 @@ dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved;
   shapes, and a proptest against a regex reading of the grammar; `crates/logit-bench/tests/allocations.rs`
   pins allocation counts for the escaped-value case; the `message_logfmt` and `message_kv` fuzz
   targets and `robustness.rs`'s log-message section (untrusted/w11). ADR: `logfmt-and-kv-parsing.md`.
-- **Verified (untrusted/w11):** reviewed, no code change; five doc fixes. `scan_quoted` returns
+- **Verified (untrusted/w11, #619):** reviewed, no code change; five doc fixes. `scan_quoted` returns
   `UnterminatedQuote` for a `\` with nothing after it, so `a="abc\`, `a="\`, `a="\"`, and
   `a="x\\\` all fail at the opening quote, pinned by
   `logfmt_a_lone_trailing_backslash_inside_quotes_is_an_unterminated_quote`. `find_bytes` only
   ever gets `pair_sep` or `kv_sep`, both from config, and rule 30 rejects an empty one; its
-  `None` for an empty needle is now documented beside that invariant. Work is linear in the
+  `None` for an empty needle is now documented beside that invariant. A quadratic search needs a
+  long needle a peer chooses, and the needle is operator config, so no sender reaches it. Work is linear in the
   message for a fixed separator: `parse_kv`'s cursor moves to `seg_end + pair_sep.len()` and each
   search starts there, so the search costs at most `pair_sep.len()` comparisons per byte;
   `parse_logfmt`'s outer loop consumes at least one byte per turn on every arm, and a line of 64 KiB of `=` finishes as
