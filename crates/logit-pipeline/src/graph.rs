@@ -261,9 +261,10 @@
 //!     an `admin.bind` starting with `/`, a path that belongs in `socket`
 //!     (`docs/adr/listener-port-sharing-and-shutdown-delay.md`).
 //! 82. A `kafka_out` with an empty `brokers` or an entry that isn't a `host:port`, a `topic` that
-//!     isn't a legal Kafka topic name, a `key` naming an empty attribute, `idempotent: true`
-//!     without `acks: all`, a `max_request_bytes` of `0`, `timeout: 0s`, or a `tls` failing rule
-//!     34's checks (`docs/adr/kafka-output.md`).
+//!     isn't a legal Kafka topic name, a `key` naming an empty attribute, a `key` other than
+//!     `none` with `record: batch` (`format: native`'s default), `idempotent: true` without
+//!     `acks: all`, a `max_request_bytes` of `0`, `timeout: 0s`, or a `tls` failing rule 34's
+//!     checks (`docs/adr/kafka-output.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3466,13 +3467,16 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // nothing to a broker that doesn't wait for every replica, and the Java producer refuses the
     // same explicit pair. A broker entry is dialed as `host:port`, so one without both fails here
     // rather than on every attempt. A topic name outside Kafka's own rule (1 to 249 characters of
-    // `[a-zA-Z0-9._-]`, not `.` or `..`) would be refused by the broker for every batch. `tls`
+    // `[a-zA-Z0-9._-]`, not `.` or `..`) would be refused by the broker for every batch. A batch
+    // record holds many events and carries no key, so a configured key would be ignored. `tls`
     // gets rule 34's two checks: its presence turns TLS on.
     for (id, component) in &components {
         let ComponentKind::KafkaOut {
             brokers,
             topic,
             key,
+            format,
+            record,
             acks,
             idempotent,
             max_request_bytes,
@@ -3512,6 +3516,22 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      carries"
                 );
             }
+        }
+        let batch = match record {
+            Some(record) => *record == logit_config::KafkaRecord::Batch,
+            None => *format == logit_config::KafkaFormat::Native,
+        };
+        if batch && *key != logit_config::KafkaKey::None {
+            let why = if record.is_some() {
+                "'record: batch'"
+            } else {
+                "'format: native', whose records default to 'record: batch',"
+            };
+            anyhow::bail!(
+                "component '{id}': kafka_out 'key' needs one event per record, and {why} packs \
+                 many events into an unkeyed record -- set 'record: event' to key each event's \
+                 record, or 'key: none'"
+            );
         }
         if *idempotent && *acks != logit_config::KafkaAcks::All {
             anyhow::bail!(
@@ -6551,6 +6571,7 @@ mod tests {
             topic: "logs".to_string(),
             key: logit_config::KafkaKey::default(),
             format: logit_config::KafkaFormat::default(),
+            record: None,
             compression: logit_config::KafkaCompression::default(),
             acks: logit_config::KafkaAcks::default(),
             idempotent: true,
@@ -6585,6 +6606,21 @@ mod tests {
             }
         });
         kafka_out_result(kind).expect("acks: leader without idempotence, and an empty tls block");
+        let kind = kafka_out_with(|k| {
+            if let ComponentKind::KafkaOut { key, format, record, .. } = k {
+                *key = logit_config::KafkaKey::TraceId;
+                *format = logit_config::KafkaFormat::Native;
+                *record = Some(logit_config::KafkaRecord::Event);
+            }
+        });
+        kafka_out_result(kind).expect("a key with native under record: event");
+        let kind = kafka_out_with(|k| {
+            if let ComponentKind::KafkaOut { format, record, .. } = k {
+                *format = logit_config::KafkaFormat::Text;
+                *record = Some(logit_config::KafkaRecord::Batch);
+            }
+        });
+        kafka_out_result(kind).expect("record: batch with no key");
     }
 
     /// Rule 82, one clause per case.
@@ -6647,6 +6683,24 @@ mod tests {
                 edit(|k| {
                     if let ComponentKind::KafkaOut { key, .. } = k {
                         *key = KafkaKey::Attribute(String::new());
+                    }
+                }),
+            ),
+            (
+                "'record: batch' packs many events into an unkeyed record -- set 'record: event'",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { key, record, .. } = k {
+                        *key = KafkaKey::TraceId;
+                        *record = Some(logit_config::KafkaRecord::Batch);
+                    }
+                }),
+            ),
+            (
+                "'format: native', whose records default to 'record: batch', packs",
+                edit(|k| {
+                    if let ComponentKind::KafkaOut { key, format, .. } = k {
+                        *key = KafkaKey::Resource("service.name".into());
+                        *format = logit_config::KafkaFormat::Native;
                     }
                 }),
             ),

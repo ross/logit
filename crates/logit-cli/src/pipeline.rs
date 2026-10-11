@@ -46,7 +46,7 @@ use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::graphite::{GraphiteOutput, Transport as GraphiteOutTransport};
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::kafka::{
-    KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings, RecordFormat, RecordKey,
+    KafkaAcks, KafkaCompression, KafkaOutput, KafkaSettings, RecordFormat, RecordKey, RecordMode,
 };
 use logit_outputs::logit::LogitOutput;
 use logit_outputs::null::NullOutput;
@@ -1201,6 +1201,7 @@ fn build_spec(
             topic,
             key,
             format,
+            record,
             compression,
             acks,
             idempotent,
@@ -1220,7 +1221,14 @@ fn build_spec(
                 },
                 format: match format {
                     logit_config::KafkaFormat::Json => RecordFormat::Json,
+                    logit_config::KafkaFormat::Text => RecordFormat::Text,
+                    logit_config::KafkaFormat::Msgpack => RecordFormat::Msgpack,
+                    logit_config::KafkaFormat::Native => RecordFormat::Native,
                 },
+                record: record.map(|record| match record {
+                    logit_config::KafkaRecord::Event => RecordMode::Event,
+                    logit_config::KafkaRecord::Batch => RecordMode::Batch,
+                }),
                 compression: match compression {
                     logit_config::KafkaCompression::None => KafkaCompression::None,
                     logit_config::KafkaCompression::Gzip => KafkaCompression::Gzip,

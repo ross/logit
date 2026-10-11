@@ -715,9 +715,33 @@ pub enum KafkaKey {
 #[serde(rename_all = "snake_case")]
 pub enum KafkaFormat {
     /// One JSON object per event, as `stdio_out`'s `format: json` writes it, without the
-    /// newline.
+    /// newline. Under `record: batch`, those objects as newline-terminated lines.
     #[default]
     Json,
+    /// The log record's body as text: a string as it is, raw bytes as they are, a map or array
+    /// as JSON, and nothing for an empty body. An event with no log record is skipped and
+    /// counted. Under `record: batch`, the bodies joined by newlines, so a body that holds a
+    /// newline reads as two.
+    Text,
+    /// The same object as `json`, key for key, as MessagePack, except that raw bytes are a
+    /// MessagePack `bin` and NaN and the infinities are floats. Under `record: batch`, the
+    /// objects back to back.
+    Msgpack,
+    /// `logit`'s own binary format, the one `stdio_out`'s `format: native` writes: one frame per
+    /// record, which `logit` decodes with no loss. Defaults to `record: batch`.
+    Native,
+}
+
+/// How many events one `kafka_out` record holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KafkaRecord {
+    /// One record per event.
+    Event,
+    /// As many of a batch's events per record as fit under `max_request_bytes`, in order; an
+    /// event too large to fit alone is dropped, counted. A batch record has no key, and its
+    /// timestamp is its first event's.
+    Batch,
 }
 
 /// How `kafka_out` compresses a record batch.
@@ -2700,12 +2724,13 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         max_body_bytes: u64,
     },
-    /// Produces each event as one record to an Apache Kafka topic (3.x and 4.x, or anything that
-    /// speaks the same protocol from Kafka 2.4 on), as the Java producer does by default:
-    /// `acks: all`, idempotence on, and keyed records placed on the partition a Java client
-    /// would pick for the same key. A failure Kafka may have partly applied (a timeout, a lost
-    /// connection) resends the unsettled records; the broker discards most such duplicates, but
-    /// not across a `logit` restart. `buffer.delivery: at_most_once` drops them instead.
+    /// Produces events to an Apache Kafka topic (3.x and 4.x, or anything that speaks the same
+    /// protocol from Kafka 2.4 on) with the Java producer's defaults: `acks: all`, idempotence
+    /// on, and keyed records placed on the partition a Java client would pick for the same key.
+    /// Each event is one record unless `record: batch` packs several into one. A failure Kafka
+    /// may have partly applied (a timeout, a lost connection) resends the unsettled records; the
+    /// broker discards most such duplicates, but not across a `logit` restart.
+    /// `buffer.delivery: at_most_once` drops them instead.
     KafkaOut {
         /// Bootstrap brokers, each a `host:port`. `logit` asks the first that answers for the
         /// topic's partitions and leaders, then connects to each leader at the address the
@@ -2723,10 +2748,16 @@ pub enum ComponentKind {
         /// (or with a map or array there) is sent unkeyed, counted.
         #[serde(default)]
         key: KafkaKey,
-        /// What a record's value holds. `json` (the default and only value) writes one JSON
-        /// object per event, the same object `stdio_out`'s `format: json` writes on one line.
+        /// What a record's value holds: `json` (the default), the object `stdio_out`'s `format:
+        /// json` writes on one line; `text`, the log body alone; `msgpack`, the `json` object as
+        /// MessagePack; or `native`, `logit`'s own lossless binary format.
         #[serde(default)]
         format: KafkaFormat,
+        /// How many events one record holds: `event`, one each, or `batch`, as many as fit under
+        /// `max_request_bytes`. Defaults to `batch` for `format: native` and `event` for the
+        /// others. A `key` other than `none` needs `event`.
+        #[serde(default)]
+        record: Option<KafkaRecord>,
         /// How record batches are compressed: `none` (the default), `gzip`, `snappy`, `lz4`, or
         /// `zstd`. `zstd` needs a broker from Kafka 2.1 on.
         #[serde(default)]
@@ -6883,6 +6914,7 @@ mod tests {
                 topic,
                 key,
                 format,
+                record,
                 compression,
                 acks,
                 idempotent,
@@ -6895,6 +6927,7 @@ mod tests {
                 assert_eq!(topic, "logs");
                 assert_eq!(key, KafkaKey::None);
                 assert_eq!(format, KafkaFormat::Json);
+                assert_eq!(record, None, "unset, so the format's own default applies");
                 assert_eq!(compression, KafkaCompression::None);
                 assert_eq!(acks, KafkaAcks::All);
                 assert!(idempotent);
@@ -6938,6 +6971,26 @@ mod tests {
             assert_eq!(max_request_bytes, 512 * 1024);
             assert_eq!(headers.keys().collect::<Vec<_>>(), vec!["a", "b"], "sent in name order");
             assert_eq!(tls, Some(TlsClientConfig::default()));
+        }
+        for (format, want) in [
+            ("json", KafkaFormat::Json),
+            ("text", KafkaFormat::Text),
+            ("msgpack", KafkaFormat::Msgpack),
+            ("native", KafkaFormat::Native),
+        ] {
+            for (record, record_want) in
+                [("event", KafkaRecord::Event), ("batch", KafkaRecord::Batch)]
+            {
+                let component: Component = serde_json::from_str(&format!(
+                    r#"{{"type": "kafka_out", "brokers": ["k:9092"], "topic": "t",
+                        "format": "{format}", "record": "{record}"}}"#
+                ))
+                .unwrap();
+                let ComponentKind::KafkaOut { format, record, .. } = component.kind else {
+                    panic!("expected KafkaOut");
+                };
+                assert_eq!((format, record), (want, Some(record_want)));
+            }
         }
         assert!(serde_json::from_str::<Component>(
             r#"{"type": "kafka_out", "brokers": ["k:9092"], "topic": "t", "linger": "5ms"}"#
