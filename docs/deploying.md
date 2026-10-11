@@ -42,6 +42,19 @@ docker run --rm \
   ghcr.io/ross/logit:latest run /config.yaml
 ```
 
+The image runs as a non-root `logit` user, and `/var/lib/logit` is the directory it owns for
+state such as a `buffer.disk` spool or a `tail_in` checkpoint. A path the user can't write makes a
+spool fail to open, and `logit run` exits `2`. To keep that state across restarts, mount a named
+volume at `/var/lib/logit`: Docker gives a new named volume the directory's owner. A bind mount
+keeps the host directory's owner instead, so make it writable by the image's `logit` user.
+
+```sh
+docker run --rm \
+  -v /path/to/config.yaml:/config.yaml:ro \
+  -v logit_state:/var/lib/logit \
+  ghcr.io/ross/logit:latest run /config.yaml
+```
+
 Put secrets and deployment-specific values (a token, a URL, a bind address) in the environment and
 reference them with `!env VAR_NAME` in the config instead of inlining them. Any field on any
 component accepts `!env`, not only `influxdb_out`'s `token`; see
@@ -754,16 +767,18 @@ uses `overflow: block` with an in-memory buffer. That sink is the primary: when 
 backs up behind it by design. Give every other sink the source reaches one of these:
 
 - If the data matters and you need to ride out an outage, set `buffer.disk`. The spool absorbs the
-  stall until it reaches `disk.max_bytes`; after that, `overflow` applies as it does to a full
-  in-memory buffer, so under `block` a full spool backs up like memory.
+  stall until it reaches `disk.max_bytes`. Under `block`, a full spool then backs up like a full
+  in-memory buffer. The other policies behave differently on a spool; see
+  [Durable buffering](#durable-buffering).
 - If the sink is best-effort, such as a stdout display or a backend under evaluation, set
   `buffer.overflow: drop_oldest` or `drop_newest`. The sink keeps draining and counts what it
   drops.
 
 `logit validate` and `logit run` warn when a listener reaches two or more sinks that use
 `overflow: block` with no `buffer.disk`, naming the listener and the sinks. It's a warning, not an
-error, and there's no setting to silence it. A `buffer.disk` sink doesn't count, and neither does
-`null_out`, whose send never fails.
+error, and there's no setting to silence it. A `buffer.disk` sink doesn't count, and neither do
+`null_out` and a `prometheus_out` serving an exposition endpoint (`bind:`), whose sends never
+fail.
 
 To find the branch that is blocking, read these on the consumer, not the producer:
 `logit.component.inbox.full` (a send found the inbox full),
