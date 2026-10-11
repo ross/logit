@@ -1,7 +1,7 @@
 # Tempo 2.10.x, monolithic, local filesystem backend, OTLP receivers only. Two senders write here:
-#   - `logit`'s `tempo_out` (demo/logit.yaml), to the `grpc` receiver: `logit`'s own internal
-#     pipeline spans, haproxy's/nginx's real access-line spans
-#     (docs/adr/trace-context-span-lifting.md), and the landing page's browser spans.
+#   - `logit`'s `tempo_out` and `self_tempo_out` (demo/logit.yaml), to the `grpc` receiver:
+#     haproxy's/nginx's real access-line spans (docs/adr/trace-context-span-lifting.md), the
+#     landing page's browser spans, and `logit`'s own internal pipeline spans.
 #   - `demo-app`'s and `demo-worker`'s real OpenTelemetry spans, sent straight to the `http`
 #     receiver rather than through `logit` (demo/logit.yaml's header comment explains why).
 # Only the OTLP ports (4317/4318) are published on the host; Grafana queries :3200 inside the

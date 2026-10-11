@@ -518,7 +518,11 @@ Per pair:
   ([ADR `internal-telemetry-as-pipeline-events`](docs/adr/internal-telemetry-as-pipeline-events.md),
   [internal-telemetry.md](docs/design/internal-telemetry.md),
   [fixtures/internal-telemetry.yaml](fixtures/internal-telemetry.yaml) is a runnable config).
-  `otlp_out` carries those spans and metrics out over the wire.
+  `otlp_out` carries those spans and metrics out over the wire. When `internal`'s pipeline is
+  dedicated (no node in it reachable from another input), it drains last, after every data node
+  has exited, so shutdown-time counts are exported
+  ([ADR `shutdown-accounting-and-cancellation-safety`](docs/adr/shutdown-accounting-and-cancellation-safety.md),
+  "Amendment: internal drains last").
 - **Internal spans**: every node visit (a listener's send, a transform's process/flush, a sink's
   deliver) mints exactly one real `SpanRecord` from that context. Spans are deterministically
   sampled on `trace_id` (`span_sample_rate`, default `0.1`, `1.0` in the demo), so every `logit`

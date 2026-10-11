@@ -1,5 +1,5 @@
 # Loki 3.7.x, monolithic single-binary, no auth, no multi-tenancy, filesystem storage. It receives
-# logs from `logit`'s `loki_out` over OTLP/HTTP and serves Grafana's queries on :3100 inside the
+# logs from `logit`'s `loki_out` and `self_loki_out` over OTLP/HTTP and serves Grafana's queries on :3100 inside the
 # `demo` network (not published on the host). Demo-only: everything under /loki lives in the
 # `loki_data` named volume (demo/compose.yaml) and is disposable.
 auth_enabled: false
@@ -34,7 +34,7 @@ schema_config:
         period: 24h
 
 limits_config:
-  # `logit`'s `loki_out` (demo/logit.yaml) is the only sender. A restarted sender can replay
+  # `logit`'s `loki_out` and `self_loki_out` (demo/logit.yaml) are the only senders. A restarted sender can replay
   # lines slightly out of order, and without this Loki rejects them as "too old" rather than
   # accepting them.
   reject_old_samples: false
