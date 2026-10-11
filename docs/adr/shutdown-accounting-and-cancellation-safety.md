@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-09-26
+updated: 2026-10-11
 ---
 
 # Shutdown accounting and cancellation safety: every shutdown loss counted, and one table of cancellation points
@@ -265,6 +265,8 @@ was missing was executable evidence under real concurrency, and the shutdown acc
   drain the instant the signal fires, and every one of those counts is recorded later, at the
   grace backstop or during the drain. They reach a test `Registry`, but not an exported pipeline.
   The self-log `diag.warn` is what an operator sees, and `docs/known-gaps/` records the gap.
+  [Superseded by the amendment "internal drains last (2026-10-11)" below: `internal` now drains
+  after every data node has exited, and the CLI logs what is still undrained.]
 - Out of this stream's scope, recorded for the sink cluster: `stdio_out`/`file_out` write in
   place with `write_all`, so when a send is cancelled mid-write and `flush()` then completes it,
   the file can hold a torn line or native frame.
@@ -559,3 +561,62 @@ wire so the peer resends. Four uncounted losses the audit found are now in `docs
 
 Site comments that restated a row now point at the table, and the runtime, `Input`, and `tcp.rs`
 module docs point at it once. No behavior changes.
+
+## Amendment: internal drains last (2026-10-11)
+
+`internal` is an ordinary input, so it does its final drain the moment the shutdown signal fires.
+Every count recorded afterward stays in the registry and never reaches an exported pipeline:
+
+- decision 4's UDP `datagrams.dropped` and `bytes.dropped{reason="shutdown"}`;
+- the drops a sink or Lua node counts during its drain, as
+  `batches.dropped{reason="shutdown"}` through `count_shutdown_drop`;
+- the final drain's own `logit.internal.*` counts.
+
+Operators and the soak ledger read those counts from stderr. The Consequences bullet about
+`internal` above recorded this as a gap. These decisions close it, continuing the numbering above.
+
+Terms:
+
+- The **telemetry subgraph** (T) is every node reachable from `internal` through each node's
+  consumers and through router or Lua `targets`, including a target's own consumers.
+- The **data nodes** (N) are every task-owning node outside T other than `internal`.
+
+10. **Shutdown runs in two stages.** The shutdown signal stops N as it does today: inputs first,
+    then the close-time flush cascade. `internal` gets its own signal from the runtime, which fires
+    once shutdown has fired and every N task has exited, finished or failed. Until then `internal`
+    keeps draining on its interval, so a long data drain is still exported tick by tick. On its
+    own signal it drains once more and returns, and T cascades as today.
+11. **`internal`'s shutdown grace counts from its own signal.** The 5 s grace
+    (`ReceiveConfig::default()`) starts when `internal` is signaled, so a long data drain can't
+    consume it.
+12. **Waiting on the data nodes adds no unbounded wait.** The runtime already joins every task
+    before returning, and each N node has its own backstop: an input's shutdown grace,
+    `write_loop`'s grace, and the Lua wedge rule.
+13. **The first-error path is unchanged.** A node failure sends the shutdown signal, stage one
+    runs, and stage two follows. A run with no shutdown signal (`run` passes `pending()`) is also
+    unchanged, because stage two needs the signal.
+14. **A node in T that a data source also feeds can't finish before `internal` closes.** One
+    `otlp_out` carrying both data and `internal`'s output is the example. The counts it records
+    while draining stay undrained. Give `internal` its own sinks, pointed at the same backend when
+    needed, such as a second `otlp_out` to the same endpoint. Operator docs recommend this. Nothing
+    enforces it and there is no validation warning, because a shared sink is valid and cheap, and
+    the loss is only of shutdown-time counters.
+15. **The CLI logs what is left.** After every node has exited, it drains the registry once more
+    and writes each leftover metric point to the self-log as one structured line,
+    `telemetry left undrained at exit`, with the fields `component`, `metric`, `tags`, and
+    `value`. The level is `warn` for a nonzero `*.dropped` metric and `info` otherwise. It does
+    this on exit 0 and exit 2 alike. That covers decision 14's residual and the final drain's own
+    counts. Spans and captured logs aren't repeated, because the logs already went to stderr.
+
+Not covered: SIGKILL and out-of-memory kills give no drain at all. Only a shorter `interval`
+narrows that loss.
+
+Alternatives considered:
+
+- **Persist leftovers to a state file and replay them on the next start.** They arrive late or
+  never, it needs a state directory, and it is awkward for cumulative counters. It stays in
+  reserve if shared sinks prove common.
+- **A dedicated exporter inside `internal` that bypasses the graph.** It reverses [ADR
+  `internal-telemetry-as-pipeline-events`](internal-telemetry-as-pipeline-events.md).
+- **Require dedicated sinks through a validation rule.** Rejected: the configs it would reject are
+  valid, and the loss is limited to shutdown counters.
