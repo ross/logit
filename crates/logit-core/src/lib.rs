@@ -4,6 +4,9 @@
 //! only -- no I/O, no pipeline, no protocol codecs live here.
 
 pub mod diag;
+/// Random ids in other systems' forms (UUID, ULID, W3C trace ids). Not re-exported:
+/// `ids::uuid_v4` names its family at the call site.
+pub mod ids;
 pub mod interner;
 pub mod provenance;
 pub mod redact;

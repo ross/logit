@@ -11557,7 +11557,7 @@ mod tests {
         }
         let mut topological_order: Vec<String> = components.keys().cloned().collect();
         topological_order.sort();
-        Graph { components, topological_order }
+        Graph { components, topological_order, warnings: Vec::new() }
     }
 
     fn recording_sink(tx: std::sync::mpsc::Sender<EventBatch>) -> NodeSpec {

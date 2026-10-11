@@ -416,6 +416,9 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `into` naming another configured source or shared by two fields; a range with both `lt` and
     `le`; a boundless range that isn't last; a non-finite bound; or a range that can never match
     (a bound below the previous one, or equal to it unless `lt: X` is followed by `le: X`).
+83. Not a rejection: a listener that reaches two or more sinks using `buffer.overflow: block` with
+    no `buffer.disk` gets a warning, since a stall in one parks the others. `null_out`, an
+    exposition-mode `prometheus_out`, and `buffer.disk` sinks don't count.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
@@ -746,7 +749,8 @@ topology, not a rare one, with these consequences:
   destination can head-of-line-block telemetry bound for an unrelated, healthy one. A sink isolates
   itself: `buffer.overflow: drop_newest | drop_oldest` keeps its inbox draining and counts what it
   drops, and `buffer.disk` defers the stall until the spool is full. The default `overflow: block`
-  keeps `tail_in`, TCP listeners, and the native hop lossless, because the sender waits. With every
+  keeps `tail_in`, TCP listeners, and the native hop lossless, because the sender waits. Rule 83
+  warns when one listener reaches two or more memory-only `block` sinks. With every
   sink set to drop, a transform, Lua node, or router backs up only when it is itself the
   bottleneck, which is a capacity matter. To find which branch is blocking, read
   `logit.component.inbox.full`, `inbox.blocked.duration`, and `inbox.batches` on the consumers

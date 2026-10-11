@@ -518,6 +518,11 @@ components:
     sources: [logs_only]
     protocol: http
     endpoint: http://loki:3100/otlp
+    # Loki, Tempo, and VictoriaMetrics share sources, so each gets a disk spool: while one is
+    # down, its spool absorbs the backlog instead of stopping the sources the others read from.
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/loki_out
 
   # `self` emits points, spans, *and* logs (docs/plans/operator-surface.md) through one
   # component, and `keep_signals: [logs]` lets `logit`'s own self-diagnostics reach Loki without
@@ -535,6 +540,8 @@ components:
     sources: [self_logs]
     protocol: http
     endpoint: http://loki:3100/otlp
+    buffer:
+      overflow: drop_oldest # best-effort, like `self_victoria_out`
 
   # The real spans `haproxy_trace`/`nginx_trace` minted, separated from the log event each rides
   # in on. `app_trace` isn't a source because it never produces a span (see its comment above).
@@ -671,6 +678,10 @@ components:
     endpoint: http://victoriametrics:8428/api/v1/write
     version: 1
     compression: zstd
+    # A disk spool, like `loki_out`'s, so a VictoriaMetrics outage never stalls the other sinks.
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/victoria_out
 
   # `self`'s metrics get their own sink, so `self`'s pipeline stays dedicated (see `self_logs`).
   # `self_windowed`'s span and log events carry no metric record, so this sink ignores them
@@ -681,6 +692,10 @@ components:
     endpoint: http://victoriametrics:8428/api/v1/write
     version: 1
     compression: zstd
+    # Best-effort: `self`'s pipeline shares nothing with a data path, and a spool for telemetry
+    # about `logit` is overkill, so a stalled sink sheds its oldest points.
+    buffer:
+      overflow: drop_oldest
 
   # `self` carries *all* of `logit`'s own telemetry, not just spans: every drain also carries this
   # process's `logit.*` metrics (Counter/Gauge/Distribution). It never mixes the two *on one
@@ -720,6 +735,10 @@ components:
     sources: [access_spans, browser_spans]
     protocol: grpc
     endpoint: tempo:4317
+    # A disk spool, like `loki_out`'s, so a Tempo outage never stalls the other sinks.
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/tempo_out
 
   # `logit`'s own internal spans (`trace_only`), through a sink of their own so `self`'s pipeline
   # stays dedicated (see `self_logs`). Same transport and endpoint as `tempo_out`.
@@ -728,3 +747,5 @@ components:
     sources: [trace_only]
     protocol: grpc
     endpoint: tempo:4317
+    buffer:
+      overflow: drop_oldest # best-effort, like `self_victoria_out`

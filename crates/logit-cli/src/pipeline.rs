@@ -169,6 +169,9 @@ pub async fn run_pipelines(
     }
 
     // After the layer is active, so `internal`'s `logs:` captures it like any other warning.
+    for warning in &graph.warnings {
+        tracing::warn!(target: "logit", "{warning}");
+    }
     if let Some(warning) =
         fd_limit_warning(listener_connection_budget(&graph), logit_inputs::open_files_limit())
     {
@@ -389,9 +392,10 @@ fn with_reopen<E>(
 ///
 /// Doesn't call `build_spec`, so its checks (a referenced file, a syslog `sd_id`) pass here and
 /// fail only at `run`.
-pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
-    graph::resolve(config)?;
-    Ok(())
+///
+/// Returns the graph's non-fatal warnings, which the caller prints.
+pub fn validate_semantics(config: Config) -> anyhow::Result<Vec<String>> {
+    Ok(graph::resolve(config)?.warnings)
 }
 
 /// Builds the boxed implementation the node runtime runs for one resolved component.
@@ -2224,9 +2228,39 @@ mod tests {
     }
 
     #[test]
+    fn validate_semantics_returns_the_graphs_warnings() {
+        let cfg = config(vec![
+            ("in", statsd_in()),
+            (
+                "out",
+                Component {
+                    buffer: logit_config::BufferConfig::default(),
+                    receive: logit_config::ReceiveConfig::default(),
+                    sources: vec!["in".to_string()],
+                    targets: Vec::new(),
+                    kind: ComponentKind::SplunkHecOut {
+                        endpoint: "https://splunk:8088/services/collector".to_string(),
+                        token: "t".to_string(),
+                        compression: logit_config::SplunkCompression::default(),
+                        multi_value: logit_config::SplunkMultiValue::default(),
+                        ack: false,
+                        ack_timeout: None,
+                        timeout: logit_config::default_splunk_timeout(),
+                        tls: logit_config::TlsClientConfig::default(),
+                        max_body_bytes: 800 * 1024 * 1024,
+                    },
+                },
+            ),
+        ]);
+        let warnings = validate_semantics(cfg).expect("valid");
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("component 'out'"), "got: {warnings:?}");
+    }
+
+    #[test]
     fn validate_semantics_accepts_a_well_formed_config() {
         let cfg = config(vec![("in", statsd_in()), ("out", influxdb_out(vec!["in"]))]);
-        assert!(validate_semantics(cfg).is_ok());
+        assert_eq!(validate_semantics(cfg).expect("valid"), Vec::<String>::new());
     }
 
     /// A sink shared by two upstream branches is valid.
