@@ -380,7 +380,7 @@ with none, a span id for a span built with `Event.new`, or a request id on a log
 
 ```lua
 function process(event)
-  if event.log.trace_id == nil then
+  if event.log and event.log.trace_id == nil then
     event.log.trace_id = random.trace_id()
     event.log.span_id = random.span_id()
   end
