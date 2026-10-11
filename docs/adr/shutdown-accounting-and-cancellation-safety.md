@@ -265,8 +265,8 @@ was missing was executable evidence under real concurrency, and the shutdown acc
   drain the instant the signal fires, and every one of those counts is recorded later, at the
   grace backstop or during the drain. They reach a test `Registry`, but not an exported pipeline.
   The self-log `diag.warn` is what an operator sees, and `docs/known-gaps/` records the gap.
-  [Superseded by the amendment "internal drains last (2026-10-11)" below: `internal` now drains
-  after every data node has exited, and the CLI logs what is still undrained.]
+  [Superseded by the amendment "internal drains last (2026-10-11)" below: decisions 10 to 15
+  move `internal`'s final drain after the data nodes' and log what is still undrained.]
 - Out of this stream's scope, recorded for the sink cluster: `stdio_out`/`file_out` write in
   place with `write_all`, so when a send is cancelled mid-write and `flush()` then completes it,
   the file can hold a torn line or native frame.
@@ -575,32 +575,43 @@ Every count recorded afterward stays in the registry and never reaches an export
 Operators and the soak ledger read those counts from stderr. The Consequences bullet about
 `internal` above recorded this as a gap. These decisions close it, continuing the numbering above.
 
-Terms:
+Terms. Reachability follows each node's consumers and router or Lua `targets`, including a
+target's own consumers. Every task-owning node other than `internal` falls into one class:
 
-- The **telemetry subgraph** (T) is every node reachable from `internal` through each node's
-  consumers and through router or Lua `targets`, including a target's own consumers.
-- The **data nodes** (N) are every task-owning node outside T other than `internal`.
+- **Data-only** nodes aren't reachable from `internal`.
+- **Shared** nodes are reachable from `internal` and from another input, such as one `otlp_out`
+  carrying both data and `internal`'s output.
+- **Telemetry-only** nodes are reachable from `internal` and from no other input.
 
-10. **Shutdown runs in two stages.** The shutdown signal stops N as it does today: inputs first,
-    then the close-time flush cascade. `internal` gets its own signal from the runtime, which fires
-    once shutdown has fired and every N task has exited, finished or failed. Until then `internal`
-    keeps draining on its interval, so a long data drain is still exported tick by tick. On its
-    own signal it drains once more and returns, and T cascades as today.
-11. **`internal`'s shutdown grace counts from its own signal.** The 5 s grace
-    (`ReceiveConfig::default()`) starts when `internal` is signaled, so a long data drain can't
-    consume it.
-12. **Waiting on the data nodes adds no unbounded wait.** The runtime already joins every task
-    before returning, and each N node has its own backstop: an input's shutdown grace,
-    `write_loop`'s grace, and the Lua wedge rule.
+10. **Shutdown runs in two stages.** The shutdown signal is stage one. Data-only and shared nodes
+    take it as every node does today: inputs stop, the close-time flush cascade runs, and a sink's
+    `write_loop` grace and a Lua node's wedge rule count from it. `internal`, and the sinks and Lua
+    nodes that are telemetry-only, take a second signal from the runtime. It fires once stage one
+    has fired and every data-only task has exited, finished or failed. Until then `internal`
+    keeps draining on its interval, so a long data drain is still exported tick by tick. On the
+    second signal it drains once more and returns, and the telemetry-only nodes cascade as today.
+11. **Stage-two graces count from stage two.** `internal`'s 5 s grace
+    (`ReceiveConfig::default()`) and a telemetry-only sink's `write_loop` grace start at the second
+    signal. A long data drain can't consume them. A telemetry-only sink idling on an empty queue
+    would otherwise reach its grace before `internal`'s final batch arrives, because `write_loop`'s
+    grace runs whether or not the queue is open.
+12. **Every wait stays bounded.** Transforms and routers take no signal, and a Lua thread parked
+    on a full inbox isn't busy, so each of them is bounded only by the grace of the sink it blocks
+    on. A data-only node can only block on a data-only or shared sink, and both count their grace
+    from stage one, so stage one ends in bounded time and stage two follows. A telemetry-only node
+    can only block on `internal`'s output, which `internal`'s grace bounds. Giving a shared sink the
+    second signal would hang: a data-only `aggregate` parked on its close-time flush into a shared
+    sink whose destination refuses would never finish, and the second signal would never fire.
 13. **The first-error path is unchanged.** A node failure sends the shutdown signal, stage one
     runs, and stage two follows. A run with no shutdown signal (`run` passes `pending()`) is also
     unchanged, because stage two needs the signal.
-14. **A node in T that a data source also feeds can't finish before `internal` closes.** One
-    `otlp_out` carrying both data and `internal`'s output is the example. The counts it records
-    while draining stay undrained. Give `internal` its own sinks, pointed at the same backend when
-    needed, such as a second `otlp_out` to the same endpoint. Operator docs recommend this. Nothing
-    enforces it and there is no validation warning, because a shared sink is valid and cheap, and
-    the loss is only of shutdown-time counters.
+14. **A shared node keeps a residual.** Stage two doesn't wait for it, and its grace counts from
+    stage one. The counts it records while draining stay undrained. When its grace runs out before
+    stage two, its inbox is closed and `internal`'s final batch to it is lost as a
+    `closed_consumer`. So `internal` should have its own sinks, pointed at the same backend when
+    needed, such as a second `otlp_out` to the same endpoint. The operator docs recommend this and
+    say why. Nothing enforces it and there is no validation warning, because a shared sink is
+    valid and cheap, and the loss is only of shutdown-time telemetry.
 15. **The CLI logs what is left.** After every node has exited, it drains the registry once more
     and writes each leftover metric point to the self-log as one structured line,
     `telemetry left undrained at exit`, with the fields `component`, `metric`, `tags`, and
