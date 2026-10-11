@@ -1041,7 +1041,10 @@ access_latency:
         - value: slow
 ```
 
-The class is a bounded value, so it's also safe to add to `keep`'s `fields` ahead of `aggregate`.
+To wire it into [The pipeline](#the-pipeline) above, change `access_trace`'s `sources` to
+`[access_latency]`, so `access_latency` runs between `access_http` and `access_trace`, then add
+`http.request.duration_class` to `access_keep`'s `fields`. The class is a bounded value, so it's
+safe to keep for `aggregate`.
 
 ## Metrics
 

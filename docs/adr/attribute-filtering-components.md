@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-10
+updated: 2026-10-11
 ---
 
 # Attribute filtering is two transform components, and a bounded matcher is not a predicate language
@@ -89,7 +89,8 @@ which keeps the two review-linked rather than independently expandable.
 
 **What stays Lua: everything with an actual operator in it** -- `>= 500`, `contains`,
 `starts_with`, real regex, comparing two attributes to each other, `or`, `not` over more than one
-pair. `routing-by-condition-is-lua`'s core holding -- that `logit` ships no native predicate
+pair. [2026-10-11: a numeric range such as `>= 500` is now `bucket` plus an equality match here
+([ADR `bucket-transform`](bucket-transform.md)).] `routing-by-condition-is-lua`'s core holding -- that `logit` ships no native predicate
 *language* -- is unchanged by this ADR; this is not an overrule of that decision, it is the
 measured trigger it named, answered with the narrowest thing that answers it.
 
@@ -248,4 +249,5 @@ component.
 - If a future config needs an actual operator (`>=`, `contains`, cross-attribute comparison) rather
   than equality, that is new evidence for `routing-by-condition-is-lua`'s own revisit trigger, not a
   reason to grow this component past what `set` can stamp -- the retired predicate grammar sketch
-  that ADR preserved is still where such a design would resume.
+  that ADR preserved is still where such a design would resume. [2026-10-11: a numeric range is
+  now `bucket` plus an equality match ([ADR `bucket-transform`](bucket-transform.md)).]

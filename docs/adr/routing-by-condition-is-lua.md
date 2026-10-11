@@ -1,6 +1,6 @@
 ---
 created: 2026-09-07
-updated: 2026-09-22
+updated: 2026-10-11
 ---
 
 # Routing by condition, sampling, throttling, dedup, and renaming are `lua` components
@@ -189,6 +189,9 @@ to resume.
   `filter`/`where`, no operators, no boolean algebra beyond a plain conjunction. Anything needing an
   actual operator (`>=`, `contains`, cross-attribute comparison) still means writing `lua`, and the
   preserved grammar sketch above is still where that design would resume.
+  [2026-10-11: a numeric range is no longer one of those operators. It's `bucket` plus an equality
+  match ([ADR `bucket-transform`](bucket-transform.md)): `bucket` writes the range's class into an
+  attribute, and `has_attributes`, `drop_attributes`, or `route` matches the class.]
 - **The same trigger fired a second time, also on 2026-09-10, for batch provenance.**
   `has_provenance`/`drop_provenance` (`docs/adr/provenance-filtering-components.md`) filter on a
   batch's `origin`/`previous` -- component ids drawn from a graph's own `components:` map, a
