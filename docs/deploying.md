@@ -571,7 +571,7 @@ pipeline](#give-internal-a-dedicated-pipeline) exports every data node's shutdow
 - The final drain's own `logit.internal.*` counts and the routine counts its pipeline's nodes
   record while handling that batch, all at `debug`.
 - A `batches.dropped` or `events.dropped{reason="shutdown"}` count from a sink or Lua node that
-  carries `internal`'s output, at `warn` under that sink's component id. That node shuts down after
+  carries `internal`'s output, at `warn` under that node's component id. That node shuts down after
   `internal`'s final drain, so no topology can export its count. `drain complete` includes it in
   `batches_dropped`.
 
