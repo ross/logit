@@ -32,8 +32,10 @@ generator_input = "load"
 generator_sink = "statsd"
 sut_listener = "statsd"
 sut_aggregate = "window"
-sut_sink = "datadog"
 wire_loss_outside_faults = 0.0
+
+[[ledger.sink]]           # an external target's sink: no backend to query
+id = "datadog"
 
 [thresholds]
 progress_window = "30s"

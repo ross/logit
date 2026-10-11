@@ -6,6 +6,7 @@ mod config;
 mod dot;
 mod pipeline;
 mod signals;
+mod undrained;
 
 /// jemalloc rather than glibc malloc (the `debian:bookworm-slim` runtime image's default): a
 /// long-lived, multi-threaded process churning small short-lived allocations is the workload
