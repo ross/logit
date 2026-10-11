@@ -720,7 +720,7 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 | `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
 | `logit.input.connections.closed{reason="idle"}` | count | an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. A close at shutdown is not counted: there is no `reason="shutdown"`, because the runtime would record it after `internal`'s final drain |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
-| `logit.input.frames.dropped{reason="oversize"\|"malformed"\|"truncated"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses |
+| `logit.input.frames.dropped{reason="oversize"\|"drained"\|"malformed"\|"truncated"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses. `drained` is a line-framed listener's line that crossed its bound before its `LF` arrived: counted once, after which the connection discards input until its next `LF` |
 
 The driver's `Diagnostics` keys: `framing_error` (any `frames.dropped` reason), `bad_frame` (a
 decoder that rejects a whole frame), `connection_error` (I/O, a TLS handshake that failed or
@@ -764,7 +764,7 @@ certificate's expiry) and `tls_reload_failed` (throttled, naming the file and wh
 
 ##### `statsd_in`
 
-`crates/logit-inputs/src/statsd.rs`.
+`crates/logit-inputs/src/statsd.rs`, with its decoder in `crates/logit-proto/src/statsd/`.
 
 **Under `transport: udp`:** `logit.input.datagrams`, `logit.input.datagram.bytes`, and
 `logit.input.reads`, the per-datagram and per-syscall detail `Fanout`'s per-batch view can't see.
@@ -776,11 +776,14 @@ table with no per-listener code.
 `syslog_in`/`graphite_in` does, and records that driver's stream set in place of the datagram
 pair, with nothing statsd-specific: `logit.input.accept_queue.depth` / `.utilization`, the
 connection metrics, `logit.input.frames` / `logit.input.frame.bytes` (one *frame* is one
-LF-delimited statsd line), and `logit.input.frames.dropped{reason}`. Only two reasons can occur:
+LF-delimited statsd line), and `logit.input.frames.dropped{reason}`. Only three reasons can occur:
 
 - **`oversize`:** a line past the driver's 64 KiB bound. Dropped and counted once; the connection
   stays open and the next line still decodes. A statsd listener frames `Lines{DrainToNextLine}` and
   never RFC 6587's octet counting, because a statsd line may legally begin with a digit.
+- **`drained`:** an `oversize` line that crossed the bound before its `LF` arrived, counted in its
+  place. The connection then discards input until its next `LF`, so a sender that never sends one
+  shows as one `drained` and no further frames.
 - **`truncated`:** a partial line left buffered when a connection ends: abruptly, on shutdown
   mid-message, **or on a clean close with the final line unterminated**. That last case is where
   statsd parts company with `syslog_in`: RFC 6587 §3.4.2 explicitly permits a terminator-less final
@@ -801,16 +804,15 @@ and `oversize` is a packet declaring more than 64 KiB, which closes the connecti
 **On either transport:** a line that *parses* badly isn't a framing error. It's the decoder's own
 `bad_line`, throttled per listener because every connection's decoder clone shares one set of
 counts. The driver's `bad_frame` key fires only for the single whole-frame failure
-`StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. A sampled `ms`/`h`/`d`
-line whose `@<rate>` implies a weight above `MAX_SAMPLE_WEIGHT` (the bound on how far decode-time
-sample-rate extrapolation can inflate a `Distribution`'s `count()`) is clamped rather than
-extrapolated without bound, and reported as
-`logit.component.diagnostics{key="sample_rate_clamped"}`. No separate counter is needed, because
-the bridge already mirrors every occurrence.
+`StatsdDecoder::decode_into` can return: a frame that isn't valid UTF-8. The decoder carries a
+sampled `ms`/`h`/`d` line's `@<rate>` verbatim and clamps nothing; `aggregate` bounds the weight a
+rate implies at `Samples::MAX_WEIGHT` and reports a clamp as
+`logit.transform.samples.weight_clamped` and a `sample_rate_clamped` diagnostic under its own
+component, not `statsd_in`'s.
 
 ##### `syslog_in`
 
-`crates/logit-inputs/src/syslog.rs`.
+`crates/logit-inputs/src/syslog.rs`, with its decoder in `crates/logit-proto/src/syslog/`.
 
 **Under `transport: udp`:** the same trio as `statsd_in`, `logit.input.datagrams`/
 `.datagram.bytes`/`.reads`.
@@ -854,6 +856,7 @@ table, and collectd's binary framing gives this listener nothing further only it
 | `encrypted_packet_dropped` | A `SecurityLevel Encrypt` datagram. This codec holds no keys. |
 | `types_db_mismatch` | The configured `types_db` defines the list's type with a different data-source count or kinds than arrived, so its records fall back to index naming. |
 | `notification_dropped` | A `0x0100`/`0x0101` notification with an out-of-set severity, an empty message, or no host set: the notification counterpart of `incomplete_identity`. |
+| `record_name_cut` | A value list whose Plugin or Type is past 127 bytes, cut to 127 in its record name; the `collectd.*` attributes keep every byte. |
 
 A type simply *missing* from `types_db` is deliberately not reported, because that's routine, not a
 misconfiguration.
@@ -877,7 +880,7 @@ misconfiguration.
   **both** protocols, where one frame is one plaintext line or one pickle payload, counted at the
   size the decoder was handed (a pickle frame's 4-byte length prefix is stripped first, so the
   count is the payload, not the wire framing).
-  `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}` and
+  `logit.input.frames.dropped{reason="oversize"|"drained"|"malformed"|"truncated"}` and
   `logit.component.receive.flushed{reason}` from the per-connection `BatchAccumulator` (the same
   layer-2 point a datagram listener's shared `decode_loop` records) complete the set. There's no
   receive queue on this transport, because TCP's own flow control is the backpressure, so none of
@@ -886,8 +889,10 @@ misconfiguration.
 Both TCP framing failures land on `frames.dropped{reason="oversize"}`. They differ in whether the
 connection survives: a plaintext line past `max_line_bytes` is dropped and the reader
 resynchronizes at the next newline, while a pickle frame declaring more than `max_frame_bytes`
-closes the connection, because a length-framed stream has no resync point. Neither is
-`metrics.skipped`: one vocabulary per driver.
+closes the connection, because a length-framed stream has no resync point. A plaintext line that
+crossed `max_line_bytes` before its newline arrived counts `reason="drained"` instead, because the
+connection then discards input until its next newline. None is `metrics.skipped`: one vocabulary
+per driver.
 
 The codec adds its own counters under both transports:
 `logit.input.metrics.skipped{reason="bad_line"|"bad_tag"|"bad_timestamp"|"non_finite_value"|
@@ -914,12 +919,14 @@ it reports depends on its `transport:`:
 - **`udp` and `unix`:** the datagram set `statsd_in` records, from the shared `UdpListener`.
 - **`tcp` and `unix_stream`:** the stream set from the shared `TcpListener`: the connection
   metrics, `logit.input.frames` / `.frame.bytes` (one frame is one LF-delimited line), and
-  `logit.input.frames.dropped{reason="oversize"|"truncated"}`.
+  `logit.input.frames.dropped{reason="oversize"|"drained"|"truncated"}`.
 
 The stream framer enforces `max_line_bytes` on `tcp` and `unix_stream`, and the decoder enforces
 it on `udp` and `unix`. Both count a dropped line as `logit.input.frames.dropped{reason="oversize"}`,
 so the series means the same on every transport. On a datagram transport it's the only series of
-that name, and the rest of the datagram still decodes.
+that name, and the rest of the datagram still decodes. On a stream transport, a line that crossed
+the bound before its `LF` arrived counts `reason="drained"` in place of `oversize`, because the
+connection then discards input until its next `LF`.
 
 `Diagnostics` keys: `bound`, the driver's keys, and the datagram decoder's throttled
 `oversize_line`.
@@ -1032,16 +1039,19 @@ client, with no socket of its own.
   `assemble::Assembler`: `malformed_line`, `malformed_metadata`, `duplicate_label`,
   `duplicate_series`, `duplicate_type`, `duplicate_metadata`, `unknown_suffix`,
   `incomplete_series`, `empty_histogram`, `non_monotonic_buckets`, plus
-  `degraded{reason="histogram_count_mismatch"}`.
+  `degraded{reason="histogram_count_mismatch"}` and `degraded{reason="exemplar_dropped"}`, the
+  second for an OpenMetrics exemplar on a `_sum`, `_count`, `_created`, or quantile line, where
+  the model has nowhere to keep it.
 - **`skipped{reason="invalid_labels"}`** (remote-write): a series with no `__name__`, an empty label
   name or value, or a label set that isn't strictly ascending by byte order. Both specs forbid a
   sender from producing these, and none is worth failing the whole request over.
 - **`skipped{reason="native_histogram"}`** (remote-write): one `histograms[]` entry. See
   `docs/known-gaps/mappings.md`; this is also why a 2.0 response's `Histograms-Written` is always
   `0`.
-- **`degraded{reason="exemplar_dropped"}`** (remote-write): an exemplar whose series has no sample
-  anywhere in the request, or whose series was itself skipped. This reason is also an encoder
-  reason on the output side. It's not additive with `invalid_labels`: a series with bad labels and
+- **`degraded{reason="exemplar_dropped"}`** (both modes): in scrape mode, an OpenMetrics exemplar
+  on a line other than a value sample or a `_bucket` (the text assembler reason above); in
+  remote-write, an exemplar whose series has no sample anywhere in the request, or whose series
+  was itself skipped. This reason is also an encoder reason on the output side. It's not additive with `invalid_labels`: a series with bad labels and
   three exemplars raises one `invalid_labels` and three `exemplar_dropped`, because they answer
   different questions.
 - **`degraded{reason="seed_mismatch"}`** (metadata cache): a *remembered* type would have made the
@@ -1429,7 +1439,8 @@ non-string message or `field`, non-UTF-8 bytes, or no match. No `Diagnostics`.
 
 ##### `logfmt` and `kv`
 
-`crates/logit-transforms/src/logfmt.rs`,
+`crates/logit-transforms/src/logfmt.rs` (the pair counters in
+`crates/logit-proto/src/message/logfmt.rs`),
 [ADR `logfmt-and-kv-parsing`](../adr/logfmt-and-kv-parsing.md).
 
 `logit.transform.pairs.parsed` / `.pairs.skipped`, once per pair: `.skipped` counts a pair the
@@ -1573,7 +1584,7 @@ Seven counters. Every tag comes from a closed, `&'static` table, never an observ
 | Name | Meaning |
 |---|---|
 | `logit.transform.http_access.normalized{field}` | a field rewritten into its conformant form: a dashed alias renamed, a composite decomposed, a numeric coerced, a duration converted, a method or version normalized, a leading `?` stripped |
-| `.derived{field}` | a field written from config or a built-in table: `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`, `span.status`, `span.duration_s`, `http.request.method_original`, and `client.address` and `client.port` under `forwarded`. Every derived attribute but those two is fill-only, so one the producer already sent is honoured and not counted |
+| `.derived{field}` | a field written from config or a built-in table: `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`, `span.status`, `span.duration_s`, `http.response.status_class` (under `status_class`), `http.request.method_original`, and `client.address` and `client.port` under `forwarded`. Every derived attribute but those two is fill-only, so one the producer already sent is honoured and not counted |
 | `.truncated{field}` | a value cut to its `max_length` |
 | `.cleaned{field}` | a control byte replaced by `_` |
 | `.invalid{field}` | present but unparseable, left as it arrived; under `forwarded`, the header's attribute when it names no usable client |

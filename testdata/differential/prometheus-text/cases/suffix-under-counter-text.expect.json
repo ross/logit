@@ -1,0 +1,13 @@
+{
+ "divergence": "`c_sum` under `# TYPE c counter`: skipped `unknown_suffix`, where Prometheus stores a series (docs/known-gaps/mappings.md: A line Prometheus's text parser keeps that this decoder skips)",
+ "divergent": [
+  [
+   "c_sum",
+   []
+  ]
+ ],
+ "result": "ok",
+ "skips": {
+  "unknown_suffix": 1
+ }
+}

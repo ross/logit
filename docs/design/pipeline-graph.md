@@ -91,12 +91,23 @@ pub enum ComponentKind {
     KeepSignals { signals: Vec<Signal> },
     // A denylist: clears the listed signals' payloads, keeping the rest.
     DropSignals { signals: Vec<Signal> },
-    // Forwards an event whose resource/attributes match every configured pair -- config is
-    // `Set`'s, field for field; never mutates (docs/adr/attribute-filtering-components.md).
-    HasAttributes { resource: BTreeMap<String, SetValue>, attributes: BTreeMap<String, SetValue> },
-    // Drops an event matching every configured pair -- has_attributes' exact complement on the
-    // identical config, taken at the top level (an event matching some-but-not-all pairs forwards).
-    DropAttributes { resource: BTreeMap<String, SetValue>, attributes: BTreeMap<String, SetValue> },
+    // Forwards an event whose resource/attributes match every configured pair and carry every
+    // listed key -- the maps are `Set`'s, field for field; never mutates (docs/adr/attribute-filtering-components.md).
+    HasAttributes {
+        resource: BTreeMap<String, SetValue>,
+        attributes: BTreeMap<String, SetValue>,
+        resource_present: Vec<String>,
+        attributes_present: Vec<String>,
+    },
+    // Drops an event matching every configured pair and carrying every listed key --
+    // has_attributes' exact complement on the identical config, taken at the top level (an event
+    // matching some-but-not-all of it forwards).
+    DropAttributes {
+        resource: BTreeMap<String, SetValue>,
+        attributes: BTreeMap<String, SetValue>,
+        resource_present: Vec<String>,
+        attributes_present: Vec<String>,
+    },
     // Forwards an event whose batch's origin/previous match every configured field -- each field
     // is a list of alternatives (OR'd within the field), the two fields AND together; never
     // mutates (docs/adr/provenance-filtering-components.md).
@@ -317,8 +328,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 34. An inconsistent `logit_out` `tls:`, or a `logit_in` `max_frame_bytes` of `0` or above 64 MiB.
 35. A `buffer.disk:` beside a non-default in-memory bound, a bad disk bound, or a shared
     `disk.path`.
-36. A `has_attributes`/`drop_attributes` with nothing configured, an empty key, or a non-finite
-    value.
+36. A `has_attributes`/`drop_attributes` with nothing configured, an empty key, a non-finite
+    value, or a presence key repeated or also named in the same side's map.
 37. A `has_provenance`/`drop_provenance` with nothing configured, or an empty or repeated entry.
     An id isn't checked against this graph: it may name a component in another process.
 38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`, a value above 65507
@@ -829,6 +840,10 @@ logit-core   logit-config   logit-script
            \            |            /
                     logit-cli                        — CLI + the kind → impl registry
 ```
+
+Pure parsers of producer bytes, wire protocols and log-message text alike, belong in `logit-proto`
+below the impl crates, and a listener or transform wraps one
+([ADR `parsers-live-in-logit-proto`](../adr/parsers-live-in-logit-proto.md)).
 
 Not drawn above: `logit-transforms` also depends on `logit-config` directly, for `route`'s
 `RouteBy` type (`docs/adr/target-components.md`). An impl crate reading a config type it needs is

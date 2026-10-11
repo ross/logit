@@ -1,0 +1,20 @@
+# TYPE request_duration_seconds counter
+# UNIT request_duration_seconds seconds
+# HELP request_duration_seconds Total request duration.
+request_duration_seconds_total{code="200"} 1027 1395066363.5
+request_duration_seconds_created{code="200"} 1605281325.123
+request_duration_seconds_total{code="500"} 3 # {trace_id="0123456789abcdef0123456789abcdef",span_id="fedcba9876543210"} 0.5 1605281325.5
+# TYPE sizes gaugehistogram
+sizes_bucket{le="10"} 5
+sizes_bucket{le="+Inf"} 7
+sizes_gsum 300.5
+sizes_gcount 7
+# TYPE build info
+# HELP build Build metadata.
+build_info{version="1.2.3"} 1
+# TYPE state stateset
+state{state="starting"} 0
+state{state="running"} 1
+# TYPE unannotated unknown
+unannotated 42
+# EOF

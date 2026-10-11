@@ -223,7 +223,7 @@ line.
 | `statsd_in` decode 1 distribution line (`ms`/`h`/`d`, unsampled) | **2** | same as `statsd_in` decode 1 line -- `ms`/`h`/`d` decode straight to `MetricKind::Samples` now (ADR `lossless-transit`'s W3), one value fits inline in `Samples`'s own `SmallVec`; no `DdSketch`/`bins` Vec is built at decode time any more |
 | `statsd_in` decode 1 sampled distribution line (`@0.1`) | **2** | same as unsampled -- the raw `sample_rate` now rides verbatim on the decoded `Samples`, with no decode-time extrapolation to allocate for |
 | `statsd_in` decode 1 set line (`s`) | **3** | 2 as above + 1 `Vec<Bytes>` for `MetricKind::SetMembers`'s members -- unlike `Samples`'s inline `SmallVec`, `SetMembers` has no small-size optimization |
-| `statsd_in` decode 1 DogStatsD event line (`_e{...}`, `TEXT` with nothing to unescape) | **2** | same as `statsd_in` decode 1 line -- `parse_event`'s `unescape_event_text` takes its zero-copy `slice_of` path, so an event costs nothing beyond the per-line/per-batch `Vec<Event>` pair every statsd line pays |
+| `statsd_in` decode 1 DogStatsD event line (`_e{...}`, `TEXT` with nothing to unescape) | **2** | same as `statsd_in` decode 1 line -- `parse_event`'s `unescape_event_text` takes its zero-copy `subslice::share` path, so an event costs nothing beyond the per-line/per-batch `Vec<Event>` pair every statsd line pays |
 | `statsd_in` decode 1 DogStatsD event line (`TEXT` with one `\n` escape) | **3** | 2 as above + 1 -- the decoded length is known up front (each two-byte escape becomes one byte), so `unescape_event_text` sizes its `Vec` exactly and `Bytes::from(Vec<u8>)` takes its `len == capacity` promotion path: one allocation, no realloc, no second eager control-block alloc of the kind a slack-capacity `String::replace` result would cost |
 | `statsd_in` decode 1 DogStatsD service check line (`_sc\|...`) | **2** | same as `statsd_in` decode 1 line -- every `statsd.service_check.*` carrier is a zero-copy datagram slice, same shape as an ordinary metric line's tags |
 | `statsd_in` decode 1 line with a repeated tag key | **4** | ADR `statsd-output`'s amendment -- 2 as `statsd_in` decode 1 line + 2: `insert_tags` builds the `Value::Array`'s `Vec` spine (`vec![existing, value]`), and `build_event`'s `attributes.clone()` -- run once even on a single-value line -- deep-copies that spine again for the `Event`. A scalar tag's share of that clone is a `Bytes` refcount bump; the `Array` is the one attribute shape whose clone allocates |
@@ -234,10 +234,11 @@ line.
 | `collectd_in` decode a 25-list datagram | **1** | + 3 reallocs (`Vec<Event>` growing 4 → 8 → 16 → 32); a collectd datagram has no header naming its value-list count, so `decode_into` cannot size the `Vec` up front |
 | `collectd_in` decode 1 three-data-source list, `types_db` resolving its names | **2** | **the same as without a `types.db`** -- the lookup is one `HashMap::get` per Values part returning a borrowed slice, and resolved names go into the same reused scratch `String` before interning |
 | `graphite_in` decode 1 plaintext line | **1** | just the `Vec<Event>`, same as `syslog_in`/`collectd_in` -- the path is interned, the value is an `f64` in the record, and one `Gauge` fits `MetricList`'s inline capacity |
-| `graphite_in` decode 1 tagged line (2 carbon tags) | **1** | **the same as untagged** -- every tag value is a zero-copy `Bytes::slice` of the datagram (`logit_proto::graphite::decode`'s `slice_of`, the trick `statsd_in`'s own `slice_of` plays) and two entries still fit `AttrMap`'s inline capacity |
+| `graphite_in` decode 1 tagged line (2 carbon tags) | **1** | **the same as untagged** -- every tag value is a zero-copy `Bytes::slice` of the datagram (`logit_core::subslice::share`, the helper `statsd_in` and `syslog_in` use too) and two entries still fit `AttrMap`'s inline capacity |
 | `graphite_in` `decode_into` into a warm buffer | **0** | ADR `decoupled-listener-io` -- nothing at all is left once the caller's `Vec<Event>` keeps its capacity, on the TCP path (the shared `logit-inputs/src/tcp.rs` driver's per-connection `scratch`) as much as the UDP one |
 | `graphite_in` decode a 25-line datagram | **1** | + 3 reallocs (`Vec<Event>` growing 4 → 8 → 16 → 32); a carbon datagram has no header naming its line count, so `decode_into` cannot size the `Vec` up front -- the same shape as `collectd_in`'s 25-list row |
 | `graphite_in` decode a 100-datapoint pickle frame | **1** | + 5 reallocs (4 → 8 → … → 128). The restricted pickle reader's stack, arenas and memo are decoder *fields*, cleared per frame rather than rebuilt (`logit_proto::graphite::pickle::PickleReader`), so walking a hundred datapoints through the stack machine allocates nothing of its own -- which is exactly why they are fields |
+| `graphite_in` decode a 100-datapoint protocol-0 pickle frame, every path escaped | **1** | + 5 reallocs, the same as protocol 2. Each escaped path decodes into the reader's scratch, a decoder field cleared per frame like the arenas, so a warm frame reuses it |
 | `prometheus_in` decode 1 scrape (11 series: 2 counter families, 1 gauge, 1 histogram, 1 summary) | **161** | `text::parse_with` + `families_to_events`, no `Decoder` trait (ADR `prometheus-scrape-and-exposition`'s "No `logit_proto::Encoder`") -- ~14.6/series, dominated by one `String`/`AttrMap` per label pair (labels are decoded as owned `String`s, not sliced from the scrape body, unlike syslog/statsd's zero-copy `Bytes` fields) plus one `Vec` per family's series list; not yet optimized the way syslog/statsd's decode paths were, tracked as follow-up work rather than fixed here |
 | `prometheus_in` decode 1 remote-write 1.0 request (100 gauge series) | **1526** | `remote_write::decode` alone -- Snappy and HTTP are the receiver's, and `families_to_events` is the scrape row's -- over `fixtures::remote_write_request_v1`. ~15.3/series, the same order as the scrape row above and for the same reason: labels become owned `String`s rather than slices of the request, one `Vec`/`HashMap` entry per series in the shared assembler, and one `Vec` per family. Prost decoding the request into owned protobuf structs is part of it (~200 `String`s for 100 two-label series); a borrowing decoder would be a different codec, not a tuning of this one. Not yet optimized, tracked as follow-up work alongside the two scrape/exposition rows |
 | `prometheus_in` decode 1 remote-write 2.0 request (100 gauge series) | **1428** | the same request through 2.0's symbol table, and **cheaper** than 1.0 by ~1/series. Both versions build the same owned label pairs for the model, so the win is upstream of this codec, in what prost materializes: 1.0 decodes a `Label { name, value }` per label per series, 2.0 decodes the table once (~105 `String`s) and the references as plain `u32`s. 2.0's per-series `Metadata` -- repeated on every one of a family's series -- costs nothing, because declarations are deduplicated by family name before any timestamp group opens. This row was 1624 before that dedupe, when each repeat also fired a bogus `skipped{reason="duplicate_metadata"}`; the number and the counter were wrong together |
@@ -252,7 +253,7 @@ line.
 | `regex` parse 1 event (sshd shape, 3 captures onto 6 existing `syslog.*` attrs) | **1** | spills past `AttrMap`'s 8-entry inline capacity |
 | `regex` no match, 1 event | **0** | nothing written, nothing allocated |
 | `csv` parse + merge (7-column access line, one quoted-but-unescaped field) | **0** | interned columns, `insert_sym`, `Bytes::slice` throughout -- fits `AttrMap`'s inline capacity |
-| `csv` parse + merge (one doubled-quote field) | **1** | `unescape`'s own copy -- the only path in `csv` that allocates (`crates/logit-transforms/src/csv.rs`) |
+| `csv` parse + merge (one doubled-quote field) | **1** | `unescape`'s own copy -- the only path in `csv` that allocates (`crates/logit-proto/src/message/csv.rs`) |
 | `csv` parse + merge (16-column wide row) | **1** | `AttrMap` inline-capacity spill only -- every field itself is still a zero-copy slice |
 | `kv_metrics` derive 4 metrics | **1** | the `MetricList` spill, grown once via `reserve`; was 3 while each distribution sketched per event -- they are raw inline `MetricKind::Samples` now ([ADR `kv-metrics-semantics`](../adr/kv-metrics-semantics.md)) |
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
@@ -273,6 +274,7 @@ line.
 | `timestamp` resolving a `%d/%b/%Y:%H:%M:%S %z` pattern | **0** | the pattern was compiled at construction and is matched against the string without a scratch buffer; the source removal is the same in-place shift ([ADR `timestamp-transform`](../adr/timestamp-transform.md)) |
 | `http_access` ignores an event with no log (metric-only event) | **0** | `process` returns before touching anything -- the design's own contract, measured |
 | `http_access` normalize a conforming semconv line, warm | **0** | every output is a pre-built `Value` (a config-derived one built once in `HttpAccess::new`, a `static_str`/`format!` cell filled on its first use) cloned by refcount thereafter -- the `shared()` promotion trick (`crates/logit-transforms/src/http_access.rs`'s doc comment) holds exactly as designed: nothing here clones an unpromoted `Bytes` |
+| `http_access` derive `http.response.status_class` (`status_class: true`), warm | **0** | the six class values are `static_str` cells built in `HttpAccess::new` and cloned by refcount, and the fixture's `AttrMap` already has room for the one added attribute; with `status_class` off, the warm conforming-line row above is unchanged |
 | `http_access` normalize a conforming semconv line, cold (fresh component, no warm-up call) | **228** | not `http_access.rs`'s own doing: the `regex` crate lazily builds a per-compiled-pattern, per-thread search cache (`regex-automata`'s pooled `Cache`) on a pattern's *first* `is_match`/`captures_read`, then reuses it for free -- the warm row above is what "scanned with `is_match`, which allocates nothing" (the module doc's own claim) means in steady state. This fixture's UA matches `browser`, the last of the four built-in classifier rules, so all four run cold (176, confirmed in isolation); its path matches none of the four route rules, so all four of those also run cold, plus the one `format!`+`shared()` pair that fills this `(method, route)`'s `span.name` cell (52, confirmed in isolation) -- 176 + 52 = 228. A real process pays this once per compiled pattern, not once per event |
 | `http_access` normalize a dashed-alias line, warm | **0** | identical to the dotted-line warm row -- `dealias` renames every dashed key present to its dotted form (`AttrMap::remove_sym` + `insert_sym`, both in-place) before step 1 ever runs, so the rest of the pipeline sees the same attributes either way and the alias path costs nothing extra |
 | `http_access` cleans one control byte in `user_agent.original` | **2** | not the module doc's "one exact-size copy" -- warmed only on a clean line, so this component's `scratch: Vec<u8>` (`HttpAccess::new`'s `Vec::new()`) has never grown when the dirty branch first runs. `cap_and_clean`'s clean-up pays for two distinct things here: `scratch.extend` growing that Vec from nothing (a real `alloc`, no prior buffer to `realloc`), then `Bytes::copy_from_slice(scratch)` copying the cleaned bytes out into the new `Value`. Confirmed by isolation: pre-warming `scratch` with one earlier dirty event drops this to exactly **1** -- the steady-state cost, paid once per process (or per query-redaction/control-byte shape) rather than once per event |
@@ -748,18 +750,18 @@ a field parsed out of a socket read buffer is a refcounted slice of that buffer,
 allocation. The datagram decoders keep that commitment (§2's decode rows); `statsd_in` broke it
 until §8 item 3 fixed it.
 
-`syslog_in` is the exemplar. `slice_of` rebuilds a `Bytes` for each extracted field by pointer
-arithmetic back into the datagram, so decoding a line costs exactly one allocation (the `Vec`)
+`syslog_in` is the exemplar. `logit_core::subslice::share` rebuilds a `Bytes` for each extracted
+field as a range-checked slice of the datagram, so decoding a line costs exactly one allocation (the `Vec`)
 however many fields it yields. `crates/logit-bench`'s `syslog_fields_share_the_datagram_allocation`
 asserts this structurally, not just by count. `json` continues it: `ValueSeed` deserializes straight
-into `Value` with no intermediate `serde_json::Value` tree, and `borrowed_str_bytes` keeps an
+into `Value` with no intermediate `serde_json::Value` tree, and the same `share` keeps an
 unescaped string a slice of the message buffer, copying only a string serde had to unescape.
 
 `statsd_in` used to build attribute values with `attributes.insert(k, v)` on a `&str`, which went
 through `impl From<&str> for Value` → `Value::str` → `Bytes::from(String)`, copying bytes already in
 the datagram; `build_event`'s `attributes.clone()` then promoted each to a shared `Bytes`, a second
-copy. That was six of the pre-fix eight allocations. It now uses `syslog.rs`'s `slice_of`
-reconstruction, asserted structurally by `crates/logit-bench`'s
+copy. That was six of the pre-fix eight allocations. It now uses the same
+`logit_core::subslice::share` reconstruction, asserted structurally by `crates/logit-bench`'s
 `statsd_tag_values_share_the_datagram_allocation` (which replaced
 `statsd_tag_values_are_copied_not_sliced`). The 2 remaining allocations are a `Vec<Event>` per line
 plus one for the batch: the same irreducible pair `syslog_in` has, split across two `Vec`s because
@@ -989,10 +991,11 @@ Two facts bound how much that matters:
 So the exposure is narrow: **a string used in key or metric-name position that never repeats.** In
 practice that means:
 
-- **statsd metric names** (`intern(name)` in `statsd.rs`'s `build_event`), which are
-  client-controlled and where putting an id in the name is a well-worn anti-pattern:
-  `user.<id>.logins`, `deploys.<sha>`, `orders.<order_id>.latency`. One such client is enough.
-- Secondarily, **JSON object keys** from log bodies (`json.rs`) when a producer puts data in key
+- **statsd metric names** (`intern(name)` in `crates/logit-proto/src/statsd/decode.rs`'s
+  `build_event`), which are client-controlled and where putting an id in the name is a well-worn
+  anti-pattern: `user.<id>.logins`, `deploys.<sha>`, `orders.<order_id>.latency`. One such client is
+  enough.
+- Secondarily, **JSON object keys** from log bodies (`logit_proto::message::json`) when a producer puts data in key
   position (`{"req_a1b2c3": {...}}`), and **DogStatsD tag keys** for the same reason. Both are
   schema-shaped in normal use and unbounded only when abused.
 
@@ -1385,7 +1388,7 @@ other docs cite items by number.
 2. ~~**Make `AttrMap::get` non-interning.**~~ **Done**: `AttrMap::get`/`remove` probe via
    `interner::lookup` instead of `intern`, closing both the CPU cost and the theoretical growth
    path (§4). It also added `interner::len()`, needed to test the fix.
-3. ~~**Give `statsd_in` the `slice_of` treatment.**~~ **Done**: 8 → 2 allocations per line (§2's
+3. ~~**Give `statsd_in` the zero-copy treatment.**~~ **Done**: 8 → 2 allocations per line (§2's
    zero-copy section). `statsd_in` keeps the same zero-copy promise `syslog_in` does.
 4. ~~**Trim `json`'s allocations.**~~ **Done, further than scoped**: 7 → 1 for the nginx shape,
    and 1 for a 28-field wide-JSON line too (§2). The plan was a checkpoint-and-rollback scheme over

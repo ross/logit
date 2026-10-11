@@ -4,7 +4,7 @@
 //! events, service checks").
 //!
 //! An event decodes to exactly the [`Event::log`] `statsd_in`'s DogStatsD `_e{...}` parser builds
-//! (`crates/logit-inputs/src/statsd.rs`'s `parse_event`): the same `statsd.event.*` attribute
+//! (`crates/logit-proto/src/statsd/decode.rs`'s `parse_event`): the same `statsd.event.*` attribute
 //! names, the same `alert_type` → severity mapping, the text as a `Raw` `Str` message. A
 //! DogStatsD event and a Datadog-API event are indistinguishable in the model, so either one
 //! re-encodes on either route.
@@ -28,7 +28,8 @@ use serde_json::{Map, Value as Json};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-/// `statsd_in`'s event attribute names (`crates/logit-inputs/src/statsd.rs`), reused verbatim.
+/// `statsd_in`'s event attribute names (`crates/logit-proto/src/statsd/decode.rs`), reused
+/// verbatim.
 pub const ATTR_EVENT_TITLE: &str = "statsd.event.title";
 pub const ATTR_EVENT_PRIORITY: &str = "statsd.event.priority";
 pub const ATTR_EVENT_HOST: &str = "statsd.event.host";

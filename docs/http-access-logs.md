@@ -263,6 +263,7 @@ put `keep_values` after this component if that matters. See "Doing some of it se
 | `error.type` | The status as a decimal string, 5xx only. |
 | `span.name` | `{method} {route}`, or the method alone when no route was written; `HTTP` stands in for `_OTHER` (`HTTP {route}`, `HTTP`). |
 | `span.status` | `error` for a 5xx or a `0` status, `unset` otherwise — **never `ok`**, which semconv reserves for an explicit override. |
+| `http.response.status_class` | Only under [`status_class: true`](#status_class): `1xx` to `5xx` from the integer `http.response.status_code`, or `unknown` for any other number, including the `0` that nginx's `000` becomes. A line with no status gets none. |
 | `http.request.method_original` | The raw method, only when it fell outside the known set. |
 | `span.duration_s` | Mirrored from `http.request.duration_s` **unless** the line already states a span duration (any `span.duration*`) or states both a start and an end. A lone end (nginx's `$msec`) or a lone start (HAProxy's `request_date(us)`) is exactly what the mirror is for: without it, `trace_context` would borrow the event's receipt time for the missing bound. |
 
@@ -994,10 +995,23 @@ rather than append to one the client sent. Any client that reaches the server di
 header the proxy keeps, can name any address as `client.address`. There's no trusted-proxy list
 or hop count (see [What it does not do](#what-it-does-not-do)).
 
+### `status_class:`
+
+```yaml
+status_class: true
+```
+
+Off by default. Derives `http.response.status_class` from `http.response.status_code`: `1xx`,
+`2xx`, `3xx`, `4xx`, or `5xx` for a status from 100 to 599, and `unknown` for any other number.
+The name is `logit`'s own, because semconv has no status-class attribute. Use it when you tag
+metrics by class rather than by every status code. It's opt-in because it adds one attribute to
+every event, which widens an `aggregate` series key or a sink's tag set whether or not you use
+it. Like every derived field, it's filled only when absent, so a class your server sent is kept.
+
 ## Bounding cardinality
 
 `http_access` bounds what it *derives*: `http.route`, `user_agent.class`, `span.name`,
-`span.status`, and `error.type` only ever take values from your config, a built-in table, or a
+`span.status`, `error.type`, and `http.response.status_class` only ever take values from your config, a built-in table, or a
 closed range, so they can go straight into an `aggregate` series key or a span name.
 
 It doesn't bound what it only caps. `server.address`, `client.address`, `upstream.address`,

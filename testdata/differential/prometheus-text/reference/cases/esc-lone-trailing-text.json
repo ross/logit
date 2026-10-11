@@ -1,0 +1,26 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "ok"
+    ]
+   ],
+   "name": "e",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": {
+  "after_entry": 1,
+  "message": "expected label value, got \"\\\"open\\\\\\\"} 1\\n\\n\" (\"INVALID\") while parsing: \"f{a=\\\"open\\\\\\\"} 1\\n\\n\""
+ },
+ "input": {
+  "crc32c": "0x2cd74998",
+  "len": 27,
+  "path": "differential/prometheus-text/cases/esc-lone-trailing-text.txt"
+ },
+ "parser": "prom"
+}

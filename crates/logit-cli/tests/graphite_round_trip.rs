@@ -22,14 +22,16 @@
 //! - `pickle-protocol-2`/`pickle-protocol-5` are real CPython `pickle.dumps(...,
 //!   protocol=2)`/`protocol=-1` dumps of `[('sys.cpu', (1700000000, 0.5))]`, the same bytes as
 //!   `crates/logit-proto/src/graphite/pickle.rs`'s `CPYTHON_PROTOCOL_2`/`CPYTHON_PROTOCOL_5`,
-//!   framed with carbon's 4-byte big-endian length prefix.
+//!   framed with carbon's 4-byte big-endian length prefix. `pickle-protocol-0` is the same list
+//!   at `protocol=0`, from Python 3.14.7, framed the same way.
 //! - `sanitizer-path`/`sanitizer-tag` are pinned by [`every_committed_in_file_matches_its_builder`]
 //!   against the test-side [`PickleBuilder`], which is independent of
 //!   `logit_proto::graphite::pickle`'s writer: a fixture built by the encoder's own code couldn't
 //!   show the encoder writes what a real payload decodes to.
 //!
-//! The `.expected` of both CPython cases and of `plaintext-to-pickle` is the same canonical pickle
-//! rendering, whichever dialect decoded the datapoint (normalization 2).
+//! The `.expected` of the three CPython cases and of `plaintext-to-pickle` is the same canonical
+//! pickle rendering, whichever dialect or pickle protocol decoded the datapoint (normalizations 2
+//! and 13).
 //!
 //! ## Per-fixture normalizations
 //!
@@ -42,7 +44,7 @@
 //! | `duplicate-tag-key` | **5** | `k=1;k=2` decodes to `k=2` (last wins), and relays that way |
 //! | `fractional-timestamp` | **6** | `1700000000.75` keeps its sub-second on decode and leaves as `1700000000` |
 //! | `tags-drop` | **11** | a tagged line under `tags: drop` loses its tag segment |
-//! | `pickle-protocol-2`/`pickle-protocol-5` | **2** | a CPython dump (protocol 2, and protocol -1's `FRAME`/`SHORT_BINUNICODE`/`MEMOIZE` shape) relays as the canonical pickle rendering |
+//! | `pickle-protocol-0`/`pickle-protocol-2`/`pickle-protocol-5` | **13** | a CPython dump (protocol 0's text opcodes, protocol 2, and protocol -1's `FRAME`/`SHORT_BINUNICODE`/`MEMOIZE` shape) relays as the canonical pickle rendering |
 //! | `plaintext-to-pickle` | **2** | the same datapoint as a plaintext line relays to the same canonical pickle bytes: the model keeps no dialect memory |
 //! | `many-lines` | **1** | five lines relay unchanged in one UDP datagram under the default cap |
 //! | `repacked-at-512` | **1** | 40 lines in one UDP datagram split into >=2 datagrams under a 512-byte cap; no `.expected`, since the boundaries may move |
@@ -506,7 +508,7 @@ async fn tags_drop_removes_the_tag_segment_entirely() {
     assert_eq!(captured[0], expected);
 }
 
-// -- pickle dialect (normalization 2) ----------------------------------------------------------
+// -- pickle spelling (normalization 13) --------------------------------------------------------
 
 /// A CPython pickle dump relays as the canonical pickle rendering, with decode equality.
 async fn assert_pickle_dialect_case(fixture: &str, decoder: impl Fn(&[u8]) -> EventBatch) {
@@ -523,6 +525,11 @@ async fn assert_pickle_dialect_case(fixture: &str, decoder: impl Fn(&[u8]) -> Ev
     assert_eq!(captured.len(), 1, "{fixture}: one TCP connection, one write");
     assert_eq!(captured[0], expected, "{fixture}: canonical pickle rendering");
     assert_eq!(decoded, batch, "{fixture}: decode(sink_output) should equal the original decode");
+}
+
+#[tokio::test]
+async fn pickle_protocol_0_decodes_and_relays_as_canonical_pickle() {
+    assert_pickle_dialect_case("pickle-protocol-0", direct_pickle_batch).await;
 }
 
 #[tokio::test]

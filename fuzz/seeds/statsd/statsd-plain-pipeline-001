@@ -1,0 +1,8 @@
+app.checkout_api.web_07.us_east_1.users.active:2665|s
+app.checkout_api.web_07.us_east_1.http.healthz.200.count:1|c
+app.checkout_api.web_07.us_east_1.http.healthz.duration:23.483177|ms
+app.checkout_api.web_07.us_east_1.render.calls:1|c|@0.5
+app.checkout_api.web_07.us_east_1.http.api.v1.checkout.400.count:1|c
+app.checkout_api.web_07.us_east_1.http.api.v1.checkout.duration:64.932081|ms
+app.checkout_api.web_07.us_east_1.render.calls:1|c|@0.5
+app.checkout_api.web_07.us_east_1.http.api.v1.users.200.count:1|c

@@ -17,8 +17,8 @@
 //! `operator-declared-resource-attributes`' rule).
 //!
 //! **Derived attributes are fill-only.** `http.route`, `span.name`, `span.status`, `error.type`,
-//! `user_agent.class`, `user_agent.synthetic.type`, and the `span.duration_s` mirror are written
-//! only when absent (by [`present`]'s rule), so a value computed server-side (a real router's
+//! `user_agent.class`, `user_agent.synthetic.type`, the `span.duration_s` mirror, and, under
+//! `status_class:`, `http.response.status_class` are written only when absent (by [`present`]'s rule), so a value computed server-side (a real router's
 //! `http.route`, an application's `span.status`) wins. There is no `overwrite:` option. The one
 //! exception is `forwarded:`, an opt-in to *replace* `client.address` and `client.port` as a pair
 //! with the client the named forwarding header names, parsed by `logit_proto::forwarded` (a
@@ -31,8 +31,8 @@
 //! second.
 //!
 //! **Every value this component writes derives from config or a built-in table, never a capture
-//! of the input**: every `http.route`, `user_agent.class`, `span.name`, `span.status`, and
-//! `error.type` comes from config, a built-in table, or a closed numeric range. The one exception
+//! of the input**: every `http.route`, `user_agent.class`, `span.name`, `span.status`,
+//! `error.type`, and `http.response.status_class` comes from config, a built-in table, or a closed numeric range. The one exception
 //! is a `span.name` built around a producer-sent `http.route`, which is as bounded as that route.
 //! A producer's own derived values are the producer's; `keep_values` bounds them if needed. Any
 //! change here must keep that property.
@@ -84,6 +84,7 @@ const UA_CLASS: &str = "user_agent.class";
 const UA_SYNTHETIC: &str = "user_agent.synthetic.type";
 const ROUTE: &str = "http.route";
 const ERROR_TYPE: &str = "error.type";
+const STATUS_CLASS: &str = "http.response.status_class";
 const SPAN_NAME: &str = "span.name";
 const SPAN_STATUS: &str = "span.status";
 const SPAN_DURATION_S: &str = "span.duration_s";
@@ -323,6 +324,7 @@ pub struct HttpAccessConfig {
     pub max_length: Vec<(String, usize)>,
     pub redact_query: Vec<String>,
     pub forwarded: Option<ForwardedHeader>,
+    pub status_class: bool,
 }
 
 // -- Pre-built state --------------------------------------------------------------------------
@@ -363,6 +365,7 @@ struct Keys {
     ua_synthetic: Key,
     route: Key,
     error_type: Key,
+    status_class: Key,
     span_name: Key,
     span_status: Key,
     span_duration_s: Key,
@@ -392,6 +395,7 @@ impl Keys {
             ua_synthetic: Key::new(UA_SYNTHETIC),
             route: Key::new(ROUTE),
             error_type: Key::new(ERROR_TYPE),
+            status_class: Key::new(STATUS_CLASS),
             span_name: Key::new(SPAN_NAME),
             span_status: Key::new(SPAN_STATUS),
             span_duration_s: Key::new(SPAN_DURATION_S),
@@ -423,6 +427,7 @@ fn canonical_names() -> impl Iterator<Item = &'static str> {
         UA_SYNTHETIC,
         ROUTE,
         ERROR_TYPE,
+        STATUS_CLASS,
         SPAN_NAME,
         SPAN_STATUS,
         SPAN_DURATION_S,
@@ -640,6 +645,9 @@ pub struct HttpAccess {
     router: Router,
     span_names: SpanNames,
     error_types: ErrorTypes,
+    /// `1xx` through `5xx`, then `unknown`, indexed by [`status_class_index`]; `None` when
+    /// `status_class:` is off.
+    status_classes: Option<[Value; 6]>,
     span_error: Value,
     span_unset: Value,
     other_method: Value,
@@ -653,6 +661,16 @@ pub struct HttpAccess {
     scratch: Vec<u8>,
     telemetry: Telemetry,
     diag: Diagnostics,
+}
+
+/// The index into `HttpAccess::status_classes`: the hundreds digit for 100 to 599, else 5
+/// (`unknown`).
+fn status_class_index(status: i64) -> usize {
+    if (100..=599).contains(&status) {
+        (status / 100 - 1) as usize
+    } else {
+        5
+    }
 }
 
 impl HttpAccess {
@@ -678,6 +696,9 @@ impl HttpAccess {
             router,
             span_names,
             error_types: ErrorTypes::new(),
+            status_classes: config
+                .status_class
+                .then(|| ["1xx", "2xx", "3xx", "4xx", "5xx", "unknown"].map(static_str)),
             span_error: static_str("error"),
             span_unset: static_str("unset"),
             other_method: static_str(OTHER_METHOD),
@@ -1272,7 +1293,7 @@ impl HttpAccess {
     }
 
     /// Step 9, each attribute written only when the producer didn't send it (by [`present`]'s
-    /// rule): `error.type` (the status, 5xx only), `span.status` (`error` for 5xx or `0`, else
+    /// rule): `http.response.status_class` (only under `status_class:`), `error.type` (the status, 5xx only), `span.status` (`error` for 5xx or `0`, else
     /// `unset`; never `ok`, which semconv reserves for an explicit override, though a producer's
     /// own `ok` is honoured even on a 5xx), `span.name` (`{method} {route}`, or the method
     /// alone), and the `span.duration_s` mirror. Its `forwarded:` half is
@@ -1283,6 +1304,15 @@ impl HttpAccess {
         let telemetry = &self.telemetry;
         if let Some(&Value::I64(status)) = attrs.get_sym(keys.status.sym) {
             let server_error = (500..=599).contains(&status);
+            if let Some(classes) = &self.status_classes {
+                if present(attrs, keys.status_class.sym).is_none() {
+                    attrs.insert_sym(
+                        keys.status_class.sym,
+                        classes[status_class_index(status)].clone(),
+                    );
+                    count(telemetry, DERIVED, keys.status_class.name);
+                }
+            }
             if server_error && present(attrs, keys.error_type.sym).is_none() {
                 attrs.insert_sym(keys.error_type.sym, self.error_types.get(status));
                 count(telemetry, DERIVED, keys.error_type.name);
@@ -2248,6 +2278,85 @@ mod tests {
         }
         let event = run(&mut t, &[("http.response.status_code", s("503"))]);
         assert_eq!(get(&event, "error.type"), Some(&s("503")), "the cached cell again");
+    }
+
+    fn with_status_class() -> HttpAccess {
+        http(HttpAccessConfig { status_class: true, ..config() })
+    }
+
+    #[test]
+    fn status_class_is_the_hundreds_digit_across_every_boundary() {
+        let mut t = with_status_class();
+        for (status, want) in [
+            (100, "1xx"),
+            (199, "1xx"),
+            (200, "2xx"),
+            (299, "2xx"),
+            (300, "3xx"),
+            (399, "3xx"),
+            (400, "4xx"),
+            (499, "4xx"),
+            (500, "5xx"),
+            (599, "5xx"),
+            (0, "unknown"),
+            (99, "unknown"),
+            (600, "unknown"),
+            (-1, "unknown"),
+        ] {
+            let event = run(&mut t, &[("http.response.status_code", Value::I64(status))]);
+            assert_eq!(get(&event, "http.response.status_class"), Some(&s(want)), "{status}");
+        }
+    }
+
+    #[test]
+    fn status_class_reads_the_coerced_status() {
+        let mut t = with_status_class();
+        for (status, want) in [("503", "5xx"), ("000", "unknown")] {
+            let event = run(&mut t, &[("http.response.status_code", s(status))]);
+            assert_eq!(get(&event, "http.response.status_class"), Some(&s(want)), "{status}");
+        }
+    }
+
+    #[test]
+    fn status_class_is_not_written_without_a_numeric_status() {
+        let mut t = with_status_class();
+        for pairs in [
+            vec![("http.request.method", s("GET"))],
+            vec![("http.response.status_code", s(""))],
+            vec![("http.response.status_code", s("-"))],
+            vec![("http.response.status_code", s("abc"))],
+        ] {
+            let event = run(&mut t, &pairs);
+            assert_eq!(get(&event, "http.response.status_class"), None, "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn a_status_class_the_producer_sent_is_kept() {
+        let event = run(
+            &mut with_status_class(),
+            &[
+                ("http.response.status_code", Value::I64(503)),
+                ("http.response.status_class", s("custom")),
+            ],
+        );
+        assert_eq!(get(&event, "http.response.status_class"), Some(&s("custom")));
+    }
+
+    #[test]
+    fn the_status_class_derived_counter_counts_only_a_class_it_wrote() {
+        let (mut t, registry, _) =
+            instrumented(HttpAccessConfig { status_class: true, ..config() });
+        run(&mut t, &[("http.response.status_code", Value::I64(200))]);
+        run(&mut t, &[("http.response.status_code", Value::I64(503)), (STATUS_CLASS, s("x"))]);
+        let events = registry.drain(0);
+        assert_eq!(counter(&events, DERIVED, Some(("field", STATUS_CLASS))), 1.0);
+    }
+
+    #[test]
+    fn status_class_is_off_by_default() {
+        let event = run(&mut bare(), &[("http.response.status_code", Value::I64(200))]);
+        assert_eq!(get(&event, "http.response.status_class"), None);
     }
 
     /// A lone start or end gets the mirror; a stated duration, or a start and an end, doesn't.

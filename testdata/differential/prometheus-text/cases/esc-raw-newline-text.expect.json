@@ -1,0 +1,18 @@
+{
+ "divergence": "a raw newline inside a label value: Prometheus's text 0.0.4 lexer reads across it, this decoder splits lines first (docs/known-gaps/mappings.md: A line Prometheus's text parser keeps that this decoder skips)",
+ "divergent": [
+  [
+   "f",
+   [
+    [
+     "a",
+     "x\ny"
+    ]
+   ]
+  ]
+ ],
+ "result": "ok",
+ "skips": {
+  "malformed_line": 2
+ }
+}

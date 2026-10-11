@@ -1,0 +1,63 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "req",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "1"
+    ]
+   ],
+   "name": "req_total",
+   "ts_ms": 1605281325500,
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "1"
+    ]
+   ],
+   "name": "req_created",
+   "value": "0x41d7eba98b47df3b"
+  },
+  {
+   "kind": "type",
+   "name": "lat",
+   "value": "summary"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "lat_count",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "lat_sum",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "lat_created",
+   "value": "0x41d7eba98b400000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xb0f3e8ec",
+  "len": 158,
+  "path": "differential/prometheus-text/cases/om-created.om"
+ },
+ "parser": "openmetrics"
+}

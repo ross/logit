@@ -17,6 +17,8 @@ libfuzzer-sys = "0.4"
 bytes = "1"
 logit-core = { path = "../crates/logit-core" }
 logit-proto = { path = "../crates/logit-proto" }
+prost = "0.14"
+serde_json = "1"
 
 # Symbols in a crash's stack trace.
 [profile.release]
@@ -107,6 +109,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "prom_text"
+path = "fuzz_targets/prom_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "proxy_header"
 path = "fuzz_targets/proxy_header.rs"
 test = false
@@ -116,6 +125,76 @@ bench = false
 [[bin]]
 name = "forwarded"
 path = "fuzz_targets/forwarded.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_framing"
+path = "fuzz_targets/stream_framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "statsd"
+path = "fuzz_targets/statsd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "syslog"
+path = "fuzz_targets/syslog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "graphite_plaintext"
+path = "fuzz_targets/graphite_plaintext.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "graphite_pickle"
+path = "fuzz_targets/graphite_pickle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "collectd"
+path = "fuzz_targets/collectd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_json"
+path = "fuzz_targets/message_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_csv"
+path = "fuzz_targets/message_csv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_logfmt"
+path = "fuzz_targets/message_logfmt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_kv"
+path = "fuzz_targets/message_kv.rs"
 test = false
 doc = false
 bench = false

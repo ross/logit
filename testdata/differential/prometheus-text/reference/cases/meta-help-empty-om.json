@@ -1,0 +1,14 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [],
+ "error": {
+  "after_entry": 0,
+  "message": "expected text in HELP"
+ },
+ "input": {
+  "crc32c": "0xb8347233",
+  "len": 34,
+  "path": "differential/prometheus-text/cases/meta-help-empty-om.om"
+ },
+ "parser": "openmetrics"
+}
