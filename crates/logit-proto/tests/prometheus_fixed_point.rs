@@ -45,39 +45,12 @@ use logit_proto::prometheus::{
 };
 use proptest::prelude::*;
 
-const RECEIVED_AT: i64 = 1_700_000_000_000_000_000;
+#[path = "support/prometheus_text.rs"]
+mod fixtures;
 
-/// Every text 0.0.4 feature in one body: all five types, both metadata lines, escaping, `+Inf`,
-/// `-Inf`, a millisecond timestamp, a negative (pre-epoch) one, an implicitly-`untyped` family,
-/// blank lines and a non-metadata comment.
-const TEXT_FIXTURE: &str = concat!(
-    "# HELP requests_total Total requests.\n",
-    "# TYPE requests_total counter\n",
-    "requests_total{code=\"200\",handler=\"/\"} 1027 1395066363000\n",
-    "requests_total{code=\"500\",handler=\"/\"}    3\n",
-    "\n",
-    "# a comment that carries no metadata\n",
-    "# HELP temperature_celsius Current temperature.\n",
-    "# TYPE temperature_celsius gauge\n",
-    "temperature_celsius{room=\"kitchen\"} 21.5\n",
-    "temperature_celsius{room=\"attic\"} -Inf\n",
-    "# TYPE latency_seconds histogram\n",
-    "latency_seconds_bucket{le=\"0.1\"} 1\n",
-    "latency_seconds_bucket{le=\"1\"} 3\n",
-    "latency_seconds_bucket{le=\"+Inf\"} 4\n",
-    "latency_seconds_sum 2.5\n",
-    "latency_seconds_count 4\n",
-    "# TYPE rpc_seconds summary\n",
-    "rpc_seconds{quantile=\"0.5\"} 0.2\n",
-    "rpc_seconds{quantile=\"0.99\"} 0.9\n",
-    "rpc_seconds_sum 12.5\n",
-    "rpc_seconds_count 100\n",
-    "# TYPE build_info untyped\n",
-    "build_info{version=\"1.2.3\"} 1\n",
-    "bare_metric 42\n",
-    "escaped{path=\"C:\\\\tmp\",note=\"line\\nbreak \\\"quoted\\\"\"} 1\n",
-    "weird{problem=\"division by zero\"} +Inf -3982045\n",
-);
+use fixtures::{OPENMETRICS_FIXTURE, TEXT_FIXTURE};
+
+const RECEIVED_AT: i64 = 1_700_000_000_000_000_000;
 
 const TEXT_CANONICAL: &str = concat!(
     "# TYPE bare_metric untyped\n",
@@ -107,48 +80,6 @@ const TEXT_CANONICAL: &str = concat!(
     "temperature_celsius{room=\"kitchen\"} 21.5\n",
     "# TYPE weird untyped\n",
     "weird{problem=\"division by zero\"} +Inf -3982045\n",
-);
-
-/// Every OpenMetrics 1.0 feature in one body: the four types text 0.0.4 doesn't have, `# UNIT`,
-/// `_created`, exemplars (on a `_total` and on a `_bucket`, with and without a trace reference and a
-/// timestamp), fractional-second timestamps, and `# EOF`.
-const OPENMETRICS_FIXTURE: &str = concat!(
-    "# TYPE request_duration_seconds counter\n",
-    "# UNIT request_duration_seconds seconds\n",
-    "# HELP request_duration_seconds Total request duration.\n",
-    "request_duration_seconds_total{code=\"200\"} 1027 1395066363.5\n",
-    "request_duration_seconds_created{code=\"200\"} 1605281325.123\n",
-    "request_duration_seconds_total{code=\"500\"} 3 # {trace_id=\"0123456789abcdef0123456789abcdef\",\
-     span_id=\"fedcba9876543210\"} 0.5 1605281325.5\n",
-    "# TYPE temperature_celsius gauge\n",
-    "temperature_celsius{room=\"kitchen\"} 21.5\n",
-    "# TYPE latency_seconds histogram\n",
-    "# UNIT latency_seconds seconds\n",
-    "latency_seconds_bucket{le=\"0.1\"} 1 # {slow=\"no\"} 0.05\n",
-    "latency_seconds_bucket{le=\"1\"} 3\n",
-    "latency_seconds_bucket{le=\"+Inf\"} 4\n",
-    "latency_seconds_sum 2.5\n",
-    "latency_seconds_count 4\n",
-    "latency_seconds_created 1605281325\n",
-    "# TYPE sizes gaugehistogram\n",
-    "sizes_bucket{le=\"10\"} 5\n",
-    "sizes_bucket{le=\"+Inf\"} 7\n",
-    "sizes_gsum 300.5\n",
-    "sizes_gcount 7\n",
-    "# TYPE rpc_seconds summary\n",
-    "rpc_seconds{quantile=\"0.5\"} 0.2\n",
-    "rpc_seconds_sum 12.5\n",
-    "rpc_seconds_count 100\n",
-    "rpc_seconds_created 1605281325\n",
-    "# TYPE build info\n",
-    "# HELP build Build metadata.\n",
-    "build_info{version=\"1.2.3\"} 1\n",
-    "# TYPE state stateset\n",
-    "state{state=\"starting\"} 0\n",
-    "state{state=\"running\"} 1\n",
-    "# TYPE unannotated unknown\n",
-    "unannotated 42\n",
-    "# EOF\n",
 );
 
 const OPENMETRICS_CANONICAL: &str = concat!(

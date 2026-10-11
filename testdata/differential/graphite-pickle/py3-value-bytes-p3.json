@@ -1,0 +1,62 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "value.bytes",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x4004000000000000",
+     "repr": "2.5"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-value-bytes-p3",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "value.bytes",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "bytes": "322e35"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "The value b'2.5'.",
+ "exercises": [
+  "SHORT_BINBYTES"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "PROTO",
+  "SHORT_BINBYTES",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 3
+}

@@ -146,8 +146,8 @@ capture's and ~55 B longer than the tagless one's.
   extrapolation path is exercised.
 - **No `|c:<container-id>` segment.** The captured DogStatsD lines carry one, because the client
   detected the recording container and volunteered it. It's in the capture (and asserted by
-  `crates/logit-inputs/src/statsd.rs`'s interop tests) but deliberately not in the load model: it
-  would add a constant ~11 B to 80% of lines on the strength of one recording environment's
+  `crates/logit-proto/src/statsd/decode.rs`'s interop tests) but deliberately not in the load model:
+  it would add a constant ~11 B to 80% of lines on the strength of one recording environment's
   accident.
 
 CI checks every rendered line against the real `StatsdDecoder`

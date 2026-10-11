@@ -1,0 +1,45 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "h",
+   "value": "histogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1.0"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "5.0"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4010000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_sum",
+   "value": "0x4022000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x987d48ca",
+  "len": 71,
+  "path": "differential/prometheus-text/cases/hist-no-inf-no-count-om.om"
+ },
+ "parser": "openmetrics"
+}

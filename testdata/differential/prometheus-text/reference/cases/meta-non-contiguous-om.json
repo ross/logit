@@ -1,0 +1,45 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "a",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "a",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "b",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "b",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "x",
+     "2"
+    ]
+   ],
+   "name": "a",
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x5c3dd1b5",
+  "len": 55,
+  "path": "differential/prometheus-text/cases/meta-non-contiguous-om.om"
+ },
+ "parser": "openmetrics"
+}

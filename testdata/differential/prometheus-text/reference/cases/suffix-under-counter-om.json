@@ -1,0 +1,29 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "c",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "c_total",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "c_sum",
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x877820e1",
+  "len": 41,
+  "path": "differential/prometheus-text/cases/suffix-under-counter-om.om"
+ },
+ "parser": "openmetrics"
+}

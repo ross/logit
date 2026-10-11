@@ -6,20 +6,23 @@
 //! stack ([`super::pickle`]).
 //!
 //! **Framing is not this decoder's job.** `graphite_in`'s listener, through the shared TCP driver's
-//! `Framer` (`crates/logit-inputs/src/tcp.rs`), owns the read buffer, the `max_line_bytes` drain,
+//! [`Framer`](crate::framing::Framer), owns the read buffer, the `max_line_bytes` drain,
 //! and the 4-byte pickle length prefix. [`GraphiteDecoder::decode_into`] gets a whole UDP datagram
 //! (possibly several lines) or one delimited message: a plaintext line or an unframed pickle
 //! payload. Line splitting still runs, since a UDP datagram may carry several lines.
 //!
 //! Every tag value is a zero-copy [`Bytes::slice`] of the input (`docs/design/memory.md` §2),
 //! including on the pickle path, because [`super::pickle::PickleReader`] yields `&str`s borrowed
-//! from the same buffer.
+//! from the same buffer. The exception is a protocol-0 path the reader decoded into its scratch (a
+//! `STRING` with a backslash, or a `UNICODE` with a non-ASCII byte or a `\u`/`\U` escape):
+//! `subslice::share` copies that path's tag values.
 
 use super::pickle::PickleReader;
 use super::Protocol;
 use crate::{CodecError, Decoder};
 use bytes::Bytes;
 use logit_core::interner::{intern, KeyCache};
+use logit_core::subslice;
 use logit_core::{
     AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, Scope, Telemetry, Value,
 };
@@ -296,7 +299,8 @@ fn parse_tags<'a>(
         if attributes.get_sym(key).is_some() {
             ctx.tag_normalized_duplicate(name);
         }
-        attributes.insert_sym(key, Value::Str(slice_of(bytes, value)));
+        // `value` borrows the datagram or pickle frame, so it shares that buffer.
+        attributes.insert_sym(key, Value::Str(subslice::share(bytes, value.as_bytes())));
     }
     Some(path)
 }
@@ -338,17 +342,6 @@ fn resolve_timestamp(seconds: f64, received_at: i64, ctx: &mut Ctx) -> Option<i6
     let whole = seconds.trunc();
     let sub_nanos = ((seconds - whole) * NANOS_PER_SECOND).round() as i64;
     Some((whole as i64).saturating_mul(NANOS_PER_SECOND as i64).saturating_add(sub_nanos))
-}
-
-/// A [`Bytes`] sharing `bytes`'s allocation for `sub`.
-///
-/// Sound only because every caller's `sub` is sliced from a `&str` validated out of `bytes`, never
-/// copied, so the pointer arithmetic lands inside `bytes`. The statsd and syslog decoders have
-/// their own copies of this.
-fn slice_of(bytes: &Bytes, sub: &str) -> Bytes {
-    let base = bytes.as_ref().as_ptr() as usize;
-    let start = sub.as_ptr() as usize - base;
-    bytes.slice(start..start + sub.len())
 }
 
 /// The telemetry/diagnostics pair every skip site needs, carried together so a skip is never
@@ -669,10 +662,8 @@ mod tests {
         let Some(Value::Str(value)) = events[0].attributes.get("host") else {
             panic!("expected a Str tag value");
         };
-        let base = bytes.as_ref().as_ptr() as usize;
-        let at = value.as_ptr() as usize;
         assert!(
-            at >= base && at + value.len() <= base + bytes.len(),
+            subslice::within(&bytes, value),
             "the tag value must be a slice of the datagram, not a copy"
         );
     }
@@ -725,9 +716,7 @@ mod tests {
         let Some(Value::Str(value)) = events[0].attributes.get("host") else {
             panic!("expected a Str tag value");
         };
-        let base = frame.as_ref().as_ptr() as usize;
-        assert!((value.as_ptr() as usize) >= base);
-        assert!(value.as_ptr() as usize + value.len() <= base + frame.len());
+        assert!(subslice::within(&frame, value), "the tag value must be a slice of the frame");
     }
 
     /// `pickle.dumps([('a.b', ('1700000000', '2.5'))], protocol=2)`, generated with CPython:

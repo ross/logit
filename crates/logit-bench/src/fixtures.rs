@@ -27,20 +27,20 @@ use logit_core::{
     Resource, Samples, Scope, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Value,
 };
 use logit_inputs::generate::{GenerateInput, GenerateMetricKind};
-use logit_inputs::statsd::StatsdDecoder;
-use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
 use logit_proto::collectd::types_db::TEST_TYPES_DB;
 use logit_proto::collectd::{CollectdDecoder, TypesDb};
 use logit_proto::forwarded::ForwardedHeader;
 use logit_proto::graphite::{GraphiteDecoder, Protocol as GraphiteProtocol};
 use logit_proto::prometheus::{PrometheusDecoder, PrometheusEncoder};
+use logit_proto::statsd::StatsdDecoder;
+use logit_proto::syslog::SyslogDecoder;
 use logit_proto::Decoder;
 use logit_transforms::{
-    AggregateTemporality, Aggregator, Arrays, CsvParser, Distributions, Fields, Flatten,
-    HttpAccess, HttpAccessConfig, JsonParser, Keep, KeepValues, Kv, KvMetrics, Logfmt, MetricSpec,
-    Normalize, RegexParser, RouteRule, RouteSet, Sample, SampleField, SampleKey, SampleMissing,
-    SampleOverride, Set, Shape,
+    AggregateTemporality, Aggregator, Arrays, Bucket, BucketBound, BucketField, CsvParser,
+    Distributions, Fields, Flatten, HttpAccess, HttpAccessConfig, JsonParser, Keep, KeepValues, Kv,
+    KvMetrics, Logfmt, MetricSpec, Normalize, RegexParser, RouteRule, RouteSet, Sample,
+    SampleField, SampleKey, SampleMissing, SampleOverride, Set, Shape,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -55,8 +55,8 @@ use std::time::Duration;
 /// `fixtures/nginx/`, which `compose.yaml`'s `nginx` service runs, still has to stay real.
 /// `perf/scenarios/json-parse.yaml`'s template is still this line's JSON body.
 ///
-/// It exercises `syslog.rs`'s two-token header rule for a hostname-less line, and its body's
-/// `": "` defeats a naive "scan for the first colon-space" parse.
+/// It exercises `logit_proto::syslog`'s two-token header rule for a hostname-less line, and its
+/// body's `": "` defeats a naive "scan for the first colon-space" parse.
 pub const NGINX_SYSLOG_LINE: &str = concat!(
     "<190>Aug 31 06:52:01 nginx_access: ",
     r#"{"host":"static.local","request_method":"GET","status":200,"#,
@@ -68,7 +68,7 @@ pub const NGINX_SYSLOG_LINE: &str = concat!(
 pub const STATSD_LINE: &str = "page.views:1|c|@0.5|#env:prod,region:us-east-1,service:web";
 
 /// The same shape as [`STATSD_LINE`], except one tag key (`team`) repeats, which `insert_tags`
-/// folds into a `Value::Array` in wire order (`crates/logit-inputs/src/statsd.rs`'s "DogStatsD
+/// folds into a `Value::Array` in wire order (`crates/logit-proto/src/statsd/mod.rs`'s "DogStatsD
 /// tags" section). The plain `env:prod` tag stays so the measurement is the repeated key's cost on
 /// top of an ordinary tagged counter.
 pub const STATSD_REPEATED_TAG_LINE: &str = "page.views:1|c|#env:prod,team:a,team:b";
@@ -94,7 +94,7 @@ pub const STATSD_SET_LINE: &str = "unique.users:abc123|s";
 
 /// A DogStatsD event (`_e{tlen,xlen}:title|text|...`) line whose `TEXT` has nothing to unescape,
 /// so `unescape_event_text` takes its zero-copy path. Datadog's documented example event, as
-/// `crates/logit-inputs/src/statsd.rs`'s `dogstatsd_docs_example_event_decodes` also uses.
+/// `crates/logit-proto/src/statsd/decode.rs`'s `dogstatsd_docs_example_event_decodes` also uses.
 pub const STATSD_EVENT_LINE: &str =
     "_e{21,36}:An exception occurred|Cannot parse CSV file from 10.0.0.17|t:warning|#err_type:bad_file";
 
@@ -104,8 +104,9 @@ pub const STATSD_EVENT_LINE: &str =
 pub const STATSD_EVENT_LINE_WITH_ESCAPED_NEWLINE: &str = "_e{5,12}:title|line1\\nline2";
 
 /// A DogStatsD service check (`_sc|name|status|...`) line, Datadog's documented example (as in
-/// `crates/logit-inputs/src/statsd.rs`'s `dogstatsd_docs_example_service_check_decodes`). Decodes
-/// to one [`logit_core::MetricKind::Gauge`] event plus the `statsd.service_check.*` carriers.
+/// `crates/logit-proto/src/statsd/decode.rs`'s `dogstatsd_docs_example_service_check_decodes`).
+/// Decodes to one [`logit_core::MetricKind::Gauge`] event plus the `statsd.service_check.*`
+/// carriers.
 pub const STATSD_SERVICE_CHECK_LINE: &str =
     "_sc|Redis connection|2|#env:dev|m:Redis connection timed out after 10s";
 
@@ -323,7 +324,7 @@ pub fn graphite_tagged_datagram() -> Bytes {
 ///
 /// Unframed, because that's what [`GraphiteDecoder`] is handed. Carbon's framing (a big-endian
 /// `u32` payload length, Twisted's `Int32StringReceiver`) belongs to the listener, which strips it
-/// before calling `decode_into` (`crates/logit-inputs/src/tcp.rs`'s `Framer`).
+/// before calling `decode_into` (`logit_proto::framing::Framer`).
 ///
 /// The opcodes are hand-written rather than produced by
 /// `logit_proto::graphite::pickle::write_datapoints`, for [`collectd_part_header`]'s reason.
@@ -355,6 +356,30 @@ pub fn graphite_pickle_frame(datapoints: usize) -> Bytes {
     }
     out.push(APPENDS);
     out.push(STOP);
+    Bytes::from(out)
+}
+
+/// [`graphite_pickle_frame`]'s datapoints at protocol 0, spelled as Python 2.7.18's
+/// `cPickle.dumps(batch)` spells them (Diamond's call; `testdata/interop/graphite/
+/// graphite-pickle-py2-000.raw` is a real capture): `(lp1`, then per datapoint
+/// `(S'<path>'\np<k>\n(I<ts>\nF0.5\ntp<k+1>\ntp<k+2>\na`, then `.`.
+///
+/// Each path holds a `\x2d` escape for its `-`, so every string takes the reader's escape-decoding
+/// path into its scratch rather than the zero-copy one. cPickle writes `\x..` for a non-ASCII byte,
+/// not for `-`; the escape here exercises the same decode with an ASCII path.
+pub fn graphite_pickle_protocol_0_frame(datapoints: usize) -> Bytes {
+    let mut out = b"(lp1\n".to_vec();
+    let mut memo = 2;
+    for index in 0..datapoints {
+        let datapoint = format!(
+            "(S'servers.web\\x2d1.cpu.core{index}'\np{memo}\n(I1700000000\nF0.5\ntp{}\ntp{}\na",
+            memo + 1,
+            memo + 2
+        );
+        out.extend_from_slice(datapoint.as_bytes());
+        memo += 3;
+    }
+    out.push(b'.');
     Bytes::from(out)
 }
 
@@ -551,6 +576,22 @@ pub fn keep_values() -> KeepValues {
             Some(Value::str("other")),
         )],
     )
+}
+
+/// A `bucket` classifying `nginx_event`'s `request_time` (`0.001`) into `request_time_class`
+/// (`tests/allocations.rs`'s `bucket_one_event`): `lt: 0.1` fast, `le: 1` ok, catch-all slow.
+pub fn bucket() -> Bucket {
+    Bucket::new(vec![BucketField {
+        field: "request_time".to_string(),
+        into: "request_time_class".to_string(),
+        ranges: vec![
+            (BucketBound::Lt(0.1), "fast".to_string()),
+            (BucketBound::Le(1.0), "ok".to_string()),
+            (BucketBound::Any, "slow".to_string()),
+        ],
+        other: Some("unknown".to_string()),
+        keep_source: true,
+    }])
 }
 
 /// [`nginx_event`] with `host` uppercased, so `keep_values`' `normalize: [lower]` step has work to
@@ -1191,12 +1232,13 @@ pub fn sum_metric_event_with_spilled_attributes() -> Event {
 /// RFC 3164, with the header shape of RFC 3164 §5.4's example (`<34>` = facility `auth`(4),
 /// severity `crit`(2)), carrying an sshd authentication failure as rsyslog would forward it, with
 /// **both** hostname and `tag[pid]:`. Unlike [`NGINX_SYSLOG_LINE`]'s `nohostname` shape, this
-/// takes `parse_3164`'s other header branch (as `syslog.rs`'s
+/// takes `parse_3164`'s other header branch (as `logit_proto::syslog`'s
 /// `rfc3164_with_hostname_decodes_message_severity_and_attributes` test does) and yields six
 /// attributes (`syslog.facility`/`severity`/`timestamp`/`hostname`/`tag`/`pid`), inside the
 /// measured syslog range (`docs/design/data-shapes.md` §6).
 ///
-/// Hand-written: no live syslogd was captured. It's derived from `syslog.rs`'s decoder and tests.
+/// Hand-written: no live syslogd was captured. It's derived from `logit_proto::syslog`'s decoder
+/// and tests.
 pub const SSHD_SYSLOG_LINE: &str = "<34>Aug 31 06:52:01 auth-edge-3 sshd[8843]: Failed password \
      for invalid user admin from 203.0.113.7 port 54321 ssh2";
 
@@ -2217,15 +2259,20 @@ pub fn http_access_event_with_control_byte() -> Event {
 /// resolved as `logit-cli`'s `to_http_access_config` does rather than copied. No user-agent rules,
 /// no extra `redact_query`, no `forwarded`.
 pub fn http_access() -> HttpAccess {
-    http_access_with(None)
+    http_access_with(None, false)
+}
+
+/// [`http_access`] with `status_class: true`.
+pub fn http_access_status_class() -> HttpAccess {
+    http_access_with(None, true)
 }
 
 /// [`http_access`] with `forwarded: x_forwarded_for`.
 pub fn http_access_forwarded() -> HttpAccess {
-    http_access_with(Some(ForwardedHeader::XForwardedFor))
+    http_access_with(Some(ForwardedHeader::XForwardedFor), false)
 }
 
-fn http_access_with(forwarded: Option<ForwardedHeader>) -> HttpAccess {
+fn http_access_with(forwarded: Option<ForwardedHeader>, status_class: bool) -> HttpAccess {
     let config = HttpAccessConfig {
         routes: vec![
             RouteRule::Builtin(RouteSet::Probes),
@@ -2241,6 +2288,7 @@ fn http_access_with(forwarded: Option<ForwardedHeader>) -> HttpAccess {
             .collect(),
         redact_query: vec![],
         forwarded,
+        status_class,
     };
     HttpAccess::new(config).expect("fixture patterns should compile")
 }

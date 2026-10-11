@@ -1,0 +1,34 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "b"
+    ]
+   ],
+   "name": "g",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "g",
+   "value": "A gauge."
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x5b623542",
+  "len": 39,
+  "path": "differential/prometheus-text/cases/eof-in-text.txt"
+ },
+ "parser": "prom"
+}

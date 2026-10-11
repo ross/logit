@@ -523,7 +523,7 @@ module doc (`crates/logit-outputs/src/kafka/encode.rs`) has the per-format table
    over the cap ends the open record. The other formats drop that event and keep filling the
    record, so `native` can emit one more record than they do for the same batch.
 4. **A batch record has no key, and its timestamp is its first event's.** A key belongs to one
-   event, and a batch record's events can each have a different one. Graph rule 82 rejects any
+   event, and a batch record's events can each have a different one. Graph rule 84 rejects any
    `key` but `none` with a batch record, including `native`'s default, and its message tells the
    operator to set `record: event`. `KafkaOutput::new` refuses the same pair.
 5. **Batch record bodies, per format:** NDJSON for `json`, each line newline-terminated;
@@ -552,7 +552,7 @@ module doc (`crates/logit-outputs/src/kafka/encode.rs`) has the per-format table
    record is a one-event frame under the batch's resource and scope, through
    `logit_proto::native::encode_events`, which encodes a slice of a batch's events without
    cloning them.
-9. **No setting is ignored by a format.** Every field applies to all four formats, so rule 82
+9. **No setting is ignored by a format.** Every field applies to all four formats, so rule 84
    has no "a setting the format ignores" clause. The one combination that leaves a setting
    unused, a key with a batch record, is rejected under point 4.
 

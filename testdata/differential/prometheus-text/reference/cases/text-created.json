@@ -1,0 +1,46 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "c",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "c_total",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "c_created",
+   "value": "0x41d7eba98b600000"
+  },
+  {
+   "kind": "type",
+   "name": "d_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "d_total",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "d_created",
+   "value": "0x41d7eba98b400000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x92144fae",
+  "len": 104,
+  "path": "differential/prometheus-text/cases/text-created.txt"
+ },
+ "parser": "prom"
+}

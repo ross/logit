@@ -1,0 +1,3 @@
+# UNIT m_seconds seconds
+# TYPE m_seconds gauge
+m_seconds 1

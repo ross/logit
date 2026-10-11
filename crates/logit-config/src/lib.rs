@@ -285,6 +285,44 @@ pub struct ValueAllowList {
     pub other: Option<SetValue>,
 }
 
+/// One source field's classification, under `bucket`'s `attributes` map.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BucketSpec {
+    /// The attribute the matched range's `value` is written to. Must be non-empty. Naming the
+    /// source field itself replaces the number with its class in place. Can't name another field
+    /// this component classifies, or the `into` of another field.
+    pub into: String,
+    /// The classes, tested in order; the first range that matches wins. Must be non-empty. Every
+    /// bound must be finite, and every range must be able to match: a bound must be larger than
+    /// the bound before it, except that `le: X` may follow `lt: X` to class the value `X` alone.
+    /// A range with no bound matches any number, and is allowed only as the last range.
+    pub ranges: Vec<BucketRange>,
+    /// What `into` becomes when the source value isn't a finite number, or is a number no range
+    /// matches. Absent (the default) writes nothing in either case.
+    #[serde(default)]
+    pub other: Option<String>,
+    /// Keep the source attribute after a class is written. Defaults to `true`. `false` removes
+    /// it, unless `into` names the source field, where the class has already replaced it.
+    #[serde(default = "default_bucket_keep_source")]
+    pub keep_source: bool,
+}
+
+/// One class in a `bucket` field's `ranges` list: at most one upper bound, and the class name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BucketRange {
+    /// Matches a number strictly below this bound. Can't be set together with `le`.
+    #[serde(default)]
+    pub lt: Option<f64>,
+    /// Matches a number at or below this bound. Can't be set together with `lt`.
+    #[serde(default)]
+    pub le: Option<f64>,
+    /// The class written to `into` when this range matches. Must be non-empty. Two ranges may
+    /// write the same class.
+    pub value: String,
+}
+
 /// One entry of `http_access`'s `routes` list: either a `builtin` set, or a `match` regex with
 /// the literal `route` it assigns. Never both, and never a mix; `logit validate` names which half
 /// is missing or which key is extra. `match` is tested unanchored (unless the pattern anchors
@@ -843,7 +881,9 @@ pub enum ComponentKind {
     /// Under `transport: tcp` a message is one LF-delimited line; there is no `framing:` field
     /// and no octet-counted alternative, because a statsd line may begin with a digit. A line
     /// longer than 64 KiB is dropped and counted (`logit.input.frames.dropped{reason="oversize"}`);
-    /// the connection stays open and the next line still decodes.
+    /// the connection stays open and the next line still decodes. A line that passed 64 KiB before
+    /// its newline arrived counts `reason="drained"` instead: the connection discards input until
+    /// its next newline.
     ///
     /// `tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS
     /// listener. It applies to `transport: tcp` only and is rejected under any other transport.
@@ -1088,7 +1128,9 @@ pub enum ComponentKind {
         /// The longest line this listener accepts, not counting its `\n`, under every transport.
         /// A longer line is dropped and counted once as
         /// `logit.input.frames.dropped{reason="oversize"}`, and the line after it still decodes; a
-        /// stream connection skips to the next newline and stays open. A byte-count string
+        /// stream connection skips to the next newline and stays open, and counts
+        /// `reason="drained"` instead when the line passed this bound before its newline arrived,
+        /// because it discards input until that newline. A byte-count string
         /// (`"65536"`, `"64KiB"`). Defaults to `"64KiB"`; `0` is rejected.
         #[serde(default = "default_lines_max_line_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
@@ -1257,9 +1299,10 @@ pub enum ComponentKind {
         #[serde(default)]
         proxy_protocol: bool,
         /// The longest plaintext line this listener assembles before dropping it and draining to
-        /// the next newline (counted once as `logit.input.frames.dropped{reason="oversize"}`; the
-        /// line after it still decodes). A byte-count string (`"8192"`, `"16KiB"`). Defaults to
-        /// `"8192"`, past any real tagged path while keeping one hostile connection from growing
+        /// the next newline (counted once as `logit.input.frames.dropped{reason="oversize"}`, or
+        /// `reason="drained"` when the line passed this bound before its newline arrived; the line
+        /// after it still decodes). A byte-count string (`"8192"`, `"16KiB"`). Defaults to
+        /// `"8192"`, past any real tagged path while keeping one runaway connection from growing
         /// an unbounded read buffer. `0` is rejected. TCP plaintext only; a UDP datagram is its
         /// own frame.
         #[serde(default = "default_graphite_max_line_bytes", with = "human_bytes")]
@@ -2258,33 +2301,49 @@ pub enum ComponentKind {
     /// `keep_signals`. An event left with no payload is dropped. `signals` may not be empty (a
     /// no-op) and may not name all three signals (that would drop every event).
     DropSignals { signals: Vec<Signal> },
-    /// Forwards an event whose batch resource and/or own attributes match every configured pair,
-    /// dropping the rest. The config is `set`'s: `resource:`/`attributes:` maps of the same
-    /// literals, so this matches on what `set` can stamp. Never mutates a forwarded event.
+    /// Forwards an event whose batch resource and/or own attributes match every configured pair
+    /// and carry every listed key, dropping the rest. `resource:` and `attributes:` are `set`'s
+    /// maps of literals, so this matches on what `set` can stamp. `resource_present:` and
+    /// `attributes_present:` list keys that must exist with any value, `null` included. Never
+    /// mutates a forwarded event.
     ///
-    /// A map is a conjunction: every pair listed, across both maps, must match; there is no
-    /// `or`. A configured key the event or resource doesn't carry never matches, and "key present
-    /// with any value" is not expressible. Values coerce across numeric representations
-    /// (`status: 200` matches an integer, float, or string `200`), but a boolean never coerces,
-    /// and two strings are never compared numerically. At least one of `resource`/`attributes`
-    /// must be non-empty, every key must be non-empty, and every numeric value must be finite.
+    /// Everything configured must hold: every pair, across both maps, matches and every listed
+    /// key is present; there is no `or`. A key the event or resource doesn't carry never matches.
+    /// Values coerce across numeric representations (`status: 200` matches an integer, float, or
+    /// string `200`), but a boolean never coerces, and two strings are never compared
+    /// numerically. At least one of the four fields must be non-empty, every key must be
+    /// non-empty, every numeric value must be finite, and a key may not repeat within a list or
+    /// appear both in a map and in the matching `_present` list (the pair already requires the
+    /// key).
     HasAttributes {
         #[serde(default)]
         resource: std::collections::BTreeMap<String, SetValue>,
         #[serde(default)]
         attributes: std::collections::BTreeMap<String, SetValue>,
+        /// Batch resource keys that must exist, with any value.
+        #[serde(default)]
+        resource_present: Vec<String>,
+        /// Event attribute keys that must exist, with any value.
+        #[serde(default)]
+        attributes_present: Vec<String>,
     },
-    /// Drops an event whose batch resource and/or own attributes match every configured pair,
-    /// forwarding the rest: the complement of `has_attributes` on the same config, taken as a
-    /// whole, not per pair. An event matching some but not all configured pairs is forwarded,
-    /// and so is one that never carried a configured key; read it as "this event isn't one of
-    /// the ones told to drop", the else-branch of a `has_attributes` fan-out. Same matching rules
-    /// and validation as `has_attributes`.
+    /// Drops an event whose batch resource and/or own attributes match every configured pair and
+    /// carry every listed key, forwarding the rest: the complement of `has_attributes` on the
+    /// same config, taken as a whole, not per pair. An event matching some but not all of the
+    /// configuration is forwarded, and so is one that never carried a configured key; read it as
+    /// "this event isn't one of the ones told to drop", the else-branch of a `has_attributes`
+    /// fan-out. Same matching rules and validation as `has_attributes`.
     DropAttributes {
         #[serde(default)]
         resource: std::collections::BTreeMap<String, SetValue>,
         #[serde(default)]
         attributes: std::collections::BTreeMap<String, SetValue>,
+        /// Batch resource keys that must exist, with any value.
+        #[serde(default)]
+        resource_present: Vec<String>,
+        /// Event attribute keys that must exist, with any value.
+        #[serde(default)]
+        attributes_present: Vec<String>,
     },
     /// Clamps attribute (and/or resource-attribute) values to a per-field allow-list: `keep`'s
     /// value-side sibling, for a tag whose valid set you know but the producer doesn't enforce
@@ -2299,6 +2358,16 @@ pub enum ComponentKind {
         /// Applied per event, to `event.attributes`.
         #[serde(default)]
         attributes: std::collections::BTreeMap<String, ValueAllowList>,
+    },
+    /// Classifies a numeric attribute into a named class by range, so a number becomes a
+    /// bounded string value that `has_attributes`, `drop_attributes`, and `route` can match:
+    /// `http.request.duration_s` becomes `fast`, `ok`, or `slow` in
+    /// `http.request.duration_class`. Integers, floats, and strings that parse as a finite number
+    /// are classified. Never drops an event. An attribute the event doesn't carry is a silent
+    /// no-op for that field, never a stamp. `attributes` must be non-empty.
+    Bucket {
+        /// Applied per event, to `event.attributes`, keyed by the source field.
+        attributes: std::collections::BTreeMap<String, BucketSpec>,
     },
     /// Forwards an event whose batch's `origin`/`previous` match a configured list: `origin` is
     /// the component that created the batch and `previous` the one that most recently handled
@@ -2450,8 +2519,9 @@ pub enum ComponentKind {
     /// `http.request.method_original`, `HTTP/` stripped off the protocol version, semconv's
     /// sensitive `url.query` values redacted, every free-text field capped and
     /// control-byte-cleaned, plus a small, bounded derived set: `user_agent.class`,
-    /// `http.route`, `error.type`, `span.name`, `span.status`, and the `span.duration_s` mirror
-    /// `trace_context` resolves a span from. Place it between `json` and `trace_context`. Every
+    /// `http.route`, `error.type`, `span.name`, `span.status`, the `span.duration_s` mirror
+    /// `trace_context` resolves a span from, and, with `status_class: true`,
+    /// `http.response.status_class`. Place it between `json` and `trace_context`. Every
     /// canonical name is also accepted with each `.` spelled `-` (`url-path`,
     /// `http-request-header-x-forwarded-for`), for an emitter whose key grammar forbids dots
     /// (HAProxy's `%{+json}o`); the dotted spelling wins when both are present.
@@ -2504,6 +2574,15 @@ pub enum ComponentKind {
         /// address as `client.address`.
         #[serde(default)]
         forwarded: Option<ForwardedHeader>,
+        /// Whether to derive `http.response.status_class` from `http.response.status_code`:
+        /// `1xx`, `2xx`, `3xx`, `4xx`, or `5xx` for a status from 100 to 599, and `unknown` for
+        /// any other number, including the `0` that nginx's `000` becomes. Off by default,
+        /// because it adds one attribute to every event, and that widens a downstream
+        /// `aggregate`'s series key or a sink's tag set. Turn it on when you tag metrics by
+        /// status class. A status that is absent produces no class, and a class the producer
+        /// already sent is kept.
+        #[serde(default)]
+        status_class: bool,
     },
     /// Keeps a fraction of events, consistently. With `key:` set, the key's value is hashed
     /// (XXH64, seed 0, over a fixed canonical byte form; a frozen cross-version contract) and
@@ -3676,6 +3755,11 @@ pub enum FlattenArrays {
     Skip,
 }
 
+/// `bucket`'s `keep_source` default: keep the source attribute.
+fn default_bucket_keep_source() -> bool {
+    true
+}
+
 /// `flatten`'s `attributes` default: every nested attribute.
 fn default_flatten_attributes() -> FlattenFields {
     FlattenFields::Keyword(FlattenKeyword::All)
@@ -4411,7 +4495,9 @@ pub struct BufferConfig {
     #[serde(with = "human_bytes")]
     #[schemars(with = "String")]
     pub max_bytes: u64,
-    /// What happens once both bounds are full. Defaults to `block`.
+    /// What happens once both bounds are full. Defaults to `block`. A full `block` sink stalls
+    /// every other sink fed from the same source, so `logit validate` warns when a source feeds
+    /// two or more sinks that use `block` and have no `disk:`.
     pub overflow: OverflowPolicy,
     /// What the sink does with a batch whose delivery outcome is unknown, such as a timeout or a
     /// `5xx`. Omitted, the sink resends it (`at_least_once`), except `statsd_out`, which drops it
@@ -5801,11 +5887,44 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::HasAttributes { resource, attributes } => {
+            ComponentKind::HasAttributes { resource, attributes, .. } => {
                 assert_eq!(resource.get("service.name"), Some(&SetValue::Str("nginx".to_string())));
                 assert_eq!(attributes.get("status"), Some(&SetValue::I64(200)));
             }
             other => panic!("expected HasAttributes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_attributes_presence_lists_deserialize_and_default_to_empty() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "has_attributes", "sources": ["in"],
+                "attributes_present": ["http.request.method"], "resource_present": ["service.name"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::HasAttributes {
+                resource,
+                attributes,
+                resource_present,
+                attributes_present,
+            } => {
+                assert!(resource.is_empty() && attributes.is_empty());
+                assert_eq!(attributes_present, vec!["http.request.method".to_string()]);
+                assert_eq!(resource_present, vec!["service.name".to_string()]);
+            }
+            other => panic!("expected HasAttributes, got {other:?}"),
+        }
+        let drop: Component = serde_json::from_str(
+            r#"{"type": "drop_attributes", "sources": ["in"], "attributes_present": ["a"]}"#,
+        )
+        .unwrap();
+        match drop.kind {
+            ComponentKind::DropAttributes { resource_present, attributes_present, .. } => {
+                assert!(resource_present.is_empty());
+                assert_eq!(attributes_present, vec!["a".to_string()]);
+            }
+            other => panic!("expected DropAttributes, got {other:?}"),
         }
     }
 
@@ -5816,7 +5935,7 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::DropAttributes { resource, attributes } => {
+            ComponentKind::DropAttributes { resource, attributes, .. } => {
                 assert!(resource.is_empty(), "resource must default to empty");
                 assert_eq!(attributes.get("stream"), Some(&SetValue::Str("debug".to_string())));
             }
@@ -5936,6 +6055,61 @@ mod tests {
         let step: NormalizeStep = serde_json::from_str(r#""lower""#).unwrap();
         assert_eq!(step, NormalizeStep::Lower);
         assert_eq!(serde_json::to_string(&NormalizeStep::Lower).unwrap(), r#""lower""#);
+    }
+
+    #[test]
+    fn bucket_component_deserializes_full_form() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "bucket", "sources": ["in"],
+                "attributes": {"duration_s": {"into": "duration_class",
+                    "ranges": [{"lt": 0.1, "value": "fast"}, {"le": 1, "value": "ok"},
+                               {"value": "slow"}],
+                    "other": "unknown", "keep_source": false}}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Bucket { attributes } => {
+                let spec = &attributes["duration_s"];
+                assert_eq!(spec.into, "duration_class");
+                assert_eq!(
+                    spec.ranges,
+                    vec![
+                        BucketRange { lt: Some(0.1), le: None, value: "fast".to_string() },
+                        BucketRange { lt: None, le: Some(1.0), value: "ok".to_string() },
+                        BucketRange { lt: None, le: None, value: "slow".to_string() },
+                    ]
+                );
+                assert_eq!(spec.other.as_deref(), Some("unknown"));
+                assert!(!spec.keep_source);
+            }
+            other => panic!("expected Bucket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bucket_other_defaults_to_none_and_keep_source_to_true() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "bucket", "sources": ["in"],
+                "attributes": {"d": {"into": "c", "ranges": [{"value": "any"}]}}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Bucket { attributes } => {
+                assert_eq!(attributes["d"].other, None);
+                assert!(attributes["d"].keep_source);
+            }
+            other => panic!("expected Bucket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bucket_rejects_an_unknown_range_key() {
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "bucket", "sources": ["in"],
+                "attributes": {"d": {"into": "c", "ranges": [{"ge": 1, "value": "big"}]}}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ge"), "got: {err}");
     }
 
     #[test]
@@ -6123,6 +6297,7 @@ mod tests {
                 max_length,
                 redact_query,
                 forwarded,
+                status_class,
             } => {
                 assert!(routes.is_empty());
                 assert_eq!(route_other, None);
@@ -6130,6 +6305,7 @@ mod tests {
                 assert!(max_length.is_empty());
                 assert!(redact_query.is_empty());
                 assert_eq!(forwarded, None);
+                assert!(!status_class);
             }
             other => panic!("expected HttpAccess, got {other:?}"),
         }
@@ -6150,7 +6326,8 @@ mod tests {
                 "user_agent_rules": [{"match": "MyMonitor/", "class": "tool"}],
                 "max_length": {"url.path": 512},
                 "redact_query": ["token"],
-                "forwarded": "x_forwarded_for"
+                "forwarded": "x_forwarded_for",
+                "status_class": true
             }"#,
         )
         .unwrap();
@@ -6162,6 +6339,7 @@ mod tests {
                 max_length,
                 redact_query,
                 forwarded,
+                status_class,
             } => {
                 assert_eq!(
                     routes,
@@ -6192,6 +6370,7 @@ mod tests {
                 assert_eq!(max_length.get("url.path"), Some(&512));
                 assert_eq!(redact_query, vec!["token".to_string()]);
                 assert_eq!(forwarded, Some(ForwardedHeader::XForwardedFor));
+                assert!(status_class);
             }
             other => panic!("expected HttpAccess, got {other:?}"),
         }
@@ -6243,6 +6422,7 @@ mod tests {
             max_length: std::collections::BTreeMap::from([("user.name".to_string(), 16)]),
             redact_query: vec![],
             forwarded: Some(ForwardedHeader::Forwarded),
+            status_class: true,
         };
         let json = serde_json::to_string(&kind).unwrap();
         let back: ComponentKind = serde_json::from_str(&json).unwrap();

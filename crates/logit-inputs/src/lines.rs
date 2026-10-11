@@ -23,10 +23,11 @@
 //! `max_line_bytes` as the bound. The framer strips one `CR` before each `LF` and hands
 //! [`LinesDecoder`] one line at a time. A line past the bound is dropped, counted once as
 //! `logit.input.frames.dropped{reason="oversize"}`, and the connection resynchronizes at the next
-//! `LF`. An unterminated final line at a close is dropped and counted `reason="truncated"`, the
-//! driver's rule for every line-framed listener: a sender that stopped mid-line never finished it.
-//! Never [`FramingMode::Rfc6587Auto`], which would read a line opening with a digit as an octet
-//! count.
+//! `LF`; `reason="drained"` in place of `oversize` when the line crossed the bound before its `LF`
+//! arrived, so the connection discards input until its next one. An unterminated final line at a
+//! close is dropped and counted `reason="truncated"`, the driver's rule for every line-framed
+//! listener: a sender that stopped mid-line never finished it. Never
+//! [`FramingMode::Rfc6587Auto`], which would read a line opening with a digit as an octet count.
 //!
 //! **`udp` and `unix`**: the driver hands [`LinesDecoder`] a whole datagram, which it splits on
 //! `LF` itself. A datagram's end also ends its last line, so an unterminated tail is emitted. The
@@ -43,7 +44,7 @@
 //! [`Event::log`] at the driver's `received_at`, no attributes, a [`LogRecord`] with
 //! [`BodyFormat::Raw`] and no severity, trace, or event name. The message is a zero-copy
 //! `Bytes` slice of the frame or datagram: [`Value::Str`] when the line is valid UTF-8,
-//! [`Value::Bytes`] otherwise, as `crate::syslog` keeps a MSG. Every event shares one
+//! [`Value::Bytes`] otherwise, as `logit_proto::syslog` keeps a MSG. Every event shares one
 //! `Arc<Resource>`, empty, across every connection's decoder clone. The decoder attaches nothing
 //! about the peer; under `peer:` the driver, stream or datagram, stamps its address after decode
 //! ([`crate::peer`]).
@@ -53,7 +54,7 @@
 //! All of it comes from the shared drivers (`crate::statsd`'s module doc lists them per
 //! transport), plus the datagram-side oversize count above.
 
-use crate::tcp::{FramingMode, Oversize, TcpListener, TcpListenerConfig, TlsServerSettings};
+use crate::tcp::{TcpListener, TcpListenerConfig, TlsServerSettings};
 use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
@@ -61,6 +62,7 @@ use logit_core::{
     AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Scope, Telemetry, Value,
 };
 use logit_pipeline::Fanout;
+use logit_proto::framing::{FramingMode, Oversize};
 use logit_proto::{CodecError, Decoder};
 use std::path::Path;
 use std::sync::Arc;
@@ -68,7 +70,7 @@ use tokio::sync::watch;
 
 /// `max_line_bytes`' default, the stream driver's own frame bound.
 /// `logit_config::default_lines_max_line_bytes` mirrors it by hand.
-pub const DEFAULT_MAX_LINE_BYTES: usize = crate::tcp::MAX_FRAME_BYTES;
+pub const DEFAULT_MAX_LINE_BYTES: usize = logit_proto::framing::MAX_FRAME_BYTES;
 
 /// Which driver a [`LinesInput`] wraps, chosen once by `transport:`. `Udp` also covers
 /// `transport: unix` and `Tcp` covers `unix_stream`: the drivers own the socket family.

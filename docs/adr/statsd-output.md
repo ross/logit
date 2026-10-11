@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-07
+updated: 2026-10-11
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -54,12 +54,12 @@ joins as many lines as fit before starting the next one. This is a deliberate di
 splitting on a delimiter its own injection-safety section exists to avoid relying on. The
 reasoning inverts here: splitting on `\n` **is** the statsd grammar — every buffered statsd client
 packs a send this way, and `StatsdDecoder::decode_into` splits an incoming datagram on `\n`
-directly (`crates/logit-inputs/src/statsd.rs`) — and this sink's own sanitizers (below) make an
-embedded `\n` unrepresentable in a name, key, or value, so a packed datagram cannot forge an extra
-metric the way a packed syslog datagram could forge an extra log line. A line that would overflow
-the cap starts a new datagram; a single line longer than the cap is **dropped whole**, never
-truncated (`syslog_out` truncates) — a truncated statsd line decodes as a different metric or a
-parse error, never a shorter version of the same one.
+directly (`crates/logit-proto/src/statsd/decode.rs`) — and this sink's own sanitizers (below) make
+an embedded `\n` unrepresentable in a name, key, or value, so a packed datagram cannot forge an
+extra metric the way a packed syslog datagram could forge an extra log line. A line that would
+overflow the cap starts a new datagram; a single line longer than the cap is **dropped whole**,
+never truncated (`syslog_out` truncates) — a truncated statsd line decodes as a different metric or
+a parse error, never a shorter version of the same one.
 
 **1432, not 512 or 8192.** 512 is Etsy statsd's conservative internet-safe figure; 8192 is
 DataDog's loopback/UDS figure (and `syslog_out`'s own `DEFAULT_MAX_MESSAGE_BYTES`, since Alloy's
@@ -82,8 +82,8 @@ Only `Counter` (`|c`) and `Gauge`/`GaugeDelta` (`|g`) are encoded. `Distribution
 
 **This means a `statsd_in -> aggregate -> statsd_out` relay drops every timer metric today.**
 `ms`/`h`/`d` on the wire all decode to `MetricKind::Distribution`
-(`logit_inputs::statsd::build_event`), so the single most common statsd workload — timers — makes
-it through the input and the aggregator, then dies at this sink, loudly counted but dropped.
+(`build_event`, now in `logit_proto::statsd`), so the single most common statsd workload — timers —
+makes it through the input and the aggregator, then dies at this sink, loudly counted but dropped.
 Deferred rather than guessed at: the aggregator's `DdSketch` no longer holds the original samples
 it merged, so "how does a merged sketch become one or more statsd lines" is a real design
 question — emit one line per fixed quantile (losing the ability to compute an arbitrary
@@ -118,11 +118,11 @@ round-trip this feature exists to preserve.
 ### Negative absolute gauges: the two-line `0|g` / `-n|g` idiom
 
 The statsd/DogStatsD grammar has no wire syntax for setting a gauge to a negative absolute value
-at all — `logit_inputs::statsd::build_event`'s `"g"` arm reads *any* leading `-` as a relative
-delta, unconditionally. A naive `Gauge(-5.0)` would therefore render as `name:-5|g` and decode
-back as `GaugeDelta(-5.0)`: a silent semantic corruption of a value type this sink otherwise
-preserves exactly. `statsd_out` instead emits the idiom both Etsy statsd and DogStatsD document
-for exactly this case: `name:0|g` immediately followed by `name:-5|g`. The two lines are pushed as
+at all — `logit_proto::statsd::decode::build_event`'s `"g"` arm reads *any* leading `-` as a
+relative delta, unconditionally. A naive `Gauge(-5.0)` would therefore render as `name:-5|g` and
+decode back as `GaugeDelta(-5.0)`: a silent semantic corruption of a value type this sink otherwise
+preserves exactly. `statsd_out` instead emits the idiom both Etsy statsd and DogStatsD document for
+exactly this case: `name:0|g` immediately followed by `name:-5|g`. The two lines are pushed as
 **one indivisible `MessageBuf` entry** (joined by an embedded `\n`) so the UDP packer can never
 split them across two datagrams — a lost first datagram would otherwise apply `-5` to whatever
 stale value the gauge already held at the receiver, rather than to the `0` this sink meant to
@@ -184,7 +184,7 @@ Never `@<rate>`: `statsd_in` already extrapolated at decode time (a `Counter`'s 
 the sample rate divided out; a `Distribution`'s samples are already replicated to the extrapolated
 weight), so emitting `@1` would be a no-op at best and anything else would double-extrapolate
 downstream. Never `|T<ts>`: the classic grammar has no timestamp segment at all, and
-`logit_inputs::statsd::parse_line` would silently ignore one if emitted, so it wouldn't even
+`logit_proto::statsd::decode::parse_line` would silently ignore one if emitted, so it wouldn't even
 round-trip through this repo's own input — a receiver stamps with its own receipt time instead.
 `MetricRecord::unit` has no statsd wire representation either and is dropped the same way. All
 three are recorded in `docs/known-gaps/statsd.md`.
@@ -255,7 +255,7 @@ sketch become one or more statsd lines' is a real design question... deserves it
 there's a concrete consumer to design against." Its "No sample rate, no timestamp, no unit"
 decision said: "Never `@<rate>`: `statsd_in` already extrapolated at decode time... Never
 `|T<ts>`: the classic grammar has no timestamp segment at all, and
-`logit_inputs::statsd::parse_line` would silently ignore one if emitted, so it wouldn't even
+`logit_proto::statsd::decode::parse_line` would silently ignore one if emitted, so it wouldn't even
 round-trip through this repo's own input."
 
 **Both premises are gone: `statsd_in` no longer sketches or extrapolates `ms`/`h`/`d`/`s` at decode
@@ -267,7 +267,7 @@ timestamp.**
 
 `MetricKind::Samples` (`crates/logit-outputs/src/statsd.rs`'s `render_samples`) renders under
 `format: dogstatsd` as one multi-value line, `name:v1:v2:...|<type>[|@rate]` — DogStatsD's own
-multi-value extension, the same one `logit_inputs::statsd::parse_line` parses on the way in.
+multi-value extension, the same one `logit_proto::statsd::decode::parse_line` parses on the way in.
 `<type>` is read off the record's `statsd.type` attribute when it names `ms`/`h`/`d`
 (`statsd_wire_type`), defaulting to `ms` when the attribute is absent or names anything else
 (`an_unrecognized_statsd_type_attribute_falls_back_to_ms`); `@rate` is omitted whenever
@@ -396,7 +396,8 @@ both new segments: `a_single_value_samples_metric_encodes_as_name_colon_value_pi
 fixed point (`mod fixed_point::decode_encode_decode_is_a_fixed_point`, 200 generated cases over
 `c`/`g`/`ms`/`h`/`d`/`s` lines with an optional rate/tags/container id/timestamp) pinning
 `decode(encode(decode(line))) == decode(line)` and `encode(decode(line))` as a fixed point of
-`encode . decode`. `crates/logit-inputs/src/statsd.rs` gained the matching decode-side coverage:
+`encode . decode`. `crates/logit-inputs/src/statsd.rs` (whose decoder and tests now live in
+`crates/logit-proto/src/statsd/decode.rs`) gained the matching decode-side coverage:
 `timer_becomes_a_single_sample_distribution`,
 `sampled_distribution_at_half_rate_preserves_the_rate_without_extrapolating`/
 `sampled_distribution_at_tenth_rate_preserves_the_rate_without_extrapolating`,
@@ -514,7 +515,8 @@ ordinary lines, right after the `_sc` line — only the first metric is claimed 
 
 ### Closing test enumeration
 
-`crates/logit-inputs/src/statsd.rs` gained: `dogstatsd_docs_example_event_decodes`,
+`crates/logit-inputs/src/statsd.rs` (now `crates/logit-proto/src/statsd/decode.rs`) gained:
+`dogstatsd_docs_example_event_decodes`,
 `dogstatsd_docs_example_service_check_decodes`, `event_with_every_optional_field_decodes`,
 `event_text_containing_pipe_colon_and_an_escaped_newline_decodes`,
 `event_title_length_running_past_the_line_is_rejected`,
@@ -598,10 +600,10 @@ duplicate token still dedupes at decode, matching the agent (`#team:a,team:a` ->
 `#urgent,urgent` -> `Bool(true)`), and a one-element `Array` is never produced, so a non-repeated
 tag's decoded shape is byte-identical to what it was before this fold existed — every fixture,
 allocation row, and unit test that assumed a plain `Value::Str` keeps passing unchanged. See
-`crates/logit-inputs/src/statsd.rs`'s module doc, "DogStatsD tags" section, for the full decode-side
-account, including the `statsd.*`-carrier-key corner (a tag literally named `statsd.type` can now
-decode to an `Array`, which matches no egress carrier arm and is filtered out uncounted, exactly as
-a wrong-typed carrier already was).
+`crates/logit-proto/src/statsd/mod.rs`'s module doc, "DogStatsD tags" section, for the full
+decode-side account, including the `statsd.*`-carrier-key corner (a tag literally named
+`statsd.type` can now decode to an `Array`, which matches no egress carrier arm and is filtered out
+uncounted, exactly as a wrong-typed carrier already was).
 
 The bare-tag note in "Sanitization" above (`Value::Bool(true)` renders as a bare tag) extends to the mixed
 form: a bare token and a valued one that share a key are not duplicates, and **both forms survive,
@@ -649,7 +651,8 @@ that round-trips a multi-valued tag reproduces the exact token order the sender 
 
 ### Closing test enumeration
 
-`crates/logit-inputs/src/statsd.rs` gained: a repeated tag key folding into an `Array` in wire order
+`crates/logit-inputs/src/statsd.rs` (now `crates/logit-proto/src/statsd/decode.rs`) gained: a
+repeated tag key folding into an `Array` in wire order
 (`#team:a,team:b` -> `Array[Str("a"), Str("b")]`); an exact duplicate deduping instead of folding
 (`#team:a,team:a` -> `Str("a")`, no `Array`); a bare/valued mix folding in order in both directions
 (`#urgent,urgent:1` and `#urgent:1,urgent`); three occurrences folding into three elements; the same

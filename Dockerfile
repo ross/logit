@@ -21,12 +21,15 @@ RUN cargo build --release -p logit-cli
 FROM debian:bookworm-slim
 
 # tzdata: named time zones in a `timestamp` component read /usr/share/zoneinfo
-# (docs/adr/timestamp-transform.md).
+# (docs/adr/timestamp-transform.md). /var/lib/logit is the state directory the non-root `logit`
+# user can write, for `buffer.disk` spools and tail checkpoints; a named volume mounted there
+# starts with that owner (docs/deploying.md, "Running it").
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         tzdata \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --create-home --shell /usr/sbin/nologin logit
+    && useradd --system --create-home --shell /usr/sbin/nologin logit \
+    && install -d -o logit -g logit /var/lib/logit
 
 COPY --from=builder /work/target/release/logit /usr/local/bin/logit
 

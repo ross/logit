@@ -1,0 +1,13 @@
+{
+ "divergence": "a `_bucket` line with no `le` label: skipped `malformed_line`, where Prometheus stores a series (docs/known-gaps/mappings.md: A line Prometheus's text parser keeps that this decoder skips)",
+ "divergent": [
+  [
+   "h_bucket",
+   []
+  ]
+ ],
+ "result": "ok",
+ "skips": {
+  "malformed_line": 1
+ }
+}
