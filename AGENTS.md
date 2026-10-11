@@ -74,8 +74,8 @@ Listeners live in `crates/logit-inputs`, codecs in `crates/logit-proto`.
 
 | Kind | Code | What it does | Decision record |
 |---|---|---|---|
-| `statsd_in` | `crates/logit-inputs/src/statsd.rs` | statsd/DogStatsD over UDP (default), `transport: tcp`, or a Unix socket (`unix`, `unix_stream`) | [ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) |
-| `syslog_in` | `crates/logit-inputs/src/syslog.rs` | syslog over UDP (default) or `transport: tcp`, optional TLS (RFC 5425) | [ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md) |
+| `statsd_in` | `crates/logit-inputs/src/statsd.rs` (listener), `crates/logit-proto/src/statsd/` (decoder) | statsd/DogStatsD over UDP (default), `transport: tcp`, or a Unix socket (`unix`, `unix_stream`) | [ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) |
+| `syslog_in` | `crates/logit-inputs/src/syslog.rs` (listener), `crates/logit-proto/src/syslog/` (decoder) | syslog over UDP (default) or `transport: tcp`, optional TLS (RFC 5425) | [ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md) |
 | `graphite_in` | `crates/logit-inputs/src/graphite/` | carbon plaintext and pickle, UDP or TCP | [ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md) |
 | `lines_in` | `crates/logit-inputs/src/lines.rs` | newline-delimited plain text over TCP (optionally TLS), UDP, or a Unix socket (`unix`, `unix_stream`); one raw log event per line, nothing parsed (compose `json`, `logfmt`, `kv`, `regex`) | [ADR `plain-lines-listener`](docs/adr/plain-lines-listener.md) |
 | `collectd_in` | `crates/logit-inputs/src/collectd.rs` | collectd's binary `network` protocol, unicast or multicast | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
@@ -416,8 +416,10 @@ Per pair:
   generic stream driver, `logit-inputs::tcp::TcpListener` (`crates/logit-inputs/src/tcp.rs`),
   which provides:
   - an accept loop and a connection cap (`max_connections:`, 1024 by default);
-  - per-listener framing: RFC 6587's auto-detecting pair for `syslog_in`, LF-delimited lines for
-    `statsd_in`, `lines_in`, and carbon plaintext, and carbon's 4-byte length prefix for pickle;
+  - per-listener framing through `logit_proto::framing`'s `Framer`
+    (`crates/logit-proto/src/framing.rs`): RFC 6587's auto-detecting pair for `syslog_in`,
+    LF-delimited lines for `statsd_in`, `lines_in`, and carbon plaintext, and carbon's 4-byte
+    length prefix for pickle;
   - `handshake_timeout:`, bounding each pre-message phase;
   - an opt-in `idle_timeout:`, bounding the quiet gaps after them (off by default;
     [ADR `idle-connection-timeout`](docs/adr/idle-connection-timeout.md));
@@ -658,6 +660,17 @@ the operator-facing account of all of this.
   `perf/results/soak-external.env`, and its ledger ends at the sink's telemetry (`ledger.sent`,
   `SENT`), with no backend query. See [tools/soak/README.md](tools/soak/README.md) and
   [ADR `soak-harness`](docs/adr/soak-harness.md).
+- **Differential corpora**: `script/differential <corpus>` regenerates a corpus of generated
+  cases under `testdata/differential/`, each committed beside a reference implementation's
+  reading of it, and `--check` fails when the committed corpus is stale. `pickle` writes
+  `testdata/differential/graphite-pickle/` from CPython 3.12 and Python 2.7, with carbon's
+  receiver's reading beside CPython's; `crates/logit-proto/tests/graphite_pickle_differential.rs`
+  reads it with no Python installed. `prom-text` writes Prometheus 3.14.0's `textparse` reading of
+  every hand-built exposition body in `testdata/differential/prometheus-text/cases/` and every
+  scrape body `script/record-fixtures prometheus-scrape` recorded from node_exporter and a
+  `prometheus_client` app into `testdata/interop/prometheus-scrape/`;
+  `crates/logit-proto/tests/prometheus_text_differential.rs` reads them with no Go installed
+  ([testdata/differential/README.md](testdata/differential/README.md)).
 
 ### Not yet built
 
@@ -677,7 +690,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 |---|---|
 | `script/bootstrap` | Build the dev container image (run first, or after touching `Dockerfile.dev`) |
 | `script/test [args]` | `cargo nextest run --workspace` |
-| `script/lint` | `cargo clippy --workspace --all-targets -- -D warnings` |
+| `script/lint` | `cargo clippy --workspace --all-targets -- -D warnings`, then `cargo check` over `fuzz/`'s own workspace |
 | `script/format [--check]` | `cargo fmt --all` |
 | `script/check [test args]` | Routine format-check + lint + workspace tests, in one dev container |
 | `script/schema` | Regenerate `schema/logit.schema.json` — run after any `logit-config` type change, and commit the result |
@@ -688,6 +701,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/victoria-interop` | Out-of-CI interop harness (`tools/victoria-interop/`, [docs/plans/victoriametrics-interop.md](docs/plans/victoriametrics-interop.md)) — runs pinned VictoriaMetrics, VictoriaLogs, VictoriaTraces, and vmagent in compose beside one `logit` per leg (`tools/victoria-interop/logit-*.yaml`), queries each backend for what arrived, and prints one `PASS`/`GAP`/`FAIL` row per leg: remote-write 1.0 (Snappy and zstd) and 2.0, vmagent scraping `prometheus_out`, `influxdb_out`, `graphite_out`, `otlp_out` over HTTP and gRPC, `syslog_out`, `prometheus_in` scraping `/federate`, and vmagent remote-writing into `prometheus_in`. The plan's "Findings" section records a run. One compose project, `victoria-interop`, so one run at a time per daemon (`VICTORIA_INTEROP_SKIP_IMAGE=1` reuses the image). Runs on the host and drives docker, like `script/shape-survey`. Not part of `cibuild` |
 | `script/splunk-interop` | Out-of-CI interop harness (`tools/splunk-interop/`, [its README](tools/splunk-interop/README.md)) — runs a pinned Splunk Enterprise in compose beside one `logit` per leg (`tools/splunk-interop/logit-*.yaml`: logs, every metric kind, spans, `ack: true`, and the recorded `testdata/interop/splunk/` corpus relayed through `splunk_hec_in`), searches Splunk over REST for each, and probes Splunk directly (gzip, per-object error semantics, `metric_type`, dimensions, `OPTIONS`, acknowledgment ids per channel, `/health` and the token, `time` forms, the envelope across objects, `/raw` line merging, index-time props on `/raw` and `/event`, `[tcpout]` framing). Splunk needs several GB of RAM and a few minutes to start. `SPLUNK_INTEROP_TARGET=cloud` starts only the `logit` legs and `replay`, against a Splunk Cloud Platform stack named in a gitignored env file, and reports a leg `SENT` from the sink's telemetry when the stack has no REST API to search. One compose project, `splunk-interop`, so one run at a time per daemon (`SPLUNK_INTEROP_SKIP_IMAGE=1` reuses the image). The `hec-relay` leg replays `testdata/interop/splunk/`, which `script/record-fixtures splunk` records from four real HEC clients (the OTel `splunk_hec` exporter, Docker's `splunk` driver, SC4S, and Splunk's Java appender). Runs on the host and drives docker. Not part of `cibuild` |
 | `script/soak run <scenario>\|list\|check <run-dir>\|self-test` | Out-of-CI soak harness (`tools/soak/`, [its README](tools/soak/README.md), [docs/plans/soak-harness.md](docs/plans/soak-harness.md)) — runs a scenario's stack (VictoriaMetrics, the `logit` under test, a second `logit` as the load source, and any service a scenario's `compose =` override adds, such as a second VictoriaMetrics) in compose, applies one-shot `tc netem` and Docker lifecycle faults (`pause`, `stop`, `kill`, `restart`, `partition`), plus `mark` and `exit` windows for events the SUT's own config causes, on the scenario's timeline, and scores a watchdog's checks (`run`, `timeline`, `exit`, `restarts`, `self_log`, `ready`, `progress`, `rss_slope`, `fd_slope`), a loss ledger (`ledger.wire`, `ledger.intake`, `ledger.edge`, `ledger.script` under `[ledger] sut_script`, `ledger.aggregate`, `ledger.egress`, `ledger.summary`, `ledger.replay`, `ledger.windows` under `[ledger] vm_every_window`, and `ledger.sent` for an external target), `identity.sink`, `recovery`, and one `expect.<name>` row per `[[expect]]` table into `perf/results/soak/<stamp>/results.md`; `check` re-scores a run directory offline. `--duration` overrides the scenario's (hours are fine; run under `tmux`, see the README's "Long runs"), `--seed N` draws a `[random]` scenario's schedule from another seed, `--keep` leaves the stack up. Needs Python 3.11+ on the host; `self-test` runs first inside `run`. One compose project per scenario, `soak-<scenario>`, so two scenarios can run at once (`SOAK_SKIP_IMAGE=1` reuses the images). A scenario with an external target (`statsd-datadog`) reads its credentials from `SOAK_EXTERNAL_ENV`, by default the git-ignored `perf/results/soak-external.env`, and refuses to start without them. Runs on the host and drives docker. Not part of `cibuild` |
+| `script/differential <corpus> [--check]` | Out-of-CI generator for a differential corpus under `testdata/differential/` (`pickle`: the carbon pickle reader against CPython 3.12, Python 2.7, and carbon 1.1.10's receiver; `prom-text`: the exposition decoder against Prometheus 3.14.0's `model/textparse`, built from `tools/differential/prom-text/go.mod`), in images pinned by tag and digest; `--check` regenerates into a temporary directory and exits 1 if the committed corpus differs ([testdata/differential/README.md](testdata/differential/README.md)). Runs on the host and drives docker, like `script/record-fixtures`. Not part of `cibuild` |
 | `script/audit` | `cargo-deny` + `cargo-audit` |
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
@@ -963,9 +977,9 @@ crates/
   logit-core        internal event model: Event, Value, Resource, metric kinds, interner, self-telemetry
   logit-config      YAML config types + generated JSON Schema
   logit-script      LuaJIT embedding (mlua), the Event proxy
-  logit-proto       codec traits, native wire format, output buffering
+  logit-proto       codec traits, native wire format, output buffering, framing (the stream `Framer` every TCP listener frames with), statsd (statsd_in's decoder), syslog (syslog_in's decoder), message (the json, csv, logfmt, and kv parse cores the transforms wrap)
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
-  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, graphite, lines (lines_in), collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
+  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target; the listener), syslog (the listener), graphite, lines (lines_in), collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), splunk (splunk_hec_out), logit (logit_out), null_out (load-test discard sink)
                     shared drivers: `stream` (the pooled TCP, TLS, and Unix-stream send of statsd, syslog, and graphite), `datagram` (the packer and UDP/Unix-datagram send of statsd, syslog, graphite, and collectd), `accounting` (`BatchAccounting`, the once-per-batch encode-side counting gate; ADR `sink-send-path-and-attempt-accounting`)
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, timestamp (event.timestamp from an attribute), scale, has_signal, keep_signals, drop_signals, has_attributes, drop_attributes, has_provenance, drop_provenance, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), sample (consistent, keyed sampling on a frozen XXH64 hash), route (implements logit-pipeline::Router)
@@ -983,7 +997,11 @@ where `script/perf run`/`attribute`/`flamegraph` write their (gitignored) output
 
 `tools/victoria-interop/` is the interop harness `script/victoria-interop` drives: `compose.yaml` (the pinned Victoria images, vmagent, and one `logit` service per leg), one `logit-<leg>.yaml` per leg (which join `script/validate` and `every_shipped_config_loads_and_validates`), `vmagent-scrape.yaml`, and the stdlib-only `check.py` that queries each backend and replays committed `testdata/interop/prometheus/` captures at VictoriaMetrics. Runs land in `perf/results/victoria-interop/<timestamp>/` (gitignored); [its README](tools/victoria-interop/README.md) has the rest.
 
-`fuzz/` is the cargo-fuzz harness `script/unsafe-check fuzz` drives ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)), its own workspace outside the root one like `tools/protogen`, so `libfuzzer-sys` never enters the stable build: one target per file in `fuzz_targets/` (depending on `logit-core` and `logit-proto` only), `seedgen/` (a plain binary that writes `seeds/<target>/` deterministically from `testdata/interop/` and encoder round trips), and the committed `seeds/`, where a `regress-*` file is a minimized crash input. `fuzz/corpus/`, `fuzz/artifacts/`, `fuzz/coverage/`, and `fuzz/target/` are gitignored; `script/format` covers the workspace, and clippy, `cargo-deny`, and `cargo-audit` don't.
+`tools/differential/` holds the generators `script/differential` runs, one directory per corpus: `pickle/` is `gen_py2.py` (Python 2 syntax, the `cPickle` payloads) and the stdlib-only `gen_cases.py` (the CPython 3 payloads, every reading, a transcription of carbon's pickle receiver, and the self-checks, including opcode coverage against `crates/logit-proto/src/graphite/pickle.rs`'s module doc); `prom-text/` is a Go program, `main.go` with its committed `go.mod`/`go.sum`, that reads each exposition body through Prometheus's `textparse.New`, with downloaded modules kept in a docker volume rather than the repository. A generator writes only its corpus's directory, or a temporary one under `--check`.
+
+`testdata/differential/` holds those corpora: generated and deterministic, unlike `testdata/interop/`'s captures, each case's bytes beside a JSON file with the reference's reading and the verdict `logit` must give, and a `divergence` on every case where the two differ. `prometheus-text/` differs in its inputs: its `cases/` are hand-built and committed as inputs, its readings sit under `reference/`, and it reads `testdata/interop/prometheus-scrape/`'s recorded bodies in place. Its tests read it with `std::fs` and no reference installed, and `fuzz/seedgen` turns every case into a seed; [its README](testdata/differential/README.md) has the rest.
+
+`fuzz/` is the cargo-fuzz harness `script/unsafe-check fuzz` drives ([ADR `out-of-ci-fuzzing`](docs/adr/out-of-ci-fuzzing.md)), its own workspace outside the root one like `tools/protogen`, so `libfuzzer-sys` never enters the stable build: one target per file in `fuzz_targets/`, 25 today, each also a row of `script/unsafe-check`'s `FUZZ_TARGETS` (depending on `logit-core` and `logit-proto` only), `seedgen/` (a plain binary that writes `seeds/<target>/` deterministically from `testdata/interop/{otlp,prometheus,prometheus-scrape,statsd,syslog,graphite,collectd,datadog}/`, every corpus under `testdata/differential/`, every `*.in` body under `crates/logit-cli/tests/fixtures/prometheus/`, `tools/record-fixtures/prometheus-metadata-target.prom`, and encoder round trips), and the committed `seeds/`, where a `regress-*` file is a minimized crash input. `fuzz/corpus/`, `fuzz/artifacts/`, `fuzz/coverage/`, and `fuzz/target/` are gitignored; `script/format` covers the workspace and `script/lint` type-checks it on stable (`cargo check`), while clippy, `cargo-deny`, and `cargo-audit` don't.
 
 `perf/load/*.yaml` are the **sidecar load specs** for real-socket scenarios
 ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)):

@@ -1,0 +1,44 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "help",
+   "name": "temperature_celsius",
+   "value": "Current temperature."
+  },
+  {
+   "kind": "type",
+   "name": "temperature_celsius",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "room",
+     "kitchen"
+    ]
+   ],
+   "name": "temperature_celsius",
+   "value": "0x4035800000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "room",
+     "attic"
+    ]
+   ],
+   "name": "temperature_celsius",
+   "value": "0xfff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x7f900fbc",
+  "len": 161,
+  "path": "differential/prometheus-text/cases/cli-gauge.txt"
+ },
+ "parser": "prom"
+}

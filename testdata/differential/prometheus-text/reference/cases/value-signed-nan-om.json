@@ -1,0 +1,26 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "ok"
+    ]
+   ],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": {
+  "after_entry": 1,
+  "message": "strconv.ParseFloat: parsing \"-NaN\": invalid syntax while parsing: \"g{v=\\\"neg\\\"} -NaN\""
+ },
+ "input": {
+  "crc32c": "0xf345a2a6",
+  "len": 49,
+  "path": "differential/prometheus-text/cases/value-signed-nan-om.om"
+ },
+ "parser": "openmetrics"
+}

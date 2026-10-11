@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use logit_core::{MetricKind, Resource, Temporality};
-use logit_inputs::statsd::StatsdDecoder;
+use logit_proto::statsd::StatsdDecoder;
 use logit_proto::Decoder;
 use support::{ephemeral_addr, wait_until_ready, KillOnDrop, TempConfig, PROCESS_DEADLINE};
 use tokio::net::UdpSocket;

@@ -1,0 +1,2379 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8; escaping=underscores",
+ "entries": [
+  {
+   "kind": "help",
+   "name": "go_gc_duration_seconds",
+   "value": "A summary of the wall-time pause (stop-the-world) duration in garbage collection cycles."
+  },
+  {
+   "kind": "type",
+   "name": "go_gc_duration_seconds",
+   "value": "summary"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.0"
+    ]
+   ],
+   "name": "go_gc_duration_seconds",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.25"
+    ]
+   ],
+   "name": "go_gc_duration_seconds",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.5"
+    ]
+   ],
+   "name": "go_gc_duration_seconds",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.75"
+    ]
+   ],
+   "name": "go_gc_duration_seconds",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "1.0"
+    ]
+   ],
+   "name": "go_gc_duration_seconds",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_gc_duration_seconds_sum",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_gc_duration_seconds_count",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_gc_gogc_percent",
+   "value": "Heap size target percentage configured by the user, otherwise 100. This value is set by the GOGC environment variable, and the runtime/debug.SetGCPercent function. Sourced from /gc/gogc:percent."
+  },
+  {
+   "kind": "type",
+   "name": "go_gc_gogc_percent",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_gc_gogc_percent",
+   "value": "0x4059000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_gc_gomemlimit_bytes",
+   "value": "Go runtime memory limit configured by the user, otherwise math.MaxInt64. This value is set by the GOMEMLIMIT environment variable, and the runtime/debug.SetMemoryLimit function. Sourced from /gc/gomemlimit:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_gc_gomemlimit_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_gc_gomemlimit_bytes",
+   "value": "0x43e0000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_goroutines",
+   "value": "Number of goroutines that currently exist."
+  },
+  {
+   "kind": "type",
+   "name": "go_goroutines",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_goroutines",
+   "value": "0x401c000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_info",
+   "value": "Information about the Go environment."
+  },
+  {
+   "kind": "type",
+   "name": "go_info",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "version",
+     "go1.26.5"
+    ]
+   ],
+   "name": "go_info",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_alloc_bytes",
+   "value": "Number of bytes allocated in heap and currently in use. Equals to /memory/classes/heap/objects:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_alloc_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_alloc_bytes",
+   "value": "0x4132fa1800000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_alloc_bytes_total",
+   "value": "Total number of bytes allocated in heap until now, even if released already. Equals to /gc/heap/allocs:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_alloc_bytes_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_alloc_bytes_total",
+   "value": "0x4132fa1800000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_buck_hash_sys_bytes",
+   "value": "Number of bytes used by the profiling bucket hash table. Equals to /memory/classes/profiling/buckets:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_buck_hash_sys_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_buck_hash_sys_bytes",
+   "value": "0x4136120200000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_frees_total",
+   "value": "Total number of heap objects frees. Equals to /gc/heap/frees:objects + /gc/heap/tiny/allocs:objects."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_frees_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_frees_total",
+   "value": "0x4089980000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_gc_sys_bytes",
+   "value": "Number of bytes used for garbage collection system metadata. Equals to /memory/classes/metadata/other:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_gc_sys_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_gc_sys_bytes",
+   "value": "0x413d1f1000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_heap_alloc_bytes",
+   "value": "Number of heap bytes allocated and currently in use, same as go_memstats_alloc_bytes. Equals to /memory/classes/heap/objects:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_heap_alloc_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_heap_alloc_bytes",
+   "value": "0x4132fa1800000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_heap_idle_bytes",
+   "value": "Number of heap bytes waiting to be used. Equals to /memory/classes/heap/released:bytes + /memory/classes/heap/free:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_heap_idle_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_heap_idle_bytes",
+   "value": "0x412c800000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_heap_inuse_bytes",
+   "value": "Number of heap bytes that are in use. Equals to /memory/classes/heap/objects:bytes + /memory/classes/heap/unused:bytes"
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_heap_inuse_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_heap_inuse_bytes",
+   "value": "0x4145e00000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_heap_objects",
+   "value": "Number of currently allocated objects. Equals to /gc/heap/objects:objects."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_heap_objects",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_heap_objects",
+   "value": "0x40b76e0000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_heap_released_bytes",
+   "value": "Number of heap bytes released to OS. Equals to /memory/classes/heap/released:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_heap_released_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_heap_released_bytes",
+   "value": "0x412c800000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_heap_sys_bytes",
+   "value": "Number of heap bytes obtained from system. Equals to /memory/classes/heap/objects:bytes + /memory/classes/heap/unused:bytes + /memory/classes/heap/released:bytes + /memory/classes/heap/free:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_heap_sys_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_heap_sys_bytes",
+   "value": "0x414d000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_last_gc_time_seconds",
+   "value": "Number of seconds since 1970 of last garbage collection."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_last_gc_time_seconds",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_last_gc_time_seconds",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_mallocs_total",
+   "value": "Total number of heap objects allocated, both live and gc-ed. Semantically a counter version for go_memstats_heap_objects gauge. Equals to /gc/heap/allocs:objects + /gc/heap/tiny/allocs:objects."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_mallocs_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_mallocs_total",
+   "value": "0x40baa10000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_mcache_inuse_bytes",
+   "value": "Number of bytes in use by mcache structures. Equals to /memory/classes/metadata/mcache/inuse:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_mcache_inuse_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_mcache_inuse_bytes",
+   "value": "0x40a1f00000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_mcache_sys_bytes",
+   "value": "Number of bytes used for mcache structures obtained from system. Equals to /memory/classes/metadata/mcache/inuse:bytes + /memory/classes/metadata/mcache/free:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_mcache_sys_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_mcache_sys_bytes",
+   "value": "0x40f39e8000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_mspan_inuse_bytes",
+   "value": "Number of bytes in use by mspan structures. Equals to /memory/classes/metadata/mspan/inuse:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_mspan_inuse_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_mspan_inuse_bytes",
+   "value": "0x40e5900000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_mspan_sys_bytes",
+   "value": "Number of bytes used for mspan structures obtained from system. Equals to /memory/classes/metadata/mspan/inuse:bytes + /memory/classes/metadata/mspan/free:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_mspan_sys_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_mspan_sys_bytes",
+   "value": "0x40e7e80000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_next_gc_bytes",
+   "value": "Number of heap bytes when next garbage collection will take place. Equals to /gc/heap/goal:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_next_gc_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_next_gc_bytes",
+   "value": "0x4150000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_other_sys_bytes",
+   "value": "Number of bytes used for other system allocations. Equals to /memory/classes/other:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_other_sys_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_other_sys_bytes",
+   "value": "0x412c5d9c00000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_stack_inuse_bytes",
+   "value": "Number of bytes obtained from system for stack allocator in non-CGO environments. Equals to /memory/classes/heap/stacks:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_stack_inuse_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_stack_inuse_bytes",
+   "value": "0x4118000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_stack_sys_bytes",
+   "value": "Number of bytes obtained from system for stack allocator. Equals to /memory/classes/heap/stacks:bytes + /memory/classes/os-stacks:bytes."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_stack_sys_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_stack_sys_bytes",
+   "value": "0x4118000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_memstats_sys_bytes",
+   "value": "Number of bytes obtained from system. Equals to /memory/classes/total:byte."
+  },
+  {
+   "kind": "type",
+   "name": "go_memstats_sys_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_memstats_sys_bytes",
+   "value": "0x41606b2100000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_sched_gomaxprocs_threads",
+   "value": "The current runtime.GOMAXPROCS setting, or the number of operating system threads that can execute user-level Go code simultaneously. Sourced from /sched/gomaxprocs:threads."
+  },
+  {
+   "kind": "type",
+   "name": "go_sched_gomaxprocs_threads",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_sched_gomaxprocs_threads",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "go_threads",
+   "value": "Number of OS threads created."
+  },
+  {
+   "kind": "type",
+   "name": "go_threads",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_threads",
+   "value": "0x4014000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_exporter_build_info",
+   "value": "A metric with a constant '1' value labeled by version, revision, branch, goversion from which node_exporter was built, and the goos and goarch for the build."
+  },
+  {
+   "kind": "type",
+   "name": "node_exporter_build_info",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "branch",
+     "HEAD"
+    ],
+    [
+     "goarch",
+     "amd64"
+    ],
+    [
+     "goos",
+     "linux"
+    ],
+    [
+     "goversion",
+     "go1.26.5"
+    ],
+    [
+     "revision",
+     "6044da783597cc3b57aef7580ddcdcff58a4ee99"
+    ],
+    [
+     "tags",
+     "unknown"
+    ],
+    [
+     "version",
+     "1.12.1"
+    ]
+   ],
+   "name": "node_exporter_build_info",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_load1",
+   "value": "1m load average."
+  },
+  {
+   "kind": "type",
+   "name": "node_load1",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_load1",
+   "value": "0x3fdb851eb851eb85"
+  },
+  {
+   "kind": "help",
+   "name": "node_load15",
+   "value": "15m load average."
+  },
+  {
+   "kind": "type",
+   "name": "node_load15",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_load15",
+   "value": "0x3ff851eb851eb852"
+  },
+  {
+   "kind": "help",
+   "name": "node_load5",
+   "value": "5m load average."
+  },
+  {
+   "kind": "type",
+   "name": "node_load5",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_load5",
+   "value": "0x3febd70a3d70a3d7"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Active_anon_bytes",
+   "value": "Memory information field Active_anon_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Active_anon_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Active_anon_bytes",
+   "value": "0x42042a4600000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Active_bytes",
+   "value": "Memory information field Active_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Active_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Active_bytes",
+   "value": "0x4215d2d2c0000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Active_file_bytes",
+   "value": "Memory information field Active_file_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Active_file_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Active_file_bytes",
+   "value": "0x42077b5f80000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_AnonHugePages_bytes",
+   "value": "Memory information field AnonHugePages_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_AnonHugePages_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_AnonHugePages_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_AnonPages_bytes",
+   "value": "Memory information field AnonPages_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_AnonPages_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_AnonPages_bytes",
+   "value": "0x4204ff9f80000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Bounce_bytes",
+   "value": "Memory information field Bounce_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Bounce_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Bounce_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Buffers_bytes",
+   "value": "Memory information field Buffers_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Buffers_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Buffers_bytes",
+   "value": "0x414c380000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Cached_bytes",
+   "value": "Memory information field Cached_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Cached_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Cached_bytes",
+   "value": "0x4238f456e0000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_CmaFree_bytes",
+   "value": "Memory information field CmaFree_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_CmaFree_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_CmaFree_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_CmaTotal_bytes",
+   "value": "Memory information field CmaTotal_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_CmaTotal_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_CmaTotal_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_CommitLimit_bytes",
+   "value": "Memory information field CommitLimit_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_CommitLimit_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_CommitLimit_bytes",
+   "value": "0x4231a262e0000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Committed_AS_bytes",
+   "value": "Memory information field Committed_AS_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Committed_AS_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Committed_AS_bytes",
+   "value": "0x42296a44e0000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_DirectMap1G_bytes",
+   "value": "Memory information field DirectMap1G_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_DirectMap1G_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_DirectMap1G_bytes",
+   "value": "0x4228000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_DirectMap2M_bytes",
+   "value": "Memory information field DirectMap2M_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_DirectMap2M_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_DirectMap2M_bytes",
+   "value": "0x4231a1c000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_DirectMap4k_bytes",
+   "value": "Memory information field DirectMap4k_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_DirectMap4k_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_DirectMap4k_bytes",
+   "value": "0x4203875980000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Dirty_bytes",
+   "value": "Memory information field Dirty_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Dirty_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Dirty_bytes",
+   "value": "0x412f800000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_HardwareCorrupted_bytes",
+   "value": "Memory information field HardwareCorrupted_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_HardwareCorrupted_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_HardwareCorrupted_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_HugePages_Free",
+   "value": "Memory information field HugePages_Free."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_HugePages_Free",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_HugePages_Free",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_HugePages_Rsvd",
+   "value": "Memory information field HugePages_Rsvd."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_HugePages_Rsvd",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_HugePages_Rsvd",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_HugePages_Surp",
+   "value": "Memory information field HugePages_Surp."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_HugePages_Surp",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_HugePages_Surp",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_HugePages_Total",
+   "value": "Memory information field HugePages_Total."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_HugePages_Total",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_HugePages_Total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Hugepagesize_bytes",
+   "value": "Memory information field Hugepagesize_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Hugepagesize_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Hugepagesize_bytes",
+   "value": "0x4140000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Inactive_anon_bytes",
+   "value": "Memory information field Inactive_anon_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Inactive_anon_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Inactive_anon_bytes",
+   "value": "0x42162acb80000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Inactive_bytes",
+   "value": "Memory information field Inactive_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Inactive_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Inactive_bytes",
+   "value": "0x42361fc830000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Inactive_file_bytes",
+   "value": "Memory information field Inactive_file_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Inactive_file_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Inactive_file_bytes",
+   "value": "0x4230951550000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_KernelStack_bytes",
+   "value": "Memory information field KernelStack_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_KernelStack_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_KernelStack_bytes",
+   "value": "0x4183660000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Mapped_bytes",
+   "value": "Memory information field Mapped_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Mapped_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Mapped_bytes",
+   "value": "0x41d34c7c00000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_MemAvailable_bytes",
+   "value": "Memory information field MemAvailable_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_MemAvailable_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_MemAvailable_bytes",
+   "value": "0x4234982100000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_MemFree_bytes",
+   "value": "Memory information field MemFree_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_MemFree_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_MemFree_bytes",
+   "value": "0x41df990c00000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_MemTotal_bytes",
+   "value": "Memory information field MemTotal_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_MemTotal_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_MemTotal_bytes",
+   "value": "0x423f44c5f0000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Mlocked_bytes",
+   "value": "Memory information field Mlocked_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Mlocked_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Mlocked_bytes",
+   "value": "0x4101000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_NFS_Unstable_bytes",
+   "value": "Memory information field NFS_Unstable_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_NFS_Unstable_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_NFS_Unstable_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_PageTables_bytes",
+   "value": "Memory information field PageTables_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_PageTables_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_PageTables_bytes",
+   "value": "0x419e518000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Percpu_bytes",
+   "value": "Memory information field Percpu_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Percpu_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Percpu_bytes",
+   "value": "0x4186900000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_SReclaimable_bytes",
+   "value": "Memory information field SReclaimable_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_SReclaimable_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_SReclaimable_bytes",
+   "value": "0x41ec2c3600000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_SUnreclaim_bytes",
+   "value": "Memory information field SUnreclaim_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_SUnreclaim_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_SUnreclaim_bytes",
+   "value": "0x41dae56400000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_ShmemHugePages_bytes",
+   "value": "Memory information field ShmemHugePages_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_ShmemHugePages_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_ShmemHugePages_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_ShmemPmdMapped_bytes",
+   "value": "Memory information field ShmemPmdMapped_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_ShmemPmdMapped_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_ShmemPmdMapped_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Shmem_bytes",
+   "value": "Memory information field Shmem_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Shmem_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Shmem_bytes",
+   "value": "0x4215c06a80000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Slab_bytes",
+   "value": "Memory information field Slab_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Slab_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Slab_bytes",
+   "value": "0x41f4cf7400000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_SwapCached_bytes",
+   "value": "Memory information field SwapCached_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_SwapCached_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_SwapCached_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_SwapFree_bytes",
+   "value": "Memory information field SwapFree_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_SwapFree_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_SwapFree_bytes",
+   "value": "0x41f27fed00000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_SwapTotal_bytes",
+   "value": "Memory information field SwapTotal_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_SwapTotal_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_SwapTotal_bytes",
+   "value": "0x41ffffff00000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Unevictable_bytes",
+   "value": "Memory information field Unevictable_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Unevictable_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Unevictable_bytes",
+   "value": "0x4101000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_VmallocChunk_bytes",
+   "value": "Memory information field VmallocChunk_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_VmallocChunk_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_VmallocChunk_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_VmallocTotal_bytes",
+   "value": "Memory information field VmallocTotal_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_VmallocTotal_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_VmallocTotal_bytes",
+   "value": "0x42bffffffffc0000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_VmallocUsed_bytes",
+   "value": "Memory information field VmallocUsed_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_VmallocUsed_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_VmallocUsed_bytes",
+   "value": "0x41a5670000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_WritebackTmp_bytes",
+   "value": "Memory information field WritebackTmp_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_WritebackTmp_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_WritebackTmp_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Writeback_bytes",
+   "value": "Memory information field Writeback_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Writeback_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Writeback_bytes",
+   "value": "0x4101000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Zswap_bytes",
+   "value": "Memory information field Zswap_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Zswap_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Zswap_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_memory_Zswapped_bytes",
+   "value": "Memory information field Zswapped_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_memory_Zswapped_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "node_memory_Zswapped_bytes",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_receive_bytes_total",
+   "value": "Network device statistic receive_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_receive_bytes_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_receive_bytes_total",
+   "value": "0x40a4da0000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_receive_bytes_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_receive_compressed_total",
+   "value": "Network device statistic receive_compressed."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_receive_compressed_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_receive_compressed_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_receive_compressed_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_receive_drop_total",
+   "value": "Network device statistic receive_drop."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_receive_drop_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_receive_drop_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_receive_drop_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_receive_errs_total",
+   "value": "Network device statistic receive_errs."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_receive_errs_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_receive_errs_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_receive_errs_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_receive_fifo_total",
+   "value": "Network device statistic receive_fifo."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_receive_fifo_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_receive_fifo_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_receive_fifo_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_receive_frame_total",
+   "value": "Network device statistic receive_frame."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_receive_frame_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_receive_frame_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_receive_frame_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_receive_multicast_total",
+   "value": "Network device statistic receive_multicast."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_receive_multicast_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_receive_multicast_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_receive_multicast_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_receive_nohandler_total",
+   "value": "Network device statistic receive_nohandler."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_receive_nohandler_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_receive_nohandler_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_receive_nohandler_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_receive_packets_total",
+   "value": "Network device statistic receive_packets."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_receive_packets_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_receive_packets_total",
+   "value": "0x4028000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_receive_packets_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_transmit_bytes_total",
+   "value": "Network device statistic transmit_bytes."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_transmit_bytes_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_transmit_bytes_total",
+   "value": "0x406c000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_transmit_bytes_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_transmit_carrier_total",
+   "value": "Network device statistic transmit_carrier."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_transmit_carrier_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_transmit_carrier_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_transmit_carrier_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_transmit_colls_total",
+   "value": "Network device statistic transmit_colls."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_transmit_colls_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_transmit_colls_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_transmit_colls_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_transmit_compressed_total",
+   "value": "Network device statistic transmit_compressed."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_transmit_compressed_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_transmit_compressed_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_transmit_compressed_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_transmit_drop_total",
+   "value": "Network device statistic transmit_drop."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_transmit_drop_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_transmit_drop_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_transmit_drop_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_transmit_errs_total",
+   "value": "Network device statistic transmit_errs."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_transmit_errs_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_transmit_errs_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_transmit_errs_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_transmit_fifo_total",
+   "value": "Network device statistic transmit_fifo."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_transmit_fifo_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_transmit_fifo_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_transmit_fifo_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_network_transmit_packets_total",
+   "value": "Network device statistic transmit_packets."
+  },
+  {
+   "kind": "type",
+   "name": "node_network_transmit_packets_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "eth0"
+    ]
+   ],
+   "name": "node_network_transmit_packets_total",
+   "value": "0x4010000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "device",
+     "lo"
+    ]
+   ],
+   "name": "node_network_transmit_packets_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_scrape_collector_duration_seconds",
+   "value": "node_exporter: Duration of a collector scrape."
+  },
+  {
+   "kind": "type",
+   "name": "node_scrape_collector_duration_seconds",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "collector",
+     "loadavg"
+    ]
+   ],
+   "name": "node_scrape_collector_duration_seconds",
+   "value": "0x3f031d71b37f2684"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "collector",
+     "meminfo"
+    ]
+   ],
+   "name": "node_scrape_collector_duration_seconds",
+   "value": "0x3f211856381af981"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "collector",
+     "netdev"
+    ]
+   ],
+   "name": "node_scrape_collector_duration_seconds",
+   "value": "0x3f29869766ecfca1"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "collector",
+     "uname"
+    ]
+   ],
+   "name": "node_scrape_collector_duration_seconds",
+   "value": "0x3ee1553cf3506f2e"
+  },
+  {
+   "kind": "help",
+   "name": "node_scrape_collector_success",
+   "value": "node_exporter: Whether a collector succeeded."
+  },
+  {
+   "kind": "type",
+   "name": "node_scrape_collector_success",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "collector",
+     "loadavg"
+    ]
+   ],
+   "name": "node_scrape_collector_success",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "collector",
+     "meminfo"
+    ]
+   ],
+   "name": "node_scrape_collector_success",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "collector",
+     "netdev"
+    ]
+   ],
+   "name": "node_scrape_collector_success",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "collector",
+     "uname"
+    ]
+   ],
+   "name": "node_scrape_collector_success",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "node_uname_info",
+   "value": "Labeled system information as provided by the uname system call."
+  },
+  {
+   "kind": "type",
+   "name": "node_uname_info",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "domainname",
+     "(none)"
+    ],
+    [
+     "machine",
+     "x86_64"
+    ],
+    [
+     "nodename",
+     "e6279465b9b4"
+    ],
+    [
+     "release",
+     "7.1.13-200.fc44.x86_64"
+    ],
+    [
+     "sysname",
+     "Linux"
+    ],
+    [
+     "version",
+     "#1 SMP PREEMPT_DYNAMIC Wed Sep  2 13:58:38 UTC 2026"
+    ]
+   ],
+   "name": "node_uname_info",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "process_cpu_seconds_total",
+   "value": "Total user and system CPU time spent in seconds."
+  },
+  {
+   "kind": "type",
+   "name": "process_cpu_seconds_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_cpu_seconds_total",
+   "value": "0x3f947ae147ae147b"
+  },
+  {
+   "kind": "help",
+   "name": "process_max_fds",
+   "value": "Maximum number of open file descriptors."
+  },
+  {
+   "kind": "type",
+   "name": "process_max_fds",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_max_fds",
+   "value": "0x411ffffc00000000"
+  },
+  {
+   "kind": "help",
+   "name": "process_network_receive_bytes_total",
+   "value": "Number of bytes received by the process over the network."
+  },
+  {
+   "kind": "type",
+   "name": "process_network_receive_bytes_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_network_receive_bytes_total",
+   "value": "0x40a1320000000000"
+  },
+  {
+   "kind": "help",
+   "name": "process_network_transmit_bytes_total",
+   "value": "Number of bytes sent by the process over the network."
+  },
+  {
+   "kind": "type",
+   "name": "process_network_transmit_bytes_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_network_transmit_bytes_total",
+   "value": "0x405c000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "process_open_fds",
+   "value": "Number of open file descriptors."
+  },
+  {
+   "kind": "type",
+   "name": "process_open_fds",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_open_fds",
+   "value": "0x4020000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "process_resident_memory_bytes",
+   "value": "Resident memory size in bytes."
+  },
+  {
+   "kind": "type",
+   "name": "process_resident_memory_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_resident_memory_bytes",
+   "value": "0x416edc0000000000"
+  },
+  {
+   "kind": "help",
+   "name": "process_start_time_seconds",
+   "value": "Start time of the process since unix epoch in seconds."
+  },
+  {
+   "kind": "type",
+   "name": "process_start_time_seconds",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_start_time_seconds",
+   "value": "0x41dab26bbb95c28f"
+  },
+  {
+   "kind": "help",
+   "name": "process_virtual_memory_bytes",
+   "value": "Virtual memory size in bytes."
+  },
+  {
+   "kind": "type",
+   "name": "process_virtual_memory_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_virtual_memory_bytes",
+   "value": "0x41d3761000000000"
+  },
+  {
+   "kind": "help",
+   "name": "process_virtual_memory_max_bytes",
+   "value": "Maximum amount of virtual memory available in bytes."
+  },
+  {
+   "kind": "type",
+   "name": "process_virtual_memory_max_bytes",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_virtual_memory_max_bytes",
+   "value": "0x43f0000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "promhttp_metric_handler_errors_total",
+   "value": "Total number of internal errors encountered by the promhttp metric handler."
+  },
+  {
+   "kind": "type",
+   "name": "promhttp_metric_handler_errors_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "cause",
+     "encoding"
+    ]
+   ],
+   "name": "promhttp_metric_handler_errors_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "cause",
+     "gathering"
+    ]
+   ],
+   "name": "promhttp_metric_handler_errors_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "promhttp_metric_handler_requests_in_flight",
+   "value": "Current number of scrapes being served."
+  },
+  {
+   "kind": "type",
+   "name": "promhttp_metric_handler_requests_in_flight",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "promhttp_metric_handler_requests_in_flight",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "help",
+   "name": "promhttp_metric_handler_requests_total",
+   "value": "Total number of scrapes by HTTP status code."
+  },
+  {
+   "kind": "type",
+   "name": "promhttp_metric_handler_requests_total",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "code",
+     "200"
+    ]
+   ],
+   "name": "promhttp_metric_handler_requests_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "code",
+     "500"
+    ]
+   ],
+   "name": "promhttp_metric_handler_requests_total",
+   "value": "0x0000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "code",
+     "503"
+    ]
+   ],
+   "name": "promhttp_metric_handler_requests_total",
+   "value": "0x0000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xf8709d7f",
+  "len": 22647,
+  "path": "interop/prometheus-scrape/node-exporter-0.body"
+ },
+ "parser": "prom"
+}

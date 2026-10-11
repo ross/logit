@@ -1,0 +1,153 @@
+{
+ "carbon": {
+  "items": 4,
+  "outcome": "ok",
+  "received": [
+   [
+    "base.cpu.user",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3ff8000000000000",
+     "repr": "1.5"
+    },
+    "store"
+   ],
+   [
+    "base.load;host=web-1",
+    {
+     "f64": "0x41d954fc40500000",
+     "repr": "1700000001.25"
+    },
+    {
+     "f64": "0xc000000000000000",
+     "repr": "-2.0"
+    },
+    "store"
+   ],
+   [
+    "base.mem",
+    {
+     "f64": "0x41d954fc40800000",
+     "repr": "1700000002.0"
+    },
+    {
+     "f64": "0x4132d68700000000",
+     "repr": "1234567.0"
+    },
+    "store"
+   ],
+   [
+    "base.cpu.user",
+    {
+     "f64": "0x41d954fc40c00000",
+     "repr": "1700000003.0"
+    },
+    {
+     "f64": "0x0000000000000000",
+     "repr": "0.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py2-base-p0",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "base.cpu.user",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "f64": "0x3ff8000000000000",
+        "repr": "1.5"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "tuple": [
+     "base.load;host=web-1",
+     {
+      "tuple": [
+       {
+        "f64": "0x41d954fc40500000",
+        "repr": "1700000001.25"
+       },
+       {
+        "int": "-2"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "tuple": [
+     "base.mem",
+     {
+      "tuple": [
+       {
+        "int": "1700000002"
+       },
+       {
+        "f64": "0x4132d68700000000",
+        "repr": "1234567.0"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "tuple": [
+     "base.cpu.user",
+     {
+      "tuple": [
+       {
+        "int": "1700000003"
+       },
+       {
+        "int": "0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "The base batch through cPickle at protocol 0, Diamond's call: a memo from 1.",
+ "exercises": [
+  "STRING",
+  "PUT",
+  "GET",
+  "INT",
+  "FLOAT",
+  "TUPLE",
+  "APPEND"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "FLOAT",
+  "GET",
+  "INT",
+  "LIST",
+  "MARK",
+  "PUT",
+  "STOP",
+  "STRING",
+  "TUPLE"
+ ],
+ "producer": "python2",
+ "protocol": 0
+}

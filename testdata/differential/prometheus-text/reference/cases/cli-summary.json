@@ -1,0 +1,51 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "rpc_seconds",
+   "value": "summary"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.5"
+    ]
+   ],
+   "name": "rpc_seconds",
+   "value": "0x3fc999999999999a"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "quantile",
+     "0.99"
+    ]
+   ],
+   "name": "rpc_seconds",
+   "value": "0x3feccccccccccccd"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "rpc_seconds_sum",
+   "value": "0x4029000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "rpc_seconds_count",
+   "value": "0x4059000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x30ea2852",
+  "len": 135,
+  "path": "differential/prometheus-text/cases/cli-summary.txt"
+ },
+ "parser": "prom"
+}

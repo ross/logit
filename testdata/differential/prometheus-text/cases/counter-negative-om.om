@@ -1,0 +1,5 @@
+# TYPE c counter
+c_total -1
+# TYPE d counter
+d_total NaN
+# EOF

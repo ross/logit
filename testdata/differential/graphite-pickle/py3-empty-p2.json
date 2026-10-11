@@ -1,0 +1,28 @@
+{
+ "carbon": {
+  "items": 0,
+  "outcome": "ok",
+  "received": []
+ },
+ "case": "py3-empty-p2",
+ "cpython": {
+  "list": []
+ },
+ "description": "An empty batch.",
+ "exercises": [
+  "EMPTY_LIST"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "BINPUT",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

@@ -101,6 +101,7 @@ impl Transform for RegexParser {
 mod tests {
     use super::*;
     use logit_core::interner::resolve;
+    use logit_core::subslice::within;
     use logit_core::{AttrMap, BodyFormat, LogRecord, MetricKind, MetricRecord, Registry};
     use logit_core::{SpanEvent, SpanKind, SpanRecord, SpanStatus};
 
@@ -375,16 +376,6 @@ mod tests {
         assert_eq!(attr(&event, "sql"), Some(&Value::I64(1)), "the untouched attribute survives");
     }
 
-    /// Whether `inner` lies within `outer`'s buffer: a captured `Value::Str` must be a slice of
-    /// the message, never a fresh allocation.
-    fn points_into(outer: &Bytes, inner: &Bytes) -> bool {
-        let outer_start = outer.as_ptr() as usize;
-        let outer_end = outer_start + outer.len();
-        let inner_start = inner.as_ptr() as usize;
-        let inner_end = inner_start + inner.len();
-        inner_start >= outer_start && inner_end <= outer_end
-    }
-
     #[test]
     fn a_captured_value_shares_the_message_buffer() {
         let mut re = RegexParser::new(r"status=(?P<status>\d+)", None).unwrap();
@@ -397,7 +388,7 @@ mod tests {
         assert!(re.process(&resource, &mut event), "always forwards");
         match attr(&event, "status") {
             Some(Value::Str(captured)) => {
-                assert!(points_into(&message, captured), "capture must slice the message buffer")
+                assert!(within(&message, captured), "capture must slice the message buffer")
             }
             other => panic!("expected Str, got {other:?}"),
         }

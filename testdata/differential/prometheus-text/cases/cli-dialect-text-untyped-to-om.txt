@@ -1,0 +1,3 @@
+# TYPE legacy_metric untyped
+legacy_metric{env="prod"} 7
+bare_no_type 1

@@ -1,0 +1,35 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "a.b",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "x",
+     "y"
+    ]
+   ],
+   "name": "a.b",
+   "value": "0x4008000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x42e850c4",
+  "len": 30,
+  "path": "differential/prometheus-text/cases/utf8-metric-name-text.txt"
+ },
+ "parser": "prom"
+}

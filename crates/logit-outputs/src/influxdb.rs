@@ -348,8 +348,9 @@ impl Encoder for InfluxLineEncoder {
 /// ## Multi-value tags: last-value-wins, counted
 ///
 /// A repeated DogStatsD tag key arrives as a [`Value::Array`] in wire order
-/// (`logit_inputs::statsd::insert_tags`). Line protocol's tag set is a map, one value per key, so
-/// this renders the **last** representable element, walking backwards past unrepresentable ones.
+/// (`logit_proto::statsd::decode::insert_tags`). Line protocol's tag set is a map, one value per
+/// key, so this renders the **last** representable element, walking backwards past unrepresentable
+/// ones.
 /// Last, not first, matches what a decoder that collapsed repeated keys wrote, so existing
 /// InfluxDB series don't change. `normalized` counts only an array whose chosen element reaches
 /// the wire; an empty or wholly unrepresentable `Array` drops the tag uncounted, as any other

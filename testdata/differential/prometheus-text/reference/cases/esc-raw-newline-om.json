@@ -1,0 +1,26 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "ok"
+    ]
+   ],
+   "name": "e",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": {
+  "after_entry": 1,
+  "message": "expected label value, got \"\\\"x\\n\" (\"INVALID\") while parsing: \"f{a=\\\"x\\n\""
+ },
+ "input": {
+  "crc32c": "0x425dd33d",
+  "len": 35,
+  "path": "differential/prometheus-text/cases/esc-raw-newline-om.om"
+ },
+ "parser": "openmetrics"
+}

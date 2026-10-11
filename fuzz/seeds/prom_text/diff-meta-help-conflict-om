@@ -1,0 +1,5 @@
+# HELP m one
+# HELP m two
+# TYPE m gauge
+m 1
+# EOF

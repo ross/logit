@@ -1,0 +1,62 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "h",
+   "value": "histogram"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "1.0"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x7ff8000000000001"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "2.0"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0xbff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_sum",
+   "value": "0x4022000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_count",
+   "value": "0x7ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xcd627b19",
+  "len": 103,
+  "path": "differential/prometheus-text/cases/hist-bad-counts-text.txt"
+ },
+ "parser": "prom"
+}

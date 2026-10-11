@@ -1,0 +1,36 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "1"
+    ]
+   ],
+   "name": "g",
+   "ts_ms": 9300000000000,
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "a",
+     "2"
+    ]
+   ],
+   "name": "g",
+   "ts_ms": 1605281325123,
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xf2aeeb49",
+  "len": 50,
+  "path": "differential/prometheus-text/cases/ts-text-past-2262.txt"
+ },
+ "parser": "prom"
+}

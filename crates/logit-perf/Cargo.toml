@@ -23,7 +23,11 @@ libc.workspace = true
 # wrote it with (`logit_proto::frame::read_frame` + `logit_proto::native::decode_batch`), not a
 # re-derived format or a human-readable render (docs/adr/load-test-harness.md's "Per-node
 # attribution" section). This dependency is why `logit-perf` is a workspace member under `crates/`
-# rather than a standalone `tools/*` workspace.
+# rather than a standalone `tools/*` workspace. Tests also decode with its `StatsdDecoder`: every
+# line `perf/load/statsd-app.yaml` renders must parse cleanly through the decoder the scenario's
+# `statsd_in` runs, or the scenario would benchmark the malformed-line path. The harness binary
+# decodes no statsd; its runtime check reads `logit.component.diagnostics{key="bad_line"}` from
+# telemetry instead.
 logit-proto.workspace = true
 # The `Event`/`MetricKind`/`DdSketch` types the decoded batches are made of, and
 # `interner::resolve` for a `MetricRecord`'s `Symbol` name.
@@ -31,10 +35,3 @@ logit-core.workspace = true
 # `Bytes` is `read_frame`'s cursor type: the whole dump is read into one and each frame split off
 # its front.
 bytes.workspace = true
-
-[dev-dependencies]
-# Tests only: every line `perf/load/statsd-app.yaml` renders must parse cleanly through the
-# `StatsdDecoder` the scenario's `statsd_in` runs, or the scenario would benchmark the
-# malformed-line path. The harness binary decodes no statsd; its runtime check reads
-# `logit.component.diagnostics{key="bad_line"}` from telemetry instead.
-logit-inputs.workspace = true
