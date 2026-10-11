@@ -1775,34 +1775,36 @@ What the run showed:
 
 ### W7a: Lua in the path (2026-10-11)
 
-Every run is from `soak/w7a` on `logit:soak` `sha256:40807aca7887`, rebuilt with `--no-cache` from
-`a1dfd4c9` (the branch changes no Rust), on the development host (32 cores). Each new scenario's
-last run passed every row, and the earlier runs found four gaps in the harness and none in
-`logit`:
+The recorded runs are from `soak/w7b` at `b1e03e31`, which carries this branch merged with
+`main`'s shutdown accounting (`internal` drains last), on `logit:soak` `sha256:0e1c5e3109ab`,
+rebuilt with `--no-cache` from that commit, on the development host (32 cores). `lua-stall` ran
+alone; the others ran two at a time under separate compose projects. Every run passed every
+row. The earlier runs, from `soak/w7a` before the merge, found four gaps in the harness and
+none in `logit`:
 
 | Run | Scenario | Verdict |
 |---|---|---|
-| `20261011T170708Z` | `lua-stall` | every row PASS, re-scored by the final checks too |
-| `20261011T172431Z` | `lua-memory` | no FAIL; `rss_slope` WARNs on the generator (+147.4 MiB/h over a run under an hour) |
-| `20261011T174241Z` | `lua-path` | every row PASS |
-| `20261011T172531Z` | `statsd-vm` | every row PASS: the regression control |
+| `20261011T220359Z` | `lua-stall` | every row PASS |
+| `20261011T221311Z` | `lua-memory` | every row PASS |
+| `20261011T221308Z` | `lua-path` | every row PASS |
+| `20261011T225118Z` | `statsd-vm` | every row PASS: the regression control |
 
 What the runs showed about `logit`:
 
 - **A stalled script reads `stalled` and recovers on its own.** In `lua-stall` the loop on the
-  360,000th event ran about 31 s. The HEALTHCHECK read `stalled (503 Service Unavailable)` at
-  +194 s and +204 s and `ok` from +214 s; `script_stalled` was counted once. The receive queue
-  filled (`receive.utilization` 1) and evicted 40,100 datagrams, counted as `overflow_oldest`,
+  360,000th event held `process()` past the 10.5 s heartbeat. The HEALTHCHECK read `stalled`
+  twice, from +194 s, and `ok` after; `script_stalled` was counted once. The receive queue
+  filled (`receive.utilization` 1) and evicted 39,000 datagrams, counted as `overflow_oldest`,
   the kernel dropped none, and the run recovered within `recovery_bound`. Docker's
   `Health.Status` stayed `healthy` throughout, since it needs three failed checks in a row, so
   only the status word in `health_log` shows the stall.
-- **`max_memory` ends the process cleanly.** In `lua-memory` the VM held 69,832,147 bytes after
-  one full collection at +267 s: one ERROR line keyed `memory_limit_exceeded`, then `exiting`
-  with code 2 and `main`'s `Error: ` line, exit code 2, `drain complete` with no batch dropped,
-  and a restart on the step's revert at +320 s that was ready on the first probe. The trip
-  matches the calibration run, 32 s after the script starts keeping strings.
-- **The script hop balances under faults.** In `lua-path`'s final life, E 643,100 == L_in ==
-  L_emit 624,463 + L_drop 12,133 + L_err 6,504, and L_sent 624,497 == L_emit + L_flush 34, the
+- **`max_memory` ends the process cleanly.** In `lua-memory` the VM held 67,339,919 bytes after
+  one full collection at +266 s: one ERROR line keyed `memory_limit_exceeded`, then
+  `drain complete` with no batch dropped and `exiting` with code 2, exit code 2, and a restart
+  on the step's revert at +320 s that was ready in 0.1 s. The exited life's egress gap was 0,
+  with no shutdown drop to count.
+- **The script hop balances under faults.** In `lua-path`'s final life, E 646,100 == L_in ==
+  L_emit 627,375 + L_drop 12,190 + L_err 6,535, and L_sent 627,409 == L_emit + L_flush 34, the
   34 being one rollup event per 10 s window. The egress gap is 0 once L_flush leaves Ab; with
   the subtraction left out on a copy of the checks, the recorded `20261011T172503Z` FAILs
   `ledger.egress` and `ledger.summary` by 34, the flush events.
@@ -1825,7 +1827,9 @@ What the runs showed about the harness:
   script dropped and failed on about 2.9% of them, which no drain exports. `ledger.egress` now
   passes such a gap inside a script band, the life's drop-and-error share of the events the
   script hadn't emitted (here the 100 in its batch), rounded up, plus 1 per outcome the life
-  shows (here 5); re-scored, the run passes every row.
+  shows (here 5); re-scored, the run passes every row. With `internal` draining last, the final
+  drain exports those drops: in the recorded `lua-path` run life 0's residual and gap were both
+  0, read "ok", and the band went unused.
 - **A drop period that divides the series count empties series.** The first `lua-path` run,
   `20261011T170612Z`, WARNed that two series' resets weren't SUT lives − 1: dropping every 50th
   event of a generator cycling 100 names dropped `soak_requests_49_total` and
