@@ -36,7 +36,7 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   with findings, tail bookkeeping (#437, #440, #442–#445, #447), which closed TAIL-01..04,
   TAIL-09..12 with findings, the sink send path (#449–#456, #457), which also closed leads
   12 and 14 and closed SINK-01..06, WIRE-08, WIRE-09, and RT-05 with findings, and the
-  untrusted-input parsers (#598–#603, #605, #606, #609, #612, #616, #619–#621, #TBD), which
+  untrusted-input parsers (#598–#603, #605, #606, #609, #612, #616, #619–#621, #626), which
   closed NET-08, CODEC-01, CODEC-05, CODEC-07, CODEC-08, CODEC-10, CODEC-12, CODEC-13, and
   XFORM-07 with findings and reviewed CODEC-02, CODEC-03, XFORM-06, and XFORM-08 clean. The sink
   send path also found two defects the survey didn't name: bisection inflating codec counters on
@@ -153,7 +153,7 @@ Entries that share a mechanism and should be verified together, in suggested ord
 8. **Aggregate (done, #400, #402, #405, #407, #410)** — XFORM-01..05, CORE-07. Proptest against a naive
    reference aggregator, merge laws (associativity/commutativity) for every mergeable kind,
    cardinality-cap soak.
-9. **Untrusted-input parsers (done, #598–#603, #605, #606, #609, #612, #616, #619–#621, #TBD)** — NET-08,
+9. **Untrusted-input parsers (done, #598–#603, #605, #606, #609, #612, #616, #619–#621, #626)** — NET-08,
    CODEC-01..03/05/07/08/10/12/13, XFORM-06/07/08. One fuzz target each; differential tests
    against reference implementations to inform committed fixtures: CPython `pickle` and
    Prometheus `textparse`, committed under `testdata/differential/`. At the stack tip every
