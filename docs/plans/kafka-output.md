@@ -55,10 +55,10 @@ leg:
 
 - **Partition parity.** The same keys, produced by `kafka_out` and by `kafka-console-producer.sh`,
   land on the same partitions.
-- **Codecs.** A topic written with each of `none`, `gzip`, `snappy`, `lz4`, and `zstd` is read by
-  the Java consumer and by kcat.
+- **Codecs.** A topic written with each of `none`, `gzip`, `snappy`, `lz4`, and `zstd` stores
+  batches under that codec and is read by the Java consumer and by kcat.
 - **Idempotent dedup.** A `tc netem` drop of the broker's response after the write leads to a
-  resend and no duplicate in the topic.
+  resend and no duplicate in the topic, while a non-idempotent control sink's resend stores one.
 - **TLS and mTLS.** A broker with a private CA, and one that requires a client certificate.
 - **Timestamps.** An event stamped more than an hour ahead is dropped and counted; the rest of its
   batch lands.
@@ -69,36 +69,51 @@ The soak scenario restarts the broker mid-run and checks the ledger for uncounte
 ## Findings (W4)
 
 `script/kafka-interop` against `apache/kafka:4.2.0` and `redpandadata/redpanda:v26.2.3`, run
-2026-10-11 (`perf/results/kafka-interop/20261011T211419Z/`): 21 of 22 rows `PASS`, one `GAP`, no
+2026-10-11 (`perf/results/kafka-interop/20261011T212530Z/`): 21 of 22 rows `PASS`, one `GAP`, no
 `FAIL`, and no `kafka_out` bug.
 
 | Leg | Apache Kafka 4.2.0 | Redpanda v26.2.3 |
 |---|---|---|
 | Partition parity | `PASS`: all 50 keys on the console producer's partition, 6 of 6 partitions used | `PASS`, the same |
-| Codecs `none`, `gzip`, `snappy`, `lz4`, `zstd` | `PASS` each: 100 records, each event once, in both the Java consumer and kcat | `PASS` each, the same |
+| Codecs `none`, `gzip`, `snappy`, `lz4`, `zstd` | `PASS` each: 100 records, each event once, in both the Java consumer and kcat; `kafka-dump-log.sh` shows all 10 stored batches under the named codec | `PASS` each: the same read-back; rpk shows all 100 records' batches under the named codec |
 | Idempotent dedup | `PASS`: 800 records for 800 events after one `Ambiguous` attempt; the non-idempotent control stored 10 duplicates | `PASS`, the same |
 | TLS, mutual TLS | `PASS`: 50 records each; with no client certificate, 0 records and only `clean` attempts | `PASS`, the same |
 | Timestamps | `PASS`: 90 of 100 records landed, the 10 stamped at 2100-01-01 dropped and counted as `invalid_timestamp` | `GAP`: 0 landed; Redpanda answers `INVALID_TIMESTAMP` naming no record, so each batch of 10 was rejected whole, counted as `rejected` |
 
 What the run showed:
 
+- **Each codec row reads the codec the broker stored.** Both consumers decode any codec, so the
+  read-back alone can't show that `compression:` reached the wire. On Kafka, `kafka-dump-log.sh`
+  reads the topic's segment file. Redpanda's segments aren't in Kafka's file format, so `rpk topic
+  consume -f '%a{compression}'` reports each record's batch codec as Redpanda serves it on a
+  fetch; with `compression.type: producer`, the default on both brokers, that's the stored
+  batch's codec. Forcing one leg's sink to `compression: none` turns its `codec-zstd` row `FAIL`
+  on both brokers.
+
 - **The dedup leg isn't vacuous.** For 8 s the broker's packets to the leg were dropped while its
   requests still arrived, so the broker appended a batch whose response never came. Both sinks
   timed out once (`Ambiguous`) and resent after the drop cleared. The idempotent sink's resend
   carried its first attempt's sequence, and the broker discarded it; the control sink's resend
-  was appended again, which is the duplicate the idempotent producer prevents.
+  was appended again, which is the duplicate the idempotent producer prevents. The row `FAIL`s
+  unless the control stored a duplicate, because an `Ambiguous` attempt whose first try never
+  reached the broker proves nothing about idempotence. With the netem drop skipped
+  (`NETEM_FOR=0`), both brokers' rows `FAIL`.
 - **Redpanda agrees with Kafka on every leg but one.** It places keyed records where the Java
   partitioner does, takes all five codecs, deduplicates an idempotent resend, and enforces
   mutual TLS. Like Kafka 4.x, it refuses a record more than an hour ahead
   (`message.timestamp.after.max.ms`, 3,600,000 by default), but it fills no `record_errors`, so
   `kafka_out` can't drop the one record and rejects the partition batch under item 5 of
   [ADR `kafka-output`](../adr/kafka-output.md). [docs/known-gaps/kafka.md](../known-gaps/kafka.md)
-  records it.
-- **The soak scenario lost nothing.** `script/soak run kafka-broker-restart` (8 minutes 30
-  seconds, `perf/results/soak/20261011T205504Z/`) restarted, paused for 40 s, and stopped for
-  60 s the broker under a 2,000 lines/s statsd stream: every row `PASS`, 1,032,400 increments
-  absorbed and 1,032,400 in the topic, and 25,900 records in the topic for 25,900 accepted. The
-  pause produced one `Ambiguous` attempt, and its resend stored no duplicate. See
+  records it. Only Redpanda's `timestamp` row can read `GAP`: Apache Kafka is the reference, so
+  any outcome but the expected one `FAIL`s its row.
+- **The soak scenario lost nothing and stored nothing twice.** `script/soak run
+  kafka-broker-restart` (8 minutes 30 seconds, `perf/results/soak/20261011T213158Z/`) restarted,
+  paused for 40 s, and stopped for 60 s the broker under a 2,000 lines/s statsd stream: every row
+  `PASS`, 1,032,400 increments absorbed and 1,032,400 in the topic's distinct records, and 25,900
+  records in the topic, all distinct, for 25,900 accepted. The pause produced one `Ambiguous`
+  attempt, and its resend stored no duplicate. The harness deduplicates the topic before it sums
+  V, so a duplicate can't hide a loss, and `ledger.topic` `FAIL`s a duplicate in a SUT life with
+  no producer epoch bump. See
   [docs/plans/soak-harness.md](soak-harness.md)'s "Findings".
 
 ## Verified so far

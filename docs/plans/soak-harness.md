@@ -814,24 +814,29 @@ both counts, or `kafka_read_failed` when either read fails or the consumer's cou
 the offsets.
 
 **V.** The SUT's `aggregate` runs `temporality: delta`, so each record, one event in
-`kafka_out`'s `format: json`, carries its window's increments. V is the sum of every record's
-`sum` metric values, credited to the SUT life its event `timestamp` falls in (`topic.py`). No
-reset logic applies, and a record stored twice adds its increments twice: a surplus is a
-duplicate, not a reset.
+`kafka_out`'s `format: json`, carries its window's increments. V is the sum of every distinct
+record's `sum` metric values, credited to the SUT life its event `timestamp` falls in
+(`topic.py`). Records are deduplicated on the value's raw bytes, because a resend re-encodes the
+same event to the same bytes; summing the copies would let a duplicate cancel a loss of the same
+size. No reset logic applies.
 
 **The checks.** `ledger.egress` and `ledger.summary` judge Ab − V against the topic as they do
-against VictoriaMetrics, with one difference: a negative gap in a life that wasn't killed is
-`duplicates`, a WARN, because `at_least_once` permits them
-([`docs/known-gaps/kafka.md`](../known-gaps/kafka.md)); `ledger.summary` shows it and doesn't
-judge it. A topic not read back, an empty one, or a record that isn't a JSON object FAILs
+against VictoriaMetrics, with one difference: a negative gap in a life that wasn't killed is a
+`surplus`, a FAIL. A topic not read back, an empty one, or a record that isn't a JSON object FAILs
 `ledger.egress`. `ledger.windows` and the freshness samples SKIP. `ledger.sent` judges the sink
 as for an external target, with `kafka_out`'s request classes: `ok` is accepted, and the
 diagnostics it quotes are keyed by the drop reason (`rejected`, `invalid_timestamp`,
 `invalid_record`, `oversize`); its PASS doesn't read `SENT`, because the ledger goes on to the
-topic. `ledger.topic` compares the topic's record count T with the records the sink saw
-accepted, A (`logit.output.records`, every SUT life): T below A FAILs, records the broker
-acknowledged and no longer holds; T above A WARNs, duplicates; a topic not read back FAILs.
-Every other target's `ledger.topic` SKIPs.
+topic. `ledger.topic` compares the topic's distinct record count T with the records the sink
+saw accepted, A (`logit.output.records`, every SUT life): T below A FAILs, records the broker
+acknowledged and no longer holds; T above A FAILs, unless the sink dropped an attempt it never
+saw answered, which may have landed, and then WARNs; a topic not read back FAILs. It judges each
+SUT life's duplicate copies too. Within one producer epoch the broker discards a resend, so a
+duplicate FAILs in a life with no epoch bump, and WARNs in a life that ended in a restart or
+kill (the next life resends under a new producer id) or whose sink counted a drop that bumps
+the epoch (`rejected`, `invalid_timestamp`, `invalid_record`, `ambiguous_at_most_once`;
+`checks.py`'s `EPOCH_BUMP_REASONS`), as [`docs/known-gaps/kafka.md`](../known-gaps/kafka.md)
+permits. Every other target's `ledger.topic` SKIPs.
 
 **The scenario.** `kafka-broker-restart` is `statsd-vm`'s generator at 2,000 lines/s through a
 2 s delta `aggregate` into `kafka_out` (`format: json`, `acks: all`, idempotent, `timeout:
@@ -839,8 +844,8 @@ Every other target's `ledger.topic` SKIPs.
 for 60 s, each followed by at least 75 s. The 10 s `timeout`, under the pause, turns the pause
 into response timeouts, `Ambiguous` attempts the broker deduplicates on the resend. Its
 expectations: `batches.dropped` 0 through each fault, at least one `ambiguous` request through
-the pause, so the no-duplicate verdicts rest on resends, and `retrying` above 0 during the stop
-and 0 after it.
+the pause, so `ledger.topic`'s no-duplicate verdict rests on resends, and `retrying` above 0
+during the stop and 0 after it.
 
 ### 9. Not in this stack
 
@@ -1738,30 +1743,31 @@ What the run showed:
 
 ### A Kafka target: `kafka-broker-restart` (2026-10-11)
 
-Run `20261011T205504Z`: `script/soak run kafka-broker-restart`, the scenario's own 8 minutes 30
-seconds, from `kafka/w4` at `35344ad3` with the scenario and its harness support uncommitted, on a
-32-core host (`logit:soak` `sha256:887a5407a3b2`, `apache/kafka:4.2.0` `sha256:9516fb7634ba`).
+Run `20261011T213158Z`: `script/soak run kafka-broker-restart`, the scenario's own 8 minutes 30
+seconds, from `kafka/w4` at `a63ec4d5` with the deduplicating topic checks uncommitted, on a
+32-core host (`logit:soak` `sha256:607d55b505bf`, `apache/kafka:4.2.0` `sha256:9516fb7634ba`).
 Overall PASS: every row passed but `ledger.windows`, which a Kafka target SKIPs, and
 `ledger.replay`, which had no killed life.
 
 - **Nothing was lost or stored twice.** The generator sent 1,032,400 lines, and every one was
-  read, sent to `aggregate`, and absorbed. The topic held 25,900 records whose increments summed
-  to 1,032,400, so Ab − V was 0, and the sink saw 25,900 records accepted, so T − A was 0. The
-  sink delivered all 259 batches it received and dropped none.
+  read, sent to `aggregate`, and absorbed. The topic held 25,900 records, all distinct, whose
+  increments summed to 1,032,400, so Ab − V was 0, and the sink saw 25,900 records accepted, so
+  T − A was 0 with no duplicate copy. The sink delivered all 259 batches it received and dropped
+  none.
 - **The restart** (+61 s to +90 s) cost four `clean` attempts, each `Connection refused`, while
   the broker came back.
 - **The pause** (+165 s to +205 s) left one attempt `ambiguous`: `waiting for a Produce response
   timed out after 10s`, with six batches queued behind it, then two `clean` attempts. The
-  resend's sequences were the first attempt's, and neither the topic's count nor V shows a
-  duplicate. The harness can't tell
+  resend's sequences were the first attempt's, and the topic holds no duplicate copy. The
+  harness can't tell
   whether the broker appended the first attempt after the unpause and discarded the resend, or
   never appended it.
 - **The stop** (+285 s to +345 s) cost seven `clean` attempts, the broker's name gone from DNS,
   and the sink stopped retrying within the recovery bound.
 - **The end sequence** found the sink's queue empty 8 s after the generator stopped, and read
-  25,900 records back, matching the partition's end offset, 3 s after the SUT stopped.
-- **RSS slopes** were +2.6 MiB/h (SUT) and +1.4 MiB/h (generator), and file descriptors held at
-  13 and 11.
+  25,900 records back, matching the partition's end offset, 4 s after the SUT stopped.
+- **RSS slopes** were +1.5 MiB/h (SUT) and +1.1 MiB/h (generator), and file descriptors held at
+  13 (SUT) and went from 12 to 11 (generator).
 
 ## Verification
 
