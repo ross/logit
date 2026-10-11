@@ -631,8 +631,9 @@ count each connection their shutdown close sequence ends as
 `idle-connection-timeout`](idle-connection-timeout.md)'s shutdown amendment. The TCP driver and
 `logit_in` don't count a shutdown close.
 
-Not covered: SIGKILL and out-of-memory kills give no drain at all. Only a shorter `interval` narrows
-that loss.
+Not covered: SIGKILL and out-of-memory kills give no drain at all. A shorter `interval` narrows the
+counts lost from the registry; batches already queued in `internal`'s pipeline are lost unless a
+sink uses `buffer.disk:`.
 
 Alternatives considered:
 
