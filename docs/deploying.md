@@ -3007,7 +3007,7 @@ settings on your stack. Against a token without it, each request counts as deliv
 
 ## `kafka_out`: producing to Kafka
 
-`kafka_out` produces each event as one record to a Kafka topic, with the Java producer's defaults:
+`kafka_out` produces events to a Kafka topic, one per record by default, with the Java producer's defaults:
 `acks: all`, idempotence on, and keyed records on the partition a Java client picks for the same
 key. It speaks the Kafka protocol from Kafka 2.4 on; it's checked against Apache Kafka 4.2.
 [`fixtures/kafka-out.yaml`](../fixtures/kafka-out.yaml) sends JSON lines from a TCP socket into
@@ -3021,6 +3021,8 @@ components:
     brokers: ["kafka-1:9092", "kafka-2:9092"]
     topic: logs
     key: {attribute: user}   # none (the default) | trace_id | {attribute: ..} | {resource: ..}
+    # format: json           # the default; text | msgpack | native
+    # record: event          # the default but for native; batch
     # compression: none      # the default; gzip | snappy | lz4 | zstd
     # acks: all              # the default; idempotent: true needs it
     # max_request_bytes: 1MiB
@@ -3035,10 +3037,22 @@ turns TLS on for every connection, checking each broker's certificate against th
 advertises; `cert_file` and `key_file` add a client certificate for mutual TLS. SASL isn't
 supported.
 
-**Records.** Each record's value is the event's JSON object, the one `stdio_out`'s `format: json`
-writes on a line ([`ndjson.rs`](../crates/logit-outputs/src/ndjson.rs) has the grammar). Its
-timestamp is the event's, as `CreateTime`, and every record carries the `headers:` map, in name
-order.
+**Records.** `format:` picks each record's value:
+
+| `format:` | Value | Default `record:` |
+|---|---|---|
+| `json` | the event's JSON object, the one `stdio_out`'s `format: json` writes on a line ([`ndjson.rs`](../crates/logit-outputs/src/ndjson.rs) has the grammar) | `event` |
+| `text` | the log body alone; an event with no log record is skipped, counted `logit.output.events.skipped{reason="no_log"}` | `event` |
+| `msgpack` | the `json` object, key for key, as MessagePack; raw bytes are a `bin` and NaN and the infinities are floats ([`msgpack.rs`](../crates/logit-outputs/src/msgpack.rs)) | `event` |
+| `native` | a frame of `logit`'s own format, which a `logit` reads back with no loss | `batch` |
+
+`record: event` sends one event per record, with the event's timestamp as `CreateTime`.
+`record: batch` packs as many of a batch's events into each record as fit under
+`max_request_bytes`: NDJSON lines for `json`, bodies joined by newlines for `text` (so a body
+that holds a newline reads as two), maps back to back for `msgpack`, and one frame for `native`.
+A batch record has no key, and its timestamp is its first event's. So `key:` needs
+`record: event`, which `format: native` has to set explicitly; `logit validate` rejects a key
+with a batch record. Every record carries the `headers:` map, in name order.
 
 **Keys and partitions.** `key: trace_id` keys a record by its trace id as 32 lowercase hex
 characters, as the OpenTelemetry Collector's Kafka exporter does, so both put one trace's records
@@ -3052,7 +3066,8 @@ goes out. Against one that doesn't, the first batch waits up to `timeout` for th
 the sink reports `refused` and holds its queue until an operator creates it.
 
 **Size.** `max_request_bytes` (1 MiB by default) caps one record and one produce request before
-compression. A record over it is dropped, counted `logit.output.records.dropped{reason="oversize"}`.
+compression. A record over it is dropped, counted `logit.output.records.dropped{reason="oversize"}`,
+and so is an event too large to fit in a `record: batch` record alone.
 Keep it at or below the topic's `max.message.bytes`: a batch the broker finds too large is split
 in two once, and a half still too large is dropped, counted `reason="rejected"`.
 
@@ -3072,7 +3087,8 @@ doc ([`kafka/mod.rs`](../crates/logit-outputs/src/kafka/mod.rs), "Response class
 table of every broker error it reads.
 
 **What to watch.** `logit.output.requests{class}`, `logit.output.records` for what Kafka
-accepted, `logit.output.records.dropped{reason}`, and `logit.output.records.unkeyed`.
+accepted, `logit.output.records.dropped{reason}`, `logit.output.records.unkeyed`, and, under
+`format: text`, `logit.output.events.skipped{reason="no_log"}`.
 `docs/design/internal-telemetry.md`'s `kafka_out` section has every counter.
 
 ## Prometheus remote-write: receiving, sending, and picking a version

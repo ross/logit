@@ -1,7 +1,7 @@
 # JSON log lines in, one Kafka record per event out: an application writing one JSON object per
 # line to a TCP socket, and `kafka_out` (docs/adr/kafka-output.md) producing each event to the
 # dev stack's broker (`compose.yaml`'s `kafka` service) as the JSON object `stdio_out`'s
-# `format: json` writes.
+# `format: json` writes. `format:` and `record:` below pick the other payloads.
 #
 #   app (TCP lines) --> lines_in --> json --> kafka_out --> kafka:9092, topic logs
 #
@@ -36,6 +36,9 @@ components:
     topic: logs
     key: {attribute: user}           # none (the default) | trace_id | {attribute: ..} | {resource: ..}
     compression: zstd                # none (the default) | gzip | snappy | lz4 | zstd
+    # format: json                   # the default; text (the log body) | msgpack | native
+    # record: event                  # the default but for native; batch packs many events per
+    #                                # record, unkeyed, so it needs `key: none`
     headers:
       source: logit
     # acks: all                      # the default; idempotent: true needs it

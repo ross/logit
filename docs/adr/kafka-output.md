@@ -470,7 +470,7 @@ carries the canonical fault-class table, so item 5's table is no longer updated.
 Building the sink settled five points the decision above leaves open. Where this section and an
 item above disagree, this section holds.
 
-1. **`record:` waits for W3.** Item 11 gives every format a `record: event | batch` override.
+1. **`record:` waits for W3.** (Settled by "Amendment: what W3 settled".) Item 11 gives every format a `record: event | batch` override.
    `kafka_out` ships `format: json` with one record per event and no `record:` field. A batch
    record needs its own timestamp and its own answer to a batch over `max_request_bytes`, which
    W3 decides with the other formats.
@@ -499,3 +499,63 @@ A Kafka 4.2 broker with `auto.create.topics.enable` answers the first `Metadata`
 missing topic with `UNKNOWN_TOPIC_OR_PARTITION` while it creates the topic. The W1 amendment's
 point 4 correction covers how the producer reads that answer, so a new topic's first batch goes
 out with no failure.
+
+## Amendment: what W3 settled (2026-10-11)
+
+Building the other formats and `record:` settled nine points item 11 and the W2 amendment's point
+1 leave open. Where this section and an item above disagree, this section holds. The encoder's
+module doc (`crates/logit-outputs/src/kafka/encode.rs`) has the per-format table.
+
+1. **`record:` is optional, and unset means the format's default**: `event` for `json`, `text`,
+   and `msgpack`, `batch` for `native`, as item 11's table gives.
+2. **A batch record packs events in order until the next would push it over the cap.** The cap is
+   `max_request_bytes` less the overhead the producer adds for the record (the batch header, the
+   record framing, and the headers), so a value that fits never trips the producer's own
+   per-record check. The event that doesn't fit starts the next record. An event whose own value
+   is over the cap is dropped and counted as `records.dropped{reason="oversize"}`, as a single
+   oversize record is; the rest of the batch still goes.
+3. **`native` finds each record's longest run of events that fits by encoding.** A frame shares
+   one dictionary across its events, so its size isn't the sum of theirs. The encoder tries the
+   rest of the batch as one frame first, then doubles and bisects over the run length. A frame
+   only grows as events are added, so this finds the same record boundaries the in-order rule
+   above would, at the cost of extra encodes when a batch doesn't fit one record
+   (`docs/known-gaps/kafka.md`).
+4. **A batch record has no key, and its timestamp is its first event's.** A key belongs to one
+   event, and a batch record's events can each have a different one. Graph rule 82 rejects any
+   `key` but `none` with a batch record, including `native`'s default, and its message tells the
+   operator to set `record: event`. `KafkaOutput::new` refuses the same pair.
+5. **Batch record bodies, per format:** NDJSON for `json`, each line newline-terminated;
+   the bodies joined by `\n` for `text`, with no newline after the last, so a body that holds a
+   newline can't be told from two bodies (`docs/known-gaps/kafka.md`); the MessagePack maps back
+   to back for `msgpack`, which a MessagePack reader takes as a stream of values; one
+   `CODEC_BATCH` frame for `native`.
+6. **`text` writes the log body by type.** A `Str` or `Bytes` body goes as its bytes, a `Map` or
+   `Array` as `ndjson.rs`'s JSON value, a timestamp as RFC 3339, another scalar as its decimal or
+   `true`/`false` text, and `Null` as an empty value. This is the OTel `kafkaexporter`'s `raw`
+   log encoding. An event with no log record is skipped and counted as
+   `logit.output.events.skipped{reason="no_log"}`, the counter `syslog_out` and `splunk_hec_out`
+   use for an event they have no wire form for. A batch whose every event is skipped sends no
+   request and succeeds.
+7. **`msgpack` is `json`'s object from one walker.** `ndjson.rs` walks an event through a
+   `TreeWriter` trait, and the JSON and MessagePack writers implement it, so the two formats
+   can't disagree on which keys appear or their order. MessagePack has types JSON lacks, and the
+   writer uses them in two places: `Value::Bytes` is a `bin`, not JSON's `b"..."` text, and a
+   non-finite float is a float, not JSON's `"NaN"`, `"inf"`, or `"-inf"`. Timestamps, ids, and
+   byte fields that are text by convention stay the strings JSON writes, so a consumer reads the
+   same values from either format. `logit_proto::msgpack::Writer` gained `begin_map` and
+   `end_map`, which patch a map's header once its length is known and still write the smallest
+   header.
+8. **A native frame is uncompressed.** `compression:` compresses the record batch it travels in,
+   and lz4 inside a compressed batch would add work for no gain. Under `record: event`, each
+   record is a one-event frame under the batch's resource and scope, through
+   `logit_proto::native::encode_events`, which encodes a slice of a batch's events without
+   cloning them.
+9. **No setting is ignored by a format.** Every field applies to all four formats, so rule 82
+   has no "a setting the format ignores" clause. The one combination that leaves a setting
+   unused, a key with a batch record, is rejected under point 4.
+
+Checked against `apache/kafka:4.2.0`: each format under each `record:` mode, read back through
+kcat and decoded (`serde_json`, `logit_proto::msgpack::Reader`, `logit_proto::native`), carried
+every event sent, with each event record's key and each record's timestamp as above. A native
+frame decoded in another process lists an event's attributes in that process's interning order,
+not the sender's: `AttrMap` order is process-local, so the comparison is field for field.

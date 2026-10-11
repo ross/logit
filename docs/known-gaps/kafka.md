@@ -41,3 +41,18 @@ Entry format and the other areas: [the known-gaps index](README.md).
     from a sender with a fast clock, never reaches the topic.
   - **Workaround:** raise `log.message.timestamp.after.max.ms` on the topic, or fix the clock or
     the `timestamp` stage upstream.
+- **A `text` batch record can't tell a newline inside a body from the one between bodies.**
+  `format: text` with `record: batch` joins the log bodies with `\n`, with no escaping or length
+  prefix ([ADR `kafka-output`](../adr/kafka-output.md), "Amendment: what W3 settled", item 5).
+  - **Consequence:** a consumer splitting the record on newlines reads a multiline body, such as
+    a stack trace, as several bodies.
+  - **Workaround:** `record: event` for a multiline source, or `format: json`, whose lines escape
+    the newline.
+- **A `native` batch record over the cap costs several encodes.** A native frame's dictionary is
+  shared by its events, so its size isn't the sum of theirs, and `record: batch` finds each
+  record's longest run of events that fits by encoding candidate frames: the rest of the batch
+  whole first, then doubling and bisecting ([ADR `kafka-output`](../adr/kafka-output.md),
+  "Amendment: what W3 settled", item 3).
+  - **Consequence:** a batch that fits one record costs one encode; one that needs `k` records
+    costs about `k` times the logarithm of the events per record more.
+  - **Workaround:** keep upstream batches under `max_request_bytes`, or raise the cap.
