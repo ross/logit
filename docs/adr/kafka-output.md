@@ -169,18 +169,24 @@ keyed records land where a Java producer's records with the same key land.
   - a batch that `write_loop` drops after an `Ambiguous` attempt under `at_most_once`, which may
     or may not have been appended.
 
-  Before that partition sends again, `kafka_out` sends `InitProducerId` with the current PID and
-  epoch (KIP-360), which keeps the PID and bumps the epoch, and every partition's sequence restarts
-  at 0 under it. The resend of the rest, the split halves, and every partition batch numbered behind
-  the failure take fresh consecutive sequences under the new epoch. Java does the same:
-  `TransactionManager.handleFailedBatch` requests an epoch bump for the partition, and the
+  Before that partition sends again, `kafka_out` bumps the epoch on the client: the same PID with
+  epoch + 1, and no request. Every partition's sequence restarts at 0 under the new epoch
+  (`ProducerAppendInfo.checkSequence` requires 0 there). `kafka_out` sends `InitProducerId` only
+  when the epoch reaches `Short.MAX_VALUE`. For a producer with no transactional id, the broker
+  (`TransactionCoordinator.handleInitProducerId`) ignores the PID and epoch in that request and
+  returns a fresh PID at epoch 0, so that request mints a new PID. The resend of the rest, the split
+  halves, and every partition batch numbered behind the failure take fresh consecutive sequences
+  under the new epoch. Java does the same: `TransactionManager.handleFailedBatch` requests an epoch
+  bump for the partition, `TransactionManager.bumpIdempotentProducerEpoch` sets the epoch to
+  epoch + 1 on the same PID without a request and resets the producer id only at
+  `Short.MAX_VALUE`, and the
   `MESSAGE_TOO_LARGE` branch removes the batch from the in-flight set before it splits, so the
   pieces take fresh sequences. With no gap inside an epoch, `OUT_OF_ORDER_SEQUENCE_NUMBER` means
   only a real one: the broker lost its sequence state.
 - **Dedup is lost across a new epoch or a new PID.** A process restart mints a new PID.
   `INVALID_PRODUCER_EPOCH` re-initializes the producer with a new PID, and an epoch bump (above, and
-  on `OUT_OF_ORDER_SEQUENCE_NUMBER`) keeps the PID under a new epoch. Either way the sequences start
-  at 0, and the broker can't match a resend against an append from before. A batch whose first
+  on `OUT_OF_ORDER_SEQUENCE_NUMBER`) moves the same PID to epoch + 1 on the client. Either way the
+  sequences start at 0, and the broker can't match a resend against an append from before. A batch whose first
   attempt landed before one of these events and whose retry was sent after it is stored twice. A
   bump renumbers every unsettled partition batch, so it also costs dedup for one still waiting on an
   `Ambiguous` answer, including the same partition's other batch in the same send, if it has one.
@@ -384,9 +390,9 @@ Each format stays decodable, so a future `kafka_in` can round-trip it.
 
 - W1 adds `kafka-protocol`, `crc`, and `crc-catalog` to `Cargo.lock` and `deny.toml`'s review,
   with none of `kafka-protocol`'s codec features, so no C codec enters the tree. It enables
-  `lz4_flex`'s frame support and widens the scope of `ruzstd`, `snap`, and `flate2`, already
-  direct dependencies of `logit-outputs`, beyond the components they serve today, updating the
-  `Cargo.toml` comments that scope them.
+  `lz4_flex`'s frame support. `snap` and `flate2` are already direct dependencies of
+  `logit-outputs`; W1 adds `ruzstd` and `lz4_flex` to it and widens the scope of all four beyond the
+  components they serve today, updating the `Cargo.toml` comments that scope them.
 - The `kafka_out` module doc carries the canonical fault-class table, each row backed by a
   fake-broker test, and this ADR's table stops being updated once it exists.
 - Duplicates are possible across a process restart, a producer re-initialization, and an epoch
