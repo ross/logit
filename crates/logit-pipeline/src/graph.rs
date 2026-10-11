@@ -260,6 +260,12 @@
 //! 81. An `admin.socket_mode` without `admin.socket`; an empty `admin.bind` or `admin.socket`; or
 //!     an `admin.bind` starting with `/`, a path that belongs in `socket`
 //!     (`docs/adr/listener-port-sharing-and-shutdown-delay.md`).
+//! 82. A `bucket` with no `attributes`; an empty field name, `into`, `ranges`, class `value`, or
+//!     `other`; an `into` naming another configured source field, or shared by two fields; a
+//!     range with both `lt` and `le`; a boundless range that isn't last; a non-finite bound; or a
+//!     range the ranges before it already cover, which can never match: a bound below the
+//!     previous one, or equal to it unless `lt: X` is followed by `le: X`
+//!     (`docs/adr/bucket-transform.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -361,6 +367,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | HasProvenance { .. }
         | DropProvenance { .. }
         | KeepValues { .. }
+        | Bucket { .. }
         | Logfmt { .. }
         | Kv { .. }
         | Regex { .. }
@@ -429,6 +436,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         HasProvenance { .. } => "has_provenance",
         DropProvenance { .. } => "drop_provenance",
         KeepValues { .. } => "keep_values",
+        Bucket { .. } => "bucket",
         Logfmt { .. } => "logfmt",
         Kv { .. } => "kv",
         Regex { .. } => "regex",
@@ -531,6 +539,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::HasProvenance { .. }
             | ComponentKind::DropProvenance { .. }
             | ComponentKind::KeepValues { .. }
+            | ComponentKind::Bucket { .. }
             | ComponentKind::Logfmt { .. }
             | ComponentKind::Kv { .. }
             | ComponentKind::Regex { .. }
@@ -1633,34 +1642,50 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 36: `has_attributes`/`drop_attributes` (`docs/adr/attribute-filtering-components.md`).
-    // The maps are conjunctions, so zero pairs match every event: `has_attributes` forwards all
-    // (no-op) and `drop_attributes` drops all (black hole), the inverse of rule 21's list of
-    // alternatives. An empty key can't name an attribute; a non-finite value never compares equal
-    // under `crate::attributes`' coercing matcher. The same key in `resource:` and `attributes:` is
-    // legal: one addresses the batch, the other the event.
+    // The maps and presence lists are conjunctions, so zero entries match every event:
+    // `has_attributes` forwards all (no-op) and `drop_attributes` drops all (black hole), the
+    // inverse of rule 21's list of alternatives. An empty key can't name an attribute; a
+    // non-finite value never compares equal under `crate::attributes`' coercing matcher. The same
+    // key in `resource:` and `attributes:` is legal: one addresses the batch, the other the event.
+    // Within one side, a key in both the map and its `_present` list is a redundancy (the pair
+    // already requires the key), and a key repeated in a list is a copy-paste mistake (rule 4's
+    // reasoning).
     for (id, component) in &components {
-        let (kind_name, resource, attributes) = match &component.kind {
-            ComponentKind::HasAttributes { resource, attributes } => {
-                ("has_attributes", resource, attributes)
-            }
-            ComponentKind::DropAttributes { resource, attributes } => {
-                ("drop_attributes", resource, attributes)
-            }
-            _ => continue,
-        };
+        let (kind_name, resource, attributes, resource_present, attributes_present) =
+            match &component.kind {
+                ComponentKind::HasAttributes {
+                    resource,
+                    attributes,
+                    resource_present,
+                    attributes_present,
+                } => ("has_attributes", resource, attributes, resource_present, attributes_present),
+                ComponentKind::DropAttributes {
+                    resource,
+                    attributes,
+                    resource_present,
+                    attributes_present,
+                } => {
+                    ("drop_attributes", resource, attributes, resource_present, attributes_present)
+                }
+                _ => continue,
+            };
 
-        if resource.is_empty() && attributes.is_empty() {
+        if resource.is_empty()
+            && attributes.is_empty()
+            && resource_present.is_empty()
+            && attributes_present.is_empty()
+        {
             if kind_name == "has_attributes" {
                 anyhow::bail!(
-                    "component '{id}': a has_attributes with neither 'resource' nor \
-                     'attributes' configured matches every event -- a no-op that forwards \
-                     every event untouched"
+                    "component '{id}': a has_attributes with none of 'resource', 'attributes', \
+                     'resource_present', or 'attributes_present' configured matches every \
+                     event -- a no-op that forwards every event untouched"
                 );
             } else {
                 anyhow::bail!(
-                    "component '{id}': a drop_attributes with neither 'resource' nor \
-                     'attributes' configured matches every event -- and so can only ever drop \
-                     every one of them"
+                    "component '{id}': a drop_attributes with none of 'resource', 'attributes', \
+                     'resource_present', or 'attributes_present' configured matches every \
+                     event -- and so can only ever drop every one of them"
                 );
             }
         }
@@ -1681,6 +1706,34 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      number -- a non-finite value never compares equal to anything, so that \
                      entry could never match"
                 );
+            }
+        }
+
+        for (map_name, map, list_name, list) in [
+            ("resource", resource, "resource_present", resource_present),
+            ("attributes", attributes, "attributes_present", attributes_present),
+        ] {
+            let mut seen = std::collections::BTreeSet::new();
+            for key in list {
+                if key.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': a {kind_name} '{list_name}' key must not be empty -- \
+                         it could never name a real attribute"
+                    );
+                }
+                if !seen.insert(key.as_str()) {
+                    anyhow::bail!(
+                        "component '{id}': a {kind_name} '{list_name}' lists '{key}' more than \
+                         once -- the repeat is a copy-paste mistake"
+                    );
+                }
+                if map.contains_key(key) {
+                    anyhow::bail!(
+                        "component '{id}': a {kind_name} lists '{key}' in both '{map_name}' and \
+                         '{list_name}' -- a '{map_name}' pair already requires the key, so \
+                         drop it from '{list_name}'"
+                    );
+                }
             }
         }
     }
@@ -2702,6 +2755,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             max_length,
             redact_query,
             forwarded: _,
+            status_class: _,
         } = &component.kind
         {
             let compile = |what: &str, pattern: &str| -> anyhow::Result<()> {
@@ -3761,6 +3815,95 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             "admin: 'bind' is a path, not a host:port -- serve the admin endpoint on a Unix socket \
              with 'socket:' instead"
         );
+    }
+
+    // Rule 82: `bucket` (`docs/adr/bucket-transform.md`). Ranges are tested first-match, so a
+    // boundless range before the end, or a bound the ranges before it already cover, can never
+    // match. `lt: X` then `le: X` is reachable: it classes the single value `X`. Two ranges may
+    // share a class. Fields apply in key order over one attribute map, so an `into` naming
+    // another configured source, or shared by two fields, would make the result depend on key
+    // order.
+    for (id, component) in &components {
+        let ComponentKind::Bucket { attributes } = &component.kind else { continue };
+        if attributes.is_empty() {
+            anyhow::bail!(
+                "component '{id}': a bucket with no 'attributes' configured can only ever be a \
+                 no-op"
+            );
+        }
+        let mut intos: HashMap<&str, &str> = HashMap::new();
+        for (field, spec) in attributes {
+            if field.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a bucket 'attributes' key must not be empty -- it could \
+                     never name a real attribute"
+                );
+            }
+            if spec.into.is_empty() {
+                anyhow::bail!("component '{id}': bucket '{field}' has an empty 'into'");
+            }
+            if spec.into != *field && attributes.contains_key(&spec.into) {
+                anyhow::bail!(
+                    "component '{id}': bucket '{field}' has 'into: {}', another configured \
+                     source field -- which one is classified first would depend on key order",
+                    spec.into
+                );
+            }
+            if let Some(other_field) = intos.insert(&spec.into, field) {
+                anyhow::bail!(
+                    "component '{id}': bucket '{other_field}' and '{field}' share 'into: {}' -- \
+                     one would overwrite the other's class",
+                    spec.into
+                );
+            }
+            if spec.ranges.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': bucket '{field}' has an empty 'ranges' list -- it could \
+                     never write a class"
+                );
+            }
+            if spec.other.as_deref().is_some_and(str::is_empty) {
+                anyhow::bail!("component '{id}': bucket '{field}' has an empty 'other'");
+            }
+            let last = spec.ranges.len() - 1;
+            // The previous range's bound, and whether it was `lt`.
+            let mut previous: Option<(f64, bool)> = None;
+            for (i, range) in spec.ranges.iter().enumerate() {
+                if range.value.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} has an empty 'value'"
+                    );
+                }
+                let (bound, is_lt) = match (range.lt, range.le) {
+                    (Some(_), Some(_)) => anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} sets both 'lt' and 'le' -- \
+                         give one bound"
+                    ),
+                    (Some(bound), None) => (bound, true),
+                    (None, Some(bound)) => (bound, false),
+                    (None, None) if i == last => continue,
+                    (None, None) => anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} has no bound but isn't the \
+                         last range -- a catch-all leaves every range after it unreachable"
+                    ),
+                };
+                if !bound.is_finite() {
+                    anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} has a non-finite bound"
+                    );
+                }
+                let covered = previous.is_some_and(|(prev, prev_lt)| {
+                    bound < prev || (bound == prev && !(prev_lt && !is_lt))
+                });
+                if covered {
+                    anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} can never match -- the \
+                         ranges before it already cover every number up to its bound {bound}"
+                    );
+                }
+                previous = Some((bound, is_lt));
+            }
+        }
     }
 
     let mut resolved = HashMap::with_capacity(components.len());
@@ -4925,6 +5068,8 @@ mod tests {
                 ComponentKind::HasAttributes {
                     resource: std::collections::BTreeMap::new(),
                     attributes: std::collections::BTreeMap::new(),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -4948,6 +5093,8 @@ mod tests {
                 ComponentKind::DropAttributes {
                     resource: std::collections::BTreeMap::new(),
                     attributes: std::collections::BTreeMap::new(),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -4957,6 +5104,126 @@ mod tests {
             "a drop_attributes with nothing configured is the black-hole shape (drops every \
              event), not the no-op shape -- got: {err}"
         );
+    }
+
+    #[test]
+    fn a_has_attributes_with_only_presence_lists_resolves_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec!["service.name".to_string()],
+                    attributes_present: vec!["m".to_string()],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]))
+        .expect("should resolve");
+    }
+
+    #[test]
+    fn a_presence_key_also_in_the_attributes_map_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "m".to_string(),
+                        logit_config::SetValue::Str("x".to_string()),
+                    )]),
+                    resource_present: vec![],
+                    attributes_present: vec!["m".to_string()],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("both 'attributes' and 'attributes_present'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_presence_key_also_in_the_resource_map_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::DropAttributes {
+                    resource: std::collections::BTreeMap::from([(
+                        "s".to_string(),
+                        logit_config::SetValue::Str("x".to_string()),
+                    )]),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec!["s".to_string()],
+                    attributes_present: vec![],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("both 'resource' and 'resource_present'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_repeated_presence_key_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec![],
+                    attributes_present: vec!["m".to_string(), "m".to_string()],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    #[test]
+    fn an_empty_presence_key_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::DropAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec!["".to_string()],
+                    attributes_present: vec![],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("key must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_has_attributes_with_all_four_fields_empty_is_still_a_no_op() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec![],
+                    attributes_present: vec![],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("resource_present"), "got: {err}");
     }
 
     #[test]
@@ -5058,6 +5325,8 @@ mod tests {
                         "".to_string(),
                         logit_config::SetValue::Str("x".to_string()),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -5078,6 +5347,8 @@ mod tests {
                         "ratio".to_string(),
                         logit_config::SetValue::F64(f64::NAN),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -5098,6 +5369,8 @@ mod tests {
                         logit_config::SetValue::Str("nginx".to_string()),
                     )]),
                     attributes: std::collections::BTreeMap::new(),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -5118,6 +5391,8 @@ mod tests {
                         "stream".to_string(),
                         logit_config::SetValue::Str("a".to_string()),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -5142,6 +5417,8 @@ mod tests {
                         "stream".to_string(),
                         logit_config::SetValue::Str("a".to_string()),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -7094,6 +7371,7 @@ mod tests {
             max_length: std::collections::BTreeMap::new(),
             redact_query: vec![],
             forwarded: None,
+            status_class: false,
         }
     }
 
@@ -7159,6 +7437,7 @@ mod tests {
             max_length: std::collections::BTreeMap::from([("url.path".to_string(), 512)]),
             redact_query: vec!["token".to_string()],
             forwarded: Some(ForwardedHeader::XForwardedFor),
+            status_class: false,
         };
         resolve(cfg(vec![
             ("in", vec![], listener()),
@@ -7329,6 +7608,7 @@ mod tests {
                 max_length: std::collections::BTreeMap::new(),
                 redact_query: vec![],
                 forwarded: Some(header),
+                status_class: false,
             };
             resolve(cfg(vec![
                 ("in", vec![], listener()),
@@ -7600,6 +7880,8 @@ mod tests {
                         "stream".to_string(),
                         logit_config::SetValue::Str("a".to_string()),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             (
@@ -7611,6 +7893,8 @@ mod tests {
                         "debug".to_string(),
                         logit_config::SetValue::Bool(true),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["drop_attributes"], sink()),
@@ -13002,6 +13286,117 @@ mod tests {
         for window in [1, 32, 1024] {
             resolve(with_window(window))
                 .unwrap_or_else(|err| panic!("window {window} should resolve, got: {err}"));
+        }
+    }
+
+    // ---- rule 82: bucket ------------------------------------------------------------------
+
+    /// A `bucket` between a listener and a sink, its `attributes` given as JSON.
+    fn cfg_with_bucket(attributes: &str) -> Config {
+        let kind = listener_from_json(&format!(
+            r#"{{"type": "bucket", "sources": ["in"], "attributes": {attributes}}}"#
+        ));
+        cfg(vec![("in", vec![], listener()), ("b", vec!["in"], kind), ("out", vec!["b"], sink())])
+    }
+
+    #[test]
+    fn rule_82_accepts_every_range_shape() {
+        for attributes in [
+            r#"{"d": {"into": "c", "ranges": [{"lt": 0.1, "value": "fast"},
+                {"le": 1, "value": "ok"}, {"value": "slow"}], "other": "unknown"}}"#,
+            r#"{"d": {"into": "d", "ranges": [{"le": 0, "value": "none"}, {"value": "some"}],
+                "keep_source": false}}"#,
+            r#"{"d": {"into": "c", "ranges": [{"lt": 1000, "value": "a"},
+                {"lt": 2000, "value": "a"}]}}"#,
+            r#"{"d": {"into": "c", "ranges": [{"value": "any"}]}}"#,
+            r#"{"d": {"into": "c", "ranges": [{"lt": 1, "value": "under"},
+                {"le": 1, "value": "one"}, {"value": "over"}]}}"#,
+            r#"{"a": {"into": "a", "ranges": [{"value": "x"}]},
+                "b": {"into": "b", "ranges": [{"value": "y"}]}}"#,
+        ] {
+            resolve(cfg_with_bucket(attributes))
+                .unwrap_or_else(|err| panic!("{attributes} should resolve: {err}"));
+        }
+    }
+
+    #[test]
+    fn rule_82_rejects_each_malformed_bucket() {
+        for (attributes, expected) in [
+            (r#"{}"#, "no 'attributes'"),
+            (r#"{"": {"into": "c", "ranges": [{"value": "a"}]}}"#, "key must not be empty"),
+            (r#"{"d": {"into": "", "ranges": [{"value": "a"}]}}"#, "empty 'into'"),
+            (r#"{"d": {"into": "c", "ranges": []}}"#, "empty 'ranges'"),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"lt": 1, "le": 1, "value": "a"}]}}"#,
+                "both 'lt' and 'le'",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"value": "a"}, {"lt": 1, "value": "b"}]}}"#,
+                "isn't the last range",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"lt": 2, "value": "a"},
+                    {"le": 1, "value": "b"}]}}"#,
+                "range 1 can never match",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"le": 1, "value": "a"},
+                    {"lt": 1, "value": "b"}]}}"#,
+                "range 1 can never match",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"lt": 1, "value": "a"},
+                    {"lt": 1, "value": "b"}]}}"#,
+                "range 1 can never match",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"le": 1, "value": "a"},
+                    {"le": 1, "value": "b"}]}}"#,
+                "range 1 can never match",
+            ),
+            (
+                r#"{"a": {"into": "b", "ranges": [{"value": "x"}]},
+                    "b": {"into": "c", "ranges": [{"value": "y"}]}}"#,
+                "another configured source field",
+            ),
+            (
+                r#"{"a": {"into": "c", "ranges": [{"value": "x"}]},
+                    "b": {"into": "c", "ranges": [{"value": "y"}]}}"#,
+                "share 'into: c'",
+            ),
+            (r#"{"d": {"into": "c", "ranges": [{"lt": 1, "value": ""}]}}"#, "empty 'value'"),
+            (r#"{"d": {"into": "c", "ranges": [{"value": "a"}], "other": ""}}"#, "empty 'other'"),
+        ] {
+            let err = expect_err(cfg_with_bucket(attributes));
+            assert!(err.contains(expected), "{attributes}: expected '{expected}', got: {err}");
+        }
+    }
+
+    /// JSON can't spell a non-finite number, so this one is built directly.
+    #[test]
+    fn rule_82_rejects_a_non_finite_bound() {
+        for bound in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let kind = ComponentKind::Bucket {
+                attributes: std::collections::BTreeMap::from([(
+                    "d".to_string(),
+                    logit_config::BucketSpec {
+                        into: "c".to_string(),
+                        ranges: vec![logit_config::BucketRange {
+                            lt: Some(bound),
+                            le: None,
+                            value: "a".to_string(),
+                        }],
+                        other: None,
+                        keep_source: true,
+                    },
+                )]),
+            };
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("b", vec!["in"], kind),
+                ("out", vec!["b"], sink()),
+            ]));
+            assert!(err.contains("non-finite bound"), "{bound}: got: {err}");
         }
     }
 }

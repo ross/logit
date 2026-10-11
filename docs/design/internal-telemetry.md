@@ -1532,6 +1532,16 @@ two fields on one component can clamp at very different rates. `.values.normaliz
 already-conforming case would make the rate unreadable. `field` is safe as a tag because the fields
 are config-declared. No `Diagnostics`: clamping to a fixed allow-list can't fail.
 
+##### `bucket`
+
+`crates/logit-transforms/src/bucket.rs`, [ADR `bucket-transform`](../adr/bucket-transform.md).
+
+`logit.transform.values.bucketed`/`.unmatched`, tagged `field`, in `keep_values`' shape: one
+`.bucketed` per present value a range classified, one `.unmatched` per present value that wasn't a
+finite number or that no range matched, whether or not `other` was written. An absent source
+counts as neither. `field` is safe as a tag because the fields are config-declared. No
+`Diagnostics`: a value that doesn't classify is steady-state data, not a failure.
+
 ##### `shape`
 
 `crates/logit-transforms/src/shape.rs`,
@@ -1574,7 +1584,7 @@ Seven counters. Every tag comes from a closed, `&'static` table, never an observ
 | Name | Meaning |
 |---|---|
 | `logit.transform.http_access.normalized{field}` | a field rewritten into its conformant form: a dashed alias renamed, a composite decomposed, a numeric coerced, a duration converted, a method or version normalized, a leading `?` stripped |
-| `.derived{field}` | a field written from config or a built-in table: `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`, `span.status`, `span.duration_s`, `http.request.method_original`, and `client.address` and `client.port` under `forwarded`. Every derived attribute but those two is fill-only, so one the producer already sent is honoured and not counted |
+| `.derived{field}` | a field written from config or a built-in table: `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`, `span.status`, `span.duration_s`, `http.response.status_class` (under `status_class`), `http.request.method_original`, and `client.address` and `client.port` under `forwarded`. Every derived attribute but those two is fill-only, so one the producer already sent is honoured and not counted |
 | `.truncated{field}` | a value cut to its `max_length` |
 | `.cleaned{field}` | a control byte replaced by `_` |
 | `.invalid{field}` | present but unparseable, left as it arrived; under `forwarded`, the header's attribute when it names no usable client |

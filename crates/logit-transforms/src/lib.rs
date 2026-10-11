@@ -10,6 +10,7 @@
 
 mod aggregate;
 mod attributes;
+mod bucket;
 mod csv;
 mod flatten;
 mod http_access;
@@ -33,6 +34,7 @@ use logit_core::{AttrMap, Value};
 
 pub use aggregate::{AggregateTemporality, Aggregator, Distributions, Sets};
 pub use attributes::{DropAttributes, HasAttributes};
+pub use bucket::{Bucket, BucketBound, BucketField};
 pub use csv::CsvParser;
 pub use flatten::{Arrays, Fields, Flatten};
 pub use http_access::{HttpAccess, HttpAccessConfig, RouteRule, RouteSet, UaRule};

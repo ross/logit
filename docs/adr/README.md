@@ -10,6 +10,7 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [`bucket`: a numeric-range classifier that writes a bounded attribute value](bucket-transform.md) | 2026-10-11 | 2026-10-11 |
 | [Run CI in an image prebaked from `Dockerfile.dev` and published to GHCR](ci-image-on-ghcr.md) | 2026-10-09 | 2026-10-09 |
 | [Parsers of producer bytes live in `logit-proto`, and listeners and transforms wrap them](parsers-live-in-logit-proto.md) | 2026-10-09 | 2026-10-09 |
 | [A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle](soak-harness.md) | 2026-10-08 | 2026-10-09 |
@@ -49,7 +50,7 @@ the same date, write the record, then add a row here.
 | [Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`](datadog-agent-and-intake-relay.md) | 2026-09-23 | 2026-10-08 |
 | [`sample`: consistent, keyed event sampling with an operator override](consistent-sampling-component.md) | 2026-09-22 | 2026-09-22 |
 | [Publish the release image to GHCR, `latest` only, on manual dispatch](publish-release-image-to-ghcr.md) | 2026-09-22 | 2026-10-09 |
-| [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-10-05 |
+| [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-10-11 |
 | [Out-of-CI verification of raw-`libc` `unsafe`: a throwaway nightly image, not a Dockerfile.dev change](out-of-ci-unsafe-verification.md) | 2026-09-21 | 2026-09-25 |
 | [`flatten`: dotted-key expansion as an opt-in, operator-placed transform](flatten-transform.md) | 2026-09-21 | 2026-09-21 |
 | [Event sizing: `AttrMap`'s inline capacity stays 8, and attribute maps are not pre-sized](event-sizing-and-allocation-strategy.md) | 2026-09-21 | 2026-09-21 |
@@ -65,7 +66,7 @@ the same date, write the record, then add a row here.
 | [Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe](idle-connection-timeout.md) | 2026-09-14 | 2026-10-07 |
 | [`syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS](syslog-tcp-ingress-and-tls.md) | 2026-09-13 | 2026-10-11 |
 | [Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch](graphite-carbon-relay.md) | 2026-09-13 | 2026-10-09 |
-| [`target` components: named destinations a router directs events into, beside `sources:`](target-components.md) | 2026-09-13 | 2026-10-04 |
+| [`target` components: named destinations a router directs events into, beside `sources:`](target-components.md) | 2026-09-13 | 2026-10-11 |
 | [A load-test harness: the real binary, a declarative event template, and CPU per event as the signal](load-test-harness.md) | 2026-09-12 | 2026-10-02 |
 | [`FramedEncoder`: a third codec trait for sinks that need per-message framing, over a shared `MessageBuf`](framed-encoder.md) | 2026-09-12 | 2026-09-13 |
 | [collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder](collectd-binary-relay.md) | 2026-09-12 | 2026-10-09 |
@@ -79,7 +80,7 @@ the same date, write the record, then add a row here.
 | [OTLP/JSON decoding: hand-written against `serde_json::Value`, not generated](otlp-json-decoding.md) | 2026-09-10 | 2026-09-10 |
 | [Provenance filtering is two transform components, combining has_attributes' and has_signal's shapes](provenance-filtering-components.md) | 2026-09-10 | 2026-09-10 |
 | [Batch provenance (`origin`/`previous`) carried on `Delivered`, stamped by `Fanout`](batch-provenance-on-delivered.md) | 2026-09-10 | 2026-10-05 |
-| [Attribute filtering is two transform components, and a bounded matcher is not a predicate language](attribute-filtering-components.md) | 2026-09-10 | 2026-09-10 |
+| [Attribute filtering is two transform components, and a bounded matcher is not a predicate language](attribute-filtering-components.md) | 2026-09-10 | 2026-10-11 |
 | [Native transport: handshake, implicit sequencing, and per-batch acknowledgement](native-transport-handshake-and-ack.md) | 2026-09-09 | 2026-10-05 |
 | [`tracing` for self-logging, with `Diagnostics` as its producer](tracing-for-self-logging.md) | 2026-09-09 | 2026-09-09 |
 | [A top-level `admin:` block, not a component, for readiness/liveness](admin-readiness-endpoint.md) | 2026-09-09 | 2026-10-07 |
@@ -87,7 +88,7 @@ the same date, write the record, then add a row here.
 | [`stdio_out`/`file_out` gain a `native` wire-format option](file-output-native-format.md) | 2026-09-09 | 2026-09-09 |
 | [`file_out`: a rotating file sink, sharing `stdio_out`'s implementation](rotating-file-output.md) | 2026-09-08 | 2026-10-05 |
 | [Native wire format encoding: hand-rolled, not `rkyv` or a `serde`/`postcard` derive](native-wire-format-encoding.md) | 2026-09-08 | 2026-09-25 |
-| [Routing by condition, sampling, throttling, dedup, and renaming are `lua` components](routing-by-condition-is-lua.md) | 2026-09-07 | 2026-09-22 |
+| [Routing by condition, sampling, throttling, dedup, and renaming are `lua` components](routing-by-condition-is-lua.md) | 2026-09-07 | 2026-10-11 |
 | [`logfmt` and `kv`: the de-facto key=value parsers, and why they stay two kinds](logfmt-and-kv-parsing.md) | 2026-09-07 | 2026-10-11 |
 | [`regex`: named captures into attributes, and taking the `regex` crate](regex-transform.md) | 2026-09-07 | 2026-09-07 |
 | [`csv`: positional columns from config, not a header row, and no type coercion](csv-positional-columns.md) | 2026-09-07 | 2026-09-07 |
