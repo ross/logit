@@ -1714,7 +1714,10 @@ def check_ledger_topic(data):
     duplicate copies per life. T below A FAILs, records the broker acknowledged and no longer
     holds, and T above A FAILs, records the sink never saw accepted, unless the sink dropped an
     attempt it never saw answered (an `ambiguous_at_most_once` record drop or any batch drop),
-    which may have landed: a WARN. A duplicate copy FAILs when the life
+    which may have landed: a WARN. When a scheduled kill ended a SUT life, a T − A difference
+    in either direction WARNs and names the killed lives: the kill loses that life's last
+    telemetry interval of A, and a spooled batch counted before the kill and replayed after it
+    is in A twice but stored once. A duplicate copy FAILs when the life
     it's credited to has no epoch-bumping event: it isn't the final life, so no later producer id
     resent it, and the sink counted no `EPOCH_BUMP_REASONS` drop in it. Within one epoch the
     broker discards a resend. Duplicates after an epoch bump WARN, which docs/known-gaps/kafka.md
@@ -1759,7 +1762,13 @@ def check_ledger_topic(data):
     detail = (f"T {_n(t_count)} distinct records in the topic ({_n(t_count + copies)} read, "
               f"{_n(copies)} duplicate copies) vs A {_n(accepted)} records the sink saw "
               f"accepted, T − A {_n(gap)}")
-    if gap < 0:
+    killed = ", ".join(str(life) for life in led.killed)
+    if gap and led.killed:
+        status = worst([status, WARN])
+        problems.insert(0, f"T − A differs across killed SUT life {killed}: the kill loses that "
+                           "life's last telemetry interval of A, and a spooled batch replayed "
+                           "after it is counted twice in A and stored once")
+    elif gap < 0:
         status = FAIL
         problems.insert(0, "the broker acknowledged records it no longer holds")
     elif gap > 0:

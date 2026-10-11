@@ -230,7 +230,9 @@ What changes for a Kafka target:
   discards a resend, so a duplicate FAILs unless its life ended in a restart or kill, or the
   sink counted a drop that bumps the epoch there (`rejected`, `invalid_timestamp`,
   `invalid_record`, `ambiguous_at_most_once`). Those duplicates WARN, as
-  [`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md) permits.
+  [`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md) permits. A run with a killed SUT
+  life WARNs, rather than FAILs, on a T − A difference in either direction, because a kill loses
+  that life's last telemetry interval and a replayed spool batch counts twice in A.
 
 ## A run
 
@@ -300,7 +302,7 @@ rule only holds in steady state. The plan's "The checks" has the full rules.
 | `ledger.replay` | the life after a killed one replays, in its first drain, a different number of batches from the killed life's last `buffer.batches`, beyond one in flight |
 | `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0; a counted egress term is shown and not judged, and on an external target the Ab − V term SKIPs |
 | `ledger.sent` | an external or Kafka target only, else SKIP: a batch the sink received didn't end in an accepted response; a clean external run's detail starts with `SENT`. See [External targets](#external-targets) |
-| `ledger.topic` | a Kafka target only, else SKIP: the topic wasn't read back; its distinct records number fewer than the sink saw accepted, or more with no dropped attempt to explain them (`WARN` with one); or a record is stored twice in a SUT life with no epoch bump (`WARN` after one). See [Kafka targets](#kafka-targets) |
+| `ledger.topic` | a Kafka target only, else SKIP: the topic wasn't read back; its distinct records number fewer than the sink saw accepted, or more with no dropped attempt to explain them (`WARN` with one, and `WARN` either way across a killed life); or a record is stored twice in a SUT life with no epoch bump (`WARN` after one). See [Kafka targets](#kafka-targets) |
 | `identity.sink` | at the final life's last drain before shutdown, the sink's batches received, plus those a disk spool replayed at open, differ from delivered + dropped + queued by more than one batch in flight |
 | `recovery` | within `recovery_bound` of a fault's end, no drain interval clear of other faults shows the sink not retrying, its buffer under 5% full or holding at most one batch, the listener's receive queue under 5% full, and ingest at 95% of the warmup rate; a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN`, and so does a run where no fault had an eligible interval |
 | `expect.<name>` | a scenario's own `[[expect]]` bound doesn't hold; see [Expectations](#expectations) |

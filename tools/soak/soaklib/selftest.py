@@ -2573,6 +2573,16 @@ def _kafka_checks():
                and "acknowledged records it no longer holds" in lost["ledger.topic"].detail,
                f"a topic below the accepted count FAILs, got {lost['ledger.topic']}")
 
+        kill = [_action("apply", "k0", "kill", "logit", 100, 100.1)]
+        killed_over = results("kafka-killed-over", topic_extra=[_topic_record(T0 + 300, 25)],
+                              timeline_extra=kill)["ledger.topic"]
+        expect(killed_over.status == checks.WARN and "killed SUT life 0" in killed_over.detail,
+               f"T above A across a killed life WARNs naming it, got {killed_over}")
+        killed_under = results("kafka-killed-under", v1_short=7, sut_extra=_kafka_lines(accepted=5),
+                               timeline_extra=kill)["ledger.topic"]
+        expect(killed_under.status == checks.WARN and "killed SUT life 0" in killed_under.detail,
+               f"T below A across a killed life WARNs naming it, got {killed_under}")
+
         garbled = results("kafka-garbled", topic_extra=["not json"])
         expect(garbled["ledger.egress"].status == checks.FAIL
                and "1 topic record(s) aren't JSON objects" in garbled["ledger.egress"].detail,
