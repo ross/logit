@@ -364,7 +364,7 @@ async fn each_error_code_row_classifies_the_partition_batch() {
     let row = |code, class, refresh| Row { code, class, refresh };
     let rows = [
         row(CORRUPT_MESSAGE, Some(Fault::Rejected), false),
-        row(UNKNOWN_TOPIC_OR_PARTITION, Some(Fault::Refused), true),
+        row(UNKNOWN_TOPIC_OR_PARTITION, Some(Fault::Clean), true),
         row(LEADER_NOT_AVAILABLE, Some(Fault::Clean), true),
         row(NOT_LEADER_OR_FOLLOWER, Some(Fault::Clean), true),
         row(REQUEST_TIMED_OUT, Some(Fault::Ambiguous), false),
@@ -384,7 +384,7 @@ async fn each_error_code_row_classifies_the_partition_batch() {
         row(UNKNOWN_PRODUCER_ID, Some(Fault::Clean), false),
         row(UNSUPPORTED_COMPRESSION_TYPE, Some(Fault::Refused), false),
         row(THROTTLING_QUOTA_EXCEEDED, Some(Fault::Clean), false),
-        row(UNKNOWN_TOPIC_ID, Some(Fault::Refused), true),
+        row(UNKNOWN_TOPIC_ID, Some(Fault::Clean), true),
         row(INCONSISTENT_TOPIC_ID, Some(Fault::Clean), true),
         // GROUP_AUTHORIZATION_FAILED, a code with no row of its own.
         row(30, Some(Fault::Rejected), false),
@@ -645,15 +645,64 @@ async fn every_codec_is_accepted_by_the_broker() {
 }
 
 #[tokio::test]
-async fn a_missing_topic_is_refused_unless_the_broker_creates_it() {
+async fn a_missing_topic_is_refused_only_after_a_refresh_confirms_it() {
+    // The first answer schedules a refresh, which polls in the same attempt until `timeout`;
+    // the topic is still missing after it, so the attempt is `Refused`, and so is the next, with
+    // one request and no second poll.
     let cluster = FakeCluster::start(1).await;
-    let mut producer = Producer::new(config(&cluster)).unwrap();
+    let short = ProducerConfig { timeout: Duration::from_millis(300), ..config(&cluster) };
+    let mut producer = Producer::new(short).unwrap();
     let err = producer.prepare(vec![record(None, "v")]).await.unwrap_err();
     assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
+    let polled = requests_of(&cluster, ApiKey::Metadata);
+    assert!(polled >= 2, "the refresh ran: {polled} Metadata requests");
+    let err = producer.prepare(vec![record(None, "v")]).await.unwrap_err();
+    assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
+    assert_eq!(requests_of(&cluster, ApiKey::Metadata), polled + 1);
 
+    // A broker that creates the topic answers the request that created it as missing; the
+    // refresh finds it, and the attempt goes through.
+    let cluster = FakeCluster::start(1).await;
     cluster.state().auto_create = Some(3);
+    let mut producer = Producer::new(config(&cluster)).unwrap();
     send_expecting(&mut producer, vec![record(None, "v")], &[None]).await;
     assert_eq!(cluster.state().topics[TOPIC].len(), 3);
+    assert_eq!(requests_of(&cluster, ApiKey::Metadata), 2);
+
+    // Still being created on the refresh: the poll waits for it.
+    let cluster = FakeCluster::start(1).await;
+    cluster.state().auto_create = Some(1);
+    for answer in [code::UNKNOWN_TOPIC_OR_PARTITION, code::LEADER_NOT_AVAILABLE] {
+        cluster.script(Step {
+            api: ApiKey::Metadata,
+            partition: None,
+            action: Action::Error(answer),
+        });
+    }
+    let mut producer = Producer::new(config(&cluster)).unwrap();
+    send_expecting(&mut producer, vec![record(None, "v")], &[None]).await;
+}
+
+/// The same rule for a `Produce` answer: the first is `Clean`, one that persists after the
+/// refresh is `Refused`, and an accepted batch starts the count again.
+#[tokio::test]
+async fn a_missing_topic_produce_answer_is_refused_only_after_a_refresh() {
+    for code in [code::UNKNOWN_TOPIC_OR_PARTITION, code::UNKNOWN_TOPIC_ID] {
+        let cluster = cluster(1, &[0]).await;
+        let mut producer = Producer::new(config(&cluster)).unwrap();
+        cluster.script(Step::produce(None, Action::Error(code)));
+        cluster.script(Step::produce(None, Action::Error(code)));
+        let metadata = requests_of(&cluster, ApiKey::Metadata);
+        send_expecting(
+            &mut producer,
+            keyed_for(0, 1, 2),
+            &[Some(Fault::Clean), Some(Fault::Refused), None],
+        )
+        .await;
+        assert!(requests_of(&cluster, ApiKey::Metadata) > metadata, "refreshed before the retry");
+        cluster.script(Step::produce(None, Action::Error(code)));
+        send_expecting(&mut producer, keyed_for(0, 1, 2), &[Some(Fault::Clean), None]).await;
+    }
 }
 
 #[tokio::test]

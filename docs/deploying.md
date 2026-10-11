@@ -3047,9 +3047,9 @@ without the value is sent unkeyed and counted `logit.output.records.unkeyed`. Un
 to one partition per batch, picked at random among those with a leader.
 
 **Topics.** The topic must exist, or the broker must create it (`auto.create.topics.enable`).
-Against a broker that creates it, the first batch logs one `retrying` error for the topic while
-the broker creates it, then goes out. Against one that doesn't, the sink reports `refused` and
-holds its queue until an operator creates the topic.
+Against a broker that creates it, the first batch waits while the broker creates the topic, then
+goes out. Against one that doesn't, the first batch waits up to `timeout` for the topic, then
+the sink reports `refused` and holds its queue until an operator creates it.
 
 **Size.** `max_request_bytes` (1 MiB by default) caps one record and one produce request before
 compression. A record over it is dropped, counted `logit.output.records.dropped{reason="oversize"}`.

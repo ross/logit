@@ -431,9 +431,13 @@ fn metadata(
     let mut topics = Vec::new();
     for asked in request.topics.iter().flatten() {
         let name = asked.name.as_ref().expect("a topic by name").0.to_string();
+        // A Kafka 4.x broker creates the topic and answers the request that asked for it
+        // `UNKNOWN_TOPIC_OR_PARTITION`; the next request finds it.
+        let mut created = false;
         if !state.topics.contains_key(&name) && request.allow_auto_topic_creation {
             if let Some(n) = state.auto_create {
                 state.add_topic(&name, &vec![0; n]);
+                created = true;
             }
         }
         let topic = MetadataResponseTopic::default()
@@ -441,6 +445,7 @@ fn metadata(
         let topic = match (&scripted, state.topics.get(&name)) {
             (Some(Action::Error(code)), _) => topic.with_error_code(*code),
             (_, None) => topic.with_error_code(code::UNKNOWN_TOPIC_OR_PARTITION),
+            (_, Some(_)) if created => topic.with_error_code(code::UNKNOWN_TOPIC_OR_PARTITION),
             (_, Some(partitions)) => topic.with_partitions(
                 partitions
                     .iter()

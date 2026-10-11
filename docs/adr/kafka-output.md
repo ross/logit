@@ -438,6 +438,17 @@ differently. Where this section and an item above disagree, this section holds.
 4. **`UNKNOWN_TOPIC_OR_PARTITION` (3) and `UNKNOWN_TOPIC_ID` (100) are `Refused`, with a metadata
    refresh before the next attempt.** That refresh is item 9's request with
    `allow_auto_topic_creation` set, so a broker that creates topics creates it then.
+
+   *Correction (2026-10-11, W2):* point 4 read code 3 and 100 as `Refused` on their first
+   answer, which item 5 doesn't say. A Kafka 4.2 broker that auto-creates a topic answers the
+   `Metadata` request that created it with code 3, so every new topic failed its first attempt
+   `Refused` and logged an error. Item 5's "`Refused` after one metadata refresh" now holds as
+   written: the first code 3 or 100, from `Metadata` or `Produce`, is `Clean` and schedules a
+   refresh, and only one that persists after a completed refresh is `Refused`, until a partition
+   batch is accepted. A first answer from `Metadata` gets its refresh in the same attempt, which
+   polls, from 100 ms doubling to 1 s (Java's `retry.backoff.ms` and `retry.backoff.max.ms`),
+   while the topic is still missing or leaderless, up to `timeout`, as Java's `waitOnMetadata`
+   polls up to `max.block.ms`. One from `Produce` gets it on the next attempt.
 5. **The details item 8 and item 5 leave open:**
    - `Metadata` is negotiated within v4 (the first version with `allow_auto_topic_creation`) to
      v12, and `InitProducerId` within v0 to v5.
@@ -475,6 +486,6 @@ item above disagree, this section holds.
    not in `records.dropped`: the record is still sent.
 
 A Kafka 4.2 broker with `auto.create.topics.enable` answers the first `Metadata` request for a
-missing topic with `UNKNOWN_TOPIC_OR_PARTITION` while it creates the topic. The sink reads that
-as `Refused`, item 9's rule, and the retry after `write_loop`'s backoff finds the topic, so the
-first batch to a new topic logs one `retrying` error.
+missing topic with `UNKNOWN_TOPIC_OR_PARTITION` while it creates the topic. The W1 amendment's
+point 4 correction covers how the producer reads that answer, so a new topic's first batch goes
+out with no failure.

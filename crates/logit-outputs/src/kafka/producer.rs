@@ -52,6 +52,14 @@ use super::partitioner;
 /// Java's `metadata.max.age.ms`.
 pub(crate) const METADATA_MAX_AGE: Duration = Duration::from_secs(300);
 
+/// The first wait between polls of a topic a first missing-topic answer found missing: Java's
+/// `retry.backoff.ms`.
+const METADATA_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The longest wait between two polls of a topic being created: Java's
+/// `retry.backoff.max.ms`.
+const METADATA_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
 /// The transaction timeout an idempotent producer's `InitProducerId` carries; the broker ignores
 /// it without a transactional id. Java's `transaction.timeout.ms` default.
 const TRANSACTION_TIMEOUT_MS: i32 = 60_000;
@@ -123,6 +131,23 @@ impl Metadata {
     fn is_stale(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.fetched) >= METADATA_MAX_AGE
     }
+}
+
+/// How far a missing topic has been confirmed: `docs/adr/kafka-output.md`, item 5, "`Refused`
+/// after one metadata refresh". The first `UNKNOWN_TOPIC_OR_PARTITION` or `UNKNOWN_TOPIC_ID`,
+/// from `Metadata` or `Produce`, is `Clean` and asks for a refresh: a broker that auto-creates
+/// the topic answers the request that created it that way. Only an answer that persists after a
+/// completed refresh is `Refused`. A first answer from `Metadata` gets its refresh at once
+/// ([`Producer::refresh_metadata`]); one from `Produce` gets it on the next attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MissingTopic {
+    /// No missing-topic answer since the last accepted partition batch.
+    #[default]
+    No,
+    /// Answered missing; no refresh has completed since.
+    Seen,
+    /// Answered missing, and a refresh has completed since.
+    Refreshed,
 }
 
 /// The idempotent producer's identity.
@@ -236,6 +261,10 @@ pub(crate) struct Producer {
     conns: HashMap<Node, Conn>,
     metadata: Option<Metadata>,
     refresh_due: bool,
+    missing_topic: MissingTopic,
+    /// Whether the last `Metadata` answer had the topic missing, or with no leader for a
+    /// partition, as while the broker creates it.
+    topic_pending: bool,
     identity: Option<Identity>,
     reinit_due: bool,
     bump_due: bool,
@@ -286,6 +315,8 @@ impl Producer {
             conns: HashMap::new(),
             metadata: None,
             refresh_due: false,
+            missing_topic: MissingTopic::No,
+            topic_pending: false,
             identity: None,
             reinit_due: false,
             bump_due: false,
@@ -502,9 +533,14 @@ impl Producer {
                 });
                 part.state = PartState::Accepted;
                 pending.accepted = true;
+                self.missing_topic = MissingTopic::No;
             }
             Response::Unsettled { fault, refresh } => {
                 self.refresh_due |= refresh;
+                part.unsettle(fault, why);
+            }
+            Response::MissingTopic => {
+                let fault = self.topic_missing();
                 part.unsettle(fault, why);
             }
             Response::OutOfOrder => {
@@ -585,6 +621,16 @@ impl Producer {
         pending.first_rejection.get_or_insert(why);
         part.state = PartState::Rejected;
         pending.parts.push(part);
+    }
+
+    /// The class of a missing-topic answer ([`MissingTopic`]), with a refresh due either way.
+    fn topic_missing(&mut self) -> Fault {
+        self.refresh_due = true;
+        if self.missing_topic == MissingTopic::Refreshed {
+            return Fault::Refused;
+        }
+        self.missing_topic = MissingTopic::Seen;
+        Fault::Clean
     }
 
     /// Records a sequence gap: the next attempt bumps the epoch.
@@ -672,9 +718,38 @@ impl Producer {
         self.refresh_metadata().await
     }
 
+    /// Fetches the topic's metadata. After a first missing-topic answer, the refresh it
+    /// schedules runs here: it polls, from [`METADATA_RETRY_BACKOFF`] doubling to
+    /// [`METADATA_RETRY_BACKOFF_MAX`], while the broker still answers the topic missing or
+    /// leaderless, and completes with the first other answer or once `timeout` has passed, as
+    /// the Java producer's `waitOnMetadata` polls until `max.block.ms`. A broker that
+    /// auto-creates the topic answers the request that created it as missing, so a new topic
+    /// costs the attempt no failure.
+    async fn refresh_metadata(&mut self) -> anyhow::Result<()> {
+        let result = self.fetch_metadata().await;
+        if result.is_ok() || self.missing_topic != MissingTopic::Seen {
+            return result;
+        }
+        let deadline = Instant::now() + self.config.timeout;
+        let mut backoff = METADATA_RETRY_BACKOFF;
+        loop {
+            tokio::time::sleep_until((Instant::now() + backoff).min(deadline)).await;
+            backoff = (backoff * 2).min(METADATA_RETRY_BACKOFF_MAX);
+            let result = self.fetch_metadata().await;
+            let leaderless = result.is_ok()
+                && self.metadata.as_ref().is_some_and(|m| m.led_partitions().is_empty());
+            if (leaderless || result.is_err() && self.topic_pending) && Instant::now() < deadline {
+                // Not complete yet: the topic is still being created.
+                self.missing_topic = MissingTopic::Seen;
+                continue;
+            }
+            return result;
+        }
+    }
+
     /// Asks for the topic's metadata with `allow_auto_topic_creation` set, so the broker's
     /// `auto.create.topics.enable` decides whether a missing topic is created.
-    async fn refresh_metadata(&mut self) -> anyhow::Result<()> {
+    async fn fetch_metadata(&mut self) -> anyhow::Result<()> {
         let topic = MetadataRequestTopic::default().with_name(Some(TopicName(self.topic.clone())));
         let request = MetadataRequest::default()
             .with_topics(Some(vec![topic]))
@@ -690,7 +765,11 @@ impl Producer {
     }
 
     fn apply_metadata(&mut self, response: MetadataResponse) -> anyhow::Result<()> {
-        let topic_name = &self.config.topic;
+        if self.missing_topic == MissingTopic::Seen {
+            self.missing_topic = MissingTopic::Refreshed;
+        }
+        self.topic_pending = false;
+        let topic_name = &self.config.topic.clone();
         let Some(topic) = response
             .topics
             .iter()
@@ -702,7 +781,17 @@ impl Producer {
         };
         if topic.error_code != code::NONE {
             self.refresh_due = true;
-            let fault = fault::classify_control(topic.error_code);
+            let fault = match topic.error_code {
+                code::UNKNOWN_TOPIC_OR_PARTITION | code::UNKNOWN_TOPIC_ID => {
+                    self.topic_pending = true;
+                    self.topic_missing()
+                }
+                code::LEADER_NOT_AVAILABLE => {
+                    self.topic_pending = true;
+                    Fault::Clean
+                }
+                other => fault::classify_control(other),
+            };
             return Err(anyhow!(
                 "Metadata for Kafka topic {topic_name:?} answered {}",
                 fault::name(topic.error_code)
@@ -732,6 +821,7 @@ impl Producer {
         }
         if count == 0 {
             self.refresh_due = true;
+            self.topic_pending = true;
             return Err(anyhow!("Kafka topic {topic_name:?} has no partitions"))
                 .context(Fault::Clean);
         }

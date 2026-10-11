@@ -60,6 +60,10 @@ pub(crate) enum Response {
     /// `INVALID_PRODUCER_EPOCH`: `Clean`, and the producer is re-initialized with a new PID
     /// before the next send.
     StaleEpoch,
+    /// `UNKNOWN_TOPIC_OR_PARTITION` or `UNKNOWN_TOPIC_ID`: `Clean` with a metadata refresh the
+    /// first time, `Refused` once it persists after a completed refresh
+    /// (`super::producer::MissingTopic`).
+    MissingTopic,
 }
 
 /// The [`Response`] for a partition's `error_code`.
@@ -68,7 +72,7 @@ pub(crate) fn classify(error_code: i16) -> Response {
     let unsettled = |fault, refresh| Response::Unsettled { fault, refresh };
     match error_code {
         NONE | DUPLICATE_SEQUENCE_NUMBER => Response::Accepted,
-        UNKNOWN_TOPIC_OR_PARTITION | UNKNOWN_TOPIC_ID => unsettled(Fault::Refused, true),
+        UNKNOWN_TOPIC_OR_PARTITION | UNKNOWN_TOPIC_ID => Response::MissingTopic,
         LEADER_NOT_AVAILABLE
         | NOT_LEADER_OR_FOLLOWER
         | KAFKA_STORAGE_ERROR
@@ -96,12 +100,12 @@ pub(crate) fn classify(error_code: i16) -> Response {
 
 /// The class of a non-zero error code in a `Metadata` or `InitProducerId` answer, which settles
 /// no partition: an authorization or version refusal holds the queue, and anything else is a
-/// state the broker leaves on its own.
+/// state the broker leaves on its own. A missing topic is the producer's to classify
+/// (`super::producer::MissingTopic`).
 pub(crate) fn classify_control(error_code: i16) -> Fault {
     use code::*;
     match error_code {
-        UNKNOWN_TOPIC_OR_PARTITION
-        | TOPIC_AUTHORIZATION_FAILED
+        TOPIC_AUTHORIZATION_FAILED
         | CLUSTER_AUTHORIZATION_FAILED
         | TRANSACTIONAL_ID_AUTHORIZATION_FAILED
         | UNSUPPORTED_VERSION => Fault::Refused,
@@ -134,7 +138,7 @@ mod tests {
         let rows = [
             (NONE, Response::Accepted),
             (CORRUPT_MESSAGE, Response::Rejected),
-            (UNKNOWN_TOPIC_OR_PARTITION, refused(true)),
+            (UNKNOWN_TOPIC_OR_PARTITION, Response::MissingTopic),
             (LEADER_NOT_AVAILABLE, clean(true)),
             (NOT_LEADER_OR_FOLLOWER, clean(true)),
             (REQUEST_TIMED_OUT, ambiguous),
@@ -157,7 +161,7 @@ mod tests {
             (UNSUPPORTED_COMPRESSION_TYPE, refused(false)),
             (INVALID_RECORD, Response::NamedRecords),
             (THROTTLING_QUOTA_EXCEEDED, clean(false)),
-            (UNKNOWN_TOPIC_ID, refused(true)),
+            (UNKNOWN_TOPIC_ID, Response::MissingTopic),
             (INCONSISTENT_TOPIC_ID, clean(true)),
             // GROUP_AUTHORIZATION_FAILED: a real code with no row.
             (30, Response::Rejected),
@@ -176,8 +180,8 @@ mod tests {
     }
 
     #[test]
-    fn control_answers_refuse_only_for_authorization_versions_and_a_missing_topic() {
-        for code in [3, 29, 31, 53, 35] {
+    fn control_answers_refuse_only_for_authorization_and_versions() {
+        for code in [29, 31, 53, 35] {
             assert_eq!(classify_control(code), Fault::Refused, "{}", name(code));
         }
         for code in [5, 15, 51, 7] {

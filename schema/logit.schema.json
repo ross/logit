@@ -2791,7 +2791,7 @@
             "sources": true,
             "targets": true,
             "timeout": {
-              "description": "Bounds each connect, TLS handshake, write, and wait for a broker's answer. Defaults to `30s`; `0s` is rejected.",
+              "description": "Bounds each connect, TLS handshake, write, and wait for a broker's answer, and the wait for a missing topic to be created. Defaults to `30s`; `0s` is rejected.",
               "default": "30s",
               "type": "string"
             },

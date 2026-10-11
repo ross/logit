@@ -2746,8 +2746,8 @@ pub enum ComponentKind {
         #[serde(default = "default_kafka_max_request_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_request_bytes: u64,
-        /// Bounds each connect, TLS handshake, write, and wait for a broker's answer. Defaults
-        /// to `30s`; `0s` is rejected.
+        /// Bounds each connect, TLS handshake, write, and wait for a broker's answer, and the
+        /// wait for a missing topic to be created. Defaults to `30s`; `0s` is rejected.
         #[serde(default = "default_kafka_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         timeout: Duration,

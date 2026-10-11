@@ -298,14 +298,22 @@ async fn a_retried_prepare_counts_encode_side_points_once() {
     assert_eq!(sum(&sums, "logit.output.batch.bytes", &[]), first);
 }
 
-/// A topic the broker won't create is `Refused`, which holds the queue.
+/// A topic the broker won't create is `Refused` once a refresh confirms it, which holds the
+/// queue; one it creates costs no failure.
 #[tokio::test]
-async fn a_missing_topic_is_refused() {
+async fn a_missing_topic_is_refused_and_a_created_one_is_sent() {
     let cluster = FakeCluster::start(1).await;
     let probe = TelemetryProbe::new();
-    let mut out = sink(settings(&cluster), &probe);
+    let short =
+        KafkaSettings { timeout: std::time::Duration::from_millis(300), ..settings(&cluster) };
+    let mut out = sink(short, &probe);
     let err = out.send(&batch(vec![event("a", "m")])).await.unwrap_err();
     assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
+
+    let cluster = FakeCluster::start(1).await;
+    cluster.state().auto_create = Some(1);
+    let mut out = sink(settings(&cluster), &probe);
+    out.send(&batch(vec![event("a", "m")])).await.expect("a created topic is sent at once");
 }
 
 /// An empty batch sends nothing.
