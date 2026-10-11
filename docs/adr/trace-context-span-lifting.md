@@ -1,6 +1,6 @@
 ---
 created: 2026-09-04
-updated: 2026-10-04
+updated: 2026-10-11
 ---
 
 # `trace_context` grows a `span:` block, and a native `traceparent` parser
@@ -114,6 +114,10 @@ the same "operator's explicit choice, never `logit`'s own initiative" posture
 [ADR `log-record-trace-context`](log-record-trace-context.md) already established, applied to a
 span id specifically.
 
+This binds every transform, not a script. A `lua` script that calls `random.trace_id()`
+([ADR `lua-random-ids`](lua-random-ids.md)) makes the choice in its own source, where an operator
+wrote it and can see it, and that's the sanctioned way to give a line with no trace a fresh one.
+
 **All-or-nothing per event, same as before.** Every attribute is parsed before anything is
 mutated; a failure — missing trace id, an unparseable id or timing value, two forms of the same
 timing quantity, a resolved span outside `max_skew` — leaves `event.attributes`,
@@ -192,9 +196,10 @@ breakdown haproxy's finer timers do, for the same not-built-here reason.
   is worse than a visible, countable skip — the same "silently wrong is worse than visibly
   incomplete" instinct `docs/known-gaps/telemetry.md` already states for a
   different case (picking an arbitrary contributing batch as a flush's parent).
-- **Minting a trace id when none is present, not just a span id.** Rejected outright, not just
-  deferred — see the Decision section; this would fork traces silently rather than report a real
-  gap in propagation.
+- **Minting a trace id when none is present, not just a span id.** Rejected outright for this
+  transform, not just deferred — see the Decision section; this would fork traces silently rather
+  than report a real gap in propagation. A script can mint one explicitly with `random.trace_id()`
+  ([ADR `lua-random-ids`](lua-random-ids.md)).
 - **Deriving a second, CLIENT-side span for the upstream hop from the same timers this ADR reads
   anyway (haproxy's `%TR`/`%Tw`/`%Tc`/`%Tr`/`%Td`, nginx's `$upstream_*`).** Declined
   (2026-09-18), not just deferred: the timing math is all there, but a proxy minting a span on its
