@@ -8,7 +8,8 @@ the checks against small synthetic run directories: a failed fault action, an ab
 exit code, an fd sample inside a later fault, and a steady state too thin to judge. For the
 ledger, it covers the reset-aware VictoriaMetrics total and its split per life, at a decrease
 and at a life start with none, and a two-life run whose final life balances and whose earlier
-life's residual reaches V, each rule broken in turn: shutdown drops on stderr, a counted and an
+life's residual reaches V, each rule broken in turn: a shutdown drop telemetry and stderr both
+carry counted once, and either copy alone WARNed, a counted and an
 uncounted egress gap, an earlier life's residual that never reaches V, an empty export, wire loss
 in and out of a fault window and at the end, the sink identity, and recovery, a two-batch sink
 queue holding one batch and a one-batch queue it fills included. Empty SUT telemetry, and lives the timeline disagrees with,
@@ -20,7 +21,7 @@ failed. For a `kill`, it covers its validation rules (the SUT only), the watchdo
 (exit code 137 only inside a scheduled kill, its start, its readiness probe, and the stdout gap
 it leaves), and a three-life run whose middle life ends by a kill: its egress band at both
 edges, with and without a residual, a surplus below it and a lost last window above it, a D
-with no stderr part, the final life's sink identity counting a spool's replayed batches,
+with no shutdown part, the final life's sink identity counting a spool's replayed batches,
 `ledger.windows` against lost middle, tail, and head windows, and `ledger.replay` against a
 short replay. `ledger.wire` counts a steady run's surplus as 0, and `ledger.windows` excuses a
 gap the aggregate sent no batch in, with the flushes reported on time or one drain late,
@@ -921,12 +922,14 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 undelivered=0, empty_export=False, ab0_short=0, merged_lives=False,
                 empty_sut=False, buffer_batches=0, buffer_util=0.0, steady_surplus=0,
                 external=False, sut_extra=(), stderr_extra=(), timeline_extra=(),
-                **resolved):
+                shutdown_in=("telemetry", "stderr"), **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
-    them dropped on stderr over two of the listener's shutdown lines, and `v0_extra` reaching
-    VictoriaMetrics after its last drain, and life 1 balances."""
+    them dropped at shutdown, and `v0_extra` reaching VictoriaMetrics after its last drain, and
+    life 1 balances. `shutdown_in` names where the shutdown drops, of datagrams and of
+    `life0_dropped`/`life1_dropped` batches, are written: telemetry, as a dedicated `internal`
+    pipeline exports them, and stderr, as the listener's `warn` lines and `drain complete`."""
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -991,6 +994,15 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
         sut.append(_line(stamp, "logit.component.receive.utilization", "gauge",
                          receive_util if life == 1 else 0.0, component="in"))
         sut.append(_line(stamp, "logit.component.retrying", "gauge", 0, component="sink"))
+        # The final drain of each life carries its shutdown drops.
+        if "telemetry" in shutdown_in and offset == (last0 if life == 0 else drains[-1][0]):
+            if life == 0 and shutdown_drops:
+                sut.append(_line(stamp, "logit.component.datagrams.dropped", "sum",
+                                 shutdown_drops, component="in", attrs={"reason": "shutdown"}))
+            batches = life0_dropped if life == 0 else life1_dropped
+            if batches:
+                sut.append(_line(stamp, "logit.component.batches.dropped", "sum", batches,
+                                 component="sink", attrs={"reason": "shutdown"}))
 
     timeline = [_phase("start", 0, t0=T0),
                 _action("apply", "c0s1", "stop", "logit", STOP[0], affects_udp_ingress=True),
@@ -1015,7 +1027,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                            "message": message, "target": "logit", **fields})
 
     stderr = [log(0, "INFO", "ready")]
-    if shutdown_drops:
+    if shutdown_drops and "stderr" in shutdown_in:
         undecoded = shutdown_drops // 4
         stderr.append(log(STOP[0] + 0.5, "WARN", f"{shutdown_drops - undecoded} datagram(s) "
                           "still in the receive queue when this listener was stopped at its "
@@ -1024,7 +1036,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                           "receive queue but not decoded when this listener was stopped at its "
                           "shutdown grace", component="in"))
     for offset, dropped in ((STOP[0] + 0.6, life0_dropped), (321, life1_dropped)):
-        if dropped:
+        if dropped and "stderr" in shutdown_in:
             stderr.append(log(offset, "WARN", "drain complete", duration="1s",
                               batches_dropped=dropped))
         else:
@@ -1069,8 +1081,21 @@ def _ledger_checks():
             expect(clean[check_id].status == checks.PASS,
                    f"{check_id} PASSes the balanced two-life fixture, got {clean[check_id]}")
         led = checks.Ledger(checks.RunData(Path(tmp) / "ledger-clean"))
-        expect(led.D_log == {0: 20}, f"the listener's shutdown warn lines go into D, got "
-                                     f"{led.D_log}")
+        expect(led.D_log == {0: 20} and led.D_shutdown == {0: 20} and led.D(0) == 20
+               and "D 20 (20 at shutdown; stderr says 20)" in " ".join(clean["ledger.intake"].lines),
+               f"a shutdown drop telemetry and stderr both carry counts once in D, got "
+               f"D {led.D(0)}, D_log {led.D_log}, D_shutdown {led.D_shutdown}")
+        stderr_only = results("ledger-shutdown-stderr-only", shutdown_in=("stderr",))
+        expect(stderr_only["ledger.intake"].status == checks.WARN
+               and "stderr shutdown lines count 20 datagram(s), telemetry's "
+               "datagrams.dropped{reason=\"shutdown\"} 0" in stderr_only["ledger.intake"].detail,
+               f"intake WARNs shutdown drops on stderr that telemetry lacks, got "
+               f"{stderr_only['ledger.intake']}")
+        tel_only = results("ledger-shutdown-telemetry-only", shutdown_in=("telemetry",))
+        expect(tel_only["ledger.intake"].status == checks.WARN
+               and tel_only["ledger.egress"].status == checks.PASS,
+               f"intake WARNs shutdown drops in telemetry that stderr lacks, and D still reads "
+               f"telemetry, got {tel_only['ledger.intake']} {tel_only['ledger.egress']}")
         expect(led.residual(0) == 30, f"life 0's W − D − B − Ab, got {led.residual(0)}")
         expect(led.R == 77000, f"R from the defaults, got {led.R}")
         expect("within [0, R]" in clean["ledger.intake"].detail,
@@ -1126,9 +1151,16 @@ def _ledger_checks():
                f"{uncounted['ledger.egress']}")
         counted = results("ledger-counted", v0_extra=-500, life0_dropped=3)
         expect(counted["ledger.egress"].status == checks.PASS
-               and "counted (drain complete batches_dropped 3)" in counted["ledger.egress"].detail,
-               f"egress marks a positive gap with batches_dropped as counted, got "
+               and "counted (batches dropped for shutdown 3)" in counted["ledger.egress"].detail,
+               f"egress marks a positive gap with a shutdown batch drop as counted, got "
                f"{counted['ledger.egress']}")
+        log_counted = results("ledger-counted-stderr-only", v0_extra=-500, life0_dropped=3,
+                              shutdown_in=("stderr",))
+        expect(log_counted["ledger.egress"].status == checks.FAIL
+               and "drain complete's batches_dropped 3, telemetry's batches.dropped"
+               in log_counted["ledger.egress"].detail,
+               f"egress counts a gap from telemetry only, and reports a drain complete count "
+               f"telemetry lacks, got {log_counted['ledger.egress']}")
         expect(counted["ledger.summary"].status == checks.PASS,
                f"a counted earlier life leaves the summary PASS, got {counted['ledger.summary']}")
 
@@ -1581,7 +1613,7 @@ def _kill_ledger():
         expect("life 1 (killed): Ab 14,000 − V 12,500 = 1,500, within band" in egress
                and "band [-1,000, 3,000]: ingest 200/s" in egress
                and "residual W − D − B − Ab 0 at its last drain" in egress
-               and "D has no stderr part" in egress,
+               and "D has no shutdown part" in egress,
                f"egress reports the killed life's gap inside its band, got {egress}")
         expect("life 2 (final): Ab 18,000 − V 18,000 = 0, ok" in egress,
                f"the final life stays exact, got {egress}")
