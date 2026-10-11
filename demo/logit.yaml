@@ -20,9 +20,12 @@
 # What goes out:
 #   - Logs to Loki (`loki_out`, OTLP/HTTP).
 #   - Metrics to VictoriaMetrics (`victoria_out`, `prometheus_out` sending remote-write).
-#   - Spans to Tempo (`tempo_out`, OTLP/gRPC): `logit`'s own internal spans, the spans haproxy and
-#     nginx get from their access lines (`docs/adr/trace-context-span-lifting.md`'s `span:` block),
-#     and the browser's spans from `browser_in`.
+#   - Spans to Tempo (`tempo_out`, OTLP/gRPC): the spans haproxy and nginx get from their access
+#     lines (`docs/adr/trace-context-span-lifting.md`'s `span:` block), and the browser's spans
+#     from `browser_in`.
+#   - `logit`'s own telemetry to the same three backends through its own sinks (`self_loki_out`,
+#     `self_victoria_out`, `self_tempo_out`), so `self` has a dedicated pipeline and drains after
+#     the data flows stop (docs/deploying.md's "Self-logging").
 #   - Every event to `stdout`, for `docker compose logs -f logit`.
 #
 # Why the app's and worker's spans bypass `logit`: every real SDK-carried span (`demo-app`'s
@@ -99,9 +102,17 @@
 #                                    v                                                    |
 #                              windowed (aggregate)                                        |
 #                                    |                                                    |
-#   self (internal) --+-> self_windowed (aggregate) --> victoria_out --> VictoriaMetrics   |
-#                      |                                                                  |
-#                      +-> trace_only (has_signal) ---------------------------------> tempo_out (otlp_out, gRPC) --> tempo
+#                                    v                                                    v
+#                     victoria_out (prometheus_out)             browser_spans --> tempo_out (otlp_out, gRPC)
+#                                    |                          (browser_in, below)       |
+#                                    v                                                    v
+#                             VictoriaMetrics                                           Tempo
+#
+#   self (internal) --+-> self_logs (keep_signals: [logs]) ---> self_loki_out (otlp_out, HTTP) --> Loki
+#                     |
+#                     +-> self_windowed (aggregate) ---------> self_victoria_out --> VictoriaMetrics
+#                     |
+#                     +-> trace_only (has_signal) -----------> self_tempo_out (otlp_out, gRPC) --> Tempo
 #
 #   demo-app --OTLP/HTTP protobuf--> tempo:4318 directly, bypassing `logit`. Its span parents to
 #   nginx's span (nginx mints and forwards its own span id, docs/adr/trace-context-span-lifting.md),
@@ -137,9 +148,11 @@
 #             not because a real OTel SDK would ever send this input anything but traces.
 #
 #   `logit`'s own self-diagnostics (warn and above, `internal`'s default `logs:` threshold) ride
-#   the same `self` -> logs_only -> loki_out leg as every other tier's log events, alongside
-#   `self`'s own points and spans (docs/plans/operator-surface.md). They're ordinary
-#   `LogRecord`-carrying events; loki_out treats them like any other.
+#   the `self` -> self_logs -> self_loki_out leg, alongside `self`'s own points and spans
+#   (docs/plans/operator-surface.md). They're ordinary `LogRecord`-carrying events. `self` has
+#   sinks of its own, with none shared with a data path, so at shutdown it drains again after
+#   every data node has stopped and exports the counts recorded during the drain
+#   (docs/deploying.md's "Self-logging").
 #
 # `admin: { bind: 0.0.0.0:9600 }` below serves `/readyz`/`/healthz`
 # (docs/deploying.md's "Probes and exit codes"), which demo/compose.yaml's `logit` healthcheck
@@ -485,14 +498,11 @@ components:
   # `haproxy_trace`/`nginx_trace` produce span-only events, so this `keep_signals: [logs]` gate in
   # front of `loki_out` keeps the sink's input to the one signal Loki takes. `keep_signals` clears
   # the payload slots it isn't given (ADR `signal-filtering-components`), so every log that
-  # reaches `loki_out` keeps its log payload intact. `self` (below) joins the same gate: it emits
-  # points, spans, *and* logs (docs/plans/operator-surface.md) through this one component, and
-  # `keep_signals: [logs]` lets `logit`'s own self-diagnostics reach Loki without also sending
-  # `loki_out` a metric point or a span it would reject.
+  # reaches `loki_out` keeps its log payload intact. `self_logs` below applies the same gate to
+  # `self`.
   logs_only:
     type: keep_signals
-    sources:
-      [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace, redis_parse, self]
+    sources: [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace, redis_parse]
     signals: [logs]
 
   # Logs to Loki, direct over OTLP with no relay service in between (docs/plans/
@@ -514,9 +524,28 @@ components:
       disk:
         path: /var/lib/logit/spool/loki_out
 
+  # `self` emits points, spans, *and* logs (docs/plans/operator-surface.md) through one
+  # component, and `keep_signals: [logs]` lets `logit`'s own self-diagnostics reach Loki without
+  # also sending a metric point or a span it would reject. `self`'s pipeline is dedicated: nothing
+  # downstream of `self` is shared with a data path, which is why `self_loki_out` repeats
+  # `loki_out`'s settings instead of sharing it. A shared sink would shut down with the data and
+  # lose the counts `self` exports after it (docs/deploying.md's "Self-logging").
+  self_logs:
+    type: keep_signals
+    sources: [self]
+    signals: [logs]
+
+  self_loki_out:
+    type: otlp_out
+    sources: [self_logs]
+    protocol: http
+    endpoint: http://loki:3100/otlp
+    buffer:
+      overflow: drop_oldest # best-effort, like `self_victoria_out`
+
   # The real spans `haproxy_trace`/`nginx_trace` minted, separated from the log event each rides
   # in on. `app_trace` isn't a source because it never produces a span (see its comment above).
-  # Feeds `tempo_out` below alongside `logit`'s own internal spans (`trace_only`).
+  # Feeds `tempo_out` below.
   access_spans:
     type: keep_signals
     sources: [haproxy_trace, nginx_trace]
@@ -640,13 +669,12 @@ components:
   # Remote-write into VictoriaMetrics (docs/deploying.md's "VictoriaMetrics, VictoriaLogs, and
   # VictoriaTraces"). `version: 1` is required: VictoriaMetrics answers a 2.0 request `204` and
   # stores nothing. `compression: zstd` is the VictoriaMetrics remote write protocol vmagent sends
-  # by default; VictoriaMetrics also accepts Snappy. `self_windowed`'s span and log events carry no
-  # metric record, so this sink ignores them without a signal gate. Each series is labelled with
-  # its event attributes and resource attributes, names sanitized (`service.name` becomes
-  # `service_name`, `web.requests` becomes `web_requests_total`).
+  # by default; VictoriaMetrics also accepts Snappy. Each series is labelled with its event
+  # attributes and resource attributes, names sanitized (`service.name` becomes `service_name`,
+  # `web.requests` becomes `web_requests_total`).
   victoria_out:
     type: prometheus_out
-    sources: [windowed, self_windowed]
+    sources: [windowed]
     endpoint: http://victoriametrics:8428/api/v1/write
     version: 1
     compression: zstd
@@ -655,18 +683,32 @@ components:
       disk:
         path: /var/lib/logit/spool/victoria_out
 
+  # `self`'s metrics get their own sink, so `self`'s pipeline stays dedicated (see `self_logs`).
+  # `self_windowed`'s span and log events carry no metric record, so this sink ignores them
+  # without a signal gate.
+  self_victoria_out:
+    type: prometheus_out
+    sources: [self_windowed]
+    endpoint: http://victoriametrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    # Best-effort: `self`'s pipeline shares nothing with a data path, and a spool for telemetry
+    # about `logit` is overkill, so a stalled sink sheds its oldest points.
+    buffer:
+      overflow: drop_oldest
+
   # `self` carries *all* of `logit`'s own telemetry, not just spans: every drain also carries this
   # process's `logit.*` metrics (Counter/Gauge/Distribution). It never mixes the two *on one
   # event*, though: each drain is either a metric-only point or a span-only span event
   # (`crates/logit-core/src/telemetry.rs`'s `drain`). `trace_only` drops the metric-only ones
-  # before `tempo_out` sees them. `has_signal` never mutates a forwarded event, so every span that
-  # reaches `tempo_out` arrives exactly as `self` produced it. See
+  # before `self_tempo_out` sees them. `has_signal` never mutates a forwarded event, so every
+  # span that reaches `self_tempo_out` arrives as `self` produced it. See
   # `docs/adr/signal-filtering-components.md`.
   #
   # The gate is a noise filter, not a correctness requirement: it keeps the sink's input to the
   # one signal Tempo takes. Tempo is a traces-only gRPC server (it registers no `MetricsService`).
-  # `otlp_out` issues one request per signal, so an `internal` metric point reaching `tempo_out`
-  # would draw a `grpc-status: 12` (UNIMPLEMENTED) answer, which `otlp_out` reads as `Rejected`
+  # `otlp_out` issues one request per signal, so an `internal` metric point reaching
+  # `self_tempo_out` would draw a `grpc-status: 12` (UNIMPLEMENTED) answer, which `otlp_out` reads as `Rejected`
   # for that signal: it counts those points `records.dropped{reason="rejected"}`, warns, and still
   # delivers the batch's spans once, retrying only an unsettled signal; a batch of only metric
   # points is dropped `rejected`. Without the gate nothing is lost or duplicated, but every batch
@@ -682,19 +724,28 @@ components:
   # Deliberately gRPC, not HTTP (docs/adr/hand-rolled-grpc-over-hyper.md): Tempo's `:4317`
   # receiver, to exercise the transport the rest of this config doesn't otherwise touch.
   # `endpoint` is a bare `host:port` authority for gRPC, not a URL (see
-  # `crates/logit-outputs/src/otlp.rs`'s `grpc_authority`). Three sources: `logit`'s own internal
-  # spans (`trace_only`), haproxy's/nginx's real access-line spans (`access_spans`,
-  # docs/adr/trace-context-span-lifting.md), and whatever real OTLP traces `browser_in` decoded
-  # (`browser_spans`). `demo-app`'s real request spans go straight to Tempo's OTLP/HTTP receiver
+  # `crates/logit-outputs/src/otlp.rs`'s `grpc_authority`). Two sources: haproxy's/nginx's real
+  # access-line spans (`access_spans`, docs/adr/trace-context-span-lifting.md), and whatever real
+  # OTLP traces `browser_in` decoded (`browser_spans`). `demo-app`'s real request spans go straight to Tempo's OTLP/HTTP receiver
   # instead, never touching `logit` (see the comment above `stdout`). They still land in the same
   # Tempo trace when trace ids agree, because Tempo doesn't care which of its receivers a span
   # arrived through.
   tempo_out:
     type: otlp_out
-    sources: [trace_only, access_spans, browser_spans]
+    sources: [access_spans, browser_spans]
     protocol: grpc
     endpoint: tempo:4317
     # A disk spool, like `loki_out`'s, so a Tempo outage never stalls the other sinks.
     buffer:
       disk:
         path: /var/lib/logit/spool/tempo_out
+
+  # `logit`'s own internal spans (`trace_only`), through a sink of their own so `self`'s pipeline
+  # stays dedicated (see `self_logs`). Same transport and endpoint as `tempo_out`.
+  self_tempo_out:
+    type: otlp_out
+    sources: [trace_only]
+    protocol: grpc
+    endpoint: tempo:4317
+    buffer:
+      overflow: drop_oldest # best-effort, like `self_victoria_out`

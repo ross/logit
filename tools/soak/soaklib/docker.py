@@ -37,20 +37,23 @@ def docker_argv(env=None):
 
 
 class Docker:
-    """One compose project's view of the daemon. `project`, `compose_file`, each of
+    """One compose project's view of the daemon. `project`, each of `compose_files` in order
+    (the base file, then a scenario's override, which compose merges onto it), each of
     `env_files` in order (a later file overrides an earlier one), and each of `profiles` are
     passed to every `compose` call."""
 
-    def __init__(self, project, compose_file, env_files, profiles=(), prefix=None):
+    def __init__(self, project, compose_files, env_files, profiles=(), prefix=None):
         self.prefix = prefix if prefix is not None else docker_argv()
         self.project = project
-        self.compose_file = str(compose_file)
+        self.compose_files = [str(path) for path in compose_files]
         self.env_files = [str(path) for path in env_files]
         self.profiles = list(profiles)
 
     def compose_args(self):
         """The global `compose` options every call passes, before the subcommand."""
-        args = ["compose", "--progress", "quiet", "-p", self.project, "-f", self.compose_file]
+        args = ["compose", "--progress", "quiet", "-p", self.project]
+        for path in self.compose_files:
+            args += ["-f", path]
         for path in self.env_files:
             args += ["--env-file", path]
         for profile in self.profiles:
@@ -78,6 +81,11 @@ class Docker:
 
     def compose(self, *args, timeout=DEFAULT_TIMEOUT):
         return self.run([*self.compose_args(), *args], timeout=timeout)
+
+    def config_json(self):
+        """`compose config --format json`: the merged, interpolated project, read from the
+        files alone with no daemon call."""
+        return self.compose("config", "--format", "json")
 
     def container_id(self, service):
         """The service's container id, running or not, or None."""

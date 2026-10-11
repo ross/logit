@@ -164,16 +164,20 @@ Prometheus spelling:
 ### `logit`'s own telemetry
 
 `logit` also observes its own pipeline via `internal` (`../docs/design/internal-telemetry.md`).
-It writes into the same VictoriaMetrics *and*, as real spans, over OTLP/gRPC into Tempo: one span
-per node-visit at `span_sample_rate: 1.0`, so nothing is thinned out
+It writes into the same VictoriaMetrics, Loki, *and*, as real spans, over OTLP/gRPC into Tempo: one
+span per node-visit at `span_sample_rate: 1.0`, so nothing is thinned out
 (`../docs/adr/internal-span-emission-and-deterministic-sampling.md`,
-`../docs/adr/hand-rolled-grpc-over-hyper.md`). These share the same `tempo_out` as haproxy's and
-nginx's access-line spans.
+`../docs/adr/hand-rolled-grpc-over-hyper.md`).
+
+`self` has a dedicated pipeline: its own sinks (`self_loki_out`, `self_victoria_out`,
+`self_tempo_out`), none shared with the data path. At shutdown the data flows stop first and `self`
+drains once more, so counts recorded during the drain are exported
+(`../docs/deploying.md`'s "Self-logging").
 
 `self` (`internal`) mixes metric-only and span-only events in one stream. `trace_only`
-(`type: has_signal`) drops the metric-only ones before they reach `tempo_out`, because Tempo is a
-traces-only backend and would reject them. `has_signal` never forwards a metrics-only batch at
-all, so you shouldn't see any `component 'tempo_out'` send failures in steady state. Without
+(`type: has_signal`) drops the metric-only ones before they reach `self_tempo_out`, because Tempo
+is a traces-only backend and would reject them. `has_signal` never forwards a metrics-only batch at
+all, so you shouldn't see any `component 'self_tempo_out'` send failures in steady state. Without
 `trace_only`, each mixed batch would still deliver its spans, but `otlp_out` would send a metrics
 request Tempo rejects on every batch, count the points `records.dropped{reason="rejected"}`, and
 warn. See [ADR `delivery-semantics`](../docs/adr/delivery-semantics.md)'s "Amendment: per-request
