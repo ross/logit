@@ -91,12 +91,23 @@ pub enum ComponentKind {
     KeepSignals { signals: Vec<Signal> },
     // A denylist: clears the listed signals' payloads, keeping the rest.
     DropSignals { signals: Vec<Signal> },
-    // Forwards an event whose resource/attributes match every configured pair -- config is
-    // `Set`'s, field for field; never mutates (docs/adr/attribute-filtering-components.md).
-    HasAttributes { resource: BTreeMap<String, SetValue>, attributes: BTreeMap<String, SetValue> },
-    // Drops an event matching every configured pair -- has_attributes' exact complement on the
-    // identical config, taken at the top level (an event matching some-but-not-all pairs forwards).
-    DropAttributes { resource: BTreeMap<String, SetValue>, attributes: BTreeMap<String, SetValue> },
+    // Forwards an event whose resource/attributes match every configured pair and carry every
+    // listed key -- the maps are `Set`'s, field for field; never mutates (docs/adr/attribute-filtering-components.md).
+    HasAttributes {
+        resource: BTreeMap<String, SetValue>,
+        attributes: BTreeMap<String, SetValue>,
+        resource_present: Vec<String>,
+        attributes_present: Vec<String>,
+    },
+    // Drops an event matching every configured pair and carrying every listed key --
+    // has_attributes' exact complement on the identical config, taken at the top level (an event
+    // matching some-but-not-all of it forwards).
+    DropAttributes {
+        resource: BTreeMap<String, SetValue>,
+        attributes: BTreeMap<String, SetValue>,
+        resource_present: Vec<String>,
+        attributes_present: Vec<String>,
+    },
     // Forwards an event whose batch's origin/previous match every configured field -- each field
     // is a list of alternatives (OR'd within the field), the two fields AND together; never
     // mutates (docs/adr/provenance-filtering-components.md).
@@ -168,8 +179,8 @@ collide, so the rule stays predictable when a protocol gains its second side lat
 `syslog_out` (RFC 3164/5424 over UDP or TCP, `docs/adr/syslog-output.md`) did after `SyslogIn`.
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
-`has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`,
-`kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`, and any future
+`has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `bucket`,
+`logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`, and any future
 native transform — take no suffix, because a transform has only one direction.
 
 **`interval` is a per-kind field.** `lua`/`lua_file` carry an optional flush interval
@@ -214,7 +225,7 @@ literal argument string.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -317,8 +328,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 34. An inconsistent `logit_out` `tls:`, or a `logit_in` `max_frame_bytes` of `0` or above 64 MiB.
 35. A `buffer.disk:` beside a non-default in-memory bound, a bad disk bound, or a shared
     `disk.path`.
-36. A `has_attributes`/`drop_attributes` with nothing configured, an empty key, or a non-finite
-    value.
+36. A `has_attributes`/`drop_attributes` with nothing configured, an empty key, a non-finite
+    value, or a presence key repeated or also named in the same side's map.
 37. A `has_provenance`/`drop_provenance` with nothing configured, or an empty or repeated entry.
     An id isn't checked against this graph: it may name a component in another process.
 38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`, a value above 65507
@@ -401,6 +412,16 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `datadog_trace_in` without `bind`.
 81. An `admin.socket_mode` without `admin.socket`, an empty `admin.bind` or `admin.socket`, or an
     `admin.bind` that is a path.
+82. A `bucket` with no `attributes`; an empty field name, `into`, `ranges`, `value`, or `other`; an
+    `into` naming another configured source or shared by two fields; a range with both `lt` and
+    `le`; a boundless range that isn't last; a non-finite bound; or a range that can never match
+    (a bound below the previous one, or equal to it unless `lt: X` is followed by `le: X`).
+83. Not a rejection: a listener that reaches two or more sinks using `buffer.overflow: block` with
+    no `buffer.disk` gets a warning, since a stall in one parks the others. `null_out`, an
+    exposition-mode `prometheus_out`, and `buffer.disk` sinks don't count.
+84. Not a rejection: an `internal` whose pipeline shares a node with another listener's gets a
+    warning naming that node, since only a dedicated pipeline exports the counts recorded during
+    shutdown.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
@@ -468,6 +489,16 @@ component is one that appears in several `sources` lists, with nothing to specia
   driver reports draining at the signal, waits out the delay with every listener still running,
   and only then sends the shutdown that starts the cascade and every `shutdown_grace` timer
   ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md)).
+- **A dedicated `internal` pipeline shuts down second.** When no other listener reaches any node
+  `internal` reaches (`Graph::internal_pipeline`), `internal` and that pipeline's sinks and Lua
+  nodes don't take the shutdown signal. They take a second signal, which the runtime sends once
+  every node outside the pipeline has exited, so `internal`'s final drain carries what the rest
+  of the drain counted, and their graces and wedge rules count from it. Nothing outside the
+  pipeline feeds a node in it, so no node waiting on the first signal can wait on the second.
+  With a mixed pipeline or no `internal`, there is one signal, and a mixed pipeline resolves with
+  rule 84's warning
+  ([ADR `shutdown-accounting-and-cancellation-safety`](../adr/shutdown-accounting-and-cancellation-safety.md),
+  decisions 10 to 16).
 
 ### Thread model: only Lua needs its own OS thread
 
@@ -652,6 +683,7 @@ A bare file name is under `crates/logit-pipeline/src/` or `crates/logit-inputs/s
 | Site (file, item) | Arms | What a losing arm drops | Why nothing is lost, or what counts it |
 |---|---|---|---|
 | `runtime.rs`, `run_with_options` (shutdown driver) | None: the driver task's `sleep(shutdown_delay)`, cut by the task's `abort()` once every node has exited, or made moot by a node error, whose join-loop branch sends the shutdown itself | The abort drops the sleep, and with it the driver's later shutdown send | Nothing: the delay only postpones the send. A node error has already sent it, so the late send is a no-op, and an abort comes only after every node has exited, so no node waits on it. Nothing to count |
+| `runtime.rs`, `run_with_options` (stage-two task) | None: two `wait_for`s in sequence, on the shutdown signal and on the count of running nodes outside a dedicated `internal` pipeline reaching zero, cut by the task's `abort()` once every node has exited | The abort drops a wait, and with it the stage-two send | Nothing: an abort comes only after every node has exited, so no pipeline node waits on the send. A run with no signal and no failure never sends it, and its pipeline nodes run until the run is dropped, as every node does |
 | `runtime.rs`, `run_input` | `biased`: the listener's `run_until_shutdown`, then the grace backstop (`unconstrained`) | The backstop winning drops the listener's future: whatever it held undelivered at the deadline | A loss bounded by `shutdown_grace`, and the listener's own counters cover what it drops (the UDP listener's rows). `biased` means a listener result ready in the same wake as the backstop, an `Err` included, is returned, not discarded. `unconstrained` keeps a listener that spends its whole coop budget on every poll from deferring the backstop: `Sleep::poll_elapsed` and `wait_for` spend that budget too, so without it the backstop would find none left on every wake |
 | `runtime.rs`, `run_output` (`already_finished`) | `write_loop`, `drain_inbox` | `write_loop` finishing first drops `drain_inbox` mid-`recv` or mid-`push` | `drain_inbox` leaves the batch it was pushing in `in_hand` and unread batches in the inbox, and `run_output`'s sweep takes both. `drain_inbox` finishing first drops nothing: `write_loop` is then awaited to the end |
 | `runtime.rs`, `run_output` (sweep) | `timeout_at(SWEEP_DRAIN_TIMEOUT, inbox.recv())` on the closed inbox | The timeout firing drops a `recv` waiting on an upstream permit still reserved | The inbox is closed first, so a later send fails upstream as `events.dropped{reason="closed_consumer"}`, and a listener with an acknowledgement also refuses that batch to its client. Every batch the sweep takes counts `batches.received`, then is spooled (`Disk`) or counted `dropped{reason="shutdown"}` (`Memory`). The bound covers only `recv`, never a disk `push`. A permit held past the bound is an uncounted exception (`docs/known-gaps/runtime.md`, "Pipeline runtime and graph") |
@@ -680,7 +712,7 @@ A bare file name is under `crates/logit-pipeline/src/` or `crates/logit-inputs/s
 | `tail/driver.rs`, `Tailer::drain` (shutdown check) | None: `*shutdown.borrow()` between two files' reads, not a `select!` | Nothing is cancelled. Shutdown returns `DrainEnd::Shutdown` before the next file's read, and the run loop does the final close, flush, and forced checkpoint | One read is at most one 64 KiB chunk, and its decode is bounded, but shutdown isn't noticed while that chunk's lines are emitted, since an `emit` waiting on the downstream isn't raced against it. If `run_input`'s backstop drops the task there, the final flush and checkpoint don't run, and the restart replays from the last interval checkpoint: duplicates, never loss (`docs/known-gaps/tailing.md`) |
 | `internal.rs`, `InternalInput::run_until_shutdown` | Unbiased: `ticker.tick()`, `shutdown_due` | Either arm winning drops the other before its body runs; a losing `tick` consumes no tick, and `wait_for` re-reads the value | Both arm bodies await: each calls `tick`, which drains the registry and awaits `Fanout::send`. While a body is parked on backpressure the `select!` isn't polled, so the signal is seen only once that send completes, and `run_input`'s backstop can drop the task with a drained batch parked in it. That batch is lost uncounted (`docs/known-gaps/telemetry.md`) |
 | `http.rs`, `drive_connection` (waits) | Three unbiased waits: `conn`, `activity.changed`, and `shutdown.wait_for` while a request is in flight; `conn`, `sleep_until(deadline)` (only with an `idle_timeout`), `activity.changed`, and `shutdown.wait_for` while idle; and `conn` against `activity.changed` after the close grace | A `conn` win returns. Otherwise the loser is a `sleep_until`, a `Notified`, or a `wait_for` | `conn` is pinned outside the loop and polled by reference, so it is never dropped. A dropped sleep loses nothing, since the loop recomputes the deadline from `last_progress`. `InFlight`'s `drop` stamps progress, then calls `notify_one`, which stores a permit when no `Notified` is waiting, so a request finishing between two waits still wakes the next one. A dropped `wait_for` loses no edge: the value stays `true`, and the next `wait_for` or the loop's `borrow()` check reads it |
-| `http.rs`, `drive_connection` (shutdown arm) | `shutdown.wait_for` in the first two waits (previous row), on the connection's own clone of the signal, plus a `*shutdown.borrow()` check at the top of the loop | Shutdown winning drops a `Notified` or a `sleep_until`. `conn` is polled by reference and never dropped | The arm sets a flag and breaks, and the close sequence runs after the loop as for an idle close (next row): `graceful_shutdown`, the grace, and a request in flight served out. The sequence has no shutdown arm. A dropped sender reads as shutdown. Nothing is counted: a shutdown close would be recorded after `internal`'s final drain, and `connections.closed` counts a policy close |
+| `http.rs`, `drive_connection` (shutdown arm) | `shutdown.wait_for` in the first two waits (previous row), on the connection's own clone of the signal, plus a `*shutdown.borrow()` check at the top of the loop | Shutdown winning drops a `Notified` or a `sleep_until`. `conn` is polled by reference and never dropped | The arm sets a flag and breaks, and the close sequence runs after the loop as for an idle close (next row): `graceful_shutdown`, the grace, and a request in flight served out. The sequence has no shutdown arm. A dropped sender reads as shutdown. Once the sequence ends, the close counts `connections.closed{reason="shutdown"}`; a connection the backstop aborts first counts nothing |
 | `http.rs`, `drive_connection` (close grace) | `timeout(grace, conn)` after `graceful_shutdown` | The timeout firing drops nothing (`conn` is polled by reference); the loop then drops the connection only when no request is in flight | With nothing in flight, the drop discards only a stopped h1 head or an h2 handshake: no request was taken, and the client resends on the closed connection. A request in flight is waited out, so its response reaches the wire. At shutdown the grace (`handshake_timeout`, 5s by default) equals `run_input`'s backstop, so a `KA::Busy` head or a still-handshaking h2 connection may be ended by the backstop's abort (the `ConnectionTasks` row) instead of this drop, with nothing in flight either way; a wait-out has no ceiling of its own and is ended the same way |
 | `http.rs`, `collect_with_stall_bound` | `timeout(stall, body.frame())`, per frame | The timeout firing drops a pending frame read, and the body read so far | The request is answered `408` (gRPC `DEADLINE_EXCEEDED`) and nothing of it is sent downstream, so the client resends it |
 | `prometheus.rs`, `scrape_target` | The `reqwest` request `timeout`, on each target's `JoinSet` task in `PrometheusInput::tick` | The timeout firing drops a scrape's request or its body read | The scrape is `ScrapeStatus::Timeout`, reported as `up` 0 for that target. A scrape consumes nothing at the target, so the next scrape reads it again: nothing is lost |
@@ -721,7 +753,8 @@ topology, not a rare one, with these consequences:
   destination can head-of-line-block telemetry bound for an unrelated, healthy one. A sink isolates
   itself: `buffer.overflow: drop_newest | drop_oldest` keeps its inbox draining and counts what it
   drops, and `buffer.disk` defers the stall until the spool is full. The default `overflow: block`
-  keeps `tail_in`, TCP listeners, and the native hop lossless, because the sender waits. With every
+  keeps `tail_in`, TCP listeners, and the native hop lossless, because the sender waits. Rule 83
+  warns when one listener reaches two or more memory-only `block` sinks. With every
   sink set to drop, a transform, Lua node, or router backs up only when it is itself the
   bottleneck, which is a capacity matter. To find which branch is blocking, read
   `logit.component.inbox.full`, `inbox.blocked.duration`, and `inbox.batches` on the consumers

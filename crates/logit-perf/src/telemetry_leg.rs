@@ -33,7 +33,8 @@
 //! scenario carrying this leg always takes the settle-then-SIGTERM path. That SIGTERM also makes
 //! the numbers whole: `InternalInput::run_until_shutdown` drains once more on the way out
 //! (`docs/design/internal-telemetry.md`, "Shutdown drains once more"), so the last partial
-//! interval reaches the dump.
+//! interval reaches the dump. The leg is a dedicated pipeline, so that drain waits until the
+//! scenario's own nodes have exited and carries what they counted while draining.
 
 use crate::scenario::Scenario;
 use anyhow::{bail, Context};

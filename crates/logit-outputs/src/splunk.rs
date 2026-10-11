@@ -337,11 +337,7 @@ fn pack(sizes: impl IntoIterator<Item = usize>, max: usize) -> Vec<Range<usize>>
 
 /// A random version-4 GUID, lowercase, the form Splunk takes as a channel.
 fn channel_guid() -> String {
-    let mut b = logit_core::trace::random_id_bytes::<16>();
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+    logit_core::ids::format_uuid(&logit_core::ids::uuid_v4())
 }
 
 /// Inline, not `spawn_blocking`: a body is at most `max_body_bytes`, which compresses in

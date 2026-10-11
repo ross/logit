@@ -52,6 +52,10 @@ components:
     sources: [self]
     signals: [logs]
 
+  # A display beside `influx_out`, so it drops its oldest batches rather than stall `self`'s
+  # metrics when nothing reads stdout.
   logs_out:
     type: stdio_out
     sources: [logs_only]
+    buffer:
+      overflow: drop_oldest

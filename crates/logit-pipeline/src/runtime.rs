@@ -137,7 +137,8 @@ pub async fn run(graph: Graph, specs: HashMap<String, NodeSpec>) -> anyhow::Resu
 ///
 /// The mechanism: `Input::run` takes its `Fanout` by value, so when a listener returns or its
 /// future is dropped, the last `Sender` into each downstream inbox goes with it, and those inboxes
-/// close. The `FiniteInput` tests prove the cascade.
+/// close. The `FiniteInput` tests prove the cascade. A dedicated `internal` pipeline stops last,
+/// on a second signal (`ShutdownStages`).
 pub async fn run_with_shutdown(
     graph: Graph,
     specs: HashMap<String, NodeSpec>,
@@ -173,6 +174,47 @@ pub struct RunOptions {
     /// Readiness reports draining for the whole wait, and every listener keeps running. Applies
     /// only when the phase was `Ready` at the signal.
     pub shutdown_delay: Duration,
+}
+
+/// The second stage of shutdown, for a dedicated `internal` pipeline ([`Graph::internal_pipeline`];
+/// `docs/adr/shutdown-accounting-and-cancellation-safety.md`, decisions 10 to 16), so that
+/// `internal`'s last drain runs after every count the rest of the drain records.
+///
+/// Stage one is the shutdown signal, and every node outside the pipeline takes it. Stage two
+/// fires once stage one has and every task outside the pipeline has exited. `internal` and the
+/// pipeline's sinks and Lua nodes take only stage two, so `internal` keeps draining on its
+/// interval through the data drain, and every grace and wedge rule in the pipeline counts from
+/// stage two. Nothing outside the pipeline feeds a node in it, so no stage-one node waits on a
+/// stage-two one.
+///
+/// With a mixed pipeline or no `internal`, `pipeline` is empty and there is one stage.
+#[derive(Default)]
+struct ShutdownStages {
+    /// `internal` and every node it reaches, when that pipeline is dedicated.
+    pipeline: std::collections::HashSet<String>,
+}
+
+impl ShutdownStages {
+    fn of(graph: &Graph) -> Self {
+        let pipeline = graph.internal_pipeline().unwrap_or_default();
+        Self { pipeline: pipeline.into_iter().map(str::to_owned).collect() }
+    }
+
+    fn is_staged(&self) -> bool {
+        !self.pipeline.is_empty()
+    }
+
+    /// Whether stage two waits for `id`'s task to exit.
+    fn waits_for(&self, id: &str) -> bool {
+        self.is_staged() && !self.pipeline.contains(id)
+    }
+
+    /// Counts a task spawned for `id` if stage two waits for it.
+    fn spawned(&self, id: &str, waiting: &watch::Sender<usize>) {
+        if self.waits_for(id) {
+            waiting.send_modify(|left| *left += 1);
+        }
+    }
 }
 
 /// Same as [`run_with_telemetry`], with [`RunOptions`].
@@ -295,6 +337,20 @@ pub async fn run_with_options(
         readiness.set_node(id, NodeState::Alias);
     }
 
+    let stages = ShutdownStages::of(&graph);
+    // The second stage of shutdown (`ShutdownStages`). Never sent with one stage.
+    let (stage_two_tx, stage_two_rx) = watch::channel(false);
+    // The one shutdown signal each listener, sink, and Lua node takes.
+    let shutdown_rx_for = |id: &str| {
+        if stages.pipeline.contains(id) {
+            stage_two_rx.clone()
+        } else {
+            shutdown_rx.clone()
+        }
+    };
+    // How many tasks stage two still waits for: counted up at each spawn, down in the join loop.
+    let (waiting_tx, waiting_rx) = watch::channel(0usize);
+
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
     // Task id -> component id, so the join loop can name a failing or panicking task in
     // `readiness`. A Lua node's entry is its `watch_lua_thread` task, since a `std::thread` can't
@@ -329,10 +385,11 @@ pub async fn run_with_options(
                     id.clone(),
                     input,
                     fanout,
-                    shutdown_rx.clone(),
+                    shutdown_rx_for(&id),
                     input_config.shutdown_grace,
                 ));
                 node_ids.insert(handle.id(), id.clone());
+                stages.spawned(&id, &waiting_tx);
                 readiness.set_node(&id, NodeState::Running);
             }
             NodeSpec::Output(output, store_config, write_config) => {
@@ -343,15 +400,17 @@ pub async fn run_with_options(
                     node_telemetry,
                     store_config,
                     write_config,
-                    shutdown_rx.clone(),
+                    shutdown_rx_for(&id),
                     shutdown_dropped_batches.clone(),
                 ));
                 node_ids.insert(handle.id(), id.clone());
+                stages.spawned(&id, &waiting_tx);
                 readiness.set_node(&id, NodeState::Running);
             }
             NodeSpec::Transform(transform) => {
                 let handle = tasks.spawn(run_transform(transform, inbox, fanout, node_telemetry));
                 node_ids.insert(handle.id(), id.clone());
+                stages.spawned(&id, &waiting_tx);
                 readiness.set_node(&id, NodeState::Running);
             }
             NodeSpec::Router(router) => {
@@ -362,6 +421,7 @@ pub async fn run_with_options(
                 let routes = resolve_target_fanouts(&id, &component.targets, &target_fanouts);
                 let handle = tasks.spawn(run_router(router, inbox, fanout, routes, node_telemetry));
                 node_ids.insert(handle.id(), id.clone());
+                stages.spawned(&id, &waiting_tx);
                 readiness.set_node(&id, NodeState::Running);
             }
             NodeSpec::Target => {
@@ -433,13 +493,14 @@ pub async fn run_with_options(
                             heartbeat,
                             io,
                             runtime,
-                            shutdown_rx.clone(),
+                            shutdown_rx_for(&id),
                             readiness.clone(),
                             watcher_telemetry,
                             watcher_diag,
                             shutdown_dropped_batches.clone(),
                         ));
                         node_ids.insert(watcher.id(), id.clone());
+                        stages.spawned(&id, &waiting_tx);
                     }
                     Ok(Err(message)) => {
                         return Err(RunError::Startup(anyhow::anyhow!(
@@ -465,6 +526,20 @@ pub async fn run_with_options(
     // `a_router_exiting_closes_its_targets_consumers_inboxes` pins it under a timeout.
     drop(target_fanouts);
 
+    // Stage two waits for both stage one and the last task it waits for, so a run with no signal
+    // and no failure never starts it, and one where every such task already finished starts it
+    // at stage one. The join loop holds `shutdown_tx` and `waiting_tx` until every task has
+    // exited, so neither wait sees a dropped sender.
+    let stage_two = stages.is_staged().then(|| {
+        let mut stage_one = shutdown_rx.clone();
+        let mut waiting = waiting_rx.clone();
+        tokio::spawn(async move {
+            let _ = stage_one.wait_for(|&due| due).await;
+            let _ = waiting.wait_for(|&left| left == 0).await;
+            let _ = stage_two_tx.send(true);
+        })
+    });
+
     // A no-op if a node has already failed (`Readiness::ready`).
     readiness.ready();
     tracing::info!(target: "logit", "ready");
@@ -475,6 +550,13 @@ pub async fn run_with_options(
     // since later ones are usually cascades from it.
     let mut result: Result<(), RunError> = Ok(());
     while let Some(joined) = tasks.join_next_with_id().await {
+        let finished = match &joined {
+            Ok((task_id, _)) => *task_id,
+            Err(join_err) => join_err.id(),
+        };
+        if node_ids.get(&finished).is_some_and(|id| stages.waits_for(id)) {
+            waiting_tx.send_modify(|left| *left = left.saturating_sub(1));
+        }
         let (task_id, outcome) = match joined {
             Ok((task_id, Ok(()))) => {
                 if let Some(id) = node_ids.get(&task_id) {
@@ -502,6 +584,9 @@ pub async fn run_with_options(
     }
     // Every node has exited; `shutdown` may never resolve (`run` passes `pending()`).
     shutdown_driver.abort();
+    if let Some(stage_two) = stage_two {
+        stage_two.abort();
+    }
 
     // Unset means every node finished on its own, with no shutdown or failure: no drain to report.
     if let Some(started) = drain_started.get() {
@@ -11472,7 +11557,7 @@ mod tests {
         }
         let mut topological_order: Vec<String> = components.keys().cloned().collect();
         topological_order.sort();
-        Graph { components, topological_order }
+        Graph { components, topological_order, warnings: Vec::new() }
     }
 
     fn recording_sink(tx: std::sync::mpsc::Sender<EventBatch>) -> NodeSpec {
@@ -12857,5 +12942,347 @@ mod tests {
             Some("a"),
             "the target's Fanout rewrote previous, exactly as it does on the process() path"
         );
+    }
+
+    /// Drains `registry` once when its shutdown signal fires and sends what it got, as
+    /// `internal`'s final drain does, with no ticks before it.
+    struct FinalDrainInput {
+        registry: Arc<Registry>,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for FinalDrainInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+
+        async fn run_until_shutdown(
+            &mut self,
+            sink: Fanout,
+            mut shutdown: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let _ = shutdown.wait_for(|&due| due).await;
+            let events = self.registry.drain(0);
+            sink.send(EventBatch { resource: Arc::new(Resource::default()), scope: None, events })
+                .await;
+            Ok(())
+        }
+    }
+
+    fn internal_kind() -> ComponentKind {
+        ComponentKind::Internal {
+            interval: Duration::from_secs(10),
+            span_sample_rate: logit_core::DEFAULT_SPAN_SAMPLE_RATE,
+            logs: logit_config::InternalLogs::default(),
+        }
+    }
+
+    /// `self`'s spec: a [`FinalDrainInput`] over `registry`, under `internal`'s 5 s grace.
+    fn final_drain_spec(registry: &Arc<Registry>) -> NodeSpec {
+        NodeSpec::Input(
+            Box::new(FinalDrainInput { registry: Arc::clone(registry) }),
+            InputRuntimeConfig { shutdown_grace: Duration::from_secs(5) },
+        )
+    }
+
+    /// A sink that never delivers, under at-least-once, so its grace cut leaves one batch for
+    /// `finish` to count as dropped for shutdown.
+    fn never_spec(grace: Duration, max_batches: usize) -> NodeSpec {
+        NodeSpec::Output(
+            Box::new(NeverOutput),
+            SinkStoreConfig::Memory(SinkQueueConfig {
+                max_batches,
+                max_bytes: u64::MAX,
+                overflow: OverflowPolicy::Block,
+            }),
+            WriteLoopConfig { shutdown_grace: grace, ..WriteLoopConfig::default() },
+        )
+    }
+
+    fn recording_spec(tx: std::sync::mpsc::Sender<EventBatch>) -> NodeSpec {
+        NodeSpec::Output(
+            Box::new(RecordingOutput { tx }),
+            SinkStoreConfig::Memory(SinkQueueConfig::default()),
+            WriteLoopConfig::default(),
+        )
+    }
+
+    fn one_batch_input() -> NodeSpec {
+        NodeSpec::Input(
+            Box::new(BurstInput { batches: vec![counter_batch_of(1)] }),
+            InputRuntimeConfig::default(),
+        )
+    }
+
+    /// When [`run_staged`] sends its shutdown signal, after the run starts.
+    const STAGED_SIGNAL_AT: Duration = Duration::from_secs(1);
+
+    /// Builds the graph [`run_staged`] runs.
+    fn staged_graph(components: Vec<(&str, Vec<&str>, ComponentKind)>) -> (Graph, Vec<String>) {
+        let ids: Vec<String> = components.iter().map(|(id, ..)| id.to_string()).collect();
+        let components: Map<String, Component> = components
+            .into_iter()
+            .map(|(id, sources, kind)| {
+                let sources = sources.into_iter().map(String::from).collect();
+                (id.to_string(), plain_component(sources, kind))
+            })
+            .collect();
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+        (g, ids)
+    }
+
+    /// Runs `components` with every node's telemetry in `registry` and a shutdown signal at
+    /// [`STAGED_SIGNAL_AT`], or with no signal, under a 60 s timeout. Returns the result and how
+    /// long the run took.
+    async fn run_staged(
+        components: Vec<(&str, Vec<&str>, ComponentKind)>,
+        specs: HashMap<String, NodeSpec>,
+        registry: &Arc<Registry>,
+        signal: bool,
+    ) -> (Result<(), RunError>, Duration) {
+        let (g, ids) = staged_graph(components);
+        let telemetry: HashMap<String, Telemetry> =
+            ids.iter().map(|id| (id.clone(), registry.telemetry_for(id, "x", "x"))).collect();
+        let (readiness, _rx) = Readiness::channel();
+        let started = tokio::time::Instant::now();
+        let shutdown = async move {
+            if signal {
+                tokio::time::sleep(STAGED_SIGNAL_AT).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_with_telemetry(g, specs, telemetry, readiness, shutdown),
+        )
+        .await
+        .expect("the run ends rather than hanging");
+        (result, started.elapsed())
+    }
+
+    /// How many batches `rx` received, and their points folded.
+    fn received_totals(rx: &std::sync::mpsc::Receiver<EventBatch>) -> (usize, Totals) {
+        let batches: Vec<EventBatch> = rx.try_iter().collect();
+        let mut totals = Totals::default();
+        for batch in &batches {
+            totals.fold(batch.events.clone());
+        }
+        (batches.len(), totals)
+    }
+
+    fn shutdown_drops(totals: &Totals, component: &str) -> f64 {
+        totals.sum(
+            "logit.component.batches.dropped",
+            &[("component", component), ("reason", "shutdown")],
+        )
+    }
+
+    /// The dedicated pipeline every staged test but the mixed ones shares: `data_in -> data_out`
+    /// beside `self -> telemetry_out`.
+    fn dedicated_components() -> Vec<(&'static str, Vec<&'static str>, ComponentKind)> {
+        vec![
+            ("data_in", vec![], statsd_in()),
+            ("data_out", vec!["data_in"], influxdb_out()),
+            ("self", vec![], internal_kind()),
+            ("telemetry_out", vec!["self"], influxdb_out()),
+        ]
+    }
+
+    /// A data sink counts a drop for shutdown 100 ms after the signal, when its grace cuts its
+    /// held batch. `internal`'s final drain waits for that sink to exit, so it carries the count.
+    #[tokio::test(start_paused = true)]
+    async fn internals_final_drain_carries_a_drop_a_data_sink_counts_after_the_signal() {
+        let registry = Registry::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert("data_in".to_string(), one_batch_input());
+        specs.insert("data_out".to_string(), never_spec(Duration::from_millis(100), 64));
+        specs.insert("self".to_string(), final_drain_spec(&registry));
+        specs.insert("telemetry_out".to_string(), recording_spec(tx));
+
+        let (result, _) = run_staged(dedicated_components(), specs, &registry, true).await;
+        result.expect("a grace-cut drain is not a failure");
+
+        let (batches, totals) = received_totals(&rx);
+        assert_eq!(batches, 1, "the final drain is delivered");
+        assert_eq!(shutdown_drops(&totals, "data_out"), 1.0);
+    }
+
+    /// The data sink drains for 7 s, longer than `internal`'s grace and the dedicated sink's.
+    /// Both count theirs from stage two, so the dedicated sink is still running when the final
+    /// drain arrives, and `internal` isn't cut off before it sends.
+    #[tokio::test(start_paused = true)]
+    async fn a_dedicated_sink_receives_a_count_from_a_data_drain_longer_than_its_grace() {
+        let registry = Registry::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert("data_in".to_string(), one_batch_input());
+        specs.insert("data_out".to_string(), never_spec(Duration::from_secs(7), 64));
+        specs.insert("self".to_string(), final_drain_spec(&registry));
+        specs.insert("telemetry_out".to_string(), recording_spec(tx));
+
+        let (result, elapsed) = run_staged(dedicated_components(), specs, &registry, true).await;
+        result.expect("a grace-cut drain is not a failure");
+        assert!(elapsed >= STAGED_SIGNAL_AT + Duration::from_secs(7), "took {elapsed:?}");
+
+        let (batches, totals) = received_totals(&rx);
+        assert_eq!(batches, 1, "the final drain is delivered");
+        assert_eq!(shutdown_drops(&totals, "data_out"), 1.0);
+    }
+
+    /// A dedicated sink whose destination never answers, behind a 3 s data drain: its grace
+    /// counts from stage two, so the run ends 3 s plus that 5 s grace after the signal.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusing_dedicated_sink_behind_a_long_data_drain_ends_the_run_in_bounded_time() {
+        let registry = Registry::new();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert("data_in".to_string(), one_batch_input());
+        specs.insert("data_out".to_string(), never_spec(Duration::from_secs(3), 64));
+        specs.insert("self".to_string(), final_drain_spec(&registry));
+        specs.insert("telemetry_out".to_string(), never_spec(Duration::from_secs(5), 64));
+
+        let (result, elapsed) = run_staged(dedicated_components(), specs, &registry, true).await;
+        result.expect("a grace-cut drain is not a failure");
+        let stage_two = STAGED_SIGNAL_AT + Duration::from_secs(3);
+        assert!(elapsed >= stage_two + Duration::from_secs(5), "took {elapsed:?}");
+        assert!(elapsed < stage_two + Duration::from_secs(6), "took {elapsed:?}");
+    }
+
+    /// With nothing but `internal` and its sink, stage two follows the signal at once.
+    #[tokio::test(start_paused = true)]
+    async fn with_no_data_nodes_internal_stops_at_the_signal() {
+        let registry = Registry::new();
+        registry.telemetry_for("marker", "x", "x").count("test.marker", 1.0, &[]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert("self".to_string(), final_drain_spec(&registry));
+        specs.insert("telemetry_out".to_string(), recording_spec(tx));
+
+        let (result, elapsed) = run_staged(
+            vec![
+                ("self", vec![], internal_kind()),
+                ("telemetry_out", vec!["self"], influxdb_out()),
+            ],
+            specs,
+            &registry,
+            true,
+        )
+        .await;
+        result.expect("a clean shutdown");
+        assert_eq!(elapsed, STAGED_SIGNAL_AT, "no wait past the signal");
+        let (batches, totals) = received_totals(&rx);
+        assert_eq!(batches, 1);
+        assert_eq!(totals.sum("test.marker", &[]), 1.0);
+    }
+
+    /// A mixed pipeline shuts down as it would with no `internal`: `windowed` holds data from
+    /// `data_in` and telemetry from `self`, and `self` returns at the signal, so `windowed`'s
+    /// close-time flush reaches `shared_out` inside that sink's 1 s grace, though `data_out`
+    /// drains for 3 s. Staging the pipeline would hold `windowed` open past that grace.
+    #[tokio::test(start_paused = true)]
+    async fn a_mixed_pipeline_stops_internal_at_the_signal_and_keeps_its_shared_data() {
+        let registry = Registry::new();
+        let (shared_tx, shared_rx) = std::sync::mpsc::channel();
+        let (telemetry_tx, telemetry_rx) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert("data_in".to_string(), one_batch_input());
+        specs.insert("data_out".to_string(), never_spec(Duration::from_secs(3), 64));
+        specs.insert(
+            "windowed".to_string(),
+            NodeSpec::Transform(Box::new(WindowingTransform {
+                interval: Duration::from_secs(3600),
+                buffered: Vec::new(),
+            })),
+        );
+        specs.insert(
+            "shared_out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx: shared_tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig { shutdown_grace: Duration::from_secs(1), ..Default::default() },
+            ),
+        );
+        specs.insert("self".to_string(), final_drain_spec(&registry));
+        specs.insert("telemetry_out".to_string(), recording_spec(telemetry_tx));
+
+        let (result, _) = run_staged(
+            vec![
+                ("data_in", vec![], statsd_in()),
+                ("data_out", vec!["data_in"], influxdb_out()),
+                ("self", vec![], internal_kind()),
+                ("windowed", vec!["data_in", "self"], ComponentKind::Keep { fields: vec![] }),
+                ("shared_out", vec!["windowed"], influxdb_out()),
+                ("telemetry_out", vec!["self"], influxdb_out()),
+            ],
+            specs,
+            &registry,
+            true,
+        )
+        .await;
+        result.expect("a grace-cut drain is not a failure");
+
+        let (_, shared) = received_totals(&shared_rx);
+        assert_eq!(shared.sum("hits", &[]), 1.0, "the data `windowed` held is delivered");
+        let (batches, telemetry) = received_totals(&telemetry_rx);
+        assert_eq!(batches, 1, "one drain, at the signal");
+        assert_eq!(shutdown_drops(&telemetry, "data_out"), 0.0, "drained before data_out's drop");
+    }
+
+    /// A data listener failing with no signal starts stage one from the join loop; stage two
+    /// follows once its sink drains, and the run ends with the listener's error.
+    #[tokio::test(start_paused = true)]
+    async fn a_data_node_failing_before_any_signal_still_reaches_stage_two() {
+        let registry = Registry::new();
+        registry.telemetry_for("marker", "x", "x").count("test.marker", 1.0, &[]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (data_tx, _data_rx) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "data_in".to_string(),
+            NodeSpec::Input(Box::new(ErrInput), InputRuntimeConfig::default()),
+        );
+        specs.insert("data_out".to_string(), recording_spec(data_tx));
+        specs.insert("self".to_string(), final_drain_spec(&registry));
+        specs.insert("telemetry_out".to_string(), recording_spec(tx));
+
+        let (result, _) = run_staged(dedicated_components(), specs, &registry, false).await;
+        let err = result.expect_err("the listener's error ends the run");
+        assert!(matches!(err, RunError::Runtime(_)));
+        assert!(format!("{:#}", err.error()).contains("boom"));
+        let (batches, totals) = received_totals(&rx);
+        assert_eq!(batches, 1, "the final drain is delivered");
+        assert_eq!(totals.sum("test.marker", &[]), 1.0);
+    }
+
+    /// With no signal and no failure, every data node can finish and `internal` still runs:
+    /// stage two needs stage one first.
+    #[tokio::test(start_paused = true)]
+    async fn with_no_signal_internal_runs_on_after_every_data_node_finishes() {
+        let registry = Registry::new();
+        let (data_tx, data_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "data_in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(counter_batch_of(1)) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert("data_out".to_string(), recording_spec(data_tx));
+        specs.insert("self".to_string(), final_drain_spec(&registry));
+        specs.insert("telemetry_out".to_string(), recording_spec(tx));
+        let (g, _) = staged_graph(dedicated_components());
+
+        let run = tokio::spawn(run(g, specs));
+        wait_until("data_out delivers", || data_rx.try_recv().is_ok()).await;
+        // A negative window: nothing may arrive in it.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(!run.is_finished(), "the run ended with no signal");
+        assert!(rx.try_recv().is_err(), "internal drained with no signal");
+        run.abort();
     }
 }

@@ -263,6 +263,7 @@ put `keep_values` after this component if that matters. See "Doing some of it se
 | `error.type` | The status as a decimal string, 5xx only. |
 | `span.name` | `{method} {route}`, or the method alone when no route was written; `HTTP` stands in for `_OTHER` (`HTTP {route}`, `HTTP`). |
 | `span.status` | `error` for a 5xx or a `0` status, `unset` otherwise — **never `ok`**, which semconv reserves for an explicit override. |
+| `http.response.status_class` | Only under [`status_class: true`](#status_class): `1xx` to `5xx` from the integer `http.response.status_code`, or `unknown` for any other number, including the `0` that nginx's `000` becomes. A line with no status gets none. |
 | `http.request.method_original` | The raw method, only when it fell outside the known set. |
 | `span.duration_s` | Mirrored from `http.request.duration_s` **unless** the line already states a span duration (any `span.duration*`) or states both a start and an end. A lone end (nginx's `$msec`) or a lone start (HAProxy's `request_date(us)`) is exactly what the mirror is for: without it, `trace_context` would borrow the event's receipt time for the missing bound. |
 
@@ -325,12 +326,16 @@ Two HAProxy rules matter more than the table:
 
 ### Trace ids
 
-**`logit` never mints a trace id.** A trace id has to come from the first hop that saw the
+**No `logit` transform mints a trace id.** A trace id has to come from the first hop that saw the
 request:
 
 - If a `traceparent` header arrived, log it verbatim under `traceparent`. `trace_context` takes the
   trace id, this line's parent span id, and the flags from it.
 - If none arrived, this server is the edge: mint a trace id here and log it as `trace.id`.
+
+A `lua` stage can mint one with `random.trace_id()` for a server that can't
+([docs/design/lua-api.md](design/lua-api.md)'s "Minting ids"), but no other hop sees an id minted
+there, so the request's backend spans land in a different trace.
 
 nginx already mints a per-request id (`$request_id`, 32 hex characters). This `map` uses it as a
 fallback while still reusing an inbound trace id:
@@ -994,10 +999,23 @@ rather than append to one the client sent. Any client that reaches the server di
 header the proxy keeps, can name any address as `client.address`. There's no trusted-proxy list
 or hop count (see [What it does not do](#what-it-does-not-do)).
 
+### `status_class:`
+
+```yaml
+status_class: true
+```
+
+Off by default. Derives `http.response.status_class` from `http.response.status_code`: `1xx`,
+`2xx`, `3xx`, `4xx`, or `5xx` for a status from 100 to 599, and `unknown` for any other number.
+The name is `logit`'s own, because semconv has no status-class attribute. Use it when you tag
+metrics by class rather than by every status code. It's opt-in because it adds one attribute to
+every event, which widens an `aggregate` series key or a sink's tag set whether or not you use
+it. Like every derived field, it's filled only when absent, so a class your server sent is kept.
+
 ## Bounding cardinality
 
 `http_access` bounds what it *derives*: `http.route`, `user_agent.class`, `span.name`,
-`span.status`, and `error.type` only ever take values from your config, a built-in table, or a
+`span.status`, `error.type`, and `http.response.status_class` only ever take values from your config, a built-in table, or a
 closed range, so they can go straight into an `aggregate` series key or a span name.
 
 It doesn't bound what it only caps. `server.address`, `client.address`, `upstream.address`,
@@ -1021,6 +1039,30 @@ access_bounded:
 `keep` still goes immediately before `aggregate`, because `aggregate`'s `SeriesKey` includes every
 attribute: whatever survives `keep` sets both series cardinality and per-window memory. Keep
 `url.path`, `client.address`, and every `user_agent.original`-style free-text field out of it.
+
+To gate on a duration, classify it first. `bucket` writes a range's class into an attribute, so
+`has_attributes`, `drop_attributes`, or `route` can match it by equality
+([ADR `bucket-transform`](adr/bucket-transform.md)):
+
+```yaml
+access_latency:
+  type: bucket
+  sources: [access_http]
+  attributes:
+    http.request.duration_s:
+      into: http.request.duration_class
+      ranges:
+        - lt: 0.1
+          value: fast
+        - le: 1
+          value: ok
+        - value: slow
+```
+
+To wire it into [The pipeline](#the-pipeline) above, change `access_trace`'s `sources` to
+`[access_latency]`, so `access_latency` runs between `access_http` and `access_trace`, then add
+`http.request.duration_class` to `access_keep`'s `fields`. The class is a bounded value, so it's
+safe to keep for `aggregate`.
 
 ## Metrics
 

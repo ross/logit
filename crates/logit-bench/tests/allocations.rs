@@ -1189,6 +1189,22 @@ fn keep_values_one_event_needs_lowering() {
     expect_allocs("keep_values: host needs lowering before it's allowed", stats, 1);
 }
 
+/// Zero: the class is a `Value` built once in `Bucket::new`, so writing it is a `Bytes` refcount
+/// bump, and `nginx_event`'s attributes have already spilled with room for one more key.
+#[test]
+fn bucket_one_event() {
+    let mut bucket = fixtures::bucket();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::nginx_event();
+    bucket.process(&resource, &mut warm);
+
+    let mut event = fixtures::nginx_event();
+    let (forwarded, stats) = measure(|| bucket.process(&resource, &mut event));
+    assert!(forwarded, "bucket forwards");
+    assert_eq!(event.attributes.get("request_time_class"), Some(&Value::str("fast")));
+    expect_allocs("bucket: classify request_time", stats, 0);
+}
+
 /// Zero: `nginx_event`'s attributes are all flat, so `flatten`'s phase-1 scan selects nothing and
 /// nothing is interned, removed, or reinserted (`docs/adr/flatten-transform.md`).
 #[test]
@@ -1358,6 +1374,22 @@ fn http_access_normalizes_a_conforming_line_warm() {
     assert_eq!(event.attributes.get("http.request.method"), Some(&Value::str("GET")));
     assert_eq!(event.attributes.get("span.name"), Some(&Value::str("GET /{other}")));
     expect_allocs("http_access: normalize a conforming line, warm", stats, 0);
+}
+
+/// [`http_access_normalizes_a_conforming_line_warm`] with `status_class: true`: the class cell is
+/// pre-built, so the derivation is one `insert_sym` of a static `Value`.
+#[test]
+fn http_access_derives_a_status_class_warm() {
+    let mut ha = fixtures::http_access_status_class();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::http_access_event();
+    ha.process(&resource, &mut warm);
+
+    let mut event = fixtures::http_access_event();
+    let (forwarded, stats) = measure(|| ha.process(&resource, &mut event));
+    assert!(forwarded, "http_access always forwards");
+    assert_eq!(event.attributes.get("http.response.status_class"), Some(&Value::str("2xx")));
+    expect_allocs("http_access: derive a status class, warm", stats, 0);
 }
 
 /// The same line through a new component, unwarmed: 228, paid once per compiled pattern per
@@ -3321,6 +3353,29 @@ fn lua_process_one_event_reading_log_trace() {
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
     assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs("lua: process 1 event, reading event.log.trace_id", stats, 9);
+}
+
+/// A script writing `random.trace_id()` to `event.log.trace_id` (`docs/adr/lua-random-ids.md`):
+/// 9. The 4 baseline, +1 `Box` on `Emit`, +3 for creating and caching the `LogProxy`, and +1 for
+/// the `random.trace_id()` call. The id renders as hex on a stack buffer and the write parses it
+/// into the `TraceRef`'s array, so the +1 is mlua's cost of calling a Rust closure that returns a
+/// string: writing a hex literal instead lands at 8, and a bare `random.trace_id()` on a
+/// passthrough script at 6 (two calls, 7).
+#[test]
+fn lua_process_one_event_minting_log_trace() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_LOG_TRACE_MINT_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    let ProcessOutcome::Emit(event, _) = outcome else { panic!("expected Emit") };
+    assert!(event.log.as_ref().and_then(|l| l.trace).is_some(), "the script sets a trace id");
+    expect_allocs(
+        "lua: process 1 event, writing random.trace_id() to event.log.trace_id",
+        stats,
+        9,
+    );
 }
 
 /// A script reading `event.metrics[1].value` (`MetricsProxy`/`MetricProxy`): 11. 4 baseline, +1

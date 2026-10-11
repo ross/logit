@@ -37,10 +37,10 @@ use logit_proto::statsd::StatsdDecoder;
 use logit_proto::syslog::SyslogDecoder;
 use logit_proto::Decoder;
 use logit_transforms::{
-    AggregateTemporality, Aggregator, Arrays, CsvParser, Distributions, Fields, Flatten,
-    HttpAccess, HttpAccessConfig, JsonParser, Keep, KeepValues, Kv, KvMetrics, Logfmt, MetricSpec,
-    Normalize, RegexParser, RouteRule, RouteSet, Sample, SampleField, SampleKey, SampleMissing,
-    SampleOverride, Set, Shape,
+    AggregateTemporality, Aggregator, Arrays, Bucket, BucketBound, BucketField, CsvParser,
+    Distributions, Fields, Flatten, HttpAccess, HttpAccessConfig, JsonParser, Keep, KeepValues, Kv,
+    KvMetrics, Logfmt, MetricSpec, Normalize, RegexParser, RouteRule, RouteSet, Sample,
+    SampleField, SampleKey, SampleMissing, SampleOverride, Set, Shape,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -578,6 +578,22 @@ pub fn keep_values() -> KeepValues {
     )
 }
 
+/// A `bucket` classifying `nginx_event`'s `request_time` (`0.001`) into `request_time_class`
+/// (`tests/allocations.rs`'s `bucket_one_event`): `lt: 0.1` fast, `le: 1` ok, catch-all slow.
+pub fn bucket() -> Bucket {
+    Bucket::new(vec![BucketField {
+        field: "request_time".to_string(),
+        into: "request_time_class".to_string(),
+        ranges: vec![
+            (BucketBound::Lt(0.1), "fast".to_string()),
+            (BucketBound::Le(1.0), "ok".to_string()),
+            (BucketBound::Any, "slow".to_string()),
+        ],
+        other: Some("unknown".to_string()),
+        keep_source: true,
+    }])
+}
+
 /// [`nginx_event`] with `host` uppercased, so `keep_values`' `normalize: [lower]` step has work to
 /// do and allocates (`keep_values_one_event_needs_lowering`).
 pub fn nginx_event_with_uppercase_host() -> Event {
@@ -1046,6 +1062,16 @@ end
 pub const LUA_LOG_TRACE_READ_SCRIPT: &str = r#"
 function process(event)
   local _ = event.log.trace_id
+  return event
+end
+"#;
+
+/// Writes a freshly minted trace id to `event.log.trace_id` on every call: the `random` global's
+/// cost on top of the `event.log` proxy's (`crates/logit-script/src/random.rs`;
+/// `tests/allocations.rs`'s `lua_process_one_event_minting_log_trace`).
+pub const LUA_LOG_TRACE_MINT_SCRIPT: &str = r#"
+function process(event)
+  event.log.trace_id = random.trace_id()
   return event
 end
 "#;
@@ -2243,15 +2269,20 @@ pub fn http_access_event_with_control_byte() -> Event {
 /// resolved as `logit-cli`'s `to_http_access_config` does rather than copied. No user-agent rules,
 /// no extra `redact_query`, no `forwarded`.
 pub fn http_access() -> HttpAccess {
-    http_access_with(None)
+    http_access_with(None, false)
+}
+
+/// [`http_access`] with `status_class: true`.
+pub fn http_access_status_class() -> HttpAccess {
+    http_access_with(None, true)
 }
 
 /// [`http_access`] with `forwarded: x_forwarded_for`.
 pub fn http_access_forwarded() -> HttpAccess {
-    http_access_with(Some(ForwardedHeader::XForwardedFor))
+    http_access_with(Some(ForwardedHeader::XForwardedFor), false)
 }
 
-fn http_access_with(forwarded: Option<ForwardedHeader>) -> HttpAccess {
+fn http_access_with(forwarded: Option<ForwardedHeader>, status_class: bool) -> HttpAccess {
     let config = HttpAccessConfig {
         routes: vec![
             RouteRule::Builtin(RouteSet::Probes),
@@ -2267,6 +2298,7 @@ fn http_access_with(forwarded: Option<ForwardedHeader>) -> HttpAccess {
             .collect(),
         redact_query: vec![],
         forwarded,
+        status_class,
     };
     HttpAccess::new(config).expect("fixture patterns should compile")
 }

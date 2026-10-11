@@ -324,12 +324,36 @@ documents the same rule for its aggregation interval against the Agent's flush i
 same reason.
 
 **Shutdown drains once more.** `InternalInput` overrides `Input::run_until_shutdown`
-([ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)) to run one final drain when the
+([ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)) to run one final drain when its
 shutdown signal fires, instead of being cancelled by drop. Otherwise every SIGTERM would lose
 everything buffered since the last tick, up to a whole `interval`. That future owns the `Fanout`, so
 no downstream node starts its close-time flush until the final batch is sent, and `run_input`'s
 `shutdown_grace` (5s for `internal`) bounds the wait. The final drain can't emit its own
 `points.emitted`/`drain.duration`, which are always recorded a tick behind and have no tick left.
+
+**With a dedicated pipeline, `internal` drains last.** `internal`'s pipeline is every node it
+reaches through consumers and router or Lua targets. It's dedicated when no other listener reaches
+any node in it. Point `internal` at its own sinks to get one, even when they go to the same backend
+as the data, such as a second `otlp_out` to the same endpoint. The runtime then shuts down in two
+stages (`crates/logit-pipeline/src/runtime.rs`'s `ShutdownStages`,
+[ADR `shutdown-accounting-and-cancellation-safety`](../adr/shutdown-accounting-and-cancellation-safety.md),
+decisions 10 to 16):
+
+1. The shutdown signal stops every node outside the pipeline as usual, while `internal` keeps
+   draining on its `interval`, so a long data drain is still exported tick by tick.
+2. Once every node outside the pipeline has exited, the runtime sends `internal` and the
+   pipeline's sinks and Lua nodes a second signal. `internal` drains once more and returns, and
+   the pipeline cascades as usual.
+
+So the final drain carries the counts recorded during the data drain: a sink's or Lua node's
+`batches.dropped{reason="shutdown"}`, a UDP listener's `datagrams.dropped{reason="shutdown"}`, and an HTTP
+listener's `connections.closed{reason="shutdown"}`.
+`internal`'s grace and each pipeline sink's grace and Lua wedge rule count from the second signal,
+so a long data drain can't use them up. With a mixed pipeline (a sink or transform that also
+carries data) there's one stage, and those counts stay undrained; `graph::resolve` adds a warning
+naming `internal` and a shared node (validation rule 84). Either way, once every node has
+exited, `logit run` drains the registry one last time and logs each leftover metric point as a
+`telemetry left undrained at exit` line (`crates/logit-cli/src/undrained.rs`).
 
 `internal` records its own points (`logit.internal.points.emitted`,
 `logit.internal.spans.emitted`, `logit.internal.logs.emitted`, `logit.internal.drain.duration`)
@@ -627,7 +651,7 @@ datagram passes through.
 | `logit.component.receive.utilization` | gauge | `max(datagram ratio, byte ratio)` against the two configured bounds |
 | `logit.component.receive.push.blocked.duration` | timing | only under `overflow: block`, only when a push actually waited |
 | `logit.component.receive.latency` | timing | arrival (`Datagram::received_at`) → dequeue, per datagram — the number that says whether event timestamps are trustworthy under load |
-| `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction) or `shutdown`: datagrams read but never decoded because the listener stopped (a batch the read half never queued, a popped batch the decode half never decoded, or what the receive queue still held when the grace backstop dropped the listener). With these, `logit.input.datagrams` equals the `receive.latency` sample count plus every reason's drops. `shutdown` counts land after `internal`'s final drain, so no exported pipeline sees them; the listener also logs each at `warn` (see `docs/known-gaps/intake.md`) |
+| `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction) or `shutdown`: datagrams read but never decoded because the listener stopped (a batch the read half never queued, a popped batch the decode half never decoded, or what the receive queue still held when the grace backstop dropped the listener). With these, `logit.input.datagrams` equals the `receive.latency` sample count plus every reason's drops. `shutdown` counts reach only a dedicated `internal` pipeline (see "With a dedicated pipeline, `internal` drains last"); with a mixed one they land after `internal`'s final drain. The listener also logs each at `warn` (see `docs/known-gaps/intake.md`) |
 | `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` is **a single tracked file or connection** ending and flushing its own accumulator on the way out: a `tail_in`/`docker_in` file that rotated away or was removed, or a `graphite_in` TCP connection the client closed or reset, or that was dropped for an oversize frame — in every case while the listener itself keeps running. `shutdown` is the whole component stopping. An ordinary client disconnect is `closed`, never `shutdown`. |
 | `logit.input.datagrams.truncated` | count | datagrams that arrived longer than the 65,507-byte receive slot and were delivered only as far as it holds, with the remainder discarded by the kernel. **IPv6-only, and Linux-only:** 65,507 is IPv4's maximum payload, IPv6 permits 65,527, and `MSG_TRUNC` in `recvmmsg`'s returned flags is what makes the loss visible rather than silent — a `recv_from` build has no way to see it and never reports this. Not emitted when it is zero, like every other loss counter here |
 | `logit.input.reads` | count | read syscalls the listener made — one per `recvmmsg(2)` batch on Linux, one per `recv_from` elsewhere. Exists to be a denominator: `logit.input.datagrams / logit.input.reads` is the **mean fill** of the syscall batch, the only number that says whether `receive.read_batch` is doing anything. A fill pinned at `read_batch` means the knob is the limit and raising it may help; a fill near 1 means datagrams arrive one at a time and the knob is irrelevant at any setting |
@@ -718,7 +742,7 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 | `logit.input.connections.rejected{reason="limit"}` | count | a connection closed at the connection cap, before any TLS handshake |
 | `logit.input.connections.rejected{reason="proxy_header"}` | count | a connection under `proxy_protocol: true` whose PROXY header was missing, malformed, cut short by the peer closing, or not complete within `handshake_timeout`; read before any TLS handshake |
 | `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
-| `logit.input.connections.closed{reason="idle"}` | count | an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. A close at shutdown is not counted: there is no `reason="shutdown"`, because the runtime would record it after `internal`'s final drain |
+| `logit.input.connections.closed{reason="idle"\|"shutdown"}` | count | `idle`: an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. `shutdown`: an HTTP listener (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver) closed an open connection at shutdown, one count per connection whose close sequence finished before `run_input`'s backstop. It lands after the shutdown signal, so only a dedicated `internal` pipeline exports it (see "With a dedicated pipeline, `internal` drains last"). The stream listeners and `logit_in` don't count a shutdown close |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
 | `logit.input.frames.dropped{reason="oversize"\|"drained"\|"malformed"\|"truncated"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses. `drained` is a line-framed listener's line that crossed its bound before its `LF` arrived: counted once, after which the connection discards input until its next `LF` |
 
@@ -940,7 +964,7 @@ connection then discards input until its next `LF`.
 `logit.input.connections.rejected{reason="limit"}` (the connection cap, `max_connections`, 1024
 by default, binding), `logit.input.connections.rejected{reason="proxy_header"}` (under
 `proxy_protocol: true`, a PROXY header that was missing, malformed, cut short, or late, read
-before any TLS accept), and `logit.input.connections.closed{reason="idle"}`. The first three are
+before any TLS accept), and `logit.input.connections.closed{reason="idle"|"shutdown"}`. The first three are
 the points `logit_in` and the shared TCP driver record, and the shared TCP driver alone records
 the `proxy_header` reason, for the same reason: this accept loop rejects at the
 cap rather than queueing behind a permit, so there's a refusal to count, and the gauge counts
@@ -1029,7 +1053,7 @@ loop and the same shared idle tracker (`crates/logit-inputs/src/http.rs`):
 `logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}`,
 `logit.input.connections.rejected{reason="proxy_header"}` (under `proxy_protocol: true`, a PROXY
 header that was missing, malformed, cut short, or late, read before any TLS accept), and
-`logit.input.connections.closed{reason="idle"}` (count). Scrape mode has none of them: it's a
+`logit.input.connections.closed{reason="idle"|"shutdown"}` (count). Scrape mode has none of them: it's a
 client, with no socket of its own.
 
 **The codec's counters**, on the decode side of both modes, are
@@ -1078,7 +1102,7 @@ TLS listener that close fails the TLS accept and is counted), `proxy_header` (bi
 **The connection metrics are `otlp_in`'s verbatim**, because this listener runs the same accept loop
 and the same shared idle tracker (`crates/logit-inputs/src/http.rs`): `logit.input.connections`
 (gauge), `logit.input.connections.rejected{reason="limit"}`,
-`logit.input.connections.closed{reason="idle"}`, and the accept-queue gauges. Under
+`logit.input.connections.closed{reason="idle"|"shutdown"}`, and the accept-queue gauges. Under
 `proxy_protocol: true`, `logit.input.connections.rejected{reason="proxy_header"}` counts a
 connection refused for its PROXY header, as on the shared TCP stream driver.
 
@@ -1134,7 +1158,7 @@ message text only, never a tag, and an API key never appears at all), `busy` (a 
 
 **The connection metrics are `datadog_in`'s, except the accept-queue gauges cover the TCP
 listener only.** `logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}`,
-and `logit.input.connections.closed{reason="idle"}` count the TCP listener and the Unix socket
+and `logit.input.connections.closed{reason="idle"|"shutdown"}` count the TCP listener and the Unix socket
 together, under one cap. The accept-queue gauges read the kernel's `TCP_INFO`, which a Unix socket
 has no counterpart for, so a `socket:`-only listener has none. Under `proxy_protocol: true`,
 `logit.input.connections.rejected{reason="proxy_header"}` counts a TCP connection refused for its
@@ -1177,7 +1201,7 @@ left out of the resource).
 
 **The connection metrics are `datadog_in`'s verbatim**, from the same accept loop and shared idle
 tracker: `logit.input.connections` (gauge, published by the same drop guard),
-`logit.input.connections.rejected{reason="limit"}`, `logit.input.connections.closed{reason="idle"}`,
+`logit.input.connections.rejected{reason="limit"}`, `logit.input.connections.closed{reason="idle"|"shutdown"}`,
 and the accept-queue gauges. Under `proxy_protocol: true`,
 `logit.input.connections.rejected{reason="proxy_header"}` counts a connection refused for its
 PROXY header, as on the shared TCP stream driver.
@@ -1532,6 +1556,16 @@ two fields on one component can clamp at very different rates. `.values.normaliz
 already-conforming case would make the rate unreadable. `field` is safe as a tag because the fields
 are config-declared. No `Diagnostics`: clamping to a fixed allow-list can't fail.
 
+##### `bucket`
+
+`crates/logit-transforms/src/bucket.rs`, [ADR `bucket-transform`](../adr/bucket-transform.md).
+
+`logit.transform.values.bucketed`/`.unmatched`, tagged `field`, in `keep_values`' shape: one
+`.bucketed` per present value a range classified, one `.unmatched` per present value that wasn't a
+finite number or that no range matched, whether or not `other` was written. An absent source
+counts as neither. `field` is safe as a tag because the fields are config-declared. No
+`Diagnostics`: a value that doesn't classify is steady-state data, not a failure.
+
 ##### `shape`
 
 `crates/logit-transforms/src/shape.rs`,
@@ -1574,7 +1608,7 @@ Seven counters. Every tag comes from a closed, `&'static` table, never an observ
 | Name | Meaning |
 |---|---|
 | `logit.transform.http_access.normalized{field}` | a field rewritten into its conformant form: a dashed alias renamed, a composite decomposed, a numeric coerced, a duration converted, a method or version normalized, a leading `?` stripped |
-| `.derived{field}` | a field written from config or a built-in table: `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`, `span.status`, `span.duration_s`, `http.request.method_original`, and `client.address` and `client.port` under `forwarded`. Every derived attribute but those two is fill-only, so one the producer already sent is honoured and not counted |
+| `.derived{field}` | a field written from config or a built-in table: `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`, `span.status`, `span.duration_s`, `http.response.status_class` (under `status_class`), `http.request.method_original`, and `client.address` and `client.port` under `forwarded`. Every derived attribute but those two is fill-only, so one the producer already sent is honoured and not counted |
 | `.truncated{field}` | a value cut to its `max_length` |
 | `.cleaned{field}` | a control byte replaced by `_` |
 | `.invalid{field}` | present but unparseable, left as it arrived; under `forwarded`, the header's attribute when it names no usable client |

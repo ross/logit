@@ -4,13 +4,17 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
 ## Transforms: predicates and sampling
 
-- **Predicate-shaped work (throttling, dedup, and anything needing a real operator: `>=`,
-  `contains`, cross-attribute comparison) costs a Lua VM, an OS thread, and roughly 9× the
+- **Predicate-shaped work (throttling, dedup, and anything needing a real operator: `contains`,
+  cross-attribute comparison, boolean combinations) costs a Lua VM, an OS thread, and roughly 9× the
   per-event allocations of a native transform, because `logit` has no native predicate
   language.** The rest of predicate-shaped work has native answers:
-  - Equality-only filtering, such as splitting a `logit_in` fan-out back apart by an attribute an
-    upstream `set` stamped: `has_attributes`/`drop_attributes`
+  - Equality and key-presence filtering, such as splitting a `logit_in` fan-out back apart by an
+    attribute an upstream `set` stamped, or keeping events that carry a key: `has_attributes`/
+    `drop_attributes`
     ([ADR `attribute-filtering-components`](../adr/attribute-filtering-components.md)).
+  - Numeric ranges, such as splitting out slow requests: `bucket` writes a range's class into an
+    attribute, and an equality component gates on it
+    ([ADR `bucket-transform`](../adr/bucket-transform.md)).
   - Destination selection (splitting one flow into named streams): `route` (equality on
     provenance/attribute/resource) and `target` components (ADR
     [`target-components`](../adr/target-components.md)); `lua` can also route with `event:to`.
@@ -417,7 +421,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   mlua-sys 0.6.8's compat53 `luaL_traceback`, which it binds for LuaJIT, names an anonymous C
   frame by searching every global and every field of every global table.
   - **Consequence:** each failed call to a proxy metamethod (`__index`/`__newindex`),
-    `event:to`, `telemetry.*`, or `print` that a script catches with `pcall` costs time in
+    `event:to`, `telemetry.*`, `random.*`, or `print` that a script catches with `pcall` costs time in
     proportion to its global state, and an error that escapes `process()`/`flush()` pays the same
     once for its traceback. The cost is per failed call, not per loop iteration of a successful
     one, and none of these is a call a script retries until it succeeds. `Event.new` raises its
