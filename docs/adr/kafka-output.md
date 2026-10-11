@@ -390,9 +390,10 @@ Each format stays decodable, so a future `kafka_in` can round-trip it.
 
 - W1 adds `kafka-protocol`, `crc`, and `crc-catalog` to `Cargo.lock` and `deny.toml`'s review,
   with none of `kafka-protocol`'s codec features, so no C codec enters the tree. It enables
-  `lz4_flex`'s frame support. `snap` and `flate2` are already direct dependencies of
-  `logit-outputs`; W1 adds `ruzstd` and `lz4_flex` to it and widens the scope of all four beyond the
-  components they serve today, updating the `Cargo.toml` comments that scope them.
+  `lz4_flex`'s frame support. `flate2` is already a direct dependency of `logit-outputs` and `snap`
+  a dev-dependency; W1 makes `snap` a normal dependency, adds `ruzstd` and `lz4_flex`, and widens
+  the scope of all four beyond the components they serve today, updating the `Cargo.toml` comments
+  that scope them.
 - The `kafka_out` module doc carries the canonical fault-class table, each row backed by a
   fake-broker test, and this ADR's table stops being updated once it exists.
 - Duplicates are possible across a process restart, a producer re-initialization, and an epoch
@@ -409,3 +410,46 @@ Each format stays decodable, so a future `kafka_in` can round-trip it.
   - a topic chosen per event;
   - `kafka_in`, a consumer-group client;
   - Redpanda and WarpStream specifics beyond what W4's interop run checks.
+
+## Amendment: what W1 settled (2026-10-11)
+
+Building the producer core settled six points the decision above leaves open or states
+differently. Where this section and an item above disagree, this section holds.
+
+1. **Settled partitions live in the sink's per-batch `Pending`, not in `BatchAccounting`.**
+   Item 4 puts them in `BatchAccounting`. The sink already has to keep one `Pending` per `logit`
+   batch across attempts, because it holds each unkeyed record's sticky partition and each
+   partition batch's sequence; a retry that re-partitioned or renumbered would lose the broker's
+   dedup. `Pending` records which partition batches the broker accepted or rejected, and
+   `Producer::attempt` resends only the rest. The send's verdict is item 4's rule unchanged.
+2. **One produce request in flight per broker, sent in sequence, with brokers in parallel.**
+   Item 2's "one produce request per broker per attempt" can't hold beside item 7: a broker takes
+   one record batch per partition per request, and a send is cut into requests under
+   `max_request_bytes`, so a broker can need several requests in one attempt. Within an attempt,
+   once a partition's batch fails, that partition's later batches aren't sent; they stay
+   unsettled as `Clean`. Nothing lands behind a gap, so the broker never answers them
+   `OUT_OF_ORDER_SEQUENCE_NUMBER`.
+3. **Split halves and the named-record remainder go out on the next attempt.** The attempt that
+   gets `MESSAGE_TOO_LARGE`, or `INVALID_TIMESTAMP` or `INVALID_RECORD` naming records, returns
+   `Clean` for that partition, and `write_loop`'s retry sends the halves or the remainder under
+   the bumped epoch. "Once" is enforced per partition batch: a half or a remainder is marked as a
+   resend, and a resend answered `MESSAGE_TOO_LARGE` again, or one with records named again, is
+   `Rejected` whole, never split or trimmed a second time.
+4. **`UNKNOWN_TOPIC_OR_PARTITION` (3) and `UNKNOWN_TOPIC_ID` (100) are `Refused`, with a metadata
+   refresh before the next attempt.** That refresh is item 9's request with
+   `allow_auto_topic_creation` set, so a broker that creates topics creates it then.
+5. **The details item 8 and item 5 leave open:**
+   - `Metadata` is negotiated within v4 (the first version with `allow_auto_topic_creation`) to
+     v12, and `InitProducerId` within v0 to v5.
+   - `ApiVersions` is sent at v3 only, so a broker older than Kafka 2.4 is unsupported. Every 3.x
+     and 4.x broker answers v3.
+   - When `record_errors` names every record of a partition batch, nothing is left to resend, and
+     the partition batch is `Rejected`.
+   - Before it writes to a pooled connection, the producer polls it once for a close. A
+     connection the broker closed (`connections.max.idle.ms`) is redialed and the request written
+     on the new one, so the attempt stays `Clean` instead of failing `Ambiguous`.
+6. **`deny.toml` needed no change.** `kafka-protocol`, `crc`, and `crc-catalog` are MIT or
+   Apache-2.0, which its allowlist already covers, and `script/audit` passes with them.
+
+The `kafka_out` module doc (`crates/logit-outputs/src/kafka/mod.rs`, "Response classes") now
+carries the canonical fault-class table, so item 5's table is no longer updated.
