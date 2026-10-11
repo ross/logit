@@ -683,6 +683,44 @@ async fn a_missing_topic_is_refused_only_after_a_refresh_confirms_it() {
     send_expecting(&mut producer, vec![record(None, "v")], &[None]).await;
 }
 
+/// A coordinator that's loading or moving answers `InitProducerId` with an error a later poll
+/// clears, so the attempt polls instead of failing, and is `Clean` only once `timeout` passes.
+#[tokio::test]
+async fn a_loading_coordinator_is_polled_inside_the_attempt() {
+    let coordinator = |cluster: &FakeCluster, answer| {
+        cluster.script(Step {
+            api: ApiKey::InitProducerId,
+            partition: None,
+            action: Action::Error(answer),
+        });
+    };
+    for answer in
+        [code::COORDINATOR_LOAD_IN_PROGRESS, code::COORDINATOR_NOT_AVAILABLE, code::NOT_COORDINATOR]
+    {
+        let cluster = cluster(1, &[0]).await;
+        coordinator(&cluster, answer);
+        coordinator(&cluster, answer);
+        let mut producer = Producer::new(config(&cluster)).unwrap();
+        send_expecting(&mut producer, vec![record(None, "v")], &[None]).await;
+        assert_eq!(requests_of(&cluster, ApiKey::InitProducerId), 3, "code {answer}");
+        assert_eq!(values_in(&cluster, 0).len(), 1);
+    }
+
+    // Still loading at `timeout`: the attempt is `Clean`, and the next one asks again.
+    let cluster = cluster(1, &[0]).await;
+    for _ in 0..64 {
+        coordinator(&cluster, code::COORDINATOR_LOAD_IN_PROGRESS);
+    }
+    let short = ProducerConfig { timeout: Duration::from_millis(300), ..config(&cluster) };
+    let mut producer = Producer::new(short).unwrap();
+    let mut pending = prepare(&mut producer, vec![record(None, "v")]).await;
+    let attempt = producer.attempt(&mut pending).await;
+    assert_eq!(class(&attempt), Some(Fault::Clean), "{:?}", attempt.result);
+    let polled = requests_of(&cluster, ApiKey::InitProducerId);
+    assert!(polled >= 2, "polled before the deadline: {polled} requests");
+    assert!(polled < 64, "the deadline ended the poll: {polled} requests");
+}
+
 /// The same rule for a `Produce` answer: the first is `Clean`, one that persists after the
 /// refresh is `Refused`, and an accepted batch starts the count again.
 #[tokio::test]

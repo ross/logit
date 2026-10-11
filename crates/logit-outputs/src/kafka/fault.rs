@@ -16,6 +16,9 @@ pub(crate) mod code {
     pub(crate) const REQUEST_TIMED_OUT: i16 = 7;
     pub(crate) const MESSAGE_TOO_LARGE: i16 = 10;
     pub(crate) const NETWORK_EXCEPTION: i16 = 13;
+    pub(crate) const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
+    pub(crate) const COORDINATOR_NOT_AVAILABLE: i16 = 15;
+    pub(crate) const NOT_COORDINATOR: i16 = 16;
     pub(crate) const RECORD_LIST_TOO_LARGE: i16 = 18;
     pub(crate) const NOT_ENOUGH_REPLICAS: i16 = 19;
     pub(crate) const NOT_ENOUGH_REPLICAS_AFTER_APPEND: i16 = 20;

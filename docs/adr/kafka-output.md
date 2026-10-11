@@ -561,3 +561,12 @@ kcat and decoded (`serde_json`, `logit_proto::msgpack::Reader`, `logit_proto::na
 every event sent, with each event record's key and each record's timestamp as above. A native
 frame decoded in another process lists an event's attributes in that process's interning order,
 not the sender's: `AttrMap` order is process-local, so the comparison is field for field.
+
+**Correction to W1: a loading coordinator is polled inside the attempt.** A fresh broker answers
+the first `InitProducerId` with `COORDINATOR_LOAD_IN_PROGRESS` (14) while it loads its
+transaction state, and W1's producer returned that as a `Clean` failure, so `write_loop` logged
+an `ERROR` and retried. The Java producer re-enqueues the request without failing a send. The
+producer now polls `InitProducerId` on 14, `COORDINATOR_NOT_AVAILABLE` (15), and
+`NOT_COORDINATOR` (16) with the missing-topic poll's backoff, 100 ms doubling to 1 s, and fails
+`Clean` only once `timeout` passes. Against a fresh `apache/kafka:4.2.0`, the first batch
+logged that `ERROR` before the change and nothing after it.

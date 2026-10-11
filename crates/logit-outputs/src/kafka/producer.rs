@@ -14,7 +14,9 @@
 //!    broker fenced its epoch, and bumps the epoch on the client when an earlier attempt left a
 //!    sequence gap: the same PID at epoch + 1, every partition's sequence back to 0, and
 //!    `InitProducerId` again only at `i16::MAX`. A new epoch renumbers every unsettled partition
-//!    batch; within one epoch a partition batch keeps its base sequence across attempts.
+//!    batch; within one epoch a partition batch keeps its base sequence across attempts. An
+//!    `InitProducerId` answered with a loading or unavailable coordinator is polled within the
+//!    attempt (`Producer::init_producer_id`).
 //! 2. Refreshes metadata when it's older than [`METADATA_MAX_AGE`] or a response asked for it.
 //! 3. Sends each leader its partition batches, one produce request at a time per broker, with
 //!    the brokers in parallel. A request holds at most one batch per partition, because a broker
@@ -36,7 +38,8 @@ use bytes::Bytes;
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
 use kafka_protocol::messages::{
-    InitProducerIdRequest, MetadataRequest, MetadataResponse, ProduceRequest, ProducerId, TopicName,
+    InitProducerIdRequest, InitProducerIdResponse, MetadataRequest, MetadataResponse,
+    ProduceRequest, ProducerId, TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::Compression;
@@ -52,13 +55,12 @@ use super::partitioner;
 /// Java's `metadata.max.age.ms`.
 pub(crate) const METADATA_MAX_AGE: Duration = Duration::from_secs(300);
 
-/// The first wait between polls of a topic a first missing-topic answer found missing: Java's
+/// The first wait between polls of a topic being created or a coordinator being loaded: Java's
 /// `retry.backoff.ms`.
-const METADATA_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
-/// The longest wait between two polls of a topic being created: Java's
-/// `retry.backoff.max.ms`.
-const METADATA_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
+/// The longest wait between two of those polls: Java's `retry.backoff.max.ms`.
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// The transaction timeout an idempotent producer's `InitProducerId` carries; the broker ignores
 /// it without a transactional id. Java's `transaction.timeout.ms` default.
@@ -710,7 +712,42 @@ impl Producer {
         self.reinit_due = false;
     }
 
+    /// Gets a new producer identity. While the broker answers that its transaction coordinator
+    /// is loading or not yet available, which a fresh broker answers to the first producer, this
+    /// polls from [`RETRY_BACKOFF`] doubling to [`RETRY_BACKOFF_MAX`] until `timeout`, as the
+    /// Java producer re-enqueues its `InitProducerId` without failing a send.
     async fn init_producer_id(&mut self) -> anyhow::Result<()> {
+        let deadline = Instant::now() + self.config.timeout;
+        let mut backoff = RETRY_BACKOFF;
+        loop {
+            let response = self.request_producer_id().await?;
+            match response.error_code {
+                code::NONE => {
+                    self.identity = Some(Identity {
+                        producer_id: response.producer_id.0,
+                        epoch: response.producer_epoch,
+                    });
+                    self.restart_sequences();
+                    return Ok(());
+                }
+                code::COORDINATOR_LOAD_IN_PROGRESS
+                | code::COORDINATOR_NOT_AVAILABLE
+                | code::NOT_COORDINATOR
+                    if Instant::now() < deadline =>
+                {
+                    tokio::time::sleep_until((Instant::now() + backoff).min(deadline)).await;
+                    backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                }
+                error_code => {
+                    let fault = fault::classify_control(error_code);
+                    return Err(anyhow!("InitProducerId answered {}", fault::name(error_code)))
+                        .context(fault);
+                }
+            }
+        }
+    }
+
+    async fn request_producer_id(&mut self) -> anyhow::Result<InitProducerIdResponse> {
         let request = InitProducerIdRequest::default()
             .with_transactional_id(None)
             .with_transaction_timeout_ms(TRANSACTION_TIMEOUT_MS)
@@ -723,15 +760,7 @@ impl Producer {
             .await
             .map_err(|err| err.error.context("InitProducerId").context(Fault::Clean))?;
         self.conns.insert(node, conn);
-        if response.error_code != code::NONE {
-            let fault = fault::classify_control(response.error_code);
-            return Err(anyhow!("InitProducerId answered {}", fault::name(response.error_code)))
-                .context(fault);
-        }
-        self.identity =
-            Some(Identity { producer_id: response.producer_id.0, epoch: response.producer_epoch });
-        self.restart_sequences();
-        Ok(())
+        Ok(response)
     }
 
     async fn ensure_metadata(&mut self) -> anyhow::Result<()> {
@@ -743,9 +772,8 @@ impl Producer {
     }
 
     /// Fetches the topic's metadata. After a first missing-topic answer, the refresh it
-    /// schedules runs here: it polls, from [`METADATA_RETRY_BACKOFF`] doubling to
-    /// [`METADATA_RETRY_BACKOFF_MAX`], while the broker still answers the topic missing or
-    /// leaderless, and completes with the first other answer or once `timeout` has passed, as
+    /// schedules runs here: it polls, from [`RETRY_BACKOFF`] doubling to [`RETRY_BACKOFF_MAX`],
+    /// while the broker still answers the topic missing or leaderless, and completes with the first other answer or once `timeout` has passed, as
     /// the Java producer's `waitOnMetadata` polls until `max.block.ms`. A broker that
     /// auto-creates the topic answers the request that created it as missing, so a new topic
     /// costs the attempt no failure.
@@ -755,10 +783,10 @@ impl Producer {
             return result;
         }
         let deadline = Instant::now() + self.config.timeout;
-        let mut backoff = METADATA_RETRY_BACKOFF;
+        let mut backoff = RETRY_BACKOFF;
         loop {
             tokio::time::sleep_until((Instant::now() + backoff).min(deadline)).await;
-            backoff = (backoff * 2).min(METADATA_RETRY_BACKOFF_MAX);
+            backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
             let result = self.fetch_metadata().await;
             let leaderless = result.is_ok()
                 && self.metadata.as_ref().is_some_and(|m| m.led_partitions().is_empty());
