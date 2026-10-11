@@ -868,8 +868,8 @@ RESIDUAL_BATCHES = 67
 # the batch it has taken off it but not yet sent.
 SCRIPT_RESIDUAL_BATCHES = 65
 # The UDP listener's `warn` lines for datagrams it counted as `datagrams.dropped{reason=
-# "shutdown"}` after `internal`'s final drain (`crates/logit-inputs/src/udp.rs`: `ReadHalf`,
-# `ResidualOnDrop`, and `Undecoded`).
+# "shutdown"}` (`crates/logit-inputs/src/udp.rs`: `ReadHalf`, `ResidualOnDrop`, and `Undecoded`).
+# Telemetry carries the same count, so these only cross-check it.
 SHUTDOWN_DROP_RE = re.compile(
     r"^(\d+) datagram\(s\) (?:still in the receive queue|read off the socket but never queued"
     r"|taken off the receive queue but not decoded)")
@@ -991,7 +991,14 @@ class Ledger:
         sut, listener = self.sut, self.listener
         self.W = sut.counter_by_life("logit.input.datagrams", component=listener)
         self.K = sut.counter_by_life("logit.input.kernel.drops", component=listener)
+        # D, every reason. Every SUT config gives `internal` a dedicated pipeline, so its final
+        # drain runs after every data node has exited and carries the shutdown drops too.
         self.D_tel = sut.counter_by_life("logit.component.datagrams.dropped", component=listener)
+        self.D_shutdown = sut.counter_by_life("logit.component.datagrams.dropped",
+                                              component=listener, reason="shutdown")
+        # Batches any data node dropped for shutdown, the sink's and a Lua node's alike.
+        self.shutdown_batches = sut.counter_by_life("logit.component.batches.dropped",
+                                                    reason="shutdown")
         self.B = sut.counter_by_life("logit.component.diagnostics", component=listener,
                                      key="bad_line")
         self.E = sut.counter_by_life("logit.component.events.sent", component=listener)
@@ -1023,9 +1030,10 @@ class Ledger:
             and record.get("on") == "logit" and not record.get("rc")}
         self.killed = sorted(self.killed_at)
 
-        # Shutdown drops and `drain complete` land after the final drain, so they come from
-        # stderr, each credited to the life its timestamp falls in. A killed life writes neither,
-        # so its D has no stderr part.
+        # The stderr copies of the shutdown counts, each credited to the life its timestamp falls
+        # in, read only to cross-check telemetry (`datagram_mismatch`, `batch_mismatch`). `drain
+        # complete` also counts the `internal` pipeline's own shutdown drops, which no drain can
+        # export. A killed life writes neither.
         self.D_log = {}
         self.batches_dropped = {}
         self.drain_completes = {}
@@ -1124,7 +1132,35 @@ class Ledger:
         return f"ΣV {_n(self.v(life, sinks))} ({parts})"
 
     def D(self, life):
-        return self.get("D_tel", life) + self.get("D_log", life)
+        return self.get("D_tel", life)
+
+    def datagram_mismatch(self, life):
+        """A detail when stderr's shutdown `warn` lines count more datagrams than telemetry's
+        `datagrams.dropped{reason="shutdown"}` for a life, else None. A killed life has neither.
+
+        Only stderr above telemetry is a disagreement. Under `receive: { overflow: block }`, a
+        `push_many` cancelled while blocked counts its datagrams as shutdown drops without
+        logging a line, so telemetry can exceed stderr on a correct ledger."""
+        logged, counted = self.get("D_log", life), self.get("D_shutdown", life)
+        if logged <= counted:
+            return None
+        return (f"life {life}: the listener's stderr shutdown lines count {_n(logged)} "
+                f"datagram(s), telemetry's datagrams.dropped{{reason=\"shutdown\"}} "
+                f"{_n(counted)}; D reads telemetry")
+
+    def batch_mismatch(self, life):
+        """A detail when `drain complete`'s `batches_dropped` and telemetry's
+        `batches.dropped{reason="shutdown"}` disagree for a life, else None. A killed life has
+        neither."""
+        if life in self.killed and life != self.final:
+            return None
+        logged, counted = self.batches_dropped.get(life, 0), self.get("shutdown_batches", life)
+        if logged == counted:
+            return None
+        return (f"life {life}: drain complete's batches_dropped {_n(logged)}, telemetry's "
+                f"batches.dropped{{reason=\"shutdown\"}} {_n(counted)}; a larger stderr count "
+                "is the internal pipeline's own drops, or a config whose internal pipeline isn't "
+                "dedicated")
 
     def symbols(self, life):
         script = ""
@@ -1132,9 +1168,9 @@ class Ledger:
             script = "".join(f"{symbol} {_n(self.get(symbol, life))}, " for symbol in (
                 "L_in", "L_emit", "L_drop", "L_err", "L_flush", "L_sent"))
         return (f"W {_n(self.get('W', life))}, K {_n(self.get('K', life))}, D {_n(self.D(life))} "
-                f"({_n(self.get('D_tel', life))} telemetry + {_n(self.get('D_log', life))} "
-                f"stderr), B {_n(self.get('B', life))}, E {_n(self.get('E', life))}, "
-                f"X {_n(self.get('X', life))}, {script}"
+                f"({_n(self.get('D_shutdown', life))} at shutdown; stderr says "
+                f"{_n(self.get('D_log', life))}), B {_n(self.get('B', life))}, "
+                f"E {_n(self.get('E', life))}, X {_n(self.get('X', life))}, {script}"
                 f"A {_n(self.get('A', life))}, Ab {_n(self.get('Ab', life))}, "
                 + ", ".join(f"V[{sink}] {_n(self.v(life, [sink]))}" for sink in self.sinks))
 
@@ -1194,21 +1230,20 @@ class Ledger:
         sink under `copy`, all under `route`): `ok`, `counted`, `counted, unattributed` (WARN),
         `within band`, `surplus`, or `uncounted`.
 
-        A positive gap is counted by a drop that can explain it. `drain complete`'s
-        `batches_dropped` counts every node's shutdown drops, which the runtime records after
-        `internal`'s final drain, so no telemetry names the sink they hit. It counts a gap only
-        for a group holding every sink: one sink, or all of them under `route`. A group holding
-        some of the sinks is counted by its own sinks' exported `batches.dropped` in the life,
-        and a gap the process-wide count alone could explain WARNs as unattributed, since it
-        may be another sink's drop.
+        A positive gap is counted by a drop that can explain it. The life's telemetry
+        `batches.dropped{reason="shutdown"}`, every node's, counts a gap only for a group
+        holding every sink: one sink, or all of them under `route`. A group holding some of the
+        sinks is counted by its own sinks' exported `batches.dropped` in the life, and a gap the
+        process-wide count alone could explain WARNs as unattributed, since it may be another
+        sink's drop.
 
         The final life's gap is Ab − V, and with a script Ab − L_flush − V, here and below. A
         stopped earlier life's is W − D − B − X − V, less a script's counted drops, the residual
-        plus Ab − V, because the close-time window delivers what that life read but hadn't
-        absorbed by its last drain into V. With a script, that residual passes through it after
-        the last drain, which exports none of what it drops, so a positive gap up to
-        `script_band` passes. A killed life has no close-time window and no `drain
-        complete`: its gap is Ab − V alone, judged inside `kill_band`; below the band it is a
+        plus Ab − V, because `aggregate`'s close-time flush delivers what that life read but
+        hadn't absorbed by its last ordinary drain into V; the final drain runs after that
+        flush, so it exports the shutdown drops. With a script, a positive gap up to
+        `script_band` passes. A killed life has no close-time window and no shutdown drops: its
+        gap is Ab − V alone, judged inside `kill_band`; below the band it is a
         surplus, above it uncounted loss. Its residual is what the kill lost from the receive
         queue and inbox, by design, and is reported, not judged here."""
         gap = self.absorbed(life) - self.v(life, sinks)
@@ -1221,7 +1256,7 @@ class Ledger:
             return FAIL, ("surplus" if gap < low else "uncounted"), gap
         if life != self.final:
             gap += self.residual(life)
-        dropped = self.batches_dropped.get(life, 0)
+        dropped = self.get("shutdown_batches", life)
         whole = set(sinks) == set(self.sinks)
         if gap == 0:
             return PASS, "ok", gap
@@ -1410,7 +1445,8 @@ def _per_life_lines(led):
 
 def check_ledger_intake(data):
     """The final life's W − D == E + B; each earlier life's residual (`Ledger.residual`) in
-    [0, R], a sanity bound. `ledger.egress` ties that residual to V."""
+    [0, R], a sanity bound. `ledger.egress` ties that residual to V. A life whose stderr
+    shutdown lines disagree with telemetry's shutdown drops WARNs."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.intake", led)
     if skipped:
@@ -1431,6 +1467,10 @@ def check_ledger_intake(data):
                      f"{'within' if ok else 'outside'} [0, R]")
         if not ok:
             status = FAIL
+    mismatches = [m for m in map(led.datagram_mismatch, led.lives) if m]
+    if mismatches:
+        status = worst([status, WARN])
+        parts += mismatches
     detail = "; ".join(parts) + f" ({led.R_text})"
     return Result("ledger.intake", status, detail, lines)
 
@@ -1547,8 +1587,8 @@ def check_ledger_aggregate(data):
 def check_ledger_egress(data):
     """The egress gap per life and per egress group (`Ledger.egress_groups`: each sink under
     `copy`, the sinks' summed V under `route`), Ab − V for the final life and a killed one, and
-    W − D − B − X − V for a stopped earlier one: 0 passes; a positive gap with that life's
-    `drain complete` `batches_dropped` above 0 is counted, never reconciled; a killed life's
+    W − D − B − X − V for a stopped earlier one: 0 passes; a positive gap with a batch that
+    life's telemetry counts `batches.dropped{reason="shutdown"}` is counted, never reconciled; a killed life's
     gap passes inside `Ledger.kill_band`; any other gap is uncounted loss, or a surplus below a
     killed life's band. A sink whose export has no series can't pass."""
     if data.external:
@@ -1567,7 +1607,7 @@ def check_ledger_egress(data):
         for life in led.lives:
             verdict_status, verdict, gap = led.egress(life, sinks)
             status = worst([status, verdict_status])
-            dropped = led.batches_dropped.get(life, 0)
+            dropped = led.get("shutdown_batches", life)
             ab_v = led.absorbed(life) - led.v(life, sinks)
             flush = f" (L_flush {_n(led.get('L_flush', life))})" if led.script else ""
             absorbed = (f"{led.ab_text} {_n(led.absorbed(life))}{flush} − "
@@ -1579,8 +1619,8 @@ def check_ledger_egress(data):
                 part = (f"life {life} (killed): {absorbed} = {_n(gap)}, {verdict} ({band}); "
                         f"residual {led.residual_text} {_n(led.residual(life))} at its last "
                         "drain, what the kill lost from the receive queue and inbox, by design, "
-                        "not judged here; D has no stderr part: a SIGKILL logs no shutdown "
-                        "drops")
+                        "not judged here; D has no shutdown part: a SIGKILL counts no "
+                        "shutdown drops")
             else:
                 whole = ("W − D − B − X − (L_drop + L_err) − V" if led.script
                          else "W − D − B − X − V")
@@ -1593,7 +1633,7 @@ def check_ledger_egress(data):
                 if set(sinks) != set(led.sinks):
                     own = (f", {' + '.join(sinks)} batches.dropped "
                            f"{_n(led.sink_dropped(life, sinks))}")
-                part += f" (drain complete batches_dropped {_n(dropped)}{own})"
+                part += f" (batches dropped for shutdown {_n(dropped)}{own})"
             parts.append(part)
         empty = [sink for sink in sinks if not led.series.get(sink)]
         for sink in empty:
@@ -1604,6 +1644,9 @@ def check_ledger_egress(data):
                             f"{selector!r}")
         groups.append(f"{label}: " + "; ".join(parts))
     lines += groups
+    mismatches = list(filter(None, map(led.batch_mismatch, led.lives)))
+    if mismatches:
+        status = worst([status, WARN])
     lives = len(led.lives)
     wrong_total = 0
     for sink in led.sinks:
@@ -1623,7 +1666,7 @@ def check_ledger_egress(data):
         elif life != led.final and led.drain_completes.get(life, 0) == 0:
             lines.append(f"life {life} has no drain complete line")
     split = f"split {led.split}"
-    detail = " | ".join(groups) + f" ({split}; {led.R_text})"
+    detail = " | ".join(groups + mismatches) + f" ({split}; {led.R_text})"
     if wrong_total:
         detail += f"; {wrong_total} series' resets aren't SUT lives − 1"
     return Result("ledger.egress", status, detail, lines)
@@ -1633,8 +1676,8 @@ def check_ledger_summary(data):
     """The final life's uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), which must
     be 0, with wire loss beside it by design. There is one Ab − V term per egress group, and
     each must be 0 or counted on its own, so a surplus at one sink can't net out loss at
-    another. A term counted only by the process-wide `drain complete` count while other sinks
-    exist WARNs as unattributed (`Ledger.egress`). With a script, E − A becomes its four script terms
+    another. A term counted only by the process-wide shutdown count while other sinks exist
+    WARNs as unattributed (`Ledger.egress`). With a script, E − A becomes its four script terms
     (`check_ledger_script`'s three identities and L_sent − A), the egress term is
     Ab − L_flush − V, and the script's drops and errors are shown beside it, counted. A counted
     egress term is shown and not judged; on an external target the Ab − V term SKIPs, and the
@@ -1923,10 +1966,8 @@ def check_ledger_sent(data):
         status = worst([status, verdict])
         problems.append((verdict, text))
 
-    shutdown = sum(led.batches_dropped.values())
-    if shutdown:
-        flag(WARN, f"drain complete reported {_n(shutdown)} batch(es) dropped at shutdown, "
-                   "counted across every node")
+    for mismatch in filter(None, map(led.batch_mismatch, led.lives)):
+        flag(WARN, mismatch)
     drained = data.phases.get("sink_drained")
     if drained and not drained.get("held"):
         left = {sink: (one or {}).get("buffer_batches")

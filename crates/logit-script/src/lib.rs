@@ -19,6 +19,7 @@ mod memory;
 mod print;
 mod provenance;
 mod proxy;
+mod random;
 mod resource;
 mod scope;
 mod telemetry;
@@ -148,6 +149,7 @@ impl ScriptWorker {
         let scope_state = scope::install(&lua)?;
         let provenance_state = provenance::install(&lua)?;
         print::install(&lua, provenance_state.clone())?;
+        random::install(&lua)?;
         // `Event.new` reads the targets cell at call time, so a later `with_targets` still takes
         // effect; an `Event.new` at top level, during `.exec()`, sees the empty table
         // (`docs/design/lua-api.md` says so).
@@ -1711,6 +1713,7 @@ mod tests {
             "print",
             "process",
             "provenance",
+            "random",
             "rawequal",
             "rawget",
             "rawset",

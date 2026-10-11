@@ -83,20 +83,31 @@ Entry format and the other areas: [the known-gaps index](README.md).
   the throttle (a lifecycle event, an unthrottled `Diagnostics::error`). It isn't built because
   nothing shipped needs it, and the throttle already covers the hot path (a malformed line, a
   parse failure).
-- **Shutdown-time counts never reach an exported pipeline.** `internal`'s `run_until_shutdown`
-  does its final drain the moment the shutdown signal fires, and every count recorded after that
-  stays in the component buffers:
+- **Shutdown-time counts never reach an exported pipeline when `internal`'s pipeline is mixed.**
+  A pipeline is mixed when any node reachable from `internal` is also reachable from another
+  input, such as one `otlp_out` carrying both data and `internal`'s output. `internal`'s
+  `run_until_shutdown` then does its final drain the moment the shutdown signal fires, and every
+  count recorded after that stays in the component buffers:
   - the UDP listeners' `datagrams.dropped`/`bytes.dropped{reason="shutdown"}`
     ([ADR `shutdown-accounting-and-cancellation-safety`](../adr/shutdown-accounting-and-cancellation-safety.md),
     decision 4);
   - the drops a sink or Lua node counts during the drain;
-  - the final drain's own `logit.internal.*.emitted`/`drain.duration`.
+  - the HTTP listeners' `connections.closed{reason="shutdown"}`.
 
-  They reach a test `Registry` but no `otlp_out` or `prometheus_out`. An operator sees them in the
-  self-log instead: each UDP guard that counts a nonzero remainder logs a `warn` naming the
-  listener and the count, and `drain complete` logs the sinks' total. Exporting them would need
-  `internal` to drain once more after every other node has stopped, into a pipeline that has
-  itself already stopped.
+  A dedicated pipeline closes this part of the gap: `internal` and its pipeline shut down after
+  every other node and drain once more, so those counts are exported (the same ADR's "Amendment:
+  internal drains last", decisions 10 to 16). Giving `internal` its own sinks, on the same backend
+  when needed, is the recommended setup
+  ([docs/deploying.md](../deploying.md)'s "Give `internal` a dedicated pipeline"), and
+  `logit validate` and `logit run` warn about a mixed one. In a mixed pipeline the counts reach a
+  test `Registry` but no `otlp_out` or `prometheus_out`. An operator sees them in the self-log
+  instead: each UDP guard that counts a nonzero remainder logs a `warn` naming the listener and
+  the count, `drain complete` logs the sinks' total, and `telemetry left undrained at exit` logs
+  every remaining point.
+
+  In both cases the final drain's own `logit.internal.*.emitted`/`drain.duration` are never
+  exported. They are recorded a tick behind, and no tick follows the final drain. Both cases log
+  them as `telemetry left undrained at exit`.
 - **A self-telemetry batch `internal` has drained is lost uncounted if the grace backstop drops it
   mid-send.** Each `tick` drains the registry, then awaits `Fanout::send`. A tick parked on a full
   downstream when shutdown fires keeps the `select!` from seeing the signal until the send

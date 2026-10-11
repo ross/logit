@@ -583,7 +583,7 @@ and takes the worst status; `report.py` is unchanged.
 | G | generator `logit.output.messages{component=statsd}`; precondition: equals `logit.output.datagrams` |
 | W | SUT `logit.input.datagrams{component=statsd}` |
 | K | SUT `logit.input.kernel.drops` |
-| D | SUT `logit.component.datagrams.dropped` under every reason, from telemetry, plus `shutdown` drops from stderr, except in a killed life, which writes none |
+| D | SUT `logit.component.datagrams.dropped` under every reason, from telemetry; the listener's stderr shutdown lines only cross-check its `shutdown` part, and a killed life counts none |
 | B | SUT `logit.component.diagnostics{key=bad_line}` |
 | E | SUT `logit.component.events.sent{component=statsd}` |
 | X | SUT `logit.component.events.dropped{component=statsd}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`) |
@@ -598,30 +598,35 @@ The generator sets `max_packet_bytes: "32"`, so one datagram carries one line of
 and G uses `output.messages` (what the kernel took), not `events.sent`. While the SUT is down,
 `statsd_out`'s per-batch name resolution fails `Clean` and nothing is sent.
 
-**Which life a hop is judged in.** `internal`'s final drain runs when the shutdown signal fires
-([`internal-telemetry.md`](../design/internal-telemetry.md), "`internal`: the drain"), and no
-drain exports the work after it: the listener decodes what its receive queue still holds and
-flushes its accumulator (`FlushReason::Shutdown`), `aggregate` absorbs those events, and its
-close-time window still reaches VictoriaMetrics. Shutdown drops land after it too, so they come
-from stderr: the listener's `warn` lines go into D, and the `drain complete` line's
-`batches_dropped` (batches, across every node) goes beside `ledger.egress`.
+**Which life a hop is judged in.** Every SUT config gives `internal` a dedicated pipeline, so
+its final drain runs after every data node has exited
+([`internal-telemetry.md`](../design/internal-telemetry.md), "`internal`: the drain"): after
+the listener decodes what its receive queue still holds and flushes its accumulator
+(`FlushReason::Shutdown`), `aggregate` absorbs those events and flushes its close-time window,
+and the sink makes its last delivery. Shutdown drops reach that drain too: the listener's
+`datagrams.dropped{reason="shutdown"}` goes into D, and a node's
+`batches.dropped{reason="shutdown"}` beside `ledger.egress`. The stderr copies, the listener's
+`warn` lines and the `drain complete` line's `batches_dropped`, cross-check them: a life whose
+stderr count exceeds telemetry's WARNs, and neither is added to telemetry. A datagram count in
+telemetry above stderr's doesn't WARN: under `receive: { overflow: block }`, a cancelled blocked
+push counts its datagrams as shutdown drops without logging a line.
 
 - The final SUT life ends after the generator stops and the VictoriaMetrics total holds (§5's
   end sequence), so nothing arrives after its final drain. `ledger.intake`, `ledger.edge`,
   `ledger.aggregate`, and `ledger.egress` are judged with no tolerance for it.
 - An earlier SUT life ends under load, at a scheduled `stop`, `restart`, or `kill`, or at an
   `exit` step's expected exit (W7a), which drains as a `stop` does. A life a `stop`, `restart`,
-  or `exit` ended is compared at its last drain, and its hops are reported. Its residual
-  W − D − B − X − Ab, what it read but had neither absorbed nor dropped, counted, by that drain,
-  must lie between 0 and the residual R that can be in flight at the signal: the
-  receive queue (`receive.max_datagrams`) plus 67 batches of at most
+  or `exit` ended is compared at its last ordinary drain, before the shutdown drain, and its
+  hops are reported. Its residual W − D − B − X − Ab, what it read but had neither absorbed nor
+  dropped, counted, by that drain, must lie between 0 and the residual R that can be in flight
+  at the signal: the receive queue (`receive.max_datagrams`) plus 67 batches of at most
   `receive.batch_max_events` each: the accumulator, the batch the listener holds while its send
   waits for a slot on a full inbox, `aggregate`'s 64-slot inbox, and the batch `aggregate` has
   taken off that inbox but not yet absorbed. A script between them (W7a) adds its own 64-slot
   inbox and the batch it holds, 65 batches more, and its counted drops and errors leave the
-  residual: W − D − B − X − (L_drop + L_err) − (Ab − L_flush). The close-time window delivers
-  that residual into V, so `ledger.egress` judges the life's W − D − B − X − V as it judges the
-  final life's Ab − V.
+  residual: W − D − B − X − (L_drop + L_err) − (Ab − L_flush). `aggregate`'s close-time flush
+  delivers that residual into V, and the final drain runs after that flush, so `ledger.egress`
+  judges the life's W − D − B − X − V as it judges the final life's Ab − V.
   The [0, R] bound only catches a residual no shutdown could leave.
 - An earlier SUT life ended by a scheduled `kill` has no final drain, no close-time window, and
   no stderr shutdown lines. Its hops are compared at its last drain, which is an ordinary one,
@@ -637,8 +642,8 @@ from stderr: the listener's `warn` lines go into D, and the `drain complete` lin
   the drain interval is the median of its drain gaps, and the aggregate interval is the SUT
   config's (the export's sample spacing only when the config names none). The detail states the
   band, both of its sides, and the rate. A gap below the band is a **surplus**, above it
-  **uncounted**; both FAIL. There's no `drain complete` line, so a gap can't be counted. D takes
-  nothing from stderr for this life, because a SIGKILL logs no shutdown drops.
+  **uncounted**; both FAIL. A SIGKILL counts no shutdown drops, so a gap can't be counted, and D
+  has no shutdown part for this life.
 - The band can't tell a lost last spooled window from the unflushed one when the life's last
   flush and its last drain fall together, and a lost middle window changes no total, because
   under `temporality: cumulative` V reads each life's last value. `ledger.windows` and
@@ -670,10 +675,11 @@ The rows:
   at 0 when W + K exceeds G in it, so a surplus in one run can't net out loss in another. The
   generator sink's own
   `drop_newest` loss while the SUT is unreachable is counted and never in G; the row shows it
-  beside the wire gap. At the end, G can fall short of W + K, because what the
-  generator's sink sends after the generator's final drain is never exported, and a send
-  cancelled at shutdown loses its counts. A negative gap of up to the generator sink's
-  `buffer.batches` at its last drain plus one batch (100 lines each) is allowed.
+  beside the wire gap. The generator's `self -> telemetry` pipeline is dedicated too, so its
+  final drain runs after its sink's last send and exports it. At the end, G can still fall short
+  of W + K, because a send the generator's sink cancels at shutdown loses its counts. A negative
+  gap of up to the generator sink's `buffer.batches` at its last drain plus one batch (100 lines
+  each) is allowed.
 - `ledger.intake`: W − D == E + B, for the final life.
 - `ledger.edge`: E == A, a single-consumer edge, for the final life. With `sut_script` (W7a),
   L_sent == A, the edge from the script to `aggregate`. From W7b, each sink's edge too: under
@@ -687,8 +693,8 @@ The rows:
   group with its own V[sink], since each holds all of `aggregate`'s output; under `route` the
   sinks form one group whose V is ΣV[sink], since each holds its target's share. Per group: Ab −
   V for the final life and a killed one, and W − D − B − X − V for a stopped earlier one, the
-  residual plus Ab − V, because its close-time window delivers the
-  residual to VictoriaMetrics after its last drain. The detail shows both parts. With
+  residual plus Ab − V, because `aggregate`'s close-time flush delivers the residual to
+  VictoriaMetrics before the final drain. The detail shows both parts. With
   `sut_script` (W7a), Ab becomes Ab − L_flush, because each `flush()` event carries one metric
   whose series `vm_selector` excludes, and a stopped earlier life's gap becomes
   W − D − B − X − (L_drop + L_err) − V. The subtraction holds only while each flush event carries
@@ -703,7 +709,8 @@ The rows:
   on nothing, or with no such events left, has a band of 0. A gap of 0 passes. A
   positive gap is lost increments. It is reported with
   that life's `drain complete` `batches_dropped` beside it, and is **counted** only when that
-  count is above 0. The two are never reconciled: `batches_dropped` counts batches, and under
+  life's telemetry `batches.dropped{reason="shutdown"}` is above 0. The two are never reconciled:
+  the count is of batches, and under
   `temporality: cumulative` a dropped batch loses only the increments since its series' last
   delivered total, which no log line states. `batches_dropped` is process-wide, and the runtime
   counts a sink's shutdown drops under the sink's id only after `internal`'s final drain, so no
@@ -758,8 +765,9 @@ The rows:
 - `identity.sink`, per sink: at the last quiet SUT drain before shutdown,
   `batches.received + buffer.disk.replayed == batches.delivered + batches.dropped (every
   reason) + buffer.batches`, allowing one batch in flight. A disk spool opens holding the
-  batches an earlier process queued, which this life delivers but never received. Checked there, not at exit, because the sink's last delivery and
-  its shutdown drops land after the final drain.
+  batches an earlier process queued, which this life delivers but never received. Checked at
+  the last quiet drain, where the one-batch allowance covers what is in flight, rather than at the
+  final drain, whose shutdown drops `ledger.egress` already reads.
 - `recovery`, per fault and per sink: within `recovery_bound` of each fault's end, some SUT
   drain shows the sink's `retrying` at 0,
   `buffer.utilization` under 0.05, or under 1.0 with `buffer.batches` at most 1 (one batch in a
@@ -915,9 +923,10 @@ and a diagnostic, and "Telemetry"). This list is the canonical copy of its verdi
   first. The sink reads that answer as `Refused` and holds its queue with no exit, so the run
   can't deliver until the key or the endpoint is fixed.
 - No `logit.output.requests` point, or none of class `2xx`: FAIL.
-- Any other counted drop (a batch's `overflow_*` or `shutdown` reason, `drain complete`'s
-  `batches_dropped`, a record's `stale`, `too_many_tags`, or other pre-send reason, the
+- Any other counted drop (a batch's `overflow_*` or `shutdown` reason, a record's `stale`, `too_many_tags`, or other pre-send reason, the
   encoder's `metrics.skipped`): WARN.
+- A life whose stderr `drain complete` `batches_dropped` differs from its telemetry
+  `batches.dropped{reason="shutdown"}`: WARN.
 - A request of class other than `2xx` (`4xx` holds a `429` too, `5xx`, `network_error`) in a
   drain whose interval overlaps a fault window is the fault's retry; outside every one it
   WARNs with the count, because the destination has a floor of errors of its own.
@@ -1180,9 +1189,9 @@ across runs:
 
 - UDP wire loss is by design and reported, not judged, outside the threshold on windows with no
   UDP-affecting fault.
-- The listener's shutdown flush, `aggregate`'s close-time window, and shutdown drops land after
-  `internal`'s final drain, so the per-hop ledger is exact only for the final SUT life, and
-  shutdown drops come from stderr.
+- An earlier SUT life stops under load, so the per-hop ledger is judged with no tolerance only
+  for the final SUT life. Shutdown drops come from telemetry, which a dedicated `internal`
+  pipeline exports, and stderr only cross-checks them.
 - The self-test doesn't run in CI.
 
 ### W1a: the first `statsd-vm` run (2026-10-08)

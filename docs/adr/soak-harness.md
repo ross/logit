@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-09
+updated: 2026-10-11
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -166,3 +166,27 @@ the compose layout, the driver loop, the full list of checks, and the workstream
   prune.
 - The ledger's "uncounted by design" rows stay reported until the gaps in
   `docs/known-gaps/intake.md` close. Closing one turns its row into a judged check.
+
+## Amendment: shutdown drops come from telemetry (2026-10-11)
+
+A dedicated `internal` pipeline now drains last at shutdown
+([ADR `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md),
+"Amendment: internal drains last"), and every SUT config has one (`self -> telemetry`). Its
+final drain runs after every data node has exited, so it exports the listener's
+`datagrams.dropped{reason="shutdown"}` and each node's `batches.dropped{reason="shutdown"}`. The
+Context bullet on what no drain exports, and the Decision's "Shutdown-time drops are read from
+stderr", no longer hold for those counts:
+
+- D and the counted verdict of `ledger.egress` read telemetry alone. Adding the stderr copy as
+  well counts each shutdown drop twice.
+- The listener's `warn` lines and the `drain complete` line's `batches_dropped` stay as a
+  cross-check: a life whose stderr count exceeds telemetry's WARNs. A telemetry count above
+  stderr's does not, because under `receive: { overflow: block }` a `push_many` cancelled while
+  blocked counts its datagrams as shutdown drops without logging a line. `drain complete` also
+  counts the `internal` pipeline's own shutdown drops, which no drain exports.
+- A SUT config that sends `self` into a pipeline another input also reaches has one shutdown
+  stage, so its shutdown drops miss telemetry. The cross-check WARNs on it, and the ledger reads
+  its losses as uncounted.
+- `identity.sink` stays at the last quiet drain before the final one, with its one-batch
+  allowance. The per-hop rows stay exact for the final SUT life only, and an earlier stopped
+  life keeps its [0, R] residual bound.
