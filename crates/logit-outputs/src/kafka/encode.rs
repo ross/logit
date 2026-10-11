@@ -24,7 +24,9 @@
 //! [`EncodeStats::oversize`]. A native frame's size isn't the sum of its events' (the dictionary
 //! is shared), so `native` finds each record's longest prefix of the remaining events that fits by
 //! encoding candidates: the whole batch once, then for each record by doubling and bisecting. A
-//! batch record has no key, and its timestamp is its first event's.
+//! frame can't skip an event, so an event over the budget ends the open `native` record where the
+//! other formats keep filling it. A batch record has no key, and its timestamp is its first
+//! event's.
 //!
 //! Under `record: event`, a key is text, as UTF-8 bytes (`docs/adr/kafka-output.md`, item 3), the
 //! same canonical bytes `sample` hashes for a key (`logit_core::sampling::hash_value`):
