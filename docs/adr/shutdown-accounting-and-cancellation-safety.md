@@ -600,9 +600,9 @@ own consumers. `internal`'s **pipeline** is every node reachable from it. The pi
     a full inbox isn't busy, so each is bounded by the nodes below it, and in the end by a sink's
     grace. A dedicated pipeline is closed in both directions: no outside node feeds a pipeline node,
     or that node would be reachable from another input, and every node a pipeline node feeds is in
-    the pipeline. So stage one involves no pipeline node and is bounded as it is today, and in stage
-    two every pipeline node's inputs close within `internal`'s stage-two grace and every sink below
-    it counts its grace from stage two.
+    the pipeline. So stage one involves no pipeline node and is bounded as it is today. In stage
+    two, `internal`'s output closes within its stage-two grace, and every node below it is bounded
+    by the sinks below it, each counting its grace from stage two.
 14. **Mixed pipelines stay as they are, with a warning.** Staging a mixed pipeline would need
     `internal` to split its output and keep shared nodes on stage one, or a shared node would hold
     data past its sink's grace and lose its close-time flush. That machinery isn't worth it for a
