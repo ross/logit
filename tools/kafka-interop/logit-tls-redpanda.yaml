@@ -1,0 +1,67 @@
+# The TLS leg of `script/kafka-interop` against Redpanda: 50 events into three sinks on the broker's
+# TLS listeners, trusting the private CA the script generates into the run directory (mounted at
+# /tls).
+#
+#   tls          :9093, server TLS only
+#   mtls         :9094, which requires a client certificate, presenting the run's client one
+#   mtls_nocert  :9094 with no client certificate: the broker refuses the handshake, so
+#                `mtls-nocert` stays empty and the sink retries until shutdown
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load_tls:
+    type: generate_in
+    count: 50
+    rate: 5
+    batch: 5
+    event:
+      log: "tls {seq}"
+      attributes: { seq: "{seq}" }
+
+  tls:
+    type: kafka_out
+    sources: [load_tls]
+    brokers: ["redpanda:9093"]
+    topic: tls
+    tls: { ca_file: /tls/ca.pem }
+
+  load_mtls:
+    type: generate_in
+    count: 50
+    rate: 5
+    batch: 5
+    event:
+      log: "tls {seq}"
+      attributes: { seq: "{seq}" }
+
+  mtls:
+    type: kafka_out
+    sources: [load_mtls]
+    brokers: ["redpanda:9094"]
+    topic: mtls
+    tls: { ca_file: /tls/ca.pem, cert_file: /tls/client.crt, key_file: /tls/client.key }
+
+  load_mtls_nocert:
+    type: generate_in
+    count: 50
+    rate: 5
+    batch: 5
+    event:
+      log: "tls {seq}"
+      attributes: { seq: "{seq}" }
+
+  mtls_nocert:
+    type: kafka_out
+    sources: [load_mtls_nocert]
+    brokers: ["redpanda:9094"]
+    topic: mtls-nocert
+    timeout: 2s
+    tls: { ca_file: /tls/ca.pem }
+    buffer: { retry_max_delay: 1s, shutdown_grace: 1s }
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/tls-redpanda-telemetry.log
+    format: json

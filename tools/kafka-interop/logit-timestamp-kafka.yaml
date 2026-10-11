@@ -1,0 +1,41 @@
+# The timestamp leg of `script/kafka-interop` against Apache Kafka 4.2.0: 100 events in batches of
+# 10, where the `lua` stage stamps the event whose `seq` ends in 3 at 2100-01-01, more than an hour
+# ahead of the broker's clock. A broker that enforces `log.message.timestamp.after.max.ms` names
+# those records in `INVALID_TIMESTAMP`, the sink drops and counts them, and the other 9 of each
+# batch land in `timestamp`: 90 records in all.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load:
+    type: generate_in
+    count: 100
+    rate: 10
+    batch: 10
+    event:
+      log: "timestamp {seq}"
+      attributes: { seq: "{seq}" }
+
+  future:
+    type: lua
+    sources: [load]
+    script: |
+      function process(event)
+        local seq = tonumber(event.attributes.seq)
+        if seq % 10 == 3 then
+          event.timestamp = "4102444800000000000"
+        end
+        return event
+      end
+
+  timestamp:
+    type: kafka_out
+    sources: [future]
+    brokers: ["kafka:9092"]
+    topic: timestamp
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/timestamp-kafka-telemetry.log
+    format: json

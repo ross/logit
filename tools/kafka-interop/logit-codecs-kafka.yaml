@@ -1,0 +1,94 @@
+# The codecs leg of `script/kafka-interop` against Apache Kafka 4.2.0: 100 events into each of five
+# topics, `codec-none`, `codec-gzip`, `codec-snappy`, `codec-lz4`, and `codec-zstd`, one sink per
+# `compression`, each fed by its own generator. The script reads each topic back with
+# `kafka-console-consumer.sh` (the Java client) and with kcat (librdkafka), and `check.py` checks
+# both decoded every record.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load_none:
+    type: generate_in
+    count: 100
+    rate: 10
+    batch: 10
+    event:
+      log: "codec {seq}"
+      attributes: { seq: "{seq}" }
+
+  none:
+    type: kafka_out
+    sources: [load_none]
+    brokers: ["kafka:9092"]
+    topic: codec-none
+    compression: none
+
+  load_gzip:
+    type: generate_in
+    count: 100
+    rate: 10
+    batch: 10
+    event:
+      log: "codec {seq}"
+      attributes: { seq: "{seq}" }
+
+  gzip:
+    type: kafka_out
+    sources: [load_gzip]
+    brokers: ["kafka:9092"]
+    topic: codec-gzip
+    compression: gzip
+
+  load_snappy:
+    type: generate_in
+    count: 100
+    rate: 10
+    batch: 10
+    event:
+      log: "codec {seq}"
+      attributes: { seq: "{seq}" }
+
+  snappy:
+    type: kafka_out
+    sources: [load_snappy]
+    brokers: ["kafka:9092"]
+    topic: codec-snappy
+    compression: snappy
+
+  load_lz4:
+    type: generate_in
+    count: 100
+    rate: 10
+    batch: 10
+    event:
+      log: "codec {seq}"
+      attributes: { seq: "{seq}" }
+
+  lz4:
+    type: kafka_out
+    sources: [load_lz4]
+    brokers: ["kafka:9092"]
+    topic: codec-lz4
+    compression: lz4
+
+  load_zstd:
+    type: generate_in
+    count: 100
+    rate: 10
+    batch: 10
+    event:
+      log: "codec {seq}"
+      attributes: { seq: "{seq}" }
+
+  zstd:
+    type: kafka_out
+    sources: [load_zstd]
+    brokers: ["kafka:9092"]
+    topic: codec-zstd
+    compression: zstd
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/codecs-kafka-telemetry.log
+    format: json

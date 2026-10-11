@@ -1,0 +1,29 @@
+# The partition-parity leg of `script/kafka-interop` against Redpanda: 200 events keyed by 50
+# distinct `user` values into the 6-partition topic `parity-logit`. The script produces the same 50
+# keys with `kafka-console-producer.sh` into `parity-java`, and `check.py` compares the partition
+# each key landed on in the two topics.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load:
+    type: generate_in
+    count: 200
+    rate: 20
+    batch: 10
+    event:
+      log: "parity {seq}"
+      attributes: { user: "user-{seq%50}", seq: "{seq}" }
+
+  parity:
+    type: kafka_out
+    sources: [load]
+    brokers: ["redpanda:9092"]
+    topic: parity-logit
+    key: { attribute: user }
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/parity-redpanda-telemetry.log
+    format: json

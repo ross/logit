@@ -1,0 +1,93 @@
+# kafka-interop
+
+`script/kafka-interop` checks `kafka_out` against a real Apache Kafka and a real Redpanda. It runs
+the legs in [`docs/plans/kafka-output.md`](../../docs/plans/kafka-output.md)'s "Interop plan
+(W4)" against each broker, reads every topic back with the Java client and kcat, and prints one
+row per leg and broker. The plan's "Findings" section records what a run showed.
+
+The script runs on the host and drives docker (`$DOCKER`, `sudo docker` by default), like
+`script/victoria-interop` and `script/splunk-interop`. It isn't part of `script/cibuild`, and no
+test depends on it running. A run takes about four minutes once the images are built.
+
+## What it runs
+
+`compose.yaml` starts one stack under the compose project `kafka-interop`, on the network
+`kafka-interop-net`, with no host ports:
+
+| Service | Image | Role |
+|---|---|---|
+| `kafka` | `apache/kafka:4.2.0` | single-node KRaft broker, started on `kafka-server.properties` |
+| `redpanda` | `redpandadata/redpanda:v26.2.3` | single-node Redpanda in `dev-container` mode, started on `redpanda.yaml` |
+| `logit-<leg>-<broker>` | `logit:kafka-interop`, built from the current tree | one per `logit-<leg>-<broker>.yaml` |
+
+Each broker has three client listeners: plain on `:9092`, TLS on `:9093`, and mutual TLS, which
+requires a client certificate, on `:9094`. The read-back runs `kafka-console-consumer.sh` and
+`kafka-get-offsets.sh` inside the `kafka` container, against either broker, and kcat in
+`edenhill/kcat:1.7.1` containers on the stack's network.
+
+The legs, each run against both brokers:
+
+| Leg | Config | What it checks |
+|---|---|---|
+| `parity` | `logit-parity-*.yaml` | 200 events keyed by 50 `user` values land on the same partitions of a 6-partition topic as the same keys from `kafka-console-producer.sh` |
+| `codec-<c>` | `logit-codecs-*.yaml` | 100 events under each `compression` (`none`, `gzip`, `snappy`, `lz4`, `zstd`) decode in both the Java consumer and kcat, each event once |
+| `dedup` | `logit-dedup-*.yaml` | while the broker's packets to this leg are dropped, an idempotent sink's resend after an `Ambiguous` attempt stores no duplicate; a non-idempotent control sink beside it does |
+| `tls`, `mtls`, `mtls-required` | `logit-tls-*.yaml` | 50 events over server TLS and over mutual TLS from the run's private CA; a sink with no client certificate stores nothing |
+| `timestamp` | `logit-timestamp-*.yaml` | in each batch of 10, the event stamped at 2100-01-01 is dropped and counted as `invalid_timestamp`, and the other nine land |
+
+Every config passes `logit validate`: `script/validate` and the
+`every_shipped_config_loads_and_validates` test both cover `logit-*.yaml` here. Each sink has
+its own `generate_in`, so a sink that stalls, as `mtls_nocert` does by design, can't hold back
+another sink in the same process.
+
+## A run
+
+1. Builds `logit:kafka-interop` from `Dockerfile`, and `logit-soak-netem:local` from
+   `tools/soak/netem/` (set `KAFKA_INTEROP_SKIP_IMAGE=1` to reuse both), and validates every leg
+   config with it.
+2. Generates a private CA, a broker certificate for the names `kafka` and `redpanda`, and a
+   client certificate into the run directory's `tls/`, with `openssl` in the Kafka image. The
+   keys are EC P-256 in PKCS#8, which Kafka's PEM keystore requires.
+3. Starts both brokers with `docker compose up --wait`, creates every topic on both, and produces
+   the 50 parity keys with `kafka-console-producer.sh`.
+4. Starts every leg. 10 s later, for 8 s, it drops every packet each broker sends to its `dedup`
+   leg, with `netem-drop.sh` run in the broker's network namespace (a `prio` qdisc, a
+   `netem loss 100%` band, and a u32 filter on the leg's address). The broker still receives
+   the leg's requests and appends them, so their responses are what's lost, and each sink's
+   2 s `timeout` reads that as `Ambiguous`.
+5. Stops each leg with SIGTERM 75 s after the start. `internal` keeps a `logit` process running
+   until a signal, so no leg ends on its own; the stop drains its sinks and writes its last
+   telemetry.
+6. Reads every topic on both brokers back with `kafka-get-offsets.sh`,
+   `kafka-console-consumer.sh`, and kcat, then runs `check.py` with `python3 -I` in a
+   `python:3.12-slim` container. `check.py` reads only the run directory.
+7. Clears the netem rules and tears the project down (`down -v --remove-orphans`) on every
+   exit.
+
+A row is `PASS` (the leg did what the plan expects), `GAP` (the broker differs from Apache Kafka
+in a way [`docs/known-gaps/kafka.md`](../../docs/known-gaps/kafka.md) records), or `FAIL`. The
+`dedup` leg fails if the idempotent sink made no `Ambiguous` attempt, because then nothing was
+resent and the leg proves nothing. The script exits 1 on any `FAIL`.
+
+A run writes `perf/results/kafka-interop/<timestamp>/` (gitignored, or under
+`KAFKA_INTEROP_OUT`):
+
+| File | Contents |
+|---|---|
+| `results.md`, `results.json` | one row per leg and broker |
+| `readback/<broker>/<topic>.java.tsv` | `kafka-console-consumer.sh` with the timestamp, partition, offset, and key printed |
+| `readback/<broker>/<topic>.kcat.tsv` | kcat's `%p\t%o\t%T\t%k\t%s` |
+| `readback/<broker>/<topic>.offsets` | `kafka-get-offsets.sh`, one `topic:partition:offset` per partition |
+| `<leg>-<broker>-telemetry.log` | each leg's `internal` telemetry, `stdio_out` `format: json` |
+| `exits.txt`, `timeline.log`, `netem.log` | each leg's exit code, the run's phases, and the qdiscs and filters each netem step set |
+| `provenance.txt`, `logs/<service>.log`, `tls/` | image digests and versions, every service's log, and the run's certificates |
+
+## Cleanup and a shared daemon
+
+Everything the script creates belongs to the `kafka-interop` project, apart from the one-shot
+netem and kcat containers, which remove themselves. The project name is fixed, so one run at a
+time per daemon: the script refuses to start while the project has containers, and prints the
+`down` command for a stack a crashed run left behind.
+
+Don't edit `script/kafka-interop` while it runs. Bash reads a script as it executes, so an edit
+can break the run partway through; the cleanup trap still tears the stack down.
