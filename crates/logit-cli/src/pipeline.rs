@@ -1060,6 +1060,7 @@ fn build_spec(
             max_length,
             redact_query,
             forwarded,
+            status_class,
         } => NodeSpec::Transform(Box::new(
             HttpAccessTransform::new(to_http_access_config(
                 routes,
@@ -1068,6 +1069,7 @@ fn build_spec(
                 max_length,
                 redact_query,
                 *forwarded,
+                *status_class,
             ))?
             .with_telemetry(telemetry.clone())
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
@@ -1971,6 +1973,7 @@ fn to_http_access_config(
     max_length: &std::collections::BTreeMap<String, usize>,
     redact_query: &[String],
     forwarded: Option<logit_config::ForwardedHeader>,
+    status_class: bool,
 ) -> HttpAccessConfig {
     let routes = routes
         .iter()
@@ -2007,6 +2010,7 @@ fn to_http_access_config(
         max_length,
         redact_query: redact_query.to_vec(),
         forwarded: forwarded.map(to_forwarded_header),
+        status_class,
     }
 }
 
@@ -4942,6 +4946,7 @@ mod tests {
                 max_length: std::collections::BTreeMap::from([("user.name".to_string(), 3)]),
                 redact_query: vec![],
                 forwarded: Some(logit_config::ForwardedHeader::XForwardedFor),
+                status_class: false,
             },
         };
         let NodeSpec::Transform(mut transform) =

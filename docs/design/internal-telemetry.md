@@ -1563,7 +1563,7 @@ Seven counters. Every tag comes from a closed, `&'static` table, never an observ
 | Name | Meaning |
 |---|---|
 | `logit.transform.http_access.normalized{field}` | a field rewritten into its conformant form: a dashed alias renamed, a composite decomposed, a numeric coerced, a duration converted, a method or version normalized, a leading `?` stripped |
-| `.derived{field}` | a field written from config or a built-in table: `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`, `span.status`, `span.duration_s`, `http.request.method_original`, and `client.address` and `client.port` under `forwarded`. Every derived attribute but those two is fill-only, so one the producer already sent is honoured and not counted |
+| `.derived{field}` | a field written from config or a built-in table: `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`, `span.status`, `span.duration_s`, `http.response.status_class` (under `status_class`), `http.request.method_original`, and `client.address` and `client.port` under `forwarded`. Every derived attribute but those two is fill-only, so one the producer already sent is honoured and not counted |
 | `.truncated{field}` | a value cut to its `max_length` |
 | `.cleaned{field}` | a control byte replaced by `_` |
 | `.invalid{field}` | present but unparseable, left as it arrived; under `forwarded`, the header's attribute when it names no usable client |

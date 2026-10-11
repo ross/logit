@@ -2702,6 +2702,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             max_length,
             redact_query,
             forwarded: _,
+            status_class: _,
         } = &component.kind
         {
             let compile = |what: &str, pattern: &str| -> anyhow::Result<()> {
@@ -7094,6 +7095,7 @@ mod tests {
             max_length: std::collections::BTreeMap::new(),
             redact_query: vec![],
             forwarded: None,
+            status_class: false,
         }
     }
 
@@ -7159,6 +7161,7 @@ mod tests {
             max_length: std::collections::BTreeMap::from([("url.path".to_string(), 512)]),
             redact_query: vec!["token".to_string()],
             forwarded: Some(ForwardedHeader::XForwardedFor),
+            status_class: false,
         };
         resolve(cfg(vec![
             ("in", vec![], listener()),
@@ -7329,6 +7332,7 @@ mod tests {
                 max_length: std::collections::BTreeMap::new(),
                 redact_query: vec![],
                 forwarded: Some(header),
+                status_class: false,
             };
             resolve(cfg(vec![
                 ("in", vec![], listener()),

@@ -184,7 +184,9 @@ Details an agent needs beyond the table:
   - redacts semconv's sensitive query keys, then caps every free-text field per `CAPPED_FIELDS`;
   - derives a bounded set: `user_agent.class` from an ordered regex table, `http.route` from
     operator `routes:` plus three built-in sets, `error.type`, `span.name`, `span.status` (never
-    `ok`), and a `span.duration_s` mirror that `trace_context` resolves a span from.
+    `ok`), a `span.duration_s` mirror that `trace_context` resolves a span from, and, under
+    `status_class: true` (off by default), `http.response.status_class` (`1xx` to `5xx`, else
+    `unknown`).
 
   Every canonical name is also accepted with each `.` replaced by `-`
   (`http-response-status_code`; only the dots change). That fixed alias table exists for

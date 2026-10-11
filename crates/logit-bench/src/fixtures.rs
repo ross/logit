@@ -2217,15 +2217,20 @@ pub fn http_access_event_with_control_byte() -> Event {
 /// resolved as `logit-cli`'s `to_http_access_config` does rather than copied. No user-agent rules,
 /// no extra `redact_query`, no `forwarded`.
 pub fn http_access() -> HttpAccess {
-    http_access_with(None)
+    http_access_with(None, false)
+}
+
+/// [`http_access`] with `status_class: true`.
+pub fn http_access_status_class() -> HttpAccess {
+    http_access_with(None, true)
 }
 
 /// [`http_access`] with `forwarded: x_forwarded_for`.
 pub fn http_access_forwarded() -> HttpAccess {
-    http_access_with(Some(ForwardedHeader::XForwardedFor))
+    http_access_with(Some(ForwardedHeader::XForwardedFor), false)
 }
 
-fn http_access_with(forwarded: Option<ForwardedHeader>) -> HttpAccess {
+fn http_access_with(forwarded: Option<ForwardedHeader>, status_class: bool) -> HttpAccess {
     let config = HttpAccessConfig {
         routes: vec![
             RouteRule::Builtin(RouteSet::Probes),
@@ -2241,6 +2246,7 @@ fn http_access_with(forwarded: Option<ForwardedHeader>) -> HttpAccess {
             .collect(),
         redact_query: vec![],
         forwarded,
+        status_class,
     };
     HttpAccess::new(config).expect("fixture patterns should compile")
 }

@@ -1345,6 +1345,22 @@ fn http_access_normalizes_a_conforming_line_warm() {
     expect_allocs("http_access: normalize a conforming line, warm", stats, 0);
 }
 
+/// [`http_access_normalizes_a_conforming_line_warm`] with `status_class: true`: the class cell is
+/// pre-built, so the derivation is one `insert_sym` of a static `Value`.
+#[test]
+fn http_access_derives_a_status_class_warm() {
+    let mut ha = fixtures::http_access_status_class();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::http_access_event();
+    ha.process(&resource, &mut warm);
+
+    let mut event = fixtures::http_access_event();
+    let (forwarded, stats) = measure(|| ha.process(&resource, &mut event));
+    assert!(forwarded, "http_access always forwards");
+    assert_eq!(event.attributes.get("http.response.status_class"), Some(&Value::str("2xx")));
+    expect_allocs("http_access: derive a status class, warm", stats, 0);
+}
+
 /// The same line through a new component, unwarmed: 228, paid once per compiled pattern per
 /// thread, not per event. Nearly all of it is the `regex` crate's lazy per-pattern `Cache`, built
 /// by the first match against each `Regex`. The fixture's UA matches `browser`, the last of four

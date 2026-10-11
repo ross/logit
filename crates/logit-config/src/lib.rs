@@ -2374,8 +2374,9 @@ pub enum ComponentKind {
     /// `http.request.method_original`, `HTTP/` stripped off the protocol version, semconv's
     /// sensitive `url.query` values redacted, every free-text field capped and
     /// control-byte-cleaned, plus a small, bounded derived set: `user_agent.class`,
-    /// `http.route`, `error.type`, `span.name`, `span.status`, and the `span.duration_s` mirror
-    /// `trace_context` resolves a span from. Place it between `json` and `trace_context`. Every
+    /// `http.route`, `error.type`, `span.name`, `span.status`, the `span.duration_s` mirror
+    /// `trace_context` resolves a span from, and, with `status_class: true`,
+    /// `http.response.status_class`. Place it between `json` and `trace_context`. Every
     /// canonical name is also accepted with each `.` spelled `-` (`url-path`,
     /// `http-request-header-x-forwarded-for`), for an emitter whose key grammar forbids dots
     /// (HAProxy's `%{+json}o`); the dotted spelling wins when both are present.
@@ -2428,6 +2429,15 @@ pub enum ComponentKind {
         /// address as `client.address`.
         #[serde(default)]
         forwarded: Option<ForwardedHeader>,
+        /// Whether to derive `http.response.status_class` from `http.response.status_code`:
+        /// `1xx`, `2xx`, `3xx`, `4xx`, or `5xx` for a status from 100 to 599, and `unknown` for
+        /// any other number, including the `0` that nginx's `000` becomes. Off by default,
+        /// because it adds one attribute to every event, and that widens a downstream
+        /// `aggregate`'s series key or a sink's tag set. Turn it on when you tag metrics by
+        /// status class. A status that is absent produces no class, and a class the producer
+        /// already sent is kept.
+        #[serde(default)]
+        status_class: bool,
     },
     /// Keeps a fraction of events, consistently. With `key:` set, the key's value is hashed
     /// (XXH64, seed 0, over a fixed canonical byte form; a frozen cross-version contract) and
@@ -5965,6 +5975,7 @@ mod tests {
                 max_length,
                 redact_query,
                 forwarded,
+                status_class,
             } => {
                 assert!(routes.is_empty());
                 assert_eq!(route_other, None);
@@ -5972,6 +5983,7 @@ mod tests {
                 assert!(max_length.is_empty());
                 assert!(redact_query.is_empty());
                 assert_eq!(forwarded, None);
+                assert!(!status_class);
             }
             other => panic!("expected HttpAccess, got {other:?}"),
         }
@@ -5992,7 +6004,8 @@ mod tests {
                 "user_agent_rules": [{"match": "MyMonitor/", "class": "tool"}],
                 "max_length": {"url.path": 512},
                 "redact_query": ["token"],
-                "forwarded": "x_forwarded_for"
+                "forwarded": "x_forwarded_for",
+                "status_class": true
             }"#,
         )
         .unwrap();
@@ -6004,6 +6017,7 @@ mod tests {
                 max_length,
                 redact_query,
                 forwarded,
+                status_class,
             } => {
                 assert_eq!(
                     routes,
@@ -6034,6 +6048,7 @@ mod tests {
                 assert_eq!(max_length.get("url.path"), Some(&512));
                 assert_eq!(redact_query, vec!["token".to_string()]);
                 assert_eq!(forwarded, Some(ForwardedHeader::XForwardedFor));
+                assert!(status_class);
             }
             other => panic!("expected HttpAccess, got {other:?}"),
         }
@@ -6085,6 +6100,7 @@ mod tests {
             max_length: std::collections::BTreeMap::from([("user.name".to_string(), 16)]),
             redact_query: vec![],
             forwarded: Some(ForwardedHeader::Forwarded),
+            status_class: true,
         };
         let json = serde_json::to_string(&kind).unwrap();
         let back: ComponentKind = serde_json::from_str(&json).unwrap();
