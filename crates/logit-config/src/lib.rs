@@ -4342,7 +4342,9 @@ pub struct BufferConfig {
     #[serde(with = "human_bytes")]
     #[schemars(with = "String")]
     pub max_bytes: u64,
-    /// What happens once both bounds are full. Defaults to `block`.
+    /// What happens once both bounds are full. Defaults to `block`. A full `block` sink stalls
+    /// every other sink fed from the same source, so `logit validate` warns when a source feeds
+    /// two or more sinks that use `block` and have no `disk:`.
     pub overflow: OverflowPolicy,
     /// What the sink does with a batch whose delivery outcome is unknown, such as a timeout or a
     /// `5xx`. Omitted, the sink resends it (`at_least_once`), except `statsd_out`, which drops it

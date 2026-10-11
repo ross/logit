@@ -161,6 +161,13 @@ components:
     temporality: cumulative
 
   # --- Backends ------------------------------------------------------------------------------
+  #
+  # The backends share inputs, so each one spools to disk. While a backend is down, its spool
+  # takes the backlog; with an in-memory buffer, a full one would stop the inputs every other
+  # backend reads from. Put /var/lib/logit on a persistent volume, writable by the user logit
+  # runs as, so a restart replays the backlog instead of losing it. The release image's `logit`
+  # user owns /var/lib/logit, and a named volume mounted there starts with that owner. logit
+  # exits if it can't create a spool.
 
   # Datadog reads `host.name` from each event's resource; on a per-host logit, stamp it with a
   # `set` ahead of the gates.
@@ -169,6 +176,9 @@ components:
     sources: [logs, delta_10s]
     api_key: !env DD_API_KEY
     # site: datadoghq.eu     # default datadoghq.com; use your organization's site
+    buffer: # a disk spool; see the note under "Backends"
+      disk:
+        path: /var/lib/logit/spool/datadog_out
 
   # `datadog_out` sends only spans a Datadog Agent has processed, so OTel spans go to Datadog's
   # OTLP intake instead. Use the same site as `datadog_out`: https://otlp.<site>.
@@ -179,6 +189,9 @@ components:
     endpoint: https://otlp.datadoghq.com
     headers:
       dd-api-key: !env DD_API_KEY
+    buffer: # a disk spool; see the note under "Backends"
+      disk:
+        path: /var/lib/logit/spool/datadog_traces_out
 
   # VictoriaMetrics' remote write: Prometheus remote write 1.0, compressed with zstd.
   victoria_out:
@@ -187,15 +200,24 @@ components:
     endpoint: http://victoriametrics:8428/api/v1/write
     version: 1
     compression: zstd
+    buffer: # a disk spool; see the note under "Backends"
+      disk:
+        path: /var/lib/logit/spool/victoria_out
 
   tempo_out:
     type: otlp_out
     sources: [traces]
     protocol: grpc
     endpoint: tempo:4317
+    buffer: # a disk spool; see the note under "Backends"
+      disk:
+        path: /var/lib/logit/spool/tempo_out
 
   loki_out:
     type: otlp_out
     sources: [logs]
     protocol: http
     endpoint: http://loki:3100/otlp
+    buffer: # a disk spool; see the note under "Backends"
+      disk:
+        path: /var/lib/logit/spool/loki_out

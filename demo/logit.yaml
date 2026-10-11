@@ -518,6 +518,11 @@ components:
     sources: [logs_only]
     protocol: http
     endpoint: http://loki:3100/otlp
+    # Loki, Tempo, and VictoriaMetrics share sources, so each gets a disk spool: while one is
+    # down, its spool absorbs the backlog instead of stopping the sources the others read from.
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/loki_out
 
   # `self` emits points, spans, *and* logs (docs/plans/operator-surface.md) through one
   # component, and `keep_signals: [logs]` lets `logit`'s own self-diagnostics reach Loki without
@@ -681,6 +686,10 @@ components:
     endpoint: http://victoriametrics:8428/api/v1/write
     version: 1
     compression: zstd
+    # A disk spool, like `loki_out`'s, so a VictoriaMetrics outage never stalls the other sinks.
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/victoria_out
 
   # `self` carries *all* of `logit`'s own telemetry, not just spans: every drain also carries this
   # process's `logit.*` metrics (Counter/Gauge/Distribution). It never mixes the two *on one
@@ -728,3 +737,7 @@ components:
     sources: [trace_only]
     protocol: grpc
     endpoint: tempo:4317
+    # A disk spool, like `loki_out`'s, so a Tempo outage never stalls the other sinks.
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/tempo_out

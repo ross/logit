@@ -117,7 +117,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 
 | Kind | What it does | Decision record |
 |---|---|---|
-| `lua`, `lua_file` | a user script, inline or from a `.lua` file path relative to the config file; an optional `interval` runs its `flush()` | [ADR `lua-flush-root-context`](docs/adr/lua-flush-root-context.md), [ADR `lua-event-constructor`](docs/adr/lua-event-constructor.md) |
+| `lua`, `lua_file` | a user script, inline or from a `.lua` file path relative to the config file; an optional `interval` runs its `flush()`, and a `random` global mints trace ids, UUIDs, and ULIDs | [ADR `lua-flush-root-context`](docs/adr/lua-flush-root-context.md), [ADR `lua-event-constructor`](docs/adr/lua-event-constructor.md), [ADR `lua-random-ids`](docs/adr/lua-random-ids.md) |
 | `aggregate` | windowed aggregation into mergeable metric kinds | [ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) |
 | `json` | parses JSON into attributes | [ADR `json-parsing-into-attributes`](docs/adr/json-parsing-into-attributes.md) |
 | `csv` | delimiter-separated columns into attributes from a config-declared, positional schema; no header-row mode | [ADR `csv-positional-columns`](docs/adr/csv-positional-columns.md) |
