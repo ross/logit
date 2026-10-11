@@ -616,8 +616,9 @@ own consumers. `internal`'s **pipeline** is every node reachable from it. The pi
     never reaches stage two.
 16. **The CLI logs what is left.** After every node has exited, it drains the registry once more and
     writes each leftover metric point to the self-log as one structured line,
-    `telemetry left undrained at exit`, with the fields `component`, `metric`, `tags`, and `value`.
-    The level is `warn` for a nonzero `*.dropped` metric and `info` otherwise. It does this on exit
+    `telemetry left undrained at exit`, with the fields `component`, `metric`, `tags`, and `value`,
+    or `count` and `sum` for a timing. The level is `warn` for a nonzero `*.dropped` metric and
+    `info` otherwise. It does this on exit
     0 and exit 2 alike. That covers a mixed pipeline's residual and the final drain's own counts.
     Spans and captured logs aren't repeated, because the logs already went to stderr.
 

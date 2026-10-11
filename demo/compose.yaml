@@ -34,10 +34,10 @@ x-postgres-env: &postgres-env
   POSTGRES_PASSWORD: demo-postgres-password
 
 services:
-  # Metrics backend. `logit`'s `victoria_out` (`prometheus_out`) remote-writes into
-  # `/api/v1/write`, and Grafana queries it as a Prometheus datasource. Single-node, no auth, no
-  # bootstrap step. The image tag is the one `script/victoria-interop` verifies
-  # (tools/victoria-interop/compose.yaml). `:8428` is published for the built-in UI at `/vmui`.
+  # Metrics backend. `logit`'s `victoria_out` and `self_victoria_out` (`prometheus_out`)
+  # remote-write into `/api/v1/write`, and Grafana queries it as a Prometheus datasource.
+  # Single-node, no auth, no bootstrap step. The image tag is the one `script/victoria-interop`
+  # verifies (tools/victoria-interop/compose.yaml). `:8428` is published for the built-in UI at `/vmui`.
   victoriametrics:
     image: docker.io/victoriametrics/victoria-metrics:v1.152.0
     command:
@@ -134,8 +134,8 @@ services:
       - grafana_data:/var/lib/grafana
     networks: [demo]
 
-  # Log backend. `logit`'s `loki_out` is the only path in: logs arrive over OTLP/HTTP with no relay
-  # service in between (demo/logit.yaml, docs/plans/otlp-logs-and-resource-identity.md). Not
+  # Log backend. `logit`'s `loki_out` and `self_loki_out` are the only paths in: logs arrive over
+  # OTLP/HTTP with no relay service in between (demo/logit.yaml, docs/plans/otlp-logs-and-resource-identity.md). Not
   # published on the host; Grafana queries it over the `demo` network.
   loki:
     image: docker.io/grafana/loki:3.7.7
@@ -156,8 +156,8 @@ services:
       - loki_data:/loki
     networks: [demo]
 
-  # Trace backend. It receives `logit`'s spans over OTLP/gRPC from `tempo_out` (demo/logit.yaml)
-  # and `app`'s/`worker`'s own spans over OTLP/HTTP (demo/tempo/tempo.yaml). Grafana provisions it
+  # Trace backend. It receives `logit`'s spans over OTLP/gRPC from `tempo_out` and
+  # `self_tempo_out` (demo/logit.yaml) and `app`'s/`worker`'s own spans over OTLP/HTTP (demo/tempo/tempo.yaml). Grafana provisions it
   # with `tracesToLogsV2` pointed at Loki
   # (demo/grafana/provisioning/datasources/datasources.yaml). Only the OTLP ports are published;
   # the query API (:3200) is reached through Grafana.
@@ -193,9 +193,9 @@ services:
       loki:
         condition: service_healthy
       # `service_started`, not `service_healthy`, because `tempo` declares no healthcheck. That's
-      # enough: `tempo_out` retries through `write_loop` like any other sink, holding a batch
-      # until it's delivered (ADR `sink-fault-classes`), so a `logit` that starts before Tempo
-      # finishes booting retries its first few span exports rather than failing.
+      # enough: `tempo_out` and `self_tempo_out` retry through `write_loop` like any other sink,
+      # holding a batch until it's delivered (ADR `sink-fault-classes`), so a `logit` that starts
+      # before Tempo finishes booting retries its first few span exports rather than failing.
       tempo:
         condition: service_started
       # `service_started`, for the same reason: `postgres_in` (demo/logit.yaml) is a `tail_in` glob

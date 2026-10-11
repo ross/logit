@@ -1255,7 +1255,7 @@
           "additionalProperties": false
         },
         {
-          "description": "`logit` observing itself: drains every component's buffered self-telemetry on `interval` and emits it as ordinary events into the graph. At most one per config.",
+          "description": "`logit` observing itself: drains every component's buffered self-telemetry on `interval` and emits it as ordinary events into the graph. At most one per config.\n\nGive `internal` its own transforms and sinks, with none shared with a data path. At shutdown, `internal` then drains once more after every data component has stopped, so the drops counted while shutting down are exported. A sink shared with data shuts down with the data, and those counts are lost. Pointing a second sink at the same backend works.",
           "type": "object",
           "required": [
             "interval",
