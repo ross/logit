@@ -10,7 +10,8 @@
 #
 #   sudo COMPOSE_PROJECT_NAME=logit docker compose up -d kafka
 #   printf '{"user":"ann","msg":"hello"}\n{"msg":"no user"}\n' | nc -q1 127.0.0.1 5170
-#   docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+#   sudo COMPOSE_PROJECT_NAME=logit docker compose exec kafka \
+#     /opt/kafka/bin/kafka-console-consumer.sh \
 #     --bootstrap-server kafka:9092 --topic logs --from-beginning \
 #     --property print.key=true --property print.headers=true --property print.partition=true
 #
