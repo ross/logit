@@ -42,6 +42,19 @@ docker run --rm \
   ghcr.io/ross/logit:latest run /config.yaml
 ```
 
+The image runs as a non-root `logit` user, and `/var/lib/logit` is the directory it owns for
+state such as a `buffer.disk` spool or a `tail_in` checkpoint. A path the user can't write makes a
+spool fail to open, and `logit run` exits `2`. To keep that state across restarts, mount a named
+volume at `/var/lib/logit`: Docker gives a new named volume the directory's owner. A bind mount
+keeps the host directory's owner instead, so make it writable by the image's `logit` user.
+
+```sh
+docker run --rm \
+  -v /path/to/config.yaml:/config.yaml:ro \
+  -v logit_state:/var/lib/logit \
+  ghcr.io/ross/logit:latest run /config.yaml
+```
+
 Put secrets and deployment-specific values (a token, a URL, a bind address) in the environment and
 reference them with `!env VAR_NAME` in the config instead of inlining them. Any field on any
 component accepts `!env`, not only `influxdb_out`'s `token`; see
@@ -63,6 +76,10 @@ docker run --rm \
 `validate` runs the same resolution and validation path as `run` (`graph::resolve`, invoked from
 `validate_semantics` in `crates/logit-cli/src/pipeline.rs`), so a config that validates can't fail
 that stage at `run`.
+
+If a config is valid but likely to misbehave, `validate` prints each finding to stderr as
+`warning: ...` before `<path> is valid`. Warnings don't change the exit code, which stays 0.
+`run` logs the same warnings at startup.
 
 **An unknown key is an error.** A misspelled or removed key, on a component or in any of its
 blocks, fails `validate` with the component's id and the key, such as
@@ -745,12 +762,23 @@ buffering:
 ### A slow or unreachable sink
 
 Under the default `overflow: block`, a sink whose buffer fills parks every branch that shares its
-upstream, including branches bound for healthy sinks. To keep one sink from stalling the others:
+upstream, including branches bound for healthy sinks. So give each source at most one sink that
+uses `overflow: block` with an in-memory buffer. That sink is the primary: when it stalls, intake
+backs up behind it by design. Give every other sink the source reaches one of these:
 
-- If the data matters and you need to ride out an outage, set `buffer.disk`. The stall waits until
-  the spool is full.
-- If the sink is best-effort, set `buffer.overflow: drop_newest` or `drop_oldest`. The sink keeps
-  draining and counts what it drops.
+- If the data matters and you need to ride out an outage, set `buffer.disk`. The spool absorbs the
+  stall until it reaches `disk.max_bytes`. Under `block`, a full spool then backs up like a full
+  in-memory buffer. The other policies behave differently on a spool; see
+  [Durable buffering](#durable-buffering).
+- If the sink is best-effort, such as a stdout display or a backend under evaluation, set
+  `buffer.overflow: drop_oldest` or `drop_newest`. The sink keeps draining and counts what it
+  drops.
+
+`logit validate` and `logit run` warn when a listener reaches two or more sinks that use
+`overflow: block` with no `buffer.disk`, naming the listener and the sinks. It's a warning, not an
+error, and there's no setting to silence it. A `buffer.disk` sink doesn't count, and neither do
+`null_out` and a `prometheus_out` serving an exposition endpoint (`bind:`), whose sends never
+fail.
 
 To find the branch that is blocking, read these on the consumer, not the producer:
 `logit.component.inbox.full` (a send found the inbox full),

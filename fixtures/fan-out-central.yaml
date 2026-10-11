@@ -8,7 +8,9 @@
 #   [the wire] --> central_in --> split (route) --> app_stream  (target) -----------------------> app_out
 #                                            \--> (unrouted: split's own consumers) --------------> untagged_out
 #
-# `stdio_out` stands in for a real sink so the example runs with no external service.
+# `stdio_out` stands in for a real sink so the example runs with no external service. Each
+# stand-in uses `overflow: drop_oldest`, so one stalled stream can't park `central_in` for the
+# other two; give a real sink in its place a `buffer.disk` spool instead.
 components:
   central_in:
     type: logit_in
@@ -50,11 +52,15 @@ components:
     type: stdio_out
     sources: [windowed]
     target: stdout
+    buffer:
+      overflow: drop_oldest
 
   app_out:
     type: stdio_out
     sources: [app_stream]
     target: stdout
+    buffer:
+      overflow: drop_oldest
 
   # The else branch: everything `stream: host`/`stream: app` didn't claim, including an absent
   # `stream`. A router's own `sources:` edge is where its unrouted events go. With no consumer here
@@ -63,3 +69,5 @@ components:
     type: stdio_out
     sources: [split]
     target: stderr
+    buffer:
+      overflow: drop_oldest

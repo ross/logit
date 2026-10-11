@@ -277,6 +277,7 @@ mod tests {
         configs.sort();
 
         assert!(configs.len() > 1, "expected demo and fixture configs");
+        let mut warned = Vec::new();
         for path in configs {
             let config = load_with(&path, &|name| match name {
                 "INFLUXDB_TOKEN" => Some("logit-test-token".to_string()),
@@ -300,9 +301,15 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|err| panic!("{} did not load: {err:#}", path.display()));
-            crate::pipeline::validate_semantics(config)
+            let warnings = crate::pipeline::validate_semantics(config)
                 .unwrap_or_else(|err| panic!("{} did not validate: {err:#}", path.display()));
+            if !warnings.is_empty() {
+                warned.push(format!("{}: {}", path.display(), warnings.join("; ")));
+            }
         }
+        // Operators copy shipped configs, so each one follows every practice `resolve` warns
+        // about.
+        assert!(warned.is_empty(), "shipped configs with warnings:\n{}", warned.join("\n"));
     }
 
     /// A `lookup` backed by a plain map, so tests never touch the real process environment.

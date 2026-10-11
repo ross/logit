@@ -221,7 +221,8 @@
 //!     `/ack`, `/health`, `/health/1.0`) rather than the `/services/collector` base, an empty
 //!     `token` or one with leading or trailing whitespace, `timeout: 0s`, an `ack_timeout` without
 //!     `ack: true` or of `0s`, a `max_body_bytes` of `0`, or a `tls` failing rule 24's checks
-//!     (`docs/adr/splunk-hec-relay.md`).
+//!     (`docs/adr/splunk-hec-relay.md`). A `max_body_bytes` above Splunk Cloud's body cap isn't
+//!     an error: it adds a non-fatal entry to [`Graph::warnings`].
 //! 71. A `lua`/`lua_file` `max_memory` of `0`: an empty Lua VM already holds more than that
 //!     (`docs/adr/lua-runaway-script-bounds.md`).
 //! 72. A `stdio_out`/`file_out` `message:` other than `escaped` outside `format: human`, where it
@@ -266,6 +267,13 @@
 //!     range the ranges before it already cover, which can never match: a bound below the
 //!     previous one, or equal to it unless `lt: X` is followed by `le: X`
 //!     (`docs/adr/bucket-transform.md`).
+//! 83. Not a rejection: a listener that reaches two or more sinks using `buffer.overflow: block`
+//!     with no `buffer.disk` adds a non-fatal entry to [`Graph::warnings`], one per distinct sink
+//!     set, because a stall in one of those sinks parks the others. The walk follows `consumers`
+//!     and router `targets`. A `buffer.disk` sink is exempt, since its spool absorbs a stall
+//!     until `disk.max_bytes`, and so are `null_out` and an exposition-mode (`bind:`)
+//!     `prometheus_out`, whose sends never fail ([`blocking_sink_warnings`],
+//!     `docs/adr/delivery-semantics.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -277,14 +285,14 @@ use logit_config::{
     default_handshake_timeout, default_max_connections, default_prometheus_scrape_interval,
     default_prometheus_scrape_timeout, default_prometheus_write_path, BufferConfig, Component,
     ComponentKind, Compression, Config, GraphiteProtocol, GraphiteTransport, LinesTransport,
-    MessageMode, MetadataCacheConfig, ReceiveConfig, StatsdTransport, StreamFormat,
+    MessageMode, MetadataCacheConfig, OverflowPolicy, ReceiveConfig, StatsdTransport, StreamFormat,
     SyslogTransport, TimestampFormat, TraceIdFormat, MAX_READ_BATCH,
 };
 use logit_core::redact;
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP;
 use logit_proto::MAX_UDP_PAYLOAD_BYTES;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 /// Rule 75's upper bound: `logit_in`'s `RECEIVER_MAX_WINDOW`, mirrored by hand since this crate
@@ -620,6 +628,10 @@ pub struct Graph {
     /// Listener-first order, a byproduct of rule 5's cycle check. Only tests read it: the node
     /// runtime creates every inbox up front, and `logit graph` renders from the raw `Config`.
     pub topological_order: Vec<String>,
+    /// Non-fatal findings for the operator. `resolve` doesn't log them, because it runs before
+    /// the telemetry layer is active and under `logit validate`, which installs no subscriber;
+    /// each caller prints or logs them.
+    pub warnings: Vec<String>,
 }
 
 /// Non-gRPC header names `otlp_out`'s HTTP transport sets itself, or that HTTP/1.1 connection
@@ -716,6 +728,7 @@ fn is_absolute_http_url(url: &str) -> bool {
 
 pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     let Config { components, admin, .. } = config;
+    let mut warnings = Vec::new();
 
     // Rule 1: at least one component.
     if components.is_empty() {
@@ -3484,7 +3497,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             );
         }
         if let Some(warning) = splunk_cloud_body_cap_warning(id, *max_body_bytes) {
-            tracing::warn!("{warning}");
+            warnings.push(warning);
         }
         if tls.cert_file.is_some() != tls.key_file.is_some() {
             anyhow::bail!(
@@ -3926,7 +3939,69 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         );
     }
 
-    Ok(Graph { components: resolved, topological_order })
+    // Rule 83
+    warnings.extend(blocking_sink_warnings(&resolved));
+
+    Ok(Graph { components: resolved, topological_order, warnings })
+}
+
+/// Rule 83: one warning per distinct set of two or more memory-only `block` sinks that one or
+/// more listeners reach. A full sink parks the fan-out that feeds it, so every sink sharing that
+/// listener stalls with it. Listeners and sinks are sorted, so the text is deterministic.
+fn blocking_sink_warnings(components: &HashMap<String, ResolvedComponent>) -> Vec<String> {
+    let mut by_sinks: BTreeMap<Vec<&str>, Vec<&str>> = BTreeMap::new();
+    for (id, component) in components {
+        if component.role() != Role::Listener {
+            continue;
+        }
+        let mut seen: HashSet<&str> = HashSet::from([id.as_str()]);
+        let mut queue: VecDeque<&str> = VecDeque::from([id.as_str()]);
+        let mut sinks: BTreeSet<&str> = BTreeSet::new();
+        while let Some(current) = queue.pop_front() {
+            let Some(node) = components.get(current) else { continue };
+            // `null_out` and an exposition-mode `prometheus_out` never fail a send, so they never
+            // fill.
+            let never_fails = matches!(
+                node.kind,
+                ComponentKind::NullOut { .. } | ComponentKind::PrometheusOut { bind: Some(_), .. }
+            );
+            if node.role() == Role::Sink
+                && !never_fails
+                && node.buffer.overflow == OverflowPolicy::Block
+                && node.buffer.disk.is_none()
+            {
+                sinks.insert(current);
+            }
+            for next in node.consumers.iter().chain(&node.targets) {
+                if seen.insert(next.as_str()) {
+                    queue.push_back(next.as_str());
+                }
+            }
+        }
+        if sinks.len() >= 2 {
+            by_sinks.entry(sinks.into_iter().collect()).or_default().push(id.as_str());
+        }
+    }
+    by_sinks
+        .into_iter()
+        .map(|(sinks, mut listeners)| {
+            listeners.sort_unstable();
+            let quote = |ids: &[&str]| {
+                ids.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ")
+            };
+            let subject = if listeners.len() == 1 {
+                format!("listener {} feeds", quote(&listeners))
+            } else {
+                format!("listeners {} each feed", quote(&listeners))
+            };
+            format!(
+                "{subject} sinks {}, which use buffer.overflow: block with no buffer.disk -- a \
+                 stall in one parks the others; give the ones that matter a buffer.disk and set \
+                 overflow: drop_oldest on the best-effort ones",
+                quote(&sinks)
+            )
+        })
+        .collect()
 }
 
 /// Rules 17/18/57's datagram predicate: the kinds the datagram listener driver backs
@@ -6886,8 +6961,156 @@ mod tests {
                 *max_body_bytes = 800 * 1024 * 1024;
             }
         });
-        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+        let graph = resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
             .expect("a body cap above Splunk Cloud's is valid for Splunk Enterprise");
+        assert_eq!(graph.warnings.len(), 1, "got: {:?}", graph.warnings);
+        assert!(graph.warnings[0].contains("component 'out'"), "{:?}", graph.warnings);
+        let ok = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], splunk_hec_out("https://splunk:8088/services/collector")),
+        ]))
+        .expect("a default config resolves");
+        assert!(ok.warnings.is_empty(), "got: {:?}", ok.warnings);
+    }
+
+    fn drop_oldest() -> BufferConfig {
+        BufferConfig { overflow: OverflowPolicy::DropOldest, ..BufferConfig::default() }
+    }
+
+    fn on_disk(path: &str) -> BufferConfig {
+        BufferConfig {
+            disk: Some(logit_config::DiskBufferConfig {
+                path: path.to_string(),
+                max_bytes: 1024 * 1024 * 1024,
+                segment_bytes: 64 * 1024 * 1024,
+                compression: Compression::None,
+                checkpoint_interval: Duration::from_secs(1),
+            }),
+            ..BufferConfig::default()
+        }
+    }
+
+    fn resolve_warnings(config: Config) -> Vec<String> {
+        match resolve(config) {
+            Ok(graph) => graph.warnings,
+            Err(err) => panic!("should resolve: {err}"),
+        }
+    }
+
+    /// Rule 83: two memory-only `block` sinks behind one listener warn, naming both.
+    #[test]
+    fn a_listener_feeding_two_blocking_sinks_warns() {
+        let warnings = resolve_warnings(cfg(vec![
+            ("in", vec![], listener()),
+            ("a", vec!["in"], sink()),
+            ("b", vec!["in"], sink()),
+        ]));
+        assert_eq!(
+            warnings,
+            vec!["listener 'in' feeds sinks 'a', 'b', which use buffer.overflow: block with no \
+                 buffer.disk -- a stall in one parks the others; give the ones that matter a \
+                 buffer.disk and set overflow: drop_oldest on the best-effort ones"
+                .to_string()]
+        );
+    }
+
+    /// Rule 83: a `drop_oldest` sink, a `buffer.disk` sink, a `null_out`, and an exposition-mode
+    /// `prometheus_out` never stall their siblings, so none of them counts toward the two. A
+    /// remote-write `prometheus_out` can fail a send, so it counts.
+    #[test]
+    fn a_sink_that_never_stalls_beside_a_blocking_one_doesnt_warn() {
+        let default = BufferConfig::default;
+        let warned: Vec<(&str, Vec<String>)> = [
+            ("drop_oldest", sink(), drop_oldest()),
+            ("disk", sink(), on_disk("/tmp/spool/b")),
+            ("null_out", null_out(), default()),
+            ("prometheus_out exposition", prometheus_out("/metrics", 100_000), default()),
+        ]
+        .into_iter()
+        .map(|(name, other, buffer)| {
+            let warnings = resolve_warnings(cfg_with_buffer(vec![
+                ("in", vec![], listener(), default()),
+                ("a", vec!["in"], sink(), default()),
+                ("b", vec!["in"], other, buffer),
+            ]));
+            (name, warnings)
+        })
+        .filter(|(_, warnings)| !warnings.is_empty())
+        .collect();
+        assert!(warned.is_empty(), "{warned:?}");
+        let remote_write = resolve_warnings(cfg(vec![
+            ("in", vec![], listener()),
+            ("a", vec!["in"], sink()),
+            ("b", vec!["in"], prometheus_remote_write("http://victoria:8428/api/v1/write")),
+        ]));
+        assert_eq!(remote_write.len(), 1, "{remote_write:?}");
+    }
+
+    /// Rule 83: a sink reached through a `route` and its `target` counts.
+    #[test]
+    fn a_blocking_sink_behind_a_route_target_counts() {
+        let warnings = resolve_warnings(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec![], route(by_attribute("stream"), &[("host", "t")])),
+            ("t", vec![], vec![], target()),
+            ("routed", vec!["t"], vec![], sink()),
+            ("direct", vec!["in"], vec![], sink()),
+        ]));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("sinks 'direct', 'routed',"), "{warnings:?}");
+    }
+
+    /// Rule 83: a sink reached through a `lua` component's `targets:` edge counts.
+    #[test]
+    fn a_blocking_sink_behind_a_lua_target_counts() {
+        let warnings = resolve_warnings(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("routed", vec!["t"], vec![], sink()),
+            ("direct", vec!["r"], vec![], sink()),
+        ]));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("sinks 'direct', 'routed',"), "{warnings:?}");
+    }
+
+    /// Rule 83: branches that reconverge on one sink count it once, so one sink alone doesn't
+    /// warn.
+    #[test]
+    fn reconverging_branches_count_a_sink_once() {
+        let warnings = resolve_warnings(cfg(vec![
+            ("in", vec![], listener()),
+            ("k1", vec!["in"], keep(vec!["a"])),
+            ("k2", vec!["in"], keep(vec!["b"])),
+            ("out", vec!["k1", "k2"], sink()),
+        ]));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Rule 83: listeners with the same sink set share one warning naming each; a listener with
+    /// another set gets its own. The text is the same on every run.
+    #[test]
+    fn listeners_sharing_a_sink_set_get_one_warning_in_a_stable_order() {
+        let config = || {
+            cfg(vec![
+                ("in_z", vec![], listener()),
+                ("in_a", vec![], listener()),
+                ("in_m", vec![], listener()),
+                ("y", vec!["in_z", "in_a"], sink()),
+                ("x", vec!["in_a", "in_z", "in_m"], sink()),
+                ("w", vec!["in_m"], sink()),
+            ])
+        };
+        let warnings = resolve_warnings(config());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].starts_with("listener 'in_m' feeds sinks 'w', 'x',"), "{warnings:?}");
+        assert!(
+            warnings[1].starts_with("listeners 'in_a', 'in_z' each feed sinks 'x', 'y',"),
+            "{warnings:?}"
+        );
+        for _ in 0..8 {
+            assert_eq!(resolve_warnings(config()), warnings);
+        }
     }
 
     /// Rule 70: rule 24's `tls` checks, including a block under `http://`.
