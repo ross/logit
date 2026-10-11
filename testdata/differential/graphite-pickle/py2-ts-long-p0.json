@@ -1,0 +1,63 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "py2.long",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py2-ts-long-p0",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "py2.long",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "A long timestamp: LONG, with its trailing L.",
+ "exercises": [
+  "LONG"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "FLOAT",
+  "LIST",
+  "LONG",
+  "MARK",
+  "PUT",
+  "STOP",
+  "STRING",
+  "TUPLE"
+ ],
+ "producer": "python2",
+ "protocol": 0
+}

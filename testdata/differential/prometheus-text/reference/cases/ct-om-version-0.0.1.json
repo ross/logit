@@ -1,0 +1,23 @@
+{
+ "content_type": "application/openmetrics-text; version=0.0.1; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "g",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x86ec5e3f",
+  "len": 25,
+  "path": "differential/prometheus-text/cases/ct-om-version-0.0.1.om"
+ },
+ "parser": "openmetrics"
+}

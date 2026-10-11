@@ -1,0 +1,26 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "v",
+     "ok"
+    ]
+   ],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": {
+  "after_entry": 1,
+  "message": "strconv.ParseFloat: parsing \"1e309\": value out of range while parsing: \"g{v=\\\"over\\\"} 1e309\""
+ },
+ "input": {
+  "crc32c": "0x618b6374",
+  "len": 51,
+  "path": "differential/prometheus-text/cases/value-overflow-om.om"
+ },
+ "parser": "openmetrics"
+}

@@ -74,8 +74,8 @@ buffer ends up as a zero-copy slice of that buffer, not a fresh allocation. `Byt
 `syslog_in`, `json`, and `statsd_in` each decode a line with one allocation, however many fields,
 tag values, or set members it yields. `statsd_in` takes two, a per-line and a per-batch
 `Vec<Event>`, because of its multi-value grammar. `statsd_in`'s tag values, `|c:<id>`, and a
-`SetMembers` line's members are zero-copy slices of the datagram, reconstructed by the same pointer
-arithmetic (`slice_of`) as `syslog_in`'s fields. Tests pin these counts; see
+`SetMembers` line's members are zero-copy slices of the datagram, reconstructed by the same
+range-checked helper (`logit_core::subslice::share`) as `syslog_in`'s fields. Tests pin these counts; see
 [memory.md](memory.md)'s zero-copy section.
 
 ## Attributes: interned keys, small-map storage
@@ -236,7 +236,8 @@ The wire carries no data-source names, so records are named as follows:
 | not in the configured files, or no `types_db:` configured at all | index naming, no diagnostic: a type missing from `types.db` is routine |
 
 Index naming is `<plugin>.<type>` for a single-source list and `<plugin>.<type>.<i>` (0-based)
-otherwise.
+otherwise. Every name carries at most the first 127 bytes of `<plugin>` and of `<type>`, the
+longest collectd's own receiver takes; the `collectd.*` attributes keep every byte.
 
 **A protocol-namespaced attribute is not the default for a new codec.** A codec adds one only when
 the wire says something the model would otherwise throw away or reinterpret. The Graphite/Carbon

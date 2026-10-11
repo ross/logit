@@ -91,12 +91,23 @@ pub enum ComponentKind {
     KeepSignals { signals: Vec<Signal> },
     // A denylist: clears the listed signals' payloads, keeping the rest.
     DropSignals { signals: Vec<Signal> },
-    // Forwards an event whose resource/attributes match every configured pair -- config is
-    // `Set`'s, field for field; never mutates (docs/adr/attribute-filtering-components.md).
-    HasAttributes { resource: BTreeMap<String, SetValue>, attributes: BTreeMap<String, SetValue> },
-    // Drops an event matching every configured pair -- has_attributes' exact complement on the
-    // identical config, taken at the top level (an event matching some-but-not-all pairs forwards).
-    DropAttributes { resource: BTreeMap<String, SetValue>, attributes: BTreeMap<String, SetValue> },
+    // Forwards an event whose resource/attributes match every configured pair and carry every
+    // listed key -- the maps are `Set`'s, field for field; never mutates (docs/adr/attribute-filtering-components.md).
+    HasAttributes {
+        resource: BTreeMap<String, SetValue>,
+        attributes: BTreeMap<String, SetValue>,
+        resource_present: Vec<String>,
+        attributes_present: Vec<String>,
+    },
+    // Drops an event matching every configured pair and carrying every listed key --
+    // has_attributes' exact complement on the identical config, taken at the top level (an event
+    // matching some-but-not-all of it forwards).
+    DropAttributes {
+        resource: BTreeMap<String, SetValue>,
+        attributes: BTreeMap<String, SetValue>,
+        resource_present: Vec<String>,
+        attributes_present: Vec<String>,
+    },
     // Forwards an event whose batch's origin/previous match every configured field -- each field
     // is a list of alternatives (OR'd within the field), the two fields AND together; never
     // mutates (docs/adr/provenance-filtering-components.md).
@@ -168,8 +179,8 @@ collide, so the rule stays predictable when a protocol gains its second side lat
 `syslog_out` (RFC 3164/5424 over UDP or TCP, `docs/adr/syslog-output.md`) did after `SyslogIn`.
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
-`has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`,
-`kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`, and any future
+`has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `bucket`,
+`logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`, and any future
 native transform — take no suffix, because a transform has only one direction.
 
 **`interval` is a per-kind field.** `lua`/`lua_file` carry an optional flush interval
@@ -214,7 +225,7 @@ literal argument string.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `timestamp`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -317,8 +328,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 34. An inconsistent `logit_out` `tls:`, or a `logit_in` `max_frame_bytes` of `0` or above 64 MiB.
 35. A `buffer.disk:` beside a non-default in-memory bound, a bad disk bound, or a shared
     `disk.path`.
-36. A `has_attributes`/`drop_attributes` with nothing configured, an empty key, or a non-finite
-    value.
+36. A `has_attributes`/`drop_attributes` with nothing configured, an empty key, a non-finite
+    value, or a presence key repeated or also named in the same side's map.
 37. A `has_provenance`/`drop_provenance` with nothing configured, or an empty or repeated entry.
     An id isn't checked against this graph: it may name a component in another process.
 38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`, a value above 65507
@@ -401,6 +412,13 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `datadog_trace_in` without `bind`.
 81. An `admin.socket_mode` without `admin.socket`, an empty `admin.bind` or `admin.socket`, or an
     `admin.bind` that is a path.
+82. A `bucket` with no `attributes`; an empty field name, `into`, `ranges`, `value`, or `other`; an
+    `into` naming another configured source or shared by two fields; a range with both `lt` and
+    `le`; a boundless range that isn't last; a non-finite bound; or a range that can never match
+    (a bound below the previous one, or equal to it unless `lt: X` is followed by `le: X`).
+83. Not a rejection: a listener that reaches two or more sinks using `buffer.overflow: block` with
+    no `buffer.disk` gets a warning, since a stall in one parks the others. `null_out`, an
+    exposition-mode `prometheus_out`, and `buffer.disk` sinks don't count.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
@@ -721,7 +739,8 @@ topology, not a rare one, with these consequences:
   destination can head-of-line-block telemetry bound for an unrelated, healthy one. A sink isolates
   itself: `buffer.overflow: drop_newest | drop_oldest` keeps its inbox draining and counts what it
   drops, and `buffer.disk` defers the stall until the spool is full. The default `overflow: block`
-  keeps `tail_in`, TCP listeners, and the native hop lossless, because the sender waits. With every
+  keeps `tail_in`, TCP listeners, and the native hop lossless, because the sender waits. Rule 83
+  warns when one listener reaches two or more memory-only `block` sinks. With every
   sink set to drop, a transform, Lua node, or router backs up only when it is itself the
   bottleneck, which is a capacity matter. To find which branch is blocking, read
   `logit.component.inbox.full`, `inbox.blocked.duration`, and `inbox.batches` on the consumers
@@ -825,6 +844,10 @@ logit-core   logit-config   logit-script
            \            |            /
                     logit-cli                        — CLI + the kind → impl registry
 ```
+
+Pure parsers of producer bytes, wire protocols and log-message text alike, belong in `logit-proto`
+below the impl crates, and a listener or transform wraps one
+([ADR `parsers-live-in-logit-proto`](../adr/parsers-live-in-logit-proto.md)).
 
 Not drawn above: `logit-transforms` also depends on `logit-config` directly, for `route`'s
 `RouteBy` type (`docs/adr/target-components.md`). An impl crate reading a config type it needs is

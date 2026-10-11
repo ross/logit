@@ -1,0 +1,5 @@
+# TYPE rpc_seconds summary
+rpc_seconds{quantile="0.5"} 0.2
+rpc_seconds{quantile="0.99"} 0.9
+rpc_seconds_sum 12.5
+rpc_seconds_count 100

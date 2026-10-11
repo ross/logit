@@ -55,14 +55,21 @@ components:
     format: datadog
 
   # Writes the lifted reference as `trace_id`/`span_id` in hex, which Datadog's log intake
-  # correlates on.
+  # correlates on. Both sinks share `app_in`, so each spools to disk: one destination that's down
+  # fills its own spool instead of stopping the tail for the other.
   datadog:
     type: datadog_out
     sources: [dd_trace]
     api_key: !env DD_API_KEY
+    buffer:
+      disk:
+        path: /tmp/logit-spool/datadog-logs-correlation/datadog
 
   # Carries the lifted ids as OTLP's native LogRecord trace_id/span_id.
   otlp:
     type: otlp_out
     sources: [dd_trace]
     endpoint: http://otel-collector:4318
+    buffer:
+      disk:
+        path: /tmp/logit-spool/datadog-logs-correlation/otlp

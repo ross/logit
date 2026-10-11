@@ -1,0 +1,4 @@
+# TYPE c counter
+c_total 1
+c_sum 2
+# EOF

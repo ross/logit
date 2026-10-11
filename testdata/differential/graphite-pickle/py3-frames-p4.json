@@ -1,0 +1,74 @@
+{
+ "carbon": {
+  "items": 34000,
+  "outcome": "ok",
+  "received": [
+   {
+    "of": [
+     "frame.shared",
+     {
+      "f64": "0x41d954fc40000000",
+      "repr": "1700000000.0"
+     },
+     {
+      "f64": "0x3ff0000000000000",
+      "repr": "1.0"
+     },
+     "store"
+    ],
+    "repeat": 34000
+   }
+  ]
+ },
+ "case": "py3-frames-p4",
+ "cpython": {
+  "list": [
+   {
+    "of": {
+     "tuple": [
+      "frame.shared",
+      {
+       "tuple": [
+        {
+         "int": "1700000000"
+        },
+        {
+         "f64": "0x3ff0000000000000",
+         "repr": "1.0"
+        }
+       ]
+      }
+     ]
+    },
+    "repeat": 34000
+   }
+  ]
+ },
+ "description": "One datapoint object 34,000 times: about 68 KB, so the pickler writes two FRAMEs.",
+ "exercises": [
+  "FRAME",
+  "BINGET",
+  "APPENDS"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPENDS",
+  "BINFLOAT",
+  "BINGET",
+  "BININT",
+  "EMPTY_LIST",
+  "FRAME",
+  "MARK",
+  "MEMOIZE",
+  "PROTO",
+  "SHORT_BINUNICODE",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 4
+}

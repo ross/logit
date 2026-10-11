@@ -12,8 +12,9 @@
 #
 # Clients keep the token they send Splunk: this listener checks it and the sink sends it on. When
 # the pipeline stalls, this listener answers `503` and the client retries, and a request that
-# carried several envelopes can then arrive twice. Give the sinks a `buffer:` if a backend may be
-# unreachable for long.
+# carried several envelopes can then arrive twice. Each sink's `buffer:` keeps one backend's
+# outage from stalling the other: `splunk` spools to disk, and `new_backend` drops its oldest
+# batches.
 components:
   hec:
     type: splunk_hec_in
@@ -27,8 +28,15 @@ components:
     token: !env SPLUNK_HEC_TOKEN
     # A HEC client's histogram arrives as the exporter's `_bucket`/`_sum`/`_count` series, which
     # are plain gauges here, so `multi_value: skip` (the default) drops nothing a client sent.
+    # Splunk is still the system of record, so an outage spools to disk instead of stopping `hec`.
+    buffer:
+      disk:
+        path: /tmp/logit-spool/splunk-hec-relay/splunk
 
   new_backend:
     type: otlp_out
     sources: [hec]
     endpoint: http://otel-collector:4318
+    # Under evaluation, so it drops its oldest batches rather than stall Splunk's copy.
+    buffer:
+      overflow: drop_oldest

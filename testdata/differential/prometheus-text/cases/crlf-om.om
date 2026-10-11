@@ -1,0 +1,4 @@
+# TYPE g gauge
+g 1
+g{a="b"} 2
+# EOF

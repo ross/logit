@@ -1,0 +1,3 @@
+# TYPE s stateset
+s{s="a"} 2
+# EOF

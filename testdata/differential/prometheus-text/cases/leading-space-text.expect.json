@@ -1,0 +1,10 @@
+{
+ "divergence": "leading spaces before a sample: Prometheus's text 0.0.4 parser keeps them in the metric name (`  g`), this decoder trims them (docs/known-gaps/mappings.md: A line Prometheus's text parser keeps that this decoder skips)",
+ "divergent": [
+  [
+   "  g",
+   []
+  ]
+ ],
+ "result": "ok"
+}

@@ -1,0 +1,57 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "UnpicklingError",
+   "message": "Attempting to unpickle unsafe module _codecs"
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py3-path-bytes-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     {
+      "bytes": "706174682e6279746573"
+     },
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "A bytes path at protocol 2, which CPython writes as _codecs.encode through GLOBAL and REDUCE.",
+ "exercises": [
+  "GLOBAL",
+  "REDUCE"
+ ],
+ "logit": {
+  "opcode": "0x63",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINFLOAT",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "GLOBAL",
+  "PROTO",
+  "REDUCE",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

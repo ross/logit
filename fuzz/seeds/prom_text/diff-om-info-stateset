@@ -1,0 +1,6 @@
+# TYPE build info
+build_info{version="1.2.3"} 1
+# TYPE s stateset
+s{s="a"} 0
+s{s="b"} 1
+# EOF

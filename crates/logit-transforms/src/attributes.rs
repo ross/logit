@@ -1,7 +1,8 @@
 //! `has_attributes`/`drop_attributes`: filter events by an operator-configured key/value match
 //! against a batch's resource and/or an event's own attributes. See
-//! `docs/adr/attribute-filtering-components.md`. The config is `set`'s, field for field: whatever
-//! `set` can stamp, these can match.
+//! `docs/adr/attribute-filtering-components.md`. The `resource:`/`attributes:` maps are `set`'s:
+//! whatever `set` can stamp, these can match. The `_present` lists add key names that must exist
+//! with any value.
 //!
 //! **A map is a conjunction.** Every configured pair, within a map and across both `resource:` and
 //! `attributes:`, must match; under an any-of reading, a sibling branch sharing one pair would
@@ -15,9 +16,12 @@
 //!
 //! **Absent is `false`**: a configured key the event/resource doesn't carry never matches. That is
 //! why the complement is top-level: negated per pair, `drop_attributes {stream: a}` would drop
-//! every event without a `stream` key, black-holing untagged traffic. "Key exists with any value"
-//! isn't expressible; `docs/adr/routing-by-condition-is-lua.md` retired `exists` to keep this a
-//! bounded matcher rather than a predicate language.
+//! every event without a `stream` key, black-holing untagged traffic.
+//!
+//! **Presence is a positive assertion**: `resource_present`/`attributes_present` list keys that
+//! must exist with any value, `Null` included, and join the same conjunction. A missing key is
+//! `false`, so presence stays inside the bounded matcher; there is no "absent" test. See the
+//! amendment in `docs/adr/attribute-filtering-components.md`.
 
 use crate::value_matches;
 use logit_core::interner::{intern, Symbol};
@@ -30,6 +34,8 @@ struct Matcher {
     /// Interned once at construction.
     resource_pairs: Vec<(Symbol, Value)>,
     attribute_pairs: Vec<(Symbol, Value)>,
+    resource_present: Vec<Symbol>,
+    attributes_present: Vec<Symbol>,
     /// The last resource's match result, keyed by `Arc::ptr_eq`; constant within a batch.
     ///
     /// Can't go stale: every producer builds a fresh `Arc<Resource>` rather than mutating one,
@@ -47,16 +53,24 @@ impl Matcher {
         Self {
             resource_pairs: resource.into_iter().map(|(k, v)| (intern(&k), v)).collect(),
             attribute_pairs: attributes.into_iter().map(|(k, v)| (intern(&k), v)).collect(),
+            resource_present: Vec::new(),
+            attributes_present: Vec::new(),
             cache: None,
         }
     }
 
-    /// `true` iff every configured pair matches.
+    fn with_present(mut self, resource: Vec<String>, attributes: Vec<String>) -> Self {
+        self.resource_present = resource.iter().map(|k| intern(k)).collect();
+        self.attributes_present = attributes.iter().map(|k| intern(k)).collect();
+        self
+    }
+
+    /// `true` iff every configured pair matches and every listed key is present.
     ///
     /// Checks the (cached) resource first and short-circuits on a miss, skipping a lookup per
     /// attribute pair.
     fn matches(&mut self, resource: &Arc<Resource>, event: &Event) -> bool {
-        if !self.resource_pairs.is_empty() {
+        if !self.resource_pairs.is_empty() || !self.resource_present.is_empty() {
             let resource_matched = match &self.cache {
                 Some((cached, matched)) if Arc::ptr_eq(cached, resource) => *matched,
                 _ => {
@@ -65,7 +79,10 @@ impl Matcher {
                             .attributes
                             .get_sym(*key)
                             .is_some_and(|actual| value_matches(configured, actual))
-                    });
+                    }) && self
+                        .resource_present
+                        .iter()
+                        .all(|key| resource.attributes.get_sym(*key).is_some());
                     self.cache = Some((resource.clone(), matched));
                     matched
                 }
@@ -76,7 +93,7 @@ impl Matcher {
         }
         self.attribute_pairs.iter().all(|(key, configured)| {
             event.attributes.get_sym(*key).is_some_and(|actual| value_matches(configured, actual))
-        })
+        }) && self.attributes_present.iter().all(|key| event.attributes.get_sym(*key).is_some())
     }
 
     #[cfg(test)]
@@ -94,6 +111,12 @@ pub struct HasAttributes {
 }
 
 impl HasAttributes {
+    /// Requires every listed key to exist, with any value, beside the pairs.
+    pub fn with_present(mut self, resource: Vec<String>, attributes: Vec<String>) -> Self {
+        self.matcher = self.matcher.with_present(resource, attributes);
+        self
+    }
+
     /// Builds the filter; the signature is [`crate::Set::new`]'s, since it matches what `set`
     /// stamps.
     pub fn new(resource: Vec<(String, Value)>, attributes: Vec<(String, Value)>) -> Self {
@@ -129,6 +152,12 @@ pub struct DropAttributes {
 }
 
 impl DropAttributes {
+    /// Requires every listed key to exist, with any value, beside the pairs.
+    pub fn with_present(mut self, resource: Vec<String>, attributes: Vec<String>) -> Self {
+        self.matcher = self.matcher.with_present(resource, attributes);
+        self
+    }
+
     /// Builds the filter; see [`HasAttributes::new`].
     pub fn new(resource: Vec<(String, Value)>, attributes: Vec<(String, Value)>) -> Self {
         Self { matcher: Matcher::new(resource, attributes), telemetry: Telemetry::default() }
@@ -506,5 +535,104 @@ mod tests {
         let resource = default_resource();
         let mut event = event_with_attrs(&[("stream", Value::str("a"))]);
         assert!(has.process(&resource, &mut event));
+    }
+
+    // -- key presence -------------------------------------------------------------------------
+
+    fn present(resource: &[&str], attributes: &[&str]) -> (Vec<String>, Vec<String>) {
+        (
+            resource.iter().map(|k| k.to_string()).collect(),
+            attributes.iter().map(|k| k.to_string()).collect(),
+        )
+    }
+
+    fn has_present(resource: &[&str], attributes: &[&str]) -> HasAttributes {
+        let (r, a) = present(resource, attributes);
+        HasAttributes::new(vec![], vec![]).with_present(r, a)
+    }
+
+    #[test]
+    fn presence_alone_forwards_an_event_carrying_the_key_with_any_value() {
+        let mut has = has_present(&[], &["method"]);
+        let resource = default_resource();
+        for value in [Value::str("GET"), Value::I64(0), Value::Bool(false)] {
+            let mut event = event_with_attrs(&[("method", value)]);
+            assert!(has.process(&resource, &mut event));
+        }
+    }
+
+    #[test]
+    fn a_null_valued_key_counts_as_present() {
+        let mut has = has_present(&[], &["method"]);
+        let mut event = event_with_attrs(&[("method", Value::Null)]);
+        assert!(has.process(&default_resource(), &mut event));
+    }
+
+    #[test]
+    fn a_missing_key_fails_has_attributes_and_is_forwarded_by_drop_attributes() {
+        let (r, a) = present(&[], &["method"]);
+        let mut has = HasAttributes::new(vec![], vec![]).with_present(r.clone(), a.clone());
+        let mut drop = DropAttributes::new(vec![], vec![]).with_present(r, a);
+        let resource = default_resource();
+        let mut event = event_with_attrs(&[("other", Value::str("x"))]);
+        assert!(!has.process(&resource, &mut event));
+        assert!(drop.process(&resource, &mut event));
+
+        let mut carrying = event_with_attrs(&[("method", Value::str("GET"))]);
+        assert!(has.process(&resource, &mut carrying));
+        assert!(!drop.process(&resource, &mut carrying));
+    }
+
+    #[test]
+    fn presence_and_a_pair_must_both_hold() {
+        let (r, a) = present(&[], &["method"]);
+        let mut has = HasAttributes::new(vec![], vec![("stream".to_string(), Value::str("a"))])
+            .with_present(r.clone(), a.clone());
+        let mut drop = DropAttributes::new(vec![], vec![("stream".to_string(), Value::str("a"))])
+            .with_present(r, a);
+        let resource = default_resource();
+
+        let mut both = event_with_attrs(&[("stream", Value::str("a")), ("method", Value::Null)]);
+        assert!(has.process(&resource, &mut both));
+        assert!(!drop.process(&resource, &mut both));
+
+        let mut pair_only = event_with_attrs(&[("stream", Value::str("a"))]);
+        assert!(!has.process(&resource, &mut pair_only), "pair holds, key missing");
+        assert!(drop.process(&resource, &mut pair_only));
+
+        let mut key_only =
+            event_with_attrs(&[("stream", Value::str("b")), ("method", Value::str("GET"))]);
+        assert!(!has.process(&resource, &mut key_only), "key present, pair differs");
+        assert!(drop.process(&resource, &mut key_only));
+    }
+
+    #[test]
+    fn every_listed_key_must_be_present() {
+        let mut has = has_present(&[], &["a", "b"]);
+        let resource = default_resource();
+        let mut one = event_with_attrs(&[("a", Value::Null)]);
+        assert!(!has.process(&resource, &mut one));
+        let mut both = event_with_attrs(&[("a", Value::Null), ("b", Value::Null)]);
+        assert!(has.process(&resource, &mut both));
+    }
+
+    #[test]
+    fn resource_presence_reads_the_batch_resource_and_is_cached() {
+        let mut has = has_present(&["service.name"], &[]);
+        let with_key = resource_with_attrs(&[("service.name", Value::Null)]);
+        let without = resource_with_attrs(&[("host.name", Value::str("h"))]);
+        let mut event = event_with_attrs(&[]);
+        assert!(has.process(&with_key, &mut event));
+        assert_eq!(has.cached_resource_matched(), Some(true));
+        assert!(!has.process(&without, &mut event));
+        assert_eq!(has.cached_resource_matched(), Some(false));
+    }
+
+    #[test]
+    fn a_resource_key_is_not_an_event_attribute_for_presence() {
+        let mut has = has_present(&[], &["service.name"]);
+        let resource = resource_with_attrs(&[("service.name", Value::str("nginx"))]);
+        let mut event = event_with_attrs(&[]);
+        assert!(!has.process(&resource, &mut event));
     }
 }

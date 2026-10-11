@@ -1,0 +1,39 @@
+{
+ "carbon": {
+  "exception": {
+   "error": "UnpicklingError",
+   "message": "pickle stream refers to out-of-band data but no *buffers* argument was given"
+  },
+  "outcome": "dropped",
+  "received": []
+ },
+ "case": "py3-value-picklebuffer-p5",
+ "cpython": {
+  "error": "UnpicklingError",
+  "message": "pickle stream refers to out-of-band data but no *buffers* argument was given"
+ },
+ "description": "A read-only PickleBuffer value written out of band.",
+ "exercises": [
+  "NEXT_BUFFER",
+  "READONLY_BUFFER"
+ ],
+ "logit": {
+  "opcode": "0x97",
+  "verdict": "malformed"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "EMPTY_LIST",
+  "FRAME",
+  "MEMOIZE",
+  "NEXT_BUFFER",
+  "PROTO",
+  "READONLY_BUFFER",
+  "SHORT_BINUNICODE",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 5
+}

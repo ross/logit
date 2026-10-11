@@ -1,0 +1,104 @@
+{
+ "carbon": {
+  "items": 2,
+  "outcome": "ok",
+  "received": [
+   [
+    "mark.list.a",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    "store"
+   ],
+   [
+    "mark.list.b",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "hand-mark-list-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "mark.list.a",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "list": [
+     "mark.list.b",
+     {
+      "list": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "f64": "0x3ff0000000000000",
+        "repr": "1.0"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "og-rek's MARK ... LIST lists, the second item a list-shaped datapoint, [path, [timestamp, value]].",
+ "divergence": "carbon unpacks any two-element sequence, so it receives the list-shaped datapoint; inside a MARK ... LIST list the reader skips it (docs/known-gaps/mappings.md: decode (Graphite), a list-shaped pickle datapoint)",
+ "exercises": [
+  "MARK",
+  "LIST"
+ ],
+ "logit": {
+  "datapoints": [
+   [
+    "mark.list.a",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x3ff0000000000000",
+     "repr": "1.0"
+    }
+   ]
+  ],
+  "skipped": 1,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "BINFLOAT",
+  "BININT",
+  "BINUNICODE",
+  "LIST",
+  "MARK",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "hand",
+ "protocol": 2
+}

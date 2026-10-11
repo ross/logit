@@ -221,7 +221,8 @@
 //!     `/ack`, `/health`, `/health/1.0`) rather than the `/services/collector` base, an empty
 //!     `token` or one with leading or trailing whitespace, `timeout: 0s`, an `ack_timeout` without
 //!     `ack: true` or of `0s`, a `max_body_bytes` of `0`, or a `tls` failing rule 24's checks
-//!     (`docs/adr/splunk-hec-relay.md`).
+//!     (`docs/adr/splunk-hec-relay.md`). A `max_body_bytes` above Splunk Cloud's body cap isn't
+//!     an error: it adds a non-fatal entry to [`Graph::warnings`].
 //! 71. A `lua`/`lua_file` `max_memory` of `0`: an empty Lua VM already holds more than that
 //!     (`docs/adr/lua-runaway-script-bounds.md`).
 //! 72. A `stdio_out`/`file_out` `message:` other than `escaped` outside `format: human`, where it
@@ -260,6 +261,19 @@
 //! 81. An `admin.socket_mode` without `admin.socket`; an empty `admin.bind` or `admin.socket`; or
 //!     an `admin.bind` starting with `/`, a path that belongs in `socket`
 //!     (`docs/adr/listener-port-sharing-and-shutdown-delay.md`).
+//! 82. A `bucket` with no `attributes`; an empty field name, `into`, `ranges`, class `value`, or
+//!     `other`; an `into` naming another configured source field, or shared by two fields; a
+//!     range with both `lt` and `le`; a boundless range that isn't last; a non-finite bound; or a
+//!     range the ranges before it already cover, which can never match: a bound below the
+//!     previous one, or equal to it unless `lt: X` is followed by `le: X`
+//!     (`docs/adr/bucket-transform.md`).
+//! 83. Not a rejection: a listener that reaches two or more sinks using `buffer.overflow: block`
+//!     with no `buffer.disk` adds a non-fatal entry to [`Graph::warnings`], one per distinct sink
+//!     set, because a stall in one of those sinks parks the others. The walk follows `consumers`
+//!     and router `targets`. A `buffer.disk` sink is exempt, since its spool absorbs a stall
+//!     until `disk.max_bytes`, and so are `null_out` and an exposition-mode (`bind:`)
+//!     `prometheus_out`, whose sends never fail ([`blocking_sink_warnings`],
+//!     `docs/adr/delivery-semantics.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -271,14 +285,14 @@ use logit_config::{
     default_handshake_timeout, default_max_connections, default_prometheus_scrape_interval,
     default_prometheus_scrape_timeout, default_prometheus_write_path, BufferConfig, Component,
     ComponentKind, Compression, Config, GraphiteProtocol, GraphiteTransport, LinesTransport,
-    MessageMode, MetadataCacheConfig, ReceiveConfig, StatsdTransport, StreamFormat,
+    MessageMode, MetadataCacheConfig, OverflowPolicy, ReceiveConfig, StatsdTransport, StreamFormat,
     SyslogTransport, TimestampFormat, TraceIdFormat, MAX_READ_BATCH,
 };
 use logit_core::redact;
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP;
 use logit_proto::MAX_UDP_PAYLOAD_BYTES;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 /// Rule 75's upper bound: `logit_in`'s `RECEIVER_MAX_WINDOW`, mirrored by hand since this crate
@@ -361,6 +375,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | HasProvenance { .. }
         | DropProvenance { .. }
         | KeepValues { .. }
+        | Bucket { .. }
         | Logfmt { .. }
         | Kv { .. }
         | Regex { .. }
@@ -429,6 +444,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         HasProvenance { .. } => "has_provenance",
         DropProvenance { .. } => "drop_provenance",
         KeepValues { .. } => "keep_values",
+        Bucket { .. } => "bucket",
         Logfmt { .. } => "logfmt",
         Kv { .. } => "kv",
         Regex { .. } => "regex",
@@ -531,6 +547,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::HasProvenance { .. }
             | ComponentKind::DropProvenance { .. }
             | ComponentKind::KeepValues { .. }
+            | ComponentKind::Bucket { .. }
             | ComponentKind::Logfmt { .. }
             | ComponentKind::Kv { .. }
             | ComponentKind::Regex { .. }
@@ -611,6 +628,10 @@ pub struct Graph {
     /// Listener-first order, a byproduct of rule 5's cycle check. Only tests read it: the node
     /// runtime creates every inbox up front, and `logit graph` renders from the raw `Config`.
     pub topological_order: Vec<String>,
+    /// Non-fatal findings for the operator. `resolve` doesn't log them, because it runs before
+    /// the telemetry layer is active and under `logit validate`, which installs no subscriber;
+    /// each caller prints or logs them.
+    pub warnings: Vec<String>,
 }
 
 /// Non-gRPC header names `otlp_out`'s HTTP transport sets itself, or that HTTP/1.1 connection
@@ -707,6 +728,7 @@ fn is_absolute_http_url(url: &str) -> bool {
 
 pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     let Config { components, admin, .. } = config;
+    let mut warnings = Vec::new();
 
     // Rule 1: at least one component.
     if components.is_empty() {
@@ -1633,34 +1655,50 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 36: `has_attributes`/`drop_attributes` (`docs/adr/attribute-filtering-components.md`).
-    // The maps are conjunctions, so zero pairs match every event: `has_attributes` forwards all
-    // (no-op) and `drop_attributes` drops all (black hole), the inverse of rule 21's list of
-    // alternatives. An empty key can't name an attribute; a non-finite value never compares equal
-    // under `crate::attributes`' coercing matcher. The same key in `resource:` and `attributes:` is
-    // legal: one addresses the batch, the other the event.
+    // The maps and presence lists are conjunctions, so zero entries match every event:
+    // `has_attributes` forwards all (no-op) and `drop_attributes` drops all (black hole), the
+    // inverse of rule 21's list of alternatives. An empty key can't name an attribute; a
+    // non-finite value never compares equal under `crate::attributes`' coercing matcher. The same
+    // key in `resource:` and `attributes:` is legal: one addresses the batch, the other the event.
+    // Within one side, a key in both the map and its `_present` list is a redundancy (the pair
+    // already requires the key), and a key repeated in a list is a copy-paste mistake (rule 4's
+    // reasoning).
     for (id, component) in &components {
-        let (kind_name, resource, attributes) = match &component.kind {
-            ComponentKind::HasAttributes { resource, attributes } => {
-                ("has_attributes", resource, attributes)
-            }
-            ComponentKind::DropAttributes { resource, attributes } => {
-                ("drop_attributes", resource, attributes)
-            }
-            _ => continue,
-        };
+        let (kind_name, resource, attributes, resource_present, attributes_present) =
+            match &component.kind {
+                ComponentKind::HasAttributes {
+                    resource,
+                    attributes,
+                    resource_present,
+                    attributes_present,
+                } => ("has_attributes", resource, attributes, resource_present, attributes_present),
+                ComponentKind::DropAttributes {
+                    resource,
+                    attributes,
+                    resource_present,
+                    attributes_present,
+                } => {
+                    ("drop_attributes", resource, attributes, resource_present, attributes_present)
+                }
+                _ => continue,
+            };
 
-        if resource.is_empty() && attributes.is_empty() {
+        if resource.is_empty()
+            && attributes.is_empty()
+            && resource_present.is_empty()
+            && attributes_present.is_empty()
+        {
             if kind_name == "has_attributes" {
                 anyhow::bail!(
-                    "component '{id}': a has_attributes with neither 'resource' nor \
-                     'attributes' configured matches every event -- a no-op that forwards \
-                     every event untouched"
+                    "component '{id}': a has_attributes with none of 'resource', 'attributes', \
+                     'resource_present', or 'attributes_present' configured matches every \
+                     event -- a no-op that forwards every event untouched"
                 );
             } else {
                 anyhow::bail!(
-                    "component '{id}': a drop_attributes with neither 'resource' nor \
-                     'attributes' configured matches every event -- and so can only ever drop \
-                     every one of them"
+                    "component '{id}': a drop_attributes with none of 'resource', 'attributes', \
+                     'resource_present', or 'attributes_present' configured matches every \
+                     event -- and so can only ever drop every one of them"
                 );
             }
         }
@@ -1681,6 +1719,34 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      number -- a non-finite value never compares equal to anything, so that \
                      entry could never match"
                 );
+            }
+        }
+
+        for (map_name, map, list_name, list) in [
+            ("resource", resource, "resource_present", resource_present),
+            ("attributes", attributes, "attributes_present", attributes_present),
+        ] {
+            let mut seen = std::collections::BTreeSet::new();
+            for key in list {
+                if key.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': a {kind_name} '{list_name}' key must not be empty -- \
+                         it could never name a real attribute"
+                    );
+                }
+                if !seen.insert(key.as_str()) {
+                    anyhow::bail!(
+                        "component '{id}': a {kind_name} '{list_name}' lists '{key}' more than \
+                         once -- the repeat is a copy-paste mistake"
+                    );
+                }
+                if map.contains_key(key) {
+                    anyhow::bail!(
+                        "component '{id}': a {kind_name} lists '{key}' in both '{map_name}' and \
+                         '{list_name}' -- a '{map_name}' pair already requires the key, so \
+                         drop it from '{list_name}'"
+                    );
+                }
             }
         }
     }
@@ -2702,6 +2768,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             max_length,
             redact_query,
             forwarded: _,
+            status_class: _,
         } = &component.kind
         {
             let compile = |what: &str, pattern: &str| -> anyhow::Result<()> {
@@ -3430,7 +3497,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             );
         }
         if let Some(warning) = splunk_cloud_body_cap_warning(id, *max_body_bytes) {
-            tracing::warn!("{warning}");
+            warnings.push(warning);
         }
         if tls.cert_file.is_some() != tls.key_file.is_some() {
             anyhow::bail!(
@@ -3763,6 +3830,95 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         );
     }
 
+    // Rule 82: `bucket` (`docs/adr/bucket-transform.md`). Ranges are tested first-match, so a
+    // boundless range before the end, or a bound the ranges before it already cover, can never
+    // match. `lt: X` then `le: X` is reachable: it classes the single value `X`. Two ranges may
+    // share a class. Fields apply in key order over one attribute map, so an `into` naming
+    // another configured source, or shared by two fields, would make the result depend on key
+    // order.
+    for (id, component) in &components {
+        let ComponentKind::Bucket { attributes } = &component.kind else { continue };
+        if attributes.is_empty() {
+            anyhow::bail!(
+                "component '{id}': a bucket with no 'attributes' configured can only ever be a \
+                 no-op"
+            );
+        }
+        let mut intos: HashMap<&str, &str> = HashMap::new();
+        for (field, spec) in attributes {
+            if field.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a bucket 'attributes' key must not be empty -- it could \
+                     never name a real attribute"
+                );
+            }
+            if spec.into.is_empty() {
+                anyhow::bail!("component '{id}': bucket '{field}' has an empty 'into'");
+            }
+            if spec.into != *field && attributes.contains_key(&spec.into) {
+                anyhow::bail!(
+                    "component '{id}': bucket '{field}' has 'into: {}', another configured \
+                     source field -- which one is classified first would depend on key order",
+                    spec.into
+                );
+            }
+            if let Some(other_field) = intos.insert(&spec.into, field) {
+                anyhow::bail!(
+                    "component '{id}': bucket '{other_field}' and '{field}' share 'into: {}' -- \
+                     one would overwrite the other's class",
+                    spec.into
+                );
+            }
+            if spec.ranges.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': bucket '{field}' has an empty 'ranges' list -- it could \
+                     never write a class"
+                );
+            }
+            if spec.other.as_deref().is_some_and(str::is_empty) {
+                anyhow::bail!("component '{id}': bucket '{field}' has an empty 'other'");
+            }
+            let last = spec.ranges.len() - 1;
+            // The previous range's bound, and whether it was `lt`.
+            let mut previous: Option<(f64, bool)> = None;
+            for (i, range) in spec.ranges.iter().enumerate() {
+                if range.value.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} has an empty 'value'"
+                    );
+                }
+                let (bound, is_lt) = match (range.lt, range.le) {
+                    (Some(_), Some(_)) => anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} sets both 'lt' and 'le' -- \
+                         give one bound"
+                    ),
+                    (Some(bound), None) => (bound, true),
+                    (None, Some(bound)) => (bound, false),
+                    (None, None) if i == last => continue,
+                    (None, None) => anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} has no bound but isn't the \
+                         last range -- a catch-all leaves every range after it unreachable"
+                    ),
+                };
+                if !bound.is_finite() {
+                    anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} has a non-finite bound"
+                    );
+                }
+                let covered = previous.is_some_and(|(prev, prev_lt)| {
+                    bound < prev || (bound == prev && !(prev_lt && !is_lt))
+                });
+                if covered {
+                    anyhow::bail!(
+                        "component '{id}': bucket '{field}' range {i} can never match -- the \
+                         ranges before it already cover every number up to its bound {bound}"
+                    );
+                }
+                previous = Some((bound, is_lt));
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is fixed here, once (see [`targets_of`]).
@@ -3783,7 +3939,69 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         );
     }
 
-    Ok(Graph { components: resolved, topological_order })
+    // Rule 83
+    warnings.extend(blocking_sink_warnings(&resolved));
+
+    Ok(Graph { components: resolved, topological_order, warnings })
+}
+
+/// Rule 83: one warning per distinct set of two or more memory-only `block` sinks that one or
+/// more listeners reach. A full sink parks the fan-out that feeds it, so every sink sharing that
+/// listener stalls with it. Listeners and sinks are sorted, so the text is deterministic.
+fn blocking_sink_warnings(components: &HashMap<String, ResolvedComponent>) -> Vec<String> {
+    let mut by_sinks: BTreeMap<Vec<&str>, Vec<&str>> = BTreeMap::new();
+    for (id, component) in components {
+        if component.role() != Role::Listener {
+            continue;
+        }
+        let mut seen: HashSet<&str> = HashSet::from([id.as_str()]);
+        let mut queue: VecDeque<&str> = VecDeque::from([id.as_str()]);
+        let mut sinks: BTreeSet<&str> = BTreeSet::new();
+        while let Some(current) = queue.pop_front() {
+            let Some(node) = components.get(current) else { continue };
+            // `null_out` and an exposition-mode `prometheus_out` never fail a send, so they never
+            // fill.
+            let never_fails = matches!(
+                node.kind,
+                ComponentKind::NullOut { .. } | ComponentKind::PrometheusOut { bind: Some(_), .. }
+            );
+            if node.role() == Role::Sink
+                && !never_fails
+                && node.buffer.overflow == OverflowPolicy::Block
+                && node.buffer.disk.is_none()
+            {
+                sinks.insert(current);
+            }
+            for next in node.consumers.iter().chain(&node.targets) {
+                if seen.insert(next.as_str()) {
+                    queue.push_back(next.as_str());
+                }
+            }
+        }
+        if sinks.len() >= 2 {
+            by_sinks.entry(sinks.into_iter().collect()).or_default().push(id.as_str());
+        }
+    }
+    by_sinks
+        .into_iter()
+        .map(|(sinks, mut listeners)| {
+            listeners.sort_unstable();
+            let quote = |ids: &[&str]| {
+                ids.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ")
+            };
+            let subject = if listeners.len() == 1 {
+                format!("listener {} feeds", quote(&listeners))
+            } else {
+                format!("listeners {} each feed", quote(&listeners))
+            };
+            format!(
+                "{subject} sinks {}, which use buffer.overflow: block with no buffer.disk -- a \
+                 stall in one parks the others; give the ones that matter a buffer.disk and set \
+                 overflow: drop_oldest on the best-effort ones",
+                quote(&sinks)
+            )
+        })
+        .collect()
 }
 
 /// Rules 17/18/57's datagram predicate: the kinds the datagram listener driver backs
@@ -4925,6 +5143,8 @@ mod tests {
                 ComponentKind::HasAttributes {
                     resource: std::collections::BTreeMap::new(),
                     attributes: std::collections::BTreeMap::new(),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -4948,6 +5168,8 @@ mod tests {
                 ComponentKind::DropAttributes {
                     resource: std::collections::BTreeMap::new(),
                     attributes: std::collections::BTreeMap::new(),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -4957,6 +5179,126 @@ mod tests {
             "a drop_attributes with nothing configured is the black-hole shape (drops every \
              event), not the no-op shape -- got: {err}"
         );
+    }
+
+    #[test]
+    fn a_has_attributes_with_only_presence_lists_resolves_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec!["service.name".to_string()],
+                    attributes_present: vec!["m".to_string()],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]))
+        .expect("should resolve");
+    }
+
+    #[test]
+    fn a_presence_key_also_in_the_attributes_map_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "m".to_string(),
+                        logit_config::SetValue::Str("x".to_string()),
+                    )]),
+                    resource_present: vec![],
+                    attributes_present: vec!["m".to_string()],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("both 'attributes' and 'attributes_present'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_presence_key_also_in_the_resource_map_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::DropAttributes {
+                    resource: std::collections::BTreeMap::from([(
+                        "s".to_string(),
+                        logit_config::SetValue::Str("x".to_string()),
+                    )]),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec!["s".to_string()],
+                    attributes_present: vec![],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("both 'resource' and 'resource_present'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_repeated_presence_key_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec![],
+                    attributes_present: vec!["m".to_string(), "m".to_string()],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    #[test]
+    fn an_empty_presence_key_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::DropAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec!["".to_string()],
+                    attributes_present: vec![],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("key must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_has_attributes_with_all_four_fields_empty_is_still_a_no_op() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec![],
+                    attributes_present: vec![],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("resource_present"), "got: {err}");
     }
 
     #[test]
@@ -5058,6 +5400,8 @@ mod tests {
                         "".to_string(),
                         logit_config::SetValue::Str("x".to_string()),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -5078,6 +5422,8 @@ mod tests {
                         "ratio".to_string(),
                         logit_config::SetValue::F64(f64::NAN),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -5098,6 +5444,8 @@ mod tests {
                         logit_config::SetValue::Str("nginx".to_string()),
                     )]),
                     attributes: std::collections::BTreeMap::new(),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -5118,6 +5466,8 @@ mod tests {
                         "stream".to_string(),
                         logit_config::SetValue::Str("a".to_string()),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -5142,6 +5492,8 @@ mod tests {
                         "stream".to_string(),
                         logit_config::SetValue::Str("a".to_string()),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -6609,8 +6961,156 @@ mod tests {
                 *max_body_bytes = 800 * 1024 * 1024;
             }
         });
-        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+        let graph = resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
             .expect("a body cap above Splunk Cloud's is valid for Splunk Enterprise");
+        assert_eq!(graph.warnings.len(), 1, "got: {:?}", graph.warnings);
+        assert!(graph.warnings[0].contains("component 'out'"), "{:?}", graph.warnings);
+        let ok = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], splunk_hec_out("https://splunk:8088/services/collector")),
+        ]))
+        .expect("a default config resolves");
+        assert!(ok.warnings.is_empty(), "got: {:?}", ok.warnings);
+    }
+
+    fn drop_oldest() -> BufferConfig {
+        BufferConfig { overflow: OverflowPolicy::DropOldest, ..BufferConfig::default() }
+    }
+
+    fn on_disk(path: &str) -> BufferConfig {
+        BufferConfig {
+            disk: Some(logit_config::DiskBufferConfig {
+                path: path.to_string(),
+                max_bytes: 1024 * 1024 * 1024,
+                segment_bytes: 64 * 1024 * 1024,
+                compression: Compression::None,
+                checkpoint_interval: Duration::from_secs(1),
+            }),
+            ..BufferConfig::default()
+        }
+    }
+
+    fn resolve_warnings(config: Config) -> Vec<String> {
+        match resolve(config) {
+            Ok(graph) => graph.warnings,
+            Err(err) => panic!("should resolve: {err}"),
+        }
+    }
+
+    /// Rule 83: two memory-only `block` sinks behind one listener warn, naming both.
+    #[test]
+    fn a_listener_feeding_two_blocking_sinks_warns() {
+        let warnings = resolve_warnings(cfg(vec![
+            ("in", vec![], listener()),
+            ("a", vec!["in"], sink()),
+            ("b", vec!["in"], sink()),
+        ]));
+        assert_eq!(
+            warnings,
+            vec!["listener 'in' feeds sinks 'a', 'b', which use buffer.overflow: block with no \
+                 buffer.disk -- a stall in one parks the others; give the ones that matter a \
+                 buffer.disk and set overflow: drop_oldest on the best-effort ones"
+                .to_string()]
+        );
+    }
+
+    /// Rule 83: a `drop_oldest` sink, a `buffer.disk` sink, a `null_out`, and an exposition-mode
+    /// `prometheus_out` never stall their siblings, so none of them counts toward the two. A
+    /// remote-write `prometheus_out` can fail a send, so it counts.
+    #[test]
+    fn a_sink_that_never_stalls_beside_a_blocking_one_doesnt_warn() {
+        let default = BufferConfig::default;
+        let warned: Vec<(&str, Vec<String>)> = [
+            ("drop_oldest", sink(), drop_oldest()),
+            ("disk", sink(), on_disk("/tmp/spool/b")),
+            ("null_out", null_out(), default()),
+            ("prometheus_out exposition", prometheus_out("/metrics", 100_000), default()),
+        ]
+        .into_iter()
+        .map(|(name, other, buffer)| {
+            let warnings = resolve_warnings(cfg_with_buffer(vec![
+                ("in", vec![], listener(), default()),
+                ("a", vec!["in"], sink(), default()),
+                ("b", vec!["in"], other, buffer),
+            ]));
+            (name, warnings)
+        })
+        .filter(|(_, warnings)| !warnings.is_empty())
+        .collect();
+        assert!(warned.is_empty(), "{warned:?}");
+        let remote_write = resolve_warnings(cfg(vec![
+            ("in", vec![], listener()),
+            ("a", vec!["in"], sink()),
+            ("b", vec!["in"], prometheus_remote_write("http://victoria:8428/api/v1/write")),
+        ]));
+        assert_eq!(remote_write.len(), 1, "{remote_write:?}");
+    }
+
+    /// Rule 83: a sink reached through a `route` and its `target` counts.
+    #[test]
+    fn a_blocking_sink_behind_a_route_target_counts() {
+        let warnings = resolve_warnings(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec![], route(by_attribute("stream"), &[("host", "t")])),
+            ("t", vec![], vec![], target()),
+            ("routed", vec!["t"], vec![], sink()),
+            ("direct", vec!["in"], vec![], sink()),
+        ]));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("sinks 'direct', 'routed',"), "{warnings:?}");
+    }
+
+    /// Rule 83: a sink reached through a `lua` component's `targets:` edge counts.
+    #[test]
+    fn a_blocking_sink_behind_a_lua_target_counts() {
+        let warnings = resolve_warnings(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("routed", vec!["t"], vec![], sink()),
+            ("direct", vec!["r"], vec![], sink()),
+        ]));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("sinks 'direct', 'routed',"), "{warnings:?}");
+    }
+
+    /// Rule 83: branches that reconverge on one sink count it once, so one sink alone doesn't
+    /// warn.
+    #[test]
+    fn reconverging_branches_count_a_sink_once() {
+        let warnings = resolve_warnings(cfg(vec![
+            ("in", vec![], listener()),
+            ("k1", vec!["in"], keep(vec!["a"])),
+            ("k2", vec!["in"], keep(vec!["b"])),
+            ("out", vec!["k1", "k2"], sink()),
+        ]));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Rule 83: listeners with the same sink set share one warning naming each; a listener with
+    /// another set gets its own. The text is the same on every run.
+    #[test]
+    fn listeners_sharing_a_sink_set_get_one_warning_in_a_stable_order() {
+        let config = || {
+            cfg(vec![
+                ("in_z", vec![], listener()),
+                ("in_a", vec![], listener()),
+                ("in_m", vec![], listener()),
+                ("y", vec!["in_z", "in_a"], sink()),
+                ("x", vec!["in_a", "in_z", "in_m"], sink()),
+                ("w", vec!["in_m"], sink()),
+            ])
+        };
+        let warnings = resolve_warnings(config());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].starts_with("listener 'in_m' feeds sinks 'w', 'x',"), "{warnings:?}");
+        assert!(
+            warnings[1].starts_with("listeners 'in_a', 'in_z' each feed sinks 'x', 'y',"),
+            "{warnings:?}"
+        );
+        for _ in 0..8 {
+            assert_eq!(resolve_warnings(config()), warnings);
+        }
     }
 
     /// Rule 70: rule 24's `tls` checks, including a block under `http://`.
@@ -7094,6 +7594,7 @@ mod tests {
             max_length: std::collections::BTreeMap::new(),
             redact_query: vec![],
             forwarded: None,
+            status_class: false,
         }
     }
 
@@ -7159,6 +7660,7 @@ mod tests {
             max_length: std::collections::BTreeMap::from([("url.path".to_string(), 512)]),
             redact_query: vec!["token".to_string()],
             forwarded: Some(ForwardedHeader::XForwardedFor),
+            status_class: false,
         };
         resolve(cfg(vec![
             ("in", vec![], listener()),
@@ -7329,6 +7831,7 @@ mod tests {
                 max_length: std::collections::BTreeMap::new(),
                 redact_query: vec![],
                 forwarded: Some(header),
+                status_class: false,
             };
             resolve(cfg(vec![
                 ("in", vec![], listener()),
@@ -7600,6 +8103,8 @@ mod tests {
                         "stream".to_string(),
                         logit_config::SetValue::Str("a".to_string()),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             (
@@ -7611,6 +8116,8 @@ mod tests {
                         "debug".to_string(),
                         logit_config::SetValue::Bool(true),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["drop_attributes"], sink()),
@@ -13002,6 +13509,117 @@ mod tests {
         for window in [1, 32, 1024] {
             resolve(with_window(window))
                 .unwrap_or_else(|err| panic!("window {window} should resolve, got: {err}"));
+        }
+    }
+
+    // ---- rule 82: bucket ------------------------------------------------------------------
+
+    /// A `bucket` between a listener and a sink, its `attributes` given as JSON.
+    fn cfg_with_bucket(attributes: &str) -> Config {
+        let kind = listener_from_json(&format!(
+            r#"{{"type": "bucket", "sources": ["in"], "attributes": {attributes}}}"#
+        ));
+        cfg(vec![("in", vec![], listener()), ("b", vec!["in"], kind), ("out", vec!["b"], sink())])
+    }
+
+    #[test]
+    fn rule_82_accepts_every_range_shape() {
+        for attributes in [
+            r#"{"d": {"into": "c", "ranges": [{"lt": 0.1, "value": "fast"},
+                {"le": 1, "value": "ok"}, {"value": "slow"}], "other": "unknown"}}"#,
+            r#"{"d": {"into": "d", "ranges": [{"le": 0, "value": "none"}, {"value": "some"}],
+                "keep_source": false}}"#,
+            r#"{"d": {"into": "c", "ranges": [{"lt": 1000, "value": "a"},
+                {"lt": 2000, "value": "a"}]}}"#,
+            r#"{"d": {"into": "c", "ranges": [{"value": "any"}]}}"#,
+            r#"{"d": {"into": "c", "ranges": [{"lt": 1, "value": "under"},
+                {"le": 1, "value": "one"}, {"value": "over"}]}}"#,
+            r#"{"a": {"into": "a", "ranges": [{"value": "x"}]},
+                "b": {"into": "b", "ranges": [{"value": "y"}]}}"#,
+        ] {
+            resolve(cfg_with_bucket(attributes))
+                .unwrap_or_else(|err| panic!("{attributes} should resolve: {err}"));
+        }
+    }
+
+    #[test]
+    fn rule_82_rejects_each_malformed_bucket() {
+        for (attributes, expected) in [
+            (r#"{}"#, "no 'attributes'"),
+            (r#"{"": {"into": "c", "ranges": [{"value": "a"}]}}"#, "key must not be empty"),
+            (r#"{"d": {"into": "", "ranges": [{"value": "a"}]}}"#, "empty 'into'"),
+            (r#"{"d": {"into": "c", "ranges": []}}"#, "empty 'ranges'"),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"lt": 1, "le": 1, "value": "a"}]}}"#,
+                "both 'lt' and 'le'",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"value": "a"}, {"lt": 1, "value": "b"}]}}"#,
+                "isn't the last range",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"lt": 2, "value": "a"},
+                    {"le": 1, "value": "b"}]}}"#,
+                "range 1 can never match",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"le": 1, "value": "a"},
+                    {"lt": 1, "value": "b"}]}}"#,
+                "range 1 can never match",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"lt": 1, "value": "a"},
+                    {"lt": 1, "value": "b"}]}}"#,
+                "range 1 can never match",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"le": 1, "value": "a"},
+                    {"le": 1, "value": "b"}]}}"#,
+                "range 1 can never match",
+            ),
+            (
+                r#"{"a": {"into": "b", "ranges": [{"value": "x"}]},
+                    "b": {"into": "c", "ranges": [{"value": "y"}]}}"#,
+                "another configured source field",
+            ),
+            (
+                r#"{"a": {"into": "c", "ranges": [{"value": "x"}]},
+                    "b": {"into": "c", "ranges": [{"value": "y"}]}}"#,
+                "share 'into: c'",
+            ),
+            (r#"{"d": {"into": "c", "ranges": [{"lt": 1, "value": ""}]}}"#, "empty 'value'"),
+            (r#"{"d": {"into": "c", "ranges": [{"value": "a"}], "other": ""}}"#, "empty 'other'"),
+        ] {
+            let err = expect_err(cfg_with_bucket(attributes));
+            assert!(err.contains(expected), "{attributes}: expected '{expected}', got: {err}");
+        }
+    }
+
+    /// JSON can't spell a non-finite number, so this one is built directly.
+    #[test]
+    fn rule_82_rejects_a_non_finite_bound() {
+        for bound in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let kind = ComponentKind::Bucket {
+                attributes: std::collections::BTreeMap::from([(
+                    "d".to_string(),
+                    logit_config::BucketSpec {
+                        into: "c".to_string(),
+                        ranges: vec![logit_config::BucketRange {
+                            lt: Some(bound),
+                            le: None,
+                            value: "a".to_string(),
+                        }],
+                        other: None,
+                        keep_source: true,
+                    },
+                )]),
+            };
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("b", vec!["in"], kind),
+                ("out", vec!["b"], sink()),
+            ]));
+            assert!(err.contains("non-finite bound"), "{bound}: got: {err}");
         }
     }
 }

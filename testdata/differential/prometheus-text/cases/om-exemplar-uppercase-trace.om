@@ -1,0 +1,3 @@
+# TYPE r counter
+r_total 3 # {trace_id="0123456789ABCDEF0123456789ABCDEF"} 0.5
+# EOF

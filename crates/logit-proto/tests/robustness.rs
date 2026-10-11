@@ -1,17 +1,38 @@
 //! Mutation testing over every decoder that reads untrusted bytes off a socket:
 //! [`frame::read_frame`], [`native::decode_batch`], each `native::control::*::decode`,
 //! `collectd::CollectdDecoder` (UDP datagrams are easy to spoof), `graphite::GraphiteDecoder`
-//! in both protocols, and `prometheus::compression::decompress_bounded`, which inflates every
-//! remote-write body `prometheus_in` receives. Pickle is the highest-risk parser in the repo: a format built for arbitrary
-//! object construction, read from a socket. A network-facing decoder must pass this suite
-//! (`docs/plans/native-transport.md`). The OTLP section pins the limits OTLP decoding relies on
-//! instead of caps of its own: each parser's nesting limit, timestamp saturation, and OTLP/JSON's
-//! peak memory per input byte.
+//! in both protocols, `prometheus::compression::decompress_bounded`, which inflates every
+//! remote-write body `prometheus_in` receives, and `framing::Framer`, which frames every TCP and
+//! Unix-stream listener's bytes in all five modes. Pickle is the highest-risk parser in the repo:
+//! a format built for arbitrary object construction, read from a socket. A network-facing decoder
+//! must pass this suite (`docs/plans/native-transport.md`). The OTLP section pins the limits OTLP
+//! decoding relies on instead of caps of its own: each parser's nesting limit, timestamp
+//! saturation, and OTLP/JSON's peak memory per input byte. The framing section also pins the
+//! drain state's single `drained` count and the table of what a FIN and an RST count. The statsd
+//! section runs `statsd::StatsdDecoder` over every recorded datagram, and pins event-text
+//! unescaping against `str::replace`, the last `|T` second whose nanoseconds fit an `i64`, and
+//! the largest allocation a 64 KiB datagram makes. The syslog section runs
+//! `syslog::SyslogDecoder` over every recorded capture with line splitting on and off, and pins
+//! the 32-byte SD-NAME bound, repeated PARAM-NAMEs folding into one array, a PARAM-VALUE cut off at
+//! the end of the input, the PRI range, the RFC 3164 timestamp's 15 bytes, a digit-led RFC 3164
+//! MSG against the dialect sniff, a 64 KiB line of distinct SD-NAMEs, and the largest allocation
+//! a 64 KiB datagram makes. The collectd section pins a Values count past the cap with its own
+//! matching length; the graphite section pins `resolve_timestamp`'s table against an exact
+//! reading, CPython's batched `APPENDS`, list-shaped pickle datapoints, and, in both, the largest
+//! allocation the worst 64 KiB input makes. The prometheus text section runs
+//! `prometheus::text::parse_with` over both dialects' fixtures and pins `count_value`'s table,
+//! `_created` on both sides of 2^63 nanoseconds, every escape at a label value's end, histogram
+//! reconstruction, the writer's fixed point, and the largest allocation the worst 64 KiB body
+//! makes; the remote-write section pins Snappy's length gate against a corrupt length and the
+//! encoder's fixed point. The log-message section covers `message::{json,csv,logfmt}`: the JSON
+//! nesting limit the parse inherits from serde_json, truncation and bit flips of an nginx line,
+//! the logfmt and csv quote scanners at a line's end, and the largest allocation each
+//! `message_*` fuzz target's worst 64 KiB message makes.
 //!
 //! For each decoder: every single-byte truncation of a valid input, thousands of seeded bit flips,
 //! length fields inflated past the input, and, for `decode_batch`, `Value` nesting past the depth
-//! cap. The decoder must never panic, and never size an allocation from an attacker-declared
-//! length before bounding it (a peak-allocation counter checks the huge-count cases). Truncation
+//! cap. The decoder must never panic, and never size an allocation from a corrupt declared length
+//! before bounding it (a peak-allocation counter checks the huge-count cases). Truncation
 //! contracts differ by decoder: see [`assert_every_truncation_never_panics`] and
 //! [`assert_every_truncation_fails_cleanly`].
 //!
@@ -19,8 +40,11 @@
 //! to flip. Iteration counts keep each decoder well under a second, since `script/test` runs this.
 
 use bytes::{Bytes, BytesMut};
-use logit_core::{AttrMap, Event, EventBatch, LogRecord, Provenance, Resource, Severity, Value};
+use logit_core::{
+    AttrMap, Event, EventBatch, Exemplar, LogRecord, Provenance, Resource, Severity, Value,
+};
 use logit_proto::frame::{self, Compression};
+use logit_proto::framing::{FrameError, Framer, FramingMode, Oversize, MAX_FRAME_BYTES};
 use logit_proto::graphite::{GraphiteDecoder, Protocol};
 use logit_proto::native::control::{self, Ack, AckStatus, Hello, HelloAck, Reject};
 use logit_proto::native::varint::{read_uvarint, write_uvarint};
@@ -32,13 +56,28 @@ use logit_proto::otlp::generated::opentelemetry::proto::resource::v1 as otlp_res
 use logit_proto::otlp::generated::opentelemetry::proto::trace::v1 as otlp_trace;
 use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{self, DecompressError, Encoding};
+use logit_proto::prometheus::generated::io::prometheus::write::v2 as pb2;
+use logit_proto::prometheus::generated::prometheus as pb1;
+use logit_proto::prometheus::text::{self, Dialect};
+use logit_proto::prometheus::{
+    remote_write, FamilyType, MetricFamily, Point, PrometheusDecoder, PrometheusEncoder, Series,
+    STALE_NAN_BITS,
+};
+use logit_proto::statsd::StatsdDecoder;
+use logit_proto::syslog::SyslogDecoder;
 use logit_proto::{
     CodecError, Decoder, Encoder, Signal, SignalDecoder, SignalEncoder, SignalPayload,
 };
+use prost::Message;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+
+#[path = "support/prometheus_text.rs"]
+mod prometheus_fixtures;
+
+use prometheus_fixtures::{OPENMETRICS_FIXTURE, TEXT_FIXTURE};
 
 // -- a tiny, self-contained peak-allocation counter -----------------------------------------
 //
@@ -50,16 +89,19 @@ struct CountingAlloc;
 thread_local! {
     static LIVE: Cell<i64> = const { Cell::new(0) };
     static PEAK: Cell<i64> = const { Cell::new(0) };
+    static LARGEST: Cell<i64> = const { Cell::new(0) };
 }
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record(layout.size() as i64);
+        record_size(layout.size());
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         record(layout.size() as i64);
+        record_size(layout.size());
         unsafe { System.alloc_zeroed(layout) }
     }
 
@@ -70,6 +112,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         record(new_size as i64 - layout.size() as i64);
+        record_size(new_size);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -86,6 +129,11 @@ fn record(delta: i64) {
     });
 }
 
+/// The largest single allocation, the size libFuzzer's `-malloc_limit_mb` checks.
+fn record_size(size: usize) {
+    LARGEST.with(|largest| largest.set(largest.get().max(size as i64)));
+}
+
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
 
@@ -96,6 +144,13 @@ fn peak_live_bytes(f: impl FnOnce()) -> i64 {
     PEAK.with(|peak| peak.set(0));
     f();
     PEAK.with(|peak| peak.get())
+}
+
+/// Runs `f`, returning its peak live bytes and its largest single allocation.
+fn peak_and_largest_allocation(f: impl FnOnce()) -> (i64, i64) {
+    LARGEST.with(|largest| largest.set(0));
+    let peak = peak_live_bytes(f);
+    (peak, LARGEST.with(|largest| largest.get()))
 }
 
 // -- seeded LCG -------------------------------------------------------------------------------
@@ -513,16 +568,16 @@ fn collectd_decode_survives_seeded_bit_flips() {
     assert_bit_flips_never_panic(&packet, 4000, |bytes| decode_collectd(bytes));
 }
 
-/// A Values part declaring 65535 data sources in 20 bytes: the attacker-chosen count must be
-/// checked against the part's length before anything is sized from it.
+/// A Values part declaring 65535 data sources in 20 bytes, as a sender's corrupt count would: the
+/// count must be checked against the part's length before anything is sized from it.
 #[test]
 fn collectd_decode_rejects_a_values_count_inflated_far_past_what_the_input_holds() {
-    let mut hostile = Vec::new();
-    hostile.extend_from_slice(&0x0006u16.to_be_bytes()); // Values
-    hostile.extend_from_slice(&20u16.to_be_bytes()); // a 20-byte part...
-    hostile.extend_from_slice(&65535u16.to_be_bytes()); // ...declaring 65535 data sources
-    hostile.extend_from_slice(&[0xAA; 14]);
-    let bytes = Bytes::from(hostile);
+    let mut corrupt = Vec::new();
+    corrupt.extend_from_slice(&0x0006u16.to_be_bytes()); // Values
+    corrupt.extend_from_slice(&20u16.to_be_bytes()); // a 20-byte part...
+    corrupt.extend_from_slice(&65535u16.to_be_bytes()); // ...declaring 65535 data sources
+    corrupt.extend_from_slice(&[0xAA; 14]);
+    let bytes = Bytes::from(corrupt);
     assert!(decode_collectd(&bytes), "an impossible data-source count must be rejected");
 
     let peak = peak_live_bytes(|| {
@@ -530,6 +585,113 @@ fn collectd_decode_rejects_a_values_count_inflated_far_past_what_the_input_holds
     });
     // 65535 data sources is ~590 KB; a few KB means the count was checked first.
     assert!(peak < 4096, "peak live bytes {peak} suggests the values count was trusted");
+}
+
+/// One collectd part: `type u16 BE, len u16 BE` (the length includes the header), payload.
+fn collectd_part(out: &mut Vec<u8>, part_type: u16, payload: &[u8]) {
+    out.extend_from_slice(&part_type.to_be_bytes());
+    out.extend_from_slice(&((4 + payload.len()) as u16).to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+/// Host, Plugin, and Type parts naming one series, so a Values part after them dispatches.
+fn collectd_identity() -> Vec<u8> {
+    let mut out = Vec::new();
+    collectd_part(&mut out, 0x0000, b"h\0");
+    collectd_part(&mut out, 0x0002, b"p\0");
+    collectd_part(&mut out, 0x0004, b"t\0");
+    out
+}
+
+/// A Values part of `count` GAUGEs whose `len` is `6 + 9 * count`, the one the count implies.
+fn collectd_gauges(out: &mut Vec<u8>, count: u16) {
+    let mut payload = count.to_be_bytes().to_vec();
+    payload.extend(std::iter::repeat_n(1u8, count.into()));
+    for _ in 0..count {
+        payload.extend_from_slice(&1.5f64.to_le_bytes());
+    }
+    collectd_part(out, 0x0006, &payload);
+}
+
+/// `decode_values` checks `len` against the count, then the count against
+/// `MAX_VALUES_PER_LIST`. A count of 65 with its own matching length passes the first check and
+/// fails the second, and a count of 64 passes both. Behind an earlier list the failure is a
+/// `bad_part` that keeps that list; alone it fails the datagram. A 65-count part whose length
+/// doesn't match fails the first check instead, with its own message.
+#[test]
+fn collectd_a_values_count_past_the_cap_with_a_matching_length_fails_the_cap_check() {
+    let decode = |datagram: &[u8]| {
+        let mut decoder =
+            logit_proto::collectd::CollectdDecoder::new(Arc::new(Resource::default()))
+                .with_diagnostics(logit_core::Diagnostics::new("collectd_in"));
+        let mut events = Vec::new();
+        let result = decoder.decode_into(Bytes::copy_from_slice(datagram), 0, &mut events);
+        (result.map(|_| ()), events, decoder.diag().occurrences("bad_part"))
+    };
+
+    let mut at_cap = collectd_identity();
+    collectd_gauges(&mut at_cap, 64);
+    let (result, events, _) = decode(&at_cap);
+    assert!(result.is_ok());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].metrics.len(), 64);
+
+    let mut past_cap = collectd_identity();
+    collectd_gauges(&mut past_cap, 65);
+    let (result, events, _) = decode(&past_cap);
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "malformed input: collectd: values part declares 65 data source(s), outside 1..=64"
+    );
+    assert!(events.is_empty());
+
+    let mut behind_a_list = collectd_identity();
+    collectd_gauges(&mut behind_a_list, 1);
+    collectd_gauges(&mut behind_a_list, 65);
+    let (result, events, bad_parts) = decode(&behind_a_list);
+    assert!(result.is_ok(), "a list already decoded keeps the datagram");
+    assert_eq!(events.len(), 1, "the list before the bad part is kept");
+    assert_eq!(bad_parts, 1);
+
+    let mut mismatched = collectd_identity();
+    let mut payload = 65u16.to_be_bytes().to_vec();
+    payload.extend(std::iter::repeat_n(1u8, 64 * 9));
+    collectd_part(&mut mismatched, 0x0006, &payload);
+    let (result, _, _) = decode(&mismatched);
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "malformed input: collectd: values part declares 65 data source(s) in 582 bytes, \
+         expected 591"
+    );
+}
+
+/// The input that makes the most events per byte: one notification's Severity and Host, then
+/// Message parts of one character each, six bytes an event, filling a 65,507-byte UDP payload.
+/// That is 10,914 events, so `out` doubles to 16,384 864-byte `Event`s, a measured 13.5 MiB
+/// `Vec`, which `script/unsafe-check`'s `collectd` malloc limit sits above. A one-value list costs
+/// 15 bytes, so value lists come to fewer events.
+#[test]
+fn collectd_worst_case_datagram_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 16 << 20;
+    const UDP_PAYLOAD: usize = 65_507;
+    let mut datagram = Vec::new();
+    collectd_part(&mut datagram, 0x0101, &4u64.to_be_bytes());
+    collectd_part(&mut datagram, 0x0000, b"h\0");
+    let header = datagram.len();
+    while datagram.len() + 6 <= UDP_PAYLOAD {
+        collectd_part(&mut datagram, 0x0100, b"m\0");
+    }
+    let mut events = 0;
+    let (peak, largest) = peak_and_largest_allocation(|| {
+        let mut out = vec![Event::empty(-1, AttrMap::new())];
+        let mut decoder =
+            logit_proto::collectd::CollectdDecoder::new(Arc::new(Resource::default()));
+        decoder.decode_into(Bytes::from(datagram.clone()), 0, &mut out).unwrap();
+        events = out.len() - 1;
+    });
+    eprintln!("{} bytes, {events} events, peak {peak}, largest {largest}", datagram.len());
+    assert_eq!(events, (datagram.len() - header) / 6, "one event per Message part");
+    assert!(largest < MALLOC_LIMIT, "largest allocation {largest}");
 }
 
 // -- graphite -----------------------------------------------------------------------------------
@@ -598,11 +760,11 @@ fn graphite_pickle_survives_seeded_bit_flips() {
 /// peak is only its own small `Vec`s.
 #[test]
 fn graphite_pickle_rejects_a_string_length_inflated_far_past_what_the_input_holds() {
-    let mut hostile = vec![0x80, 0x02, 0x58];
-    hostile.extend_from_slice(&u32::MAX.to_le_bytes());
-    hostile.extend_from_slice(b"short");
-    hostile.push(0x2e);
-    let bytes = Bytes::from(hostile);
+    let mut corrupt = vec![0x80, 0x02, 0x58];
+    corrupt.extend_from_slice(&u32::MAX.to_le_bytes());
+    corrupt.extend_from_slice(b"short");
+    corrupt.push(0x2e);
+    let bytes = Bytes::from(corrupt);
     assert!(decode_graphite(&bytes, Protocol::Pickle), "an impossible length must be rejected");
 
     let peak = peak_live_bytes(|| {
@@ -615,11 +777,11 @@ fn graphite_pickle_rejects_a_string_length_inflated_far_past_what_the_input_hold
 #[test]
 fn graphite_pickle_rejects_a_64_bit_string_length() {
     for opcode in [0x8du8, 0x8e] {
-        let mut hostile = vec![0x80, 0x05, opcode];
-        hostile.extend_from_slice(&u64::MAX.to_le_bytes());
-        hostile.extend_from_slice(b"short");
-        hostile.push(0x2e);
-        let bytes = Bytes::from(hostile);
+        let mut corrupt = vec![0x80, 0x05, opcode];
+        corrupt.extend_from_slice(&u64::MAX.to_le_bytes());
+        corrupt.extend_from_slice(b"short");
+        corrupt.push(0x2e);
+        let bytes = Bytes::from(corrupt);
         assert!(decode_graphite(&bytes, Protocol::Pickle), "opcode {opcode:#04x}");
 
         let peak = peak_live_bytes(|| {
@@ -636,10 +798,10 @@ fn graphite_pickle_rejects_a_64_bit_string_length() {
 fn graphite_pickle_rejects_nesting_past_the_depth_cap() {
     let depth = logit_proto::graphite::MAX_PICKLE_DEPTH;
     for marks in [depth, depth + 1, 100_000] {
-        let mut hostile = vec![0x80u8, 0x02];
-        hostile.extend(std::iter::repeat_n(0x28u8, marks));
-        hostile.push(0x2e);
-        let bytes = Bytes::from(hostile);
+        let mut corrupt = vec![0x80u8, 0x02];
+        corrupt.extend(std::iter::repeat_n(0x28u8, marks));
+        corrupt.push(0x2e);
+        let bytes = Bytes::from(corrupt);
         assert!(decode_graphite(&bytes, Protocol::Pickle), "{marks} marks must be rejected");
     }
 }
@@ -658,12 +820,12 @@ fn graphite_pickle_rejects_inflated_long_and_frame_lengths() {
     assert!(decode_graphite(&Bytes::from(frame), Protocol::Pickle));
 }
 
-/// `PROTO 2, EMPTY_LIST, LONG_BINPUT 499999, STOP` (9 bytes): a memo key with nothing behind it
-/// must be rejected, not grow the memo to 500,000 slots (~8 MB).
+/// `PROTO 2, EMPTY_LIST, LONG_BINPUT 499999, STOP` (9 bytes): a corrupt memo key with nothing
+/// behind it must be rejected, not grow the memo to 500,000 slots (~8 MB).
 #[test]
-fn graphite_pickle_never_allocates_from_a_hostile_memo_key() {
-    let hostile = vec![0x80, 0x02, 0x5d, 0x72, 0x1f, 0xa1, 0x07, 0x00, 0x2e];
-    let bytes = Bytes::from(hostile);
+fn graphite_pickle_never_allocates_from_a_corrupt_memo_key() {
+    let corrupt = vec![0x80, 0x02, 0x5d, 0x72, 0x1f, 0xa1, 0x07, 0x00, 0x2e];
+    let bytes = Bytes::from(corrupt);
     assert!(
         decode_graphite(&bytes, Protocol::Pickle),
         "a memo key skipping ahead must be rejected"
@@ -675,27 +837,335 @@ fn graphite_pickle_never_allocates_from_a_hostile_memo_key() {
     assert!(peak < 4096, "peak live bytes {peak} suggests the memo key sized the memo");
 }
 
-/// Every opcode byte off the allowlist is refused, checked exhaustively.
+/// Every opcode byte off the allowlist is refused, checked exhaustively, by the allowlist's own
+/// message rather than a short read or a bad argument.
 #[test]
 fn graphite_pickle_rejects_every_opcode_outside_the_allowlist() {
     const PERMITTED: &[u8] = &[
-        0x28, 0x29, 0x2e, 0x42, 0x43, 0x47, 0x4a, 0x4b, 0x4d, 0x4e, 0x54, 0x55, 0x58, 0x5d, 0x61,
-        0x65, 0x68, 0x6a, 0x6c, 0x71, 0x72, 0x74, 0x80, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b,
-        0x8c, 0x8d, 0x8e, 0x94, 0x95,
+        0x28, 0x29, 0x2e, 0x42, 0x43, 0x46, 0x47, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x53, 0x54,
+        0x55, 0x56, 0x58, 0x5d, 0x61, 0x65, 0x67, 0x68, 0x6a, 0x6c, 0x70, 0x71, 0x72, 0x74, 0x80,
+        0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x94, 0x95,
     ];
+    assert_eq!(PERMITTED.len(), 42, "the allowlist the module doc's table names");
     for opcode in 0u8..=255 {
         if PERMITTED.contains(&opcode) {
             continue;
         }
-        // Trailing operand bytes, so a refusal is the allowlist, not a short read.
-        let mut hostile = vec![0x80u8, 0x02, opcode];
-        hostile.extend_from_slice(&[0u8; 16]);
-        hostile.push(0x2e);
-        assert!(
-            decode_graphite(&Bytes::from(hostile), Protocol::Pickle),
-            "opcode {opcode:#04x} must not be accepted"
+        // Trailing operand bytes and a newline, so a refusal is the allowlist, not a short read
+        // or a protocol-0 argument with no end.
+        let mut corrupt = vec![0x80u8, 0x02, opcode];
+        corrupt.extend_from_slice(&[b'0'; 16]);
+        corrupt.push(b'\n');
+        corrupt.push(0x2e);
+        let err = pickle_decode(&corrupt).expect_err("an opcode off the allowlist must fail");
+        assert_eq!(
+            err.to_string(),
+            format!("malformed input: pickle opcode {opcode:#04x} is not permitted"),
         );
     }
+}
+
+/// A protocol-0 argument has no declared length: one with no `\n` behind it runs to the end of
+/// the frame and fails there, allocating nothing.
+#[test]
+fn graphite_pickle_rejects_an_unterminated_protocol_0_argument_without_allocating() {
+    for &opcode in b"ILFSVpg" {
+        let mut corrupt = vec![b'(', b'l', opcode, b'\''];
+        corrupt.extend(std::iter::repeat_n(b'\\', 1 << 16));
+        let err = pickle_decode(&corrupt).expect_err("an unterminated argument must fail");
+        assert!(err.to_string().contains("no terminating newline"), "{err}");
+        let peak = peak_live_bytes(|| {
+            let _ = pickle_decode(&corrupt);
+        });
+        // `pickle_decode` copies the frame into a `Bytes`; nothing else may be sized from it.
+        let bound = (corrupt.len() + 4096) as i64;
+        assert!(peak < bound, "peak live bytes {peak} for opcode {opcode:#04x}");
+    }
+}
+
+/// The scratch holds decoded protocol-0 strings and is at most twice the frame: a `UNICODE` of
+/// Latin-1 bytes at 0x80 or above doubles, and every other decode shrinks or keeps its size.
+#[test]
+fn graphite_pickle_protocol_0_scratch_stays_within_twice_the_frame() {
+    const PATH_BYTES: usize = 1 << 16;
+    let latin1 = {
+        let mut frame = b"(l(V".to_vec();
+        frame.extend(std::iter::repeat_n(0xe9u8, PATH_BYTES));
+        frame.extend_from_slice(b"\n(I1\nF1\ntta.");
+        frame
+    };
+    let escaped = {
+        let mut frame = b"(l(S'".to_vec();
+        frame.extend(b"\\x41".iter().copied().cycle().take(PATH_BYTES));
+        frame.extend_from_slice(b"'\n(I1\nF1\ntta.");
+        frame
+    };
+    for (name, frame, path_len) in
+        [("UNICODE", &latin1, 2 * PATH_BYTES), ("STRING", &escaped, PATH_BYTES / 4)]
+    {
+        let mut reader = logit_proto::graphite::pickle::PickleReader::new();
+        let mut paths = Vec::new();
+        let peak = peak_live_bytes(|| {
+            reader.read_datapoints(frame, |path, _, _| paths.push(path.len())).unwrap();
+        });
+        assert_eq!(paths, [path_len], "{name}");
+        // The scratch `Vec` doubles as it grows, so its capacity can reach twice what it holds.
+        let bound = (2 * 2 * frame.len() + 4096) as i64;
+        assert!(peak <= bound, "{name}: peak live bytes {peak}");
+    }
+}
+
+/// The exact reading of a positive, finite `seconds` in nanoseconds, from the `f64`'s mantissa
+/// and exponent with integer arithmetic: rounded half away from zero, as `f64::round` rounds,
+/// and saturating at `i64::MAX`. The oracle `resolve_timestamp`'s split arithmetic is checked
+/// against.
+fn exact_nanos(seconds: f64) -> i64 {
+    assert!(seconds.is_finite() && seconds > 0.0);
+    let bits = seconds.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = (bits & ((1 << 52) - 1)) as i128;
+    let (mantissa, exponent) =
+        if biased == 0 { (fraction, -1074) } else { (fraction | (1 << 52), biased - 1075) };
+    // A normal mantissa is at least 2^52, so a non-negative exponent is 2^52 seconds or more.
+    if exponent >= 0 {
+        return i64::MAX;
+    }
+    let scaled = mantissa * 1_000_000_000;
+    let shift = -exponent;
+    // `scaled` is under 2^83, so a wider shift leaves less than half a nanosecond.
+    if shift > 84 {
+        return 0;
+    }
+    let whole = scaled >> shift;
+    let rest = scaled & ((1i128 << shift) - 1);
+    let nanos = whole + i128::from(rest >= 1i128 << (shift - 1));
+    i64::try_from(nanos).unwrap_or(i64::MAX)
+}
+
+/// The timestamp one plaintext line `a.b 1 <field>` decodes to, or `None` if it's skipped.
+fn graphite_timestamp(field: &str) -> Option<i64> {
+    let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default()));
+    let mut events = Vec::new();
+    let line = Bytes::from(format!("a.b 1 {field}"));
+    decoder.decode_into(line, GRAPHITE_RECEIVED_AT, &mut events).unwrap();
+    assert!(events.len() <= 1);
+    events.first().map(|event| event.timestamp)
+}
+
+const GRAPHITE_RECEIVED_AT: i64 = 1_699_000_000_123_456_789;
+
+/// `resolve_timestamp`'s table, through the plaintext decoder: whole seconds and the sub-second
+/// part are scaled separately and summed, saturating. From 2^20 seconds up the sub-second
+/// product is exact, so the decoder agrees with [`exact_nanos`] at every row there. Below it the
+/// product rounds once: `0.5011891235` lands a nanosecond above the exact reading of its `f64`,
+/// which is the reading of the decimal the sender wrote. `0.9999999999`'s sub-second part rounds
+/// to a whole second and carries.
+#[test]
+fn graphite_timestamps_resolve_to_the_exact_reading() {
+    let before = f64::from_bits(9_223_372_036.854_776_f64.to_bits() - 1);
+    let after = f64::from_bits(9_223_372_036.854_776_f64.to_bits() + 1);
+    let cases: &[(String, i64)] = &[
+        ("1700000000.25".into(), 1_700_000_000_250_000_000),
+        ("1700000000.0000000001".into(), 1_700_000_000_000_000_000),
+        ("1700000000.0000001".into(), 1_700_000_000_000_000_000),
+        ("2147483647".into(), 2_147_483_647_000_000_000),
+        ("2147483648.5".into(), 2_147_483_648_500_000_000),
+        ("1048576.0000000005".into(), 1_048_576_000_000_000),
+        ("9223372036.854775807".into(), i64::MAX),
+        (format!("{before}"), 9_223_372_036_854_774_475),
+        (format!("{after}"), i64::MAX),
+        ("1e300".into(), i64::MAX),
+        ("4.9e-324".into(), 0),
+        ("0.9999999999".into(), 1_000_000_000),
+        ("0.5011891235".into(), 501_189_124),
+    ];
+    for (field, nanos) in cases {
+        assert_eq!(graphite_timestamp(field), Some(*nanos), "{field}");
+        let seconds: f64 = field.parse().unwrap();
+        if seconds >= (1u64 << 20) as f64 {
+            assert_eq!(exact_nanos(seconds), *nanos, "{field}: the exact reading");
+        }
+    }
+    assert_eq!(exact_nanos(0.501_189_123_5), 501_189_123, "the exact reading below 2^20");
+
+    for field in ["-1", "-1.0", "-1e0", "-1.000"] {
+        assert_eq!(graphite_timestamp(field), Some(GRAPHITE_RECEIVED_AT), "{field}: the sentinel");
+    }
+    for field in ["-1.0000000000000002", "-0.0", "0", "-0.9999999999999999", "NaN", "inf"] {
+        assert_eq!(graphite_timestamp(field), None, "{field}: not a positive instant");
+    }
+}
+
+/// Builds the bytes CPython's `pickle.dumps(points, protocol=2)` writes for a list of more than
+/// one `(str, (int, float))` tuple whose ints fit `BININT`, after `Modules/_pickle.c`'s
+/// `batch_list_exact`: `EMPTY_LIST`, then `MARK … APPENDS` per batch of 1,000 items, the last
+/// batch however short; every string and tuple memoized in order, `BINPUT` up to key 255 and
+/// `LONG_BINPUT` after.
+fn cpython_protocol_2(points: &[(String, i32, f64)]) -> Vec<u8> {
+    fn put(out: &mut Vec<u8>, key: &mut u32) {
+        match u8::try_from(*key) {
+            Ok(short) => out.extend_from_slice(&[0x71, short]),
+            Err(_) => {
+                out.push(0x72);
+                out.extend_from_slice(&key.to_le_bytes());
+            }
+        }
+        *key += 1;
+    }
+    let mut out = vec![0x80, 0x02, 0x5d];
+    let mut key = 0;
+    put(&mut out, &mut key);
+    for batch in points.chunks(1000) {
+        out.push(0x28);
+        for (path, seconds, value) in batch {
+            out.push(0x58);
+            out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            out.extend_from_slice(path.as_bytes());
+            put(&mut out, &mut key);
+            out.push(0x4a);
+            out.extend_from_slice(&seconds.to_le_bytes());
+            out.push(0x47);
+            out.extend_from_slice(&value.to_be_bytes());
+            out.push(0x86);
+            put(&mut out, &mut key);
+            out.push(0x86);
+            put(&mut out, &mut key);
+        }
+        out.push(0x65);
+    }
+    out.push(0x2e);
+    out
+}
+
+fn pickle_decode(payload: &[u8]) -> Result<Vec<Event>, CodecError> {
+    let mut decoder =
+        GraphiteDecoder::new(Arc::new(Resource::default())).with_protocol(Protocol::Pickle);
+    let mut events = Vec::new();
+    decoder.decode_into(Bytes::copy_from_slice(payload), 0, &mut events)?;
+    Ok(events)
+}
+
+/// CPython splits a list of more than 1,000 items into `MARK … APPENDS` batches onto the one list,
+/// and 3,001 is four of them, the last holding one item. Each batch extends the list at the tail
+/// of the reader's list arena, which `append_range` requires, so every datapoint decodes. The
+/// length and FNV-1a hash are those of CPython 3.14.7's own dump of the same list, so the builder
+/// writes CPython's bytes.
+#[test]
+fn graphite_pickle_decodes_cpythons_batched_appends_in_full() {
+    let points: Vec<(String, i32, f64)> =
+        (0..3001).map(|i| (format!("b.{i}"), 1_700_000_000 + i, f64::from(i))).collect();
+    let payload = cpython_protocol_2(&points);
+    let fnv = payload.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &b| {
+        (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    assert_eq!((payload.len(), fnv), (CPYTHON_3001_LEN, CPYTHON_3001_FNV), "not CPython's bytes");
+    let events = pickle_decode(&payload).expect("a batched list decodes");
+    assert_eq!(events.len(), 3001, "every datapoint, across all four batches");
+    for (event, (path, seconds, value)) in events.iter().zip(&points) {
+        assert_eq!(logit_core::interner::resolve(event.metrics[0].name), path);
+        assert_eq!(event.timestamp, i64::from(*seconds) * 1_000_000_000);
+        assert!(matches!(event.metrics[0].kind, logit_core::MetricKind::Gauge(v) if v == *value));
+    }
+}
+
+const CPYTHON_3001_LEN: usize = 124_181;
+const CPYTHON_3001_FNV: u64 = 0x5948_4b3a_3842_6e28;
+
+/// `pickle.dumps([['a.b', [1700000000, 0.5]]], protocol=2)`: carbon's receiver unpacks any
+/// two-element sequence, so it takes list-shaped datapoints, but this reader keeps each list as a
+/// range at the tail of one arena. The inner `[1700000000, 0.5]` is filled before the datapoint
+/// list around it, which then can't be extended, so the frame fails. No recorded or surveyed
+/// producer writes a list here (CPython callers, og-rek in carbon-relay-ng, Dropwizard, Diamond,
+/// statsite, and graphitesend all write tuples), so it's a non-goal, recorded in
+/// `docs/known-gaps/mappings.md`. og-rek's `MARK … LIST` builds a list in one step, so a list item
+/// there costs only itself.
+#[test]
+fn graphite_pickle_list_shaped_datapoints_fail_the_frame() {
+    // EMPTY_LIST BINPUT 0 EMPTY_LIST BINPUT 1 MARK X'a.b' BINPUT 2 EMPTY_LIST BINPUT 3 MARK
+    // J1700000000 G0.5 APPENDS APPENDS APPEND STOP: CPython 3.14.7's bytes.
+    let mut nested = vec![0x80, 0x02, 0x5d, 0x71, 0x00, 0x5d, 0x71, 0x01, 0x28, 0x58, 3, 0, 0, 0];
+    nested.extend_from_slice(b"a.b");
+    nested.extend_from_slice(&[0x71, 0x02, 0x5d, 0x71, 0x03, 0x28, 0x4a, 0x00, 0xf1, 0x53, 0x65]);
+    nested.extend_from_slice(&[0x47, 0x3f, 0xe0, 0, 0, 0, 0, 0, 0, 0x65, 0x65, 0x61, 0x2e]);
+    let err = pickle_decode(&nested).expect_err("a list-shaped datapoint fails the frame");
+    assert_eq!(
+        err.to_string(),
+        "malformed input: pickle APPEND/APPENDS onto a list this reader cannot extend"
+    );
+
+    // MARK (path, (ts, value)) EMPTY_LIST MARK BININT1 1 BININT1 2 APPENDS LIST STOP: a list item
+    // inside og-rek's one-step list is a wrong-shaped item, skipped.
+    let mut og_rek = vec![0x80, 0x02, 0x28, 0x55, 3];
+    og_rek.extend_from_slice(b"a.b");
+    og_rek.extend_from_slice(&[0x4a, 0x00, 0xf1, 0x53, 0x65, 0x47, 0x3f, 0xe0, 0, 0, 0, 0, 0, 0]);
+    og_rek.extend_from_slice(&[0x86, 0x86, 0x5d, 0x28, 0x4b, 1, 0x4b, 2, 0x65, 0x6c, 0x2e]);
+    let events = pickle_decode(&og_rek).expect("og-rek's MARK … LIST decodes");
+    assert_eq!(events.len(), 1, "the tuple datapoint decodes and the list item is skipped");
+}
+
+/// The input that makes the most events per byte, `BINGET` of one memoized datapoint repeated to
+/// fill a 64 KiB payload: two bytes per event, 32,759 of them, so the decoder's `out` doubles to
+/// 32,768 864-byte `Event`s, a measured 27 MiB `Vec`. The largest single allocation is what
+/// `script/unsafe-check`'s `graphite_pickle` malloc limit sits above. The reader's own arenas
+/// hold one 16-byte value per byte at most.
+#[test]
+fn graphite_pickle_worst_case_payload_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 32 << 20;
+    let mut payload = vec![0x80, 0x02, 0x5d, 0x28, 0x58, 1, 0, 0, 0, b'a', 0x4b, 1, 0x4b, 1];
+    payload.extend_from_slice(&[0x86, 0x86, 0x71, 0x00]);
+    while payload.len() + 4 <= 1 << 16 {
+        payload.extend_from_slice(&[0x68, 0x00]);
+    }
+    payload.extend_from_slice(&[0x65, 0x2e]);
+    let mut events = 0;
+    let (peak, largest) = peak_and_largest_allocation(|| {
+        let mut out = vec![Event::empty(-1, AttrMap::new())];
+        let mut decoder =
+            GraphiteDecoder::new(Arc::new(Resource::default())).with_protocol(Protocol::Pickle);
+        decoder.decode_into(Bytes::from(payload.clone()), 0, &mut out).unwrap();
+        events = out.len() - 1;
+    });
+    eprintln!("{} bytes, {events} events, peak {peak}, largest {largest}", payload.len());
+    assert_eq!(events, (payload.len() - 20) / 2 + 1, "one event per BINGET, and the first");
+    assert!(largest < MALLOC_LIMIT, "largest allocation {largest}");
+
+    // Protocol 0's densest spelling, `g0\n`, is three bytes per event, so it makes fewer.
+    let mut payload = b"(l(S'a'\np0\n(I1\nI1\nttp0\na(".to_vec();
+    while payload.len() + 4 <= 1 << 16 {
+        payload.extend_from_slice(b"g0\n");
+    }
+    payload.extend_from_slice(b"e.");
+    let mut p0_events = 0;
+    let (_, p0_largest) = peak_and_largest_allocation(|| {
+        let mut out = vec![Event::empty(-1, AttrMap::new())];
+        let mut decoder =
+            GraphiteDecoder::new(Arc::new(Resource::default())).with_protocol(Protocol::Pickle);
+        decoder.decode_into(Bytes::from(payload.clone()), 0, &mut out).unwrap();
+        p0_events = out.len() - 1;
+    });
+    assert!(p0_events < events, "protocol 0: {p0_events} events");
+    assert!(p0_largest <= largest, "protocol 0: largest allocation {p0_largest}");
+}
+
+/// The plaintext counterpart: `a 1 1`, the shortest line that decodes, and its `LF`, filling a
+/// 64 KiB datagram. That is one 864-byte `Event` per six bytes, 10,922 of them, so `out` doubles
+/// to 16,384 `Event`s, a measured 13.5 MiB `Vec`, which `script/unsafe-check`'s
+/// `graphite_plaintext` malloc limit sits above.
+#[test]
+fn graphite_plaintext_worst_case_datagram_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 16 << 20;
+    let mut datagram = b"a 1 1\n".repeat(MAX_FRAME_BYTES / 6);
+    datagram.pop();
+    let mut events = 0;
+    let (peak, largest) = peak_and_largest_allocation(|| {
+        let mut out = vec![Event::empty(-1, AttrMap::new())];
+        let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default()));
+        decoder.decode_into(Bytes::from(datagram.clone()), 0, &mut out).unwrap();
+        events = out.len() - 1;
+    });
+    eprintln!("{} bytes, {events} events, peak {peak}, largest {largest}", datagram.len());
+    assert_eq!(events, MAX_FRAME_BYTES / 6, "one event per line");
+    assert!(largest < MALLOC_LIMIT, "largest allocation {largest}");
 }
 
 // -- control messages -----------------------------------------------------------------------
@@ -1336,6 +1806,645 @@ fn otlp_json_peak_memory_per_input_byte_is_documented() {
     }
 }
 
+// -- framing ------------------------------------------------------------------------------------
+//
+// The stream `Framer`, driven as `logit_inputs::tcp`'s driver drives it: push, then `next_frame`
+// until `Ok(None)` or a fatal error, then `finish` on a FIN or `abandon` on any other end.
+
+/// rsyslog's RFC 6587 non-transparent stream (`testdata/interop/syslog/README.md`).
+const RSYSLOG_TCP: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../testdata/interop/syslog/rsyslog-tcp-000.raw"
+));
+
+/// The `datadog` Python client's stream Unix socket: little-endian length-prefixed packets
+/// (`testdata/interop/datadog/README.md`).
+const DOGSTATSD_UNIX_STREAM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../testdata/interop/datadog/dogstatsd-unix-stream-000.raw"
+));
+
+const DRAIN: FramingMode = FramingMode::Lines { oversize: Oversize::DrainToNextLine };
+const FATAL_LINES: FramingMode = FramingMode::Lines { oversize: Oversize::Fatal };
+
+/// Pushes `bytes` and drains: every frame, then the first error if it was fatal. Non-fatal
+/// errors are collected and the drain goes on, as the driver's does.
+fn drain_push(framer: &mut Framer, bytes: &[u8]) -> (Vec<Bytes>, Vec<FrameError>) {
+    framer.push(bytes);
+    let (mut frames, mut errors) = (Vec::new(), Vec::new());
+    loop {
+        match framer.next_frame() {
+            Ok(Some(frame)) => frames.push(frame),
+            Ok(None) => return (frames, errors),
+            Err(err) => {
+                let fatal = err.is_fatal();
+                errors.push(err);
+                if fatal {
+                    return (frames, errors);
+                }
+            }
+        }
+    }
+}
+
+/// Every mode's valid stream with its length prefix where it has one, for the bit-flip sweep.
+fn framing_cases() -> Vec<(FramingMode, Vec<u8>)> {
+    let mut pickle = (GRAPHITE_PICKLE.len() as u32).to_be_bytes().to_vec();
+    pickle.extend_from_slice(GRAPHITE_PICKLE);
+    vec![
+        (FramingMode::Rfc6587Auto, RSYSLOG_TCP.to_vec()),
+        (
+            FramingMode::Rfc6587Auto,
+            format!("{} {}", RSYSLOG_TCP.len(), "x".repeat(RSYSLOG_TCP.len())).into_bytes(),
+        ),
+        (DRAIN, GRAPHITE_PLAINTEXT.to_vec()),
+        (FATAL_LINES, GRAPHITE_PLAINTEXT.to_vec()),
+        (FramingMode::LengthPrefixed, pickle),
+        (FramingMode::LengthPrefixedLe, DOGSTATSD_UNIX_STREAM.to_vec()),
+    ]
+}
+
+/// Every prefix of the stream, closed by a FIN: a short syslog frame, or none, never a panic.
+#[test]
+fn framer_survives_every_truncation_of_the_rsyslog_stream_then_finish() {
+    for len in 0..=RSYSLOG_TCP.len() {
+        let closed = std::panic::catch_unwind(|| {
+            let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
+            let (frames, errors) = drain_push(&mut framer, &RSYSLOG_TCP[..len]);
+            assert!(errors.is_empty(), "a prefix of an LF-framed stream frames cleanly");
+            let last = framer.finish().expect("an LF-framed remainder is a final message");
+            assert_eq!(framer.buffered(), 0);
+            frames.len() + usize::from(last.is_some())
+        });
+        let count = closed.unwrap_or_else(|_| panic!("a {len}-byte prefix panicked"));
+        assert!(count <= 1, "a {len}-byte prefix of one message framed {count}");
+    }
+}
+
+/// A flipped bit can change the framing a stream latches, a count, or a prefix; whatever it
+/// does, push, drain, and close never panic, under every mode and split across two pushes.
+#[test]
+fn framer_survives_seeded_bit_flips_in_every_mode() {
+    let mut rng = Lcg::new(0xF4A3_E5EE_D000_0001);
+    for (mode, valid) in framing_cases() {
+        for _ in 0..1500 {
+            let mut mutated = valid.clone();
+            let byte_idx = rng.next_usize(mutated.len());
+            let bit = rng.next_usize(8);
+            mutated[byte_idx] ^= 1 << bit;
+            let split = rng.next_usize(mutated.len() + 1);
+            let bound = [64, 4096, MAX_FRAME_BYTES][rng.next_usize(3)];
+            let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut framer = Framer::new(mode, bound);
+                let (_, errors) = drain_push(&mut framer, &mutated[..split]);
+                if errors.iter().any(FrameError::is_fatal) {
+                    return;
+                }
+                let (_, errors) = drain_push(&mut framer, &mutated[split..]);
+                if !errors.iter().any(FrameError::is_fatal) {
+                    let _ = framer.finish();
+                }
+            }))
+            .is_err();
+            assert!(!panicked, "{mode:?}: a flip at byte {byte_idx} bit {bit} panicked");
+        }
+    }
+}
+
+/// A corrupt length prefix of `u32::MAX` is refused before anything is sized from it: one fatal
+/// `Oversize`, and the peak is the framer's own read buffer.
+#[test]
+fn a_corrupt_u32_max_length_prefix_is_a_fatal_oversize_without_a_large_allocation() {
+    for mode in [FramingMode::LengthPrefixed, FramingMode::LengthPrefixedLe] {
+        let mut err = None;
+        let peak = peak_live_bytes(|| {
+            let mut framer = Framer::new(mode, MAX_FRAME_BYTES);
+            framer.push(&[0xFF, 0xFF, 0xFF, 0xFF, b'x']);
+            err = framer.next_frame().err();
+        });
+        let err = err.expect("a declared length past the bound is an error");
+        assert!(matches!(err, FrameError::Oversize(_)), "{mode:?}: {err:?}");
+        assert!(err.is_fatal(), "{mode:?}: a length-framed stream has no resync point");
+        assert!(peak < 64 * 1024, "{mode:?}: peaked at {peak} live bytes");
+    }
+}
+
+/// A sender that writes only keepalive newlines produces no frame and costs nothing at a close;
+/// each `next_frame` call over a megabyte of them returns.
+#[test]
+fn an_all_newline_keepalive_stream_yields_no_frames_and_terminates() {
+    let newlines = vec![b'\n'; 1 << 20];
+    for mode in [FramingMode::Rfc6587Auto, DRAIN, FATAL_LINES] {
+        let mut framer = Framer::new(mode, 64);
+        let (frames, errors) = drain_push(&mut framer, &newlines);
+        assert!(frames.is_empty() && errors.is_empty(), "{mode:?}: {frames:?} {errors:?}");
+        assert_eq!(framer.buffered(), 0, "{mode:?}: every newline is consumed");
+        assert_eq!(framer.finish(), Ok(None), "{mode:?}");
+    }
+}
+
+/// The drain state lasts until the line's `LF`, however many pushes that takes, holds nothing
+/// meanwhile, counts the line once as `drained`, and lets the next line frame.
+#[test]
+fn the_drain_latch_holds_across_many_pushes_and_counts_once() {
+    let mut framer = Framer::new(DRAIN, 64);
+    let mut errors = Vec::new();
+    let (frames, first) = drain_push(&mut framer, &[b'x'; 65]);
+    assert!(frames.is_empty());
+    errors.extend(first);
+    for _ in 0..1000 {
+        let (frames, more) = drain_push(&mut framer, &[b'y'; 4096]);
+        assert!(frames.is_empty(), "the abandoned line never frames");
+        errors.extend(more);
+        assert_eq!(framer.buffered(), 0, "a drain holds nothing between pushes");
+    }
+    let (frames, more) = drain_push(&mut framer, b"\nvalid line\n");
+    errors.extend(more);
+    assert_eq!(frames, vec![Bytes::from_static(b"valid line")]);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(matches!(errors[0], FrameError::Drained(_)), "{:?}", errors[0]);
+    assert_eq!(errors[0].reason(), "drained");
+}
+
+/// The same bytes ended by a FIN (`finish`) and by an RST, shutdown, or idle close (`abandon`):
+/// the `frames.dropped` reason each counts, or the frame a FIN delivers.
+#[test]
+fn a_fin_and_an_rst_agree_about_every_remainder() {
+    enum Fin {
+        Nothing,
+        Truncated,
+        Delivers(&'static [u8]),
+    }
+    let cases: [(FramingMode, &[u8], Fin, Option<&str>); 12] = [
+        (FramingMode::Rfc6587Auto, b"<13>a\n", Fin::Nothing, None),
+        (FramingMode::Rfc6587Auto, b"<13>a\n<13>b", Fin::Delivers(b"<13>b"), Some("truncated")),
+        (FramingMode::Rfc6587Auto, b"<13>a\n<13>b\r", Fin::Delivers(b"<13>b"), Some("truncated")),
+        (FramingMode::Rfc6587Auto, b"<13>a\n\r", Fin::Nothing, None),
+        (FramingMode::Rfc6587Auto, b"9 <13>", Fin::Truncated, Some("truncated")),
+        (DRAIN, b"a 1 2\n \t\r", Fin::Nothing, None),
+        (DRAIN, b"a 1 2\nb 1", Fin::Truncated, Some("truncated")),
+        (DRAIN, &[b'x'; 100], Fin::Nothing, None),
+        (FATAL_LINES, b"a 1 2\n\r\n\r", Fin::Nothing, None),
+        (FramingMode::LengthPrefixed, &[0, 0, 0, 1, b'h'], Fin::Nothing, None),
+        (FramingMode::LengthPrefixed, &[0, 0, 0, 2, b'h'], Fin::Truncated, Some("truncated")),
+        (FramingMode::LengthPrefixedLe, &[2, 0], Fin::Truncated, Some("truncated")),
+    ];
+    for (mode, wire, fin, rst) in cases {
+        let label = format!("{mode:?} {:?}", String::from_utf8_lossy(wire));
+        let mut by_fin = Framer::new(mode, 64);
+        let mut by_rst = Framer::new(mode, 64);
+        let (_, errors) = drain_push(&mut by_fin, wire);
+        assert!(!errors.iter().any(FrameError::is_fatal), "{label}: {errors:?}");
+        drain_push(&mut by_rst, wire);
+        match (fin, by_fin.finish()) {
+            (Fin::Nothing, Ok(None)) => {}
+            (Fin::Truncated, Err(FrameError::Truncated(_))) => {}
+            (Fin::Delivers(want), Ok(Some(frame))) => assert_eq!(&frame[..], want, "{label}"),
+            (_, got) => panic!("{label}: a FIN gave {got:?}"),
+        }
+        assert_eq!(by_rst.abandon().as_ref().map(FrameError::reason), rst, "{label}");
+    }
+}
+
+// -- statsd -------------------------------------------------------------------------------------
+//
+// `StatsdDecoder::decode_into` over one datagram, as `statsd_in` hands it one. A bad line is a
+// throttled `bad_line` diagnostic, never an error, so a rejected line shows as a missing event.
+
+/// Every recorded statsd datagram: `testdata/interop/statsd/` and the `datadog` client's Unix
+/// datagrams (each directory's `README.md` has the provenance).
+fn statsd_datagrams() -> Vec<(String, Vec<u8>)> {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/interop");
+    let mut out = Vec::new();
+    for (dir, prefix) in [("statsd", "statsd-"), ("datadog", "dogstatsd-unix-0")] {
+        let mut paths: Vec<_> = std::fs::read_dir(format!("{root}/{dir}"))
+            .expect("the recorded corpus is checked in")
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.starts_with(prefix) && name.ends_with(".raw")
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            out.push((name, std::fs::read(&path).unwrap()));
+        }
+    }
+    assert!(out.len() >= 60, "expected the whole recorded corpus, got {}", out.len());
+    out
+}
+
+fn statsd_decode(datagram: &[u8]) -> Result<Vec<Event>, CodecError> {
+    let mut out = Vec::new();
+    StatsdDecoder::new(Arc::new(Resource::default())).decode_into(
+        Bytes::copy_from_slice(datagram),
+        0,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+#[test]
+fn statsd_survives_every_single_byte_truncation_of_every_recorded_datagram() {
+    for (name, datagram) in statsd_datagrams() {
+        let survived = std::panic::catch_unwind(|| {
+            assert_every_truncation_never_panics(&datagram, |bytes| statsd_decode(bytes).is_err())
+        });
+        assert!(survived.is_ok(), "{name}");
+    }
+}
+
+#[test]
+fn statsd_survives_seeded_bit_flips_over_every_recorded_datagram() {
+    for (name, datagram) in statsd_datagrams() {
+        let survived = std::panic::catch_unwind(|| {
+            assert_bit_flips_never_panic(&datagram, 300, |bytes| statsd_decode(bytes).is_err())
+        });
+        assert!(survived.is_ok(), "{name}");
+    }
+}
+
+/// An event's text unescaped against `str::replace` as the oracle. `unescape_event_text` sizes
+/// its buffer as `raw.len() - escapes` and `debug_assert`s it filled that, which runs here: a
+/// count off by one either way panics in this test. Text with nothing to unescape stays a slice
+/// of the datagram.
+#[test]
+fn statsd_event_text_unescapes_as_str_replace_does() {
+    let mut texts: Vec<String> = (0..=64).map(|n| "\\n".repeat(n)).collect();
+    texts.extend(
+        [
+            "",
+            "\\",
+            "a\\",
+            "\\\\n",
+            "\\\\\\n",
+            "\\nn",
+            "n\\",
+            "\\n\\",
+            "a\\nb\\nc",
+            "é\\nü\\n",
+            "\\n|t:error",
+            "\\N\\r\\t",
+        ]
+        .map(String::from),
+    );
+    for text in texts {
+        let datagram = format!("_e{{1,{}}}:t|{text}", text.len());
+        let bytes = Bytes::from(datagram.clone());
+        let mut out = Vec::new();
+        StatsdDecoder::new(Arc::new(Resource::default()))
+            .decode_into(bytes.clone(), 0, &mut out)
+            .unwrap();
+        assert_eq!(out.len(), 1, "{datagram:?} decodes to one event");
+        let Value::Str(message) = &out[0].log.as_ref().unwrap().message else {
+            panic!("{datagram:?}: the message is a Str");
+        };
+        assert_eq!(&message[..], text.replace("\\n", "\n").as_bytes(), "{datagram:?}");
+        assert_eq!(
+            logit_core::subslice::within(&bytes, message),
+            !text.contains("\\n"),
+            "{datagram:?}: a slice if and only if nothing was unescaped"
+        );
+    }
+}
+
+/// `|T` seconds become nanoseconds through `checked_mul` and `i64::try_from`: `9223372036` is the
+/// last second whose nanoseconds fit an `i64`, `9223372037` the first that doesn't, and
+/// `18446744074` the first whose `u64` multiplication overflows. Each rejection drops only its
+/// line, and an event's and a service check's `d:` share the parse.
+#[test]
+fn statsd_wire_seconds_reject_past_the_last_representable_second() {
+    let events = statsd_decode(b"a:1|c|T9223372036").unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].timestamp, 9_223_372_036_000_000_000);
+    for secs in ["9223372037", "18446744073", "18446744074", "18446744073709551616"] {
+        for line in [
+            format!("a:1|c|T{secs}"),
+            format!("_e{{1,1}}:t|x|d:{secs}"),
+            format!("_sc|check|0|d:{secs}"),
+        ] {
+            let events = statsd_decode(format!("{line}\nb:1|c").as_bytes()).unwrap();
+            assert_eq!(events.len(), 1, "{line}: only the other line decodes");
+            assert_eq!(events[0].timestamp, 0, "{line}");
+        }
+    }
+}
+
+/// The input that makes the most events per byte, `a:1:1:…|c` filling the frame bound: one
+/// 864-byte `Event` per two wire bytes. Two lines can be worse than one, because the second
+/// line's append doubles `out`'s capacity past the first line's exact fit. The largest single
+/// allocation is what `script/unsafe-check`'s `statsd` malloc limit sits above.
+#[test]
+fn statsd_worst_case_datagram_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 56 << 20;
+    let one_line = {
+        let mut line = b"a:1".to_vec();
+        while line.len() + 4 <= MAX_FRAME_BYTES {
+            line.extend_from_slice(b":1");
+        }
+        line.extend_from_slice(b"|c");
+        line
+    };
+    let two_lines = {
+        let mut line = one_line[..one_line.len() - 8].to_vec();
+        line.extend_from_slice(b"|c\na:1|c");
+        line
+    };
+    for (name, datagram) in [("one line", one_line), ("two lines", two_lines)] {
+        assert!(datagram.len() <= MAX_FRAME_BYTES, "{name}");
+        let mut events = 0;
+        let (peak, largest) = peak_and_largest_allocation(|| {
+            events = statsd_decode(&datagram).unwrap().len();
+        });
+        eprintln!(
+            "{name}: {} bytes, {events} events, peak {peak}, largest {largest}",
+            datagram.len()
+        );
+        assert!(events * 2 + 8 >= datagram.len(), "{name}: about one event per two bytes");
+        assert!(largest < MALLOC_LIMIT, "{name}: largest allocation {largest}");
+    }
+}
+
+// -- syslog -------------------------------------------------------------------------------------
+//
+// `SyslogDecoder::decode_into` over one datagram, as `syslog_in`'s UDP arm hands it one, or over
+// one frame with line splitting off, as its TCP arm does. A bad line is a throttled `bad_line`
+// diagnostic, never an error, so a rejected line shows as a missing event.
+
+/// Every recorded syslog capture in `testdata/interop/syslog/` (its `README.md` has the
+/// provenance). `rsyslog-tcp-000.raw` is a TCP stream of one LF-terminated message, which line
+/// splitting reads as one datagram.
+fn syslog_captures() -> Vec<(String, Vec<u8>)> {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/interop/syslog");
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .expect("the recorded corpus is checked in")
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "raw"))
+        .collect();
+    paths.sort();
+    let out: Vec<_> = paths
+        .into_iter()
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, std::fs::read(&path).unwrap())
+        })
+        .collect();
+    assert_eq!(out.len(), 7, "expected the whole recorded corpus");
+    out
+}
+
+fn syslog_decoder(line_splitting: bool) -> SyslogDecoder {
+    SyslogDecoder::new(Arc::new(Resource::default())).with_line_splitting(line_splitting)
+}
+
+fn syslog_decode(input: &[u8]) -> Vec<Event> {
+    let mut out = Vec::new();
+    syslog_decoder(true)
+        .decode_into(Bytes::copy_from_slice(input), 0, &mut out)
+        .expect("syslog decoding never fails a datagram");
+    out
+}
+
+/// The one event `line` decodes to, or a panic naming the line.
+fn syslog_event(line: &[u8]) -> Event {
+    let mut events = syslog_decode(line);
+    assert_eq!(events.len(), 1, "{:?} decodes to one event", String::from_utf8_lossy(line));
+    events.pop().unwrap()
+}
+
+fn syslog_message(event: &Event) -> &str {
+    event.log.as_ref().unwrap().message.as_str().expect("a UTF-8 message")
+}
+
+#[test]
+fn syslog_survives_every_single_byte_truncation_of_every_capture() {
+    for (name, capture) in syslog_captures() {
+        for splitting in [true, false] {
+            let survived = std::panic::catch_unwind(|| {
+                assert_every_truncation_never_panics(&capture, |bytes| {
+                    let mut out = Vec::new();
+                    syslog_decoder(splitting).decode_into(bytes.clone(), 0, &mut out).is_err()
+                })
+            });
+            assert!(survived.is_ok(), "{name}, line splitting {splitting}");
+        }
+    }
+}
+
+#[test]
+fn syslog_survives_seeded_bit_flips_over_every_capture() {
+    for (name, capture) in syslog_captures() {
+        for splitting in [true, false] {
+            let survived = std::panic::catch_unwind(|| {
+                assert_bit_flips_never_panic(&capture, 300, |bytes| {
+                    let mut out = Vec::new();
+                    syslog_decoder(splitting).decode_into(bytes.clone(), 0, &mut out).is_err()
+                })
+            });
+            assert!(survived.is_ok(), "{name}, line splitting {splitting}");
+        }
+    }
+}
+
+/// RFC 5424 §6.3.3 caps an SD-NAME at 32 bytes, for an SD-ID and a PARAM-NAME alike. A line past
+/// it isn't RFC 5424, so it falls back to RFC 3164 with its whole MSG and no `syslog.sd`.
+#[test]
+fn syslog_sd_names_are_accepted_at_32_bytes_and_fall_back_at_33() {
+    let (at, past) = ("i".repeat(32), "i".repeat(33));
+    for (id, param) in [(&at, &at), (&past, &at), (&at, &past)] {
+        let line = format!(r#"<134>1 - - - - - [{id} {param}="v"] msg"#);
+        let event = syslog_event(line.as_bytes());
+        let fits = id.len() <= 32 && param.len() <= 32;
+        let label = format!("SD-ID {} and PARAM-NAME {}", id.len(), param.len());
+        assert_eq!(event.attributes.get("syslog.sd").is_some(), fits, "{label}");
+        let message = if fits { "msg" } else { &line[5..] };
+        assert_eq!(syslog_message(&event), message, "{label}");
+    }
+}
+
+/// A PARAM-NAME repeated a thousand times in one element, in a line under 64 KiB, folds into one
+/// `Value::Array` in wire order.
+#[test]
+fn syslog_a_thousand_repeated_param_names_fold_into_one_array_in_order() {
+    let mut line = b"<134>1 - - - - - [rep@1".to_vec();
+    for i in 0..1000 {
+        line.extend_from_slice(format!(r#" k="{i}""#).as_bytes());
+    }
+    line.extend_from_slice(b"] msg");
+    assert!(line.len() <= MAX_FRAME_BYTES);
+    let event = syslog_event(&line);
+    let Some(Value::Map(sd)) = event.attributes.get("syslog.sd") else {
+        panic!("syslog.sd is a Map");
+    };
+    let Some(Value::Map(params)) = sd.get("rep@1") else { panic!("rep@1 is a Map") };
+    assert_eq!(params.len(), 1, "one PARAM-NAME");
+    let Some(Value::Array(values)) = params.get("k") else { panic!("k is an Array") };
+    let expected: Vec<Value> = (0..1000).map(|i| Value::str(i.to_string())).collect();
+    assert_eq!(values, &expected);
+    assert_eq!(syslog_message(&event), "msg");
+}
+
+/// A PARAM-VALUE cut off at the end of the input, in its body or right after a backslash, fails
+/// the RFC 5424 parse under either mode, never a panic or an index past the end, and the line
+/// falls back to RFC 3164 with its whole MSG.
+#[test]
+fn syslog_a_param_value_cut_off_at_the_end_of_the_input_falls_back() {
+    for line in [
+        &br#"<134>1 - - - - - [a@1 k="abc"#[..],
+        br#"<134>1 - - - - - [a@1 k="abc\"#,
+        br#"<134>1 - - - - - [a@1 k=""#,
+        br#"<134>1 - - - - - [a@1 k="\"#,
+    ] {
+        for splitting in [true, false] {
+            let mut out = Vec::new();
+            syslog_decoder(splitting).decode_into(Bytes::from_static(line), 0, &mut out).unwrap();
+            assert_eq!(out.len(), 1, "{:?}", String::from_utf8_lossy(line));
+            assert!(out[0].attributes.get("syslog.sd").is_none());
+            assert_eq!(syslog_message(&out[0]).as_bytes(), &line[5..]);
+        }
+    }
+}
+
+/// PRI is `0` to `191` with no leading zero (`crates/logit-proto/src/syslog/mod.rs`'s
+/// "Mapping").
+#[test]
+fn syslog_pri_accepts_0_and_191_and_rejects_192_and_00() {
+    for (pri, facility, severity) in [("0", 0, 0), ("191", 23, 7)] {
+        let event = syslog_event(format!("<{pri}>msg").as_bytes());
+        assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(facility)), "{pri}");
+        assert_eq!(event.attributes.get("syslog.severity"), Some(&Value::U64(severity)), "{pri}");
+    }
+    for pri in ["192", "00", "000", "0191"] {
+        assert!(syslog_decode(format!("<{pri}>msg").as_bytes()).is_empty(), "{pri}");
+    }
+}
+
+/// The RFC 3164 timestamp is 15 bytes: one byte short is MSG text, and 15 with nothing after it
+/// is a timestamp and an empty MSG.
+#[test]
+fn syslog_rfc3164_timestamp_needs_all_15_bytes() {
+    let event = syslog_event(b"<13>Oct 11 22:14:1");
+    assert!(event.attributes.get("syslog.timestamp").is_none());
+    assert_eq!(syslog_message(&event), "Oct 11 22:14:1");
+
+    let event = syslog_event(b"<13>Oct 11 22:14:15");
+    assert_eq!(
+        event.attributes.get("syslog.timestamp").and_then(Value::as_str),
+        Some("Oct 11 22:14:15")
+    );
+    assert_eq!(syslog_message(&event), "");
+}
+
+/// A tag-less RFC 3164 MSG starting with a digit and a space, against the dialect sniff
+/// (`crates/logit-proto/src/syslog/mod.rs`'s "Dialect disambiguation"): any digit, `1` included,
+/// falls back to RFC 3164 with a `sniff_fallback`, and two digits never sniff.
+#[test]
+fn syslog_a_digit_led_rfc3164_msg_against_the_dialect_sniff() {
+    let registry = logit_core::Registry::new();
+    let telemetry = registry.telemetry_for("syslog_in", "syslog", "input");
+    let diag = logit_core::Diagnostics::new("syslog_in").with_telemetry(telemetry);
+    let mut decoder = syslog_decoder(true).with_diagnostics(diag);
+    let mut decode_with_diag = |line: &'static [u8]| {
+        let mut out = Vec::new();
+        decoder.decode_into(Bytes::from_static(line), 0, &mut out).unwrap();
+        let keys: Vec<String> = registry
+            .drain(0)
+            .iter()
+            .filter_map(|e| e.attributes.get("key").and_then(Value::as_str).map(String::from))
+            .collect();
+        (out, keys)
+    };
+
+    for line in [
+        &b"<13>4 requests failed"[..],
+        b"<13>0 a b c",
+        b"<13>9 lives",
+        b"<14>1 worker died",
+        b"<13>1 2 3 msg",
+    ] {
+        let (events, keys) = decode_with_diag(line);
+        assert_eq!(events.len(), 1, "{:?}", String::from_utf8_lossy(line));
+        assert_eq!(syslog_message(&events[0]), std::str::from_utf8(&line[4..]).unwrap());
+        assert_eq!(keys, ["sniff_fallback"], "{:?}", String::from_utf8_lossy(line));
+    }
+
+    let (events, keys) = decode_with_diag(b"<13>10 workers started");
+    assert_eq!(syslog_message(&events[0]), "10 workers started");
+    assert!(keys.is_empty(), "a two-digit token never sniffs as RFC 5424: {keys:?}");
+}
+
+/// The input that makes the most events per byte: `<0>`, the shortest accepted line, and its `LF`,
+/// filling a 64 KiB datagram, decoded into an `out` that already holds one event, as the fuzz
+/// target's marker does. That is one 864-byte `Event` per four bytes, 16,384 of them, and the
+/// marker pushes the count one past a power of two, so `out` doubles once more: a measured 27 MiB
+/// `Vec` of 32,768 events. The largest single allocation is what `script/unsafe-check`'s `syslog`
+/// malloc limit sits above.
+#[test]
+fn syslog_worst_case_datagram_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 32 << 20;
+    let mut datagram = b"<0>\n".repeat(MAX_FRAME_BYTES / 4);
+    datagram.pop();
+    assert!(datagram.len() < MAX_FRAME_BYTES);
+    let mut events = 0;
+    let (peak, largest) = peak_and_largest_allocation(|| {
+        let mut out = vec![Event::empty(-1, AttrMap::new())];
+        syslog_decoder(true).decode_into(Bytes::from(datagram.clone()), 0, &mut out).unwrap();
+        events = out.len() - 1;
+    });
+    eprintln!("{} bytes, {events} events, peak {peak}, largest {largest}", datagram.len());
+    assert_eq!(events, MAX_FRAME_BYTES / 4, "one event per `<0>` line");
+    assert!(largest < MALLOC_LIMIT, "largest allocation {largest}");
+}
+
+/// A 64 KiB line of distinct SD-NAMEs, in the order that costs `AttrMap` the most: each name
+/// interned before the line in reverse, so every insert into the sorted map lands at its front.
+/// The parse is one forward pass, but that fold is quadratic in the name count; the frame cap
+/// bounds it, and no count cap is added (`docs/known-gaps/syslog.md`). This pins the result, not
+/// the time, which the test prints: about 10 ms for the PARAMs and 17 ms for the SD-IDs in a
+/// release build, against 3 ms for the PARAMs in first-seen order.
+#[test]
+fn syslog_a_64_kib_line_of_distinct_sd_names_decodes_whole() {
+    let time = |line: &[u8]| {
+        let start = std::time::Instant::now();
+        let event = syslog_event(line);
+        eprintln!("{} bytes in {:?}", line.len(), start.elapsed());
+        event
+    };
+    let sd_of = |event: &Event| match event.attributes.get("syslog.sd") {
+        Some(Value::Map(sd)) => sd.as_ref().clone(),
+        other => panic!("syslog.sd is a Map: {other:?}"),
+    };
+
+    let mut line = b"<134>1 - - - - - [d@1".to_vec();
+    let mut names = Vec::new();
+    while line.len() + 16 < MAX_FRAME_BYTES {
+        let name = format!("p{:x}", names.len());
+        line.extend_from_slice(format!(r#" {name}="""#).as_bytes());
+        names.push(name);
+    }
+    line.extend_from_slice(b"] m");
+    for name in names.iter().rev() {
+        logit_core::interner::intern(name);
+    }
+    let sd = sd_of(&time(&line));
+    let Some(Value::Map(params)) = sd.get("d@1") else { panic!("d@1 is a Map") };
+    assert_eq!(params.len(), names.len(), "every PARAM-NAME is kept");
+
+    let mut line = b"<134>1 - - - - - ".to_vec();
+    let mut ids = Vec::new();
+    while line.len() + 16 < MAX_FRAME_BYTES {
+        let id = format!("s{:x}", ids.len());
+        line.extend_from_slice(format!("[{id}]").as_bytes());
+        ids.push(id);
+    }
+    line.extend_from_slice(b" m");
+    for id in ids.iter().rev() {
+        logit_core::interner::intern(id);
+    }
+    assert_eq!(sd_of(&time(&line)).len(), ids.len(), "every SD-ID is kept");
+}
+
 // -- native decode: canonical varints, trailing bytes, the decode budget -----------------------
 //
 // Hand-built payloads, so a test can place bytes the encoder never writes. The builders mirror
@@ -1851,3 +2960,860 @@ const RATIO_EXPONENTIAL_BUCKET: f64 = 8.0;
 const RATIO_SAMPLE: f64 = 2.0;
 const RATIO_HISTOGRAM_BUCKET: f64 = 1.8;
 const RATIO_SUMMARY_QUANTILE: f64 = 1.0;
+
+// -- prometheus text ----------------------------------------------------------------------------
+//
+// `prometheus::text::parse_with` and its assembler over the two `prometheus_fixed_point.rs`
+// fixtures, plus the float-to-integer guards, label-value escapes at a string's end, the histogram
+// reconstruction rules (`crates/logit-proto/src/prometheus/text.rs`'s "Leniencies"), and the
+// writer's fixed point.
+
+const PROMETHEUS_DIALECTS: [Dialect; 2] = [Dialect::Text0_0_4, Dialect::OpenMetrics1_0];
+
+fn prometheus_fixture(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Text0_0_4 => TEXT_FIXTURE,
+        Dialect::OpenMetrics1_0 => OPENMETRICS_FIXTURE,
+    }
+}
+
+/// Every `reason` a registry counted, with its count, sorted.
+type Reasons = Vec<(String, u64)>;
+
+type PrometheusParsed = (Result<Vec<MetricFamily>, CodecError>, Reasons);
+
+/// Lines after `# TYPE h histogram`, the buckets they make, and what they count.
+type HistogramCase = (&'static str, &'static [(f64, u64)], Reasons);
+
+/// A parse with telemetry, returning every `logit.input.metrics.{skipped,degraded}` reason and its
+/// count.
+fn prometheus_parse(body: &[u8], dialect: Dialect) -> PrometheusParsed {
+    let registry = logit_core::Registry::new();
+    let mut decoder = PrometheusDecoder::new().with_telemetry(registry.telemetry_for(
+        "prometheus_in",
+        "prometheus_in",
+        "source",
+    ));
+    let result = text::parse_with(body, dialect, &mut decoder);
+    (result, telemetry_reasons(&registry, "logit.input.metrics."))
+}
+
+/// Every `reason` the registry holds under a counter starting with `prefix`, with its count.
+fn telemetry_reasons(registry: &logit_core::Registry, prefix: &str) -> Reasons {
+    let mut reasons: Vec<(String, u64)> = registry
+        .drain(0)
+        .iter()
+        .filter_map(|event| {
+            let metric = event.metrics.first()?;
+            let name = logit_core::interner::resolve(metric.name);
+            let logit_core::MetricKind::Sum(sum) = &metric.kind else { return None };
+            let reason = event.attributes.get("reason").and_then(Value::as_str)?;
+            name.starts_with(prefix).then(|| (format!("{name}{{{reason}}}"), sum.value as u64))
+        })
+        .collect();
+    reasons.sort();
+    reasons
+}
+
+fn prometheus_written(families: &[MetricFamily], dialect: Dialect) -> String {
+    let mut out = Vec::new();
+    text::write(families, dialect, &mut out);
+    String::from_utf8(out).expect("the writer writes UTF-8")
+}
+
+/// A text 0.0.4 body never fails as a whole. An OpenMetrics prefix fails until it holds the
+/// `# EOF` line, its trailing `LF` aside.
+#[test]
+fn prometheus_text_survives_every_single_byte_truncation() {
+    for dialect in PROMETHEUS_DIALECTS {
+        let valid = prometheus_fixture(dialect).as_bytes();
+        let eof_line = valid.len() - 1;
+        for len in 0..valid.len() {
+            let (result, _) = prometheus_parse(&valid[..len], dialect);
+            let expect_ok = dialect == Dialect::Text0_0_4 || len >= eof_line;
+            assert_eq!(result.is_ok(), expect_ok, "{dialect:?}, a {len}-byte prefix: {result:?}");
+        }
+    }
+}
+
+/// A flip can break a line or the `# EOF`, never the parse: text 0.0.4 stays `Ok`, and an
+/// OpenMetrics `Err` is one of the two whole-body rejections.
+#[test]
+fn prometheus_text_survives_seeded_bit_flips() {
+    for dialect in PROMETHEUS_DIALECTS {
+        let valid = prometheus_fixture(dialect).as_bytes();
+        let mut rng = Lcg::new(0x5EED_5EED_5EED_5EEDu64);
+        for _ in 0..300 {
+            let mut mutated = valid.to_vec();
+            let (byte, bit) = (rng.next_usize(mutated.len()), rng.next_usize(8));
+            mutated[byte] ^= 1 << bit;
+            let result = std::panic::catch_unwind(|| prometheus_parse(&mutated, dialect).0)
+                .unwrap_or_else(|_| {
+                    panic!("{dialect:?}: a flip at byte {byte} bit {bit} panicked")
+                });
+            match result {
+                Ok(_) => {}
+                Err(CodecError::Malformed(reason)) if dialect == Dialect::OpenMetrics1_0 => {
+                    assert!(reason.contains("`# EOF`"), "{dialect:?}, byte {byte}: {reason}")
+                }
+                Err(other) => panic!("{dialect:?}, a flip at byte {byte} bit {bit}: {other}"),
+            }
+        }
+    }
+}
+
+/// `assemble.rs`'s `count_value` through a `+Inf` bucket: a finite, non-negative float rounds
+/// (half away from zero) and saturates at `u64::MAX`; anything else skips the line, which leaves
+/// the histogram with no bucket at all.
+#[test]
+fn prometheus_text_count_values_round_saturate_or_skip() {
+    let cases: [(&str, Option<u64>); 7] = [
+        ("18446744073709551615", Some(u64::MAX)),
+        ("1e19", Some(10_000_000_000_000_000_000)),
+        ("1e300", Some(u64::MAX)),
+        ("NaN", None),
+        ("-0.0", Some(0)),
+        ("-1.0", None),
+        ("0.5", Some(1)),
+    ];
+    for (value, expected) in cases {
+        let body = format!("# TYPE h histogram\nh_bucket{{le=\"+Inf\"}} {value}\n");
+        let (result, reasons) = prometheus_parse(body.as_bytes(), Dialect::Text0_0_4);
+        let families = result.unwrap();
+        match expected {
+            Some(count) => {
+                let Point::Histogram { buckets, count: total, .. } = &families[0].series[0].point
+                else {
+                    panic!("{value}: {families:?}")
+                };
+                assert_eq!((buckets.as_slice(), *total), (&[(f64::INFINITY, count)][..], count));
+                assert!(reasons.is_empty(), "{value}: {reasons:?}");
+            }
+            None => {
+                assert!(families.is_empty(), "{value}: {families:?}");
+                assert_eq!(
+                    reasons,
+                    [
+                        ("logit.input.metrics.skipped{incomplete_series}".to_string(), 1),
+                        ("logit.input.metrics.skipped{malformed_line}".to_string(), 1),
+                    ],
+                    "{value}"
+                );
+            }
+        }
+    }
+}
+
+/// `created_nanos`' `f64` arm, which a remote-write 1.0 `_created` sample reaches (it carries no
+/// source token), on both sides of 2^63 nanoseconds in both directions, and the text path's
+/// exponent fallback (`parse_scaled_decimal`), which has the same guard.
+#[test]
+fn prometheus_created_timestamps_on_both_sides_of_the_i64_range() {
+    use pb1::metric_metadata::MetricType;
+    // 9,223,372,036.854775808 seconds is 2^63 nanoseconds; the third case is the nearest `f64`.
+    let cases: [(f64, Option<i64>); 5] = [
+        (9_223_372_036.0, Some(9_223_372_036_000_000_000)),
+        (9_223_372_037.0, None),
+        (9_223_372_036.854_776, None),
+        (-9_223_372_036.0, Some(-9_223_372_036_000_000_000)),
+        (-9_223_372_037.0, None),
+    ];
+    let label = |name: &str, value: &str| pb1::Label { name: name.into(), value: value.into() };
+    for (seconds, expected) in cases {
+        let request = pb1::WriteRequest {
+            timeseries: ["foo_total", "foo_created"]
+                .into_iter()
+                .zip([1.0, seconds])
+                .map(|(name, value)| pb1::TimeSeries {
+                    labels: vec![label("__name__", name)],
+                    samples: vec![pb1::Sample { value, timestamp: 1000 }],
+                    ..Default::default()
+                })
+                .collect(),
+            metadata: vec![pb1::MetricMetadata {
+                r#type: MetricType::Counter as i32,
+                metric_family_name: "foo".into(),
+                ..Default::default()
+            }],
+        };
+        let decoded = remote_write::decode(
+            &request.encode_to_vec(),
+            remote_write::Version::V1,
+            &mut PrometheusDecoder::new(),
+        )
+        .unwrap();
+        assert_eq!(decoded.groups[0][0].series[0].created, expected, "{seconds} s");
+    }
+
+    for (text, expected) in [
+        ("9.223372036e9", Some(9_223_372_036_000_000_000)),
+        ("9.223372037e9", None),
+        ("-9.223372037e9", None),
+    ] {
+        let body = format!("# TYPE foo counter\nfoo_total 1\nfoo_created {text}\n# EOF\n");
+        let (result, _) = prometheus_parse(body.as_bytes(), Dialect::OpenMetrics1_0);
+        assert_eq!(result.unwrap()[0].series[0].created, expected, "{text}");
+    }
+}
+
+/// Every escape at the end of a label value: `\\` and `\"` close on the next quote, a lone `\`
+/// before the quote escapes it and leaves the value open, and a `\` ending the line has nothing to
+/// escape. The writer escapes `\`, `"`, and `LF` and nothing else, as both formats specify.
+#[test]
+fn prometheus_text_label_escapes_at_the_end_of_a_value() {
+    let closed = [
+        (r#"e{a="x\\"} 1"#, "x\\"),
+        (r#"e{a="x\""} 1"#, "x\""),
+        (r#"e{a="x\n"} 1"#, "x\n"),
+        (r#"e{a="x\t"} 1"#, "x\\t"),
+        (r#"e{a="\\\"\\"} 1"#, "\\\"\\"),
+    ];
+    for (line, value) in closed {
+        let (result, reasons) = prometheus_parse(line.as_bytes(), Dialect::Text0_0_4);
+        let families = result.unwrap();
+        assert_eq!(families[0].series[0].labels, [("a".to_string(), value.to_string())], "{line}");
+        assert!(reasons.is_empty(), "{line}: {reasons:?}");
+        let written = prometheus_written(&families, Dialect::Text0_0_4);
+        let escaped = value.replace('\\', r"\\").replace('"', r#"\""#).replace('\n', r"\n");
+        assert_eq!(written, format!("# TYPE e untyped\ne{{a=\"{escaped}\"}} 1\n"), "{line}");
+        let (again, _) = prometheus_parse(written.as_bytes(), Dialect::Text0_0_4);
+        assert_eq!(again.unwrap(), families, "{line}: the written form parses back");
+    }
+    for line in [r#"e{a="x\"} 1"#, r#"e{a="x\"#, r#"e{a="x\\\"} 1"#, r#"e{a="x"#] {
+        let (result, reasons) = prometheus_parse(line.as_bytes(), Dialect::Text0_0_4);
+        assert!(result.unwrap().is_empty(), "{line}");
+        assert_eq!(reasons, [("logit.input.metrics.skipped{malformed_line}".to_string(), 1)]);
+    }
+}
+
+/// Out-of-order buckets are sorted; a missing `+Inf` comes from `_count`, or from the highest
+/// bucket when `_count` is smaller or absent; a `_count` that disagrees with `+Inf` loses to it,
+/// degraded rather than skipped.
+#[test]
+fn prometheus_text_histogram_reconstruction() {
+    let degraded =
+        || vec![("logit.input.metrics.degraded{histogram_count_mismatch}".to_string(), 1)];
+    let cases: [HistogramCase; 5] = [
+        (
+            "h_bucket{le=\"5\"} 4\nh_bucket{le=\"1\"} 2\nh_bucket{le=\"+Inf\"} 6",
+            &[(1.0, 2), (5.0, 4), (f64::INFINITY, 6)],
+            vec![],
+        ),
+        ("h_bucket{le=\"1\"} 2\nh_count 7", &[(1.0, 2), (f64::INFINITY, 7)], vec![]),
+        ("h_bucket{le=\"1\"} 2\nh_count 1", &[(1.0, 2), (f64::INFINITY, 2)], degraded()),
+        ("h_bucket{le=\"1\"} 2", &[(1.0, 2), (f64::INFINITY, 2)], vec![]),
+        ("h_bucket{le=\"+Inf\"} 6\nh_count 5", &[(f64::INFINITY, 6)], degraded()),
+    ];
+    for (lines, buckets, reasons) in cases {
+        let body = format!("# TYPE h histogram\n{lines}\n");
+        let (result, got) = prometheus_parse(body.as_bytes(), Dialect::Text0_0_4);
+        let families = result.unwrap();
+        let Point::Histogram { buckets: got_buckets, count, .. } = &families[0].series[0].point
+        else {
+            panic!("{lines}: {families:?}")
+        };
+        assert_eq!(got_buckets.as_slice(), buckets, "{lines}");
+        assert_eq!(*count, buckets[buckets.len() - 1].1, "{lines}: the count is the +Inf bucket");
+        assert_eq!(got, reasons, "{lines}");
+    }
+}
+
+/// A histogram whose only bucket is `-Inf` gains a `+Inf` one, on decode and on encode:
+/// `Point::Histogram`'s buckets end at `+Inf` (`crates/logit-proto/src/prometheus/mod.rs`), and a
+/// last bound of `-Inf` isn't one.
+#[test]
+fn prometheus_text_a_neg_inf_only_histogram_gains_a_pos_inf_bucket() {
+    let body = "# TYPE h histogram\nh_bucket{le=\"-Inf\"} 3\n";
+    let families = prometheus_parse(body.as_bytes(), Dialect::Text0_0_4).0.unwrap();
+    let Point::Histogram { buckets, count, .. } = &families[0].series[0].point else {
+        panic!("{families:?}")
+    };
+    assert_eq!(buckets.as_slice(), [(f64::NEG_INFINITY, 3), (f64::INFINITY, 3)]);
+    assert_eq!(*count, 3);
+
+    // The encode side's `cumulative_counts`, from a model histogram no decode produced.
+    let histogram = logit_core::Histogram {
+        buckets: vec![(f64::NEG_INFINITY, 3)],
+        temporality: logit_core::Temporality::Cumulative,
+        sum: None,
+        min: None,
+        max: None,
+    };
+    let record = logit_core::MetricRecord::new(
+        logit_core::interner::intern("h"),
+        logit_core::MetricKind::Histogram(histogram),
+    );
+    let event = Event::metric(0, AttrMap::new(), record);
+    let resource = Resource::default();
+    let families = logit_proto::prometheus::events_to_families(
+        std::iter::once((&resource, &event)),
+        &mut PrometheusEncoder::new(),
+    );
+    let Point::Histogram { buckets, .. } = &families[0].series[0].point else {
+        panic!("{families:?}")
+    };
+    assert_eq!(buckets.as_slice(), [(f64::NEG_INFINITY, 3), (f64::INFINITY, 3)]);
+}
+
+/// A line naming `le` or `quantile` twice is a `duplicate_label`, as any repeated label is,
+/// rather than a bound plus a series label of the same name.
+#[test]
+fn prometheus_text_a_repeated_le_or_quantile_is_a_duplicate_label() {
+    for body in [
+        "# TYPE h histogram\nh_bucket{le=\"1\",le=\"2\"} 1\n",
+        "# TYPE s summary\ns{quantile=\"0.5\",quantile=\"0.9\"} 1\n",
+    ] {
+        let (result, reasons) = prometheus_parse(body.as_bytes(), Dialect::Text0_0_4);
+        assert!(result.unwrap().is_empty(), "{body}");
+        assert_eq!(
+            reasons,
+            [("logit.input.metrics.skipped{duplicate_label}".to_string(), 1)],
+            "{body}"
+        );
+    }
+}
+
+/// The writer orders families by the name their `# TYPE` line carries, writes one family per
+/// name, counting the other's series, and writes nothing for a family with no line to write, so
+/// `write(parse(write(parse(x)))) == write(parse(x))`.
+#[test]
+fn prometheus_text_writes_a_fixed_point() {
+    let cases: [(&str, &str, u64); 3] = [
+        (
+            "# TYPE build info\nbuild_info 1\nbuildUinfo 1\n",
+            "# TYPE buildUinfo untyped\nbuildUinfo 1\n# TYPE build_info gauge\nbuild_info 1\n",
+            0,
+        ),
+        (
+            "# TYPE foo counter\nfoo 1\n# TYPE foo_total gauge\nfoo_total 2\n",
+            "# TYPE foo_total counter\nfoo_total 1\n",
+            1,
+        ),
+        ("# TYPE s summary\ns_created 1605281325\n", "", 0),
+    ];
+    for (body, expected, collisions) in cases {
+        let families = prometheus_parse(body.as_bytes(), Dialect::Text0_0_4).0.unwrap();
+        let registry = logit_core::Registry::new();
+        let mut encoder = logit_proto::prometheus::PrometheusEncoder::new()
+            .with_telemetry(registry.telemetry_for("prometheus_out", "prometheus_out", "sink"));
+        let mut out = Vec::new();
+        text::write_with(&families, Dialect::Text0_0_4, &mut out, &mut encoder);
+        let written = String::from_utf8(out).unwrap();
+        assert_eq!(written, expected, "{body}");
+        let counted = telemetry_reasons(&registry, "logit.output.metrics.skipped");
+        let expected_counts: Vec<(String, u64)> = (collisions > 0)
+            .then(|| ("logit.output.metrics.skipped{name_collision}".to_string(), collisions))
+            .into_iter()
+            .collect();
+        assert_eq!(counted, expected_counts, "{body}");
+        let (again, reasons) = prometheus_parse(written.as_bytes(), Dialect::Text0_0_4);
+        assert!(reasons.is_empty(), "{body}: {reasons:?}");
+        assert_eq!(prometheus_written(&again.unwrap(), Dialect::Text0_0_4), written, "{body}");
+    }
+}
+
+/// The input that allocates the most for `prom_text`'s run: distinct one- to three-character
+/// metric names, `aa 1` lines filling 64 KiB, each its own family of one series. Parsing,
+/// writing, and the target's `families_to_events_with` over them, whose `Vec<Event>` doubles past
+/// the 10,922 events to 16,384: the largest allocation is what `script/unsafe-check`'s
+/// `prom_text` malloc limit sits above.
+#[test]
+fn prometheus_text_worst_case_body_stays_under_the_fuzz_malloc_limit() {
+    const MALLOC_LIMIT: i64 = 16 << 20;
+    let first = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_:";
+    let rest = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_:";
+    let names = first
+        .iter()
+        .map(|&a| vec![a])
+        .chain(first.iter().flat_map(|&a| rest.iter().map(move |&b| vec![a, b])));
+    let names =
+        names.chain(first.iter().flat_map(|&a| {
+            rest.iter().flat_map(move |&b| rest.iter().map(move |&c| vec![a, b, c]))
+        }));
+    let mut body = Vec::new();
+    for name in names {
+        if body.len() + name.len() + 3 > MAX_FRAME_BYTES - 1 {
+            break;
+        }
+        body.extend_from_slice(&name);
+        body.extend_from_slice(b" 1\n");
+    }
+    let mut series = 0;
+    let (peak, largest) = peak_and_largest_allocation(|| {
+        let families = text::parse(&body, Dialect::Text0_0_4).unwrap();
+        let mut out = Vec::new();
+        text::write(&families, Dialect::Text0_0_4, &mut out);
+        let events = logit_proto::prometheus::families_to_events_with(
+            &families,
+            0,
+            &mut PrometheusDecoder::new(),
+            &mut |_, _| {},
+        );
+        series = events.len();
+    });
+    eprintln!("{} bytes, {series} series, peak {peak}, largest {largest}", body.len());
+    assert_eq!(series, body.iter().filter(|&&b| b == b'\n').count(), "one series per line");
+    assert!(largest < MALLOC_LIMIT, "largest allocation {largest}");
+}
+
+// -- prometheus remote-write --------------------------------------------------------------------
+//
+// The Snappy length gate and the encoder's fixed point. The 2.0 symbol-table rules are pinned in
+// `prometheus_remote_write_fixed_point.rs` (`version_2_symbol_table_errors_fail_the_whole_request`)
+// and checked over built requests by the `prom_remote_write` fuzz target.
+
+/// Snappy's block header is a varint of the decompressed length. Declared over the cap, it's
+/// refused before anything is allocated; declared at the cap over a body too short for it, the
+/// decoder allocates the declared length, at most the cap, and then fails; a varint past 32 bits
+/// is malformed on the header.
+#[test]
+fn snappy_never_allocates_past_the_cap_from_a_corrupt_length() {
+    let varint = |len: u64| {
+        let mut out = BytesMut::new();
+        write_uvarint(&mut out, len);
+        out.to_vec()
+    };
+    let body = [0x00, 0x00, 0x00, 0x00];
+    let cases: [(Vec<u8>, &str, i64); 4] = [
+        ([varint(u32::MAX as u64), body.to_vec()].concat(), "too large", 64 * 1024),
+        ([varint(REMOTE_WRITE_CAP as u64 + 1), body.to_vec()].concat(), "too large", 64 * 1024),
+        (
+            [varint(REMOTE_WRITE_CAP as u64), body.to_vec()].concat(),
+            "malformed",
+            REMOTE_WRITE_CAP as i64 + 64 * 1024,
+        ),
+        ([varint(u64::MAX), body.to_vec()].concat(), "malformed", 64 * 1024),
+    ];
+    for (input, expected, bound) in cases {
+        let mut result = None;
+        let peak = peak_live_bytes(|| {
+            result =
+                Some(compression::decompress_bounded(Encoding::Snappy, &input, REMOTE_WRITE_CAP));
+        });
+        let kind = match result {
+            Some(Err(DecompressError::TooLarge { .. })) => "too large",
+            Some(Err(DecompressError::Malformed { .. })) => "malformed",
+            other => panic!("{input:02x?}: {other:?}"),
+        };
+        assert_eq!(kind, expected, "{input:02x?}");
+        assert!(peak < bound, "{input:02x?}: peak live bytes {peak}, bound {bound}");
+    }
+}
+
+fn remote_write_counter(
+    name: &str,
+    timestamp: i64,
+    value: f64,
+    exemplars: Vec<Exemplar>,
+) -> MetricFamily {
+    let mut family = MetricFamily::new(name, FamilyType::Counter);
+    family.series.push(Series {
+        labels: Vec::new(),
+        point: Point::Counter(value),
+        timestamp: Some(timestamp),
+        created: None,
+        exemplars,
+    });
+    family
+}
+
+fn remote_write_exemplar(timestamp: i64) -> Exemplar {
+    Exemplar { timestamp, value: 1.0, trace: None, filtered_attributes: AttrMap::new() }
+}
+
+fn assert_remote_write_fixed_point(body: &[u8], version: remote_write::Version) {
+    let decoded = remote_write::decode(body, version, &mut PrometheusDecoder::new()).unwrap();
+    let again = remote_write::encode(&decoded.groups, version, &mut PrometheusEncoder::new());
+    assert_eq!(again, body, "{version:?}: encode(decode(B)) != B");
+}
+
+/// 1.0 metadata names a counter after its value sample, `_total` included: the model name gains
+/// `_total` on decode whatever the metadata says, so any other name would differ on the next
+/// encode.
+#[test]
+fn remote_write_1_0_metadata_names_a_counter_with_its_total_suffix() {
+    let groups = [vec![remote_write_counter("foo", 1_000_000_000, 1.0, Vec::new())]];
+    let body =
+        remote_write::encode(&groups, remote_write::Version::V1, &mut PrometheusEncoder::new());
+    let request = pb1::WriteRequest::decode(body.as_slice()).unwrap();
+    assert_eq!(request.metadata[0].metric_family_name, "foo_total");
+    assert_remote_write_fixed_point(&body, remote_write::Version::V1);
+}
+
+/// An exemplar lands on a reading, never on a stale marker: the encoder drops an exemplar it finds
+/// on a stale series, so one placed there would be lost on the next hop.
+#[test]
+fn remote_write_an_exemplar_is_never_placed_on_a_stale_marker() {
+    let label = |name: &str, value: &str| pb1::Label { name: name.into(), value: value.into() };
+    let request = pb1::WriteRequest {
+        timeseries: vec![pb1::TimeSeries {
+            labels: vec![label("__name__", "foo_total")],
+            samples: vec![
+                pb1::Sample { value: f64::from_bits(STALE_NAN_BITS), timestamp: 0 },
+                pb1::Sample { value: 1.0, timestamp: 1000 },
+            ],
+            exemplars: vec![pb1::Exemplar { labels: Vec::new(), value: 1.0, timestamp: 0 }],
+            histograms: Vec::new(),
+        }],
+        metadata: Vec::new(),
+    };
+    let decoded = remote_write::decode(
+        &request.encode_to_vec(),
+        remote_write::Version::V1,
+        &mut PrometheusDecoder::new(),
+    )
+    .unwrap();
+    let exemplars: Vec<usize> =
+        decoded.groups.iter().map(|g| g[0].series[0].exemplars.len()).collect();
+    assert_eq!(exemplars, [0, 1], "on the 1000 ms reading, not the stale marker at 0 ms");
+    assert_eq!(decoded.exemplars, 1);
+    let body = remote_write::encode(
+        &decoded.groups,
+        remote_write::Version::V1,
+        &mut PrometheusEncoder::new(),
+    );
+    assert_remote_write_fixed_point(&body, remote_write::Version::V1);
+}
+
+/// Every series of a family carries one help and unit, the first the groups offer: decode applies
+/// a family's description to all its series, so a series written without it would decode with
+/// it.
+#[test]
+fn remote_write_every_series_of_a_family_carries_one_description() {
+    let gauge = |value: &str, help: Option<&str>| {
+        let mut family = MetricFamily::new("g", FamilyType::Gauge);
+        family.help = help.map(String::from);
+        family.series.push(Series {
+            labels: vec![("a".to_string(), value.to_string())],
+            point: Point::Gauge(1.0),
+            timestamp: Some(if help.is_some() { 1_000_000_000 } else { 0 }),
+            created: None,
+            exemplars: Vec::new(),
+        });
+        family
+    };
+    let groups = [vec![gauge("1", None)], vec![gauge("2", Some("A gauge."))]];
+    let body =
+        remote_write::encode(&groups, remote_write::Version::V2, &mut PrometheusEncoder::new());
+    let request = pb2::Request::decode(body.as_slice()).unwrap();
+    let helps: Vec<&str> = request
+        .timeseries
+        .iter()
+        .map(|series| request.symbols[series.metadata.unwrap().help_ref as usize].as_str())
+        .collect();
+    assert_eq!(helps, ["A gauge.", "A gauge."]);
+    assert_remote_write_fixed_point(&body, remote_write::Version::V2);
+}
+
+/// A series merged from several groups writes its exemplars in timestamp order, the order decode
+/// places them by.
+#[test]
+fn remote_write_a_series_exemplars_are_written_in_timestamp_order() {
+    let groups = [
+        vec![remote_write_counter("foo_total", 0, 1.0, vec![remote_write_exemplar(2_000_000_000)])],
+        vec![remote_write_counter(
+            "foo_total",
+            1_000_000_000,
+            2.0,
+            vec![remote_write_exemplar(1_000_000_000)],
+        )],
+    ];
+    for version in [remote_write::Version::V1, remote_write::Version::V2] {
+        let body = remote_write::encode(&groups, version, &mut PrometheusEncoder::new());
+        let timestamps: Vec<i64> = match version {
+            remote_write::Version::V1 => {
+                pb1::WriteRequest::decode(body.as_slice()).unwrap().timeseries[0]
+                    .exemplars
+                    .iter()
+                    .map(|e| e.timestamp)
+                    .collect()
+            }
+            remote_write::Version::V2 => pb2::Request::decode(body.as_slice()).unwrap().timeseries
+                [0]
+            .exemplars
+            .iter()
+            .map(|e| e.timestamp)
+            .collect(),
+        };
+        assert_eq!(timestamps, [1000, 2000], "{version:?}");
+        assert_remote_write_fixed_point(&body, version);
+    }
+}
+
+// -- log messages: json, csv, logfmt, kv --------------------------------------------------------
+//
+// The parse cores in `logit_proto::message`. The JSON nesting limit is serde_json's default
+// recursion limit, which the core relies on in place of a depth cap of its own; the rest pins
+// truncation, the escape scanners at a line's end, and the largest allocation each `message_*`
+// fuzz target's worst 64 KiB input makes.
+
+/// An nginx `access_json_full` line (`fixtures/nginx/nginx.conf`).
+const NGINX_ACCESS_JSON: &str = concat!(
+    r#"{"time":"2026-09-07T06:52:01+00:00","remote_addr":"203.0.113.7","host":"shop.example.com","#,
+    r#""request_method":"GET","request_uri":"/search?q=\"a\\b\"","status":200,"#,
+    r#""body_bytes_sent":612,"request_time":0.012,"upstream_response_time":"0.010","#,
+    r#""http_referer":"","http_user_agent":"curl/8.5.0 \u001B[31m","#,
+    r#""http_x_forwarded_for":"203.0.113.7, 10.0.0.1"}"#
+);
+
+/// The 64 KiB message each `message_*` fuzz target's `max_len` admits behind its selector byte.
+const MESSAGE_BYTES: usize = 65_536;
+
+/// The malloc limit `script/unsafe-check` gives the four `message_*` targets.
+const MESSAGE_MALLOC_LIMIT: i64 = 16 << 20;
+
+fn json_parse(body: &[u8], prefix: bool) -> Result<Vec<(logit_core::Symbol, Value)>, String> {
+    let body = Bytes::copy_from_slice(body);
+    let mut out = Vec::new();
+    let mut keys = logit_core::interner::KeyCache::new();
+    let result = if prefix {
+        logit_proto::message::json::parse_object_prefix(&body, &mut out, &mut keys)
+    } else {
+        logit_proto::message::json::parse_object(&body, &mut out, &mut keys)
+    };
+    result.map(|()| out).map_err(|e| e.to_string())
+}
+
+/// `depth` containers, the top-level object included: `{"a":[[…]]}`.
+fn json_nested(depth: usize) -> String {
+    format!("{{\"a\":{}{}}}", "[".repeat(depth - 1), "]".repeat(depth - 1))
+}
+
+/// serde_json's default recursion limit admits 127 nested containers and fails the 128th, so a
+/// build that turned on its `unbounded_depth` feature would fail here first.
+#[test]
+fn json_nesting_stops_at_serde_jsons_recursion_limit() {
+    for prefix in [false, true] {
+        assert!(json_parse(json_nested(127).as_bytes(), prefix).is_ok(), "127, prefix {prefix}");
+        let err = json_parse(json_nested(128).as_bytes(), prefix).unwrap_err();
+        assert!(err.starts_with("recursion limit exceeded"), "128, prefix {prefix}: {err}");
+    }
+    let objects = |depth| format!("{}1{}", "{\"a\":".repeat(depth), "}".repeat(depth));
+    assert!(json_parse(objects(127).as_bytes(), false).is_ok(), "127 objects");
+    let err = json_parse(objects(128).as_bytes(), false).unwrap_err();
+    assert!(err.starts_with("recursion limit exceeded"), "128 objects: {err}");
+}
+
+/// No proper prefix of an object parses, in either mode, and none panics.
+#[test]
+fn json_survives_every_single_byte_truncation_of_an_nginx_line() {
+    let valid = NGINX_ACCESS_JSON.as_bytes();
+    assert_eq!(json_parse(valid, false).unwrap().len(), 12);
+    for len in 0..valid.len() {
+        for prefix in [false, true] {
+            let result = std::panic::catch_unwind(|| json_parse(&valid[..len], prefix));
+            let result = result.unwrap_or_else(|_| panic!("a {len}-byte prefix panicked"));
+            assert!(result.is_err(), "a {len}-byte prefix parsed, prefix {prefix}");
+        }
+    }
+}
+
+/// A flipped bit never panics, and every string that parses is valid UTF-8 and matches
+/// serde_json's own reading of the same bytes.
+#[test]
+fn json_survives_bit_flips_of_an_nginx_line() {
+    let valid = NGINX_ACCESS_JSON.as_bytes();
+    let mut rng = Lcg::new(0x5EED_5EED_5EED_5EEDu64);
+    for _ in 0..4000 {
+        let mut mutated = valid.to_vec();
+        let byte_idx = rng.next_usize(mutated.len());
+        mutated[byte_idx] ^= 1 << rng.next_usize(8);
+        let result = std::panic::catch_unwind(|| json_parse(&mutated, false))
+            .unwrap_or_else(|_| panic!("a bit flip at byte {byte_idx} panicked"));
+        let reference = serde_json::from_slice::<serde_json::Value>(&mutated);
+        let (Ok(pairs), Ok(serde_json::Value::Object(reference))) = (&result, &reference) else {
+            assert!(
+                result.is_err() && !matches!(reference, Ok(serde_json::Value::Object(_))),
+                "a bit flip at byte {byte_idx}: {result:?} against {reference:?}"
+            );
+            continue;
+        };
+        for (key, value) in pairs {
+            let key = logit_core::interner::resolve(*key);
+            if let Value::Str(s) = value {
+                let s = std::str::from_utf8(s).expect("a Value::Str is valid UTF-8");
+                // A flip can only duplicate a key by renaming one, and the later value wins.
+                if pairs.iter().filter(|(k, _)| logit_core::interner::resolve(*k) == key).count()
+                    == 1
+                {
+                    assert_eq!(reference[key].as_str(), Some(s), "byte {byte_idx}, key {key}");
+                }
+            }
+        }
+    }
+}
+
+fn logfmt_parse(
+    line: &str,
+    bare_keys: bool,
+) -> (Result<(), logit_proto::message::logfmt::ParseError>, Vec<(logit_core::Symbol, Value)>) {
+    let raw = Bytes::copy_from_slice(line.as_bytes());
+    let text = std::str::from_utf8(&raw).unwrap();
+    let mut out = Vec::new();
+    let mut keys = logit_core::interner::KeyCache::new();
+    let telemetry = logit_core::Telemetry::default();
+    let result = logit_proto::message::logfmt::parse_logfmt(
+        &raw, text, bare_keys, &mut out, &mut keys, &telemetry,
+    );
+    (result, out)
+}
+
+/// A line of nothing but `=` is a keyless token, skipped to the end, and nothing else: the scan
+/// finishes with no pair and no bareword.
+#[test]
+fn logfmt_a_line_of_only_equals_signs_is_no_pairs() {
+    use logit_proto::message::logfmt::ParseError;
+    for bare_keys in [false, true] {
+        let line = "=".repeat(MESSAGE_BYTES);
+        let (result, out) = logfmt_parse(&line, bare_keys);
+        assert!(matches!(result, Err(ParseError::NoPairs)), "bare_keys {bare_keys}");
+        assert!(out.is_empty());
+        let (result, out) = logfmt_parse("= == === a=1", bare_keys);
+        assert!(result.is_ok());
+        assert_eq!(out, [(logit_core::interner::intern("a"), Value::str("1"))]);
+    }
+}
+
+/// A `\` as a quoted value's last byte has nothing to escape, so the quote never closes.
+#[test]
+fn logfmt_a_lone_trailing_backslash_inside_quotes_is_an_unterminated_quote() {
+    use logit_proto::message::logfmt::ParseError;
+    for line in ["a=\"abc\\", "a=\"\\", "a=\"\\\"", "a=\"x\\\\\\"] {
+        let (result, _) = logfmt_parse(line, false);
+        assert!(matches!(result, Err(ParseError::UnterminatedQuote(2))), "{line:?}");
+    }
+    let (result, out) = logfmt_parse("a=\"x\\\\\"", false);
+    assert!(result.is_ok());
+    assert_eq!(out, [(logit_core::interner::intern("a"), Value::str("x\\"))]);
+}
+
+fn csv_fields(row: &[u8], delim: u8) -> Result<Vec<Bytes>, logit_proto::message::csv::RowError> {
+    let row = Bytes::copy_from_slice(row);
+    let mut offsets = Vec::new();
+    logit_proto::message::csv::split_row(&row, delim, &mut offsets)?;
+    Ok(offsets
+        .iter()
+        .map(|&(start, end, needs_unescape)| {
+            let field = row.slice(start as usize..end as usize);
+            if needs_unescape {
+                logit_proto::message::csv::unescape(&field)
+            } else {
+                field
+            }
+        })
+        .collect())
+}
+
+/// A row of `n` quotes: an even `n` is one quoted field of `(n - 2) / 2` literal quotes, an odd
+/// one never closes. Each unescape runs under `unescape`'s `debug_assert_eq!` that its first pass
+/// sized the output to the byte, live in a test build.
+#[test]
+fn csv_unescape_sizes_runs_of_doubled_quotes() {
+    use logit_proto::message::csv::RowError;
+    for n in 1..200 {
+        let row = vec![b'"'; n];
+        match csv_fields(&row, b',') {
+            Ok(fields) => {
+                assert_eq!(n % 2, 0, "{n} quotes parsed");
+                assert_eq!(fields, [Bytes::from(vec![b'"'; (n - 2) / 2])], "{n} quotes");
+            }
+            Err(err) => {
+                assert_eq!(n % 2, 1, "{n} quotes: {err}");
+                assert_eq!(err, RowError::UnterminatedQuote);
+            }
+        }
+    }
+    let fields = csv_fields(br##""a""b""","""c","""""##, b',').unwrap();
+    assert_eq!(fields, [&b"a\"b\""[..], b"\"c", b"\""]);
+}
+
+/// Runs `f` and returns its largest single allocation, failing past the targets' malloc limit.
+fn largest_under_message_limit(name: &str, f: impl FnOnce()) -> i64 {
+    let (peak, largest) = peak_and_largest_allocation(f);
+    eprintln!("{name}: peak {peak}, largest {largest}");
+    assert!(largest < MESSAGE_MALLOC_LIMIT, "{name}: largest allocation {largest}");
+    largest
+}
+
+/// The largest allocations a 64 KiB message makes in `message_json`: `[0,0,…]` and a run of
+/// one-pair objects, through the core and through `serde_json::Value`, which the target also
+/// parses. Each grows a `Vec` by doubling.
+#[test]
+fn json_worst_case_message_stays_under_the_fuzz_malloc_limit() {
+    let body = |open: &str, item: &str, close: &str| {
+        let mut body = open.to_string();
+        while body.len() + item.len() + close.len() <= MESSAGE_BYTES {
+            body.push_str(item);
+        }
+        body.pop();
+        body.push_str(close);
+        body
+    };
+    let cases = [
+        ("one array of zeros", body("{\"a\":[", "0,", "]}")),
+        ("top-level pairs", body("{", "\"a\":0,", "}")),
+        ("nested pairs", body("{\"a\":{", "\"a\":0,", "}}")),
+    ];
+    for (name, body) in &cases {
+        assert!(body.len() <= MESSAGE_BYTES);
+        largest_under_message_limit(name, || {
+            json_parse(body.as_bytes(), false).unwrap();
+            serde_json::from_slice::<serde_json::Value>(body.as_bytes()).unwrap();
+        });
+    }
+}
+
+/// `message_csv`'s worst message, 64 KiB of delimiters: 65,537 empty fields, whose offsets and
+/// the target's reference reading grow by doubling, the reading to the largest allocation.
+#[test]
+fn csv_worst_case_message_stays_under_the_fuzz_malloc_limit() {
+    let row = vec![b','; MESSAGE_BYTES];
+    largest_under_message_limit("delimiters", || {
+        let fields = csv_fields(&row, b',').unwrap();
+        assert_eq!(fields.len(), MESSAGE_BYTES + 1);
+        // One push per field, as the target's `reference` builds its reading.
+        let mut reference: Vec<Vec<u8>> = Vec::new();
+        for f in &fields {
+            reference.push(f.to_vec());
+        }
+        assert_eq!(reference.len(), fields.len());
+    });
+}
+
+/// `message_logfmt`'s and `message_kv`'s worst messages: one-byte barewords two bytes apart, the
+/// most pairs per byte, under `bare_keys`; `out`, the target's rendered line, and its reparse
+/// grow by doubling.
+#[test]
+fn logfmt_and_kv_worst_case_messages_stay_under_the_fuzz_malloc_limit() {
+    let barewords = "a ".repeat(MESSAGE_BYTES / 2 - 2);
+    largest_under_message_limit("logfmt barewords", || {
+        let (result, out) = logfmt_parse(&format!("{barewords}b=1"), true);
+        assert!(result.is_ok());
+        assert_eq!(out.len(), MESSAGE_BYTES / 2 - 1);
+        let (result, again) = logfmt_parse(&format!("{barewords}b=\"1\""), true);
+        assert!(result.is_ok());
+        assert_eq!(again, out);
+    });
+
+    let line = "a&".repeat(MESSAGE_BYTES / 2);
+    largest_under_message_limit("kv barewords", || {
+        let raw = Bytes::copy_from_slice(line.as_bytes());
+        let text = std::str::from_utf8(&raw).unwrap();
+        let mut out = Vec::new();
+        let mut keys = logit_core::interner::KeyCache::new();
+        let result = logit_proto::message::logfmt::parse_kv(
+            &raw,
+            text,
+            "&",
+            "=",
+            true,
+            &mut out,
+            &mut keys,
+            &logit_core::Telemetry::default(),
+        );
+        assert!(result.is_err(), "barewords alone are NoPairs");
+        assert_eq!(out.len(), MESSAGE_BYTES / 2);
+        let reference: Vec<(&str, &str)> = text.split('&').map(|s| (s, s)).collect();
+        assert_eq!(reference.len(), out.len() + 1);
+    });
+}

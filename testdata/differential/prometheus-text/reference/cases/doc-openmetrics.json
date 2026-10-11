@@ -1,0 +1,154 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "acme_http_router_request_seconds",
+   "value": "summary"
+  },
+  {
+   "kind": "unit",
+   "name": "acme_http_router_request_seconds",
+   "value": "seconds"
+  },
+  {
+   "kind": "help",
+   "name": "acme_http_router_request_seconds",
+   "value": "Latency though all of ACME's HTTP request router."
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "GET"
+    ],
+    [
+     "path",
+     "/api/v1"
+    ]
+   ],
+   "name": "acme_http_router_request_seconds_sum",
+   "value": "0x40c1a628f5c28f5c"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "GET"
+    ],
+    [
+     "path",
+     "/api/v1"
+    ]
+   ],
+   "name": "acme_http_router_request_seconds_count",
+   "value": "0x4128a2e600000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "GET"
+    ],
+    [
+     "path",
+     "/api/v1"
+    ]
+   ],
+   "name": "acme_http_router_request_seconds_created",
+   "value": "0x41d7eba98b400000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "POST"
+    ],
+    [
+     "path",
+     "/api/v2"
+    ]
+   ],
+   "name": "acme_http_router_request_seconds_sum",
+   "value": "0x407df4cccccccccd"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "POST"
+    ],
+    [
+     "path",
+     "/api/v2"
+    ]
+   ],
+   "name": "acme_http_router_request_seconds_count",
+   "value": "0x4041000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "POST"
+    ],
+    [
+     "path",
+     "/api/v2"
+    ]
+   ],
+   "name": "acme_http_router_request_seconds_created",
+   "value": "0x41d7eba98b400000"
+  },
+  {
+   "kind": "type",
+   "name": "go_goroutines",
+   "value": "gauge"
+  },
+  {
+   "kind": "help",
+   "name": "go_goroutines",
+   "value": "Number of goroutines that currently exist."
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "go_goroutines",
+   "value": "0x4051400000000000"
+  },
+  {
+   "kind": "type",
+   "name": "process_cpu_seconds",
+   "value": "counter"
+  },
+  {
+   "kind": "unit",
+   "name": "process_cpu_seconds",
+   "value": "seconds"
+  },
+  {
+   "kind": "help",
+   "name": "process_cpu_seconds",
+   "value": "Total user and system CPU time spent in seconds."
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "process_cpu_seconds_total",
+   "value": "0x415006449d70a3d7"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xd3297125",
+  "len": 952,
+  "path": "differential/prometheus-text/cases/doc-openmetrics.om"
+ },
+ "parser": "openmetrics"
+}

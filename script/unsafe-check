@@ -76,12 +76,43 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # targets' 64 admits `decode_batch_body`'s events `Vec` regrowing by doubling past its initial
 # 4,096: a batch of one-byte empty events at `max_len` regrows to about 56 MiB. `proxy_header`'s
 # `max_len` admits the largest PROXY v2 header, 16 plus 65,535 bytes, and one payload byte behind
-# it. `forwarded`'s 4,096 is past any forwarding header a proxy writes. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
+# it. `forwarded`'s 4,096 is past any forwarding header a proxy writes. `stream_framing`'s `max_len`
+# is its 4 selector bytes, the longest frame header (`65536 `, six bytes), and a frame of
+# `MAX_FRAME_BYTES`, so an at-bound frame fits under every framing; its only growing allocation is
+# the framer's buffer, never larger than the input, so 16 MiB is ample, and it needs no fork mode
+# because the framer interns nothing. `statsd`'s `max_len` is `MAX_FRAME_BYTES`, the largest
+# packet any transport hands the decoder, above UDP's 65,507-byte payload. Its worst input,
+# `a:1:1:…|c`, is one 864-byte `Event` per two bytes, and a second line's append doubles `out` past
+# the first line's exact fit: a measured 54 MiB `Vec`, which
+# `crates/logit-proto/tests/robustness.rs`'s statsd section pins under 56. `syslog`'s worst
+# input, `<0>` lines filling 64 KiB, is one 864-byte `Event` per four bytes, and the target's
+# marker event takes `out` one past 16,384 events, so it doubles to a measured 27 MiB `Vec`, which
+# the syslog section pins under 32. `graphite_plaintext`'s `max_len` is `statsd`'s; its worst
+# input, `a 1 1` lines filling 64 KiB, is one `Event` per six bytes, a measured 13.5 MiB `Vec`,
+# which the graphite section pins under 16. `graphite_pickle`'s is its mode byte and a 64 KiB
+# payload, past which carbon's 1 MiB frame bound reaches no new reader state: its worst input,
+# one memoized datapoint repeated by two-byte `BINGET`s, is a measured 27 MiB `Vec`, pinned under
+# 32; protocol 0's densest repeat, the three-byte `g0\n`, makes fewer events, and its decoded
+# strings' scratch is at most twice the payload. `collectd`'s is its two cut bytes and a 65,507-byte UDP payload; its worst input, one-byte
+# notification messages six bytes apart, is a measured 13.5 MiB `Vec`, pinned under 16 in the
+# collectd section. `prom_text`'s is its dialect byte and a body one byte short of 64 KiB; its
+# worst input, distinct one- to three-character names on `aa 1` lines, is one family of one
+# series per five or six bytes, and the target's model mapping makes one 864-byte `Event` of
+# each: a measured 13.5 MiB `Vec`, pinned under 16 in the prometheus text section. The four
+# `message_*` targets' `max_len` is a selector byte and a 64 KiB message, past the 65,507-byte
+# datagram and `MAX_FRAME_BYTES` line most messages arrive in; each worst message grows one `Vec`
+# by doubling, measured in the robustness suite's log-message section under 16: `message_json`'s
+# `{"a":[0,0,…]}` at 1.25 MiB, `message_csv`'s 65,537 empty fields at 3 MiB, `message_logfmt`'s
+# one-byte barewords at 1.5 MiB, and `message_kv`'s at 2 MiB. `message_csv` needs no fork mode
+# because the split interns nothing. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
 #
-# `native_batch` and `native_hop_batch` run in fork mode: the process-wide interner never evicts, so a
-# long-lived fuzz process accumulates every dictionary string it decodes until the arena outgrows
-# the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a
-# child fatal, as it is outside fork mode.
+# `native_batch`, `native_hop_batch`, `statsd`, `syslog`, `graphite_plaintext`,
+# `graphite_pickle`, `collectd`, `prom_text`, `prom_remote_write`, `message_json`,
+# `message_logfmt`, and `message_kv` run in fork mode: the process-wide interner never evicts, so
+# a long-lived fuzz process accumulates every dictionary string, metric name, tag key, SD-ID,
+# PARAM-NAME, carbon path, Prometheus exemplar label name and family name, and log-message key it
+# decodes until the arena outgrows the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal, as it
+# is outside fork mode.
 FUZZ_TARGETS=(
     "native_frame|262144|65|"
     "native_batch|65536|64|-fork=1 -ignore_ooms=0"
@@ -94,9 +125,20 @@ FUZZ_TARGETS=(
     "otlp_json|65536|64|"
     "otlp_grpc|65536|16|"
     "prom_decompress|65536|16|"
-    "prom_remote_write|65536|64|"
+    "prom_remote_write|65536|64|-fork=1 -ignore_ooms=0"
+    "prom_text|65536|16|-fork=1 -ignore_ooms=0"
     "proxy_header|65552|16|"
     "forwarded|4096|16|"
+    "stream_framing|65546|16|"
+    "statsd|65536|56|-fork=1 -ignore_ooms=0"
+    "syslog|65536|32|-fork=1 -ignore_ooms=0"
+    "graphite_plaintext|65536|16|-fork=1 -ignore_ooms=0"
+    "graphite_pickle|65537|32|-fork=1 -ignore_ooms=0"
+    "collectd|65509|16|-fork=1 -ignore_ooms=0"
+    "message_json|65537|16|-fork=1 -ignore_ooms=0"
+    "message_csv|65537|16|"
+    "message_logfmt|65537|16|-fork=1 -ignore_ooms=0"
+    "message_kv|65537|16|-fork=1 -ignore_ooms=0"
 )
 
 # The sanitizer builds' RUSTFLAGS differ from miri's and careful's, so they get their own volume

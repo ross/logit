@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-04
+updated: 2026-10-11
 ---
 
 # `target` components: named destinations a router directs events into, beside `sources:`
@@ -99,7 +99,9 @@ components:
   a value no route names, is *unrouted*. This is `has_attributes`'/`has_provenance`'s bounded
   matcher pointed at a destination instead of a keep/drop verdict, and its config is deliberately
   no wider than theirs: no operators, no boolean algebra. `routing-by-condition-is-lua`'s core
-  holding is unchanged -- anything needing an operator is still a `lua` component.
+  holding is unchanged -- anything needing an operator is still a `lua` component. [2026-10-11: a
+  numeric range is now `bucket` plus an equality match on `route`
+  ([ADR `bucket-transform`](bucket-transform.md)).]
 - **`lua`/`lua_file`**, with a `targets: [..]` list on the component and a new handle method,
   `event:to("target_id")`. The mark rides on the handle, so `return event` and `return {a, b}` are
   unchanged and each event carries its own destination; an unmarked event is unrouted;

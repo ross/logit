@@ -1,0 +1,4 @@
+# HELP m a\\b\nc\"d\te
+# TYPE m gauge
+m 1
+# EOF
