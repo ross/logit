@@ -274,6 +274,12 @@
 //!     until `disk.max_bytes`, and so are `null_out` and an exposition-mode (`bind:`)
 //!     `prometheus_out`, whose sends never fail ([`blocking_sink_warnings`],
 //!     `docs/adr/delivery-semantics.md`).
+//! 84. Not a rejection: an `internal` whose pipeline (every node reachable from it through
+//!     `consumers` and `targets`) shares a node with another listener's adds a non-fatal entry to
+//!     [`Graph::warnings`] naming the first shared node. Only a dedicated pipeline drains last at
+//!     shutdown, so a mixed one never exports the counts recorded during shutdown
+//!     ([`mixed_internal_pipeline_warning`],
+//!     `docs/adr/shutdown-accounting-and-cancellation-safety.md`, decision 14).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -4000,7 +4006,31 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // Rule 83
     warnings.extend(blocking_sink_warnings(&resolved));
 
-    Ok(Graph { components: resolved, topological_order, warnings })
+    let mut graph = Graph { components: resolved, topological_order, warnings };
+    // Rule 84
+    if let Some(warning) = mixed_internal_pipeline_warning(&graph) {
+        graph.warnings.push(warning);
+    }
+    Ok(graph)
+}
+
+/// Rule 84: a warning naming `internal` and its first shared node when another listener reaches
+/// any node of `internal`'s pipeline. The runtime stages shutdown only for a dedicated pipeline,
+/// so a mixed one's final drain runs at the signal and misses every count recorded after it.
+fn mixed_internal_pipeline_warning(graph: &Graph) -> Option<String> {
+    let internal = graph.internal_id()?;
+    let shared = graph.internal_pipeline_shared_nodes();
+    let first = shared.first()?;
+    let others = match shared.len() - 1 {
+        0 => String::new(),
+        1 => " and 1 other node".to_owned(),
+        n => format!(" and {n} other nodes"),
+    };
+    Some(format!(
+        "internal '{internal}' shares '{first}'{others} with another listener's pipeline -- \
+         telemetry counted during shutdown won't be exported, only logged at exit; give \
+         '{internal}' its own sinks, such as a second sink to the same backend"
+    ))
 }
 
 /// Rule 83: one warning per distinct set of two or more memory-only `block` sinks that one or
@@ -8501,6 +8531,55 @@ mod tests {
         .expect("should resolve");
         assert!(through_a_target.internal_pipeline().is_none());
         assert_eq!(through_a_target.internal_pipeline_shared_nodes(), vec!["shared_out"]);
+    }
+
+    fn internal_warnings(config: Config) -> Vec<String> {
+        resolve_warnings(config).into_iter().filter(|w| w.starts_with("internal ")).collect()
+    }
+
+    /// Rule 84: a mixed pipeline warns once, naming `internal` and its first shared node.
+    #[test]
+    fn a_mixed_internal_pipeline_warns_once_naming_a_shared_node() {
+        let warnings = internal_warnings(cfg(vec![
+            ("self", vec![], internal()),
+            ("data", vec![], listener()),
+            ("telemetry_out", vec!["self"], sink()),
+            ("shared_out", vec!["self", "data"], sink()),
+        ]));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("internal 'self' shares 'shared_out' with another listener's"),
+            "{warnings:?}"
+        );
+
+        let warnings = internal_warnings(cfg(vec![
+            ("self", vec![], internal()),
+            ("data", vec![], listener()),
+            ("windowed", vec!["self", "data"], keep(vec!["x"])),
+            ("out", vec!["windowed"], sink()),
+        ]));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("internal 'self' shares 'out' and 1 other node with"),
+            "{warnings:?}"
+        );
+    }
+
+    /// Rule 84: a dedicated pipeline and a config with no `internal` don't warn at all.
+    #[test]
+    fn a_dedicated_internal_pipeline_or_no_internal_does_not_warn() {
+        let dedicated = resolve_warnings(cfg(vec![
+            ("self", vec![], internal()),
+            ("data", vec![], listener()),
+            ("self_out", vec!["self"], sink()),
+            ("data_out", vec!["data"], sink()),
+        ]));
+        assert!(dedicated.is_empty(), "{dedicated:?}");
+        let none = resolve_warnings(cfg(vec![
+            ("data", vec![], listener()),
+            ("data_out", vec!["data"], sink()),
+        ]));
+        assert!(none.is_empty(), "{none:?}");
     }
 
     #[test]
