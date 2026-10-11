@@ -555,7 +555,7 @@ that recorded the point.
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
 | `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
-| `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for a nonzero `*.dropped` count whose `reason` isn't one the config asked for (`absorbed`, `unrouted`, `script_drop`); `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
+| `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for a nonzero `*.dropped` count whose `reason` isn't one the config asked for (`absorbed`, `unrouted`, `script_drop`), other than `keep` and `remove`'s `logit.transform.attributes.dropped`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
 `telemetry left undrained at exit` is the last word on counts recorded after `internal`'s final

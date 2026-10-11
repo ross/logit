@@ -29,17 +29,23 @@ pub enum Reading {
 }
 
 impl Leftover {
-    /// A nonzero `*.dropped` count whose `reason` the config didn't ask for is data the run lost;
-    /// everything else is routine. The intended reasons are an exclusion list, so a reason added
-    /// later warns until someone decides it is intended.
+    /// A nonzero `*.dropped` count is data the run lost, unless the config asked for the drop:
+    /// its `reason` is in `INTENDED_REASONS`, or its metric is in `INTENDED_METRICS`. Everything
+    /// else is routine. Both are exclusion lists, so a reason or metric added later warns until
+    /// someone decides it is intended.
     fn is_loss(&self) -> bool {
         /// Drops a transform or router makes because the config says to: an aggregate or filter
         /// absorbing an event, a route with no matching target, and a script returning no event.
-        const INTENDED: [&str; 3] = ["absorbed", "unrouted", "script_drop"];
+        const INTENDED_REASONS: [&str; 3] = ["absorbed", "unrouted", "script_drop"];
+        /// Config-intended drops counted with no `reason` tag. A component that adds a counter
+        /// named `*.dropped` for something the config asked for and tags no reason must add the
+        /// metric here, or every clean exit logs it at `warn`.
+        const INTENDED_METRICS: [&str; 1] = ["logit.transform.attributes.dropped"];
         let reason = self.tags.split(',').find_map(|pair| pair.strip_prefix("reason="));
         matches!(self.reading, Reading::Value(v) if v != 0.0)
             && self.metric.ends_with(".dropped")
-            && !reason.is_some_and(|r| INTENDED.contains(&r))
+            && !INTENDED_METRICS.contains(&self.metric)
+            && !reason.is_some_and(|r| INTENDED_REASONS.contains(&r))
     }
 }
 
@@ -175,6 +181,17 @@ mod tests {
         for lost in ["shutdown", "rejected", "ambiguous_at_most_once", "a_new_reason"] {
             assert!(dropped(lost).is_loss(), "{lost}");
         }
+    }
+
+    #[test]
+    fn an_intended_metric_with_no_reason_is_not_a_loss() {
+        let attributes = |value| Leftover {
+            component: "c".into(),
+            metric: "logit.transform.attributes.dropped",
+            tags: String::new(),
+            reading: Reading::Value(value),
+        };
+        assert!(!attributes(4.0).is_loss());
     }
 
     #[test]
