@@ -57,8 +57,9 @@ state, a mark's word inside it, `degraded` only inside an exit step, a sample ti
 `Start` and counted once, and the `Health.Status` fallback); the watchdog around an expected
 exit (its code, its start, the two self-log lines it needs and the `Error: ` line after them,
 and an exit that never came); and the ledger with a script between the listener and
-`aggregate`: `ledger.script`'s identities, the egress gap without the flush events, the wider
-residual band, and an earlier life ended by an expected exit.
+`aggregate`: `ledger.script`'s identities, the egress gap without the flush events, a stopped
+life's gap judged with no allowance for the script, the wider residual band, and an earlier life
+ended by an expected exit.
 
 For service roles and several sinks, it covers compose.yaml's `soak.role` labels against
 `BASE_ROLES`, reading a role map from `docker compose config`'s JSON, every role-map rule, the
@@ -2035,8 +2036,8 @@ def _ledger_checks():
 def _script_ledger():
     """The ledger with a `lua` component between the listener and `aggregate`: `ledger.script`'s
     three identities, `ledger.edge` moving to the script's edge, the egress gap leaving out the
-    flush events V excludes, the residual band one inbox and one batch wider, and an earlier
-    life ended by an expected exit."""
+    flush events V excludes, a stopped life's gap judged with no allowance for the script, the
+    residual band one inbox and one batch wider, and an earlier life ended by an expected exit."""
     per_drain = {"drop": 20, "err": 10, "flush": 1}
     with tempfile.TemporaryDirectory() as tmp:
         def results(name, **kwargs):
@@ -2091,32 +2092,14 @@ def _script_ledger():
                f"egress and the summary FAIL a final-life gap with a script, got "
                f"{lost['ledger.egress']} / {lost['ledger.summary']}")
 
-        # Life 0's script drops 3% of what it receives, so it may drop up to ceil(0.03 x 30) + 2
-        # of its 30-event residual after the last drain, where no drain counts them.
-        banded = results("script-band", v0_extra=27)
-        expect(banded["ledger.egress"].status == checks.PASS
-               and "within script band (script band [1, 3]" in banded["ledger.egress"].detail,
-               f"egress passes a stopped life's gap inside the script band, got "
-               f"{banded['ledger.egress']}")
-        over = results("script-band-over", v0_extra=26)
-        expect(over["ledger.egress"].status == checks.FAIL
-               and "uncounted" in over["ledger.egress"].detail,
-               f"egress FAILs a gap past the script band, got {over['ledger.egress']}")
-        # A life whose script dropped and failed on nothing has a band of 0: a gap of 1 is loss.
-        clean_script = {"drop": 0, "err": 0, "flush": 1}
-        lossless = _ledger_run(tmp, "script-band-zero", script=clean_script, v0_extra=29)
-        result = checks.check_ledger_egress(checks.RunData(lossless))
-        expect(result.status == checks.FAIL and "uncounted" in result.detail,
-               f"egress FAILs a 1-increment gap in a life whose script dropped nothing, got "
-               f"{result}")
-        # 5,000 events the script emitted sat downstream of it at the stop: it can't drop
-        # those, so the band's base is the 30 upstream plus one batch, not the 5,030 residual,
-        # and a gap of 100 is loss.
-        backlog = results("script-band-backlog", ab0_short=250, v0_extra=4930)
-        expect(backlog["ledger.egress"].status == checks.FAIL
-               and "uncounted" in backlog["ledger.egress"].detail,
-               f"egress FAILs loss the script band would hide behind a downstream backlog, got "
-               f"{backlog['ledger.egress']}")
+        # Life 0's script drops and fails on events, and the final drain exports both counts, so
+        # a stopped life's gap of 1 with no shutdown drop is loss like any other.
+        gap = results("script-stopped-gap", v0_extra=29)
+        expect(gap["ledger.egress"].status == checks.FAIL
+               and "life 0: W − D − B − X − (L_drop + L_err) − V 1" in gap["ledger.egress"].detail
+               and "uncounted" in gap["ledger.egress"].detail,
+               f"egress FAILs a stopped scripted life's 1-increment gap with no shutdown drop, "
+               f"got {gap['ledger.egress']}")
         # A residual between the plain R (77,000) and the script's (142,000).
         wide = results("script-wide-residual", life0_extra=100030, v0_extra=100010)
         expect(wide["ledger.intake"].status == checks.PASS

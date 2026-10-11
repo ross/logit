@@ -698,18 +698,11 @@ The rows:
   `sut_script` (W7a), Ab becomes Ab − L_flush, because each `flush()` event carries one metric
   whose series `vm_selector` excludes, and a stopped earlier life's gap becomes
   W − D − B − X − (L_drop + L_err) − V. The subtraction holds only while each flush event carries
-  one metric, which the scenario's script guarantees. The residual of a stopped earlier life
-  passes through the script after its last drain, so the script drops and fails on its share of
-  it where no drain counts them. Only events the script hadn't emitted can be dropped: those
-  still upstream of it, W − D − B − X − L_in, plus the one listener batch
-  (`receive.batch_max_events`) it held, capped at the residual. A positive gap up to the
-  **script band**, the life's (L_drop + L_err) / L_in times that base, rounded up, plus 1 for
-  each outcome the life shows (a drop, an error), since a periodic rule can land on one more
-  event than its share, passes as "within script band". A life whose script dropped and failed
-  on nothing, or with no such events left, has a band of 0. A gap of 0 passes. A positive gap
-  is lost increments. It is reported with the life's telemetry
-  `batches.dropped{reason="shutdown"}` that can explain it beside it, and is **counted** only
-  when that count is above 0. The two are never reconciled: the count is of batches, and under
+  one metric, which the scenario's script guarantees. `internal` drains last, so the final drain
+  exports the script's drops and errors on a stopped life's residual too, and L_drop and L_err
+  include them. A gap of 0 passes. A positive gap is lost increments. It is reported with the
+  life's telemetry `batches.dropped{reason="shutdown"}` that can explain it beside it, and is
+  **counted** only when that count is above 0. The two are never reconciled: the count is of batches, and under
   `temporality: cumulative` a dropped batch loses only the increments since its series' last
   delivered total, which no log line states. A shutdown drop can explain a group's gap at any
   node but a sink outside the group: under `copy` (W7b), each sink is its own group, so a drop
@@ -1908,12 +1901,12 @@ What the runs showed about the harness:
 - **A stopped life's script drops after its last drain aren't exported.** The second `lua-path`
   run, `20261011T172503Z`, FAILed `ledger.egress` for its first life with a gap of 3. The life
   stopped with 100 events read but not yet through the script; after the last drain the
-  script dropped and failed on about 2.9% of them, which no drain exports. `ledger.egress` now
-  passes such a gap inside a script band, the life's drop-and-error share of the events the
-  script hadn't emitted (here the 100 in its batch), rounded up, plus 1 per outcome the life
-  shows (here 5); re-scored, the run passes every row. With `internal` draining last, the final
-  drain exports those drops: in the recorded `lua-path` run life 0's residual and gap were both
-  0, read "ok", and the band went unused.
+  script dropped and failed on about 2.9% of them, which no drain exported then. A script band
+  briefly passed such a gap: the life's drop-and-error share of the events the script hadn't
+  emitted, rounded up, plus 1 per outcome the life showed. The band was retired once `internal`
+  drained last: the final drain now exports those drops and errors, L_drop and L_err include
+  them, and the residual subtracts them, so a band could only mask loss. In the recorded
+  `lua-path` run, `20261011T221308Z`, life 0's residual and gap were both 0.
 - **A drop period that divides the series count empties series.** The first `lua-path` run,
   `20261011T170612Z`, WARNed that two series' resets weren't SUT lives − 1: dropping every 50th
   event of a generator cycling 100 names dropped `soak_requests_49_total` and

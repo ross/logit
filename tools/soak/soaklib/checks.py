@@ -24,7 +24,6 @@ sinks' V add up to it, so the egress gap is judged on their sum.
 
 import bisect
 import json
-import math
 import re
 import statistics
 from dataclasses import dataclass, field
@@ -1089,7 +1088,6 @@ class Ledger:
         batch_max = _yaml_int(text, "batch_max_events") or DEFAULT_BATCH_MAX_EVENTS
         batches = RESIDUAL_BATCHES + (SCRIPT_RESIDUAL_BATCHES if self.script else 0)
         self.R = max_datagrams + batches * batch_max
-        self.batch_max = batch_max
         self.R_text = f"R {_n(self.R)} = {_n(max_datagrams)} + {batches} x {_n(batch_max)}"
         # The aggregate's configured window, in seconds, or None when the config doesn't say.
         self.interval = component_duration(text, self.aggregate or "", "interval")
@@ -1237,11 +1235,11 @@ class Ledger:
         stopped earlier life's is W − D − B − X − V, less a script's counted drops, the residual
         plus Ab − V, because `aggregate`'s close-time flush delivers what that life read but
         hadn't absorbed by its last ordinary drain into V; the final drain runs after that
-        flush, so it exports the shutdown drops. With a script, a positive gap up to
-        `script_band` passes. A killed life has no close-time window and no shutdown drops: its
-        gap is Ab − V alone, judged inside `kill_band`; below the band it is a
-        surplus, above it uncounted loss. Its residual is what the kill lost from the receive
-        queue and inbox, by design, and is reported, not judged here."""
+        flush, so it exports the shutdown drops and the script's counted drops and errors. A
+        killed life has no close-time window and no shutdown drops: its gap is Ab − V alone,
+        judged inside `kill_band`; below the band it is a surplus, above it uncounted loss. Its
+        residual is what the kill lost from the receive queue and inbox, by design, and is
+        reported, not judged here."""
         gap = self.absorbed(life) - self.v(life, sinks)
         if life in self.killed and life != self.final:
             low, high, _ = self.kill_band(life)
@@ -1256,8 +1254,6 @@ class Ledger:
             return PASS, "ok", gap
         if gap > 0 and self.shutdown_credit(life, sinks) > 0:
             return PASS, "counted", gap
-        if self.script and life != self.final and 0 < gap <= self.script_band(life)[0]:
-            return PASS, "within script band", gap
         return FAIL, "uncounted", gap
 
     def other_sinks_shutdown(self, life, sinks):
@@ -1274,28 +1270,6 @@ class Ledger:
         every sink and the count is the life's whole."""
         return (self.get("shutdown_batches", life)
                 - self.other_sinks_shutdown(life, sinks))
-
-    def script_band(self, life):
-        """`(high, text)`: the gap a stopped earlier life may show because its script dropped or
-        failed on events after the last drain, which no drain exports.
-
-        Only events the script hadn't yet emitted can be dropped: those still upstream of it,
-        W − D − B − X − L_in, plus the batch it held, one listener batch, capped at the
-        residual. The band is the life's own share of dropped and failed events,
-        (L_drop + L_err) / L_in, of that base, rounded up, plus 1 for each outcome the life
-        shows (a drop, an error), since a periodic rule can land on one more event than its
-        share. With no base, or no drop and no error, the band is 0."""
-        received = self.get("L_in", life)
-        share = self.script_dropped(life) / received if received else 0.0
-        upstream = max(0, self.get("W", life) - self.D(life) - self.get("B", life)
-                       - self.get("X", life) - received)
-        base = min(max(0, self.residual(life)), upstream + self.batch_max)
-        outcomes = sum(1 for symbol in ("L_drop", "L_err") if self.get(symbol, life) > 0)
-        high = math.ceil(share * base) + outcomes if base > 0 and outcomes else 0
-        return high, (f"script band [1, {_n(high)}]: the life's drop-and-error share {share:.2%} "
-                      f"of the {_n(base)} event(s) the script hadn't emitted (upstream "
-                      f"{_n(upstream)} plus one {_n(self.batch_max)}-event batch, capped at the "
-                      f"residual), rounded up, plus {outcomes}, one per outcome it shows")
 
 
 def _ledger(data):
@@ -1628,8 +1602,6 @@ def check_ledger_egress(data):
                          else "W − D − B − X − V")
                 part = (f"life {life}: {whole} {_n(gap)} = residual "
                         f"{_n(led.residual(life))} + {led.ab_text} − V {_n(ab_v)}, {verdict}")
-                if verdict == "within script band":
-                    part += f" ({led.script_band(life)[1]})"
             if gap > 0 and not (life in led.killed and life != led.final):
                 others = ""
                 elsewhere = led.other_sinks_shutdown(life, sinks)
