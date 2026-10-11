@@ -521,6 +521,8 @@ it. A throttled diagnostic, or a component-owned lifecycle message like `bound`/
 carries a `key` naming *why*. The process-level lifecycle events (`starting`, `ready`,
 `shutdown signal received`, `shutdown delay elapsed`, `reopen signal received`,
 `drain complete`, `exiting`) carry neither, because they describe the process, not a component.
+`telemetry left undrained at exit` is the exception: it carries `component`, naming the component
+that recorded the point.
 
 **Lifecycle event names are stable `&'static str` values, so you can alert on them directly:**
 
@@ -542,12 +544,12 @@ carries a `key` naming *why*. The process-level lifecycle events (`starting`, `r
 `telemetry left undrained at exit` is the last word on counts recorded after `internal`'s final
 drain. Each line carries `component`, `metric`, `tags` (the point's tags as `key=value` pairs
 sorted by key and joined by `,`), and `value`; a timing carries `count` and `sum` (in seconds)
-instead of `value`. A mixed `internal` pipeline, where `internal` shares a sink or transform with
-data, is what typically leaves counts here: that sink's `batches.dropped{reason="shutdown"}` and a
-UDP listener's `datagrams.dropped{reason="shutdown"}` land after `internal` has stopped. With a
-dedicated pipeline, `internal` drains last and these lines carry only what its final drain caused:
-`internal`'s own counts and its sinks' delivery of that last batch (see
-[`docs/design/internal-telemetry.md`](design/internal-telemetry.md)'s "`internal`: the drain"). A
+instead of `value`. To avoid leftovers, [give `internal` a dedicated
+pipeline](#give-internal-a-dedicated-pipeline). With one, `internal` drains last and the lines
+carry only the final drain's own `logit.internal.*` counts and any count recorded during the
+pipeline's own shutdown. A mixed pipeline, where `internal` shares a sink or transform with data,
+is what typically leaves drop counts here: that sink's `batches.dropped{reason="shutdown"}` and a
+UDP listener's `datagrams.dropped{reason="shutdown"}` land after `internal` has stopped. A
 second SIGTERM/SIGINT (exit `130`), SIGKILL, or an out-of-memory kill exits without
 them.
 
