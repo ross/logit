@@ -626,9 +626,13 @@ The rows:
   W − D − B − X − (L_drop + L_err) − V. The subtraction holds only while each flush event carries
   one metric, which the scenario's script guarantees. The residual of a stopped earlier life
   passes through the script after its last drain, so the script drops and fails on its share of
-  it where no drain counts them: a positive gap up to the **script band**, the life's
-  (L_drop + L_err) / L_in times the residual, rounded up, plus 2 for the shipped scripts'
-  periodic rules landing on an extra event, passes as "within script band". A gap of 0 passes. A
+  it where no drain counts them. Only events the script hadn't emitted can be dropped: those
+  still upstream of it, W − D − B − X − L_in, plus the one listener batch
+  (`receive.batch_max_events`) it held, capped at the residual. A positive gap up to the
+  **script band**, the life's (L_drop + L_err) / L_in times that base, rounded up, plus 1 for
+  each outcome the life shows (a drop, an error), since a periodic rule can land on one more
+  event than its share, passes as "within script band". A life whose script dropped and failed
+  on nothing, or with no such events left, has a band of 0. A gap of 0 passes. A
   positive gap is lost increments. It is reported with
   that life's `drain complete` `batches_dropped` beside it, and is **counted** only when that
   count is above 0. The two are never reconciled: `batches_dropped` counts batches, and under
@@ -1810,8 +1814,9 @@ What the runs showed about the harness:
   run, `20261011T172503Z`, FAILed `ledger.egress` for its first life with a gap of 3. The life
   stopped with 100 events read but not yet through the script; after the last drain the
   script dropped and failed on about 2.9% of them, which no drain exports. `ledger.egress` now
-  passes such a gap inside a script band, the life's drop-and-error share of the residual,
-  rounded up, plus 2 (here 5); re-scored, the run passes every row.
+  passes such a gap inside a script band, the life's drop-and-error share of the events the
+  script hadn't emitted (here the 100 in its batch), rounded up, plus 1 per outcome the life
+  shows (here 5); re-scored, the run passes every row.
 - **A drop period that divides the series count empties series.** The first `lua-path` run,
   `20261011T170612Z`, WARNed that two series' resets weren't SUT lives − 1: dropping every 50th
   event of a generator cycling 100 names dropped `soak_requests_49_total` and

@@ -1414,6 +1414,21 @@ def _script_ledger():
         expect(over["ledger.egress"].status == checks.FAIL
                and "uncounted" in over["ledger.egress"].detail,
                f"egress FAILs a gap past the script band, got {over['ledger.egress']}")
+        # A life whose script dropped and failed on nothing has a band of 0: a gap of 1 is loss.
+        clean_script = {"drop": 0, "err": 0, "flush": 1}
+        lossless = _ledger_run(tmp, "script-band-zero", script=clean_script, v0_extra=29)
+        result = checks.check_ledger_egress(checks.RunData(lossless))
+        expect(result.status == checks.FAIL and "uncounted" in result.detail,
+               f"egress FAILs a 1-increment gap in a life whose script dropped nothing, got "
+               f"{result}")
+        # 5,000 events the script emitted sat downstream of it at the stop: it can't drop
+        # those, so the band's base is the 30 upstream plus one batch, not the 5,030 residual,
+        # and a gap of 100 is loss.
+        backlog = results("script-band-backlog", ab0_short=250, v0_extra=4930)
+        expect(backlog["ledger.egress"].status == checks.FAIL
+               and "uncounted" in backlog["ledger.egress"].detail,
+               f"egress FAILs loss the script band would hide behind a downstream backlog, got "
+               f"{backlog['ledger.egress']}")
         # A residual between the plain R (77,000) and the script's (142,000).
         wide = results("script-wide-residual", life0_extra=100030, v0_extra=100010)
         expect(wide["ledger.intake"].status == checks.PASS

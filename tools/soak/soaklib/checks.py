@@ -1035,6 +1035,7 @@ class Ledger:
         batch_max = _yaml_int(text, "batch_max_events") or DEFAULT_BATCH_MAX_EVENTS
         batches = RESIDUAL_BATCHES + (SCRIPT_RESIDUAL_BATCHES if self.script else 0)
         self.R = max_datagrams + batches * batch_max
+        self.batch_max = batch_max
         self.R_text = f"R {_n(self.R)} = {_n(max_datagrams)} + {batches} x {_n(batch_max)}"
         # The aggregate's configured window, in seconds, or None when the config doesn't say.
         self.interval = component_duration(text, self.aggregate or "", "interval")
@@ -1158,16 +1159,25 @@ class Ledger:
 
     def script_band(self, life):
         """`(high, text)`: the gap a stopped earlier life may show because its script dropped or
-        failed on part of the residual after the last drain, which no drain exports: the
-        life's own share of dropped and failed events, (L_drop + L_err) / L_in, of the
-        residual, rounded up, plus 2, one per periodic rule of the shipped scripts landing on
-        an extra event."""
+        failed on events after the last drain, which no drain exports.
+
+        Only events the script hadn't yet emitted can be dropped: those still upstream of it,
+        W − D − B − X − L_in, plus the batch it held, one listener batch, capped at the
+        residual. The band is the life's own share of dropped and failed events,
+        (L_drop + L_err) / L_in, of that base, rounded up, plus 1 for each outcome the life
+        shows (a drop, an error), since a periodic rule can land on one more event than its
+        share. With no base, or no drop and no error, the band is 0."""
         received = self.get("L_in", life)
         share = self.script_dropped(life) / received if received else 0.0
-        residual = max(0, self.residual(life))
-        high = math.ceil(share * residual) + 2
+        upstream = max(0, self.get("W", life) - self.D(life) - self.get("B", life)
+                       - self.get("X", life) - received)
+        base = min(max(0, self.residual(life)), upstream + self.batch_max)
+        outcomes = sum(1 for symbol in ("L_drop", "L_err") if self.get(symbol, life) > 0)
+        high = math.ceil(share * base) + outcomes if base > 0 and outcomes else 0
         return high, (f"script band [1, {_n(high)}]: the life's drop-and-error share {share:.2%} "
-                      f"of the residual {_n(residual)}, rounded up, plus 2")
+                      f"of the {_n(base)} event(s) the script hadn't emitted (upstream "
+                      f"{_n(upstream)} plus one {_n(self.batch_max)}-event batch, capped at the "
+                      f"residual), rounded up, plus {outcomes}, one per outcome it shows")
 
 
 def _ledger(data):
