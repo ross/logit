@@ -205,7 +205,7 @@
           "type": "string"
         },
         "overflow": {
-          "description": "What happens once both bounds are full. Defaults to `block`.",
+          "description": "What happens once both bounds are full. Defaults to `block`. A full `block` sink stalls every other sink fed from the same source, so `logit validate` warns when a source feeds two or more sinks that use `block` and have no `disk:`.",
           "default": "block",
           "allOf": [
             {

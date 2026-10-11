@@ -236,7 +236,9 @@ fn main() -> anyhow::Result<()> {
             // The graph checks `run` makes before spawning anything. `build_spec`'s checks (a
             // syslog `sd_id`, a referenced file) run only under `run` (docs/deploying.md's
             // "`logit validate` as a preflight").
-            pipeline::validate_semantics(config)?;
+            for warning in pipeline::validate_semantics(config)? {
+                eprintln!("warning: {warning}");
+            }
             println!("{} is valid", path.display());
             Ok(())
         }
@@ -266,11 +268,18 @@ fn main() -> anyhow::Result<()> {
             // DOT first, always, then any validation error on stderr: a cycle is easier to see
             // rendered than read out of an error naming two component ids.
             println!("{}", dot::render(&config));
-            if let Err(err) = pipeline::validate_semantics(config) {
-                eprintln!("warning: {err}");
-                std::process::exit(1);
+            match pipeline::validate_semantics(config) {
+                Ok(warnings) => {
+                    for warning in warnings {
+                        eprintln!("warning: {warning}");
+                    }
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!("warning: {err}");
+                    std::process::exit(1);
+                }
             }
-            Ok(())
         }
         Command::Ready { admin } => match check_ready(&admin) {
             Ok(word) => {

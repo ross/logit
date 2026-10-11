@@ -56,7 +56,11 @@ components:
     sources: [tap]
     interval: 10s
 
+  # A tap must not perturb the flow it measures, so this sink drops its oldest batches rather
+  # than stall `statsd`, and with it `metrics`, when it falls behind.
   shape_out:
     type: stdio_out
     sources: [shape_rollup]
     target: stdout
+    buffer:
+      overflow: drop_oldest
