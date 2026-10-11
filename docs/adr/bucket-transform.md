@@ -54,10 +54,14 @@ latency_class:
 **Config.** `attributes` maps a source field to its spec. Each spec has:
 
 - `into`: the attribute the class is written to. Naming the source field replaces the number with
-  its class in place.
+  its class in place. It can't name another configured source field or another field's `into`:
+  fields apply in key order over one attribute map, so either would make the result depend on
+  how the keys sort.
 - `ranges`: an ordered list, first match wins. A range has one upper bound, `lt` (value < bound)
   or `le` (value <= bound), and a class `value`. A range with no bound is the catch-all and may
-  only be last. Bounds must be finite and strictly increasing.
+  only be last. Bounds must be finite, and every range must be able to match: each bound is larger
+  than the one before it, except that `le: X` may follow `lt: X`, which classes the single value
+  `X` (`lt: 0`, `le: 0`, catch-all is negative, zero, positive).
 - `other`: the class for a present value that isn't a finite number, or that no range matches.
   Absent means nothing is written.
 - `keep_source`: default `true`. `false` removes the source after a write, unless `into` names the
@@ -87,11 +91,12 @@ an unset field), as `kv_metrics` argues for its skips. Telemetry mirrors `keep_v
 pair: `logit.transform.values.bucketed` and `logit.transform.values.unmatched`, each tagged with the
 config-declared `field`.
 
-**Graph validation (rule 82)** rejects an empty `attributes` map, an empty field name or `into`, an
-empty `ranges`, a range with both `lt` and `le`, a boundless range that isn't last, a non-finite
-bound, bounds that don't strictly increase, and an empty class `value` or `other`. Each is a
-config that can never write a class, or a range that can never match. Two ranges may share a
-class.
+**Graph validation (rule 82)** rejects an empty `attributes` map; an empty field name, `into`,
+`ranges`, class `value`, or `other`; an `into` that names another configured source field, or that
+two fields share; a range with both `lt` and `le`; a boundless range that isn't last; a non-finite
+bound; and a range the ranges before it already cover: a bound below the previous one, or equal to
+it unless `lt: X` is followed by `le: X`. Each is a config that can never write a class, a range
+that can never match, or a result that depends on key order. Two ranges may share a class.
 
 ## Alternatives considered
 

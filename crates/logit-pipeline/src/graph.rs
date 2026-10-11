@@ -260,9 +260,11 @@
 //! 81. An `admin.socket_mode` without `admin.socket`; an empty `admin.bind` or `admin.socket`; or
 //!     an `admin.bind` starting with `/`, a path that belongs in `socket`
 //!     (`docs/adr/listener-port-sharing-and-shutdown-delay.md`).
-//! 82. A `bucket` with no `attributes`, an empty field name or `into`, an empty `ranges`, a range
-//!     with both `lt` and `le`, a boundless range that isn't last, a non-finite bound, bounds
-//!     that don't strictly increase, or an empty class `value` or `other`
+//! 82. A `bucket` with no `attributes`; an empty field name, `into`, `ranges`, class `value`, or
+//!     `other`; an `into` naming another configured source field, or shared by two fields; a
+//!     range with both `lt` and `le`; a boundless range that isn't last; a non-finite bound; or a
+//!     range the ranges before it already cover, which can never match: a bound below the
+//!     previous one, or equal to it unless `lt: X` is followed by `le: X`
 //!     (`docs/adr/bucket-transform.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
@@ -3771,8 +3773,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 82: `bucket` (`docs/adr/bucket-transform.md`). Ranges are tested first-match, so a
-    // boundless range before the end, or a bound no larger than the one before it, leaves every
-    // later range unreachable. Two ranges may share a class.
+    // boundless range before the end, or a bound the ranges before it already cover, can never
+    // match. `lt: X` then `le: X` is reachable: it classes the single value `X`. Two ranges may
+    // share a class. Fields apply in key order over one attribute map, so an `into` naming
+    // another configured source, or shared by two fields, would make the result depend on key
+    // order.
     for (id, component) in &components {
         let ComponentKind::Bucket { attributes } = &component.kind else { continue };
         if attributes.is_empty() {
@@ -3781,6 +3786,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                  no-op"
             );
         }
+        let mut intos: HashMap<&str, &str> = HashMap::new();
         for (field, spec) in attributes {
             if field.is_empty() {
                 anyhow::bail!(
@@ -3790,6 +3796,20 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             }
             if spec.into.is_empty() {
                 anyhow::bail!("component '{id}': bucket '{field}' has an empty 'into'");
+            }
+            if spec.into != *field && attributes.contains_key(&spec.into) {
+                anyhow::bail!(
+                    "component '{id}': bucket '{field}' has 'into: {}', another configured \
+                     source field -- which one is classified first would depend on key order",
+                    spec.into
+                );
+            }
+            if let Some(other_field) = intos.insert(&spec.into, field) {
+                anyhow::bail!(
+                    "component '{id}': bucket '{other_field}' and '{field}' share 'into: {}' -- \
+                     one would overwrite the other's class",
+                    spec.into
+                );
             }
             if spec.ranges.is_empty() {
                 anyhow::bail!(
@@ -3801,19 +3821,21 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!("component '{id}': bucket '{field}' has an empty 'other'");
             }
             let last = spec.ranges.len() - 1;
-            let mut previous: Option<f64> = None;
+            // The previous range's bound, and whether it was `lt`.
+            let mut previous: Option<(f64, bool)> = None;
             for (i, range) in spec.ranges.iter().enumerate() {
                 if range.value.is_empty() {
                     anyhow::bail!(
                         "component '{id}': bucket '{field}' range {i} has an empty 'value'"
                     );
                 }
-                let bound = match (range.lt, range.le) {
+                let (bound, is_lt) = match (range.lt, range.le) {
                     (Some(_), Some(_)) => anyhow::bail!(
                         "component '{id}': bucket '{field}' range {i} sets both 'lt' and 'le' -- \
                          give one bound"
                     ),
-                    (Some(bound), None) | (None, Some(bound)) => bound,
+                    (Some(bound), None) => (bound, true),
+                    (None, Some(bound)) => (bound, false),
                     (None, None) if i == last => continue,
                     (None, None) => anyhow::bail!(
                         "component '{id}': bucket '{field}' range {i} has no bound but isn't the \
@@ -3825,14 +3847,16 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         "component '{id}': bucket '{field}' range {i} has a non-finite bound"
                     );
                 }
-                if previous.is_some_and(|previous| bound <= previous) {
+                let covered = previous.is_some_and(|(prev, prev_lt)| {
+                    bound < prev || (bound == prev && !(prev_lt && !is_lt))
+                });
+                if covered {
                     anyhow::bail!(
-                        "component '{id}': bucket '{field}' range {i}'s bound {bound} isn't \
-                         larger than the bound before it -- bounds must strictly increase, or a \
-                         range is unreachable"
+                        "component '{id}': bucket '{field}' range {i} can never match -- the \
+                         ranges before it already cover every number up to its bound {bound}"
                     );
                 }
-                previous = Some(bound);
+                previous = Some((bound, is_lt));
             }
         }
     }
@@ -13099,6 +13123,10 @@ mod tests {
             r#"{"d": {"into": "c", "ranges": [{"lt": 1000, "value": "a"},
                 {"lt": 2000, "value": "a"}]}}"#,
             r#"{"d": {"into": "c", "ranges": [{"value": "any"}]}}"#,
+            r#"{"d": {"into": "c", "ranges": [{"lt": 1, "value": "under"},
+                {"le": 1, "value": "one"}, {"value": "over"}]}}"#,
+            r#"{"a": {"into": "a", "ranges": [{"value": "x"}]},
+                "b": {"into": "b", "ranges": [{"value": "y"}]}}"#,
         ] {
             resolve(cfg_with_bucket(attributes))
                 .unwrap_or_else(|err| panic!("{attributes} should resolve: {err}"));
@@ -13123,12 +13151,32 @@ mod tests {
             (
                 r#"{"d": {"into": "c", "ranges": [{"lt": 2, "value": "a"},
                     {"le": 1, "value": "b"}]}}"#,
-                "strictly increase",
+                "range 1 can never match",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"le": 1, "value": "a"},
+                    {"lt": 1, "value": "b"}]}}"#,
+                "range 1 can never match",
             ),
             (
                 r#"{"d": {"into": "c", "ranges": [{"lt": 1, "value": "a"},
+                    {"lt": 1, "value": "b"}]}}"#,
+                "range 1 can never match",
+            ),
+            (
+                r#"{"d": {"into": "c", "ranges": [{"le": 1, "value": "a"},
                     {"le": 1, "value": "b"}]}}"#,
-                "strictly increase",
+                "range 1 can never match",
+            ),
+            (
+                r#"{"a": {"into": "b", "ranges": [{"value": "x"}]},
+                    "b": {"into": "c", "ranges": [{"value": "y"}]}}"#,
+                "another configured source field",
+            ),
+            (
+                r#"{"a": {"into": "c", "ranges": [{"value": "x"}]},
+                    "b": {"into": "c", "ranges": [{"value": "y"}]}}"#,
+                "share 'into: c'",
             ),
             (r#"{"d": {"into": "c", "ranges": [{"lt": 1, "value": ""}]}}"#, "empty 'value'"),
             (r#"{"d": {"into": "c", "ranges": [{"value": "a"}], "other": ""}}"#, "empty 'other'"),

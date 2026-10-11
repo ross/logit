@@ -401,9 +401,10 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `datadog_trace_in` without `bind`.
 81. An `admin.socket_mode` without `admin.socket`, an empty `admin.bind` or `admin.socket`, or an
     `admin.bind` that is a path.
-82. A `bucket` with no `attributes`, an empty field name, `into`, `ranges`, `value`, or `other`, a
-    range with both `lt` and `le`, a boundless range that isn't last, or a non-finite or
-    non-increasing bound.
+82. A `bucket` with no `attributes`; an empty field name, `into`, `ranges`, `value`, or `other`; an
+    `into` naming another configured source or shared by two fields; a range with both `lt` and
+    `le`; a boundless range that isn't last; a non-finite bound; or a range that can never match
+    (a bound below the previous one, or equal to it unless `lt: X` is followed by `le: X`).
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

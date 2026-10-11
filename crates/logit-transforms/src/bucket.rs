@@ -227,6 +227,22 @@ mod tests {
     }
 
     #[test]
+    fn lt_then_le_on_one_bound_classes_that_single_value() {
+        let mut b = Bucket::new(vec![field(
+            &[
+                (BucketBound::Lt(0.0), "neg"),
+                (BucketBound::Le(0.0), "zero"),
+                (BucketBound::Any, "pos"),
+            ],
+            None,
+            true,
+        )]);
+        assert_eq!(class_of(&mut b, Value::I64(-1)), Some(Value::str("neg")));
+        assert_eq!(class_of(&mut b, Value::I64(0)), Some(Value::str("zero")));
+        assert_eq!(class_of(&mut b, Value::I64(1)), Some(Value::str("pos")));
+    }
+
+    #[test]
     fn a_numeric_string_coerces() {
         let mut b = latency(None);
         assert_eq!(class_of(&mut b, Value::str("0.05")), Some(Value::str("fast")));

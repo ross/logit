@@ -290,11 +290,13 @@ pub struct ValueAllowList {
 #[serde(deny_unknown_fields)]
 pub struct BucketSpec {
     /// The attribute the matched range's `value` is written to. Must be non-empty. Naming the
-    /// source field itself replaces the number with its class in place.
+    /// source field itself replaces the number with its class in place. Can't name another field
+    /// this component classifies, or the `into` of another field.
     pub into: String,
     /// The classes, tested in order; the first range that matches wins. Must be non-empty. Every
-    /// bound must be finite and larger than the bound before it. A range with no bound matches
-    /// any number, and is allowed only as the last range.
+    /// bound must be finite, and every range must be able to match: a bound must be larger than
+    /// the bound before it, except that `le: X` may follow `lt: X` to class the value `X` alone.
+    /// A range with no bound matches any number, and is allowed only as the last range.
     pub ranges: Vec<BucketRange>,
     /// What `into` becomes when the source value isn't a finite number, or is a number no range
     /// matches. Absent (the default) writes nothing in either case.
