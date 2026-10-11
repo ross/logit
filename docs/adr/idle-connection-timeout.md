@@ -1,6 +1,6 @@
 ---
 created: 2026-09-14
-updated: 2026-10-07
+updated: 2026-10-11
 ---
 
 # Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe
@@ -426,6 +426,10 @@ never completes. A reviewer can answer each decision below yes or no.
    The TCP driver and `logit_in` count no shutdown close, and
    [`internal-telemetry.md`](../design/internal-telemetry.md) defines `connections.closed` as a
    policy close.
+   [Superseded on 2026-10-11 by the "internal drains last" amendment of ADR
+   `shutdown-accounting-and-cancellation-safety`: a dedicated `internal` pipeline drains after
+   the listeners exit, so the HTTP listeners now count `connections.closed{reason="shutdown"}`.
+   The TCP driver and `logit_in` still count no shutdown close.]
 9. **There is no new grace knob.** The close grace stays `handshake_timeout`, which is what
    flushes a `GOAWAY`. The outer bound is the runtime's fixed 5 s grace for a listener with no
    `receive:` block. By default the two are equal, so the backstop ends an h1 connection stopped

@@ -625,6 +625,12 @@ own consumers. `internal`'s **pipeline** is every node reachable from it. The pi
     covers a mixed pipeline's residual and the final drain's own counts. Spans and captured logs
     aren't repeated, because the logs already went to stderr.
 
+Because a dedicated pipeline exports what a listener counts while it stops, the HTTP listeners
+count each connection their shutdown close sequence ends as
+`logit.input.connections.closed{reason="shutdown"}`. That supersedes decision 8 of [ADR
+`idle-connection-timeout`](idle-connection-timeout.md)'s shutdown amendment. The TCP driver and
+`logit_in` don't count a shutdown close.
+
 Not covered: SIGKILL and out-of-memory kills give no drain at all. Only a shorter `interval` narrows
 that loss.
 

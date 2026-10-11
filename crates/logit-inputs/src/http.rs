@@ -189,7 +189,8 @@ where
     E: std::fmt::Display,
 {
     let mut conn = std::pin::pin!(conn);
-    // Set when shutdown starts the close rather than the idle policy: only the policy is counted.
+    // Set when shutdown starts the close rather than the idle policy, which picks the close's
+    // `reason` tag.
     let mut closing = false;
 
     loop {
@@ -283,11 +284,9 @@ where
             break;
         }
     }
-    // A shutdown close isn't counted: `connections.closed` counts a policy close (`crate::otlp`'s
-    // "Idle timeout" doc section).
-    if !closing {
-        telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "idle")]);
-    }
+    // A close after a stalled body counts as `idle`: both are the listener's timing policy.
+    let reason = if closing { "shutdown" } else { "idle" };
+    telemetry.count("logit.input.connections.closed", 1.0, &[("reason", reason)]);
     Ok(())
 }
 
