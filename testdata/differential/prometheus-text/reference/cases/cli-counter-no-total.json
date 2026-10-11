@@ -1,0 +1,45 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "help",
+   "name": "requests",
+   "value": "Total requests served."
+  },
+  {
+   "kind": "type",
+   "name": "requests",
+   "value": "counter"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "get"
+    ]
+   ],
+   "name": "requests",
+   "ts_ms": 1395066363000,
+   "value": "0x4014000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [
+    [
+     "method",
+     "post"
+    ]
+   ],
+   "name": "requests",
+   "value": "0x4000000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xe5f3a308",
+  "len": 128,
+  "path": "differential/prometheus-text/cases/cli-counter-no-total.txt"
+ },
+ "parser": "prom"
+}

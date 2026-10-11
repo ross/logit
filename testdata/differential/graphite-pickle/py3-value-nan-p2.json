@@ -1,0 +1,66 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "value.nan",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x7ff8000000000000",
+     "repr": "nan"
+    },
+    "nan"
+   ]
+  ]
+ },
+ "case": "py3-value-nan-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "value.nan",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "f64": "0x7ff8000000000000",
+        "repr": "nan"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "decoder_skips": {
+  "non_finite_value": 1
+ },
+ "description": "The value nan.",
+ "exercises": [
+  "BINFLOAT"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BINFLOAT",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

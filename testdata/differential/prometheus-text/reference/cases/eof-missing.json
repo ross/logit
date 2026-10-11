@@ -1,0 +1,26 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "g",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": {
+  "after_entry": 2,
+  "message": "data does not end with # EOF"
+ },
+ "input": {
+  "crc32c": "0xc501c940",
+  "len": 19,
+  "path": "differential/prometheus-text/cases/eof-missing.om"
+ },
+ "parser": "openmetrics"
+}

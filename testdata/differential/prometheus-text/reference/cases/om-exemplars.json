@@ -1,0 +1,89 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "r",
+   "value": "counter"
+  },
+  {
+   "exemplar": {
+    "labels": [
+     [
+      "span_id",
+      "fedcba9876543210"
+     ],
+     [
+      "trace_id",
+      "0123456789abcdef0123456789abcdef"
+     ]
+    ],
+    "ts_ms": 1605281325500,
+    "value": "0x3fe0000000000000"
+   },
+   "kind": "series",
+   "labels": [],
+   "name": "r_total",
+   "value": "0x4008000000000000"
+  },
+  {
+   "kind": "type",
+   "name": "h",
+   "value": "histogram"
+  },
+  {
+   "exemplar": {
+    "labels": [
+     [
+      "slow",
+      "no"
+     ]
+    ],
+    "value": "0x3fa999999999999a"
+   },
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "0.1"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x3ff0000000000000"
+  },
+  {
+   "exemplar": {
+    "labels": [],
+    "value": "0x401c000000000000"
+   },
+   "kind": "series",
+   "labels": [
+    [
+     "le",
+     "+Inf"
+    ]
+   ],
+   "name": "h_bucket",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_count",
+   "value": "0x4000000000000000"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "h_sum",
+   "value": "0x401c333333333333"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0x4784cfc7",
+  "len": 234,
+  "path": "differential/prometheus-text/cases/om-exemplars.om"
+ },
+ "parser": "openmetrics"
+}

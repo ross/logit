@@ -1,7 +1,8 @@
 #!/bin/bash
 # Usage: script/record-fixtures [producer ...]
-#   Producers: logger, python-syslog-handler, rsyslog, rsyslog-tcp, collectd, otlp, graphite,
-#              prometheus, vmagent, statsd, datadog (= datadog-agent, datadog-tracer,
+#   Producers: logger, python-syslog-handler, rsyslog, rsyslog-tcp, collectd, otlp, graphite (also
+#              graphite-p0, graphite-py2, graphite-dropwizard, one capture each), prometheus,
+#              prometheus-scrape, vmagent, statsd, datadog (= datadog-agent, datadog-tracer,
 #              datadog-dogstatsd-unix), splunk (= splunk-otel, splunk-docker, splunk-sc4s,
 #              splunk-java, then check_splunk_capture.py)
 #   With no arguments, records every producer in `all` below.
@@ -27,6 +28,8 @@ PROM_CFG_DIR="" # set by record_prometheus, removed by cleanup()
 DD_CONF_DIR=""  # set by record_datadog_agent, removed by cleanup()
 # The Datadog producers' shared `/var/run/datadog`: the Agent's sockets, or the capture's.
 DD_VOLUME="logit-record-fixtures-dd-run"
+# The JDK and Maven the Java producers (`graphite`'s Dropwizard capture, `splunk-java`) build in.
+MAVEN_IMAGE="maven:3.9.16-eclipse-temurin-17"
 
 # ---- shared plumbing ---------------------------------------------------------------------------
 
@@ -67,7 +70,7 @@ finish_capture() {
 
 cleanup() {
     ${DOCKER} rm -f -v capture otelcol prometheus vmagent metatarget dd-agent dd-clients \
-        splunk-dind splunk-sc4s splunk-java >/dev/null 2>&1 || true
+        scrape-node scrape-python splunk-dind splunk-sc4s splunk-java >/dev/null 2>&1 || true
     ${DOCKER} volume rm "${DD_VOLUME}" >/dev/null 2>&1 || true
     ${DOCKER} network rm "${NET}" >/dev/null 2>&1 || true
     # record_prometheus and record_datadog_agent render config into a temp dir; remove it here too
@@ -140,7 +143,7 @@ record_rsyslog() {
 # rsyslog over TCP: the same entrypoint with rsyslog-tcp.conf, whose `omfwd` sets no
 # `TCP_Framing`, so rsyslog sends its default RFC 6587 §3.4.2 non-transparent (LF-terminated)
 # framing. That stock default is what this fixture checks the auto-detecting `Framer`
-# (crates/logit-inputs/src/tcp.rs) against. One connection, so one file with one message.
+# (crates/logit-proto/src/framing.rs) against. One connection, so one file with one message.
 record_rsyslog_tcp() {
     echo "== recording: rsyslog (TCP, non-transparent framing) =="
     local out="${OUT_ROOT}/syslog"
@@ -228,10 +231,16 @@ record_otlp() {
 # `interop_fixture_write_graphite_plaintext_decodes` (crates/logit-inputs/src/graphite/mod.rs)
 # decodes it as one buffer. The 90s timeout covers the apt-get install.
 #
-# Pickle comes from python_graphite_pickle_producer.py, a stdlib-only sender, at `protocol=2` and
-# `protocol=-1` (highest available: 5 on python:3.12-slim), one capture each so a test can name the
-# opcodes it checks. `python3 --version` prints beside the script's `pickle.HIGHEST_PROTOCOL` line
-# for testdata/interop/graphite/README.md's provenance table.
+# Pickle comes from three senders, one capture each so a test can name the opcodes it checks:
+# - python_graphite_pickle_producer.py, a stdlib-only sender, at `protocol=0`, `protocol=2`, and
+#   `protocol=-1` (highest available: 5 on python:3.12-slim). `python3 --version` prints beside the
+#   script's `pickle.HIGHEST_PROTOCOL` line for testdata/interop/graphite/README.md's provenance
+#   table.
+# - python2_diamond_pickle_producer.py on python:2.7-slim: Diamond's `cPickle.dumps(batch)` call,
+#   protocol 0 with cPickle's memo numbering.
+# - Dropwizard Metrics' `GraphiteReporter` over `PickledGraphite` (tools/record-fixtures/
+#   dropwizard-graphite/), built in `MAVEN_IMAGE`. The 600s timeout covers the first run's
+#   dependency download.
 record_graphite() {
     echo "== recording: collectd write_graphite plugin (plaintext TCP, debian:bookworm-slim) =="
     local out="${OUT_ROOT}/graphite"
@@ -259,6 +268,46 @@ record_graphite() {
         -v "${TOOLS_DIR}/python_graphite_pickle_producer.py:/producer/run.py:ro,z" \
         -w /producer python:3.12-slim \
         bash -c "python3 --version && python3 run.py --host capture --port 2004 --protocol -1"
+    finish_capture
+
+    record_graphite_p0
+    record_graphite_py2
+    record_graphite_dropwizard
+}
+
+record_graphite_p0() {
+    local out="${OUT_ROOT}/graphite"
+    echo "== recording: stdlib pickle producer (protocol 0) =="
+    start_capture tcp 2004 "${out}" graphite-pickle-p0 1
+    ${DOCKER} run --rm --network "${NET}" \
+        -v "${TOOLS_DIR}/python_graphite_pickle_producer.py:/producer/run.py:ro,z" \
+        -w /producer python:3.12-slim \
+        bash -c "python3 --version && python3 run.py --host capture --port 2004 --protocol 0"
+    finish_capture
+}
+
+record_graphite_py2() {
+    local out="${OUT_ROOT}/graphite"
+    echo "== recording: Diamond's cPickle.dumps(batch) on Python 2 (python:2.7-slim) =="
+    start_capture tcp 2004 "${out}" graphite-pickle-py2 1
+    ${DOCKER} run --rm --network "${NET}" \
+        -v "${TOOLS_DIR}/python2_diamond_pickle_producer.py:/producer/run.py:ro,z" \
+        -w /producer python:2.7-slim \
+        python2 run.py capture 2004
+    finish_capture
+}
+
+record_graphite_dropwizard() {
+    local out="${OUT_ROOT}/graphite"
+    echo "== recording: Dropwizard Metrics PickledGraphite (${MAVEN_IMAGE}) =="
+    start_capture tcp 2004 "${out}" graphite-dropwizard 1 600
+    ${DOCKER} run --rm --network "${NET}" \
+        -v "${TOOLS_DIR}/dropwizard-graphite:/src:ro,z" "${MAVEN_IMAGE}" \
+        bash -c "cp -r /src /build && cd /build && java -version 2>&1 | head -1 \
+            && mvn -q -B package dependency:copy-dependencies -DskipTests \
+            && ls target/dependency | grep -E 'metrics' \
+            && java -cp 'target/classes:target/dependency/*' Main capture 2004" \
+        2>&1 | sed 's/^/  [java] /'
     finish_capture
 }
 
@@ -354,6 +403,80 @@ record_prometheus() {
     ${DOCKER} rm -f metatarget >/dev/null 2>&1 || true
     rm -rf "${PROM_CFG_DIR}"
     PROM_CFG_DIR=""
+}
+
+# Scrape bodies from two real exporters, for the Prometheus text differential corpus
+# (testdata/differential/prometheus-text/): `prom/node-exporter` with four collectors, and a
+# `prometheus_client` app (python_prometheus_client_app.py) exposing every type that library
+# writes, OpenMetrics `_created`, exemplars, `info`, and `stateset` among them. Each body lands as
+# `<exporter>-<n>.body`, byte for byte as served, beside a `.headers` sidecar holding the response's
+# `Content-Type`, which picks the dialect.
+#
+# curl fetches each target twice: with `prometheus_in`'s own `Accept` header, read out of
+# crates/logit-inputs/src/prometheus.rs at record time, then with a forced
+# `text/plain;version=0.0.4`. The second body is kept only when its `Content-Type` differs from
+# the first's, so an exporter that ignores `Accept` records one body.
+#
+# Size: node_exporter runs four collectors, chosen for small output, beside its own `go_*`,
+# `process_*`, and `promhttp_*` metrics. Bodies are never trimmed, since a trimmed body isn't real
+# bytes; drop a collector instead.
+PROM_SCRAPE_NODE_IMAGE="prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0"
+PROM_SCRAPE_PYTHON_IMAGE="python:3.12.15-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1"
+PROM_SCRAPE_CLIENT_VERSION="0.26.0"
+PROM_SCRAPE_CURL_IMAGE="curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777"
+
+# scrape_target <out_dir> <exporter> <url>: writes <exporter>-0 and, when the forced text 0.0.4
+# request gets a different Content-Type, <exporter>-1.
+scrape_target() {
+    local out="$1" exporter="$2" url="$3" accept first="" i=0
+    accept="$(grep -A1 '^const ACCEPT_HEADER_VALUE' "${ROOT}/crates/logit-inputs/src/prometheus.rs" |
+        sed -n 's/^ *"\(.*\)";$/\1/p')"
+    [ -n "${accept}" ] || { echo "record-fixtures: no ACCEPT_HEADER_VALUE found" >&2; return 1; }
+    for value in "${accept}" "text/plain;version=0.0.4"; do
+        local stem="${out}/${exporter}-${i}" headers ct
+        headers="$(mktemp)"
+        # The body goes to stdout and the response headers to stderr, both into host files, so
+        # nothing in the container writes to the bind-mounted tree. `--retry-all-errors` covers the
+        # target's name not resolving yet, as well as its port not listening yet.
+        ${DOCKER} run --rm --network "${NET}" "${PROM_SCRAPE_CURL_IMAGE}" \
+            -sS --fail --retry 60 --retry-all-errors --retry-delay 1 \
+            -H "Accept: ${value}" -D /dev/stderr -o - "${url}" \
+            >"${stem}.body" 2>"${headers}" || { cat "${headers}" >&2; rm -f "${headers}"; return 1; }
+        ct="$(grep -i '^content-type:' "${headers}" | tail -1 | tr -d '\r' | sed 's/^[^:]*:[ \t]*//')"
+        rm -f "${headers}"
+        echo "-- ${exporter}-${i}: Accept: ${value} -> Content-Type: ${ct} ($(wc -c <"${stem}.body") bytes)"
+        if [ "${i}" = 1 ] && [ "${ct}" = "${first}" ]; then
+            echo "   the same Content-Type as ${exporter}-0, so not kept"
+            rm -f "${stem}.body"
+            break
+        fi
+        printf 'content-type: %s\n' "${ct}" >"${stem}.headers"
+        first="${ct}"
+        i=$((i + 1))
+    done
+}
+
+record_prometheus_scrape() {
+    echo "== recording: Prometheus scrape bodies (node_exporter, prometheus_client) =="
+    local out="${OUT_ROOT}/prometheus-scrape"
+    mkdir -p "${out}"
+    rm -f "${out}"/*.body "${out}"/*.headers
+    ${DOCKER} run --rm "${PROM_SCRAPE_NODE_IMAGE}" --version 2>&1 | sed -n 1p | sed 's/^/  [node] /'
+    ${DOCKER} run --rm "${PROM_SCRAPE_CURL_IMAGE}" --version 2>&1 | sed -n 1p | sed 's/^/  [curl] /'
+
+    ${DOCKER} run -d --name scrape-node --network "${NET}" "${PROM_SCRAPE_NODE_IMAGE}" \
+        --collector.disable-defaults --collector.loadavg --collector.meminfo \
+        --collector.netdev --collector.uname >/dev/null
+    scrape_target "${out}" node-exporter http://scrape-node:9100/metrics
+
+    ${DOCKER} run -d --name scrape-python --network "${NET}" \
+        -v "${TOOLS_DIR}/python_prometheus_client_app.py:/app.py:ro,z" \
+        "${PROM_SCRAPE_PYTHON_IMAGE}" \
+        bash -c "pip install -q --no-cache-dir --root-user-action=ignore \
+            prometheus_client==${PROM_SCRAPE_CLIENT_VERSION} && exec python3 /app.py" >/dev/null
+    scrape_target "${out}" python-client http://scrape-python:8000/metrics
+    ${DOCKER} logs scrape-python 2>&1 | sed 's/^/  [python] /'
+    ${DOCKER} rm -f scrape-node scrape-python >/dev/null 2>&1 || true
 }
 
 # Remote-write from `victoriametrics/vmagent:v1.152.0`, on both of its wires:
@@ -681,7 +804,6 @@ SPLUNK_TELEMETRYGEN_IMAGE="ghcr.io/open-telemetry/opentelemetry-collector-contri
 SPLUNK_DIND_IMAGE="docker:29.8.1-dind"
 SPLUNK_ALPINE_IMAGE="alpine:3.22"
 SPLUNK_SC4S_IMAGE="ghcr.io/splunk/splunk-connect-for-syslog/container3:3.40.0"
-SPLUNK_MAVEN_IMAGE="maven:3.9.16-eclipse-temurin-17"
 
 # splunk_capture <prefix> <timeout> [raw_capture.py args...]: start_capture on port 8088, named
 # by path, with Splunk's success body on every data route and its health body on both health
@@ -856,11 +978,11 @@ for line in open('/lines.txt').read().splitlines():
 # asynchronously, so the two `/event` appenders' requests interleave in no fixed order. The 600 s
 # timeout covers the first run's Maven downloads.
 record_splunk_java() {
-    echo "== recording: splunk-library-javalogging Logback appender (${SPLUNK_MAVEN_IMAGE}) =="
+    echo "== recording: splunk-library-javalogging Logback appender (${MAVEN_IMAGE}) =="
     splunk_capture java 600 --max-per-path 1 \
         --require /services/collector/event/1.0=6 --require /services/collector/raw=3
     ${DOCKER} run --rm --name splunk-java --network "${NET}" --hostname splunk-java-fixture \
-        -v "${TOOLS_DIR}/splunk-java:/src:ro,z" "${SPLUNK_MAVEN_IMAGE}" \
+        -v "${TOOLS_DIR}/splunk-java:/src:ro,z" "${MAVEN_IMAGE}" \
         bash -c "cp -r /src /build && cd /build && java -version 2>&1 | head -1 \
             && mvn -q -B package dependency:copy-dependencies -DskipTests \
             && ls target/dependency | grep -E 'splunk|logback|okhttp' \
@@ -892,8 +1014,8 @@ record_splunk() {
 
 # ---- entry point ----------------------------------------------------------------------------------
 
-all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus vmagent statsd datadog
-    splunk)
+all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus
+    prometheus-scrape vmagent statsd datadog splunk)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -912,7 +1034,11 @@ for p in "${producers[@]}"; do
     collectd) record_collectd ;;
     otlp) record_otlp ;;
     graphite) record_graphite ;;
+    graphite-p0) record_graphite_p0 ;;
+    graphite-py2) record_graphite_py2 ;;
+    graphite-dropwizard) record_graphite_dropwizard ;;
     prometheus) record_prometheus ;;
+    prometheus-scrape) record_prometheus_scrape ;;
     vmagent) record_vmagent ;;
     statsd) record_statsd ;;
     datadog-agent) record_datadog_agent ;;

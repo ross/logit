@@ -58,6 +58,13 @@
 //! | `0x0100` Message | dispatches a **notification**: one [`logit_core::Event::log`] built from the current sticky host/plugin/plugin_instance/type/type_instance/time/severity -- see "Notifications" below | `notification_dropped` when severity, host or the message itself fails validation |
 //! | any other part type | skipped by length | -- |
 //!
+//! In every record name, `<plugin>` and `<type>` are each cut to their first 127 bytes, the
+//! longest string collectd's own receiver takes, and a UTF-8 sequence the cut splits becomes
+//! U+FFFD; the `collectd.*` attributes keep every byte. A list whose name is cut reports
+//! `record_name_cut`. A sink that drops `collectd.*` attributes, such as `graphite_out`, writes two
+//! Plugins or Types that share their first 127 bytes as one series (ADR `collectd-binary-relay`'s
+//! record-name amendment).
+//!
 //! ## Notifications: `0x0100`/`0x0101`
 //!
 //! A notification is dispatched **at the Message part**, against whatever sticky state the
@@ -253,7 +260,10 @@ pub const NOTIF_MAX_MSG_LEN: usize = 256;
 /// (`<plugin>.<type>.<i>`), **not** interner growth: distinct `<plugin>`/`<type>` strings are
 /// uncapped, and a fresh Plugin part plus a one-value list mints a new interned name for ~21 wire
 /// bytes. That is the same wire-chosen-name exposure `statsd_in` has, accepted on
-/// `docs/design/memory.md` §4's "listeners are private" premise.
+/// `docs/design/memory.md` §4's "listeners are private" premise. A name carries at most 127
+/// wire bytes of each of `<plugin>` and `<type>` (up to three times that once invalid UTF-8
+/// becomes U+FFFD), so one Values part mints at most 64 names of under 800 bytes, however long
+/// its Plugin and Type parts are.
 pub const MAX_VALUES_PER_LIST: usize = 64;
 
 /// The wire Host. See this module doc's well-known-attribute table.

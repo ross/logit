@@ -1,0 +1,1 @@
+app.http.response.size_bytes:36148|d|#env:prod,service:checkout-api,region:us-east-1,host:web-07,endpoint:/healthz,status:200|c:in-81635

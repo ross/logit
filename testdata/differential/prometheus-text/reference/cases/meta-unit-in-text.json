@@ -1,0 +1,23 @@
+{
+ "content_type": "text/plain; version=0.0.4; charset=utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "m_seconds",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "m_seconds",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xa458cbfa",
+  "len": 60,
+  "path": "differential/prometheus-text/cases/meta-unit-in-text.txt"
+ },
+ "parser": "prom"
+}

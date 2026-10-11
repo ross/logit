@@ -1,0 +1,2 @@
+# TYPE "a.b" gauge
+{"a.b"} 2

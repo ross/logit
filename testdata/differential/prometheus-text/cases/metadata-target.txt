@@ -1,0 +1,35 @@
+# The scrape target the `prometheus` producer's **metadata** capture points at, served as a static
+# file by a `python3 -m http.server` container (see `record_prometheus` in script/record-fixtures).
+#
+# Why not Prometheus's own /metrics, which the two sample captures scrape. Remote-write 1.0 metadata
+# is not subject to `write_relabel_configs` -- it comes from the scrape cache, every family the
+# response declared -- so a self-scrape puts several hundred families behind the
+# `metadata_config.send_interval` ticker, which then ships `max_samples_per_send` of them per
+# request in map order. Whichever ten a given run happens to send is not reproducible, and the
+# committed replay test needs the recorded metadata to actually describe the families the recorded
+# *sample* captures carry. A target that declares exactly those four families makes one metadata
+# request cover all of them, every time, and keeps the fixture inside
+# testdata/interop/README.md's size budget at the same time.
+#
+# The four names and types match `record_prometheus`'s `keep_regex` exactly. Values are arbitrary --
+# nothing in this corpus reads them, since this target's samples never reach the wire (that run
+# renders `write_relabel_configs` as `action: drop` over `.*`). Only the `# TYPE` and `# HELP` lines
+# matter, and those are what Prometheus turns into the `MetricMetadata` entries being recorded.
+# HELP prometheus_build_info A metric with a constant '1' value labeled by version, revision, branch, goversion from which prometheus was built, and the goos and goarch for the build.
+# TYPE prometheus_build_info gauge
+prometheus_build_info{branch="HEAD",goarch="amd64",goos="linux",goversion="go1.26.6",revision="d7598b7141418fa35be2b5ec5d0fefb634199610",tags="netgo,builtinassets",version="3.14.0"} 1
+# HELP prometheus_tsdb_wal_page_flushes_total Total number of page flushes.
+# TYPE prometheus_tsdb_wal_page_flushes_total counter
+prometheus_tsdb_wal_page_flushes_total 3
+# HELP prometheus_tsdb_compaction_duration_seconds Duration of compaction runs
+# TYPE prometheus_tsdb_compaction_duration_seconds histogram
+prometheus_tsdb_compaction_duration_seconds_bucket{le="1"} 0
+prometheus_tsdb_compaction_duration_seconds_bucket{le="+Inf"} 0
+prometheus_tsdb_compaction_duration_seconds_sum 0
+prometheus_tsdb_compaction_duration_seconds_count 0
+# HELP go_gc_duration_seconds A summary of the wall-time pause (stop-the-world) duration in garbage collection cycles.
+# TYPE go_gc_duration_seconds summary
+go_gc_duration_seconds{quantile="0"} 5.5084e-05
+go_gc_duration_seconds{quantile="1"} 0.000302739
+go_gc_duration_seconds_sum 0.001626892
+go_gc_duration_seconds_count 17

@@ -1,0 +1,21 @@
+{
+ "content_type": "application/openmetrics-text; version=1.0.0; charset=utf-8",
+ "entries": [
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": {
+  "after_entry": 1,
+  "message": "invalid UTF-8 label value: \"\\\"\\xff\\\"\""
+ },
+ "input": {
+  "crc32c": "0x3200273e",
+  "len": 25,
+  "path": "differential/prometheus-text/cases/non-utf8-label-om.om"
+ },
+ "parser": "openmetrics"
+}
