@@ -9,7 +9,9 @@
 //! `write_loop` won't retry under the posture), and calls [`Producer::abandon`] on one dropped
 //! with a partition batch unsettled: when the send was final, or when `Output::observe_batch`
 //! starts another batch first, as after a shutdown cut. A caller that never calls
-//! `observe_batch` gets a fresh `Pending` on every `send`.
+//! `observe_batch` gets a fresh `Pending` on every `send`. Under `at_most_once`, a `Refused`
+//! send first drops each partition batch left `Ambiguous`, so the retry doesn't resend it
+//! (`docs/adr/kafka-output.md`, "Amendment: what W2 settled", item 5).
 //!
 //! How each response is classified is the module doc's table (`super`, "Response classes").
 //!
@@ -262,6 +264,23 @@ impl KafkaOutput {
         }
         let pending = self.pending.as_mut().expect("set above");
         let attempt = self.producer.attempt(pending).await;
+        // `Refused` outranks `Ambiguous` in the verdict and is retried under either posture, so
+        // under `at_most_once` an `Ambiguous` partition batch is dropped here or the retry
+        // resends it.
+        if self.accounting.posture() == DeliveryPosture::AtMostOnce {
+            if let Err(err) = &attempt.result {
+                if logit_pipeline::classify(err) == Fault::Refused {
+                    let lost = self.producer.drop_ambiguous(pending);
+                    if lost > 0 {
+                        self.telemetry.count(
+                            RECORDS_DROPPED,
+                            lost as f64,
+                            &[("reason", "ambiguous_at_most_once")],
+                        );
+                    }
+                }
+            }
+        }
         for settled in &attempt.settled {
             let n = settled.records as f64;
             match settled.settlement {

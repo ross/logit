@@ -167,6 +167,9 @@ pub(crate) enum PartState {
     },
     Accepted,
     Rejected,
+    /// An `Ambiguous` partition batch the sink let go of under `at_most_once`
+    /// ([`Producer::drop_ambiguous`]).
+    Dropped,
 }
 
 /// One partition batch: a partition's records, sent as one record batch.
@@ -407,6 +410,27 @@ impl Producer {
         if self.config.idempotent && pending.parts.iter().any(|p| p.is_unsettled() && numbered(p)) {
             self.bump_due = true;
         }
+    }
+
+    /// Settles each partition batch whose last attempt was `Ambiguous` as dropped, marking the
+    /// sequence gap as [`Producer::abandon`] does, and returns how many records they held. Under
+    /// `at_most_once` the sink calls it before retrying a `Refused` send, so the retry resends
+    /// only the partition batches the broker can't have appended.
+    pub(crate) fn drop_ambiguous(&mut self, pending: &mut Pending) -> usize {
+        let generation = self.generation;
+        let mut dropped = 0;
+        let mut gap = false;
+        for part in &mut pending.parts {
+            if matches!(part.state, PartState::Unsettled { fault: Fault::Ambiguous, .. }) {
+                gap |= matches!(part.sequence, Some((g, _)) if g == generation);
+                dropped += part.records.len();
+                part.state = PartState::Dropped;
+            }
+        }
+        if gap {
+            self.gap();
+        }
+        dropped
     }
 
     /// Sends every unsettled partition batch of `pending` once.

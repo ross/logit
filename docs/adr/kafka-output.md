@@ -467,7 +467,7 @@ carries the canonical fault-class table, so item 5's table is no longer updated.
 
 ## Amendment: what W2 settled (2026-10-11)
 
-Building the sink settled four points the decision above leaves open. Where this section and an
+Building the sink settled five points the decision above leaves open. Where this section and an
 item above disagree, this section holds.
 
 1. **`record:` waits for W3.** Item 11 gives every format a `record: event | batch` override.
@@ -484,6 +484,16 @@ item above disagree, this section holds.
    caller that never calls `observe_batch` gets a fresh `Pending` on every `send`.
 4. **An event whose configured key has no value is counted in `logit.output.records.unkeyed`**,
    not in `records.dropped`: the record is still sent.
+5. **Under `at_most_once`, an `Ambiguous` partition is dropped when another partition in the same
+   attempt is `Refused`.** Item 4's ranking puts `Refused` over `Ambiguous`, and `write_loop`
+   retries `Refused` under both postures, so a held `Ambiguous` partition would be resent with
+   the `Refused` one. Without idempotence, which `acks: leader` and `acks: none` allow, that
+   resend can store its records twice. So before the retry, the sink settles each `Ambiguous`
+   partition as dropped, counts its records in
+   `logit.output.records.dropped{reason="ambiguous_at_most_once"}`, and marks the sequence gap
+   as `Producer::abandon` does. The send still returns `Refused` for the partitions left. This
+   corrects item 4's statement that an `Ambiguous` partition under `at_most_once` always makes
+   the send return `Ambiguous`.
 
 A Kafka 4.2 broker with `auto.create.topics.enable` answers the first `Metadata` request for a
 missing topic with `UNKNOWN_TOPIC_OR_PARTITION` while it creates the topic. The W1 amendment's

@@ -53,6 +53,12 @@
 //! `Refused` over `Ambiguous` over `Clean`. With none unsettled, it succeeds when any was
 //! accepted on this attempt or an earlier one, and otherwise fails `Rejected` with the first
 //! rejection (`producer::Attempt::result`).
+//!
+//! The ranking doesn't depend on the posture, but what follows a `Refused` result does. Under
+//! `at_most_once`, the sink settles each partition batch left `Ambiguous` as dropped before the
+//! retry (`producer::Producer::drop_ambiguous`), so the retry resends only the partition batches
+//! the broker can't have appended, and the send still returns `Refused` for those
+//! (`sink::tests::at_most_once_drops_an_ambiguous_partition_when_another_is_refused`).
 
 mod batch;
 mod compression;

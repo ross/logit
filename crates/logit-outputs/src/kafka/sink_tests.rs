@@ -232,6 +232,42 @@ async fn at_most_once_drops_an_ambiguous_batch_and_the_next_bumps_the_epoch() {
     assert_eq!((last.records, last.producer_epoch, last.base_sequence), (3, 1, 0));
 }
 
+/// Under `at_most_once`, an `Ambiguous` partition in an attempt another partition answers
+/// `Refused` is dropped and counted, not resent with the `Refused` one: without idempotence the
+/// resend would append its records twice.
+#[tokio::test]
+async fn at_most_once_drops_an_ambiguous_partition_when_another_is_refused() {
+    let cluster = FakeCluster::start(2).await;
+    cluster.state().add_topic(TOPIC, &[0, 1]);
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink(
+        KafkaSettings {
+            key: RecordKey::Attribute("k".into()),
+            acks: KafkaAcks::Leader,
+            idempotent: false,
+            ..settings(&cluster)
+        },
+        &probe,
+    );
+    cluster.script(Step::produce(Some(0), Action::AppendThenError(fault::code::REQUEST_TIMED_OUT)));
+    cluster.script(Step::produce(Some(1), Action::Error(fault::code::TOPIC_AUTHORIZATION_FAILED)));
+    let mut events = keyed_for("a", 0, 2, 3);
+    events.extend(keyed_for("b", 1, 2, 2));
+    let sums = run(&mut out, &mut probe, vec![batch(events)], at_most_once()).await;
+
+    let partitions: Vec<i32> = received(&cluster).iter().map(|r| r.partition).collect();
+    assert_eq!(partitions.iter().filter(|&&p| p == 0).count(), 1, "{partitions:?}");
+    assert_eq!(partitions.iter().filter(|&&p| p == 1).count(), 2, "{partitions:?}");
+    assert_eq!(messages_in(&cluster, 0).len(), 3, "appended once");
+    assert_eq!(messages_in(&cluster, 1).len(), 2);
+    assert_eq!(
+        sum(&sums, "logit.output.records.dropped", &[("reason", "ambiguous_at_most_once")]),
+        3.0
+    );
+    assert_eq!(sum(&sums, "logit.output.records", &[]), 2.0);
+    assert_eq!(sum(&sums, "logit.output.requests", &[("class", "refused")]), 1.0);
+}
+
 /// The drops each have their reason: a record over `max_request_bytes`, records the broker
 /// named, and a partition batch it rejected. An unkeyed record is counted, and goes out.
 #[tokio::test]
