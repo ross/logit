@@ -1020,11 +1020,12 @@ record_kafka() {
         done
     done
     # Copy each segment and its kafka-dump-log.sh rendering out, after every producer has run.
+    # Each segment is saved as `.segment`, not `.log`: `.gitignore`'s `*.log` would leave it untracked.
     for producer in java kcat; do
         for comp in none gzip snappy lz4 zstd; do
             topic="kafka-record-b-${producer}-${comp}"
             seg="$(kafka_exec find / -path "*/${topic}-0/*.log" 2>/dev/null | head -1 | tr -d '\r' || true)"
-            kafka_exec cat "${seg}" >"${KAFKA_OUT}/batches/${producer}-${comp}.log"
+            kafka_exec cat "${seg}" >"${KAFKA_OUT}/batches/${producer}-${comp}.segment"
             {
                 echo "# ${KAFKA_IMAGE} kafka-dump-log.sh --files <${topic}-0/00000000000000000000.log> --print-data-log --deep-iteration"
                 kafka_exec "${KAFKA_BIN}/kafka-dump-log.sh" --files "${seg}" --print-data-log --deep-iteration \
