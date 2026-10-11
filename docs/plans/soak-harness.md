@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-09
+updated: 2026-10-11
 ---
 
 # Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger
@@ -90,6 +90,7 @@ tools/soak/
   scenarios/spool-kill-replay/          # W3: a SIGKILL inside a sink outage, a disk spool
   scenarios/random-faults/              # W4: a seeded random schedule, meant for hours
   scenarios/statsd-datadog/             # W5: an external Datadog target, no backend query
+  scenarios/kafka-broker-restart/       # a Kafka target: kafka_out to a local broker, read back
 ```
 
 Subcommands: `run <scenario> [--duration 20m] [--seed N] [--keep] [--out DIR]`, `list`,
@@ -305,7 +306,8 @@ has no drain (a counter) or the gauge was never set by its end, the run's points
 are of the other kind, or the step was scheduled but its apply didn't return 0. A scenario with
 no `[[expect]]` gets one `expect` row that SKIPs.
 
-A scenario may name an external target in a `[target]` table (W5); see "External targets".
+A scenario may name an external target in a `[target]` table (W5); see "External targets". It
+may instead name a local Kafka broker as its target; see "Kafka targets".
 
 ### 3. Compose (W1a)
 
@@ -321,6 +323,7 @@ service (W4; see "The driver loop and end sequence" for the arithmetic), and
 | `victoria-metrics` | `victoriametrics/victoria-metrics:v1.152.0`, `-retentionPeriod=100y`, `ports: ["127.0.0.1::8428"]`, so the host driver polls freshness every 30 s and dumps the final export with no checker container. The driver re-reads the port after any start of this service |
 | `logit` (the SUT) | `depends_on: [victoria-metrics]`, not required from W5, when `victoria-metrics` moved to the compose profile `local` the driver enables for a local target only; `environment:` passes each variable an external target may list (`DD_API_KEY`), empty when unset |
 | `generator` | `depends_on: {logit: {condition: service_healthy}}` |
+| `kafka` | `apache/kafka:4.2.0`, a single-node KRaft broker in the compose profile `kafka`, which the driver enables for a Kafka target only; one partition per topic, topics created on first use, a `kafka-broker-api-versions.sh` health check the SUT's optional `depends_on` waits for. No published port: the driver reads the topic through `docker exec` |
 
 Configs mount from absolute paths in `compose.env` (`SOAK_SUT_CONFIG`,
 `SOAK_GENERATOR_CONFIG`), which the driver passes with `--env-file`, because `sudo` strips the
@@ -782,6 +785,62 @@ partition, `records.dropped{reason="stale"}` 0 through the partition and the kil
 retries, so a row after a netem step, which TCP can absorb, would fail on a gauge never set;
 and with the intake reachable the sink's queue is often empty at the kill, so no row asks for a
 replay above 0: `ledger.replay` ties the replay to the killed life's last `buffer.batches`.
+
+### 8b. Kafka targets
+
+A scenario whose sink is `kafka_out` names the stack's own broker as its target, and the ledger
+reads the topic back as its V:
+
+```toml
+[target]
+kind = "kafka"
+topic = "soak"             # the topic the SUT's kafka_out writes; required
+# name = "kafka"           # optional, a label for results
+```
+
+`validate()` refuses a Kafka target with no `topic` or with one Kafka wouldn't create (ASCII
+letters, digits, `.`, `_`, and `-`, up to 249 characters, not `.` or `..`), an `env`, and the
+VictoriaMetrics ledger keys. A fault on `kafka` is allowed for a Kafka target only, and one on
+`victoria-metrics` is refused for it, as for an external target; `kill` stays the SUT's only.
+Every fault on `kafka` affects egress. A `topic` on any other target is refused.
+
+**The driver.** Compose runs the `kafka` profile in place of `local`, with no env-file copy.
+The driver skips everything that reads VictoriaMetrics, and its end sequence waits for the sink's
+queue to empty, as for an external target. After the SUT stops it reads the topic in the broker
+container with the image's own tools: `kafka-get-offsets.sh` for each partition's end offset
+(`kafka-offsets.txt`), then `kafka-console-consumer.sh --from-beginning --max-messages <their
+sum>` (`kafka-topic.ndjson`, one record value per line). It records a `kafka_read` phase with
+both counts, or `kafka_read_failed` when either read fails or the consumer's count differs from
+the offsets.
+
+**V.** The SUT's `aggregate` runs `temporality: delta`, so each record, one event in
+`kafka_out`'s `format: json`, carries its window's increments. V is the sum of every record's
+`sum` metric values, credited to the SUT life its event `timestamp` falls in (`topic.py`). No
+reset logic applies, and a record stored twice adds its increments twice: a surplus is a
+duplicate, not a reset.
+
+**The checks.** `ledger.egress` and `ledger.summary` judge Ab − V against the topic as they do
+against VictoriaMetrics, with one difference: a negative gap in a life that wasn't killed is
+`duplicates`, a WARN, because `at_least_once` permits them
+([`docs/known-gaps/kafka.md`](../known-gaps/kafka.md)); `ledger.summary` shows it and doesn't
+judge it. A topic not read back, an empty one, or a record that isn't a JSON object FAILs
+`ledger.egress`. `ledger.windows` and the freshness samples SKIP. `ledger.sent` judges the sink
+as for an external target, with `kafka_out`'s request classes: `ok` is accepted, and the
+diagnostics it quotes are keyed by the drop reason (`rejected`, `invalid_timestamp`,
+`invalid_record`, `oversize`); its PASS doesn't read `SENT`, because the ledger goes on to the
+topic. `ledger.topic` compares the topic's record count T with the records the sink saw
+accepted, A (`logit.output.records`, every SUT life): T below A FAILs, records the broker
+acknowledged and no longer holds; T above A WARNs, duplicates; a topic not read back FAILs.
+Every other target's `ledger.topic` SKIPs.
+
+**The scenario.** `kafka-broker-restart` is `statsd-vm`'s generator at 2,000 lines/s through a
+2 s delta `aggregate` into `kafka_out` (`format: json`, `acks: all`, idempotent, `timeout:
+10s`), topic `soak`. Its 6.5-minute cycle restarts the broker, pauses it for 40 s, and stops it
+for 60 s, each followed by at least 75 s. The 10 s `timeout`, under the pause, turns the pause
+into response timeouts, `Ambiguous` attempts the broker deduplicates on the resend. Its
+expectations: `batches.dropped` 0 through each fault, at least one `ambiguous` request through
+the pause, so the no-duplicate verdicts rest on resends, and `retrying` above 0 during the stop
+and 0 after it.
 
 ### 9. Not in this stack
 
@@ -1676,6 +1735,33 @@ What the run showed:
   to 640 s), and file descriptors stayed flat (logit 15 to 15, generator 11 to 11).
 - **Readiness after the unpause and the restart was 0.1 s**, and all 128 health samples outside
   fault windows were healthy.
+
+### A Kafka target: `kafka-broker-restart` (2026-10-11)
+
+Run `20261011T205504Z`: `script/soak run kafka-broker-restart`, the scenario's own 8 minutes 30
+seconds, from `kafka/w4` at `35344ad3` with the scenario and its harness support uncommitted, on a
+32-core host (`logit:soak` `sha256:887a5407a3b2`, `apache/kafka:4.2.0` `sha256:9516fb7634ba`).
+Overall PASS: every row passed but `ledger.windows`, which a Kafka target SKIPs, and
+`ledger.replay`, which had no killed life.
+
+- **Nothing was lost or stored twice.** The generator sent 1,032,400 lines, and every one was
+  read, sent to `aggregate`, and absorbed. The topic held 25,900 records whose increments summed
+  to 1,032,400, so Ab − V was 0, and the sink saw 25,900 records accepted, so T − A was 0. The
+  sink delivered all 259 batches it received and dropped none.
+- **The restart** (+61 s to +90 s) cost four `clean` attempts, each `Connection refused`, while
+  the broker came back.
+- **The pause** (+165 s to +205 s) left one attempt `ambiguous`: `waiting for a Produce response
+  timed out after 10s`, with six batches queued behind it, then two `clean` attempts. The
+  resend's sequences were the first attempt's, and neither the topic's count nor V shows a
+  duplicate. The harness can't tell
+  whether the broker appended the first attempt after the unpause and discarded the resend, or
+  never appended it.
+- **The stop** (+285 s to +345 s) cost seven `clean` attempts, the broker's name gone from DNS,
+  and the sink stopped retrying within the recovery bound.
+- **The end sequence** found the sink's queue empty 8 s after the generator stopped, and read
+  25,900 records back, matching the partition's end offset, 3 s after the SUT stopped.
+- **RSS slopes** were +2.6 MiB/h (SUT) and +1.4 MiB/h (generator), and file descriptors held at
+  13 and 11.
 
 ## Verification
 

@@ -23,7 +23,10 @@ A scenario's target is where the SUT's sink delivers. The default is the local
 `victoria-metrics` service, which the checks query for V. A `[target]` table with
 `kind = "external"` names a destination outside the stack, such as Datadog, which nothing
 queries: the stack runs without `victoria-metrics`, faults on it are refused, and the ledger
-ends at the sink's own telemetry (docs/plans/soak-harness.md's "External targets").
+ends at the sink's own telemetry (docs/plans/soak-harness.md's "External targets"). A
+`[target]` table with `kind = "kafka"` runs a local Kafka broker, the `kafka` service, in place of
+`victoria-metrics`: faults on `kafka` are allowed for that target only, and the ledger's V is the
+topic it names, read back at the end (docs/plans/soak-harness.md's "Kafka targets").
 """
 
 import os
@@ -36,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # The services compose.yaml defines, and the two that run `logit`.
-SERVICES = ("logit", "generator", "victoria-metrics")
+SERVICES = ("logit", "generator", "victoria-metrics", "kafka")
 LOGIT_SERVICES = ("logit", "generator")
 
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
@@ -55,15 +58,21 @@ TOP_LEVEL_KEYS = {
     "name", "description", "duration", "warmup", "cooldown", "recovery_bound", "cycle",
     "configs", "ledger", "thresholds", "step", "expect", "random", "target",
 }
-# The local target, the default, and the kind with no backend query.
+# The local target, the default; the kind with no backend query; and the local Kafka broker,
+# whose kind is also its service name.
 LOCAL_TARGET = "victoria-metrics"
 EXTERNAL_TARGET = "external"
-TARGET_KEYS = {"kind", "name", "env"}
+KAFKA_TARGET = "kafka"
+TARGET_KINDS = (LOCAL_TARGET, EXTERNAL_TARGET, KAFKA_TARGET)
+TARGET_KEYS = {"kind", "name", "env", "topic"}
+# Kafka's legal topic names (`Topic.validate`): ASCII letters, digits, `.`, `_`, and `-`, up to
+# 249 characters.
+_TOPIC_NAME = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
 # The variables compose.yaml passes into the SUT's environment for an external target. A
 # `[target] env` entry outside this list would reach no container, so `validate()` refuses it;
 # the self-test checks that compose.yaml passes each one.
 EXTERNAL_ENV_PASSED = ("DD_API_KEY",)
-# The ledger keys that name a VictoriaMetrics query, which an external target has none of.
+# The ledger keys that name a VictoriaMetrics query, which only the local target has.
 VM_LEDGER_KEYS = {"vm_selector", "vm_every_window"}
 _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
@@ -271,13 +280,29 @@ class Scenario:
     steps: list = field(default_factory=list)
     expectations: list = field(default_factory=list)
     random: object = None
-    # `{kind, name, env}`; kind `victoria-metrics` (the default) or `external`.
+    # `{kind, name, env}`, plus `topic` for a Kafka target; kind `victoria-metrics` (the
+    # default), `external`, or `kafka`.
     target: dict = field(default_factory=lambda: {"kind": LOCAL_TARGET, "name": LOCAL_TARGET,
                                                   "env": []})
 
     @property
     def external(self):
         return self.target.get("kind") == EXTERNAL_TARGET
+
+    @property
+    def kafka(self):
+        return self.target.get("kind") == KAFKA_TARGET
+
+    @property
+    def has_vm(self):
+        """Whether the stack runs `victoria-metrics`, which only the local target does."""
+        return self.target.get("kind") == LOCAL_TARGET
+
+    @property
+    def services(self):
+        """The services this scenario's stack runs."""
+        return tuple(s for s in SERVICES
+                     if (s != LOCAL_TARGET or self.has_vm) and (s != KAFKA_TARGET or self.kafka))
 
     @property
     def directory(self):
@@ -311,8 +336,7 @@ class Scenario:
             "seed": seed,
             "random": None if self.random is None else self.random.to_json(),
             "configs": dict(self.configs),
-            "target": {"kind": self.target["kind"], "name": self.target["name"],
-                       "env": list(self.target["env"])},
+            "target": target_json(self.target),
             "ledger": dict(self.ledger),
             "thresholds": {
                 "progress_window": self.thresholds["progress_window"],
@@ -380,18 +404,18 @@ def from_dict(raw, path):
         cycle = dur(raw, "cycle", "scenario")
 
     target = _parse_target(raw.get("target", {}), problems)
-    external = target["kind"] == EXTERNAL_TARGET
+    no_vm = target["kind"] != LOCAL_TARGET
     configs = raw.get("configs", {})
     ledger = raw.get("ledger", {})
     thresholds = dict(raw.get("thresholds", {}))
-    # An external target has no VictoriaMetrics to query, so the keys naming one are refused
+    # Only the local target has VictoriaMetrics to query, so the keys naming one are refused
     # with their own message rather than ignored.
-    ledger_keys = LEDGER_KEYS - VM_LEDGER_KEYS if external else LEDGER_KEYS
-    ledger_optional = OPTIONAL_LEDGER_KEYS | (VM_LEDGER_KEYS if external else set())
-    if external and isinstance(ledger, dict):
+    ledger_keys = LEDGER_KEYS - VM_LEDGER_KEYS if no_vm else LEDGER_KEYS
+    ledger_optional = OPTIONAL_LEDGER_KEYS | (VM_LEDGER_KEYS if no_vm else set())
+    if no_vm and isinstance(ledger, dict):
         for key in sorted(VM_LEDGER_KEYS & set(ledger)):
-            problems.append(f"ledger.{key} names a VictoriaMetrics query, and an external "
-                            "target has no backend query")
+            problems.append(f"ledger.{key} names a VictoriaMetrics query, and the "
+                            f"{target['kind']} target has no VictoriaMetrics")
     for table, keys, optional, where in (
         (configs, CONFIG_KEYS, set(), "configs"),
         (ledger, ledger_keys, ledger_optional, "ledger"),
@@ -476,11 +500,20 @@ def from_dict(raw, path):
     return scenario
 
 
+def target_json(target):
+    """The resolved scenario's `target`: `{kind, name, env}`, plus `topic` for Kafka."""
+    out = {"kind": target["kind"], "name": target["name"], "env": list(target["env"])}
+    if "topic" in target:
+        out["topic"] = target["topic"]
+    return out
+
+
 def _parse_target(table, problems):
-    """The `[target]` table as `{kind, name, env}`, appending to `problems` what breaks its
-    rules: an unknown key or kind; for an external target, a `name` that isn't a slug or an
-    `env` that isn't a list of distinct variable names compose.yaml passes; and for the local
-    target, any `name` or `env`."""
+    """The `[target]` table as `{kind, name, env}`, plus `topic` for Kafka, appending to
+    `problems` what breaks its rules: an unknown key or kind; for an external target, a `name`
+    that isn't a slug, an `env` that isn't a list of distinct variable names compose.yaml
+    passes, or a `topic`; for a Kafka target, a missing or illegal `topic`, a `name` that isn't
+    a slug, or an `env`; and for the local target, any `name`, `env`, or `topic`."""
     local = {"kind": LOCAL_TARGET, "name": LOCAL_TARGET, "env": []}
     if not isinstance(table, dict):
         problems.append("`target` must be a table, written [target]")
@@ -488,15 +521,35 @@ def _parse_target(table, problems):
     for key in sorted(set(table) - TARGET_KEYS):
         problems.append(f"target: unknown key `{key}`")
     kind = table.get("kind", LOCAL_TARGET)
-    if kind not in (LOCAL_TARGET, EXTERNAL_TARGET):
-        problems.append(f"target.kind must be {LOCAL_TARGET!r} or {EXTERNAL_TARGET!r}, got "
-                        f"{kind!r}")
+    if kind not in TARGET_KINDS:
+        problems.append(f"target.kind must be {LOCAL_TARGET!r}, {EXTERNAL_TARGET!r}, or "
+                        f"{KAFKA_TARGET!r}, got {kind!r}")
         return local
     if kind == LOCAL_TARGET:
-        for key in sorted({"name", "env"} & set(table)):
-            problems.append(f"target.{key} is for an external target; the local target is "
-                            f"{LOCAL_TARGET}")
+        for key in sorted({"name", "env", "topic"} & set(table)):
+            problems.append(f"target.{key} is for an external or kafka target; the local "
+                            f"target is {LOCAL_TARGET}")
         return local
+    if kind == KAFKA_TARGET:
+        if "env" in table:
+            problems.append("target.env is for an external target; the kafka target runs "
+                            "inside the stack and needs no credentials")
+        name = table.get("name", KAFKA_TARGET)
+        if not isinstance(name, str) or not _TARGET_NAME.match(name):
+            problems.append("target.name must be lowercase letters, digits, `_`, or `-`")
+            name = KAFKA_TARGET
+        topic = table.get("topic")
+        if topic is None:
+            problems.append("target: a kafka target needs `topic`, the topic the SUT's "
+                            "kafka_out writes and the ledger reads back")
+            topic = ""
+        elif not isinstance(topic, str) or not _TOPIC_NAME.match(topic) or topic in (".", ".."):
+            problems.append("target.topic must be a legal Kafka topic name: ASCII letters, "
+                            "digits, `.`, `_`, or `-`, up to 249 characters")
+            topic = ""
+        return {"kind": kind, "name": name, "env": [], "topic": topic}
+    if "topic" in table:
+        problems.append("target.topic is for a kafka target")
     name = table.get("name")
     if not isinstance(name, str) or not _TARGET_NAME.match(name):
         problems.append("target.name must be lowercase letters, digits, `_`, or `-`, such as "
@@ -702,15 +755,18 @@ def validate(scenario, duration=None, seed=None):
         problems.append("thresholds.progress_window must be longer than 0s")
     if not isinstance(scenario.ledger.get("vm_every_window", False), bool):
         problems.append("ledger.vm_every_window must be true or false")
-    if scenario.external:
-        # An external target's stack runs without the victoria-metrics service.
-        held = [f"step {spec.index + 1}" for spec in scenario.steps if spec.on == LOCAL_TARGET]
+    # A target's stack runs only its own backend service: `victoria-metrics` for the local
+    # target, `kafka` for a Kafka one, neither for an external one.
+    for service in (LOCAL_TARGET, KAFKA_TARGET):
+        if service in scenario.services:
+            continue
+        held = [f"step {spec.index + 1}" for spec in scenario.steps if spec.on == service]
         if scenario.random is not None:
             held += [f"random.fault {t.index + 1}" for t in scenario.random.faults
-                     if t.on == LOCAL_TARGET]
+                     if t.on == service]
         for where in held:
-            problems.append(f"{where}: a fault on {LOCAL_TARGET}, which an external target's "
-                            "stack doesn't run")
+            problems.append(f"{where}: a fault on {service}, which the {scenario.target['kind']} "
+                            "target's stack doesn't run")
 
     for spec in scenario.steps:
         where = f"step {spec.index + 1} ({spec.action or '?'} on {spec.on or '?'})"

@@ -14,6 +14,12 @@ telemetry whose process lives disagree with the timeline.
 A run against an external target (`[target] kind = "external"`) has no backend query, so every
 row that reads V or the freshness samples SKIPs or leaves them out, and `ledger.sent` ends the
 ledger at the sink's own telemetry instead. A local run's `ledger.sent` SKIPs.
+
+A run against a Kafka target (`[target] kind = "kafka"`) has no VictoriaMetrics: the freshness
+samples and `ledger.windows` SKIP, `ledger.sent` judges the sink as for an external target, and
+V comes from the topic the driver read back (topic.py), so `ledger.egress` and `ledger.summary`
+judge Ab − V against it, a surplus WARNing as duplicates. `ledger.topic` judges the topic's
+record count against the records the sink saw accepted; it SKIPs for every other target.
 """
 
 import bisect
@@ -23,9 +29,9 @@ import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import collect, faults, telemetry, vm
-from .scenario import (EXPECT_REDUCERS, EXTERNAL_TARGET, LOCAL_TARGET, LOGIT_SERVICES,
-                       SERVICES, parse_duration)
+from . import collect, faults, telemetry, topic, vm
+from .scenario import (EXPECT_REDUCERS, EXTERNAL_TARGET, KAFKA_TARGET, LOCAL_TARGET,
+                       LOGIT_SERVICES, SERVICES, parse_duration)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
@@ -152,6 +158,13 @@ class RunData:
         self.target = self.resolved.get("target") or {"kind": LOCAL_TARGET,
                                                       "name": LOCAL_TARGET}
         self.external = self.target.get("kind") == EXTERNAL_TARGET
+        self.kafka = self.target.get("kind") == KAFKA_TARGET
+        self.has_vm = self.target.get("kind") == LOCAL_TARGET
+        # A Kafka target's topic, read back after the SUT stopped; None when the file is absent.
+        try:
+            self.topic_text = (self.run_dir / topic.TOPIC_FILE).read_text()
+        except OSError:
+            self.topic_text = None
 
         phases = {r["phase"]: r for r in self.timeline if r.get("event") == "phase"}
         self.phases = phases
@@ -559,7 +572,7 @@ def check_progress(data):
     if share is not None and share < COVERAGE_MIN_SHARE:
         status = worst([status, WARN])
         lines.append(f"delivery windows cover little of the run: {coverage}")
-    fresh = (f"no freshness samples ({NO_BACKEND})" if data.external else
+    fresh = (f"no freshness samples ({no_vm_reason(data)})" if not data.has_vm else
              f"{fresh_judged} freshness sample(s) under {FRESHNESS_MAX_AGE_S}s")
     detail = (f"{judged} {window:.0f}s window(s) with deliveries outside fault windows; "
               f"{fresh}; {coverage}")
@@ -699,14 +712,23 @@ RECOVERED_UTILIZATION = 0.05
 RECOVERED_RATE_SHARE = 0.95
 # Why a row that reads V SKIPs on an external target.
 NO_BACKEND = "external target: no backend query"
+NO_VM_KAFKA = "kafka target: no VictoriaMetrics"
+
+
+def no_vm_reason(data):
+    return NO_VM_KAFKA if data.kafka else NO_BACKEND
+
 # `ledger.sent`'s reading of an external sink's telemetry (`datadog_out`'s module doc, "Faults,
 # retries, and duplicate safety" and "Telemetry"): the `records.dropped` reasons and the batch
 # drop reason that mean the destination refused the data or it was too large to send, the
 # diagnostics quoting its answer to a dropped request (or the pre-send `oversize` drop), and the
 # diagnostics for a refusal the sink holds its queue on. Every other counted drop WARNs.
-REJECTED_RECORD_REASONS = ("rejected", "oversize")
+# `kafka_out` adds the records a broker named (`invalid_timestamp`, `invalid_record`) and keys its
+# diagnostics by the drop reason (its sink module doc, "Telemetry").
+REJECTED_RECORD_REASONS = ("rejected", "oversize", "invalid_timestamp", "invalid_record")
 REJECTED_BATCH_REASONS = ("rejected",)
-REJECTION_KEYS = ("request_rejected", "series_rejected", "oversize")
+REJECTION_KEYS = ("request_rejected", "series_rejected", "oversize", "rejected",
+                  "invalid_timestamp", "invalid_record")
 REFUSAL_KEYS = ("api_key_rejected", "request_refused")
 _ANSWERED_RE = re.compile(r"answered (\d{3})")
 
@@ -842,6 +864,13 @@ class Ledger:
         self.series = data.vm_series
         self.V, self.V_total, self.resets, self.mismatched = vm.totals_by_life(
             self.series, self.life_starts)
+        # A Kafka target's V is the topic's increments, credited to lives by record timestamp.
+        self.records = []
+        self.unparsed = 0
+        if data.kafka:
+            self.records, self.unparsed = topic.parse_records(data.topic_text or "")
+            self.V, self.V_total = topic.totals_by_life(self.records, self.life_starts)
+            self.resets, self.mismatched = {}, []
 
         if self.gen is not None:
             self.G = sum(self.gen.counter_by_life("logit.output.messages",
@@ -934,14 +963,17 @@ class Ledger:
 
     def egress(self, life):
         """`(status, verdict, gap)` for one life's egress: `ok`, `counted`, `within band`,
-        `surplus`, or `uncounted`.
+        `surplus`, `duplicates`, or `uncounted`.
 
         The final life's gap is Ab − V. A stopped earlier life's is W − D − B − V, the residual
         plus Ab − V, because the close-time window delivers what that life read but hadn't
         absorbed by its last drain into V. A killed life has no close-time window and no `drain
         complete`: its gap is Ab − V alone, judged inside `kill_band`; below the band it is a
         surplus, above it uncounted loss. Its residual is what the kill lost from the receive
-        queue and inbox, by design, and is reported, not judged here."""
+        queue and inbox, by design, and is reported, not judged here.
+
+        On a Kafka target, V counts a duplicated record's increments twice, so a negative gap
+        in a life that wasn't killed is `duplicates`, a WARN: `at_least_once` permits them."""
         gap = self.get("Ab", life) - self.get("V", life)
         if life in self.killed and life != self.final:
             low, high, _ = self.kill_band(life)
@@ -957,6 +989,8 @@ class Ledger:
             return PASS, "ok", gap
         if gap > 0 and dropped > 0:
             return PASS, "counted", gap
+        if gap < 0 and self.data.kafka:
+            return WARN, "duplicates", gap
         return FAIL, "uncounted", gap
 
 
@@ -1171,6 +1205,12 @@ def check_ledger_egress(data):
     band. An export with no series can't pass."""
     if data.external:
         return Result("ledger.egress", SKIP, f"{NO_BACKEND}; ledger.sent judges the sink")
+    if data.kafka and data.phases.get("kafka_read") is None:
+        failed = data.phases.get("kafka_read_failed") or {}
+        return Result("ledger.egress", FAIL, "the topic wasn't read back, so V is unknown: "
+                      + (json.dumps({k: v for k, v in failed.items()
+                                     if k not in ("event", "phase", "t", "offset")})[:500]
+                         if failed else "no kafka_read phase in the timeline"))
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.egress", led)
     if skipped:
@@ -1199,11 +1239,21 @@ def check_ledger_egress(data):
         if gap > 0 and not (life in led.killed and life != led.final):
             part += f" (drain complete batches_dropped {_n(dropped)})"
         parts.append(part)
+    lives = len(led.lives)
+    if data.kafka:
+        if not led.records:
+            status = FAIL
+            parts.insert(0, f"no records in {topic.TOPIC_FILE}")
+        if led.unparsed:
+            status = FAIL
+            parts.insert(0, f"{_n(led.unparsed)} topic record(s) aren't JSON objects")
+        lines.append(f"{_n(len(led.records))} topic record(s), V {_n(led.V_total)} (the sum of "
+                     "their delta sums)")
+        return Result("ledger.egress", status, "; ".join(parts) + f" ({led.R_text})", lines)
     if not led.series:
         status = FAIL
         parts.insert(0, "no series in vm-export.jsonl match vm_selector "
                         f"{data.ledger.get('vm_selector')!r}")
-    lives = len(led.lives)
     wrong = {name: n for name, n in led.resets.items() if n != lives - 1}
     lines.append(f"{len(led.series)} series, reset-aware V {_n(led.V_total)}; resets per series "
                  f"should be {lives - 1} (SUT lives − 1)")
@@ -1226,7 +1276,8 @@ def check_ledger_egress(data):
 def check_ledger_summary(data):
     """The final life's uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), which must
     be 0, with wire loss beside it by design. A counted egress term is shown and not judged;
-    on an external target the Ab − V term SKIPs, and the row judges the other three."""
+    on an external target the Ab − V term SKIPs, and the row judges the other three. On a Kafka
+    target a surplus Ab − V (duplicates) is shown and not judged, as `ledger.egress` WARNs it."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.summary", led)
     if skipped:
@@ -1244,9 +1295,9 @@ def check_ledger_summary(data):
         shown.append(f"Ab − V SKIP ({NO_BACKEND})")
     else:
         _, verdict, egress_gap = led.egress(life)
-        counted = verdict == "counted"
+        counted = verdict in ("counted", "duplicates")
         judged = sum(value for _, value in terms) + (0 if counted else egress_gap)
-        shown.append(f"Ab − V {_n(egress_gap)}" + (" counted" if counted else ""))
+        shown.append(f"Ab − V {_n(egress_gap)}" + (f" {verdict}" if counted else ""))
     wire = ""
     if led.gen is not None:
         wire = (f"; wire G − (W + K) {_n(led.G - sum(led.W.values()) - sum(led.K.values()))} "
@@ -1301,8 +1352,8 @@ def check_ledger_windows(data):
     emits a series only in a window that updated it, so an idle series has gaps by design. Under
     `temporality: cumulative` V reads only each life's last value, so a lost middle window
     changes no total and only this row sees it."""
-    if data.external:
-        return Result("ledger.windows", SKIP, NO_BACKEND)
+    if not data.has_vm:
+        return Result("ledger.windows", SKIP, no_vm_reason(data))
     if data.ledger.get("vm_every_window") is not True:
         return Result("ledger.windows", SKIP, "not enabled ([ledger] vm_every_window)")
     led = _ledger(data)
@@ -1459,9 +1510,12 @@ def check_ledger_sent(data):
     response, judged per SUT life by the sink's batch identity and over the run by its drops,
     refusals, and request classes. A local target SKIPs. `docs/plans/soak-harness.md`, "8.
     External targets (W5)", lists each FAIL and WARN."""
-    if not data.external:
+    if data.has_vm:
         return Result("ledger.sent", SKIP, "local target: ledger.egress judges delivery against "
                       "VictoriaMetrics")
+    # The request class an accepted answer carries: an HTTP sink's status class, or the class
+    # `kafka_out` counts a successful produce attempt under.
+    accepted_class = "ok" if data.kafka else "2xx"
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.sent", led)
     if skipped:
@@ -1525,6 +1579,8 @@ def check_ledger_sent(data):
             status_text = f"status {answered.group(1)}"
         elif first.key == "oversize":
             status_text = "dropped before sending"
+        elif data.kafka:
+            status_text = "the broker's error"
         else:
             status_text = "a 2xx whose body named dropped series"
         return (f"{status_text}: {first.key} at {data.offset(first.ts)}: {first.message[:300]}")
@@ -1588,7 +1644,7 @@ def check_ledger_sent(data):
             continue
         cls = point.attributes.get("class", "?")
         classes[cls] = classes.get(cls, 0) + point.value
-        if cls == "2xx":
+        if cls == accepted_class:
             continue
         # A drain's deltas cover the interval since the drain before it.
         index = bisect.bisect_left(drains, point.ts)
@@ -1600,10 +1656,12 @@ def check_ledger_sent(data):
     shown = ", ".join(f"{cls} {_n(value)}" for cls, value in sorted(classes.items()))
     if not classes:
         flag(FAIL, f"no logit.output.requests from {sink}: nothing shows a request was sent")
-    elif not classes.get("2xx"):
-        flag(FAIL, f"no request to {data.target.get('name')} answered 2xx ({shown})")
+    elif not classes.get(accepted_class):
+        flag(FAIL, f"no request to {data.target.get('name')} answered {accepted_class} "
+                   f"({shown})")
     if outside:
-        flag(WARN, f"{_n(sum(outside.values()))} request(s) answered other than 2xx outside "
+        flag(WARN, f"{_n(sum(outside.values()))} request(s) answered other than "
+                   f"{accepted_class} outside "
                    "every fault window ("
                    + ", ".join(f"{cls} {_n(v)}" for cls, v in sorted(outside.items())) + ")")
     accepted = sum(sut.counter_by_life("logit.output.records", component=sink).values())
@@ -1611,15 +1669,55 @@ def check_ledger_sent(data):
     lines += [f"{entry.key} at {data.offset(entry.ts)}: {entry.message[:300]}"
               for entry in diagnostics]
 
+    evidence = ("ledger.egress and ledger.topic read the topic back" if data.kafka else
+                f"{NO_BACKEND}, so a 2xx is the end of the evidence")
     summary = (f"requests {shown or 'none'}; records accepted {_n(accepted)}; "
-               + "; ".join(identities) + f" (one batch in flight allowed); {NO_BACKEND}, so a "
-               "2xx is the end of the evidence")
+               + "; ".join(identities) + f" (one batch in flight allowed); {evidence}")
     if status == PASS:
-        return Result("ledger.sent", PASS, f"SENT to {data.target.get('name')}: every batch "
+        # `SENT` marks a ledger that ends at the sink; a Kafka target's goes on to the topic.
+        lead = "" if data.kafka else "SENT "
+        return Result("ledger.sent", PASS, f"{lead}to {data.target.get('name')}: every batch "
                       f"received ended in an accepted response; {summary}", lines)
     worst_first = sorted(problems, key=lambda item: -_ORDER[item[0]])
     return Result("ledger.sent", status, f"{worst_first[0][1]}; {summary}",
                   [text for _, text in worst_first] + lines)
+
+
+def check_ledger_topic(data):
+    """For a Kafka target: the topic's record count T against the records `kafka_out` saw
+    accepted, A (`logit.output.records`, summed over every SUT life). T below A FAILs, records
+    the broker acknowledged and no longer holds; T above A WARNs, records stored more than once,
+    which `at_least_once` permits (docs/known-gaps/kafka.md); a topic not read back FAILs. Every
+    other target SKIPs."""
+    if not data.kafka:
+        return Result("ledger.topic", SKIP, f"{data.target.get('kind')} target: no topic")
+    read = data.phases.get("kafka_read")
+    if read is None:
+        failed = data.phases.get("kafka_read_failed") or {}
+        shown = {k: v for k, v in failed.items() if k not in ("event", "phase", "t", "offset")}
+        return Result("ledger.topic", FAIL, "the topic wasn't read back: "
+                      + (json.dumps(shown)[:500] if shown else "no kafka_read phase"))
+    led = _ledger(data)
+    skipped = _skip_without_sut("ledger.topic", led)
+    if skipped:
+        return skipped
+    t_count = len(topic.record_lines(data.topic_text))
+    by_life = led.sut.counter_by_life("logit.output.records", component=led.sink)
+    accepted = sum(by_life.values())
+    lines = [f"topic {data.target.get('topic')!r}: end offsets {read.get('offsets')}, "
+             f"{_n(t_count)} record(s) read back",
+             "records accepted by life: " + ", ".join(
+                 f"life {life} {_n(value)}" for life, value in sorted(by_life.items()))]
+    gap = t_count - accepted
+    detail = (f"T {_n(t_count)} records in the topic vs A {_n(accepted)} records the sink saw "
+              f"accepted, T − A {_n(gap)}")
+    if gap < 0:
+        return Result("ledger.topic", FAIL, f"{detail}: the broker acknowledged records it no "
+                      "longer holds", lines)
+    if gap > 0:
+        return Result("ledger.topic", WARN, f"{detail}: duplicates, which at_least_once "
+                      "permits", lines)
+    return Result("ledger.topic", PASS, detail, lines)
 
 
 def _step_value(series, t, default=0.0):
@@ -1869,7 +1967,8 @@ CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_intake,
     check_ledger_edge, check_ledger_aggregate, check_ledger_egress, check_ledger_windows,
-    check_ledger_replay, check_ledger_summary, check_ledger_sent, check_identity_sink,
+    check_ledger_replay, check_ledger_summary, check_ledger_sent, check_ledger_topic,
+    check_identity_sink,
     check_recovery, check_expect,
 )
 

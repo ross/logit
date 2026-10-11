@@ -156,37 +156,37 @@ ACTIONS = {
         apply=netem_apply,
         revert=netem_revert,
         affects_udp_ingress=lambda step: step.on == "generator",
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_egress=lambda step: step.on in ("logit", "victoria-metrics", "kafka"),
     ),
     "pause": Action(
         apply=pause_apply,
         revert=pause_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_egress=lambda step: step.on in ("logit", "victoria-metrics", "kafka"),
     ),
     "stop": Action(
         apply=stop_apply,
         revert=stop_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_egress=lambda step: step.on in ("logit", "victoria-metrics", "kafka"),
     ),
     "kill": Action(
         apply=kill_apply,
         revert=stop_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_egress=lambda step: step.on in ("logit", "victoria-metrics", "kafka"),
     ),
     "restart": Action(
         apply=restart_apply,
         revert=restart_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_egress=lambda step: step.on in ("logit", "victoria-metrics", "kafka"),
     ),
     "partition": Action(
         apply=partition_apply,
         revert=partition_revert,
         affects_udp_ingress=_lifecycle_on_sut_or_generator_partition,
-        affects_egress=lambda step: step.on in ("logit", "victoria-metrics"),
+        affects_egress=lambda step: step.on in ("logit", "victoria-metrics", "kafka"),
     ),
 }
 

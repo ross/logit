@@ -64,7 +64,8 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import checks, collect, docker, driver, faults, report, scenario, telemetry, vm
+from . import (checks, collect, docker, driver, faults, report, scenario, telemetry, topic,
+               vm)
 
 _FAILURES = []
 _PASSED = [0]
@@ -921,12 +922,14 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 undelivered=0, empty_export=False, ab0_short=0, merged_lives=False,
                 empty_sut=False, buffer_batches=0, buffer_util=0.0, steady_surplus=0,
                 external=False, sut_extra=(), stderr_extra=(), timeline_extra=(),
-                **resolved):
+                kafka=False, topic_extra=(), topic_read=True, **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
     them dropped on stderr over two of the listener's shutdown lines, and `v0_extra` reaching
-    VictoriaMetrics after its last drain, and life 1 balances."""
+    VictoriaMetrics after its last drain, and life 1 balances. With `kafka`, the target is a
+    Kafka topic: the same V lands as four delta records in `kafka-topic.ndjson`, two per life,
+    plus `topic_extra` lines, and the timeline records the read unless `topic_read` is false."""
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -1002,6 +1005,16 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
         resolved.setdefault("target", {"kind": "external", "name": "datadog",
                                        "env": ["DD_API_KEY"]})
         ledger = {k: v for k, v in LEDGER.items() if k != "vm_selector"}
+    elif kafka:
+        resolved.setdefault("target", {"kind": "kafka", "name": "kafka", "env": [],
+                                       "topic": "soak"})
+        ledger = {k: v for k, v in LEDGER.items() if k != "vm_selector"}
+        if topic_read:
+            timeline.append(_phase("kafka_read", 325, topic="soak", offsets={"0": 4},
+                                   end_offsets=4, records=4, processed=4))
+        else:
+            timeline.append(_phase("kafka_read_failed", 325, step="offsets", rc=1,
+                                   stderr="broker down"))
     else:
         ledger = LEDGER
     run_dir = _run_dir(tmp, name, timeline, list(sut) + list(sut_extra), ledger=ledger,
@@ -1050,11 +1063,23 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             export.append({"metric": {"__name__": f"x_{index}_total"},
                            "values": [share // 2, share, other // 2, other],
                            "timestamps": [int((T0 + s) * 1000) for s in (50, 100, 200, 300)]})
-    if external:
-        # Nothing queries an external target, so the driver writes no export.
+    if external or kafka:
+        # Neither target has VictoriaMetrics, so the driver writes no export.
         export = []
     (run_dir / "vm-export.jsonl").write_text("".join(json.dumps(s) + "\n" for s in export))
+    if kafka:
+        records = [_topic_record(T0 + offset, amount) for offset, amount in
+                   ((50, v0 // 2), (100, v0 - v0 // 2), (200, v1 // 2), (300, v1 - v1 // 2))]
+        (run_dir / topic.TOPIC_FILE).write_text(
+            "\n".join(records + list(topic_extra)) + "\n")
     return run_dir
+
+
+def _topic_record(t, amount, name="x_0"):
+    """One `kafka_out` `format: json` record value: an `aggregate` delta window's sum."""
+    return json.dumps({"timestamp": _stamp(t), "metrics": [
+        {"name": name, "kind": "sum", "value": amount, "temporality": "delta",
+         "monotonic": True}], "attributes": {}}, separators=(",", ":"))
 
 
 def _ledger_checks():
@@ -1789,10 +1814,10 @@ def _target_rules(root):
          "an external target still needs the sink id"),
         (base, lambda raw: raw["step"].append({"at": "11m", "action": "stop",
                                                "on": "victoria-metrics", "for": "20s"}),
-         "a fault on victoria-metrics, which an external target's stack doesn't run",
+         "a fault on victoria-metrics, which the external target's stack doesn't run",
          "a fault on victoria-metrics with an external target"),
         (vm_base, lambda raw: raw.update(target={"kind": "victoria-metrics", "name": "vm"}),
-         "target.name is for an external target", "a name on the local target"),
+         "target.name is for an external or kafka target", "a name on the local target"),
         (vm_base, lambda raw: raw.update(target="external"), "`target` must be a table",
          "a target that isn't a table"),
     ]
@@ -2302,6 +2327,216 @@ def _report():
                "a fixed schedule's header names no seed")
 
 
+def _kafka_base(root):
+    path = root / "scenarios" / "kafka-broker-restart" / "scenario.toml"
+    return path, tomllib.loads(path.read_text())
+
+
+def _kafka_rules(root):
+    """The `[target] kind = "kafka"` rules: `topic` required and legal, no `env`, no
+    VictoriaMetrics ledger key, a fault on `kafka` for a Kafka target only and none on
+    `victoria-metrics` for one; the services, profile, and image each kind of target gets; and
+    compose.yaml's `kafka` service in its own profile."""
+    path, base = _kafka_base(root)
+    vm_path, vm_base = _base(root)
+    ext_path, ext_base = _external_base(root)
+
+    def mutate(raw, edit):
+        raw = copy.deepcopy(raw)
+        edit(raw)
+        return raw
+
+    loaded = scenario.from_dict(copy.deepcopy(base), path)
+    expect(loaded.kafka and not loaded.external and not loaded.has_vm
+           and loaded.target == {"kind": "kafka", "name": "kafka", "env": [], "topic": "soak"},
+           f"kafka-broker-restart loads as a Kafka target, got {loaded.target}")
+    expect(loaded.services == ("logit", "generator", "kafka"),
+           f"a Kafka target's stack runs kafka and no victoria-metrics, got {loaded.services}")
+    expect(loaded.to_json()["target"]["topic"] == "soak",
+           "the resolved scenario records the topic")
+    local = scenario.from_dict(copy.deepcopy(vm_base), vm_path)
+    external = scenario.from_dict(copy.deepcopy(ext_base), ext_path)
+    expect(local.services == ("logit", "generator", "victoria-metrics")
+           and external.services == ("logit", "generator"),
+           f"the local stack runs victoria-metrics only, an external one neither, got "
+           f"{local.services} {external.services}")
+    expect("topic" not in local.to_json()["target"] and "topic" not in external.to_json()["target"],
+           "only a Kafka target's resolved scenario has a topic")
+    expect(driver.profiles_for(loaded) == ["kafka"] and driver.profiles_for(local) == ["local"]
+           and driver.profiles_for(external) == [],
+           "each target gets its own backend's compose profile")
+
+    def table(**changes):
+        return lambda raw: raw["target"].update(changes)
+
+    cases = [
+        (base, lambda raw: raw["target"].pop("topic"), "a kafka target needs `topic`",
+         "a Kafka target with no topic"),
+        (base, table(topic="has space"), "target.topic must be a legal Kafka topic name",
+         "an illegal topic name"),
+        (base, table(topic=".."), "target.topic must be a legal Kafka topic name",
+         "the topic `..`"),
+        (base, table(topic="x" * 250), "target.topic must be a legal Kafka topic name",
+         "a 250-character topic"),
+        (base, table(env=["DD_API_KEY"]), "target.env is for an external target",
+         "env on a Kafka target"),
+        (base, table(name="Kafka Two"), "target.name must be lowercase",
+         "a Kafka target name"),
+        (base, lambda raw: raw["ledger"].update(vm_selector="{x}"),
+         "ledger.vm_selector names a VictoriaMetrics query, and the kafka target",
+         "vm_selector on a Kafka target"),
+        (base, lambda raw: raw["step"].append({"at": "6m", "action": "stop",
+                                               "on": "victoria-metrics", "for": "10s"}),
+         "a fault on victoria-metrics, which the kafka target's stack doesn't run",
+         "a fault on victoria-metrics with a Kafka target"),
+        (base, lambda raw: raw["step"][0].update(action="kill"), "kill is for logit only",
+         "a kill on the broker"),
+        (vm_base, lambda raw: raw["step"].append({"at": "12m", "action": "stop", "on": "kafka",
+                                                  "for": "10s"}),
+         "a fault on kafka, which the victoria-metrics target's stack doesn't run",
+         "a fault on kafka with the local target"),
+        (ext_base, lambda raw: raw["step"].append({"at": "11m30s", "action": "stop",
+                                                   "on": "kafka", "for": "10s"}),
+         "a fault on kafka, which the external target's stack doesn't run",
+         "a fault on kafka with an external target"),
+        (ext_base, table(topic="soak"), "target.topic is for a kafka target",
+         "a topic on an external target"),
+        (vm_base, lambda raw: raw.update(target={"kind": "victoria-metrics", "topic": "x"}),
+         "target.topic is for an external or kafka target", "a topic on the local target"),
+    ]
+    paths = {id(base): path, id(vm_base): vm_path, id(ext_base): ext_path}
+    for raw, edit, needle, what in cases:
+        _refused(paths[id(raw)], mutate(raw, edit), needle, what)
+
+    compose = (root / "compose.yaml").read_text()
+    kafka_service = compose.split("\n  kafka:")[1].split("\n  logit:")[0]
+    expect("profiles: [kafka]" in kafka_service and driver.KAFKA_IMAGE in kafka_service
+           and 'restart: "no"' in kafka_service,
+           "compose.yaml runs the pinned broker in the kafka profile, never restarted by docker")
+    sut = compose.split("\n  logit:")[1].split("\n  generator:")[0]
+    expect("kafka: { condition: service_healthy, required: false }" in sut,
+           "the SUT waits for a healthy broker when its profile runs, and only then")
+    for action in faults.ACTIONS.values():
+        expect(action.affects_egress(scenario.Step(id="x", spec_index=0, cycle=0, action="stop",
+                                                   on="kafka", args="", start=0, end=1)),
+               "every fault on the broker affects the SUT's egress")
+
+
+def _kafka_topic():
+    """The topic read's parsers: end offsets, the consumer's count, record values to V per
+    life, and what isn't a JSON object."""
+    offsets = topic.end_offsets("soak:0:120\nsoak:1:7\nnoise\n")
+    expect(offsets == {0: 120, 1: 7}, f"kafka-get-offsets lines parse, got {offsets}")
+    expect(topic.end_offsets("Error: no such topic") is None,
+           "an answer with no offset line is None")
+    expect(topic.processed_count("[2026] WARN x\nProcessed a total of 42 messages\n") == 42
+           and topic.processed_count("") is None, "the consumer's closing count parses")
+    expect(topic.consumer_argv("soak", 9)[-2:] == ["--max-messages", "9"]
+           and "--from-beginning" in topic.consumer_argv("soak"),
+           "the consumer reads from the beginning, as many records as the offsets promise")
+    stamp = topic.parse_time("2026-10-11T12:00:00.250000000Z")
+    expect(stamp is not None and abs(stamp - 1791720000.25) < 1e-6,
+           f"a nine-digit RFC 3339 time parses, got {stamp}")
+    lines = [_topic_record(1000, 30), _topic_record(1000, 5, name="other"),
+             _topic_record(2500, 70), "not json", "[1, 2]",
+             json.dumps({"timestamp": _stamp(2600), "metrics": [
+                 {"name": "x_0", "kind": "gauge", "value": 9}]})]
+    records, unparsed = topic.parse_records("\n".join(lines) + "\n\n")
+    expect(len(records) == 4 and unparsed == 2,
+           f"two of six lines aren't JSON objects, got {records} {unparsed}")
+    prefixed, _ = topic.parse_records("\n".join(lines), prefix="x_")
+    expect([amount for _, amount in prefixed] == [30, 0, 70, 0],
+           f"only sums under the prefix count, got {prefixed}")
+    by_life, total = topic.totals_by_life(records, [900, 2000])
+    expect(by_life == {0: 35, 1: 70} and total == 105,
+           f"each record goes to the life its timestamp falls in; a gauge adds 0, got "
+           f"{by_life} {total}")
+
+
+def _kafka_lines(accepted=4, ok=True):
+    """`kafka_out` telemetry for the ledger fixture's SUT: one produce attempt per drain,
+    answered `ok` (else `clean`), and `accepted` records over the run at +300."""
+    drains = [o for o in range(5, STOP[0], 5)] + [o for o in range(135, 321, 5)]
+    lines = [_line(_stamp(T0 + o), "logit.output.requests", "sum", 1, component="sink",
+                   attrs={"class": "ok" if ok else "clean"}) for o in drains]
+    lines.append(_line(_stamp(T0 + 300), "logit.output.records", "sum", accepted,
+                       component="sink"))
+    return lines
+
+
+def _kafka_checks():
+    """The checks over a Kafka two-life run: V from the topic, `ledger.egress` and
+    `ledger.summary` judging it, a duplicate WARNing, a lost record FAILing, a topic not read
+    back, `ledger.topic`'s three verdicts, and `ledger.sent` on `kafka_out`'s classes."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            kwargs.setdefault("sut_extra", _kafka_lines())
+            run_dir = _ledger_run(tmp, name, kafka=True, **kwargs)
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        clean = results("kafka-clean")
+        for check_id in ("ledger.intake", "ledger.edge", "ledger.aggregate", "ledger.egress",
+                         "ledger.summary", "ledger.topic", "identity.sink"):
+            expect(clean[check_id].status == checks.PASS,
+                   f"{check_id} PASSes a balanced Kafka run, got {clean[check_id]}")
+        led = checks.Ledger(checks.RunData(Path(tmp) / "kafka-clean"))
+        expect(led.V == {0: led.get("Ab", 0) + 30, 1: led.get("Ab", 1)} and not led.unparsed,
+               f"V is the topic's increments per life, got {led.V}")
+        sent = clean["ledger.sent"]
+        expect(sent.status == checks.PASS and not sent.detail.startswith("SENT")
+               and "read the topic back" in sent.detail and "ok 58" in sent.detail,
+               f"ledger.sent judges kafka_out's ok class and doesn't end the evidence, got "
+               f"{sent}")
+        expect(clean["ledger.windows"].status == checks.SKIP
+               and checks.NO_VM_KAFKA in clean["ledger.windows"].detail,
+               f"ledger.windows SKIPs on a Kafka target, got {clean['ledger.windows']}")
+        expect(checks.NO_VM_KAFKA in clean["progress"].detail,
+               f"progress names no freshness samples, got {clean['progress'].detail}")
+
+        dup = results("kafka-duplicate", topic_extra=[_topic_record(T0 + 300, 25)])
+        expect(dup["ledger.egress"].status == checks.WARN
+               and "= -25, duplicates" in dup["ledger.egress"].detail,
+               f"a duplicated record's increments WARN as duplicates, got {dup['ledger.egress']}")
+        expect(dup["ledger.summary"].status == checks.PASS
+               and "Ab − V -25 duplicates" in dup["ledger.summary"].detail,
+               f"ledger.summary shows duplicates and doesn't judge them, got "
+               f"{dup['ledger.summary']}")
+        expect(dup["ledger.topic"].status == checks.WARN
+               and "T 5 records in the topic vs A 4" in dup["ledger.topic"].detail,
+               f"a topic above the accepted count WARNs, got {dup['ledger.topic']}")
+
+        lost = results("kafka-lost", v1_short=7, sut_extra=_kafka_lines(accepted=5))
+        expect(lost["ledger.egress"].status == checks.FAIL
+               and "= 7, uncounted" in lost["ledger.egress"].detail,
+               f"increments missing from the topic FAIL, got {lost['ledger.egress']}")
+        expect(lost["ledger.summary"].status == checks.FAIL,
+               f"ledger.summary FAILs a missing increment, got {lost['ledger.summary']}")
+        expect(lost["ledger.topic"].status == checks.FAIL
+               and "acknowledged records it no longer holds" in lost["ledger.topic"].detail,
+               f"a topic below the accepted count FAILs, got {lost['ledger.topic']}")
+
+        garbled = results("kafka-garbled", topic_extra=["not json"])
+        expect(garbled["ledger.egress"].status == checks.FAIL
+               and "1 topic record(s) aren't JSON objects" in garbled["ledger.egress"].detail,
+               f"a record that isn't a JSON object FAILs, got {garbled['ledger.egress']}")
+
+        unread = results("kafka-unread", topic_read=False)
+        for check_id in ("ledger.egress", "ledger.topic"):
+            expect(unread[check_id].status == checks.FAIL
+                   and "broker down" in unread[check_id].detail,
+                   f"{check_id} FAILs a topic never read back, quoting why, got "
+                   f"{unread[check_id]}")
+
+        no_ok = results("kafka-no-ok", sut_extra=_kafka_lines(ok=False))
+        expect(no_ok["ledger.sent"].status == checks.FAIL
+               and "answered ok (clean 58)" in no_ok["ledger.sent"].detail,
+               f"no attempt answered ok FAILs, got {no_ok['ledger.sent']}")
+
+        local = {r.id: r for r in checks.run_all(_ledger_run(tmp, "kafka-local"))}
+        expect(local["ledger.topic"].status == checks.SKIP,
+               f"ledger.topic SKIPs on the local target, got {local['ledger.topic']}")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -2327,10 +2562,11 @@ def run(root, quiet=False):
                      _log_capture, _signals, _deadlines, _hung_inspect, _inspect_redacted,
                      _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks,
                      _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
-                     _sink_drain, _external_checks, _report, _shipped):
+                     _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
+                     _report, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
-                              _target_rules, _sink_drain, _shipped)
+                              _target_rules, _sink_drain, _kafka_rules, _shipped)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")

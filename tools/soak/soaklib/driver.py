@@ -31,6 +31,11 @@ needs at the code:
   directory outside the repo and the run directory, removed when `execute()` returns. Nothing
   queries the destination: no readiness, freshness, flush, or export. The end sequence waits for
   the SUT sink's queue to empty instead of for the stored total to hold.
+- A Kafka target (`[target] kind = "kafka"`) runs the `kafka` compose profile, a local broker,
+  in place of `local`, with no env-file copy. Like an external target it has no
+  VictoriaMetrics, so its end sequence waits for the sink's queue to empty; after the SUT stops,
+  it reads the target's topic back from the broker into `kafka-topic.ndjson` (topic.py), the
+  ledger's V.
 
 Every time in `timeline.jsonl`, `watchdog.jsonl`, `stats.ndjson`, and `vm-freshness.jsonl` is
 epoch seconds (`t`, `started_at`, `finished_at`), with `offset` measured from the timeline's zero:
@@ -46,11 +51,12 @@ import time
 import traceback
 from pathlib import Path
 
-from . import checks, collect, faults, report, scenario as scenario_mod, telemetry, vm
+from . import checks, collect, faults, report, scenario as scenario_mod, telemetry, topic, vm
 from .docker import Docker
 
 NETEM_IMAGE = "logit-soak-netem:local"
 VM_IMAGE = "victoriametrics/victoria-metrics:v1.152.0"
+KAFKA_IMAGE = "apache/kafka:4.2.0"
 ADMIN = "http://127.0.0.1:9600"
 
 INSPECT_EVERY_S = 5
@@ -71,8 +77,12 @@ SINK_DRAIN_BOUND_S = 120
 SINK_DRAIN_TAIL_LINES = 400
 # The aggregate window assumed when the SUT config names none.
 DEFAULT_AGGREGATE_INTERVAL_S = 10.0
-# The compose profile holding `victoria-metrics`, enabled for a local target only.
+# The compose profile holding `victoria-metrics`, enabled for a local target only, and the one
+# holding the `kafka` broker, enabled for a Kafka target only.
 LOCAL_PROFILE = "local"
+KAFKA_PROFILE = "kafka"
+# How long the topic read waits for its consumer: its own idle timeout, then the process.
+TOPIC_READ_TIMEOUT_S = 180
 
 
 class Abort(Exception):
@@ -111,6 +121,15 @@ def interrupt_on_signals():
             signal.signal(signum, signal.default_int_handler)
 
 
+def profiles_for(scenario):
+    """The compose profiles a scenario's stack runs: its target's backend, if it has one."""
+    if scenario.has_vm:
+        return [LOCAL_PROFILE]
+    if scenario.kafka:
+        return [KAFKA_PROFILE]
+    return []
+
+
 def exit_code(results, ended=None):
     """130 for an interrupted run, 1 for an aborted or errored one or any `FAIL` row, else 0.
     `ended` is the phase the driver ended on: `interrupted`, `aborted`, `error`, or None."""
@@ -127,6 +146,8 @@ class Run:
         self.root = Path(root)
         self.scenario = scenario
         self.external = scenario.external
+        self.has_vm = scenario.has_vm
+        self.kafka = scenario.kafka
         # The operator's env file for an external target. Compose reads `private_env`, a plain
         # copy outside the run directory, since the file can be in shell `export` form and
         # holds credentials.
@@ -180,7 +201,7 @@ class Run:
             self.private_env = scenario_mod.private_env_copy(self.external_env,
                                                              self.scenario.target["env"])
         env_files = [env_file] + ([self.private_env] if self.external else [])
-        profiles = [] if self.external else [LOCAL_PROFILE]
+        profiles = profiles_for(self.scenario)
         self.docker = Docker(self.project, self.root / "compose.yaml", env_files, profiles)
         self.ctx = faults.Context(docker=self.docker, ids=self.ids, netem_image=NETEM_IMAGE)
         self.timeline = collect.Jsonl(self.run_dir / "timeline.jsonl")
@@ -219,7 +240,8 @@ class Run:
                    f"  {' '.join(self.docker.prefix)} compose -p {self.project} "
                    f"-f {self.docker.compose_file} down -v")
             return 1
-        images = [self.image, NETEM_IMAGE] + ([] if self.external else [VM_IMAGE])
+        images = ([self.image, NETEM_IMAGE] + ([VM_IMAGE] if self.has_vm else [])
+                  + ([KAFKA_IMAGE] if self.kafka else []))
         collect.provenance(self.run_dir, self.root.parent.parent, self.docker,
                            images, self.scenario.name,
                            self.duration, self.seed, self.argv, self.seed_source)
@@ -258,7 +280,7 @@ class Run:
         self.phase("up_end", rc=result.rc, stderr=result.stderr.strip()[-2000:])
         if not result.ok:
             raise Abort(f"compose up failed: {result.stderr.strip()[-500:]}")
-        if not self.external:
+        if self.has_vm:
             self.refresh_vm_base()
             deadline = _now() + 60
             while not (self.vm_base and vm.healthy(self.vm_base)):
@@ -315,7 +337,7 @@ class Run:
             if offset >= next_slow:
                 next_slow = _next_multiple(offset, SLOW_POLL_EVERY_S)
                 self.sample_stats()
-                if not self.external:
+                if self.has_vm:
                     self.sample_freshness()
             if offset >= next_chunk:
                 next_chunk = _next_multiple(offset, LOG_CHUNK_EVERY_S)
@@ -480,10 +502,10 @@ class Run:
                                  timeout=GENERATOR_STOP_T + 15)
         self.phase("generator_stopped", rc=result.rc, stderr=result.stderr.strip())
 
-        if self.external:
-            self.wait_sink_drained()
-        else:
+        if self.has_vm:
             self.wait_quiet()
+        else:
+            self.wait_sink_drained()
 
         result = self.docker.run(["stop", "-t", str(SUT_STOP_T), self.ids["logit"]],
                                  timeout=SUT_STOP_T + 15)
@@ -491,7 +513,9 @@ class Run:
         self.phase("sut_stopped", rc=result.rc, stderr=result.stderr.strip(),
                    exit_code=(info.get("State") or {}).get("ExitCode"))
 
-        if self.external:
+        if self.kafka:
+            self.read_topic()
+        if not self.has_vm:
             self.phase("end_end")
             return
         self.refresh_vm_base()
@@ -506,6 +530,41 @@ class Run:
             export_path.write_text("")
             self.phase("vm_export_failed", error=str(err))
         self.phase("end_end")
+
+    def read_topic(self):
+        """Reads the Kafka target's topic back from the broker after the SUT stopped: each
+        partition's end offset into `kafka-offsets.txt`, then that many records from the
+        beginning into `kafka-topic.ndjson`, one record value per line, the ledger's V. Records
+        `kafka_read` with both counts, or `kafka_read_failed` when either read fails or the two
+        disagree."""
+        name = self.scenario.target["topic"]
+        container = self.ids.get("kafka")
+        topic_path = self.run_dir / topic.TOPIC_FILE
+        if not container:
+            topic_path.write_text("")
+            self.phase("kafka_read_failed", error="no kafka container")
+            return
+        result = self.docker.exec_(container, topic.offsets_argv(name), timeout=POLL_TIMEOUT_S * 4)
+        (self.run_dir / topic.OFFSETS_FILE).write_text(result.stdout)
+        offsets = topic.end_offsets(result.stdout)
+        if not result.ok or offsets is None:
+            topic_path.write_text("")
+            self.phase("kafka_read_failed", rc=result.rc, step="offsets",
+                       stderr=result.stderr.strip()[-2000:])
+            return
+        expected = sum(offsets.values())
+        result = self.docker.exec_(container, topic.consumer_argv(name, expected),
+                                   timeout=TOPIC_READ_TIMEOUT_S)
+        topic_path.write_text(result.stdout)
+        records = len(topic.record_lines(result.stdout))
+        processed = topic.processed_count(result.stderr)
+        extra = dict(rc=result.rc, topic=name, offsets=offsets, end_offsets=expected,
+                     records=records, processed=processed)
+        if records != expected or (processed is not None and processed != records):
+            self.phase("kafka_read_failed", step="consume", **extra,
+                       stderr=result.stderr.strip()[-2000:])
+            return
+        self.phase("kafka_read", **extra)
 
     def wait_quiet(self):
         """Waits until VictoriaMetrics' total holds for two aggregate windows, bounded at

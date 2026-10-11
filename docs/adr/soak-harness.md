@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-09
+updated: 2026-10-11
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -166,3 +166,13 @@ the compose layout, the driver loop, the full list of checks, and the workstream
   prune.
 - The ledger's "uncounted by design" rows stay reported until the gaps in
   `docs/known-gaps/intake.md` close. Closing one turns its row into a judged check.
+
+## Amendment: a Kafka target's oracle is its topic (2026-10-11)
+
+A scenario can name the stack's own Kafka broker as its target (`[target] kind = "kafka"`). The
+egress oracle is then the topic, read back with the broker image's own tools after the SUT stops,
+not a stored total. The SUT's `aggregate` runs `temporality: delta`, so V is the sum of every
+record's increments and a lost record shows as a deficit. A delta oracle sees a duplicate too, as
+a surplus: `ledger.egress` WARNs it as duplicates, which `at_least_once` permits, rather than
+FAILing it, and `ledger.topic` compares the topic's record count with the records the sink saw
+accepted. [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Kafka targets", has the rules.
