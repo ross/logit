@@ -565,13 +565,20 @@ that recorded the point.
 drain. Each line carries `component`, `metric`, `tags` (the point's tags as `key=value` pairs
 sorted by key and joined by `,`), and `value`; a timing carries `count` and `sum` (in seconds)
 instead of `value`. A [dedicated `internal`
-pipeline](#give-internal-a-dedicated-pipeline) avoids drop leftovers: `internal` drains last, so
-the lines carry only the final drain's own `logit.internal.*` counts and the routine counts its
-pipeline's nodes record while handling that batch, all at `debug`. A mixed pipeline, where `internal` shares a sink or transform with data,
-is what typically leaves drop counts here: that sink's `batches.dropped{reason="shutdown"}` and a
-UDP listener's `datagrams.dropped{reason="shutdown"}` land after `internal` has stopped. A
-second SIGTERM/SIGINT (exit `130`), SIGKILL, or an out-of-memory kill exits without
-them.
+pipeline](#give-internal-a-dedicated-pipeline) exports every data node's shutdown drops, because
+`internal` drains last. The lines that remain come from `internal`'s own side:
+
+- The final drain's own `logit.internal.*` counts and the routine counts its pipeline's nodes
+  record while handling that batch, all at `debug`.
+- A `batches.dropped` or `events.dropped{reason="shutdown"}` count that a sink or Lua node
+  carrying `internal`'s output records while it shuts down, at `warn` under that node's component
+  id. That node shuts down after `internal`'s final drain, so no topology can export the count. `drain complete` includes it in
+  `batches_dropped`.
+
+A mixed pipeline, where `internal` shares a sink or transform with data, also leaves data drop
+counts here: that sink's `batches.dropped{reason="shutdown"}` and a UDP listener's
+`datagrams.dropped{reason="shutdown"}` land after `internal` has stopped. A second SIGTERM/SIGINT
+(exit `130`), SIGKILL, or an out-of-memory kill exits without any of these lines.
 
 Outside the lifecycle events, `logit run` can log startup `warn` lines before `ready`:
 
@@ -596,13 +603,24 @@ Give `internal` its own transforms and sinks, with no node shared with a data pa
 `internal` has a dedicated pipeline, it shuts down last: after every other node has exited, it
 drains once more. That final drain exports the counts recorded while the data flows were stopping:
 a UDP listener's `datagrams.dropped{reason="shutdown"}`, an HTTP listener's
-`connections.closed{reason="shutdown"}`, and a sink's or Lua node's
+`connections.closed{reason="shutdown"}`, and a data sink's or Lua node's
 `batches.dropped{reason="shutdown"}`. If any node in `internal`'s pipeline also carries data, such
 as one `otlp_out` fed by both, `internal` drains once when the shutdown signal arrives and
 shuts down with the data. Later counts then appear only in the self-log (`warn` lines, `drain complete`, and
 `telemetry left undrained at exit`), never in an exported pipeline. The final drain's own `logit.internal.*` counts
 are never exported in either case. `logit validate` and `logit run` warn about a mixed pipeline,
 naming `internal` and a node it shares.
+
+A dedicated pipeline has two limits:
+
+- It can't export a shutdown drop that its own sinks or Lua nodes count while they shut down,
+  because they shut down after the final drain. Those drops appear only in the self-log, as described under
+  `telemetry left undrained at exit` in [Self-logging](#self-logging).
+- A second SIGTERM/SIGINT (exit `130`), SIGKILL, or an out-of-memory kill gets no final drain and
+  no exit summary. It loses the counts recorded since `internal`'s last drain, up to one
+  `interval`, and every telemetry batch still in `internal`'s pipeline: an `aggregate` window and a
+  sink's in-memory queue, which grows while its destination is down. A sink with `buffer.disk:`
+  keeps its queue for the next start.
 
 A dedicated pipeline makes exit take longer. After the data drain ends, `internal` gets its own
 5 s grace for its final send, and each of its sinks gets its `buffer.shutdown_grace` to deliver
