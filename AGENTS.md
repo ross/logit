@@ -129,12 +129,13 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `set` | stamps constant values onto event attributes and/or the batch resource | [ADR `operator-declared-resource-attributes`](docs/adr/operator-declared-resource-attributes.md) |
 | `scale` | multiplies named numeric attributes by a constant factor (unit conversion) | [ADR `scale-transform`](docs/adr/scale-transform.md) |
 | `keep_values` | clamps attribute values to a per-field allow-list | [ADR `value-allowlist-cardinality-clamp`](docs/adr/value-allowlist-cardinality-clamp.md) |
+| `bucket` | classifies a numeric attribute into a named class by range, so `has_attributes`, `drop_attributes`, and `route` can gate on a range | [ADR `bucket-transform`](docs/adr/bucket-transform.md) |
 | `timestamp` | resolves `event.timestamp` from an attribute (RFC 3164/3339, unix epochs, or a strftime pattern, in a named zone), so a replayed backlog or a tailed file carries the record's own time | [ADR `timestamp-transform`](docs/adr/timestamp-transform.md) |
 | `trace_context` | gives a `LogRecord` a native application trace/span reference, from W3C hex ids or, under `format: datadog`, a dd-trace tracer's decimal and 128-bit `dd.trace_id`/`dd.span_id`; an opt-in `span:` block turns an access log line into a real `SpanRecord` on the same event | [ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md), [ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md) |
 | `http_access` | normalizes web-server access logs onto OTel semconv | [ADR `http-access-normalization`](docs/adr/http-access-normalization.md) |
 | `flatten` | rewrites a nested attribute into flat, dot-joined keys | [ADR `flatten-transform`](docs/adr/flatten-transform.md) |
 | `has_signal`, `keep_signals`, `drop_signals` | forward an event carrying a listed signal; keep, or clear, the listed signals' payloads | [ADR `signal-filtering-components`](docs/adr/signal-filtering-components.md) |
-| `has_attributes`, `drop_attributes` | forward, or drop, an event whose resource and/or attributes match every configured pair | [ADR `attribute-filtering-components`](docs/adr/attribute-filtering-components.md) |
+| `has_attributes`, `drop_attributes` | forward, or drop, an event whose resource and/or attributes match every configured pair, and carry every listed key | [ADR `attribute-filtering-components`](docs/adr/attribute-filtering-components.md) |
 | `has_provenance`, `drop_provenance` | forward, or drop, an event whose batch `origin`/`previous` match a configured list | [ADR `provenance-filtering-components`](docs/adr/provenance-filtering-components.md) |
 | `sample` | consistent, keyed sampling | [ADR `consistent-sampling-component`](docs/adr/consistent-sampling-component.md) |
 | `shape` | an observer that measures each event's shape | [ADR `shape-observer-component`](docs/adr/shape-observer-component.md) |
@@ -184,7 +185,9 @@ Details an agent needs beyond the table:
   - redacts semconv's sensitive query keys, then caps every free-text field per `CAPPED_FIELDS`;
   - derives a bounded set: `user_agent.class` from an ordered regex table, `http.route` from
     operator `routes:` plus three built-in sets, `error.type`, `span.name`, `span.status` (never
-    `ok`), and a `span.duration_s` mirror that `trace_context` resolves a span from.
+    `ok`), a `span.duration_s` mirror that `trace_context` resolves a span from, and, under
+    `status_class: true` (off by default), `http.response.status_class` (`1xx` to `5xx`, else
+    `unknown`).
 
   Every canonical name is also accepted with each `.` replaced by `-`
   (`http-response-status_code`; only the dots change). That fixed alias table exists for
@@ -973,7 +976,7 @@ crates/
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target; the listener), syslog (the listener), graphite, lines (lines_in), collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), splunk (splunk_hec_out), logit (logit_out), null_out (load-test discard sink)
                     shared drivers: `stream` (the pooled TCP, TLS, and Unix-stream send of statsd, syslog, and graphite), `datagram` (the packer and UDP/Unix-datagram send of statsd, syslog, graphite, and collectd), `accounting` (`BatchAccounting`, the once-per-batch encode-side counting gate; ADR `sink-send-path-and-attempt-accounting`)
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, timestamp (event.timestamp from an attribute), scale, has_signal, keep_signals, drop_signals, has_attributes, drop_attributes, has_provenance, drop_provenance, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), sample (consistent, keyed sampling on a frozen XXH64 hash), route (implements logit-pipeline::Router)
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, timestamp (event.timestamp from an attribute), scale, has_signal, keep_signals, drop_signals, has_attributes, drop_attributes, has_provenance, drop_provenance, keep_values, bucket (numeric range into a named class), logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), sample (consistent, keyed sampling on a frozen XXH64 hash), route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
   logit-perf        dev-only, publish = false: the load-test harness binary (`logit-perf`, `script/perf`) -- spawns the real logit-cli binary against perf/scenarios/*.yaml (docs/adr/load-test-harness.md, docs/design/performance.md)

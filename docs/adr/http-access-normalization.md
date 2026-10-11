@@ -1,6 +1,6 @@
 ---
 created: 2026-09-22
-updated: 2026-10-05
+updated: 2026-10-11
 ---
 
 # `http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields
@@ -316,3 +316,22 @@ and is the canonical account of what follows:
 
 The overwrite stays the one exception to fill-only, for the reason the Decision gives: a web
 server always logs the peer address.
+
+## Amendment (2026-10-11): an opt-in status class
+
+`status_class: true` derives `http.response.status_class` from `http.response.status_code`, after
+status coercion:
+
+- **Name.** `http.response.status_class` is a `logit`-own name beside `user_agent.class`. OTel
+  semconv has no status-class attribute.
+- **Values.** `1xx`, `2xx`, `3xx`, `4xx`, and `5xx` for a status from 100 to 599. Any other
+  present number is `unknown`, including the `0` that nginx's `000` coerces to. A status that is
+  absent, or one that didn't coerce, produces no class, the component's absent rule. The values
+  are a closed set of constants, so the invariant that every derived value comes from config, a
+  built-in table, or a closed numeric range holds.
+- **Fill-only.** It is written only when absent, like every other derived field. The dashed-alias
+  table includes the name, as it does for the other derived names.
+- **Opt-in.** The default is `false`. The attribute is one more key on every event, which an
+  operator who doesn't tag on it would otherwise pay for in `aggregate`'s series key and in a
+  sink's tag set. The other derived fields were on from the start because `trace_context` or a
+  semconv metric dimension reads them.
