@@ -922,14 +922,16 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 undelivered=0, empty_export=False, ab0_short=0, merged_lives=False,
                 empty_sut=False, buffer_batches=0, buffer_util=0.0, steady_surplus=0,
                 external=False, sut_extra=(), stderr_extra=(), timeline_extra=(),
-                kafka=False, topic_extra=(), topic_read=True, **resolved):
+                kafka=False, topic_extra=(), topic_read=True, topic_records=None, **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
     them dropped on stderr over two of the listener's shutdown lines, and `v0_extra` reaching
     VictoriaMetrics after its last drain, and life 1 balances. With `kafka`, the target is a
     Kafka topic: the same V lands as four delta records in `kafka-topic.ndjson`, two per life,
-    plus `topic_extra` lines, and the timeline records the read unless `topic_read` is false."""
+    plus `topic_extra` lines, and the timeline records the read unless `topic_read` is false.
+    `topic_records(v0, v1)`, when given, returns the `(offset, amount)` records to write in place
+    of the four."""
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -1068,8 +1070,10 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
         export = []
     (run_dir / "vm-export.jsonl").write_text("".join(json.dumps(s) + "\n" for s in export))
     if kafka:
-        records = [_topic_record(T0 + offset, amount) for offset, amount in
-                   ((50, v0 // 2), (100, v0 - v0 // 2), (200, v1 // 2), (300, v1 - v1 // 2))]
+        shares = ((50, v0 // 2), (100, v0 - v0 // 2), (200, v1 // 2), (300, v1 - v1 // 2))
+        if topic_records is not None:
+            shares = topic_records(v0, v1)
+        records = [_topic_record(T0 + offset, amount) for offset, amount in shares]
         (run_dir / topic.TOPIC_FILE).write_text(
             "\n".join(records + list(topic_extra)) + "\n")
     return run_dir
@@ -2441,16 +2445,23 @@ def _kafka_topic():
              _topic_record(2500, 70), "not json", "[1, 2]",
              json.dumps({"timestamp": _stamp(2600), "metrics": [
                  {"name": "x_0", "kind": "gauge", "value": 9}]})]
-    records, unparsed = topic.parse_records("\n".join(lines) + "\n\n")
-    expect(len(records) == 4 and unparsed == 2,
-           f"two of six lines aren't JSON objects, got {records} {unparsed}")
-    prefixed, _ = topic.parse_records("\n".join(lines), prefix="x_")
+    records, unparsed, copies = topic.parse_records("\n".join(lines) + "\n\n")
+    expect(len(records) == 4 and unparsed == 2 and copies == [],
+           f"two of six lines aren't JSON objects, got {records} {unparsed} {copies}")
+    prefixed, _, _ = topic.parse_records("\n".join(lines), prefix="x_")
     expect([amount for _, amount in prefixed] == [30, 0, 70, 0],
            f"only sums under the prefix count, got {prefixed}")
     by_life, total = topic.totals_by_life(records, [900, 2000])
     expect(by_life == {0: 35, 1: 70} and total == 105,
            f"each record goes to the life its timestamp falls in; a gauge adds 0, got "
            f"{by_life} {total}")
+    resent = lines[:3] + [lines[2], lines[0], lines[2]]
+    records, _, copies = topic.parse_records("\n".join(resent))
+    by_life, total = topic.totals_by_life(records, [900, 2000])
+    expect(len(records) == 3 and total == 105
+           and topic.duplicates_by_life(copies, [900, 2000]) == {0: 1, 1: 2},
+           f"a record's copies count once in V and per life as duplicates, got {records} "
+           f"{copies}")
 
 
 def _kafka_lines(accepted=4, ok=True):
@@ -2465,9 +2476,10 @@ def _kafka_lines(accepted=4, ok=True):
 
 
 def _kafka_checks():
-    """The checks over a Kafka two-life run: V from the topic, `ledger.egress` and
-    `ledger.summary` judging it, a duplicate WARNing, a lost record FAILing, a topic not read
-    back, `ledger.topic`'s three verdicts, and `ledger.sent` on `kafka_out`'s classes."""
+    """The checks over a Kafka two-life run: V from the topic's distinct records,
+    `ledger.egress` and `ledger.summary` judging it, a surplus and a loss a duplicate offsets
+    FAILing, a lost record FAILing, a topic not read back, `ledger.topic`'s verdicts on T − A and
+    on duplicates with and without an epoch bump, and `ledger.sent` on `kafka_out`'s classes."""
     with tempfile.TemporaryDirectory() as tmp:
         def results(name, **kwargs):
             kwargs.setdefault("sut_extra", _kafka_lines())
@@ -2493,17 +2505,63 @@ def _kafka_checks():
         expect(checks.NO_VM_KAFKA in clean["progress"].detail,
                f"progress names no freshness samples, got {clean['progress'].detail}")
 
-        dup = results("kafka-duplicate", topic_extra=[_topic_record(T0 + 300, 25)])
-        expect(dup["ledger.egress"].status == checks.WARN
-               and "= -25, duplicates" in dup["ledger.egress"].detail,
-               f"a duplicated record's increments WARN as duplicates, got {dup['ledger.egress']}")
-        expect(dup["ledger.summary"].status == checks.PASS
-               and "Ab − V -25 duplicates" in dup["ledger.summary"].detail,
-               f"ledger.summary shows duplicates and doesn't judge them, got "
-               f"{dup['ledger.summary']}")
-        expect(dup["ledger.topic"].status == checks.WARN
-               and "T 5 records in the topic vs A 4" in dup["ledger.topic"].detail,
-               f"a topic above the accepted count WARNs, got {dup['ledger.topic']}")
+        surplus = results("kafka-surplus", topic_extra=[_topic_record(T0 + 300, 25)])
+        expect(surplus["ledger.egress"].status == checks.FAIL
+               and "= -25, surplus" in surplus["ledger.egress"].detail,
+               f"a distinct record's increments above Ab FAIL as a surplus, got "
+               f"{surplus['ledger.egress']}")
+        expect(surplus["ledger.summary"].status == checks.FAIL,
+               f"ledger.summary judges a surplus, got {surplus['ledger.summary']}")
+        expect(surplus["ledger.topic"].status == checks.FAIL
+               and "T 5 distinct records" in surplus["ledger.topic"].detail
+               and "never saw accepted" in surplus["ledger.topic"].detail,
+               f"a distinct record the sink never saw accepted FAILs, got "
+               f"{surplus['ledger.topic']}")
+
+        # Life 1 loses 7 and stores a 7 record twice: the raw sum equals Ab, the distinct V
+        # doesn't.
+        offset = results("kafka-offset", v1_short=7, sut_extra=_kafka_lines(accepted=5),
+                         topic_records=lambda v0, v1: (
+                             (50, v0 // 2), (100, v0 - v0 // 2), (200, v1 // 2), (250, 7),
+                             (250, 7), (300, v1 - v1 // 2 - 7)))
+        expect(offset["ledger.egress"].status == checks.FAIL
+               and "= 7, uncounted" in offset["ledger.egress"].detail
+               and "6 topic record(s), 5 distinct, 1 duplicate copies" in "\n".join(
+                   offset["ledger.egress"].lines),
+               f"a loss a duplicate of the same size offsets FAILs, got "
+               f"{offset['ledger.egress']}")
+        expect(offset["ledger.summary"].status == checks.FAIL,
+               f"ledger.summary FAILs the offset loss, got {offset['ledger.summary']}")
+
+        def resent(copy_offset):
+            def shares(v0, v1):
+                base = [(50, v0 // 2), (100, v0 - v0 // 2), (200, v1 // 2), (300, v1 - v1 // 2)]
+                return base + [next(r for r in base if r[0] == copy_offset)]
+            return shares
+
+        clean_dup = results("kafka-dup-clean", topic_records=resent(300))
+        expect(clean_dup["ledger.egress"].status == checks.PASS,
+               f"V counts a duplicated record once, got {clean_dup['ledger.egress']}")
+        expect(clean_dup["ledger.topic"].status == checks.FAIL
+               and "T 4 distinct records in the topic (5 read, 1 duplicate copies) vs A 4"
+               in clean_dup["ledger.topic"].detail
+               and "life 1: 1 duplicate copies with no epoch bump"
+               in clean_dup["ledger.topic"].detail,
+               f"a duplicate in a life with no epoch bump FAILs, got {clean_dup['ledger.topic']}")
+
+        bumped = results("kafka-dup-bumped", topic_records=resent(300),
+                         sut_extra=_kafka_lines() + [_line(
+                             _stamp(T0 + 250), "logit.output.records.dropped", "sum", 3,
+                             component="sink", attrs={"reason": "rejected"})])
+        expect(bumped["ledger.topic"].status == checks.WARN
+               and "3 record(s) dropped rejected" in bumped["ledger.topic"].detail,
+               f"a duplicate after a rejection's epoch bump WARNs, got {bumped['ledger.topic']}")
+
+        restarted = results("kafka-dup-restart", topic_records=resent(100))
+        expect(restarted["ledger.topic"].status == checks.WARN
+               and "a later life resent under a new producer id"
+               in restarted["ledger.topic"].detail,
+               f"a duplicate in a life a restart ended WARNs, got {restarted['ledger.topic']}")
 
         lost = results("kafka-lost", v1_short=7, sut_extra=_kafka_lines(accepted=5))
         expect(lost["ledger.egress"].status == checks.FAIL

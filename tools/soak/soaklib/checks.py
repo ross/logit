@@ -17,9 +17,11 @@ ledger at the sink's own telemetry instead. A local run's `ledger.sent` SKIPs.
 
 A run against a Kafka target (`[target] kind = "kafka"`) has no VictoriaMetrics: the freshness
 samples and `ledger.windows` SKIP, `ledger.sent` judges the sink as for an external target, and
-V comes from the topic the driver read back (topic.py), so `ledger.egress` and `ledger.summary`
-judge Ab − V against it, a surplus WARNing as duplicates. `ledger.topic` judges the topic's
-record count against the records the sink saw accepted; it SKIPs for every other target.
+V comes from the topic's distinct records, read back by the driver and deduplicated on their
+raw bytes (topic.py), so `ledger.egress` and `ledger.summary` judge Ab − V against it, and a
+surplus FAILs as on any target. `ledger.topic` judges the topic's distinct record count against
+the records the sink saw accepted, and its duplicate copies per life against `EPOCH_BUMP_REASONS`;
+it SKIPs for every other target.
 """
 
 import bisect
@@ -730,6 +732,14 @@ REJECTED_BATCH_REASONS = ("rejected",)
 REJECTION_KEYS = ("request_rejected", "series_rejected", "oversize", "rejected",
                   "invalid_timestamp", "invalid_record")
 REFUSAL_KEYS = ("api_key_rejected", "request_refused")
+# `kafka_out`'s `records.dropped` reasons for a partition batch settled without being appended,
+# each of which bumps the producer epoch (`crates/logit-outputs/src/kafka/producer.rs`'s module
+# doc). The broker's duplicate detection doesn't span an epoch bump, so a life that counted one
+# may store a record twice (docs/known-gaps/kafka.md). `oversize` drops a record before it gets a
+# sequence, so it bumps nothing. The `MESSAGE_TOO_LARGE` split and `OUT_OF_ORDER_SEQUENCE_NUMBER`
+# bump the epoch with no drop counted, so a duplicate they cause FAILs `ledger.topic` and needs
+# reading by hand.
+EPOCH_BUMP_REASONS = ("rejected", "invalid_timestamp", "invalid_record", "ambiguous_at_most_once")
 _ANSWERED_RE = re.compile(r"answered (\d{3})")
 
 
@@ -864,12 +874,15 @@ class Ledger:
         self.series = data.vm_series
         self.V, self.V_total, self.resets, self.mismatched = vm.totals_by_life(
             self.series, self.life_starts)
-        # A Kafka target's V is the topic's increments, credited to lives by record timestamp.
+        # A Kafka target's V is the topic's distinct records' increments, credited to lives by
+        # record timestamp, with each extra copy credited the same way.
         self.records = []
         self.unparsed = 0
+        self.duplicates = {}
         if data.kafka:
-            self.records, self.unparsed = topic.parse_records(data.topic_text or "")
+            self.records, self.unparsed, copies = topic.parse_records(data.topic_text or "")
             self.V, self.V_total = topic.totals_by_life(self.records, self.life_starts)
+            self.duplicates = topic.duplicates_by_life(copies, self.life_starts)
             self.resets, self.mismatched = {}, []
 
         if self.gen is not None:
@@ -914,6 +927,16 @@ class Ledger:
 
     def get(self, symbol, life):
         return getattr(self, symbol).get(life, 0)
+
+    def epoch_bumps(self, life):
+        """`{reason: records}` for the sink's `EPOCH_BUMP_REASONS` drops in one life."""
+        bumps = {}
+        for reason in EPOCH_BUMP_REASONS:
+            value = self.sut.counter_by_life("logit.output.records.dropped", component=self.sink,
+                                             reason=reason).get(life, 0)
+            if value:
+                bumps[reason] = value
+        return bumps
 
     def D(self, life):
         return self.get("D_tel", life) + self.get("D_log", life)
@@ -963,7 +986,7 @@ class Ledger:
 
     def egress(self, life):
         """`(status, verdict, gap)` for one life's egress: `ok`, `counted`, `within band`,
-        `surplus`, `duplicates`, or `uncounted`.
+        `surplus`, or `uncounted`.
 
         The final life's gap is Ab − V. A stopped earlier life's is W − D − B − V, the residual
         plus Ab − V, because the close-time window delivers what that life read but hadn't
@@ -972,8 +995,8 @@ class Ledger:
         surplus, above it uncounted loss. Its residual is what the kill lost from the receive
         queue and inbox, by design, and is reported, not judged here.
 
-        On a Kafka target, V counts a duplicated record's increments twice, so a negative gap
-        in a life that wasn't killed is `duplicates`, a WARN: `at_least_once` permits them."""
+        On a Kafka target, V counts each distinct record once, so a negative gap in a life that
+        wasn't killed is a `surplus`, never a duplicate: increments V holds and Ab doesn't."""
         gap = self.get("Ab", life) - self.get("V", life)
         if life in self.killed and life != self.final:
             low, high, _ = self.kill_band(life)
@@ -990,7 +1013,7 @@ class Ledger:
         if gap > 0 and dropped > 0:
             return PASS, "counted", gap
         if gap < 0 and self.data.kafka:
-            return WARN, "duplicates", gap
+            return FAIL, "surplus", gap
         return FAIL, "uncounted", gap
 
 
@@ -1202,7 +1225,7 @@ def check_ledger_egress(data):
     for a stopped earlier one: 0 passes; a positive gap with that life's `drain complete`
     `batches_dropped` above 0 is counted, never reconciled; a killed life's gap passes inside
     `Ledger.kill_band`; any other gap is uncounted loss, or a surplus below a killed life's
-    band. An export with no series can't pass."""
+    band or below 0 on a Kafka target. An export with no series can't pass."""
     if data.external:
         return Result("ledger.egress", SKIP, f"{NO_BACKEND}; ledger.sent judges the sink")
     if data.kafka and data.phases.get("kafka_read") is None:
@@ -1247,8 +1270,10 @@ def check_ledger_egress(data):
         if led.unparsed:
             status = FAIL
             parts.insert(0, f"{_n(led.unparsed)} topic record(s) aren't JSON objects")
-        lines.append(f"{_n(len(led.records))} topic record(s), V {_n(led.V_total)} (the sum of "
-                     "their delta sums)")
+        copies = sum(led.duplicates.values())
+        lines.append(f"{_n(len(led.records) + copies)} topic record(s), {_n(len(led.records))} "
+                     f"distinct, {_n(copies)} duplicate copies; V {_n(led.V_total)} (the sum of "
+                     "the distinct records' delta sums)")
         return Result("ledger.egress", status, "; ".join(parts) + f" ({led.R_text})", lines)
     if not led.series:
         status = FAIL
@@ -1277,7 +1302,7 @@ def check_ledger_summary(data):
     """The final life's uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), which must
     be 0, with wire loss beside it by design. A counted egress term is shown and not judged;
     on an external target the Ab − V term SKIPs, and the row judges the other three. On a Kafka
-    target a surplus Ab − V (duplicates) is shown and not judged, as `ledger.egress` WARNs it."""
+    target V counts the topic's distinct records, so a duplicate never enters the sum."""
     led = _ledger(data)
     skipped = _skip_without_sut("ledger.summary", led)
     if skipped:
@@ -1295,7 +1320,7 @@ def check_ledger_summary(data):
         shown.append(f"Ab − V SKIP ({NO_BACKEND})")
     else:
         _, verdict, egress_gap = led.egress(life)
-        counted = verdict in ("counted", "duplicates")
+        counted = verdict == "counted"
         judged = sum(value for _, value in terms) + (0 if counted else egress_gap)
         shown.append(f"Ab − V {_n(egress_gap)}" + (f" {verdict}" if counted else ""))
     wire = ""
@@ -1684,11 +1709,16 @@ def check_ledger_sent(data):
 
 
 def check_ledger_topic(data):
-    """For a Kafka target: the topic's record count T against the records `kafka_out` saw
-    accepted, A (`logit.output.records`, summed over every SUT life). T below A FAILs, records
-    the broker acknowledged and no longer holds; T above A WARNs, records stored more than once,
-    which `at_least_once` permits (docs/known-gaps/kafka.md); a topic not read back FAILs. Every
-    other target SKIPs."""
+    """For a Kafka target: the topic's distinct record count T against the records `kafka_out`
+    saw accepted, A (`logit.output.records`, summed over every SUT life), and the topic's
+    duplicate copies per life. T below A FAILs, records the broker acknowledged and no longer
+    holds, and T above A FAILs, records the sink never saw accepted, unless the sink dropped an
+    attempt it never saw answered (an `ambiguous_at_most_once` record drop or any batch drop),
+    which may have landed: a WARN. A duplicate copy FAILs when the life
+    it's credited to has no epoch-bumping event: it isn't the final life, so no later producer id
+    resent it, and the sink counted no `EPOCH_BUMP_REASONS` drop in it. Within one epoch the
+    broker discards a resend. Duplicates after an epoch bump WARN, which docs/known-gaps/kafka.md
+    permits. A topic not read back FAILs. Every other target SKIPs."""
     if not data.kafka:
         return Result("ledger.topic", SKIP, f"{data.target.get('kind')} target: no topic")
     read = data.phases.get("kafka_read")
@@ -1701,23 +1731,55 @@ def check_ledger_topic(data):
     skipped = _skip_without_sut("ledger.topic", led)
     if skipped:
         return skipped
-    t_count = len(topic.record_lines(data.topic_text))
+    t_count = len(led.records)
+    copies = sum(led.duplicates.values())
     by_life = led.sut.counter_by_life("logit.output.records", component=led.sink)
     accepted = sum(by_life.values())
     lines = [f"topic {data.target.get('topic')!r}: end offsets {read.get('offsets')}, "
-             f"{_n(t_count)} record(s) read back",
+             f"{_n(t_count + copies)} record(s) read back, {_n(t_count)} distinct",
              "records accepted by life: " + ", ".join(
                  f"life {life} {_n(value)}" for life, value in sorted(by_life.items()))]
+    status = PASS
+    problems = []
+    for life, count in sorted(led.duplicates.items()):
+        bumps = led.epoch_bumps(life)
+        why = []
+        if life != led.final:
+            why.append("a later life resent under a new producer id")
+        why += [f"{_n(value)} record(s) dropped {reason}" for reason, value in bumps.items()]
+        if why:
+            status = worst([status, WARN])
+            problems.append(f"life {life}: {_n(count)} duplicate copies after an epoch bump "
+                            f"({'; '.join(why)}), which at_least_once permits")
+        else:
+            status = FAIL
+            problems.append(f"life {life}: {_n(count)} duplicate copies with no epoch bump: "
+                            "the broker stored a resend it should have discarded")
     gap = t_count - accepted
-    detail = (f"T {_n(t_count)} records in the topic vs A {_n(accepted)} records the sink saw "
+    detail = (f"T {_n(t_count)} distinct records in the topic ({_n(t_count + copies)} read, "
+              f"{_n(copies)} duplicate copies) vs A {_n(accepted)} records the sink saw "
               f"accepted, T − A {_n(gap)}")
     if gap < 0:
-        return Result("ledger.topic", FAIL, f"{detail}: the broker acknowledged records it no "
-                      "longer holds", lines)
-    if gap > 0:
-        return Result("ledger.topic", WARN, f"{detail}: duplicates, which at_least_once "
-                      "permits", lines)
-    return Result("ledger.topic", PASS, detail, lines)
+        status = FAIL
+        problems.insert(0, "the broker acknowledged records it no longer holds")
+    elif gap > 0:
+        unsettled = sum(led.sut.counter_by_life("logit.output.records.dropped",
+                                                component=led.sink,
+                                                reason="ambiguous_at_most_once").values())
+        batches = sum(led.sut.counter_by_life("logit.component.batches.dropped",
+                                              component=led.sink).values())
+        if unsettled or batches:
+            status = worst([status, WARN])
+            problems.insert(0, f"records the sink never saw accepted, which an attempt it "
+                               f"dropped unanswered may have landed ({_n(unsettled)} record(s) "
+                               f"dropped ambiguous_at_most_once, {_n(batches)} batch(es) "
+                               "dropped)")
+        else:
+            status = FAIL
+            problems.insert(0, "records the sink never saw accepted")
+    if problems:
+        detail += ": " + "; ".join(problems)
+    return Result("ledger.topic", status, detail, lines)
 
 
 def _step_value(series, t, default=0.0):

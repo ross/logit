@@ -1,13 +1,14 @@
 # A generated statsd stream into `logit` and out to a local Kafka broker that is restarted,
 # paused, and stopped mid-run. The ledger's V is the topic, read back after the SUT stops
 # (`[target] kind = "kafka"`, tools/soak/README.md's "Kafka targets"): `ledger.egress` judges the
-# increments the SUT absorbed against those the topic holds, and `ledger.topic` the topic's
-# record count against the records the sink saw accepted.
+# increments the SUT absorbed against those the topic's distinct records hold, and
+# `ledger.topic` the topic's distinct record count against the records the sink saw accepted,
+# and its duplicate copies per SUT life.
 #
 # `kafka_out` is idempotent by default, so a resend after an `Ambiguous` attempt carries its
 # first attempt's producer id, epoch, and sequence, and the broker discards one it already
 # appended. A broker restart keeps the producer state, so no fault here should store a record
-# twice; a duplicate would show as a surplus V and a topic count above the accepted one.
+# twice: `ledger.topic` FAILs a duplicate copy in a SUT life with no epoch bump.
 #
 # The schema is docs/plans/soak-harness.md's "The scenario schema".
 
@@ -96,8 +97,8 @@ window = "through"
 reduce = "delta"
 max = 0
 
-# The pause leaves at least one attempt `Ambiguous`, so the no-duplicate verdicts of
-# `ledger.egress` and `ledger.topic` rest on resends the broker had to deduplicate.
+# The pause leaves at least one attempt `Ambiguous`, so `ledger.topic`'s no-duplicate verdict
+# rests on resends the broker had to deduplicate.
 [[expect]]
 name = "pause-is-ambiguous"
 service = "logit"

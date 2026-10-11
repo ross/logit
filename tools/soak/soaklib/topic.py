@@ -7,11 +7,13 @@ deletes and no transactions holds one record per offset. The consumer prints one
 line, and `kafka_out`'s `format: json` writes each value as one object in
 `crates/logit-outputs/src/ndjson.rs`'s grammar, so a value with no newline in it is one line.
 
-V is the sum of every record's `sum` metric values under the scenario's `aggregate`, which must
-run `temporality: delta`: each record then carries one window's increments, and V counts what
-reached the topic with no reset logic. A duplicated record adds its increments twice, so V above
-Ab is a duplicate, not a reset. Each record is credited to the SUT life its event `timestamp`
-(the window's flush time) falls in.
+V is the sum of every distinct record's `sum` metric values under the scenario's `aggregate`,
+which must run `temporality: delta`: each record then carries one window's increments, and V
+counts what reached the topic with no reset logic. Records are deduplicated on the value's raw
+bytes before they're summed, because a resend re-encodes the same event to the same bytes, and
+two distinct windows of one series never share a timestamp. Summing the copies instead would let
+a duplicate cancel a loss of the same size in V. Each record, and each extra copy, is credited to
+the SUT life its event `timestamp` (the window's flush time) falls in.
 """
 
 import datetime
@@ -81,10 +83,13 @@ def parse_time(text):
 
 
 def parse_records(text, prefix=""):
-    """The topic read as `(records, unparsed)`: `records` is one `(epoch seconds, amount)` per
-    record value that parses as a JSON object, `amount` the sum of its `sum` metrics whose name
-    starts with `prefix`; `unparsed` counts the lines that don't."""
+    """The topic read as `(records, unparsed, duplicates)`: `records` is one `(epoch seconds,
+    amount)` per distinct record value that parses as a JSON object, `amount` the sum of its
+    `sum` metrics whose name starts with `prefix`; `unparsed` counts the lines that don't parse;
+    `duplicates` is one epoch-seconds timestamp per extra copy of a value already seen."""
     records = []
+    duplicates = []
+    seen = set()
     unparsed = 0
     for line in record_lines(text):
         try:
@@ -95,14 +100,28 @@ def parse_records(text, prefix=""):
         if not isinstance(event, dict):
             unparsed += 1
             continue
+        t = parse_time(event.get("timestamp"))
+        if line in seen:
+            duplicates.append(t)
+            continue
+        seen.add(line)
         amount = 0
         for metric in event.get("metrics") or []:
             if (isinstance(metric, dict) and metric.get("kind") == "sum"
                     and str(metric.get("name", "")).startswith(prefix)
                     and isinstance(metric.get("value"), (int, float))):
                 amount += metric["value"]
-        records.append((parse_time(event.get("timestamp")), amount))
-    return records, unparsed
+        records.append((t, amount))
+    return records, unparsed, duplicates
+
+
+def duplicates_by_life(duplicates, life_starts):
+    """`{life: extra copies}`, each copy credited as `totals_by_life` credits a record."""
+    by_life = {}
+    for t in duplicates:
+        life = 0 if t is None else vm.life_at(life_starts, t)
+        by_life[life] = by_life.get(life, 0) + 1
+    return by_life
 
 
 def totals_by_life(records, life_starts):
