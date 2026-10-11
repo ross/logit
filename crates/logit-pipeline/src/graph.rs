@@ -274,7 +274,13 @@
 //!     until `disk.max_bytes`, and so are `null_out` and an exposition-mode (`bind:`)
 //!     `prometheus_out`, whose sends never fail ([`blocking_sink_warnings`],
 //!     `docs/adr/delivery-semantics.md`).
-//! 84. A `kafka_out` with an empty `brokers` or an entry that isn't a `host:port`, a `topic` that
+//! 84. Not a rejection: an `internal` whose pipeline (every node reachable from it through
+//!     `consumers` and `targets`) shares a node with another listener's adds a non-fatal entry to
+//!     [`Graph::warnings`] naming the first shared node. Only a dedicated pipeline drains last at
+//!     shutdown, so a mixed one never exports the counts recorded during shutdown
+//!     ([`mixed_internal_pipeline_warning`],
+//!     `docs/adr/shutdown-accounting-and-cancellation-safety.md`, decision 14).
+//! 85. A `kafka_out` with an empty `brokers` or an entry that isn't a `host:port`, a `topic` that
 //!     isn't a legal Kafka topic name, a `key` naming an empty attribute, `idempotent: true`
 //!     without `acks: all`, a `max_request_bytes` of `0`, `timeout: 0s`, or a `tls` failing rule
 //!     34's checks (`docs/adr/kafka-output.md`).
@@ -639,6 +645,64 @@ pub struct Graph {
     /// the telemetry layer is active and under `logit validate`, which installs no subscriber;
     /// each caller prints or logs them.
     pub warnings: Vec<String>,
+}
+
+impl Graph {
+    /// The `internal` component's id, if the config has one (rule 13 allows at most one).
+    pub(crate) fn internal_id(&self) -> Option<&str> {
+        self.components
+            .iter()
+            .find(|(_, c)| matches!(c.kind, ComponentKind::Internal { .. }))
+            .map(|(id, _)| id.as_str())
+    }
+
+    /// `starts` and every component downstream of them, through `consumers` and through a
+    /// router's or Lua node's `targets`, which reach a target's own consumers in turn. The node
+    /// runtime's staged shutdown splits the graph by it (`run_with_options`).
+    pub(crate) fn reachable_from<'a>(
+        &'a self,
+        starts: impl IntoIterator<Item = &'a str>,
+    ) -> std::collections::HashSet<&'a str> {
+        let mut seen = std::collections::HashSet::new();
+        let mut pending: Vec<&str> = starts.into_iter().collect();
+        while let Some(id) = pending.pop() {
+            let Some((id, component)) = self.components.get_key_value(id) else { continue };
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            pending.extend(component.consumers.iter().map(String::as_str));
+            pending.extend(component.targets.iter().map(String::as_str));
+        }
+        seen
+    }
+
+    /// `internal`'s pipeline, `internal` included, when it is dedicated: no node in it is
+    /// reachable from another listener. `None` when the pipeline is mixed or there's no
+    /// `internal`. The node runtime stages shutdown only for a dedicated pipeline
+    /// (`docs/adr/shutdown-accounting-and-cancellation-safety.md`, decisions 10 to 16).
+    pub(crate) fn internal_pipeline(&self) -> Option<std::collections::HashSet<&str>> {
+        let internal = self.internal_id()?;
+        let pipeline = self.reachable_from([internal]);
+        self.internal_pipeline_shared_nodes().is_empty().then_some(pipeline)
+    }
+
+    /// The nodes of `internal`'s pipeline that another listener also reaches, sorted. Empty when
+    /// the pipeline is dedicated or there's no `internal`.
+    pub(crate) fn internal_pipeline_shared_nodes(&self) -> Vec<&str> {
+        let Some(internal) = self.internal_id() else {
+            return Vec::new();
+        };
+        let pipeline = self.reachable_from([internal]);
+        let from_others = self.reachable_from(
+            self.components
+                .iter()
+                .filter(|(id, c)| c.role() == Role::Listener && id.as_str() != internal)
+                .map(|(id, _)| id.as_str()),
+        );
+        let mut shared: Vec<&str> = pipeline.intersection(&from_others).copied().collect();
+        shared.sort_unstable();
+        shared
+    }
 }
 
 /// Non-gRPC header names `otlp_out`'s HTTP transport sets itself, or that HTTP/1.1 connection
@@ -3529,7 +3593,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 84: `kafka_out` (`docs/adr/kafka-output.md`). An idempotent producer's sequences mean
+    // Rule 85: `kafka_out` (`docs/adr/kafka-output.md`). An idempotent producer's sequences mean
     // nothing to a broker that doesn't wait for every replica, and the Java producer refuses the
     // same explicit pair. A broker entry is dialed as `host:port`, so one without both fails here
     // rather than on every attempt. A topic name outside Kafka's own rule (1 to 249 characters of
@@ -4035,7 +4099,31 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // Rule 83
     warnings.extend(blocking_sink_warnings(&resolved));
 
-    Ok(Graph { components: resolved, topological_order, warnings })
+    let mut graph = Graph { components: resolved, topological_order, warnings };
+    // Rule 84
+    if let Some(warning) = mixed_internal_pipeline_warning(&graph) {
+        graph.warnings.push(warning);
+    }
+    Ok(graph)
+}
+
+/// Rule 84: a warning naming `internal` and its first shared node when another listener reaches
+/// any node of `internal`'s pipeline. The runtime stages shutdown only for a dedicated pipeline,
+/// so a mixed one's final drain runs at the signal and misses every count recorded after it.
+fn mixed_internal_pipeline_warning(graph: &Graph) -> Option<String> {
+    let internal = graph.internal_id()?;
+    let shared = graph.internal_pipeline_shared_nodes();
+    let first = shared.first()?;
+    let others = match shared.len() - 1 {
+        0 => String::new(),
+        1 => " and 1 other node".to_owned(),
+        n => format!(" and {n} other nodes"),
+    };
+    Some(format!(
+        "internal '{internal}' shares '{first}'{others} with another listener's pipeline -- \
+         telemetry counted during shutdown won't be exported, only logged at exit; give \
+         '{internal}' its own sinks, such as a second sink to the same backend"
+    ))
 }
 
 /// Rule 83: one warning per distinct set of two or more memory-only `block` sinks that one or
@@ -4097,7 +4185,7 @@ fn blocking_sink_warnings(components: &HashMap<String, ResolvedComponent>) -> Ve
         .collect()
 }
 
-/// Rule 84's broker check: a non-empty host and a numeric port, a bracketed IPv6 host included.
+/// Rule 85's broker check: a non-empty host and a numeric port, a bracketed IPv6 host included.
 fn is_host_port(entry: &str) -> bool {
     entry.rsplit_once(':').is_some_and(|(host, port)| {
         let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -4105,7 +4193,7 @@ fn is_host_port(entry: &str) -> bool {
     })
 }
 
-/// Rule 84's topic check: Kafka's `Topic.validate`.
+/// Rule 85's topic check: Kafka's `Topic.validate`.
 fn is_kafka_topic_name(topic: &str) -> bool {
     (1..=249).contains(&topic.len())
         && topic != "."
@@ -6894,7 +6982,7 @@ mod tests {
         assert!(err.contains("'idle_timeout' must be greater than 0s"), "got: {err}");
     }
 
-    // ---- rule 84: kafka_out ----------------------------------------------------------------
+    // ---- rule 85: kafka_out ----------------------------------------------------------------
 
     /// A `kafka_out` with every optional field at its default.
     fn kafka_out() -> ComponentKind {
@@ -6939,9 +7027,9 @@ mod tests {
         kafka_out_result(kind).expect("acks: leader without idempotence, and an empty tls block");
     }
 
-    /// Rule 84, one clause per case.
+    /// Rule 85, one clause per case.
     #[test]
-    fn rule_84_rejects_each_kafka_out_misconfiguration() {
+    fn rule_85_rejects_each_kafka_out_misconfiguration() {
         use logit_config::{KafkaAcks, KafkaKey, TlsClientConfig};
         type Edit = Box<dyn FnOnce(&mut ComponentKind)>;
         let edit = |f: fn(&mut ComponentKind)| -> Edit { Box::new(f) };
@@ -8631,6 +8719,150 @@ mod tests {
         .expect("rule 50 should let a targets-only router resolve");
         assert!(graph.components["r"].consumers.is_empty(), "r has no ordinary consumers");
         assert_eq!(graph.components["r"].targets, vec!["t".to_string()]);
+    }
+
+    /// `reachable_from` follows `consumers` and a router's `targets` on to the target's own
+    /// consumers, and never walks upstream.
+    #[test]
+    fn reachable_from_follows_consumers_and_targets_downstream_only() {
+        let graph = resolve(cfg_with_targets(vec![
+            ("self", vec![], vec![], internal()),
+            ("data", vec![], vec![], listener()),
+            ("r", vec!["self"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("telemetry_out", vec!["t"], vec![], sink()),
+            ("shared_out", vec!["r", "data"], vec![], sink()),
+            ("data_out", vec!["data"], vec![], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.internal_id(), Some("self"));
+
+        let mut from_internal: Vec<&str> = graph.reachable_from(["self"]).into_iter().collect();
+        from_internal.sort_unstable();
+        assert_eq!(from_internal, vec!["r", "self", "shared_out", "t", "telemetry_out"]);
+
+        let mut from_data: Vec<&str> = graph.reachable_from(["data"]).into_iter().collect();
+        from_data.sort_unstable();
+        assert_eq!(from_data, vec!["data", "data_out", "shared_out"]);
+    }
+
+    fn sorted(set: std::collections::HashSet<&str>) -> Vec<&str> {
+        let mut ids: Vec<&str> = set.into_iter().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A pipeline no other listener reaches, through a router and its target too, is dedicated.
+    #[test]
+    fn internal_pipeline_is_dedicated_when_no_other_listener_reaches_it() {
+        let graph = resolve(cfg_with_targets(vec![
+            ("self", vec![], vec![], internal()),
+            ("data", vec![], vec![], listener()),
+            ("r", vec!["self"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("telemetry_out", vec!["t"], vec![], sink()),
+            ("self_out", vec!["r"], vec![], sink()),
+            ("data_out", vec!["data"], vec![], sink()),
+        ]))
+        .expect("should resolve");
+        let pipeline = graph.internal_pipeline().expect("dedicated");
+        assert_eq!(sorted(pipeline), vec!["r", "self", "self_out", "t", "telemetry_out"]);
+        assert!(graph.internal_pipeline_shared_nodes().is_empty());
+    }
+
+    /// A shared sink, a shared transform, or a shared sink reached only through a target each
+    /// make the pipeline mixed, and the shared nodes are named in order.
+    #[test]
+    fn internal_pipeline_is_mixed_when_another_listener_reaches_any_node_of_it() {
+        let shared_sink = resolve(cfg(vec![
+            ("self", vec![], internal()),
+            ("data", vec![], listener()),
+            ("telemetry_out", vec!["self"], sink()),
+            ("shared_out", vec!["self", "data"], sink()),
+        ]))
+        .expect("should resolve");
+        assert!(shared_sink.internal_pipeline().is_none());
+        assert_eq!(shared_sink.internal_pipeline_shared_nodes(), vec!["shared_out"]);
+
+        let shared_transform = resolve(cfg(vec![
+            ("self", vec![], internal()),
+            ("data", vec![], listener()),
+            ("windowed", vec!["self", "data"], keep(vec!["x"])),
+            ("out", vec!["windowed"], sink()),
+        ]))
+        .expect("should resolve");
+        assert!(shared_transform.internal_pipeline().is_none());
+        assert_eq!(shared_transform.internal_pipeline_shared_nodes(), vec!["out", "windowed"]);
+
+        let through_a_target = resolve(cfg_with_targets(vec![
+            ("self", vec![], vec![], internal()),
+            ("data", vec![], vec![], listener()),
+            ("r", vec!["self"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("self_out", vec!["r"], vec![], sink()),
+            ("shared_out", vec!["t", "data"], vec![], sink()),
+        ]))
+        .expect("should resolve");
+        assert!(through_a_target.internal_pipeline().is_none());
+        assert_eq!(through_a_target.internal_pipeline_shared_nodes(), vec!["shared_out"]);
+    }
+
+    fn internal_warnings(config: Config) -> Vec<String> {
+        resolve_warnings(config).into_iter().filter(|w| w.starts_with("internal ")).collect()
+    }
+
+    /// Rule 84: a mixed pipeline warns once, naming `internal` and its first shared node.
+    #[test]
+    fn a_mixed_internal_pipeline_warns_once_naming_a_shared_node() {
+        let warnings = internal_warnings(cfg(vec![
+            ("self", vec![], internal()),
+            ("data", vec![], listener()),
+            ("telemetry_out", vec!["self"], sink()),
+            ("shared_out", vec!["self", "data"], sink()),
+        ]));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("internal 'self' shares 'shared_out' with another listener's"),
+            "{warnings:?}"
+        );
+
+        let warnings = internal_warnings(cfg(vec![
+            ("self", vec![], internal()),
+            ("data", vec![], listener()),
+            ("windowed", vec!["self", "data"], keep(vec!["x"])),
+            ("out", vec!["windowed"], sink()),
+        ]));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("internal 'self' shares 'out' and 1 other node with"),
+            "{warnings:?}"
+        );
+    }
+
+    /// Rule 84: a dedicated pipeline and a config with no `internal` don't warn at all.
+    #[test]
+    fn a_dedicated_internal_pipeline_or_no_internal_does_not_warn() {
+        let dedicated = resolve_warnings(cfg(vec![
+            ("self", vec![], internal()),
+            ("data", vec![], listener()),
+            ("self_out", vec!["self"], sink()),
+            ("data_out", vec!["data"], sink()),
+        ]));
+        assert!(dedicated.is_empty(), "{dedicated:?}");
+        let none = resolve_warnings(cfg(vec![
+            ("data", vec![], listener()),
+            ("data_out", vec!["data"], sink()),
+        ]));
+        assert!(none.is_empty(), "{none:?}");
+    }
+
+    #[test]
+    fn a_graph_with_no_internal_has_no_internal_pipeline() {
+        let graph = resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], sink())]))
+            .expect("should resolve");
+        assert_eq!(graph.internal_id(), None);
+        assert!(graph.internal_pipeline().is_none());
+        assert!(graph.internal_pipeline_shared_nodes().is_empty());
     }
 
     #[test]

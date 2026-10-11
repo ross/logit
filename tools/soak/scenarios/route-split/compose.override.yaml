@@ -1,0 +1,9 @@
+# route-split's second VictoriaMetrics, for the SUT's second sink, merged onto
+# tools/soak/compose.yaml. It is the base `victoria-metrics` service under another name, so it
+# publishes its own ephemeral loopback port and the driver queries it on its own. `extends.file`
+# resolves against the project directory, the base file's, not this file's.
+services:
+  victoria-metrics-b:
+    extends: { file: compose.yaml, service: victoria-metrics }
+    profiles: [local]
+    labels: { soak.role: backend }

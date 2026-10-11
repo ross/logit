@@ -421,7 +421,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   mlua-sys 0.6.8's compat53 `luaL_traceback`, which it binds for LuaJIT, names an anonymous C
   frame by searching every global and every field of every global table.
   - **Consequence:** each failed call to a proxy metamethod (`__index`/`__newindex`),
-    `event:to`, `telemetry.*`, or `print` that a script catches with `pcall` costs time in
+    `event:to`, `telemetry.*`, `random.*`, or `print` that a script catches with `pcall` costs time in
     proportion to its global state, and an error that escapes `process()`/`flush()` pays the same
     once for its traceback. The cost is per failed call, not per loop iteration of a successful
     one, and none of these is a call a script retries until it succeeds. `Event.new` raises its

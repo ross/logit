@@ -8,7 +8,8 @@ the checks against small synthetic run directories: a failed fault action, an ab
 exit code, an fd sample inside a later fault, and a steady state too thin to judge. For the
 ledger, it covers the reset-aware VictoriaMetrics total and its split per life, at a decrease
 and at a life start with none, and a two-life run whose final life balances and whose earlier
-life's residual reaches V, each rule broken in turn: shutdown drops on stderr, a counted and an
+life's residual reaches V, each rule broken in turn: a shutdown drop telemetry and stderr both
+carry counted once, and either copy alone WARNed, a counted and an
 uncounted egress gap, an earlier life's residual that never reaches V, an empty export, wire loss
 in and out of a fault window and at the end, the sink identity, and recovery, a two-batch sink
 queue holding one batch and a one-batch queue it fills included. Empty SUT telemetry, and lives the timeline disagrees with,
@@ -20,7 +21,7 @@ failed. For a `kill`, it covers its validation rules (the SUT only), the watchdo
 (exit code 137 only inside a scheduled kill, its start, its readiness probe, and the stdout gap
 it leaves), and a three-life run whose middle life ends by a kill: its egress band at both
 edges, with and without a residual, a surplus below it and a lost last window above it, a D
-with no stderr part, the final life's sink identity counting a spool's replayed batches,
+with no shutdown part, the final life's sink identity counting a spool's replayed batches,
 `ledger.windows` against lost middle, tail, and head windows, and `ledger.replay` against a
 short replay. `ledger.wire` counts a steady run's surplus as 0, and `ledger.windows` excuses a
 gap the aggregate sent no batch in, with the flushes reported on time or one drain late,
@@ -47,6 +48,31 @@ non-2xx answer inside and outside a fault window, counted drops and encoder skip
 batch neither delivered nor dropped, and no request telemetry; the rows that read V SKIP; and a
 local run's `ledger.sent` SKIPs.
 
+For `mark` and `exit` steps, it covers every validation rule (`ready` on a `mark` only and a
+known word, `code` and `key` required on an `exit` and refused elsewhere, an `exit` on the SUT
+only, no netem inside one, neither in a `[random]` schedule) and `[ledger] sut_script`; the
+driver around an `exit` (its revert starts only an exited container, and fail-fast accepts
+`exited` only inside its window); `ready` from `health_log`'s status word (`ok` in steady
+state, a mark's word inside it, `degraded` only inside an exit step, a sample timed at its
+`Start` and counted once, and the `Health.Status` fallback); the watchdog around an expected
+exit (its code, its start, the two self-log lines it needs and the `Error: ` line after them,
+and an exit that never came); and the ledger with a script between the listener and
+`aggregate`: `ledger.script`'s identities, the egress gap without the flush events, a stopped
+life's gap judged with no allowance for the script, the wider residual band, and an earlier life
+ended by an expected exit.
+
+For service roles and several sinks, it covers compose.yaml's `soak.role` labels against
+`BASE_ROLES`, reading a role map from `docker compose config`'s JSON, every role-map rule, the
+rules that need the service list (a step or a sink on a service the stack lacks, a `kill` on a
+second backend, an `[[expect]]` on a backend), the fault predicates by role, and every
+`[[ledger.sink]]`, `split`, and `compose` rule; `prepare()` with an override and a given role
+map, with no role map and no daemon, and with a role map the scenario's services miss; a
+backend's port re-read alone after its revert, freshness per sink, and the end sequence's wait
+for every sink's total. Over two exports, under `copy` and `route`, it covers each per-sink row:
+a sink short or empty while the other balances, a surplus at one sink that can't net out loss
+at the other, the summed V under `route`, a reset on one backend only, a sink edge short of
+what was sent to it, and `identity.sink`, `recovery`, and `progress` naming the sink that broke.
+
 No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
 suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
 a slip in a part's own stand-ins included, gets rc 127 from `Docker.run`'s `OSError` instead of
@@ -56,6 +82,7 @@ running a command. A part that passes `prefix=` names its own fake and is unaffe
 import copy
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -97,10 +124,14 @@ def _base(root):
     return path, tomllib.loads(path.read_text())
 
 
-def _refused(path, raw, needle, what, seed=None, duration=None):
+def _refused(path, raw, needle, what, seed=None, duration=None, roles=None):
+    """Expects `raw` refused with a problem containing `needle`, by `load()`'s rules or by
+    `service_problems()` against `roles`, the base role map by default."""
     try:
         loaded = scenario.from_dict(raw, path)
         scenario.validate(loaded, duration=duration, seed=seed)
+        scenario.check_services(loaded, scenario.base_roles(loaded) if roles is None
+                                else roles)
     except scenario.ScenarioError as err:
         expect(any(needle in problem for problem in err.problems),
                f"{what}: expected a problem containing {needle!r}, got {err.problems}")
@@ -184,12 +215,90 @@ def _rules(root):
              "doesn't fit one whole cycle", "a duration shorter than one cycle")
     _refused(path, mutate(lambda r: r.update(durration="10m")), "unknown top-level key",
              "a misspelled key")
-    _refused(path, mutate(lambda r: r["ledger"].pop("vm_selector")),
-             "ledger: missing `vm_selector`", "a missing ledger key")
+    _refused(path, mutate(lambda r: r["ledger"].pop("sut_listener")),
+             "ledger: missing `sut_listener`", "a missing ledger key")
     _refused(path, copy.deepcopy(base), "--seed applies to a [random] schedule only",
              "--seed on a fixed schedule", seed=7)
     _refused(path, copy.deepcopy(base), "leaves no time", "a duration inside warmup+cooldown",
              duration=150)
+
+
+MARK = {"at": "11m10s", "action": "mark", "on": "logit", "for": "60s", "ready": "stalled"}
+EXIT = {"at": "11m10s", "action": "exit", "on": "logit", "for": "60s", "code": 2,
+        "key": "memory_limit_exceeded"}
+
+
+def _expected_event_rules(root):
+    """`mark` and `exit` steps, their fields, and `[ledger] sut_script`."""
+    path, base = _base(root)
+
+    def with_step(**fields):
+        raw = copy.deepcopy(base)
+        raw["step"].append({k: v for k, v in fields.items() if v is not None})
+        return raw
+
+    for fields, what in ((MARK, "a mark with a ready word"),
+                         ({**MARK, "ready": None}, "a mark with no ready word"),
+                         ({**MARK, "on": "victoria-metrics", "ready": None},
+                          "a mark on another service"),
+                         (EXIT, "an exit with a code and a key")):
+        try:
+            loaded = scenario.from_dict(with_step(**fields), path)
+            step = next(s for s in scenario.expand(loaded) if s.action == fields["action"])
+            expect(step.to_json().get("ready") == fields.get("ready")
+                   and step.to_json().get("code") == fields.get("code"),
+                   f"{what}: the expanded step carries its fields, got {step.to_json()}")
+        except scenario.ScenarioError as err:
+            expect(False, f"{what} is refused: {err.problems}")
+    expect(faults.ACTIONS["mark"].affects_udp_ingress(scenario.Step(
+        "c0s8", 7, 0, "mark", "logit", "", 0, 1), scenario.BASE_ROLES),
+        "a mark on the SUT is UDP-affecting")
+    expect(not faults.ACTIONS["mark"].affects_udp_ingress(scenario.Step(
+        "c0s8", 7, 0, "mark", "victoria-metrics", "", 0, 1), scenario.BASE_ROLES),
+        "a mark on VictoriaMetrics isn't UDP-affecting")
+    expect("exit" in faults.STARTS_ON_REVERT and "exit" not in faults.EXIT_CODES,
+           "an exit's revert is a start, and its code comes from the step")
+
+    cases = [
+        ({**MARK, "ready": "ok"}, "`ready` must be one of", "a mark expecting ok"),
+        ({**MARK, "ready": "wedged"}, "`ready` must be one of", "an unknown ready word"),
+        ({**MARK, "action": "pause", "on": "generator"}, "`ready` is for mark only",
+         "ready on a pause"),
+        ({**MARK, "code": 2}, "`code` is for exit only", "code on a mark"),
+        ({**MARK, "key": "x"}, "`key` is for exit only", "key on a mark"),
+        ({**EXIT, "code": None}, "exit needs `code`", "an exit without code"),
+        ({**EXIT, "key": None}, "exit needs `key`", "an exit without key"),
+        ({**EXIT, "code": 256}, "`code` must be an integer from 0 to 255", "a code over 255"),
+        ({**EXIT, "code": "2"}, "`code` must be an integer", "a string code"),
+        ({**EXIT, "code": True}, "`code` must be an integer", "a boolean code"),
+        ({**EXIT, "key": ""}, "`key` must be a self-log key", "an empty key"),
+        ({**EXIT, "on": "generator"}, "exit is for logit only", "an exit on the generator"),
+        ({**EXIT, "ready": "degraded"}, "`ready` is for mark only", "ready on an exit"),
+    ]
+    for fields, needle, what in cases:
+        _refused(path, with_step(**fields), needle, what)
+    netem_in_exit = with_step(**EXIT)
+    netem_in_exit["step"].append({"at": "11m20s", "action": "netem", "on": "logit",
+                                  "args": "delay 10ms", "for": "5s"})
+    _refused(path, netem_in_exit, "netem on logit during its exit", "netem during an exit")
+    _refused(path, with_step(**{**MARK, "at": "10m50s"}), "two faults overlap on logit",
+             "a mark overlapping a fault on its container")
+    script = copy.deepcopy(base)
+    script["ledger"]["sut_script"] = ""
+    _refused(path, script, "ledger.sut_script must name", "an empty sut_script")
+    script["ledger"]["sut_script"] = "enrich"
+    try:
+        expect(scenario.from_dict(script, path).ledger["sut_script"] == "enrich",
+               "a sut_script loads")
+    except scenario.ScenarioError as err:
+        expect(False, f"a sut_script is refused: {err.problems}")
+
+    raw = tomllib.loads((root / "scenarios" / "random-faults" / "scenario.toml").read_text())
+    for action in ("mark", "exit"):
+        changed = copy.deepcopy(raw)
+        changed["random"]["fault"][0].update(action=action, on="logit", args=[])
+        _refused(root / "scenarios" / "random-faults" / "scenario.toml", changed,
+                 "write it as a [[step]]", f"`{action}` in a [random] schedule")
 
 
 VALID_EXPECT = {"name": "buffer-climbs", "service": "logit",
@@ -464,8 +573,6 @@ def _random(root):
          "a first fault too soon after warmup"),
         ([step(1, "pause", "logit", 30, 200)], "starts inside warmup", "a fault in warmup"),
         ([step(1, "pause", "logit", 3000, 3550)], "ends inside cooldown", "a fault in cooldown"),
-        ([step(1, "kill", "generator", 300, 330)], "kill is for logit only",
-         "a kill on the generator"),
     ):
         problems = scenario._schedule_problems(loaded, steps, 3600)
         expect(any(needle in problem for problem in problems),
@@ -732,7 +839,8 @@ def _slope():
 
 T0 = telemetry.parse_rfc3339("2026-10-08T12:00:00Z")
 RESOLVED = {"name": "fixture", "duration": 600.0, "warmup": 60.0, "cooldown": 120.0,
-            "recovery_bound": 45.0, "ledger": {"sut_sink": "sink"},
+            "recovery_bound": 45.0, "ledger": {"sink": [{"id": "sink"}], "split": "copy"},
+            "services": dict(scenario.BASE_ROLES),
             "thresholds": {"progress_window": 30.0, "fd_growth": 8,
                            "rss_growth_mib_per_hour": 64}}
 
@@ -907,9 +1015,10 @@ def _vm_resets():
            f"V credits each segment to its own life, got {by_life} {total} {mismatched}")
 
 
-LEDGER = {"vm_selector": "{__name__=~\"x_[0-9]+_total\"}", "generator_input": "load",
-          "generator_sink": "out", "sut_listener": "in", "sut_aggregate": "window",
-          "sut_sink": "sink", "wire_loss_outside_faults": 0.0}
+LEDGER = {"generator_input": "load", "generator_sink": "out", "sut_listener": "in",
+          "sut_aggregate": "window", "wire_loss_outside_faults": 0.0, "split": "copy",
+          "sink": [{"id": "sink", "backend": "victoria-metrics",
+                    "vm_selector": "{__name__=~\"x_[0-9]+_total\"}"}]}
 # The fixture's SUT stop: applied at +101, reverted by +131, so life 1 starts at +131.
 STOP = (101, 131)
 PER_DRAIN = 1000
@@ -921,12 +1030,24 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 undelivered=0, empty_export=False, ab0_short=0, merged_lives=False,
                 empty_sut=False, buffer_batches=0, buffer_util=0.0, steady_surplus=0,
                 external=False, sut_extra=(), stderr_extra=(), timeline_extra=(),
+                script=None, l_in_short=0, l_err_unreported=0, l_sent_short=0,
+                sut_end="stop", shutdown_in=("telemetry", "stderr"), dropped_at="sink",
                 **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
     rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
-    them dropped on stderr over two of the listener's shutdown lines, and `v0_extra` reaching
-    VictoriaMetrics after its last drain, and life 1 balances."""
+    them dropped at shutdown, and `v0_extra` reaching VictoriaMetrics after its last drain, and
+    life 1 balances. `shutdown_in` names where the shutdown drops, of datagrams and of
+    `life0_dropped`/`life1_dropped` batches, are written: telemetry, as a dedicated `internal`
+    pipeline exports them, and stderr, as the listener's `warn` lines and `drain complete`.
+    `dropped_at` names the component whose telemetry carries those batches.
+
+    `script` puts a `lua` component, `lua`, between the listener and `window`: a dict of the
+    events it drops (`drop`), fails on (`err`), and returns from `flush()` (`flush`) per drain,
+    each flush event one metric `window` absorbs and V excludes. `l_in_short`,
+    `l_err_unreported`, and `l_sent_short` break its hop in life 1's drain at +200. `sut_end`
+    `"exit"` ends life 0 with an `exit` step (code 2) in place of the stop, its revert starting
+    the SUT."""
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -969,12 +1090,32 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             w += life0_extra
         if life == 1 and offset == 200:
             e -= e1_short
-        a = e - (a1_short if life == 1 and offset == 210 else 0)
+        flush = 0
+        if script is not None:
+            l_in = e - (l_in_short if life == 1 and offset == 200 else 0)
+            drop, err, flush = script["drop"], script["err"], script["flush"]
+            emit = l_in - drop - err
+            l_sent = emit + flush - (l_sent_short if life == 1 and offset == 200 else 0)
+            for metric, value, attrs in (
+                    ("logit.component.events.received", l_in, None),
+                    ("logit.script.events.emitted", emit, {"outcome": "emit"}),
+                    ("logit.component.events.dropped", drop, {"reason": "script_drop"}),
+                    ("logit.component.errors", err
+                     - (l_err_unreported if life == 1 and offset == 200 else 0),
+                     {"reason": "process"}),
+                    ("logit.component.flush.events", flush, None),
+                    ("logit.component.events.sent", l_sent, None)):
+                sut.append(_line(stamp, metric, "sum", value, component="lua", attrs=attrs))
+            e_into_window = l_sent
+        else:
+            e_into_window = e
+        a = e_into_window - (a1_short if life == 1 and offset == 210 else 0)
         ab = a - (ab1_short if life == 1 and offset == 220 else 0)
         if life == 0:
             ab -= ab0_short
         totals[life]["W"] += w
-        totals[life]["E"] += ab
+        # What V holds: every increment `window` absorbed but the script's flush events.
+        totals[life]["E"] += ab - flush
         for metric, value, comp in (("logit.input.datagrams", w, "in"),
                                     ("logit.component.events.sent", e, "in"),
                                     ("logit.component.events.received", a, "window"),
@@ -991,19 +1132,33 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
         sut.append(_line(stamp, "logit.component.receive.utilization", "gauge",
                          receive_util if life == 1 else 0.0, component="in"))
         sut.append(_line(stamp, "logit.component.retrying", "gauge", 0, component="sink"))
+        # The final drain of each life carries its shutdown drops.
+        if "telemetry" in shutdown_in and offset == (last0 if life == 0 else drains[-1][0]):
+            if life == 0 and shutdown_drops:
+                sut.append(_line(stamp, "logit.component.datagrams.dropped", "sum",
+                                 shutdown_drops, component="in", attrs={"reason": "shutdown"}))
+            batches = life0_dropped if life == 0 else life1_dropped
+            if batches:
+                sut.append(_line(stamp, "logit.component.batches.dropped", "sum", batches,
+                                 component=dropped_at, attrs={"reason": "shutdown"}))
 
+    end_fields = {"code": 2, "key": "memory_limit_exceeded"} if sut_end == "exit" else {}
     timeline = [_phase("start", 0, t0=T0),
-                _action("apply", "c0s1", "stop", "logit", STOP[0], affects_udp_ingress=True),
-                _action("revert", "c0s1", "stop", "logit", STOP[1] - 1, STOP[1],
-                        affects_udp_ingress=True),
+                _action("apply", "c0s1", sut_end, "logit", STOP[0], affects_udp_ingress=True,
+                        **end_fields),
+                _action("revert", "c0s1", sut_end, "logit", STOP[1] - 1, STOP[1],
+                        affects_udp_ingress=True, **end_fields,
+                        **({"started": True} if sut_end == "exit" else {})),
                 _ready("c0s1", "logit", STOP[1] + 1),
                 _phase("end_begin", 300), _phase("end_end", 330)] + list(timeline_extra)
     if external:
         resolved.setdefault("target", {"kind": "external", "name": "datadog",
                                        "env": ["DD_API_KEY"]})
-        ledger = {k: v for k, v in LEDGER.items() if k != "vm_selector"}
+        ledger = {**LEDGER, "sink": [{"id": "sink"}]}
     else:
-        ledger = LEDGER
+        ledger = dict(LEDGER)
+    if script is not None:
+        ledger["sut_script"] = "lua"
     run_dir = _run_dir(tmp, name, timeline, list(sut) + list(sut_extra), ledger=ledger,
                        **resolved)
     if empty_sut:
@@ -1015,7 +1170,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                            "message": message, "target": "logit", **fields})
 
     stderr = [log(0, "INFO", "ready")]
-    if shutdown_drops:
+    if shutdown_drops and "stderr" in shutdown_in:
         undecoded = shutdown_drops // 4
         stderr.append(log(STOP[0] + 0.5, "WARN", f"{shutdown_drops - undecoded} datagram(s) "
                           "still in the receive queue when this listener was stopped at its "
@@ -1024,7 +1179,7 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                           "receive queue but not decoded when this listener was stopped at its "
                           "shutdown grace", component="in"))
     for offset, dropped in ((STOP[0] + 0.6, life0_dropped), (321, life1_dropped)):
-        if dropped:
+        if dropped and "stderr" in shutdown_in:
             stderr.append(log(offset, "WARN", "drain complete", duration="1s",
                               batches_dropped=dropped))
         else:
@@ -1053,8 +1208,643 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
     if external:
         # Nothing queries an external target, so the driver writes no export.
         export = []
-    (run_dir / "vm-export.jsonl").write_text("".join(json.dumps(s) + "\n" for s in export))
+    _write_export(run_dir, "sink", export)
     return run_dir
+
+
+def _write_export(run_dir, sink, series):
+    """Writes one sink's export where the driver does: `vm-export/<sink>.jsonl`."""
+    (run_dir / "vm-export").mkdir(exist_ok=True)
+    (run_dir / "vm-export" / f"{sink}.jsonl").write_text(
+        "".join(json.dumps(one) + "\n" for one in series))
+
+
+# Two sinks, each to its own backend; under `route` each fed by its own target.
+TWO_SINKS = (("vm_a", "victoria-metrics", "tier_a"), ("vm_b", "victoria-metrics-b", "tier_b"))
+# What the multi-sink fixture's `window` sends per drain: 10 events, under `route` 5 to each target.
+AGGREGATE_SENT = 10
+
+
+def _sinks_run(tmp, name, split="copy", edit=None, export_edit=None, **kwargs):
+    """`_ledger_run`'s two-life run directory, rewritten for two sinks (`TWO_SINKS`): each line
+    the fixture's one sink wrote is written once per sink, `window` sends `AGGREGATE_SENT` events
+    per drain that each sink receives under `copy` and half of which each target sends and its
+    sink receives under `route`, and the export goes to each sink whole under `copy` and split
+    by series under `route` (`x_0_total` to `vm_a`, `x_1_total` to `vm_b`).
+
+    `edit(sink, record)` may change or drop (return None) each per-sink telemetry record, and
+    `export_edit(sink, series)` each sink's export."""
+    run_dir = _ledger_run(tmp, name, **kwargs)
+    sinks = [one for one, _, _ in TWO_SINKS]
+    out = []
+    for line in (run_dir / "logs" / "logit.stdout").read_text().splitlines():
+        record = json.loads(line)
+        attributes = record["attributes"]
+        if attributes["component"] != "sink":
+            out.append(line)
+            if record["metrics"][0]["name"] == "logit.process.uptime":
+                stamp = record["timestamp"]
+                out.append(_line(stamp, "logit.component.events.sent", "sum", AGGREGATE_SENT,
+                                 component="window"))
+                for sink, _, target in TWO_SINKS:
+                    share = AGGREGATE_SENT if split == "copy" else AGGREGATE_SENT // 2
+                    received = json.loads(_line(stamp, "logit.component.events.received", "sum",
+                                                share, component=sink))
+                    received = edit(sink, received) if edit else received
+                    if received is not None:
+                        out.append(json.dumps(received))
+                    if split == "route":
+                        out.append(_line(stamp, "logit.component.events.sent", "sum", share,
+                                         component=target))
+            continue
+        for sink in sinks:
+            copied = json.loads(line)
+            copied["attributes"]["component"] = sink
+            copied = edit(sink, copied) if edit else copied
+            if copied is not None:
+                out.append(json.dumps(copied))
+    (run_dir / "logs" / "logit.stdout").write_text("\n".join(out) + "\n")
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    resolved["services"] = {**scenario.BASE_ROLES, "victoria-metrics-b": "backend"}
+    selector = resolved["ledger"]["sink"][0].get("vm_selector")
+    resolved["ledger"]["split"] = split
+    resolved["ledger"]["sink"] = [
+        {"id": sink, "backend": backend, "vm_selector": selector,
+         **({"target": target} if split == "route" else {})}
+        for sink, backend, target in TWO_SINKS]
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    series = vm.parse_export((run_dir / "vm-export" / "sink.jsonl").read_text())
+    (run_dir / "vm-export" / "sink.jsonl").unlink()
+    for index, sink in enumerate(sinks):
+        mine = (copy.deepcopy(series) if split == "copy" else
+                [copy.deepcopy(one) for one in series
+                 if one["metric"]["__name__"] == f"x_{index}_total"])
+        _write_export(run_dir, sink, export_edit(sink, mine) if export_edit else mine)
+    return run_dir
+
+
+def _sink_ledger():
+    """The ledger with two sinks: under `copy` each sink's V judged alone against Ab, under
+    `route` their sum, and every per-sink row (`progress`, `identity.sink`, `recovery`,
+    `ledger.edge`, `ledger.egress`, `ledger.windows`) reporting one line per sink with the worst
+    status winning."""
+    rows = ("ledger.edge", "ledger.egress", "ledger.summary", "identity.sink", "recovery",
+            "progress")
+
+    def short_final(target, by):
+        """An `export_edit` taking `by` off `target`'s last value of each series."""
+        def edit(sink, series):
+            if sink == target:
+                for one in series:
+                    one["values"][-1] -= by
+            return series
+        return edit
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            return {r.id: r for r in checks.run_all(_sinks_run(tmp, name, **kwargs))}
+
+        for split in ("copy", "route"):
+            clean = results(f"sinks-{split}", split=split)
+            for row in rows:
+                expect(clean[row].status == checks.PASS,
+                       f"{row} PASSes the balanced two-sink {split} fixture, got {clean[row]}")
+            for sink, _, _ in TWO_SINKS:
+                for row in ("identity.sink", "recovery", "progress", "ledger.edge"):
+                    expect(sink in clean[row].detail or sink in " ".join(clean[row].lines),
+                           f"{row} reports {sink} under {split}, got {clean[row]}")
+        copied = results("sinks-copy-detail")
+        egress = copied["ledger.egress"].detail
+        expect("vm_a: life 0" in egress and "vm_b: life 0" in egress
+               and "V[vm_a]" in egress and "V[vm_b]" in egress and "split copy" in egress,
+               f"egress under copy judges each sink alone, got {egress}")
+        routed = results("sinks-route-detail", split="route")
+        egress = routed["ledger.egress"].detail
+        expect("vm_a + vm_b: life 0" in egress and "ΣV" in egress and "split route" in egress,
+               f"egress under route judges the summed V, got {egress}")
+        expect("T_sent[tier_a]" in routed["ledger.edge"].detail
+               and "S_in[vm_b]" in routed["ledger.edge"].detail,
+               f"edge under route judges each target against its sink, got "
+               f"{routed['ledger.edge']}")
+
+        # One sink short in the final life: under copy only that sink's line FAILs.
+        lost = results("sinks-copy-lost", export_edit=short_final("vm_b", 20))
+        egress = lost["ledger.egress"].detail
+        expect(lost["ledger.egress"].status == checks.FAIL
+               and "vm_b: " in egress and "V[vm_b] " in egress
+               and egress.split(" | ")[0].endswith("ok")
+               and "uncounted" in egress.split(" | ")[1],
+               f"copy FAILs the short sink alone, got {egress}")
+        expect(lost["ledger.summary"].status == checks.FAIL
+               and "Ab − V[vm_b] 40" in lost["ledger.summary"].detail,
+               f"the summary FAILs the short sink's term, got {lost['ledger.summary']}")
+        # A surplus at one sink and a matching loss at the other can't net out in the summary.
+        def opposite(sink, series):
+            for one in series:
+                one["values"][-1] += 20 if sink == "vm_a" else -20
+            return series
+        netted = results("sinks-copy-netted", export_edit=opposite)
+        expect(netted["ledger.summary"].status == checks.FAIL,
+               f"the summary FAILs opposite gaps at two sinks, got {netted['ledger.summary']}")
+        # 100 increments moved from each of vm_b's series to each of vm_a's: under route,
+        # where each sink holds one series, the sum still balances; under copy, where each
+        # sink holds both, each sink is 200 off.
+        def moved(sink, series):
+            for one in series:
+                one["values"][-1] += 100 if sink == "vm_a" else -100
+            return series
+        routed_moved = results("sinks-route-moved", split="route", export_edit=moved)
+        expect(routed_moved["ledger.egress"].status == checks.PASS,
+               f"route's summed V balances a total moved between sinks, got "
+               f"{routed_moved['ledger.egress']}")
+        copied_moved = results("sinks-copy-moved", export_edit=moved)
+        expect(copied_moved["ledger.egress"].status == checks.FAIL
+               and "V[vm_a] 34,200 = -200, uncounted" in copied_moved["ledger.egress"].detail
+               and "V[vm_b] 33,800 = 200, uncounted" in copied_moved["ledger.egress"].detail,
+               f"copy FAILs the same move at each sink, got {copied_moved['ledger.egress']}")
+
+        # A shutdown drop counts a gap only at a node that can explain it: under copy, every
+        # node's but the other sinks'; under route, every node's.
+        elsewhere = results("sinks-copy-dropped-elsewhere", life1_dropped=1, dropped_at="vm_a",
+                            export_edit=short_final("vm_b", 20))
+        egress = elsewhere["ledger.egress"].detail
+        expect(elsewhere["ledger.egress"].status == checks.FAIL
+               and "V[vm_b] 33,960 = 40, uncounted (batches dropped for shutdown 0, not "
+               "counting 1 at the other sinks)" in egress
+               and elsewhere["ledger.summary"].status == checks.FAIL,
+               f"under copy another sink's shutdown drop doesn't count vm_b's gap, got "
+               f"{elsewhere['ledger.egress']} / {elsewhere['ledger.summary']}")
+        attributed = results("sinks-copy-attributed", life1_dropped=1, dropped_at="vm_b",
+                             export_edit=short_final("vm_b", 20))
+        expect(attributed["ledger.egress"].status == checks.PASS
+               and "V[vm_b] 33,960 = 40, counted (batches dropped for shutdown 1)"
+               in attributed["ledger.egress"].detail
+               and attributed["ledger.summary"].status == checks.PASS,
+               f"under copy a sink's own shutdown drop counts its gap, got "
+               f"{attributed['ledger.egress']} / {attributed['ledger.summary']}")
+        def short_both(sink, series):
+            for one in series:
+                one["values"][-1] -= 20
+            return series
+        upstream = results("sinks-copy-upstream", life1_dropped=1, dropped_at="window",
+                           export_edit=short_both)
+        egress = upstream["ledger.egress"].detail
+        expect(upstream["ledger.egress"].status == checks.PASS
+               and "V[vm_a] 33,960 = 40, counted (batches dropped for shutdown 1)" in egress
+               and "V[vm_b] 33,960 = 40, counted (batches dropped for shutdown 1)" in egress
+               and upstream["ledger.summary"].status == checks.PASS,
+               f"under copy a shutdown drop upstream of the fan-out counts every sink's gap, got "
+               f"{upstream['ledger.egress']} / {upstream['ledger.summary']}")
+        for dropper, short in (("vm_a", "vm_b"), ("vm_b", "vm_a")):
+            routed_drop = results(f"sinks-route-counted-{dropper}", split="route",
+                                  life1_dropped=1, dropped_at=dropper,
+                                  export_edit=short_final(short, 20))
+            expect(routed_drop["ledger.egress"].status == checks.PASS
+                   and "= 20, counted (batches dropped for shutdown 1)"
+                   in routed_drop["ledger.egress"].detail
+                   and routed_drop["ledger.summary"].status == checks.PASS,
+                   f"under route {dropper}'s shutdown drop counts the summed gap, got "
+                   f"{routed_drop['ledger.egress']} / {routed_drop['ledger.summary']}")
+        half = results("sinks-copy-half", split="copy",
+                       export_edit=lambda sink, series: [one for one in series
+                                                        if sink == "vm_a"
+                                                        or one["metric"]["__name__"] == "x_0_total"])
+        expect(half["ledger.egress"].status == checks.FAIL
+               and half["ledger.egress"].detail.split(" | ")[0].endswith("ok"),
+               f"copy FAILs a sink holding half the series, got {half['ledger.egress']}")
+        route_lost = results("sinks-route-lost", split="route",
+                             export_edit=short_final("vm_a", 20))
+        expect(route_lost["ledger.egress"].status == checks.FAIL
+               and "vm_a + vm_b: " in route_lost["ledger.egress"].detail
+               and "uncounted" in route_lost["ledger.egress"].detail,
+               f"route FAILs a summed V short at one sink, got {route_lost['ledger.egress']}")
+        empty = results("sinks-copy-empty",
+                        export_edit=lambda sink, series: [] if sink == "vm_b" else series)
+        expect(empty["ledger.egress"].status == checks.FAIL
+               and "no series in vm-export/vm_b.jsonl" in empty["ledger.egress"].detail
+               and "vm-export/vm_a.jsonl" not in empty["ledger.egress"].detail,
+               f"egress FAILs the sink whose export is empty, by name, got {empty['ledger.egress']}")
+
+        # A reset on one backend only: vm_b's series fall back inside the final life, so its
+        # resets aren't lives − 1, and egress WARNs naming vm_b and not vm_a.
+        def reset_b(sink, series):
+            if sink == "vm_b":
+                for one in series:
+                    one["values"] = one["values"][:3] + [1, one["values"][3]]
+                    one["timestamps"] = (one["timestamps"][:3] + [one["timestamps"][3] - 1000]
+                                         + one["timestamps"][3:])
+            return series
+        reset = results("sinks-copy-reset-b", export_edit=reset_b)
+        lines = " ".join(reset["ledger.egress"].lines)
+        expect(reset["ledger.egress"].status in (checks.WARN, checks.FAIL)
+               and "vm_b: 2 series with resets other than 1" in lines
+               and "vm_a: 2 series with resets" not in lines,
+               f"egress names the one backend whose series reset, got {reset['ledger.egress']}")
+
+        # Per-sink rows: the worst sink's status wins, and the line names it.
+        def undelivered_b(sink, record):
+            metric = record["metrics"][0]
+            if (sink == "vm_b" and metric["name"] == "logit.component.batches.delivered"
+                    and record["timestamp"] in (_stamp(T0 + 200), _stamp(T0 + 205))):
+                metric["value"] = 0
+            return record
+        stuck = results("sinks-identity-b", edit=undelivered_b)
+        expect(stuck["identity.sink"].status == checks.FAIL
+               and "vm_b: received" in stuck["identity.sink"].detail
+               and "gap 2" in stuck["identity.sink"].detail
+               and "gap 0" in stuck["identity.sink"].detail,
+               f"identity.sink FAILs the sink that lost batches, by name, got "
+               f"{stuck['identity.sink']}")
+
+        def busy_b(sink, record):
+            metric = record["metrics"][0]
+            if sink == "vm_b" and metric["name"] == "logit.component.buffer.utilization":
+                metric["value"] = 0.5
+            if sink == "vm_b" and metric["name"] == "logit.component.buffer.batches":
+                metric["value"] = 2
+            return record
+        busy = results("sinks-recovery-b", edit=busy_b)
+        lines = busy["recovery"].lines
+        expect(busy["recovery"].status == checks.FAIL
+               and any("vm_b not recovered" in line for line in lines)
+               and any("vm_a recovered" in line for line in lines),
+               f"recovery judges each sink, got {busy['recovery']}")
+
+        def silent_b(sink, record):
+            metric = record["metrics"][0]
+            if (sink == "vm_b" and metric["name"] == "logit.component.batches.delivered"
+                    and record["timestamp"] >= _stamp(T0 + 240)):
+                return None
+            return record
+        silent = results("sinks-progress-b", edit=silent_b)
+        expect(silent["progress"].status == checks.FAIL
+               and "no vm_b deliveries" in silent["progress"].detail,
+               f"progress FAILs the sink with no deliveries, by name, got {silent['progress']}")
+
+        def short_receipt(sink, record):
+            metric = record["metrics"][0]
+            if (sink == "vm_b" and metric["name"] == "logit.component.events.received"
+                    and record["timestamp"] == _stamp(T0 + 250)):
+                metric["value"] -= 3
+            return record
+        for split, needle in (("copy", "A_sent 380 != S_in[vm_b] 377"),
+                              ("route", "T_sent[tier_b] 190 != S_in[vm_b] 187")):
+            edge = results(f"sinks-edge-{split}", split=split, edit=short_receipt)["ledger.edge"]
+            expect(edge.status == checks.FAIL and needle in edge.detail,
+                   f"edge FAILs a sink receiving less than was sent to it under {split}, got "
+                   f"{edge}")
+
+
+def _declared_roles(text):
+    """`{service: role}` from a compose file's text: each service under `services:` at two
+    spaces, and the `soak.role` label in its block. For the shipped files only, which label each
+    service inline; the driver reads `docker compose config` instead."""
+    roles = {}
+    current = None
+    inside = False
+    for line in text.splitlines():
+        if line.startswith("services:"):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if line and not line.startswith(" "):
+            break
+        header = re.match(r"^  ([A-Za-z0-9_.-]+):\s*$", line)
+        if header:
+            current = header.group(1)
+            roles[current] = None
+            continue
+        label = re.search(r"soak\.role:\s*([a-z]+)", line)
+        if label and current is not None:
+            roles[current] = label.group(1)
+    return roles
+
+
+def _override_roles(loaded):
+    """The role map the driver would resolve for a shipped scenario: `base_roles()` with each
+    service its override labels."""
+    roles = scenario.base_roles(loaded)
+    if loaded.compose is not None:
+        roles.update(_declared_roles(loaded.compose_path().read_text()))
+    return roles
+
+
+def _roles(root):
+    """Service roles: compose.yaml's labels are `BASE_ROLES`; the role map's own rules; reading
+    `docker compose config`'s JSON; the rules that need the service list, against the base map
+    and an override's; and the fault predicates, which judge a service by its role."""
+    base = (root / "compose.yaml").read_text()
+    expect(_declared_roles(base) == scenario.BASE_ROLES,
+           f"compose.yaml labels each service as BASE_ROLES says, got {_declared_roles(base)}")
+    config = json.dumps({"name": "p", "services": {
+        "logit": {"labels": {"soak.role": "sut"}, "image": "x"},
+        "generator": {"labels": {"soak.role": "generator"}},
+        "victoria-metrics": {"labels": {"soak.role": "backend"}},
+        "victoria-metrics-b": {"labels": {"soak.role": "backend", "other": "1"}},
+        "nginx": {"image": "nginx"}}})
+    roles = scenario.roles_from_config(config)
+    expect(roles == {"logit": "sut", "generator": "generator", "victoria-metrics": "backend",
+                     "victoria-metrics-b": "backend", "nginx": None},
+           f"roles_from_config reads each service's soak.role label, got {roles}")
+    for junk in ("", "{}", "not json"):
+        try:
+            scenario.roles_from_config(junk)
+            expect(False, f"roles_from_config accepted {junk!r}")
+        except ValueError:
+            expect(True, "")
+    for bad, needle, what in (
+            ({**scenario.BASE_ROLES, "nginx": None}, "compose service nginx: label soak.role",
+             "an unlabeled service"),
+            ({**scenario.BASE_ROLES, "x": "sink"}, "must be one of sut, generator, backend",
+             "an unknown role"),
+            ({**scenario.BASE_ROLES, "logit-2": "sut"}, "one sut service, logit, and has logit, "
+             "logit-2", "two SUTs"),
+            ({"sut": "sut", "generator": "generator"}, "one sut service, logit, and has sut",
+             "a SUT under another name"),
+            ({"logit": "sut"}, "one generator service, generator, and has none",
+             "no generator")):
+        problems = scenario.role_problems(bad)
+        expect(any(needle in problem for problem in problems),
+               f"{what}: expected {needle!r}, got {problems}")
+    expect(scenario.role_problems(scenario.BASE_ROLES) == [], "BASE_ROLES breaks no role rule")
+
+    path, raw = _base(root)
+    copy_path = root / "scenarios" / "fanout-copy" / "scenario.toml"
+    two = scenario.load(copy_path)
+    with_b = _override_roles(two)
+    expect(with_b == {**scenario.BASE_ROLES, "victoria-metrics-b": "backend"},
+           f"fanout-copy's override adds a second backend, got {with_b}")
+    expect(scenario.service_problems(two, with_b) == [],
+           f"fanout-copy's steps and sinks hold with its override's roles, got "
+           f"{scenario.service_problems(two, with_b)}")
+    problems = scenario.service_problems(two, scenario.BASE_ROLES)
+    expect(any("unknown service `victoria-metrics-b`" in p for p in problems)
+           and any("backend `victoria-metrics-b` isn't a backend service" in p for p in problems),
+           f"without the override, a step and a sink on victoria-metrics-b are refused, got "
+           f"{problems}")
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    _refused(path, mutate(lambda r: r["ledger"]["sink"][0].update(backend="logit")),
+             "backend `logit` isn't a backend service", "a sink whose backend is the SUT")
+    _refused(path, mutate(lambda r: r["ledger"]["sink"][0].update(backend="vm")),
+             "backend `vm` isn't a backend service; the stack's are victoria-metrics",
+             "a sink whose backend isn't in the stack")
+    _refused(path, mutate(lambda r: r.update(expect=[{
+        "name": "x", "service": "victoria-metrics", "metric": "m", "step": 1,
+        "window": "during", "reduce": "delta", "min": 1}])),
+             "unknown service `victoria-metrics`; telemetry comes from generator or logit",
+             "an expectation on a backend")
+    _refused(path, mutate(lambda r: r["step"].append(
+        {"at": "11m10s", "action": "kill", "on": "victoria-metrics-b", "for": "20s"})),
+             "kill is for logit only", "a kill on a second backend",
+             roles={**scenario.BASE_ROLES, "victoria-metrics-b": "backend"})
+    _refused(path, raw, "one generator service", "a scenario run on a stack with no generator",
+             roles={"logit": "sut", "victoria-metrics": "backend"})
+
+    step = scenario.Step("c0s1", 0, 0, "stop", "victoria-metrics-b", "", 0, 1)
+    roles_b = {**scenario.BASE_ROLES, "victoria-metrics-b": "backend"}
+    for action in ("netem", "pause", "stop", "partition"):
+        step.action = action
+        expect(faults.ACTIONS[action].affects_egress(step, roles_b)
+               and not faults.ACTIONS[action].affects_udp_ingress(step, roles_b),
+               f"a {action} on a second backend affects egress only")
+    step.on, step.action = "generator", "netem"
+    expect(faults.ACTIONS["netem"].affects_udp_ingress(step, roles_b)
+           and not faults.ACTIONS["netem"].affects_egress(step, roles_b),
+           "a netem on the generator affects UDP ingress only")
+    step.on, step.action = "logit", "stop"
+    expect(faults.ACTIONS["stop"].affects_udp_ingress(step, roles_b)
+           and faults.ACTIONS["stop"].affects_egress(step, roles_b),
+           "a stop on the SUT affects both")
+
+
+def _sink_rules(root):
+    """`[[ledger.sink]]`, `[ledger] split`, and `compose`: every rule `load()` holds them to."""
+    path, raw = _base(root)
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    def sink(**changes):
+        return lambda r: r["ledger"]["sink"][0].update(changes)
+
+    def route(*sinks):
+        def edit(r):
+            r["ledger"]["split"] = "route"
+            r["ledger"]["sink"] = [dict(r["ledger"]["sink"][0], **one) for one in sinks]
+        return edit
+
+    loaded = scenario.load(path)
+    expect(loaded.sinks == [{"id": "victoria_metrics", "backend": "victoria-metrics",
+                             "vm_selector": '{__name__=~"soak_requests_[0-9]+_total"}'}]
+           and loaded.split == "copy" and loaded.to_json()["ledger"]["split"] == "copy",
+           f"statsd-vm has one sink and the default split, got {loaded.sinks} {loaded.split}")
+    cases = [
+        (lambda r: r["ledger"].pop("sink"), "ledger: missing `sink`", "no sink"),
+        (lambda r: r["ledger"].update(sink=[]), "ledger.sink must be one or more tables",
+         "an empty sink array"),
+        (lambda r: r["ledger"].update(sink="vm"), "ledger.sink must be one or more tables",
+         "a sink that isn't a table"),
+        (sink(sinks="x"), "ledger.sink 1: unknown key `sinks`", "an unknown sink key"),
+        (lambda r: r["ledger"]["sink"][0].pop("id"), "ledger.sink 1: `id` must name",
+         "a sink with no id"),
+        (sink(id="vm a"), "ledger.sink 1: `id` must name", "a sink id with a space"),
+        (lambda r: r["ledger"]["sink"].append(dict(r["ledger"]["sink"][0])),
+         "ledger.sink 2: `id` 'victoria_metrics' repeats", "a repeated sink id"),
+        (lambda r: r["ledger"]["sink"][0].pop("backend"), "ledger.sink 1: missing `backend`",
+         "a local sink with no backend"),
+        (lambda r: r["ledger"]["sink"][0].pop("vm_selector"),
+         "ledger.sink 1: missing `vm_selector`", "a local sink with no selector"),
+        (lambda r: r["ledger"].update(split="mirror"), "ledger.split must be one of copy, route",
+         "an unknown split"),
+        (sink(target="t"), "ledger.sink 1: `target` is for split = \"route\"",
+         "a target under copy"),
+        (route({"target": "t"}), "needs two or more [[ledger.sink]] tables",
+         "a route with one sink"),
+        (route({"target": "t"}, {"id": "b"}), "ledger.sink 2: under split = \"route\" a sink "
+         "needs `target`", "a routed sink with no target"),
+        (route({"target": "t"}, {"id": "b", "target": "t"}), "ledger.sink 2: `target` 't' "
+         "repeats", "two sinks fed by one target"),
+        (lambda r: r.update(compose=3), "`compose` must name an override file",
+         "a compose that isn't a string"),
+        (lambda r: r.update(compose="../compose.yaml"), "`compose` must name an override file",
+         "a compose outside the scenario's directory"),
+        (lambda r: r.update(compose="missing.yaml"), "compose: missing.yaml not found",
+         "a compose file that doesn't exist"),
+    ]
+    for edit, needle, what in cases:
+        _refused(path, mutate(edit), needle, what)
+    try:
+        routed = scenario.from_dict(mutate(route({"target": "t"}, {"id": "b", "target": "u"})),
+                                    path)
+        expect(routed.split == "route" and [s["target"] for s in routed.sinks] == ["t", "u"],
+               f"two routed sinks with distinct targets load, got {routed.sinks}")
+    except scenario.ScenarioError as err:
+        expect(False, f"two routed sinks are refused: {err.problems}")
+
+
+class _ConfigDocker:
+    """A `Docker` whose only call is `config_json`, answering `result`; any other call raises,
+    so a test using it can't start anything."""
+
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+
+    def config_json(self):
+        self.calls += 1
+        return self.result
+
+    def __getattr__(self, name):
+        raise AssertionError(f"_ConfigDocker.{name} called")
+
+
+def _driver_roles(root):
+    """`prepare()` with a compose override and a role map: the override is passed after the
+    base file and copied into the run, and the resolved scenario records it and the roles; a
+    run built without `roles=` asks compose, here a daemon that isn't there, and stops before
+    writing the resolved scenario; a role map missing the override's service fails the
+    scenario's checks there too. The driver's per-backend ports and the freshness poll per
+    sink follow."""
+    two = scenario.load(root / "scenarios" / "fanout-copy" / "scenario.toml")
+    roles = _override_roles(two)
+    with tempfile.TemporaryDirectory() as tmp:
+        argv = docker.Docker("p", ["c.yaml", "o.yaml"], ["a.env"], ["local"], prefix=["docker"])
+        expect(argv.compose_args() == ["compose", "--progress", "quiet", "-p", "p", "-f",
+                                       "c.yaml", "-f", "o.yaml", "--env-file", "a.env",
+                                       "--profile", "local"],
+               f"compose gets the base file, then the override, got {argv.compose_args()}")
+        run = driver.Run(root, two, two.duration, None, False, Path(tmp) / "given", [],
+                         "logit:soak", roles=roles)
+        run.prepare()
+        resolved = json.loads((run.run_dir / "scenario.resolved.json").read_text())
+        expect(run.docker.compose_files == [str(root / "compose.yaml"), str(two.compose_path())]
+               and (run.run_dir / "configs" / "compose.override.yaml").is_file()
+               and resolved["compose"] == "compose.override.yaml"
+               and resolved["services"] == roles
+               and [s["backend"] for s in resolved["ledger"]["sink"]]
+               == ["victoria-metrics", "victoria-metrics-b"],
+               f"prepare passes and copies the override and records it and the roles, got "
+               f"{run.docker.compose_files} {resolved.get('compose')} {resolved.get('services')}")
+        for jsonl in (run.timeline, run.watchdog, run.stats, run.freshness, run.capture):
+            jsonl.close()
+
+        asked = driver.Run(root, two, two.duration, None, False, Path(tmp) / "asked", [],
+                           "logit:soak")
+        try:
+            asked.prepare()
+            expect(False, "prepare() with no daemon resolved a role map")
+        except scenario.ScenarioError as err:
+            expect("docker compose config failed (rc 127)" in str(err)
+                   and not (asked.run_dir / "scenario.resolved.json").exists(),
+                   f"prepare() asks compose for the roles and stops when it can't, got {err}")
+        narrow = driver.Run(root, two, two.duration, None, False, Path(tmp) / "narrow", [],
+                            "logit:soak", roles=scenario.BASE_ROLES)
+        try:
+            narrow.prepare()
+            expect(False, "prepare() ran fanout-copy on a stack without victoria-metrics-b")
+        except scenario.ScenarioError as err:
+            expect("unknown service `victoria-metrics-b`" in str(err)
+                   and not (narrow.run_dir / "scenario.resolved.json").exists(),
+                   f"prepare() checks the scenario's services before anything starts, got {err}")
+
+        resolver = driver.Run(root, two, two.duration, None, False, "/nonexistent", [],
+                              "logit:soak")
+        resolver.docker = _ConfigDocker(docker.Result(0, config_text(roles), ""))
+        expect(resolver.resolve_roles() == roles and resolver.docker.calls == 1,
+               "resolve_roles reads the role map from compose config's JSON")
+        resolver.docker = _ConfigDocker(docker.Result(0, "Warning: x\n", ""))
+        try:
+            resolver.resolve_roles()
+            expect(False, "resolve_roles accepted output that isn't JSON")
+        except scenario.ScenarioError as err:
+            expect("docker compose config" in str(err), f"got {err}")
+
+    # Ports per backend: a revert on victoria-metrics-b re-reads its port only.
+    class Ports:
+        def __init__(self):
+            self.asked = []
+
+        def port(self, service, private):
+            self.asked.append((service, private))
+            return f"127.0.0.1:{9000 + len(self.asked)}"
+
+        def inspect(self, container, timeout=None):
+            return {"State": {"StartedAt": "x"}}
+
+    run = driver.Run(root, two, two.duration, None, False, "/nonexistent", [], "logit:soak",
+                     roles=roles)
+    run.docker = Ports()
+    run.ids = {name: name for name in roles}
+    step = scenario.Step("c0s1", 0, 0, "stop", "victoria-metrics-b", "", 0, 1)
+    run.after("apply", step, {"rc": 0})
+    run.after("revert", step, {"rc": 0})
+    expect(run.docker.asked == [("victoria-metrics-b", 8428)]
+           and run.vm_base == {"victoria-metrics-b": "http://127.0.0.1:9001"},
+           f"a revert on a backend re-reads that backend's port only, got {run.docker.asked}")
+
+    # Freshness: one record per sink, a held backend's skipped.
+    run.down = {"victoria-metrics-b"}
+    run.vm_base = {"victoria-metrics": "http://a", "victoria-metrics-b": "http://b"}
+    run.freshness = _Records()
+    run.t0 = 0.0
+    real = vm.freshness
+    vm.freshness = lambda base, selector, now, lookback: {"series": 1, "newest_ms": 1,
+                                                         "age_s": 1.0, "base": base}
+    try:
+        run.sample_freshness()
+    finally:
+        vm.freshness = real
+    by_sink = {record["sink"]: record for record in run.freshness}
+    expect(by_sink["vm_a"].get("base") == "http://a"
+           and by_sink["vm_b"].get("skipped") == "victoria-metrics-b held by a step",
+           f"freshness is sampled per sink, skipping a held backend, got {by_sink}")
+
+    # The end sequence's wait holds only once every sink's total holds.
+    totals = {"http://a": [10, 20, 20, 20, 20, 20, 20, 20],
+              "http://b": [5, 5, 5, 9, 9, 9, 9, 9]}
+    seen = {"http://a": 0, "http://b": 0}
+
+    def export(base, selector, start, end=None):
+        index = min(seen[base], len(totals[base]) - 1)
+        seen[base] += 1
+        return [{"metric": {"__name__": "x"}, "values": [totals[base][index]],
+                 "timestamps": [0]},
+                {"metric": {"__name__": "x"}, "values": [1, 2], "timestamps": [0, 2000]}]
+
+    clock = [1000.0]
+    reals = (vm.export, vm.force_flush, driver._now, driver.time.sleep)
+    vm.export, vm.force_flush = export, lambda base: None
+    driver._now = lambda: clock[0]
+    driver.time.sleep = lambda s: clock.__setitem__(0, clock[0] + s)
+    run.docker = Ports()
+    run.vm_base = {}
+    run.timeline = _Records()
+    real_refresh = run.refresh_vm_base
+    run.refresh_vm_base = lambda backend: run.vm_base.__setitem__(
+        backend, "http://a" if backend == "victoria-metrics" else "http://b")
+    try:
+        run.wait_quiet()
+    finally:
+        vm.export, vm.force_flush, driver._now, driver.time.sleep = reals
+        run.refresh_vm_base = real_refresh
+    quiet = run.timeline[-1]
+    expect(quiet["held"] and quiet["totals"] == {"vm_a": 22, "vm_b": 11}
+           and seen["http://b"] >= 5,
+           f"wait_quiet holds once both sinks' totals hold, got {quiet}")
+
+
+def config_text(roles):
+    """`docker compose config --format json`-shaped output for `roles`."""
+    return json.dumps({"services": {name: {"labels": {"soak.role": role}}
+                                    for name, role in roles.items()}})
 
 
 def _ledger_checks():
@@ -1069,9 +1859,23 @@ def _ledger_checks():
             expect(clean[check_id].status == checks.PASS,
                    f"{check_id} PASSes the balanced two-life fixture, got {clean[check_id]}")
         led = checks.Ledger(checks.RunData(Path(tmp) / "ledger-clean"))
-        expect(led.D_log == {0: 20}, f"the listener's shutdown warn lines go into D, got "
-                                     f"{led.D_log}")
-        expect(led.residual(0) == 30, f"life 0's W − D − B − Ab, got {led.residual(0)}")
+        expect(led.D_log == {0: 20} and led.D_shutdown == {0: 20} and led.D(0) == 20
+               and "D 20 (20 at shutdown; stderr says 20)" in " ".join(clean["ledger.intake"].lines),
+               f"a shutdown drop telemetry and stderr both carry counts once in D, got "
+               f"D {led.D(0)}, D_log {led.D_log}, D_shutdown {led.D_shutdown}")
+        stderr_only = results("ledger-shutdown-stderr-only", shutdown_in=("stderr",))
+        expect(stderr_only["ledger.intake"].status == checks.WARN
+               and "stderr shutdown lines count 20 datagram(s), telemetry's "
+               "datagrams.dropped{reason=\"shutdown\"} 0" in stderr_only["ledger.intake"].detail,
+               f"intake WARNs shutdown drops on stderr that telemetry lacks, got "
+               f"{stderr_only['ledger.intake']}")
+        tel_only = results("ledger-shutdown-telemetry-only", shutdown_in=("telemetry",))
+        expect(tel_only["ledger.intake"].status == checks.PASS
+               and tel_only["ledger.egress"].status == checks.PASS,
+               f"intake doesn't WARN on shutdown drops in telemetry that stderr lacks (a "
+               f"cancelled blocked push counts without logging), and D still reads telemetry, "
+               f"got {tel_only['ledger.intake']} {tel_only['ledger.egress']}")
+        expect(led.residual(0) == 30, f"life 0's W − D − B − X − Ab, got {led.residual(0)}")
         expect(led.R == 77000, f"R from the defaults, got {led.R}")
         expect("within [0, R]" in clean["ledger.intake"].detail,
                f"intake reports the earlier life's residual, got {clean['ledger.intake'].detail}")
@@ -1126,9 +1930,16 @@ def _ledger_checks():
                f"{uncounted['ledger.egress']}")
         counted = results("ledger-counted", v0_extra=-500, life0_dropped=3)
         expect(counted["ledger.egress"].status == checks.PASS
-               and "counted (drain complete batches_dropped 3)" in counted["ledger.egress"].detail,
-               f"egress marks a positive gap with batches_dropped as counted, got "
+               and "counted (batches dropped for shutdown 3)" in counted["ledger.egress"].detail,
+               f"egress marks a positive gap with a shutdown batch drop as counted, got "
                f"{counted['ledger.egress']}")
+        log_counted = results("ledger-counted-stderr-only", v0_extra=-500, life0_dropped=3,
+                              shutdown_in=("stderr",))
+        expect(log_counted["ledger.egress"].status == checks.FAIL
+               and "drain complete's batches_dropped 3, telemetry's batches.dropped"
+               in log_counted["ledger.egress"].detail,
+               f"egress counts a gap from telemetry only, and reports a drain complete count "
+               f"telemetry lacks, got {log_counted['ledger.egress']}")
         expect(counted["ledger.summary"].status == checks.PASS,
                f"a counted earlier life leaves the summary PASS, got {counted['ledger.summary']}")
 
@@ -1139,7 +1950,7 @@ def _ledger_checks():
                f"the summary FAILs an uncounted Ab − V, got {final_lost['ledger.summary']}")
         final_counted = results("ledger-final-counted", v1_short=40, life1_dropped=1)
         expect(final_counted["ledger.summary"].status == checks.PASS
-               and "Ab − V 40 counted" in final_counted["ledger.summary"].detail,
+               and "Ab − V[sink] 40 counted" in final_counted["ledger.summary"].detail,
                f"the summary shows a counted egress term and judges the rest, got "
                f"{final_counted['ledger.summary']}")
         final_dup = results("ledger-final-negative", v1_short=-40)
@@ -1220,6 +2031,119 @@ def _ledger_checks():
         expect(behind["recovery"].status == checks.WARN,
                f"recovery WARNs a shortfall when the generator fell behind, got "
                f"{behind['recovery']}")
+
+
+def _script_ledger():
+    """The ledger with a `lua` component between the listener and `aggregate`: `ledger.script`'s
+    three identities, `ledger.edge` moving to the script's edge, the egress gap leaving out the
+    flush events V excludes, a stopped life's gap judged with no allowance for the script, the
+    residual band one inbox and one batch wider, and an earlier life ended by an expected exit."""
+    per_drain = {"drop": 20, "err": 10, "flush": 1}
+    with tempfile.TemporaryDirectory() as tmp:
+        def results(name, **kwargs):
+            run_dir = _ledger_run(tmp, name, script=dict(per_drain), **kwargs)
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        clean = results("script-clean")
+        for check_id in ("ledger.intake", "ledger.edge", "ledger.script", "ledger.aggregate",
+                         "ledger.egress", "ledger.summary"):
+            expect(clean[check_id].status == checks.PASS,
+                   f"{check_id} PASSes the balanced script fixture, got {clean[check_id]}")
+        expect("script to aggregate" in clean["ledger.edge"].detail,
+               f"edge judges the script's edge, got {clean['ledger.edge']}")
+        expect("Ab − L_flush" in clean["ledger.egress"].detail
+               and "Ab − L_flush" in clean["ledger.summary"].detail
+               and "counted" in clean["ledger.summary"].detail,
+               f"egress and the summary name the flush term and the counted script drops, got "
+               f"{clean['ledger.egress']} / {clean['ledger.summary']}")
+        led = checks.Ledger(checks.RunData(Path(tmp) / "script-clean"))
+        expect(led.residual(0) == 30, f"life 0's residual less the script's drops and the "
+                                      f"flush events, got {led.residual(0)}")
+        expect(led.R == 142000, f"R grows by one inbox and one batch with a script, got {led.R}")
+
+        lost_edge = results("script-l-in", l_in_short=4)
+        expect(lost_edge["ledger.script"].status == checks.FAIL
+               and "E == L_in off by 4" in lost_edge["ledger.script"].detail,
+               f"ledger.script FAILs events lost between the listener and the script, got "
+               f"{lost_edge['ledger.script']}")
+        expect(lost_edge["ledger.summary"].status == checks.FAIL,
+               f"the summary FAILs a nonzero E − L_in, got {lost_edge['ledger.summary']}")
+        unaccounted = results("script-l-err", l_err_unreported=3)
+        expect(unaccounted["ledger.script"].status == checks.FAIL
+               and "L_in == L_emit + L_drop + L_err off by 3" in
+               unaccounted["ledger.script"].detail,
+               f"ledger.script FAILs events neither emitted, dropped, nor failed on, got "
+               f"{unaccounted['ledger.script']}")
+        unsent = results("script-l-sent", l_sent_short=6)
+        expect(unsent["ledger.script"].status == checks.FAIL
+               and "L_sent == L_emit + L_flush off by -6" in unsent["ledger.script"].detail,
+               f"ledger.script FAILs a send short of what it emitted, got "
+               f"{unsent['ledger.script']}")
+        expect(unsent["ledger.edge"].status == checks.PASS,
+               f"edge judges L_sent == A, which a short send keeps, got {unsent['ledger.edge']}")
+        edge = results("script-edge", a1_short=7)
+        expect(edge["ledger.edge"].status == checks.FAIL
+               and "L_sent" in edge["ledger.edge"].detail,
+               f"edge FAILs L_sent != A, got {edge['ledger.edge']}")
+
+        lost = results("script-final-uncounted", v1_short=40)
+        expect(lost["ledger.egress"].status == checks.FAIL
+               and lost["ledger.summary"].status == checks.FAIL,
+               f"egress and the summary FAIL a final-life gap with a script, got "
+               f"{lost['ledger.egress']} / {lost['ledger.summary']}")
+
+        # Life 0's script drops and fails on events, and the final drain exports both counts, so
+        # a stopped life's gap of 1 with no shutdown drop is loss like any other.
+        gap = results("script-stopped-gap", v0_extra=29)
+        expect(gap["ledger.egress"].status == checks.FAIL
+               and "life 0: W − D − B − X − (L_drop + L_err) − V 1" in gap["ledger.egress"].detail
+               and "uncounted" in gap["ledger.egress"].detail,
+               f"egress FAILs a stopped scripted life's 1-increment gap with no shutdown drop, "
+               f"got {gap['ledger.egress']}")
+        # A residual between the plain R (77,000) and the script's (142,000).
+        wide = results("script-wide-residual", life0_extra=100030, v0_extra=100010)
+        expect(wide["ledger.intake"].status == checks.PASS
+               and wide["ledger.egress"].status == checks.PASS,
+               f"an earlier life's residual within the script's R passes, got "
+               f"{wide['ledger.intake']} / {wide['ledger.egress']}")
+
+        # Life 0 ends with an expected exit: two lives, its gap counted by the script node's own
+        # shutdown batch drops.
+        exited = results("script-exit", sut_end="exit", v0_extra=-500, life0_dropped=3,
+                         dropped_at="lua")
+        expect(not exited["ledger.egress"].detail.startswith("SUT telemetry shows")
+               and exited["ledger.egress"].status == checks.PASS
+               and "counted (batches dropped for shutdown 3)" in exited["ledger.egress"].detail,
+               f"an exit-ended life is a stopped earlier life with a counted gap, got "
+               f"{exited['ledger.egress']}")
+        expect(exited["ledger.script"].status == checks.PASS
+               and exited["ledger.summary"].status == checks.PASS,
+               f"the final life after an exit balances, got {exited['ledger.script']} / "
+               f"{exited['ledger.summary']}")
+        # The script node failed, and the listener's next batch went to its closed inbox,
+        # counted as `closed_consumer`: that life's gap is 0, not 100 uncounted.
+        closed = [_line(_stamp(T0 + 100), "logit.component.events.dropped", "sum", 100,
+                        component="in", attrs={"reason": "closed_consumer"})]
+        closed_run = results("script-exit-closed-consumer", sut_end="exit", sut_extra=closed,
+                             v0_extra=-70)
+        expect(closed_run["ledger.egress"].status == checks.PASS
+               and "W − D − B − X − (L_drop + L_err) − V 0" in closed_run["ledger.egress"].detail,
+               f"egress counts the listener's dropped events, got {closed_run['ledger.egress']}")
+        unexited = _ledger_run(tmp, "script-exit-unstarted", script=dict(per_drain),
+                               sut_end="exit")
+        timeline = collect.read_jsonl(unexited / "timeline.jsonl")
+        for record in timeline:
+            if record.get("event") == "revert":
+                record["started"] = False
+        (unexited / "timeline.jsonl").write_text("".join(json.dumps(r) + "\n" for r in timeline))
+        result = checks.check_ledger_egress(checks.RunData(unexited))
+        expect(result.status == checks.SKIP and "timeline starts the SUT into 1" in result.detail,
+               f"an exit revert that started nothing starts no life, got {result}")
+
+        none = _ledger_run(tmp, "script-none")
+        result = checks.check_ledger_script(checks.RunData(none))
+        expect(result.status == checks.SKIP, f"ledger.script SKIPs with no sut_script, got "
+                                             f"{result}")
 
 
 def _expect_run(tmp, name, expectations, apply_rc=0, second_cycle=False):
@@ -1425,6 +2349,272 @@ def _kill_watchdog():
                f"progress doesn't flag the stdout gap a kill leaves, got {result}")
 
 
+class _ExitDocker:
+    """A stand-in for an `exit` step's revert and the driver's start bookkeeping: `inspect`
+    answers `status` and `started`, and `run` records each command."""
+
+    def __init__(self, status):
+        self.status = status
+        self.calls = []
+
+    def inspect(self, container, timeout=None):
+        return {"State": {"Status": self.status, "StartedAt": "second"}}
+
+    def run(self, args, timeout=None):
+        self.calls.append(list(args))
+        return docker.Result(0, "", "")
+
+
+def _exit_driver():
+    """The driver around an `exit` step: its revert starts the container only when it has
+    exited, and the fail-fast check accepts `exited` only inside its window."""
+    step = scenario.Step("c0s1", 0, 0, "exit", "logit", "", 10.0, 20.0, code=2,
+                         key="memory_limit_exceeded")
+    for status, starts in (("exited", True), ("running", False)):
+        fake = _ExitDocker(status)
+        ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+        result = faults.ACTIONS["exit"].revert(ctx, step)
+        expect(result["rc"] == 0 and result["started"] is starts
+               and (fake.calls == [["start", "sut"]]) is starts,
+               f"an exit's revert on a {status} container starts it: {starts}, got {result} "
+               f"{fake.calls}")
+        expect(faults.ACTIONS["exit"].apply(ctx, step) == {"rc": 0, "stderr": ""}
+               and len(fake.calls) == int(starts), "an exit's apply makes no Docker call")
+
+    def fresh():
+        run = driver.Run.__new__(driver.Run)
+        run.down, run.paused, run.exiting = set(), set(), set()
+        run.pending_ready, run.fail_fast = {}, None
+        run.started_at = {"logit": "first"}
+        run.ids = {"logit": "sut"}
+        run.roles = dict(scenario.BASE_ROLES)
+        run.docker = _ExitDocker("running")
+        return run
+
+    exited = {"status": "exited", "exit_code": 2, "started_at": "first"}
+    run = fresh()
+    run.check_expected("logit", exited)
+    expect(run.fail_fast is not None, "an exit with no step behind it fails fast")
+    run = fresh()
+    run.after("apply", step, {"rc": 0})
+    run.check_expected("logit", exited)
+    run.check_expected("logit", {"status": "running", "exit_code": 0, "started_at": "first"})
+    expect(run.fail_fast is None, f"an exit step accepts exited and running, got "
+                                  f"{run.fail_fast}")
+    run.after("revert", step, {"rc": 0, "started": True})
+    expect(run.started_at["logit"] == "second" and "logit" in run.pending_ready
+           and not run.exiting, "a revert that started the SUT probes its readiness")
+    run.check_expected("logit", {**exited, "started_at": "second"})
+    expect(run.fail_fast is not None, "after the window, exited fails fast again")
+    run = fresh()
+    run.after("apply", step, {"rc": 0})
+    run.after("revert", step, {"rc": 0, "started": False})
+    expect(not run.pending_ready and run.started_at["logit"] == "first",
+           "a revert that started nothing probes nothing")
+
+
+def _health(offset, word, start=None):
+    """A `health_log` entry for a HEALTHCHECK that started at `start` (default `offset`)."""
+    output = "ok\n" if word == "ok" else f"{word} (503 Service Unavailable)\n"
+    started = _stamp(T0 + (offset if start is None else start))
+    return {"Start": started, "End": started, "ExitCode": 0 if word == "ok" else 1,
+            "Output": output}
+
+
+def _ready_words():
+    """`ready` from the status word in `health_log`: `ok` in steady time, a mark's word inside
+    it, `degraded` only inside an exit step, each sample timed at its `Start` and counted once,
+    and `Health.Status` when no `health_log` was recorded."""
+    mark = [_action("apply", "c0s1", "mark", "logit", 100, 100, ready="stalled"),
+            _action("revert", "c0s1", "mark", "logit", 160, 160, ready="stalled")]
+    exit_step = [_action("apply", "c0s1", "exit", "logit", 100, 100, code=2,
+                         key="memory_limit_exceeded"),
+                 _action("revert", "c0s1", "exit", "logit", 160, 161, code=2,
+                         key="memory_limit_exceeded", started=True),
+                 _ready("c0s1", "logit", 162)]
+    start, end = _phase("start", 0, t0=T0), [_phase("end_begin", 400), _phase("end_end", 450)]
+
+    def run(tmp, name, steps, words, health_log=True):
+        """`words(offset)` -> (word, start offset or None) for the SUT's sample at `offset`."""
+        run_dir = _run_dir(tmp, name, [start] + steps + end)
+        records = []
+        for offset in range(0, 400, 5):
+            word, started = words(offset)
+            for svc in ("logit", "generator"):
+                record = {"t": T0 + offset, "svc": svc, "status": "running",
+                          "health": "healthy" if svc != "logit" or word == "ok" else "unhealthy"}
+                if health_log:
+                    record["health_log"] = (_health(offset, word, started) if svc == "logit"
+                                            else _health(offset, "ok"))
+                records.append(record)
+        (run_dir / "watchdog.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+        return run_dir
+
+    def ok(offset):
+        return "ok", None
+
+    def stalled_in(low, high):
+        return lambda offset: ("stalled", None) if low <= offset <= high else ("ok", None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        result = _status(run(tmp, "ready-ok", [], ok), checks.check_ready)
+        expect(result.status == checks.PASS and "read ok" in result.detail,
+               f"ready PASSes ok samples, got {result}")
+        samples = checks.health_samples(checks.RunData(Path(tmp) / "ready-ok"))
+        expect(len(samples) == 160 and samples[0][2] == "ok",
+               f"one sample per service and Start, got {len(samples)}")
+
+        result = _status(run(tmp, "ready-mark", mark, stalled_in(120, 140)), checks.check_ready)
+        expect(result.status == checks.PASS and "c0s1: logit read stalled 5 time(s)"
+               in result.detail, f"ready PASSes a stall inside a mark that expects it, got "
+                                 f"{result}")
+        result = _status(run(tmp, "ready-mark-missing", mark, ok), checks.check_ready)
+        expect(result.status == checks.FAIL and "never read stalled" in result.detail,
+               f"ready FAILs a mark whose word never appears, got {result}")
+        result = _status(run(tmp, "ready-stall-steady", [], stalled_in(250, 260)),
+                         checks.check_ready)
+        expect(result.status == checks.FAIL and "read stalled at +250s" in result.detail,
+               f"ready FAILs a stall outside every fault window, got {result}")
+        # Recorded at +200 to +215, after the mark's window and its recovery, but started at
+        # +150, inside the mark: the HEALTHCHECK's own time decides.
+        late = run(tmp, "ready-late-record", mark,
+                   lambda o: ("stalled", 150) if 200 <= o <= 215 else ("ok", None))
+        result = _status(late, checks.check_ready)
+        expect(result.status == checks.PASS and "read stalled 1 time(s)" in result.detail,
+               f"ready times a sample at its Start and counts it once, got {result}")
+
+        degraded = lambda o: ("degraded", None) if 120 <= o <= 130 else ("ok", None)
+        result = _status(run(tmp, "ready-degraded-exit", exit_step, degraded),
+                         checks.check_ready)
+        expect(result.status == checks.PASS, f"ready accepts degraded inside an exit step, got "
+                                             f"{result}")
+        result = _status(run(tmp, "ready-degraded-mark", mark, lambda o: (
+            ("degraded", None) if 120 <= o <= 130 else ("stalled", None) if o == 140
+            else ("ok", None))), checks.check_ready)
+        expect(result.status == checks.FAIL and "degraded" in result.detail
+               and "outside every exit step" in result.detail,
+               f"ready FAILs degraded outside every exit step, even inside a mark, got {result}")
+
+        result = _status(run(tmp, "ready-fallback", [], stalled_in(250, 260), health_log=False),
+                         checks.check_ready)
+        expect(result.status == checks.FAIL and "health unhealthy" in result.detail,
+               f"ready falls back to Health.Status with no health_log, got {result}")
+        result = _status(run(tmp, "ready-fallback-mark", mark, ok, health_log=False),
+                         checks.check_ready)
+        expect(result.status == checks.FAIL and "can't be judged" in result.detail,
+               f"a mark's word can't pass with no health_log, got {result}")
+    expect(checks.readiness_word("stalled (503 Service Unavailable)") == "stalled"
+           and checks.readiness_word("ok\n") == "ok" and checks.readiness_word("") is None,
+           "readiness_word takes the status word")
+
+
+def _exit_watchdog():
+    """The watchdog around an `exit` step applied at +60 and reverted at +120: the SUT exits
+    by itself at +75 with code 2 and an ERROR line keyed `memory_limit_exceeded`, and the
+    revert starts it again."""
+    keyed = {"code": 2, "key": "memory_limit_exceeded"}
+    steps = [_action("apply", "c0s1", "exit", "logit", 60, 60, **keyed),
+             _action("revert", "c0s1", "exit", "logit", 119, 120, started=True, **keyed)]
+    start, end = _phase("start", 0, t0=T0), [_phase("end_begin", 400), _phase("end_end", 450)]
+
+    def log(offset, level, message, **fields):
+        return json.dumps({"timestamp": _stamp(T0 + offset), "level": level,
+                           "message": message, "target": "logit", **fields})
+
+    trip = [log(74.5, "ERROR", "Lua VM holds 70000000 bytes after 8 full collections",
+                key="memory_limit_exceeded", component="enrich"),
+            log(75, "ERROR", "exiting", code=2, reason="a node failed"),
+            "Error: component 'enrich': Lua VM holds 70000000 bytes after 8 full collections"]
+
+    def run(tmp, name, exits=True, code=2, at=75, stderr=trip, steps=steps, ready=True):
+        timeline = [start] + steps + ([_ready("c0s1", "logit", 122)] if ready else []) + end
+        run_dir = _run_dir(tmp, name, timeline)
+        first, second = _stamp(T0 - 5), _stamp(T0 + 119.5)
+        watchdog = []
+        for offset in range(0, 400, 5):
+            for svc in ("logit", "generator"):
+                down = svc == "logit" and exits and at < offset < 120
+                restarted = svc == "logit" and exits and offset >= 120
+                watchdog.append({
+                    "t": T0 + offset, "svc": svc, "status": "exited" if down else "running",
+                    "exit_code": code if down else 0, "health": "healthy",
+                    "started_at": second if restarted else first,
+                    "finished_at": _stamp(T0 + at) if svc == "logit" and exits and offset > at
+                    else "", "restart_count": 0})
+        (run_dir / "watchdog.jsonl").write_text("".join(json.dumps(r) + "\n" for r in watchdog))
+        (run_dir / "inspect").mkdir()
+        for svc, started in (("logit", second if exits else first), ("generator", first)):
+            (run_dir / "inspect" / f"{svc}.json").write_text(json.dumps({"State": {
+                "Status": "exited", "ExitCode": 0, "OOMKilled": False, "StartedAt": started,
+                "FinishedAt": _stamp(T0 + 450)}}))
+        (run_dir / "logs" / "logit.stderr").write_text("\n".join(
+            [log(0, "INFO", "ready")] + list(stderr)) + "\n")
+        return run_dir
+
+    with tempfile.TemporaryDirectory() as tmp:
+        clean = run(tmp, "exit-clean")
+        for check in (checks.check_exit, checks.check_restarts, checks.check_timeline,
+                      checks.check_self_log):
+            result = _status(clean, check)
+            expect(result.status == checks.PASS,
+                   f"{check.__name__} PASSes an expected exit and its start, got {result}")
+        result = _status(clean, checks.check_exit)
+        expect("inside expected exit c0s1" in result.detail, f"exit names the step, got {result}")
+        result = _status(clean, checks.check_self_log)
+        expect("3 expected-exit line(s)" in result.detail,
+               f"self_log counts the ERROR, exiting, and Error: lines, got {result}")
+        stray = run(tmp, "exit-stray-error-text", stderr=trip + [trip[2]])
+        result = _status(stray, checks.check_self_log)
+        expect(result.status == checks.WARN and "non-JSON" in result.detail,
+               f"self_log excuses only the Error: line right after an expected exiting line, "
+               f"got {result}")
+
+        unstarted = [steps[0], {**steps[1], "started": False}]
+        missing = run(tmp, "exit-missing", exits=False, stderr=(), steps=unstarted, ready=False)
+        for check in (checks.check_exit, checks.check_self_log):
+            result = _status(missing, check)
+            expect(result.status == checks.FAIL
+                   and "expected exit did not happen" in result.detail,
+                   f"{check.__name__} FAILs an exit step whose exit never came, got {result}")
+        result = _status(missing, checks.check_restarts)
+        expect(result.status == checks.PASS, f"restarts needs no start when the revert started "
+                                             f"nothing, got {result}")
+
+        wrong = run(tmp, "exit-code-1", code=1)
+        result = _status(wrong, checks.check_exit)
+        expect(result.status == checks.FAIL and "which leaves 2" in result.detail,
+               f"exit FAILs an exit with a code other than its step's, got {result}")
+        unkeyed = run(tmp, "exit-no-key", stderr=trip[1:])
+        result = _status(unkeyed, checks.check_self_log)
+        expect(result.status == checks.FAIL
+               and "no ERROR line keyed memory_limit_exceeded" in result.detail,
+               f"self_log FAILs an expected exit with no ERROR line keyed its key, got {result}")
+        other_code = run(tmp, "exit-line-code-3", stderr=[trip[0], log(75, "ERROR", "exiting",
+                                                                         code=3)])
+        result = _status(other_code, checks.check_self_log)
+        expect(result.status == checks.FAIL
+               and "exiting with code 3" in " ".join(result.lines),
+               f"self_log FAILs an exiting line with a code the step doesn't name, got {result}")
+        outside = run(tmp, "exit-line-outside", stderr=trip + [
+            log(300, "ERROR", "Lua VM holds", key="memory_limit_exceeded")])
+        result = _status(outside, checks.check_self_log)
+        expect(result.status == checks.FAIL and "+300s" in result.detail,
+               f"self_log FAILs the step's key outside its window, got {result}")
+        quiet = [line for line in _sut_stdout(400)
+                 if not 75 < (telemetry.parse_rfc3339(json.loads(line)["timestamp"]) - T0) < 120]
+        gap = run(tmp, "exit-gap")
+        (gap / "logs" / "logit.stdout").write_text("\n".join(quiet) + "\n")
+        result = _status(gap, checks.check_progress)
+        expect(not any("went quiet" in line for line in result.lines),
+               f"progress doesn't flag the stdout gap an expected exit leaves, got {result}")
+        early = run(tmp, "exit-before-window", at=50,
+                    stderr=[log(49.5, "ERROR", "x", key="memory_limit_exceeded"),
+                            log(50, "ERROR", "exiting", code=2)])
+        result = _status(early, checks.check_exit)
+        expect(result.status == checks.FAIL and "outside every scheduled stop" in result.detail,
+               f"exit FAILs an exit before its step's window, got {result}")
+
+
 # The kill fixture's SUT config: a small R (100 + 67 x 10 = 770), and the 10 s aggregate
 # interval the band and `ledger.windows` read.
 KILL_SUT_CONFIG = ("components:\n"
@@ -1559,7 +2749,7 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
                     timestamps.append(int((T0 + s) * 1000))
         export.append({"metric": {"__name__": f"x_{index}_total"}, "values": values,
                        "timestamps": timestamps})
-    (run_dir / "vm-export.jsonl").write_text("".join(json.dumps(s) + "\n" for s in export))
+    _write_export(run_dir, "sink", export)
     return run_dir
 
 
@@ -1578,12 +2768,12 @@ def _kill_ledger():
         expect(led.killed == [1] and led.R == 770, f"life 1 is the killed one and R is 770, got "
                                                     f"{led.killed} {led.R}")
         egress = clean["ledger.egress"].detail
-        expect("life 1 (killed): Ab 14,000 − V 12,500 = 1,500, within band" in egress
+        expect("life 1 (killed): Ab 14,000 − V[sink] 12,500 = 1,500, within band" in egress
                and "band [-1,000, 3,000]: ingest 200/s" in egress
-               and "residual W − D − B − Ab 0 at its last drain" in egress
-               and "D has no stderr part" in egress,
+               and "residual W − D − B − X − Ab 0 at its last drain" in egress
+               and "D has no shutdown part" in egress,
                f"egress reports the killed life's gap inside its band, got {egress}")
-        expect("life 2 (final): Ab 18,000 − V 18,000 = 0, ok" in egress,
+        expect("life 2 (final): Ab 18,000 − V[sink] 18,000 = 0, ok" in egress,
                f"the final life stays exact, got {egress}")
 
         edge_high = results("kill-high-edge", kill_gap=3000)
@@ -1592,7 +2782,7 @@ def _kill_ledger():
                f"{edge_high['ledger.egress']}")
         over = results("kill-over", kill_gap=3001)
         expect(over["ledger.egress"].status == checks.FAIL
-               and "life 1 (killed): Ab 14,000 − V 10,999 = 3,001, uncounted"
+               and "life 1 (killed): Ab 14,000 − V[sink] 10,999 = 3,001, uncounted"
                in over["ledger.egress"].detail,
                f"egress FAILs a killed life's gap above its band as uncounted, got "
                f"{over['ledger.egress']}")
@@ -1608,8 +2798,8 @@ def _kill_ledger():
         residual = results("kill-residual", kill_residual=500, kill_gap=2600)
         detail = residual["ledger.egress"].detail
         expect(residual["ledger.egress"].status == checks.PASS
-               and "Ab 14,000 − V 11,400 = 2,600, within band (band [-1,500, 3,000]" in detail
-               and "residual W − D − B − Ab 500 at its last drain" in detail,
+               and "Ab 14,000 − V[sink] 11,400 = 2,600, within band (band [-1,500, 3,000]" in detail
+               and "residual W − D − B − X − Ab 500 at its last drain" in detail,
                f"a killed life's residual is reported beside Ab − V, never added to it, got "
                f"{residual['ledger.egress']}")
         residual_low = results("kill-residual-low", kill_residual=500, kill_gap=-1500)
@@ -1628,7 +2818,7 @@ def _kill_ledger():
                f"{last['ledger.egress']} {last['ledger.windows']}")
 
         expect(clean["ledger.windows"].status == checks.PASS
-               and "2 series x 3 life/lives, widest gap 10s" in clean["ledger.windows"].detail,
+               and "2 series over 1 sink(s) x 3 life/lives, widest gap 10s" in clean["ledger.windows"].detail,
                f"windows PASSes a sample in every window, got {clean['ledger.windows']}")
         middle = results("kill-middle-windows", drop=(150, 160, 170, 180, 190))
         expect(middle["ledger.windows"].status == checks.FAIL
@@ -1758,7 +2948,8 @@ def _target_rules(root):
                                                  "env": ["DD_API_KEY"]},
            f"statsd-datadog loads as an external target, got {loaded.target}")
     resolved = loaded.to_json()
-    expect(resolved["target"]["kind"] == "external" and "vm_selector" not in resolved["ledger"],
+    expect(resolved["target"]["kind"] == "external"
+           and resolved["ledger"]["sink"] == [{"id": "datadog"}],
            f"the resolved scenario records the target, got {resolved['target']}")
     local = scenario.from_dict(copy.deepcopy(vm_base), vm_path)
     expect(not local.external and local.to_json()["target"]["kind"] == "victoria-metrics",
@@ -1780,16 +2971,18 @@ def _target_rules(root):
          "a variable compose.yaml doesn't pass"),
         (base, table(env=["DD_API_KEY", "DD_API_KEY"]), "target.env repeats a variable",
          "a repeated variable"),
-        (base, lambda raw: raw["ledger"].update(vm_selector="{x}"),
-         "ledger.vm_selector names a VictoriaMetrics query", "vm_selector on an external target"),
+        (base, lambda raw: raw["ledger"]["sink"][0].update(vm_selector="{x}"),
+         "`vm_selector` names a backend query", "vm_selector on an external target"),
+        (base, lambda raw: raw["ledger"]["sink"][0].update(backend="victoria-metrics"),
+         "`backend` names a backend query", "a backend on an external target"),
         (base, lambda raw: raw["ledger"].update(vm_every_window=True),
          "ledger.vm_every_window names a VictoriaMetrics query",
          "vm_every_window on an external target"),
-        (base, lambda raw: raw["ledger"].pop("sut_sink"), "ledger: missing `sut_sink`",
+        (base, lambda raw: raw["ledger"].pop("sink"), "ledger: missing `sink`",
          "an external target still needs the sink id"),
         (base, lambda raw: raw["step"].append({"at": "11m", "action": "stop",
                                                "on": "victoria-metrics", "for": "20s"}),
-         "a fault on victoria-metrics, which an external target's stack doesn't run",
+         "unknown service `victoria-metrics`; an external target's stack runs no backend",
          "a fault on victoria-metrics with an external target"),
         (vm_base, lambda raw: raw.update(target={"kind": "victoria-metrics", "name": "vm"}),
          "target.name is for an external target", "a name on the local target"),
@@ -1803,7 +2996,7 @@ def _target_rules(root):
 
     def external_random(raw):
         raw["target"] = {"kind": "external", "name": "datadog", "env": ["DD_API_KEY"]}
-        del raw["ledger"]["vm_selector"]
+        raw["ledger"]["sink"] = [{"id": "datadog"}]
         raw["ledger"].pop("vm_every_window", None)
         raw["random"]["fault"].append({"weight": 1, "action": "pause",
                                        "on": "victoria-metrics",
@@ -1860,7 +3053,7 @@ def _target_rules(root):
         expect(bystander.exists(), "remove_private_env leaves a directory it didn't make")
         env.write_text("export DD_API_KEY=abc\n")
 
-        argv = docker.Docker("p", "c.yaml", ["a.env", "b.env"], ["local"], prefix=["docker"])
+        argv = docker.Docker("p", ["c.yaml"], ["a.env", "b.env"], ["local"], prefix=["docker"])
         expect(argv.compose_args() == ["compose", "--progress", "quiet", "-p", "p", "-f",
                                        "c.yaml", "--env-file", "a.env", "--env-file", "b.env",
                                        "--profile", "local"],
@@ -1868,7 +3061,7 @@ def _target_rules(root):
                f"{argv.compose_args()}")
 
         run = driver.Run(root, loaded, loaded.duration, None, False, tmp, [], "logit:soak",
-                         env)
+                         env, roles=scenario.base_roles(loaded))
         run.prepare()
         private = run.private_env
         expect(run.docker.profiles == [] and private is not None
@@ -1893,7 +3086,7 @@ def _target_rules(root):
         expect(code == 1 and not private.exists() and not private.parent.exists(),
                "execute() removes the private env copy, an early return included")
         vm_run = driver.Run(root, local, local.duration, None, False, Path(tmp) / "vm", [],
-                            "logit:soak")
+                            "logit:soak", roles=scenario.BASE_ROLES)
         vm_run.prepare()
         expect(vm_run.docker.profiles == ["local"] and len(vm_run.docker.env_files) == 1,
                f"a local run enables the local profile, got {vm_run.docker.profiles}")
@@ -1987,7 +3180,7 @@ def _prepare_raises(root, path, env, tmp):
     order = []
 
     class Raising:
-        def __init__(self, project, compose_file, env_files, profiles=(), prefix=None):
+        def __init__(self, project, compose_files, env_files, profiles=(), prefix=None):
             order.append(("docker", Path(env_files[-1])))
             raise RuntimeError("no daemon")
 
@@ -2016,7 +3209,7 @@ class _BusyDocker:
     before it starts anything."""
 
     prefix = ["docker"]
-    compose_file = "compose.yaml"
+    compose_files = ["compose.yaml"]
 
     def project_containers(self):
         return ["leftover"]
@@ -2081,10 +3274,10 @@ def _sink_drain(root):
     expect(record["held"] and record["waited_s"] >= 40,
            f"the wait outlasts a queue still sending, got {record}")
     record = wait(drains(lambda t: 1))
-    expect(not record["held"] and record["buffer_batches"] == 1,
+    expect(not record["held"] and record["sinks"]["datadog"]["buffer_batches"] == 1,
            f"a queue that never empties ends the wait at its bound, got {record}")
     record = wait(drains(lambda t: 0, lambda t: 1))
-    expect(not record["held"] and record["retrying"] == 1,
+    expect(not record["held"] and record["sinks"]["datadog"]["retrying"] == 1,
            f"a sink still retrying never counts as drained, got {record}")
 
 
@@ -2222,13 +3415,14 @@ def _external_checks():
                f"batches still queued at the final life's quiet drain FAIL, got {queued}")
         undrained = results("external-undrained", sut_extra=_datadog_lines(), timeline_extra=[
             _phase("sink_drained", 320, held=False, hold_s=20, polls=60, bound_s=120,
-                   buffer_batches=2, retrying=1, newest_drain=T0 + 320)])["ledger.sent"]
+                   sinks={"sink": {"buffer_batches": 2, "retrying": 1}})])["ledger.sent"]
         expect(undrained.status == checks.FAIL and "held=false after 120s" in undrained.detail
-               and "buffer.batches 2 left unsent" in undrained.detail,
+               and "buffer.batches sink 2 left unsent" in undrained.detail,
                f"a sink_drained that never held FAILs with the count, got {undrained}")
         drained = results("external-drained", sut_extra=_datadog_lines(), timeline_extra=[
             _phase("sink_drained", 320, held=True, hold_s=20, polls=3, waited_s=24,
-                   buffer_batches=0, retrying=0, newest_drain=T0 + 320)])["ledger.sent"]
+                   newest_drain=T0 + 320,
+                   sinks={"sink": {"buffer_batches": 0, "retrying": 0}})])["ledger.sent"]
         expect(drained.status == checks.PASS and drained.detail.startswith("SENT"),
                f"a sink_drained that held reads SENT, got {drained}")
         no_2xx = results("external-no-2xx", sut_extra=_datadog_lines(cls="4xx"))["ledger.sent"]
@@ -2310,6 +3504,9 @@ def _shipped(root):
             loaded = scenario.load(path)
             expect(loaded.name == path.parent.name,
                    f"{path}: name {loaded.name!r} matches its directory")
+            # The services an override adds are read from its labels, as compose would merge
+            # them; `run` checks against compose's own answer before the stack starts.
+            scenario.check_services(loaded, _override_roles(loaded))
         except scenario.ScenarioError as err:
             expect(False, f"{path}: {err}")
 
@@ -2327,10 +3524,13 @@ def run(root, quiet=False):
                      _log_capture, _signals, _deadlines, _hung_inspect, _inspect_redacted,
                      _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks,
                      _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
-                     _sink_drain, _external_checks, _report, _shipped):
+                     _sink_drain, _external_checks, _report, _expected_event_rules,
+                     _exit_driver, _ready_words, _exit_watchdog, _script_ledger, _sink_ledger, _roles,
+                     _sink_rules, _driver_roles, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
-                              _target_rules, _sink_drain, _shipped)
+                              _target_rules, _sink_drain, _expected_event_rules, _shipped,
+                              _roles, _sink_rules, _driver_roles)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")

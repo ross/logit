@@ -138,10 +138,10 @@
 //! [`drive_connection`] races it in the two waits before the close: the wait on a request in
 //! flight and the idle wait. Either trigger runs the same close sequence, which doesn't race the
 //! signal itself. A request in flight is served out, hyper ends an h1 connection after its current
-//! response and GOAWAYs an h2 one, and nothing is answered `503`. A shutdown close isn't counted:
-//! `connections.closed` counts a policy close, and one recorded at shutdown would land after
-//! `internal`'s final drain. The pre-serve steps (the PROXY header, the TLS accept, the first-byte
-//! peek) race the signal as a whole and end with nothing of a request read.
+//! response and GOAWAYs an h2 one, and nothing is answered `503`. A shutdown close counts
+//! `logit.input.connections.closed{reason="shutdown"}`, which only a dedicated `internal` pipeline
+//! exports, since it lands after a mixed one's final drain. The pre-serve steps (the PROXY header, the TLS
+//! accept, the first-byte peek) race the signal as a whole and end with nothing of a request read.
 //!
 //! *The listener owns its connection tasks.* They run in a
 //! [`ConnectionTasks`](crate::listener::ConnectionTasks) local to `run_until_shutdown`, which on
@@ -3050,10 +3050,15 @@ mod tests {
     }
 
     /// An h1 keep-alive connection between exports (`KA::Idle`) is closed by shutdown, the
-    /// listener returns, and no `Fanout` clone outlives it.
+    /// listener returns, and no `Fanout` clone outlives it. The close is counted
+    /// `connections.closed{reason="shutdown"}`, never `idle`.
     async fn shutdown_closes_an_idle_keep_alive_connection(idle_timeout: Option<Duration>) {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
         let (addr, input) = bound_input(OtlpTransport::Http).await;
-        let input = input.with_idle_timeout(idle_timeout).with_handshake_timeout(SHUTDOWN_GRACE);
+        let input = input
+            .with_telemetry(probe.telemetry("otlp_in", "otlp_in", "listener"))
+            .with_idle_timeout(idle_timeout)
+            .with_handshake_timeout(SHUTDOWN_GRACE);
         let (sink, mut rx) = fanout_into_channel();
         let running = logit_pipeline::test_util::spawn_input(input, sink).await;
 
@@ -3066,6 +3071,9 @@ mod tests {
         running.stop().await;
         logit_pipeline::test_util::expect_closed(&mut keep_alive, "a keep-alive connection").await;
         expect_inbox_closed(&mut rx).await;
+        // The listener has returned, so its connection task has finished counting.
+        assert_eq!(probe.sum("logit.input.connections.closed", &[("reason", "shutdown")]), 1.0);
+        assert_eq!(probe.sum("logit.input.connections.closed", &[("reason", "idle")]), 0.0);
     }
 
     #[tokio::test]

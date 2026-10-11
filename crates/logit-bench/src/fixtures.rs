@@ -1066,6 +1066,16 @@ function process(event)
 end
 "#;
 
+/// Writes a freshly minted trace id to `event.log.trace_id` on every call: the `random` global's
+/// cost on top of the `event.log` proxy's (`crates/logit-script/src/random.rs`;
+/// `tests/allocations.rs`'s `lua_process_one_event_minting_log_trace`).
+pub const LUA_LOG_TRACE_MINT_SCRIPT: &str = r#"
+function process(event)
+  event.log.trace_id = random.trace_id()
+  return event
+end
+"#;
+
 /// Reads `event.metrics[1].value` on every call: the `event.metrics` surface's cost
 /// (`crates/logit-script/src/proxy.rs`'s `MetricsProxy`/`MetricProxy`; `tests/allocations.rs`'s
 /// `lua_process_one_event_reading_metric_value`, whose doc says why the read is discarded rather

@@ -133,8 +133,10 @@ error.
   controllers, and external load balancers, plus, for anything that routes on its own probe of
   `/readyz`, that probe's period times its failure threshold. Set
   `terminationGracePeriodSeconds` to at least the delay plus the largest `shutdown_grace` in the
-  config, plus a few seconds' margin, or the kubelet's SIGKILL cuts the drain short. The same
-  budget applies to Docker's `--stop-timeout` and systemd's `TimeoutStopSec=`.
+  config, plus a few seconds' margin, or the kubelet's SIGKILL cuts the drain short. With a
+  [dedicated `internal` pipeline](#give-internal-a-dedicated-pipeline), add its second stage:
+  the larger of `internal`'s fixed 5 s and its sinks' `buffer.shutdown_grace`. The same budget
+  applies to Docker's `stop_grace_period`/`--stop-timeout` and systemd's `TimeoutStopSec=`.
   [Overlapping two instances on one port](#overlapping-two-instances-on-one-port) puts the delay
   into a rolling-upgrade recipe, with a `preStop` hook as the fallback where the delay can't be
   used.
@@ -423,7 +425,8 @@ The config sets `reuse_port: true` on each listener, `admin.socket: /run/logit/a
 - **Don't declare `ports:` on the container.** Under `hostNetwork`, every container port is also a
   host port, and the scheduler won't place a second pod claiming the same host port on a node, so
   the surge pod stays `Pending` and the rollout stops.
-- **`terminationGracePeriodSeconds: 30` fits `delay: 10s` and the default 5 s grace.**
+- **`terminationGracePeriodSeconds: 30` fits `delay: 10s`, the default 5 s grace, and a
+  dedicated `internal` pipeline's 5 s second stage.**
   [Signal and restart behavior](#signal-and-restart-behavior) has the sizing rule.
 - **Give the `exec` probe a `timeoutSeconds` of at least 2.** The kubelet stops the probe at its
   timeout, and the default 1 s can be too short for the `logit ready` process to start and get an
@@ -538,6 +541,8 @@ it. A throttled diagnostic, or a component-owned lifecycle message like `bound`/
 carries a `key` naming *why*. The process-level lifecycle events (`starting`, `ready`,
 `shutdown signal received`, `shutdown delay elapsed`, `reopen signal received`,
 `drain complete`, `exiting`) carry neither, because they describe the process, not a component.
+`telemetry left undrained at exit` is the exception: it carries `component`, naming the component
+that recorded the point.
 
 **Lifecycle event names are stable `&'static str` values, so you can alert on them directly:**
 
@@ -553,12 +558,30 @@ carries a `key` naming *why*. The process-level lifecycle events (`starting`, `r
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
 | `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
+| `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for a nonzero `*.dropped` count whose `reason` isn't one the config asked for (`absorbed`, `unrouted`, `script_drop`), other than `keep` and `remove`'s `logit.transform.attributes.dropped`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
-Outside the lifecycle events, `logit run` can log one startup `warn` before `ready`: when the
-listeners' summed `max_connections` reaches the process's open-files limit (Linux only). See
-["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener) for its text and
-the fix.
+`telemetry left undrained at exit` is the last word on counts recorded after `internal`'s final
+drain. Each line carries `component`, `metric`, `tags` (the point's tags as `key=value` pairs
+sorted by key and joined by `,`), and `value`; a timing carries `count` and `sum` (in seconds)
+instead of `value`. A [dedicated `internal`
+pipeline](#give-internal-a-dedicated-pipeline) avoids drop leftovers: `internal` drains last, so
+the lines carry only the final drain's own `logit.internal.*` counts and the routine counts its
+pipeline's nodes record while handling that batch, all at `debug`. A mixed pipeline, where `internal` shares a sink or transform with data,
+is what typically leaves drop counts here: that sink's `batches.dropped{reason="shutdown"}` and a
+UDP listener's `datagrams.dropped{reason="shutdown"}` land after `internal` has stopped. A
+second SIGTERM/SIGINT (exit `130`), SIGKILL, or an out-of-memory kill exits without
+them.
+
+Outside the lifecycle events, `logit run` can log startup `warn` lines before `ready`:
+
+- The listeners' summed `max_connections` reaches the process's open-files limit (Linux only). See
+  ["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener) for its text and
+  the fix.
+- A listener reaches two or more sinks that use `overflow: block` with no `buffer.disk`. See
+  [A slow or unreachable sink](#a-slow-or-unreachable-sink).
+- `internal` shares a node with a data path. See
+  [Give `internal` a dedicated pipeline](#give-internal-a-dedicated-pipeline).
 
 To ship `logit`'s own logs with no separate log-shipping setup, use the `internal` component's
 `logs:` setting (`warn` by default, `error`, or `off`). It routes every `warn`-or-above
@@ -566,6 +589,53 @@ self-diagnostic into the pipeline as an ordinary log event, alongside `internal`
 any sink attached to `internal` (directly or through a `keep`/`aggregate`/`lua`) carries them like
 any other signal. See [`docs/design/internal-telemetry.md`](design/internal-telemetry.md)'s "Logs"
 section.
+
+### Give `internal` a dedicated pipeline
+
+Give `internal` its own transforms and sinks, with no node shared with a data path. When
+`internal` has a dedicated pipeline, it shuts down last: after every other node has exited, it
+drains once more. That final drain exports the counts recorded while the data flows were stopping:
+a UDP listener's `datagrams.dropped{reason="shutdown"}`, an HTTP listener's
+`connections.closed{reason="shutdown"}`, and a sink's or Lua node's
+`batches.dropped{reason="shutdown"}`. If any node in `internal`'s pipeline also carries data, such
+as one `otlp_out` fed by both, `internal` drains once when the shutdown signal arrives and
+shuts down with the data. Later counts then appear only in the self-log (`warn` lines, `drain complete`, and
+`telemetry left undrained at exit`), never in an exported pipeline. The final drain's own `logit.internal.*` counts
+are never exported in either case. `logit validate` and `logit run` warn about a mixed pipeline,
+naming `internal` and a node it shares.
+
+A dedicated pipeline makes exit take longer. After the data drain ends, `internal` gets its own
+5 s grace for its final send, and each of its sinks gets its `buffer.shutdown_grace` to deliver
+it, counted from that point. Budget for both in the orchestrator's kill deadline: Kubernetes'
+`terminationGracePeriodSeconds` defaults to 30 s, but Docker's `stop_grace_period`/`--stop-timeout`
+defaults to 10 s, which the default 5 s data drain plus a 5 s second stage already uses up. A
+SIGKILL that lands first loses the shutdown-time telemetry this pipeline exists to export.
+[Signal and restart behavior](#signal-and-restart-behavior) has the sizing rule.
+
+When the backend is the same, add a second sink that points at it. This config sends data and
+`internal`'s telemetry to one collector through two `otlp_out` sinks:
+
+```yaml
+components:
+  statsd:
+    type: statsd_in
+  self:
+    type: internal
+    interval: 10s
+  data_out:
+    type: otlp_out
+    sources: [statsd]
+    endpoint: http://collector:4318
+  self_out:
+    type: otlp_out
+    sources: [self]
+    endpoint: http://collector:4318
+```
+
+A dedicated pipeline can have transforms, such as a `keep_signals` or an `aggregate`, between
+`internal` and its sinks. See [`docs/design/internal-telemetry.md`](design/internal-telemetry.md)
+and the [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md)'s
+"Amendment: internal drains last" section.
 
 ## Sink delivery buffering
 
