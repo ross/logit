@@ -3386,6 +3386,29 @@ fn lua_process_one_event_reading_log_trace() {
     expect_allocs("lua: process 1 event, reading event.log.trace_id", stats, 9);
 }
 
+/// A script writing `random.trace_id()` to `event.log.trace_id` (`docs/adr/lua-random-ids.md`):
+/// 9. The 4 baseline, +1 `Box` on `Emit`, +3 for creating and caching the `LogProxy`, and +1 for
+/// the `random.trace_id()` call. The id renders as hex on a stack buffer and the write parses it
+/// into the `TraceRef`'s array, so the +1 is mlua's cost of calling a Rust closure that returns a
+/// string: writing a hex literal instead lands at 8, and a bare `random.trace_id()` on a
+/// passthrough script at 6 (two calls, 7).
+#[test]
+fn lua_process_one_event_minting_log_trace() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_LOG_TRACE_MINT_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    let ProcessOutcome::Emit(event, _) = outcome else { panic!("expected Emit") };
+    assert!(event.log.as_ref().and_then(|l| l.trace).is_some(), "the script sets a trace id");
+    expect_allocs(
+        "lua: process 1 event, writing random.trace_id() to event.log.trace_id",
+        stats,
+        9,
+    );
+}
+
 /// A script reading `event.metrics[1].value` (`MetricsProxy`/`MetricProxy`): 11. 4 baseline, +1
 /// `Box` on `Emit`, +3 for creating and caching `MetricsProxy` on the first `event.metrics` access
 /// (as [`lua_process_one_event_reading_metric_len`] pins), and +3 for the per-index `MetricProxy`.
