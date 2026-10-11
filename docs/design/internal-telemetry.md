@@ -2070,11 +2070,12 @@ attempt.
 | `logit.output.records.dropped{reason="oversize"}` | count | a record over `max_request_bytes` alone, never sent, once per batch |
 | `logit.output.records.dropped{reason="rejected"}` | count | the records of a partition batch the broker rejected |
 | `logit.output.records.dropped{reason="invalid_timestamp"\|"invalid_record"}` | count | records the broker named in `record_errors`, dropped before the rest of their partition batch is resent once |
-| `logit.output.records.dropped{reason="ambiguous_at_most_once"}` | count | records left unsettled when `at_most_once` drops a batch after an `Ambiguous` attempt |
+| `logit.output.records.dropped{reason="ambiguous_at_most_once"}` | count | records left unsettled when `at_most_once` drops a batch after an `Ambiguous` attempt, or drops an `Ambiguous` partition batch before retrying a `Refused` one |
 | `logit.output.records.unkeyed` | count | records sent without a key because the configured `key:` had no value on their event, once per batch |
 
-`Diagnostics` keys, each throttled: `oversize`, `rejected`, `invalid_timestamp`, and
-`invalid_record`, each carrying the broker's error code name and message. The broker settles a
+`Diagnostics` keys, each throttled: `oversize`, naming the record count and the
+`max_request_bytes` cap, and `rejected`, `invalid_timestamp`, and `invalid_record`, each carrying
+the broker's error code name and message. The broker settles a
 partition batch once per `logit` batch, and a retry never resends a settled one, so every count
 but `requests` is met once per batch.
 

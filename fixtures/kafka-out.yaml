@@ -5,8 +5,10 @@
 #
 #   app (TCP lines) --> lines_in --> json --> kafka_out --> kafka:9092, topic logs
 #
-# Run it in the dev container on the compose network, then send a few lines and read them back:
+# Start the broker, which `script/server` doesn't, then run this config in the dev container on
+# the compose network, send a few lines, and read them back:
 #
+#   sudo COMPOSE_PROJECT_NAME=logit docker compose up -d kafka
 #   printf '{"user":"ann","msg":"hello"}\n{"msg":"no user"}\n' | nc -q1 127.0.0.1 5170
 #   docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
 #     --bootstrap-server kafka:9092 --topic logs --from-beginning \

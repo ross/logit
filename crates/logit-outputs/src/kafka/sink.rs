@@ -22,13 +22,14 @@
 //! | `logit.output.requests{class}` | one per attempt, `class` its result (`crate::count_request`) |
 //! | `logit.output.batch.bytes` | the record values' bytes, before compression, once per batch |
 //! | `logit.output.records` | records the broker accepted |
-//! | `logit.output.records.dropped{reason}` | `oversize` (one record over `max_request_bytes`, never sent), `rejected` (a partition batch the broker rejected), `invalid_timestamp` or `invalid_record` (records the broker named), or `ambiguous_at_most_once` (records left unsettled when `at_most_once` drops an `Ambiguous` batch) |
+//! | `logit.output.records.dropped{reason}` | `oversize` (one record over `max_request_bytes`, never sent), `rejected` (a partition batch the broker rejected), `invalid_timestamp` or `invalid_record` (records the broker named), or `ambiguous_at_most_once` (records left unsettled when `at_most_once` drops an `Ambiguous` batch, or an `Ambiguous` partition batch beside a `Refused` one) |
 //! | `logit.output.records.unkeyed` | records sent without a key because the configured key had no value on their event |
 //!
 //! `oversize` and `records.unkeyed` are encode-side, counted once per batch; the others follow
 //! the broker's answer, which a retry never meets twice for one partition batch. Each drop but
-//! `ambiguous_at_most_once` raises a throttled diagnostic of the same name, with the broker's
-//! error code and message.
+//! `ambiguous_at_most_once` raises a throttled diagnostic of the same name: `oversize` names the
+//! record count and the `max_request_bytes` cap, and `rejected`, `invalid_timestamp`, and
+//! `invalid_record` carry the broker's error code and message.
 
 use std::path::Path;
 use std::sync::Arc;
