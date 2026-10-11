@@ -573,10 +573,15 @@ UDP listener's `datagrams.dropped{reason="shutdown"}` land after `internal` has 
 second SIGTERM/SIGINT (exit `130`), SIGKILL, or an out-of-memory kill exits without
 them.
 
-Outside the lifecycle events, `logit run` can log one startup `warn` before `ready`: when the
-listeners' summed `max_connections` reaches the process's open-files limit (Linux only). See
-["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener) for its text and
-the fix.
+Outside the lifecycle events, `logit run` can log startup `warn` lines before `ready`:
+
+- The listeners' summed `max_connections` reaches the process's open-files limit (Linux only). See
+  ["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener) for its text and
+  the fix.
+- A listener reaches two or more sinks that use `overflow: block` with no `buffer.disk`. See
+  [A slow or unreachable sink](#a-slow-or-unreachable-sink).
+- `internal` shares a node with a data path. See
+  [Give `internal` a dedicated pipeline](#give-internal-a-dedicated-pipeline).
 
 To ship `logit`'s own logs with no separate log-shipping setup, use the `internal` component's
 `logs:` setting (`warn` by default, `error`, or `off`). It routes every `warn`-or-above
@@ -590,7 +595,8 @@ section.
 Give `internal` its own transforms and sinks, with no node shared with a data path. When
 `internal` has a dedicated pipeline, it shuts down last: after every other node has exited, it
 drains once more. That final drain exports the counts recorded while the data flows were stopping:
-a UDP listener's `datagrams.dropped{reason="shutdown"}`, and a sink's or Lua node's
+a UDP listener's `datagrams.dropped{reason="shutdown"}`, an HTTP listener's
+`connections.closed{reason="shutdown"}`, and a sink's or Lua node's
 `batches.dropped{reason="shutdown"}`. If any node in `internal`'s pipeline also carries data, such
 as one `otlp_out` fed by both, `internal` drains once when the shutdown signal arrives and
 shuts down with the data. Later counts then appear only in the self-log (`warn` lines, `drain complete`, and
