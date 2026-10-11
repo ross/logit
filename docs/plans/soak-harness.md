@@ -998,8 +998,10 @@ diagnostics it quotes are keyed by the drop reason (`rejected`, `invalid_timesta
 topic. `ledger.topic` compares the topic's distinct record count T with the records the sink
 saw accepted, A (`logit.output.records`, every SUT life): T below A FAILs, records the broker
 acknowledged and no longer holds; T above A FAILs, unless the sink dropped an attempt it never
-saw answered, which may have landed, and then WARNs; a topic not read back FAILs. It judges each
-SUT life's duplicate copies too. Within one producer epoch the broker discards a resend, so a
+saw answered, which may have landed, and then WARNs. Across a killed SUT life a T − A difference
+in either direction WARNs and names the life, because the kill loses that life's last telemetry
+interval of A and a replayed spool batch counts twice in A. A topic not read back FAILs. It
+judges each SUT life's duplicate copies too. Within one producer epoch the broker discards a resend, so a
 duplicate FAILs in a life with no epoch bump, and WARNs in a life that ended in a restart or
 kill (the next life resends under a new producer id) or whose sink counted a drop that bumps
 the epoch (`rejected`, `invalid_timestamp`, `invalid_record`, `ambiguous_at_most_once`;
