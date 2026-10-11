@@ -164,8 +164,10 @@ components:
   #
   # The backends share inputs, so each one spools to disk. While a backend is down, its spool
   # takes the backlog; with an in-memory buffer, a full one would stop the inputs every other
-  # backend reads from. Put /var/lib/logit on a persistent volume so a restart replays the
-  # backlog instead of losing it.
+  # backend reads from. Put /var/lib/logit on a persistent volume, writable by the user logit
+  # runs as, so a restart replays the backlog instead of losing it. The release image's `logit`
+  # user owns /var/lib/logit, and a named volume mounted there starts with that owner. logit
+  # exits if it can't create a spool.
 
   # Datadog reads `host.name` from each event's resource; on a per-host logit, stamp it with a
   # `set` ahead of the gates.
