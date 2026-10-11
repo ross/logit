@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-10-09
+updated: 2026-10-11
 ---
 
 # Out-of-CI fuzzing: a `cargo-fuzz` workspace in the unsafe-check image, with every crash landed as a stable test
@@ -338,7 +338,7 @@ symbol-table rules are reachable, and a fixed-point oracle on every input.
 
 ### Seeds and differential corpora
 
-`seedgen` also reads `testdata/interop/{statsd,syslog,graphite,collectd,datadog}/`, and every corpus
+`seedgen` also reads `testdata/interop/{statsd,syslog,graphite,collectd,datadog,prometheus-scrape}/`, and every corpus
 under `testdata/differential/`. A differential corpus differs from `testdata/interop/`, which
 holds captured bytes that don't reproduce: it's generated, deterministic, and carries a reference
 implementation's reading of each case beside the case's bytes. `script/differential <corpus>`
@@ -391,3 +391,17 @@ canonical `frames.dropped` reasons. `untrusted/w6`, the branch that adds the `st
 target, adds `drained` there, to the reason lists in that doc's `statsd_in`, `graphite_in`, and
 `lines_in` sections (the listeners that frame with `DrainToNextLine`), and to those listeners'
 module docs.
+
+## Amendment (2026-10-11): `script/lint` type-checks `fuzz/`
+
+`script/lint` ends with `cargo check --manifest-path fuzz/Cargo.toml --workspace --all-targets`,
+on the stable toolchain the dev and CI images carry. `libfuzzer-sys`'s build script compiles
+libFuzzer with the image's C++ compiler, and only `cargo fuzz build` and `cargo fuzz run` need
+nightly, so the check fits the stable build: it took about 7 seconds from an empty target
+directory. A decoder signature change that breaks a target or `seedgen` now fails `script/check`
+and CI, where "What `script/cibuild` doesn't cover" left it to the next campaign's build.
+
+The check doesn't build under the sanitizer, run a target, or lint `fuzz/`. A change to what a
+decoder accepts can still break a target's oracle with every check green, so the
+"Consequences" advice stands: run `script/unsafe-check fuzz-seed` and a short `fuzz-all` after
+changing a decoder a target calls.
