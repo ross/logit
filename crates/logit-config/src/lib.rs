@@ -2182,33 +2182,49 @@ pub enum ComponentKind {
     /// `keep_signals`. An event left with no payload is dropped. `signals` may not be empty (a
     /// no-op) and may not name all three signals (that would drop every event).
     DropSignals { signals: Vec<Signal> },
-    /// Forwards an event whose batch resource and/or own attributes match every configured pair,
-    /// dropping the rest. The config is `set`'s: `resource:`/`attributes:` maps of the same
-    /// literals, so this matches on what `set` can stamp. Never mutates a forwarded event.
+    /// Forwards an event whose batch resource and/or own attributes match every configured pair
+    /// and carry every listed key, dropping the rest. `resource:` and `attributes:` are `set`'s
+    /// maps of literals, so this matches on what `set` can stamp. `resource_present:` and
+    /// `attributes_present:` list keys that must exist with any value, `null` included. Never
+    /// mutates a forwarded event.
     ///
-    /// A map is a conjunction: every pair listed, across both maps, must match; there is no
-    /// `or`. A configured key the event or resource doesn't carry never matches, and "key present
-    /// with any value" is not expressible. Values coerce across numeric representations
-    /// (`status: 200` matches an integer, float, or string `200`), but a boolean never coerces,
-    /// and two strings are never compared numerically. At least one of `resource`/`attributes`
-    /// must be non-empty, every key must be non-empty, and every numeric value must be finite.
+    /// Everything configured must hold: every pair, across both maps, matches and every listed
+    /// key is present; there is no `or`. A key the event or resource doesn't carry never matches.
+    /// Values coerce across numeric representations (`status: 200` matches an integer, float, or
+    /// string `200`), but a boolean never coerces, and two strings are never compared
+    /// numerically. At least one of the four fields must be non-empty, every key must be
+    /// non-empty, every numeric value must be finite, and a key may not repeat within a list or
+    /// appear both in a map and in the matching `_present` list (the pair already requires the
+    /// key).
     HasAttributes {
         #[serde(default)]
         resource: std::collections::BTreeMap<String, SetValue>,
         #[serde(default)]
         attributes: std::collections::BTreeMap<String, SetValue>,
+        /// Batch resource keys that must exist, with any value.
+        #[serde(default)]
+        resource_present: Vec<String>,
+        /// Event attribute keys that must exist, with any value.
+        #[serde(default)]
+        attributes_present: Vec<String>,
     },
-    /// Drops an event whose batch resource and/or own attributes match every configured pair,
-    /// forwarding the rest: the complement of `has_attributes` on the same config, taken as a
-    /// whole, not per pair. An event matching some but not all configured pairs is forwarded,
-    /// and so is one that never carried a configured key; read it as "this event isn't one of
-    /// the ones told to drop", the else-branch of a `has_attributes` fan-out. Same matching rules
-    /// and validation as `has_attributes`.
+    /// Drops an event whose batch resource and/or own attributes match every configured pair and
+    /// carry every listed key, forwarding the rest: the complement of `has_attributes` on the
+    /// same config, taken as a whole, not per pair. An event matching some but not all of the
+    /// configuration is forwarded, and so is one that never carried a configured key; read it as
+    /// "this event isn't one of the ones told to drop", the else-branch of a `has_attributes`
+    /// fan-out. Same matching rules and validation as `has_attributes`.
     DropAttributes {
         #[serde(default)]
         resource: std::collections::BTreeMap<String, SetValue>,
         #[serde(default)]
         attributes: std::collections::BTreeMap<String, SetValue>,
+        /// Batch resource keys that must exist, with any value.
+        #[serde(default)]
+        resource_present: Vec<String>,
+        /// Event attribute keys that must exist, with any value.
+        #[serde(default)]
+        attributes_present: Vec<String>,
     },
     /// Clamps attribute (and/or resource-attribute) values to a per-field allow-list: `keep`'s
     /// value-side sibling, for a tag whose valid set you know but the producer doesn't enforce
@@ -5643,11 +5659,44 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::HasAttributes { resource, attributes } => {
+            ComponentKind::HasAttributes { resource, attributes, .. } => {
                 assert_eq!(resource.get("service.name"), Some(&SetValue::Str("nginx".to_string())));
                 assert_eq!(attributes.get("status"), Some(&SetValue::I64(200)));
             }
             other => panic!("expected HasAttributes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_attributes_presence_lists_deserialize_and_default_to_empty() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "has_attributes", "sources": ["in"],
+                "attributes_present": ["http.request.method"], "resource_present": ["service.name"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::HasAttributes {
+                resource,
+                attributes,
+                resource_present,
+                attributes_present,
+            } => {
+                assert!(resource.is_empty() && attributes.is_empty());
+                assert_eq!(attributes_present, vec!["http.request.method".to_string()]);
+                assert_eq!(resource_present, vec!["service.name".to_string()]);
+            }
+            other => panic!("expected HasAttributes, got {other:?}"),
+        }
+        let drop: Component = serde_json::from_str(
+            r#"{"type": "drop_attributes", "sources": ["in"], "attributes_present": ["a"]}"#,
+        )
+        .unwrap();
+        match drop.kind {
+            ComponentKind::DropAttributes { resource_present, attributes_present, .. } => {
+                assert!(resource_present.is_empty());
+                assert_eq!(attributes_present, vec!["a".to_string()]);
+            }
+            other => panic!("expected DropAttributes, got {other:?}"),
         }
     }
 
@@ -5658,7 +5707,7 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::DropAttributes { resource, attributes } => {
+            ComponentKind::DropAttributes { resource, attributes, .. } => {
                 assert!(resource.is_empty(), "resource must default to empty");
                 assert_eq!(attributes.get("stream"), Some(&SetValue::Str("debug".to_string())));
             }

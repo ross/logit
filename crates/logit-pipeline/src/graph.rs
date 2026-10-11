@@ -1633,34 +1633,50 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 36: `has_attributes`/`drop_attributes` (`docs/adr/attribute-filtering-components.md`).
-    // The maps are conjunctions, so zero pairs match every event: `has_attributes` forwards all
-    // (no-op) and `drop_attributes` drops all (black hole), the inverse of rule 21's list of
-    // alternatives. An empty key can't name an attribute; a non-finite value never compares equal
-    // under `crate::attributes`' coercing matcher. The same key in `resource:` and `attributes:` is
-    // legal: one addresses the batch, the other the event.
+    // The maps and presence lists are conjunctions, so zero entries match every event:
+    // `has_attributes` forwards all (no-op) and `drop_attributes` drops all (black hole), the
+    // inverse of rule 21's list of alternatives. An empty key can't name an attribute; a
+    // non-finite value never compares equal under `crate::attributes`' coercing matcher. The same
+    // key in `resource:` and `attributes:` is legal: one addresses the batch, the other the event.
+    // Within one side, a key in both the map and its `_present` list is a redundancy (the pair
+    // already requires the key), and a key repeated in a list is a copy-paste mistake (rule 4's
+    // reasoning).
     for (id, component) in &components {
-        let (kind_name, resource, attributes) = match &component.kind {
-            ComponentKind::HasAttributes { resource, attributes } => {
-                ("has_attributes", resource, attributes)
-            }
-            ComponentKind::DropAttributes { resource, attributes } => {
-                ("drop_attributes", resource, attributes)
-            }
-            _ => continue,
-        };
+        let (kind_name, resource, attributes, resource_present, attributes_present) =
+            match &component.kind {
+                ComponentKind::HasAttributes {
+                    resource,
+                    attributes,
+                    resource_present,
+                    attributes_present,
+                } => ("has_attributes", resource, attributes, resource_present, attributes_present),
+                ComponentKind::DropAttributes {
+                    resource,
+                    attributes,
+                    resource_present,
+                    attributes_present,
+                } => {
+                    ("drop_attributes", resource, attributes, resource_present, attributes_present)
+                }
+                _ => continue,
+            };
 
-        if resource.is_empty() && attributes.is_empty() {
+        if resource.is_empty()
+            && attributes.is_empty()
+            && resource_present.is_empty()
+            && attributes_present.is_empty()
+        {
             if kind_name == "has_attributes" {
                 anyhow::bail!(
-                    "component '{id}': a has_attributes with neither 'resource' nor \
-                     'attributes' configured matches every event -- a no-op that forwards \
-                     every event untouched"
+                    "component '{id}': a has_attributes with none of 'resource', 'attributes', \
+                     'resource_present', or 'attributes_present' configured matches every \
+                     event -- a no-op that forwards every event untouched"
                 );
             } else {
                 anyhow::bail!(
-                    "component '{id}': a drop_attributes with neither 'resource' nor \
-                     'attributes' configured matches every event -- and so can only ever drop \
-                     every one of them"
+                    "component '{id}': a drop_attributes with none of 'resource', 'attributes', \
+                     'resource_present', or 'attributes_present' configured matches every \
+                     event -- and so can only ever drop every one of them"
                 );
             }
         }
@@ -1681,6 +1697,34 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      number -- a non-finite value never compares equal to anything, so that \
                      entry could never match"
                 );
+            }
+        }
+
+        for (map_name, map, list_name, list) in [
+            ("resource", resource, "resource_present", resource_present),
+            ("attributes", attributes, "attributes_present", attributes_present),
+        ] {
+            let mut seen = std::collections::BTreeSet::new();
+            for key in list {
+                if key.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': a {kind_name} '{list_name}' key must not be empty -- \
+                         it could never name a real attribute"
+                    );
+                }
+                if !seen.insert(key.as_str()) {
+                    anyhow::bail!(
+                        "component '{id}': a {kind_name} '{list_name}' lists '{key}' more than \
+                         once -- the repeat is a copy-paste mistake"
+                    );
+                }
+                if map.contains_key(key) {
+                    anyhow::bail!(
+                        "component '{id}': a {kind_name} lists '{key}' in both '{map_name}' and \
+                         '{list_name}' -- a '{map_name}' pair already requires the key, so \
+                         drop it from '{list_name}'"
+                    );
+                }
             }
         }
     }
@@ -4925,6 +4969,8 @@ mod tests {
                 ComponentKind::HasAttributes {
                     resource: std::collections::BTreeMap::new(),
                     attributes: std::collections::BTreeMap::new(),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -4948,6 +4994,8 @@ mod tests {
                 ComponentKind::DropAttributes {
                     resource: std::collections::BTreeMap::new(),
                     attributes: std::collections::BTreeMap::new(),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -4957,6 +5005,126 @@ mod tests {
             "a drop_attributes with nothing configured is the black-hole shape (drops every \
              event), not the no-op shape -- got: {err}"
         );
+    }
+
+    #[test]
+    fn a_has_attributes_with_only_presence_lists_resolves_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec!["service.name".to_string()],
+                    attributes_present: vec!["m".to_string()],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]))
+        .expect("should resolve");
+    }
+
+    #[test]
+    fn a_presence_key_also_in_the_attributes_map_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "m".to_string(),
+                        logit_config::SetValue::Str("x".to_string()),
+                    )]),
+                    resource_present: vec![],
+                    attributes_present: vec!["m".to_string()],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("both 'attributes' and 'attributes_present'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_presence_key_also_in_the_resource_map_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::DropAttributes {
+                    resource: std::collections::BTreeMap::from([(
+                        "s".to_string(),
+                        logit_config::SetValue::Str("x".to_string()),
+                    )]),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec!["s".to_string()],
+                    attributes_present: vec![],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("both 'resource' and 'resource_present'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_repeated_presence_key_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec![],
+                    attributes_present: vec!["m".to_string(), "m".to_string()],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    #[test]
+    fn an_empty_presence_key_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::DropAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec!["".to_string()],
+                    attributes_present: vec![],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("key must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_has_attributes_with_all_four_fields_empty_is_still_a_no_op() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                    resource_present: vec![],
+                    attributes_present: vec![],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("resource_present"), "got: {err}");
     }
 
     #[test]
@@ -5058,6 +5226,8 @@ mod tests {
                         "".to_string(),
                         logit_config::SetValue::Str("x".to_string()),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -5078,6 +5248,8 @@ mod tests {
                         "ratio".to_string(),
                         logit_config::SetValue::F64(f64::NAN),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -5098,6 +5270,8 @@ mod tests {
                         logit_config::SetValue::Str("nginx".to_string()),
                     )]),
                     attributes: std::collections::BTreeMap::new(),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -5118,6 +5292,8 @@ mod tests {
                         "stream".to_string(),
                         logit_config::SetValue::Str("a".to_string()),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -5142,6 +5318,8 @@ mod tests {
                         "stream".to_string(),
                         logit_config::SetValue::Str("a".to_string()),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["filter"], sink()),
@@ -7600,6 +7778,8 @@ mod tests {
                         "stream".to_string(),
                         logit_config::SetValue::Str("a".to_string()),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             (
@@ -7611,6 +7791,8 @@ mod tests {
                         "debug".to_string(),
                         logit_config::SetValue::Bool(true),
                     )]),
+                    resource_present: Vec::new(),
+                    attributes_present: Vec::new(),
                 },
             ),
             ("out", vec!["drop_attributes"], sink()),

@@ -1831,7 +1831,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Forwards an event whose batch resource and/or own attributes match every configured pair, dropping the rest. The config is `set`'s: `resource:`/`attributes:` maps of the same literals, so this matches on what `set` can stamp. Never mutates a forwarded event.\n\nA map is a conjunction: every pair listed, across both maps, must match; there is no `or`. A configured key the event or resource doesn't carry never matches, and \"key present with any value\" is not expressible. Values coerce across numeric representations (`status: 200` matches an integer, float, or string `200`), but a boolean never coerces, and two strings are never compared numerically. At least one of `resource`/`attributes` must be non-empty, every key must be non-empty, and every numeric value must be finite.",
+          "description": "Forwards an event whose batch resource and/or own attributes match every configured pair and carry every listed key, dropping the rest. `resource:` and `attributes:` are `set`'s maps of literals, so this matches on what `set` can stamp. `resource_present:` and `attributes_present:` list keys that must exist with any value, `null` included. Never mutates a forwarded event.\n\nEverything configured must hold: every pair, across both maps, matches and every listed key is present; there is no `or`. A key the event or resource doesn't carry never matches. Values coerce across numeric representations (`status: 200` matches an integer, float, or string `200`), but a boolean never coerces, and two strings are never compared numerically. At least one of the four fields must be non-empty, every key must be non-empty, every numeric value must be finite, and a key may not repeat within a list or appear both in a map and in the matching `_present` list (the pair already requires the key).",
           "type": "object",
           "required": [
             "type"
@@ -1844,6 +1844,14 @@
                 "$ref": "#/definitions/SetValue"
               }
             },
+            "attributes_present": {
+              "description": "Event attribute keys that must exist, with any value.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "buffer": true,
             "receive": true,
             "resource": {
@@ -1851,6 +1859,14 @@
               "type": "object",
               "additionalProperties": {
                 "$ref": "#/definitions/SetValue"
+              }
+            },
+            "resource_present": {
+              "description": "Batch resource keys that must exist, with any value.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
               }
             },
             "sources": true,
@@ -1865,7 +1881,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Drops an event whose batch resource and/or own attributes match every configured pair, forwarding the rest: the complement of `has_attributes` on the same config, taken as a whole, not per pair. An event matching some but not all configured pairs is forwarded, and so is one that never carried a configured key; read it as \"this event isn't one of the ones told to drop\", the else-branch of a `has_attributes` fan-out. Same matching rules and validation as `has_attributes`.",
+          "description": "Drops an event whose batch resource and/or own attributes match every configured pair and carry every listed key, forwarding the rest: the complement of `has_attributes` on the same config, taken as a whole, not per pair. An event matching some but not all of the configuration is forwarded, and so is one that never carried a configured key; read it as \"this event isn't one of the ones told to drop\", the else-branch of a `has_attributes` fan-out. Same matching rules and validation as `has_attributes`.",
           "type": "object",
           "required": [
             "type"
@@ -1878,6 +1894,14 @@
                 "$ref": "#/definitions/SetValue"
               }
             },
+            "attributes_present": {
+              "description": "Event attribute keys that must exist, with any value.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "buffer": true,
             "receive": true,
             "resource": {
@@ -1885,6 +1909,14 @@
               "type": "object",
               "additionalProperties": {
                 "$ref": "#/definitions/SetValue"
+              }
+            },
+            "resource_present": {
+              "description": "Batch resource keys that must exist, with any value.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
               }
             },
             "sources": true,

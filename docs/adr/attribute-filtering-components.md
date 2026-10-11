@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-10
+updated: 2026-10-11
 ---
 
 # Attribute filtering is two transform components, and a bounded matcher is not a predicate language
@@ -131,7 +131,8 @@ as "this event isn't one of the ones told to drop" -- precisely the else-branch 
 fan-out-after-`logit_in` topology needs downstream of the tagged branches. "Key present with any
 value" is deliberately not expressible either way; `exists` was one of the three functions the
 retired predicate grammar offered, and not shipping it is part of keeping this a bounded matcher
-rather than a predicate language creeping back in one function at a time.
+rather than a predicate language creeping back in one function at a time. [Amended 2026-10-11:
+key presence is now a list field; see "Amendment: key presence".]
 
 **Values coerce across numeric representations, modelled on `crate::numeric` and
 `logit-script`'s `lua_value_matches`, deliberately not on `aggregate`'s `value_key_eq`.** Config
@@ -249,3 +250,45 @@ component.
   than equality, that is new evidence for `routing-by-condition-is-lua`'s own revisit trigger, not a
   reason to grow this component past what `set` can stamp -- the retired predicate grammar sketch
   that ADR preserved is still where such a design would resume.
+
+## Amendment: key presence (2026-10-11)
+
+`has_attributes` and `drop_attributes` gain two optional list fields beside the maps:
+
+```yaml
+http_only:
+  type: has_attributes
+  sources: [parsed]
+  attributes_present: [http.request.method]
+  resource_present: [service.name]
+```
+
+- **Semantics.** `attributes_present` and `resource_present` name keys that must exist on the
+  event's attributes or the batch resource, with any value, `Null` included. They join the same
+  conjunction as the pairs: `has_attributes` forwards an event only when every pair matches and
+  every listed key is present, and `drop_attributes` drops only when all of that holds, forwarding
+  the rest. The complement is still taken as a whole, so a missing key makes `drop_attributes`
+  forward the event, as an unmatched pair does.
+- **Validation.** Rule 36 gains four conditions. At least one of the four fields must be
+  non-empty. Every listed key must be non-empty. A key may not repeat within a list. A key may not
+  appear in both `attributes` and `attributes_present`, or in both `resource` and
+  `resource_present`, because the pair already requires the key; the redundancy reads like a
+  mistake. A key in `resource_present` and `attributes_present` together stays legal, for the
+  reason the maps' shared key does.
+- **A list, not a null value in the map.** `SetValue` has no null variant, and a `key:` with
+  nothing after it reads as a typo rather than a presence test. A list names the intent.
+- **The earlier text changes in two places.** "Key present with any value is not expressible"
+  no longer holds, and the config is no longer `set`'s config field for field: the two lists have
+  no `set` counterpart. The structural bound shrinks to "the maps are `set`'s; the lists add only
+  key names".
+
+**This is presence, not an operator, so `routing-by-condition-is-lua`'s holding stands.** A
+presence test is a positive assertion about data that is there; an absent key is `false`, as for
+any pair. It adds no comparison, no `not`, no `or`, no parsing, and no runtime failure mode. What
+stays Lua is unchanged: an absence test ("carries no `stream`"), anything comparing values by
+more than equality, and any `or`. The retired `exists` function was the first step of a
+predicate grammar; a list of key names is not a grammar and has nowhere to grow into one.
+
+Matching reuses `AttrMap::get_sym` and the resource-match cache, which now also covers
+`resource_present`. Telemetry and the allocation pins are unchanged: a presence probe is the same
+stack-only binary search as a pair's, with no value comparison.

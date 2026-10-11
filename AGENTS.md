@@ -134,7 +134,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `http_access` | normalizes web-server access logs onto OTel semconv | [ADR `http-access-normalization`](docs/adr/http-access-normalization.md) |
 | `flatten` | rewrites a nested attribute into flat, dot-joined keys | [ADR `flatten-transform`](docs/adr/flatten-transform.md) |
 | `has_signal`, `keep_signals`, `drop_signals` | forward an event carrying a listed signal; keep, or clear, the listed signals' payloads | [ADR `signal-filtering-components`](docs/adr/signal-filtering-components.md) |
-| `has_attributes`, `drop_attributes` | forward, or drop, an event whose resource and/or attributes match every configured pair | [ADR `attribute-filtering-components`](docs/adr/attribute-filtering-components.md) |
+| `has_attributes`, `drop_attributes` | forward, or drop, an event whose resource and/or attributes match every configured pair, and carry every listed key | [ADR `attribute-filtering-components`](docs/adr/attribute-filtering-components.md) |
 | `has_provenance`, `drop_provenance` | forward, or drop, an event whose batch `origin`/`previous` match a configured list | [ADR `provenance-filtering-components`](docs/adr/provenance-filtering-components.md) |
 | `sample` | consistent, keyed sampling | [ADR `consistent-sampling-component`](docs/adr/consistent-sampling-component.md) |
 | `shape` | an observer that measures each event's shape | [ADR `shape-observer-component`](docs/adr/shape-observer-component.md) |
