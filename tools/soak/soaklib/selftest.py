@@ -1092,10 +1092,11 @@ def _ledger_checks():
                f"intake WARNs shutdown drops on stderr that telemetry lacks, got "
                f"{stderr_only['ledger.intake']}")
         tel_only = results("ledger-shutdown-telemetry-only", shutdown_in=("telemetry",))
-        expect(tel_only["ledger.intake"].status == checks.WARN
+        expect(tel_only["ledger.intake"].status == checks.PASS
                and tel_only["ledger.egress"].status == checks.PASS,
-               f"intake WARNs shutdown drops in telemetry that stderr lacks, and D still reads "
-               f"telemetry, got {tel_only['ledger.intake']} {tel_only['ledger.egress']}")
+               f"intake doesn't WARN on shutdown drops in telemetry that stderr lacks (a "
+               f"cancelled blocked push counts without logging), and D still reads telemetry, "
+               f"got {tel_only['ledger.intake']} {tel_only['ledger.egress']}")
         expect(led.residual(0) == 30, f"life 0's W − D − B − Ab, got {led.residual(0)}")
         expect(led.R == 77000, f"R from the defaults, got {led.R}")
         expect("within [0, R]" in clean["ledger.intake"].detail,

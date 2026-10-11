@@ -898,11 +898,14 @@ class Ledger:
         return self.get("D_tel", life)
 
     def datagram_mismatch(self, life):
-        """A detail when stderr's shutdown `warn` lines and telemetry's
-        `datagrams.dropped{reason="shutdown"}` disagree for a life, else None. A killed life has
-        neither."""
+        """A detail when stderr's shutdown `warn` lines count more datagrams than telemetry's
+        `datagrams.dropped{reason="shutdown"}` for a life, else None. A killed life has neither.
+
+        Only stderr above telemetry is a disagreement. Under `receive: { overflow: block }`, a
+        `push_many` cancelled while blocked counts its datagrams as shutdown drops without
+        logging a line, so telemetry can exceed stderr on a correct ledger."""
         logged, counted = self.get("D_log", life), self.get("D_shutdown", life)
-        if logged == counted:
+        if logged <= counted:
             return None
         return (f"life {life}: the listener's stderr shutdown lines count {_n(logged)} "
                 f"datagram(s), telemetry's datagrams.dropped{{reason=\"shutdown\"}} "
@@ -972,8 +975,9 @@ class Ledger:
         batch dropped for shutdown.
 
         The final life's gap is Ab − V. A stopped earlier life's is W − D − B − V, the residual
-        plus Ab − V, because the close-time window delivers what that life read but hadn't
-        absorbed by its last drain into V. A killed life has no close-time window and no
+        plus Ab − V, because `aggregate`'s close-time flush delivers what that life read but
+        hadn't absorbed by its last ordinary drain into V; the final drain runs after that
+        flush, so it exports the shutdown drops. A killed life has no close-time window and no
         shutdown drops: its gap is Ab − V alone, judged inside `kill_band`; below the band it is a
         surplus, above it uncounted loss. Its residual is what the kill lost from the receive
         queue and inbox, by design, and is reported, not judged here."""

@@ -180,7 +180,9 @@ stderr", no longer hold for those counts:
 - D and the counted verdict of `ledger.egress` read telemetry alone. Adding the stderr copy as
   well counts each shutdown drop twice.
 - The listener's `warn` lines and the `drain complete` line's `batches_dropped` stay as a
-  cross-check: a life whose stderr and telemetry counts disagree WARNs. `drain complete` also
+  cross-check: a life whose stderr count exceeds telemetry's WARNs. A telemetry count above
+  stderr's does not, because under `receive: { overflow: block }` a `push_many` cancelled while
+  blocked counts its datagrams as shutdown drops without logging a line. `drain complete` also
   counts the `internal` pipeline's own shutdown drops, which no drain exports.
 - A SUT config that sends `self` into a pipeline another input also reaches has one shutdown
   stage, so its shutdown drops miss telemetry. The cross-check WARNs on it, and the ledger reads

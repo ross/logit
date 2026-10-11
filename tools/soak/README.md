@@ -263,7 +263,9 @@ goes into D, and a node's `batches.dropped{reason="shutdown"}` is what makes a p
 `ledger.egress` gap counted. A SUT config that sends `self` anywhere else loses those counts, so
 keep its pipeline dedicated. The stderr copies, the listener's `warn` lines and `drain complete`'s
 `batches_dropped`, only cross-check telemetry: `ledger.intake` and `ledger.egress` `WARN` when a
-life's copies disagree, and are never added to it. `drain complete` also counts the `internal`
+life's stderr count exceeds telemetry's, and are never added to it. A telemetry count above
+stderr's is not a disagreement: under `receive: { overflow: block }`, a cancelled blocked push
+counts its datagrams as shutdown drops without logging a line. `drain complete` also counts the `internal`
 pipeline's own shutdown drops, which no drain exports. The per-hop rows are judged with no
 tolerance only for the final SUT life, because an earlier life stops under load. A life a
 `kill` ended writes no final drain and counts no shutdown drops, so up to one 5 s `internal`
