@@ -1914,6 +1914,11 @@ pub enum ComponentKind {
     },
     /// `logit` observing itself: drains every component's buffered self-telemetry on `interval`
     /// and emits it as ordinary events into the graph. At most one per config.
+    ///
+    /// Give `internal` its own transforms and sinks, with none shared with a data path. At
+    /// shutdown, `internal` then drains once more after every data component has stopped, so the
+    /// drops counted while shutting down are exported. A sink shared with data shuts down with the
+    /// data, and those counts are lost. Pointing a second sink at the same backend works.
     Internal {
         /// The drain cadence for every component's buffered points, and the sampling tick for
         /// process-level metrics (resident memory, CPU time, threads, open files, interner size,
