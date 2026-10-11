@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use logit_core::interner::intern;
-use logit_core::{Event, EventBatch, Provenance, Resource};
+use logit_core::{Event, EventBatch, Provenance, Resource, Scope};
 
 use crate::frame::{read_frame, write_frame, Compression};
 use crate::native::dict::{Dict, DictBuilder};
@@ -95,13 +95,20 @@ pub struct SeqId {
 /// The dictionary is written first but built last: [`DictBuilder`] collects symbols while the
 /// other sections encode into their own buffers, so the batch is walked once.
 pub fn encode_batch(batch: &EventBatch) -> Bytes {
+    encode_events(&batch.resource, batch.scope.as_deref(), &batch.events)
+}
+
+/// [`encode_batch`] over a batch's parts: the payload of a batch holding `events` under
+/// `resource` and `scope`. `kafka_out` encodes a slice of a batch's events as one frame with it,
+/// without cloning them into a new [`EventBatch`].
+pub fn encode_events(resource: &Resource, scope: Option<&Scope>, events: &[Event]) -> Bytes {
     let mut dict = DictBuilder::default();
 
     let mut resource_buf = BytesMut::new();
-    record::write_resource(&mut resource_buf, &mut dict, &batch.resource);
+    record::write_resource(&mut resource_buf, &mut dict, resource);
 
     let mut scope_buf = BytesMut::new();
-    match &batch.scope {
+    match scope {
         Some(scope) => {
             scope_buf.extend_from_slice(&[1]);
             let mut tmp = BytesMut::new();
@@ -113,8 +120,8 @@ pub fn encode_batch(batch: &EventBatch) -> Bytes {
     }
 
     let mut events_buf = BytesMut::new();
-    write_uvarint(&mut events_buf, batch.events.len() as u64);
-    for event in &batch.events {
+    write_uvarint(&mut events_buf, events.len() as u64);
+    for event in events {
         let body = record::write_event(&mut dict, event);
         write_uvarint(&mut events_buf, body.len() as u64);
         events_buf.extend_from_slice(&body);
