@@ -91,6 +91,59 @@ async fn a_sighup_during_the_drain_doesnt_exit_130() {
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
+/// A drop a data sink counts during the drain reaches `internal`'s own `file_out`. The data
+/// `influxdb_out`'s one request is accepted and never answered, so its grace cuts it 1 s after the
+/// SIGTERM and it counts the batch dropped for shutdown. `internal`'s last drain waits for that
+/// sink to finish.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sigterm_exports_a_drop_the_data_drain_counts_through_internal() {
+    let dir = scratch_dir("term-last-drain");
+    let path = dir.join("telemetry.ndjson");
+    let influx = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let influx_addr = influx.local_addr().unwrap();
+    let statsd_addr = {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.local_addr().unwrap().to_string()
+    };
+    let config = TempConfig::write(
+        "term-last-drain",
+        format!(
+            "components:\n  data_in:\n    type: statsd_in\n    bind: \"{statsd_addr}\"\n  \
+             data_out:\n    type: influxdb_out\n    sources: [data_in]\n    url: \
+             \"http://{influx_addr}\"\n    org: o\n    bucket: b\n    token: t\n    buffer:\n      \
+             shutdown_grace: 1s\n  self:\n    type: internal\n    interval: 100ms\n  \
+             telemetry_out:\n    type: file_out\n    sources: [self]\n    format: json\n    \
+             path: \"{}\"\n    rotate:\n      max_bytes: 1MiB\n",
+            path.display()
+        ),
+    );
+    let (mut child, stderr) = spawn_run(&config);
+    stderr.wait_for("ready");
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    sender.send_to(b"hits:1|c\n", &statsd_addr).unwrap();
+    let (_held, _) = tokio::time::timeout(PROCESS_DEADLINE, influx.accept())
+        .await
+        .expect("influxdb_out never connected to send a batch")
+        .expect("accepting influxdb_out's connection");
+
+    send_signal(&child.0, libc::SIGTERM);
+    let status = wait_for_exit(&mut child.0).await;
+    assert_eq!(status.code(), Some(0), "{status:?}");
+
+    let text = std::fs::read_to_string(&path).expect("reading the telemetry file");
+    let dropped = text.lines().any(|line| {
+        let event: serde_json::Value = serde_json::from_str(line).expect("a JSON line");
+        let attributes = &event["attributes"];
+        attributes["component"] == "data_out"
+            && attributes["reason"] == "shutdown"
+            && event["metrics"].as_array().is_some_and(|metrics| {
+                metrics.iter().any(|m| m["name"] == "logit.component.batches.dropped")
+            })
+    });
+    assert!(dropped, "no shutdown drop for data_out in:\n{text}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A SIGTERM sent while `config::load` is still reading the config is held, not defaulted: the
 /// process starts, drains, and exits 0. The config path is a FIFO, so the signal lands while the
 /// load is blocked on it.
