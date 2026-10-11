@@ -1,0 +1,23 @@
+{
+ "content_type": "text/plain; version=1.0.0; charset=utf-8; escaping=allow-utf-8",
+ "entries": [
+  {
+   "kind": "type",
+   "name": "g",
+   "value": "gauge"
+  },
+  {
+   "kind": "series",
+   "labels": [],
+   "name": "g",
+   "value": "0x3ff0000000000000"
+  }
+ ],
+ "error": null,
+ "input": {
+  "crc32c": "0xc501c940",
+  "len": 19,
+  "path": "differential/prometheus-text/cases/ct-text-utf8-escaping.txt"
+ },
+ "parser": "prom"
+}

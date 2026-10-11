@@ -1,0 +1,14 @@
+# TYPE g gaugehistogram
+g_bucket{le="1"} 0.5
+g_bucket{le="+Inf"} 2.5
+g_gcount 2.49
+g_gsum 1
+# TYPE h histogram
+h_bucket{le="1"} 1.5
+h_bucket{le="+Inf"} 3.0
+h_count 3.0
+h_sum 2
+# TYPE s summary
+s_count 2.5
+s_sum 1
+# EOF

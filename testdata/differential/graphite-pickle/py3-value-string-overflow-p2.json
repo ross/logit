@@ -1,0 +1,63 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "value.string-overflow",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x7ff0000000000000",
+     "repr": "inf"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py3-value-string-overflow-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "value.string-overflow",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       "1e400"
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "decoder_divergence": "carbon drops only a NaN value and stores infinity; the decoder skips every non-finite value (docs/known-gaps/mappings.md: encode (Graphite), a non-finite value)",
+ "decoder_skips": {
+  "non_finite_value": 1
+ },
+ "description": "The value '1e400'.",
+ "exercises": [
+  "BINUNICODE"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "BINUNICODE",
+  "EMPTY_LIST",
+  "PROTO",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "cpython3",
+ "protocol": 2
+}

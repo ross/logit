@@ -55,7 +55,7 @@ prost.workspace = true
 # influxdb.rs's test that a Lua stage doesn't change an attribute's tag inclusion
 # (`bytes_attribute_stays_excluded_from_tags_after_a_lua_enrichment_stage`).
 logit-script.workspace = true
-# Relay and round-trip tests decode with the real listeners' decoders and `LogitInput`.
+# `logit.rs`'s transport tests run a real `LogitInput` as the receiving end.
 logit-inputs.workspace = true
 # TLS tests assert on the `insecure_skip_verify` warning, which reaches only `tracing`. Dev-only:
 # `logit-outputs` never installs a subscriber itself.

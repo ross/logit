@@ -1,0 +1,62 @@
+{
+ "carbon": {
+  "items": 1,
+  "outcome": "ok",
+  "received": [
+   [
+    "py2.int64",
+    {
+     "f64": "0x41d954fc40000000",
+     "repr": "1700000000.0"
+    },
+    {
+     "f64": "0x4270000000000000",
+     "repr": "1099511627776.0"
+    },
+    "store"
+   ]
+  ]
+ },
+ "case": "py2-value-int64-p2",
+ "cpython": {
+  "list": [
+   {
+    "tuple": [
+     "py2.int64",
+     {
+      "tuple": [
+       {
+        "int": "1700000000"
+       },
+       {
+        "int": "1099511627776"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "description": "A 64-bit int value past i32: the text INT opcode inside a protocol-2 pickle.",
+ "exercises": [
+  "INT"
+ ],
+ "logit": {
+  "datapoints": "carbon",
+  "skipped": 0,
+  "verdict": "ok"
+ },
+ "opcodes": [
+  "APPEND",
+  "BININT",
+  "BINPUT",
+  "EMPTY_LIST",
+  "INT",
+  "PROTO",
+  "SHORT_BINSTRING",
+  "STOP",
+  "TUPLE2"
+ ],
+ "producer": "python2",
+ "protocol": 2
+}

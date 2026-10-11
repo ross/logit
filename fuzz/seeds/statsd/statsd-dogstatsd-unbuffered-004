@@ -1,0 +1,1 @@
+app.worker.queue.depth:110|g|#env:prod,service:checkout-api,region:us-east-1,host:web-07,queue:email|c:in-81635

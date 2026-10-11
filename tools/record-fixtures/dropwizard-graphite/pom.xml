@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The `graphite-dropwizard` producer for script/record-fixtures: a one-class app that reports a
+  Dropwizard Metrics registry through `GraphiteReporter` over `PickledGraphite`, the library's
+  hand-written protocol-0 pickle sender, to the capture listener. Built and run in one maven
+  container; `dependency:copy-dependencies` puts the runtime jars beside the classes so the app
+  runs with plain `java -cp`.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>dev.logit.fixtures</groupId>
+  <artifactId>dropwizard-graphite-fixture</artifactId>
+  <version>1</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.dropwizard.metrics</groupId>
+      <artifactId>metrics-graphite</artifactId>
+      <version>4.2.25</version>
+    </dependency>
+    <!-- metrics-core logs through slf4j; a no-op binding keeps the run's output to the app's. -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-nop</artifactId>
+      <version>1.7.36</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <!-- Main.java sits beside this file rather than under src/main/java. -->
+    <sourceDirectory>.</sourceDirectory>
+  </build>
+</project>

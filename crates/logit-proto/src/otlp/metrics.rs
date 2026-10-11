@@ -23,6 +23,8 @@
 //! - `Summary{quantiles,count,sum}` → `Summary`: exact, **but `record.exemplars` is dropped**:
 //!   `SummaryDataPoint` has no `exemplars` field. A `Samples` or `Distribution` degraded into a
 //!   `Summary` loses its exemplars the same way.
+//!   A quantile outside `[0, 1]` is written as is; `docs/known-gaps/mappings.md`'s "Cross-protocol
+//!   semantic gaps" section has the row.
 //! - `Samples(s)` → `Summary` of `DISTRIBUTION_QUANTILES`: **lossy**. Sketched first
 //!   (`Samples::sketch`, each value weighted by `Samples::weight`), then degraded like
 //!   `Distribution`. Counts `logit.output.metrics.degraded{metric_kind="samples"}`.
@@ -50,7 +52,7 @@
 //! **Decode.** `Sum` → `MetricKind::Sum{value,temporality,monotonic}` from real fields; a
 //! cumulative `Sum` stays a `Sum`. `Histogram` → `Histogram{buckets,temporality,sum,min,max}`,
 //! rebuilding the trailing infinite bucket when `bucket_counts` has one more entry than
-//! `explicit_bounds` (the OTLP-mandated shape). `Summary` → `Summary{quantiles,count,sum}`.
+//! `explicit_bounds` (the OTLP-mandated shape). `Summary` → `Summary{quantiles,count,sum}`, each quantile read with no range check.
 //! `ExponentialHistogram` → `ExponentialHistogram` field for field (scale, zero count and
 //! threshold, positive and negative offset and bucket counts, temporality, count, sum/min/max),
 //! with no bucket materialization.
@@ -627,6 +629,26 @@ mod tests {
         match &events[0].metrics[0].kind {
             MetricKind::Histogram(got) => assert_eq!(*got, h),
             other => panic!("expected Histogram, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_summary_quantile_outside_the_unit_interval_passes_through_unchanged() {
+        // Documented gap (`docs/known-gaps/mappings.md`): neither direction range-checks a quantile.
+        let s = Summary { quantiles: vec![(1.5, 10.0), (-0.25, 1.0)], count: 2, sum: 11.0 };
+        let metric = encode(MetricKind::Summary(s.clone())).unwrap();
+        match &metric.data {
+            Some(pb::metric::Data::Summary(summary)) => {
+                let got: Vec<f64> =
+                    summary.data_points[0].quantile_values.iter().map(|q| q.quantile).collect();
+                assert_eq!(got, vec![1.5, -0.25]);
+            }
+            other => panic!("expected Summary, got {other:?}"),
+        }
+        let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+        match &events[0].metrics[0].kind {
+            MetricKind::Summary(got) => assert_eq!(*got, s),
+            other => panic!("expected Summary, got {other:?}"),
         }
     }
 
