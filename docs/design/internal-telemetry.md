@@ -349,7 +349,9 @@ So the final drain carries the counts recorded during the data drain: a sink's o
 `batches.dropped{reason="shutdown"}`, and a UDP listener's `datagrams.dropped{reason="shutdown"}`.
 `internal`'s grace and each pipeline sink's grace and Lua wedge rule count from the second signal,
 so a long data drain can't use them up. With a mixed pipeline (a sink or transform that also
-carries data) there's one stage, and those counts stay undrained.
+carries data) there's one stage, and those counts stay undrained. Either way, once every node has
+exited, `logit run` drains the registry one last time and logs each leftover metric point as a
+`telemetry left undrained at exit` line (`crates/logit-cli/src/undrained.rs`).
 
 `internal` records its own points (`logit.internal.points.emitted`,
 `logit.internal.spans.emitted`, `logit.internal.logs.emitted`, `logit.internal.drain.duration`)

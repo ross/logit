@@ -536,7 +536,20 @@ carries a `key` naming *why*. The process-level lifecycle events (`starting`, `r
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
 | `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
+| `telemetry left undrained at exit` | info/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for a nonzero `*.dropped` count. Only with an `internal` component. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
+
+`telemetry left undrained at exit` is the last word on counts recorded after `internal`'s final
+drain. Each line carries `component`, `metric`, `tags` (the point's tags as `key=value` pairs
+sorted by key and joined by `,`), and `value`; a timing carries `count` and `sum` (in seconds)
+instead of `value`. A mixed `internal` pipeline, where `internal` shares a sink or transform with
+data, is what typically leaves counts here: that sink's `batches.dropped{reason="shutdown"}` and a
+UDP listener's `datagrams.dropped{reason="shutdown"}` land after `internal` has stopped. With a
+dedicated pipeline, `internal` drains last and these lines carry only what its final drain caused:
+`internal`'s own counts and its sinks' delivery of that last batch (see
+[`docs/design/internal-telemetry.md`](design/internal-telemetry.md)'s "`internal`: the drain"). A
+second SIGTERM/SIGINT (exit `130`), SIGKILL, or an out-of-memory kill exits without
+them.
 
 Outside the lifecycle events, `logit run` can log one startup `warn` before `ready`: when the
 listeners' summed `max_connections` reaches the process's open-files limit (Linux only). See
