@@ -8,8 +8,9 @@
 //! - a request carries one record batch per partition, decompressed with the producer's own
 //!   codecs (`super::compression`);
 //! - an idempotent batch is checked as `ProducerAppendInfo.checkSequence` checks it: an older
-//!   epoch is `INVALID_PRODUCER_EPOCH`; a new epoch or an unknown producer must start at
-//!   sequence 0; the same epoch must continue at the last appended sequence + 1, wrapping from
+//!   epoch is `INVALID_PRODUCER_EPOCH`; a known producer at a new epoch must start at
+//!   sequence 0; a producer the partition has no state for is accepted at any sequence; the
+//!   same epoch must continue at the last appended sequence + 1, wrapping from
 //!   `i32::MAX` to 0; anything else is `OUT_OF_ORDER_SEQUENCE_NUMBER`. A batch matching one of
 //!   the producer's last five appended batches is answered `NONE` with its original offset and
 //!   not appended again.
@@ -585,7 +586,7 @@ fn append(
                     return Err(code::OUT_OF_ORDER_SEQUENCE_NUMBER);
                 }
             }
-            _ if first != 0 => return Err(code::OUT_OF_ORDER_SEQUENCE_NUMBER),
+            Some(_) if first != 0 => return Err(code::OUT_OF_ORDER_SEQUENCE_NUMBER),
             _ => {}
         }
     }
@@ -605,4 +606,32 @@ fn append(
         }
     }
     Ok(base_offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(producer_epoch: i16, base_sequence: i32) -> kafka_protocol::records::BatchDecodeInfo {
+        use super::super::batch::{encode, ProducerRecord, Stamp};
+        let record =
+            ProducerRecord { key: None, value: None, headers: Default::default(), timestamp: 0 };
+        let stamp = Stamp { producer_id: 7, producer_epoch, base_sequence };
+        let mut bytes = encode(&[record], stamp, Compression::None).unwrap();
+        RecordBatchDecoder::decode_batch_info(&mut bytes).unwrap().remove(0)
+    }
+
+    #[test]
+    fn unknown_producer_is_accepted_at_any_sequence() {
+        let mut p = Partition::default();
+        assert_eq!(append(&mut p, &info(0, 5), vec![]), Ok(0));
+    }
+
+    #[test]
+    fn known_producer_at_a_new_epoch_must_start_at_zero() {
+        let mut p = Partition::default();
+        append(&mut p, &info(0, 0), vec![]).unwrap();
+        assert_eq!(append(&mut p, &info(1, 5), vec![]), Err(code::OUT_OF_ORDER_SEQUENCE_NUMBER));
+        assert_eq!(append(&mut p, &info(1, 0), vec![]), Ok(0));
+    }
 }
