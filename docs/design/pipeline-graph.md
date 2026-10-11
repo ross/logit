@@ -417,8 +417,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `le`; a boundless range that isn't last; a non-finite bound; or a range that can never match
     (a bound below the previous one, or equal to it unless `lt: X` is followed by `le: X`).
 83. Not a rejection: a listener that reaches two or more sinks using `buffer.overflow: block` with
-    no `buffer.disk` gets a warning, since a stall in one parks the others. `null_out` and
-    `buffer.disk` sinks don't count.
+    no `buffer.disk` gets a warning, since a stall in one parks the others. `null_out`, an
+    exposition-mode `prometheus_out`, and `buffer.disk` sinks don't count.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

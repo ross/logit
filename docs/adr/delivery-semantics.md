@@ -486,8 +486,10 @@ nothing from their config. There's no opt-out.
 - **Why `buffer.disk` is exempt.** A spool absorbs the stall up to `disk.max_bytes`, which by
   default is far longer than an in-memory buffer lasts. Past that bound a spool under `block`
   backs up like memory; the operator sized it, so the rule doesn't second-guess it.
-- **Why `null_out` is exempt.** Its send never fails, so it never fills and never stalls a
-  sibling.
+- **Why `null_out` and an exposition-mode `prometheus_out` are exempt.** Neither send ever fails:
+  `null_out` discards, and a `prometheus_out` with `bind:` writes into its own registry. So
+  neither fills and stalls a sibling. A remote-write `prometheus_out` (`endpoint:`) can fail a
+  send, so it counts.
 - **Shipped configs follow the practice.** `every_shipped_config_loads_and_validates` asserts
   that every config under `demo/`, `examples/`, `fixtures/`, `perf/scenarios/`, and the harness
   directories resolves with no warnings, so an example an operator copies never models the shape

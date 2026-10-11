@@ -271,8 +271,9 @@
 //!     with no `buffer.disk` adds a non-fatal entry to [`Graph::warnings`], one per distinct sink
 //!     set, because a stall in one of those sinks parks the others. The walk follows `consumers`
 //!     and router `targets`. A `buffer.disk` sink is exempt, since its spool absorbs a stall
-//!     until `disk.max_bytes`, and so is `null_out`, whose send never fails
-//!     ([`blocking_sink_warnings`], `docs/adr/delivery-semantics.md`).
+//!     until `disk.max_bytes`, and so are `null_out` and an exposition-mode (`bind:`)
+//!     `prometheus_out`, whose sends never fail ([`blocking_sink_warnings`],
+//!     `docs/adr/delivery-semantics.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3958,8 +3959,14 @@ fn blocking_sink_warnings(components: &HashMap<String, ResolvedComponent>) -> Ve
         let mut sinks: BTreeSet<&str> = BTreeSet::new();
         while let Some(current) = queue.pop_front() {
             let Some(node) = components.get(current) else { continue };
+            // `null_out` and an exposition-mode `prometheus_out` never fail a send, so they never
+            // fill.
+            let never_fails = matches!(
+                node.kind,
+                ComponentKind::NullOut { .. } | ComponentKind::PrometheusOut { bind: Some(_), .. }
+            );
             if node.role() == Role::Sink
-                && !matches!(node.kind, ComponentKind::NullOut { .. })
+                && !never_fails
                 && node.buffer.overflow == OverflowPolicy::Block
                 && node.buffer.disk.is_none()
             {
@@ -7007,15 +7014,17 @@ mod tests {
         );
     }
 
-    /// Rule 83: a `drop_oldest` sink, a `buffer.disk` sink, and a `null_out` never stall their
-    /// siblings, so none of them counts toward the two.
+    /// Rule 83: a `drop_oldest` sink, a `buffer.disk` sink, a `null_out`, and an exposition-mode
+    /// `prometheus_out` never stall their siblings, so none of them counts toward the two. A
+    /// remote-write `prometheus_out` can fail a send, so it counts.
     #[test]
-    fn a_drop_oldest_disk_or_null_out_sink_beside_a_blocking_one_doesnt_warn() {
+    fn a_sink_that_never_stalls_beside_a_blocking_one_doesnt_warn() {
         let default = BufferConfig::default;
         let warned: Vec<(&str, Vec<String>)> = [
             ("drop_oldest", sink(), drop_oldest()),
             ("disk", sink(), on_disk("/tmp/spool/b")),
             ("null_out", null_out(), default()),
+            ("prometheus_out exposition", prometheus_out("/metrics", 100_000), default()),
         ]
         .into_iter()
         .map(|(name, other, buffer)| {
@@ -7029,6 +7038,12 @@ mod tests {
         .filter(|(_, warnings)| !warnings.is_empty())
         .collect();
         assert!(warned.is_empty(), "{warned:?}");
+        let remote_write = resolve_warnings(cfg(vec![
+            ("in", vec![], listener()),
+            ("a", vec!["in"], sink()),
+            ("b", vec!["in"], prometheus_remote_write("http://victoria:8428/api/v1/write")),
+        ]));
+        assert_eq!(remote_write.len(), 1, "{remote_write:?}");
     }
 
     /// Rule 83: a sink reached through a `route` and its `target` counts.
