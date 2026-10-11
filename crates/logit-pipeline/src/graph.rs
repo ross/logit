@@ -221,7 +221,8 @@
 //!     `/ack`, `/health`, `/health/1.0`) rather than the `/services/collector` base, an empty
 //!     `token` or one with leading or trailing whitespace, `timeout: 0s`, an `ack_timeout` without
 //!     `ack: true` or of `0s`, a `max_body_bytes` of `0`, or a `tls` failing rule 24's checks
-//!     (`docs/adr/splunk-hec-relay.md`).
+//!     (`docs/adr/splunk-hec-relay.md`). A `max_body_bytes` above Splunk Cloud's body cap isn't
+//!     an error: it adds a non-fatal entry to [`Graph::warnings`].
 //! 71. A `lua`/`lua_file` `max_memory` of `0`: an empty Lua VM already holds more than that
 //!     (`docs/adr/lua-runaway-script-bounds.md`).
 //! 72. A `stdio_out`/`file_out` `message:` other than `escaped` outside `format: human`, where it
@@ -620,6 +621,10 @@ pub struct Graph {
     /// Listener-first order, a byproduct of rule 5's cycle check. Only tests read it: the node
     /// runtime creates every inbox up front, and `logit graph` renders from the raw `Config`.
     pub topological_order: Vec<String>,
+    /// Non-fatal findings for the operator. `resolve` doesn't log them, because it runs before
+    /// the telemetry layer is active and under `logit validate`, which installs no subscriber;
+    /// each caller prints or logs them.
+    pub warnings: Vec<String>,
 }
 
 /// Non-gRPC header names `otlp_out`'s HTTP transport sets itself, or that HTTP/1.1 connection
@@ -716,6 +721,7 @@ fn is_absolute_http_url(url: &str) -> bool {
 
 pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     let Config { components, admin, .. } = config;
+    let mut warnings = Vec::new();
 
     // Rule 1: at least one component.
     if components.is_empty() {
@@ -3484,7 +3490,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             );
         }
         if let Some(warning) = splunk_cloud_body_cap_warning(id, *max_body_bytes) {
-            tracing::warn!("{warning}");
+            warnings.push(warning);
         }
         if tls.cert_file.is_some() != tls.key_file.is_some() {
             anyhow::bail!(
@@ -3926,7 +3932,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         );
     }
 
-    Ok(Graph { components: resolved, topological_order })
+    Ok(Graph { components: resolved, topological_order, warnings })
 }
 
 /// Rules 17/18/57's datagram predicate: the kinds the datagram listener driver backs
@@ -6886,8 +6892,16 @@ mod tests {
                 *max_body_bytes = 800 * 1024 * 1024;
             }
         });
-        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+        let graph = resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
             .expect("a body cap above Splunk Cloud's is valid for Splunk Enterprise");
+        assert_eq!(graph.warnings.len(), 1, "got: {:?}", graph.warnings);
+        assert!(graph.warnings[0].contains("component 'out'"), "{:?}", graph.warnings);
+        let ok = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], splunk_hec_out("https://splunk:8088/services/collector")),
+        ]))
+        .expect("a default config resolves");
+        assert!(ok.warnings.is_empty(), "got: {:?}", ok.warnings);
     }
 
     /// Rule 70: rule 24's `tls` checks, including a block under `http://`.

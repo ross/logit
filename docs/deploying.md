@@ -64,6 +64,10 @@ docker run --rm \
 `validate_semantics` in `crates/logit-cli/src/pipeline.rs`), so a config that validates can't fail
 that stage at `run`.
 
+If a config is valid but likely to misbehave, `validate` prints each finding to stderr as
+`warning: ...` before `<path> is valid`. Warnings don't change the exit code, which stays 0.
+`run` logs the same warnings at startup.
+
 **An unknown key is an error.** A misspelled or removed key, on a component or in any of its
 blocks, fails `validate` with the component's id and the key, such as
 ``component `scrape`: unknown field `tls` ``. Keys whose names are your data, such as `set`'s
