@@ -705,8 +705,14 @@ The rows:
   that life's `drain complete` `batches_dropped` beside it, and is **counted** only when that
   count is above 0. The two are never reconciled: `batches_dropped` counts batches, and under
   `temporality: cumulative` a dropped batch loses only the increments since its series' last
-  delivered total, which no log line states. A killed life's gap passes inside its band (see
-  "Which life a hop is judged in"). Any other gap is **uncounted loss, FAIL**.
+  delivered total, which no log line states. `batches_dropped` is process-wide, and the runtime
+  counts a sink's shutdown drops under the sink's id only after `internal`'s final drain, so no
+  export names the sink a shutdown drop hit. It counts a gap only for an egress group that holds
+  every sink: the one sink, or all of them under `route`. Under `copy` with several sinks, a
+  sink's gap is counted by that sink's own exported `batches.dropped` in the life, and a gap
+  only the process-wide count could explain reads **counted, unattributed** and WARNs, here and
+  in `ledger.summary`, since another sink may have dropped. A killed life's gap passes inside
+  its band (see "Which life a hop is judged in"). Any other gap is **uncounted loss, FAIL**.
 - `ledger.windows`, only under `[ledger] vm_every_window = true`, else SKIP: in every sink's
   export (W7b), per SUT life and series, consecutive samples are at most 1.5 × the SUT
   config's `aggregate` interval apart,
@@ -946,13 +952,15 @@ shaping until a scenario needs them (W2 at the earliest); a checker container; a
 
 ### 10. Next scenarios
 
-Every shipped scenario drives one path, `statsd_in` over UDP into one `aggregate` and one sink,
-on §3's three services, and `[ledger]` names one component per hop. The scenarios below widen
+Every shipped scenario drives one path, `statsd_in` over UDP into one `aggregate`, on §3's base
+stack plus any services its `compose` override adds. `[ledger]` names one component per hop up
+to `aggregate`, and one `[[ledger.sink]]` per sink after it. The scenarios below widen
 that, grouped by cost; the Workstreams table gives the landing order. Each states what it
 proves, its faults, its rows, and the harness support it needs; §2's validation, §5's end
 sequence, and §6's checks hold unless an item says otherwise.
 
-**Cheap now.** Each is a scenario directory on the three services plus a small check extension.
+**Cheap now.** Each is a scenario directory on the base stack, plus an override's services
+where it needs them, and a small check extension.
 
 1. **Lua in the path (built in W7a).** `statsd_in → lua → aggregate → prometheus_out`, which
    drives `run_lua` and `/readyz`'s `stalled`, the one not-ready answer for a node that hasn't

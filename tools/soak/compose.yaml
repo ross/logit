@@ -21,8 +21,8 @@
 # (`-f compose.yaml -f <override>`) and labels any service it adds, such as a second backend.
 #
 # No `container_name` and no `name:`, so a second scenario under another project can't collide
-# with this one. The one published port is VictoriaMetrics on an ephemeral loopback port, which
-# the driver reads with `compose port` after every start of that service.
+# with this one. The only published ports are the backends': each publishes its own ephemeral
+# loopback port, which the driver reads with `compose port` after every start of that backend.
 
 x-logit: &logit
   image: ${SOAK_IMAGE:-logit:soak}

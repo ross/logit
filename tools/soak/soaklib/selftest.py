@@ -1331,12 +1331,56 @@ def _sink_ledger():
         netted = results("sinks-copy-netted", export_edit=opposite)
         expect(netted["ledger.summary"].status == checks.FAIL,
                f"the summary FAILs opposite gaps at two sinks, got {netted['ledger.summary']}")
-        # Under copy, one sink holding the other's share is still a gap at each; under route
-        # the same total across both sinks balances.
-        moved = results("sinks-route-moved", split="route",
-                        export_edit=lambda sink, series: series)
-        expect(moved["ledger.egress"].status == checks.PASS,
-               f"route's summed V balances the two halves, got {moved['ledger.egress']}")
+        # 100 increments moved from each of vm_b's series to each of vm_a's: under route,
+        # where each sink holds one series, the sum still balances; under copy, where each
+        # sink holds both, each sink is 200 off.
+        def moved(sink, series):
+            for one in series:
+                one["values"][-1] += 100 if sink == "vm_a" else -100
+            return series
+        routed_moved = results("sinks-route-moved", split="route", export_edit=moved)
+        expect(routed_moved["ledger.egress"].status == checks.PASS,
+               f"route's summed V balances a total moved between sinks, got "
+               f"{routed_moved['ledger.egress']}")
+        copied_moved = results("sinks-copy-moved", export_edit=moved)
+        expect(copied_moved["ledger.egress"].status == checks.FAIL
+               and "V[vm_a] 34,200 = -200, uncounted" in copied_moved["ledger.egress"].detail
+               and "V[vm_b] 33,800 = 200, uncounted" in copied_moved["ledger.egress"].detail,
+               f"copy FAILs the same move at each sink, got {copied_moved['ledger.egress']}")
+
+        # `drain complete`'s batches_dropped is process-wide, and the runtime counts a sink's
+        # shutdown drops after the final drain: under copy it can't count vm_b's gap when
+        # vm_a may be the sink that dropped.
+        unattributed = results("sinks-copy-unattributed", life1_dropped=1,
+                               export_edit=short_final("vm_b", 20))
+        egress = unattributed["ledger.egress"].detail
+        expect(unattributed["ledger.egress"].status == checks.WARN
+               and "V[vm_b] 33,960 = 40, counted, unattributed" in egress
+               and "vm_b batches.dropped 0" in egress
+               and unattributed["ledger.summary"].status == checks.WARN,
+               f"a process-wide shutdown drop leaves a short sink unattributed, never PASS, "
+               f"got {unattributed['ledger.egress']} / {unattributed['ledger.summary']}")
+        own_drop = [_line(_stamp(T0 + 250), "logit.component.batches.dropped", "sum", 1,
+                          component="vm_b", attrs={"reason": "overflow_oldest"})]
+        attributed = results("sinks-copy-attributed", sut_extra=own_drop,
+                             export_edit=short_final("vm_b", 20))
+        expect(attributed["ledger.egress"].status == checks.PASS
+               and "V[vm_b] 33,960 = 40, counted" in attributed["ledger.egress"].detail
+               and attributed["ledger.summary"].status == checks.PASS,
+               f"a sink's own counted drop counts its gap, got {attributed['ledger.egress']}")
+        other = [dict(json.loads(own_drop[0]))]
+        other[0]["attributes"]["component"] = "vm_a"
+        elsewhere = results("sinks-copy-dropped-elsewhere", sut_extra=[json.dumps(other[0])],
+                            export_edit=short_final("vm_b", 20))
+        expect(elsewhere["ledger.egress"].status == checks.FAIL
+               and "V[vm_b] 33,960 = 40, uncounted" in elsewhere["ledger.egress"].detail,
+               f"another sink's drop doesn't count vm_b's gap, got {elsewhere['ledger.egress']}")
+        routed_drop = results("sinks-route-counted", split="route", life1_dropped=1,
+                              export_edit=short_final("vm_a", 20))
+        expect(routed_drop["ledger.egress"].status == checks.PASS
+               and "= 20, counted" in routed_drop["ledger.egress"].detail,
+               f"under route the group holds every sink, so the process-wide count counts it, "
+               f"got {routed_drop['ledger.egress']}")
         half = results("sinks-copy-half", split="copy",
                        export_edit=lambda sink, series: [one for one in series
                                                         if sink == "vm_a"
