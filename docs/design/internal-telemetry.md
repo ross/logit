@@ -324,12 +324,32 @@ documents the same rule for its aggregation interval against the Agent's flush i
 same reason.
 
 **Shutdown drains once more.** `InternalInput` overrides `Input::run_until_shutdown`
-([ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)) to run one final drain when the
+([ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)) to run one final drain when its
 shutdown signal fires, instead of being cancelled by drop. Otherwise every SIGTERM would lose
 everything buffered since the last tick, up to a whole `interval`. That future owns the `Fanout`, so
 no downstream node starts its close-time flush until the final batch is sent, and `run_input`'s
 `shutdown_grace` (5s for `internal`) bounds the wait. The final drain can't emit its own
 `points.emitted`/`drain.duration`, which are always recorded a tick behind and have no tick left.
+
+**With a dedicated pipeline, `internal` drains last.** `internal`'s pipeline is every node it
+reaches through consumers and router or Lua targets. It's dedicated when no other listener reaches
+any node in it. Point `internal` at its own sinks to get one, even when they go to the same backend
+as the data, such as a second `otlp_out` to the same endpoint. The runtime then shuts down in two
+stages (`crates/logit-pipeline/src/runtime.rs`'s `ShutdownStages`,
+[ADR `shutdown-accounting-and-cancellation-safety`](../adr/shutdown-accounting-and-cancellation-safety.md),
+decisions 10 to 16):
+
+1. The shutdown signal stops every node outside the pipeline as usual, while `internal` keeps
+   draining on its `interval`, so a long data drain is still exported tick by tick.
+2. Once every node outside the pipeline has exited, the runtime sends `internal` and the
+   pipeline's sinks and Lua nodes a second signal. `internal` drains once more and returns, and
+   the pipeline cascades as usual.
+
+So the final drain carries the counts recorded during the data drain: a sink's or Lua node's
+`batches.dropped{reason="shutdown"}`, and a UDP listener's `datagrams.dropped{reason="shutdown"}`.
+`internal`'s grace and each pipeline sink's grace and Lua wedge rule count from the second signal,
+so a long data drain can't use them up. With a mixed pipeline (a sink or transform that also
+carries data) there's one stage, and those counts stay undrained.
 
 `internal` records its own points (`logit.internal.points.emitted`,
 `logit.internal.spans.emitted`, `logit.internal.logs.emitted`, `logit.internal.drain.duration`)
@@ -627,7 +647,7 @@ datagram passes through.
 | `logit.component.receive.utilization` | gauge | `max(datagram ratio, byte ratio)` against the two configured bounds |
 | `logit.component.receive.push.blocked.duration` | timing | only under `overflow: block`, only when a push actually waited |
 | `logit.component.receive.latency` | timing | arrival (`Datagram::received_at`) → dequeue, per datagram — the number that says whether event timestamps are trustworthy under load |
-| `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction) or `shutdown`: datagrams read but never decoded because the listener stopped (a batch the read half never queued, a popped batch the decode half never decoded, or what the receive queue still held when the grace backstop dropped the listener). With these, `logit.input.datagrams` equals the `receive.latency` sample count plus every reason's drops. `shutdown` counts land after `internal`'s final drain, so no exported pipeline sees them; the listener also logs each at `warn` (see `docs/known-gaps/intake.md`) |
+| `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction) or `shutdown`: datagrams read but never decoded because the listener stopped (a batch the read half never queued, a popped batch the decode half never decoded, or what the receive queue still held when the grace backstop dropped the listener). With these, `logit.input.datagrams` equals the `receive.latency` sample count plus every reason's drops. `shutdown` counts reach only a dedicated `internal` pipeline (see "With a dedicated pipeline, `internal` drains last"); with a mixed one they land after `internal`'s final drain. The listener also logs each at `warn` (see `docs/known-gaps/intake.md`) |
 | `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` is **a single tracked file or connection** ending and flushing its own accumulator on the way out: a `tail_in`/`docker_in` file that rotated away or was removed, or a `graphite_in` TCP connection the client closed or reset, or that was dropped for an oversize frame — in every case while the listener itself keeps running. `shutdown` is the whole component stopping. An ordinary client disconnect is `closed`, never `shutdown`. |
 | `logit.input.datagrams.truncated` | count | datagrams that arrived longer than the 65,507-byte receive slot and were delivered only as far as it holds, with the remainder discarded by the kernel. **IPv6-only, and Linux-only:** 65,507 is IPv4's maximum payload, IPv6 permits 65,527, and `MSG_TRUNC` in `recvmmsg`'s returned flags is what makes the loss visible rather than silent — a `recv_from` build has no way to see it and never reports this. Not emitted when it is zero, like every other loss counter here |
 | `logit.input.reads` | count | read syscalls the listener made — one per `recvmmsg(2)` batch on Linux, one per `recv_from` elsewhere. Exists to be a denominator: `logit.input.datagrams / logit.input.reads` is the **mean fill** of the syscall batch, the only number that says whether `receive.read_batch` is doing anything. A fill pinned at `read_batch` means the knob is the limit and raising it may help; a fill near 1 means datagrams arrive one at a time and the knob is irrelevant at any setting |
@@ -718,7 +738,7 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 | `logit.input.connections.rejected{reason="limit"}` | count | a connection closed at the connection cap, before any TLS handshake |
 | `logit.input.connections.rejected{reason="proxy_header"}` | count | a connection under `proxy_protocol: true` whose PROXY header was missing, malformed, cut short by the peer closing, or not complete within `handshake_timeout`; read before any TLS handshake |
 | `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
-| `logit.input.connections.closed{reason="idle"}` | count | an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. A close at shutdown is not counted: there is no `reason="shutdown"`, because the runtime would record it after `internal`'s final drain |
+| `logit.input.connections.closed{reason="idle"}` | count | an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. A close at shutdown is not counted: there is no `reason="shutdown"`, because `connections.closed` counts a policy close |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
 | `logit.input.frames.dropped{reason="oversize"\|"drained"\|"malformed"\|"truncated"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses. `drained` is a line-framed listener's line that crossed its bound before its `LF` arrived: counted once, after which the connection discards input until its next `LF` |
 

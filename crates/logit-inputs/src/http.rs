@@ -283,8 +283,8 @@ where
             break;
         }
     }
-    // A shutdown close isn't counted: it would land after `internal`'s final drain, and
-    // `connections.closed` counts a policy close (`crate::otlp`'s "Idle timeout" doc section).
+    // A shutdown close isn't counted: `connections.closed` counts a policy close (`crate::otlp`'s
+    // "Idle timeout" doc section).
     if !closing {
         telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "idle")]);
     }

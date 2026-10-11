@@ -139,9 +139,8 @@
 //! flight and the idle wait. Either trigger runs the same close sequence, which doesn't race the
 //! signal itself. A request in flight is served out, hyper ends an h1 connection after its current
 //! response and GOAWAYs an h2 one, and nothing is answered `503`. A shutdown close isn't counted:
-//! `connections.closed` counts a policy close, and one recorded at shutdown would land after
-//! `internal`'s final drain. The pre-serve steps (the PROXY header, the TLS accept, the first-byte
-//! peek) race the signal as a whole and end with nothing of a request read.
+//! `connections.closed` counts a policy close. The pre-serve steps (the PROXY header, the TLS
+//! accept, the first-byte peek) race the signal as a whole and end with nothing of a request read.
 //!
 //! *The listener owns its connection tasks.* They run in a
 //! [`ConnectionTasks`](crate::listener::ConnectionTasks) local to `run_until_shutdown`, which on

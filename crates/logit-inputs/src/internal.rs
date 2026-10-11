@@ -4,6 +4,10 @@
 //! `docs/adr/internal-telemetry-as-pipeline-events.md`). Graph rule 13 allows at most one
 //! `internal`: a second would split the one process-wide buffer set between them.
 //!
+//! It drains once more at shutdown. With a dedicated pipeline, that last drain waits until the
+//! rest of the graph has drained, so it carries the counts the drain recorded
+//! ([`InternalInput::run_until_shutdown`]).
+//!
 //! A drain yields three kinds of event: metric points (timestamped at the drain), spans (at their
 //! own start), and captured logs (at capture). Logs arrive only when `logs:` isn't `off`:
 //! `logit-cli` activates `logit_core::TelemetryLayer` at that threshold (`warn`, the default, or
@@ -98,13 +102,22 @@ impl Input for InternalInput {
     /// intervals and lose the third. `logit-perf`'s attribution mode (`docs/design/performance.md`)
     /// SIGTERMs a short-lived process and reads these points back, so it needs that last slice.
     ///
+    /// **When `shutdown` fires.** With a dedicated pipeline, where no other listener reaches any
+    /// node this one feeds, the runtime sends it only once every node outside that pipeline has
+    /// exited (`logit_pipeline::runtime`'s `ShutdownStages`). Until then this
+    /// loop keeps ticking, so the final drain carries every count the rest of the drain recorded:
+    /// a sink's or Lua node's drops for shutdown, and a UDP listener's shutdown remainders. With a
+    /// mixed pipeline it fires with the process's shutdown signal, and those counts stay
+    /// undrained.
+    ///
     /// **Why the final batch is delivered.** Downstream inboxes stay open while this future
     /// holds `sink`, so no downstream close-time flush starts until this returns
     /// (`run_with_telemetry`'s shutdown cascade). `run_input` bounds the wait by
-    /// `InputRuntimeConfig::shutdown_grace`, which for `internal` is always
-    /// `ReceiveConfig::default()`'s 5s (graph rule 17 rejects a `receive:` block on it). One drain
-    /// and one `Fanout::send` fit well inside that; the grace cuts short a send blocked on
-    /// downstream backpressure, its only unbounded wait.
+    /// `InputRuntimeConfig::shutdown_grace`, counted from the same signal, which for `internal`
+    /// is always `ReceiveConfig::default()`'s 5s (graph rule 17 rejects a `receive:` block on
+    /// it). One drain and one `Fanout::send` fit well inside that; the grace cuts short a send
+    /// blocked on downstream backpressure, its only unbounded wait. A dedicated pipeline's sinks
+    /// count their own graces from that signal too, so a long data drain consumes neither.
     ///
     /// **Residual.** The final drain's own `logit.internal.{points,spans,logs}.emitted` and
     /// `logit.internal.drain.duration` are recorded after it, so with no tick left they're never
