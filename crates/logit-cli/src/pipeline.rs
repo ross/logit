@@ -130,6 +130,9 @@ fn severity_for_logs(logs: logit_config::InternalLogs) -> Option<logit_core::Sev
 /// Every failure before the pipeline reports ready is `RunError::Startup` (exit 1); after, it's a
 /// runtime failure (exit 2). See `docs/deploying.md`'s "Probes and exit codes".
 ///
+/// Once the pipeline has run, on success or failure, a config with an `internal` logs every point
+/// its registry still holds ([`crate::undrained`]) before `exiting`.
+///
 /// `telemetry_layer` is `main`'s handle, installed inactive by `init_logging` and activated here
 /// once the config's `internal` component is known.
 pub async fn run_pipelines(
@@ -223,6 +226,10 @@ pub async fn run_pipelines(
     drop(signals);
     for admin_server in admin_servers {
         admin_server.abort();
+    }
+    // Before `exiting`, so that stays the last line.
+    if let Some(info) = &internal {
+        crate::undrained::log_leftovers(&info.registry);
     }
     match &result {
         Ok(()) => tracing::info!(target: "logit", code = 0, "exiting"),

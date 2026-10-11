@@ -144,6 +144,46 @@ async fn a_sigterm_exports_a_drop_the_data_drain_counts_through_internal() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// With a mixed `internal` pipeline, a shutdown drop the shared sink counts after `internal`'s
+/// final drain reaches stderr as a `telemetry left undrained at exit` line at `warn`. `data_out`
+/// carries both `data_in` and `internal`, and its one request is accepted and never answered, so
+/// its grace cuts it 1 s after the SIGTERM, when `internal` has already returned.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sigterm_logs_a_mixed_pipelines_undrained_shutdown_drop_at_exit() {
+    let influx = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let influx_addr = influx.local_addr().unwrap();
+    let statsd_addr = ephemeral_addr().await;
+    let config = TempConfig::write(
+        "term-undrained",
+        format!(
+            "components:\n  data_in:\n    type: statsd_in\n    bind: \"{statsd_addr}\"\n  \
+             self:\n    type: internal\n    interval: 100ms\n  data_out:\n    type: \
+             influxdb_out\n    sources: [data_in, self]\n    url: \"http://{influx_addr}\"\n    \
+             org: o\n    bucket: b\n    token: t\n    buffer:\n      shutdown_grace: 1s\n"
+        ),
+    );
+    let (mut child, stderr) = spawn_run(&config);
+    stderr.wait_for("ready");
+    let (_held, _) = tokio::time::timeout(PROCESS_DEADLINE, influx.accept())
+        .await
+        .expect("influxdb_out never connected to send a batch")
+        .expect("accepting influxdb_out's connection");
+
+    send_signal(&child.0, libc::SIGTERM);
+    let status = wait_for_exit(&mut child.0).await;
+    assert_eq!(status.code(), Some(0), "{status:?}");
+
+    let line = stderr.wait_for("\"logit.component.batches.dropped\"");
+    let event: serde_json::Value = serde_json::from_str(&line).expect("a JSON log line");
+    assert_eq!(event["message"], "telemetry left undrained at exit", "{line}");
+    assert_eq!(event["level"], "WARN", "{line}");
+    assert_eq!(event["target"], "logit", "{line}");
+    assert_eq!(event["component"], "data_out", "{line}");
+    let tags = event["tags"].as_str().expect("a tags string");
+    assert!(tags.split(',').any(|tag| tag == "reason=shutdown"), "{line}");
+    assert!(event["value"].as_f64().is_some_and(|v| v > 0.0), "{line}");
+}
+
 /// A SIGTERM sent while `config::load` is still reading the config is held, not defaulted: the
 /// process starts, drains, and exits 0. The config path is a FIFO, so the signal lands while the
 /// load is blocked on it.
