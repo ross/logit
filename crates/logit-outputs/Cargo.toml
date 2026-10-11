@@ -62,7 +62,10 @@ logit-inputs.workspace = true
 tracing-subscriber.workspace = true
 # Codec fixed-point property tests (`decode(encode(decode(x))) == decode(x)`).
 proptest.workspace = true
-# `ndjson`'s test that every line it writes parses as JSON.
+# `ndjson`'s test that every line it writes parses as JSON, and the kafka_out sink tests'.
 serde_json.workspace = true
+# `msgpack`'s parity test reads an NDJSON line into a tree that keeps each object's key order,
+# which `serde_json::Value` doesn't.
+serde.workspace = true
 # `test-util` for the paused-clock TLS handshake timeout test in `stream.rs`.
 tokio = { workspace = true, features = ["test-util"] }

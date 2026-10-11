@@ -1,6 +1,6 @@
 //! `format: json` for `stdio_out`/`file_out`: one JSON object per event, one per line, for a
-//! program to read. `kafka_out`'s `format: json` sends each object as one record's value. This doc
-//! is the canonical grammar.
+//! program to read. `kafka_out`'s `format: json` sends each object as one record's value, or a
+//! run of these lines as one record under `record: batch`. This doc is the canonical grammar.
 //!
 //! Each line is one [`Event`] of an [`EventBatch`], in batch order, terminated by `\n`, with no
 //! pretty-printing and nothing between batches. Every populated field of the event model
@@ -59,10 +59,11 @@
 //! `tools/splunk-interop/check.py`, `tools/victoria-interop/check.py`, and
 //! `tools/soak/soaklib/telemetry.py`. A change here is mirrored there.
 //!
-//! Everything writes straight into the caller's `String` with `push_str`/`write!`: no per-field
-//! `String`, no serde (`docs/design/memory.md`).
+//! One walker visits every field through [`TreeWriter`]: [`Json`] writes this grammar, and
+//! `crate::msgpack` writes the same object as MessagePack for `kafka_out`'s `format: msgpack`, so a
+//! change to the keys here changes that format too. [`Json`] writes straight into the caller's
+//! `String` with `push_str`/`write!`: no per-field `String`, no serde (`docs/design/memory.md`).
 
-use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::time::write_rfc3339_utc;
 use logit_core::trace::push_hex;
@@ -80,36 +81,6 @@ pub fn render_ndjson(out: &mut String, batch: &EventBatch) {
     }
 }
 
-/// An open JSON object whose keys are static ASCII names, so they need no escaping. Tracks the
-/// comma so an omitted field never leaves a stray separator.
-struct Obj<'a> {
-    out: &'a mut String,
-    first: bool,
-}
-
-impl<'a> Obj<'a> {
-    fn open(out: &'a mut String) -> Self {
-        out.push('{');
-        Obj { out, first: true }
-    }
-
-    /// Writes `"key":` (after a comma unless first) and returns the buffer for its value.
-    fn key(&mut self, key: &str) -> &mut String {
-        if !self.first {
-            self.out.push(',');
-        }
-        self.first = false;
-        self.out.push('"');
-        self.out.push_str(key);
-        self.out.push_str("\":");
-        self.out
-    }
-
-    fn close(self) {
-        self.out.push('}');
-    }
-}
-
 /// Appends one event's object, without the newline: the line [`render_ndjson`] writes, which
 /// `kafka_out`'s `format: json` sends as a record's value.
 pub(crate) fn render_event(
@@ -118,124 +89,313 @@ pub(crate) fn render_event(
     scope: Option<&Scope>,
     event: &Event,
 ) {
-    let mut obj = Obj::open(out);
-    push_timestamp(obj.key("timestamp"), event.timestamp);
+    walk_event(&mut Json(out), resource, scope, event);
+}
+
+/// Appends `value` in this grammar's value form: `kafka_out`'s `format: text` writes a map or
+/// array log body this way.
+pub(crate) fn render_value(out: &mut String, value: &Value) {
+    walk_value(&mut Json(out), value);
+}
+
+/// What the event walker writes each node of an event's object through. [`Json`] writes this
+/// module's grammar and `crate::msgpack::Msgpack` writes the same tree as MessagePack; one walker
+/// visits every field for both, so the two can't disagree on which keys appear or their order.
+pub(crate) trait TreeWriter {
+    /// A map being written: what the writer needs to separate or count its entries.
+    type Map;
+    fn open_map(&mut self) -> Self::Map;
+    /// Starts an entry under a static ASCII key, which needs no escaping.
+    fn key(&mut self, map: &mut Self::Map, key: &'static str);
+    /// Starts an entry under an attribute's key.
+    fn attr_key(&mut self, map: &mut Self::Map, key: &str);
+    fn close_map(&mut self, map: Self::Map);
+    /// Starts an array of `len` items, each preceded by [`TreeWriter::item`].
+    fn open_array(&mut self, len: usize);
+    fn item(&mut self, index: usize);
+    fn close_array(&mut self);
+    fn null(&mut self);
+    fn bool(&mut self, v: bool);
+    fn i64(&mut self, v: i64);
+    fn u64(&mut self, v: u64);
+    fn f64(&mut self, v: f64);
+    /// A `Value::Str` or a static name.
+    fn str(&mut self, s: &str);
+    /// A `Value::Bytes`.
+    fn bytes(&mut self, bytes: &[u8]);
+    /// A byte field that is text by convention: `status_message`, `trace_state`, `schema_url`,
+    /// scope `name`/`version`, and a set member.
+    fn text_bytes(&mut self, bytes: &[u8]);
+    /// Nanoseconds since the Unix epoch.
+    fn timestamp(&mut self, nanos: i64);
+    /// A trace or span id.
+    fn hex(&mut self, bytes: &[u8]);
+}
+
+/// The JSON writer: this module's grammar, into a `String`.
+pub(crate) struct Json<'a>(pub(crate) &'a mut String);
+
+impl Json<'_> {
+    /// The comma before every entry but a map's first. The map state is `true` until a key is
+    /// written.
+    fn separate(&mut self, first: &mut bool) {
+        if !*first {
+            self.0.push(',');
+        }
+        *first = false;
+    }
+}
+
+impl TreeWriter for Json<'_> {
+    type Map = bool;
+
+    fn open_map(&mut self) -> bool {
+        self.0.push('{');
+        true
+    }
+
+    fn key(&mut self, first: &mut bool, key: &'static str) {
+        self.separate(first);
+        self.0.push('"');
+        self.0.push_str(key);
+        self.0.push_str("\":");
+    }
+
+    fn attr_key(&mut self, first: &mut bool, key: &str) {
+        self.separate(first);
+        push_json_str(self.0, key);
+        self.0.push(':');
+    }
+
+    fn close_map(&mut self, _: bool) {
+        self.0.push('}');
+    }
+
+    fn open_array(&mut self, _len: usize) {
+        self.0.push('[');
+    }
+
+    fn item(&mut self, index: usize) {
+        if index > 0 {
+            self.0.push(',');
+        }
+    }
+
+    fn close_array(&mut self) {
+        self.0.push(']');
+    }
+
+    fn null(&mut self) {
+        self.0.push_str("null");
+    }
+
+    fn bool(&mut self, v: bool) {
+        self.0.push_str(if v { "true" } else { "false" });
+    }
+
+    fn i64(&mut self, v: i64) {
+        let _ = write!(self.0, "{v}");
+    }
+
+    fn u64(&mut self, v: u64) {
+        let _ = write!(self.0, "{v}");
+    }
+
+    /// A JSON number, or `"NaN"`/`"inf"`/`"-inf"` for the values JSON has no number for.
+    /// `Display` never uses exponent notation, so every finite value is a valid JSON number as
+    /// written.
+    fn f64(&mut self, v: f64) {
+        if v.is_finite() {
+            let _ = write!(self.0, "{v}");
+        } else if v.is_nan() {
+            self.0.push_str("\"NaN\"");
+        } else if v > 0.0 {
+            self.0.push_str("\"inf\"");
+        } else {
+            self.0.push_str("\"-inf\"");
+        }
+    }
+
+    fn str(&mut self, s: &str) {
+        push_json_str(self.0, s);
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.0.push_str("\"b\\\"");
+        push_lossless_bytes_body(self.0, bytes);
+        self.0.push_str("\\\"\"");
+    }
+
+    /// A JSON string, each invalid byte as `\xHH`.
+    fn text_bytes(&mut self, bytes: &[u8]) {
+        self.0.push('"');
+        push_lossless_bytes_body(self.0, bytes);
+        self.0.push('"');
+    }
+
+    fn timestamp(&mut self, nanos: i64) {
+        self.0.push('"');
+        write_rfc3339_utc(self.0, nanos);
+        self.0.push('"');
+    }
+
+    fn hex(&mut self, bytes: &[u8]) {
+        self.0.push('"');
+        push_hex(self.0, bytes);
+        self.0.push('"');
+    }
+}
+
+pub(crate) fn walk_event<W: TreeWriter>(
+    w: &mut W,
+    resource: &Resource,
+    scope: Option<&Scope>,
+    event: &Event,
+) {
+    let mut obj = w.open_map();
+    w.key(&mut obj, "timestamp");
+    w.timestamp(event.timestamp);
     if let Some(log) = &event.log {
-        render_log(obj.key("log"), log);
+        w.key(&mut obj, "log");
+        walk_log(w, log);
     }
     if !event.metrics.is_empty() {
-        let out = obj.key("metrics");
-        out.push('[');
-        for (i, metric) in event.metrics.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            render_metric(out, metric);
-        }
-        out.push(']');
+        w.key(&mut obj, "metrics");
+        walk_array(w, event.metrics.iter(), walk_metric);
     }
     if let Some(span) = &event.span {
-        render_span(obj.key("span"), event.timestamp, span);
+        w.key(&mut obj, "span");
+        walk_span(w, event.timestamp, span);
     }
     if !event.attributes.is_empty() {
-        push_attrs(obj.key("attributes"), &event.attributes);
+        w.key(&mut obj, "attributes");
+        walk_attrs(w, &event.attributes);
     }
     if !resource.attributes.is_empty()
         || resource.schema_url.is_some()
         || resource.dropped_attributes_count != 0
     {
-        let mut res = Obj::open(obj.key("resource"));
+        w.key(&mut obj, "resource");
+        let mut res = w.open_map();
         if !resource.attributes.is_empty() {
-            push_attrs(res.key("attributes"), &resource.attributes);
+            w.key(&mut res, "attributes");
+            walk_attrs(w, &resource.attributes);
         }
         if let Some(url) = &resource.schema_url {
-            push_text_bytes(res.key("schema_url"), url);
+            w.key(&mut res, "schema_url");
+            w.text_bytes(url);
         }
-        push_nonzero(&mut res, "dropped_attributes_count", resource.dropped_attributes_count);
-        res.close();
+        push_nonzero(w, &mut res, "dropped_attributes_count", resource.dropped_attributes_count);
+        w.close_map(res);
     }
     if let Some(scope) = scope {
-        let mut sc = Obj::open(obj.key("scope"));
+        w.key(&mut obj, "scope");
+        let mut sc = w.open_map();
         if !scope.name.is_empty() {
-            push_text_bytes(sc.key("name"), &scope.name);
+            w.key(&mut sc, "name");
+            w.text_bytes(&scope.name);
         }
         if !scope.version.is_empty() {
-            push_text_bytes(sc.key("version"), &scope.version);
+            w.key(&mut sc, "version");
+            w.text_bytes(&scope.version);
         }
         if !scope.attributes.is_empty() {
-            push_attrs(sc.key("attributes"), &scope.attributes);
+            w.key(&mut sc, "attributes");
+            walk_attrs(w, &scope.attributes);
         }
         if let Some(url) = &scope.schema_url {
-            push_text_bytes(sc.key("schema_url"), url);
+            w.key(&mut sc, "schema_url");
+            w.text_bytes(url);
         }
-        push_nonzero(&mut sc, "dropped_attributes_count", scope.dropped_attributes_count);
-        sc.close();
+        push_nonzero(w, &mut sc, "dropped_attributes_count", scope.dropped_attributes_count);
+        w.close_map(sc);
     }
-    obj.close();
+    w.close_map(obj);
 }
 
-fn render_log(out: &mut String, log: &LogRecord) {
-    let mut obj = Obj::open(out);
-    if let Some(severity) = log.severity {
-        push_json_str(obj.key("severity"), severity.as_str());
+/// An array of `items`, each written by `item`.
+fn walk_array<W: TreeWriter, T>(
+    w: &mut W,
+    items: impl ExactSizeIterator<Item = T>,
+    mut item: impl FnMut(&mut W, T),
+) {
+    w.open_array(items.len());
+    for (i, it) in items.enumerate() {
+        w.item(i);
+        item(w, it);
     }
-    push_json_str(obj.key("format"), log.body_format.as_str());
-    push_value(obj.key("message"), &log.message);
+    w.close_array();
+}
+
+fn walk_log<W: TreeWriter>(w: &mut W, log: &LogRecord) {
+    let mut obj = w.open_map();
+    if let Some(severity) = log.severity {
+        w.key(&mut obj, "severity");
+        w.str(severity.as_str());
+    }
+    w.key(&mut obj, "format");
+    w.str(log.body_format.as_str());
+    w.key(&mut obj, "message");
+    walk_value(w, &log.message);
     if let Some(name) = log.event_name {
-        push_json_str(obj.key("event_name"), resolve(name));
+        w.key(&mut obj, "event_name");
+        w.str(resolve(name));
     }
     if log.observed_timestamp != 0 {
-        push_timestamp(obj.key("observed_timestamp"), log.observed_timestamp);
+        w.key(&mut obj, "observed_timestamp");
+        w.timestamp(log.observed_timestamp);
     }
     if let Some(trace) = &log.trace {
-        push_trace_ref(&mut obj, trace);
+        walk_trace_ref(w, &mut obj, trace);
     }
-    push_nonzero(&mut obj, "dropped_attributes_count", log.dropped_attributes_count);
-    obj.close();
+    push_nonzero(w, &mut obj, "dropped_attributes_count", log.dropped_attributes_count);
+    w.close_map(obj);
 }
 
 /// `trace_id`, `span_id` when present, and `trace_flags` always: a log's or an exemplar's
 /// [`TraceRef`].
-fn push_trace_ref(obj: &mut Obj<'_>, trace: &TraceRef) {
-    push_hex_str(obj.key("trace_id"), &trace.trace_id);
+fn walk_trace_ref<W: TreeWriter>(w: &mut W, obj: &mut W::Map, trace: &TraceRef) {
+    w.key(obj, "trace_id");
+    w.hex(&trace.trace_id);
     if let Some(span_id) = &trace.span_id {
-        push_hex_str(obj.key("span_id"), span_id);
+        w.key(obj, "span_id");
+        w.hex(span_id);
     }
-    let _ = write!(obj.key("trace_flags"), "{}", trace.flags);
+    w.key(obj, "trace_flags");
+    w.u64(u64::from(trace.flags));
 }
 
-fn render_metric(out: &mut String, metric: &MetricRecord) {
-    let mut obj = Obj::open(out);
-    push_json_str(obj.key("name"), resolve(metric.name));
-    push_json_str(obj.key("kind"), kind_name(&metric.kind));
+fn walk_metric<W: TreeWriter>(w: &mut W, metric: &MetricRecord) {
+    let mut obj = w.open_map();
+    w.key(&mut obj, "name");
+    w.str(resolve(metric.name));
+    w.key(&mut obj, "kind");
+    w.str(kind_name(&metric.kind));
     if !metric.is_no_recorded_value() {
-        render_kind_fields(&mut obj, &metric.kind);
+        walk_kind_fields(w, &mut obj, &metric.kind);
     }
     if let Some(unit) = metric.unit {
-        push_json_str(obj.key("unit"), resolve(unit));
+        w.key(&mut obj, "unit");
+        w.str(resolve(unit));
     }
     if let Some(description) = metric.description {
-        push_json_str(obj.key("description"), resolve(description));
+        w.key(&mut obj, "description");
+        w.str(resolve(description));
     }
     if metric.start_timestamp != 0 {
-        push_timestamp(obj.key("start_timestamp"), metric.start_timestamp);
+        w.key(&mut obj, "start_timestamp");
+        w.timestamp(metric.start_timestamp);
     }
-    push_nonzero(&mut obj, "flags", metric.flags);
+    push_nonzero(w, &mut obj, "flags", metric.flags);
     if metric.is_no_recorded_value() {
-        obj.key("no_recorded_value").push_str("true");
+        w.key(&mut obj, "no_recorded_value");
+        w.bool(true);
     }
     if !metric.exemplars.is_empty() {
-        let out = obj.key("exemplars");
-        out.push('[');
-        for (i, exemplar) in metric.exemplars.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            render_exemplar(out, exemplar);
-        }
-        out.push(']');
+        w.key(&mut obj, "exemplars");
+        walk_array(w, metric.exemplars.iter(), walk_exemplar);
     }
-    obj.close();
+    w.close_map(obj);
 }
 
 fn kind_name(kind: &MetricKind) -> &'static str {
@@ -253,314 +413,254 @@ fn kind_name(kind: &MetricKind) -> &'static str {
     }
 }
 
-fn render_kind_fields(obj: &mut Obj<'_>, kind: &MetricKind) {
+/// `key: v` for an `f64` field.
+fn push_f64<W: TreeWriter>(w: &mut W, obj: &mut W::Map, key: &'static str, v: f64) {
+    w.key(obj, key);
+    w.f64(v);
+}
+
+/// `key: n` for an unsigned integer field.
+fn push_u64<W: TreeWriter>(w: &mut W, obj: &mut W::Map, key: &'static str, n: u64) {
+    w.key(obj, key);
+    w.u64(n);
+}
+
+fn walk_kind_fields<W: TreeWriter>(w: &mut W, obj: &mut W::Map, kind: &MetricKind) {
     match kind {
         MetricKind::Sum(s) => {
-            push_f64(obj.key("value"), s.value);
-            push_temporality(obj, s.temporality);
-            let _ = write!(obj.key("monotonic"), "{}", s.monotonic);
+            push_f64(w, obj, "value", s.value);
+            push_temporality(w, obj, s.temporality);
+            w.key(obj, "monotonic");
+            w.bool(s.monotonic);
         }
-        MetricKind::Gauge(v) => push_f64(obj.key("value"), *v),
-        MetricKind::GaugeDelta(v) => push_f64(obj.key("delta"), *v),
+        MetricKind::Gauge(v) => push_f64(w, obj, "value", *v),
+        MetricKind::GaugeDelta(v) => push_f64(w, obj, "delta", *v),
         MetricKind::Samples(s) => {
-            push_f64_array(obj.key("values"), &s.values);
-            push_f64(obj.key("sample_rate"), s.sample_rate);
+            w.key(obj, "values");
+            walk_array(w, s.values.iter(), |w, v| w.f64(*v));
+            push_f64(w, obj, "sample_rate", s.sample_rate);
         }
         MetricKind::SetMembers(members) => {
-            let out = obj.key("members");
-            out.push('[');
-            for (i, member) in members.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                push_text_bytes(out, member);
-            }
-            out.push(']');
+            w.key(obj, "members");
+            walk_array(w, members.iter(), |w, member| w.text_bytes(member));
         }
         MetricKind::Distribution(sketch) => {
             let count = sketch.count();
-            let _ = write!(obj.key("count"), "{count}");
-            push_f64(obj.key("sum"), sketch.sum());
+            push_u64(w, obj, "count", count as u64);
+            push_f64(w, obj, "sum", sketch.sum());
             // `quantile` is `None` only for an empty sketch, and `min`/`max` with it.
             if let Some(p50) = sketch.quantile(0.5) {
                 if let Some(min) = sketch.min() {
-                    push_f64(obj.key("min"), min);
+                    push_f64(w, obj, "min", min);
                 }
                 if let Some(max) = sketch.max() {
-                    push_f64(obj.key("max"), max);
+                    push_f64(w, obj, "max", max);
                 }
-                push_f64(obj.key("avg"), sketch.sum() / count as f64);
-                push_f64(obj.key("p50"), p50);
+                push_f64(w, obj, "avg", sketch.sum() / count as f64);
+                push_f64(w, obj, "p50", p50);
                 for (key, q) in [("p90", 0.9), ("p95", 0.95), ("p99", 0.99)] {
                     if let Some(v) = sketch.quantile(q) {
-                        push_f64(obj.key(key), v);
+                        push_f64(w, obj, key, v);
                     }
                 }
             }
         }
-        MetricKind::Set(hll) => {
-            let _ = write!(obj.key("estimate"), "{}", hll.estimate());
-        }
+        MetricKind::Set(hll) => push_u64(w, obj, "estimate", hll.estimate()),
         MetricKind::Histogram(h) => {
-            push_temporality(obj, h.temporality);
-            let out = obj.key("buckets");
-            out.push('[');
-            for (i, (bound, count)) in h.buckets.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push_str("{\"bound\":");
-                push_f64(out, *bound);
-                let _ = write!(out, ",\"count\":{count}}}");
-            }
-            out.push(']');
-            push_sum_min_max(obj, h.sum, h.min, h.max);
+            push_temporality(w, obj, h.temporality);
+            w.key(obj, "buckets");
+            walk_array(w, h.buckets.iter(), |w, (bound, count)| {
+                let mut bucket = w.open_map();
+                push_f64(w, &mut bucket, "bound", *bound);
+                push_u64(w, &mut bucket, "count", *count);
+                w.close_map(bucket);
+            });
+            push_sum_min_max(w, obj, h.sum, h.min, h.max);
         }
-        MetricKind::ExponentialHistogram(e) => render_exp_histogram(obj, e),
+        MetricKind::ExponentialHistogram(e) => walk_exp_histogram(w, obj, e),
         MetricKind::Summary(s) => {
-            let _ = write!(obj.key("count"), "{}", s.count);
-            push_f64(obj.key("sum"), s.sum);
-            let out = obj.key("quantiles");
-            out.push('[');
-            for (i, (q, v)) in s.quantiles.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push_str("{\"quantile\":");
-                push_f64(out, *q);
-                out.push_str(",\"value\":");
-                push_f64(out, *v);
-                out.push('}');
-            }
-            out.push(']');
+            push_u64(w, obj, "count", s.count);
+            push_f64(w, obj, "sum", s.sum);
+            w.key(obj, "quantiles");
+            walk_array(w, s.quantiles.iter(), |w, (q, v)| {
+                let mut quantile = w.open_map();
+                push_f64(w, &mut quantile, "quantile", *q);
+                push_f64(w, &mut quantile, "value", *v);
+                w.close_map(quantile);
+            });
         }
     }
 }
 
-fn render_exp_histogram(obj: &mut Obj<'_>, e: &ExpHistogram) {
-    let _ = write!(obj.key("scale"), "{}", e.scale);
-    push_temporality(obj, e.temporality);
-    let _ = write!(obj.key("count"), "{}", e.count);
-    let _ = write!(obj.key("zero_count"), "{}", e.zero_count);
-    push_f64(obj.key("zero_threshold"), e.zero_threshold);
+fn walk_exp_histogram<W: TreeWriter>(w: &mut W, obj: &mut W::Map, e: &ExpHistogram) {
+    w.key(obj, "scale");
+    w.i64(i64::from(e.scale));
+    push_temporality(w, obj, e.temporality);
+    push_u64(w, obj, "count", e.count);
+    push_u64(w, obj, "zero_count", e.zero_count);
+    push_f64(w, obj, "zero_threshold", e.zero_threshold);
     for (key, (offset, counts)) in [("positive", &e.positive), ("negative", &e.negative)] {
         if counts.is_empty() {
             continue;
         }
-        let out = obj.key(key);
-        let _ = write!(out, "{{\"offset\":{offset},\"counts\":[");
-        for (i, count) in counts.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            let _ = write!(out, "{count}");
-        }
-        out.push_str("]}");
+        w.key(obj, key);
+        let mut side = w.open_map();
+        w.key(&mut side, "offset");
+        w.i64(i64::from(*offset));
+        w.key(&mut side, "counts");
+        walk_array(w, counts.iter(), |w, count| w.u64(*count));
+        w.close_map(side);
     }
-    push_sum_min_max(obj, e.sum, e.min, e.max);
+    push_sum_min_max(w, obj, e.sum, e.min, e.max);
 }
 
-fn push_temporality(obj: &mut Obj<'_>, temporality: Temporality) {
-    push_json_str(obj.key("temporality"), temporality.as_str());
+fn push_temporality<W: TreeWriter>(w: &mut W, obj: &mut W::Map, temporality: Temporality) {
+    w.key(obj, "temporality");
+    w.str(temporality.as_str());
 }
 
-fn push_sum_min_max(obj: &mut Obj<'_>, sum: Option<f64>, min: Option<f64>, max: Option<f64>) {
+fn push_sum_min_max<W: TreeWriter>(
+    w: &mut W,
+    obj: &mut W::Map,
+    sum: Option<f64>,
+    min: Option<f64>,
+    max: Option<f64>,
+) {
     for (key, v) in [("sum", sum), ("min", min), ("max", max)] {
         if let Some(v) = v {
-            push_f64(obj.key(key), v);
+            push_f64(w, obj, key, v);
         }
     }
 }
 
-fn render_exemplar(out: &mut String, exemplar: &Exemplar) {
-    let mut obj = Obj::open(out);
-    push_timestamp(obj.key("timestamp"), exemplar.timestamp);
-    push_f64(obj.key("value"), exemplar.value);
+fn walk_exemplar<W: TreeWriter>(w: &mut W, exemplar: &Exemplar) {
+    let mut obj = w.open_map();
+    w.key(&mut obj, "timestamp");
+    w.timestamp(exemplar.timestamp);
+    push_f64(w, &mut obj, "value", exemplar.value);
     if let Some(trace) = &exemplar.trace {
-        push_trace_ref(&mut obj, trace);
+        walk_trace_ref(w, &mut obj, trace);
     }
     if !exemplar.filtered_attributes.is_empty() {
-        push_attrs(obj.key("attributes"), &exemplar.filtered_attributes);
+        w.key(&mut obj, "attributes");
+        walk_attrs(w, &exemplar.filtered_attributes);
     }
-    obj.close();
+    w.close_map(obj);
 }
 
 /// `start` is the event's timestamp: a `SpanRecord` carries no start of its own.
-fn render_span(out: &mut String, start: i64, span: &SpanRecord) {
-    let mut obj = Obj::open(out);
-    push_value(obj.key("name"), &span.name);
-    push_hex_str(obj.key("trace_id"), &span.trace_id);
-    push_hex_str(obj.key("span_id"), &span.span_id);
+fn walk_span<W: TreeWriter>(w: &mut W, start: i64, span: &SpanRecord) {
+    let mut obj = w.open_map();
+    w.key(&mut obj, "name");
+    walk_value(w, &span.name);
+    w.key(&mut obj, "trace_id");
+    w.hex(&span.trace_id);
+    w.key(&mut obj, "span_id");
+    w.hex(&span.span_id);
     if let Some(parent) = &span.parent_span_id {
-        push_hex_str(obj.key("parent_span_id"), parent);
+        w.key(&mut obj, "parent_span_id");
+        w.hex(parent);
     }
-    push_json_str(obj.key("kind"), span.kind.as_str());
-    push_json_str(obj.key("status"), span.status.as_str());
+    w.key(&mut obj, "kind");
+    w.str(span.kind.as_str());
+    w.key(&mut obj, "status");
+    w.str(span.status.as_str());
     let ext = span.ext.as_deref();
     if let Some(message) = ext.and_then(|e| e.status_message.as_ref()) {
-        push_text_bytes(obj.key("status_message"), message);
+        w.key(&mut obj, "status_message");
+        w.text_bytes(message);
     }
     if let Some(state) = ext.and_then(|e| e.trace_state.as_ref()) {
-        push_text_bytes(obj.key("trace_state"), state);
+        w.key(&mut obj, "trace_state");
+        w.text_bytes(state);
     }
-    push_nonzero(&mut obj, "flags", span.flags);
-    push_timestamp(obj.key("start"), start);
-    push_timestamp(obj.key("end"), span.end_timestamp);
+    push_nonzero(w, &mut obj, "flags", span.flags);
+    w.key(&mut obj, "start");
+    w.timestamp(start);
+    w.key(&mut obj, "end");
+    w.timestamp(span.end_timestamp);
     // Saturating: an end before the start must render, not panic or wrap.
-    let _ = write!(obj.key("duration_ns"), "{}", span.end_timestamp.saturating_sub(start));
+    w.key(&mut obj, "duration_ns");
+    w.i64(span.end_timestamp.saturating_sub(start));
     if let Some(ext) = ext {
-        push_nonzero(&mut obj, "dropped_attributes_count", ext.dropped_attributes_count);
-        push_nonzero(&mut obj, "dropped_events_count", ext.dropped_events_count);
-        push_nonzero(&mut obj, "dropped_links_count", ext.dropped_links_count);
+        push_nonzero(w, &mut obj, "dropped_attributes_count", ext.dropped_attributes_count);
+        push_nonzero(w, &mut obj, "dropped_events_count", ext.dropped_events_count);
+        push_nonzero(w, &mut obj, "dropped_links_count", ext.dropped_links_count);
     }
     if !span.events.is_empty() {
-        let out = obj.key("events");
-        out.push('[');
-        for (i, span_event) in span.events.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            render_span_event(out, span_event);
-        }
-        out.push(']');
+        w.key(&mut obj, "events");
+        walk_array(w, span.events.iter(), walk_span_event);
     }
     if !span.links.is_empty() {
-        let out = obj.key("links");
-        out.push('[');
-        for (i, link) in span.links.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            render_span_link(out, link);
-        }
-        out.push(']');
+        w.key(&mut obj, "links");
+        walk_array(w, span.links.iter(), walk_span_link);
     }
-    obj.close();
+    w.close_map(obj);
 }
 
-fn render_span_event(out: &mut String, span_event: &SpanEvent) {
-    let mut obj = Obj::open(out);
-    push_value(obj.key("name"), &span_event.name);
-    push_timestamp(obj.key("timestamp"), span_event.timestamp);
+fn walk_span_event<W: TreeWriter>(w: &mut W, span_event: &SpanEvent) {
+    let mut obj = w.open_map();
+    w.key(&mut obj, "name");
+    walk_value(w, &span_event.name);
+    w.key(&mut obj, "timestamp");
+    w.timestamp(span_event.timestamp);
     if !span_event.attributes.is_empty() {
-        push_attrs(obj.key("attributes"), &span_event.attributes);
+        w.key(&mut obj, "attributes");
+        walk_attrs(w, &span_event.attributes);
     }
-    push_nonzero(&mut obj, "dropped_attributes_count", span_event.dropped_attributes_count);
-    obj.close();
+    push_nonzero(w, &mut obj, "dropped_attributes_count", span_event.dropped_attributes_count);
+    w.close_map(obj);
 }
 
-fn render_span_link(out: &mut String, link: &SpanLink) {
-    let mut obj = Obj::open(out);
-    push_hex_str(obj.key("trace_id"), &link.trace_id);
-    push_hex_str(obj.key("span_id"), &link.span_id);
-    push_nonzero(&mut obj, "flags", link.flags);
+fn walk_span_link<W: TreeWriter>(w: &mut W, link: &SpanLink) {
+    let mut obj = w.open_map();
+    w.key(&mut obj, "trace_id");
+    w.hex(&link.trace_id);
+    w.key(&mut obj, "span_id");
+    w.hex(&link.span_id);
+    push_nonzero(w, &mut obj, "flags", link.flags);
     if let Some(state) = &link.trace_state {
-        push_text_bytes(obj.key("trace_state"), state);
+        w.key(&mut obj, "trace_state");
+        w.text_bytes(state);
     }
     if !link.attributes.is_empty() {
-        push_attrs(obj.key("attributes"), &link.attributes);
+        w.key(&mut obj, "attributes");
+        walk_attrs(w, &link.attributes);
     }
-    push_nonzero(&mut obj, "dropped_attributes_count", link.dropped_attributes_count);
-    obj.close();
+    push_nonzero(w, &mut obj, "dropped_attributes_count", link.dropped_attributes_count);
+    w.close_map(obj);
 }
 
-fn push_nonzero(obj: &mut Obj<'_>, key: &str, n: u32) {
+fn push_nonzero<W: TreeWriter>(w: &mut W, obj: &mut W::Map, key: &'static str, n: u32) {
     if n != 0 {
-        let _ = write!(obj.key(key), "{n}");
+        push_u64(w, obj, key, u64::from(n));
     }
 }
 
-/// An attribute map as a JSON object in `AttrMap`'s own (sorted-by-`Symbol`) order.
-fn push_attrs(out: &mut String, attrs: &AttrMap) {
-    out.push('{');
-    for (i, (key, value)) in attrs.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        push_json_str(out, resolve(key));
-        out.push(':');
-        push_value(out, value);
+/// An attribute map in `AttrMap`'s own (sorted-by-`Symbol`) order.
+fn walk_attrs<W: TreeWriter>(w: &mut W, attrs: &AttrMap) {
+    let mut obj = w.open_map();
+    for (key, value) in attrs.iter() {
+        w.attr_key(&mut obj, resolve(key));
+        walk_value(w, value);
     }
-    out.push('}');
+    w.close_map(obj);
 }
 
-fn push_value(out: &mut String, value: &Value) {
+fn walk_value<W: TreeWriter>(w: &mut W, value: &Value) {
     match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::I64(i) => {
-            let _ = write!(out, "{i}");
-        }
-        Value::U64(u) => {
-            let _ = write!(out, "{u}");
-        }
-        Value::F64(f) => push_f64(out, *f),
-        Value::Str(s) => {
-            // `Value::Str` is constructed only from valid UTF-8, so this cannot panic.
-            push_json_str(out, std::str::from_utf8(s).expect("Value::Str is always valid UTF-8"));
-        }
-        Value::Bytes(b) => {
-            out.push_str("\"b\\\"");
-            push_lossless_bytes_body(out, b);
-            out.push_str("\\\"\"");
-        }
-        Value::Timestamp(ns) => push_timestamp(out, *ns),
-        Value::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                push_value(out, item);
-            }
-            out.push(']');
-        }
-        Value::Map(map) => push_attrs(out, map),
+        Value::Null => w.null(),
+        Value::Bool(b) => w.bool(*b),
+        Value::I64(i) => w.i64(*i),
+        Value::U64(u) => w.u64(*u),
+        Value::F64(f) => w.f64(*f),
+        // `Value::Str` is constructed only from valid UTF-8, so this cannot panic.
+        Value::Str(s) => w.str(std::str::from_utf8(s).expect("Value::Str is always valid UTF-8")),
+        Value::Bytes(b) => w.bytes(b),
+        Value::Timestamp(ns) => w.timestamp(*ns),
+        Value::Array(items) => walk_array(w, items.iter(), walk_value),
+        Value::Map(map) => walk_attrs(w, map),
     }
-}
-
-/// A JSON number, or `"NaN"`/`"inf"`/`"-inf"` for the values JSON has no number for. `Display`
-/// never uses exponent notation, so every finite value is a valid JSON number as written.
-fn push_f64(out: &mut String, v: f64) {
-    if v.is_finite() {
-        let _ = write!(out, "{v}");
-    } else if v.is_nan() {
-        out.push_str("\"NaN\"");
-    } else if v > 0.0 {
-        out.push_str("\"inf\"");
-    } else {
-        out.push_str("\"-inf\"");
-    }
-}
-
-fn push_f64_array(out: &mut String, values: &[f64]) {
-    out.push('[');
-    for (i, v) in values.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        push_f64(out, *v);
-    }
-    out.push(']');
-}
-
-fn push_timestamp(out: &mut String, nanos: i64) {
-    out.push('"');
-    write_rfc3339_utc(out, nanos);
-    out.push('"');
-}
-
-fn push_hex_str(out: &mut String, bytes: &[u8]) {
-    out.push('"');
-    push_hex(out, bytes);
-    out.push('"');
-}
-
-/// A byte field that is text by convention: a JSON string, each invalid byte as `\xHH`.
-fn push_text_bytes(out: &mut String, bytes: &Bytes) {
-    out.push('"');
-    push_lossless_bytes_body(out, bytes);
-    out.push('"');
 }
 
 /// `bytes`' valid UTF-8 runs JSON-escaped, each invalid byte as the text `\xHH`, with no quotes.
@@ -611,6 +711,7 @@ fn push_json_escaped(out: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use logit_core::interner::intern;
     use logit_core::{
         BodyFormat, DdSketch, Histogram, HyperLogLog, Samples, Severity, SpanExt, SpanKind,

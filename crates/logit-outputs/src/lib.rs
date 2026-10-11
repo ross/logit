@@ -16,6 +16,7 @@ pub mod human;
 pub mod influxdb;
 pub mod kafka;
 pub mod logit;
+mod msgpack;
 pub mod ndjson;
 pub mod null;
 pub mod otlp;
