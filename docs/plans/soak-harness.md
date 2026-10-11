@@ -1926,38 +1926,40 @@ What the runs showed about the harness:
 
 ### W7b: two sinks of one kind (2026-10-11)
 
-Every run is from `soak/w7b` on W7a's `logit:soak` `sha256:40807aca7887` (the branch changes no
-Rust), on the development host (32 cores), two or three scenarios at a time under separate
-compose projects. Each new scenario passed every row on its first run, and the migrated ledger
-reads the regression controls as W1b to W7a recorded them:
+The recorded runs are from `soak/w7b` at `b1e03e31`, merged with `main`'s shutdown accounting
+(`internal` drains last), on `logit:soak` `sha256:0e1c5e3109ab`, rebuilt with `--no-cache` from
+that commit, on the development host (32 cores), two scenarios at a time under separate compose
+projects. Every run passed every row:
 
 | Run | Scenario | Verdict |
 |---|---|---|
-| `20261011T182342Z` | `fanout-copy` | every row PASS |
-| `20261011T182454Z` | `fanout-block` | every row PASS |
-| `20261011T183147Z` | `route-split` | every row PASS |
-| `20261011T183713Z` | `statsd-vm` | every row PASS: the regression control |
-| `20261011T184149Z` | `statsd-vm-lost-total` | every row PASS: life 0's gap of 63,500 is counted by `drain complete`'s `batches_dropped` 4 |
-| `20261011T184731Z` | `spool-kill-replay` | every row PASS: `ledger.replay` 6 replayed vs 6 queued, `ledger.windows` across the kill |
-| `20261011T184747Z` | `lua-path` | every row PASS: `ledger.script` and the egress gap without L_flush balance in the final life |
+| `20261011T223021Z` | `fanout-copy` | every row PASS |
+| `20261011T224405Z` | `fanout-block` | every row PASS |
+| `20261011T223024Z` | `route-split` | every row PASS |
+| `20261011T225118Z` | `statsd-vm` | every row PASS: the regression control |
+| `20261011T225122Z` | `statsd-vm-lost-total` | every row PASS: life 0's gap of 63,300 is counted by 4 batches its telemetry exports as `batches.dropped{reason="shutdown"}`, and stderr's `drain complete` agrees |
+| `20261011T224408Z` | `spool-kill-replay` | every row PASS: `ledger.replay` 6 replayed vs 6 queued, `ledger.windows` across the kill |
+
+The fan-out scenarios each run one sink under `overflow: drop_oldest`, `vm_b` in `fanout-copy`
+and `route-split` and `vm_a` in `fanout-block`, because `logit validate` warns when a listener
+reaches two memory-only `block` sinks, and a shipped config validates with no warning. Each
+such queue's 1,024 batches hold every fault's windows, so it dropped nothing.
 
 What the runs showed about `logit`:
 
 - **A sink's outage holds its own queue and nothing else, while its queue has room.** In
-  `fanout-copy` `vm_b`'s default queue held its backend's 90 s stop (9 batches) while `vm_a`
-  delivered 9 batches, one per window; both backends ended with Ab 1,512,800 each, and neither
-  sink dropped a batch through any of the four faults, the overlapping stop of both backends
-  included. `route-split` showed the same with each sink holding one shard: V 546,300 at each
-  backend, summing to Ab 1,092,600, and nothing unrouted.
+  `fanout-copy` `vm_b`'s queue held up to 8 batches through its backend's 90 s stop while `vm_a`
+  delivered 9, one per window; both backends ended with Ab 1,512,700 each, and neither sink
+  dropped a batch through any of the four faults, the overlapping stop of both backends
+  included. `route-split` showed the same with each sink holding one shard: V 546,400 at each
+  backend, summing to Ab 1,092,800, and nothing unrouted.
 - **A blocked sink stalls every sink beside it.** In `fanout-block` `vm_b`'s 2-batch queue
-  filled 3 s into its backend's stop, and its 64-batch inbox about 35 s later, at +98 s. From
-  the next drain `window` sent no batch and `vm_a`, whose backend was up, delivered none: 0 in
-  each drain from +103 s to +163 s, 5 s after the backend came back, when the sink's retry
-  reached it. `inbox.full` counted 1 under `vm_b` and 1 under `window`, the listener evicted and
-  counted 86,000 datagrams (`overflow_oldest`), the kernel dropped none, and both sinks delivered
-  all 535 batches after: `vm_b` 78 in its first drain back. This is the shared send of a
-  fan-out, which offers a batch to each consumer in turn; the scenario pins it rather than
-  treating it as loss, since every event was counted.
+  filled during its backend's stop, then its 64-batch inbox: `inbox.full` counted 1 under `vm_b`
+  and 1 under `window`, and `vm_a`, whose backend was up, delivered 0 batches from +110 s to
+  +150 s. The listener evicted and counted 86,000 datagrams (`overflow_oldest`), the kernel
+  dropped none, `vm_a` delivered 80 batches in the 45 s after the stop, and `vm_b`'s queue was
+  back to 1. This is the shared send of a fan-out, which offers a batch to each consumer in
+  turn; the scenario pins it rather than treating it as loss, since every event was counted.
 - DogStatsD tags reach `prometheus_out` as labels through `aggregate` and `route`: each backend
   stored 50 series, `soak_requests_N_total{shard="N mod 2"}`, and the generator's 29-byte tagged
   lines still went one per datagram under `max_packet_bytes: "32"`.
@@ -1971,8 +1973,11 @@ What the work showed about the harness:
   assert a sink kept delivering; the fan-out scenarios bound the `delta` over the window
   instead.
 - `statsd-vm-lost-total` is a control for the counted rule, not a FAIL: its gap is counted.
-  Re-scored from a copy with `batches_dropped` removed from its `drain complete` lines,
-  `ledger.egress` FAILs that life's 63,500 as uncounted on the migrated ledger.
+- With `internal` draining last, every node's shutdown drops are exported under its own id, so
+  `ledger.egress` credits a group's gap with every node's except those of the sinks outside the
+  group. None of the recorded fan-out runs stopped the SUT, so the self-test fixtures pin the
+  per-sink rule: another sink's drop leaves a short sink uncounted under `copy`, its own drop
+  or one at `aggregate` counts it, and either sink's drop counts the summed gap under `route`.
 
 ## Verification
 
